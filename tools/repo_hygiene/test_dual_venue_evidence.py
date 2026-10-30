@@ -9561,6 +9561,67 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
         self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["legacy-dumpfail", "typed-dumpfail", "typed-rc3"])
         self.assertEqual([n.split(" ")[0] for n in g["attached"]["names"]], ["typed-clean"])
 
+    # r15 (sol r14 6515820868, adversary r13 ADV-A1): an event is the token right after a segment's timestamp, so ' WATCH ' inside a dump path opens no WATCH
+    # message and the failure and exit after it are still read. Only a segment whose own event is WATCH opens one, on the first segment too, behind either
+    # form of the record's leading field (the drivers' 'watcherPid=<n> watcherExited=<b> reason=<text> log=', or 'watcherPid=<n> ' alone).
+    R15_ATTACH = "2026-10-29T00:00:01Z DEBUGGER_ATTACHED pid=7"
+    R15_FAILED = "2026-10-29T00:00:02Z DUMP_FAILED err=80 path=C:\\x {word} y\\MLVApp_7_20261029T000002.dmp create"
+    R15_WRITTEN = "2026-10-29T00:00:02Z DUMP_WRITTEN path=C:\\x WATCH y\\MLVApp_7_20261029T000002.dmp bytes=4096 context=1"
+    R15_EXIT = "2026-10-29T00:00:03Z EXIT_PROCESS exitCode=-1073740940 firstChanceExceptions=1"
+    R15_RC = "2026-10-29T00:00:03Z DEBUGGER_EXIT rc={rc}"
+    R15_HEAD = "watcherPid=55 watcherExited=True reason= log="
+    R15_WATCH = "2026-10-29T00:00:00Z WATCH exe=C:\\MLVApp.exe match={match} pid=55"
+
+    def test_r15_b1_a_watch_token_inside_another_event_never_opens_a_watch_message(self) -> None:
+        leg = {"status": "RAN", "arm": "FIX-W", "stopCycle": True, "crash": True, "dumps": []}
+        failed = lambda word: " | ".join([self.R15_ATTACH, self.R15_FAILED.format(word=word), self.R15_EXIT, self.R15_RC.format(rc=3)])
+        forged = " | ".join([self.R15_WATCH.format(match="a"), self.R15_ATTACH, "b"])
+        logs = {
+            "sol-watch": "t DEBUGGER_ATTACHED pid=7 | t DUMP_FAILED err=80 path=C:\\x WATCH y\\a.dmp create | t DEBUGGER_EXIT rc=3",
+            "sol-normal": "t DEBUGGER_ATTACHED pid=7 | t DUMP_FAILED err=80 path=C:\\x normal y\\a.dmp create | t DEBUGGER_EXIT rc=3",
+            "opus-watch": failed("WATCH"),
+            "head-watch": self.R15_HEAD + " | ".join([self.R15_WATCH.format(match="x"), failed("WATCH")]),
+            "written-rc3": " | ".join([self.R15_ATTACH, self.R15_WRITTEN, self.R15_RC.format(rc=3)]),
+            "written-rc0": " | ".join([self.R15_ATTACH, self.R15_WRITTEN, self.R15_RC.format(rc=0)]),
+            "head-closed": self.R15_HEAD + " | ".join([self.R15_WATCH.format(match="x"), self.R15_ATTACH, self.R15_RC.format(rc=1)]),
+            "short-closed": "watcherPid=55 " + " | ".join([self.R15_WATCH.format(match="x"), self.R15_ATTACH]),
+            "head-forged": self.R15_HEAD + forged,
+            "short-forged": "watcherPid=55 " + forged,
+            "reason-forged": "watcherPid=55 watcherExited=False reason=WATCHER_KILLED still running 300 s after the smoke run returned log=" + forged,
+            "head-attach-first": self.R15_HEAD + " | ".join([self.R15_ATTACH, self.R15_RC.format(rc=1)]),
+            "head-failed-first": self.R15_HEAD + " | ".join([self.R15_FAILED.format(word="WATCH"), self.R15_ATTACH]),
+        }
+        g = self.account([dict(leg, name=n, heapDumpWatch=t) for n, t in logs.items()])["groups"]
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["attached"]["names"]), ["head-attach-first", "head-closed", "short-closed", "written-rc0"])
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]),
+                         ["head-failed-first", "head-forged", "head-watch", "opus-watch", "reason-forged", "short-forged", "sol-normal", "sol-watch", "written-rc3"])
+
+    # r15 class sweep: one log, one verdict from every reader. The same four lines, ' WATCH ' in the dump path, are a failed capture for the shared judge
+    # (Get-DvHeapCaptureFromLog), for Stop-AttrCudaHeapDumpWatch's own anchored events, and for the soak accounting as a joined record and as a typed tail.
+    def test_r15_b1_every_reader_agrees_on_a_failed_dump_whose_path_holds_watch(self) -> None:
+        lines = [self.R15_ATTACH, self.R15_FAILED.format(word="WATCH"), self.R15_EXIT, self.R15_RC.format(rc=3)]
+        judge = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                          "$l = @($env:DVE_LINES | ConvertFrom-Json); Write-Output ('JUDGE=' + (Get-DvHeapCaptureFromLog -State 'ATTACHED_NO_CRASH' -LogLines $l).consistent)"],
+                         env_extra={"DVE_LINES": json.dumps(lines)})
+        self.assertEqual(judge.returncode, 0, judge.stdout + judge.stderr)
+        self.assertIn("JUDGE=False", judge.stdout.splitlines(), judge.stdout)
+        with tempfile.TemporaryDirectory(prefix="heap-agree-") as d:
+            hd = Path(d) / "hd"
+            hd.mkdir()
+            (hd / "watcher.log").write_text("\n".join(["2026-10-29T00:00:00Z WATCH_REQUESTED", "2026-10-29T00:00:01Z ATTACH pid=7"] + lines) + "\n", encoding="utf-8")
+            stop = run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ATTR_MODULE}' -Force\n"
+                             "$p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList '-NoProfile','-Command','exit 3' -WindowStyle Hidden -PassThru; [void]$p.WaitForExit(60000)\n"
+                             f"$r = [ordered]@{{ schema = 'mlv-app/heap-corruption-dump/v1'; requested = $true; dumpDir = '{hd}'; watcherPid = $p.Id; reason = $null; watcherExited = $null; captureState = $null; watcherLog = @(); dumps = @(); watcherProcess = $p }}\n"
+                             "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\nWrite-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)"], timeout=240)
+            self.assertEqual(stop.returncode, 0, stop.stdout + stop.stderr)
+            self.assertIn("CAPTURE=STOP_FAILED", stop.stdout.splitlines(), stop.stdout)
+            self.assertIn("REASON=WATCHER_CAPTURE_FAILED the dump write failed (DUMP_FAILED)", stop.stdout.splitlines(), stop.stdout)
+        leg = {"status": "RAN", "arm": "FIX-W", "stopCycle": True, "crash": True, "dumps": []}
+        g = self.account([dict(leg, name="joined", heapDumpWatch=" | ".join(lines)),
+                          dict(leg, name="typed", watch="debugger", captureState="ATTACHED_NO_CRASH", watcherLog=lines)])["groups"]
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["joined", "typed"])
+        self.assertEqual(g["attached"]["legs"], 0)
+
     def test_r12p2_a2_every_carried_watcher_log_is_debugger_evidence_and_is_read_for_failure(self) -> None:
         # r12 pass 2 (adversary 9621fe1e A2): watch 'none' (or no watch) with a watcherLog showing DEBUGGER_ATTACHED is never unattached; a typed
         # ATTACHED_NO_CRASH record whose heapDumpWatch log shows DUMP_FAILED / rc=3 is never attached
