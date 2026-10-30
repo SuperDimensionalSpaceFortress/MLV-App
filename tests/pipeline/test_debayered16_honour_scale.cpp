@@ -36,12 +36,27 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #define HONOUR_SCALE_TEST_SETENV(name, value) _putenv_s((name), (value))
 #define HONOUR_SCALE_TEST_UNSETENV(name) _putenv_s((name), "")
 #else
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #define HONOUR_SCALE_TEST_SETENV(name, value) setenv((name), (value), 1)
 #define HONOUR_SCALE_TEST_UNSETENV(name) unsetenv((name))
 #endif
+
+extern "C" {
+#include "../../src/debayer/debayer.h"
+int debayerBasicU16ReinitDispatchForTesting(void);
+}
 
 namespace {
 
@@ -1101,4 +1116,195 @@ TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyRe
     ASSERT_EQ(4, d.factor);
     ASSERT_FALSE(playbackPrepReducedSourceConfig(workspace, config, 1, d, 1808, 2268, 1808, 2268, &reduced));
     ASSERT_FALSE(playbackPrepReducedSourceConfig(workspace, config, 1, d, 1808, 2268, 1808, 2268, nullptr));
+}
+
+// r2 B1 (Dot 4fcd6bc7, adversary A2): the policy admits odd reduced widths (4004x2268 at x4 is
+// 1001x564) and allocates exactly reducedWidth*reducedHeight words. The bilinear kernels read
+// the x+2 column, which at an odd width is past the row and, on the final row pair, one word
+// past the frame. The frame below ends exactly at a no-access page; a read of that page is
+// recorded by the fault handler, which then opens the page read-only so the kernel finishes.
+namespace {
+
+struct GuardPage
+{
+    char *lo = nullptr;
+    char *hi = nullptr;
+    long hits = 0;
+    const char *firstFault = nullptr;
+};
+
+GuardPage g_guardPage;
+
+#ifdef _WIN32
+LONG CALLBACK guardPageHandler(EXCEPTION_POINTERS *info)
+{
+    const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const char *addr = reinterpret_cast<const char *>(rec->ExceptionInformation[1]);
+    if (addr < g_guardPage.lo || addr >= g_guardPage.hi)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (g_guardPage.hits++ == 0)
+        g_guardPage.firstFault = addr;
+    DWORD old = 0;
+    VirtualProtect(g_guardPage.lo, static_cast<SIZE_T>(g_guardPage.hi - g_guardPage.lo), PAGE_READONLY, &old);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#else
+struct sigaction g_guardPagePrevious;
+
+void guardPageHandler(int sig, siginfo_t *info, void *)
+{
+    const char *addr = static_cast<const char *>(info->si_addr);
+    if (addr < g_guardPage.lo || addr >= g_guardPage.hi)
+    {
+        sigaction(sig, &g_guardPagePrevious, nullptr);
+        return;
+    }
+    if (g_guardPage.hits++ == 0)
+        g_guardPage.firstFault = addr;
+    mprotect(g_guardPage.lo, static_cast<size_t>(g_guardPage.hi - g_guardPage.lo), PROT_READ);
+}
+#endif
+
+// A frame of `bytes` bytes ending exactly at a no-access page; run() reports the guard reads.
+class GuardedFrame
+{
+public:
+    explicit GuardedFrame(size_t bytes) : m_bytes(bytes)
+    {
+#ifdef _WIN32
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        m_page = si.dwPageSize;
+#else
+        m_page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+        const size_t dataPages = (bytes + m_page - 1) / m_page;
+        m_mapBytes = (dataPages + 1) * m_page;
+#ifdef _WIN32
+        m_base = static_cast<char *>(VirtualAlloc(nullptr, m_mapBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+#else
+        void *p = mmap(nullptr, m_mapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        m_base = p == MAP_FAILED ? nullptr : static_cast<char *>(p);
+#endif
+        m_guard = m_base ? m_base + dataPages * m_page : nullptr;
+    }
+    ~GuardedFrame()
+    {
+        if (!m_base)
+            return;
+#ifdef _WIN32
+        VirtualFree(m_base, 0, MEM_RELEASE);
+#else
+        munmap(m_base, m_mapBytes);
+#endif
+    }
+    bool ok() const { return m_base != nullptr; }
+    void *data() const { return m_guard - m_bytes; }
+
+    // Arms the guard, runs fn, disarms; returns the number of faulting reads of the guard page
+    // and the first one's offset past the frame's end in *firstOffset.
+    template <typename Fn> long run(Fn fn, long *firstOffset)
+    {
+        g_guardPage.lo = m_guard;
+        g_guardPage.hi = m_guard + m_page;
+        g_guardPage.hits = 0;
+        g_guardPage.firstFault = nullptr;
+#ifdef _WIN32
+        DWORD old = 0;
+        VirtualProtect(m_guard, m_page, PAGE_NOACCESS, &old);
+        void *handler = AddVectoredExceptionHandler(1, guardPageHandler);
+        fn();
+        RemoveVectoredExceptionHandler(handler);
+        VirtualProtect(m_guard, m_page, PAGE_READWRITE, &old);
+#else
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = guardPageHandler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_guardPagePrevious);
+        mprotect(m_guard, m_page, PROT_NONE);
+        fn();
+        mprotect(m_guard, m_page, PROT_READ | PROT_WRITE);
+        sigaction(SIGSEGV, &g_guardPagePrevious, nullptr);
+#endif
+        *firstOffset = g_guardPage.firstFault ? static_cast<long>(g_guardPage.firstFault - m_guard) : -1;
+        return g_guardPage.hits;
+    }
+
+private:
+    size_t m_bytes = 0;
+    size_t m_page = 0;
+    size_t m_mapBytes = 0;
+    char *m_base = nullptr;
+    char *m_guard = nullptr;
+};
+
+bool hostRunsDebayerAvx2()
+{
+#if defined(__GNUC__) && !defined(__clang__) && (defined(__x86_64__) || defined(__i386__))
+    // The kernel's own kill switch latches scalar whatever the host supports.
+    const char *kill = std::getenv("MLVAPP_DISABLE_AVX2");
+    if (kill && kill[0] != '\0' && std::strcmp(kill, "0") != 0)
+        return false;
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
+
+} // namespace
+
+TEST(Debayered16ReconReuse, ReducedDebayerOddWidthReadsStayInsideTheBayerFrame)
+{
+    EnvGuard guard;
+    struct Case { int width; int height; };
+    // 1001x564 is the admitted x4 geometry of a 4004x2268 clip (the AVX2 path's scalar tail
+    // reaches x=999); 127x20 ends in a short tail; 17x10 is below the AVX2 width floor.
+    const Case cases[] = { { 1001, 564 }, { 127, 20 }, { 17, 10 } };
+    const bool avx2Host = hostRunsDebayerAvx2();
+    int avx2Runs = 0;
+    for (const Case &c : cases)
+    {
+        const size_t pixels = static_cast<size_t>(c.width) * static_cast<size_t>(c.height);
+        std::vector<uint16_t> out(pixels * 3u, 0);
+        for (const bool scalar : { true, false })
+        {
+            if (!scalar && !avx2Host)
+                continue;
+            HONOUR_SCALE_TEST_SETENV("MLVAPP_DISABLE_AVX2_DEBAYER", scalar ? "1" : "");
+            const int avx2 = debayerBasicU16ReinitDispatchForTesting();
+            ASSERT_EQ(scalar ? 0 : 1, avx2);
+            if (!scalar && c.width >= 18)
+                ++avx2Runs;
+            GuardedFrame frame(pixels * sizeof(uint16_t));
+            ASSERT_TRUE(frame.ok());
+            uint16_t *bayer = static_cast<uint16_t *>(frame.data());
+            for (size_t i = 0; i < pixels; ++i)
+                bayer[i] = static_cast<uint16_t>((i * 37u + 1u) & 0x3FFFu);
+            long offset = -1;
+            const long hits = frame.run([&] { debayerBasicU16(out.data(), bayer, c.width, c.height, 1, 0); }, &offset);
+            std::printf("[debayered16-honour-scale] debayerBasicU16 %s %dx%d: guard reads=%ld first offset=%ld\n",
+                        scalar ? "scalar" : "avx2", c.width, c.height, hits, offset);
+            ASSERT_EQ(0L, hits);
+        }
+        // The float sibling (debayerBasic) indexes the same 4x4 neighbourhood.
+        GuardedFrame frame(pixels * sizeof(float));
+        ASSERT_TRUE(frame.ok());
+        float *bayer = static_cast<float *>(frame.data());
+        for (size_t i = 0; i < pixels; ++i)
+            bayer[i] = static_cast<float>((i * 37u + 1u) & 0x3FFFu);
+        long offset = -1;
+        const long hits = frame.run([&] { debayerBasic(out.data(), bayer, c.width, c.height, 1); }, &offset);
+        std::printf("[debayered16-honour-scale] debayerBasic %dx%d: guard reads=%ld first offset=%ld\n", c.width,
+                    c.height, hits, offset);
+        ASSERT_EQ(0L, hits);
+    }
+    HONOUR_SCALE_TEST_UNSETENV("MLVAPP_DISABLE_AVX2_DEBAYER");
+    debayerBasicU16ReinitDispatchForTesting();
+    std::printf("[debayered16-honour-scale] odd-width guard: avx2 host=%d avx2 runs=%d\n", avx2Host ? 1 : 0, avx2Runs);
+    ASSERT_EQ(avx2Host ? 2 : 0, avx2Runs);
 }
