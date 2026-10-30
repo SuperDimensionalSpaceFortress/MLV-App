@@ -28,6 +28,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1"
@@ -36,6 +37,15 @@ PWSH = shutil.which("pwsh")
 # Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s) plus
 # its ~30 s of unit cases, so a hung suite fails by its own name there first. Measured 349 s locally, 282 s on the hosted runner.
 UNIT_RUN_TIMEOUT_SEC = 600
+
+
+def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        if not tolerate_oserror:
+            raise
+        return f"<read failed: errno {exc.errno} {exc.strerror}>"
 
 
 def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, str]:
@@ -63,8 +73,10 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
                 proc.kill()
                 proc.wait(timeout=30)
         elapsed = time.monotonic() - started
-        stdout = out_path.read_text(encoding="utf-8", errors="replace")
-        stderr = err_path.read_text(encoding="utf-8", errors="replace")
+        # After a timeout the case-named verdict below is the failure, so a read error (a Windows sharing violation on a file the
+        # killed tree still holds) is recorded in the text instead of replacing it. Without a timeout the read error surfaces.
+        stdout = _read_captured(out_path, tolerate_oserror=timed_out)
+        stderr = _read_captured(err_path, tolerate_oserror=timed_out)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if timed_out:
@@ -358,6 +370,67 @@ class BoundedRunTests(unittest.TestCase):
     def test_a_finished_run_returns_its_code_and_both_streams(self) -> None:
         rc, out, err = run_bounded([sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err'); sys.exit(3)"], 60, "finished-case")
         self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
+
+
+class BoundedRunOutputReadFailureTests(unittest.TestCase):
+    """sol r2 BLOCKER: a captured-output read error after a timeout must not replace the case-named timeout verdict.
+
+    Injected in memory (no real process, no real sharing violation): wait() raises TimeoutExpired, the tree and root cleanup
+    succeed, and one of the two output reads raises PermissionError(13, 'sharing violation').
+    """
+
+    class _TimedOutProc:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            return 1
+
+        def kill(self) -> None:
+            pass
+
+    def _run_failing_read(self, failing_name: str, *, timeout_expires: bool = True) -> BaseException:
+        proc = self._TimedOutProc()
+        if not timeout_expires:
+            proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
+        real_read_text = Path.read_text
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path.name == failing_name:
+                raise PermissionError(13, "sharing violation")
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", return_value=proc), \
+                mock.patch.object(subprocess, "run"), \
+                mock.patch.object(Path, "read_text", read_text):
+            try:
+                run_bounded(["child"], 3, "stub-hang-case")
+            except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                return exc
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_the_stdout_read_fails(self) -> None:
+        caught = self._run_failing_read("stdout.txt")
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("<read failed: errno 13", str(caught))
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_the_stderr_read_fails(self) -> None:
+        caught = self._run_failing_read("stderr.txt")
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("<read failed: errno 13", str(caught))
+
+    def test_a_read_failure_without_a_timeout_still_surfaces_as_the_oserror(self) -> None:
+        # The non-timeout path is unchanged: with no verdict to protect, the read error is the failure.
+        for name in ("stdout.txt", "stderr.txt"):
+            caught = self._run_failing_read(name, timeout_expires=False)
+            self.assertIsInstance(caught, PermissionError, f"{name}: {caught!r}")
 
 
 if __name__ == "__main__":
