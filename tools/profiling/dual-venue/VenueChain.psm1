@@ -1084,7 +1084,8 @@ function Read-VenueLeaseBatchReceipt {
     if ($lines.Count -eq 1 -and $lines[0] -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; record = $null; error = $null } }
     foreach ($line in $lines) {
         $rec = try { $line | ConvertFrom-Json } catch { $null }
-        if ($null -ne $rec -and [string]$rec.leaseId -ceq $LeaseId) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
+        # r12 (adversary r11 A2): ordinal on the exact lease id (-ceq is culture-aware); an empty or whitespace-only -LeaseId names no lease, so it matches no line
+        if ($null -ne $rec -and -not [string]::IsNullOrWhiteSpace($LeaseId) -and [string]::Equals([string]$rec.leaseId, $LeaseId, [StringComparison]::Ordinal)) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
     }
     [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
 }

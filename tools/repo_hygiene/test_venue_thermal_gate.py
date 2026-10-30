@@ -452,6 +452,64 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertEqual(ps_json(rows("1.t", "1.t")), "a|cpu")
         self.assertEqual(ps_json(rows("1.t", "1.u")), "")
 
+    def test_r12_adversary_a1_a2_lease_identity_is_compared_ordinally_on_the_raw_lease_id(self) -> None:
+        # adversary r11 A1 / A2 on e5ff0114: the identity trimmed the leaseId (' L1' == 'L1'), and PowerShell -eq / -ceq compare culture-aware, so 'L<SHY>1' == 'L1<SHY>' (U+00AD is
+        # ignorable). Both made two DISTINCT leases one thermal sequence: b's hot first leg was charged to a|cpu (heavy), and a-A,a-B,b-A,b-B was spread to a-A,b-A,a-B,b-B.
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-raw-lease-"))
+        shy = chr(0xAD)
+        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
+                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
+                  "[pscustomobject]@{ batches = @($h.rows | ForEach-Object { $_.batch }); heat = @($h.rows | ForEach-Object { $_.heat }); heavy = @($hk.Keys); "
+                  "order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
+
+        def leg(name: str, heat: str, **more) -> dict:
+            return {"name": f"01-{name}-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": heat, **more}
+
+        def receipt(ident: dict, legs: list) -> str:
+            return json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, **ident, "legs": legs}) + "\n"
+
+        def run(i1: dict, i2: dict) -> dict:
+            (d / "batches.jsonl").write_text(receipt(i1, [leg("a", "clear")]) + receipt(i2, [leg("b", "hot")]), encoding="utf-8")
+            return ps_json(spread.replace("<D>", str(d)))
+
+        original, chained = "a-A,a-B,b-A,b-B", "a-A,b-A,a-B,b-B"
+        # A1: ids that differ only by surrounding whitespace are distinct leases; A2: ids that differ only by an ignorable character are distinct leases
+        for l1, l2 in (("L1", " L1"), ("L1", "L1 "), ("L1", "L1\t"), (" L1", "L1"), ("L" + shy + "1", "L1" + shy), ("L1", "L1" + shy), ("L1", "L" + shy + "1")):
+            got = run({"token": "t", "leaseId": l1}, {"token": "t", "leaseId": l2})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (l1, l2, got))
+            self.assertEqual(len(set(got["batches"])), 2, (l1, l2, got))
+        # control: the SAME exact lease id (and token) across two receipts is one lease and chains; so does a lease id that is itself spelled with a soft hyphen or spaces
+        for lid in ("L1", "L1" + shy, " L1 ", "L" + shy + "1"):
+            got = run({"token": "t", "leaseId": lid}, {"token": "t", "leaseId": lid})
+            self.assertEqual((got["heavy"], got["order"]), (["a|cpu"], chained), (lid, got))
+        # a whitespace-only lease id is a barrier, not a match; an absent or empty one is a receipt older than the lease id and is still identified by its token
+        for lid in (" ", "\t", "   "):
+            got = run({"token": "t", "leaseId": lid}, {"token": "t", "leaseId": lid})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (lid, got))
+        for ident in ({"token": "t"}, {"token": "t", "leaseId": ""}, {"token": "t", "leaseId": None}):
+            got = run(ident, ident)
+            self.assertEqual((got["heavy"], got["order"]), (["a|cpu"], chained), (ident, got))
+        # A2 sibling: a leg row with no onLease field takes the sidecar's heat only when the sidecar names the batch's EXACT lease id
+        (d / "batches.jsonl").write_text(receipt({"token": "t", "leaseId": "L1"}, [leg("a", "clear"), {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "jobId": "j2", "heatAtProbe": "unknown"}]), encoding="utf-8")
+        for sid, want in (("L1", "hot"), ("L1" + shy, "unknown"), ("L" + shy + "1", "unknown"), (" L1", "unknown"), ("L1 ", "unknown")):
+            (d / "agent-result-j2.json").write_text(json.dumps({"admission": {"heat": "hot", "leaseBatch": {"leaseId": sid}, "slotContinuity": "kept"}}), encoding="utf-8")
+            self.assertEqual(ps_json(spread.replace("<D>", str(d)))["heat"], ["clear", want], sid)
+        # a whitespace-only batch lease id can never be proven by a sidecar
+        (d / "batches.jsonl").write_text(receipt({"token": "t", "leaseId": " "}, [leg("a", "clear"), {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "jobId": "j2", "heatAtProbe": "unknown"}]), encoding="utf-8")
+        (d / "agent-result-j2.json").write_text(json.dumps({"admission": {"heat": "hot", "leaseBatch": {"leaseId": " "}, "slotContinuity": "kept"}}), encoding="utf-8")
+        self.assertEqual(ps_json(spread.replace("<D>", str(d)))["heat"], ["clear", "unknown"])
+
+    def test_r12_adversary_a2_heavy_leg_keys_compares_the_batch_ordinally(self) -> None:
+        # the direct helper (VenueThermalGate.psm1:189 -cne): two rows whose batch differs only by an ignorable character are two leases
+        def rows(b1: str, b2: str) -> str:
+            return (f"$shy = [string][char]0x00AD; $k = Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{{ batch = {b1}; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }}, "
+                    f"[pscustomobject]@{{ batch = {b2}; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }}); (@($k.Keys) -join ',')")
+        self.assertEqual(ps_json(rows("('1.t' + $shy)", "'1.t'")), "")
+        self.assertEqual(ps_json(rows("('1.' + $shy + 't')", "('1.t' + $shy)")), "")
+        self.assertEqual(ps_json(rows("'1.t'", "'1.t'")), "a|cpu")
+        self.assertEqual(ps_json(rows("('1.t' + $shy)", "('1.t' + $shy)")), "a|cpu")
+
     def test_r7p2_a1_an_agent_heat_read_on_another_lease_is_never_charged_to_this_leases_predecessor(self) -> None:
         # adversary r7 A1 on 83fd79de: b ran on a replacement lease (jobLease L2, onLease false, LEASE_LOST); its grant heat is L2's, yet the reader took it and charged it
         # to a on L1, so a|cpu became heavy. The same holds for the agent-result sidecar's admission.heat (sibling): only a reading on the batch's own lease counts.

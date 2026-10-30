@@ -115,7 +115,9 @@ if ($JobId -like 'lease-batch-open-*') {
     $lid = "lease-$($n + 1)"
     $adm = [ordered]@{ gate = 'fake'; mode = 'lease'; label = 'clear'; heavySlotHeld = "1:$(1001 + $n)"; slot = 'C:\t\.heavy-slots\1'; leaseMinutes = 45; waitedSec = 7; leaseRequests = 2
         leaseRefusals = @([ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' }) }
-    if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $token; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
+    # r12 (adversary A2): FAKE_OPEN_TOKEN_SHY=1 answers with the batch's token plus a soft hyphen (U+00AD): culture-aware equality says it is the same token, ordinal says it is not
+    $tokOut = $(if ($env:FAKE_OPEN_TOKEN_SHY -eq '1') { $token + [string][char]0x00AD } else { $token })
+    if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $tokOut; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
@@ -190,7 +192,8 @@ if ($legMode -eq 'hang') {
     exit 0
 }
 $lose =@(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
-$lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } else { $st.leaseId })
+# r12 (adversary A2): FAKE_LEG_LEASE_SHY=1 reports the batch's lease id plus a soft hyphen (U+00AD): culture-aware equality says it is the same lease, ordinal says it is not
+$lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } elseif ($env:FAKE_LEG_LEASE_SHY -eq '1') { $st.leaseId + [string][char]0x00AD } else { $st.leaseId })
 $now = [DateTimeOffset]::UtcNow
 $remain = [int](Pick $env:FAKE_LEG_REMAIN $k '2600')
 $outbox = Join-Path $share 'outbox'
@@ -657,6 +660,35 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual((b2["legsRan"], b2["legsCounted"]), (1, 1))
         res = batch_result(r.stdout)
         self.assertEqual((res["ran"], res["counted"]), (2, 1))
+
+    def test_r12_adversary_a2_a_job_lease_that_differs_only_by_an_ignorable_character_is_another_lease(self) -> None:
+        # adversary r11 A2 on e5ff0114 (sibling Invoke-VenueLeaseBatch.ps1:2013): jobLease -ceq $b.leaseId is culture-aware, so lease-1 + U+00AD read as the batch's own lease
+        # and a leg that ran on ANOTHER lease was counted. Ordinal equality: it is LEASE_LOST and uncounted, exactly like a different lease id.
+        r = self.run_batch(self.specs[:2], FAKE_LEG_LEASE_SHY="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"], b1["legs"][0]["class"], b1["legs"][0]["onLease"]), ("LEASE_LOST", 1, 0, "LEASE_LOST", False), b1)
+
+    def test_r12_adversary_a2_an_open_whose_token_differs_only_by_an_ignorable_character_is_not_this_batch(self) -> None:
+        # sibling Invoke-VenueLeaseBatch.ps1:1762: [string]$adm.leaseBatch.token -cne $token is culture-aware, so token + U+00AD was accepted as this batch's token
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_TOKEN_SHY="1")
+        b = self.batches()[0]
+        self.assertEqual(b["endReason"], "AGENT_NOT_BATCH_CAPABLE", (r.stdout, r.stderr, b))
+
+    def test_r12_adversary_a2_the_agents_batch_receipt_is_found_by_the_exact_lease_id_only(self) -> None:
+        # sibling VenueChain.psm1:1087: [string]$rec.leaseId -ceq $LeaseId was culture-aware, and an empty or whitespace lease id matched a record with no lease id
+        (self.share / "logs").mkdir()
+        lines = [{"leaseId": "L1" + chr(0xAD), "endReason": "other"}, {"endReason": "noid"}, {"leaseId": "L1", "endReason": "closed"}]
+        (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines), encoding="utf-8")
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'; $shy = [string][char]0x00AD\n"
+            "$rd = { param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }\n"
+            "[ordered]@{ exact = (& $rd 'L1'); shyMid = (& $rd ('L' + $shy + '1')); lead = (& $rd ' L1'); empty = (& $rd ''); blank = (& $rd ' ') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"exact": "FOUND:closed", "shyMid": "ABSENT:", "lead": "ABSENT:", "empty": "ABSENT:", "blank": "ABSENT:"})
 
     def test_an_agent_without_lease_batches_stops_before_any_probe_or_leg(self) -> None:
         r = self.run_batch(self.specs[:2], FAKE_OPEN_MODES="nobatch")

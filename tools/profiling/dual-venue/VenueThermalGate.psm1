@@ -186,7 +186,8 @@ function Get-VenueHeavyLegKeys {
         # r8 (adversary efe7699b A3): a row with no batch is a lease of its own, so two such rows are never on "the same" lease
         # r11 (sol r10 B1): an empty or whitespace batch is no identity either (two of them were one lease), so it is a lease of its own exactly like a missing one
         if ($null -eq $f.batch -or [string]::IsNullOrWhiteSpace([string]$f.batch)) { $lastBatch = $null; $lastRanKey = $null }
-        elseif ($lastBatch -isnot [string] -or [string]$f.batch -cne $lastBatch) { $lastBatch = [string]$f.batch; $lastRanKey = $null }
+        # r12 (adversary r11 A2): the batch is compared ORDINALLY: PowerShell -ceq / -cne are case-sensitive but still culture-aware, so a soft hyphen (U+00AD) or another ignorable character made two distinct leases equal
+        elseif ($lastBatch -isnot [string] -or -not [string]::Equals([string]$f.batch, $lastBatch, [StringComparison]::Ordinal)) { $lastBatch = [string]$f.batch; $lastRanKey = $null }
         if ([string]$f.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
         # adversary r1b A5: the predecessor is the last leg that LAUNCHED (RAN, LEG_FAILED, LEASE_EXPIRED); a row of unknown identity (a $null key) is a barrier, so
         # heat is never charged across it. A leg that never launched (THERMAL_HOT_SKIPPED, a RETRY whose own re-check failed) leaves the predecessor as it was.
@@ -254,8 +255,12 @@ function Read-VenueLegHeatHistory {
             # r11 (sol r10 B1 / adversary A2): the identity is the lease (leaseId) PLUS a normalised, non-empty token, length-framed so no leaseId/token pair can spell another's. A
             # whitespace token is no token, and the generated fallback ("line:<n>") lives in its own namespace ("tok:" never starts it), so neither can equal another lease's identity
             $tokenText = $(if ($b.PSObject.Properties['token'] -and $null -ne $b.token) { ([string]$b.token).Trim() } else { '' })
-            $leaseText = $(if ($b.PSObject.Properties['leaseId'] -and $null -ne $b.leaseId) { ([string]$b.leaseId).Trim() } else { '' })
-            $lease = $(if ($tokenText) { "tok:$($leaseText.Length):${leaseText}:$tokenText" } else { "line:$lineNo" })
+            # r12 (adversary r11 A1 / A2): the leaseId is the RAW string, never trimmed (' L1' is not 'L1'), and the identity is compared ordinally (Get-VenueHeavyLegKeys). A non-empty but
+            # whitespace-only leaseId is no identity at all, so it is a lease of its own (a barrier) like a missing token; an absent or empty one is a receipt older than the lease id,
+            # still identified by its token
+            $leaseText = $(if ($b.PSObject.Properties['leaseId'] -and $null -ne $b.leaseId) { [string]$b.leaseId } else { '' })
+            $leaseBlank = ($leaseText.Length -gt 0 -and [string]::IsNullOrWhiteSpace($leaseText))
+            $lease = $(if ($tokenText -and -not $leaseBlank) { "tok:$($leaseText.Length):${leaseText}:$tokenText" } else { "line:$lineNo" })
             $leaseLabel = $(if ($tokenText) { $tokenText } else { "line $lineNo" })
             $unnamed = 0
             foreach ($l in @($b.legs)) {
@@ -271,7 +276,7 @@ function Read-VenueLegHeatHistory {
                 # it never followed. Such a row keeps only the probe's reading, which is always this lease's.
                 # r8 (adversary r8 A2): a row with NO onLease field (LEG_FAILED, LEASE_EXPIRED: the runner never read their agent result) in a batch that names its leaseId
                 # is not known to be on that lease: its recorded grant heat is not taken, and its sidecar's admission.heat only when the sidecar itself shows the job on the
-                # batch's lease, by the runner's own onLease rule (admission.leaseBatch.leaseId -ceq the batch's leaseId and slotContinuity not 'lost'). A batch with no
+                # batch's lease, by the runner's own onLease rule (admission.leaseBatch.leaseId ordinally equal to the batch's leaseId and slotContinuity not 'lost'). A batch with no
                 # leaseId (receipts older than the lease id) reads as before.
                 $batchLease = $(if ($b.PSObject.Properties['leaseId'] -and $b.leaseId) { [string]$b.leaseId } else { $null })
                 $hasOnLease = [bool]$l.PSObject.Properties['onLease']
@@ -292,7 +297,8 @@ function Read-VenueLegHeatHistory {
                             $lb = $(if ($null -ne $adm -and $adm.PSObject.Properties['leaseBatch'] -and $adm.leaseBatch -is [System.Management.Automation.PSCustomObject]) { $adm.leaseBatch } else { $null })
                             $jl = $(if ($null -ne $lb -and $lb.PSObject.Properties['leaseId'] -and $null -ne $lb.leaseId) { [string]$lb.leaseId } else { $null })
                             $sc = $(if ($null -ne $adm -and $adm.PSObject.Properties['slotContinuity']) { [string]$adm.slotContinuity } else { '' })
-                            $sameLease = ($null -ne $jl -and $jl -ceq $batchLease -and $sc -cne 'lost')
+                            # r12 (adversary r11 A2): ordinal, on the raw ids; a blank batch lease id can never be proven
+                            $sameLease = ($null -ne $jl -and -not [string]::IsNullOrWhiteSpace($batchLease) -and [string]::Equals($jl, $batchLease, [StringComparison]::Ordinal) -and $sc -cne 'lost')
                         }
                         if ($sameLease -and $null -ne $adm -and $adm.PSObject.Properties['heat'] -and [string]$adm.heat -cin @('hot', 'clear')) { $heat = [string]$adm.heat }
                     }

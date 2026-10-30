@@ -1759,7 +1759,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         } elseif (($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME') -or $null -eq $op.result -or [int]$op.result.exitCode -ne 0 -or $null -eq $adm -or [string]$adm.label -cne 'clear') {
             $b.endReason = 'OPEN_FAILED'; $b.endDetail = "outcome=$($op.outcome) exit=$(if ($op.result) { $op.result.exitCode }) label=$(if ($adm) { $adm.label }) $($op.message)".Trim()
             Set-Stop 'OPEN_FAILED' 9
-        } elseif ($null -eq $adm.leaseBatch -or [string]$adm.leaseBatch.token -cne $token -or -not $adm.leaseBatch.leaseId) {
+        } elseif ($null -eq $adm.leaseBatch -or -not [string]::Equals([string]$adm.leaseBatch.token, $token, [StringComparison]::Ordinal) -or -not $adm.leaseBatch.leaseId) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
         } elseif ($openHit) {
@@ -2010,7 +2010,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $ja = $(if ($jr.state -ceq 'FOUND') { $jr.result.admission } else { $null })
                 $jobLease = $(if ($null -ne $ja -and $null -ne $ja.leaseBatch) { [string]$ja.leaseBatch.leaseId } else { $null })
-                $onLease = ($null -ne $jobLease -and $jobLease -ceq $b.leaseId -and [string]$ja.slotContinuity -cne 'lost')
+                # r12 (adversary r11 A2): the lease id is compared ORDINALLY (-ceq is case-sensitive but culture-aware: a soft hyphen made another lease the batch's own); blank is no lease
+                $onLease = ($null -ne $jobLease -and -not [string]::IsNullOrWhiteSpace([string]$b.leaseId) -and [string]::Equals($jobLease, [string]$b.leaseId, [StringComparison]::Ordinal) -and [string]$ja.slotContinuity -cne 'lost')
                 if ($onLease) { $e2 = Get-LeaseEndUtc $jr.result; if ($null -ne $e2 -and $e2 -lt $leaseEnd) { $leaseEnd = $e2; $b.leaseEndUtc = $leaseEnd.ToString('o') } }
                 # CAPS e: the longest gap between the lease's successful renews up to this leg's end (the agent's own measure). Over -RenewGapMaxSec heavy-slot.py
                 # demoted the lease, so this leg and every later one did not have it exclusively: never counted, and the batch ends.
