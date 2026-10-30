@@ -35,6 +35,9 @@
 # counted apart and is never a probe that measured anything). Select-VenueQuietWindow decides whether a chain should wait for a later hour.
 # Nothing here reads a venue share, submits a job or touches a process.
 
+# r13 (adversary r12 A1): the agent's results and receipts are read with their lease ids and tokens as the raw strings written (ConvertFrom-Json made a timestamp-shaped one a DateTime)
+Import-Module (Join-Path $PSScriptRoot 'VenueRawJson.psm1') -DisableNameChecking
+
 $script:ClaimSchema = 'mlv-app/venue-claim/v1'
 $script:UnreadableGraceSec = 30
 $script:PidStartToleranceSec = 2
@@ -827,7 +830,7 @@ function Get-VenueJobResult {
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = $r.error } }
     $text = [string](@($r.value) -join "`n")
     if ($text -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; result = $null; error = $null } }
-    try { return [pscustomobject]@{ state = 'FOUND'; result = ($text | ConvertFrom-Json); error = $null } }
+    try { return [pscustomobject]@{ state = 'FOUND'; result = (ConvertFrom-VenueJsonRawIdentity -Text $text); error = $null } }
     catch { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = "result.json does not parse: $($_.Exception.Message)" } }
 }
 
@@ -1083,7 +1086,7 @@ function Read-VenueLeaseBatchReceipt {
     $lines = @($r.value | ForEach-Object { [string]$_ } | Where-Object { $_ })
     if ($lines.Count -eq 1 -and $lines[0] -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; record = $null; error = $null } }
     foreach ($line in $lines) {
-        $rec = try { $line | ConvertFrom-Json } catch { $null }
+        $rec = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
         # r12 (adversary r11 A2): ordinal on the exact lease id (-ceq is culture-aware); an empty or whitespace-only -LeaseId names no lease, so it matches no line
         if ($null -ne $rec -and -not [string]::IsNullOrWhiteSpace($LeaseId) -and [string]::Equals([string]$rec.leaseId, $LeaseId, [StringComparison]::Ordinal)) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
     }
@@ -1147,7 +1150,7 @@ function Read-VenueLeaseLedger {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
     $since = $(if ($null -ne $SinceUtc) { ConvertTo-VenueUtc $SinceUtc } else { [DateTime]::MinValue })
     @(foreach ($line in [IO.File]::ReadAllLines($path)) {
-            $r = try { $line | ConvertFrom-Json } catch { $null }
+            $r = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
             if ($null -eq $r) { continue }
             $s = ConvertTo-VenueUtc $r.startUtc; $e = ConvertTo-VenueUtc $r.endUtc
             if ($null -ne $s -and $null -ne $e -and $e -gt $s -and $e -gt $since) { [pscustomobject]@{ startUtc = $s; endUtc = $e; leaseId = [string]$r.leaseId } }

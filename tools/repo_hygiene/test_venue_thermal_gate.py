@@ -510,6 +510,90 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertEqual(ps_json(rows("'1.t'", "'1.t'")), "a|cpu")
         self.assertEqual(ps_json(rows("('1.t' + $shy)", "('1.t' + $shy)")), "a|cpu")
 
+    def _r13_chain(self, d: Path, ident1: dict, ident2: dict) -> dict:
+        """Two lease-batch receipts in d/batches.jsonl: lease 1 runs a (clear), lease 2 runs b (hot at its first probe). Returns the heavy keys and the spread order."""
+        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
+                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
+                  "[pscustomobject]@{ batches = @($h.rows | ForEach-Object { $_.batch }); heavy = @($hk.Keys); order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
+
+        def leg(name: str, heat: str) -> dict:
+            return {"name": f"01-{name}-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": heat}
+
+        def receipt(ident: dict, legs: list) -> str:
+            return json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, **ident, "legs": legs}) + "\n"
+
+        (d / "batches.jsonl").write_text(receipt(ident1, [leg("a", "clear")]) + receipt(ident2, [leg("b", "hot")]), encoding="utf-8")
+        return ps_json(spread.replace("<D>", str(d)))
+
+    def test_r13_adversary_a1_timestamp_shaped_lease_ids_that_read_as_one_datetime_are_distinct_leases(self) -> None:
+        # adversary r12 A1 on 08c9aef5 (VenueThermalGate.psm1:249): `$line | ConvertFrom-Json` turns a timestamp-shaped leaseId / token into a DateTime BEFORE the [string] cast, so two
+        # DISTINCT lease ids that read as one instant became one identity and b's hot first leg was charged to a|cpu. The identity is the RAW string the receipt carries.
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-datetime-lease-"))
+        original, chained = "a-A,a-B,b-A,b-B", "a-A,b-A,a-B,b-B"
+        same_instant = ("2026-10-30T10:00:00Z", "2026-10-30T10:00:00.0Z"), ("2026-10-30T10:00:00Z", "2026-10-30T10:00:00+00:00"), ("2026-10-30T10:00:00Z", "2026-10-30T05:00:00-05:00")
+        for l1, l2 in same_instant:
+            got = self._r13_chain(d, {"token": "t", "leaseId": l1}, {"token": "t", "leaseId": l2})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (l1, l2, got))
+            # the token is an identity field too: the same lease id with two timestamp-shaped tokens is two leases
+            got = self._r13_chain(d, {"token": l1, "leaseId": "L1"}, {"token": l2, "leaseId": "L1"})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (l1, l2, got))
+        # controls: the SAME raw lease id (and token) is one lease and chains
+        for ident in ({"token": "t", "leaseId": "2026-10-30T10:00:00Z"}, {"token": "2026-10-30T10:00:00Z", "leaseId": "L1"}, {"token": "t", "leaseId": "L1"}):
+            got = self._r13_chain(d, ident, dict(ident))
+            self.assertEqual((got["heavy"], got["order"]), (["a|cpu"], chained), (ident, got))
+
+    def test_r13_adversary_a1_the_agent_result_sidecar_proves_the_batch_lease_by_the_raw_lease_id(self) -> None:
+        # sibling (VenueThermalGate.psm1:293/298): the sidecar's admission.leaseBatch.leaseId was read through ConvertFrom-Json too, so a sidecar whose lease id only READS as the
+        # batch's instant proved a hot grant that ran on ANOTHER lease and charged it to this lease's predecessor
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-datetime-sidecar-"))
+        lease = "2026-10-30T10:00:00Z"
+        a = {"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "onLease": True, "heatAtProbe": "clear"}
+        b = {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "jobId": "j2"}   # no onLease field: the sidecar must show the job on the batch's lease
+        (d / "batches.jsonl").write_text(json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "token": "t", "leaseId": lease, "legs": [a, b]}) + "\n", encoding="utf-8")
+        script = "$h = Read-VenueLegHeatHistory -RunDir @('<D>'); [pscustomobject]@{ heat = @($h.rows | ForEach-Object { $_.heat }) }"
+
+        def heat(sidecar_lease: str) -> list:
+            (d / "agent-result-j2.json").write_text(json.dumps({"admission": {"heat": "hot", "leaseBatch": {"leaseId": sidecar_lease}}}), encoding="utf-8")
+            return ps_json(script.replace("<D>", str(d)))["heat"]
+
+        self.assertEqual(heat("2026-10-30T10:00:00.0Z"), ["clear", "unknown"])
+        self.assertEqual(heat("2026-10-30T05:00:00-05:00"), ["clear", "unknown"])
+        self.assertEqual(heat(lease), ["clear", "hot"])   # control: the same raw lease id is proof
+
+    def test_r13_dot_residual2_the_token_is_the_raw_string_never_trimmed(self) -> None:
+        # Dot residual 2 / Grok G1 (VenueThermalGate.psm1:257): the token was .Trim()ed, so receipts with no leaseId and tokens 't' and ' t' collapsed to one identity
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-raw-token-"))
+        original, chained = "a-A,a-B,b-A,b-B", "a-A,b-A,a-B,b-B"
+        for t1, t2 in (("t", " t"), ("t", "t "), (" t", "t"), ("t", "t\t"), ("t", "\tt")):
+            got = self._r13_chain(d, {"token": t1}, {"token": t2})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (t1, t2, got))
+            got = self._r13_chain(d, {"token": t1, "leaseId": "L1"}, {"token": t2, "leaseId": "L1"})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (t1, t2, got))
+        # controls: the same raw token chains (with and without a lease id), and a whitespace-only token is no token: a barrier, as before
+        for ident in ({"token": " t"}, {"token": "t"}, {"token": " t ", "leaseId": "L1"}):
+            got = self._r13_chain(d, ident, dict(ident))
+            self.assertEqual((got["heavy"], got["order"]), (["a|cpu"], chained), (ident, got))
+        for blank in ("", " ", "\t"):
+            got = self._r13_chain(d, {"token": blank}, {"token": blank})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (blank, got))
+
+    def test_r13_adversary_a2_heavy_leg_keys_are_case_sensitive(self) -> None:
+        # adversary r12 A2 on 08c9aef5 (VenueThermalGate.psm1:180): [ordered]@{} is case-insensitive, so a heavy key 'A|cpu' also answered .Contains('a|cpu') (the runner's lookup, Invoke-VenueLeaseBatch.ps1:1149)
+        # and 'A|cpu' / 'a|cpu' were one key. Leg ids are case-sensitive names (the leg spec's legId allows both cases), so the keys are compared ordinally.
+        def keys(*pairs: tuple[str, str]) -> str:
+            rows = ", ".join(f"[pscustomobject]@{{ batch = 'L'; key = '{k}'; status = 'RAN'; heat = '{h}' }}" for k, h in pairs)
+            return f"$k = Get-VenueHeavyLegKeys -Rows @({rows}); [pscustomobject]@{{ keys = @($k.Keys); upper = [bool]$k.Contains('A|cpu'); lower = [bool]$k.Contains('a|cpu') }}"
+        got = ps_json(keys(("A|cpu", "clear"), ("x|cpu", "hot")))
+        self.assertEqual((got["keys"], got["upper"], got["lower"]), (["A|cpu"], True, False), got)
+        got = ps_json(keys(("a|cpu", "clear"), ("x|cpu", "hot")))
+        self.assertEqual((got["keys"], got["upper"], got["lower"]), (["a|cpu"], False, True), got)
+        # two distinct keys stay two (the insensitive dictionary merged them and counted two successors on one key)
+        got = ps_json(keys(("A|cpu", "clear"), ("x|cpu", "hot"), ("a|cpu", "clear"), ("y|cpu", "hot")))
+        self.assertEqual((sorted(got["keys"]), got["upper"], got["lower"]), (["A|cpu", "a|cpu"], True, True), got)
+
     def test_r7p2_a1_an_agent_heat_read_on_another_lease_is_never_charged_to_this_leases_predecessor(self) -> None:
         # adversary r7 A1 on 83fd79de: b ran on a replacement lease (jobLease L2, onLease false, LEASE_LOST); its grant heat is L2's, yet the reader took it and charged it
         # to a on L1, so a|cpu became heavy. The same holds for the agent-result sidecar's admission.heat (sibling): only a reading on the batch's own lease counts.
@@ -1200,6 +1284,22 @@ class ThermalSpreadPlanTests(unittest.TestCase):
         self.assertEqual((ts["heavyKeys"], ts["heavyAdjacentBefore"], ts["heavyAdjacent"], ts["heatRows"]), (["fx-a|cpu"], 1, 0, 2))
         self.assertEqual(ts["skipped"], [f"{gone} (no batches.jsonl)"], ts)
         self.assertEqual(tvlb.batch_result(r.stdout)["legPlan"]["order"], "ThermalSpread")
+
+    def test_r13_adversary_a2_a_heavy_key_in_another_case_is_not_this_legs_key(self) -> None:
+        # adversary r12 A2 on 08c9aef5 (Invoke-VenueLeaseBatch.ps1:1149): the history's heavy key 'FX-A|cpu' (a different leg whose id differs only by case) answered .Contains('fx-a|cpu'),
+        # so fx-a was spread as heavy. Leg ids are case-sensitive: nothing here is heavy, and the plan keeps its order.
+        prior = self.case / "prior-run"
+        prior.mkdir()
+        rows = [{"name": "01-FX-A-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "clear"},
+                {"name": "02-fx-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "hot"}]
+        (prior / "batches.jsonl").write_text(json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "legs": rows}) + "\n", encoding="utf-8")
+        a, b = self.commit_a, self.commit_b
+        plan = self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[0], "B", b), self.item(self.specs[1], "A", a), self.item(self.specs[1], "B", b)])
+        r = self.run_plan(plan, "-PlanOrder", "ThermalSpread", "-HeatFrom", str(prior))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        ts = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))["thermalSpread"]
+        self.assertEqual((ts["heavyKeys"], ts["heavyAdjacentBefore"], ts["heavyAdjacent"]), (["FX-A|cpu"], 0, 0), ts)
+        self.assertEqual([(c["leaf"], c["sourceCommit"]) for c in self.leg_calls()], [("fx-a", a), ("fx-a", b), ("fx-b", a), ("fx-b", b)])
 
     def test_heat_from_needs_thermal_spread(self) -> None:
         a = self.commit_a

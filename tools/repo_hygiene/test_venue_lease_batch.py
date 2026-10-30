@@ -113,6 +113,8 @@ if ($JobId -like 'lease-batch-open-*') {
     $remain = [int](Pick $env:FAKE_LEASE_REMAIN $n '2700')
     if ($mode -eq 'retracted') { throw 'RETRACTED: fake queue ceiling' }
     $lid = "lease-$($n + 1)"
+    # r13 (adversary r12 A1): FAKE_OPEN_LEASE_ID answers with that exact lease id (a timestamp-shaped one, which ConvertFrom-Json turns into a DateTime)
+    if ($env:FAKE_OPEN_LEASE_ID) { $lid = $env:FAKE_OPEN_LEASE_ID }
     $adm = [ordered]@{ gate = 'fake'; mode = 'lease'; label = 'clear'; heavySlotHeld = "1:$(1001 + $n)"; slot = 'C:\t\.heavy-slots\1'; leaseMinutes = 45; waitedSec = 7; leaseRequests = 2
         leaseRefusals = @([ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' }) }
     # r12 (adversary A2): FAKE_OPEN_TOKEN_SHY=1 answers with the batch's token plus a soft hyphen (U+00AD): culture-aware equality says it is the same token, ordinal says it is not
@@ -193,7 +195,8 @@ if ($legMode -eq 'hang') {
 }
 $lose =@(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
 # r12 (adversary A2): FAKE_LEG_LEASE_SHY=1 reports the batch's lease id plus a soft hyphen (U+00AD): culture-aware equality says it is the same lease, ordinal says it is not
-$lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } elseif ($env:FAKE_LEG_LEASE_SHY -eq '1') { $st.leaseId + [string][char]0x00AD } else { $st.leaseId })
+$lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } elseif ($env:FAKE_LEG_LEASE_SHY -eq '1') { $st.leaseId + [string][char]0x00AD } elseif ($env:FAKE_LEG_LEASE_ID) { $env:FAKE_LEG_LEASE_ID } else { $st.leaseId })
+# r13 (adversary r12 A1): FAKE_LEG_LEASE_ID reports that exact lease id (a different spelling of the batch's instant), instead of the batch's own
 $now = [DateTimeOffset]::UtcNow
 $remain = [int](Pick $env:FAKE_LEG_REMAIN $k '2600')
 $outbox = Join-Path $share 'outbox'
@@ -689,6 +692,43 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"exact": "FOUND:closed", "shyMid": "ABSENT:", "lead": "ABSENT:", "empty": "ABSENT:", "blank": "ABSENT:"})
+
+    def test_r13_adversary_a1_a_job_lease_id_that_reads_as_the_batchs_instant_but_is_spelled_otherwise_is_another_lease(self) -> None:
+        # adversary r12 A1 on 08c9aef5 (the sibling of VenueThermalGate.psm1:249 in the runner): the agent's results were read through ConvertFrom-Json, which turns a timestamp-shaped
+        # leaseId into a DateTime, so the batch's lease '...:00Z' and a leg job's '...:00.0Z' both became the same culture-formatted string and the leg was counted on a lease it was not on.
+        batch_lease = "2026-10-30T10:00:00Z"
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_LEASE_ID=batch_lease, FAKE_LEG_LEASE_ID="2026-10-30T10:00:00.0Z")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["leaseId"], b1["endReason"], b1["legsRan"], b1["legsCounted"], b1["legs"][0]["class"], b1["legs"][0]["onLease"]), (batch_lease, "LEASE_LOST", 1, 0, "LEASE_LOST", False), b1)
+        self.assertEqual(b1["legs"][0]["jobLease"], "2026-10-30T10:00:00.0Z", b1)
+
+    def test_r13_adversary_a1_a_timestamp_shaped_lease_id_is_recorded_and_matched_as_written(self) -> None:
+        # control for the test above: the same raw timestamp-shaped lease id is the batch's own lease, and the receipt keeps the id as the agent wrote it
+        batch_lease = "2026-10-30T10:00:00Z"
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_LEASE_ID=batch_lease, FAKE_LEG_LEASE_ID=batch_lease)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["leaseId"], b1["legsCounted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), (batch_lease, 2, True, batch_lease), b1)
+
+    def test_r13_adversary_a1_the_agents_batch_receipt_and_the_lease_ledger_keep_the_lease_id_as_written(self) -> None:
+        # siblings VenueChain.psm1 Read-VenueLeaseBatchReceipt / Read-VenueLeaseLedger: a timestamp-shaped lease id was a DateTime, so '...:00.0Z' was FOUND for '...:00Z' and the ledger row's id was reformatted
+        (self.share / "logs").mkdir()
+        lines = [{"leaseId": "2026-10-30T10:00:00.0Z", "endReason": "other"}, {"leaseId": "2026-10-30T10:00:00Z", "endReason": "closed"}]
+        (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
+        claim_dir = self.share / "claims"
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'; $cd = '{psq(claim_dir)}'\n"
+            "$rd = { param($id) $x = Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId $id; \"$($x.state):$($x.record.endReason)\" }\n"
+            "$p = Get-VenueLeaseLedgerPath -Venue 'v' -ClaimDir $cd; New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null\n"
+            "[IO.File]::WriteAllText($p, '{\"startUtc\":\"2026-10-30T10:00:00Z\",\"endUtc\":\"2026-10-30T10:45:00Z\",\"leaseId\":\"2026-10-30T10:00:00.0Z\"}' + \"`n\")\n"
+            "$led = @(Read-VenueLeaseLedger -Venue 'v' -ClaimDir $cd -SinceUtc '2000-01-01T00:00:00Z')\n"
+            "[ordered]@{ exact = (& $rd '2026-10-30T10:00:00Z'); dotZero = (& $rd '2026-10-30T10:00:00.0Z'); offset = (& $rd '2026-10-30T10:00:00+00:00'); ledger = [string]$led[0].leaseId } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"exact": "FOUND:closed", "dotZero": "FOUND:other", "offset": "ABSENT:", "ledger": "2026-10-30T10:00:00.0Z"})
 
     def test_an_agent_without_lease_batches_stops_before_any_probe_or_leg(self) -> None:
         r = self.run_batch(self.specs[:2], FAKE_OPEN_MODES="nobatch")

@@ -20,6 +20,9 @@
 
 Set-StrictMode -Version Latest
 
+# r13 (adversary r12 A1): the receipts' lease ids and tokens are read as the raw strings they were written as (ConvertFrom-Json made a timestamp-shaped one a DateTime)
+Import-Module (Join-Path $PSScriptRoot 'VenueRawJson.psm1') -DisableNameChecking
+
 $script:HeatMaxThrottledRows = 6
 $script:HeatMeanMaxC = 88.0
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
@@ -177,7 +180,8 @@ function Get-VenueHeavyLegKeys {
     # Rows in run order: { batch, key, status, heat }. A key is HEAVY when a leg that directly followed a RAN leg of that key on the same batch read hot
     # (its heat before any wait, or at grant for rows written before this gate). Returns key -> number of hot successors (only heavy keys).
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
-    $heavy = [ordered]@{}
+    # r13 (adversary r12 A2): [ordered]@{} compares keys case-INSENSITIVELY, so a heavy key 'A|cpu' also answered .Contains('a|cpu'); leg ids are case-sensitive names, so the keys are ordinal
+    $heavy = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     $lastBatch = $null; $lastRanKey = $null
     foreach ($r in $Rows) {
         if ($null -eq $r) { continue }
@@ -246,7 +250,7 @@ function Read-VenueLegHeatHistory {
         $lineNo = 0
         foreach ($line in $lines) {
             if (-not $line.Trim()) { continue }
-            $b = try { $line | ConvertFrom-Json } catch { $null }
+            $b = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
             if ($null -eq $b -or $b -isnot [System.Management.Automation.PSCustomObject] -or -not $b.PSObject.Properties['legs']) { $skipped.Add("$f (unreadable line)"); continue }
             # adversary r1 A8: one lease is one batch receipt (token), not one batch number: a reused -RunDir numbers its batches from 1 again
             # r8 (adversary efe7699b A2): a receipt with no token is a lease of its own (its line), never grouped with another by batch number: two leases L1 and L2
@@ -254,14 +258,17 @@ function Read-VenueLegHeatHistory {
             $lineNo++
             # r11 (sol r10 B1 / adversary A2): the identity is the lease (leaseId) PLUS a normalised, non-empty token, length-framed so no leaseId/token pair can spell another's. A
             # whitespace token is no token, and the generated fallback ("line:<n>") lives in its own namespace ("tok:" never starts it), so neither can equal another lease's identity
-            $tokenText = $(if ($b.PSObject.Properties['token'] -and $null -ne $b.token) { ([string]$b.token).Trim() } else { '' })
+            # r13 (Dot residual 2 / Grok G1): the token is the RAW string too, never trimmed ('t' and ' t' are two tokens); a whitespace-only token is no token (a barrier, as before), and the
+            # identity frames it by length exactly like the leaseId
+            $tokenText = $(if ($b.PSObject.Properties['token'] -and $null -ne $b.token) { [string]$b.token } else { '' })
+            $tokenBlank = [string]::IsNullOrWhiteSpace($tokenText)
             # r12 (adversary r11 A1 / A2): the leaseId is the RAW string, never trimmed (' L1' is not 'L1'), and the identity is compared ordinally (Get-VenueHeavyLegKeys). A non-empty but
             # whitespace-only leaseId is no identity at all, so it is a lease of its own (a barrier) like a missing token; an absent or empty one is a receipt older than the lease id,
             # still identified by its token
             $leaseText = $(if ($b.PSObject.Properties['leaseId'] -and $null -ne $b.leaseId) { [string]$b.leaseId } else { '' })
             $leaseBlank = ($leaseText.Length -gt 0 -and [string]::IsNullOrWhiteSpace($leaseText))
-            $lease = $(if ($tokenText -and -not $leaseBlank) { "tok:$($leaseText.Length):${leaseText}:$tokenText" } else { "line:$lineNo" })
-            $leaseLabel = $(if ($tokenText) { $tokenText } else { "line $lineNo" })
+            $lease = $(if (-not $tokenBlank -and -not $leaseBlank) { "tok:$($leaseText.Length):${leaseText}:$($tokenText.Length):$tokenText" } else { "line:$lineNo" })
+            $leaseLabel = $(if (-not $tokenBlank) { $tokenText } else { "line $lineNo" })
             $unnamed = 0
             foreach ($l in @($b.legs)) {
                 # adversary r1 A5: a scalar-run row carries no leg name (Add-PlanIdentity names -LegPlan rows only): counted and named in .skipped, never silently dropped.
@@ -290,7 +297,7 @@ function Read-VenueLegHeatHistory {
                     # r3 pass 1 A1: `(try { } catch { })` is not an expression (PowerShell ran `try` as a command): the probe is its own statement
                     $arOk = $(if ($null -eq $ar) { $false } else { try { [bool](Test-Path -LiteralPath $ar -PathType Leaf) } catch { $false } })
                     if ($arOk) {
-                        $a = try { [IO.File]::ReadAllText($ar) | ConvertFrom-Json } catch { $null }
+                        $a = try { ConvertFrom-VenueJsonRawIdentity -Text ([IO.File]::ReadAllText($ar)) } catch { $null }
                         $adm = $(if ($null -ne $a -and $a.PSObject.Properties['admission'] -and $a.admission -is [System.Management.Automation.PSCustomObject]) { $a.admission } else { $null })
                         $sameLease = $true
                         if ($needLeaseProof) {
