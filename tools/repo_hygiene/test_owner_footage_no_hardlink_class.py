@@ -514,6 +514,35 @@ _NATIVE_LOOKUP_RE = re.compile(
 # Each argument of a counted call or declaration is plain tokens only: a comment, string, directive or any other punctuation inside one could hide the ')' or
 # ',' the parser counts, so "(uint)size /*, 10)*/, 11" read as class 10 while C# compiled 11 (r14 iter 1, adversary ea865d3b-A1).
 _PLAIN_ARGUMENT_RE = re.compile(r"[A-Za-z0-9_ \t()]+")
+# ---- r18 (sol r17b B1/B2; folds LANE-DIRTY-SAVE-CENSUS-REFLECTION-AND-PARAM-TYPES-1). THREAT MODEL: the census guarantees that the only native call the saver
+# can make with a file-information class is the one counted NtSetInformationFile call, whose class argument is the literal 10 and reaches the native as 10,
+# plus the class-4 SetFileInformationByHandle calls. It reads text, so it can only vouch for a call it can NAME statically; anything that reaches a method it
+# cannot name, or turns a checked literal into another value, FAILS CLOSED as a class, not one spelling at a time:
+# B1, a method the census cannot name: every reflection RESOLUTION or HANDLE api (a metadata token, a handle or a function pointer turned into something
+# callable) anywhere in the text, and every invoke of a method object, delegate or function pointer inside the payload, is a violation unless its exact
+# file:line is listed in LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED (reviewed; empty).
+LANE_DIRTY_SAVE_REL = "tools/coordination/lane-dirty-save.ps1"
+LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED: frozenset[str] = frozenset()
+_REFLECTION_HANDLE_RE = re.compile(
+    r"Resolve(?:Method|Member|Field|Type|Signature|String)\w*|Get(?:Method|Field|Type)FromHandle|\w*(?:Method|Type|Field|Module)Handle\w*|\w*FunctionPointer\w*"
+    r"|CreateDelegate|\bModules?\b|ManifestModule|MetadataToken|FindMembers|TargetSite|Declared(?:Method|Member|Constructor|Field|Propert|NestedType|Event)\w*"
+    r"|__arglist|__makeref|__refvalue|TypedReference|\bcalli\b", re.IGNORECASE)
+# payload-only (the PowerShell half pins every member, and its own Invoke-Dirty* functions would match): a method object's .Invoke, a delegate's .Method, a
+# function pointer or anonymous delegate, and unsafe code
+_PAYLOAD_INDIRECT_CALL_RE = re.compile(r"Invoke|\bdelegate\b|\bunsafe\b|\.\s*Method\b", re.IGNORECASE)
+# B2, a literal the native does not receive: every P/Invoke parameter is `[ref|out] <type> <name>` with a type from this list, or a struct the payload declares
+# while no user-defined conversion exists anywhere in it (a conversion runs at the call, so `..., 10)` can pass 11). A list name the payload declares itself
+# (a nested `struct IntPtr`) is a violation, and the two counted natives are pinned to their exact parameter types: a wider integer would move the class on x86.
+LANE_DIRTY_SAVE_PINVOKE_TYPES = {
+    "sbyte", "byte", "short", "ushort", "int", "uint", "long", "ulong", "nint", "nuint", "char", "string", "byte[]", "char[]",
+    "IntPtr", "UIntPtr", "StringBuilder", "SafeHandle", "SafeFileHandle",
+}
+_PINVOKE_NAMED_TYPES = {"IntPtr", "UIntPtr", "StringBuilder", "SafeHandle", "SafeFileHandle"}
+LANE_DIRTY_SAVE_NT_TYPES = ("IntPtr", "out IoStatusBlock", "IntPtr", "uint", "int")
+LANE_DIRTY_SAVE_K32_TYPES = ("IntPtr", "int", "ref DispositionInfo", "uint")
+_USER_CONVERSION_RE = re.compile(r"\boperator\b|\bimplicit\b|\bexplicit\b", re.IGNORECASE)
+_PINVOKE_PARAMETER_RE = re.compile(r"(?:(?P<mode>ref|out)\s+)?(?P<type>[A-Za-z_]\w*(?:\[\])?)\s+[A-Za-z_]\w*")
+_TYPE_DECLARATION_RE = re.compile(r"\b(?P<kind>struct|class|enum|interface|record)\s+(?P<name>\w+)")
 
 
 def _finditer_in_child(pattern: str, texts: list[str], timeout: float) -> dict:
@@ -582,11 +611,38 @@ def _call_arguments(text: str, at: int) -> list[str] | None:
     return None
 
 
-def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: int, allowed: set[str], arity: int):
+def _pinvoke_parameter_violations(body: str) -> list[tuple[int, str]]:
+    """(offset in `body`, why) for each P/Invoke parameter whose type the census cannot read as the value the call passes (r18, sol r17b B2)."""
+    code = re.sub(_CS_LINE_COMMENT, lambda match: " " * len(match.group(0)), body)  # a comment declares nothing; offsets are kept
+    declared = list(_TYPE_DECLARATION_RE.finditer(code))
+    structs = {match.group("name") for match in declared if match.group("kind") == "struct"}
+    conversions = [match.group(0) for match in _USER_CONVERSION_RE.finditer(body)]
+    found = [(match.start(), f"a type named like a P/Invoke primitive is declared in the payload: {match.group(0)}")
+             for match in declared if match.group("name") in _PINVOKE_NAMED_TYPES]
+    for match in _EXTERN_RE.finditer(code):
+        params = _call_arguments(code, match.end() - 1)
+        if params is None:
+            found.append((match.start(), "a P/Invoke declaration whose parameter list cannot be read"))
+            continue
+        for param in params if params != [""] else []:
+            shape = _PINVOKE_PARAMETER_RE.fullmatch(" ".join(param.split()))
+            kind = shape.group("type") if shape else None
+            if kind in LANE_DIRTY_SAVE_PINVOKE_TYPES:
+                continue
+            if kind in structs and not conversions:
+                continue
+            why = ("not `[ref|out] <type> <name>`" if shape is None else f"a struct while the payload has a user-defined conversion {conversions}"
+                   if kind in structs else "a type outside the P/Invoke primitives and the payload's own structs")
+            found.append((match.start(), f"a P/Invoke parameter the census cannot read as the value passed ({why}): {param!r}"))
+    return found
+
+
+def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: int, allowed: set[str], arity: int, types: tuple[str, ...]):
     """(declaration lines, call lines, violations, spans of the counted name tokens) for one native entry point in `text`.
 
     The declaration and every call must have exactly `arity` parameters / arguments, and the class is read at its fixed position `class_at`
-    (r13, HARDLINK-CENSUS-ARITY-1: an extra trailing argument used to leave a checked '10' last while 11 sat in the class position)."""
+    (r13, HARDLINK-CENSUS-ARITY-1: an extra trailing argument used to leave a checked '10' last while 11 sat in the class position). The declaration's
+    parameter types are exactly `types` (r18, sol r17b B2: a converting struct or a wider integer changes what the native receives for the checked literal)."""
     declarations, calls, violations, spans = [], [], [], []
     for match in pattern.finditer(text):
         number = text.count("\n", 0, match.start()) + 1
@@ -603,6 +659,8 @@ def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: i
             spans.append(match.span())
             if args is None or len(args) != arity:
                 violations.append(f"{number}: {declaration} declared with {len(args or [])} parameter(s), not {arity}: {line}")
+            elif (declared := tuple(" ".join(arg.split()[:-1]) for arg in args)) != types:
+                violations.append(f"{number}: {declaration} declared with parameter types {declared}, not {types}: {line}")
             continue
         if args is None:
             violations.append(f"{number}: {declaration} named but not called (a string, delegate or comment): {line}")
@@ -815,6 +873,14 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an escaped identifier character{outside}: {match.group(0)}")
     for match in _REFLECTION_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a reflection lookup: {match.group(0)}")
+
+    def indirect(at: int, token: str) -> None:
+        line = text.count(chr(10), 0, at) + 1
+        if f"{LANE_DIRTY_SAVE_REL}:{line}" not in LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED:
+            violations.append(f"{line}: a method the census cannot name statically (reflection resolution, a handle or an indirect invoke): {token}")
+
+    for match in _REFLECTION_HANDLE_RE.finditer(text):
+        indirect(match.start(), match.group(0))
     for match in _CS_DYNAMIC_CODE_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: code compiled or loaded at run time: {match.group(0)}")
     lines = text.split("\n")
@@ -835,7 +901,11 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
                             (_PAYLOAD_PROCESS_RE, "a process start or run-time binding"), (_PAYLOAD_DIRECTIVE_RE, "a preprocessor directive")):
             for match in regex.finditer(body):
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
-        attributes = [match.group(0) for match in _PAYLOAD_DLLIMPORT_ATTRIBUTE_RE.finditer(body)]
+        for match in _PAYLOAD_INDIRECT_CALL_RE.finditer(body):
+            indirect(at + match.start(), match.group(0))
+        for start, why in _pinvoke_parameter_violations(body):
+            violations.append(f"{text.count(chr(10), 0, at + start) + 1}: {why}")
+        attributes =[match.group(0) for match in _PAYLOAD_DLLIMPORT_ATTRIBUTE_RE.finditer(body)]
         externs = len(re.findall(r"\bextern\b", body))
         if (len(_PAYLOAD_DLLIMPORT_RE.findall(body)) != len(attributes) or len(attributes) != externs
                 or any(attribute not in LANE_DIRTY_SAVE_PAYLOAD_DLLIMPORTS for attribute in attributes)):
@@ -851,9 +921,10 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
     # the census proper runs on the text C# compiles: every escape resolved
     text = _CS_ESCAPE_RE.sub(_resolve_cs_escape, text)
     _, nt_calls, nt_violations, nt_spans = _native_census(
-        text, _NATIVE_SET_INFO_RE, "NtSetInformationFile", LANE_DIRTY_SAVE_NT_ARITY - 1, LANE_DIRTY_SAVE_NT_CLASSES, LANE_DIRTY_SAVE_NT_ARITY)
+        text, _NATIVE_SET_INFO_RE, "NtSetInformationFile", LANE_DIRTY_SAVE_NT_ARITY - 1, LANE_DIRTY_SAVE_NT_CLASSES, LANE_DIRTY_SAVE_NT_ARITY,
+        LANE_DIRTY_SAVE_NT_TYPES)
     _, _, k32_violations, _ = _native_census(
-        text, _K32_SET_INFO_RE, "SetFileInformationByHandle", 1, LANE_DIRTY_SAVE_K32_CLASSES, LANE_DIRTY_SAVE_K32_ARITY)
+        text, _K32_SET_INFO_RE, "SetFileInformationByHandle", 1, LANE_DIRTY_SAVE_K32_CLASSES, LANE_DIRTY_SAVE_K32_ARITY, LANE_DIRTY_SAVE_K32_TYPES)
     violations += nt_violations + k32_violations
     if len(nt_calls) != LANE_DIRTY_SAVE_NT_CALLS:
         violations.append(f"NtSetInformationFile must be called exactly {LANE_DIRTY_SAVE_NT_CALLS} time(s), found lines {nt_calls}")
@@ -1480,6 +1551,98 @@ class NoHardLinkCreationTests(unittest.TestCase):
         # control: the saver's own three directives are read as exactly the pinned list, whatever its line ends are
         body = _ADD_TYPE_PAYLOAD_RE.search(text).group("body")
         self.assertEqual([match.group(0).strip() for match in _PAYLOAD_USING_RE.finditer(body.replace("\n", "\r"))], LANE_DIRTY_SAVE_PAYLOAD_USINGS)
+
+    def _r18_rows(self) -> dict[str, tuple[str, str]]:
+        # r18 (sol r17b B1/B2, producer 4d335027-A1/A2): each mutant returned [] on 4d335027 while C# would reach the native with class 11
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        call = "IoStatusBlock io;\n                int st = NtSetInformationFile(h, out io, info, (uint)size, 10);"
+        nt_decl = "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass);"
+        k32_decl = "static extern bool SetFileInformationByHandle(IntPtr handle, int infoClass, ref DispositionInfo info, uint size);"
+        iosb = "struct IoStatusBlock { public IntPtr Status, Information; }"
+        for anchor in (call, nt_decl, k32_decl, iosb):
+            self.assertIn(anchor, text, "the r18 mutants are cut from this exact text")
+
+        def before_call(code: str) -> str:
+            return text.replace(call, code + "\n" + call, 1)
+
+        def converting(name: str, field: str, decl: str) -> str:
+            struct = (f"{iosb}\n    [StructLayout(LayoutKind.Sequential)]\n    struct {name} {{ public {field} Value; "
+                      f"public static implicit operator {name}(int value) {{ return new {name} {{ Value = 11 }}; }} }}")
+            return text.replace(iosb, struct, 1).replace(decl, decl.replace("int infoClass", f"{name} infoClass"), 1)
+
+        loop = "for (int token = 0x06000001; token < 0x06000080; token++) { "
+        indirect = "a method the census cannot name statically"
+        return {
+            "B1 sol's Module.ResolveMethod then Invoke": (before_call(
+                loop + "var method = typeof(DirtyFinalPath).Module.ResolveMethod(token); if (method.Name == string.Concat(\"Nt\", \"Set\", \"Information\", "
+                "\"File\")) { method.Invoke(null, new object[] { h, null, info, (uint)size, 11 }); break; } }"), indirect),
+            "B1 a ModuleHandle function pointer": (before_call(
+                loop + "var p = typeof(DirtyFinalPath).Module.ModuleHandle.ResolveMethodHandle(token).GetFunctionPointer(); IoStatusBlock q; "
+                "((delegate* unmanaged<IntPtr, out IoStatusBlock, IntPtr, uint, int, int>)p)(h, out q, info, (uint)size, 11); }"), indirect),
+            "B1 a delegate's .Method": (before_call("Func<string, string> f = Resolve; var m2 = f.Method; m2.Invoke(null, new object[] { \"x\" });"), indirect),
+            "B1 a handle without Invoke": (before_call("var t = typeof(DirtyFinalPath).TypeHandle;"), indirect),
+            "B1 an anonymous delegate": (before_call("Action a = delegate { };"), indirect),
+            "B2 sol's converting struct on NtSetInformationFile": (converting("DirtyInfoClass", "int", nt_decl), "a user-defined conversion"),
+            "B2 the class-4 sibling": (converting("DirtyInfoClass", "int", k32_decl), "a user-defined conversion"),
+            "B2 an 8-byte converting struct": (converting("DirtyWideClass", "long", nt_decl), "a user-defined conversion"),
+            "B2 a wider length moves the class on x86": (text.replace(nt_decl, nt_decl.replace("uint length", "ulong length"), 1).replace(
+                "info, (uint)size, 10);", "info, 47244640280, 10);", 1), "declared with parameter types"),
+            "B2 a nested type named IntPtr": (text.replace(iosb, iosb + "\n    struct IntPtr { public long V; }", 1), "named like a P/Invoke primitive"),
+            "B2 a parameter attribute": (text.replace("static extern bool CloseHandle(IntPtr handle);", "static extern bool CloseHandle([In] IntPtr handle);", 1),
+                                         "not `[ref|out] <type> <name>`"),
+            "B2 a class parameter": (text.replace("static extern bool CloseHandle(IntPtr handle);", "static extern bool CloseHandle(object handle);", 1),
+                                     "a type outside the P/Invoke primitives"),
+        }
+
+    def test_the_lane_dirty_saver_census_fails_closed_on_what_it_cannot_name_or_read_r18(self) -> None:
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        rows = self._r18_rows()
+        found = dict(zip(rows, lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])))
+        missed = [name for name, (mutant, expected) in rows.items() if mutant == text or not any(expected in violation for violation in found[name])]
+        self.assertEqual(missed, [], {name: found[name] for name in missed})
+        # controls: the saver as it is is clean, and a conversion operator ANYWHERE refuses every struct parameter, even one it does not convert to
+        operator_only = text.replace("struct IoStatusBlock { public IntPtr Status, Information; }", "struct IoStatusBlock { public IntPtr Status, Information; }\n"
+                                     "    struct Widen { public int V; public static implicit operator Widen(int v) { return new Widen(); } }", 1)
+        clean, beside = lane_dirty_save_violations_many([LANE_DIRTY_SAVE.read_bytes(), operator_only])
+        self.assertEqual(clean, [])
+        self.assertTrue(beside and all("user-defined conversion" in violation for violation in beside), beside)
+
+    def test_dropping_the_r18_rules_turns_their_rows_red(self) -> None:
+        # with the r18 rules removed the census is 4d335027's again, and sol's rows (plus the generalised ones) are clean: the rules, not some older rule, catch them
+        class AnyTypes(tuple):  # compares equal to every declared parameter list, so the exact pin is dropped too
+            __hash__ = tuple.__hash__
+
+            def __eq__(self, other: object) -> bool:
+                return True
+
+            def __ne__(self, other: object) -> bool:
+                return False
+
+        rows = self._r18_rows()
+        never = re.compile(r"(?!x)x")
+        names = [name for name in rows if name.startswith(("B1 sol", "B1 a ModuleHandle", "B2 sol", "B2 the class-4", "B2 an 8-byte", "B2 a wider"))]
+        with mock.patch(f"{__name__}._REFLECTION_HANDLE_RE", never), mock.patch(f"{__name__}._PAYLOAD_INDIRECT_CALL_RE", never), \
+                mock.patch(f"{__name__}._pinvoke_parameter_violations", lambda body: []), \
+                mock.patch(f"{__name__}.LANE_DIRTY_SAVE_NT_TYPES", AnyTypes()), mock.patch(f"{__name__}.LANE_DIRTY_SAVE_K32_TYPES", AnyTypes()):
+            found = lane_dirty_save_violations_many([rows[name][0] for name in names])
+        self.assertEqual(len(names), 6)
+        self.assertEqual({name: violations for name, violations in zip(names, found) if violations}, {})
+
+    def test_the_indirect_call_allowlist_is_keyed_by_file_and_line(self) -> None:
+        mutant, _ = self._r18_rows()["B1 a handle without Invoke"]
+        line = mutant.count("\n", 0, mutant.index("TypeHandle")) + 1
+        with mock.patch(f"{__name__}.LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED", frozenset({f"{LANE_DIRTY_SAVE_REL}:{line}"})):
+            self.assertEqual(lane_dirty_save_violations(mutant), [])
+        with mock.patch(f"{__name__}.LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED", frozenset({f"{LANE_DIRTY_SAVE_REL}:{line + 1}"})):
+            self.assertTrue(lane_dirty_save_violations(mutant))
+        # every reviewed entry still names a line the rules match, so a stale one cannot silently allow the next edit there
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        body = _ADD_TYPE_PAYLOAD_RE.search(text)
+        hits = {text.count("\n", 0, match.start()) + 1 for match in _REFLECTION_HANDLE_RE.finditer(text)}
+        hits |= {text.count("\n", 0, body.start("body") + match.start()) + 1 for match in _PAYLOAD_INDIRECT_CALL_RE.finditer(body.group("body"))}
+        stale = [entry for entry in LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED
+                 if not entry.startswith(LANE_DIRTY_SAVE_REL + ":") or int(entry.rsplit(":", 1)[1]) not in hits]
+        self.assertEqual(sorted(stale), [])
 
     def _assert_r15_rows_rejected_quietly(self) -> None:
         text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
