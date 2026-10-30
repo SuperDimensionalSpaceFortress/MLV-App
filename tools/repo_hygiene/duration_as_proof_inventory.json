@@ -2422,17 +2422,7 @@
       "flag": "Debayered16InlineReducedRecon::reconstructed",
       "justification": "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the recon's own run is proved by s.outcome == None and s.recon.decoded just above; this assert proves the captured timing survives the reduced debayer, which is the value M2 reads.",
       "lines": [
-        777
-      ]
-    },
-    {
-      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
-      "anchor": "ASSERT_TRUE ( s . llrawprocMsAfterDebayer == 0.0 ) ;",
-      "class": "not_run_proof_structural",
-      "clock": "qpc_stage_clock",
-      "justification": "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: proves the reduced debayer clears the thread's llrawproc timing, the reason the recon captures it first; a structural check on the reset, not evidence a stage ran.",
-      "lines": [
-        778
+        885
       ]
     },
     {
@@ -2443,7 +2433,7 @@
       "flag": "Debayered16InlineReducedRecon::preDualIsoFixCompleted",
       "justification": "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 adversary A1: the fix pass's run is proved by the preDualIsoFixCompleted assert on the next line; this one proves the timing reached the recon's result.",
       "lines": [
-        795
+        948
       ]
     },
     {
@@ -2454,7 +2444,7 @@
       "flag": "Debayered16InlineReducedRecon::preDualIsoFixCompleted",
       "justification": "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 adversary A1: the fix pass's run is proved by the preDualIsoFixCompleted assert on the line above; this one proves its captured duration survives the reduced debayer.",
       "lines": [
-        797
+        950
       ]
     }
   ]
