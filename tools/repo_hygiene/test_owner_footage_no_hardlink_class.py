@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import bisect
+import hashlib
 import json
 import random
 import re
@@ -988,6 +989,58 @@ def lane_dirty_save_violations(source: str | bytes) -> list[str]:
     return lane_dirty_save_violations_many([source])[0]
 
 
+# ---- r19 (sol r18 B1/B2; HUB RULING E on PR #698): THE GATE IS A RAW-TOKEN TRIPWIRE PLUS A BLOB PIN, AND IT PARSES NOTHING. Rounds r12-r18 each closed one
+# lexical construct in the hand-written C#/PowerShell walker above, and the next key found another. In r18, a '//' inside a string literal was read as a
+# comment and hid executable C#, and a struct return type moved the counted native's arguments. Each new construct is a new class, so a parser cannot
+# converge. The gate below therefore searches the RAW bytes of every in-scope file, case-insensitively and with nothing stripped or resolved, for the
+# tokens the census exists to guard. Any file with a hit must be pinned here by repo path AND git blob sha, so an edit to it fails until a reviewed
+# one-line re-pin. In scope: every file whose hard-link allowance is keyed by file (HARD_LINK_ALLOWED). lane_dirty_save_violations above stays as a
+# DIAGNOSTIC (its tests still pass). It is no longer the gate.
+LANE_DIRTY_SAVE_TRIPWIRE_TOKENS = (
+    # the natives and link spellings (_NATIVE_SET_INFO_RE, _K32_SET_INFO_RE, _LINK_NAME_RE, HARD_LINK_TEXT_PATTERNS, HARD_LINK_PY_ATTRIBUTES)
+    r"(?:Nt|Zw)SetInformationFile", r"SetFileInformationByHandle", r"CreateHardLink", r"FileLinkInfo", r"HardLink", r"mklink", r"fsutil", r"fs\.link",
+    r"create_hard_link", r"hardlink_to", r"link_to", r"os\.link", r"(?<![\w$.\-])ln\s", r"\bcp\s+-",
+    # every native the saver binds (LANE_DIRTY_SAVE_NATIVES) and every route to one (_EXTERN_RE, _NATIVE_LOOKUP_RE, DllImport, the r18 Marshal/pointer rules)
+    r"CreateFile", r"GetFinalPathNameByHandle", r"CloseHandle", r"GetFileInformationByHandle", r"NtCreateFile", r"RtlNtStatusToDosError", r"ReOpenFile",
+    r"DllImport", r"LibraryImport", r"\bextern\b", r"EntryPoint", r"GetProcAddress", r"FunctionPointer", r"NativeLibrary", r"LoadLibrary", r"\bcalli\b",
+    r"unmanaged", r"Marshal", r"BindToMoniker",
+    # code reached at run time (_CS_DYNAMIC_CODE_RE, _PAYLOAD_PROCESS_RE, _REFLECTION_RE, _REFLECTION_HANDLE_RE, _PAYLOAD_INDIRECT_CALL_RE, the r15 AST pins)
+    r"Add-Type", r"Assembly", r"CodeDom", r"CodeProvider", r"CodeAnalysis", r"Invoke", r"\biex\b", r"ScriptBlock", r"Reflection", r"GetMethod",
+    r"BindingFlags", r"Delegate", r"Activator", r"Emit", r"Runspace", r"Process", r"ShellExecute", r"WinExec", r"Import-Module",
+    # writes (WRITE_PRIMITIVES)
+    r"WriteAll", r"AppendAll", r"Set-Content", r"Add-Content", r"Out-File", r"StreamWriter", r"FileStream", r"FileMode", r"OpenWrite",
+    # forms of a name no plain token matches, each itself a token: a C# escape, a PowerShell backtick inside a word, a [char] or (char) cast, a literal joined
+    # to another, a join / format / replace / decode, a non-ASCII byte, a control byte, a bare CR
+    r"\\[ux][0-9a-f]", r"\w`\w", r"\[char\]", r"\(char\)", r"[\"']\s*\+", r"\+\s*@?\$?[\"']", r"-join", r"-f\b", r"Concat", r"Format", r"-replace",
+    r"\.Replace\s*\(", r"FromBase64", r"GetString", r"[\x80-\xff]", r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", r"\r(?!\n)",
+)
+_TRIPWIRE_RE = re.compile(b"|".join(f"(?:{token})".encode("ascii") for token in LANE_DIRTY_SAVE_TRIPWIRE_TOKENS), re.IGNORECASE)
+# repo path -> git blob sha of the reviewed content (`git rev-parse HEAD:<path>`). Re-pinning is a one-line change to this map, made after a human reviews
+# the diff it covers.
+TRIPWIRE_PINNED = {
+    "tools/coordination/lane-dirty-save.ps1": "1b7d574c762775a5ff6a0eb7e56014c2bab9be68",
+    "tools/coordination/record_workstream_completion.py": "ead6ffc10c78d8bd4f5a94088685d6cd1fc1a20f",
+}
+
+
+def git_blob_sha(data: bytes) -> str:
+    """The sha git gives these bytes as a blob. CRLF is turned into LF first, as autocrlf does on add, so a Windows checkout hashes like the index."""
+    data = data.replace(b"\r\n", b"\n")
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def tripwire_violations(rel: str, source: str | bytes) -> list[str]:
+    """[] when `source` (the content of repo path `rel`) hits no tripwire token, or is exactly the content pinned for `rel`; otherwise one violation."""
+    data = source.encode("utf-8", "surrogatepass") if isinstance(source, str) else source
+    hits = [(data.count(b"\n", 0, match.start()) + 1, match.group(0)) for match in _TRIPWIRE_RE.finditer(data)]
+    sha = git_blob_sha(data)
+    if not hits or TRIPWIRE_PINNED.get(rel) == sha:
+        return []
+    shown = ", ".join(f"{line}:{token.decode('ascii', 'backslashreplace')!r}" for line, token in hits[:8]) + (", ..." if len(hits) > 8 else "")
+    return [f"{rel}: blob {sha} has {len(hits)} tripwire hit(s) ({shown}) and is not the pinned content ({TRIPWIRE_PINNED.get(rel, 'no pin')}): "
+            "review the change, then re-pin it in TRIPWIRE_PINNED"]
+
+
 # The saver's two launch loops, by their text: sol's repros name them as lines 569 and 667 of 48959b31, and a row must follow the line, not its number.
 LAUNCH_569 = "    foreach ($a in (@('-C', $Wt) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }"
 LAUNCH_667 = "    foreach ($a in (@('-C', $Wt) + $GitDiffArgs)) { [void]$psi.ArgumentList.Add($a) }"
@@ -1689,6 +1742,103 @@ class NoHardLinkCreationTests(unittest.TestCase):
         self.assertNotEqual(edited, text)
         self.assertEqual(lane_dirty_save_violations(edited), [])
         self.assertEqual(sum(byte > 127 for byte in PS_AST_INVENTORY.read_bytes()), 0, "the inventory helper must stay ASCII")
+        # r19: the GATE still refuses it. Every edit to the saver, harmless or not, needs a reviewed re-pin (hub ruling E).
+        self.assertTrue(tripwire_violations(LANE_DIRTY_SAVE_REL, edited))
+
+    def test_every_file_keyed_hard_link_allowance_is_tripwire_clean_at_its_pinned_blob(self) -> None:
+        # r19 gate: the scope is every file whose hard-link allowance is keyed by file, each such file is pinned, and no pin is stale
+        self.assertEqual(sorted(TRIPWIRE_PINNED), sorted(HARD_LINK_ALLOWED), "every file-keyed hard-link allowance must carry a blob pin, and only those")
+        for rel in sorted(HARD_LINK_ALLOWED):
+            with self.subTest(rel=rel):
+                data = (ROOT / rel).read_bytes()
+                self.assertEqual(tripwire_violations(rel, data), [])
+                self.assertTrue(_TRIPWIRE_RE.search(data), f"{rel} hits no token, so its pin is dead weight: drop it")
+                self.assertEqual(tripwire_violations(rel, data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")), [], "a CRLF checkout hashes like the index")
+                self.assertTrue(tripwire_violations(rel, data + b"\n"), "one appended byte must re-fail until re-pinned")
+                self.assertTrue(tripwire_violations("tools/coordination/unpinned-copy.ps1", data), "a pin belongs to its path, not to its content")
+
+    def _r19_rows(self) -> dict[str, str]:
+        # sol r18 B1/B2 on d07fa3a9, literally: the walker returns [] for each (a '//' inside a literal read as a comment; a struct return that adds a hidden
+        # return-buffer argument on x64 and moves 11 into the native's class position)
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        identity = "        IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);\n        if (h == (IntPtr)(-1)) return null;\n"
+        close = '    [DllImport("kernel32.dll")]\n    static extern bool CloseHandle(IntPtr handle);\n'
+        iosb = "struct IoStatusBlock { public IntPtr Status, Information; }"
+        nt_decl = "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass);"
+        k32_decl = "static extern bool SetFileInformationByHandle(IntPtr handle, int infoClass, ref DispositionInfo info, uint size);"
+        call = "int st = NtSetInformationFile(h, out io, info, (uint)size, 10);\n                return st < 0 ? RtlNtStatusToDosError(st) : 0;"
+        dispose = "return SetFileInformationByHandle(h, 4, ref d, 1);"
+        for anchor in (identity, close, iosb, nt_decl, k32_decl, call, dispose):
+            self.assertIn(anchor, text, "the r19 rows are cut from this exact text")
+        large = iosb + "\n    struct LargeResult { public long A, B; }"
+        # '//' is interpolated so no string constant of this file holds `//"; System.`: the r16/r17 pattern-equivalence test reads every constant here, and
+        # that text is exactly where the two patterns differ (r16's comment may stop mid-line)
+        slashes = "/" * 2
+        return {
+            "B1 sol's '//' literal hides File.WriteAllText": text.replace(identity, identity + f'        string a = "System{slashes}"; System.IO.File.WriteAllText('
+                                                                         '"C:/fixture/wt/src/a.txt", "CORRUPTED"); string b = @"x\n.Text";\n', 1),
+            "B1 a '//' literal hides Marshal.BindToMoniker": text.replace(identity, identity + f'        string marker="{slashes}"; object o=Marshal.BindToMoniker('
+                                                                         '"script:C:/fixture/payload.sct");\n', 1),
+            "B1 a '//' literal hides a CloseHandle(object) extern": text.replace(
+                close, f'    const string Marker="{slashes}"; [DllImport("kernel32.dll")] static extern bool CloseHandle(object handle);\n', 1),
+            "B2 a LargeResult return on NtSetInformationFile": text.replace(iosb, large, 1).replace(
+                nt_decl, nt_decl.replace("static extern int", "static extern LargeResult"), 1).replace(
+                call, "var st = NtSetInformationFile(h, out io, info, 11, 10);\n                return 0;", 1),
+            "B2 a LargeResult return on SetFileInformationByHandle": text.replace(iosb, large, 1).replace(
+                k32_decl, k32_decl.replace("static extern bool", "static extern LargeResult"), 1).replace(
+                dispose, "return SetFileInformationByHandle(new IntPtr(11), 4, ref d, 1).A == 0;"),
+        }
+
+    def test_the_tripwire_rejects_every_census_bypass_row_r12_to_r19(self) -> None:
+        # Every saver variant the census tests feed the walker is harvested by running those tests on a detached instance with a recorder in the walker's
+        # place. These are the r12-r18 rows, each a bypass a key or an adversary found, plus their controls. Sol r18's five rows are added to them. Each
+        # variant differs from the pinned saver, so the gate must reject each one.
+        fed: list[str | bytes] = []
+
+        def record(sources: list[str | bytes]) -> list[list[str]]:
+            fed.extend(sources)
+            return [["recorded"] for _ in sources]
+
+        harvest = sorted(name for name in dir(self) if name.startswith("test_the_lane_dirty_saver_census"))
+        with mock.patch(f"{__name__}.lane_dirty_save_violations_many", record):
+            for name in harvest:
+                try:
+                    getattr(type(self)(name), name)()  # no result attached, so a subTest failure raises here instead of being reported
+                except AssertionError:
+                    pass  # only the inputs are wanted; each test asserts its own expectations when it runs itself
+        rows = {f"harvested #{index}": source for index, source in enumerate(fed)}
+        rows.update(self._r19_rows())
+        pinned = TRIPWIRE_PINNED[LANE_DIRTY_SAVE_REL]
+        variants = {name: source for name, source in rows.items()
+                    if git_blob_sha(source if isinstance(source, bytes) else source.encode("utf-8", "surrogatepass")) != pinned}
+        self.assertGreaterEqual(len(harvest), 9)
+        self.assertGreaterEqual(len(variants), 150, f"{len(variants)} variants from {harvest}")
+        self.assertEqual([name for name, source in variants.items() if not tripwire_violations(LANE_DIRTY_SAVE_REL, source)], [])
+        self.assertEqual(tripwire_violations(LANE_DIRTY_SAVE_REL, LANE_DIRTY_SAVE.read_bytes()), [])
+
+    def test_the_tripwire_catches_a_name_in_a_form_no_plain_token_matches(self) -> None:
+        # r19: a file in scope with no pin fails on any hit, so a name written in a form no plain token matches must hit through the form itself
+        new = "tools/coordination/an-unpinned-saver.ps1"
+        forms = {
+            "a C# \\u escape": "[IO.File]::\\u0057riteAlltext($p, 'x')\n",
+            "a C# \\x escape": "static extern int N\\x0074Set(int c);\n",
+            "a backtick-split PowerShell name": "A`dd-Type -TypeDefinition $s\n",
+            "a [char] cast": "$n = [char]87\n",
+            "a (char) cast": "var n = (char)87;\n",
+            "a double-quoted literal joined": '$n = "Write" + "AllText"\n',
+            "a single-quoted literal joined": "$n = 'Nt' +'SetInfo'\n",
+            "a -join": "$n = ('Wr', 'iteAll') -join ''\n",
+            "a -f format": "$n = '{0}Set' -f 'Nt'\n",
+            "a non-ASCII byte": "$n = 'caf" + chr(0xE9) + "'\n",
+            "a control byte": "$n = 'a\x0cb'\n",
+            "a bare CR line end": "$a = 1\r$b = 2\n",
+            "a raw native name in a comment": "# NtSetInformationFile\n",
+            "Sol's WriteAllText hidden behind a '//' literal": f'string a = "System{"/" * 2}"; System.IO.File.WriteAllText("a", "b");\n',
+        }
+        for name, form in forms.items():
+            with self.subTest(form=name):
+                self.assertTrue(tripwire_violations(new, form), form)
+        self.assertEqual(tripwire_violations(new, "Write-Host 'saved'\n$a = 1\n"), [], "a file with no token needs no pin")
 
     def test_every_named_hard_link_exception_still_matches(self) -> None:
         present = {path.relative_to(ROOT).as_posix() for path in _tool_sources() if hard_link_hits(path)}
