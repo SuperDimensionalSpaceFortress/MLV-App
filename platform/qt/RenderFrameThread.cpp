@@ -4631,6 +4631,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     /* CPU-DEBAYERED16-HONOUR-SCALE-1: the OutputDebayered16 CPU branch debayered
      * the slot's reduced recon (renderedImageWidth/Height are then reduced). */
     bool debayered16ReducedReconConsumed = false;
+    Debayered16InlineReducedRecon inlineReducedRecon;
 
     GpuAmazeDebayerBackendAvailability r16AmazeTextureAvailability;
     r16AmazeTextureAvailability.available =
@@ -5216,7 +5217,6 @@ void RenderFrameThread::drawFrame( int slotIndex,
         Debayered16ReconRefusal phase3ReconReuseOutcome =
             Debayered16ReconRefusal::GpuDebayerRendered;
         Debayered16RenderedDims debayered16Dims;
-        Debayered16InlineReducedRecon inlineReducedRecon;
         if ( !renderedDebayeredFrame )
         {
             const size_t reconPixelCount =
@@ -5810,8 +5810,16 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * struct fields also written by the processed8-prefetch worker thread
      * rendering concurrently on the same mlvObject), they cannot read a
      * value written by that other thread's frame. */
-    const double llrawprocPreDualIsoFixMs = llrpGetLastPreDualIsoFixMilliseconds();
-    const bool preDualIsoFixActive = llrpGetLastPreDualIsoFixCompleted() != 0;
+    /* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the reduced debayer clears both, so a
+     * frame the render reconstructed itself reports what its recon captured. */
+    const bool inlineReconConsumed =
+        debayered16ReducedReconConsumed && inlineReducedRecon.reconstructed;
+    const double llrawprocPreDualIsoFixMs = inlineReconConsumed
+        ? inlineReducedRecon.preDualIsoFixMs
+        : llrpGetLastPreDualIsoFixMilliseconds();
+    const bool preDualIsoFixActive = inlineReconConsumed
+        ? inlineReducedRecon.preDualIsoFixCompleted
+        : llrpGetLastPreDualIsoFixCompleted() != 0;
     const int preDualIsoFixWidth = preDualIsoFixActive ? sourceWidth : 0;
     const int preDualIsoFixHeight = preDualIsoFixActive ? sourceHeight : 0;
     QString phase4bFallbackReason = QStringLiteral("none");

@@ -763,6 +763,27 @@ TEST(Debayered16ReconReuse, HonourScaleInlineReconTimingSurvivesTheReducedDebaye
     ASSERT_TRUE(s.llrawprocMsAfterDebayer == 0.0);
 }
 
+// Adversary A1: the full-resolution fix pass's telemetry is cleared the same way, so a frame
+// with a completed pass must carry it out of the recon or it publishes zero dimensions.
+TEST(Debayered16ReconReuse, HonourScaleInlineFullResFixTelemetrySurvivesTheReducedDebayer)
+{
+    EnvGuard guard;
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        fixture.video()->llrawproc->focus_pixels = 1;
+        ProductionSlot slot;
+        const InlineStep s = inlineStep(fixture, 1, scale, slot, nullptr);
+        printInlineStep("full-res fixes", 1, scale, s);
+        ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+        ASSERT_TRUE(s.recon.fullResFixesMs > 0.0);
+        ASSERT_TRUE(s.recon.preDualIsoFixCompleted);
+        ASSERT_TRUE(s.recon.preDualIsoFixMs > 0.0);
+        ASSERT_TRUE(llrpGetLastPreDualIsoFixCompleted() == 0);
+    }
+}
+
 // (a) The look gate at x2 and x4 over 8 frames of the large fixture (16 frames available).
 TEST(Debayered16ReconReuse, HonourScaleReducedReconLookWithinGateOfTodaysPrepReducedFrame)
 {

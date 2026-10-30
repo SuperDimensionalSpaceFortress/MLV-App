@@ -154,6 +154,15 @@ TEST(Debayered16HonourScaleWiring, InlineReducedReconRunsBeforeTheDispatchAndKee
     ASSERT_TRUE(applyAt > admittedAt);
     ASSERT_TRUE(dispatchAt > applyAt);
     ASSERT_TRUE(timingAt > dispatchAt);
+    // Adversary A1: the fix-pass geometry and duration come from what the recon captured.
+    const int fixMsAt = body.indexOf(QStringLiteral(
+        "const double llrawprocPreDualIsoFixMs = inlineReconConsumed\n"
+        "        ? inlineReducedRecon.preDualIsoFixMs"));
+    const int fixActiveAt = body.indexOf(QStringLiteral(
+        "const bool preDualIsoFixActive = inlineReconConsumed\n"
+        "        ? inlineReducedRecon.preDualIsoFixCompleted"));
+    ASSERT_TRUE(fixMsAt > timingAt);
+    ASSERT_TRUE(fixActiveAt > fixMsAt);
     // One call site: the recon worker never takes this route.
     ASSERT_EQ(1, source.count(QStringLiteral("debayered16RunInlineReducedRecon(")));
 

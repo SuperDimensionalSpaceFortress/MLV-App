@@ -560,6 +560,9 @@ struct Debayered16InlineReducedRecon
     double downsampleMs = 0.0;
     /*! llrpGetLastTotalMilliseconds of the recon: the reduced debayer clears it. */
     double llrawprocMs = 0.0;
+    /*! The full-resolution fix pass's llrpGetLastPreDualIsoFix*, cleared the same way. */
+    bool preDualIsoFixCompleted = false;
+    double preDualIsoFixMs = 0.0;
     const char * fallbackReason = "";
 };
 
@@ -622,6 +625,8 @@ inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject
         return recon;
     }
     recon.llrawprocMs = llrpGetLastTotalMilliseconds();
+    recon.preDualIsoFixCompleted = llrpGetLastPreDualIsoFixCompleted() != 0;
+    recon.preDualIsoFixMs = llrpGetLastPreDualIsoFixMilliseconds();
     recon.provenance.done = debayered16ReconDoneStamp( video );
     recon.scale = plan.scale;
     recon.reducedWidth = plan.reducedWidth;
