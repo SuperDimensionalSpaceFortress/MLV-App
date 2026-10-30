@@ -32,6 +32,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -4752,24 +4753,36 @@ LINT_PROBE_CRASH_SIGNALS = frozenset({4, 6, 7, 8, 11})  # SIGILL, SIGABRT, SIGBU
 
 
 _PWSH_IDENTITY_CACHE: dict = {}  # PWSH -> its identity string, once a `--version` has been asked
+_PWSH_IDENTITY_LOCK = threading.Lock()  # one `--version` at a time: the four fresh probes of LintCacheColdWarmTests fail together
 
 
 def _pwsh_identity(remaining: "float | None" = None) -> str:
     """The interpreter path and `--version`, looked up once per process (only a failure asks for it); it never raises, so it cannot hide the failure it explains.
-    `remaining` is what is left of the caller's budget: the lookup is bounded by the smaller of 30 s and that, and a cold lookup with nothing left starts
-    no subprocess at all (it says so, and caches nothing)."""
+    `remaining` is what is left of the caller's budget: the lookup is bounded by the smaller of 30 s and that (waiting for a lookup another thread is already
+    making is part of it), and a cold lookup with nothing left starts no subprocess at all (it says so, and caches nothing). Concurrent cold callers share
+    one query: the first asks, the others wait for its answer inside their own budget."""
     if not PWSH:
         return "pwsh not on PATH"
     if PWSH not in _PWSH_IDENTITY_CACHE:
         timeout = 30 if remaining is None else min(30, remaining)
         if timeout <= 0:
             return f"{PWSH} (version not probed (budget spent))"
+        give_up = time.monotonic() + timeout
+        if not _PWSH_IDENTITY_LOCK.acquire(timeout=timeout):
+            return f"{PWSH} (version not probed (another lookup was still running))"
         try:
-            done = subprocess.run([PWSH, "--version"], capture_output=True, text=True, timeout=timeout)
-            version = (done.stdout or done.stderr).strip() or f"version unknown (rc={done.returncode})"
-        except Exception as error:  # a crashing interpreter may crash here too
-            version = f"version unknown ({type(error).__name__})"
-        _PWSH_IDENTITY_CACHE[PWSH] = f"{PWSH} ({version})"
+            if PWSH not in _PWSH_IDENTITY_CACHE:  # whoever held the lock may have answered while this caller waited
+                timeout = give_up - time.monotonic()
+                if timeout <= 0:
+                    return f"{PWSH} (version not probed (budget spent))"
+                try:
+                    done = subprocess.run([PWSH, "--version"], capture_output=True, text=True, timeout=timeout)
+                    version = (done.stdout or done.stderr).strip() or f"version unknown (rc={done.returncode})"
+                except Exception as error:  # a crashing interpreter may crash here too
+                    version = f"version unknown ({type(error).__name__})"
+                _PWSH_IDENTITY_CACHE[PWSH] = f"{PWSH} ({version})"
+        finally:
+            _PWSH_IDENTITY_LOCK.release()
     return _PWSH_IDENTITY_CACHE[PWSH]
 
 
@@ -4833,10 +4846,11 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
         try:
             done = _run_pwsh(probe, remaining, encoding="utf-8")
         except subprocess.TimeoutExpired as expired:
+            attempts.append(f"attempt {attempt}: timed out and was killed after {time.monotonic() - began:.1f} s")  # r3 (sol r2 B2): the first crash stays in `attempts`
             identity = _pwsh_identity(limit - time.monotonic())
             raise AssertionError(f"the cache probe {tag} timed out and was killed after {time.monotonic() - started:.0f} s (bound {LINT_PROBE_BOUND_SEC} s); "
                                  f"stderr tail: {_probe_tail(expired.stderr)}; stdout tail: {_probe_tail(expired.stdout)}; "
-                                 f"argv={_pwsh_argv(probe)}; interpreter={identity}") from None
+                                 f"{' | '.join(attempts)}; argv={_pwsh_argv(probe)}; interpreter={identity}") from None
         finished = time.monotonic()
         lasted = finished - began
         signal = f" (signal {-done.returncode})" if done.returncode < 0 else ""
@@ -4856,7 +4870,7 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
     rows = json.loads(done.stdout.strip())
     if len(rows) != len(steps):
         identity = _pwsh_identity(limit - time.monotonic())
-        raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps; argv={_pwsh_argv(probe)}; interpreter={identity}")
+        raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps; {' | '.join(attempts)}; argv={_pwsh_argv(probe)}; interpreter={identity}")
     return rows
 
 
@@ -5340,6 +5354,69 @@ class LintCacheProbeBoundTests(unittest.TestCase):
             self.assertIn("version not probed (budget spent)", real(0), "no budget, no subprocess")
             self.assertEqual(0, run.call_count)
             self.assertIn("version unknown", real(), "and the spent-budget answer was not cached")
+
+    # CI-FLAKE-LINT-CACHE-PROBE-SIGSEGV-1 r3 (sol r2 B1/B2): the identity is asked once per path even under concurrent failures, and every failure
+    # that follows a retry names the attempts it made.
+    def test_four_concurrent_cold_failures_ask_the_interpreter_version_once(self):
+        """B1: the fan-out in LintCacheColdWarmTests.setUpClass runs four probes at once; four failures on a cold cache must share ONE `--version`.
+        A real Barrier inside the version query is reached by all four only when the lookup is not synchronised."""
+        _PWSH_IDENTITY_CACHE.clear()
+        self.addCleanup(_PWSH_IDENTITY_CACHE.clear)
+        queries: list = []
+        start = threading.Barrier(4)
+        meet = threading.Barrier(4)
+
+        def version(argv, **kwargs):
+            queries.append(argv)
+            try:
+                meet.wait(timeout=1.0)
+            except threading.BrokenBarrierError:
+                pass  # a lone query never meets the others: that is the fixed behaviour
+            return subprocess.CompletedProcess(argv, 0, stdout="PowerShell 7.4.1\n", stderr="")
+
+        def failing(probe, timeout, encoding=None):
+            return subprocess.CompletedProcess([], 7, stdout="", stderr="")
+
+        def worker(number: int) -> str:
+            start.wait(timeout=5)
+            try:
+                _cache_probe(LINT_PS1, self.STEPS, self.tmp, f"fresh{number}", 1020.0)
+            except AssertionError as caught:
+                return str(caught)
+            return "no failure"
+
+        with mock.patch.object(sys.modules[__name__], "_pwsh_identity", _PWSH_IDENTITY_REAL), mock.patch.object(sys.modules[__name__], "PWSH", "/fake/bin/pwsh"), \
+                mock.patch.object(sys.modules[__name__], "_run_pwsh", failing), mock.patch.object(time, "monotonic", lambda: 1000.0), \
+                mock.patch.object(subprocess, "run", version):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                messages = list(pool.map(worker, range(4)))
+        self.assertEqual(1, len(queries), f"{len(queries)} concurrent `--version` queries: the identity must be asked once per path")
+        for message in messages:
+            self.assertIn("PowerShell 7.4.1", message)
+
+    def test_a_start_crash_then_a_retry_timeout_names_both_attempts(self):
+        """B2: attempt 1 died of SIGSEGV after 1.3 s, attempt 2 was killed at the bound: the assertion still carries the first signal."""
+        rows, message, started, _ = self._scripted([self.CRASH, subprocess.TimeoutExpired(["pwsh"], 598.7)], elapsed=[1.3, 598.7])
+        self.assertIsNone(rows)
+        self.assertEqual(2, len(started))
+        for needle in ("timed out", "rc=-11", "signal 11", "attempt 1", "attempt 2", self.IDENTITY):
+            self.assertIn(needle, message)
+        _, first, _, _ = self._scripted([subprocess.TimeoutExpired(["pwsh"], 600)], elapsed=600)
+        self.assertIn("attempt 1", first, "a timeout on the first attempt names it too")
+
+    def test_a_start_crash_then_a_wrong_row_count_names_both_attempts(self):
+        """B2 sibling: the retry ran but answered the wrong number of rows."""
+        rows, message, _, _ = self._scripted([self.CRASH, subprocess.CompletedProcess([], 0, stdout="[]", stderr="")])
+        self.assertIsNone(rows)
+        for needle in ("answered 0 of 1", "rc=-11", "attempt 1", "attempt 2", self.IDENTITY):
+            self.assertIn(needle, message)
+
+    def test_every_failure_message_of_the_cache_probe_carries_the_attempt_history(self):
+        """B2 class: every AssertionError the probe raises names the attempts made, so no reporting path can drop the first crash."""
+        raises = [n for n in ast.walk(ast.parse(inspect.getsource(_cache_probe))) if isinstance(n, ast.Raise) and "AssertionError" in ast.unparse(n)]
+        self.assertEqual(4, len(raises), "no-budget, timeout, failure and row-count messages")
+        for node in raises:
+            self.assertIn("attempts", ast.unparse(node), f"line {node.lineno} of _cache_probe reports a failure without the attempt history")
 
     @requires_pwsh
     def test_a_real_pwsh_that_exits_non_zero_with_no_output_gives_a_typed_message(self):
