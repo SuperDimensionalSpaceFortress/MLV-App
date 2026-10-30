@@ -915,7 +915,8 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
     const int swapAt = r1.indexOf(swapCall);
     const int stampAt = r1.indexOf(swapStamp);
     ASSERT_TRUE(swapAt >= 0 && stampAt > swapAt);
-    ASSERT_EQ(swapCallMsLine, r1.mid(swapAt + swapCall.size(), stampAt - swapAt - swapCall.size()).trimmed());
+    ASSERT_EQ(swapCallMsLine.toStdString(),
+              r1.mid(swapAt + swapCall.size(), stampAt - swapAt - swapCall.size()).trimmed().toStdString());
 
     // r2: the setup-start tail block, after setupStartMs and before ensurePreviewProcessingProgram().
     const int setupStartAt = body.indexOf(QStringLiteral("const double setupStartMs = elapsedMs();"));
@@ -930,8 +931,9 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
     ASSERT_TRUE(r2.contains(QStringLiteral("tail.gui_idle_ms = static_cast<double>(m_tailIdleNs) / 1000000.0;")));
     ASSERT_EQ(0, countOccurrences(r2, QStringLiteral("- m_tailBlockStartNs")));
 
-    // Adversary A2 sibling: no probe where aboutToBlock/awake do not bound the wait (the idle stays not known).
-    const int dispatcherGateAt = source.indexOf(QStringLiteral("!dispatcher->inherits(\"QEventDispatcherGlib\")"));
+    // Adversary A2 sibling and ADV-A1: only the dispatcher whose awake follows the wait before any dispatch gets a probe;
+    // on every other one a wake's events run before the next awake, so the idle stays not known.
+    const int dispatcherGateAt = source.indexOf(QStringLiteral("if ( dispatcher && dispatcher->inherits(\"QEventDispatcherWin32\") )"));
     ASSERT_TRUE(dispatcherGateAt >= 0);
     ASSERT_TRUE(source.indexOf(QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")) > dispatcherGateAt);
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")));

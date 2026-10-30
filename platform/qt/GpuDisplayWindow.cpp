@@ -938,14 +938,14 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     // PLAYBACK-PRESENT-TAIL-TIMING-1: path-1 paint+swap pairs and event-loop idle inside the tail window (from a
     // path-3 swap return to the next recon setup start), gated like the recorder below. Connected BEFORE the recorder
     // (slots run in connection order) so a per-swap log line is never timed as paint+swap. Same idle arithmetic as
-    // MainWindow's present-gap probe, except that QEventDispatcherGlib does not bound the wait with aboutToBlock/awake
-    // (awake fires only on a non-blocking pass, after a wake's events ran as if idle): no probe there, so the idle
-    // stays not known and the present buckets unknown.
+    // MainWindow's present-gap probe, but only on QEventDispatcherWin32, whose awake follows the wait before anything
+    // dispatches: the Glib and Unix dispatchers run a wake's events before their next awake, so their idle would hold
+    // GUI work. No probe on those: the idle stays not known and the present buckets unknown.
     if ( swapTelemetryEnabled() )
     {
         connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteQtPaintSwap);
         QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance(thread());
-        if ( dispatcher && !dispatcher->inherits("QEventDispatcherGlib") )
+        if ( dispatcher && dispatcher->inherits("QEventDispatcherWin32") )
         {
             connect(dispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
             {
