@@ -9146,20 +9146,18 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
     // be at least its floor (HFR-10S-1: 10 s for an HFR clip, else 20 s) and must outlast the play window
     // measured from --start-frame; path-free message.
-    // PLAYBACK-HFR-CONFORM-DEFAULT-1: measured at the PLAYBACK rate (getPlaybackFramerate(): the clip's own rate, or the
-    // conform rate for a clip above the threshold), the same unit checkPlayableWindow() uses for the Play itself -- a 59.94 fps
-    // clip of 971 frames conformed to 24 is 40.5 s of playback, not 16.2 s. The floor's VALUE is the clip's own
-    // (playGateMinPlayWindowSeconds(), classified by its NATIVE fps): the one floor every play gate uses.
+    // SOURCE seconds at the NATIVE fps, conformed or not (HUB RULING 2026-10-30T22:17:51Z): a 59.94 fps clip of 971
+    // frames is 16.2 s whatever rate it plays at.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
-        const double guardFps = static_cast<double>( getPlaybackFramerate() );
+        const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
         const double guardClipSeconds =
             ( guardFrames > 0 && guardFps > 0.0 ) ? guardFrames / guardFps : 0.0;
         const double guardWindowSeconds = qMax( 100, options.durationMs ) / 1000.0;
         const double guardRemainingSeconds = guardFps > 0.0
             ? guardClipSeconds - qMax( 0, options.startFrame ) / guardFps
             : 0.0;
-        const double guardFloorSeconds = playGateMinPlayWindowSeconds();
+        const double guardFloorSeconds = playback_frame_range::minPlayWindowSeconds( guardFps );
         const double guardRequiredSeconds = qMax( guardFloorSeconds, guardWindowSeconds );
         if( guardClipSeconds < guardFloorSeconds || guardRemainingSeconds < guardWindowSeconds )
         {
@@ -9805,11 +9803,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // window is >= 20 s AND >= the requested window; this is also the one Play of the process.
     // A --presented-frames target ends the Play early after N presented frames, so it is a play window
     // of N / fps seconds and must reach the clip's floor too (a pinned run of 24 frames would play ~1 s).
-    // The floor is the one every gate uses (playGateMinPlayWindowSeconds(): classified by the NATIVE fps), so a
-    // conformed HFR clip's 240 presents at 24 fps are the same 10 s window its --seconds 10 was admitted for.
-    const double presentedTargetFps = getPlaybackFramerate();   // presents arrive at the PLAYBACK rate (conform included)
-    if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps,
-                                                                  playGateMinPlayWindowSeconds() ) )
+    // fps is the NATIVE rate, conformed or not (HUB RULING 2026-10-30T22:17:51Z): each present advances one source
+    // frame, so a conformed HFR clip needs 600 presents for its 10 s floor, as a native one does.
+    const double presentedTargetFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
+    if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps ) )
     {
         m_playbackSmokeFullscreenLossLatchArmed = false;
         ++m_programmaticPlayLedger.refused;
@@ -30831,11 +30828,9 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
     Q_UNUSED( site );
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
-    // PLAYBACK-HFR-CONFORM-DEFAULT-1: the window is SECONDS OF PLAYBACK, so it is measured at the rate the
-    // timeline runs (getPlaybackFramerate()): the clip's native fps, or the conform rate for a clip above the
-    // threshold -- 20 s of a 59.94 clip conformed to 24 is 480 source frames, not 1199. Identical to the native
-    // fps for every clip that is not conformed.
-    const double fps = haveClip ? getPlaybackFramerate() : 0.0;
+    // The window is SOURCE seconds at the NATIVE fps, conformed or not (HFR-10S-1; HUB RULING 2026-10-30T22:17:51Z):
+    // 20 s of a 59.94 clip is 1199 source frames at any playback rate. Conform changes only the pace below.
+    const double fps = playGateNativeFps();
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
@@ -30849,7 +30844,7 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
         ui->spinBoxCutIn->value(),
         ui->spinBoxCutOut->value(),
         totalFrames, fps, requestedSeconds,
-        playGateMinPlayWindowSeconds(),
+        playback_frame_range::minPlayWindowSeconds( fps ),
         !f3CutRangeRepairDisabledByEnvironment(),
         enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );
 }

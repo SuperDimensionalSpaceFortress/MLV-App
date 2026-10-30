@@ -676,7 +676,9 @@ JKL-style reverse playback; previous-frame stepping uses <kbd>,</kbd>.
 <a id="high-frame-rate-conform"></a>Clips recorded faster than 30 fps
 (for example 59.94 fps) play as slow motion at 24 fps by default, so a
 59.94 fps clip plays at about 0.4x speed and every recorded frame is
-shown. Configure it under **Playback → High Frame Rate Conform**:
+shown (with **Drop Frame Mode** on, a frame can still be skipped to catch
+up after a stall, as at any rate). Configure it under **Playback → High
+Frame Rate Conform**:
 
 | Setting | Default | Choices |
 |---|---|---|

@@ -149,17 +149,16 @@ FRAME:
   `native_fps`, `pace_fps`, `fps_override`; the receipt oracle turns anything short of the requirement into
   `INVALID_SOURCE_FRAMES`, never a pass.
 
-### High-frame-rate conform (PLAYBACK-HFR-CONFORM-DEFAULT-1): the pre-launch gate measures at the playback rate
+### High-frame-rate conform (PLAYBACK-HFR-CONFORM-DEFAULT-1): conform changes the pace, never the window
 
-A clip above 30 fps plays at the 24 fps conform target by default, so a Play consumes source frames at the PLAYBACK rate. The app's
-own `checkPlayableWindow` already measures the window at `getPlaybackFramerate()`; `Test-GuiSmokeClipLength` (the runner's pre-launch
-gate) now does the same for a caller that plays, through `Get-GuiSmokePlaybackFps` (the `PlaybackConformPolicy.h` defaults: above 30 and
-above the 24 target plays at 24). A `-ClipOnly` caller plays nothing and keeps the native length, and a clip at or below 30 fps is
-unchanged. M16-1456 is 969 frames at 59.94 fps: 16.17 s native, 40.4 s of playback, so a 25 s window is admitted.
-
-**Open (not changed here):** the receipt oracles (`Get-GuiSmokeSourceFramesVerdict`, `Get-DvPlaybackProblems` in
-`DualVenueRunner.psm1` and the job's `Get-AttrCudaSourceFramesVerdict`) still compare `pace_fps` and the 20 s floor with `native_fps`, so a conformed run is
-classified `INVALID_SOURCE_FRAMES` (typed, never a PASS) until they read the playback rate from `playback_smoke.conform`.
+HUB RULING 2026-10-30T22:17:51Z (#420): a clip above 30 fps plays at the 24 fps conform target by default, and its play window is
+still SOURCE seconds at the native fps (the 2026-10-15 amendment above). `checkPlayableWindow`, the GUI-smoke clip guard, the
+`--presented-frames` check and `Test-GuiSmokeClipLength` all measure with the clip's native fps; only the engine pace
+(`getPlaybackFramerate()`) is the conform rate. The receipt oracles already count in this unit. A conformed Play therefore takes longer
+on the clock, inside the same budget `requested / 0.5 + 15 s`. A 25 s window on M16-1457 (1667 frames at 59.94) needs 1499 source
+frames: 62.4 s at 24 fps, inside 65 s. M16-1456 (16.2 s) cannot hold a 25 s window. Under a 24 fps conform, a native rate above
+62.4 fps (for a 25 s window), 66 fps (20 s) or 84 fps (10 s) cannot reach the window inside the budget. Such a Play is refused
+`PLAY_PACE_TOO_SLOW` before it starts (fail closed). No venue clip today is above 59.94 fps.
 
 ### Typed refusals and exit codes
 

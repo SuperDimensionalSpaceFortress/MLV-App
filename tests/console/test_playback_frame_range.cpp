@@ -793,11 +793,6 @@ TEST( HfrPlayFloor, PinnedWindowsAcceptedAndRefusedBeforePlay )
     ASSERT_TRUE( playback_frame_range::presentedFramesTargetReachesFloor( 600, 59.94 ) );
     ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 599, 59.94 ) );
     ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 300, 29.97 ) );
-    // HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (adversary A2): a conformed HFR play passes its presents' rate (24) and its
-    // NATIVE-classified floor (10 s), so 240 presents are the 10 s window --seconds 10 admitted; 239 are not.
-    ASSERT_TRUE( playback_frame_range::presentedFramesTargetReachesFloor( 240, 24.0, 10.0 ) );
-    ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 239, 24.0, 10.0 ) );
-    ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 240, 24.0 ) );   // default: 24 fps -> 20 s
 }
 
 TEST( HfrPlayFloor, AConformedPlayOfAnHfrClipStillAdvancesTenSecondsOfSourceFrames )
@@ -810,6 +805,33 @@ TEST( HfrPlayFloor, AConformedPlayOfAnHfrClipStillAdvancesTenSecondsOfSourceFram
     ASSERT_EQ( 600, v.requiredFrames );
     ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 599, v.requiredFrames, true, 20000, 35000 ) == playback_frame_range::PlayStopState::Continue );
     ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 600, v.requiredFrames, true, 25000, 35000 ) == playback_frame_range::PlayStopState::Reached );
+}
+
+TEST( HfrPlayFloor, AConformedPlayCannotStretchAShortHfrClipIntoALongerWindow )
+{
+    // HFR-NATIVE-60FPS-FULLRES-1 (HUB RULING 2026-10-30T22:17:51Z): 971 frames at 59.94 are 16.2 s of SOURCE. A 24 fps
+    // conform plays them for 40.5 s, but a 25 s window still needs ceil(25 x 59.94) = 1499 source frames: refused.
+    const PlayableWindowVerdict shortClip = evaluatePlayableWindow( 0, 1, 971, 971, 59.94, 25.0,
+                                                                    playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_FALSE( shortClip.ok );
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( shortClip.reason ) );
+    ASSERT_EQ( 1499, shortClip.requiredFrames );
+    // The 27.8 s clip (1667 frames) is admitted at the 24 fps pace: 1498 / 24 = 62.4 s <= 25 / 0.5 + 15 = 65 s.
+    const PlayableWindowVerdict longClip = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0,
+                                                                   playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( longClip.ok );
+    ASSERT_EQ( 1499, longClip.requiredFrames );
+}
+
+TEST( HfrPlayFloor, AConformTooSlowForTheSourceWindowIsRefusedBeforePlay )
+{
+    // The ruling's recorded side effect, fail closed: a 120 fps clip conformed to 24 needs 1200 source frames for its
+    // 10 s floor, 1199 / 24 = 50 s of Play, over the 10 / 0.5 + 15 = 35 s budget: PLAY_PACE_TOO_SLOW before Play.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
+                                                            playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
+    ASSERT_EQ( 1200, v.requiredFrames );
 }
 
 TEST( HfrPlayFloor, AnHfrClipLoopedToReachTenSecondsIsRefusedAndNeverCountsAsPlayed )

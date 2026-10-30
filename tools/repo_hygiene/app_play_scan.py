@@ -161,16 +161,14 @@ PINNED_STOP_STATEMENTS = {
     "MainWindow::checkPlayableWindow": (
         "return playback_frame_range::evaluatePlayableWindow( ui->horizontalSliderPosition->value(), "
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
-        "playGateMinPlayWindowSeconds(), !f3CutRangeRepairDisabledByEnvironment(), "
+        "playback_frame_range::minPlayWindowSeconds( fps ), !f3CutRangeRepairDisabledByEnvironment(), "
         "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
         "const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;",
-        "const double fps = haveClip ? getPlaybackFramerate() : 0.0;",
+        "const double fps = playGateNativeFps();",
     ),
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the settle / play-action requests and the smoke's clip-aware
     # floors read the floor through these two helpers; their bodies are the ONE derivation (minPlayWindowSeconds of the loaded
     # clip's NATIVE fps, 0 -- the 20 s floor -- without a clip). A constant or another fps source here fails the scan.
-    # Merge with PLAYBACK-HFR-CONFORM-DEFAULT-1: checkPlayableWindow measures SECONDS at the playback rate (fps above) and takes
-    # its floor from playGateMinPlayWindowSeconds(), so the floor's value is still the native classification.
     "MainWindow::playGateNativeFps": (
         "return ( m_fileLoaded && m_pMlvObject ) ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;",
     ),

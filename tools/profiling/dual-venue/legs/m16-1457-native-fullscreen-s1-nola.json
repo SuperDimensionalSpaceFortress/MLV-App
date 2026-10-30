@@ -8,7 +8,7 @@
   "backends": ["cuda"],
   "scaleFactor": 1,
   "displayMode": "fullscreen",
-  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": false, "playbackConform": "off" },
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": true, "playbackConform": "off" },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
   "criteria": {
     "acceptance": {

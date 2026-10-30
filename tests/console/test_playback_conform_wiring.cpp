@@ -114,14 +114,16 @@ TEST(PlaybackConformWiring, PaceGuardHelperPacesAtPlaybackRate)
     ASSERT_FALSE(source.contains(QStringLiteral("playback_native_pace::guardPaceFps( getFramerate(),")));
 }
 
-// Adversary A2: the --presented-frames early stop takes the same native-classified floor as every other play gate.
-TEST(PlaybackConformWiring, PresentedFramesTargetUsesTheNativeClassifiedFloor)
+// HUB RULING 2026-10-30T22:17:51Z (adversary A2): a play window is SOURCE seconds at the NATIVE fps, conformed or not.
+// Every present advances one source frame, so N presents are N / native seconds against the clip's own floor.
+TEST(PlaybackConformWiring, PresentedFramesTargetCountsSourceFramesAtTheNativeRate)
 {
     const QString source = mainWindowSource();
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
-        "if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps,")));
+        "const double presentedTargetFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );")));
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
-        "                                                                  playGateMinPlayWindowSeconds() ) )")));
+        "if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps ) )")));
+    ASSERT_FALSE(source.contains(QStringLiteral("presentedTargetFps = getPlaybackFramerate()")));
 }
 
 TEST(PlaybackConformWiring, LoopWrapPaceGuardUsesPlaybackRate)
@@ -199,22 +201,28 @@ TEST(PlaybackConformWiring, SmokeSlipHistogramResetUsesPlaybackRate)
         "m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );")));
 }
 
-TEST(PlaybackConformWiring, PlayableWindowIsMeasuredAndPacedAtPlaybackRate)
+// HUB RULING 2026-10-30T22:17:51Z: the window is SOURCE seconds at the NATIVE fps (master's HFR-10S-1 unit); only the
+// pace is the playback rate, so a conformed HFR Play must still advance ceil(max(floor, requested) x native) frames.
+TEST(PlaybackConformWiring, PlayableWindowIsSourceSecondsPacedAtPlaybackRate)
 {
     const QString body = checkPlayableWindowBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
-    ASSERT_TRUE(body.contains(QStringLiteral("const double fps = haveClip ? getPlaybackFramerate() : 0.0;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("const double fps = playGateNativeFps();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_frame_range::minPlayWindowSeconds( fps ),")));
     ASSERT_TRUE(body.contains(QStringLiteral("const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;")));
+    ASSERT_FALSE(body.contains(QStringLiteral("const double fps = haveClip ? getPlaybackFramerate() : 0.0;")));
     ASSERT_FALSE(body.contains(QStringLiteral("= getFramerate();")));
 }
 
-TEST(PlaybackConformWiring, GuiSmokeClipLengthGuardIsMeasuredAtPlaybackRate)
+TEST(PlaybackConformWiring, GuiSmokeClipLengthGuardIsSourceSecondsAtTheNativeRate)
 {
     const QString source = mainWindowSource();
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "const double guardFps = static_cast<double>( getPlaybackFramerate() );")));
-    ASSERT_FALSE(source.contains(QStringLiteral(
         "const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "const double guardFloorSeconds = playback_frame_range::minPlayWindowSeconds( guardFps );")));
+    ASSERT_FALSE(source.contains(QStringLiteral(
+        "const double guardFps = static_cast<double>( getPlaybackFramerate() );")));
 }
 
 TEST(PlaybackConformWiring, ContactSheetTimeAxisUsesPlaybackRate)
@@ -224,12 +232,6 @@ TEST(PlaybackConformWiring, ContactSheetTimeAxisUsesPlaybackRate)
     ASSERT_TRUE(source.contains(QStringLiteral("m_contactSheetCaptureFps = getPlaybackFramerate();")));
     ASSERT_FALSE(source.contains(QStringLiteral("contactSheetFps = getFramerate();")));
     ASSERT_FALSE(source.contains(QStringLiteral("m_contactSheetCaptureFps = getFramerate();")));
-}
-
-TEST(PlaybackConformWiring, PresentedFramesFloorUsesPlaybackRate)
-{
-    const QString source = mainWindowSource();
-    ASSERT_TRUE(source.contains(QStringLiteral("const double presentedTargetFps = getPlaybackFramerate();")));
 }
 
 // ---- (2) export / metadata / timecode are untouched -----------------------------------------

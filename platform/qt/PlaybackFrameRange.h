@@ -252,12 +252,9 @@ struct PlaybackWrapRecorder
 //
 // PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15: "Amend rule so that hfr 60fps clips are allowed to be
 // 10 seconds"): the floor is a function of the clip's NATIVE fps -- 10 s for a high-frame-rate clip (native fps >= 50:
-// 50, 59.94, 60), 20 s for every other clip, and 20 s whenever the fps is unknown (fail closed, never 10).
-// PLAYBACK-HFR-CONFORM-DEFAULT-1 (merged with HFR-10S-1): the floor's VALUE is classified by the NATIVE fps, but the
-// app's gates count seconds of PLAYBACK (MainWindow passes getPlaybackFramerate() as fps and the native-classified
-// floor explicitly), so a conformed play of an HFR clip advances ceil(10 x 24) source frames for a 10 s window, the
-// same wall-clock window its --seconds asked for. minPlayWindowSeconds() is the ONE derivation every gate below uses;
-// nothing else spells the floor.
+// 50, 59.94, 60), 20 s for every other clip, and 20 s whenever the fps is unknown (fail closed, never 10). Seconds are
+// SOURCE seconds at the native fps, so a conformed play of an HFR clip still has to advance ceil(10 x native fps)
+// source frames. minPlayWindowSeconds() is the ONE derivation every gate below uses; nothing else spells the floor.
 // ---------------------------------------------------------------------------------------------------------
 constexpr double kStandardMinPlayWindowSeconds = 20.0;
 constexpr double kHfrMinPlayWindowSeconds = 10.0;
@@ -573,15 +570,11 @@ inline PlayableWindowVerdict evaluatePlayableWindow(
 
 // A --presented-frames target ends playback EARLY, after N presented frames: it is itself a play window of
 // N / fps seconds and must reach the floor (a pinned-frame run of 24 frames would play ~1 s). 0 = no early stop.
-// The floor is the clip's own: minPlayWindowSeconds( fps ) (HFR-10S-1) by default. fps is the rate presents arrive at;
-// a conformed play passes the playback fps there and its NATIVE-classified floor as floorSeconds (the app passes
-// playGateMinPlayWindowSeconds()), the same floor the --seconds check and checkPlayableWindow() use.
-inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps,
-                                               double floorSeconds = kFloorFromNativeFps )
+// The floor is the clip's own: minPlayWindowSeconds( fps ) (HFR-10S-1).
+inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps )
 {
     if( targetPresentedFrames <= 0 ) return true;
-    if( floorSeconds == kFloorFromNativeFps ) floorSeconds = minPlayWindowSeconds( fps );
-    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= floorSeconds;
+    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= minPlayWindowSeconds( fps );
 }
 
 // ProgrammaticPlayLedger -- pure. One per process. admit() is the only way a programmatic Play is allowed:

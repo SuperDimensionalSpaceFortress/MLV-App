@@ -6977,7 +6977,9 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.assertEqual(heavy["generatorArgs"]["telemetryArm"], "HEAVY")
         self.assertEqual(dict(heavy, legId=base["legId"], generatorArgs=dict(heavy["generatorArgs"], telemetryArm="LIGHT")), base)
         nola = load("m16-1457-native-fullscreen-s1-nola")
-        self.assertEqual(nola["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": False, "playbackConform": "off"})
+        # Adversary A1: forceLookAssist false only skips forcing, and the app defaults Look Assist ON. disableLookAssist is the arm that turns it off
+        # (--no-look-assist), and the smoke runner fails the run when the app still reports look_assist_enabled != 0.
+        self.assertEqual(nola["generatorArgs"], {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "disableLookAssist": True, "playbackConform": "off"})
         for role in ("acceptance", "supplementary"):
             self.assertNotIn("lookFlavorReported", json.dumps(nola["criteria"][role]), "Look Assist is off: no flavor criterion")
         doc = json.loads((DV / "legsets" / "hfr-native-m16-1457.json").read_text(encoding="utf-8"))

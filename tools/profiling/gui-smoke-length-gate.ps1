@@ -223,46 +223,6 @@ function Get-GuiSmokeClipLength {
     return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps) }
 }
 
-function Get-GuiSmokePlaybackFps {
-    <#
-    .SYNOPSIS
-    The rate a clip PLAYS at in the app, in source frames per second. PLAYBACK-HFR-CONFORM-DEFAULT-1: a clip above the
-    conform threshold plays as slow motion at the conform target, so a play window consumes frames at THAT rate, not at the
-    clip's own. Mirrors playback_conform::playbackFps (platform/qt/PlaybackConformPolicy.h) at its defaults (enabled,
-    target 24, threshold 30), which is what a smoke run sees: the app reads its settings from the automation-isolated store.
-    Conform never speeds a clip up, so a clip at or below the threshold (or at or below the target) plays at its own rate.
-    HFR-NATIVE-60FPS-FULLRES-1: -ConformEnvOverride is the run's MLVAPP_PLAYBACK_CONFORM as the app parses it
-    (Get-GuiSmokeConformEnvOverride): 0 is the native-HFR arm, so the clip plays at its own rate; 1 or -1 (unset) keeps the default.
-    #>
-    param([Parameter(Mandatory = $true)][double]$ClipFps, [ValidateRange(-1, 1)][int]$ConformEnvOverride = -1)
-    if ($ConformEnvOverride -eq 0) { return $ClipFps }
-    $conformTargetFps = 24.0
-    $conformThresholdFps = 30.0
-    if ($ClipFps -gt $conformThresholdFps -and $conformTargetFps -lt $ClipFps) { return $conformTargetFps }
-    return $ClipFps
-}
-
-function Get-GuiSmokeConformEnvOverride {
-    <#
-    .SYNOPSIS
-    HFR-NATIVE-60FPS-FULLRES-1: the MLVAPP_PLAYBACK_CONFORM the app will see, parsed the way the app parses it
-    (playback_conform::conformEnabledFromEnvValue: trimmed "1" -> 1, "0" -> 0, anything else -> -1). The KEY=VALUE -Pairs the runner
-    adds to the app's environment win (the last one, comma lists expanded as Add-EnvironmentPairs does); else -Inherited (the
-    runner's own environment, which the app inherits).
-    #>
-    param([string[]]$Pairs = @(), [AllowNull()][AllowEmptyString()][string]$Inherited = $null)
-    $value = $Inherited
-    foreach ($rawPair in @($Pairs)) {
-        if ([string]::IsNullOrWhiteSpace($rawPair)) { continue }
-        foreach ($pair in @($rawPair -split ',')) {
-            $at = $pair.IndexOf('=')
-            if ($at -ge 1 -and $pair.Substring(0, $at).Trim() -ceq 'MLVAPP_PLAYBACK_CONFORM') { $value = $pair.Substring($at + 1) }
-        }
-    }
-    if ($null -eq $value) { return -1 }
-    switch -CaseSensitive ($value.Trim()) { '1' { return 1 } '0' { return 0 } default { return -1 } }
-}
-
 function Get-GuiSmokeClipPlayFloorSeconds {
     # The play floor of ONE clip, from the Get-GuiSmokeClipLength result: Get-GuiSmokeMinPlaySeconds of its header fps, and the
     # 20 s floor when the header cannot be read (the length gate then refuses it as CLIP_LENGTH_UNKNOWN). The one place a launcher
@@ -276,8 +236,7 @@ function Test-GuiSmokeClipLength {
     .SYNOPSIS
     The length gate. Returns [pscustomobject]@{ verdict; message; clipSeconds; windowSeconds;
     requiredSeconds; frames; fps }. verdict is OK | CLIP_TOO_SHORT | PLAY_WINDOW_TOO_SHORT | CLIP_LENGTH_UNKNOWN.
-    A play window may never exceed the footage that remains after -StartFrame. For a caller that plays, clipSeconds and fps are
-    PLAYBACK seconds and rate (a conformed high-frame-rate clip: frames / 24); -ClipOnly keeps the native figures.
+    A play window may never exceed the footage that remains after -StartFrame.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -291,22 +250,12 @@ function Test-GuiSmokeClipLength {
         [switch]$ClipOnly,
         # --presented-frames / -TargetPresentedFrames ends the play EARLY after N presented frames, so it is
         # itself a play window of N / fps seconds and must reach MinSeconds (0 = no early stop).
-        [int]$TargetPresentedFrames = 0,
-        # HFR-NATIVE-60FPS-FULLRES-1: the run's MLVAPP_PLAYBACK_CONFORM as the app parses it (Get-GuiSmokeConformEnvOverride);
-        # 0 = the native-HFR arm, gated at the clip's own rate. -1 (the default) = the app's default conform.
-        [ValidateRange(-1, 1)][int]$ConformEnvOverride = -1
+        [int]$TargetPresentedFrames = 0
     )
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $fmt = { param($v) ([double]$v).ToString('0.###', $inv) }
     $len = Get-GuiSmokeClipLength -Path $Path
     if ($MinSeconds -lt 0) { $MinSeconds = Get-GuiSmokeClipPlayFloorSeconds -ClipLength $len }
-    # A caller that plays measures the footage at the rate the app plays it (Get-GuiSmokePlaybackFps); a -ClipOnly caller
-    # plays nothing, so its footage stays the clip's native length. The floor above is the clip's own (classified by its NATIVE
-    # fps, HFR-10S-1), taken before the conversion, as the app's playGateMinPlayWindowSeconds() does.
-    if ($len.known -and -not $ClipOnly) {
-        $playFps = Get-GuiSmokePlaybackFps -ClipFps $len.fps -ConformEnvOverride $ConformEnvOverride
-        $len = [pscustomobject]@{ known = $true; reason = ''; frames = $len.frames; fps = $playFps; seconds = ([double]$len.frames / $playFps) }
-    }
     $required = [Math]::Max($MinSeconds, $WindowSeconds)
     $out = [pscustomobject]@{
         verdict = 'OK'; message = 'OK'; clipSeconds = $len.seconds; windowSeconds = $WindowSeconds
