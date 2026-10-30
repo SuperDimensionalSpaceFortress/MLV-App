@@ -182,8 +182,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
 CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B (generatorArgs.prepConflatedMove true -> MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1),
-# one per display-matrix cell the CPU route runs at s2 and s4, keyed to the cell it twins. The OFF arm is the twinned cell itself (env unset).
-PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-display-{mode}-s{scale}-pcm.json": f"legs/m16-1243-display-{mode}-s{scale}.json"
+# one per capture-free pace cell the CPU route runs at s2 and s4 (a speed leg, so the post-play visual strips are on by default), keyed to the cell it twins. The
+# OFF arm is the twinned cell itself (env unset).
+PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
                             for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
@@ -6986,9 +6987,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
                 # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS; -missdump: the warm-reuse miss dump on,
-                # MISSDUMP_LEGS; -pcm: the cell with the #397 prep-conflated-move switch on, PREP_CONFLATED_MOVE_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump|-pcm)?$", path.name)
-                self.assertEqual(spec["generatorArgs"].get("prepConflatedMove", False), spec["legId"].endswith("-pcm"), path.name)
+                # MISSDUMP_LEGS)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump)?$", path.name)
+                self.assertNotIn("prepConflatedMove", spec.get("generatorArgs") or {}, path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -7007,7 +7008,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(spec["generatorArgs"].get("disablePrepPointwiseFast", False), spec["legId"].endswith("-nofast"), path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?(-pcm)?$", path.name)
+                # -pcm: the cell with the #397 prep-conflated-move switch on (PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, PREP_CONFLATED_MOVE_LEGS); no other leg sets it
+                self.assertEqual(spec["generatorArgs"].get("prepConflatedMove", False), spec["legId"].endswith("-pcm"), path.name)
             elif spec["card"] == "PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1":   # the cpu receipt pace leg that keeps the per-frame log, named by its cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertEqual(spec["legId"], "m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy", path.name)
