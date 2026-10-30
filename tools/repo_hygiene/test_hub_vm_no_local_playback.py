@@ -19,8 +19,11 @@ Launch command lines in the fixtures are assembled at run time so this file itse
 from __future__ import annotations
 
 import ast
+import contextlib
+import functools
 import hashlib
 import inspect
+import io
 import itertools
 import json
 import os
@@ -196,11 +199,14 @@ def _popen_pwsh(probe: Path) -> "subprocess.Popen":
     return proc
 
 
+def _pwsh_argv(probe: Path) -> "list[str | None]":
+    return [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)]
+
+
 def _run_pwsh(probe: Path, timeout: float, encoding: "str | None" = None) -> "subprocess.CompletedProcess":
     """The one place a pwsh lint probe is run in the foreground; counted in _PWSH_SPAWNS."""
     _PWSH_SPAWNS.append(probe.name)
-    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(probe)], capture_output=True, text=True, encoding=encoding,
-                          timeout=timeout)
+    return subprocess.run(_pwsh_argv(probe), capture_output=True, text=True, encoding=encoding, timeout=timeout)
 
 
 def _lint_blob_id(lint: Path) -> str:
@@ -4737,6 +4743,32 @@ def _probe_tail(text: "str | bytes | None", limit: int = 300) -> str:
     return repr(text[-limit:]) if text else "<no output>"
 
 
+# CI-FLAKE-LINT-CACHE-PROBE-SIGSEGV-1: a hosted pwsh sometimes segfaults at start-up (rc=-11, no output, ~1-2 s: runs 39749674283, 40331627659,
+# 41000650226), before it reads the probe. That one shape is retried once; every other failure, and a second crash, still fails as before.
+LINT_PROBE_START_WINDOW_SEC = 5
+
+
+@functools.lru_cache(maxsize=None)
+def _pwsh_identity() -> str:
+    """The interpreter path and `--version`, looked up once per process (only a failure asks for it); it never raises, so it cannot hide the failure it explains."""
+    if not PWSH:
+        return "pwsh not on PATH"
+    try:
+        done = subprocess.run([PWSH, "--version"], capture_output=True, text=True, timeout=30)
+        version = (done.stdout or done.stderr).strip() or f"version unknown (rc={done.returncode})"
+    except Exception as error:  # a crashing interpreter may crash here too
+        version = f"version unknown ({type(error).__name__})"
+    return f"{PWSH} ({version})"
+
+
+_PWSH_IDENTITY_REAL = _pwsh_identity  # the tests replace the module name; this keeps the real, cached function reachable
+
+
+def _is_start_crash(done: "subprocess.CompletedProcess", elapsed: float) -> bool:
+    """An interpreter start crash: killed by a signal, said nothing, and died inside the start-up window."""
+    return done.returncode < 0 and not done.stdout and not done.stderr and elapsed < LINT_PROBE_START_WINDOW_SEC
+
+
 def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: "float | None" = None) -> list[dict]:
     """Run `steps` in order in ONE pwsh that dot-sources `lint` once. A step is {"op": "lint", "text": T} (findings of
     Get-LocalPlaybackPromptFindings), {"op": "regex", "pattern": P, "input": I} (Get-LintRegex P, whether it matches I, and `slot`: the first step
@@ -4775,15 +4807,28 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
         "}\n"
         "ConvertTo-Json -InputObject $out.ToArray() -Depth 5 -Compress\n",
     )
-    try:
-        done = _run_pwsh(probe, timeout, encoding="utf-8")
-    except subprocess.TimeoutExpired as expired:
-        raise AssertionError(f"the cache probe {tag} timed out and was killed after {time.monotonic() - started:.0f} s (bound {LINT_PROBE_BOUND_SEC} s); "
-                             f"stderr tail: {_probe_tail(expired.stderr)}; stdout tail: {_probe_tail(expired.stdout)}") from None
-    if done.returncode != 0 or not done.stdout.strip():
+    attempts: list[str] = []
+    for attempt in (1, 2):
+        began = time.monotonic()
+        if attempt == 2:
+            timeout = LINT_PROBE_BOUND_SEC if deadline is None else max(1.0, deadline - began)
+        try:
+            done = _run_pwsh(probe, timeout, encoding="utf-8")
+        except subprocess.TimeoutExpired as expired:
+            raise AssertionError(f"the cache probe {tag} timed out and was killed after {time.monotonic() - started:.0f} s (bound {LINT_PROBE_BOUND_SEC} s); "
+                                 f"stderr tail: {_probe_tail(expired.stderr)}; stdout tail: {_probe_tail(expired.stdout)}; "
+                                 f"argv={_pwsh_argv(probe)}; interpreter={_pwsh_identity()}") from None
+        if done.returncode == 0 and done.stdout.strip():
+            break
         signal = f" (signal {-done.returncode})" if done.returncode < 0 else ""
+        lasted = time.monotonic() - began
+        attempts.append(f"attempt {attempt}: rc={done.returncode}{signal} after {lasted:.1f} s")
+        if attempt == 1 and _is_start_crash(done, lasted):
+            print(f"[{tag}] interpreter start crash (rc={done.returncode}{signal}, no output, {lasted:.1f} s): running the probe once more", file=sys.stderr)
+            continue
         raise AssertionError(f"the cache probe {tag} failed: rc={done.returncode}{signal}, not timed out, elapsed {time.monotonic() - started:.1f} s "
-                             f"of the {LINT_PROBE_BOUND_SEC} s bound; stderr tail: {_probe_tail(done.stderr)}; stdout tail: {_probe_tail(done.stdout)}")
+                             f"of the {LINT_PROBE_BOUND_SEC} s bound; stderr tail: {_probe_tail(done.stderr)}; stdout tail: {_probe_tail(done.stdout)}; "
+                             f"{' | '.join(attempts)}; argv={_pwsh_argv(probe)}; interpreter={_pwsh_identity()}")
     rows = json.loads(done.stdout.strip())
     if len(rows) != len(steps):
         raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps")
@@ -4952,6 +4997,11 @@ class LintCacheProbeBoundTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="hubvm-cacheprobe-pin-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        patch = mock.patch.object(sys.modules[__name__], "_pwsh_identity", create=True, return_value=self.IDENTITY)  # never spawn the real --version here
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    IDENTITY = "/fake/bin/pwsh (PowerShell 7.9.9)"
 
     def _probe_with(self, outcome, tag: str = "pin"):
         """_cache_probe with subprocess.run answering `outcome` (a CompletedProcess, or an exception to raise); returns (rows, the run mock)."""
@@ -4987,7 +5037,7 @@ class LintCacheProbeBoundTests(unittest.TestCase):
             self.assertIn(needle, message)
 
     def test_a_signal_death_is_named_as_one(self):
-        message = self._failure_of(subprocess.CompletedProcess([], -9, stdout="", stderr=""), "fresh8")
+        message = self._failure_of(subprocess.CompletedProcess([], -9, stdout="", stderr="Killed"), "fresh8")  # output: not an interpreter start crash, so no retry
         self.assertIn("rc=-9", message)
         self.assertIn("signal 9", message)
 
@@ -5001,6 +5051,107 @@ class LintCacheProbeBoundTests(unittest.TestCase):
             message =self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
         for needle in ("fresh8", "timed out", "7 s", "half a line"):
             self.assertIn(needle, message)
+
+    # CI-FLAKE-LINT-CACHE-PROBE-SIGSEGV-1: hosted ubuntu runs 39749674283 (fresh12), 40331627659 (fresh4) and merge_group 41000650226 (fresh9, PR #711)
+    # lost a probe to "rc=-11 (signal 11) ... elapsed 1.3 s ... <no output>": the pwsh itself segfaulted at start-up, before the lint ran. These
+    # tests replace _run_pwsh and the clock, so no interpreter is started and no real time passes.
+    CRASH = subprocess.CompletedProcess([], -11, stdout="", stderr="")
+    GOOD = subprocess.CompletedProcess([], 0, stdout='[{"op":"state"}]', stderr="")
+
+    def _scripted(self, outcomes, elapsed: float = 1.3):
+        """_cache_probe(tag fresh9) with _run_pwsh answering `outcomes` in turn, each taking `elapsed` fake seconds.
+        Returns (rows or None, failure message or None, probe names started, stderr text)."""
+        clock, started, err = [1000.0], [], io.StringIO()
+
+        def fake(probe, timeout, encoding=None):
+            started.append(probe.name)
+            clock[0] += elapsed
+            return outcomes[len(started) - 1]  # an unscripted extra attempt is an IndexError: a retry the test did not expect
+
+        with mock.patch.object(sys.modules[__name__], "_run_pwsh", fake), mock.patch.object(time, "monotonic", lambda: clock[0]), \
+                contextlib.redirect_stderr(err):
+            try:
+                rows = _cache_probe(LINT_PS1, self.STEPS, self.tmp, "fresh9")
+            except AssertionError as caught:
+                return None, str(caught), started, err.getvalue()
+        return rows, None, started, err.getvalue()
+
+    def test_a_start_up_segfault_is_retried_once_and_the_second_attempt_stands(self):
+        rows, message, started, err = self._scripted([self.CRASH, self.GOOD])
+        self.assertIsNone(message)
+        self.assertEqual([{"op": "state"}], rows)
+        self.assertEqual(["fresh9-probe.ps1"] * 2, started, "exactly one retry")
+        self.assertIn("fresh9", err)
+        self.assertIn("rc=-11", err, "the retry is logged on stderr with the tag and the first return code")
+
+    def test_two_start_up_segfaults_fail_and_the_message_names_both_attempts(self):
+        rows, message, started, _ = self._scripted([self.CRASH, self.CRASH])
+        self.assertIsNone(rows)
+        self.assertEqual(2, len(started), "one retry, never two")
+        for needle in ("fresh9", "rc=-11", "signal 11", "attempt 1", "attempt 2", "<no output>"):
+            self.assertIn(needle, message)
+
+    def test_a_failure_names_the_argv_the_interpreter_path_and_its_version(self):
+        _, message, _, _ = self._scripted([self.CRASH, self.CRASH])
+        for needle in ("-NoProfile", "fresh9-probe.ps1", self.IDENTITY):
+            self.assertIn(needle, message)
+        _, message, _, _ = self._scripted([subprocess.CompletedProcess([], 3, stdout="", stderr="no")])
+        for needle in ("-NoProfile", "fresh9-probe.ps1", self.IDENTITY):
+            self.assertIn(needle, message, "a plain failure is diagnosable too")
+
+    def test_a_segfault_that_printed_something_is_not_retried(self):
+        for crash in (subprocess.CompletedProcess([], -11, stdout="", stderr="Segmentation fault"),
+                      subprocess.CompletedProcess([], -11, stdout="[", stderr="")):
+            _, message, started, err = self._scripted([crash])
+            self.assertEqual(1, len(started))
+            self.assertIn("rc=-11", message)
+            self.assertNotIn("retry", err.lower())
+
+    def test_a_non_signal_failure_is_not_retried(self):
+        for rc in (1, 7):
+            _, message, started, _ = self._scripted([subprocess.CompletedProcess([], rc, stdout="", stderr="")])
+            self.assertEqual(1, len(started))
+            self.assertIn(f"rc={rc}", message)
+
+    def test_a_segfault_after_the_start_up_window_is_not_retried(self):
+        _, message, started, _ = self._scripted([self.CRASH], elapsed=6.0)
+        self.assertEqual(1, len(started))
+        self.assertIn("rc=-11", message)
+        _, message, started, _ = self._scripted([self.CRASH, self.GOOD], elapsed=1.3)
+        self.assertEqual(2, len(started), "the same crash inside the window is retried (the window, not the signal, decided)")
+
+    def test_the_retry_window_is_short_and_the_bound_is_not_widened(self):
+        self.assertLessEqual(LINT_PROBE_START_WINDOW_SEC, 10)
+        self.assertLessEqual(LINT_PROBE_BOUND_SEC, 600)
+
+    def test_a_timeout_is_not_retried(self):
+        started = []
+
+        def fake(probe, timeout, encoding=None):
+            started.append(probe.name)
+            raise subprocess.TimeoutExpired(["pwsh"], timeout)
+
+        with mock.patch.object(sys.modules[__name__], "_run_pwsh", fake), self.assertRaises(AssertionError) as caught:
+            _cache_probe(LINT_PS1, self.STEPS, self.tmp, "fresh9")
+        self.assertEqual(1, len(started))
+        self.assertIn("timed out", str(caught.exception))
+        self.assertIn(self.IDENTITY, str(caught.exception))
+
+    def test_the_interpreter_identity_is_looked_up_once_and_never_fails_the_report(self):
+        """setUp replaced _pwsh_identity; _PWSH_IDENTITY_REAL is the real, cached one."""
+        real = _PWSH_IDENTITY_REAL
+        real.cache_clear()
+        self.addCleanup(real.cache_clear)
+        ok = subprocess.CompletedProcess([], 0, stdout="PowerShell 7.4.1\n", stderr="")
+        with mock.patch.object(sys.modules[__name__], "PWSH", "/fake/bin/pwsh"), mock.patch.object(subprocess, "run", return_value=ok) as run:
+            first, second = real(), real()
+        self.assertEqual(first, second)
+        self.assertEqual(1, run.call_count, "looked up once per process, never per assertion")
+        self.assertIn("/fake/bin/pwsh", first)
+        self.assertIn("PowerShell 7.4.1", first)
+        real.cache_clear()
+        with mock.patch.object(sys.modules[__name__], "PWSH", "/fake/bin/pwsh"), mock.patch.object(subprocess, "run", side_effect=OSError("gone")):
+            self.assertIn("version unknown", real())
 
     @requires_pwsh
     def test_a_real_pwsh_that_exits_non_zero_with_no_output_gives_a_typed_message(self):
