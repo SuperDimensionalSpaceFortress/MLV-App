@@ -451,6 +451,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
         # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing ('receipt' lets a cpu leg reach the CPU reduced dual-ISO recon).
         if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }
+        # CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the app's quality mode ('hq' runs the default mode, Phase 3 Disabled, on a cpu leg).
+        if ($spec.generatorArgs.PSObject.Properties['qualityMode']) { $gen['QualityMode'] = [string]$spec.generatorArgs.qualityMode }
         # PLAYBACK-VSYNC-DEFAULT-1: the vsync A/B arm, any leg type (the app reads MLVAPP_SWAP_INTERVAL).
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).

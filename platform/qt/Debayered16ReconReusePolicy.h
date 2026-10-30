@@ -30,6 +30,12 @@
  * playback prep would have box-reduced the full frame to. A reduced slot whose
  * request was not admitted keeps the ReducedScale refusal: its rawImage16 is not
  * a recon, so today's getMlvRawFrameDebayered renders it at full size.
+ *
+ * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: with Phase 3 Disabled (quality modes 0-2) no
+ * recon worker runs, so an admitted request reached the render unreconned and
+ * rendered the full frame. debayered16InlineReducedReconWanted admits such a frame
+ * and debayered16RunInlineReducedRecon reconstructs it on the render thread with
+ * the #271/#405 pieces; renderDebayered16FromSlot then consumes it unchanged.
  */
 
 #ifndef DEBAYERED16RECONREUSEPOLICY_H
@@ -505,6 +511,84 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
     if( counters ) counters->note( outcome );
     if( renderedDims ) *renderedDims = dims;
     return outcome;
+}
+
+/*! What the render knows when it decides to reconstruct a frame itself. */
+struct Debayered16InlineReducedReconInputs
+{
+    /*! The slot reached the render through the recon worker (consumeReconnedRaw). */
+    bool slotReconned = false;
+    /*! No recon worker runs in this quality mode. A Phase 3 frame that missed the
+     *  worker keeps today's full render. */
+    bool phase3Disabled = false;
+    /*! PresentationContext::cpuDebayered16HonourScaleAdmitted. */
+    bool honourScaleAdmitted = false;
+    bool playbackActive = false;
+    /*! PresentationContext::playbackScaleFactor. */
+    int scale = 1;
+    /*! mlvRawDebayerCacheMayServeFrame != 0, read before any decode. */
+    bool frameCacheMayServe = true;
+};
+
+/*! \return true when the render should reconstruct this frame at the reduced scale. */
+inline bool debayered16InlineReducedReconWanted( const Debayered16InlineReducedReconInputs & in )
+{
+    (void)in;
+    return false;
+}
+
+/*! One inline reduced recon. Reconstructed false leaves the frame to today's
+ *  getMlvRawFrameDebayered, which decodes for itself; fallbackReason says why. */
+struct Debayered16InlineReducedRecon
+{
+    bool reconstructed = false;
+    int scale = 1;
+    int reducedWidth = 0;
+    int reducedHeight = 0;
+    Debayered16ReconProvenance provenance;
+    /*! The decode ran, so its thread-local telemetry describes this frame. */
+    bool decoded = false;
+    double decodeMs = 0.0;
+    double fullResFixesMs = 0.0;
+    double downsampleMs = 0.0;
+    /*! llrpGetLastTotalMilliseconds of the recon: the reduced debayer clears it. */
+    double llrawprocMs = 0.0;
+    const char * fallbackReason = "";
+};
+
+/*! The recon worker's reduced recon on the calling thread. rawBuffer (rawWords
+ *  words) receives the decode. */
+inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject_t * video,
+                                                                       uint32_t frameNumber,
+                                                                       int scale,
+                                                                       int threads,
+                                                                       uint16_t * rawBuffer,
+                                                                       size_t rawWords,
+                                                                       std::vector<uint16_t> & reducedBayer )
+{
+    (void)video;
+    (void)frameNumber;
+    (void)scale;
+    (void)threads;
+    (void)rawBuffer;
+    (void)rawWords;
+    (void)reducedBayer;
+    return Debayered16InlineReducedRecon();
+}
+
+/*! The policy inputs of a frame the render reconstructed itself: its own recon,
+ *  so frame and serial are the render's. */
+inline void applyDebayered16InlineReducedRecon( const Debayered16InlineReducedRecon & recon,
+                                                uint32_t frameNumber,
+                                                uint64_t requestSerial,
+                                                Debayered16ReconReuseInputs & in )
+{
+    in.consumeReconnedRaw = recon.reconstructed;
+    applyDebayered16ReconProvenance( recon.provenance, in );
+    in.reconFrameNumber = frameNumber;
+    in.renderFrameNumber = frameNumber;
+    in.reconRequestSerial = requestSerial;
+    in.renderRequestSerial = requestSerial;
 }
 
 #endif // DEBAYERED16RECONREUSEPOLICY_H

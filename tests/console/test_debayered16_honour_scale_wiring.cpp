@@ -114,3 +114,55 @@ TEST(Debayered16HonourScaleWiring, RenderConsumesAReducedSlotOnlyForAnAdmittedRe
     ASSERT_TRUE(dimsAt > dispatchAt);
     ASSERT_TRUE(resizeAt > dimsAt);
 }
+
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the render's inline reduced recon decides before it
+// reconstructs, resets the slot first, snapshots what the reduced debayer clears, and hands
+// the slot to the same dispatch. Pipeline tests drive the shared helpers; this pins the order
+// in drawFrame, which they cannot reach.
+TEST(Debayered16HonourScaleWiring, InlineReducedReconRunsBeforeTheDispatchAndKeepsItsTelemetry)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    const int drawAt = source.indexOf(QStringLiteral("void RenderFrameThread::drawFrame( int slotIndex,"));
+    ASSERT_TRUE(drawAt >= 0);
+    const QString body = source.mid(drawAt);
+    const int phase3At = body.indexOf(QStringLiteral(
+        "inlineReduced.phase3Disabled = phase3Mode() == Phase3Mode::Disabled;"));
+    const int cacheAt = body.indexOf(QStringLiteral(
+        "!m_pMlvObject || mlvRawDebayerCacheMayServeFrame( m_pMlvObject, frameNumber ) != 0;"));
+    const int wantedAt = body.indexOf(QStringLiteral("debayered16InlineReducedReconWanted( inlineReduced )"));
+    const int resetAt = body.indexOf(QStringLiteral("slot.reducedReconScale = 1;"), wantedAt);
+    const int runAt = body.indexOf(QStringLiteral("debayered16RunInlineReducedRecon("));
+    const int snapshotAt = body.indexOf(QStringLiteral("captureRawUint16DecodeTelemetry( workerRawTelemetry,"));
+    const int scaleKeyAt = body.indexOf(QStringLiteral("QStringLiteral(\"cpu_dualiso_recon_scale\")"));
+    const int fallbackKeyAt = body.indexOf(QStringLiteral("QStringLiteral(\"cpu_dualiso_recon_fallback_reason\")"));
+    const int admittedAt = body.indexOf(QStringLiteral("reuse.honourScaleAdmitted ="));
+    const int applyAt = body.indexOf(QStringLiteral("applyDebayered16InlineReducedRecon( inlineReducedRecon,"));
+    const int dispatchAt = body.indexOf(QStringLiteral("renderDebayered16FromSlot("));
+    const int timingAt = body.indexOf(QStringLiteral(
+        "QStringLiteral(\"debayered16_recon_worker_llrawproc_total_ms\"),\n"
+        "            inlineReducedRecon.reconstructed\n"
+        "                ? inlineReducedRecon.llrawprocMs"));
+    ASSERT_TRUE(phase3At >= 0);
+    ASSERT_TRUE(cacheAt > phase3At);
+    ASSERT_TRUE(wantedAt > cacheAt);
+    ASSERT_TRUE(resetAt > wantedAt);
+    ASSERT_TRUE(runAt > resetAt);
+    ASSERT_TRUE(snapshotAt > runAt);
+    ASSERT_TRUE(scaleKeyAt > snapshotAt);
+    ASSERT_TRUE(fallbackKeyAt > scaleKeyAt);
+    ASSERT_TRUE(admittedAt > fallbackKeyAt);
+    ASSERT_TRUE(applyAt > admittedAt);
+    ASSERT_TRUE(dispatchAt > applyAt);
+    ASSERT_TRUE(timingAt > dispatchAt);
+    // One call site: the recon worker never takes this route.
+    ASSERT_EQ(1, source.count(QStringLiteral("debayered16RunInlineReducedRecon(")));
+
+    // The decode goes through the raw prefetch, the entry today's full path decodes with.
+    const QString policy = readRepoFile(QStringLiteral("platform/qt/Debayered16ReconReusePolicy.h"));
+    const QString helper = functionBody(policy, QStringLiteral("inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon("));
+    const int planAt = helper.indexOf(QStringLiteral("mlvDualIsoPreviewScaleReconPlan("));
+    const int decodeAt = helper.indexOf(QStringLiteral("getMlvRawFrameUint16( video,"));
+    ASSERT_TRUE(planAt >= 0);
+    ASSERT_TRUE(decodeAt > planAt);
+    ASSERT_FALSE(helper.contains(QStringLiteral("getMlvRawFrameUint16Uncached")));
+}

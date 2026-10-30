@@ -410,6 +410,12 @@ param(
     [ValidateSet('', 'receipt', 'subset')]
     [string]$PlaybackProcessing = '',
 
+    # CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the app's quality mode for the run. 'hq' replaces the job's pinned phase3_hq, so a cpu leg
+    # runs the default HighQuality mode (Phase 3 Disabled). Empty (the default) adds nothing: the emitted job is the text it was
+    # before this parameter. Refused with -Backend cuda: the CUDA texture route needs Phase 3.
+    [ValidateSet('', 'hq')]
+    [string]$QualityMode = '',
+
     # UPSTREAM-CPU-BASELINE-1: run the app with Look Assist OFF (the smoke runner's existing -DisableLookAssist, which passes
     # --no-look-assist and fails the run closed if the app still reports Look Assist enabled). The fork turns Look Assist on for
     # every clip by default (ReceiptSettings.cpp), so a no-look leg must ask. Refused with -ForceLookAssist. Absent (the default)
@@ -5633,6 +5639,11 @@ if ($DisableLookAssist) {
 $isCpuBackend = ($Backend -eq 'cpu')
 if ($isCpuBackend -and $DisablePaintPerSubmit) {
     throw 'DUAL_VENUE_CPU_BACKEND_CONFLICT -DisablePaintPerSubmit sets a GPU-window env (MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT) and is CUDA-path only; it cannot be combined with -Backend cpu'
+}
+if (-not [string]::IsNullOrWhiteSpace($QualityMode)) {
+    # CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: only a job that asks for a quality mode carries it; every other job is unchanged.
+    if (-not $isCpuBackend) { throw 'DUAL_VENUE_QUALITY_MODE_CPU_ONLY -QualityMode needs -Backend cpu: the CUDA texture route needs Phase 3' }
+    $template = Edit-DualVenueTemplate $template "'MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq'," "'MLVAPP_PLAYBACK_QUALITY_MODE=$QualityMode',"
 }
 $isVariant = ($Venue -ne 'bachelor') -or $isCpuBackend -or [bool]$ForceLookAssist
 if ($isVariant) {

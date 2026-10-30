@@ -988,6 +988,35 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
 
+    def test_quality_mode_reaches_the_job_env_and_absent_changes_nothing(self) -> None:
+        """CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: -QualityMode hq changes exactly the job's pinned quality env line, so a cpu leg runs the default mode (Phase 3 Disabled);
+        an absent or empty argument emits the default job byte for byte; a cuda job refuses it (the CUDA texture route needs Phase 3)."""
+        base = ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4"]
+        default = self.generate(GENERATOR, "qm-default.job.ps1", base)
+        hq = self.generate(GENERATOR, "qm-hq.job.ps1", [*base, "-QualityMode", "hq"])
+        self.assertEqual(self.parse_errors(hq), 0)
+        text = hq.read_text(encoding="utf-8")
+        self.assertEqual(text.count("'MLVAPP_PLAYBACK_QUALITY_MODE=hq',"), 1)
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq"), 0)
+        self.assertEqual(text.replace("MLVAPP_PLAYBACK_QUALITY_MODE=hq", "MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq"), default.read_text(encoding="utf-8"))
+        explicit_empty = self.generate(GENERATOR, "qm-empty.job.ps1", [*base, "-QualityMode", ""])
+        self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -QualityMode is the default job, byte for byte")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["qualityMode"]["enum"], ["hq"])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['qualityMode']) { $gen['QualityMode'] = [string]$spec.generatorArgs.qualityMode }", runner)
+        for name in ("fullscreen-s4", "windowed-s4", "fullscreen-s2", "windowed-s2"):
+            spec = json.loads((DV / "legs" / f"m16-1243-q1-cpu-look-{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual(spec["backends"], ["cpu"])
+            self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq")
+            self.assertNotIn("playbackProcessing", spec["generatorArgs"], "receipt routes Processed8, not the route under test")
+
+    def test_quality_mode_is_refused_on_a_cuda_job(self) -> None:
+        """CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: a typed refusal, never a job that silently runs the CUDA route without Phase 3."""
+        result = run_pwsh(self.generator_command(GENERATOR, self.tmp / "qm-cuda.job.ps1", ["-QualityMode", "hq"]))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DUAL_VENUE_QUALITY_MODE_CPU_ONLY", result.stdout + result.stderr)
+
     def test_disable_look_assist_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
         """UPSTREAM-CPU-BASELINE-1: -DisableLookAssist adds exactly '-DisableLookAssist' to the smoke runner's command (it passes --no-look-assist and fails
         the run closed if the app still reports Look Assist enabled); absent, the job is the default byte for byte. The runner maps the leg's
