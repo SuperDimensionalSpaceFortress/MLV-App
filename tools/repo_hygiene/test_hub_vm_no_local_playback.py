@@ -4746,6 +4746,7 @@ def _probe_tail(text: "str | bytes | None", limit: int = 300) -> str:
 # CI-FLAKE-LINT-CACHE-PROBE-SIGSEGV-1: a hosted pwsh sometimes segfaults at start-up (rc=-11, no output, ~1-2 s: runs 39749674283, 40331627659,
 # 41000650226), before it reads the probe. That one shape is retried once; every other failure, and a second crash, still fails as before.
 LINT_PROBE_START_WINDOW_SEC = 5
+LINT_PROBE_CRASH_SIGNALS = frozenset({4, 6, 7, 8, 11})  # SIGILL, SIGABRT, SIGBUS, SIGFPE, SIGSEGV: the interpreter faulting; never SIGKILL / SIGTERM / SIGINT
 
 
 @functools.lru_cache(maxsize=None)
@@ -4765,8 +4766,8 @@ _PWSH_IDENTITY_REAL = _pwsh_identity  # the tests replace the module name; this 
 
 
 def _is_start_crash(done: "subprocess.CompletedProcess", elapsed: float) -> bool:
-    """An interpreter start crash: killed by a signal, said nothing, and died inside the start-up window."""
-    return done.returncode < 0 and not done.stdout and not done.stderr and elapsed < LINT_PROBE_START_WINDOW_SEC
+    """An interpreter start crash: died of a fault signal, said nothing, and did it inside the start-up window."""
+    return -done.returncode in LINT_PROBE_CRASH_SIGNALS and not done.stdout and not done.stderr and elapsed < LINT_PROBE_START_WINDOW_SEC
 
 
 def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: "float | None" = None) -> list[dict]:
@@ -4779,7 +4780,8 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
     `deadline` (a time.monotonic() value derived from it) when the caller shares one budget among several probes. A probe that fails raises a
     message with the tag, the return code, whether it timed out, elapsed against the bound and both stream tails."""
     started = time.monotonic()
-    timeout = LINT_PROBE_BOUND_SEC if deadline is None else max(1.0, deadline - started)
+    limit = started + LINT_PROBE_BOUND_SEC if deadline is None else deadline  # one budget for the probe AND its retry
+    timeout = max(1.0, limit - started)
     src = work / f"{tag}-in.json"
     src.write_text(json.dumps(steps), encoding="utf-8")
     probe = work / f"{tag}-probe.ps1"
@@ -4811,7 +4813,7 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
     for attempt in (1, 2):
         began = time.monotonic()
         if attempt == 2:
-            timeout = LINT_PROBE_BOUND_SEC if deadline is None else max(1.0, deadline - began)
+            timeout = max(0.1, limit - began)  # what is left, not a fresh bound
         try:
             done = _run_pwsh(probe, timeout, encoding="utf-8")
         except subprocess.TimeoutExpired as expired:
@@ -4823,7 +4825,7 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
         signal = f" (signal {-done.returncode})" if done.returncode < 0 else ""
         lasted = time.monotonic() - began
         attempts.append(f"attempt {attempt}: rc={done.returncode}{signal} after {lasted:.1f} s")
-        if attempt == 1 and _is_start_crash(done, lasted):
+        if attempt == 1 and _is_start_crash(done, lasted) and time.monotonic() < limit:
             print(f"[{tag}] interpreter start crash (rc={done.returncode}{signal}, no output, {lasted:.1f} s): running the probe once more", file=sys.stderr)
             continue
         raise AssertionError(f"the cache probe {tag} failed: rc={done.returncode}{signal}, not timed out, elapsed {time.monotonic() - started:.1f} s "
@@ -4831,7 +4833,7 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
                              f"{' | '.join(attempts)}; argv={_pwsh_argv(probe)}; interpreter={_pwsh_identity()}")
     rows = json.loads(done.stdout.strip())
     if len(rows) != len(steps):
-        raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps")
+        raise AssertionError(f"the cache probe {tag} answered {len(rows)} of {len(steps)} steps; argv={_pwsh_argv(probe)}; interpreter={_pwsh_identity()}")
     return rows
 
 
@@ -5058,20 +5060,22 @@ class LintCacheProbeBoundTests(unittest.TestCase):
     CRASH = subprocess.CompletedProcess([], -11, stdout="", stderr="")
     GOOD = subprocess.CompletedProcess([], 0, stdout='[{"op":"state"}]', stderr="")
 
-    def _scripted(self, outcomes, elapsed: float = 1.3):
-        """_cache_probe(tag fresh9) with _run_pwsh answering `outcomes` in turn, each taking `elapsed` fake seconds.
-        Returns (rows or None, failure message or None, probe names started, stderr text)."""
+    def _scripted(self, outcomes, elapsed: float = 1.3, deadline: "float | None" = None):
+        """_cache_probe(tag fresh9) with _run_pwsh answering `outcomes` in turn, each taking `elapsed` fake seconds (the clock starts at 1000.0; the timeout
+        each attempt was given lands in self.timeouts). Returns (rows or None, failure message or None, probe names started, stderr text)."""
         clock, started, err = [1000.0], [], io.StringIO()
+        self.timeouts = []
 
         def fake(probe, timeout, encoding=None):
             started.append(probe.name)
+            self.timeouts.append(timeout)
             clock[0] += elapsed
             return outcomes[len(started) - 1]  # an unscripted extra attempt is an IndexError: a retry the test did not expect
 
         with mock.patch.object(sys.modules[__name__], "_run_pwsh", fake), mock.patch.object(time, "monotonic", lambda: clock[0]), \
                 contextlib.redirect_stderr(err):
             try:
-                rows = _cache_probe(LINT_PS1, self.STEPS, self.tmp, "fresh9")
+                rows = _cache_probe(LINT_PS1, self.STEPS, self.tmp, "fresh9", deadline)
             except AssertionError as caught:
                 return None, str(caught), started, err.getvalue()
         return rows, None, started, err.getvalue()
@@ -5099,6 +5103,11 @@ class LintCacheProbeBoundTests(unittest.TestCase):
         for needle in ("-NoProfile", "fresh9-probe.ps1", self.IDENTITY):
             self.assertIn(needle, message, "a plain failure is diagnosable too")
 
+    def test_a_wrong_row_count_names_the_argv_and_the_interpreter_too(self):
+        _, message, _, _ = self._scripted([subprocess.CompletedProcess([], 0, stdout="[]", stderr="")])
+        for needle in ("answered 0 of 1", "fresh9-probe.ps1", self.IDENTITY):
+            self.assertIn(needle, message)
+
     def test_a_segfault_that_printed_something_is_not_retried(self):
         for crash in (subprocess.CompletedProcess([], -11, stdout="", stderr="Segmentation fault"),
                       subprocess.CompletedProcess([], -11, stdout="[", stderr="")):
@@ -5119,6 +5128,29 @@ class LintCacheProbeBoundTests(unittest.TestCase):
         self.assertIn("rc=-11", message)
         _, message, started, _ = self._scripted([self.CRASH, self.GOOD], elapsed=1.3)
         self.assertEqual(2, len(started), "the same crash inside the window is retried (the window, not the signal, decided)")
+
+    def test_only_a_crash_signal_is_retried_never_an_external_kill(self):
+        """Adversary r1 A2: SIGKILL (an OOM kill, a cancelled job) and SIGTERM are not the interpreter crashing, so they fail at once."""
+        for number in (9, 15, 2, 1, 13):
+            _, message, started, _ = self._scripted([subprocess.CompletedProcess([], -number, stdout="", stderr="")])
+            self.assertEqual(1, len(started), f"signal {number} must not be retried")
+            self.assertIn(f"signal {number}", message)
+        for number in (11, 6, 7, 4, 8):
+            rows, _, started, _ = self._scripted([subprocess.CompletedProcess([], -number, stdout="", stderr=""), self.GOOD])
+            self.assertEqual(2, len(started), f"signal {number} (a fault in the interpreter itself) is retried once")
+
+    def test_the_retry_runs_inside_the_same_budget_not_a_fresh_one(self):
+        """Adversary r1 A1: the second attempt gets what is LEFT of the bound / the shared deadline, and none at all when that is spent."""
+        _, message, started, _ = self._scripted([self.CRASH, self.GOOD], elapsed=1.3, deadline=1001.0)
+        self.assertEqual(1, len(started), "the crash used up the shared deadline: no retry")
+        self.assertIn("rc=-11", message)
+        with mock.patch.object(sys.modules[__name__], "LINT_PROBE_BOUND_SEC", 10):
+            rows, _, started, _ = self._scripted([self.CRASH, self.GOOD], elapsed=4.0)
+        self.assertEqual(2, len(started))
+        self.assertAlmostEqual(10.0, self.timeouts[0])
+        self.assertAlmostEqual(6.0, self.timeouts[1], msg="the retry may use only the 6 s left of the 10 s bound")
+        rows, _, started, _ = self._scripted([self.CRASH, self.GOOD], elapsed=2.0, deadline=1010.0)
+        self.assertAlmostEqual(8.0, self.timeouts[1], msg="and only what is left of a shared deadline (1010.0 - 1002.0)")
 
     def test_the_retry_window_is_short_and_the_bound_is_not_widened(self):
         self.assertLessEqual(LINT_PROBE_START_WINDOW_SEC, 10)
