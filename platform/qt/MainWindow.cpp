@@ -1640,6 +1640,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "batch/BatchLogger.h"
 #include "batch/ReceiptLoader.h"
 #include "batch/ReceiptSafety.h"
+#include <QAbstractEventDispatcher>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
@@ -2475,6 +2476,25 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     {
         connect( qApp, &QGuiApplication::applicationStateChanged,
                  this, &MainWindow::onPlaybackSmokeApplicationStateChanged );
+    }
+    // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI event loop's blocked time inside an open
+    // present-to-next-result gap is idle, not busy (gui_present_summary avg_gui_busy_ms). Same
+    // env gate as above, decided once here; kept out of the pinned block above.
+    QAbstractEventDispatcher *const guiPresentIdleDispatcher = playbackSmokeFrameTelemetryEnabled()
+        ? QAbstractEventDispatcher::instance( thread() ) : nullptr;
+    if( guiPresentIdleDispatcher )
+    {
+        m_guiPresentGapClock.start();
+        connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
+        {
+            if( m_guiPresentGapStartNs >= 0 )
+                m_guiPresentGapIdle.blocked( m_guiPresentGapClock.nsecsElapsed() );
+        } );
+        // The wait also ends at the first event dispatched after it (eventFilter): GLib emits
+        // awake only after dispatching (GuiPresentGapIdle.h).
+        connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::awake,
+                 this, &MainWindow::endGuiPresentIdleWait );
+        m_guiPresentIdleProbeConnected = true;
     }
 
     //Init scripting engine
@@ -3455,6 +3475,8 @@ bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, long *
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     Q_UNUSED( watched );
+    // Application filter: the first event dispatched after a dispatcher wait ends that wait.
+    endGuiPresentIdleWait();
     if( event->type() == QEvent::MouseMove )
     {
         static bool graphicsViewReached = false;
@@ -4827,6 +4849,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
         result.task.rebindOwnedImagePointers();
         m_playbackPrepResults.pop_front();
     }
+    closeGuiPresentGap();
 
     const uint64_t latest = m_latestRequestedSerial.load( std::memory_order_acquire );
     const uint64_t activeGeneration =
@@ -4864,7 +4887,66 @@ void MainWindow::onPlaybackPrepResultReady( void )
     }
 
     presentPlaybackPreparedFrame( result );
+    openGuiPresentGap();
 }
+
+// CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: a gap opens when a worker prep present returns and
+// closes when the GUI thread takes the next prep result; only inside a smoke session whose
+// event-loop idle probe is connected. busy = wall - dispatcher idle - smoke runner sleep;
+// other busy = busy - viewport paint.
+void MainWindow::openGuiPresentGap( void )
+{
+    m_guiPresentGapStartNs = -1;
+    m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+    if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
+    m_guiPresentGapRunnerSleepNs = 0;
+    m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
+    m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+}
+
+void MainWindow::closeGuiPresentGap( void )
+{
+    if( m_guiPresentGapStartNs < 0 ) return;
+    const qint64 nowNs = m_guiPresentGapClock.nsecsElapsed();
+    // No wait is still pending here: this result's own delivery passed eventFilter, which ended
+    // it. Charging a pending wait as idle up to now (r1) counted the GUI work a GLib dispatcher
+    // runs before its late awake as idle (GUI-IDLE-LATE-AWAKE).
+    const gui_present_gap::Split split = gui_present_gap::split(
+        nowNs - m_guiPresentGapStartNs, m_guiPresentGapIdle.idleNs, m_guiPresentGapRunnerSleepNs,
+        ui->graphicsView->paintTiming().sumMs - m_guiPresentGapPaintStartMs );
+    GuiPresentGapTotals &gaps = m_guiPresentGaps;
+    ++gaps.gaps;
+    gaps.gapSumMs += split.gapMs;
+    gaps.gapMaxMs = qMax( gaps.gapMaxMs, split.gapMs );
+    gaps.idleSumMs += split.idleMs;
+    gaps.runnerSleepSumMs += split.runnerSleepMs;
+    gaps.busySumMs += split.busyMs;
+    gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
+    gaps.otherBusySumMs += split.otherBusyMs;
+    gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
+    m_guiPresentGapStartNs = -1;
+    m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+}
+
+// Ends a dispatcher wait still open in a gap: from awake, and from eventFilter (the first event
+// dispatched after the wait). One branch when no wait is open.
+void MainWindow::endGuiPresentIdleWait( void )
+{
+    if( m_guiPresentGapIdle.blockStartNs >= 0 )
+        m_guiPresentGapIdle.ended( m_guiPresentGapClock.nsecsElapsed() );
+}
+
+// A smoke runner's sleep on the GUI thread is neither GUI work nor dispatcher idle: inside an
+// open gap it is reported on its own (avg_gui_present_gap_runner_sleep_ms), never as busy. No
+// gap opens or closes during the sleep (both run on this thread).
+void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
+{
+    const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
+    QThread::msleep( ms );
+    if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
+        m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
+}
+
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
 {
     const PlaybackPrepTask &task = result.task;
@@ -4973,7 +5055,10 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 ? task.readyFrame.processedFrame16Signature
                 : display_frame));
 
-    m_lastDrawFrameReadyImageMs = result.imageBuildMs;
+    // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the draw-image cost is this GUI thread's image
+    // region (set when it closes below), never the prep worker's build (that stays in
+    // playback_prep_worker_build_ms). A present-nothing return leaves no GUI image cost.
+    m_lastDrawFrameReadyImageMs = 0.0;
     const size_t sourceImageBytes = static_cast<size_t>( sourceWidth )
         * static_cast<size_t>( sourceHeight ) * 3u;
     const size_t sourceImage16Bytes = sourceImageBytes * sizeof( uint16_t );
@@ -6430,7 +6515,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("playback_prep_region_image_ms"),
         prepRegionImageMs );
-    m_lastDrawFrameReadyImageMs = result.imageBuildMs;
+    m_lastDrawFrameReadyImageMs = prepRegionImageMs;
     mlv_stage_timing_note_elapsed("drawFrameReady.image", display_frame, m_lastDrawFrameReadyImageMs);
 
     const qint64 prepRegionPresentStartNs = prepRegionClock.nsecsElapsed();
@@ -7414,7 +7499,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         for( int attempt = 0; attempt < 200 && !isMlvObjectCaching( m_pMlvObject ); ++attempt )
         {
             QCoreApplication::processEvents();
-            QThread::msleep( 10 );
+            sleepGuiThreadForSmokeRunner( 10 );
         }
     }
     applyEffectiveDualIsoPlaybackSettings();
@@ -8103,6 +8188,8 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             autoSettleClock.start();
             // ENFORCE-3: the settle holds Play until the engine has CONSUMED the source frames of the 20 s window
             // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
+            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
+            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
             const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
             while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
@@ -8142,7 +8229,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             && !m_lastLookAssistDiagnosticsValid )
         {
             qApp->processEvents( QEventLoop::AllEvents );
-            QThread::msleep( 10 );
+            sleepGuiThreadForSmokeRunner( 10 );
         }
 
         qApp->processEvents( QEventLoop::AllEvents );
@@ -8465,6 +8552,8 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             // ENFORCE-3: hold until the engine has CONSUMED the source frames of the 20 s window; a Play the
             // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
+            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
+            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
             const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
@@ -8485,7 +8574,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         for( int attempt = 0; attempt < 200 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )
         {
             qApp->processEvents( QEventLoop::AllEvents );
-            QThread::msleep( 5 );
+            sleepGuiThreadForSmokeRunner( 5 );
         }
         m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
         disconnect( readyConnection );
@@ -9285,7 +9374,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             {
                 requestFrameRefresh( true, "gui-smoke-look-assist-settle" );
             }
-            QThread::msleep( 25 );
+            sleepGuiThreadForSmokeRunner( 25 );
         }
         lookAssistWaitMs = static_cast<int>( lookAssistClock.elapsed() );
     }
@@ -9327,7 +9416,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     "gui-smoke-look-assist-safety-fallback-settle-retry" );
                 nextRetryMs = fallbackSettleClock.elapsed() + 50;
             }
-            QThread::msleep( 10 );
+            sleepGuiThreadForSmokeRunner( 10 );
         }
         qApp->processEvents( QEventLoop::AllEvents );
 
@@ -9477,7 +9566,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
           && settleClock.elapsed() < settleCpuMaxMs ) )
     {
         qApp->processEvents( QEventLoop::AllEvents );
-        QThread::msleep( 25 );
+        sleepGuiThreadForSmokeRunner( 25 );
 
         if( options.settleCpuPercent >= 0.0
          && lastCpuSeconds >= 0.0
@@ -9522,7 +9611,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )
     {
         qApp->processEvents( QEventLoop::AllEvents );
-        QThread::msleep( 5 );
+        sleepGuiThreadForSmokeRunner( 5 );
     }
 
     // CUDA-PLAYBACK-FULLSCREEN-UI-1 round 2: measures the foreground+fullscreen preamble
@@ -9892,7 +9981,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 requestFrameRefresh( true, reason );
                 nextRetryMs = waitClock.elapsed() + 80;
             }
-            QThread::msleep( 10 );
+            sleepGuiThreadForSmokeRunner( 10 );
         }
         qApp->processEvents( QEventLoop::AllEvents );
         return isFrameSettledForAnalysis( frameIndex, requestFloor );
@@ -9949,7 +10038,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
              ++attempt )
         {
             qApp->processEvents( QEventLoop::AllEvents );
-            QThread::msleep( 5 );
+            sleepGuiThreadForSmokeRunner( 5 );
         }
 
         stressSeekedAfterSwitch =
@@ -10128,7 +10217,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             midSessionExposureChangeApplied = true;
             qApp->processEvents( QEventLoop::AllEvents );
         }
-        QThread::msleep( 10 );
+        sleepGuiThreadForSmokeRunner( 10 );
     }
     const qint64 playedMs = playbackClock.elapsed();
     // ENFORCE-3: a measured Play that did not CONSUME the required source frames -- the engine ended it first
@@ -10537,7 +10626,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             while( visualTailClock.elapsed() < targetMs )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                QThread::msleep( 2 );
+                sleepGuiThreadForSmokeRunner( 2 );
             }
             grabVisual( QStringLiteral("play"), k, false );
         }
@@ -10547,7 +10636,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             while( visualTailClock.elapsed() < targetMs )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                QThread::msleep( 2 );
+                sleepGuiThreadForSmokeRunner( 2 );
             }
             grabVisual( QStringLiteral("play_unbound"), k, false );
         }
@@ -10566,7 +10655,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )
         {
             qApp->processEvents( QEventLoop::AllEvents );
-            QThread::msleep( 5 );
+            sleepGuiThreadForSmokeRunner( 5 );
         }
         // (3) the SAME timeline position through the paused full-quality path.
         int visualSettledFrame = visualStopFrame;
@@ -10576,7 +10665,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         {
             // let the display window present the settled frame before it is captured
             qApp->processEvents( QEventLoop::AllEvents );
-            QThread::msleep( 10 );
+            sleepGuiThreadForSmokeRunner( 10 );
         }
         grabVisual( QStringLiteral("paused_unbound"), 0, visualSettled );
         grabVisual( QStringLiteral("paused"), 0, visualSettled );
@@ -10693,7 +10782,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )
     {
         qApp->processEvents( QEventLoop::AllEvents );
-        QThread::msleep( 5 );
+        sleepGuiThreadForSmokeRunner( 5 );
     }
     m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
 
@@ -25600,6 +25689,10 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokePrepWorkerQueueSumMs = 0.0;
     m_playbackSmokePrepWorkerBuildSumMs = 0.0;
     m_playbackSmokePrepSpans = PlaybackSmokePrepSpanTotals();
+    m_guiPresentGaps = GuiPresentGapTotals();
+    m_guiPresentGapStartNs = -1;
+    m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+    ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
     m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -26769,6 +26862,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             spans.refusalLast =
                 telemetryStringValue( timing, "playback_prep_reduced_refusal_reason" );
             ++spans.refusalCounts[spans.refusalLast];
+            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present regions.
+            spans.regionSetupMs += telemetryDoubleValue( timing, "playback_prep_region_setup_ms" );
+            spans.regionImageMs += telemetryDoubleValue( timing, "playback_prep_region_image_ms" );
+            spans.regionPresentMs += telemetryDoubleValue( timing, "playback_prep_region_present_ms" );
+            spans.regionFinishMs += telemetryDoubleValue( timing, "playback_prep_region_finish_ms" );
+            spans.regionTotalMs += telemetryDoubleValue( timing, "playback_prep_region_total_ms" );
+            spans.regionUnattributedMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_unattributed_ms" );
         }
     }
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
@@ -29824,6 +29925,14 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
              it != spans.pointwiseFastRefusalCounts.constEnd(); ++it )
             pointwiseFastRefusalCounts[it.key().isEmpty() ? QStringLiteral("none") : it.key()] += it.value();
         const double cpuRouteFrames = static_cast<double>( spans.cpuRouteFrames );
+        // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI-thread region spans are summed on
+        // CPU-route frames only, so they average over those frames.
+        const auto avgCpuRouteMs = [&spans]( double sum ) -> double
+        {
+            return spans.cpuRouteFrames > 0
+                ? sum / static_cast<double>( spans.cpuRouteFrames )
+                : 0.0;
+        };
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "
@@ -29839,7 +29948,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "playback_prep_stage_mask=%24 playback_prep_pointwise_fast_frames=%25 "
                    "playback_prep_pointwise_fast=%26 playback_prep_pointwise_omp_threads=%27 "
                    "playback_prep_pointwise_omp_threads_last=%28 playback_prep_pointwise_fast_refusal=%29 "
-                   "pointwise_fast_refusal_counts=%30" )
+                   "pointwise_fast_refusal_counts=%30 "
+                   "avg_playback_prep_region_setup_ms=%31 avg_playback_prep_region_image_ms=%32 "
+                   "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
+                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -29871,7 +29983,53 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( spans.cpuRouteFrames == 0 ? QStringLiteral("unset")
                          : ( spans.pointwiseFastRefusalLast.isEmpty() ? QStringLiteral("none")
                                                                       : spans.pointwiseFastRefusalLast ) )
-                   .arg( joinCounts( pointwiseFastRefusalCounts ) );
+                   .arg( joinCounts( pointwiseFastRefusalCounts ) )
+                   .arg( avgCpuRouteMs( spans.regionSetupMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionPresentMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionFinishMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 );
+    }
+
+    /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
+     * paint (GraphicsZoomView::paintEvent, per paint) and the GUI thread's busy time between a
+     * worker prep present's exit and the next prep result's entry (wall gap less event-loop
+     * idle and less the smoke runner's own sleeps, which are reported apart -- except the two
+     * pinned Play-poll loops of runHeadlessPlaybackProfile, whose sleep stays in busy); other busy = busy
+     * less the viewport paint inside that gap. gui_idle_source=none
+     * means the idle probe was not connected and every gap field is 0. */
+    {
+        const GraphicsZoomView::PaintTiming paint = ui->graphicsView->paintTiming();
+        const GuiPresentGapTotals &gaps = m_guiPresentGaps;
+        const auto avgOver = []( double sum, quint64 count ) -> double
+        {
+            return count > 0 ? sum / static_cast<double>( count ) : 0.0;
+        };
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.gui_present_summary session=%1 frames=%2 "
+                   "preview_viewport_paints=%3 avg_preview_viewport_paint_ms=%4 "
+                   "max_preview_viewport_paint_ms=%5 gui_present_gaps=%6 "
+                   "avg_gui_present_gap_ms=%7 max_gui_present_gap_ms=%8 avg_gui_present_gap_idle_ms=%9 "
+                   "avg_gui_present_gap_runner_sleep_ms=%10 avg_gui_busy_ms=%11 max_gui_busy_ms=%12 "
+                   "avg_gui_other_busy_ms=%13 max_gui_other_busy_ms=%14 gui_idle_source=%15" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokePresentedFrames )
+                   .arg( paint.paints )
+                   .arg( avgOver( paint.sumMs, paint.paints ), 0, 'f', 3 )
+                   .arg( paint.maxMs, 0, 'f', 3 )
+                   .arg( gaps.gaps )
+                   .arg( avgOver( gaps.gapSumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( gaps.gapMaxMs, 0, 'f', 3 )
+                   .arg( avgOver( gaps.idleSumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( avgOver( gaps.runnerSleepSumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( avgOver( gaps.busySumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( gaps.busyMaxMs, 0, 'f', 3 )
+                   .arg( avgOver( gaps.otherBusySumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( gaps.otherBusyMaxMs, 0, 'f', 3 )
+                   .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
+                                                        : QStringLiteral("none") );
     }
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
