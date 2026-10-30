@@ -849,15 +849,19 @@ try {
     # millisecond conversion fits an Int32 (Start-Sleep -Milliseconds). Anything else is a typed refusal, not a late assertion or a cast
     # overflow. Returns @{ ok; sec; why }.
     $script:RenewTtlSec = 3
+    $script:RenewStallMaxSec = 20   # the stall sits inside Invoke-RenewedAcrossExit75's 40 s queue guard with ~9 s of waiting around it
     function Get-RenewStallOverride([string]$Raw, [double]$TtlSec = $script:RenewTtlSec) {
         if ([string]::IsNullOrWhiteSpace($Raw)) { return [pscustomobject]@{ ok = $true; sec = [double]0; why = 'unset: no stall' } }
         $v = [double]0
         if (-not [double]::TryParse($Raw.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$v) -or [double]::IsNaN($v) -or [double]::IsInfinity($v)) {
             return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC '$($Raw -replace '[^\x20-\x7E]', '?')' is not a finite number of seconds" }
         }
+        # A nonzero mantissa that parsed to 0 underflowed (1e-400): refused, never read as "no stall".
+        if ($v -eq 0 -and ($Raw.Trim() -replace '[eE].*$', '') -match '[1-9]') { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC '$($Raw -replace '[^\x20-\x7E]', '?')' underflows to 0 s: not a usable number of seconds (write 0 for no stall)" } }
         if ($v -eq 0) { return [pscustomobject]@{ ok = $true; sec = [double]0; why = '0: no stall' } }
         if ($v -le $TtlSec) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s must be longer than the $TtlSec s renewal window (or 0/unset for none): a shorter stall cannot lapse the sidecar and would fail the stall assertion late" } }
         if ([Math]::Round($v * 1000) -gt [int]::MaxValue) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s overflows the Int32 millisecond conversion (at most $([int]::MaxValue / 1000) s)" } }
+        if ($v -gt $script:RenewStallMaxSec) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s exceeds the $($script:RenewStallMaxSec) s ceiling (the case runs under a 40 s queue guard; a longer stall ends it queue-expired)" } }
         return [pscustomobject]@{ ok = $true; sec = $v; why = "$v s stall" }
     }
     # The verdict wrapper: with $script:VerdictNowPin set by a renewing read (below) the very next verdict for that job is taken as
@@ -1831,20 +1835,21 @@ function Exit-HeavySlot {
 
     # ------------------------------------------------------------ liveness-renew-stall-override-bound: the hand-set stall is bounded
     if (Test-Case 'liveness-renew-stall-override-bound') {
-        $okVec = [ordered]@{ '' = 0; '   ' = 0; '0' = 0; '0.0' = 0; '3.001' = 3.001; '4' = 4; ' 4 ' = 4; '60' = 60; '2147483.647' = 2147483.647 }
+        $okVec = [ordered]@{ '' = 0; '   ' = 0; '0' = 0; '0.0' = 0; '3.001' = 3.001; '4' = 4; ' 4 ' = 4; '20' = 20; '0e5' = 0 }
         foreach ($k in $okVec.Keys) {
             $r = Get-RenewStallOverride $k
             Assert-True ($r.ok -and $r.sec -eq $okVec[$k]) "liveness-renew-stall-override-bound: '$k' is accepted as $($okVec[$k]) s: ok=$($r.ok) sec=$($r.sec) why=$($r.why)"
         }
         $badVec = [ordered]@{ '1' = 'longer than the 3 s renewal window'; '3' = 'longer than the 3 s renewal window'; '-4' = 'longer than the 3 s renewal window'; '2147483.648' = 'overflows the Int32'; '1e12' = 'overflows the Int32'
-            'abc' = 'not a finite number'; 'NaN' = 'not a finite number'; 'Infinity' = 'not a finite number'; '4s' = 'not a finite number' }
+            'abc' = 'not a finite number'; 'NaN' = 'not a finite number'; 'Infinity' = 'not a finite number'; '4s' = 'not a finite number'
+            '1e-400' = 'underflows to 0 s'; '20.001' = 'exceeds the 20 s ceiling'; '60' = 'exceeds the 20 s ceiling'; '2147483.647' = 'exceeds the 20 s ceiling' }
         foreach ($k in $badVec.Keys) {
             $r = Get-RenewStallOverride $k
             Assert-True ((-not $r.ok) -and $null -eq $r.sec -and $r.why -like "QL_TEST_RENEW_STALL_SEC *$($badVec[$k])*") "liveness-renew-stall-override-bound: '$k' is a typed refusal ('$($badVec[$k])'): ok=$($r.ok) why=$($r.why)"
         }
         # The ms conversion Start-SidecarRenewOnRead performs holds for the largest accepted value.
-        $big = (Get-RenewStallOverride '2147483.647').sec
-        Assert-True ([int]($big * 1000) -eq [int]::MaxValue) "liveness-renew-stall-override-bound: the largest accepted stall converts to Int32 milliseconds without overflow"
+        $big = (Get-RenewStallOverride '20').sec
+        Assert-True ([int]($big * 1000) -eq 20000 -and 20000 -lt [int]::MaxValue) "liveness-renew-stall-override-bound: the largest accepted stall converts to Int32 milliseconds without overflow"
         $results.livenessRenewStallOverrideBound = [ordered]@{ accepted = $okVec.Count; refused = $badVec.Count }
     }
 
