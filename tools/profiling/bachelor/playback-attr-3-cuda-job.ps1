@@ -422,7 +422,8 @@ param(
 
     # HFR-NATIVE-60FPS-FULLRES-1: the high-frame-rate conform arm (passed to the app as MLVAPP_PLAYBACK_CONFORM=1 for 'on',
     # 0 for 'off', the native-HFR arm), any leg type. Empty (the default) sets nothing: the emitted job is the text it was before.
-    [ValidateSet('', 'on', 'off')]
+    # Case-sensitive (adversary A4): the emitter compares -ceq 'on', so 'ON' must be refused at bind, never emitted as 0.
+    [ValidateSet('', 'on', 'off', IgnoreCase = $false)]
     [string]$PlaybackConform = '',
 
     # GPU-EVENT153-ROOTCAUSE-2: turns the CUDA backends' per-launch timer on (MLVAPP_CUDA_LAUNCH_TIMING=1) with this

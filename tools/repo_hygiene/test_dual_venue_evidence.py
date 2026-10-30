@@ -8637,6 +8637,18 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force; try {{ [void](Get-DvVisualCaptureRequest -Spec ([pscustomobject]{spec})); 'NO_THROW' }} catch {{ $_.Exception.Message }}"])
                 self.assertTrue(proc.stdout.strip().startswith("DVE_LEG_SPEC_INVALID"), proc.stdout + proc.stderr)
 
+    def test_the_generator_refuses_a_conform_arm_in_any_other_case(self) -> None:
+        """HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (adversary A4): the generator emits MLVAPP_PLAYBACK_CONFORM=1 only for -ceq 'on', so its ValidateSet must be
+        case-sensitive: 'ON' or 'On' would otherwise bind and emit 0 (the native arm). Read from the generator's own parameter block (AST)."""
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{GENERATOR}', [ref]$null, [ref]$null); "
+                  "$p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'PlaybackConform' }; "
+                  "$v = $p.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' }; "
+                  "$ic = $v.NamedArguments | Where-Object { $_.ArgumentName -eq 'IgnoreCase' }; "
+                  "if ($null -eq $ic) { 'ABSENT' } else { $ic.Argument.Extent.Text }")
+        proc = run_pwsh(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "$false")
+
     def test_all_six_pace_specs_request_visual_capture(self) -> None:
         """HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (ACK 420 item 4, Dot f3a58c4d): the six m16-1243 Cinematic pace legs are the D4 visual route, so each
         committed spec, read by the runner's own Get-DvVisualCaptureRequest, must request the capture (applies and requested, no opt-out)."""
