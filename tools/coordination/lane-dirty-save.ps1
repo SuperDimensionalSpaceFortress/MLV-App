@@ -33,7 +33,8 @@
 # refuses a directory that is not itself a worktree root (that would resolve to an ENCLOSING repo and save its diff). The same logic is deployed board-local in
 # hub-autopilot\dispatch-fix-round.ps1; keep the two in step.
 # The caller's GIT_* variables are captured and cleared inside the try whose finally puts them back: a throw while they are captured is DIRTY_TREE_SAVE_FAILED with
-# every one captured so far restored, and a variable gone between its check and its read is treated as absent (r16, sol r15b B2).
+# every one captured so far restored, and a variable gone between its check and its read is treated as absent (r16, sol r15b B2). Every variable named GIT_TRACE* goes the
+# same way, by prefix, because git appends to a file a trace variable names, which could be a tracked file of this worktree (r20, sol r19 B1); the reapply command scrubs them too.
 # Still open, as successor work (not guarded here): metadata changed and changed back between two checks, a junction INTO the worktree, a link made to a placed
 # file after its flush, the dispatcher-to-saver identity handoff, parity with the board-local copy, a destination that is an ignored directory inside some other
 # worktree, git reading repository config (aliases, fsmonitor, diff drivers) from the worktree it is pointed at, and deadlines / output buffering on git calls.
@@ -701,6 +702,7 @@ function Add-DirtyReuseHold($List, $Placed) {
 
 # The reapply= value of a SAVED line. It must work where it is pasted, which is where the saver put the caller's GIT_* variables back: an inherited GIT_COMMON_DIR beats
 # --git-dir and has no option of its own, so the command clears every repository-selecting variable for the one git call and puts each back after it (r13, sol r12 B2).
+# It clears every GIT_TRACE* the same way, listed by prefix when the command runs, because the paster's environment decides which ones exist (r20, sol r19 B1).
 # --git-dir / --work-tree beat a core.worktree; nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified (r5, r6 adversary A1).
 # An empty main patch (git apply refuses it, exit 128) is never advertised: a staged-only save reapplies the staged diff to the index (--cached), and with nothing
 # staged either the line names the status file, whose untracked names are all there is (their content is not saved).
@@ -712,7 +714,7 @@ function Get-DirtyReapplyCommand([string]$Wt, [string]$Patch, [long]$PatchBytes,
     $git = "git -C $(ConvertTo-DirtySingleQuoted $Wt) --git-dir $(ConvertTo-DirtySingleQuoted (Join-Path $Wt '.git')) --work-tree $(ConvertTo-DirtySingleQuoted $Wt) $what"
     # Removed, never set to $null: PowerShell passes $null to a .NET string parameter as '', and git reads an empty GIT_COMMON_DIR / GIT_INDEX_FILE as a path.
     # Captured inside the try whose finally puts them back, so a throw while capturing restores every one already removed (r16 adversary a11c4459-A3).
-    return "& { `$n = $names; `$o = @{}; try { foreach (`$v in `$n) { `$o[`$v] = [Environment]::GetEnvironmentVariable(`$v); Remove-Item -LiteralPath `"Env:`$v`" -ErrorAction SilentlyContinue }; " +
+    return "& { `$n = @($names); `$o = @{}; try { `$n += @((Get-ChildItem Env:).Name -like 'GIT_TRACE*'); foreach (`$v in `$n) { `$o[`$v] = [Environment]::GetEnvironmentVariable(`$v); Remove-Item -LiteralPath `"Env:`$v`" -ErrorAction SilentlyContinue }; " +
         "$git } finally { foreach (`$v in `$n) { if (`$null -ne `$o[`$v]) { Set-Item -LiteralPath `"Env:`$v`" -Value `$o[`$v] } } } }"
 }
 
@@ -744,6 +746,9 @@ function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$C
     try {
         # Captured INSIDE the try whose finally restores them (r16, sol r15b B2): a throw here is DIRTY_TREE_SAVE_FAILED with every variable captured so far put back.
         # A variable gone between its check and its read was not there to save: it is absent, and nothing is put back for it. Removed, not emptied: git reads an empty GIT_DIR as a path.
+        # Every GIT_TRACE* joins the list by prefix, so a trace variable git adds later is covered. Git appends to a file such a variable names, and a save must not change
+        # a tracked file (r20, sol r19 B1). -ErrorAction Stop: a listing that fails is a typed failure before any git call, never a save with a trace still set.
+        $gitEnv += @(Get-Item -Path 'Env:GIT_TRACE*' -ErrorAction Stop | ForEach-Object { $_.Name })
         foreach ($v in $gitEnv) {
             if (-not (Test-Path -LiteralPath "Env:$v")) { continue }
             $found = Get-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue

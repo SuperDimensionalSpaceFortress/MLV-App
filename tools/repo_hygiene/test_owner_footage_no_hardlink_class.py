@@ -47,6 +47,7 @@ import subprocess
 import sys
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -209,6 +210,9 @@ def hard_link_text_hits(text: str, is_python: bool = False) -> list[tuple[int, s
 # each call's info class is a literal from the named set, and no link name appears at all. The observed CI red was a
 # census mismatch on a rename, not a demonstrated hard link; this keeps it that way.
 LANE_DIRTY_SAVE = ROOT / "tools" / "coordination" / "lane-dirty-save.ps1"
+# The saver as r19 froze it, for the walker's own regressions only: they test the walker as a function, so no edit to the live saver can fail them (see the r20 note below).
+LANE_DIRTY_SAVE_FIXTURE = ROOT / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
+LANE_DIRTY_SAVE_FIXTURE_BLOB = "1b7d574c762775a5ff6a0eb7e56014c2bab9be68"
 LANE_DIRTY_SAVE_NT_CLASSES = {"10"}  # NtSetInformationFile: FileRenameInformation. 11 (FileLinkInformation) creates a hard link.
 LANE_DIRTY_SAVE_NT_CALLS = 1
 LANE_DIRTY_SAVE_K32_CLASSES = {"4"}  # SetFileInformationByHandle: FileDispositionInfo (that enum has no link class; pinned anyway).
@@ -994,8 +998,9 @@ def lane_dirty_save_violations(source: str | bytes) -> list[str]:
 # comment and hid executable C#, and a struct return type moved the counted native's arguments. Each new construct is a new class, so a parser cannot
 # converge. The gate below therefore searches the RAW bytes of every in-scope file, case-insensitively and with nothing stripped or resolved, for the
 # tokens the census exists to guard. Any file with a hit must be pinned here by repo path AND git blob sha, so an edit to it fails until a reviewed
-# one-line re-pin. In scope: every file whose hard-link allowance is keyed by file (HARD_LINK_ALLOWED). lane_dirty_save_violations above stays as a
-# DIAGNOSTIC (its tests still pass). It is no longer the gate.
+# one-line re-pin. In scope: every file whose hard-link allowance is keyed by file (HARD_LINK_ALLOWED).
+# r20 (sol r19 B2): lane_dirty_save_violations above is a DIAGNOSTIC and nothing else. Over the live saver it is only reported (walker_diagnostic), so a reviewed
+# re-pin is all an edit to the saver needs. Its regressions test the walker as a function on LANE_DIRTY_SAVE_FIXTURE, never on the live file.
 LANE_DIRTY_SAVE_TRIPWIRE_TOKENS = (
     # the natives and link spellings (_NATIVE_SET_INFO_RE, _K32_SET_INFO_RE, _LINK_NAME_RE, HARD_LINK_TEXT_PATTERNS, HARD_LINK_PY_ATTRIBUTES)
     r"(?:Nt|Zw)SetInformationFile", r"SetFileInformationByHandle", r"CreateHardLink", r"FileLinkInfo", r"HardLink", r"mklink", r"fsutil", r"fs\.link",
@@ -1018,7 +1023,7 @@ _TRIPWIRE_RE = re.compile(b"|".join(f"(?:{token})".encode("ascii") for token in 
 # repo path -> git blob sha of the reviewed content (`git rev-parse HEAD:<path>`). Re-pinning is a one-line change to this map, made after a human reviews
 # the diff it covers.
 TRIPWIRE_PINNED = {
-    "tools/coordination/lane-dirty-save.ps1": "1b7d574c762775a5ff6a0eb7e56014c2bab9be68",
+    "tools/coordination/lane-dirty-save.ps1": "f93365756899bf9b6ca8e21cc274f42d5f5ed0a6",
     "tools/coordination/record_workstream_completion.py": "ead6ffc10c78d8bd4f5a94088685d6cd1fc1a20f",
 }
 
@@ -1039,6 +1044,22 @@ def tripwire_violations(rel: str, source: str | bytes) -> list[str]:
     shown = ", ".join(f"{line}:{token.decode('ascii', 'backslashreplace')!r}" for line, token in hits[:8]) + (", ..." if len(hits) > 8 else "")
     return [f"{rel}: blob {sha} has {len(hits)} tripwire hit(s) ({shown}) and is not the pinned content ({TRIPWIRE_PINNED.get(rel, 'no pin')}): "
             "review the change, then re-pin it in TRIPWIRE_PINNED"]
+
+
+def _gate_bytes(rel: str) -> bytes:
+    """The content the gate judges for repo path `rel`. One seam, so a regression can stand in an edited saver and run the gate's own tests on it."""
+    return (ROOT / rel).read_bytes()
+
+
+def walker_diagnostic(source: str | bytes) -> list[str]:
+    """Reports what the old walker says about `source` as a warning, and returns it. Nothing here can fail a test: the tripwire is the gate (hub ruling E, r20)."""
+    try:
+        findings = lane_dirty_save_violations(source)
+    except Exception as error:
+        findings = [f"the walker raised {error!r}"]
+    if findings:
+        warnings.warn(f"lane-dirty-save walker diagnostic (not a gate): {findings}", stacklevel=2)
+    return findings
 
 
 # The saver's two launch loops, by their text: sol's repros name them as lines 569 and 667 of 48959b31, and a row must follow the line, not its number.
@@ -1297,11 +1318,19 @@ class NoHardLinkCreationTests(unittest.TestCase):
         self.assertEqual(len({number for number, _ in hard_link_hits(ledger)}), 1, hard_link_hits(ledger))
 
     def test_the_lane_dirty_saver_keeps_exactly_its_one_rename_call(self) -> None:
-        # HARD_LINK_ALLOWED is keyed by file; this keeps the allowance to the one class-10 rename (PR #698 r12).
-        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes()), [])
+        # HARD_LINK_ALLOWED is keyed by file; the pin keeps the allowance to the reviewed bytes, which hold the one class-10 rename (PR #698 r12, r20).
+        data = _gate_bytes(LANE_DIRTY_SAVE_REL)
+        walker_diagnostic(data)
+        self.assertEqual(tripwire_violations(LANE_DIRTY_SAVE_REL, data), [])
+
+    def test_the_walker_fixture_is_the_frozen_clean_saver(self) -> None:
+        # the walker's regressions cut their mutants from this file, so it must stay the bytes r19 pinned, and the walker must read those as clean
+        data = LANE_DIRTY_SAVE_FIXTURE.read_bytes()
+        self.assertEqual(git_blob_sha(data), LANE_DIRTY_SAVE_FIXTURE_BLOB)
+        self.assertEqual(lane_dirty_save_violations(data), [])
 
     def test_the_lane_dirty_saver_census_goes_red_on_every_widening(self) -> None:
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         call = re.search(r"NtSetInformationFile\(h, out io, info, \(uint\)size, 10\);", text)
         self.assertIsNotNone(call, "the census mutants below are cut from this exact call")
         call = call.group(0)
@@ -1369,7 +1398,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
     def test_the_lane_dirty_saver_census_rejects_a_literal_non_ascii_character(self) -> None:
         # r14 (Dot on 3e52cb20, HARDLINK-CENSUS-LITERAL-FORMAT-CHAR-1): C# removes a Cf character from an identifier, so each literal below binds the counted
         # native beside the original declaration and class-10 call while the name regex sees nothing. Built with chr() so this file stays ASCII.
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         call = re.search(r"NtSetInformationFile\(h, out io, info, \(uint\)size, 10\);", text).group(0)
 
         def extra(name: str, info_class: str) -> str:
@@ -1398,7 +1427,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def test_the_lane_dirty_saver_census_rejects_what_the_r14_adversary_compiled_past_it(self) -> None:
         # r14 iter 1 (adversary ea865d3b): each input below returned [] while C# or PowerShell would reach class 11 or an uncounted native.
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         call = "NtSetInformationFile(h, out io, info, (uint)size, 10);"
         dispose = "SetFileInformationByHandle(h, 4, ref d, 1)"
         payload_close = "\n'@\n"
@@ -1468,7 +1497,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def _assert_r15_rows_rejected(self) -> None:
         """Every row of r15_census_rows() gives a violation, and each B1 member row names its member as computed (the class rule, not a pinned-name miss)."""
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         rows = r15_census_rows(text)
         found = dict(zip(rows, lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])))
         for name, (mutant, expected) in rows.items():
@@ -1490,7 +1519,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def _assert_r16_rows_rejected(self) -> None:
         """Every row of r16_census_rows() gives the binding-access diagnostic (the class rule, not a pinned-name miss)."""
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         rows = r16_census_rows(text)
         found = dict(zip(rows, lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])))
         missed = [name for name, (mutant, expected) in rows.items() if mutant == text or not any(expected in violation for violation in found[name])]
@@ -1509,7 +1538,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
     def test_the_qualified_name_pattern_finds_what_the_r16_pattern_found_on_every_fixture(self) -> None:
         # r17 (CodeQL check-run 123193275334): the rewrite keeps every r16 match on the saver's payload, every census row's payload and every string literal
         # in this file (each inserted fixture fragment). The r16 pattern runs in a child, on these fixtures only (it finishes on them), never on the pumps.
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         sources = [text] + [mutant for rows in (r15_census_rows(text), r16_census_rows(text)) for mutant, _ in rows.values()]
         fixtures = [payload.group("body") for source in sources for payload in _ADD_TYPE_PAYLOAD_RE.finditer(source)]
         fixtures += [node.value for node in ast.walk(ast.parse(THIS_FILE.read_text(encoding="utf-8")))
@@ -1549,7 +1578,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
             result = _finditer_in_child(regex.pattern, [pump], timeout=60)
             self.assertLess(result["seconds"], 1.0, (regex.pattern, result["seconds"]))
         # the whole census on the adversary's accepted saver variant: it finishes, and a comment full of System roots is not a qualified name
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         started = time.perf_counter()
         self.assertEqual(lane_dirty_save_violations(text.replace("public static class DirtyFinalPath {",
                                                                  "//" + "System//" * 8000 + "\npublic static class DirtyFinalPath {", 1)), [])
@@ -1567,7 +1596,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
     def test_the_lane_dirty_saver_census_rejects_what_the_r17_adversary_compiled_past_it(self) -> None:
         # r17 iter 1 (adversary 4b76fdba): each insertion returned [] while Roslyn parsed System.IO.File.WriteAllText. Built from the saver's raw bytes, so a
         # CR stays a CR (read_text would turn it into LF).
-        text = LANE_DIRTY_SAVE.read_bytes().decode("utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_bytes().decode("utf-8")
         anchor = "public static string Identity(string path) {"
         self.assertIn(anchor, text)
         write = '.File.WriteAllText("C:/fixture/wt/src/a.txt", "x");'
@@ -1589,12 +1618,12 @@ class NoHardLinkCreationTests(unittest.TestCase):
         missed = [name for name, (_, expected) in rows.items() if mutants[name] == text or not any(expected in violation for violation in found[name])]
         self.assertEqual(missed, [], {name: found[name] for name in missed})
         # control: the saver as it is has no '#' in its payload and stays clean
-        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes()), [])
+        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE_FIXTURE.read_bytes()), [])
 
     def test_the_lane_dirty_saver_census_rejects_a_using_directive_the_r17_scanner_missed(self) -> None:
         # r17b (adversary a0436b16-A1): the census returned [] while Roslyn read a fourth using directive after a CR-only line end, and X.IO.File through
         # its alias. Built from the saver's raw bytes, so a CR stays a CR.
-        text = LANE_DIRTY_SAVE.read_bytes().decode("utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_bytes().decode("utf-8")
         head, anchor = "public static class DirtyFinalPath {", "public static string Identity(string path) {"
         self.assertIn(head, text)
         self.assertIn(anchor, text)
@@ -1617,7 +1646,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def _r18_rows(self) -> dict[str, tuple[str, str]]:
         # r18 (sol r17b B1/B2, producer 4d335027-A1/A2): each mutant returned [] on 4d335027 while C# would reach the native with class 11
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         call = "IoStatusBlock io;\n                int st = NtSetInformationFile(h, out io, info, (uint)size, 10);"
         nt_decl = "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass);"
         k32_decl = "static extern bool SetFileInformationByHandle(IntPtr handle, int infoClass, ref DispositionInfo info, uint size);"
@@ -1661,7 +1690,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
         }
 
     def test_the_lane_dirty_saver_census_fails_closed_on_what_it_cannot_name_or_read_r18(self) -> None:
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         rows = self._r18_rows()
         found = dict(zip(rows, lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])))
         missed = [name for name, (mutant, expected) in rows.items() if mutant == text or not any(expected in violation for violation in found[name])]
@@ -1669,7 +1698,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
         # controls: the saver as it is is clean, and a conversion operator ANYWHERE refuses every struct parameter, even one it does not convert to
         operator_only = text.replace("struct IoStatusBlock { public IntPtr Status, Information; }", "struct IoStatusBlock { public IntPtr Status, Information; }\n"
                                      "    struct Widen { public int V; public static implicit operator Widen(int v) { return new Widen(); } }", 1)
-        clean, beside = lane_dirty_save_violations_many([LANE_DIRTY_SAVE.read_bytes(), operator_only])
+        clean, beside = lane_dirty_save_violations_many([LANE_DIRTY_SAVE_FIXTURE.read_bytes(), operator_only])
         self.assertEqual(clean, [])
         self.assertTrue(beside and all("user-defined conversion" in violation for violation in beside), beside)
 
@@ -1703,7 +1732,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
         with mock.patch(f"{__name__}.LANE_DIRTY_SAVE_INDIRECT_CALL_ALLOWED", frozenset({f"{LANE_DIRTY_SAVE_REL}:{line + 1}"})):
             self.assertTrue(lane_dirty_save_violations(mutant))
         # every reviewed entry still names a line the rules match, so a stale one cannot silently allow the next edit there
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         body = _ADD_TYPE_PAYLOAD_RE.search(text)
         hits = {text.count("\n", 0, match.start()) + 1 for match in _REFLECTION_HANDLE_RE.finditer(text)}
         hits |= {text.count("\n", 0, body.start("body") + match.start()) + 1 for match in _PAYLOAD_INDIRECT_CALL_RE.finditer(body.group("body"))}
@@ -1712,7 +1741,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
         self.assertEqual(sorted(stale), [])
 
     def _assert_r15_rows_rejected_quietly(self) -> None:
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         rows = {name: row for name, row in r15_census_rows(text).items() if name.startswith("B1 ") and row[1] == "a member named at run time"}
         self.assertGreaterEqual(len(rows), 3)
         for (name, (_, expected)), violations in zip(rows.items(), lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])):
@@ -1720,11 +1749,11 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def test_the_lane_dirty_saver_census_reports_bad_text_instead_of_raising(self) -> None:
         # sol r14 hardening / fable r14 finding 2: an out-of-range escape, a stray control character and invalid UTF-8 are diagnostics, never an exception
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         escape, control, undecodable = lane_dirty_save_violations_many([
             text + "\n# \\U00110000\n",
             text.replace("Add-Type -TypeDefinition @'", "\x0c\nAdd-Type -TypeDefinition @'"),
-            LANE_DIRTY_SAVE.read_bytes() + b"\n# \xff\n",
+            LANE_DIRTY_SAVE_FIXTURE.read_bytes() + b"\n# \xff\n",
         ])
         self.assertTrue(any("outside Unicode" in violation for violation in escape), escape)
         self.assertTrue(any("a control character: U+000C" in violation for violation in control), control)
@@ -1732,25 +1761,46 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def test_the_lane_dirty_saver_census_fails_closed_without_the_parser(self) -> None:
         with mock.patch(f"{__name__}.shutil.which", lambda name: None):
-            violations = lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes())
+            violations = lane_dirty_save_violations(LANE_DIRTY_SAVE_FIXTURE.read_bytes())
         self.assertTrue(any("could not run" in violation for violation in violations), violations)
 
     def test_a_harmless_ascii_edit_to_the_saver_stays_clean(self) -> None:
         # control: the AST census pins names, not text, so a comment, a message string and whitespace change nothing
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         edited = text.replace("reason=dest-unc-unproven", "reason=dest-unc-not-proven", 1) + "\n# a harmless trailing comment\n\n"
         self.assertNotEqual(edited, text)
         self.assertEqual(lane_dirty_save_violations(edited), [])
         self.assertEqual(sum(byte > 127 for byte in PS_AST_INVENTORY.read_bytes()), 0, "the inventory helper must stay ASCII")
         # r19: the GATE still refuses it. Every edit to the saver, harmless or not, needs a reviewed re-pin (hub ruling E).
+        self.assertTrue(tripwire_violations(LANE_DIRTY_SAVE_REL, _gate_bytes(LANE_DIRTY_SAVE_REL) + b"\n# a harmless trailing comment\n\n"))
+
+    def _saver_edited_with(self, edited: bytes) -> mock._patch:
+        return mock.patch(f"{__name__}._gate_bytes", lambda rel: edited if rel == LANE_DIRTY_SAVE_REL else (ROOT / rel).read_bytes())
+
+    def test_a_reviewed_re_pin_is_all_a_harmless_comment_holding_a_census_token_needs(self) -> None:
+        # sol r19 B2, literally: the walker refuses this comment for its Add-Type token, and the gate's own tests must pass anyway once the blob is re-pinned
+        edited = _gate_bytes(LANE_DIRTY_SAVE_REL) + b"\n# Add-Type\n"
+        self.assertTrue(any("Add-Type must appear exactly once" in finding for finding in lane_dirty_save_violations(edited)), "the walker must refuse this input, or the row proves nothing")
+        with self._saver_edited_with(edited), mock.patch.dict(TRIPWIRE_PINNED, {LANE_DIRTY_SAVE_REL: git_blob_sha(edited)}), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.test_the_lane_dirty_saver_keeps_exactly_its_one_rename_call()
+            self.test_every_file_keyed_hard_link_allowance_is_tripwire_clean_at_its_pinned_blob()
+
+    def test_the_same_comment_without_its_re_pin_stays_red(self) -> None:
+        # the other half of the row above: the walker has stopped gating, and the edit still fails until a human re-pins it
+        edited = _gate_bytes(LANE_DIRTY_SAVE_REL) + b"\n# Add-Type\n"
         self.assertTrue(tripwire_violations(LANE_DIRTY_SAVE_REL, edited))
+        with self._saver_edited_with(edited), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with self.assertRaises(AssertionError):
+                self.test_the_lane_dirty_saver_keeps_exactly_its_one_rename_call()
 
     def test_every_file_keyed_hard_link_allowance_is_tripwire_clean_at_its_pinned_blob(self) -> None:
         # r19 gate: the scope is every file whose hard-link allowance is keyed by file, each such file is pinned, and no pin is stale
         self.assertEqual(sorted(TRIPWIRE_PINNED), sorted(HARD_LINK_ALLOWED), "every file-keyed hard-link allowance must carry a blob pin, and only those")
         for rel in sorted(HARD_LINK_ALLOWED):
             with self.subTest(rel=rel):
-                data = (ROOT / rel).read_bytes()
+                data = _gate_bytes(rel)
                 self.assertEqual(tripwire_violations(rel, data), [])
                 self.assertTrue(_TRIPWIRE_RE.search(data), f"{rel} hits no token, so its pin is dead weight: drop it")
                 self.assertEqual(tripwire_violations(rel, data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")), [], "a CRLF checkout hashes like the index")
@@ -1760,7 +1810,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
     def _r19_rows(self) -> dict[str, str]:
         # sol r18 B1/B2 on d07fa3a9, literally: the walker returns [] for each (a '//' inside a literal read as a comment; a struct return that adds a hidden
         # return-buffer argument on x64 and moves 11 into the native's class position)
-        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        text = LANE_DIRTY_SAVE_FIXTURE.read_text(encoding="utf-8")
         identity = "        IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);\n        if (h == (IntPtr)(-1)) return null;\n"
         close = '    [DllImport("kernel32.dll")]\n    static extern bool CloseHandle(IntPtr handle);\n'
         iosb = "struct IoStatusBlock { public IntPtr Status, Information; }"
@@ -1814,7 +1864,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
         self.assertGreaterEqual(len(harvest), 9)
         self.assertGreaterEqual(len(variants), 150, f"{len(variants)} variants from {harvest}")
         self.assertEqual([name for name, source in variants.items() if not tripwire_violations(LANE_DIRTY_SAVE_REL, source)], [])
-        self.assertEqual(tripwire_violations(LANE_DIRTY_SAVE_REL, LANE_DIRTY_SAVE.read_bytes()), [])
+        self.assertEqual(tripwire_violations(LANE_DIRTY_SAVE_REL, _gate_bytes(LANE_DIRTY_SAVE_REL)), [])
 
     def test_the_tripwire_catches_a_name_in_a_form_no_plain_token_matches(self) -> None:
         # r19: a file in scope with no pin fails on any hit, so a name written in a form no plain token matches must hit through the form itself

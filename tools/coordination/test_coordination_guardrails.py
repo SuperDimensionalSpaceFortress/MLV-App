@@ -4289,6 +4289,108 @@ def test_save_dirty_worktree_evidence_fails_typed_and_restores_when_the_capture_
     assert "REPO C:\\fixture\\caller.git|C:\\fixture\\common|C:\\fixture\\caller" in lines, shown
 
 
+# r20 (sol r19 B1): git appends to a file a GIT_TRACE* variable names, so one naming a tracked file changed the worktree the save promises to leave alone.
+_DIRTY_TRACE_VARIABLES = ("GIT_TRACE", "GIT_TRACE2_EVENT", "GIT_TRACE_PERFORMANCE")
+
+
+def _dirty_trace_repo(tmp_path):
+    """The dirty fixture repo plus a clean tracked file no patch rewrites, for a trace variable to name."""
+    wt, dest = _dirty_save_repo(tmp_path)
+    keep = wt / "src" / "keep.txt"
+    keep.write_bytes(b"keep\n")
+    git(wt, "add", "src/keep.txt")
+    git(wt, "commit", "-qm", "a second tracked file")
+    return wt, dest, keep
+
+
+def _dirty_save_in_env(wt, dest, env, after=""):
+    return subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                           f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; {after}"], text=True, capture_output=True, env=env)
+
+
+@dirty_save_only
+@pytest.mark.parametrize("name", _DIRTY_TRACE_VARIABLES)
+def test_save_dirty_worktree_evidence_leaves_a_tracked_trace_destination_alone(tmp_path, name):
+    wt, dest, keep = _dirty_trace_repo(tmp_path)
+    for target in (wt / "src" / "a.txt", keep):  # sol's row names the dirty file itself
+        before = target.read_bytes()
+        out = _dirty_save_in_env(wt, dest, dict(os.environ, **{name: target.as_posix()}), f"'AFTER ' + [Environment]::GetEnvironmentVariable('{name}')")
+        assert out.stdout.startswith("DIRTY_TREE_SAVED") and "verified=reverse-apply-ok" in out.stdout, (name, out.stdout, out.stderr)
+        assert target.read_bytes() == before, (name, target)
+        assert f"AFTER {target.as_posix()}" in out.stdout.splitlines(), (name, out.stdout)  # the caller's own value is put back
+
+
+@dirty_save_only
+@pytest.mark.parametrize("name", _DIRTY_TRACE_VARIABLES)
+def test_save_dirty_worktree_evidence_reapply_command_leaves_a_tracked_trace_destination_alone(tmp_path, name):
+    wt, dest, keep = _dirty_trace_repo(tmp_path)
+    before = keep.read_bytes()
+    env = dict(os.environ, **{name: keep.as_posix()})
+    saved = re.search(_DIRTY_REAPPLY_RE, _dirty_save_in_env(wt, dest, env).stdout.strip())
+    assert saved, name
+    git(wt, "checkout", "--", "src/a.txt")
+    again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1) + f"; 'AFTER ' + [Environment]::GetEnvironmentVariable('{name}'); exit $LASTEXITCODE"],
+                           text=True, capture_output=True, env=env)
+    assert again.returncode == 0 and (wt / "src" / "a.txt").read_text().replace("\r\n", "\n") == "two\n", (name, saved.group(1), again.stdout, again.stderr)
+    assert keep.read_bytes() == before, name
+    assert f"AFTER {keep.as_posix()}" in again.stdout.splitlines(), (name, again.stdout)
+
+
+@dirty_save_only
+@pytest.mark.parametrize("name", ["GIT_TRACE_WHATEVER", "git_trace_lower_case"])
+def test_save_dirty_worktree_evidence_scrubs_trace_variables_by_prefix_not_by_list(tmp_path, name):
+    # A name git does not know changes no bytes, so this reads what every git launch inherits. Watch stands in front of the native calls and both ProcessStartInfo launches.
+    wt, dest = _dirty_save_repo(tmp_path)
+    body = (
+        f"$env:{name} = 'C:/fixture/never-opened.txt'; $global:calls = 0; $global:leaked = 0; $real = @(Get-Command git -CommandType Application)[0].Source; "
+        f"function Watch {{ $global:calls++; if ([Environment]::GetEnvironmentVariable('{name}')) {{ $global:leaked++ }} }}; "
+        "function git { Watch; & $real @args }; "
+        "$capture = ${function:Invoke-DirtyGitCapture}; function Invoke-DirtyGitCapture { Watch; & $capture @args }; "
+        "$complete = ${function:Test-DirtyPatchComplete}; function Test-DirtyPatchComplete { Watch; & $complete @args }; "
+        f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; "
+        f"'SEEN ' + $global:leaked + ' of ' + $global:calls; 'AFTER ' + [Environment]::GetEnvironmentVariable('{name}')"
+    )
+    out = dirty_save_pwsh(body)
+    lines = out.stdout.splitlines()
+    assert lines[0].startswith("DIRTY_TREE_SAVED"), out.stdout + out.stderr
+    seen = re.fullmatch(r"SEEN 0 of (\d+)", lines[-2])
+    assert seen and int(seen.group(1)) >= 10, lines[-2]  # none of the launches, and there were launches
+    assert lines[-1] == "AFTER C:/fixture/never-opened.txt", out.stdout
+
+
+_DIRTY_TRACE_CALLER = "$env:GIT_DIFF_OPTS = '--unified=0'; $env:GIT_TRACE = 'C:\\fixture\\one.txt'; $env:GIT_TRACE2_EVENT = 'C:\\fixture\\two.txt'; "
+_DIRTY_TRACE_RESULT = "'RESULT ' + $out; 'VALUES ' + [string]$env:GIT_DIFF_OPTS + '|' + [string]$env:GIT_TRACE + '|' + [string]$env:GIT_TRACE2_EVENT"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_and_restores_when_a_trace_capture_throws(tmp_path):
+    # the r16 rule holds for the variables added by prefix: a throw part way through the scrub is a typed failure with every value back
+    out = dirty_save_pwsh(
+        _DIRTY_TRACE_CALLER + "function Test-Path { param([string]$LiteralPath, [string]$PathType = 'Any') "
+        "$r = Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType; "
+        "if ($r -and $LiteralPath -eq 'Env:GIT_TRACE2_EVENT') { throw [System.IO.IOException]::new('trace capture failed') }; $r }; "
+        f"$out = try {{ Save-DirtyWorktreeEvidence -Wt '{tmp_path}' -Dest '{tmp_path}' -CardName C1 }} catch {{ 'THREW ' + $_.Exception.GetType().Name }}; " + _DIRTY_TRACE_RESULT)
+    lines = out.stdout.splitlines()
+    assert "RESULT DIRTY_TREE_SAVE_FAILED card=C1 reason=trace capture failed" in lines, out.stdout + out.stderr
+    assert "VALUES --unified=0|C:\\fixture\\one.txt|C:\\fixture\\two.txt" in lines, out.stdout + out.stderr
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_when_the_trace_listing_throws(tmp_path):
+    # a listing that cannot be read must not become a save with a trace still set: it stops before any git call, with nothing removed
+    wt, dest = _dirty_save_repo(tmp_path)
+    before = (wt / "src" / "a.txt").read_bytes()
+    out = dirty_save_pwsh(
+        _DIRTY_TRACE_CALLER + "function git { 'GIT WAS CALLED' | Out-Host }; "
+        "function Get-Item { [CmdletBinding()] param([string]$Path, [string]$LiteralPath) if ($Path) { Write-Error 'trace listing failed'; return }; "  # non-terminating, so only -ErrorAction Stop ends the save
+        "Microsoft.PowerShell.Management\\Get-Item -LiteralPath $LiteralPath }; "
+        f"$out = try {{ Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 }} catch {{ 'THREW ' + $_.Exception.GetType().Name }}; " + _DIRTY_TRACE_RESULT)
+    lines = out.stdout.splitlines()
+    assert "RESULT DIRTY_TREE_SAVE_FAILED card=C1 reason=trace listing failed" in lines, out.stdout + out.stderr
+    assert "VALUES --unified=0|C:\\fixture\\one.txt|C:\\fixture\\two.txt" in lines, out.stdout + out.stderr
+    assert "GIT WAS CALLED" not in out.stdout and (wt / "src" / "a.txt").read_bytes() == before
+
+
 def test_continuation_reuses_a_clean_existing_worktree(tmp_path):
     """The arm none of the round-1 tests exercised: the branch IS checked out somewhere. Stage 1's
     tree carries its build outputs, and making stage 2 rebuild from scratch is most of why the wide
