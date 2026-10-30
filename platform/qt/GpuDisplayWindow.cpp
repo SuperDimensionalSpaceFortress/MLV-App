@@ -10,6 +10,7 @@
 #include "GpuFieldTelemetry.h"
 #include "PlaybackEnvFlags.h"
 #include "PlaybackRouteStagedSlotPolicy.h"
+#include "PreviewPaintTiming.h"
 #include "PlaybackScaling.h"
 #include "PlaybackStartupSplit.h"
 #include "PlaybackSwapInterval.h"
@@ -2316,6 +2317,8 @@ void GpuDisplayWindow::updateTextureIfNeeded()
 
 void GpuDisplayWindow::paintGL()
 {
+    // The GL window paints the preview outside the QGraphicsView: same preview paint sink.
+    const preview_paint_timing::Scope paintTiming;
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
