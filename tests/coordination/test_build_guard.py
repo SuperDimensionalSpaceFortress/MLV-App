@@ -52,6 +52,9 @@ def _env(exempt=None, heavy_slot: Path = NO_HEAVY_SLOT, extra: dict = None) -> d
     env.pop("MLV_BUILD_GUARD_EXEMPT", None)
     for name in ("HEAVY_SLOT_HELD", "HEAVY_SLOT_HELD_START", "HEAVY_SLOT_HELD_NAME", "MLV_LANE_RUN_DIR"):
         env.pop(name, None)
+    # The stub's options are opt-ins: a test gets one only through `extra`, never from the machine that runs the suite.
+    for name in [name for name in env if name.upper().startswith("STUB_HEAVY_SLOT_")]:
+        del env[name]
     env["MLV_HEAVY_SLOT_CMD"] = str(heavy_slot)
     if exempt is not None:
         env["MLV_BUILD_GUARD_EXEMPT"] = exempt
@@ -1192,6 +1195,20 @@ def test_a_holder_lost_after_its_ready_file_vanished_is_still_classified(box) ->
     assert "HEAVY_SLOT_LOST_DURING_ACTION label=build code=0 utc=" in done.stdout, done.stdout + done.stderr
     assert "heavy-slot: released" not in done.stderr
     assert box["marker"].exists()
+
+
+def test_a_parent_stub_opt_in_does_not_reach_the_readyorphan_sibling(box, monkeypatch) -> None:
+    # CI-FLAKE-BUILD-GUARD-HOLDER-EXIT-REASON-RACE-1 r2 (sol r1b B1): a parent STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT=1 was inherited by
+    # the sibling above, which then requeued with exit 3 instead of running its action; only a test that asks for it gets it.
+    monkeypatch.setenv("STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT", "1")
+    test_a_holder_lost_after_its_ready_file_vanished_is_still_classified(box)
+
+
+def test_env_scrubs_every_inherited_stub_option_and_keeps_explicit_ones(monkeypatch) -> None:
+    for name in ("PUBLISH_AFTER_EXIT", "HOLD_S", "CHILD_S", "DELAY_S", "CODE", "FINAL", "MODE", "LOG", "HELD_START"):
+        monkeypatch.setenv(f"STUB_HEAVY_SLOT_{name}", "1")
+    assert not [name for name in _env() if name.startswith("STUB_HEAVY_SLOT_")]
+    assert _env(extra={"STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT": "1"})["STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT"] == "1"
 
 
 def test_a_stop_file_that_cannot_be_written_still_ends_the_holder(box) -> None:
