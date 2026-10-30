@@ -530,6 +530,12 @@ _REFLECTION_HANDLE_RE = re.compile(
 # payload-only (the PowerShell half pins every member, and its own Invoke-Dirty* functions would match): a method object's .Invoke, a delegate's .Method, a
 # function pointer or anonymous delegate, and unsafe code
 _PAYLOAD_INDIRECT_CALL_RE = re.compile(r"Invoke|\bdelegate\b|\bunsafe\b|\.\s*Method\b", re.IGNORECASE)
+# the interop class the pinned `using System.Runtime.InteropServices;` reaches is default-deny by member too (it can make a delegate from a pointer, a pointer
+# from a delegate, or activate COM by moniker): every Marshal token, comments blanked, is `Marshal.<one of these>`
+LANE_DIRTY_SAVE_PAYLOAD_MARSHAL = {
+    "AllocHGlobal", "Copy", "FreeHGlobal", "GetLastWin32Error", "SizeOf", "StringToHGlobalUni", "StructureToPtr", "WriteByte", "WriteInt32", "WriteIntPtr",
+}
+_PAYLOAD_MARSHAL_RE = re.compile(r"Marshal\w*(?:\s*\.\s*(?P<member>\w+))?", re.IGNORECASE)
 # B2, a literal the native does not receive: every P/Invoke parameter is `[ref|out] <type> <name>` with a type from this list, or a struct the payload declares
 # while no user-defined conversion exists anywhere in it (a conversion runs at the call, so `..., 10)` can pass 11). A list name the payload declares itself
 # (a nested `struct IntPtr`) is a violation, and the two counted natives are pinned to their exact parameter types: a wider integer would move the class on x86.
@@ -903,6 +909,10 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
         for match in _PAYLOAD_INDIRECT_CALL_RE.finditer(body):
             indirect(at + match.start(), match.group(0))
+        code = re.sub(_CS_LINE_COMMENT, lambda comment: " " * len(comment.group(0)), body)
+        for match in _PAYLOAD_MARSHAL_RE.finditer(code):
+            if match.group(0).split(".")[0].strip() != "Marshal" or match.group("member") not in LANE_DIRTY_SAVE_PAYLOAD_MARSHAL:
+                indirect(at + match.start(), f"{match.group(0)} (a Marshal member outside {sorted(LANE_DIRTY_SAVE_PAYLOAD_MARSHAL)})")
         for start, why in _pinvoke_parameter_violations(body):
             violations.append(f"{text.count(chr(10), 0, at + start) + 1}: {why}")
         attributes =[match.group(0) for match in _PAYLOAD_DLLIMPORT_ATTRIBUTE_RE.finditer(body)]
@@ -1582,6 +1592,9 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "B1 a delegate's .Method": (before_call("Func<string, string> f = Resolve; var m2 = f.Method; m2.Invoke(null, new object[] { \"x\" });"), indirect),
             "B1 a handle without Invoke": (before_call("var t = typeof(DirtyFinalPath).TypeHandle;"), indirect),
             "B1 an anonymous delegate": (before_call("Action a = delegate { };"), indirect),
+            "B1 a Marshal member outside the pinned set": (before_call('object o = Marshal.BindToMoniker("x");'), "a Marshal member outside"),
+            "B1 a Marshal member behind a comment": (before_call('object o = Marshal.// gap\n                    BindToMoniker("x");'), "a Marshal member outside"),
+            "B1 Marshal named as a type": (before_call("var mt = typeof(Marshal);"), "a Marshal member outside"),
             "B2 sol's converting struct on NtSetInformationFile": (converting("DirtyInfoClass", "int", nt_decl), "a user-defined conversion"),
             "B2 the class-4 sibling": (converting("DirtyInfoClass", "int", k32_decl), "a user-defined conversion"),
             "B2 an 8-byte converting struct": (converting("DirtyWideClass", "long", nt_decl), "a user-defined conversion"),
@@ -1620,12 +1633,13 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
         rows = self._r18_rows()
         never = re.compile(r"(?!x)x")
-        names = [name for name in rows if name.startswith(("B1 sol", "B1 a ModuleHandle", "B2 sol", "B2 the class-4", "B2 an 8-byte", "B2 a wider"))]
+        names = [name for name in rows if name.startswith(("B1 sol", "B1 a ModuleHandle", "B1 a Marshal member", "B2 sol", "B2 the class-4", "B2 an 8-byte", "B2 a wider"))]
         with mock.patch(f"{__name__}._REFLECTION_HANDLE_RE", never), mock.patch(f"{__name__}._PAYLOAD_INDIRECT_CALL_RE", never), \
+                mock.patch(f"{__name__}._PAYLOAD_MARSHAL_RE", never), \
                 mock.patch(f"{__name__}._pinvoke_parameter_violations", lambda body: []), \
                 mock.patch(f"{__name__}.LANE_DIRTY_SAVE_NT_TYPES", AnyTypes()), mock.patch(f"{__name__}.LANE_DIRTY_SAVE_K32_TYPES", AnyTypes()):
             found = lane_dirty_save_violations_many([rows[name][0] for name in names])
-        self.assertEqual(len(names), 6)
+        self.assertEqual(len(names), 8)
         self.assertEqual({name: violations for name, violations in zip(names, found) if violations}, {})
 
     def test_the_indirect_call_allowlist_is_keyed_by_file_and_line(self) -> None:
