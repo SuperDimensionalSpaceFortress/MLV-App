@@ -935,25 +935,17 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     setFormat(fmt);
     m_tailClock.start();
 
-    // Real swap path 1 of 3: Qt's own automatic swap after paintGL() returns, in its
-    // normal paint-event cycle (frameSwapped() fires only for THIS swap, not for the
-    // explicit manual ones in grabPresentedFramebufferIfActive (path 2) or
-    // setPresentedGpuPlaybackReconAmazePostWbTexture's paint-per-submit (path 3)).
-    // Decided once, here, rather than re-checked per swap: the env var is cached (see
-    // swapTelemetryEnabled()) and cannot change mid-run, so when telemetry is off this
-    // window never even connects the signal -- zero cost, not just an early return in
-    // the slot.
-    if ( swapTelemetryEnabled() )
-    {
-        connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteRealSwap);
-    }
     // PLAYBACK-PRESENT-TAIL-TIMING-1: path-1 paint+swap pairs and event-loop idle inside the tail window (from a
-    // path-3 swap return to the next recon setup start), gated like the recorder above (a separate block keeps that
-    // one's pinned shape). Same idle arithmetic as MainWindow's present-gap probe.
+    // path-3 swap return to the next recon setup start), gated like the recorder below. Connected BEFORE the recorder
+    // (slots run in connection order) so a per-swap log line is never timed as paint+swap. Same idle arithmetic as
+    // MainWindow's present-gap probe, except that QEventDispatcherGlib does not bound the wait with aboutToBlock/awake
+    // (awake fires only on a non-blocking pass, after a wake's events ran as if idle): no probe there, so the idle
+    // stays not known and the present buckets unknown.
     if ( swapTelemetryEnabled() )
     {
         connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteQtPaintSwap);
-        if ( QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance(thread()) )
+        QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance(thread());
+        if ( dispatcher && !dispatcher->inherits("QEventDispatcherGlib") )
         {
             connect(dispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
             {
@@ -968,6 +960,19 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
             });
             m_tailIdleProbe = true;
         }
+    }
+
+    // Real swap path 1 of 3: Qt's own automatic swap after paintGL() returns, in its
+    // normal paint-event cycle (frameSwapped() fires only for THIS swap, not for the
+    // explicit manual ones in grabPresentedFramebufferIfActive (path 2) or
+    // setPresentedGpuPlaybackReconAmazePostWbTexture's paint-per-submit (path 3)).
+    // Decided once, here, rather than re-checked per swap: the env var is cached (see
+    // swapTelemetryEnabled()) and cannot change mid-run, so when telemetry is off this
+    // window never even connects the signal -- zero cost, not just an early return in
+    // the slot.
+    if ( swapTelemetryEnabled() )
+    {
+        connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteRealSwap);
     }
 }
 
@@ -1211,9 +1216,9 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         tail.qt_paint_swaps = m_tailQtPaintSwaps;
         tail.qt_paint_swap_max_ms = static_cast<double>(m_tailQtPaintSwapMaxNs) / 1000000.0;
         tail.grab_swaps = m_tailGrabSwaps;
-        tail.gui_idle_known = m_tailIdleProbe;
-        const qint64 openBlockNs = m_tailBlockStartNs >= 0 ? tailSetupStartNs - m_tailBlockStartNs : 0;
-        tail.gui_idle_ms = static_cast<double>(m_tailIdleNs + openBlockNs) / 1000000.0;
+        // A block still open here never reported its wake (this thread is running, not blocked): idle is not known.
+        tail.gui_idle_known = m_tailIdleProbe && m_tailBlockStartNs < 0;
+        tail.gui_idle_ms = static_cast<double>(m_tailIdleNs) / 1000000.0;
         m_tailSwapReturnNs = -1;
         m_tailBlockStartNs = -1;
     }

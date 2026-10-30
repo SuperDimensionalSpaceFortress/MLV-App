@@ -85,7 +85,7 @@ struct GpuPresentTailTiming
     int qt_paint_swaps = 0;             // swap path 1 inside the window (smoke telemetry only)
     double qt_paint_swap_max_ms = 0.0;  // paintUnderGL -> frameSwapped (smoke only)
     int grab_swaps = 0;                 // swap path 2 inside the window (smoke only)
-    bool gui_idle_known = false;        // smoke only: the dispatcher idle probe is connected
+    bool gui_idle_known = false;        // smoke only: the idle probe is connected and no block was open at setup
     double gui_idle_ms = 0.0;           // event loop blocked inside the window; busy = window - idle
 };
 static_assert(std::is_trivially_copyable<GpuPresentTailTiming>::value, "no per-frame allocation");

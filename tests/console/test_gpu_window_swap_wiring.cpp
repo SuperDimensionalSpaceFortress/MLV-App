@@ -925,6 +925,23 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
     const QString r2 = body.mid(setupStampAt, ensureAt - setupStampAt);
     ASSERT_TRUE(r2.contains(QStringLiteral("m_tailSwapReturnNs = -1;")));
     ASSERT_TRUE(r2.contains(QStringLiteral("m_tailBlockStartNs = -1;")));
+    // Adversary A2: a block still open at setup start never reported its wake, so its span is not idle.
+    ASSERT_TRUE(r2.contains(QStringLiteral("tail.gui_idle_known = m_tailIdleProbe && m_tailBlockStartNs < 0;")));
+    ASSERT_TRUE(r2.contains(QStringLiteral("tail.gui_idle_ms = static_cast<double>(m_tailIdleNs) / 1000000.0;")));
+    ASSERT_EQ(0, countOccurrences(r2, QStringLiteral("- m_tailBlockStartNs")));
+
+    // Adversary A2 sibling: no probe where aboutToBlock/awake do not bound the wait (the idle stays not known).
+    const int dispatcherGateAt = source.indexOf(QStringLiteral("!dispatcher->inherits(\"QEventDispatcherGlib\")"));
+    ASSERT_TRUE(dispatcherGateAt >= 0);
+    ASSERT_TRUE(source.indexOf(QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")) > dispatcherGateAt);
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("&QAbstractEventDispatcher::awake")));
+
+    // Adversary A1: frameSwapped slots run in connection order, so the path-1 pair clock is read before the recorder
+    // can log; connected after it, a per-swap log line is timed as paint+swap.
+    const int pairSlotAt = source.indexOf(QStringLiteral("&GpuDisplayWindow::noteQtPaintSwap);"));
+    const int recorderSlotAt = source.indexOf(QStringLiteral("&GpuDisplayWindow::noteRealSwap);"));
+    ASSERT_TRUE(pairSlotAt >= 0 && recorderSlotAt > pairSlotAt);
 
     // r3-r5: the path-1 paint stamp, its frameSwapped slot and the dispatcher idle lambdas.
     const QString r3 = functionBody(source, QStringLiteral("void GpuDisplayWindow::paintUnderGL()"),
