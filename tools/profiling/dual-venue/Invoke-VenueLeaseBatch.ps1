@@ -201,6 +201,9 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
+# r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
+# entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
+$ThermalDispatchGraceSec = 1
 
 $script:summaryBeforeExit = $null   # r3: set once a refusal ends a run that already has a batch receipt; the typed refusal prints the summary just before its exit 2
 function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("BATCH_USAGE $Message"); if ($script:summaryBeforeExit) { & $script:summaryBeforeExit }; exit 2 }
@@ -991,7 +994,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
         $wait = [int][Math]::Max(0, [Math]::Min($wait, $ThermalWaitCapSec - $el))
     }
     $qArgs[$qArgs.IndexOf('-MaxWaitSec') + 1] = [string]$wait
-    if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec $el -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
+    if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec $el -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
         return [pscustomobject]@{ expiredBeforeDispatch = $true }
     }
     # r5 pass 1 A2: the probe's output is CAPTURED, not redirected to the file: a `*>` file redirect opens (creates) the file after the admission above, and that open can stall on a share (a
@@ -1114,7 +1117,7 @@ $legThermal = @{}
 # r4: whole seconds since the leg's first hot reading in this batch, on the monotonic clock, read NOW (so a site that logs or sleeps reads it again afterwards)
 function Get-ThermalElapsedSec($Th, [switch]$Ceiling) {
     if ($null -eq $Th.firstHotUtc) { return 0 }
-    Get-VenueThermalElapsedSec -FirstHotTimestamp $Th.firstHotTs -Ceiling:$Ceiling
+    Get-VenueThermalElapsedSec -FirstHotTimestamp $Th.firstHotTs -NowTimestamp ([Diagnostics.Stopwatch]::GetTimestamp()) -Ceiling:$Ceiling
 }
 $results =[System.Collections.Generic.List[object]]::new()
 $batches = [System.Collections.Generic.List[object]]::new()
@@ -1509,7 +1512,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $expiredBeforeProbe = $false
                 if ($thermalActive -and $thw.reprobePending) {
                     $thw.reprobePending = $false
-                    $expiredBeforeProbe = -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $thw -Ceiling) -SlowestReprobeSec $thw.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow
+                    $expiredBeforeProbe = -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $thw -Ceiling) -SlowestReprobeSec $thw.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow
                 }
                 $probeEndUtc = $null; $probeEndTs = 0L
                 if ($expiredBeforeProbe) { $probeSec = 0 } else {
@@ -1540,12 +1543,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; firstHotTs = 0L; batch = $batchNo; waitSec = 0; slowProbeSec = 0; reprobePending = $false; doneWaitSec = 0; doneOvershootSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
                 # adversary r1 A6: the first reading belongs to the leg's CURRENT predecessor, so it is taken again after a re-queue or in a new batch
                 if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.firstHeat = $null; $th.slowProbeSec = 0; $th.doneWaitSec = 0; $th.doneOvershootSec = 0; $th.batch = $batchNo }
-                if ($null -eq $th.firstHeat -and ($q.verdict -ceq 'QUIET' -or $q.heat -cne 'unknown')) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
+                # r9 (sol r8 B1): the first KNOWN reading is kept: an unknown first reading (its leg then returned VENUE_NOT_QUIESCENT, never played) is replaced by the retry's known
+                # one, which still follows the same predecessor. The RETRY row already written keeps the unknown it was written with.
+                if (($null -eq $th.firstHeat -and ($q.verdict -ceq 'QUIET' -or $q.heat -cne 'unknown')) -or ($th.firstHeat -ceq 'unknown' -and [string]$q.heat -cin @('hot', 'clear'))) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
                 # adversary r3 A1 / Dot B2: ONE function (Get-VenueThermalProbeBudget) decides whether another probe may start. A probe that ran DURING the wait is a re-probe and feeds
                 # the slowest-so-far; the probe that made the first hot reading is not counted, so the first hot reading always gets a cooling sleep and one re-probe
                 if ($thermalActive) { $th.slowProbeSec = [int][Math]::Max($th.slowProbeSec, $probeSec) }
                 $thElapsed = $(if ($thermalActive) { Get-ThermalElapsedSec $th } else { 0 })
-                $thBudget = $(if ($thermalActive) { Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec $thElapsed -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $ThermalPollSec } else { $null })
+                $thBudget = $(if ($thermalActive) { Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec $thElapsed -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $ThermalPollSec } else { $null })
                 # adversary r2b A1: while a thermal wait is active, a busy (non-QUIET) probe is the cap's business when it reads hot, and ALWAYS once the cap has run out
                 # (whatever its heat): such probes used to retry here without limit, past the cap and unrecorded. They fall through to the gate below as hot, which
                 # waits (cap not reached) or skips the leg (cap reached): a leg is never launched on a busy probe, and no probe starts after the cap but the one that
@@ -1567,7 +1572,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                         $busySleep = [int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))
                         # adversary r3 A1: during a thermal wait the next probe starts no later than the deadline less the slowest re-probe (the same budget function as the poll sleep).
                         # r4: read the clock AFTER the log write, so a stalled append shortens (or removes) the sleep instead of being added to it
-                        if ($thermalActive) { $busySleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $busySleep).sleepSec }
+                        if ($thermalActive) { $busySleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $busySleep).sleepSec }
                         if ($busySleep -gt 0) { Start-Sleep -Seconds $busySleep }
                     }
                     continue
@@ -1580,7 +1585,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # runner spent between the probe and here (a stalled log append) is already part of the wait
                 $gFirstUtc = $th.firstHotUtc; $gFirstTs = $th.firstHotTs
                 if ($null -eq $gFirstUtc -and $gateHeat -ceq 'hot' -and $null -ne $probeEndUtc) { $gFirstUtc = $probeEndUtc; $gFirstTs = $probeEndTs }
-                $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $gateHeat -FirstHotUtc $gFirstUtc -NowUtc $(if ($null -ne $gFirstUtc) { Get-VenueThermalNowUtc -FirstHotUtc $gFirstUtc -FirstHotTimestamp $gFirstTs } else { [DateTime]::UtcNow }) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
+                $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $gateHeat -FirstHotUtc $gFirstUtc -NowUtc $(if ($null -ne $gFirstUtc) { Get-VenueThermalNowUtc -FirstHotUtc $gFirstUtc -FirstHotTimestamp $gFirstTs -NowTimestamp ([Diagnostics.Stopwatch]::GetTimestamp()) } else { [DateTime]::UtcNow }) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
                 if ($null -eq $th.firstHotUtc -and $null -ne $gs.firstHotUtc) { $th.firstHotTs = $gFirstTs }
                 $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
                 # adversary r1 A9 / r1b A2, r3 (Dot B2): a re-probe is started only if the SLOWEST re-probe so far says it can end inside the cap: the sleep is shortened to fit,
@@ -1589,7 +1594,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # and job queue limits cannot be bounded from here, so a later probe slower than the one before can end past the cap. The cap is therefore a SOFT
                 # budget, cap + one probe: a leg still hot then is skipped (never run hot), and a leg that reads clear then runs, and the receipt records the excess
                 # as thermalWaitOvershootSec (max(0, waitSec - cap)) so no row claims a wait inside the cap that was not
-                $gb = Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec ([int]$gs.waitSec) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $ThermalPollSec
+                $gb = Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec ([int]$gs.waitSec) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $ThermalPollSec
                 if ($gs.step -ceq 'WAIT' -and (-not $gb.mayStartProbe -or $expiredBeforeProbe)) { $gs = [pscustomobject]@{ step = 'SKIP'; firstHotUtc = $gs.firstHotUtc; waitSec = $gs.waitSec; remainingSec = 0 } }
                 if ($gs.step -ceq 'WAIT') {
                     # r1b A4: counted before the room check, so a batch that ran short waiting for heat never reads as LEG_BUDGET_EXCEEDS_LEASE
@@ -1604,7 +1609,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # r4 (adversary r3 pass 2 A1, Dot c5946322): the sleep was planned BEFORE the log write above, which may have stalled. The budget is asked again with the clock read
                     # now and the sleep is cut to what is left of the allowance (none at all when it is gone); the next iteration then re-checks the deadline before it dispatches.
                     $th.reprobePending = $true
-                    $sleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $sleep).sleepSec
+                    $sleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $sleep).sleepSec
                     if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
                     continue
                 }

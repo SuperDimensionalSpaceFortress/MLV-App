@@ -459,6 +459,21 @@ class ThermalGateModuleTests(unittest.TestCase):
         got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = '1'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, [pscustomobject]@{ batch = '1'; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }))")
         self.assertEqual(got, {"a|cpu": 1}, got)
 
+    def test_r9_sol_b3_a_null_key_row_is_a_barrier_whatever_its_status(self) -> None:
+        # sol r8 B3 on fc0412d8: a null-key RETRY, THERMAL_HOT_SKIPPED or NOT_RUN row was passed over as a known never-launched row, so a|cpu was charged across a row of
+        # unknown identity although the helper promises a null-key barrier. Every null-key (or empty-key) row is a barrier, for every status.
+        for key in ("$null", "''"):
+            for status in ("RETRY", "THERMAL_HOT_SKIPPED", "NOT_RUN", "RAN", "LEG_FAILED", "UNKNOWN"):
+                with self.subTest(key=key, status=status):
+                    got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = 'L'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, "
+                                  f"[pscustomobject]@{{ batch = 'L'; key = {key}; status = '{status}'; heat = 'unknown' }}, [pscustomobject]@{{ batch = 'L'; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }}))")
+                    self.assertEqual(got, {}, f"heat was charged across a row of unknown identity: {got}")
+        # control: a KEYED never-launched row is still passed over to the launched row before it
+        for status in ("RETRY", "THERMAL_HOT_SKIPPED", "NOT_RUN"):
+            got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = 'L'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, "
+                          f"[pscustomobject]@{{ batch = 'L'; key = 'x|cpu'; status = '{status}'; heat = 'unknown' }}, [pscustomobject]@{{ batch = 'L'; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }}))")
+            self.assertEqual(got, {"a|cpu": 1}, status)
+
     def test_r8_efe7699b_a2_two_receipts_with_no_token_are_two_leases_not_one_batch_number(self) -> None:
         # adversary efe7699b A2: receipts with no token were grouped by batch number, so L1's batch 1 and L2's batch 1 became one sequence and L2's hot first leg
         # was charged to L1's last: a|cpu heavy from a reading it never preceded
@@ -812,6 +827,20 @@ class ThermalGateRunnerTests(unittest.TestCase):
                 self.assertEqual(len(row), 1, b["legs"])
                 self.assertEqual(row[0].get("heatAtProbe"), "hot", row[0])
 
+    def test_r9_sol_b1_an_unknown_first_reading_never_masks_a_later_hot_one_on_a_same_lease_retry(self) -> None:
+        # sol r8 B1 on fc0412d8 (its repro): one lease, fx-a runs (clear); fx-b's first probe reads unknown, it launches and returns VENUE_NOT_QUIESCENT (it never played), its
+        # retry's probe reads hot, it waits, then runs clear. firstHeat was fixed at that unknown, so fx-b's RAN row said heatAtProbe=unknown, the history fell back to the clear
+        # grant and fx-a was never measured heavy. The first KNOWN heat is kept across the retry; the RETRY row keeps the reading it was written with.
+        r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "120", FAKE_HEAT="0,NA,9,0", FAKE_LEG_OUTCOMES="PASS,VENUE_NOT_QUIESCENT,PASS")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        got = [(l["status"], l.get("heatAtProbe")) for l in b["legs"]]
+        self.assertEqual(got, [("RAN", "clear"), ("RETRY", "unknown"), ("RAN", "hot")], b["legs"])
+        self.assertEqual(b["thermalWaits"], 1, b)
+        # the spread reads fx-a as heavy from these rows (the scalar rows carry no leg name, so they are keyed here by their place in the run)
+        rows = ", ".join(f"[pscustomobject]@{{ batch = '1'; key = '{k}|cpu'; status = '{l['status']}'; heat = '{l['heatAtProbe']}' }}" for k, l in zip("abb", b["legs"]))
+        self.assertEqual(ps_json(f"[pscustomobject](Get-VenueHeavyLegKeys -Rows @({rows}))"), {"a|cpu": 1})
+
     def test_unknown_heat_is_not_gated(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_HEAT="NA")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -953,6 +982,40 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
         self.assertEqual(got, [False, True, False, True, True, True, True, False, False, False], got)
         runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
         self.assertIn("mayDispatchNow", runner, "the dispatch check is the budget function's, not a second copy of the rule")
+
+    # r9 (sol r8 B2): every thermal-helper call of the runner, taken from its own AST and evaluated with the runner's own grace assignment
+    RUNNER_CALLS = (
+        "$ast = [System.Management.Automation.Language.Parser]::ParseFile('{runner}', [ref]$null, [ref]$null); "
+        "$calls = @($ast.FindAll({{ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq '{name}' }}, $true)); "
+        "foreach ($a in @($ast.FindAll({{ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$ThermalDispatchGraceSec' }}, $true))) {{ . ([scriptblock]::Create($a.Extent.Text)) }}; ")
+
+    def test_r9_sol_b2_an_ambient_default_never_widens_the_runners_dispatch_grace_or_freezes_its_thermal_clock(self) -> None:
+        # sol r8 B2 on fc0412d8: $PSDefaultParameterValues = @{ 'Get-VenueThermalProbeBudget:DispatchGraceSec' = 60 } reached every budget call of the runner (none passed the
+        # grace), so with elapsed 230 on cap 180 the admission said mayDispatchNow (a probe 50 s past the deadline). Each call is taken from the runner's AST and run with that
+        # ambient default: none may admit it. The same class: an ambient -NowTimestamp froze the thermal clock (elapsed 0, the deadline never reached).
+        runner = str(DV / "Invoke-VenueLeaseBatch.ps1").replace("'", "''")
+        got = ps_json(
+            self.RUNNER_CALLS.format(runner=runner, name="Get-VenueThermalProbeBudget")
+            + "$PSDefaultParameterValues = @{ 'Get-VenueThermalProbeBudget:DispatchGraceSec' = 60 }; "
+            "function Get-ThermalElapsedSec($Th, [switch]$Ceiling) { 230 }; "
+            "$ThermalWaitCapSec = 180; $ThermalPollSec = 30; $el = 230; $thElapsed = 230; $busySleep = 30; $sleep = 30; "
+            "$st = [pscustomobject]@{ slowProbeSec = 0 }; $ThermalState = $st; $thw = $st; $th = $st; $gs = [pscustomobject]@{ waitSec = 230 }; "
+            "@($calls | ForEach-Object { [bool](. ([scriptblock]::Create($_.Extent.Text))).mayDispatchNow })")
+        self.assertGreaterEqual(len(got), 6, got)
+        self.assertEqual(got, [False] * len(got), "an ambient default widened the runner's one-second dispatch grace")
+        # control: the helper itself still honours an explicit grace (the parameter is the helper's, the runner's value is its own)
+        self.assertTrue(ps_json("(Get-VenueThermalProbeBudget -CapSec 180 -ElapsedSec 230 -SlowestReprobeSec 0 -WantSleepSec 30 -DispatchGraceSec 60).mayDispatchNow"))
+        # the runner's thermal clock: its Get-ThermalElapsedSec and its Get-VenueThermalNowUtc call, with ambient -NowTimestamp defaults of 0, still read the 230 s that passed
+        fn = ("$ast = [System.Management.Automation.Language.Parser]::ParseFile('" + runner + "', [ref]$null, [ref]$null); "
+              ". ([scriptblock]::Create($ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-ThermalElapsedSec' }, $true).Extent.Text)); ")
+        got = ps_json(
+            fn + self.RUNNER_CALLS.format(runner=runner, name="Get-VenueThermalNowUtc")
+            + "$PSDefaultParameterValues = @{ 'Get-VenueThermalElapsedSec:NowTimestamp' = [long]0; 'Get-VenueThermalNowUtc:NowTimestamp' = [long]0 }; "
+            "$gFirstTs = [Diagnostics.Stopwatch]::GetTimestamp() - [long](230 * [Diagnostics.Stopwatch]::Frequency); $gFirstUtc = [DateTime]::UtcNow.AddSeconds(-230); "
+            "$th = [pscustomobject]@{ firstHotUtc = $gFirstUtc; firstHotTs = $gFirstTs }; "
+            "@((Get-ThermalElapsedSec $th), (Get-ThermalElapsedSec $th -Ceiling)) + @($calls | ForEach-Object { [int][Math]::Floor(((. ([scriptblock]::Create($_.Extent.Text))) - $gFirstUtc).TotalSeconds) })")
+        self.assertEqual(len(got), 3, got)
+        self.assertTrue(all(230 <= v <= 240 for v in got), f"an ambient -NowTimestamp froze the runner's thermal clock: {got}")
 
     def test_r6_a1_a_reprobe_quiet_wait_is_cut_to_the_cap_left_at_its_dispatch(self) -> None:
         # adversary r5 A1 on 09f9f657 (cap 180, poll 30, -ProbeMaxWaitSec 600, a 100 s probe-script Test-Path): the re-probe's quiet-wait allowance was fixed at the loop top (150) and
