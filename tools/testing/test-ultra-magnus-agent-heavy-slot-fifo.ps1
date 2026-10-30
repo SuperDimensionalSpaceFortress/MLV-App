@@ -11,7 +11,10 @@ param(
     [switch]$UnitOnly,
     [string[]]$Only = @(),
     # Overrides the agent under test (the RED run points this at a copy of the base agent).
-    [string]$AgentScript = ''
+    [string]$AgentScript = '',
+    # Wall-clock bounds of the two sub-suites -UnitOnly runs (measured 272 s and 48 s); a suite past its bound fails by name.
+    [int]$QuietLeaseBoundSec = 400,
+    [int]$StageExemptBoundSec = 120
 )
 
 # AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c: the Bachelor agent's heavy-slot gate
@@ -478,15 +481,32 @@ $results.unit = $unit
 
 # BACHELOR-AGENT-QUIET-LEASE-1: the quiet-lease cases (lease mode, the default) run in their own process against a fake
 # heavy-slot.py, so this script's status-mode mocks never meet them. A failure there fails this run.
+# CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1: each sub-suite runs under a wall-clock bound, so a hung one fails by name (and its
+# whole process tree is killed) instead of running to the CI job cap. Measured 272 s (quiet-lease) and 48 s (stage-exempt) locally.
+function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
+    $outF = [IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
+    try {
+        $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { '"' + $_ + '"' }
+        $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $suiteArgs -NoNewWindow -PassThru -RedirectStandardOutput $outF -RedirectStandardError $errF
+        $null = $p.Handle   # keeps ExitCode readable after the exit
+        $t0 = Get-Date
+        $finished = $p.WaitForExit($TimeoutSec * 1000)
+        if (-not $finished) { & taskkill.exe /F /T /PID $p.Id *> $null }
+        $text = ((Get-Content -LiteralPath $outF -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $errF -ErrorAction SilentlyContinue)) -join ' | '
+        Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound (ran $([int]((Get-Date) - $t0).TotalSeconds) s) and its process tree was killed; output so far: $text"
+        return [pscustomobject]@{ ExitCode = $p.ExitCode; Json = ((Get-Content -LiteralPath $outF -ErrorAction SilentlyContinue) -join "`n"); Text = $text }
+    }
+    finally { Remove-Item -LiteralPath $outF, $errF -Force -ErrorAction SilentlyContinue }
+}
 $leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
-$leaseOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $leaseTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
-Assert-True ($LASTEXITCODE -eq 0) "quiet-lease cases ($leaseTest) pass: $($leaseOut -join ' | ')"
-$results.quietLease = ($leaseOut -join "`n") | ConvertFrom-Json
+$lease = Invoke-BoundedSuite 'quiet-lease cases' $leaseTest $QuietLeaseBoundSec
+Assert-True ($lease.ExitCode -eq 0) "quiet-lease cases ($leaseTest) pass: $($lease.Text)"
+$results.quietLease = $lease.Json | ConvertFrom-Json
 # STAGE-JOB-LEASE-EXEMPT-1: the staging-job exemption runs the same way (its own process, its own fake heavy-slot.py).
 $stageTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-stage-exempt.ps1'
-$stageOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $stageTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
-Assert-True ($LASTEXITCODE -eq 0) "stage-exempt cases ($stageTest) pass: $($stageOut -join ' | ')"
-$results.stageExempt = ($stageOut -join "`n") | ConvertFrom-Json
+$stage = Invoke-BoundedSuite 'stage-exempt cases' $stageTest $StageExemptBoundSec
+Assert-True ($stage.ExitCode -eq 0) "stage-exempt cases ($stageTest) pass: $($stage.Text)"
+$results.stageExempt = $stage.Json | ConvertFrom-Json
 
 if ($UnitOnly) {
     [pscustomobject]@{ status = 'PASS'; mode = 'unit-only'; results = $results } | ConvertTo-Json -Depth 8

@@ -23,6 +23,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -30,6 +33,44 @@ ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1"
 FIFO_TEST = ROOT / "tools" / "testing" / "test-ultra-magnus-agent-heavy-slot-fifo.ps1"
 PWSH = shutil.which("pwsh")
+# Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s) plus
+# its ~30 s of unit cases, so a hung suite fails by its own name there first. Measured 349 s locally, 282 s on the hosted runner.
+UNIT_RUN_TIMEOUT_SEC = 600
+
+
+def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, str]:
+    """Run argv under a real wall-clock bound and return (returncode, stdout, stderr).
+
+    subprocess.run(timeout=) is NOT a bound on Windows when the child has children: it kills only the root process and
+    then waits in communicate() for the pipes to close, and any surviving grandchild (the suites here start pwsh agents,
+    fake heavy-slot.py processes and sleepers) keeps them open. Hosted run 40388902288 sat 36 min past a 600 s timeout
+    that way until the job cap cancelled it. So the output goes to files (nothing waits for pipe EOF) and a timeout kills
+    the whole tree, then fails naming the case and the elapsed time.
+    """
+    tmp = tempfile.mkdtemp(prefix="heavy-slot-gate-")
+    out_path, err_path = Path(tmp) / "stdout.txt", Path(tmp) / "stderr.txt"
+    started = time.monotonic()
+    timed_out = False
+    try:
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+                proc.kill()
+                proc.wait(timeout=30)
+        elapsed = time.monotonic() - started
+        stdout = out_path.read_text(encoding="utf-8", errors="replace")
+        stderr = err_path.read_text(encoding="utf-8", errors="replace")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if timed_out:
+        raise AssertionError(f"{case} exceeded its {timeout:g} s wall-clock bound (ran {elapsed:.0f} s) and its process tree was "
+                             f"killed.\nstdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}")
+    return proc.returncode, stdout, stderr
 
 
 def _code_lines(text: str) -> list[str]:
@@ -254,10 +295,11 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
     def test_pure_function_cases_pass(self) -> None:
         # A hang guard, not a speed bound. -UnitOnly also runs the quiet-lease and stage-exempt suites in their own processes;
         # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 runs real (fake) status probes there, and the whole run took 312 s on a loaded host.
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly"],
-                              capture_output=True, text=True, timeout=600)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        out = json.loads(proc.stdout)
+        # CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1: run_bounded, because subprocess.run(timeout=) hangs past its timeout here.
+        rc, stdout, stderr = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly"],
+                                         UNIT_RUN_TIMEOUT_SEC, "BachelorAgentHeavySlotGateUnit.test_pure_function_cases_pass")
+        self.assertEqual(rc, 0, stdout + stderr)
+        out = json.loads(stdout)
         self.assertEqual(out["status"], "PASS")
         self.assertEqual(out["results"]["unit"]["thresholds"]["t7"], "hot")
         self.assertEqual(out["results"]["unit"]["verdicts"]["ownSlotExcluded"], "clear")
@@ -297,6 +339,25 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["heartbeat"]["free"], "gate-wait job=j1 state=queued waited=Ns")
         self.assertEqual(unit["heartbeat"]["umRunState"], "queued")
         self.assertLessEqual(unit["heartbeat"]["capped"], 64)
+
+
+@unittest.skipUnless(os.name == "nt", "the bound is a Windows process-tree kill")
+class BoundedRunTests(unittest.TestCase):
+    """run_bounded fails a hung process tree by case name inside its bound (the old subprocess.run(timeout=) did not)."""
+
+    # The root sleeps and so does a grandchild that inherits its stdout/stderr, the shape that kept the pipes open.
+    HUNG_TREE = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); time.sleep(120)"
+
+    def test_a_hung_tree_fails_naming_the_case_and_returns_inside_the_bound(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            run_bounded([sys.executable, "-c", self.HUNG_TREE], 3, "stub-hang-case")
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught.exception))
+
+    def test_a_finished_run_returns_its_code_and_both_streams(self) -> None:
+        rc, out, err = run_bounded([sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err'); sys.exit(3)"], 60, "finished-case")
+        self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
 
 
 if __name__ == "__main__":
