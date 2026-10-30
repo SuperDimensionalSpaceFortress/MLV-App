@@ -131,6 +131,21 @@ inline const char *setupPartName( SetupPart p )
     }
 }
 
+/*! PLAYBACK-PRESENT-TAIL-TIMING-1: the prev-window fields of GpuPresentTailTiming -- the window from the previous
+ *  present's path-3 swap return to this present's setup start. */
+struct PresentTailSample
+{
+    bool prevKnown = false;
+    double prevPostPaintMs = 0.0;
+    double prevPostSwapMs = 0.0;
+    double swapReturnToSetupMs = 0.0;
+    int qtPaintSwaps = 0;
+    double qtPaintSwapMaxMs = 0.0;
+    int grabSwaps = 0;
+    bool guiIdleKnown = false;
+    double guiIdleMs = 0.0;
+};
+
 /*! One texture-present setup block. partsMs is indexed by SetupPart up to (not including) Untimed. */
 struct PresentSetupSample
 {
@@ -138,7 +153,45 @@ struct PresentSetupSample
     std::array<double, static_cast<int>( SetupPart::Untimed )> partsMs {};
     bool lutRebuilt = false;
     const char *lutMiss = "none";   // the group the rebuild names (static string)
+    PresentTailSample tail;         // PLAYBACK-PRESENT-TAIL-TIMING-1
+    bool tailKnown = false;         // a GpuDisplayWindow recon present reported its tail
+    bool fullscreen = false;
 };
+
+/*! PLAYBACK-PRESENT-TAIL-TIMING-1: what the window before a setup block held. Pre-registered, first match wins
+ *  (presentSetupBucket); None only when a session has no setup block after the first. */
+inline constexpr double kGuiBusyBucketMs = 20.0;   // GUI_BUSY needs busy > this (strict)
+enum class SetupBucket { SetupAfterSwap = 0, GuiBusy, SwapPath1, SwapPath2, Unknown, None };
+
+inline const char *setupBucketName( SetupBucket b )
+{
+    switch( b )
+    {
+    case SetupBucket::SetupAfterSwap: return "setup_after_swap";
+    case SetupBucket::GuiBusy: return "gui_busy";
+    case SetupBucket::SwapPath1: return "swap_path1";
+    case SetupBucket::SwapPath2: return "swap_path2";
+    case SetupBucket::Unknown: return "unknown";
+    default: return "none";
+    }
+}
+
+/*! The window's busy ms (window minus event-loop idle), or -1 when the window or its idle probe is not known. */
+inline double presentSetupGuiBusyMs( const PresentSetupSample &s )
+{
+    if( !s.tailKnown || !s.tail.prevKnown || !s.tail.guiIdleKnown ) return -1.0;
+    return s.tail.swapReturnToSetupMs - s.tail.guiIdleMs;
+}
+
+inline SetupBucket presentSetupBucket( const PresentSetupSample &s )
+{
+    if( !s.tailKnown || !s.tail.prevKnown || !s.tail.guiIdleKnown ) return SetupBucket::Unknown;
+    if( s.tail.grabSwaps >= 1 ) return SetupBucket::SwapPath2;
+    if( s.tail.qtPaintSwaps >= 1 ) return SetupBucket::SwapPath1;
+    const double busy = presentSetupGuiBusyMs( s );
+    if( busy > kGuiBusyBucketMs && 2.0 * busy >= s.tail.swapReturnToSetupMs ) return SetupBucket::GuiBusy;
+    return SetupBucket::SetupAfterSwap;
+}
 
 /*! The part that took the most of \a s: the largest timed part, or UNTIMED when what no part timed is larger.
  *  Ties go to the earlier part. */
@@ -256,6 +309,11 @@ struct Summary
     int presentSetupOver50 = 0;                        // setup total > kPresentSetupStallMs
     double presentSetupMaxMs = 0.0;
     SetupPart presentSetupMaxPart = SetupPart::Count;  // of the max-setup present; Count = none
+    // PLAYBACK-PRESENT-TAIL-TIMING-1: the max-setup present's own tail window, display and bucket.
+    PresentTailSample presentSetupMaxTail;
+    double presentSetupMaxGuiBusyMs = -1.0;            // -1 when not known
+    bool presentSetupMaxFullscreen = false;
+    SetupBucket presentSetupMaxBucket = SetupBucket::None;
     int lutRebuildsAfterFirst = 0;
     std::vector<std::pair<std::string, long long>> lutMissFields;   // group -> rebuilds, in first-seen order
 };
@@ -457,6 +515,10 @@ public:
         {
             m_setupMaxMs = s.totalMs;
             m_setupMaxPart = presentSetupMaxPart( s );
+            m_setupMaxTail = s.tail;
+            m_setupMaxGuiBusyMs = presentSetupGuiBusyMs( s );
+            m_setupMaxFullscreen = s.fullscreen;
+            m_setupMaxBucket = presentSetupBucket( s );
         }
         if( s.lutRebuilt )
         {
@@ -510,6 +572,10 @@ public:
         out.presentSetupOver50 = m_setupOver50;
         out.presentSetupMaxMs = m_setupMaxMs;
         out.presentSetupMaxPart = m_setupSamples > 0 ? m_setupMaxPart : SetupPart::Count;
+        out.presentSetupMaxTail = m_setupMaxTail;
+        out.presentSetupMaxGuiBusyMs = m_setupMaxGuiBusyMs;
+        out.presentSetupMaxFullscreen = m_setupMaxFullscreen;
+        out.presentSetupMaxBucket = m_setupSamples > 0 ? m_setupMaxBucket : SetupBucket::None;
         out.lutRebuildsAfterFirst = m_lutRebuilds;
         out.lutMissFields = m_lutMissFields;
         out.advanceByPath = m_advanceByPath;
@@ -736,6 +802,10 @@ private:
     int m_setupOver50 = 0;
     double m_setupMaxMs = 0.0;
     SetupPart m_setupMaxPart = SetupPart::Count;
+    PresentTailSample m_setupMaxTail;
+    double m_setupMaxGuiBusyMs = -1.0;
+    bool m_setupMaxFullscreen = false;
+    SetupBucket m_setupMaxBucket = SetupBucket::None;
     int m_lutRebuilds = 0;
     std::vector<std::pair<std::string, long long>> m_lutMissFields;
 

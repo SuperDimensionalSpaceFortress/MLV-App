@@ -10,6 +10,7 @@
 #include <QVector2D>
 
 #include <cstdint>
+#include <type_traits>
 
 /* PLAYBACK-GL-PRESENT-SETUP-STALL-1: the config fields `signature` hashes, split into
  * groups so a LUT texture-set rebuild can name what moved (the first group whose digest
@@ -69,6 +70,25 @@ struct GpuPresentSetupTiming
      * (playback_warm_output_reuse::stateFields), else empty. */
     QString reuse_states;
 };
+
+/* PLAYBACK-PRESENT-TAIL-TIMING-1: the GUI-thread tail of one GpuDisplayWindow recon present, plus the window
+ * from the PREVIOUS present's swap return to THIS present's setup start. CPU wall time only. */
+struct GpuPresentTailTiming
+{
+    bool painted = false;               // paint-per-submit (swap path 3) ran this call
+    double post_paint_ms = 0.0;         // the paintGL() call before the path-3 swap
+    double post_swap_ms = 0.0;          // the path-3 swapBuffers call (== swapCallMs)
+    bool prev_known = false;            // a path-3 swap opened the window and no setup has closed it since
+    double prev_post_paint_ms = 0.0;
+    double prev_post_swap_ms = 0.0;
+    double swap_return_to_setup_ms = 0.0;
+    int qt_paint_swaps = 0;             // swap path 1 inside the window (smoke telemetry only)
+    double qt_paint_swap_max_ms = 0.0;  // paintUnderGL -> frameSwapped (smoke only)
+    int grab_swaps = 0;                 // swap path 2 inside the window (smoke only)
+    bool gui_idle_known = false;        // smoke only: the dispatcher idle probe is connected
+    double gui_idle_ms = 0.0;           // event loop blocked inside the window; busy = window - idle
+};
+static_assert(std::is_trivially_copyable<GpuPresentTailTiming>::value, "no per-frame allocation");
 
 struct GpuPreviewProcessingConfig
 {

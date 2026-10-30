@@ -1187,6 +1187,10 @@ private:
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
+    // PLAYBACK-PRESENT-TAIL-TIMING-1: the GpuDisplayWindow recon present tail of the frame presentPlaybackPreparedFrame
+    // is presenting (reset at its entry); notePlaybackSmokePresentedFrame reads it for that same frame.
+    GpuPresentTailTiming m_lastPresentTailTiming;
+    bool m_lastPresentTailTimingKnown = false;
     // PLAYBACK-STARTUP-WAIT-PREWARM-1: where the Play -> first-present wait goes (playback_smoke.startup_split);
     // fed only while m_playbackSmokeActive, reset at every smoke session start.
     playback_startup_split::StartupSplit m_playbackStartupSplit;

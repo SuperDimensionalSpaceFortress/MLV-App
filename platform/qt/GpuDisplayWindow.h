@@ -24,6 +24,7 @@
 
 #include <QImage>
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QSize>
 #include <QString>
 #include <QOpenGLFunctions>
@@ -92,6 +93,9 @@ public:
      * (a default value when no window is active). GUI-thread only; read it right after
      * presentGpuPlaybackReconAmazePostWbTextureIfActive. */
     static GpuPresentSetupTiming lastPresentSetupTimingIfActive(void);
+    /* PLAYBACK-PRESENT-TAIL-TIMING-1: the active window's last recon present tail (default when none is active).
+     * GUI-thread only; read it right after presentGpuPlaybackReconAmazePostWbTextureIfActive. */
+    static GpuPresentTailTiming lastPresentTailTimingIfActive(void);
     /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: warm the playback recon texture route while paused (program compile,
      * one AMaZE run at texWidth x texHeight on temporary textures, then freed). Changes nothing on screen. GUI-thread
      * only; summary receives one "ok=... program_ms=... amaze_ms=..." fragment for the log.
@@ -239,6 +243,9 @@ public:
 protected:
     void initializeGL() override;
     void paintGL() override;
+    /* PLAYBACK-PRESENT-TAIL-TIMING-1: runs only in Qt's own paint cycle (swap path 1), never for a direct paintGL()
+     * call; stamps the path-1 paint start for noteQtPaintSwap(). */
+    void paintUnderGL() override;
 
 private:
     friend class GuiSmokeTest; // Exercise real context-loss teardown/rebuild without requiring the OS to recreate the platform window.
@@ -277,6 +284,8 @@ private:
      * GpuWindowSwapTelemetryCounters::swapCallSamplesMs), gated like noteRealSwap(). Reads
      * wglGetSwapIntervalEXT once per session, at the first timed swap, context current. */
     void noteSwapCall(double swapCallMs);
+    /* PLAYBACK-PRESENT-TAIL-TIMING-1: frameSwapped() after a paintUnderGL() stamp: one path-1 paint+swap pair. */
+    void noteQtPaintSwap(void);
 
     void ensureProgram(void);
     void ensurePreviewProcessingProgram(void);
@@ -339,6 +348,20 @@ private:
     QOpenGLShaderProgram *m_previewProcessingProgram;
     GpuPreviewProcessingLutTextureSet m_lutSet;
     GpuPresentSetupTiming m_lastPresentSetupTiming;
+    /* PLAYBACK-PRESENT-TAIL-TIMING-1: the recon present tail and the window from a path-3 swap return to the next
+     * setup start (m_tailSwapReturnNs >= 0 while that window is open). All on m_tailClock; POD only. */
+    QElapsedTimer m_tailClock;
+    qint64 m_tailSwapReturnNs = -1;
+    qint64 m_tailBlockStartNs = -1;
+    qint64 m_tailIdleNs = 0;
+    qint64 m_qtPaintStartNs = -1;
+    int m_tailQtPaintSwaps = 0;
+    qint64 m_tailQtPaintSwapMaxNs = 0;
+    int m_tailGrabSwaps = 0;
+    bool m_tailIdleProbe = false;
+    double m_tailPrevPaintMs = 0.0;
+    double m_tailPrevSwapMs = 0.0;
+    GpuPresentTailTiming m_lastPresentTailTiming;
     // Presentation options captured at the most recent recon-texture submit; consumed
     // by paintGL() when it draws that texture (paintGL runs later / can run twice --
     // see grabPresentedFramebufferIfActive -- so the options must outlive the submit

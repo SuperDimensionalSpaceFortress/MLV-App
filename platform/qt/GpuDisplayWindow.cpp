@@ -16,6 +16,7 @@
 #include "debug/StageTiming.h"
 #include "../../src/mlv_include.h"
 
+#include <QAbstractEventDispatcher>
 #include <QGraphicsView>
 #include <QWidget>
 #include <QGridLayout>
@@ -874,6 +875,13 @@ GpuPresentSetupTiming GpuDisplayWindow::lastPresentSetupTimingIfActive()
     return win ? win->lastPresentSetupTiming() : GpuPresentSetupTiming();
 }
 
+GpuPresentTailTiming GpuDisplayWindow::lastPresentTailTimingIfActive()
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    return win ? win->m_lastPresentTailTiming : GpuPresentTailTiming();
+}
+
 bool GpuDisplayWindow::readGpuReconSourceBayer16TextureIfActive(
     QByteArray *textureBytes,
     int *width,
@@ -925,6 +933,7 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     QSurfaceFormat fmt = format();
     fmt.setSwapInterval(playbackSwapInterval());
     setFormat(fmt);
+    m_tailClock.start();
 
     // Real swap path 1 of 3: Qt's own automatic swap after paintGL() returns, in its
     // normal paint-event cycle (frameSwapped() fires only for THIS swap, not for the
@@ -938,6 +947,43 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     {
         connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteRealSwap);
     }
+    // PLAYBACK-PRESENT-TAIL-TIMING-1: path-1 paint+swap pairs and event-loop idle inside the tail window (from a
+    // path-3 swap return to the next recon setup start), gated like the recorder above (a separate block keeps that
+    // one's pinned shape). Same idle arithmetic as MainWindow's present-gap probe.
+    if ( swapTelemetryEnabled() )
+    {
+        connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteQtPaintSwap);
+        if ( QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance(thread()) )
+        {
+            connect(dispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
+            {
+                if ( m_tailSwapReturnNs >= 0 )
+                    m_tailBlockStartNs = m_tailClock.nsecsElapsed();
+            });
+            connect(dispatcher, &QAbstractEventDispatcher::awake, this, [this]()
+            {
+                if ( m_tailBlockStartNs < 0 ) return;
+                m_tailIdleNs += m_tailClock.nsecsElapsed() - m_tailBlockStartNs;
+                m_tailBlockStartNs = -1;
+            });
+            m_tailIdleProbe = true;
+        }
+    }
+}
+
+void GpuDisplayWindow::paintUnderGL()
+{
+    if ( swapTelemetryEnabled() ) m_qtPaintStartNs = m_tailClock.nsecsElapsed();
+}
+
+void GpuDisplayWindow::noteQtPaintSwap()
+{
+    if ( m_qtPaintStartNs < 0 ) return;
+    const qint64 pairNs = m_tailClock.nsecsElapsed() - m_qtPaintStartNs;
+    m_qtPaintStartNs = -1;
+    if ( m_tailSwapReturnNs < 0 ) return;
+    ++m_tailQtPaintSwaps;
+    if ( pairNs > m_tailQtPaintSwapMaxNs ) m_tailQtPaintSwapMaxNs = pairNs;
 }
 
 GpuDisplayWindow::~GpuDisplayWindow()
@@ -1052,6 +1098,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     };
     // PLAYBACK-GL-PRESENT-SETUP-STALL-1: this call's setup split; never a previous call's.
     m_lastPresentSetupTiming = GpuPresentSetupTiming();
+    m_lastPresentTailTiming = GpuPresentTailTiming();   // PLAYBACK-PRESENT-TAIL-TIMING-1: likewise this call's tail
 
     if ( !state || !state->valid || state->width <= 0 || state->height <= 0 || !wbMultipliers )
     {
@@ -1152,6 +1199,24 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     // only, no GL query or fence); MainWindow reads it via lastPresentSetupTiming().
     GpuPresentSetupTiming &setupTiming = m_lastPresentSetupTiming;
     const double setupStartMs = elapsedMs();
+    // PLAYBACK-PRESENT-TAIL-TIMING-1: close the window the previous path-3 swap opened (POD stores only)
+    const qint64 tailSetupStartNs = m_tailClock.nsecsElapsed();
+    if ( m_tailSwapReturnNs >= 0 )
+    {
+        GpuPresentTailTiming &tail = m_lastPresentTailTiming;
+        tail.prev_known = true;
+        tail.prev_post_paint_ms = m_tailPrevPaintMs;
+        tail.prev_post_swap_ms = m_tailPrevSwapMs;
+        tail.swap_return_to_setup_ms = static_cast<double>(tailSetupStartNs - m_tailSwapReturnNs) / 1000000.0;
+        tail.qt_paint_swaps = m_tailQtPaintSwaps;
+        tail.qt_paint_swap_max_ms = static_cast<double>(m_tailQtPaintSwapMaxNs) / 1000000.0;
+        tail.grab_swaps = m_tailGrabSwaps;
+        tail.gui_idle_known = m_tailIdleProbe;
+        const qint64 openBlockNs = m_tailBlockStartNs >= 0 ? tailSetupStartNs - m_tailBlockStartNs : 0;
+        tail.gui_idle_ms = static_cast<double>(m_tailIdleNs + openBlockNs) / 1000000.0;
+        m_tailSwapReturnNs = -1;
+        m_tailBlockStartNs = -1;
+    }
     ensurePreviewProcessingProgram();
     double partStartMs = elapsedMs();
     setupTiming.program_ms = partStartMs - setupStartMs;
@@ -1557,10 +1622,23 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     bool paintedSynchronously = false;
     if ( paintPerSubmitEnabled() && isExposed() && isValid() )
     {
+        const double postPaintStartMs = elapsedMs();   // PLAYBACK-PRESENT-TAIL-TIMING-1
         paintGL();
         const double swapCallStartMs = elapsedMs();
         glContext->swapBuffers(this);
         const double swapCallMs = elapsedMs() - swapCallStartMs;
+        m_tailSwapReturnNs = m_tailClock.nsecsElapsed();
+        // PLAYBACK-PRESENT-TAIL-TIMING-1: this call's tail; the swap return opens the window the next setup closes
+        m_tailBlockStartNs = -1;
+        m_tailIdleNs = 0;
+        m_tailQtPaintSwaps = 0;
+        m_tailQtPaintSwapMaxNs = 0;
+        m_tailGrabSwaps = 0;
+        m_tailPrevPaintMs = swapCallStartMs - postPaintStartMs;
+        m_tailPrevSwapMs = swapCallMs;
+        m_lastPresentTailTiming.painted = true;
+        m_lastPresentTailTiming.post_paint_ms = m_tailPrevPaintMs;
+        m_lastPresentTailTiming.post_swap_ms = swapCallMs;
         // Real swap path 3 of 3: like grabPresentedFramebufferIfActive's manual swap (path 2),
         // this runs outside Qt's own paint-event cycle, so frameSwapped() (path 1) does
         // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
@@ -1870,6 +1948,8 @@ void GpuDisplayWindow::swapOutsidePaintEventAndRecord(GpuDisplayWindow *win, QOp
     // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: the screenshot grab and the visual-capture
     // forced paint both swap HERE, once per frame they paint, never inline.
     if ( swapTelemetryEnabled() ) win->noteRealSwap();
+    // PLAYBACK-PRESENT-TAIL-TIMING-1: a path-2 swap inside the tail window (gated like the recorder above)
+    if ( swapTelemetryEnabled() && win->m_tailSwapReturnNs >= 0 ) ++win->m_tailGrabSwaps;
 }
 
 bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,

@@ -4867,6 +4867,8 @@ void MainWindow::onPlaybackPrepResultReady( void )
 }
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
 {
+    m_lastPresentTailTiming = GpuPresentTailTiming();   // PLAYBACK-PRESENT-TAIL-TIMING-1: never a previous frame's
+    m_lastPresentTailTimingKnown = false;
     const PlaybackPrepTask &task = result.task;
     RenderFrameThread::ReadyFrame readyFrame = task.readyFrame;
     const uint64_t display_frame = task.displayFrame;
@@ -5308,6 +5310,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 texturePresentSetupTiming =
                     GpuDisplayWindow::lastPresentSetupTimingIfActive();
                 texturePresentSetupTimingKnown = true;
+                m_lastPresentTailTiming = GpuDisplayWindow::lastPresentTailTimingIfActive();
+                m_lastPresentTailTimingKnown = true;
                 gpuPlaybackReconAmazeTexturePresentedByWindow =
                     framePresentedByViewport;
             }
@@ -26224,6 +26228,19 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             const QByteArray lutMiss = timing.value(
                 QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss") ).toString().toLatin1();
             setupSample.lutMiss = lutMiss.constData();   // copied by notePresentSetup before lutMiss goes away
+            // PLAYBACK-PRESENT-TAIL-TIMING-1: this frame's own tail (presentPlaybackPreparedFrame read it for this frame)
+            const GpuPresentTailTiming &tail = m_lastPresentTailTiming;
+            setupSample.tailKnown = m_lastPresentTailTimingKnown;
+            setupSample.tail.prevKnown = tail.prev_known;
+            setupSample.tail.prevPostPaintMs = tail.prev_post_paint_ms;
+            setupSample.tail.prevPostSwapMs = tail.prev_post_swap_ms;
+            setupSample.tail.swapReturnToSetupMs = tail.swap_return_to_setup_ms;
+            setupSample.tail.qtPaintSwaps = tail.qt_paint_swaps;
+            setupSample.tail.qtPaintSwapMaxMs = tail.qt_paint_swap_max_ms;
+            setupSample.tail.grabSwaps = tail.grab_swaps;
+            setupSample.tail.guiIdleKnown = tail.gui_idle_known;
+            setupSample.tail.guiIdleMs = tail.gui_idle_ms;
+            setupSample.fullscreen = isFullScreen();
             m_playbackSlipHistogram.notePresentSetup( setupSample );
         }
     }
@@ -29276,6 +29293,21 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                                                                 ? QStringLiteral("none")
                                                                 : missFields.join( QLatin1Char(',') ) )
                << QStringLiteral("present_setup_first_ms=%1").arg( slip.presentSetupFirstMs, 0, 'f', 3 );
+        // PLAYBACK-PRESENT-TAIL-TIMING-1: the max-setup present's own tail window (previous swap return -> its setup)
+        const playback_slip::PresentTailSample &maxTail = slip.presentSetupMaxTail;
+        fields << QStringLiteral("present_setup_max_prev_paint_ms=%1").arg( maxTail.prevPostPaintMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_prev_swap_ms=%1").arg( maxTail.prevPostSwapMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_swap_return_to_setup_ms=%1").arg( maxTail.swapReturnToSetupMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_gui_busy_ms=%1").arg( slip.presentSetupMaxGuiBusyMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_qt_paint_swaps=%1").arg( maxTail.qtPaintSwaps )
+               << QStringLiteral("present_setup_max_qt_paint_swap_max_ms=%1").arg( maxTail.qtPaintSwapMaxMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_grab_swaps=%1").arg( maxTail.grabSwaps )
+               << QStringLiteral("present_setup_max_display=%1").arg(
+                      slip.presentSetupSamplesAfterFirst == 0 ? QStringLiteral("none")
+                      : slip.presentSetupMaxFullscreen       ? QStringLiteral("fullscreen")
+                                                             : QStringLiteral("windowed") )
+               << QStringLiteral("present_setup_max_bucket=%1").arg(
+                      QLatin1String( playback_slip::setupBucketName( slip.presentSetupMaxBucket ) ) );
         qInfo().noquote() << fields.join( QLatin1Char(' ') );
         for( const SlipRecord &r : slip.slipLines )
         {

@@ -582,3 +582,101 @@ TEST(PlaybackSlipHistogram, PresentSetupLutMissFieldsTallyRebuildsByGroupInFirst
     ASSERT_EQ( 0, e.presentSetupOver50 );
     ASSERT_TRUE( e.presentSetupMaxPart == playback_slip::SetupPart::Count );
 }
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1: each setup block carries the window from the previous present's swap return to its
+// own start; the max-setup present's window is bucketed by a pre-registered first-match rule.
+namespace
+{
+playback_slip::PresentSetupSample tailSample( double totalMs, double windowMs, double idleMs, int qtPaintSwaps = 0,
+                                             int grabSwaps = 0, bool prevKnown = true, bool idleKnown = true,
+                                             bool tailKnown = true )
+{
+    playback_slip::PresentSetupSample s = setupSample( totalMs );
+    s.tailKnown = tailKnown;
+    s.tail.prevKnown = prevKnown;
+    s.tail.swapReturnToSetupMs = windowMs;
+    s.tail.guiIdleKnown = idleKnown;
+    s.tail.guiIdleMs = idleMs;
+    s.tail.qtPaintSwaps = qtPaintSwaps;
+    s.tail.grabSwaps = grabSwaps;
+    return s;
+}
+}
+
+TEST(PlaybackSlipHistogram, PresentSetupBucketRuleIsFirstMatchWithStrictGuiBusyEdge)
+{
+    using playback_slip::SetupBucket;
+    using playback_slip::presentSetupBucket;
+    // UNKNOWN first: no tail, no previous window, or no idle probe -- even with swaps in the window.
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 80.0, 0.0, 1, 1, true, true, false ) ) == SetupBucket::Unknown );
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 80.0, 0.0, 1, 1, false ) ) == SetupBucket::Unknown );
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 80.0, 0.0, 1, 1, true, false ) ) == SetupBucket::Unknown );
+    // PATH2 > PATH1 > GUI_BUSY.
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 80.0, 0.0, 1, 1 ) ) == SetupBucket::SwapPath2 );
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 80.0, 0.0, 1, 0 ) ) == SetupBucket::SwapPath1 );
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 80.0, 0.0 ) ) == SetupBucket::GuiBusy );
+    // GUI_BUSY needs busy > 20 (strict) and busy at least half the window.
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 40.0, 20.0 ) ) == SetupBucket::SetupAfterSwap );   // busy 20.0
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 40.0, 19.999 ) ) == SetupBucket::GuiBusy );        // busy 20.001
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 50.0, 25.0 ) ) == SetupBucket::GuiBusy );          // 2*busy == R
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 50.5, 25.5 ) ) == SetupBucket::SetupAfterSwap );   // 2*busy < R
+    ASSERT_TRUE( presentSetupBucket( tailSample( 60.0, 30.0, 25.0 ) ) == SetupBucket::SetupAfterSwap );
+    ASSERT_NEAR( -1.0, playback_slip::presentSetupGuiBusyMs( tailSample( 60.0, 30.0, 25.0, 0, 0, true, false ) ), 1e-12 );
+    ASSERT_EQ( std::string( "setup_after_swap" ), std::string( playback_slip::setupBucketName( SetupBucket::SetupAfterSwap ) ) );
+    ASSERT_EQ( std::string( "gui_busy" ), std::string( playback_slip::setupBucketName( SetupBucket::GuiBusy ) ) );
+    ASSERT_EQ( std::string( "swap_path1" ), std::string( playback_slip::setupBucketName( SetupBucket::SwapPath1 ) ) );
+    ASSERT_EQ( std::string( "swap_path2" ), std::string( playback_slip::setupBucketName( SetupBucket::SwapPath2 ) ) );
+    ASSERT_EQ( std::string( "unknown" ), std::string( playback_slip::setupBucketName( SetupBucket::Unknown ) ) );
+    ASSERT_EQ( std::string( "none" ), std::string( playback_slip::setupBucketName( SetupBucket::None ) ) );
+}
+
+TEST(PlaybackSlipHistogram, PresentSetupMaxTailIsTheMaxSetupPresentsOwn)
+{
+    using playback_slip::SetupBucket;
+    SlipHistogram h;
+    h.reset( 0, kNativeFps );
+    h.notePresentSetup( tailSample( 400.0, 900.0, 0.0, 4, 5 ) );    // first: allocation, apart
+    h.notePresentSetup( tailSample( 120.0, 90.0, 80.0, 3, 0 ) );
+    playback_slip::PresentSetupSample max = tailSample( 230.0, 60.0, 10.0 );
+    max.tail.prevPostPaintMs = 7.0;
+    max.tail.prevPostSwapMs = 16.0;
+    max.fullscreen = true;
+    h.notePresentSetup( max );
+    h.notePresentSetup( tailSample( 90.0, 500.0, 0.0, 6, 2 ) );
+    const Summary s = h.finish( 1000.0, 0 );
+    ASSERT_NEAR( 230.0, s.presentSetupMaxMs, 1e-12 );
+    ASSERT_TRUE( s.presentSetupMaxBucket == SetupBucket::GuiBusy );
+    ASSERT_NEAR( 7.0, s.presentSetupMaxTail.prevPostPaintMs, 1e-12 );
+    ASSERT_NEAR( 16.0, s.presentSetupMaxTail.prevPostSwapMs, 1e-12 );
+    ASSERT_NEAR( 60.0, s.presentSetupMaxTail.swapReturnToSetupMs, 1e-12 );
+    ASSERT_NEAR( 50.0, s.presentSetupMaxGuiBusyMs, 1e-12 );
+    ASSERT_EQ( 0, s.presentSetupMaxTail.qtPaintSwaps );   // not the session maximum (6)
+    ASSERT_EQ( 0, s.presentSetupMaxTail.grabSwaps );      // not the session maximum (2, or the first's 5)
+    ASSERT_TRUE( s.presentSetupMaxFullscreen );
+}
+
+TEST(PlaybackSlipHistogram, PresentSetupFirstTailIsExcludedAndAnEmptySessionBucketsNone)
+{
+    using playback_slip::SetupBucket;
+    SlipHistogram onlyFirst;
+    onlyFirst.reset( 0, kNativeFps );
+    playback_slip::PresentSetupSample first = tailSample( 400.0, 900.0, 0.0, 4, 5 );
+    first.fullscreen = true;
+    onlyFirst.notePresentSetup( first );
+    const Summary f = onlyFirst.finish( 1000.0, 0 );
+    ASSERT_EQ( 0, f.presentSetupSamplesAfterFirst );
+    ASSERT_TRUE( f.presentSetupMaxBucket == SetupBucket::None );
+    ASSERT_EQ( 0, f.presentSetupMaxTail.grabSwaps );
+    ASSERT_EQ( 0, f.presentSetupMaxTail.qtPaintSwaps );
+    ASSERT_NEAR( 0.0, f.presentSetupMaxTail.swapReturnToSetupMs, 1e-12 );
+    ASSERT_NEAR( -1.0, f.presentSetupMaxGuiBusyMs, 1e-12 );
+    ASSERT_FALSE( f.presentSetupMaxFullscreen );
+
+    // After the first, a present without a tail (the GpuDisplayViewport route) buckets UNKNOWN.
+    onlyFirst.notePresentSetup( tailSample( 5.0, 0.0, 0.0, 0, 0, false, false, false ) );
+    ASSERT_TRUE( onlyFirst.finish( 1000.0, 0 ).presentSetupMaxBucket == SetupBucket::Unknown );
+
+    SlipHistogram empty;
+    empty.reset( 0, kNativeFps );
+    ASSERT_TRUE( empty.finish( 1000.0, 0 ).presentSetupMaxBucket == SetupBucket::None );
+}

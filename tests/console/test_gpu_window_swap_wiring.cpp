@@ -857,3 +857,123 @@ TEST(VisualCaptureBinding, EveryCaptureNamesWhereItsPaintedSerialCameFrom)
     // the pixmap-route basis is set only beside the item's own serial, never for a GL route
     ASSERT_TRUE(helper.lastIndexOf(QStringLiteral("serial = pixmapItemSerial;"), pixmapAt) > viewportAt);
 }
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 (T9): the tail markers around the path-3 paint/swap and at the next setup start are
+// CPU clock reads and POD stores only. A GL call there (an error drain, a finish, a fence) would itself move the stall
+// the markers bucket; an allocation would put a per-frame cost on the GUI thread.
+namespace
+{
+QString regionBetween(const QString & source, const QString & from, const QString & to)
+{
+    const int at = source.indexOf(from);
+    const int end = at < 0 ? -1 : source.indexOf(to, at);
+    if (at < 0 || end <= at) return QString();
+    return source.mid(at, end + to.size() - at);
+}
+
+void assertNoGlSyncAndNoAllocation(const QString & region)
+{
+    ASSERT_FALSE(region.isEmpty());
+    for (const char * call : { "glGetError", "glFinish", "glFlush", "glFenceSync", "glClientWaitSync", "glBeginQuery" })
+        ASSERT_EQ(0, countOccurrences(region, QString::fromLatin1(call)));
+    for (const char * token : { "new ", "QString", "QStringLiteral", "QByteArray", "push_back", "append(", "std::vector" })
+        ASSERT_EQ(0, countOccurrences(region, QString::fromLatin1(token)));
+}
+
+int glCallCount(const QString & region)
+{
+    return region.count(QRegularExpression(QStringLiteral("\\bgl[A-Z]\\w*\\s*\\(")));
+}
+} // namespace
+
+TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString setupStamp = QStringLiteral("const qint64 tailSetupStartNs = m_tailClock.nsecsElapsed();");
+    const QString paintStamp = QStringLiteral("const double postPaintStartMs = elapsedMs();");
+    const QString swapStamp = QStringLiteral("m_tailSwapReturnNs = m_tailClock.nsecsElapsed();");
+    const QString swapCall = QStringLiteral("glContext->swapBuffers(this);");
+    const QString swapCallMsLine = QStringLiteral("const double swapCallMs = elapsedMs() - swapCallStartMs;");
+    ASSERT_EQ(1, countOccurrences(body, setupStamp));
+    ASSERT_EQ(1, countOccurrences(body, paintStamp));
+    ASSERT_EQ(1, countOccurrences(body, swapStamp));
+
+    // r1: post_paint stamp -> swap-return stamp. Only paintGL() and the path-3 swap are GL-ish.
+    const QString r1 = regionBetween(body, paintStamp, swapStamp);
+    assertNoGlSyncAndNoAllocation(r1);
+    ASSERT_EQ(1, countOccurrences(r1, QStringLiteral("paintGL();")));
+    ASSERT_EQ(1, countOccurrences(r1, swapCall));
+    QString r1Rest = r1;
+    r1Rest.remove(QStringLiteral("paintGL();")).remove(swapCall);
+    ASSERT_EQ(0, r1Rest.count(QRegularExpression(QStringLiteral("gl\\w*\\s*\\("),
+                                                 QRegularExpression::CaseInsensitiveOption)));
+    // The swap-return stamp follows the swap with only the swapCallMs line between.
+    const int swapAt = r1.indexOf(swapCall);
+    const int stampAt = r1.indexOf(swapStamp);
+    ASSERT_TRUE(swapAt >= 0 && stampAt > swapAt);
+    ASSERT_EQ(swapCallMsLine, r1.mid(swapAt + swapCall.size(), stampAt - swapAt - swapCall.size()).trimmed());
+
+    // r2: the setup-start tail block, after setupStartMs and before ensurePreviewProcessingProgram().
+    const int setupStartAt = body.indexOf(QStringLiteral("const double setupStartMs = elapsedMs();"));
+    const int ensureAt = body.indexOf(QStringLiteral("ensurePreviewProcessingProgram();"), setupStartAt);
+    const int setupStampAt = body.indexOf(setupStamp);
+    ASSERT_TRUE(setupStartAt >= 0 && setupStampAt > setupStartAt && ensureAt > setupStampAt);
+    const QString r2 = body.mid(setupStampAt, ensureAt - setupStampAt);
+    ASSERT_TRUE(r2.contains(QStringLiteral("m_tailSwapReturnNs = -1;")));
+    ASSERT_TRUE(r2.contains(QStringLiteral("m_tailBlockStartNs = -1;")));
+
+    // r3-r5: the path-1 paint stamp, its frameSwapped slot and the dispatcher idle lambdas.
+    const QString r3 = functionBody(source, QStringLiteral("void GpuDisplayWindow::paintUnderGL()"),
+                                    QStringLiteral("void GpuDisplayWindow::noteQtPaintSwap()"));
+    ASSERT_TRUE(r3.contains(QStringLiteral("if ( swapTelemetryEnabled() ) m_qtPaintStartNs = m_tailClock.nsecsElapsed();")));
+    const QString r4 = functionBody(source, QStringLiteral("void GpuDisplayWindow::noteQtPaintSwap()"),
+                                    QStringLiteral("GpuDisplayWindow::~GpuDisplayWindow()"));
+    const QString r5 = regionBetween(source, QStringLiteral("&QAbstractEventDispatcher::aboutToBlock"),
+                                     QStringLiteral("m_tailIdleProbe = true;"));
+    ASSERT_TRUE(r5.contains(QStringLiteral("&QAbstractEventDispatcher::awake")));
+    for (const QString & region : { r2, r3, r4, r5 }) {
+        assertNoGlSyncAndNoAllocation(region);
+        ASSERT_EQ(0, glCallCount(region));
+    }
+
+    const QString header = readRepoFile(QStringLiteral("platform/qt/GpuPreviewProcessing.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "static_assert(std::is_trivially_copyable<GpuPresentTailTiming>::value")));
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 (W1): slip_summary appends the max-setup tail keys after present_setup_first_ms (the
+// existing keys keep their order), and no tail field rides the per-frame stageTimingTelemetry hash.
+TEST(GpuPresentTailTiming, SlipSummaryAppendsTheTailKeysAndNoTailFieldUsesStageTimingTelemetry)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int firstAt = source.indexOf(QStringLiteral("QStringLiteral(\"present_setup_first_ms=%1\")"));
+    ASSERT_TRUE(firstAt >= 0);
+    int previousAt = firstAt;
+    for (const char * key : { "present_setup_max_prev_paint_ms=", "present_setup_max_prev_swap_ms=",
+                              "present_setup_max_swap_return_to_setup_ms=", "present_setup_max_gui_busy_ms=",
+                              "present_setup_max_qt_paint_swaps=", "present_setup_max_qt_paint_swap_max_ms=",
+                              "present_setup_max_grab_swaps=", "present_setup_max_display=",
+                              "present_setup_max_bucket=" }) {
+        const QString needle = QStringLiteral("QStringLiteral(\"%1").arg(QLatin1String(key));
+        ASSERT_EQ(1, countOccurrences(source, needle));
+        const int at = source.indexOf(needle);
+        ASSERT_TRUE(at > previousAt);
+        previousAt = at;
+    }
+    ASSERT_TRUE(source.indexOf(QStringLiteral("qInfo().noquote() << fields.join( QLatin1Char(' ') );"), firstAt)
+                > previousAt);
+
+    const QRegularExpression insertKey(QStringLiteral(
+        "stageTimingTelemetry\\.insert\\(\\s*QStringLiteral\\(\"([^\"]*)\""));
+    const QRegularExpression tailToken(QStringLiteral(
+        "post_paint|post_swap|prev_paint|prev_swap|prev_post|swap_return|qt_paint|grab_swap|gui_idle|gui_busy|"
+        "setup_bucket|present_tail|tail_timing"));
+    int keys = 0;
+    for (auto it = insertKey.globalMatch(source); it.hasNext(); ++keys)
+        ASSERT_FALSE(tailToken.match(it.next().captured(1)).hasMatch());
+    ASSERT_TRUE(keys > 100);
+}
