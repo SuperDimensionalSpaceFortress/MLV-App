@@ -33,6 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene import test_venue_chain_runner as base
+from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings
 
 DV = Path(os.environ["VENUE_CLAIM_FIFO_DV_DIR"]) if os.environ.get("VENUE_CLAIM_FIFO_DV_DIR") else base.DV
 RUNNER = DV / "Invoke-VenueChain.ps1"
@@ -170,11 +171,10 @@ $b3 = Request-VenueClaim -Venue bachelor -RunDir 'run-B' -ClaimDir $d -Ticket $B
         self.assertEqual((r["b3"], r["b3Granted"]), ("TAKEN", True), "once A is gone the next ticket gets the claim")
 
     def test_mutation_without_the_head_check_the_younger_waiter_wins(self) -> None:
-        mut = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)) / MODULE.name
         text = MODULE.read_text(encoding="utf-8")
         anchor = "if ($position -ne 1) {"
         self.assertEqual(text.count(anchor), 1, "mutation anchor moved")
-        mut.write_text(text.replace(anchor, "if ($false) {"), encoding="utf-8")
+        mut = copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)), text.replace(anchor, "if ($false) {"))
         r = self.ps(self.A_FIRST, module=mut)
         self.assertTrue(r["b1Granted"], "the mutant must reproduce the race: the younger waiter that polls first takes the claim")
 
@@ -370,7 +370,7 @@ $plain = Request-VenueClaim -Venue bachelor -RunDir 'run-L2' -ClaimDir $d
         text = RUNNER.read_text(encoding="utf-8")
         self.assertEqual(text.count(old), 1, f"mutation anchor moved: {old}")
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
-        (d / MODULE.name).write_text(MODULE.read_text(encoding="utf-8"), encoding="utf-8")
+        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     def run_kept_head_scenario(self, runner: Path | None) -> tuple[list[str], list[str], list[str]]:
@@ -480,11 +480,10 @@ foreach ($n in @@NAMES@@) { Set-Content -LiteralPath (Join-Path $dir $n) -Value 
         self.assertEqual(self.tie_break_order(list(reversed(want))), want, "equal ticks order by pid then start ticks as NUMBERS, whatever order the files were created in")
 
     def test_r2_mutation_without_the_tie_break_equal_ticks_follow_enumeration_order(self) -> None:
-        mut = Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)) / MODULE.name
         text = MODULE.read_text(encoding="utf-8")
         anchor = "Sort-Object -Property key, pidKey, startKey, name"
         self.assertEqual(text.count(anchor), 1, "mutation anchor moved")
-        mut.write_text(text.replace(anchor, "Sort-Object -Property key"), encoding="utf-8")
+        mut = copy_with_siblings(MODULE, Path(tempfile.mkdtemp(prefix="mut-", dir=self.case)), text.replace(anchor, "Sort-Object -Property key"))
         tick = "0000000000000000100"
         got = self.tie_break_order([f"{tick}-p9-5.ticket.json", f"{tick}-p10-5.ticket.json"], module=mut)
         self.assertEqual(got, [f"{tick}-p10-5.ticket.json", f"{tick}-p9-5.ticket.json"], "the mutant orders by file name text: p10 before p9")

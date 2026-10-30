@@ -29,9 +29,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, sibling_modules
+
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
-RUNNER = DV / "Invoke-VenueChain.ps1"
+RUNNER =DV / "Invoke-VenueChain.ps1"
 MODULE = DV / "VenueChain.psm1"
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -199,6 +201,36 @@ def chain_result(stdout: str) -> dict:
 
 
 @requires_windows_pwsh
+@requires_windows_pwsh
+class VenueFixtureModuleCopyTests(unittest.TestCase):
+    """BACHELOR-THERMAL-GATE-WAIT-1 r14 (CI-B1): the scratch copies the mutation fixtures run must carry every sibling module VenueChain.psm1 imports."""
+
+    def import_copy(self, folder: Path) -> subprocess.CompletedProcess:
+        script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
+                  "& (Get-Module VenueChain) { (Get-Command ConvertFrom-VenueJsonRawIdentity).Module.Path }")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+
+    def test_ci_b1_the_derived_sibling_set_names_the_raw_json_module(self) -> None:
+        self.assertIn("VenueRawJson.psm1", [p.name for p in sibling_modules(MODULE)])
+
+    def test_ci_b1_a_scratch_copy_with_its_siblings_imports_and_resolves_them_from_the_scratch_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci-b1-") as tmp:
+            folder = Path(os.path.realpath(tmp))
+            copy_with_siblings(MODULE, folder)
+            r = self.import_copy(folder)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(Path(r.stdout.strip()), folder / "VenueRawJson.psm1")
+
+    def test_ci_b1_control_a_scratch_copy_without_its_siblings_stops_on_the_import(self) -> None:
+        # the failure the hosted run hit: with only the module copied, the import stops before any mutation under test
+        with tempfile.TemporaryDirectory(prefix="ci-b1-") as tmp:
+            folder = Path(os.path.realpath(tmp))
+            shutil.copy2(MODULE, folder / MODULE.name)
+            r = self.import_copy(folder)
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("VenueRawJson.psm1", r.stdout + r.stderr)
+
+
 class VenueChainRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -257,7 +289,7 @@ class VenueChainRunnerTests(unittest.TestCase):
         if count is not None:
             self.assertEqual(found, count, f"mutation anchor count changed: {old!r}")
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
-        shutil.copy2(MODULE, d / MODULE.name)
+        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     def write_claim(self, pid: int, created_iso: str, expires: datetime, run_dir: str = "C:\\elsewhere\\lane-OTHER") -> str:
@@ -1048,7 +1080,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         text = RUNNER.read_text(encoding="utf-8")
         self.assertEqual(text.count(old), count, f"mutation anchor count changed: {old!r}")
         (d / RUNNER.name).write_text(text.replace(old, new), encoding="utf-8")
-        shutil.copy2(MODULE, d / MODULE.name)
+        copy_with_siblings(MODULE, d)
         return d / RUNNER.name
 
     # ---------------------------------------------------------------- (a) after each Bachelor leg, when ultra-magnus is idle

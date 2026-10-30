@@ -147,6 +147,16 @@ if ($JobId -like 'lease-batch-open-*') {
         $res | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $outbox "$JobId.result.json")
         throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake) for the full -MaxAdmissionWaitSec"
     }
+    if ($env:FAKE_OPEN_VIA_REAL_UMRUN -eq '1') {
+        # r14 (adversary r13 A1): the open's result reaches the runner through the REAL um-run.ps1 reader, the way it does in production: the agent's result file is staged in the outbox
+        # at um-run's first poll and um-run returns what it read. The fake's own drop of the job file is withdrawn first (the real um-run drops it itself).
+        Remove-Item -LiteralPath (Join-Path $AgentShare "inbox\$JobId.job.ps1") -Force
+        [IO.File]::WriteAllText((Join-Path $AgentShare 'heartbeat.txt'), 'alive')
+        $json = $res | ConvertTo-Json -Depth 6
+        $outbox = Join-Path $AgentShare 'outbox'
+        $hook = { New-Item -ItemType Directory -Force -Path $outbox | Out-Null; [IO.File]::WriteAllText((Join-Path $outbox "$JobId.result.json"), $json) }.GetNewClosure()
+        return (& $env:FAKE_REAL_UMRUN -ScriptPath $ScriptPath -JobId $JobId -AgentShare $AgentShare -TimeoutSec 60 -PollSeconds 1 -TestHookAtLoopTop $hook 6>$null)
+    }
     return $res
 }
 if ($JobId -like 'lease-batch-close-*') {
@@ -710,6 +720,24 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         b1 = self.batches()[0]
         self.assertEqual((b1["leaseId"], b1["legsCounted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), (batch_lease, 2, True, batch_lease), b1)
+
+    def test_r14_adversary_a1_the_open_read_by_the_real_um_run_and_a_leg_naming_the_same_timestamp_lease_id_count_on_lease(self) -> None:
+        # adversary r13 A1 on 778fe1aa: um-run.ps1 still ConvertFrom-Json'd the open's result, so the batch held the lease as DateTime text ('10/30/2026 10:00:00') while the leg result's
+        # raw reader returned '2026-10-30T10:00:00Z': onLease false, LEASE_LOST, valid work uncounted. Both now carry the raw string.
+        batch_lease = "2026-10-30T10:00:00Z"
+        real = str(RUNNER.parent.parent / "um-run.ps1")
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_LEASE_ID=batch_lease, FAKE_LEG_LEASE_ID=batch_lease, FAKE_OPEN_VIA_REAL_UMRUN="1", FAKE_REAL_UMRUN=real)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["leaseId"], b1["legsCounted"], b1["legs"][0]["onLease"], b1["legs"][0]["jobLease"]), (batch_lease, 2, True, batch_lease), b1)
+
+    def test_r14_adversary_a1_control_through_the_real_um_run_a_leg_on_another_spelling_of_the_same_instant_is_another_lease(self) -> None:
+        batch_lease = "2026-10-30T10:00:00Z"
+        real = str(RUNNER.parent.parent / "um-run.ps1")
+        r = self.run_batch(self.specs[:2], FAKE_OPEN_LEASE_ID=batch_lease, FAKE_LEG_LEASE_ID="2026-10-30T10:00:00.0Z", FAKE_OPEN_VIA_REAL_UMRUN="1", FAKE_REAL_UMRUN=real)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1 = self.batches()[0]
+        self.assertEqual((b1["leaseId"], b1["endReason"], b1["legsCounted"], b1["legs"][0]["onLease"]), (batch_lease, "LEASE_LOST", 0, False), b1)
 
     def test_r13_adversary_a1_the_agents_batch_receipt_and_the_lease_ledger_keep_the_lease_id_as_written(self) -> None:
         # siblings VenueChain.psm1 Read-VenueLeaseBatchReceipt / Read-VenueLeaseLedger: a timestamp-shaped lease id was a DateTime, so '...:00.0Z' was FOUND for '...:00Z' and the ledger row's id was reformatted

@@ -512,18 +512,88 @@ class ThermalGateModuleTests(unittest.TestCase):
 
     def _r13_chain(self, d: Path, ident1: dict, ident2: dict) -> dict:
         """Two lease-batch receipts in d/batches.jsonl: lease 1 runs a (clear), lease 2 runs b (hot at its first probe). Returns the heavy keys and the spread order."""
-        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
-                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
-                  "[pscustomobject]@{ batches = @($h.rows | ForEach-Object { $_.batch }); heavy = @($hk.Keys); order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
-
         def leg(name: str, heat: str) -> dict:
             return {"name": f"01-{name}-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": heat}
 
         def receipt(ident: dict, legs: list) -> str:
             return json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, **ident, "legs": legs}) + "\n"
 
-        (d / "batches.jsonl").write_text(receipt(ident1, [leg("a", "clear")]) + receipt(ident2, [leg("b", "hot")]), encoding="utf-8")
+        return self._chain_text(d, receipt(ident1, [leg("a", "clear")]) + receipt(ident2, [leg("b", "hot")]))
+
+    @staticmethod
+    def _chain_text(d: Path, text: str) -> dict:
+        """d/batches.jsonl is exactly `text` (lines of lease-batch receipts); returns the batch ids read, the heavy keys and the spread order."""
+        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
+                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
+                  "[pscustomobject]@{ batches = @($h.rows | ForEach-Object { $_.batch }); heavy = @($hk.Keys); order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
+        (d / "batches.jsonl").write_text(text, encoding="utf-8")
         return ps_json(spread.replace("<D>", str(d)))
+
+    # r14 (adversary r13 A2/A3/A4, Dot I1): the raw lease identity is recovered exactly or the receipt is a barrier with no identity (never a legacy token-only receipt)
+    _R14_LEASES = ("2026-10-30T10:00:00Z", "2026-10-30T10:00:00.0Z")
+
+    def _r14_lines(self, shape: str, lease1: str, lease2: str) -> str:
+        def leg(name: str, heat: str) -> dict:
+            return {"name": f"01-{name}-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": heat}
+
+        def rec(lease: str, name: str, heat: str) -> str:
+            body = {"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "leaseId": lease, "token": "t", "legs": [leg(name, heat)]}
+            text = json.dumps(body)
+            if shape == "case":
+                return text.replace('"leaseId"', '"LeaseId"')
+            if shape == "unwrapped":
+                return "[" + text + "]"
+            if shape == "single-quoted":
+                return text.replace('"', "'")
+            return text
+        return rec(lease1, "a", "clear") + "\n" + rec(lease2, "b", "hot") + "\n"
+
+    def test_r14_adversary_a2_a3_a4_distinct_timestamp_leases_in_any_accepted_shape_are_never_chained(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-r14-shapes-"))
+        original = "a-A,a-B,b-A,b-B"
+        for shape in ("plain", "case", "unwrapped", "single-quoted"):
+            got = self._chain_text(d, self._r14_lines(shape, *self._R14_LEASES))
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (shape, got))
+
+    def test_r14_same_lease_control_a_plain_or_case_variant_receipt_still_chains_but_an_unrecoverable_one_is_a_barrier(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-r14-control-"))
+        original, chained = "a-A,a-B,b-A,b-B", "a-A,b-A,a-B,b-B"
+        lease = self._R14_LEASES[0]
+        for shape in ("plain", "case"):
+            got = self._chain_text(d, self._r14_lines(shape, lease, lease))
+            self.assertEqual((got["heavy"], got["order"]), (["a|cpu"], chained), (shape, got))
+        # the raw identity of these cannot be recovered exactly, so even the SAME lease is two barriers (fail closed: no predecessor, never legacy token-only)
+        for shape in ("unwrapped", "single-quoted"):
+            got = self._chain_text(d, self._r14_lines(shape, lease, lease))
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (shape, got))
+
+    def test_r14_dot_i1_an_unrecoverable_receipt_still_needs_the_on_lease_proof_for_a_recorded_grant_heat(self) -> None:
+        # a strict-parser rejection (single quotes) used to null the lease id, which removed the missing-onLease proof: the row's recorded grant heat was then trusted
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-r14-proof-"))
+        a = {"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "onLease": True, "heatAtProbe": "clear"}
+        b = {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "heatAtGrant": "hot"}   # no onLease field
+        script = "$h = Read-VenueLegHeatHistory -RunDir @('<D>'); [pscustomobject]@{ heat = @($h.rows | ForEach-Object { $_.heat }) }"
+
+        def heat(text: str) -> list:
+            (d / "batches.jsonl").write_text(text + "\n", encoding="utf-8")
+            return ps_json(script.replace("<D>", str(d)))["heat"]
+        receipt = {"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "token": "t", "legs": [a, b]}
+        self.assertEqual(heat(json.dumps({**receipt, "leaseId": "L1"})), ["clear", "unknown"])                       # the proof is needed with a lease id
+        self.assertEqual(heat(json.dumps({**receipt, "leaseId": "2026-10-30T10:00:00Z"}).replace('"', "'")), ["clear", "unknown"])   # and when the lease id is unrecoverable
+        self.assertEqual(heat(json.dumps(receipt)), ["clear", "hot"])                                              # a receipt older than the lease id reads as before
+
+    def test_r14_a_line_that_is_not_a_readable_receipt_is_a_barrier_row_named_in_skipped(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-r14-unreadable-"))
+        both_cases = '{"leaseId": "L1", "LeaseId": "L2", "token": "t", "legs": []}'   # ConvertFrom-Json refuses two properties that differ only by case
+        (d / "batches.jsonl").write_text(both_cases + "\n", encoding="utf-8")
+        got = ps_json("$h = Read-VenueLegHeatHistory -RunDir @('" + str(d) + "'); [pscustomobject]@{ batches = @($h.rows | ForEach-Object { $_.batch }); keys = @($h.rows | ForEach-Object { $_.key }); skipped = @($h.skipped) }")
+        self.assertEqual(got["batches"], ["1.unreadable:1"], got)
+        self.assertEqual(len(got["skipped"]), 1, got)
+        self.assertIn("unreadable line", got["skipped"][0])
 
     def test_r13_adversary_a1_timestamp_shaped_lease_ids_that_read_as_one_datetime_are_distinct_leases(self) -> None:
         # adversary r12 A1 on 08c9aef5 (VenueThermalGate.psm1:249): `$line | ConvertFrom-Json` turns a timestamp-shaped leaseId / token into a DateTime BEFORE the [string] cast, so two

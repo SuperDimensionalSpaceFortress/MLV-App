@@ -247,11 +247,20 @@ function Read-VenueLegHeatHistory {
         if (-not $isFile) { $skipped.Add("$dir (no batches.jsonl)"); continue }
         # adversary r1 A7: a file that cannot be read (held exclusively, gone) is skipped and named, never a throw that refuses the whole plan
         $lines = try { [IO.File]::ReadAllLines($f) } catch { $skipped.Add("$f (unreadable: $($_.Exception.Message -replace '\s+', ' '))"); continue }
-        $lineNo = 0
+        $lineNo = 0; $srcLine = 0
         foreach ($line in $lines) {
+            $srcLine++
             if (-not $line.Trim()) { continue }
-            $b = try { ConvertFrom-VenueJsonRawIdentity -Text $line } catch { $null }
-            if ($null -eq $b -or $b -isnot [System.Management.Automation.PSCustomObject] -or -not $b.PSObject.Properties['legs']) { $skipped.Add("$f (unreadable line)"); continue }
+            $rr = try { Read-VenueJsonRawIdentity -Text $line } catch { $null }
+            $b = $(if ($null -ne $rr) { $rr.value } else { $null })
+            if ($null -eq $b -or $b -isnot [System.Management.Automation.PSCustomObject] -or -not $b.PSObject.Properties['legs']) {
+                # r14 (adversary r13 A4 / Dot I1): a line that is not a readable receipt was still a lease that ran between its neighbours: it stays in the sequence as a barrier row, so the
+                # leg after it is never charged to the leg before it
+                $skipped.Add("$f (unreadable line)"); $rows.Add([pscustomobject]@{ batch = "$d.unreadable:$srcLine"; key = $null; name = $null; status = 'UNKNOWN'; heat = 'unknown' }); continue
+            }
+            # r14 (adversary r13 A2/A3/A4, Dot I1): a receipt whose raw identity could not be recovered exactly carries no identity (Read-VenueJsonRawIdentity): it is a barrier with no
+            # predecessor, never a legacy token-only receipt, and its rows still need their on-lease proof
+            $exact = [bool]$rr.exact
             # adversary r1 A8: one lease is one batch receipt (token), not one batch number: a reused -RunDir numbers its batches from 1 again
             # r8 (adversary efe7699b A2): a receipt with no token is a lease of its own (its line), never grouped with another by batch number: two leases L1 and L2
             # both numbered batch 1 became one sequence and L2's hot first leg was charged to L1's last
@@ -267,7 +276,7 @@ function Read-VenueLegHeatHistory {
             # still identified by its token
             $leaseText = $(if ($b.PSObject.Properties['leaseId'] -and $null -ne $b.leaseId) { [string]$b.leaseId } else { '' })
             $leaseBlank = ($leaseText.Length -gt 0 -and [string]::IsNullOrWhiteSpace($leaseText))
-            $lease = $(if (-not $tokenBlank -and -not $leaseBlank) { "tok:$($leaseText.Length):${leaseText}:$($tokenText.Length):$tokenText" } else { "line:$lineNo" })
+            $lease = $(if ($exact -and -not $tokenBlank -and -not $leaseBlank) { "tok:$($leaseText.Length):${leaseText}:$($tokenText.Length):$tokenText" } else { "line:$lineNo" })
             $leaseLabel = $(if (-not $tokenBlank) { $tokenText } else { "line $lineNo" })
             $unnamed = 0
             foreach ($l in @($b.legs)) {
@@ -288,7 +297,7 @@ function Read-VenueLegHeatHistory {
                 $batchLease = $(if ($b.PSObject.Properties['leaseId'] -and $b.leaseId) { [string]$b.leaseId } else { $null })
                 $hasOnLease = [bool]$l.PSObject.Properties['onLease']
                 $offLease = ($hasOnLease -and -not ($l.onLease -is [bool] -and $l.onLease))
-                $needLeaseProof = (-not $hasOnLease -and $null -ne $batchLease)
+                $needLeaseProof = (-not $hasOnLease -and ($null -ne $batchLease -or -not $exact))
                 if ($l.PSObject.Properties['heatAtProbe'] -and [string]$l.heatAtProbe -cin @('hot', 'clear')) { $heat = [string]$l.heatAtProbe }
                 elseif ($offLease) { }
                 elseif (-not $needLeaseProof -and $l.PSObject.Properties['heatAtGrant'] -and [string]$l.heatAtGrant -cin @('hot', 'clear')) { $heat = [string]$l.heatAtGrant }
