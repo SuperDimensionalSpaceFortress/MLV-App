@@ -19379,19 +19379,13 @@ double MainWindow::getFramerate( void )
 //rate, or the conform rate for a high-frame-rate clip. No export-override input, by design.
 double MainWindow::getPlaybackFramerate( void )
 {
-    return playback_conform::playbackFps( getMlvFramerate( m_pMlvObject ),
-                                          m_conformEnabled,
-                                          m_conformTargetFps,
-                                          m_conformThresholdFps );
+    return playback_conform::playbackFps( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );
 }
 
 bool MainWindow::playbackConformActive( void )
 {
     return m_fileLoaded && m_pMlvObject
-        && playback_conform::conformApplies( getMlvFramerate( m_pMlvObject ),
-                                             m_conformEnabled,
-                                             m_conformTargetFps,
-                                             m_conformThresholdFps );
+        && playback_conform::conformApplies( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );
 }
 
 //Auto quality target: capped by the playback rate ONLY while conform is active, so a clip at or under
@@ -19400,9 +19394,7 @@ bool MainWindow::playbackConformActive( void )
 int MainWindow::effectivePlaybackAutoTargetFps( void )
 {
     if( playback_auto_target_fps_env_override() > 0 ) return m_playbackAutoTargetFps;
-    return playback_conform::effectiveAutoTargetFps( m_playbackAutoTargetFps,
-                                                     m_pMlvObject ? getPlaybackFramerate() : 0.0,
-                                                     playbackConformActive() );
+    return playback_conform::effectiveAutoTargetFps( m_playbackAutoTargetFps, m_pMlvObject ? getPlaybackFramerate() : 0.0, playbackConformActive() );
 }
 
 //The ONLY place m_tryToSyncAudio is raised: audio is muted while conform is active (its native
@@ -19438,8 +19430,7 @@ void MainWindow::setupPlaybackConformMenu( void )
         const playback_conform::Settings saved = playback_conform::loadSettings( set );
         m_conformEnabledSetting = saved.enabled;
         // HFR-NATIVE-60FPS-FULLRES-1: MLVAPP_PLAYBACK_CONFORM=0|1 wins for this process and is never persisted.
-        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(),
-                                                                    saved.enabled );
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), saved.enabled );
         m_conformTargetFps = saved.targetFps;
         m_conformThresholdFps = saved.thresholdFps;
     }

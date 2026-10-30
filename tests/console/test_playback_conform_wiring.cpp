@@ -239,6 +239,21 @@ TEST(PlaybackConformWiring, ExportOverrideNeverReachesThePlaybackRate)
     ASSERT_FALSE(body.contains(QStringLiteral("getFramerate(")));
 }
 
+// HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1): the four conform policy calls are pinned with
+// their FULL argument list, so a flipped bool argument (!m_conformEnabled, !saved.enabled, !playbackConformActive()) fails here.
+TEST(PlaybackConformWiring, ConformPolicyCallsPassTheirFullArgumentLists)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "return playback_conform::playbackFps( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "&& playback_conform::conformApplies( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "return playback_conform::effectiveAutoTargetFps( m_playbackAutoTargetFps, m_pMlvObject ? getPlaybackFramerate() : 0.0, playbackConformActive() );")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), saved.enabled );")));
+}
+
 TEST(PlaybackConformWiring, ExportCallSitesStillReadTheExportRate)
 {
     const QString source = mainWindowSource();
