@@ -41,6 +41,8 @@
 #ifndef DEBAYERED16RECONREUSEPOLICY_H
 #define DEBAYERED16RECONREUSEPOLICY_H
 
+#include "../../src/debug/StageTiming.h"
+#include "../../src/mlv/pipeline_stage_capture.h"
 #include "../../src/mlv_include.h"
 
 #include <algorithm>
@@ -533,8 +535,13 @@ struct Debayered16InlineReducedReconInputs
 /*! \return true when the render should reconstruct this frame at the reduced scale. */
 inline bool debayered16InlineReducedReconWanted( const Debayered16InlineReducedReconInputs & in )
 {
-    (void)in;
-    return false;
+    if( Debayered16ReconReusePolicy::killSwitchSet() ) return false;
+    if( in.slotReconned ) return false;
+    if( !in.phase3Disabled ) return false;
+    if( !in.honourScaleAdmitted ) return false;
+    if( !in.playbackActive ) return false;
+    if( in.scale != 2 && in.scale != 4 ) return false;
+    return !in.frameCacheMayServe;
 }
 
 /*! One inline reduced recon. Reconstructed false leaves the frame to today's
@@ -557,7 +564,9 @@ struct Debayered16InlineReducedRecon
 };
 
 /*! The recon worker's reduced recon on the calling thread. rawBuffer (rawWords
- *  words) receives the decode. */
+ *  words) receives the decode. The plan reads no pixels, so a frame it refuses
+ *  costs no decode. A null worker state is the calling thread's own pool slot,
+ *  which reseeds from the shared object on every call, like the recon worker's. */
 inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject_t * video,
                                                                        uint32_t frameNumber,
                                                                        int scale,
@@ -566,14 +575,59 @@ inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject
                                                                        size_t rawWords,
                                                                        std::vector<uint16_t> & reducedBayer )
 {
-    (void)video;
-    (void)frameNumber;
-    (void)scale;
-    (void)threads;
-    (void)rawBuffer;
-    (void)rawWords;
-    (void)reducedBayer;
-    return Debayered16InlineReducedRecon();
+    Debayered16InlineReducedRecon recon;
+    recon.provenance.settingsAtDecode = video ? getMlvLlrawprocSettingsFingerprint( video ) : 0;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    if( !mlvDualIsoPreviewScaleReconPlan( video, scale, &plan ) )
+    {
+        recon.fallbackReason = plan.reason;
+        return recon;
+    }
+    if( plan.scale != scale )
+    {
+        recon.fallbackReason = "reduced recon plan is not at the requested scale";
+        return recon;
+    }
+    if( !rawBuffer
+     || rawWords < static_cast<size_t>( plan.fullWidth ) * static_cast<size_t>( plan.fullHeight ) )
+    {
+        recon.fallbackReason = "raw buffer is smaller than the frame";
+        return recon;
+    }
+    try
+    {
+        reducedBayer.resize( static_cast<size_t>( plan.reducedWidth )
+                             * static_cast<size_t>( plan.reducedHeight ) );
+    }
+    catch( const std::bad_alloc & )
+    {
+        recon.fallbackReason = "reduced recon buffer allocation failed";
+        return recon;
+    }
+    const double decodeStart = mlv_stage_timing_now();
+    recon.provenance.acquisitionSucceeded =
+        getMlvRawFrameUint16( video, frameNumber, rawBuffer ) == 0;
+    recon.decoded = true;
+    recon.decodeMs = ( mlv_stage_timing_now() - decodeStart ) * 1000.0;
+    if( !recon.provenance.acquisitionSucceeded )
+    {
+        recon.fallbackReason = "the render's decode of this frame failed";
+        return recon;
+    }
+    mlv_pipeline_capture_set_current_frame( frameNumber );
+    if( mlvDualIsoPreviewScaleReconRun( video, &plan, rawBuffer, reducedBayer.data(), nullptr, threads,
+                                        &recon.fullResFixesMs, &recon.downsampleMs ) != 1 )
+    {
+        recon.fallbackReason = "reduced recon rejected by the scaled llrawproc subset";
+        return recon;
+    }
+    recon.llrawprocMs = llrpGetLastTotalMilliseconds();
+    recon.provenance.done = debayered16ReconDoneStamp( video );
+    recon.scale = plan.scale;
+    recon.reducedWidth = plan.reducedWidth;
+    recon.reducedHeight = plan.reducedHeight;
+    recon.reconstructed = true;
+    return recon;
 }
 
 /*! The policy inputs of a frame the render reconstructed itself: its own recon,
