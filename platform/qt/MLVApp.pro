@@ -393,7 +393,10 @@ HEADERS += MainWindow.h \
            PlaybackAudioGate.h \
            PlaybackEnvFlags.h \
            PlaybackWorkerJoin.h \
+           PlaybackPrepInFlightGate.h \
+           ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
+           PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \

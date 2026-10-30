@@ -114,6 +114,29 @@ inline long long contactSheetInPassTargetMs( int i, int frameCount, long long wi
         ( 2.0 * i + 1.0 ) * static_cast<double>( windowMs ) / ( 2.0 * frameCount ) ) );
 }
 
+// VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): an UNPACED run stops at its required source frames, so one faster
+// than the paced rate stops before the wall-clock centres above (480 frames at 60 fps stop at 8 s, before a 10 s
+// target) and a healthy faster run exited 14 with its capture never taken. Unpaced, each target is instead the centre
+// of N equal slices of the REQUIRED SOURCE FRAMES, which the run passes before it stops at any fps. Clamped to
+// [1, required]; 0 when frameCount <= 0 or required <= 0 (never due).
+inline int64_t contactSheetInPassTargetSourceFrames( int i, int frameCount, int64_t requiredSourceFrames )
+{
+    if( frameCount <= 0 || requiredSourceFrames <= 0 ) return 0;
+    const int64_t centre = static_cast<int64_t>( std::llround(
+        ( 2.0 * i + 1.0 ) * static_cast<double>( requiredSourceFrames ) / ( 2.0 * frameCount ) ) );
+    return std::min<int64_t>( requiredSourceFrames, std::max<int64_t>( 1, centre ) );
+}
+
+// The ONE "is this in-pass target due" decision noteContactSheetPresentedFrame() makes. Paced: the wall clock since the
+// measured Play started, unchanged (a paced target the Play never reaches still leaves the sheet short: exit 14).
+// Unpaced: the distinct source frames consumed.
+inline bool contactSheetInPassTargetDue( bool unpaced, int64_t elapsedMs, int64_t targetMs,
+                                         int64_t consumedSourceFrames, int64_t targetSourceFrames )
+{
+    if( unpaced ) return targetSourceFrames > 0 && consumedSourceFrames >= targetSourceFrames;
+    return elapsedMs >= targetMs;
+}
+
 // The in-pass grabs run on the GUI thread inside the measured interval. The honest companion to the
 // leg's fps is the fps with their recorded cost taken out of the elapsed time: equal to the measured
 // fps when nothing was grabbed, never lower. A grab total that swallows the interval is a broken

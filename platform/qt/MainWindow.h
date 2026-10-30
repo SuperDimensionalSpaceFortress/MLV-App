@@ -33,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
@@ -735,6 +736,7 @@ private:
                 scopeSourceImage = sourceImage;
                 scopeSourceImageSize = sourceImageSize;
                 readyFrame.rawImage8 = sourceImage;
+                readyFrame.rawImage8Bytes = sourceImageSize;
             }
             if( !ownedSourceImage16.empty() )
             {
@@ -888,6 +890,24 @@ private:
     bool m_audioExportEnabled;
     bool m_hdrExport;
     bool m_exportAbortPressed;
+    // r3: an export job whose open a busy prep task refused is retried, not dropped.
+    bool m_exportRetryHeadJob = false;
+    int m_exportOpenAbortRetries = 0;
+    // r3: true while the sliders describe no receipt (a prep-refused open left them); setReceipt is a no-op.
+    // r4: setSliders applies nothing either; only a successful open (markClipOpenSucceeded) re-attaches them.
+    bool m_slidersDetachedFromReceipt = false;
+    // r4 (adversary A4): bumped by every successful clip open; a deferred reopen scheduled under an older value
+    // is a no-op, and so is one that fires while an export holds a clip (GUI block to final reopen).
+    unsigned long long m_clipOpenGeneration = 0;
+    // r5 (Dot 29eac4d5 A1): the file the last successful open loaded; receiptOwnedByLoadedClip compares it with
+    // the active row. A refused direct receipt write is logged once per clip-open generation.
+    QString m_loadedClipFileName;
+    unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
+    bool m_exportInProgress = false;
+    // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
+    unsigned long long m_exportBatchGeneration = 0;
+    // r4: set while a deferred reopen runs, so a refusal inside it is not retried again.
+    bool m_inClipReopenRetry = false;
     bool m_zoomTo100Center;
     bool m_zoomModeChanged;
     bool m_playbackStopped;
@@ -1213,6 +1233,10 @@ private:
     };
     QElapsedTimer m_contactSheetCaptureClock;
     QVector<qint64> m_contactSheetCaptureTargetMs;
+    // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2: an unpaced measured Play keys its targets to source frames consumed
+    // (contactSheetInPassTargetDue), so a run that outpaces the wall-clock centres still takes them before it stops.
+    QVector<qint64> m_contactSheetCaptureTargetSourceFrames;
+    bool m_contactSheetCaptureUnpaced = false;
     QVector<ContactSheetPendingGrab> m_contactSheetPendingGrabs;
     int m_contactSheetCaptureNextTargetIndex = 0;
     int m_contactSheetCaptureStartFrame = 0;
@@ -1615,6 +1639,7 @@ private:
     bool m_playbackPrepPendingValid = false;
     PlaybackPrepTask m_playbackPrepPending;
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
+    PlaybackPrepInFlightGate m_playbackPrepInFlight;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};
@@ -1759,7 +1784,11 @@ private:
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
-    void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
+    PlaybackPrepDrainOutcome drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
+    // Returns playbackPrepBorrowFreeingMutationAllowed for its drain: a caller that
+    // then frees memory a prep task borrows must abort on false.
+    bool waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
+    bool playbackPrepQuiescentBeforeClipReplacement( const char *reason );
     struct PlaybackPrepThreadState;
     PlaybackPrepResult buildPlaybackPrepResult( const PlaybackPrepTask &task,
                                                 PlaybackPrepThreadState *threadState = nullptr );
@@ -1788,7 +1817,7 @@ private:
     QString playbackDebayerLabel( void ) const;
     QString selectedPlaybackProcessingLabel( void ) const;
     QString playbackProcessingLabel( void ) const;
-    void importNewMlv(QString fileName);
+    bool importNewMlv(QString fileName);
     int openMlvForPreview(QString fileName);
     int openMlv(QString fileName);
     void playbackHandling( int timeDiff );
@@ -1801,7 +1830,7 @@ private:
     void startExportCdng( QString fileName );
     void startExportMlv( QString fileName );
     void startExportAVFoundation( QString fileName );
-    void addFileToSession( QString fileName );
+    ClipInformation *addFileToSession( QString fileName );
     int askToSaveCurrentSession( void );
     void openSession(QString fileNameSession );
     void saveSession( QString fileName );
@@ -1811,7 +1840,7 @@ private:
     void initPlaybackPreviewModeFromSettings( void );
     void initPlaybackPreviewResolutionFromSettings( void );
     void drainLookAssistWorkers( const char *reason );
-    void freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
+    bool freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
     void initPlaybackScaleFactorFromSettings( void );
     void seedPlaybackQualityActiveStateForCurrentContext( void );
     void resetPlaybackQualityAutoRunState( void );
@@ -1862,7 +1891,13 @@ private:
     void replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings *receiptSource , bool paste);
     void resetReceiptWithDefault( ReceiptSettings *receipt );
     int showFileInEditor(int row);
-    void addClipToExportQueue( int row, QString fileName );
+    void markClipOpenSucceeded( void );
+    bool loadedClipIsRow( int row ) const;
+    bool receiptOwnedByLoadedClip( const char *site );
+    void retryClipReopenAfterPrepAbort( int row );
+    void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );
+    void resetExportOpenAbortRetries( void );
+    bool addClipToExportQueue( int row, QString fileName );
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );

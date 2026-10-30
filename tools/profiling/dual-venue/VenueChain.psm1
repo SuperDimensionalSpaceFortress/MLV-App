@@ -599,18 +599,59 @@ function Get-VenueStagedBuildManifest {
     .SYNOPSIS
     The sha256 of the build manifest already staged on a venue (<AgentShare>\cache\playback-attr-3-cuda-<sha12>-build.json, the file Invoke-VenueLeg hashes), read
     on a worker thread and given up after -TimeoutSec (a UNC path of a host that is down can block a Test-Path for minutes). Never stages anything.
+    r5 (adversary A2): the same read also reports what the leg job's own validator (Assert-AttrCudaBuildManifest) needs INSIDE the file: it parses, it declares
+    -SourceCommit, its dllPairManifestSha256 is 64 hex and its pendingSymbolPresence is a boolean. contentProblem says which fails ('' = none; $null = not checked,
+    which is what an offline -ProbeScript that returns only a hash gets).
     .OUTPUTS
-    [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error }
+    [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
     param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null)
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
-    $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else { { param($p) if (Test-Path -LiteralPath $p -PathType Leaf) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' } } })
+    $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
+            {
+                param($p)
+                # r13 (Dot A1''): a read that fails (a manifest a writer holds open, a share error) ends the read, so it is UNREACHABLE with its own error. Under the runspace's default
+                # Continue, a failed byte read went on with no bytes and the read reported NOT_STAGED, a manifest it never looked at.
+                $ErrorActionPreference = 'Stop'
+                if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
+                # ONE read: the digest and the facts below come from the same bytes (a file replaced between two reads would pair one version's hash with another's content)
+                $bytes = [IO.File]::ReadAllBytes($p)
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                # r6 (adversary A1): decoded exactly as Assert-AttrCudaBuildManifest's own file read does (UTF-8 default, ONE BOM consumed, UTF-16/32 by BOM), from the bytes already hashed
+                $m = try { [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true).ReadToEnd() | ConvertFrom-Json } catch { $null }
+                if ($null -eq $m) { 'UNPARSEABLE'; return }
+                $c = $m.PSObject.Properties['sourceCommit']; 'C:' + $(if ($null -eq $c) { '' } else { [string]$c.Value })
+                $d = $m.PSObject.Properties['dllPairManifestSha256']; 'D:' + $(if ($null -eq $d) { '' } else { ([string]$d.Value).ToLowerInvariant() })
+                $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
+                # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
+                # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
+                foreach ($k in 'packageZip', 'exe', 'dll') {
+                    $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
+                    'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                }
+            } })
     $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
-    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error } }
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
-    if ($sha -cmatch '^[0-9a-f]{64}$') { return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null } }
-    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null }
+    if ($sha -cmatch '^[0-9a-f]{64}$') {
+        $problem = $null
+        if ($r.value.Count -gt 1) {
+            $facts = @($r.value | Select-Object -Skip 1 | ForEach-Object { [string]$_ })
+            $commit = @($facts | Where-Object { $_.StartsWith('C:') }) | Select-Object -First 1
+            $dll = @($facts | Where-Object { $_.StartsWith('D:') }) | Select-Object -First 1
+            $sym = @($facts | Where-Object { $_.StartsWith('S:') }) | Select-Object -First 1
+            $problem = $(if ($facts -contains 'UNPARSEABLE') { 'ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE the staged manifest is not JSON' }
+                elseif ($commit.Substring(2) -ne $SourceCommit) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
+                elseif ($dll.Substring(2) -notmatch '^[0-9a-f]{64}$') { "ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND the staged manifest carries no well-formed dllPairManifestSha256 (got '$($dll.Substring(2))')" }
+                elseif ($sym -ne 'S:bool') { 'ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID the staged manifest pendingSymbolPresence is not a boolean' }
+                elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }
+                else { '' })
+        }
+        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem }
+    }
+    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null }
 }
 
 $script:VenueAbandonedReads = 0
@@ -970,6 +1011,31 @@ function Read-VenueLeaseBatchReceipt {
     [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
 }
 
+function Get-VenueInterleavedLegPlan {
+    <#
+    .SYNOPSIS
+    LEASE-BATCH-MULTI-BUILD-1: a lease-batch leg plan with its arms INTERLEAVED (A B A B ...) instead of run in blocks, so lease position and venue heat fall on
+    every arm alike. Arms are taken in order of first appearance, one leg each per round, each arm's legs keeping their own order; an arm with more legs than the
+    others runs its remainder at the end (A A A B -> A B A A). Every item is returned once; nothing is added or dropped.
+    .OUTPUTS
+    The -Items objects, reordered.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
+    # An arm label is case-sensitive (the plan validates it with -cnotmatch, so A and a are two labels): an [ordered]@{} would key them case-insensitively and merge them.
+    $queues = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.Queue[object]]]::new([StringComparer]::Ordinal)
+    $armOrder = [System.Collections.Generic.List[string]]::new()
+    foreach ($it in $Items) {
+        $arm = [string]$it.arm
+        if (-not $queues.ContainsKey($arm)) { $queues[$arm] = [System.Collections.Generic.Queue[object]]::new(); $armOrder.Add($arm) }
+        $queues[$arm].Enqueue($it)
+    }
+    $left = $Items.Count
+    while ($left -gt 0) {
+        # the comma keeps an array-valued item ONE output object (a bare Dequeue() result would be enumerated into its elements)
+        foreach ($arm in $armOrder) { $q = $queues[$arm]; if ($q.Count -gt 0) { , $q.Dequeue(); $left-- } }
+    }
+}
+
 function Get-VenueLegPreLoadMean {
     <#
     .SYNOPSIS
@@ -1167,5 +1233,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

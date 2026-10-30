@@ -1,0 +1,39 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-pace-cinematic-agxoff-unpaced",
+  "card": "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1",
+  "legType": "speed",
+  "clipId": "M16-1243",
+  "playSeconds": 20,
+  "backends": ["cuda", "cpu"],
+  "scaleFactor": 2,
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "swapInterval": 0, "unpaced": true, "presentTrace": true, "forceLookAssist": true, "lookFlavor": "cinematic", "lookReceipt": "look-receipts/agx-off.marxml", "lookReceiptSha256": "1481809362b949466bd8c85cd602afea52cc8a4a0ae5c134ed287a8c272f09de" },
+  "visualCapture": false,
+  "visualCaptureOptOutReason": "unpaced throughput/stage leg: the untimed capture tail keeps playing unpaced past the measured window, so its presents count against the header-frame loop check and blur the measured rate",
+  "presentTearingExpectedReason": "unpaced headroom leg at swap interval 0: every present goes out with SyncInterval 0, so PresentMon reports AllowsTearing=1 on its Independent Flip presents by design; a measurement-only mode (MLVAPP_PLAYBACK_UNPACED is honoured only in an automation run) that no user playback path reaches",
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ]
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ]
+    }
+  }
+}

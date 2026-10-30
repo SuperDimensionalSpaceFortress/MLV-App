@@ -100,6 +100,8 @@ FAKE_ASSEMBLE = r"""
 Add-Content -LiteralPath $env:FAKE_CALLS -Value "ASSEMBLE sha=$SourceCommit dll=$DllPairDir out=$OutDir pid=$PID"
 switch ($env:FAKE_ASSEMBLE) {
     'guard' { "BUILD_MEM_REFUSED label=attr3-assemble:$($SourceCommit.Substring(0, 12)) freePhysGB=1.2 freeCommitGB=2.3 need=6/8 waitedSec=1200 utc=fixture"; exit 3 }
+    'requeue' { "BUILD_HEAVY_SLOT_REQUEUE label=attr3-assemble:$($SourceCommit.Substring(0, 12)) code=$env:FAKE_REQUEUE_CODE ticket=t-1 reason=timed out utc=2026-10-29T10:00:00Z"; exit 3 }
+    'slot-busy' { "BUILD_SLOT_BUSY label=attr3-assemble:$($SourceCommit.Substring(0, 12)) heldBy=[pid=1 label=peer] waitedSec=1200 utc=fixture"; exit 3 }
     'fail' { 'RESULT=ASSEMBLE_FAILED STEP=make EXIT=15'; exit 15 }
     'sleep' { Start-Sleep -Seconds 300; exit 0 }
 }
@@ -683,6 +685,24 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertTrue(any(l.startswith(f"BUILD_MEM_REFUSED label=attr3-assemble:{S12} ") for l in p.stdout.splitlines()), p.stdout)
         self.assertFalse(any("stage" in c for c in self.submissions()), self.submissions())
         self.assertEqual(self.rows()[-1]["outcome"], "BUILD_GUARD_REFUSED")
+
+    def test_a_heavy_slot_requeue_is_a_build_guard_refusal_never_an_assembly_failure(self) -> None:
+        # MLV-VM-HEAVY-SLOT-ADOPT-1 r13 (sol r12 B1): the machine heavy slot's REQUEUE (heavy-slot code 75/76/77) is a capacity
+        # refusal like BUILD_MEM_REFUSED and BUILD_SLOT_BUSY (the controls), never ASSEMBLE_FAILED (exit 45).
+        self.built_dll_pair()
+        for mode, code, token in (("requeue", "75", "BUILD_HEAVY_SLOT_REQUEUE"), ("requeue", "76", "BUILD_HEAVY_SLOT_REQUEUE"),
+                                  ("requeue", "77", "BUILD_HEAVY_SLOT_REQUEUE"), ("guard", "", "BUILD_MEM_REFUSED"),
+                                  ("slot-busy", "", "BUILD_SLOT_BUSY")):
+            with self.subTest(mode=mode, code=code):
+                p = self.run_driver(env={"FAKE_ASSEMBLE": mode, "FAKE_REQUEUE_CODE": code})
+                self.assert_exit(p, "BUILD_GUARD_REFUSED")
+                lines = [l for l in p.stdout.splitlines() if l.startswith(f"{token} label=attr3-assemble:{S12} ")]
+                self.assertEqual(len(lines), 1, p.stdout)
+                if code:
+                    self.assertIn(f" code={code} ticket=t-1 reason=timed out ", lines[0])
+                self.assertNotIn("ASSEMBLE_FAILED", p.stdout)
+                self.assertFalse(any("stage" in c for c in self.submissions()), self.submissions())
+                self.assertEqual(self.rows()[-1]["outcome"], "BUILD_GUARD_REFUSED")
 
     def test_an_assembler_failure_is_typed(self) -> None:
         self.built_dll_pair()

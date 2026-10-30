@@ -38,7 +38,7 @@
 # FLOORS. The disk floor and the host commit ceiling are the ONE shared board scripts <main checkout>\.claude-state\hub-autopilot\disk-floor.ps1 (Test-DiskFloor) and
 # host-commit-gate.ps1 (Test-HostCommitGate), dot-sourced, never copied. A missing or unloadable gate script is GATE_UNAVAILABLE (fail closed, never an admit). A refusal
 # prints the gate's own text VERBATIM and exits 3: the hub autopilot re-arms a capacity refusal on exactly that text. A build-guard refusal of the assembler
-# (BUILD_MEM_REFUSED / BUILD_SLOT_BUSY) is printed verbatim and exits 3 too.
+# (BUILD_MEM_REFUSED / BUILD_SLOT_BUSY / BUILD_HEAVY_SLOT_REQUEUE) is printed verbatim and exits 3 too.
 #
 # BOUNDED. Every child (generators, um-run, the assembler) runs as a process bounded by what is left of -MaxTotalSec and is killed, with its tree, past it. um-run gets
 # the same remaining budget as its queue / admission / claimed waits, so it normally ends itself first; an um-run killed at the cap is STAGE_UNRESOLVED (the agent may
@@ -575,7 +575,9 @@ if ($buildInCache) {
         Say "assemble $commit -> $buildDir (build-guard)"
         $a = Invoke-Child 'assemble' $Assembler @('-SourceCommit', $commit, '-DllPairDir', $dllDir, '-OutDir', $buildDir)
         if ($a.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the assembler was still running at the $MaxTotalSec s cap and was killed (see $($script:WorkDir)\assemble.log)" }
-        $guard = @($a.out -split "`r?`n" | Where-Object { $_ -match '^(BUILD_MEM_REFUSED|BUILD_SLOT_BUSY)\b' })
+        # A machine heavy-slot REQUEUE (heavy-slot code 75/76/77, or its holder gone before the action) is a capacity refusal
+        # like the other two, never an assembly failure (MLV-VM-HEAVY-SLOT-ADOPT-1 r13, sol r12 B1).
+        $guard = @($a.out -split "`r?`n" | Where-Object { $_ -match '^(BUILD_MEM_REFUSED|BUILD_SLOT_BUSY|BUILD_HEAVY_SLOT_REQUEUE)\b' })
         if ($a.exit -eq 3 -and $guard.Count -gt 0) { Stop-Nightly 'BUILD_GUARD_REFUSED' 'the build guard refused the assemble' -Verbatim $guard }
         $ok = [regex]::Match($a.out, '(?m)^RESULT=ASSEMBLE_OK SOURCE=([0-9a-f]{40}) .*MANIFEST_SHA256=([0-9a-f]{64})')
         if ($a.exit -ne 0 -or -not $ok.Success -or $ok.Groups[1].Value -cne $commit) {
