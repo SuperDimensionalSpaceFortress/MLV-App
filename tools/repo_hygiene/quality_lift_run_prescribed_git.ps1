@@ -1,7 +1,8 @@
 # Test harness for test_quality_lift_adversary_template.py. ASCII only.
 # Reads a rendered adversary prompt and takes every double-backticked ``git -C ...`` command it prescribes.
 # Each command is parsed first and refused unless it is ONE plain command whose elements are all constant
-# strings (a double-quoted string, a variable, a subexpression, ; & | are all refused), so nothing the prompt
+# strings (a constant single- or double-quoted string is accepted; an expandable string, a variable, a
+# subexpression, ; & | are all refused), so nothing the prompt
 # holds can run. It is then run as `git <the arguments PowerShell resolved>` against a git stub that is a real
 # child process (quality_lift_echo_args.ps1), so the arguments cross the same native-argument conversion a real
 # git.exe would see. The received argument lists are written as UTF-8 JSON to -OutPath. No real git runs.
