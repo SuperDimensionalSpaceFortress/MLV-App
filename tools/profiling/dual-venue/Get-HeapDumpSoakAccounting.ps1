@@ -61,21 +61,27 @@ function Get-SoakCaptureClass($r) {
     $watchNone = ($null -ne $p['watch']) -and ([string]$r.watch -ceq 'none')
     # r11 (adversary r10 A6): a leg is unattached only when nothing in its record asks for or shows the debugger: no captureState, no r6b watcher log,
     # heapCorruptionDump not true and no watch but 'none'. A record that says watch 'none' AND carries any of those contradicts itself: not verified.
-    $debuggerNamed = ($null -ne $p['captureState']) -or ($null -ne $p['heapDumpWatch']) -or
+    # r12 pass 2 (adversary 9621fe1e A2): every watcher log the record carries -- the r6b/r7 heapDumpWatch text and the typed record's watcherLog tail --
+    # is debugger evidence, and each is read for a failed capture, whichever branch judges the record
+    $logs = @()
+    if ($null -ne $p['heapDumpWatch']) { $logs += [string]$r.heapDumpWatch }
+    if ($null -ne $p['watcherLog']) { $logs += (@($r.watcherLog | ForEach-Object { [string]$_ }) -join "`n") }
+    $logFailed = @($logs | Where-Object { Test-SoakLogCaptureFailed $_ }).Count -gt 0
+    $debuggerNamed = ($null -ne $p['captureState']) -or ($logs.Count -gt 0) -or
         (($null -ne $p['heapCorruptionDump']) -and (Test-JsonTrue $r.heapCorruptionDump)) -or (($null -ne $p['watch']) -and -not $watchNone)
     if ($watchNone -and $debuggerNamed) { return 'captureNotVerified' }
     if ($null -ne $p['captureState'] -and -not $watchNone) {
         $verified = ([string]$r.captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED'))
         if (-not $verified) { return 'captureNotVerified' }
-        # r12 (adversary c525ecbc A4): the record's own watcher log tail, when it carries one, can still show the capture failed
-        if (($null -ne $p['watcherLog']) -and (Test-SoakLogCaptureFailed (@($r.watcherLog | ForEach-Object { [string]$_ }) -join "`n"))) { return 'captureNotVerified' }
+        # r12 (adversary c525ecbc A4): a log the record carries can still show the capture failed
+        if ($logFailed) { return 'captureNotVerified' }
         return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     if ($watchNone) { return $(if ($pageHeap) { 'pageheap' } else { 'unattached' }) }
-    if ($null -ne $p['heapDumpWatch']) {
+    if ($logs.Count -gt 0) {
         # r8 (adversary A4): a verified legacy attach keeps a page-heap leg in pageheap, as the typed branch does
         # r10 (adversary r10 A2): the event is the token right after a log line's timestamp, never text inside another line (the WATCH line carries the exe path)
-        if (-not (Test-SoakLogAttached ([string]$r.heapDumpWatch)) -or (Test-SoakLogCaptureFailed ([string]$r.heapDumpWatch))) { return 'captureNotVerified' }
+        if ($logFailed -or @($logs | Where-Object { Test-SoakLogAttached $_ }).Count -eq 0) { return 'captureNotVerified' }
         return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     # r8 (CoS Iverson #432 item 2): a record that names a debugger watch but carries no capture evidence is not verified, never unattached

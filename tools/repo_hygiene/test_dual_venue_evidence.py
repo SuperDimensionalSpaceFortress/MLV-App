@@ -9451,6 +9451,21 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
         self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["legacy-dumpfail", "typed-dumpfail", "typed-rc3"])
         self.assertEqual([n.split(" ")[0] for n in g["attached"]["names"]], ["typed-clean"])
 
+    def test_r12p2_a2_every_carried_watcher_log_is_debugger_evidence_and_is_read_for_failure(self) -> None:
+        # r12 pass 2 (adversary 9621fe1e A2): watch 'none' (or no watch) with a watcherLog showing DEBUGGER_ATTACHED is never unattached; a typed
+        # ATTACHED_NO_CRASH record whose heapDumpWatch log shows DUMP_FAILED / rc=3 is never attached
+        attached_log = ["2026-10-29T00:00:01Z DEBUGGER_ATTACHED pid=7"]
+        records = [{"status": "RAN", "name": "none-with-log", "arm": "FIX-W", "stopCycle": True, "crash": False, "dumps": [], "watch": "none", "watcherLog": attached_log},
+                   {"status": "RAN", "name": "nowatch-with-log", "arm": "FIX-W", "stopCycle": True, "crash": False, "dumps": [], "watcherLog": attached_log},
+                   {"status": "RAN", "name": "typed-legacy-fail", "arm": "FIX-W", "stopCycle": True, "crash": False, "dumps": [], "watch": "debugger",
+                    "captureState": "ATTACHED_NO_CRASH",
+                    "heapDumpWatch": "2026-10-29T00:00:01Z DEBUGGER_ATTACHED pid=7\n2026-10-29T00:00:02Z DUMP_FAILED err=112\n2026-10-29T00:00:03Z DEBUGGER_EXIT rc=3"},
+                   {"status": "RAN", "name": "clean-unattached", "arm": "FIX-W", "stopCycle": True, "crash": False, "dumps": [], "watch": "none"}]
+        g = self.account(records)["groups"]
+        self.assertEqual([n.split(" ")[0] for n in g["unattached"]["names"]], ["clean-unattached"])
+        self.assertEqual(g["attached"]["legs"], 1)   # nowatch-with-log: its own log shows the attach
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["none-with-log", "typed-legacy-fail"])
+
     def test_r11b2_a4_the_reader_hashes_and_interprets_the_same_watcher_log_bytes(self) -> None:
         # r11b pass 2 (adversary r11b A4): a file swapped between hashing and reading cannot be produced on demand; this pins the one-read shape
         text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
