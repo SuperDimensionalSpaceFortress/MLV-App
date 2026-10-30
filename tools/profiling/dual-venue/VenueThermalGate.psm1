@@ -184,7 +184,8 @@ function Get-VenueHeavyLegKeys {
         # r8 (adversary r8 A3): every field is read through PSObject.Properties, so a row missing one is a barrier (no status, no key), never a strict-mode throw
         $f = @{}; foreach ($p in 'batch', 'key', 'status', 'heat') { $f[$p] = $(if ($r.PSObject.Properties[$p]) { $r.$p } else { $null }) }
         # r8 (adversary efe7699b A3): a row with no batch is a lease of its own, so two such rows are never on "the same" lease
-        if ($null -eq $f.batch) { $lastBatch = $null; $lastRanKey = $null }
+        # r11 (sol r10 B1): an empty or whitespace batch is no identity either (two of them were one lease), so it is a lease of its own exactly like a missing one
+        if ($null -eq $f.batch -or [string]::IsNullOrWhiteSpace([string]$f.batch)) { $lastBatch = $null; $lastRanKey = $null }
         elseif ($lastBatch -isnot [string] -or [string]$f.batch -cne $lastBatch) { $lastBatch = [string]$f.batch; $lastRanKey = $null }
         if ([string]$f.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
         # adversary r1b A5: the predecessor is the last leg that LAUNCHED (RAN, LEG_FAILED, LEASE_EXPIRED); a row of unknown identity (a $null key) is a barrier, so
@@ -250,7 +251,12 @@ function Read-VenueLegHeatHistory {
             # r8 (adversary efe7699b A2): a receipt with no token is a lease of its own (its line), never grouped with another by batch number: two leases L1 and L2
             # both numbered batch 1 became one sequence and L2's hot first leg was charged to L1's last
             $lineNo++
-            $lease = $(if ($b.PSObject.Properties['token'] -and $b.token) { [string]$b.token } else { "line$lineNo" })
+            # r11 (sol r10 B1 / adversary A2): the identity is the lease (leaseId) PLUS a normalised, non-empty token, length-framed so no leaseId/token pair can spell another's. A
+            # whitespace token is no token, and the generated fallback ("line:<n>") lives in its own namespace ("tok:" never starts it), so neither can equal another lease's identity
+            $tokenText = $(if ($b.PSObject.Properties['token'] -and $null -ne $b.token) { ([string]$b.token).Trim() } else { '' })
+            $leaseText = $(if ($b.PSObject.Properties['leaseId'] -and $null -ne $b.leaseId) { ([string]$b.leaseId).Trim() } else { '' })
+            $lease = $(if ($tokenText) { "tok:$($leaseText.Length):${leaseText}:$tokenText" } else { "line:$lineNo" })
+            $leaseLabel = $(if ($tokenText) { $tokenText } else { "line $lineNo" })
             $unnamed = 0
             foreach ($l in @($b.legs)) {
                 # adversary r1 A5: a scalar-run row carries no leg name (Add-PlanIdentity names -LegPlan rows only): counted and named in .skipped, never silently dropped.
@@ -293,7 +299,7 @@ function Read-VenueLegHeatHistory {
                 }
                 $rows.Add([pscustomobject]@{ batch = "$d.$lease"; key = (Get-VenueLegKeyFromName -Name ([string]$l.name) -Backend $backend -Arm $arm); name = [string]$l.name; status = [string]$l.status; heat = $heat })
             }
-            if ($unnamed -gt 0) { $skipped.Add("$f lease $lease ($unnamed leg rows with no leg name or status: a scalar run's rows cannot be keyed)") }
+            if ($unnamed -gt 0) { $skipped.Add("$f lease $leaseLabel ($unnamed leg rows with no leg name or status: a scalar run's rows cannot be keyed)") }
         }
     }
     [pscustomobject]@{ rows = @($rows); skipped = @($skipped) }

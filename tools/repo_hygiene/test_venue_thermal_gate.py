@@ -397,6 +397,61 @@ class ThermalGateModuleTests(unittest.TestCase):
         history({"heatAtProbe": "unknown", "heatAtGrant": "warm"})
         self.assertEqual(run()["heat"], ["clear", "unknown"])
 
+    def test_r11_sol_r10_b1_adv_a2_distinct_leases_never_share_a_predecessor_when_receipt_identities_collide(self) -> None:
+        # sol r10 B1 / adversary A2 on 16a8a2ff: a whitespace receipt token was accepted as an identity, and a generated "line1" fallback shared a namespace with a literal
+        # token "line1", so two receipts on DISTINCT leases (L1, L2) got the same batch identity and L2's hot first leg was charged to L1's last: a|cpu became heavy and
+        # the order a-A,a-B,b-A,b-B was spread to a-A,b-A,a-B,b-B. Controls: distinct tokens and two missing tokens keep the original order.
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-identity-"))
+        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
+                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
+                  "[pscustomobject]@{ batches = @($h.rows | ForEach-Object { $_.batch }); heavy = @($hk.Keys); order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
+
+        def leg(name: str, heat: str) -> dict:
+            return {"name": f"01-{name}-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": heat}
+
+        def receipt(ident: dict, legs: list) -> str:
+            return json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, **ident, "legs": legs}) + "\n"
+
+        def run(i1: dict, i2: dict) -> dict:
+            (d / "batches.jsonl").write_text(receipt(i1, [leg("a", "clear")]) + receipt(i2, [leg("b", "hot")]), encoding="utf-8")
+            return ps_json(spread.replace("<D>", str(d)))
+
+        original = "a-A,a-B,b-A,b-B"
+        # (a) two whitespace tokens on distinct leases
+        got = run({"token": " ", "leaseId": "L1"}, {"token": " ", "leaseId": "L2"})
+        self.assertEqual((got["heavy"], got["order"]), ([], original), got)
+        self.assertEqual(len(set(got["batches"])), 2, got)
+        # (b) a missing token on line 1 and a literal token "line1" on line 2 (the generated fallback must not equal a literal token)
+        got = run({"leaseId": "L1"}, {"token": "line1", "leaseId": "L2"})
+        self.assertEqual((got["heavy"], got["order"]), ([], original), got)
+        self.assertEqual(len(set(got["batches"])), 2, got)
+        # sweep: the same literal token on distinct leases, and an empty or non-string token, are not one lease either
+        for t1, t2 in (("t", "t"), ("", ""), (None, None), (7, 7), ("  ", "\t")):
+            got = run({"token": t1, "leaseId": "L1"}, {"token": t2, "leaseId": "L2"})
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (t1, t2, got))
+        # controls: distinct tokens, and two missing tokens, keep the original order
+        for i1, i2 in (({"token": "t1", "leaseId": "L1"}, {"token": "t2", "leaseId": "L2"}), ({"leaseId": "L1"}, {"leaseId": "L2"}), ({}, {})):
+            got = run(i1, i2)
+            self.assertEqual((got["heavy"], got["order"]), ([], original), (i1, i2, got))
+        # the real thing still works: ONE receipt (one lease) whose second leg reads hot makes the first heavy, whatever the token looks like
+        for tok in ("t", " t ", "line1"):
+            (d / "batches.jsonl").write_text(receipt({"token": tok, "leaseId": "L1"}, [leg("a", "clear"), leg("b", "hot")]), encoding="utf-8")
+            got = ps_json(spread.replace("<D>", str(d)))
+            self.assertEqual((got["heavy"], got["order"]), (["a|cpu"], "a-A,b-A,a-B,b-B"), (tok, got))
+
+    def test_r11_sol_r10_b1_direct_helper_rows_with_an_empty_or_whitespace_batch_are_leases_of_their_own(self) -> None:
+        # the class sweep of sol r10 B1: Get-VenueHeavyLegKeys joined two rows whose batch was '' or '  ' (equal strings) into one lease, as it never did for $null
+        def rows(b1, b2) -> str:
+            lit = lambda v: "$null" if v is None else f"'{v}'"  # noqa: E731
+            return (f"$k = Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{{ batch = {lit(b1)}; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }}, "
+                    f"[pscustomobject]@{{ batch = {lit(b2)}; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }}); (@($k.Keys) -join ',')")
+        for b1, b2 in ((None, None), ("", ""), (" ", " "), ("\t", "\t"), ("", None)):
+            self.assertEqual(ps_json(rows(b1, b2)), "", (b1, b2))
+        # controls: the same real batch is one lease (heavy), distinct batches are not
+        self.assertEqual(ps_json(rows("1.t", "1.t")), "a|cpu")
+        self.assertEqual(ps_json(rows("1.t", "1.u")), "")
+
     def test_r7p2_a1_an_agent_heat_read_on_another_lease_is_never_charged_to_this_leases_predecessor(self) -> None:
         # adversary r7 A1 on 83fd79de: b ran on a replacement lease (jobLease L2, onLease false, LEASE_LOST); its grant heat is L2's, yet the reader took it and charged it
         # to a on L1, so a|cpu became heavy. The same holds for the agent-result sidecar's admission.heat (sibling): only a reading on the batch's own lease counts.
