@@ -128,6 +128,38 @@ class AdversaryTemplateLiteralPathTests(unittest.TestCase):
                     self.assertIn('"base":' + json.dumps(base), out.read_text(encoding="utf-8"))
 
 
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@unittest.skipUnless(SHELLS, "no PowerShell on PATH")
+class RelativePathFollowsPowerShellLocationTests(unittest.TestCase):
+    """FLEET-QUALITY-RENDER-OUTPATH-RELATIVE-1: -TemplatePath was read through the PowerShell location but -OutPath
+    was written through [IO.File], which resolves against the PROCESS cwd. After Set-Location the two diverged."""
+
+    def test_relative_template_and_out_path_resolve_against_the_powershell_location(self):
+        for exe in SHELLS:
+            with self.subTest(shell=Path(exe).stem):
+                with tempfile.TemporaryDirectory() as proc_cwd, tempfile.TemporaryDirectory() as ps_loc:
+                    shutil.copyfile(TEMPLATE, Path(ps_loc) / "tpl.md")
+                    expected = Path(proc_cwd) / "expected.md"
+                    r = _run(exe, _render_args(expected, "C:\\w", Card="C-1", Round="r1"))
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    command = "; ".join([
+                        "Set-Location -LiteralPath " + _ps_quote(ps_loc),
+                        "& " + _ps_quote(RENDERER) + " -TemplatePath 'tpl.md' -OutPath 'prompt.md' -WorkDir 'C:\\w'"
+                        + " -Head " + HEAD + " -Base " + _ps_quote(BASE) + " -Card 'C-1' -Round 'r1'",
+                    ])
+                    r = subprocess.run([exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                                       capture_output=True, text=True, cwd=proc_cwd)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertFalse((Path(proc_cwd) / "prompt.md").exists(),
+                                     "a relative -OutPath must not land in the process cwd")
+                    landed = Path(ps_loc) / "prompt.md"
+                    self.assertTrue(landed.is_file(), "a relative -OutPath must land under the PowerShell location")
+                    self.assertEqual(landed.read_bytes(), expected.read_bytes())
+
+
 class TemplateShapeTests(unittest.TestCase):
     def test_template_names_the_literal_path_attack_row(self):
         text = TEMPLATE.read_text(encoding="utf-8")
