@@ -2780,9 +2780,9 @@ function Start-AttrCudaHeapDumpWatch {
     -ExePath whose command line contains -CommandLineMatch and no --help (the feature probes run `--gui-smoke-playback --help`). Its script
     and log stay in -DumpDir. Never throws: the record says why no watcher runs. Returns the record Stop-AttrCudaHeapDumpWatch completes.
     -DumpType is the MINIDUMP_TYPE: the default 0x1826 is full memory + handles + unloaded modules + memory info + thread info.
-    r7 (CoS #432): every write this function makes goes through the job's slot-checked helpers (New-AttrCudaDirectory, Publish-AttrCudaText);
-    the watcher log is CREATED here through Publish-AttrCudaText, and its dump is opened CreateNew (an existing name, a link included, is
-    refused, never written through).
+    r7 (CoS #432): every write this function makes goes through the job's slot-checked helpers (New-AttrCudaDirectory, Publish-AttrCudaText,
+    Publish-AttrCudaTextWithFileId); the watcher log is CREATED here through Publish-AttrCudaTextWithFileId, and its dump is opened CreateNew
+    (an existing name, a link included, is refused, never written through).
     r11 (adversary r10 A7): the hidden watcher opens that log ONCE, and writes every line through that one handle, only after proving on the
     handle that it is the file published here (one link, no reparse point, holding exactly the request line); a slot swapped for a link to
     another file is never written (exit 7). r11 (CI, splice scan R1/R3/R4): the body uses only the scan's allowlisted commands and members.
@@ -3107,13 +3107,20 @@ function Start-AttrCudaHeapDumpWatch {
             # time is exactly the one Start read, and the owner link must carry that very number.
             'function Seq([int]$id, [long]$created) { [MlvHeapDumpWatch.Debugger]::Sequence([uint32]$id, $created) }'
             '$ownerSeq = Seq $ownerPid $ownerCreated'
+            # r15 (sol r14 6515820868, adversary r13 ADV-A2): sequence numbers order ancestry, not freshness, and a date cannot say a process is newer than the
+            # request once the clock steps back. This process is made after the request and before the job launches the smoke instance (the job calls Start just
+            # before the launch, after every feature probe), so its own number is a clock-free floor: only a process numbered above it can be this run's instance.
+            # No number on either side refuses. The date stays as a second condition: an instance it wrongly refuses after a clock step ends in NO_TARGET, a
+            # capture not verified, while attaching the wrong process would read as a verified one.
+            '$watcherSeq = Seq $PID 0'
+            'function Fresh($p) { $watcherSeq -gt 0 -and (Seq ([int]$p.ProcessId) 0) -gt $watcherSeq }'
             'function Owned($p) { $c = $p; $cSeq = Seq ([int]$p.ProcessId) 0; for ($i = 0; $i -lt 8 -and $null -ne $c -and $cSeq -gt 0; $i++) { $budget = Left; if ($budget -lt 1) { return $false }; $parentId = [int]$c.ParentProcessId; if ($parentId -eq $ownerPid) { $nSeq = Seq $parentId $ownerCreated; return ($ownerSeq -gt 0 -and $nSeq -eq $ownerSeq -and $nSeq -lt $cSeq) }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $parentId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n) { return $false }; $nSeq = Seq $parentId 0; if ($nSeq -lt 1 -or $nSeq -ge $cSeq) { return $false }; $c = $n; $cSeq = $nSeq }; return $false }'
             'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$target = $null'
             'while ($null -eq $target) {'
             '    $budget = Left; if ($budget -lt 1) { break }'
             # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or file name (r10: tokenised, see HasHelpArg)
-            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -OperationTimeoutSec $budget -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and -not (HasHelpArg $_.CommandLine) -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -OperationTimeoutSec $budget -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and -not (HasHelpArg $_.CommandLine) -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Fresh $_) -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
             '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
             '}'
             '# r10 (adversary r10 A6): a target that only turned up after the budget was spent is not attached'

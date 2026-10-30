@@ -91,8 +91,9 @@ inline PlaybackPrepDrainOutcome playbackPrepDrainInFlight( std::mutex &queueMute
 // may run after `outcome`. Clip replacement is one: setMlvProcessing reallocs
 // processing->gradient_mask (the task's config.gradientMaskData) and
 // RenderFrameThread::init re-assigns every slot buffer (the task's readyFrame
-// pointers). After a timed-out drain the task may still be reading either, so the
-// caller must abort (or defer) the mutation, never run it.
+// pointers). After playbackPrepDrainInFlight times out the task may still be reading
+// either. MainWindow's drain never returns that way (it blocks until the worker has
+// left), but drained=false still means the caller aborts (or defers) the mutation.
 inline bool playbackPrepBorrowFreeingMutationAllowed( const PlaybackPrepDrainOutcome &outcome )
 {
     return outcome.drained;

@@ -29,12 +29,16 @@ function Test-JsonTrue($v) { ($v -is [bool]) -and $v }
 # token right after the timestamp is DEBUGGER_ATTACHED is an attach.
 # r11b (adversary r11b A1): the close must be UNAMBIGUOUS: when more than one segment from the WATCH opener on ends with that pid= (one of them forged inside
 # the WATCH text), nothing after the opener on that line is read.
+# r15 (sol r14 6515820868, adversary r13 ADV-A1): the r10 rule holds for WATCH too: only a segment whose own token right after the timestamp is WATCH opens a
+# message, so ' WATCH ' inside a dump path opens nothing. The record's leading field is cut first, in either form ('watcherPid=<n> watcherExited=<b> reason=<text> log='
+# as the drivers write it, or 'watcherPid=<n> ' alone), so the first segment's timestamp sits where every other segment's does.
 function Get-SoakLogEventSegments([string]$text) {
-    $watcherPid = $(if ($text -cmatch '^watcherPid=(?<p>\d+)\s') { $Matches['p'] } else { $null })
+    $watcherPid = $null
+    if ($text -cmatch '^watcherPid=(?<p>\d+)\s(?:watcherExited=\S*\s+reason=.*? log=)?') { $watcherPid = $Matches['p']; $text = $text.Substring($Matches[0].Length) }
     foreach ($line in [regex]::Split($text, '\r?\n')) {
         $segments = @([regex]::Split($line, ' \| '))
         for ($i = 0; $i -lt $segments.Count; $i++) {
-            if ($segments[$i] -cmatch '(^|\s)\S+ WATCH(\s|$)') {
+            if ($segments[$i] -cmatch '^\S+ WATCH(\s|$)') {
                 $closes = @(for ($j = $i; $j -lt $segments.Count; $j++) { if (($null -ne $watcherPid) -and ($segments[$j] -cmatch ('\spid=' + $watcherPid + '$'))) { $j } })
                 if ($closes.Count -ne 1) { break }
                 $i = $closes[0]

@@ -8907,8 +8907,10 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
             "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
             f"$watcherText = @(Get-Content -LiteralPath '{d}\\hd\\heap-dump-watcher.ps1')\n"
-            "$defs = @($watcherText | Where-Object { $_ -match '^function (Left|Owned)\\b' })\n"
+            "$defs = @($watcherText | Where-Object { $_ -match '^function (Left|Owned|Fresh)\\b' })\n"
             "$ownerSeqLine = @($watcherText | Where-Object { $_ -cmatch '^\\$ownerSeq = ' })\n"
+            "$watcherSeqLine = @($watcherText | Where-Object { $_ -cmatch '^\\$watcherSeq = ' })\n"
+            "$selectLine = @($watcherText | Where-Object { $_ -cmatch '^\\s+\\$target = @\\(Get-CimInstance ' })\n"
             "Write-Output ('START_PINS_OWNER=' + [bool]($watcherText | Where-Object { $_ -cmatch '^\\$ownerCreated = \\[long\\]\\d+$' }))\n"
             "$t0 = [datetime]::new(2026, 10, 29, 0, 0, 0, [DateTimeKind]::Utc); $notBefore = $t0; $maxWaitSec = 900; $ownerPid = 4321\n"
             "$real = $t0.AddSeconds(-30); $ownerCreated = $real.ToFileTimeUtc()\n"
@@ -8917,10 +8919,40 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             "$script:kernel = @{}; $script:wmi = @{}; $script:q = 0\n"
             "function Seq([int]$id, [long]$created) { $k = $script:kernel[$id]; if ($null -eq $k -or ($created -ne 0 -and $created -ne $k[1])) { 0L } else { [long]$k[0] } }\n"
             "function Get-CimInstance { param($ClassName, $Filter, $OperationTimeoutSec)\n"
-            "    $script:q++; if ($Filter -cmatch '^ProcessId = (\\d+)$') { $script:wmi[[int]$Matches[1]] } }\n"
+            "    $script:q++; if ($Filter -cmatch '^ProcessId = (\\d+)$') { $script:wmi[[int]$Matches[1]] } elseif ($Filter -cmatch '^Name = ') { @($script:wmi.Values) } }\n"
             "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
             "function OwnerSeqNow { foreach ($l in $ownerSeqLine) { . ([scriptblock]::Create($l)) }; $ownerSeq }\n"
+            "function WatcherSeqNow { foreach ($l in $watcherSeqLine) { . ([scriptblock]::Create($l)) }; $watcherSeq }\n"
             + body)
+
+    # r15 (sol r14 6515820868, adversary r13 ADV-A2): the watcher's own selector line, as Start writes it, over a table. Owner 4321 (number 100) starts a
+    # matching child; its date passes notBefore because the clock stepped back between the child and the request, and Owned passes. The watcher's number
+    # (300) is the floor: a child numbered below it was running before the watcher existed, so it is never selected, whatever its date says. A child above
+    # the floor is; a number at the floor, a missing number on either side, and (the kept second condition) a date before notBefore all refuse.
+    def test_r15_b2_an_owned_instance_already_running_at_the_request_is_never_selected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-fresh-") as d:
+            proc = self._owned_script(d,
+                "$script:kernel[4321] = @(100, $ownerCreated); $ownerSeq = OwnerSeqNow\n"
+                "$script:kernel[$PID] = @(300, 0L); $watcherSeq = WatcherSeqNow\n"
+                "$exeName = 'MLVApp.exe'; $exeFull = 'C:\\x\\MLVApp.exe'; $match = '--gui-smoke-playback'; $budget = 5\n"
+                "function HasHelpArg([string]$cl) { $false }\n"
+                "function Pick([datetime]$created) {\n"
+                "    $script:wmi[9876] = [pscustomobject]@{ ProcessId = 9876; ParentProcessId = 4321; CreationDate = $created; ExecutablePath = $exeFull\n"
+                "        CommandLine = ($exeFull + ' ' + $match) }\n"
+                "    $target = $null; . ([scriptblock]::Create($selectLine[0])); $(if ($null -eq $target) { 'none' } else { [string]$target.ProcessId }) }\n"
+                "function Row([long]$number, [datetime]$created) { $script:kernel[9876] = @($number, $created.ToFileTimeUtc()); Pick $created }\n"
+                "$late = $t0.AddSeconds(30)\n"
+                "Write-Output ('ROLLBACK=' + (Row 200 $late))\n"
+                "Write-Output ('FRESH=' + (Row 400 $late))\n"
+                "Write-Output ('ATFLOOR=' + (Row 300 $late))\n"
+                "Write-Output ('NODATE=' + (Row 400 $t0.AddSeconds(-5)))\n"
+                "$script:kernel.Remove(9876); Write-Output ('NOTARGETNUMBER=' + (Pick $late))\n"
+                "$script:kernel.Remove($PID); $watcherSeq = WatcherSeqNow\n"
+                "Write-Output ('NOFLOOR=' + (Row 400 $late))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual([out.get(k) for k in ("ROLLBACK", "FRESH", "ATFLOOR", "NODATE", "NOTARGETNUMBER", "NOFLOOR")],
+                             ["none", "9876", "none", "none", "none", "none"], proc.stdout + proc.stderr)
 
     # r11b (adversary r11 A4): request at T0 with owner pid 4321; the owner exits, an unrelated launcher takes pid 4321 at T0+2 s and starts a matching
     # instance at T0+3 s. The watcher's own Owned (read from the script Start writes) refuses it; the real owner, created before the request, is accepted.
@@ -9575,7 +9607,7 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
     def test_r15_b1_a_watch_token_inside_another_event_never_opens_a_watch_message(self) -> None:
         leg = {"status": "RAN", "arm": "FIX-W", "stopCycle": True, "crash": True, "dumps": []}
         failed = lambda word: " | ".join([self.R15_ATTACH, self.R15_FAILED.format(word=word), self.R15_EXIT, self.R15_RC.format(rc=3)])
-        forged = " | ".join([self.R15_WATCH.format(match="a"), self.R15_ATTACH, "b"])
+        forged = self.R15_WATCH.format(match=" | ".join(["a", self.R15_ATTACH, "b"]))       # the attach is match text: the one close is after 'b'
         logs = {
             "sol-watch": "t DEBUGGER_ATTACHED pid=7 | t DUMP_FAILED err=80 path=C:\\x WATCH y\\a.dmp create | t DEBUGGER_EXIT rc=3",
             "sol-normal": "t DEBUGGER_ATTACHED pid=7 | t DUMP_FAILED err=80 path=C:\\x normal y\\a.dmp create | t DEBUGGER_EXIT rc=3",
