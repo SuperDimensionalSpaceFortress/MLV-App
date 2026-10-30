@@ -44,6 +44,22 @@ public:
                               [this]{ return !m_inFlight; } );
     }
 
+    // r9 (adversary A1): the drain a core mutation uses. A timed-out wait must not let the
+    // mutation go on while the worker may still read what it frees (gradientMaskData). Waits
+    // timeoutMs; if the task is still in flight, calls onTimeout() with `lock` released (the
+    // caller logs), then waits until the worker leaves. Returns only with nothing in flight;
+    // true if the bounded wait was enough. The worker's section takes no lock the GUI holds.
+    template <class OnTimeout>
+    bool drainForCoreMutationLocked( std::unique_lock<std::mutex> &lock, int timeoutMs, OnTimeout &&onTimeout )
+    {
+        if( drainLocked( lock, timeoutMs ) ) return true;
+        lock.unlock();
+        onTimeout();
+        lock.lock();
+        m_cv.wait( lock, [this]{ return !m_inFlight; } );
+        return false;
+    }
+
 private:
     std::condition_variable m_cv;
     bool m_inFlight = false;
@@ -75,8 +91,9 @@ inline PlaybackPrepDrainOutcome playbackPrepDrainInFlight( std::mutex &queueMute
 // may run after `outcome`. Clip replacement is one: setMlvProcessing reallocs
 // processing->gradient_mask (the task's config.gradientMaskData) and
 // RenderFrameThread::init re-assigns every slot buffer (the task's readyFrame
-// pointers). After a timed-out drain the task may still be reading either, so the
-// caller must abort (or defer) the mutation, never run it.
+// pointers). After playbackPrepDrainInFlight times out the task may still be reading
+// either. MainWindow's drain never returns that way (it blocks until the worker has
+// left), but drained=false still means the caller aborts (or defers) the mutation.
 inline bool playbackPrepBorrowFreeingMutationAllowed( const PlaybackPrepDrainOutcome &outcome )
 {
     return outcome.drained;
