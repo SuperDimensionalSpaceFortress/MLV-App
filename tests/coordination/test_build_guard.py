@@ -1139,7 +1139,11 @@ def test_heavy_slots_own_pin_mismatch_refuses_before_the_build(box) -> None:
 def test_a_ready_file_from_an_ended_holder_is_a_requeue_while_heavy_slot_still_runs(box) -> None:
     # r2 adversary A1: the cmd wrapper outlives the release (heavy-slot's own work after its child), so liveness is the
     # holder's, named in the ready file, not the wrapper's.
-    done = _heavy(box, "readyorphan", ["-Command", _marker_command(box)], extra={"STUB_HEAVY_SLOT_HOLD_S": "4"})
+    # CI-FLAKE-BUILD-GUARD-HOLDER-EXIT-REASON-RACE-1: the ready file is published only after the holder child has ended, so the
+    # guard's first read always finds the holder gone. Without that, a holder still shutting down at the 250 ms poll was an
+    # admission and the typed reason came out as holder-exited-before-action (hosted runs 40979348494 and 41000767969).
+    done = _heavy(box, "readyorphan", ["-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_HOLD_S": "4", "STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT": "1"})
     assert done.returncode == 3, done.stdout + done.stderr
     assert "BUILD_HEAVY_SLOT_REQUEUE label=build code=0 ticket=stub-" in done.stdout
     assert "reason=holder-exited-after-ready" in done.stdout
