@@ -239,12 +239,18 @@ TEST(GuiPresentAttributionWiring, GuiBusyGapOpensAfterPresentAndClosesOnTheNextR
     ASSERT_TRUE(openAt > presentAt);
 
     // Idle is the event loop blocked in its wait, from the GUI dispatcher's own signals, and
-    // the connection exists only under the smoke-telemetry env gate (zero cost when off).
+    // the connection exists only under the smoke-telemetry env gate (zero cost when off). r2: it
+    // sits in its own block, outside the pinned applicationStateChanged block
+    // (PlaybackSmokeForegroundWiring pins that block byte for byte).
     const QString source = mainWindowSource();
-    const QString gate = bracedBlockAfter(source, QStringLiteral("if( playbackSmokeFrameTelemetryEnabled() )"));
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "QAbstractEventDispatcher \\*const guiPresentIdleDispatcher = playbackSmokeFrameTelemetryEnabled\\(\\)\\s*"
+        "\\? QAbstractEventDispatcher::instance\\( thread\\(\\) \\) : nullptr;")).match(source).hasMatch());
+    const QString gate = bracedBlockAfter(source, QStringLiteral("if( guiPresentIdleDispatcher )"));
     ASSERT_FALSE(gate.isEmpty());
     ASSERT_TRUE(gate.contains(QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")));
     ASSERT_TRUE(gate.contains(QStringLiteral("&QAbstractEventDispatcher::awake")));
+    ASSERT_TRUE(gate.contains(QStringLiteral("m_guiPresentIdleProbeConnected = true;")));
 }
 
 TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
@@ -252,21 +258,31 @@ TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
     // Adversary A1 (400865b1): the measured gui-smoke loop is processEvents(AllEvents) then
     // QThread::msleep( 10 ). That sleep never reaches the dispatcher's aboutToBlock, so it was
     // charged as GUI busy. Every runner sleep goes through the accounting helper, the gap keeps
-    // it apart, and busy excludes it.
+    // it apart, and busy excludes it. r2: the two Play-poll loops of runHeadlessPlaybackProfile
+    // are pinned ENFORCE-3 stop statements (tools/repo_hygiene/app_play_scan.py
+    // PINNED_STOP_STATEMENTS), so they keep their raw QThread::msleep( 10 ) -- exactly those two.
     const QString source = mainWindowSource();
-    const QString runners[][2] = {
-        { QStringLiteral("int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & options)"),
-          QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)") },
-        { QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-          QStringLiteral("bool MainWindow::importNewMlv(QString fileName)") },
-    };
-    for (const auto & runner : runners)
-    {
-        const QString body = functionBody(source, runner[0], runner[1]);
-        ASSERT_FALSE(body.isEmpty());
-        ASSERT_EQ(0, body.count(QStringLiteral("QThread::msleep(")));
-        ASSERT_TRUE(body.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")) > 0);
-    }
+    const QString smoke = functionBody(source,
+        QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
+    ASSERT_FALSE(smoke.isEmpty());
+    ASSERT_EQ(0, smoke.count(QStringLiteral("QThread::msleep(")));
+    ASSERT_TRUE(smoke.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")) > 0);
+
+    const QString profile = functionBody(source,
+        QStringLiteral("int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & options)"),
+        QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"));
+    ASSERT_FALSE(profile.isEmpty());
+    ASSERT_TRUE(profile.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")) > 0);
+    ASSERT_EQ(2, profile.count(QStringLiteral("QThread::msleep(")));
+    const QRegularExpression pinnedPoll(QStringLiteral(
+        "while\\( \\( (autoSettleState|playActionState) = programmaticPlayState\\([^\\n]*\\)\\s*"
+        "== playback_frame_range::PlayStopState::Continue \\)\\s*\\{\\s*"
+        "qApp->processEvents\\( QEventLoop::AllEvents \\);\\s*QThread::msleep\\( 10 \\);\\s*\\}"));
+    int pinnedPolls = 0;
+    for (QRegularExpressionMatchIterator it = pinnedPoll.globalMatch(profile); it.hasNext(); it.next())
+        ++pinnedPolls;
+    ASSERT_EQ(2, pinnedPolls);
 
     const QString helper = bracedBlockAfter(
         source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));

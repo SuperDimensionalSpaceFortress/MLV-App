@@ -2476,24 +2476,27 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     {
         connect( qApp, &QGuiApplication::applicationStateChanged,
                  this, &MainWindow::onPlaybackSmokeApplicationStateChanged );
-        // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI event loop's blocked time inside an open
-        // present-to-next-result gap is idle, not busy (gui_present_summary avg_gui_busy_ms).
-        if( QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance( thread() ) )
+    }
+    // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI event loop's blocked time inside an open
+    // present-to-next-result gap is idle, not busy (gui_present_summary avg_gui_busy_ms). Same
+    // env gate as above, decided once here; kept out of the pinned block above.
+    QAbstractEventDispatcher *const guiPresentIdleDispatcher = playbackSmokeFrameTelemetryEnabled()
+        ? QAbstractEventDispatcher::instance( thread() ) : nullptr;
+    if( guiPresentIdleDispatcher )
+    {
+        m_guiPresentGapClock.start();
+        connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
         {
-            m_guiPresentGapClock.start();
-            connect( dispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
-            {
-                if( m_guiPresentGapStartNs >= 0 )
-                    m_guiPresentGapBlockStartNs = m_guiPresentGapClock.nsecsElapsed();
-            } );
-            connect( dispatcher, &QAbstractEventDispatcher::awake, this, [this]()
-            {
-                if( m_guiPresentGapBlockStartNs < 0 ) return;
-                m_guiPresentGapIdleNs += m_guiPresentGapClock.nsecsElapsed() - m_guiPresentGapBlockStartNs;
-                m_guiPresentGapBlockStartNs = -1;
-            } );
-            m_guiPresentIdleProbeConnected = true;
-        }
+            if( m_guiPresentGapStartNs >= 0 )
+                m_guiPresentGapBlockStartNs = m_guiPresentGapClock.nsecsElapsed();
+        } );
+        connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::awake, this, [this]()
+        {
+            if( m_guiPresentGapBlockStartNs < 0 ) return;
+            m_guiPresentGapIdleNs += m_guiPresentGapClock.nsecsElapsed() - m_guiPresentGapBlockStartNs;
+            m_guiPresentGapBlockStartNs = -1;
+        } );
+        m_guiPresentIdleProbeConnected = true;
     }
 
     //Init scripting engine
@@ -8183,13 +8186,15 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             autoSettleClock.start();
             // ENFORCE-3: the settle holds Play until the engine has CONSUMED the source frames of the 20 s window
             // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
+            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
+            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
             const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
             while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                sleepGuiThreadForSmokeRunner( 10 );
+                QThread::msleep( 10 );
             }
             programmaticStop( "profile-look-assist-settle" );
             if( autoSettleState != playback_frame_range::PlayStopState::Reached )
@@ -8545,12 +8550,14 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             // ENFORCE-3: hold until the engine has CONSUMED the source frames of the 20 s window; a Play the
             // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
+            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
+            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
             const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                sleepGuiThreadForSmokeRunner( 10 );
+                QThread::msleep( 10 );
             }
             playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;
             playActionSmokeTimedOut = playActionState == playback_frame_range::PlayStopState::SafetyTimeout;
@@ -29986,7 +29993,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
      * paint (GraphicsZoomView::paintEvent, per paint) and the GUI thread's busy time between a
      * worker prep present's exit and the next prep result's entry (wall gap less event-loop
-     * idle and less the smoke runner's own sleeps, which are reported apart); other busy = busy
+     * idle and less the smoke runner's own sleeps, which are reported apart -- except the two
+     * pinned Play-poll loops of runHeadlessPlaybackProfile, whose sleep stays in busy); other busy = busy
      * less the viewport paint inside that gap. gui_idle_source=none
      * means the idle probe was not connected and every gap field is 0. */
     {
