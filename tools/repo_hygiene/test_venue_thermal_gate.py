@@ -1042,6 +1042,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
 @requires_windows_pwsh
 class ThermalSpreadPlanTests(unittest.TestCase):
     stage =tvlb.VenueLeaseBatchLegPlanTests.stage
+    artifact_path = tvlb.VenueLeaseBatchLegPlanTests.artifact_path   # stage() stages the three cached artifacts through it (#705)
     item = tvlb.VenueLeaseBatchLegPlanTests.item
     write_plan = tvlb.VenueLeaseBatchLegPlanTests.write_plan
     plan_cmd = tvlb.VenueLeaseBatchLegPlanTests.plan_cmd
