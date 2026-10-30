@@ -4008,29 +4008,39 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
 
 // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: wait for the prep worker to leave the task it
 // is computing (invalidate cannot see it). Never call this while holding the render
-// mutex: the worker's drop path takes it. On timeout it logs and returns, never hangs.
-// It logs (always, not trace-only) only when a task was in flight: at most once per
-// stop or core mutation.
-// r2 (CoS B1): it returns the outcome instead of discarding it. A caller that then
-// frees or reallocates memory the task borrows must check
-// playbackPrepBorrowFreeingMutationAllowed and abort on false (PlaybackPrepInFlightGate.h).
+// mutex: the worker's drop path takes it. Every caller mutates core state next, so a
+// timeout never returns early (r9, adversary A1): it logs drain_timeout, then blocks until
+// the worker leaves and logs drain_late. It logs (always, not trace-only) only when a task
+// was in flight.
+// r2 (CoS B1): it returns the outcome instead of discarding it. drained=false means the
+// bounded wait ran out (the worker has left by now); a clip replacement still aborts on it
+// through playbackPrepBorrowFreeingMutationAllowed (PlaybackPrepInFlightGate.h).
 PlaybackPrepDrainOutcome MainWindow::drainPlaybackPrepInFlight( const char *reason, int timeoutMs )
 {
+    PlaybackPrepDrainOutcome outcome;
     const double drainStart = mlv_stage_timing_now();
-    const PlaybackPrepDrainOutcome outcome =
-        playbackPrepDrainInFlight( m_playbackPrepMutex, m_playbackPrepInFlight, timeoutMs );
-    const bool waited = outcome.waited;
-    const bool drained = outcome.drained;
-    const uint64_t serial = outcome.serial;
-    if( !waited ) return outcome;
-    logInteractionEvent(
-        drained ? QStringLiteral("playback_prep.drain")
-                : QStringLiteral("playback_prep.drain_timeout"),
-        QStringLiteral("reason=%1 serial=%2 waited_ms=%3 timeout_ms=%4")
-            .arg( reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified") )
-            .arg( static_cast<qulonglong>( serial ) )
-            .arg( ( mlv_stage_timing_now() - drainStart ) * 1000.0, 0, 'f', 2 )
-            .arg( timeoutMs ) );
+    const QString reasonText =
+        reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
+    auto logDrain = [&]( const QString &event ) {
+        logInteractionEvent(
+            event,
+            QStringLiteral("reason=%1 serial=%2 waited_ms=%3 timeout_ms=%4")
+                .arg( reasonText )
+                .arg( static_cast<qulonglong>( outcome.serial ) )
+                .arg( ( mlv_stage_timing_now() - drainStart ) * 1000.0, 0, 'f', 2 )
+                .arg( timeoutMs ) );
+    };
+    {
+        std::unique_lock<std::mutex> lk( m_playbackPrepMutex );
+        outcome.waited = m_playbackPrepInFlight.inFlightLocked();
+        outcome.serial = m_playbackPrepInFlight.serialLocked();
+        if( outcome.waited )
+            outcome.drained = m_playbackPrepInFlight.drainForCoreMutationLocked(
+                lk, timeoutMs, [&]{ logDrain( QStringLiteral("playback_prep.drain_timeout") ); } );
+    }
+    if( !outcome.waited ) return outcome;
+    logDrain( outcome.drained ? QStringLiteral("playback_prep.drain")
+                              : QStringLiteral("playback_prep.drain_late") );
     return outcome;
 }
 
