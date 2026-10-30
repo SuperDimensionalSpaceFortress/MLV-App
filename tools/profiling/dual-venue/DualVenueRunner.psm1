@@ -1332,11 +1332,12 @@ function Get-DvPrepConflatedMoveEvidence {
     .SYNOPSIS
     PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: did a leg that asks for the #397 prep-conflated-move switch (generatorArgs.prepConflatedMove = true, which sets
     MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1) run with the switch active? Read from the app's own `playback_smoke.start` line for the MEASURED session
-    (Get-DvSmokeSessionLineFields), field prep_conflated_move_active (the app's decision, 0 or 1), never from the spec, the launcher's env block or the job's
-    summary: a switch value in a receipt is a request, not engagement. FAIL CLOSED: `blocks` is true when the leg asked and the line is absent, carries no
-    prep_conflated_move_active, or says anything but 1. A binary that emits no such field (#397 5fb4b801 emits none) therefore never counts; its reason
-    says ROUTE_NOT_ENGAGED. A leg that does not ask for it never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from
-    the hashed run log.
+    (read strictly below: single-ASCII-space tokens, the key once, printable ASCII), field prep_conflated_move_active (the app's decision, 0 or 1), never from the
+    spec, the launcher's env block or the job's summary: a switch value in a receipt is a request, not engagement. FAIL CLOSED: `blocks` is true when the leg asked
+    and the line is absent, carries no prep_conflated_move_active, or says anything but a clean 1. A binary that emits no such field (#397 5fb4b801 emits none)
+    therefore never counts; its reason says ROUTE_NOT_ENGAGED. A leg that does NOT ask blocks only when the app reports the switch on (the OFF arm inherited the
+    variable: PREP_CONFLATED_MOVE_INHERITED) or the key is present but unreadable; with no field, or a clean 0, it is unchanged. Pure and shared: the runner gates
+    on it and Test-DvReceiptValid re-derives it from the hashed run log.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'prepConflatedMove'
@@ -1344,17 +1345,42 @@ function Get-DvPrepConflatedMoveEvidence {
     $observed = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
+    # The measured session's start line, read STRICTLY (adversary r1 A2): fields are separated by single ASCII spaces only, so a launcher env value that carries a
+    # character the app's env sanitizer leaves alone (a no-break or em space) cannot pass for a field of its own. The key must occur exactly once, as the start of a
+    # token, on a line of printable ASCII, with the value 0 or 1; anything else is unreadable, never a PASS.
+    $line = $null
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $pattern = 'playback_smoke\.start session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            foreach ($l in ($LogText -split "`r?`n")) { if ($l -match $pattern) { $line = $l } }
+        }
+    }
+    $key = 'prep_conflated_move_active='
+    $keyCount = 0
+    $tokens = @()
+    if ($null -ne $line) {
+        $keyCount = ([regex]::Matches($line, [regex]::Escape($key))).Count
+        $tokens = @($line.Split(' ') | Where-Object { $_.StartsWith($key, [System.StringComparison]::Ordinal) })
+    }
+    if ($keyCount -eq 1 -and $tokens.Count -eq 1 -and $line -cnotmatch '[^\x20-\x7E]') {
+        $value = $tokens[0].Substring($key.Length)
+        if ($value -cmatch '^[01]$') { $observed = [int]$value }
+    }
+    $unreadable = 'the switch state is unreadable: the measured session''s playback_smoke.start line carries prep_conflated_move_active= more than once, inside another field, beside a character other than printable ASCII, or with a value other than 0 or 1'
     if ($requested) {
         $verdict = 'NOT_HONOURED'
-        $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'start'
-        if ($f.Count -eq 0) { $reason = 'the switch state is unreadable: the run log has no playback_smoke.start line for the measured session' }
-        elseif (-not $f.ContainsKey('prep_conflated_move_active')) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.start line has no prep_conflated_move_active= field, so the binary does not report which prep queue ran' }
-        else {
-            $observed = ConvertTo-DvInt64 $f['prep_conflated_move_active']
-            if ($null -eq $observed) { $reason = "the switch state is unreadable: prep_conflated_move_active='$($f['prep_conflated_move_active'])' is not an integer" }
-            elseif ($observed -ne 1) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.start says prep_conflated_move_active=$observed, not the 1 the leg names" }
-            else { $verdict = 'HONOURED' }
-        }
+        if ($null -eq $line) { $reason = 'the switch state is unreadable: the run log has no playback_smoke.start line for the measured session' }
+        elseif ($keyCount -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.start line has no prep_conflated_move_active= field, so the binary does not report which prep queue ran' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($observed -ne 1) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.start says prep_conflated_move_active=$observed, not the 1 the leg names" }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($keyCount -gt 0) {
+        # adversary r1 A1: an absent key sets nothing, so a launcher that already carries the variable runs the OFF arm ON. A leg that does not ask counts only if the
+        # app does not report the switch on (a binary that emits no field, or says 0, is unchanged).
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -eq 1) { $verdict = 'NOT_HONOURED'; $reason = 'PREP_CONFLATED_MOVE_INHERITED: the leg does not ask for the switch but the app reports prep_conflated_move_active=1 (the variable came from the launcher''s environment), so this run is not the OFF arm' }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
@@ -2525,7 +2551,7 @@ function Test-DvReceiptValid {
             # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: a leg that asks for the prep-conflated-move switch the app did not report active (or whose report is unreadable, or absent
             # because the binary emits none) is no measurement of that arm; the receipt's own prepConflatedMove block is re-derived like the workerThreads block.
             $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $ev.logText
-            if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason); a run that did not show the switch active is no measurement of the arm its leg names") }
+            if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason); a run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm") }
             $storedPrepConflatedMove = Get-DvProp $Receipt 'prepConflatedMove'
             if ($prepConflatedMoveVerdict.requested) {
                 if ($null -eq $storedPrepConflatedMove) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no prepConflatedMove block (requested / observed / verdict) and its committed spec names a prepConflatedMove') }

@@ -863,7 +863,7 @@ if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
 $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText
 if ($prepConflatedMoveVerdict.requested) { $receipt['prepConflatedMove'] = [ordered]@{ requested = $true; observed = $prepConflatedMoveVerdict.observed; verdict = $prepConflatedMoveVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
-    $detail = "INVALID: the job result was $outcome ($detail) but PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason). A run that did not show the switch active is no measurement of the arm this leg names"
+    $detail = "INVALID: the job result was $outcome ($detail) but PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason). A run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does

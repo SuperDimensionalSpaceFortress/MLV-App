@@ -11381,10 +11381,48 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                 v = self.verdict(self.ON, log)
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
-    def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
+    def test_a_leg_that_does_not_ask_is_unchanged_unless_the_app_reports_the_switch_on(self) -> None:
         for spec in ({}, {"generatorArgs": {"unpaced": True}}):
-            v = self.verdict(spec, self.log(self.start("prep_conflated_move_active=1")))
-            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), spec)
+            for name, log in (("old binary, no field", self.log(self.start(""))),
+                              ("field off", self.log(self.start("prep_conflated_move_active=0"))),
+                              ("no log", "")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+
+    def test_the_off_arm_that_inherited_the_switch_from_the_launcher_does_not_count_as_off(self) -> None:
+        # adversary r1 A1 (6bd2a183): an absent key emits no removal of MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE, so a launcher that already carries it ran the OFF arm
+        # ON; the gate returned NOT_REQUESTED/blocks=false even though the app reported active=1. A leg that does not ask counts only if the app does not say it is on.
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}):
+            with self.subTest(spec=spec):
+                v = self.verdict(spec, self.log(self.start("prep_conflated_move_active=1")))
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                self.assertIn("PREP_CONFLATED_MOVE_INHERITED", v["reason"])
+
+    def test_a_forged_field_in_an_env_value_never_honours_a_leg(self) -> None:
+        # adversary r1 A2 (6bd2a183): envValueForLog replaces only ASCII space and tab, so MLVAPP_FORCE_THREADS="0<NBSP>prep_conflated_move_active=1" reaches the
+        # start line as env_force_threads=0<NBSP>prep_conflated_move_active=1 and a \S+ field parser reads the suffix as a field of its own. Fields are separated by
+        # single ASCII spaces only, the key may appear exactly once, and a line that carries the key next to a non-ASCII character is unreadable.
+        forged = ("env_force_threads=0 prep_conflated_move_active=1", "env_force_threads=0 prep_conflated_move_active=1",
+                  "env_force_threads=0 prep_conflated_move_active=1 env_raw_uint16_prefetch_decoders=unset")
+        for tail in forged:
+            with self.subTest(requested=True, tail=ascii(tail)):
+                v = self.verdict(self.ON, self.log(self.start(tail)))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+            with self.subTest(requested=False, tail=ascii(tail)):
+                v = self.verdict({}, self.log(self.start(tail)))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        for name, tail in (("duplicate key", "prep_conflated_move_active=0 prep_conflated_move_active=1"),
+                           ("genuine field beside a non-ASCII value", "env_force_threads=é prep_conflated_move_active=1"),
+                           ("value with a sign", "prep_conflated_move_active=+1"),
+                           ("value with a suffix", "prep_conflated_move_active=1x")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(self.start(tail)))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_genuine_field_among_ordinary_fields_is_still_honoured(self) -> None:
+        v = self.verdict(self.ON, self.log(self.start("env_raw_uint16_prefetch_decoders=unset prep_conflated_move_active=1")))
+        self.assertEqual((v["verdict"], v["observed"], v["blocks"]), ("HONOURED", 1, False), v)
 
 
 if __name__ == "__main__":
