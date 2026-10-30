@@ -122,7 +122,13 @@ if ($JobId -like 'lease-batch-open-*') {
     # r5b: FAKE_OPEN_CLAIM_READONLY per open (1 = the claim file is read-only for that wait, so every renewal comes back BUSY; writable again after it)
     $ro = (Pick $env:FAKE_OPEN_CLAIM_READONLY $n '0') -eq '1'
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $true }
-    if ($sleep -gt 0) { Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep); Start-Sleep -Seconds $sleep; $now = [DateTimeOffset]::UtcNow }
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r8: FAKE_OPEN_RELEASE (a path) ends that wait the moment the file exists, with FAKE_OPEN_SLEEP its upper bound, so a case that acts
+    # during the wait releases the open when it is done instead of sleeping out a fixed margin
+    if ($sleep -gt 0) {
+        Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep)
+        if ($env:FAKE_OPEN_RELEASE) { $until = [DateTime]::UtcNow.AddSeconds($sleep); while (-not (Test-Path -LiteralPath $env:FAKE_OPEN_RELEASE) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 50 } } else { Start-Sleep -Seconds $sleep }
+        $now = [DateTimeOffset]::UtcNow
+    }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
     if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
@@ -349,6 +355,119 @@ def batch_result(stdout: str) -> dict:
     if not lines:
         raise AssertionError("no LEASE_BATCH_RESULT line in:\n" + stdout)
     return json.loads(lines[-1][len("LEASE_BATCH_RESULT="):])
+
+
+# LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r10: numeric-contract scanners for the dual-venue PowerShell. Both are tested on their own spellings below, so a pin cannot go blind
+# to the one adjacent spelling it was written against (fable key3 r9 P-02).
+def _ps_balanced(text: str, open_at: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket that closes the one at open_at, or -1."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _ps_balanced_back(text: str, close_at: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket that opens the one closing at close_at, or -1."""
+    depth = 0
+    for i in range(close_at, -1, -1):
+        if text[i] == close_ch:
+            depth += 1
+        elif text[i] == open_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _ps_split_args(text: str) -> list[str]:
+    out, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur).strip())
+    return out
+
+
+# an operand that is (or contains) a [double]: a double literal, a [double] cast, a TimeSpan total, a monotonic clock, or the runner's own double budget names
+_PS_DOUBLE_OPERAND = re.compile(r"Total(?:Seconds|Milliseconds|Minutes)\b|\.Elapsed\b|\[(?:system\.)?double\]|(?<![\w.$])\d+\.\d+\b|\$(?:left|share)\b|\.sec\b", re.I)
+
+
+# a second operand that is whole by construction (an [int] / [long] cast, or a Floor / Ceiling / Truncate): the Int32 overload loses nothing on it
+_PS_INTEGRAL_OPERAND = re.compile(r"\s*(?:\[(?:int|int32|long|int64)\]|\[(?:system\.)?math\]::(?:floor|ceiling|truncate)\()", re.I)
+
+
+def ps_integer_first_minmax(text: str) -> list[tuple[int, str]]:
+    """Every [Math]::Min/Max call whose first operand is not a double while its second one is: PowerShell picks the Int32 overload for it and ROUNDS the double (2.3 -> 2).
+    Heuristic: a second operand is a double only when it names one (a TimeSpan total, a clock, a double literal or cast, the runner's budget names). An untyped variable product such as
+    `$f * $BudgetBasisSec` is invisible to it (VenueChain.psm1 Get-VenueLeaseCaps, carried as VENUE-LEASE-CAPS-MINMAX-OVERLOAD-1)."""
+    hits = []
+    for m in re.finditer(r"\[(?:system\.)?math\]::(?:min|max)\(", text, re.I):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        if "#" in text[line_start:m.start()]:
+            continue  # a comment
+        close = _ps_balanced(text, m.end() - 1, "(", ")")
+        args = _ps_split_args(text[m.end():close]) if close > 0 else []
+        if len(args) == 2 and not _PS_DOUBLE_OPERAND.search(args[0]) and _PS_DOUBLE_OPERAND.search(args[1]) and not _PS_INTEGRAL_OPERAND.match(args[1]):
+            hits.append((text.count("\n", 0, m.start()) + 1, text[m.start():close + 1]))
+    return hits
+
+
+_PS_FLOAT_TYPE = re.compile(r"(?:system\.)?(?:double|single|float|decimal)", re.I)
+
+
+def ps_float_validaterange_params(text: str) -> list[tuple[int, str, bool]]:
+    """Every [ValidateRange(..)] on a floating-point parameter, as (line, text, has_integer_endpoint). The type may follow the attribute, precede it ([double][ValidateRange(..)]),
+    sit past other attributes ([Parameter()]) and the attribute may span lines."""
+    found = []
+    for m in re.finditer(r"\[ValidateRange\(", text, re.I):
+        close = _ps_balanced(text, m.end() - 1, "(", ")")
+        if close < 0:
+            continue
+        end = close + 1
+        while end < len(text) and text[end].isspace():
+            end += 1
+        if text[end:end + 1] != "]":
+            continue
+        groups = []
+        j = end + 1
+        while True:
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if text[j:j + 1] != "[":
+                break
+            e = _ps_balanced(text, j, "[", "]")
+            if e < 0:
+                break
+            groups.append(text[j + 1:e].strip())
+            j = e + 1
+        i = m.start() - 1
+        while True:
+            while i >= 0 and text[i].isspace():
+                i -= 1
+            if i < 0 or text[i] != "]":
+                break
+            b = _ps_balanced_back(text, i, "[", "]")
+            if b < 0:
+                break
+            groups.append(text[b + 1:i].strip())
+            i = b - 1
+        if any(_PS_FLOAT_TYPE.fullmatch(g) for g in groups):
+            ends = _ps_split_args(text[m.end():close])
+            found.append((text.count("\n", 0, m.start()) + 1, text[m.start():end + 1], any(re.fullmatch(r"-?\d+", e) for e in ends)))
+    return found
 
 
 @requires_windows_pwsh
@@ -1267,7 +1386,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # -ClaimTtlSec 60 (its floor), and um-run blocks 80 s on the open while the agent re-asks a refused (exit 75) request: longer than the claim's TTL. At
         # TTL + 10 s VenueChain.psm1's own Get-VenueClaim (Get-VenueClaimStaleReason) still finds the claim LIVE, with the same nonce and a later expiresUtc,
         # and no waiting chain could break it. RED (no renewal): the claim reads STALE reason=expired while its owner is alive and holding the venue.
-        args, e = self.batch_cmd([self.specs[0]], "-ClaimTtlSec", "60", FAKE_OPEN_SLEEP="80")
+        # r8: the open is released as soon as the TTL + 10 s checks are made (FAKE_OPEN_RELEASE; 120 s is only its bound), not slept out to 80 s. The 70 s horizon itself stays:
+        # -ClaimTtlSec has a 60 s floor, and a claim that survives its TTL can only be seen after it.
+        release = self.case / "open.release"
+        release.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self.specs[0]], "-ClaimTtlSec", "60", FAKE_OPEN_SLEEP="120", FAKE_OPEN_RELEASE=str(release))
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         try:
             end = time.monotonic() + 60
@@ -1286,6 +1409,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             c1 = read_claim_json(self.claim_path)
             self.assertGreater(parse_utc(c1["expiresUtc"]), datetime.now(timezone.utc), c1)
             self.assertEqual({k: v for k, v in c1.items() if k != "expiresUtc"}, {k: v for k, v in c0.items() if k != "expiresUtc"}, "only expiresUtc changes")
+            release.write_text("go", encoding="utf-8")
             so, se = p.communicate(timeout=300)
         finally:
             if p.poll() is None:
@@ -1801,11 +1925,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         cache = self.share / "cache"
         cache.mkdir(exist_ok=True)
         p = cache / f"playback-attr-3-cuda-{commit[:12]}-build.json"
-        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS, "body": body}
+        import hashlib
+        # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the three cached artifacts the manifest digests name are staged beside it, each hashing to its digest (an override replaces the
+        # digest and leaves that artifact unstaged, as the digest-shape cases below need)
+        digests = {}
+        for label in ARTIFACT_SHAS:
+            content = f"{label}:{commit}:{body}".encode("utf-8")
+            self.artifact_path(commit, label).write_bytes(content)
+            digests[label] = {"sha256": hashlib.sha256(content).hexdigest()}
+        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **digests, "body": body}
         doc.update(override)
         p.write_text(json.dumps({k: v for k, v in doc.items() if v is not ABSENT}), encoding="utf-8")
-        import hashlib
         return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def artifact_path(self, commit: str, label: str) -> Path:
+        # the names the leg job reads from the agent cache (Get-AttrCudaArtifactNames)
+        s = commit[:12]
+        name = {"exe": f"MLVApp-playback-attr-3-cuda-{s}.exe", "dll": f"igpu_recon_cuda-playback-attr-3-cuda-{s}.dll", "packageZip": f"MLVApp-playback-attr-3-cuda-{s}-pkg.zip"}[label]
+        return self.share / "cache" / name
 
     def item(self, spec: Path, arm: str, commit: str, backend: str = "cpu", manifest: str | None = None) -> dict:
         return {"legSpec": str(spec), "backend": backend, "sourceCommit": commit, "buildManifestSha256": manifest or self.manifests[commit], "arm": arm}
@@ -2640,7 +2777,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         spec2 = self.case / "fx-b-copy.json"
         spec2.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
         plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(spec2, "A", self.commit_a)])
-        anchor = "        $hit = Get-InputOutputRefusal\n"   # the claim-time guard (the only 8-space one); independent of what follows it, so the same fixture runs on a runner without the sticky hit
+        # the claim-time guard (r12, #705 merge: bounded by Invoke-InputGuard, found once); independent of what follows it, so the same fixture runs on a runner without the sticky hit
+        anchor = "        try { $hit = Invoke-InputGuard }\n"
         args, e = self.plan_cmd(plan, *extra, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
         return args, e, (anchor, f"        if ($batchNo -eq 2) {{ {inject} }}\n" + anchor)
 
@@ -3317,11 +3455,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 s, t, log, snap = psq(spec2), psq(target), psq(self.run_dir / "batch.log"), self.case / "r7-b1.snap"
                 move = "" if how == "denied" else f"[IO.File]::Move('{s}', '{t}'); "
                 inject = (f"{move}[IO.File]::Delete('{log}'); New-Item -ItemType HardLink -Path '{log}' -Value '{t}' | Out-Null; Copy-Item -LiteralPath '{t}' -Destination '{psq(snap)}'"
-                          + ("; $script:rpf06DenySpec = $true" if how == "denied" else ""))
+                          + ("; $env:MLV_TEST_RPF06_DENY_SPEC = '1'" if how == "denied" else ""))
                 args, e, patch = self._two_batch_plan(inject)
                 patches = [patch]
                 if how == "denied":
-                    patches.append((self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
+                    # r12 (#705 merge): the claim guard runs on Invoke-InputGuard's worker runspace, which gets the patched function but not this run's script variables, so the
+                    # injected denial is a process-wide flag (as a real denied lookup reaches every thread)
+                    patches.append((self._RPF06_RESOLVE, f"if ($env:MLV_TEST_RPF06_DENY_SPEC -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
                 args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
                 r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
                 self.assertTrue(snap.exists(), "batch.log was relinked to the input (the case under test)\n" + r.stdout + r.stderr)
@@ -4280,6 +4420,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             time.sleep(0.2)
         self.fail(f"{text!r} never reached {log}")
 
+    def _open_release(self) -> Path:
+        """The file whose existence ends the fake um-run's open wait (FAKE_OPEN_RELEASE); absent until the case releases the open."""
+        rel = self.case / "open.release"
+        rel.unlink(missing_ok=True)
+        return rel
+
+    def _wait_for_open_wait(self, timeout_s: float = 90) -> None:
+        """Returns once the fake um-run is blocked in the open's wait (its OPENWAIT event, logged just before it blocks), so what the case does next lands inside that wait."""
+        end = time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            try:
+                if any(" OPENWAIT " in line for line in self.events_raw()):
+                    return
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.fail("the open never reached its wait")
+
     def _alias_during_claim_wait(self, args: list[str], e: dict, spec: Path, alias: Path) -> tuple[int, str, str]:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
@@ -4553,6 +4711,1121 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", r.stderr)
         self.assertIn("for exe ", r.stderr)
 
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 (Dot 6440180395 on #684): the preflight checked that the manifest's artifact digests were well-formed, never that the cached artifacts
+    # exist and hash to them; the leg job found out after the lease opened (playback-attr-3-cuda-job.ps1 $manifestChecks), so the lease was spent and nothing was measured.
+    def test_artifact_preflight_a_staged_build_whose_cached_artifact_is_absent_is_refused_before_the_claim_and_the_lease(self) -> None:
+        a, c = self.commit_a, "3" * 40
+        for label in ("exe", "dll", "packageZip"):
+            with self.subTest(absent=label):
+                manifest = self.stage(c, f"no {label}")
+                self.artifact_path(c, label).unlink()
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_ARTIFACT_MISSING item=2 ")
+
+    def test_artifact_preflight_a_staged_build_whose_cached_artifact_differs_from_its_digest_is_refused_before_the_claim_and_the_lease(self) -> None:
+        a, c = self.commit_a, "3" * 40
+        for label in ("exe", "dll", "packageZip"):
+            with self.subTest(differs=label):
+                manifest = self.stage(c, f"stale {label}")
+                self.artifact_path(c, label).write_bytes(b"a different build's bytes")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_ARTIFACT_MISMATCH item=2 ")
+
+    # r8b adversary A1 (pass 1 on a2c32874): the verifier opened each cached artifact with FileShare.ReadWrite, but the leg job hashes it with FileShare.Read
+    # (AttrCudaArtifacts.psm1 Get-Sha), which a retained writer handle refuses. A build with a writer open was STAGED here and threw after the lease opened. It is now read the way
+    # the leg job reads it, so the writer makes the read fail and the plan is refused SHARE_UNREACHABLE (an unreadable file is not a missing or matching one) before any claim.
+    def test_artifact_preflight_r8b_adv_a1_a_cached_artifact_a_writer_holds_open_is_refused_as_the_leg_job_would_fail_on_it(self) -> None:
+        c = "3" * 40
+        manifest = self.stage(c, "writer open")
+        with open(self.artifact_path(c, "packageZip"), "r+b"):
+            self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]), "SHARE_UNREACHABLE item=1 ")
+
+    # r8b adversary pass 2 on 29c63516, A1: the hash worker checked -ArtifactMinSec before the existence check only, so a Test-Path that used the time still opened and hashed the file
+    # with less than the minimum left. The minimum is now checked again between the existence check and the open.
+    def test_artifact_preflight_r8b_adv_a1_the_hash_worker_checks_the_minimum_again_after_the_existence_check(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start = text.index("# a read that fails ends the read (UNREACHABLE), never \"absent\"")
+        worker = text[start:text.index("Invoke-VenueBoundedRead -ScriptText $probe.ToString()", start)]
+        exists, opened = worker.index("Test-Path -LiteralPath $i.path"), worker.index("[IO.File]::Open($i.path")
+        checks = [m.start() for m in re.finditer(r"-lt \$i\.minSec\) \{ 'NOTIME:'", worker)]
+        self.assertEqual(len(checks), 3, "the minimum is checked before the existence check, again before the open, and again once the file is open (r10 adversary A1)")
+        self.assertTrue(checks[0] < exists < checks[1] < opened < checks[2] < worker.index("ComputeHash"), (checks, exists, opened))
+
+    # r9 B1 (sol r8b = opus = fable H2 = Dot): `[ValidateRange(1, 600)]` on a `[double]` has Int32 endpoints, so PowerShell validates a ROUNDED INTEGER copy of the value: 0.6 and 600.5
+    # bound while the original value went on to the helper (a 0.6 s bound under the 1 s the contract names, a 600.5 s one over the 600 s cap). Double endpoints validate the value as given.
+    # Sites: Get-VenueStagedBuildManifest -TimeoutSec / -ArtifactMinSec and Invoke-VenueBoundedRead -TimeoutSec. Fractional budgets in range (2.8) must still bind.
+    def _binding_outcomes(self, calls: dict[str, str]) -> dict[str, str]:
+        lines = ["Import-Module '" + str(MODULE) + "' -Force -DisableNameChecking", "$out = [ordered]@{}"]
+        for key, call in calls.items():
+            lines.append("try { $null = " + call + "; $out['" + key + "'] = 'BOUND' } catch { $out['" + key + "'] = if ($_.FullyQualifiedErrorId -like 'ParameterArgumentValidationError*') { 'REFUSED' } else { 'OTHER:' + $_.FullyQualifiedErrorId } }")
+        lines += ["ConvertTo-Json -Compress -InputObject $out", "Complete-VenueProcess -ExitCode 0"]
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "\n".join(lines)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_artifact_preflight_r9_b1_a_fractional_timeout_outside_the_range_is_refused_at_binding_not_rounded_into_it(self) -> None:
+        manifest = "Get-VenueStagedBuildManifest -AgentShare '" + str(self.share) + "' -SourceCommit ('a' * 40) -ProbeScript { param($p) '' } "
+        bounded = "& (Get-Module VenueChain) { Invoke-VenueBoundedRead -ScriptText '1' -Argument 0 "
+        got = self._binding_outcomes({
+            "manifest_timeout_0.6": manifest + "-TimeoutSec 0.6",
+            "manifest_timeout_600.5": manifest + "-TimeoutSec 600.5",
+            "manifest_minsec_0.6": manifest + "-ArtifactMinSec 0.6",
+            "manifest_minsec_600.5": manifest + "-ArtifactMinSec 600.5",
+            "bounded_timeout_0.6": bounded + "-TimeoutSec 0.6 }",
+            "bounded_timeout_600.5": bounded + "-TimeoutSec 600.5 }",
+            # controls: the range's own ends and a fractional budget inside it still bind
+            "manifest_timeout_1": manifest + "-TimeoutSec 1",
+            "manifest_timeout_2.8": manifest + "-TimeoutSec 2.8",
+            "manifest_timeout_600": manifest + "-TimeoutSec 600",
+            "manifest_minsec_1": manifest + "-ArtifactMinSec 1",
+            "manifest_minsec_2.8": manifest + "-ArtifactMinSec 2.8",
+            "bounded_timeout_1": bounded + "-TimeoutSec 1 }",
+            "bounded_timeout_2.8": bounded + "-TimeoutSec 2.8 }",
+            "bounded_timeout_600": bounded + "-TimeoutSec 600 }",
+        })
+        refused = {k: v for k, v in got.items() if k.rsplit("_", 1)[1] in ("0.6", "600.5")}
+        bound = {k: v for k, v in got.items() if k not in refused}
+        self.assertEqual(set(refused.values()), {"REFUSED"}, got)
+        self.assertEqual(set(bound.values()), {"BOUND"}, got)
+
+    def test_artifact_preflight_r9_b1_no_double_parameter_of_the_dual_venue_scripts_has_integer_range_endpoints(self) -> None:
+        # the class, not the three sites: any `[ValidateRange(<int>, <int>)]` on a floating-point parameter in the dual-venue scripts validates a rounded copy. r10 (fable key3 r9 P-02):
+        # whatever order, spelling or layout the declaration takes ([Parameter()] between, [double] before the attribute, [Double] / [System.Double], a multi-line attribute)
+        bad, seen = [], 0
+        for path in sorted(DV.glob("*.ps*1")):
+            for line, text, integer_end in ps_float_validaterange_params(path.read_text(encoding="utf-8")):
+                seen += 1
+                if integer_end:
+                    bad.append(f"{path.name}:{line}: {text}")
+        self.assertEqual(bad, [], "a floating-point parameter's ValidateRange endpoints must be doubles (1.0, 600.0)")
+        self.assertGreaterEqual(seen, 3, "the scan found the r9 sites (Get-VenueStagedBuildManifest -TimeoutSec / -ArtifactMinSec, Invoke-VenueBoundedRead -TimeoutSec): it is not vacuous")
+
+    def test_artifact_preflight_r10_the_validaterange_scanner_sees_every_declaration_spelling(self) -> None:
+        bad = [
+            "param([ValidateRange(1, 600)][double]$T)",
+            "param([ValidateRange(1, 600)]  [Double]$T)",
+            "param([ValidateRange(1, 600)][System.Double]$T)",
+            "param([Parameter()][ValidateRange(1, 600)][double]$T)",
+            "param([Parameter(Mandatory)]\n  [ValidateRange(1, 600)]\n  [double]\n  $T)",
+            "param([double][ValidateRange(1, 600)]$T)",
+            "param([Parameter()][double][ValidateRange(1, 600)]$T)",
+            "param([ValidateRange(\n    1,\n    600.0)][double]$T)",
+            "param([ValidateRange(0.5, 600)][single]$T)",
+            "param([ValidateRange( 1 , 600 ) ][decimal]$T)",
+        ]
+        for text in bad:
+            self.assertEqual([x[2] for x in ps_float_validaterange_params(text)], [True], text)
+        good = [
+            "param([ValidateRange(1.0, 600.0)][double]$T)",
+            "param([double][ValidateRange(1.0, 600.0)]$T)",
+            "param([Parameter()]\n[ValidateRange(\n  1.0,\n  600.0)]\n[double]$T)",
+        ]
+        for text in good:
+            self.assertEqual([x[2] for x in ps_float_validaterange_params(text)], [False], text)
+        for text in ("param([ValidateRange(1, 600)][int]$T)", "param([int][ValidateRange(1, 600)]$T)", "param([ValidateRange(1, 600)][string]$T)"):
+            self.assertEqual(ps_float_validaterange_params(text), [], text)
+
+    # r9 hardening (sol r7 + sol r8b + fable H3 + Dot P3): the per-file minimum re-check was pinned by source position only, so a label-gated mutation (the NOTIME check restricted to
+    # packageZip) passed the pin. Behavioural: the production worker scriptblock (lifted from the module's AST) runs on three files with a fake clock (no real sleeps) and a Test-Path
+    # shadow that spends fake time, window 4 s / minimum 2 s. Every file has the minimum checked before its existence check AND again after it, for EACH label; the wrong digest makes
+    # a file that was opened and hashed visible as a MISMATCH line, so "no open" is an observable absence. The shadow also records which files had an existence read STARTED: the check
+    # before it is what keeps a file from even being looked at with the window spent (a UNC Test-Path can itself block), and an absent file shows it as NOTIME, never MISSING.
+    def _artifact_worker_run(self, case: str, end_sec: float = 4.0, start_now: float = 0.0, delay_label: str = "", consume_label: str = "", absent_label: str = "", open_label: str = "") -> tuple[list[str], list[str]]:
+        d = self.case / ("worker-files-" + case)
+        d.mkdir(exist_ok=True)
+        for label in ("packageZip", "exe", "dll"):
+            if label != absent_label:
+                (d / f"{label}.bin").write_bytes(f"{label} bytes".encode("utf-8"))
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseFile('" + str(MODULE) + "', [ref]$null, [ref]$null)\n"
+            "$w = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and $x.Extent.Text -match '^\\{\\s*param\\(\\$items\\)' }, $true).ScriptBlock.GetScriptBlock()\n"
+            "$global:clk = [pscustomobject]@{ now = " + repr(start_now) + " }\n"
+            "$clock = [pscustomobject]@{}\n"
+            "Add-Member -InputObject $clock -MemberType ScriptProperty -Name Elapsed -Value { [pscustomobject]@{ TotalSeconds = $global:clk.now } }\n"
+            "$global:delayPath = '" + (str(d / f"{delay_label}.bin") if delay_label else "") + "'\n"
+            "$global:tp = [System.Collections.Generic.List[string]]::new()\n"
+            "function Test-Path { param([string]$LiteralPath, [string]$PathType) $global:tp.Add((Split-Path -Leaf $LiteralPath)); if ($global:delayPath -and $LiteralPath -ceq $global:delayPath) { $global:clk.now += 3 }; Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType }\n"
+            "$items = foreach ($label in 'packageZip', 'exe', 'dll') {\n"
+            "    $it = [pscustomobject]@{ label = $label; name = \"$label.bin\"; path = '" + str(d) + "\\' + $label + '.bin'; clock = $clock; endSec = " + repr(end_sec) + "; minSec = 2.0 }\n"
+            # r10 adversary A1: the open spends the window -- the 2nd read of .path is [IO.File]::Open's own argument (the 1st is Test-Path's), so the fake clock moves between the
+            # existence check and the open's return, exactly where a slow SMB open spends it
+            "    if ($label -ceq '" + open_label + "') { $p0 = $it.path; $it.PSObject.Properties.Remove('path'); Add-Member -InputObject $it -MemberType NoteProperty -Name _reads -Value 0; Add-Member -InputObject $it -MemberType NoteProperty -Name _p -Value $p0; Add-Member -InputObject $it -MemberType ScriptProperty -Name path -Value { $this._reads++; if ($this._reads -eq 2) { $global:clk.now += 3 }; $this._p } }\n"
+            "    if ($label -ceq '" + consume_label + "') { Add-Member -InputObject $it -MemberType ScriptProperty -Name sha -Value { $global:clk.now += 3; ('0' * 64) } }\n"
+            "    else { Add-Member -InputObject $it -MemberType NoteProperty -Name sha -Value ('0' * 64) }\n"
+            "    $it\n"
+            "}\n"
+            "$lines = @(& $w $items | ForEach-Object { [string]$_ })\n"
+            "ConvertTo-Json -Compress -InputObject @{ lines = $lines; tp = @($global:tp) }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, case + "\n" + out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        return [":".join(line.split(":")[:2]) for line in got["lines"]], [t.removesuffix(".bin") for t in got["tp"]]
+
+    def test_artifact_preflight_r9_the_hash_worker_checks_the_minimum_behaviourally_before_and_after_the_existence_check_for_every_file(self) -> None:
+        order = ["packageZip", "exe", "dll"]
+        # control: nothing spends time, so every file is looked at, opened and hashed (the wrong digest shows as MISMATCH) and none is NOTIME
+        self.assertEqual(self._artifact_worker_run("control"), ([f"MISMATCH:{k}" for k in order], order))
+        # the existence check of file L takes 3 s of the 4 s window: L is NOTIME and was not opened (no MISMATCH:L); the files before it were hashed
+        for i, label in enumerate(order):
+            with self.subTest(existence_check_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("exists-" + label, delay_label=label), ([f"MISMATCH:{k}" for k in order[:i]] + [f"NOTIME:{label}"], order[:i + 1]))
+        # the hash of file L spends the window: the NEXT file starts with 1 s left, under the 2 s minimum, so it is NOTIME with NO existence read started on it, and a file that is
+        # also absent is still NOTIME (not MISSING: nothing was looked at)
+        for i, label in enumerate(order[:-1]):
+            nxt = order[i + 1]
+            with self.subTest(hash_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("hash-" + label, consume_label=label), ([f"MISMATCH:{k}" for k in order[:i + 1]] + [f"NOTIME:{nxt}"], order[:i + 1]))
+                self.assertEqual(self._artifact_worker_run("hash-" + label + "-next-absent", consume_label=label, absent_label=nxt), ([f"MISMATCH:{k}" for k in order[:i + 1]] + [f"NOTIME:{nxt}"], order[:i + 1]))
+        # the first file with the window already spent is NOTIME and never looked at
+        self.assertEqual(self._artifact_worker_run("late", start_now=3.0), (["NOTIME:packageZip"], []))
+        # the contract's own boundary stays: under the minimum left (0.9 s of a 2 s minimum) is NOTIME and nothing is read; exactly the minimum left is read
+        self.assertEqual(self._artifact_worker_run("boundary-under", end_sec=0.9), (["NOTIME:packageZip"], []))
+        self.assertEqual(self._artifact_worker_run("boundary-at", end_sec=2.0), ([f"MISMATCH:{k}" for k in order], order))
+
+    # r10 adversary A1 (pass 2 on 3c341d79): the minimum was checked before the existence check and again before the open, but the OPEN can take the time too (an SMB open): a file
+    # whose open spent the window went on to ComputeHash with under the minimum left, and as the last matching artifact it was STAGED. The worker checks again once the file is open.
+    def test_artifact_preflight_r10_adv_a1_the_hash_worker_checks_the_minimum_again_after_the_open_for_every_file(self) -> None:
+        order = ["packageZip", "exe", "dll"]
+        for i, label in enumerate(order):
+            with self.subTest(open_spends_the_window=label):
+                # file L was looked at and opened (its Test-Path ran), then its open spent 3 of the 4 s: NOTIME:L, no hash of it (no MISMATCH:L), nothing after it touched
+                self.assertEqual(self._artifact_worker_run("open-" + label, open_label=label), ([f"MISMATCH:{k}" for k in order[:i]] + [f"NOTIME:{label}"], order[:i + 1]))
+
+    def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
+        c = "3" * 40
+        manifest = self.stage(c, "named")
+        self.artifact_path(c, "dll").unlink()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("igpu_recon_cuda-playback-attr-3-cuda-333333333333.dll", r.stderr)
+        # the control: every artifact staged and matching
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.events.unlink(missing_ok=True)
+        ok = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b, "cuda")]))
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, self.kinds())
+
+    def test_artifact_preflight_an_artifact_that_changes_while_the_batch_waits_on_a_foreign_claim_is_refused_after_the_wait(self) -> None:
+        self._fresh_run_dir()
+        exe = self.artifact_path(self.commit_a, "exe")
+        original = exe.read_bytes()
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        try:
+            code, so, se = self._during_claim_wait(args, e, lambda: exe.write_bytes(b"replaced while the batch waited"))
+        finally:
+            exe.write_bytes(original)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=BUILD_ARTIFACT_MISMATCH item=1 ", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+
+    # adversary r1 A1: the supplementary route calls with -TimeoutSec 30, and the artifact hash had its own 300 s default, so a stalled share held the primary chain for five minutes.
+    def test_artifact_preflight_adv_a1_the_artifact_hash_stays_inside_the_calls_own_timeout(self) -> None:
+        c = "3" * 40
+        self.stage(c, "slow share")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 3 -VerifyArtifacts -ArtifactProbeScript {{ param($i) [Threading.Thread]::Sleep(25000); 'late' }}\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sec = [int]$sw.Elapsed.TotalSeconds; error = [string]$r.error }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertLessEqual(got["sec"], 6, f"the call (timeout 3 s) took {got['sec']} s: {got}")
+        self.assertIn("could not be hashed", got["error"])
+
+    # adversary r2 A2: with no explicit bound the hash gets what is left of -TimeoutSec, and a 1 s floor ran a 1 s call to 2 s (850 ms manifest read + 900 ms hash, then STAGED). Now less than a whole second
+    # left is UNREACHABLE at once, so no call outlasts its own -TimeoutSec by more than the manifest read itself.
+    def test_artifact_preflight_adv_r2_a2_a_call_with_under_a_second_left_for_the_hash_ends_unreachable_not_over_its_timeout(self) -> None:
+        c = "3" * 40
+        self.stage(c, "tight")
+        manifest_probe = ("param($p) [Threading.Thread]::Sleep(850); ('a' * 64); 'C:" + c + "'; 'D:' + ('f' * 64); 'S:bool'; "
+                          "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 1 -VerifyArtifacts "
+                  f"-ProbeScript {{ {manifest_probe} }} -ArtifactProbeScript {{ param($i) [Threading.Thread]::Sleep(900) }}\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; ms = [int]$sw.Elapsed.TotalMilliseconds; error = [string]$r.error }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertLess(got["ms"], 1500, f"the call (timeout 1 s) ran {got['ms']} ms: {got}")
+        self.assertIn("no time is left", got["error"])
+
+    # adversary r1 A2: the post-claim guard runs between the grant and the claim keeper's start. A hash that outlasts ClaimTtlSec - ClaimRenewSec made every guard "lapse" the claim, release it and
+    # ask again until the deadline. The runner has no seam that slows a real hash, so the budget's derivation is pinned in the source: set from the grant time, handed to the artifact read, cleared after.
+    def test_artifact_preflight_adv_a2_the_post_claim_guard_hashes_inside_the_claim_guard_budget(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        # r3: the budget is New-GuardBudget's (a Stopwatch started at the grant read), so the claim guard and the post-open guard count on one monotonic clock each
+        # r7: less 1 s for the guard's own end, now that its reads get the exact remainder
+        grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget ($ClaimTtlSec - $ClaimRenewSec - 1) ")
+        self.assertLess(text.index("$grantReadUtc = [DateTime]::UtcNow", grant - 2000), grant)
+        # r4 (sol r3 B1): the whole guard runs under that budget (Invoke-InputGuard), not only its manifest and artifact reads
+        call, clear = text.index("try { $hit = Invoke-InputGuard }", grant), text.index("$script:guardBudget = $null", grant)
+        self.assertLess(grant, call)
+        self.assertLess(call, clear)
+        self.assertLess(clear, text.index("if ($hit) {", grant))
+        self.assertIn("clock = [Diagnostics.Stopwatch]::StartNew()", text[text.index("function New-GuardBudget"):text.index("function Get-InputContentRefusal")])
+        guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
+        # adversary r2 A1: the manifest read AND the hash come out of ONE share of the budget, and a share too small for both is a typed refusal. r4 (hub ruling 17:18:14Z): ONE deadline
+        # through both phases, so no fixed split: the timed r4 cases below hold the behaviour (Dot's literal case, key3 row L-04, the post-open 500 s room)
+        self.assertIn("($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds)", guard)
+        # r5 (key3 r4 B1): -VerifyArtifacts is off only under a budget that says so (the claim wait, no claim held)
+        # r7 (sol r6 B1): the guard's minimum and the module's -ArtifactMinSec are ONE value, and the share is the unfloored remainder
+        self.assertIn("-TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript", guard)
+        self.assertIn("$verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)", guard)
+        self.assertNotIn("$manifestSec", guard)
+        self.assertNotIn("-ArtifactTimeoutSec", guard)
+        self.assertIn("if ($share -lt $script:GuardReadMinSec) { return", guard)
+        self.assertNotIn("Floor", guard)
+        self.assertIn("$script:GuardReadMinSec = 2\n", text)
+        self.assertNotIn("-TimeoutSec 30", guard)
+        # and the pre-claim preflight, which holds no claim, asks for its own explicit bound
+        self.assertIn("-VerifyArtifacts -ArtifactTimeoutSec 300 }", text)
+
+    # r2 (Dot fd08838 cos-feedback/mlv-app/pr-705.md): the test above pins the source; this one TIMES the guard through the runner's offline probe seams. With -ClaimTtlSec 60 and
+    # -ClaimRenewSec 30 (their floors) the guard has 30 s from the grant. Inside the guard (the claim file exists; the preflight before it is fast) the manifest read takes 18 s and the
+    # artifact hash 18 s more. On 22d5ad64 the hash had a whole share of the budget, taken BEFORE the manifest read: it answered at about 36 s, the claim lapsed in the guard and was
+    # asked for again until DEADLINE (exit 3). The manifest read and the hash must share ONE bound: the hash runs out first and the plan is refused SHARE_UNREACHABLE, inside 30 s.
+    def test_artifact_preflight_r2_a_slow_manifest_read_and_a_slow_hash_end_typed_inside_the_claim_guard_budget(self) -> None:
+        c = self.commit_a
+        doc = json.loads((self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json").read_text(encoding="utf-8"))
+        started = self.case / "guard-read-started.txt"
+        in_guard = f"if (Test-Path -LiteralPath '{self.claim_path}' -PathType Leaf) {{ "
+        facts = [self.manifests[c], "C:" + c, "D:" + "f" * 64, "S:bool"] + [x for k in ("packageZip", "exe", "dll") for x in (f"A:{k}=ok", f"H:{k}={doc[k]['sha256']}")]
+        manifest_probe, artifact_probe = self.case / "manifest-probe.ps1", self.case / "artifact-probe.ps1"
+        manifest_probe.write_text("param($p)\n" + in_guard + f"[IO.File]::AppendAllText('{started}', [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.ffffff', [Globalization.CultureInfo]::InvariantCulture) + [Environment]::NewLine); [Threading.Thread]::Sleep(18000) }}\n"
+                                  + "".join(f"'{f}'\n" for f in facts), encoding="utf-8")
+        artifact_probe.write_text("param($items)\n" + in_guard + "[Threading.Thread]::Sleep(18000) }\n", encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-ClaimTtlSec", "60", "-ClaimRenewSec", "30",
+                          "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=75)),
+                          "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        ended = datetime.now(timezone.utc)
+        log = self.run_dir / "batch.log"
+        text = r.stdout + r.stderr + (log.read_text(encoding="utf-8", errors="replace") if log.exists() else "")
+        self.assertNotIn("CLAIM_LAPSED_IN_GUARD", text, "the guard outlasted the claim's TTL less one renew interval and the claim was asked for again")
+        self.assertEqual(r.returncode, 2, text)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        starts = started.read_text(encoding="utf-8").split()
+        self.assertEqual(len(starts), 1, f"one guard read, no release-and-retry: {starts}")
+        guard_sec = (ended - datetime.fromisoformat(starts[0]).replace(tzinfo=timezone.utc)).total_seconds()
+        self.assertLess(guard_sec, 30, f"the guard (and the refusal after it) took {guard_sec:.1f} s of a 30 s claim-guard budget")
+
+    def test_artifact_preflight_r2_the_probe_seams_are_refused_with_the_real_um_run(self) -> None:
+        probe = self.case / "probe.ps1"
+        probe.write_text("param($p) ''\n", encoding="utf-8")
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-ArtifactProbeScript", str(probe))
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE -StagedBuildProbeScript and -ArtifactProbeScript are offline test seams", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    # r3 (Dot 780783c4; hub ACK 6449516541): once the open returns, the guard re-reads and re-hashes every build on the LEASE's time. On f0e12522 it had a fixed 300 s for that while
+    # the lease end is clamped (-LeaseCapSec), so a healthy but slow re-hash left less than the leg budget: LEG_BUDGET_EXCEEDS_LEASE, a lease charged with no leg. The guard is now
+    # bounded by the lease's room less -LeaseMarginSec, the leg budget and 1 s, and a re-hash that cannot fit is refused typed while the leg budget is still left. The card's numbers
+    # (cap 120, leg 60, margin 0, a 70 s hash) are scaled to cap 95 and a 40 s hash so the case stays near 30 s (-LegBudgetSec cannot go under 60). The hash is slow only once the
+    # open was answered (the fake agent's state file exists), so the preflight and the claim guard stay fast.
+    def _post_open_hash_run(self, hash_sec: float, *extra: str, cap: str = "95", leg: str = "60", margin: str = "0", items: list | None = None, post_open: str | None = None,
+                            **env: str) -> tuple[subprocess.CompletedProcess, float]:
+        # post_open: PowerShell run in the artifact probe once the open was answered, in place of the hash_sec sleep
+        state = self.share / "fake-agent-state.json"
+        self.assertFalse(state.exists())
+        probe = self.case / "artifact-probe-post-open.ps1"
+        body = post_open if post_open is not None else f"[Threading.Thread]::Sleep({int(hash_sec * 1000)})"
+        probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ {body} }}\n", encoding="utf-8")
+        r = self.run_plan(self.write_plan(items or [self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", cap, "-LegBudgetSec", leg, "-LeaseMarginSec", margin,
+                          "-ArtifactProbeScript", str(probe), *extra, **env)
+        ticks = {}
+        for line in self.events_raw():
+            t, kind, rest = line.split(" ", 2)
+            if kind == "UMRUN":
+                ticks.setdefault("open" if rest.startswith("lease-batch-open-") else "close", int(t))
+        self.assertIn("open", ticks, r.stdout + r.stderr)
+        if "close" not in ticks and env.get("NO_CLOSE_EXPECTED"):
+            # r6: a close redirect that failed closed submits no close job (JOB_WRITE_FAILED); the hold then ends when the run does
+            done = datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))
+            ticks["close"] = (done - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
+        self.assertIn("close", ticks, r.stdout + r.stderr)
+        return r, (ticks["close"] - ticks["open"]) / 1e7
+
+    # r8: the slow-rehash cases run in the cap 75 / leg 60 room (14 s) the guard-read cases already use, with the hash 6 s over the room as the 40 s hash was over the 34 s room of
+    # cap 95: the refusal must land inside the room (held < 75 - 60 + 4), never after the hash has spent the leg budget (LEG_BUDGET_EXCEEDS_LEASE)
+    def test_artifact_preflight_r3_a_slow_post_open_rehash_is_refused_typed_before_the_leg_budget_is_spent(self) -> None:
+        r, held = self._post_open_hash_run(20, cap="75")
+        log = self.run_dir / "batch.log"
+        text = r.stdout + r.stderr + (log.read_text(encoding="utf-8", errors="replace") if log.exists() else "")
+        self.assertEqual(r.returncode, 2, text)
+        self.assertNotIn("LEG_BUDGET_EXCEEDS_LEASE", text, "the re-hash spent the lease's leg budget and the lease was charged with no leg")
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertIn("the lease's room after the open", r.stderr)
+        # #705 r14 (adversary r14 A1 sibling): the hash given up on is a read still held on the manifest's share, so the manifest's location is left unknown and nothing more is
+        # written into -RunDir (the receipt included); on 80df9163 the receipt was written through unbounded re-reads of every input's path
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists() and self.batches(), "no receipt was written into -RunDir after a share read was given up on")
+        self.assertEqual(self.leg_calls(), [])
+        # refused while a leg budget was still left in the 75 s lease, not after the 20 s hash
+        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s before the close: the re-hash ran into the leg budget")
+
+    def test_artifact_preflight_r3_a_fast_post_open_rehash_still_runs_the_leg(self) -> None:
+        r, held = self._post_open_hash_run(0)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 1, 1))
+        self.assertEqual(len(self.leg_calls()), 1)
+
+    def test_artifact_preflight_r3_a_lease_with_no_room_for_the_rehash_and_one_leg_is_refused_at_once(self) -> None:
+        # a lease shorter than the leg budget cannot start the re-read: LEG_BUDGET_EXCEEDS_LEASE at once, typed by the guard, before any probe and without the 40 s re-hash
+        r, held = self._post_open_hash_run(40, FAKE_LEASE_REMAIN="30")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE item=1 ", r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"]), ("LEG_BUDGET_EXCEEDS_LEASE", 0))
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        self.assertLess(held, 20, f"the lease was held {held:.1f} s: the 40 s re-hash ran on a lease that could hold no leg")
+
+    # r3 adversary A1 (pass 1 on 5c3407ff): the guard skipped the content re-check when the lease's room (a float) was under the leg budget, but the leg loop rounds the room to whole
+    # seconds, so a room of 59.9 s with a 60 s budget skipped the check AND let a probe and a leg run on a manifest changed in the open wait. The content is never skipped now.
+    def test_artifact_preflight_r3_adv_a1_a_lease_room_just_under_the_leg_budget_runs_no_probe_on_an_unchecked_build(self) -> None:
+        manifest = self.share / "cache" / f"playback-attr-3-cuda-{self.commit_a[:12]}-build.json"
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "95", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                FAKE_OPEN_SLEEP="6", FAKE_LEASE_REMAIN="60")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
+            with open(manifest, "a", encoding="utf-8") as f:
+                f.write("\n")
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertRegex(se, r"LEG_PLAN_REFUSED reason=(LEG_BUDGET_EXCEEDS_LEASE|BUILD_MANIFEST_MISMATCH) item=1 ")
+        self.assertIn("found after the open", se)
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        self.assertEqual(self.leg_calls(), [])
+
+    # r3 adversary A2 (pass 1 on 5c3407ff): an open held in the agent's gate ran the guard at once with no budget (300 s), so a slow re-hash ran while the agent had already admitted
+    # the open and published its result, and the lease was held through it before the lease-aware guard below ever started. That call now checks locations only.
+    def test_artifact_preflight_r3_adv_a2_a_gate_held_open_is_not_rehashed_before_its_result_is_read(self) -> None:
+        r, held = self._post_open_hash_run(20, cap="75", FAKE_OPEN_MODES="gatewait")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s before the close: a re-hash ran outside the lease's room")
+
+    # r4 ITEM 1 (hub ruling 2026-10-27T17:18:14Z: one absolute deadline through both phases; key3 and fable r3 B1). On 02612714 each build's share was split into a fixed manifest
+    # part (min(30, share - 1)) and the rest for the hash, so read time the manifest did not use never reached the hash and a check that fits was refused SHARE_UNREACHABLE.
+    def _timed_probes(self, manifest_ms: int, hash_ms: int, when: str = "$true", no_digests_when: str = "$false") -> tuple[Path, Path]:
+        """Manifest and artifact probe seams for both staged builds: the manifest read sleeps manifest_ms and the hash hash_ms while `when` holds (a PowerShell condition). While
+        `no_digests_when` holds the manifest read emits A:<k>=ok without the paired H:<k>= digest lines (key3 r3 H3's throw)."""
+        manifest_probe, artifact_probe = self.case / "timed-manifest-probe.ps1", self.case / "timed-artifact-probe.ps1"
+        body = ["param($p)", f"if ({when}) {{ [Threading.Thread]::Sleep({manifest_ms}) }}", f"$noDigests = {no_digests_when}"]
+        for c in (self.commit_a, self.commit_b):
+            doc = json.loads((self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json").read_text(encoding="utf-8"))
+            facts = [self.manifests[c], "C:" + c, "D:" + "f" * 64, "S:bool"] + [f"A:{k}=ok" for k in ("packageZip", "exe", "dll")]
+            digests = [f"H:{k}={doc[k]['sha256']}" for k in ("packageZip", "exe", "dll")]
+            body.append(f"if ($p -like '*{c[:12]}*') {{ " + "; ".join(f"'{f}'" for f in facts) + "; if (-not $noDigests) { " + "; ".join(f"'{f}'" for f in digests) + " } }")
+        manifest_probe.write_text("\n".join(body) + "\n", encoding="utf-8")
+        artifact_probe.write_text("param($items)\n" + f"if ({when}) {{ [Threading.Thread]::Sleep({hash_ms}) }}\n", encoding="utf-8")
+        return manifest_probe, artifact_probe
+
+    def test_artifact_preflight_r4_item1_dots_literal_case_two_builds_fast_manifest_and_a_2s_hash_runs_the_legs(self) -> None:
+        # Dot's literal case: -ClaimTtlSec 60, -ClaimRenewSec 15, two builds, a 0.1 s manifest read and a 2 s hash. The claim guard has 45 s, 22 s per build. On 02612714: manifest
+        # bound 21 s, hash bound 1 s, so the 2 s hash was refused SHARE_UNREACHABLE with ~41 s of the budget unused.
+        manifest_probe, artifact_probe = self._timed_probes(100, 2000)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b)]), "-ClaimTtlSec", "60", "-ClaimRenewSec", "15",
+                          "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        self.assertNotIn("SHARE_UNREACHABLE", r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 2, 2))
+
+    def test_artifact_preflight_r4_item1_key3_row_l04_a_10s_post_open_hash_in_a_34s_room_runs_the_leg(self) -> None:
+        # key3 row L-04: cap 95 / leg 60 / margin 0, a fast manifest read, a 10 s re-hash once the lease is open. The guard's room is 34 s. On 02612714: manifest bound 30 s, hash
+        # bound 3 s, so SHARE_UNREACHABLE, exit 2, legsAttempted 0, the lease charged with no leg.
+        r, held = self._post_open_hash_run(10)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 1, 1))
+        self.assertEqual(len(self.leg_calls()), 1)
+
+    def test_artifact_preflight_r4_item1_a_healthy_3s_rehash_in_a_500s_lease_runs_the_leg(self) -> None:
+        # fable r3 B1's post-open sibling: a lease with 500 s of room, -LeaseMarginSec 120, -LegBudgetSec 360: the guard has 19 s. On 02612714 the manifest got 18 s and the hash 1 s,
+        # so a healthy 3 s re-hash of the cached artifacts closed a lease charged with no leg. The leg runs, and the lease is not charged without one.
+        r, held = self._post_open_hash_run(3, cap="2700", leg="360", margin="120", FAKE_LEASE_REMAIN="500")
+        self.assertNotIn("SHARE_UNREACHABLE", r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 1, 1))
+        self.assertEqual(len(self.leg_calls()), 1)
+
+    def test_artifact_preflight_r4_item1_control_a_hash_over_the_remainder_is_still_refused_inside_the_room(self) -> None:
+        # the control: the one deadline still binds. A 0.1 s manifest read and a 40 s re-hash in the 34 s room end SHARE_UNREACHABLE while the leg budget is left (the r3 40 s case
+        # above holds the same with a fast manifest read).
+        r, held = self._post_open_hash_run(20, cap="75")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s: the re-hash ran into the leg budget")
+
+    # r4 ITEM 2 (sol r3 B1; Dot 6454756990): the guard's own file system reads -- a build manifest's existence (Test-Path), each input's physical path and identity
+    # (Get-RunDirOutputRefusal), each leg spec's bytes (Get-LegSpecRefusal) -- ran OUTSIDE the bounded reader, so one that blocked spent the lease's leg reserve and the refusal came
+    # late (sol: 45.01 s against a 34 s budget). Every guard read now runs under the guard's one deadline. -GuardReadDelay delays exactly one kind of read in one guard. The room is
+    # cap 75 / leg 60 / margin 0: the post-open guard has 14 s, and the delay is 25 s.
+    def _delayed_guard_read_run(self, read: str) -> tuple[subprocess.CompletedProcess, float]:
+        return self._post_open_hash_run(0, "-GuardReadDelay", f"open:{read}=25", cap="75")
+
+    def _assert_delayed_read_refused_inside_the_room(self, r: subprocess.CompletedProcess, held: float, extra: float = 0) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertIn("the guard's reads did not finish within the lease's room after the open", r.stderr)
+        self.assertNotIn("LEG_BUDGET_EXCEEDS_LEASE", r.stdout + r.stderr, "the delayed read spent the leg budget before the refusal")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        # the refusal came inside the 14 s room (plus the close), never after the 25 s read: the leg reserve was never spent
+        # r5 (adversary r5 A1): a location left unknown adds the documented bounded re-read of -RunDir (at most 2 s) before the close
+        self.assertLess(held, 75 - 60 + 4 + extra, f"the lease was held {held:.1f} s before the close: the delayed read ran past the guard's room")
+        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
+
+    def test_artifact_preflight_r4_item2_a_delayed_existence_read_after_the_open_ends_share_unreachable_inside_the_room(self) -> None:
+        r, held = self._delayed_guard_read_run("existence")
+        self._assert_delayed_read_refused_inside_the_room(r, held, extra=2)
+        # where an input is was never verified: nothing more is written into -RunDir (fail closed, as an unresolvable location is)
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+
+    def test_artifact_preflight_r4_item2_a_delayed_identity_and_path_read_after_the_open_ends_share_unreachable_inside_the_room(self) -> None:
+        r, held = self._delayed_guard_read_run("identity")
+        self._assert_delayed_read_refused_inside_the_room(r, held, extra=2)
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+
+    def test_artifact_preflight_r4_item2_a_delayed_spec_read_after_the_open_ends_share_unreachable_inside_the_room(self) -> None:
+        r, held = self._delayed_guard_read_run("spec")
+        self._assert_delayed_read_refused_inside_the_room(r, held, extra=2)
+        # #705 r14 (adversary r14 A1): every location was verified BEFORE the spec read, but the worker given up on is still in a read of the spec's share, so the spec's location
+        # cannot be read again on the main thread inside the room (each later L and receipt write would, through Get-WriteDestinationHit): it is left unknown and nothing more is
+        # written into -RunDir. On 80df9163 the suppression stayed off and the receipt was written through those unbounded reads.
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists() and self.batches(), "no receipt was written into -RunDir after the guard gave up on a share read")
+
+    def test_artifact_preflight_r4_item2_fast_control_the_same_room_with_no_delay_runs_the_leg(self) -> None:
+        r, held = self._post_open_hash_run(0, cap="75")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 1, 1))
+
+    def test_artifact_preflight_r4_item2_no_room_control_a_lease_shorter_than_the_leg_is_refused_at_once(self) -> None:
+        # no room: the location checks still run (alias detection kept), then LEG_BUDGET_EXCEEDS_LEASE before any content read, as on r3
+        r, held = self._post_open_hash_run(40, cap="75", FAKE_LEASE_REMAIN="30")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE item=1 ", r.stderr)
+        self.assertNotIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertLess(held, 20)
+        self.assertFalse(self.claim_path.exists())
+
+    def test_artifact_preflight_r4_adv_a1_no_room_refuses_before_a_slow_spec_read(self) -> None:
+        # r4 adversary A1 (pass 1 on 31d1fdaf): cap 62 / leg 60 / margin 0 leaves the post-open guard about 1 s. Invoke-InputGuard's 10 s floor for that case (meant for the location
+        # checks) let the content check read a spec that took 5 s before it noticed no time was left, so the refusal came after the leg reserve was spent. Now no content read starts.
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:spec=5", cap="62")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE ", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 4.5, f"the lease was held {held:.1f} s: the 5 s spec read ran on a lease with no room for it")
+
+    def test_artifact_preflight_r4_adv_p2_a1_no_room_bounds_a_slow_location_read_to_2s_not_10s(self) -> None:
+        # r4 adversary pass 2 A1 (on 336d318d): with about 1 s of room the location checks were given 10 s, so a 5 s identity read ran to its end before the refusal. They get 2 s
+        # now; one still running then fails closed (no more writes into -RunDir), typed with the no-room reason.
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:identity=5", cap="62")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE", r.stderr)
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 4.5, f"the lease was held {held:.1f} s: the 5 s identity read ran on a lease with no room for it")
+
+    def test_artifact_preflight_r4_adv_p2_a2_no_spec_read_starts_once_an_earlier_read_used_the_room(self) -> None:
+        # r4 adversary pass 2 A2 (on 336d318d): cap 66 / leg 60 / margin 0 leaves about 5 s; two leg specs whose reads take 3 s each. The no-room check ran once, before the first
+        # read, so the second started with under 2 s left. It is checked before each read now: the first read runs, the second is refused before it starts.
+        items = [self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "A", self.commit_a)]
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:spec=3", cap="66", items=items)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE item=2 ", r.stderr)
+        self.assertNotIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 5.5, f"the lease was held {held:.1f} s: a second 3 s spec read started with under 2 s of room")
+
+    def test_artifact_preflight_r4_item2_a_delayed_read_in_the_claim_guard_ends_typed_inside_the_claim_budget(self) -> None:
+        # the claim guard's sibling: -ClaimTtlSec 60 / -ClaimRenewSec 30 gives 30 s; a 40 s identity read ends SHARE_UNREACHABLE inside it, the claim released, no lease opened,
+        # never CLAIM_LAPSED_IN_GUARD and a release-and-retry
+        t0 = time.monotonic()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-ClaimTtlSec", "60", "-ClaimRenewSec", "30", "-GuardReadDelay", "claim:identity=40")
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertIn("the guard's reads did not finish within the claim guard", r.stderr)
+        self.assertNotIn("CLAIM_LAPSED_IN_GUARD", r.stdout + r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        self.assertLess(took, 40, f"the run took {took:.1f} s: the 40 s read was waited for")
+
+    # r5 ITEM 1 (key3 r4 B1, catalogue row L-05; Dot 6457724432): an attempt the claim was NOT granted for ran the guard inline with no budget, and the guard hashed every cached
+    # artifact (-VerifyArtifacts) on the venue's share on every -ClaimPollSec poll while a foreign chain held the venue (and measured). Master's wait read the manifests only.
+    def test_artifact_preflight_r5_l05_no_artifact_read_while_a_foreign_claim_is_waited_out_then_one_hash_under_the_claim(self) -> None:
+        self._fresh_run_dir()
+        state = self.share / "fake-agent-state.json"
+        self.assertFalse(state.exists())
+        manifest_calls, artifact_calls = self.case / "manifest-calls.txt", self.case / "artifact-calls.txt"
+        manifest_probe, artifact_probe = self._timed_probes(0, 0)
+        # every manifest read (one per build per guard, a denied poll's included) and every artifact hash (one per build per -VerifyArtifacts call) appends a line;
+        # a hash says whether the open was answered yet (the fake agent's state file), so the claim guard's hash is told from the post-open guard's
+        manifest_probe.write_text(manifest_probe.read_text(encoding="utf-8").replace("param($p)\n", f"param($p)\n[IO.File]::AppendAllText('{manifest_calls}', 'm' + [Environment]::NewLine)\n", 1),
+                                  encoding="utf-8")
+        artifact_probe.write_text("param($items)\n" + f"$w = $(if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ 'open' }} else {{ 'before-open' }})\n"
+                                  + f"[IO.File]::AppendAllText('{artifact_calls}', $w + [Environment]::NewLine)\n", encoding="utf-8")
+
+        def lines(p: Path) -> list[str]:
+            return p.read_text(encoding="utf-8").split() if p.exists() else []
+
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
+                                "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("CLAIM_HELD")
+            # the reset after the one-time preflight (Dot): CLAIM_HELD is logged after the first denied poll's guard, so the preflight's one hash is all there may be by now
+            at_held = len(lines(artifact_calls))
+            m0 = len(lines(manifest_calls))
+            end = time.monotonic() + 120
+            while len(lines(manifest_calls)) < m0 + 3 and time.monotonic() < end and p.poll() is None:
+                time.sleep(0.2)
+            denied_polls = len(lines(manifest_calls)) - m0
+            during = len(lines(artifact_calls)) - at_held
+            mark = len(lines(artifact_calls))
+            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertGreaterEqual(denied_polls, 3, f"three more denied polls re-read the manifest (the manifest check is kept while no claim is held): {so + se}")
+        self.assertEqual(at_held, 1, f"only the one-time preflight hashed before the first denied poll ended; the denied poll hashed too: {lines(artifact_calls)}")
+        self.assertEqual(during, 0, f"{during} artifact hashes during {denied_polls} denied polls while a foreign claim held the venue")
+        self.assertEqual(p.returncode, 0, so + se)
+        after = lines(artifact_calls)[mark:]
+        self.assertEqual(after.count("before-open"), 1, f"exactly one hash under the claim guard's budget once the claim was granted: {after}")
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1))
+
+    # r12 (#704 merge): #704's receipt guard (Test-ReceiptWriteSuppressed) re-runs Get-InputOutputRefusal before each receipt file, with no guard budget, so on the merged tree it
+    # hashed every cached artifact again (300 s bound) once per receipt file after the legs ran, and an artifact changed then would end a finished run in a typed stop. Neither parent
+    # did that: the receipt guard keeps its location and manifest checks, and the artifacts are hashed only by the preflight, the claim guard and the post-open guard.
+    def test_artifact_preflight_r12_the_receipt_guard_hashes_no_artifact(self) -> None:
+        self._fresh_run_dir()
+        state = self.share / "fake-agent-state.json"
+        artifact_calls = self.case / "r12-artifact-calls.txt"
+        manifest_probe, artifact_probe = self._timed_probes(0, 0)
+        artifact_probe.write_text("param($items)\n" + f"$w = $(if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ 'open' }} else {{ 'before-open' }})\n"
+                                  + f"[IO.File]::AppendAllText('{artifact_calls}', $w + [Environment]::NewLine)\n", encoding="utf-8")
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
+                                "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = artifact_calls.read_text(encoding="utf-8").split() if artifact_calls.exists() else []
+        # the preflight and the claim guard (before the open), then the post-open guard: nothing at the receipts
+        self.assertEqual(calls, ["before-open", "before-open", "open"], r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1))
+
+    # r5 ITEM 2 (sol r4 B1; key3 r4 H-B): once Invoke-InputGuard gave up on a location read (locationUnknown), Test-OpenOutputAlias re-resolved -RunDir (Get-PhysicalPath) and read
+    # its identity on the main thread, unbounded, and the claim-time refusal probed batch.log: a -RunDir that stopped answering (a UNC share, a junction whose target went away) then
+    # held the run before the typed refusal and the lease close. '<guard>:rundir=<sec>' stalls every read of -RunDir in that guard and after it; GUARD_READ_DELAY_SEAM on stderr names
+    # each main-thread read that reached the stall.
+    def test_artifact_preflight_r5_item2_a_stalled_rundir_after_the_open_reaches_the_typed_refusal_and_the_close_inside_the_room(self) -> None:
+        # sol's repro: cap 75, leg budget 60, margin 0 (the post-open guard has 14 s); -RunDir's metadata reads stall 40 s once the open is answered
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", NO_CLOSE_EXPECTED="1")
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        # the 14 s room, the close, and the documented 2 s bounded re-read of -RunDir (adversary r5 A1), never the 40 s stall
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close: the stalled -RunDir was waited for")
+        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        # r7 (sol r6 B2): a -RunDir re-read that does not answer leaves its location unknown, never the preflight's: the redirect fails closed and the close job is typed unwritable
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the redirect was made against -RunDir's preflight location")
+        self.assertIn('"closeOutcome":"JOB_WRITE_FAILED"', r.stderr)
+
+    def test_artifact_preflight_r5_item2_a_stalled_rundir_in_the_claim_guard_refuses_without_probing_batch_log(self) -> None:
+        # the claim-time sibling (sol r4 B1, Stop-PlanRefused): -ClaimTtlSec 60 / -ClaimRenewSec 30 gives the claim guard 30 s; -RunDir stalls 40 s
+        t0 = time.monotonic()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-ClaimTtlSec", "60", "-ClaimRenewSec", "30", "-GuardReadDelay", "claim:rundir=40")
+        took = time.monotonic() - t0
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "batch.log was probed after the guard gave up on -RunDir's location")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        self.assertLess(took, 40, f"the run took {took:.1f} s: the stalled -RunDir was read again after the 30 s guard")
+
+    # r5 adversary A1 (pass 1 on 8559ef31): the location-unknown redirect check compared TEMP with -RunDir's preflight location only, so a -RunDir junction re-pointed AT TEMP before
+    # the open returned got its close redirect (and the close job) made inside the current -RunDir. -RunDir is now re-read on a pool thread bounded at 2 s.
+    def test_artifact_preflight_r5_adv_a1_a_rundir_junction_repointed_at_temp_gets_no_close_redirect_inside_it(self) -> None:
+        old, new, link = self.case / "rd-old", self.case / "rd-new", self.case / "run-link"
+        old.mkdir(parents=True, exist_ok=True)
+        new.mkdir(parents=True, exist_ok=True)
+        self._junction(link, old)
+        self.addCleanup(lambda: os.path.lexists(link) and os.rmdir(link))
+        self.run_dir = link
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                "-GuardReadDelay", "open:identity=25", FAKE_OPEN_SLEEP="6", TEMP=str(new), TMP=str(new))
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            # r15 (hosted CI 40963950528): the open's job file is written into -RunDir\batch-jobs AFTER the read-back line, so a repoint made at that line raced it and, on a slow
+            # runner, the job write met the new target first (OUTPUT_ZONE_UNRESOLVED, the open never submitted). The repoint lands inside the open's wait, as the case means.
+            self._wait_for_open_wait()
+            os.rmdir(link)                 # the junction itself, not its target
+            self._junction(link, new)      # -RunDir now IS TEMP
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        made = [x.name for x in new.iterdir() if x.name.startswith("venue-lease-batch-close-")]
+        self.assertEqual(made, [], f"the close redirect was made inside the current -RunDir: {made}\n{se}")
+        self.assertIn("an input whose location is unknown is refused", se)
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", se)
+        self.assertIn("is inside -RunDir", se)
+
+    # r7 ITEM 2 (sol r6 B2 = adversary r6 A1 = fable/key3 r6 H1; new catalogue row): the same repoint, but the bounded re-read of -RunDir times out (open:rundir=40). The cleanup fell
+    # back to where the PREFLIGHT found -RunDir (rd-old), TEMP (rd-new) was outside that, and the close redirect was MADE inside the current -RunDir while the run said it wrote nothing
+    # more there. A re-read that does not answer leaves the location unknown: the redirect fails closed (FAILED, no job folder, the close typed JOB_WRITE_FAILED).
+    def _repointed_rundir_run(self, guard_delay: str, repoint: bool) -> tuple[str, str, Path, int]:
+        old, new, link = self.case / "rd-old", self.case / "rd-new", self.case / "run-link"
+        old.mkdir(parents=True, exist_ok=True)
+        new.mkdir(parents=True, exist_ok=True)
+        self._junction(link, old)
+        self.addCleanup(lambda: os.path.lexists(link) and os.rmdir(link))
+        self.run_dir = link
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                "-GuardReadDelay", guard_delay, FAKE_OPEN_SLEEP="6", TEMP=str(new), TMP=str(new))
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            # r15: inside the open's wait, after its job file is written (see the r5 adversary A1 case above)
+            self._wait_for_open_wait()
+            if repoint:
+                os.rmdir(link)                 # the junction itself, not its target
+                self._junction(link, new)      # -RunDir now IS TEMP
+            try:
+                so, se = p.communicate(timeout=120)
+            except subprocess.TimeoutExpired:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                so, se = p.communicate(timeout=60)
+                self.fail(f"the run did not end in 120 s:\n{so}\n{se}")
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        return so, se, new, p.returncode
+
+    def test_artifact_preflight_r7_b2_a_repointed_rundir_whose_reread_times_out_gets_no_close_redirect_inside_it(self) -> None:
+        so, se, new, code = self._repointed_rundir_run("open:rundir=40", repoint=True)
+        made = [x.name for x in new.iterdir() if x.name.startswith("venue-lease-batch-close-")]
+        self.assertEqual(made, [], f"the close redirect was made inside the current -RunDir: {made}\n{se}")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("an input whose location is unknown is refused", se)
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", se)
+        self.assertIn("did not answer within 2 s", se)
+        res = batch_result(so)
+        self.assertEqual(res["outputRedirect"]["state"], "FAILED", res)
+        self.assertIn('"closeOutcome":"JOB_WRITE_FAILED"', se, "the failed redirect leaves the close job unwritable, typed")
+        self.assertEqual(self.leg_calls(), [])
+
+    def test_artifact_preflight_r7_b2_control_a_rundir_reread_that_answers_still_gets_the_redirect_in_an_independent_temp(self) -> None:
+        # the guard gives up on a location (its identity reads stall 25 s in a 14 s room), but -RunDir's own re-read answers: TEMP (rd-new) is not -RunDir (rd-old), so the redirect is made
+        so, se, new, code = self._repointed_rundir_run("open:identity=25", repoint=False)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("an input whose location is unknown is refused", se)
+        self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", se, se)
+        self.assertEqual(len([x for x in new.iterdir() if x.name.startswith("venue-lease-batch-close-")]), 1, se)
+        self.assertEqual(batch_result(so)["outputRedirect"]["state"], "MADE")
+
+    # r5 adversary pass 2 A2 (on 4a8e2e87): a -RunDir junction removed after the open was submitted made the worker's resolve FAIL (not time out), so the hit was a known location
+    # hit and Test-OpenOutputAlias read -RunDir again on the main thread, unbounded. A location that cannot be resolved under a guard budget is a location left unknown.
+    def test_artifact_preflight_r5_adv_p2_a2_a_rundir_junction_removed_after_the_open_is_not_read_again_on_the_main_thread(self) -> None:
+        old, link = self.case / "rd-old", self.case / "run-link"
+        self._junction(link, old)
+        self.addCleanup(lambda: os.path.lexists(link) and os.rmdir(link))
+        self.run_dir = link
+        # r8: the open blocks until the junction is removed (FAKE_OPEN_RELEASE), not for a fixed 6 s; the 3 s -GuardReadDelay is only what a main-thread -RunDir read would stall on
+        # (GUARD_READ_DELAY_SEAM on stderr says it did), so it does not have to outlast anything
+        release = self._open_release()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                "-GuardReadDelay", "open:rundir=3", FAKE_OPEN_SLEEP="60", FAKE_OPEN_RELEASE=str(release))
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            self._wait_for_open_wait()
+            os.rmdir(link)   # the junction itself; its target stays
+            release.write_text("go", encoding="utf-8")
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", se, "-RunDir was read again on the main thread after the guard could not resolve it")
+        self.assertEqual(p.returncode, 2, so + se)
+        # r12 (#704 merge, RPF-06): -RunDir's zone no longer resolves while the plan itself opens, so the hit is typed OUTPUT_ZONE_UNRESOLVED (no longer "cannot be resolved to a
+        # physical path"), and under the guard budget it is still a location left unknown (no main-thread re-read, asserted above)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED ", se)
+        self.assertIn("an output location could not be resolved", se)
+        self.assertIn("BATCH_OUTPUT_ALIASED", se)
+        self.assertEqual(self.leg_calls(), [])
+
+    # r6 (sol r5 B1 = key3 r5 B1; new catalogue row: TEMP reaches a -RunDir that stalls after the open): after a location-unknown guard result -RunDir was re-read bounded, but TEMP
+    # was not. The pair list resolved TEMP (CreateFileW) before the spelling check that rejects a nested TEMP at once, and the identity walk from TEMP up ran on the main thread too,
+    # so a TEMP inside the stalled -RunDir held the typed refusal and the close. '<guard>:rundir=<sec>' now stalls every TEMP read that reaches -RunDir (TEMP_READ_DELAY_SEAM on
+    # stderr says it was armed). RED on 52bd3050's logic with that seam: the 40 s stall is waited for before the close.
+    def _stalled_rundir_temp_run(self, temp: Path, expect: str, armed: bool = True) -> None:
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", TEMP=str(temp), TMP=str(temp), NO_CLOSE_EXPECTED="1")
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
+        self.assertIn('"closeOutcome":"JOB_WRITE_FAILED"', r.stderr, "the failed redirect leaves the close job unwritable, typed")
+        if armed:
+            self.assertIn("TEMP_READ_DELAY_SEAM", r.stderr, "the seam never stalled a TEMP read: this row would pass vacuously")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        # the 14 s room, the close, and the 2 s bound on the -RunDir re-read and the TEMP walk (raced, one bound), never the 40 s stall
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close: a TEMP read that reached the stalled -RunDir was waited for")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the redirect fails closed")
+        self.assertIn(expect, r.stderr)
+        self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
+        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
+
+    def test_artifact_preflight_r6_b1_a_temp_nested_in_a_stalled_rundir_fails_the_redirect_closed_by_spelling_before_any_temp_read(self) -> None:
+        temp = self.run_dir / "tmp"
+        temp.mkdir(parents=True, exist_ok=True)
+        # spelling alone rejects it now, before any TEMP read, so the seam is never reached on the fixed code
+        self._stalled_rundir_temp_run(temp, "is inside -RunDir", armed=False)
+
+    def test_artifact_preflight_r6_b1_a_temp_junction_into_a_stalled_rundir_fails_the_redirect_closed_within_2s(self) -> None:
+        alias = self.case / "r6-temp-junction"
+        self._junction(alias, self.run_dir / "tmp")
+        self.addCleanup(lambda: os.path.lexists(alias) and os.rmdir(alias))
+        self._stalled_rundir_temp_run(alias, "did not answer within 2 s")
+
+    def test_artifact_preflight_r6_b1_a_temp_whose_identity_read_stalls_fails_the_redirect_closed_within_2s(self) -> None:
+        # TEMP's final path answers and is not -RunDir's (\\localhost\C$\<RunDir>\tmp); the identity read of the folder that IS -RunDir stalls with it
+        (self.run_dir / "tmp").mkdir(parents=True, exist_ok=True)
+        self._stalled_rundir_temp_run(self._loopback_unc(self.run_dir) / "tmp", "did not answer within 2 s")
+
+    def test_artifact_preflight_r6_b1_control_an_independent_answering_temp_still_gets_the_redirect_fast(self) -> None:
+        # sol r5 INV-4 row 1: TEMP elsewhere and answering gets the redirect. r7 (sol r6 B2): only when -RunDir's own re-read answers too (here the guard gives up on its identity
+        # reads, open:identity=25 in the 14 s room); a -RunDir re-read that times out is no longer replaced by the preflight's location (the r7_b2 rows)
+        temp = self.case / "r6-temp-elsewhere"
+        temp.mkdir(parents=True, exist_ok=True)
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:identity=25", cap="75", TEMP=str(temp), TMP=str(temp))
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("TEMP_READ_DELAY_SEAM", r.stderr)
+        self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, r.stderr)
+        self.assertEqual(len(list(temp.glob("venue-lease-batch-close-*"))), 1, r.stderr)
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close")
+
+    # r5 adversary A2 (pass 1 on 8559ef31): no content read starts with under 2 s of the guard's room, but Get-VenueStagedBuildManifest started the hash with 1 s left of its call.
+    # cap 66 / leg 60 / margin 0 leaves the post-open guard about 5 s (one build: a 4 s read); the manifest read takes 2.2 s once the open is answered, so the hash would start with 1.8 s.
+    # r7 (sol r6 B1): the share is no longer floored (4.x s, not 4), so the read takes 3 s to leave the hash under 2 s, as 2.2 s did of a floored 4
+    def test_artifact_preflight_r5_adv_a2_no_artifact_hash_starts_with_under_2s_of_the_guard_room(self) -> None:
+        state = self.share / "fake-agent-state.json"
+        manifest_probe, _ = self._timed_probes(3000, 0, when=f"(Test-Path -LiteralPath '{state}' -PathType Leaf)")
+        r, held = self._post_open_hash_run(0, "-StagedBuildProbeScript", str(manifest_probe), cap="66")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("no time is left of -TimeoutSec", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+
+    # r5 adversary A3 (pass 1 on 8559ef31): each build got floor(room / builds), so N healthy fast builds in a room under 2N s were refused before any read and the opened lease charged
+    # with no leg. Two builds, cap 65 / leg 60 / margin 0: about 4 s of room, 1 s each on 8559ef31; the real reads take well under a second.
+    def test_artifact_preflight_r5_adv_a3_two_fast_builds_in_a_4s_room_are_read_not_refused(self) -> None:
+        items = [self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b)]
+        r, held = self._post_open_hash_run(0, cap="65", items=items)
+        self.assertNotIn("to read and hash the staged build", r.stdout + r.stderr, "a build was refused for its split of the room before any read")
+        self.assertNotIn("LEG_PLAN_REFUSED", r.stderr)
+        self.assertGreaterEqual(len(self.leg_calls()), 1, r.stdout + r.stderr)
+
+    # r7 ITEM 1 (sol r6 B1 = adversary r6 A2; new catalogue row): the guard floored its room to whole seconds (2.8 -> 2) and Get-VenueStagedBuildManifest floored the remainder after
+    # the manifest read again (1.87 -> 1), under its -ArtifactMinSec 2: a room of 2.8 or 2.99 s, a 100 ms manifest read and a 100 ms matching hash were refused SHARE_UNREACHABLE
+    # with no hash (after the open, a lease closed and charged with no leg). Run on the runner's own functions (New-GuardBudget, Get-InputContentRefusal, lifted from its AST) with
+    # offline probes; each manifest read and each hash appends a line.
+    def _guard_room_run(self, room: float, manifest_ms: int = 100, hash_ms: int = 100) -> dict:
+        c = "3" * 40
+        reads, hashes = self.case / f"room-{room}-{manifest_ms}-reads.txt", self.case / f"room-{room}-{manifest_ms}-hashes.txt"
+        bounds = self.case / f"room-{room}-{manifest_ms}-bounds.txt"
+        facts = ("('a' * 64); 'C:" + c + "'; 'D:' + ('f' * 64); 'S:bool'; "
+                 "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
+                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                  # the runner's own top-level threshold, when it has one
+                  "$min = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq '$script:GuardReadMinSec' }, $true)\n"
+                  "if ($min) { . ([scriptblock]::Create($min.Extent.Text)) }\n"
+                  f"$legPlanMode = $true; $AgentShare = '{self.share}'; $script:guardProgress = $null\n"
+                  f"$script:guardedInputs = @([pscustomobject]@{{ kind = 'build'; item = 1; path = 'manifest'; commit = '{c}'; sha256 = ('a' * 64) }})\n"
+                  f"$stagedBuildProbe = {{ param($p) [IO.File]::AppendAllText('{reads}', 'm' + [Environment]::NewLine); [Threading.Thread]::Sleep({manifest_ms}); {facts} }}\n"
+                  f"$artifactProbe = {{ param($i) [IO.File]::AppendAllText('{hashes}', 'h' + [Environment]::NewLine); [IO.File]::AppendAllText('{bounds}', ([string]($i[0].endSec - $i[0].clock.Elapsed.TotalSeconds) + [Environment]::NewLine)); [Threading.Thread]::Sleep({hash_ms}) }}\n"
+                  # r11 (hosted CI 40805584834): the room is measured on the real clock, and Invoke-VenueBoundedRead starts a runspace per read -- a cost the injected probes do not
+                  # control (warming the first one, adversary r7 A3, left every later start). A 2.3 s room holds only 0.3 s of it above the hash's 2 s minimum, and a loaded hosted runner
+                  # spent 190 ms there ("1.99 s left, under 2"). The room tests pin the BUDGET ARITHMETIC, so the reads run in-process here (the same script text, argument and result
+                  # shape; the runspace itself and its timeout are pinned by the bounded-read tests) and the only time a read takes is the probe's own sleep.
+                  "& (Get-Module VenueChain) { function script:Invoke-VenueBoundedRead { param([string]$ScriptText, $Argument, [double]$TimeoutSec) "
+                  "[pscustomobject]@{ answered = $true; value = @(& ([scriptblock]::Create($ScriptText)) $Argument); error = $null } } }\n"
+                  # r15 (hosted CI 40963950528: "bound 1.91397" in a 2.3 s room; reproduced on Virtual-Ten as "2.25 s share ... 1.93 s left"): the first pass through the guard, the
+                  # module and the probes pays PowerShell's one-time parse and compile cost, up to 0.3 s on a loaded host, on the room's real clock. One identical pass in a 30 s room
+                  # first, its probe lines discarded, so the measured pass is charged only what the probes sleep and the budget arithmetic is what the room tests pin.
+                  "$script:guardBudget = New-GuardBudget 30 'the warm-up room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
+                  "$null = Get-InputContentRefusal\n"
+                  f"foreach ($f in '{reads}', '{hashes}', '{bounds}') {{ if (Test-Path -LiteralPath $f) {{ Remove-Item -LiteralPath $f }} }}\n"
+                  f"$script:guardBudget = New-GuardBudget {room} 'the test room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
+                  "$hit = Get-InputContentRefusal\n"
+                  "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        got["reads"] = len(reads.read_text(encoding="utf-8").split()) if reads.exists() else 0
+        got["hashes"] = len(hashes.read_text(encoding="utf-8").split()) if hashes.exists() else 0
+        # the bound the (first) hash was given, on the call's own clock: what was left of the room after the manifest read
+        given = bounds.read_text(encoding="utf-8").split() if bounds.exists() else []
+        got["bound"] = float(given[0]) if given else None
+        return got
+
+    def test_artifact_preflight_r7_b1_a_healthy_build_in_a_2_8s_guard_room_is_validated_with_one_hash(self) -> None:
+        got = self._guard_room_run(2.8)
+        self.assertEqual((got["code"], got["hashes"]), ("", 1), f"a 2.8 s room, a 100 ms read and a 100 ms hash: {got}")
+
+    def test_artifact_preflight_r7_b1_a_healthy_build_in_a_2_99s_guard_room_is_validated_with_one_hash(self) -> None:
+        got = self._guard_room_run(2.99)
+        self.assertEqual((got["code"], got["hashes"]), ("", 1), f"a 2.99 s room, a 100 ms read and a 100 ms hash: {got}")
+
+    def test_artifact_preflight_r7_b1_control_a_3_1s_guard_room_is_validated_with_one_hash(self) -> None:
+        got = self._guard_room_run(3.1)
+        self.assertEqual((got["code"], got["hashes"]), ("", 1), got)
+
+    def test_artifact_preflight_r7_b1_control_a_room_under_the_minimum_is_refused_typed_before_any_read(self) -> None:
+        got = self._guard_room_run(1.9)
+        self.assertEqual((got["code"], got["reads"], got["hashes"]), ("LEG_BUDGET_EXCEEDS_LEASE", 0, 0), got)
+        self.assertIn("no time is left in the test room", got["why"])
+
+    # r10 B1 (sol r9 = Dot cc5b2a97): `[Math]::Min(330, <double>)` takes the Int32 overload (an integer first operand), so a guard room of 2.3 / 2.4 / 2.49 s became a 2 s share, the hash was
+    # left under its 2 s minimum after a 100 ms manifest read and a healthy staged build was refused SHARE_UNREACHABLE with no hash (after the open, a lease closed and charged with no leg).
+    # A room of 2.8 rounded UP to 3 and hid it. The share keeps its fraction, and the hash is given what is left of the room, never more.
+    def _assert_fractional_room_validates(self, room: float) -> None:
+        got = self._guard_room_run(room)
+        self.assertEqual((got["code"], got["hashes"]), ("", 1), f"a {room} s room, a 100 ms read and a 100 ms hash: {got}")
+        self.assertIsNotNone(got["bound"], got)
+        self.assertGreaterEqual(got["bound"], 2.0, f"the hash started under its 2 s minimum: {got}")
+        self.assertLessEqual(got["bound"], room - 0.1, f"the hash was given more than the room left after the 100 ms read: {got}")
+
+    def test_artifact_preflight_r10_b1_a_healthy_build_in_a_2_3s_guard_room_is_validated_with_one_hash(self) -> None:
+        self._assert_fractional_room_validates(2.3)
+
+    def test_artifact_preflight_r10_b1_a_healthy_build_in_a_2_4s_guard_room_is_validated_with_one_hash(self) -> None:
+        self._assert_fractional_room_validates(2.4)
+
+    def test_artifact_preflight_r10_b1_a_healthy_build_in_a_2_49s_guard_room_is_validated_with_one_hash(self) -> None:
+        self._assert_fractional_room_validates(2.49)
+
+    def test_artifact_preflight_r10_b1_a_room_that_rounded_up_is_not_overshot_by_the_hash_bound(self) -> None:
+        # the other direction of the same defect: 2.6 and 2.8 rounded UP to a 3 s share, and the hash was given more than the room held
+        for room in (2.6, 2.8):
+            got = self._guard_room_run(room)
+            self.assertEqual((got["code"], got["hashes"]), ("", 1), got)
+            self.assertLessEqual(got["bound"], room - 0.1, f"a {room} s room: the hash was given more than it held: {got}")
+
+    def test_artifact_preflight_r10_b1_the_refusal_after_a_slow_read_names_the_fractional_bound_and_time_left(self) -> None:
+        # room 2.4 admits the read (2 s minimum) but a 500 ms read leaves the hash about 1.9 s: refused typed, and the message carries the sub-second quantities it measured
+        got = self._guard_room_run(2.4, manifest_ms=500)
+        self.assertEqual((got["code"], got["hashes"]), ("SHARE_UNREACHABLE", 0), got)
+        m = re.search(r"no time is left of -TimeoutSec (\d+(?:\.\d+)?) after the manifest read \((\d+(?:\.\d+)?) s left, under 2\)", got["why"])
+        self.assertIsNotNone(m, got["why"])
+        self.assertTrue(2.3 <= float(m.group(1)) <= 2.4, f"-TimeoutSec should name the 2.4 s room less the read start, not a rounded integer: {got['why']}")
+        self.assertTrue(1.5 < float(m.group(2)) < 2.0 and "." in m.group(2), f"the time left is under 2 and fractional, never rounded up to '2' or down to '1': {got['why']}")
+
+    def test_artifact_preflight_r10_b1_sibling_a_time_left_just_under_the_minimum_is_not_reported_as_the_minimum(self) -> None:
+        # [Math]::Max(0, $left) with an integer first operand rounded 1.9 to "2 s left, under 2"; room 3.0 and a 1 s read leave the hash just under 2 s
+        got = self._guard_room_run(3.0, manifest_ms=1000)
+        self.assertEqual((got["code"], got["hashes"]), ("SHARE_UNREACHABLE", 0), got)
+        m = re.search(r"\((\d+(?:\.\d+)?) s left, under 2\)", got["why"])
+        self.assertIsNotNone(m, got["why"])
+        self.assertLess(float(m.group(1)), 2.0, f"'{m.group(0)}' reports the time left rounded up to the minimum it is under: {got['why']}")
+
+    def test_artifact_preflight_r7_b1_control_no_hash_starts_with_under_the_minimum_left_after_the_read(self) -> None:
+        # the read is admitted (2.3 s left) but takes 600 ms: the hash would start with about 1.7 s, so none starts, and the call still ends inside the room
+        got = self._guard_room_run(2.3, manifest_ms=600)
+        self.assertEqual((got["code"], got["reads"], got["hashes"]), ("SHARE_UNREACHABLE", 1, 0), got)
+        self.assertIn("no time is left of -TimeoutSec", got["why"])
+        self.assertLess(got["ms"], 2300, got)
+
+    # r7 adversary A2 (pass 1 on dbe8a7a0): -ArtifactMinSec was checked once, before the three-file hash worker, so after a slow packageZip the exe and the dll started with under
+    # the minimum. The worker now checks it before EACH file. A hash bound (-ArtifactTimeoutSec 1) under the minimum (-ArtifactMinSec 2) starts no file at all; RED on dbe8a7a0,
+    # which hashed all three (STAGED, no problem) inside that 1 s.
+    def test_artifact_preflight_r7_adv_a2_no_artifact_file_starts_hashing_with_under_the_minimum_left(self) -> None:
+        c = self.commit_a
+        for k in ("packageZip", "exe", "dll"):
+            self.assertTrue(self.artifact_path(c, k).exists(), k)
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 1 -ArtifactMinSec 2\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; error = [string]$r.error; problem = [string]$r.artifactProblem }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertIn("to start hashing packageZip", got["error"])
+        # control: the same build with room for every file is STAGED and matches
+        script = script.replace(" -ArtifactTimeoutSec 1 -ArtifactMinSec 2", "")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual((got["state"], got["problem"]), ("STAGED", ""), got)
+
+    # r7 adversary A1 (pass 1 on dbe8a7a0): the guard capped a build's share at 300 s while the room was larger, so a 310 s post-open hash (one the preflight's 30 s + 300 s
+    # bounds accept) in a 519 s room was refused SHARE_UNREACHABLE and the lease charged with no leg. The cap is now the preflight's own 330 s. The adversary's input, literally.
+    # r8: the hash bound is read, not waited out. Invoke-VenueBoundedRead gives the post-open hash exactly (endSec - clock) seconds, so the probe records that bound at its start and
+    # hashes at once: a 310 s hash is accepted iff the bound it was given is over 310 s. RED on a 300 s cap: the bound is at most 300 s and this fails, as the 310 s sleep did.
+    def test_artifact_preflight_r7_adv_a1_a_310s_post_open_hash_in_a_519s_room_runs_the_leg(self) -> None:
+        bounds = self.case / "post-open-hash-bounds.txt"
+        bounds.unlink(missing_ok=True)
+        record = f"[IO.File]::AppendAllText('{bounds}', ([string]($items[0].endSec - $items[0].clock.Elapsed.TotalSeconds) + [Environment]::NewLine))"
+        r, held = self._post_open_hash_run(0, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=900)), cap="1000", leg="360", margin="120", post_open=record)
+        self.assertNotIn("LEG_PLAN_REFUSED", r.stderr, r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1), b)
+        given = [float(x) for x in bounds.read_text(encoding="utf-8").split()]
+        self.assertTrue(given, "the post-open hash probe ran")
+        self.assertGreater(max(given), 310, f"the post-open hash was given at most {max(given):.1f} s: a 310 s hash the preflight accepts would be refused")
+        self.assertLessEqual(max(given), 330, f"the post-open hash was given {max(given):.1f} s: over the preflight's own 330 s bounds")
+
+    def test_artifact_preflight_r7_adv_a1_the_guard_share_cap_is_the_preflights_own_bounds(self) -> None:
+        # r10: the cap is pinned by its VALUE and its type, not by one spelling: `Min(330, ...)` with an integer first operand was the r9 B1 defect (Int32 overload), and any double
+        # spelling of the same cap (330.0, [double]330, 330.00) is the contract
+        text = RUNNER.read_text(encoding="utf-8")
+        guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
+        m = re.search(r"\$share = \[Math\]::Min\((\[double\]\s*)?(\d+(?:\.\d+)?)\s*,\s*\$script:guardBudget\.sec\s*-\s*\$script:guardBudget\.clock\.Elapsed\.TotalSeconds\)", guard)
+        self.assertIsNotNone(m, "the guard's share is Min(<cap>, <budget> - <elapsed>)")
+        self.assertEqual(float(m.group(2)), 330.0, "the cap is the preflight's own 30 s + 300 s bounds")
+        self.assertTrue(m.group(1) or "." in m.group(2), "the cap is a double: an integer first operand takes the Int32 overload and rounds the room (2.3 s -> 2)")
+        self.assertIn("-TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", text, "the preflight's bounds the cap is the sum of")
+
+    def test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand(self) -> None:
+        # the class, not the :771 instance: every [Math]::Min/Max in the dual-venue folder whose second operand is a double (a TimeSpan total, a clock, a budget) has a double first operand too
+        bad = []
+        for path in sorted(DV.glob("*.ps*1")):
+            for line, call in ps_integer_first_minmax(path.read_text(encoding="utf-8")):
+                bad.append(f"{path.name}:{line}: {call}")
+        self.assertEqual(bad, [], "make the first operand a double (330.0, [double]$x): an integer one selects the Int32 overload and rounds the double")
+
+    def test_artifact_preflight_r10_adv_a3_the_windows_pwsh_skip_stays_on_the_runner_class_and_no_helper_carries_it(self) -> None:
+        # a helper block inserted between `@requires_windows_pwsh` and its class moved the skip onto the helper's def (the helper then raised SkipTest, and the class ran unguarded
+        # on a host with no pwsh). The decorator belongs on VenueLeaseBatchRunnerTests; the scanners above it are plain functions.
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        decorated = {n.name: [ast.unparse(d) for d in n.decorator_list] for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+        self.assertIn("requires_windows_pwsh", decorated["VenueLeaseBatchRunnerTests"])
+        self.assertEqual({name: d for name, d in decorated.items() if name.startswith(("ps_", "_ps_")) and d}, {})
+
+    def test_artifact_preflight_r10_adv_a3_a_remainder_just_under_the_minimum_is_not_printed_as_the_minimum(self) -> None:
+        # the module's own refusal line, run with a remainder of 1.999 s (Round(.., 2) printed "2 s left, under 2"); the line is lifted from the source, not re-spelled here
+        line = next(l for l in MODULE.read_text(encoding="utf-8").splitlines() if "after the manifest read (" in l and "$left -lt $ArtifactMinSec" in l)
+        script = ("$left = 1.999; $TimeoutSec = 3; $ArtifactMinSec = 2; $path = 'p'\n"
+                  "$r = & { " + line.strip() + " }\n"
+                  "ConvertTo-Json -Compress -InputObject @{ error = [string]$r.error }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        error = json.loads(out.stdout.strip().splitlines()[-1])["error"]
+        m = re.search(r"\((\d+(?:\.\d+)?) s left, under 2\)", error)
+        self.assertIsNotNone(m, error)
+        self.assertLess(float(m.group(1)), 2.0, error)
+
+    def test_artifact_preflight_r10_the_math_overload_scanner_sees_every_spelling(self) -> None:
+        bad = [
+            "[Math]::Min(330, $b.sec - $b.clock.Elapsed.TotalSeconds)",
+            "[math]::MAX( 0 , $left )",
+            "[System.Math]::Max(0, $left)",
+            "[Math]::Min($Wait, ($d - [DateTime]::UtcNow).TotalSeconds)",
+            "[int][Math]::Max(60, [Math]::Min($w, ($d - [DateTime]::UtcNow).TotalSeconds))",
+            "$x = [Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds + 10)",
+            "[Math]::Min(2, [double]$remaining)",
+        ]
+        for text in bad:
+            self.assertTrue(ps_integer_first_minmax(text), text)
+        good = [
+            "[Math]::Min(330.0, $b.sec - $b.clock.Elapsed.TotalSeconds)",
+            "[Math]::Max(0.0, $left)",
+            "[Math]::Min([double]$Wait, ($d - [DateTime]::UtcNow).TotalSeconds)",
+            "[Math]::Min([double]330, $left)",
+            "[Math]::Max($a.TotalSeconds, 0)",
+            "[Math]::Min($LeaseCapSec, [Math]::Max(0, $bw.budgetRoomSec))",
+            "[Math]::Min($ClaimPollSec, 5)",
+            "[Math]::Min($Cap, [int][Math]::Floor(($d - [DateTime]::UtcNow).TotalSeconds))",
+            "[Math]::Max(1, [Math]::Floor(($e - [DateTime]::UtcNow).TotalSeconds))",
+            "# [Math]::Min(330, $b.sec - $b.clock.Elapsed.TotalSeconds) is the defect",
+            "$x = 1 # [Math]::Max(0, $left)",
+        ]
+        for text in good:
+            self.assertEqual(ps_integer_first_minmax(text), [], text)
+
+    def test_artifact_preflight_r4_the_guard_read_delay_seam_is_refused_with_the_real_um_run_and_checked_for_shape(self) -> None:
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:spec=5")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE -GuardReadDelay is an offline test seam", r.stderr)
+        # r4 adversary A3: a non-ASCII decimal digit (U+0661) is refused typed, not accepted by \d and thrown on by [int]
+        for bad in ("open:hash=5", "open:spec=١"):
+            r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", bad)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("is not <claim|open>:<existence|identity|spec|rundir>=<sec>", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    # r4 ITEM 3 (key3 r3 H3): the claim guard runs before the batch try, so a throw in it once the claim was granted left the claim held, with no keeper, until its TTL (and the run
+    # ended exit 1). Input: a manifest read that emits A:<k>=ok without the paired H:<k>= digest lines, only inside the guard (the claim file exists), so the preflight passes and
+    # Get-VenueStagedBuildManifest's .Substring on the missing digest throws in the guard.
+    def test_artifact_preflight_r4_item3_a_throw_in_the_claim_guard_releases_the_claim_and_ends_typed(self) -> None:
+        in_guard = f"(Test-Path -LiteralPath '{self.claim_path}' -PathType Leaf)"
+        manifest_probe, artifact_probe = self._timed_probes(0, 0, no_digests_when=in_guard)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
+                          "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_PLAN_INVALID ", r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim granted before the throw was released")
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+
+    def test_artifact_preflight_the_artifact_names_are_the_ones_the_leg_job_derives(self) -> None:
+        script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"
+                  "$n = Get-AttrCudaArtifactNames -SourceCommit ('3' * 40)\n"
+                  "ConvertTo-Json -Compress -InputObject ([ordered]@{ exe = $n.exeName; dll = $n.reconName; packageZip = $n.packageZipName })\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        for label, name in json.loads(out.stdout).items():
+            self.assertEqual(self.artifact_path("3" * 40, label).name, name, label)
+
     # r13 (adversary r13 A2): the open can wait long in the agent's gate, and a link to an output made in that wait was written through by the first probe (gate.log).
     def test_r13_adv_a2_an_output_alias_added_while_the_open_waits_is_refused_before_any_probe(self) -> None:
         # gate.log: the probe's -GateLog, which Wait-VenueQuiet appends to. batch.log (r13 pass 2 A1): the runner's own log, which the finally wrote through after the refusal.
@@ -4572,7 +5845,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         try:
             # the last line before um-run blocks (FAKE_OPEN_SLEEP); a link made before it is written through at once, the race no re-check closes
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-            time.sleep(2)
+            self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
             (self.run_dir / leaf).unlink(missing_ok=True)
             os.link(spec, self.run_dir / leaf)
             so, se = p.communicate(timeout=240)
@@ -4598,7 +5871,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "exit1": (9, "OPEN_FAILED", ()),
             "nobatch": (10, "AGENT_NOT_BATCH_CAPABLE", ()),
             "gatewait": (2, "LEG_SPEC_IS_RUN_OUTPUT", ()),
-            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", "+60")),
+            # r8: the held open is waited for until the deadline, so the deadline is the case's whole run time: 20 s (it was 60) is still 6-7 times what the run needs to reach the open
+            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", "+20")),
         }
         for mode, (code, reason, extra) in cases.items():
             with self.subTest(open=mode):
@@ -4616,13 +5890,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         spec.unlink(missing_ok=True)
         shutil.copy2(self.specs[0], spec)
         before = hashlib.sha256(spec.read_bytes()).hexdigest()
-        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode)
+        # r8: the open blocks until the link is made (FAKE_OPEN_RELEASE) -- 60 s is only its bound -- instead of for a fixed 12 s
+        release = self._open_release()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="60", FAKE_OPEN_RELEASE=str(release), FAKE_OPEN_MODES=mode)
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-            time.sleep(2)
+            self._wait_for_open_wait()
             (self.run_dir / "batch.log").unlink(missing_ok=True)
             os.link(spec, self.run_dir / "batch.log")
+            release.write_text("go", encoding="utf-8")
             so, se = p.communicate(timeout=300)
         finally:
             if p.poll() is None:
@@ -4653,7 +5930,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             args[args.index("-ClaimDir") + 1] = str(claim_dir)
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-        time.sleep(2)
+        self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
         return p, spec, hashlib.sha256
 
     def _finish(self, p) -> tuple[str, str]:
@@ -4749,7 +6026,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=ef, text=True, env=e)
             try:
                 self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-                time.sleep(2)
+                self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
                 (self.run_dir / "batch.log").unlink(missing_ok=True)
                 os.link(spec, self.run_dir / "batch.log")
                 end = time.monotonic() + 90
@@ -4832,6 +6109,37 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 before = hashlib.sha256(manifest.read_bytes()).hexdigest()
                 r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=digest or staged)]))
                 self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), before, "the refused staged manifest was appended to through batch.log: " + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted")
+
+    def test_artifact_preflight_r14_adv_p2_a1_a_manifest_that_links_to_batch_log_is_not_appended_to_when_its_artifacts_cannot_be_hashed(self) -> None:
+        # #705 r14 adversary pass 2 A1: the cached build.json is a symbolic link to a plain one-name batch.log, and its artifacts cannot be hashed (the read throws, as a package zip
+        # held with FileShare.None does). On 31ba19ee the preflight refused SHARE_UNREACHABLE BEFORE the manifest's run-output guard, and that refusal's log line was appended to
+        # batch.log, which is the manifest. The guard now comes first, as it did before the artifact hash existed. The hard-link case (two names, so never appended to) shows the same
+        # order on any host: it was refused SHARE_UNREACHABLE, never named as the run output it is; the symbolic-link case needs the privilege to make one (hosted CI has it).
+        import hashlib
+        c = "7" * 40
+        probe = self.case / "artifact-probe-throws.ps1"
+        probe.write_text("param($items)\nthrow 'the package zip is held with FileShare.None'\n", encoding="utf-8")
+        for how in ("hard link", "symbolic link"):
+            with self.subTest(how=how):
+                staged = self.stage(c, "linked build")
+                manifest = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+                self._fresh_run_dir()
+                log = self.run_dir / "batch.log"
+                if how == "hard link":
+                    os.link(manifest, log)
+                else:
+                    log.write_bytes(manifest.read_bytes())
+                    manifest.unlink()
+                    try:
+                        os.symlink(log, manifest)
+                    except OSError as e:
+                        self.skipTest(f"file symlinks need the privilege here: {e}")
+                before = hashlib.sha256(log.read_bytes()).hexdigest()
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=staged)]), "-ArtifactProbeScript", str(probe))
+                self.assertEqual(hashlib.sha256(log.read_bytes()).hexdigest(), before, "the staged manifest was appended to through batch.log: " + r.stderr)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", r.stderr)
                 self.assertEqual(self.kinds(), [], "nothing is submitted")
@@ -5008,12 +6316,21 @@ del _name
 # CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: ci_unittest_shard places whole classes, and VenueLeaseBatchLegPlanTests measured 1039-1121 s on hosted windows (master
 # runs 40858861385, 40864893269, 40871917397, 40878296653), past the 1074 s one windows shard or heavy part holds under ShardDurationBudgetTests. Its test_r1_* ..
 # test_r8_* cases move, unchanged, into a sibling class on the same fixtures (the split #705 r13 staged), so no class is too heavy to place. Each case runs once.
+# LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: the 69 test_artifact_preflight_* cases measured 545.9 s on hosted windows (run 40861273862), which with the 79 cases
+# left in VenueLeaseBatchLegPlanTests is 1131 s, past the same 1074 s, so they move, unchanged, into a third sibling class on the same fixtures.
+@requires_windows_pwsh
+class VenueLeaseBatchArtifactPreflightTests(VenueLeaseBatchLegPlanTests):
+    """The LegPlan cases named test_artifact_preflight_* (LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1)."""
+
+
 @requires_windows_pwsh
 class VenueLeaseBatchLegPlanEarlyRoundTests(VenueLeaseBatchLegPlanTests):
     """The LegPlan cases named test_r1_* through test_r8_* (letter suffixes included)."""
 
 
 def _leg_plan_home(name: str) -> type:
+    if name.startswith("test_artifact_preflight_"):
+        return VenueLeaseBatchArtifactPreflightTests
     lettered = re.match(r"test_r(\d+)", name)
     if lettered and int(lettered.group(1)) <= 8:
         return VenueLeaseBatchLegPlanEarlyRoundTests
@@ -5021,7 +6338,7 @@ def _leg_plan_home(name: str) -> type:
 
 
 for _name, _case in [(n, f) for n, f in vars(VenueLeaseBatchLegPlanTests).items() if n.startswith("test_") and callable(f)]:
-    for _cls in (VenueLeaseBatchLegPlanTests, VenueLeaseBatchLegPlanEarlyRoundTests):
+    for _cls in (VenueLeaseBatchLegPlanTests, VenueLeaseBatchArtifactPreflightTests, VenueLeaseBatchLegPlanEarlyRoundTests):
         setattr(_cls, _name, _case if _cls is _leg_plan_home(_name) else None)
 del _name, _case, _cls
 

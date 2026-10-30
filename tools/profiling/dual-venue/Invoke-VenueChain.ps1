@@ -351,9 +351,11 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         L "SUPPLEMENTARY_REMOTE_JOB_RECONCILED leg=$($Leg.name) jobId=$(Format-RemoteJobIds $rem.jobIds) state=FINISHED from leg=$($rem.leg) venue=$suppVenue role=supplementary"
         $script:suppRemote = $null
     }
-    $built = Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $SourceCommit -TimeoutSec 30
+    $built = Get-VenueStagedBuildManifest -AgentShare $share -SourceCommit $SourceCommit -TimeoutSec 30 -VerifyArtifacts
     if ($built.state -ceq 'UNREACHABLE') { Write-SuppSkip $Leg $Trigger 'UM_SHARE_UNREACHABLE' "$($built.error)" $false; return }
     if ($built.state -ceq 'NOT_STAGED') { Write-SuppSkip $Leg $Trigger 'BUILD_NOT_STAGED' "no staged build manifest for $($SourceCommit.Substring(0, 12)) at $($built.path); the chain stages and builds nothing" $true; return }
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: a staged manifest whose cached exe/dll/zip is absent or differs from its digest would fail in the leg job after the claim and the probe
+    if ($built.artifactProblem) { $ap = $built.artifactProblem -split ' ', 2; Write-SuppSkip $Leg $Trigger $ap[0] "$($ap[1])" $true; return }
     $req = Request-VenueClaim -Venue $suppVenue -RunDir $RunDir -Purpose "$Purpose supplementary leg $($Leg.name)" -TtlSec ([Math]::Max(60, [Math]::Min($SupplementaryMaxSec, $remainSec) + $suppProbeStaleSec)) -ClaimDir $ClaimDir
     foreach ($b in $req.broken) { L "CLAIM_STALE_BROKEN venue=$suppVenue reason=$($b.reason) ownerPid=$($b.claim.ownerPid) runDir=$($b.claim.runDir) expiresUtc=$($b.claim.expiresUtc)" }
     if (-not $req.granted) { Write-SuppSkip $Leg $Trigger 'UM_BUSY' "claim state=$($req.state)" $false; return }
@@ -449,7 +451,7 @@ foreach ($leg in $plan) {
             if ($w.action -ceq 'WAIT') {
                 Close-LegTicket $leg.name 'TICKET_DROPPED' 'waiting-for-a-better-window'
                 $until = [DateTimeOffset]::Parse($w.targetUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
-                while ([DateTime]::UtcNow -lt $until -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min(60, ($until - [DateTime]::UtcNow).TotalSeconds))) }
+                while ([DateTime]::UtcNow -lt $until -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Seconds ([int][Math]::Max(1.0, [Math]::Min(60.0, ($until - [DateTime]::UtcNow).TotalSeconds))) }
                 continue
             }
         }

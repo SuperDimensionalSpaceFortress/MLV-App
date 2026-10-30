@@ -1358,6 +1358,41 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
         self.assertEqual(list((self.empty_share).rglob("*")), [self.empty_share / "cache"], "the chain staged something on the venue share")
 
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: a staged manifest whose digests are sound but whose cached exe/dll/zip is absent or differs would fail in the leg job after the claim and the probe
+    def _um_share_with_build(self, absent: str = "", differs: str = "") -> Path:
+        import hashlib
+        share = self.case / "um-share-built"
+        (share / "cache").mkdir(parents=True)
+        s = SHA[:12]
+        names = {"exe": f"MLVApp-playback-attr-3-cuda-{s}.exe", "dll": f"igpu_recon_cuda-playback-attr-3-cuda-{s}.dll", "packageZip": f"MLVApp-playback-attr-3-cuda-{s}-pkg.zip"}
+        doc = {"sourceCommit": SHA, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False}
+        for label, name in names.items():
+            content = f"{label}-bytes".encode("utf-8")
+            doc[label] = {"sha256": hashlib.sha256(content).hexdigest()}
+            if label != absent:
+                (share / "cache" / name).write_bytes(b"other bytes" if label == differs else content)
+        (share / "cache" / f"playback-attr-3-cuda-{s}-build.json").write_text(json.dumps(doc), encoding="utf-8")
+        return share
+
+    def test_a_staged_build_with_a_missing_or_stale_cached_artifact_is_a_typed_skip_and_a_complete_one_still_runs(self) -> None:
+        for label, kwargs, reason in (("missing exe", {"absent": "exe"}, "BUILD_ARTIFACT_MISSING"), ("stale dll", {"differs": "dll"}, "BUILD_ARTIFACT_MISMATCH")):
+            with self.subTest(case=label):
+                share = self._um_share_with_build(**kwargs)
+                rd = self.case / f"lane-ART-{kwargs and list(kwargs)[0]}"
+                r = self.run_chain(rd, self.specs, share=share)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual([v for _, v, _ in self.starts()], ["bachelor", "bachelor"])
+                self.assertEqual([s["reason"] for s in chain_result(r.stdout)["supplementary"]], [reason] * 2)
+                self.assertEqual([c for c in self.quiet_calls() if "venue=ultra-magnus" in c], [], "nothing is probed or claimed on a venue whose staged build cannot run")
+                self.assertFalse((self.claims / "ultra-magnus.claim.json").exists())
+                shutil.rmtree(share, ignore_errors=True)
+                for p in (self.quiet_log, self.leg_log):
+                    p.unlink(missing_ok=True)
+        share = self._um_share_with_build()
+        r = self.run_chain(self.case / "lane-ART-ok", self.specs, share=share)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ultra-magnus", [v for _, v, _ in self.starts()], "a complete staged build still runs the supplementary leg")
+
     def test_a_spec_without_a_supplementary_block_is_skipped_once_and_never_touches_ultra_magnus(self) -> None:
         rd = self.case / "lane-NOCRIT"
         r = self.run_chain(rd, [self.bare], "-SupplementaryHeldSec", "0")
