@@ -104,9 +104,10 @@ def test_a_second_save_with_different_dirt_never_overwrites_the_first(repo, tmp_
     (repo / "a.txt").write_bytes(b"different dirt\n")
     assert save(repo, "-LanePid", pid).returncode == 0
     assert all((tmp_path / "run" / n).read_bytes() == b for n, b in first.items())
-    assert len(saved(repo)) > len(first)
+    second = len(saved(repo))
+    assert second > len(first)
     assert save(repo, "-LanePid", pid).returncode == 0
-    assert len(saved(repo)) == 2 * len(first)  # the same dirt twice adds nothing
+    assert len(saved(repo)) == second  # the same dirt twice adds nothing
 
 
 @pytest.mark.parametrize("caller_disable", [None, "0"])
@@ -122,3 +123,69 @@ def test_a_configured_trace2_target_cannot_write_into_a_tracked_file(repo, tmp_p
     before = (repo / "a.txt").read_bytes()
     assert save(repo, "-LanePid", str(dead_pid()), env=env).returncode == 0
     assert (repo / "a.txt").read_bytes() == before
+
+
+def test_staged_work_the_working_tree_no_longer_has_is_saved(repo, tmp_path):  # adversary A1
+    (repo / "a.txt").write_bytes(b"two\n")
+    git(repo, "add", "a.txt")
+    (repo / "a.txt").write_bytes(b"one\r\ntwo\nthree\n")
+    assert git(repo, "diff", "HEAD", "--binary") == b""
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(n.endswith(".staged.patch") and (tmp_path / "run" / n).read_bytes() == git(repo, "diff", "--cached", "--binary") for n in saved(repo))
+
+
+def test_the_persisted_receipt_is_the_printed_receipt_of_the_saved_set(repo, tmp_path):  # adversary A3
+    (repo / "u.txt").write_text("u\n")
+    pid = str(dead_pid())
+    assert save(repo, "-LanePid", pid).returncode == 0
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = save(repo, "-LanePid", pid)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip() in [(tmp_path / "run" / n).read_text().strip() for n in saved(repo) if n.endswith(".receipt.json")]
+
+
+def test_child_json_uses_its_root_created_utc_not_a_nested_one(repo, tmp_path):  # adversary A4
+    dirty(repo)
+    future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)).isoformat()
+    child = tmp_path / "child.json"
+    child.write_text(json.dumps({"pid": os.getpid(), "extra": {"createdUtc": "2000-01-01T00:00:00Z"}, "createdUtc": future}))
+    assert save(repo, "-ChildJson", str(child)).returncode == 20
+
+
+def test_a_pid_reused_two_seconds_after_created_utc_is_dead(repo, tmp_path):  # adversary A5
+    dirty(repo)
+    born = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=2)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        child = tmp_path / "child.json"
+        child.write_text(json.dumps({"pid": sleeper.pid, "createdUtc": born.isoformat()}))
+        assert save(repo, "-ChildJson", str(child)).returncode == 0
+    finally:
+        sleeper.kill()
+
+
+def test_relative_paths_resolve_where_powershell_is_not_where_dotnet_is(repo, tmp_path):  # adversary A6
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    cmd = f"Set-Location '{tmp_path}'; [Environment]::CurrentDirectory = '{other}'; & '{SCRIPT}' -WorkDir wt -RunDir run -LanePid {dead_pid()}; exit $LASTEXITCODE"
+    dirty(repo)
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", cmd], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert saved(repo) != []
+
+
+def test_a_missing_git_is_exit_40_not_a_powershell_throw(repo):  # adversary A7
+    dirty(repo)
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "PATH": str(Path(os.environ["SystemRoot"]) / "System32")})
+    assert r.returncode == 40, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+def test_diff_context_config_cannot_make_the_patch_unappliable(repo, tmp_path):  # adversary A8
+    git(repo, "config", "diff.context", "0")
+    (repo / "a.txt").write_bytes(b"one\r\nTWO\nthree\n")
+    assert save(repo, "-LanePid", str(dead_pid())).returncode == 0
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(repo), str(clone)], check=True, capture_output=True)
+    git(clone, "apply", "--binary", "--check", str(next((tmp_path / "run").glob("*.patch"))))
