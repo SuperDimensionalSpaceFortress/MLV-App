@@ -169,7 +169,10 @@ if ($TimeoutSec -le 0) {
     throw "UMRUN_TIMEOUT_SEC_INVALID -TimeoutSec must be a positive integer (1..86400); 0 has no defined client patience"
 }
 Import-Module (Join-Path $PSScriptRoot 'UmRunDrop.psm1') -Force
-$inbox   = Join-Path $AgentShare "inbox"
+# BACHELOR-THERMAL-GATE-WAIT-1 r14 (adversary r13 A1): the result's lease ids and tokens reach the caller as the raw strings the agent wrote (ConvertFrom-Json made a timestamp-shaped
+# leaseId a DateTime, so the batch runner held '10/30/2026 10:00:00' for the lease its leg results name '2026-10-30T10:00:00Z' and uncounted valid work as LEASE_LOST)
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueRawJson.psm1') -DisableNameChecking
+$inbox   =Join-Path $AgentShare "inbox"
 $outbox  = Join-Path $AgentShare "outbox"
 $running = Join-Path $AgentShare "running"
 $hb      = Join-Path $AgentShare "heartbeat.txt"
@@ -261,7 +264,7 @@ function Get-UmRunResultIfPresent {
     param([string]$Path)
     if (Test-Path -LiteralPath $Path) {
         Start-Sleep -Milliseconds 400   # let the atomic rename settle
-        return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+        return ConvertFrom-VenueJsonRawIdentity -Text (Get-Content -LiteralPath $Path -Raw)
     }
     return $null
 }
