@@ -163,6 +163,22 @@ TEST(Debayered16HonourScaleWiring, InlineReducedReconRunsBeforeTheDispatchAndKee
         "        ? inlineReducedRecon.preDualIsoFixCompleted"));
     ASSERT_TRUE(fixMsAt > timingAt);
     ASSERT_TRUE(fixActiveAt > fixMsAt);
+    // r3 (ADV-A1): the decode and llrawproc records survive the reduced debayer
+    // (renderDebayered16FromSlot restores them; pipeline-tested), so the export reads them.
+    // The two values outside that restore come from the recon, and the debayer-exclusive
+    // split subtracts only what ran inside the render thread's debayered-frame total.
+    const int rawMsAt = body.indexOf(QStringLiteral(
+        "const double renderThreadRawUint16Ms =\n"
+        "        inlineReconConsumed ? 0.0 : getMlvLastRawUint16Milliseconds();"));
+    const int llrawprocMsAt = body.indexOf(QStringLiteral(
+        "const double llrawprocMs =\n"
+        "        inlineReconConsumed ? inlineReducedRecon.llrawprocMs : renderThreadLlrawprocMs;"));
+    const int exclusiveAt = body.indexOf(QStringLiteral(
+        "- renderThreadRawUint16Ms\n"
+        "                                                - renderThreadLlrawprocMs );"));
+    ASSERT_TRUE(rawMsAt > fixActiveAt);
+    ASSERT_TRUE(llrawprocMsAt > rawMsAt);
+    ASSERT_TRUE(exclusiveAt > llrawprocMsAt);
     // One call site: the recon worker never takes this route.
     ASSERT_EQ(1, source.count(QStringLiteral("debayered16RunInlineReducedRecon(")));
 
@@ -174,4 +190,19 @@ TEST(Debayered16HonourScaleWiring, InlineReducedReconRunsBeforeTheDispatchAndKee
     ASSERT_TRUE(planAt >= 0);
     ASSERT_TRUE(decodeAt > planAt);
     ASSERT_FALSE(helper.contains(QStringLiteral("getMlvRawFrameUint16Uncached")));
+
+    // r3: only a recon the calling thread made itself keeps its records (a worker slot's
+    // render thread decoded nothing, so its reset stays).
+    const QString apply = functionBody(policy, QStringLiteral("inline void applyDebayered16InlineReducedRecon("));
+    ASSERT_TRUE(apply.contains(QStringLiteral("in.reconOnCallingThread = recon.reconstructed;")));
+    const QString render = functionBody(policy, QStringLiteral("inline Debayered16ReconRefusal renderDebayered16FromSlot("));
+    const int saveAt = render.indexOf(QStringLiteral(
+        "if( reuse.reconOnCallingThread ) mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread();"));
+    const int reducedAt = render.indexOf(QStringLiteral("getMlvRawFrameDebayeredFromReducedReconnedRaw16("));
+    const int restoreAt = render.indexOf(QStringLiteral(
+        "if( reuse.reconOnCallingThread ) mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread();"));
+    ASSERT_TRUE(saveAt >= 0);
+    ASSERT_TRUE(reducedAt > saveAt);
+    ASSERT_TRUE(restoreAt > reducedAt);
+    ASSERT_EQ(1, render.count(QStringLiteral("mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread")));
 }

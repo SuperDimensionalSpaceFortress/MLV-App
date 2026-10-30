@@ -288,6 +288,10 @@ struct Debayered16ReconReuseInputs
     bool reconHqDualIso = false;
     /*! rawImage16 holds at least Width * Height words. */
     bool reconBufferComplete = false;
+    /*! CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the calling thread decoded and
+     *  reconstructed this frame itself (the inline reduced recon), so its last
+     *  decode and llrawproc records describe this frame and survive the debayer. */
+    bool reconOnCallingThread = false;
 };
 
 /*! What the recon worker records when a recon finishes, on the recon thread. */
@@ -466,11 +470,17 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
         if( afterAdmissionForTesting ) afterAdmissionForTesting( video, afterAdmissionContext );
         int reducedWidth = 0;
         int reducedHeight = 0;
-        if( getMlvRawFrameDebayeredFromReducedReconnedRaw16( video, frameNumber, reuse.reducedReconBayer,
+        /* r3 (ADV-A1): the reduced debayer clears the thread's decode and llrawproc
+         * records, which after an inline recon are this frame's own. */
+        if( reuse.reconOnCallingThread ) mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread();
+        const int reducedDebayered =
+            getMlvRawFrameDebayeredFromReducedReconnedRaw16( video, frameNumber, reuse.reducedReconBayer,
                                                              reuse.reducedReconWidth, reuse.reducedReconHeight,
                                                              reuse.reducedReconScale, slotRawImage16,
                                                              reuse.reconHqDualIso ? 1 : 0,
-                                                             &reducedWidth, &reducedHeight ) )
+                                                             &reducedWidth, &reducedHeight );
+        if( reuse.reconOnCallingThread ) mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread();
+        if( reducedDebayered )
         {
             dims.width = reducedWidth;
             dims.height = reducedHeight;
@@ -643,6 +653,7 @@ inline void applyDebayered16InlineReducedRecon( const Debayered16InlineReducedRe
                                                 Debayered16ReconReuseInputs & in )
 {
     in.consumeReconnedRaw = recon.reconstructed;
+    in.reconOnCallingThread = recon.reconstructed;
     applyDebayered16ReconProvenance( recon.provenance, in );
     in.reconFrameNumber = frameNumber;
     in.renderFrameNumber = frameNumber;

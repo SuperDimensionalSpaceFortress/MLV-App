@@ -6205,8 +6205,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
 
     const bool rawFromWorker = workerRawTelemetry.valid;
-    /* The render thread's own raw_uint16 ms is what its debayered-frame total contains. */
-    const double renderThreadRawUint16Ms = getMlvLastRawUint16Milliseconds();
+    /* The render thread's own raw_uint16 ms is what its debayered-frame total contains.
+     * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: an inline recon's decode and llrawproc ran
+     * before the reduced debayer, outside that total; their records survive it. */
+    const double renderThreadRawUint16Ms =
+        inlineReconConsumed ? 0.0 : getMlvLastRawUint16Milliseconds();
     const double rawUint16Ms = rawFromWorker ? workerRawTelemetry.rawUint16Ms : renderThreadRawUint16Ms;
     const double rawUint16DiskReadMs = rawFromWorker
         ? workerRawTelemetry.diskReadMs : getMlvLastRawUint16DiskReadMilliseconds();
@@ -6277,7 +6280,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         ? ( workerRawTelemetry.prefetchHit ? 1 : 0 ) : getMlvLastRawUint16PrefetchHit();
     const quint64 rawUint16PrefetchDecodeFailures =
         static_cast<quint64>( getMlvRawUint16PrefetchDecodeFailures( m_pMlvObject ) );
-    const double llrawprocMs = getMlvLastLlrawprocMilliseconds();
+    const double renderThreadLlrawprocMs = getMlvLastLlrawprocMilliseconds();
+    const double llrawprocMs =
+        inlineReconConsumed ? inlineReducedRecon.llrawprocMs : renderThreadLlrawprocMs;
     const double llrawprocDarkFrameMs = llrpGetLastDarkFrameMilliseconds();
     const double llrawprocVerticalStripesMs = llrpGetLastVerticalStripesMilliseconds();
     const double llrawprocFocusPixelsMs = llrpGetLastFocusPixelsMilliseconds();
@@ -6308,7 +6313,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const double debayerExclusiveMs = qMax( 0.0,
                                             getMlvLastDebayeredFrameMilliseconds()
                                                 - renderThreadRawUint16Ms
-                                                - llrawprocMs );
+                                                - renderThreadLlrawprocMs );
     const double debayerKnownMs =
         rawFloatConvertMs +
         debayerWbPrepareMs +

@@ -29,10 +29,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -462,6 +464,106 @@ std::vector<std::vector<uint16_t>> playProduction(int scale, int frames, const c
     return out;
 }
 
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3 (ADV-A1): the calling thread's last decode and
+// llrawproc records, every one the reduced debayer's reset clears
+// (mlv_reset_last_raw_stage_telemetry, llrpResetLastRunTimingForCurrentThread). drawFrame
+// reads these getters after the debayer and exports them.
+struct ThreadRecords
+{
+    std::vector<std::pair<const char *, double>> values;
+    dualiso_full20bit_timing_t full20 = {};
+
+    static ThreadRecords capture()
+    {
+        ThreadRecords r;
+#define THREAD_RECORD(getter) r.values.emplace_back(#getter, static_cast<double>(getter()))
+        THREAD_RECORD(getMlvLastRawUint16Milliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DiskReadMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DecompressMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DecompressPrepareMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DecompressExecuteMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6SplitActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6SplitRequested);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericSplitActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericSplitRequested);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathMeasurementRequested);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathMeasurementActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathEligible);
+        THREAD_RECORD(getMlvLastRawUint16Lj92ScanComponentCount);
+        THREAD_RECORD(getMlvLastRawUint16Lj92WriteLength);
+        THREAD_RECORD(getMlvLastRawUint16Lj92ExpectedWriteLength);
+        THREAD_RECORD(getMlvLastRawUint16Lj92SkipLength);
+        THREAD_RECORD(getMlvLastRawUint16Lj92LinearizeActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92ComponentCount);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Predictor);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6TotalMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6BitstreamMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6PredictorMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericTotalMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericBitstreamMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericPredictorMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathTotalMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathBitstreamMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16UnpackMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16CopyMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16PrefetchHit);
+        THREAD_RECORD(getMlvLastRawUint16Source);
+        THREAD_RECORD(getMlvLastRawUint16FrameLj92Milliseconds);
+        THREAD_RECORD(getMlvLastRawUint16InflightWaitMilliseconds);
+        THREAD_RECORD(llrpGetLastSharedLockMilliseconds);
+        THREAD_RECORD(llrpGetLastDualIsoRefineLockMilliseconds);
+        THREAD_RECORD(llrpGetLastPublishLockMilliseconds);
+        THREAD_RECORD(llrpGetLastTotalMilliseconds);
+        THREAD_RECORD(llrpGetLastDarkFrameMilliseconds);
+        THREAD_RECORD(llrpGetLastVerticalStripesMilliseconds);
+        THREAD_RECORD(llrpGetLastFocusPixelsMilliseconds);
+        THREAD_RECORD(llrpGetLastBadPixelsMilliseconds);
+        THREAD_RECORD(llrpGetLastPatternNoiseMilliseconds);
+        THREAD_RECORD(llrpGetLastDualIsoMilliseconds);
+        THREAD_RECORD(llrpGetLastChromaSmoothMilliseconds);
+        THREAD_RECORD(llrpGetLastPreDualIsoFixMilliseconds);
+        THREAD_RECORD(llrpGetLastPreDualIsoFixCompleted);
+#undef THREAD_RECORD
+        llrpGetLastDualIsoFull20bitTiming(&r.full20);
+        return r;
+    }
+
+    double value(const char * name) const
+    {
+        for (const auto & v : values)
+            if (std::strcmp(v.first, name) == 0) return v.second;
+        return -12345.0;
+    }
+
+    // Records that differ from `recorded`, each printed; the full20 struct counts as one.
+    int mismatches(const ThreadRecords & recorded, const char * label) const
+    {
+        int n = 0;
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            if (values[i].second != recorded.values[i].second)
+            {
+                std::printf("[debayered16-inline-records] %s: %s recorded=%.6f exported=%.6f\n", label,
+                            values[i].first, recorded.values[i].second, values[i].second);
+                ++n;
+            }
+        }
+        // Up to the last member: struct copies need not carry tail padding.
+        if (std::memcmp(&full20, &recorded.full20, offsetof(dualiso_full20bit_timing_t, valid) + sizeof(int)) != 0)
+        {
+            std::printf("[debayered16-inline-records] %s: dual_iso_full20 recorded path_kind=%d input=%dx%d "
+                        "exported path_kind=%d input=%dx%d\n",
+                        label, static_cast<int>(recorded.full20.path_kind), recorded.full20.input_width,
+                        recorded.full20.input_height, static_cast<int>(full20.path_kind), full20.input_width,
+                        full20.input_height);
+            ++n;
+        }
+        return n;
+    }
+};
+
 // CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: what drawFrame does for one OutputDebayered16 frame
 // with Phase 3 Disabled: no recon worker ran, so the slot arrives unreconned. The render
 // admits the frame, reconstructs it inline and dispatches as for a worker slot.
@@ -474,6 +576,9 @@ struct InlineStep
     Debayered16RenderedDims dims;
     uint64_t renderLlrawprocRuns = 0;
     double llrawprocMsAfterDebayer = -1.0;
+    // r3: the thread's records right after the recon, and after the render's debayer.
+    ThreadRecords recordedAtRecon;
+    ThreadRecords afterDebayer;
 };
 
 InlineStep inlineStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, ProductionSlot & slot,
@@ -527,10 +632,12 @@ InlineStep inlineStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, P
     reuse.reconBufferComplete = slot.rawImage16.size() >= n * 3u;
     if (step.recon.reconstructed) applyDebayered16InlineReducedRecon(step.recon, static_cast<uint32_t>(frame), 11, reuse);
     llrpResetDebugRunCount();
+    step.recordedAtRecon = ThreadRecords::capture();
     step.outcome = renderDebayered16FromSlot(fixture.video(), static_cast<uint32_t>(frame), reuse, slot.rawImage16.data(),
                                              n, slot.scratch, counters, nullptr, nullptr, &step.dims);
     step.renderLlrawprocRuns = llrpGetDebugRunCount();
     step.llrawprocMsAfterDebayer = llrpGetLastTotalMilliseconds();
+    step.afterDebayer = ThreadRecords::capture();
     return step;
 }
 
@@ -763,7 +870,8 @@ TEST(Debayered16ReconReuse, HonourScaleInlinePlaybackLeavesExportUntouched)
 }
 
 // The reduced debayer clears the thread's llrawproc timing, so the recon's own is captured
-// first: a head frame reporting 0.0 is a telemetry bug, not a win.
+// first: a head frame reporting 0.0 is a telemetry bug, not a win. r3: the thread's record
+// survives the debayer too (ADV-A1).
 TEST(Debayered16ReconReuse, HonourScaleInlineReconTimingSurvivesTheReducedDebayer)
 {
     EnvGuard guard;
@@ -775,7 +883,52 @@ TEST(Debayered16ReconReuse, HonourScaleInlineReconTimingSurvivesTheReducedDebaye
     ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
     ASSERT_TRUE(s.recon.decoded);
     ASSERT_TRUE(s.recon.llrawprocMs > 0.0);
-    ASSERT_TRUE(s.llrawprocMsAfterDebayer == 0.0);
+    ASSERT_TRUE(s.llrawprocMsAfterDebayer == s.recon.llrawprocMs);
+}
+
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3 (ADV-A1): after an inline reduced recon is consumed,
+// every decode, LJ92, llrawproc and dual_iso_full20 record drawFrame exports still holds the
+// value the recon recorded, not the reduced debayer's reset (LJ92 component count 0,
+// predictor -1, zero stage times). Every frame and scale runs before the one assert.
+TEST(Debayered16ReconReuse, HonourScaleInlineDecodeRecordsSurviveTheReducedDebayer)
+{
+    EnvGuard guard;
+    int mismatches = 0;
+    int legs = 0;
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        fixture.video()->llrawproc->focus_pixels = 1;
+        ProductionSlot slot;
+        for (int f = 0; f < 2; ++f)
+        {
+            const InlineStep s = inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr);
+            printInlineStep("decode records", f, scale, s);
+            ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, s.dims.reducedScale);
+            const ThreadRecords & at = s.recordedAtRecon;
+            std::printf("[debayered16-inline-records] x%d frame %d recorded: raw_uint16_ms=%.3f source=%.0f "
+                        "lj92_components=%.0f lj92_predictor=%.0f llrawproc_total_ms=%.3f dual_iso_ms=%.3f "
+                        "full20_path_kind=%d pre_dualiso_fix_completed=%.0f\n",
+                        scale, f, at.value("getMlvLastRawUint16Milliseconds"), at.value("getMlvLastRawUint16Source"),
+                        at.value("getMlvLastRawUint16Lj92ComponentCount"),
+                        at.value("getMlvLastRawUint16Lj92Predictor"), at.value("llrpGetLastTotalMilliseconds"),
+                        at.value("llrpGetLastDualIsoMilliseconds"), static_cast<int>(at.full20.path_kind),
+                        at.value("llrpGetLastPreDualIsoFixCompleted"));
+            // Not vacuous: the recon left records the reset would clear.
+            ASSERT_TRUE(at.value("getMlvLastRawUint16Milliseconds") > 0.0);
+            ASSERT_TRUE(at.value("llrpGetLastTotalMilliseconds") > 0.0);
+            ASSERT_TRUE(at.value("llrpGetLastPreDualIsoFixCompleted") != 0.0);
+            char label[48];
+            std::snprintf(label, sizeof(label), "x%d frame %d", scale, f);
+            mismatches += s.afterDebayer.mismatches(at, label);
+            ++legs;
+        }
+    }
+    std::printf("[debayered16-inline-records] legs=%d mismatched records=%d\n", legs, mismatches);
+    ASSERT_EQ(4, legs);
+    ASSERT_EQ(0, mismatches);
 }
 
 // Adversary A1: the full-resolution fix pass's telemetry is cleared the same way, so a frame
@@ -795,7 +948,8 @@ TEST(Debayered16ReconReuse, HonourScaleInlineFullResFixTelemetrySurvivesTheReduc
         ASSERT_TRUE(s.recon.fullResFixesMs > 0.0);
         ASSERT_TRUE(s.recon.preDualIsoFixCompleted);
         ASSERT_TRUE(s.recon.preDualIsoFixMs > 0.0);
-        ASSERT_TRUE(llrpGetLastPreDualIsoFixCompleted() == 0);
+        // r3 (ADV-A1): the thread's own record survives the reduced debayer as well.
+        ASSERT_TRUE(llrpGetLastPreDualIsoFixCompleted() != 0);
     }
 }
 

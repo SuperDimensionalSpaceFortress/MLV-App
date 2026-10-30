@@ -152,43 +152,52 @@ static uint64_t file_get_pos(FILE *stream)
 #define MLV_THREAD_LOCAL __thread
 #endif
 
+/* Every record mlv_reset_last_raw_stage_telemetry clears, with the value it is
+ * cleared to. CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the save/restore pair
+ * (mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread) copies the same list,
+ * so a record added here is covered by both. */
+#define MLV_LAST_RAW_STAGE_TELEMETRY(X) \
+    X(double, g_mlv_last_raw_uint16_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_disk_read_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_decompress_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_decompress_prepare_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_decompress_execute_ms, 0.0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred6_split_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred6_split_requested, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_generic_split_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_generic_split_requested, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_scan_component_count, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_write_length, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_expected_write_length, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_skip_length, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_linearize_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_component_count, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_predictor, -1) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred6_total_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred6_predictor_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_generic_total_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_generic_bitstream_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_generic_predictor_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_unpack_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_copy_ms, 0.0) \
+    X(int, g_mlv_last_raw_uint16_prefetch_hit, 0) \
+    X(int, g_mlv_last_raw_uint16_source, MLV_RAW_UINT16_SOURCE_NONE) \
+    X(double, g_mlv_last_raw_uint16_frame_lj92_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_inflight_wait_ms, 0.0)
+
 static void mlv_reset_last_raw_stage_telemetry(void)
 {
-    g_mlv_last_raw_uint16_ms = 0.0;
-    g_mlv_last_raw_uint16_disk_read_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_execute_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
-    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_skip_length = 0;
-    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
-    g_mlv_last_raw_uint16_lj92_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_predictor = -1;
-    g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_unpack_ms = 0.0;
-    g_mlv_last_raw_uint16_copy_ms = 0.0;
-    g_mlv_last_raw_uint16_prefetch_hit = 0;
-    g_mlv_last_raw_uint16_source = MLV_RAW_UINT16_SOURCE_NONE;
-    g_mlv_last_raw_uint16_frame_lj92_ms = 0.0;
-    g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
+#define MLV_RESET_LAST_RAW_STAGE_RECORD(type, name, cleared) name = (cleared);
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_RESET_LAST_RAW_STAGE_RECORD)
+#undef MLV_RESET_LAST_RAW_STAGE_RECORD
 }
 
 static int mlv_env_value_is_truthy(const char * value)
@@ -6702,6 +6711,33 @@ static int g_mlv_debayered16_reduced_bit_shift_error_for_testing = 0;
 void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error)
 {
     g_mlv_debayered16_reduced_bit_shift_error_for_testing = error;
+}
+
+/* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: one saved copy per thread of every
+ * decode record the reconned debayers clear (MLV_LAST_RAW_STAGE_TELEMETRY) and of
+ * llrawproc's last-run records (llrpSaveLastRunTimingForCurrentThread). */
+typedef struct
+{
+#define MLV_SAVED_LAST_RAW_STAGE_RECORD(type, name, cleared) type name;
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_SAVED_LAST_RAW_STAGE_RECORD)
+#undef MLV_SAVED_LAST_RAW_STAGE_RECORD
+} mlv_saved_last_raw_stage_telemetry_t;
+static MLV_STAGE_THREAD_LOCAL mlv_saved_last_raw_stage_telemetry_t g_mlv_saved_last_raw_stage_telemetry;
+
+void mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread(void)
+{
+#define MLV_SAVE_LAST_RAW_STAGE_RECORD(type, name, cleared) g_mlv_saved_last_raw_stage_telemetry.name = name;
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_SAVE_LAST_RAW_STAGE_RECORD)
+#undef MLV_SAVE_LAST_RAW_STAGE_RECORD
+    llrpSaveLastRunTimingForCurrentThread();
+}
+
+void mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread(void)
+{
+#define MLV_RESTORE_LAST_RAW_STAGE_RECORD(type, name, cleared) name = g_mlv_saved_last_raw_stage_telemetry.name;
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_RESTORE_LAST_RAW_STAGE_RECORD)
+#undef MLV_RESTORE_LAST_RAW_STAGE_RECORD
+    llrpRestoreLastRunTimingForCurrentThread();
 }
 
 int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,

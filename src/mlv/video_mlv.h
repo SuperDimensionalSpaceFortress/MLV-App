@@ -259,6 +259,13 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     int * outHeight);
 /* Test-only: an error added to the reduced entry's bit shift (0 in production). */
 void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error);
+/* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the reconned debayers clear the calling
+ * thread's last decode and llrawproc records (getMlvLastRawUint16*, llrpGetLast*).
+ * A thread that decoded and reconstructed the frame itself saves them before the
+ * debayer and restores them after, so they keep describing that frame. One saved
+ * copy per thread. */
+void mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread(void);
+void mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread(void);
 /* Nonzero when getMlvRawFrameDebayered could serve frameIndex from the AMaZE
  * frame cache: the cache is running, or this frame is already cached. */
 int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);
