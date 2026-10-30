@@ -17,6 +17,7 @@ Windows-only (PowerShell tools).
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -33,7 +34,7 @@ from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, sibling
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
-RUNNER =DV / "Invoke-VenueChain.ps1"
+RUNNER = DV / "Invoke-VenueChain.ps1"
 MODULE = DV / "VenueChain.psm1"
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -201,7 +202,6 @@ def chain_result(stdout: str) -> dict:
 
 
 @requires_windows_pwsh
-@requires_windows_pwsh
 class VenueFixtureModuleCopyTests(unittest.TestCase):
     """BACHELOR-THERMAL-GATE-WAIT-1 r14 (CI-B1): the scratch copies the mutation fixtures run must carry every sibling module VenueChain.psm1 imports."""
 
@@ -231,6 +231,7 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
             self.assertIn("VenueRawJson.psm1", r.stdout + r.stderr)
 
 
+@requires_windows_pwsh
 class VenueChainRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1685,6 +1686,32 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertTrue(all(b < 128 for b in MODULE.read_bytes()) and all(b < 128 for b in RUNNER.read_bytes()))
         for needle in ("Get-CimInstance", "Win32_Process", "Get-Process -Name", "Get-WmiObject"):
             self.assertNotIn(needle, text, f"{needle}: the idle check reads the claim and the line, never a process scan")
+
+
+class PwshGuardCoverageTests(unittest.TestCase):
+    """BACHELOR-THERMAL-GATE-WAIT-1 r15 (Dot B1): every pwsh-driven test class in this file carries `@requires_windows_pwsh` exactly once.
+
+    r14 stacked the decorator twice on VenueFixtureModuleCopyTests and left VenueChainRunnerTests bare, so on the hosted ubuntu runner (pwsh present, not Windows) the Windows-only
+    scenarios ran: `cmd` and `Get-CimInstance` do not exist there (shard 2/4 of run 41117732120). Deliberately NOT guarded itself: it reads source and runs on every host.
+    """
+
+    GUARDED = ("VenueFixtureModuleCopyTests", "VenueChainRunnerTests", "VenueChainSupplementaryTests")
+
+    def classes(self) -> dict:
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        return {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+
+    def test_r15_b1_every_pwsh_test_class_is_decorated_exactly_once(self) -> None:
+        classes = self.classes()
+        for name in self.GUARDED:
+            self.assertIn(name, classes, f"{name} moved or was renamed: update the guard list")
+            count = sum(1 for d in classes[name].decorator_list if isinstance(d, ast.Name) and d.id == "requires_windows_pwsh")
+            self.assertEqual(count, 1, f"{name} must carry @requires_windows_pwsh exactly once, found {count}")
+
+    def test_r15_b1_no_other_test_class_is_left_out_of_the_guard_list(self) -> None:
+        for name, node in self.classes().items():
+            if name != type(self).__name__ and any(isinstance(b, ast.Attribute) and b.attr == "TestCase" for b in node.bases):
+                self.assertIn(name, self.GUARDED, f"{name} is a TestCase in a pwsh-only file but is not in the guard list")
 
 
 if __name__ == "__main__":
