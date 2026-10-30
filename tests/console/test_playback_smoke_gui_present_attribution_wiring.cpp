@@ -12,6 +12,8 @@
 // sources as text (mirrors test_playback_smoke_processed8_liveness_wiring.cpp).
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
+#include "../../platform/qt/GuiPresentGapIdle.h"
+#include "../../platform/qt/PreviewPaintTiming.h"
 
 #include <QFile>
 #include <QRegularExpression>
@@ -112,7 +114,9 @@ QString summaryFormat(const QString & finishBody, const QString & kind)
     return end > at ? finishBody.mid(at, end - at) : QString();
 }
 
-const char * const kRegionSpans[] = { "setup", "image", "present", "finish", "total", "unattributed" };
+const qint64 kNsPerMs = 1000000;
+
+const char * const kRegionSpans[] ={ "setup", "image", "present", "finish", "total", "unattributed" };
 
 } // namespace
 
@@ -292,29 +296,88 @@ TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
 
     const QString close = closeGapBody();
     ASSERT_FALSE(close.isEmpty());
-    ASSERT_TRUE(close.contains(QStringLiteral("const double busyMs = gapMs - idleMs - runnerSleepMs;")));
-    ASSERT_TRUE(close.contains(QStringLiteral("gaps.runnerSleepSumMs += runnerSleepMs;")));
+    ASSERT_TRUE(close.contains(QStringLiteral("m_guiPresentGapIdle.idleNs, m_guiPresentGapRunnerSleepNs,")));
+    ASSERT_TRUE(close.contains(QStringLiteral("gaps.runnerSleepSumMs += split.runnerSleepMs;")));
+    // gap 20, idle 8, runner sleep 2, paint 3 -> busy 10, other busy 7.
+    const gui_present_gap::Split split = gui_present_gap::split(20 * kNsPerMs, 8 * kNsPerMs, 2 * kNsPerMs, 3.0);
+    ASSERT_NEAR(2.0, split.runnerSleepMs, 1e-9);
+    ASSERT_NEAR(10.0, split.busyMs, 1e-9);
+    ASSERT_NEAR(7.0, split.otherBusyMs, 1e-9);
 
     const QString format = summaryFormat(finishSmokeBody(),
                                          QStringLiteral("playback_smoke.gui_present_summary session=%1"));
     ASSERT_EQ(1, format.count(QStringLiteral("avg_gui_present_gap_runner_sleep_ms=")));
 }
 
-TEST(GuiPresentAttributionWiring, PendingDispatcherWaitIsIdleWhenTheResultArrivesFirst)
+TEST(GuiPresentAttributionWiring, GuiIdleLateAwakeCallbackWorkStaysBusy)
 {
-    // Adversary A2 (400865b1): a dispatcher that delivers the next result before it emits awake
-    // left the wait pending; the close dropped it and charged the whole wait as busy. The close
-    // now counts a pending wait as idle up to the close, before it derives idle.
+    // GUI-IDLE-LATE-AWAKE (sol r2 B1, ADV-A1): QEventDispatcherGlib emits awake only after
+    // g_main_context_iteration() dispatched the ready callbacks, so a wait ended at awake (or, when
+    // the result came first, at the close) counted that callback work as idle. A wait now ends at
+    // the first event the GUI thread dispatches after it, or at awake, whichever comes first.
+    // Input 1: block 0; wait 10; work 5 (first dispatch at 10); awake 15; next block 15; the
+    // result is dispatched at 30 before awake and closes the gap at 30.
+    gui_present_gap::IdleWaits waits;
+    waits.blocked(0);
+    waits.ended(10 * kNsPerMs);
+    waits.ended(15 * kNsPerMs);
+    waits.blocked(15 * kNsPerMs);
+    waits.ended(30 * kNsPerMs);
+    gui_present_gap::Split split = gui_present_gap::split(30 * kNsPerMs, waits.idleNs, 0, 0.0);
+    ASSERT_NEAR(25.0, split.idleMs, 1e-9);
+    ASSERT_NEAR(5.0, split.busyMs, 1e-9);
+    ASSERT_NEAR(5.0, split.otherBusyMs, 1e-9);
+    // Input 2: block 0; wait 10; callback work 4 (dispatched at 10); close at 14 before awake.
+    waits = gui_present_gap::IdleWaits();
+    waits.blocked(0);
+    waits.ended(10 * kNsPerMs);
+    split = gui_present_gap::split(14 * kNsPerMs, waits.idleNs, 0, 0.0);
+    ASSERT_NEAR(10.0, split.idleMs, 1e-9);
+    ASSERT_NEAR(4.0, split.busyMs, 1e-9);
+
+    // Wiring: awake and the application event filter both end a wait, the filter before anything
+    // else it does; the close never charges a still-pending wait as idle.
+    const QString source = mainWindowSource();
+    const QString gate = bracedBlockAfter(source, QStringLiteral("if( guiPresentIdleDispatcher )"));
+    ASSERT_TRUE(gate.contains(QStringLiteral("m_guiPresentGapIdle.blocked( m_guiPresentGapClock.nsecsElapsed() );")));
+    ASSERT_TRUE(QRegularExpression(QStringLiteral(
+        "&QAbstractEventDispatcher::awake,\\s*this, &MainWindow::endGuiPresentIdleWait \\);")).match(gate).hasMatch());
+    ASSERT_TRUE(source.contains(QStringLiteral("qApp->installEventFilter( this );")));
+    const QString filter = bracedBlockAfter(source, QStringLiteral("bool MainWindow::eventFilter(QObject *watched, QEvent *event)"));
+    const int endAt = filter.indexOf(QStringLiteral("endGuiPresentIdleWait();"));
+    ASSERT_TRUE(endAt >= 0);
+    ASSERT_TRUE(endAt < filter.indexOf(QStringLiteral("event->type()")));
+    const QString endWait = bracedBlockAfter(source, QStringLiteral("void MainWindow::endGuiPresentIdleWait( void )"));
+    ASSERT_TRUE(endWait.contains(QStringLiteral("m_guiPresentGapIdle.ended( m_guiPresentGapClock.nsecsElapsed() );")));
     const QString close = closeGapBody();
     ASSERT_FALSE(close.isEmpty());
-    const QRegularExpressionMatch pending = QRegularExpression(QStringLiteral(
-        "if\\( m_guiPresentGapBlockStartNs >= 0 \\)\\s*"
-        "m_guiPresentGapIdleNs \\+= nowNs - m_guiPresentGapBlockStartNs;")).match(close);
-    ASSERT_TRUE(pending.hasMatch());
-    const int idleAt = close.indexOf(QStringLiteral("const double idleMs ="));
-    ASSERT_TRUE(idleAt > pending.capturedStart());
-    ASSERT_TRUE(close.indexOf(QStringLiteral("const qint64 nowNs = m_guiPresentGapClock.nsecsElapsed();"))
-                < pending.capturedStart());
+    ASSERT_FALSE(close.contains(QStringLiteral(".ended(")));
+    ASSERT_FALSE(close.contains(QStringLiteral("BlockStartNs")));
+}
+
+TEST(GuiPresentAttributionWiring, GuiPaintDirectGrabReachesThePaintSinkOnce)
+{
+    // GUI-PAINT-DIRECT-GRAB (sol r2 B2, r1 OPEN A2): QOpenGLWidget::grabFramebuffer() calls
+    // paintGL directly, with no Paint event, so the GL viewport's event-filter Scope never saw it
+    // and the paint was charged to other busy. paintGL now opens its own Scope; only the outermost
+    // Scope counts, so a Paint-event paint (Scope around QOpenGLWidget::event -> paintGL) is still
+    // counted once.
+    preview_paint_timing::reset();
+    const auto paintGl = []() { const preview_paint_timing::Scope paintTiming; };
+    paintGl(); // grabFramebuffer() outside a paint
+    {
+        const preview_paint_timing::Scope paintEvent; // the event filter's consumed Paint
+        paintGl();
+    }
+    ASSERT_EQ(2u, static_cast<unsigned>(preview_paint_timing::totals().paints));
+    ASSERT_EQ(0, preview_paint_timing::scopeDepth());
+    preview_paint_timing::reset();
+
+    const QString viewport = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+    const QString paintGlBody = bracedBlockAfter(viewport, QStringLiteral("void GpuDisplayViewport::paintGL()"));
+    const int scopeAt = paintGlBody.indexOf(QStringLiteral("const preview_paint_timing::Scope paintTiming;"));
+    ASSERT_TRUE(scopeAt >= 0);
+    ASSERT_TRUE(scopeAt < paintGlBody.indexOf(QStringLiteral("m_paintedSerialValid = false;")));
 }
 
 TEST(GuiPresentAttributionWiring, GlViewportAndGlWindowPaintsReachTheSamePaintSink)

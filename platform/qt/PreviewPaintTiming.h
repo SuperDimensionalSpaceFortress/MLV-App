@@ -34,13 +34,23 @@ inline void reset()
     totals() = Totals();
 }
 
-// Times one paint, from construction to destruction.
+inline int &scopeDepth()
+{
+    static int value = 0;
+    return value;
+}
+
+// Times one paint, from construction to destruction. Only the outermost Scope counts, so a paintGL
+// that opens its own Scope is timed once whether a Paint event (already in a Scope) or a direct
+// grabFramebuffer() reached it (GUI-PAINT-DIRECT-GRAB).
 class Scope
 {
 public:
-    Scope() { m_timer.start(); }
+    Scope() : m_outer( scopeDepth()++ == 0 ) { if( m_outer ) m_timer.start(); }
     ~Scope()
     {
+        --scopeDepth();
+        if( !m_outer ) return;
         const double ms = static_cast<double>( m_timer.nsecsElapsed() ) / 1000000.0;
         Totals &value = totals();
         ++value.paints;
@@ -51,6 +61,7 @@ public:
     Scope &operator=( const Scope & ) = delete;
 
 private:
+    const bool m_outer;
     QElapsedTimer m_timer;
 };
 

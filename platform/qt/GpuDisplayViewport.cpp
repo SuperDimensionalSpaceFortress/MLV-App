@@ -1024,6 +1024,8 @@ void GpuDisplayViewport::initializeGL()
 
 void GpuDisplayViewport::paintGL()
 {
+    // grab()/grabFramebuffer() call paintGL with no Paint event: time it here too (counted once).
+    const preview_paint_timing::Scope paintTiming;
     // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: set again below only when this paint draws a frame.
     m_paintedSerialValid = false;
     const QColor clearColor = m_view

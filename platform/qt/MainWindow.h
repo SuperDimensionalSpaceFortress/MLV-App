@@ -42,6 +42,7 @@
 #include "PlaybackFirstPresentIdentity.h"
 #include "PlaybackRoutePrewarmPolicy.h"
 #include "PlaybackReconWarmRunPolicy.h"
+#include "GuiPresentGapIdle.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1527,9 +1528,8 @@ private:
     GuiPresentGapTotals m_guiPresentGaps;
     QElapsedTimer m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
-    qint64 m_guiPresentGapIdleNs = 0;
+    gui_present_gap::IdleWaits m_guiPresentGapIdle;
     qint64 m_guiPresentGapRunnerSleepNs = 0;
-    qint64 m_guiPresentGapBlockStartNs = -1;
     double m_guiPresentGapPaintStartMs = 0.0;
     bool m_guiPresentIdleProbeConnected = false;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
@@ -1827,6 +1827,7 @@ private:
     void presentPlaybackPreparedFrame( const PlaybackPrepResult &result );
     void openGuiPresentGap( void );
     void closeGuiPresentGap( void );
+    void endGuiPresentIdleWait( void );
     void sleepGuiThreadForSmokeRunner( unsigned long ms );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,

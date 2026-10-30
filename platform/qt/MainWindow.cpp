@@ -2488,14 +2488,12 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
         connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
         {
             if( m_guiPresentGapStartNs >= 0 )
-                m_guiPresentGapBlockStartNs = m_guiPresentGapClock.nsecsElapsed();
+                m_guiPresentGapIdle.blocked( m_guiPresentGapClock.nsecsElapsed() );
         } );
-        connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::awake, this, [this]()
-        {
-            if( m_guiPresentGapBlockStartNs < 0 ) return;
-            m_guiPresentGapIdleNs += m_guiPresentGapClock.nsecsElapsed() - m_guiPresentGapBlockStartNs;
-            m_guiPresentGapBlockStartNs = -1;
-        } );
+        // The wait also ends at the first event dispatched after it (eventFilter): GLib emits
+        // awake only after dispatching (GuiPresentGapIdle.h).
+        connect( guiPresentIdleDispatcher, &QAbstractEventDispatcher::awake,
+                 this, &MainWindow::endGuiPresentIdleWait );
         m_guiPresentIdleProbeConnected = true;
     }
 
@@ -3477,6 +3475,8 @@ bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, long *
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     Q_UNUSED( watched );
+    // Application filter: the first event dispatched after a dispatcher wait ends that wait.
+    endGuiPresentIdleWait();
     if( event->type() == QEvent::MouseMove )
     {
         static bool graphicsViewReached = false;
@@ -4897,9 +4897,8 @@ void MainWindow::onPlaybackPrepResultReady( void )
 void MainWindow::openGuiPresentGap( void )
 {
     m_guiPresentGapStartNs = -1;
-    m_guiPresentGapBlockStartNs = -1;
+    m_guiPresentGapIdle = gui_present_gap::IdleWaits();
     if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
-    m_guiPresentGapIdleNs = 0;
     m_guiPresentGapRunnerSleepNs = 0;
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
     m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
@@ -4909,29 +4908,32 @@ void MainWindow::closeGuiPresentGap( void )
 {
     if( m_guiPresentGapStartNs < 0 ) return;
     const qint64 nowNs = m_guiPresentGapClock.nsecsElapsed();
-    // A dispatcher may deliver this result before it emits awake: a wait still pending here
-    // ended to deliver it, so it is idle up to now.
-    if( m_guiPresentGapBlockStartNs >= 0 )
-        m_guiPresentGapIdleNs += nowNs - m_guiPresentGapBlockStartNs;
-    const double gapMs = static_cast<double>( nowNs - m_guiPresentGapStartNs ) / 1000000.0;
-    const double idleMs = qMin( gapMs, static_cast<double>( m_guiPresentGapIdleNs ) / 1000000.0 );
-    const double runnerSleepMs =
-        qMin( gapMs - idleMs, static_cast<double>( m_guiPresentGapRunnerSleepNs ) / 1000000.0 );
-    const double busyMs = gapMs - idleMs - runnerSleepMs;
-    const double paintMs = qMax( 0.0, ui->graphicsView->paintTiming().sumMs - m_guiPresentGapPaintStartMs );
-    const double otherBusyMs = qMax( 0.0, busyMs - paintMs );
+    // No wait is still pending here: this result's own delivery passed eventFilter, which ended
+    // it. Charging a pending wait as idle up to now (r1) counted the GUI work a GLib dispatcher
+    // runs before its late awake as idle (GUI-IDLE-LATE-AWAKE).
+    const gui_present_gap::Split split = gui_present_gap::split(
+        nowNs - m_guiPresentGapStartNs, m_guiPresentGapIdle.idleNs, m_guiPresentGapRunnerSleepNs,
+        ui->graphicsView->paintTiming().sumMs - m_guiPresentGapPaintStartMs );
     GuiPresentGapTotals &gaps = m_guiPresentGaps;
     ++gaps.gaps;
-    gaps.gapSumMs += gapMs;
-    gaps.gapMaxMs = qMax( gaps.gapMaxMs, gapMs );
-    gaps.idleSumMs += idleMs;
-    gaps.runnerSleepSumMs += runnerSleepMs;
-    gaps.busySumMs += busyMs;
-    gaps.busyMaxMs = qMax( gaps.busyMaxMs, busyMs );
-    gaps.otherBusySumMs += otherBusyMs;
-    gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, otherBusyMs );
+    gaps.gapSumMs += split.gapMs;
+    gaps.gapMaxMs = qMax( gaps.gapMaxMs, split.gapMs );
+    gaps.idleSumMs += split.idleMs;
+    gaps.runnerSleepSumMs += split.runnerSleepMs;
+    gaps.busySumMs += split.busyMs;
+    gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
+    gaps.otherBusySumMs += split.otherBusyMs;
+    gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
     m_guiPresentGapStartNs = -1;
-    m_guiPresentGapBlockStartNs = -1;
+    m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+}
+
+// Ends a dispatcher wait still open in a gap: from awake, and from eventFilter (the first event
+// dispatched after the wait). One branch when no wait is open.
+void MainWindow::endGuiPresentIdleWait( void )
+{
+    if( m_guiPresentGapIdle.blockStartNs >= 0 )
+        m_guiPresentGapIdle.ended( m_guiPresentGapClock.nsecsElapsed() );
 }
 
 // A smoke runner's sleep on the GUI thread is neither GUI work nor dispatcher idle: inside an
@@ -25689,7 +25691,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokePrepSpans = PlaybackSmokePrepSpanTotals();
     m_guiPresentGaps = GuiPresentGapTotals();
     m_guiPresentGapStartNs = -1;
-    m_guiPresentGapBlockStartNs = -1;
+    m_guiPresentGapIdle = gui_present_gap::IdleWaits();
     ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;

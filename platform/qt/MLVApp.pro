@@ -481,6 +481,7 @@ HEADERS += MainWindow.h \
            ResizeLabel.h \
     GraphicsZoomView.h \
     PreviewPaintTiming.h \
+    GuiPresentGapIdle.h \
     DarkStyle.h \
     JumpSlider.h \
     AudioPlayback.h \
