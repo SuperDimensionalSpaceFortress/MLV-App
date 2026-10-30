@@ -1267,6 +1267,8 @@ TEST(Debayered16ReconReuse, ReducedDebayerOddWidthReadsStayInsideTheBayerFrame)
     const Case cases[] = { { 1001, 564 }, { 127, 20 }, { 17, 10 } };
     const bool avx2Host = hostRunsDebayerAvx2();
     int avx2Runs = 0;
+    // Every leg runs before the one assert, so a RED names each dispatch that overreads.
+    long guardReads = 0;
     for (const Case &c : cases)
     {
         const size_t pixels = static_cast<size_t>(c.width) * static_cast<size_t>(c.height);
@@ -1289,7 +1291,7 @@ TEST(Debayered16ReconReuse, ReducedDebayerOddWidthReadsStayInsideTheBayerFrame)
             const long hits = frame.run([&] { debayerBasicU16(out.data(), bayer, c.width, c.height, 1, 0); }, &offset);
             std::printf("[debayered16-honour-scale] debayerBasicU16 %s %dx%d: guard reads=%ld first offset=%ld\n",
                         scalar ? "scalar" : "avx2", c.width, c.height, hits, offset);
-            ASSERT_EQ(0L, hits);
+            guardReads += hits;
         }
         // The float sibling (debayerBasic) indexes the same 4x4 neighbourhood.
         GuardedFrame frame(pixels * sizeof(float));
@@ -1301,10 +1303,11 @@ TEST(Debayered16ReconReuse, ReducedDebayerOddWidthReadsStayInsideTheBayerFrame)
         const long hits = frame.run([&] { debayerBasic(out.data(), bayer, c.width, c.height, 1); }, &offset);
         std::printf("[debayered16-honour-scale] debayerBasic %dx%d: guard reads=%ld first offset=%ld\n", c.width,
                     c.height, hits, offset);
-        ASSERT_EQ(0L, hits);
+        guardReads += hits;
     }
     HONOUR_SCALE_TEST_UNSETENV("MLVAPP_DISABLE_AVX2_DEBAYER");
     debayerBasicU16ReinitDispatchForTesting();
     std::printf("[debayered16-honour-scale] odd-width guard: avx2 host=%d avx2 runs=%d\n", avx2Host ? 1 : 0, avx2Runs);
     ASSERT_EQ(avx2Host ? 2 : 0, avx2Runs);
+    ASSERT_EQ(0L, guardReads);
 }
