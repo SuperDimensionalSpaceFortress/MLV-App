@@ -3039,6 +3039,14 @@ DETACHED_LAUNCH_SITES = {
         ("Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden",
          "the verdict worker re-launches this script with -File; it holds no lane worktree"),
     ],
+    "tools/profiling/bachelor/AttrCudaArtifacts.psm1": [
+        ("Start-Process -FilePath $PwshPath -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', "
+         "'-File', ('\"' + $watcherPath + '\"')) -WindowStyle Hidden -PassThru",
+         "CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: Start-AttrCudaHeapDumpWatch, spliced into the venue-side playback job only with -HeapCorruptionDump, "
+         "starts the hidden heap-dump watcher with -File <DumpDir>\\heap-dump-watcher.ps1 on its command line. It runs on the venue host under "
+         "the job, ends by its own -MaxWaitSec acquisition budget or when the attached app exits, and Stop-AttrCudaHeapDumpWatch waits on and "
+         "kills it through the process handle Start kept (-PassThru); it never runs against a hub lane worktree"),
+    ],
     "tools/profiling/bachelor/playback-attr-3-cuda-assemble.ps1": [
         ("Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help'",
          "venue-side smoke probe of the assembled release exe; not PowerShell, no lane worktree"),

@@ -8798,9 +8798,11 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
                 self.assertNotIn(raw, body, f"{fn} writes raw with {raw}")
         start, stop = bodies["Start-AttrCudaHeapDumpWatch"], bodies["Stop-AttrCudaHeapDumpWatch"]
         self.assertIn("[void](New-AttrCudaDirectory -Path $DumpDir)", start)
-        self.assertIn("$logSlot = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine", start)
-        # r12 (adversary c525ecbc A1): the identity of that published file is what OpenLog proves the handle against
-        self.assertIn("$logId = Get-AttrCudaFileId -Path $logSlot", start)
+        # r12 (adversary c525ecbc A1): the identity of that published file is what OpenLog proves the handle against. r13 (adversary 9621fe1e A1): it
+        # is read off the handle that created the file, never by looking the name up again
+        self.assertIn("$logPublished = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine -PassThruFileId", start)
+        self.assertIn("$logId = $logPublished.FileId", start)
+        self.assertNotIn("Get-AttrCudaFileId -Path", start)
         self.assertIn("$watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher", start)
         self.assertIn("'if ([MlvHeapDumpWatch.Debugger]::OpenLog($log, $requestLine, $logVolume, $logIndexHigh, $logIndexLow) -ne 0) { exit 7 }'", start)
         self.assertIn("'function W([string]$m) { [MlvHeapDumpWatch.Debugger]::Log($m) }'", start)
@@ -8895,55 +8897,88 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
         self.assertIn("bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !attachBreak);", run)
         self.assertNotIn("bool breakpoint = exception == 0x80000003u || exception == 0x4000001Fu;", run)
 
+    # r13 (adversary 9621fe1e A3): the watcher's Left / Owned / Seq exactly as Start writes them, with every process read (WMI rows, kernel sequence
+    # numbers) answered by a table. Seq(pid, created) is the table's number for that pid when created is 0 or equals that process's creation time, else 0.
+    # The watcher's own $ownerSeq line is evaluated against the same table, so the owner identity comes from the code under test.
+    def _owned_script(self, d: str, body: str) -> subprocess.CompletedProcess:
+        return self.run_module(
+            f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
+            "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+            f"$watcherText = @(Get-Content -LiteralPath '{d}\\hd\\heap-dump-watcher.ps1')\n"
+            "$defs = @($watcherText | Where-Object { $_ -match '^function (Left|Owned)\\b' })\n"
+            "$ownerSeqLine = @($watcherText | Where-Object { $_ -cmatch '^\\$ownerSeq = ' })\n"
+            "Write-Output ('START_PINS_OWNER=' + [bool]($watcherText | Where-Object { $_ -cmatch '^\\$ownerCreated = \\[long\\]\\d+$' }))\n"
+            "$t0 = [datetime]::new(2026, 10, 29, 0, 0, 0, [DateTimeKind]::Utc); $notBefore = $t0; $maxWaitSec = 900; $ownerPid = 4321\n"
+            "$real = $t0.AddSeconds(-30); $ownerCreated = $real.ToFileTimeUtc()\n"
+            "$clock = [pscustomobject]@{}; $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { [TimeSpan]::FromSeconds(1) }\n"
+            # pid -> @(sequence number, creation FILETIME); wmi: pid -> row
+            "$script:kernel = @{}; $script:wmi = @{}; $script:q = 0\n"
+            "function Seq([int]$id, [long]$created) { $k = $script:kernel[$id]; if ($null -eq $k -or ($created -ne 0 -and $created -ne $k[1])) { 0L } else { [long]$k[0] } }\n"
+            "function Get-CimInstance { param($ClassName, $Filter, $OperationTimeoutSec)\n"
+            "    $script:q++; if ($Filter -cmatch '^ProcessId = (\\d+)$') { $script:wmi[[int]$Matches[1]] } }\n"
+            "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
+            "function OwnerSeqNow { foreach ($l in $ownerSeqLine) { . ([scriptblock]::Create($l)) }; $ownerSeq }\n"
+            + body)
+
     # r11b (adversary r11 A4): request at T0 with owner pid 4321; the owner exits, an unrelated launcher takes pid 4321 at T0+2 s and starts a matching
     # instance at T0+3 s. The watcher's own Owned (read from the script Start writes) refuses it; the real owner, created before the request, is accepted.
+    # r13: the owner link is the process on 4321 whose creation time is the one Start read, by kernel sequence number; no WMI query is needed for it.
     def test_r11b_a4_a_process_that_took_the_owner_pid_after_the_request_is_never_the_owner(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heap-ownerpid-") as d:
-            proc = self.run_module(
-                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
-                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
-                f"$defs = @(Get-Content -LiteralPath '{d}\\hd\\heap-dump-watcher.ps1' | Where-Object {{ $_ -match '^function (Left|Owned)\\b' }})\n"
-                "$t0 = [datetime]::new(2026, 10, 29, 0, 0, 0, [DateTimeKind]::Utc); $notBefore = $t0; $maxWaitSec = 900; $ownerPid = 4321\n"
-                # r12: the real owner's creation time, as Start reads it (the watcher compares the owner link to it)
-                "$ownerCreated = $t0.AddSeconds(-30).ToFileTimeUtc()\n"
-                "$clock = [pscustomobject]@{}; $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { [TimeSpan]::FromSeconds(1) }\n"
-                "$script:wmiOwnerCreated = $t0.AddSeconds(2); $script:q = 0\n"
-                "function Get-CimInstance { param($ClassName, $Filter, $OperationTimeoutSec)\n"
-                "    $script:q++; if ($Filter -ceq 'ProcessId = 4321') { [pscustomobject]@{ ProcessId = 4321; ParentProcessId = 1; CreationDate = $script:wmiOwnerCreated } } }\n"
-                "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
+            proc = self._owned_script(d,
+                "$script:kernel[9876] = @(500, $t0.AddSeconds(3).ToFileTimeUtc())\n"
                 "$candidate = [pscustomobject]@{ ProcessId = 9876; ParentProcessId = 4321; CreationDate = $t0.AddSeconds(3) }\n"
+                # the watcher started after the recycle: the pid's process is the impostor, so the owner identity it reads is none
+                "$script:kernel[4321] = @(450, $t0.AddSeconds(2).ToFileTimeUtc()); $ownerSeq = OwnerSeqNow\n"
                 "Write-Output ('RECYCLED=' + (Owned $candidate)); Write-Output ('QUERIES=' + $script:q)\n"
-                "$script:wmiOwnerCreated = $t0.AddSeconds(-30)\n"
+                "$script:kernel[4321] = @(100, $ownerCreated); $ownerSeq = OwnerSeqNow\n"
                 "Write-Output ('REAL=' + (Owned $candidate))\n")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
-            self.assertEqual((out["RECYCLED"], out["QUERIES"], out["REAL"]), ("False", "1", "True"), proc.stdout)
+            self.assertEqual((out["RECYCLED"], out["QUERIES"], out["REAL"]), ("False", "0", "True"), proc.stdout)
 
     # r12 (adversary b20cc814 A6): notBefore T0, the real owner 4321 created at T0-30 s exits; after a backward clock step an unrelated process takes pid
     # 4321 dated T0-58 s (before notBefore), and after a forward step starts a matching target at T0+3 s. Dates alone pass; the owner's own creation time
-    # (Start read it) does not match, so Owned refuses. A WMI value up to 9 ticks below the real creation time is still the owner.
+    # (Start read it) does not match, so Owned refuses. r13: the kernel creation time is exact, so one tick later is another process.
     def test_r12_b20_a6_a_recycled_owner_pid_dated_before_the_request_by_a_clock_step_is_never_the_owner(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heap-ownerclock-") as d:
-            proc = self.run_module(
-                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
-                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
-                f"$watcherText = Get-Content -LiteralPath '{d}\\hd\\heap-dump-watcher.ps1'\n"
-                "$defs = @($watcherText | Where-Object { $_ -match '^function (Left|Owned)\\b' })\n"
-                "Write-Output ('START_PINS_OWNER=' + [bool]($watcherText | Where-Object { $_ -cmatch '^\\$ownerCreated = \\[long\\]\\d+$' }))\n"
-                "$t0 = [datetime]::new(2026, 10, 29, 0, 0, 0, [DateTimeKind]::Utc); $notBefore = $t0; $maxWaitSec = 900; $ownerPid = 4321\n"
-                "$real = $t0.AddSeconds(-30); $ownerCreated = $real.ToFileTimeUtc()\n"
-                "$clock = [pscustomobject]@{}; $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { [TimeSpan]::FromSeconds(1) }\n"
-                "$script:wmi = $t0.AddSeconds(-58)\n"
-                "function Get-CimInstance { param($ClassName, $Filter, $OperationTimeoutSec)\n"
-                "    if ($Filter -ceq 'ProcessId = 4321') { [pscustomobject]@{ ProcessId = 4321; ParentProcessId = 1; CreationDate = $script:wmi } } }\n"
-                "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
+            proc = self._owned_script(d,
+                "$script:kernel[9876] = @(500, $t0.AddSeconds(3).ToFileTimeUtc())\n"
                 "$candidate = [pscustomobject]@{ ProcessId = 9876; ParentProcessId = 4321; CreationDate = $t0.AddSeconds(3) }\n"
+                "$script:kernel[4321] = @(100, $ownerCreated); $ownerSeq = OwnerSeqNow\n"
+                "Write-Output ('REAL=' + (Owned $candidate))\n"
+                # the owner exits after the watcher read its identity; the impostor dated T0-58 s by a clock step takes the pid
+                "$script:kernel[4321] = @(450, $t0.AddSeconds(-58).ToFileTimeUtc())\n"
                 "Write-Output ('RECYCLED=' + (Owned $candidate))\n"
-                "$script:wmi = $real.AddTicks(-9); Write-Output ('REAL_TRUNCATED=' + (Owned $candidate))\n"
-                "$script:wmi = $real.AddTicks(1); Write-Output ('LATER=' + (Owned $candidate))\n")
+                "$script:kernel[4321] = @(450, $real.AddTicks(1).ToFileTimeUtc()); Write-Output ('LATER=' + (Owned $candidate))\n")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
-            self.assertEqual((out["START_PINS_OWNER"], out["RECYCLED"], out["REAL_TRUNCATED"], out["LATER"]), ("True", "False", "True", "False"), proc.stdout)
+            self.assertEqual((out["START_PINS_OWNER"], out["REAL"], out["RECYCLED"], out["LATER"]), ("True", "True", "False", "False"), proc.stdout)
+
+    # r13 (adversary 9621fe1e A3): owner 4321 (the real one, by identity) -> intermediate 5555 -> target 9876. The real intermediate exits and an unrelated
+    # child of the owner takes pid 5555 AFTER the target was made, but a backward clock step dates it T0+1 s, before the target's T0+3 s. Dates pass every
+    # link (r12 accepted it); its kernel sequence number is above the target's, so Owned refuses. The real intermediate (number below) is accepted.
+    def test_r13_a3_a_recycled_intermediate_parent_dated_before_its_child_by_a_clock_step_is_never_an_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-midclock-") as d:
+            proc = self._owned_script(d,
+                "$script:kernel[4321] = @(100, $ownerCreated); $ownerSeq = OwnerSeqNow\n"
+                "$script:kernel[9876] = @(500, $t0.AddSeconds(3).ToFileTimeUtc())\n"
+                "$script:wmi[4321] = [pscustomobject]@{ ProcessId = 4321; ParentProcessId = 1; CreationDate = $real }\n"
+                "$script:wmi[5555] = [pscustomobject]@{ ProcessId = 5555; ParentProcessId = 4321; CreationDate = $t0.AddSeconds(1) }\n"
+                "$candidate = [pscustomobject]@{ ProcessId = 9876; ParentProcessId = 5555; CreationDate = $t0.AddSeconds(3) }\n"
+                "$script:kernel[5555] = @(900, $t0.AddSeconds(1).ToFileTimeUtc())\n"
+                "Write-Output ('RECYCLED=' + (Owned $candidate))\n"
+                "$script:kernel[5555] = @(300, $t0.AddSeconds(1).ToFileTimeUtc())\n"
+                "Write-Output ('REAL=' + (Owned $candidate))\n"
+                # an intermediate that is gone (no sequence number) proves nothing
+                "$script:kernel.Remove(5555); Write-Output ('GONE=' + (Owned $candidate))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["RECYCLED"], out["REAL"], out["GONE"]), ("False", "True", "False"), proc.stdout)
+        start = re.search(r"(?ms)^function Start-AttrCudaHeapDumpWatch \{.*?^\}", ATTR_MODULE.read_text(encoding="utf-8")).group(0)
+        owned = next(l for l in start.splitlines() if l.strip().startswith("'function Owned("))
+        # no link is ordered by a date any more
+        self.assertNotIn("CreationDate", owned)
 
     # r12 (adversary c525ecbc A1, b20cc814 A3): Start published hd\watcher.log; before OpenLog, hd is renamed and replaced by a directory JUNCTION to an
     # outside directory whose watcher.log is a plain one-link file holding exactly the request line. The reparse flag covers only the last component, so
@@ -8974,6 +9009,78 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
         self.assertIn("CreateFileW(dumpPath, 0xC0010000u, 0u, IntPtr.Zero, 1u, 0x00000080u, IntPtr.Zero)", start)
         self.assertIn("!string.Equals(directory, sinkDirectory, StringComparison.OrdinalIgnoreCase)", start)
         self.assertIn("SetFileInformationByHandle(stream.SafeFileHandle, 4, ref delete, 1u);", start)
+
+    # r13 (adversary 9621fe1e A1): Start publishes hd\watcher.log; right after the publish call returns (before Start takes the log's identity), hd is renamed
+    # and replaced by a JUNCTION to an outside directory whose watcher.log is a copy of the published file. A lookup by name then pins the outside file. The
+    # swap is undone for Start's next publish (whose slot check refuses a linked parent; Stop's heap-dump.json likewise) and redone after it, with the
+    # watcher script copied out too, so the watcher opens the outside log; with the r12 lookup by name it wrote into it. The identity Start hands the watcher is read off the handle that
+    # created the log, so the outside copy is another file: the watcher refuses it (exit 7, STOP_FAILED) and the outside file is untouched.
+    def test_r13_a1_the_log_identity_is_the_creating_handle_not_a_later_lookup_by_name(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-pubswap-") as d:
+            proc = self.run_module(
+                f"$victimDir = '{d}\\victim'; [void](New-Item -ItemType Directory -Path $victimDir)\n"
+                "$attr = Get-Module AttrCudaArtifacts\n"
+                # the swaps happen inside the module, around each publish call Start makes
+                "& $attr { param($victimDir)\n"
+                "    $script:r13Publish = ${function:Publish-AttrCudaText}; $script:r13Victim = $victimDir\n"
+                "    function script:R13Swap([string]$dir) { Rename-Item -LiteralPath $dir -NewName 'hd.moved'; [void](New-Item -ItemType Junction -Path $dir -Target $script:r13Victim) }\n"
+                "    function script:R13Unswap([string]$dir) { [IO.Directory]::Delete($dir); Rename-Item -LiteralPath ($dir + '.moved') -NewName 'hd' }\n"
+                "    function script:Publish-AttrCudaText { [CmdletBinding()] param([string]$Path, [AllowEmptyString()][AllowNull()][object]$Value, [string]$OwnedJournal = '', [switch]$PassThruFileId)\n"
+                "        $dir = Split-Path -Parent $Path; $leaf = Split-Path -Leaf $Path\n"
+                "        if ($leaf -in @('heap-dump-watcher.ps1', 'heap-dump.json')) { R13Unswap $dir }\n"
+                "        $out = & $script:r13Publish @PSBoundParameters\n"
+                "        if ($leaf -in @('watcher.log', 'heap-dump-watcher.ps1')) {\n"
+                "            Copy-Item -LiteralPath $Path -Destination (Join-Path $script:r13Victim $leaf) -Force\n"
+                "            R13Swap $dir }\n"
+                "        $out } } $victimDir\n"
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
+                "Write-Output ('STARTED=' + ($null -ne $r.watcherPid))\n"
+                "$deadline = (Get-Date).AddSeconds(60); while ($null -ne $r.watcherProcess -and (Get-Date) -lt $deadline -and -not $r.watcherProcess.HasExited) { Start-Sleep -Milliseconds 250 }\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "$fs = [IO.File]::Open((Join-Path $victimDir 'watcher.log'), 'Open', 'Read', 'ReadWrite'); try { $victimLines = @(([IO.StreamReader]::new($fs)).ReadToEnd() -split '\\r?\\n' | Where-Object { $_ }) } finally { $fs.Dispose() }\n"
+                "Write-Output ('VICTIM_LINES=' + $victimLines.Count); Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual(out["STARTED"], "True", proc.stdout)
+            self.assertEqual(out["VICTIM_LINES"], "1", proc.stdout)
+            self.assertEqual(out["CAPTURE"], "STOP_FAILED", proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_LOG_UNPROVEN"), proc.stdout)
+
+    # r13 (adversary 9621fe1e A1): -PassThruFileId returns the identity of the very file the call created (the creating handle), and refuses an occupied
+    # multi-link slot like every publish
+    def test_r13_a1_publish_passthru_file_id_is_the_written_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-pubid-") as d:
+            proc = self.run_module(
+                "$attr = Get-Module AttrCudaArtifacts\n"
+                f"$p = & $attr {{ Publish-AttrCudaText -Path '{d}\\a.log' -Value 'REQ' -PassThruFileId }}\n"
+                f"$byName = & $attr {{ Get-AttrCudaFileId -Path '{d}\\a.log' }}\n"
+                "Write-Output ('PATH=' + $p.Path); Write-Output ('SAME=' + ($p.FileId.VolumeSerialNumber -eq $byName.VolumeSerialNumber -and $p.FileId.FileIndexHigh -eq $byName.FileIndexHigh -and $p.FileId.FileIndexLow -eq $byName.FileIndexLow))\n"
+                "Write-Output ('LINKS=' + $p.FileId.NumberOfLinks)\n"
+                f"Write-Output ('TEXT=' + ([IO.File]::ReadAllText('{d}\\a.log')).Trim())\n"
+                f"$plain = & $attr {{ Publish-AttrCudaText -Path '{d}\\b.log' -Value 'X' }}; Write-Output ('PLAIN=' + ($plain -is [string]))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["PATH"], out["SAME"], out["LINKS"], out["TEXT"], out["PLAIN"]), (f"{d}\\a.log", "True", "1", "REQ", "True"), proc.stdout)
+
+    # r13 (adversary 9621fe1e A3): Sequence reads the kernel's creation-ordered number of the process on a pid: a child started later has a larger number,
+    # the exact creation time binds it (one tick off is 0), and a pid with no process is 0
+    def test_r13_a3_sequence_orders_real_processes_by_creation_and_binds_the_creation_time(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-seq-") as d:
+            proc = self._debugger_script(d,
+                "$me = [MlvHeapDumpWatch.Debugger]::Sequence([uint32]$PID, 0L)\n"
+                "$created = (Get-Process -Id $PID).StartTime.ToUniversalTime().ToFileTimeUtc()\n"
+                f"$child = Start-Process -FilePath '{self._ps51()}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 5' -WindowStyle Hidden -PassThru\n"
+                "$kid = [MlvHeapDumpWatch.Debugger]::Sequence([uint32]$child.Id, 0L)\n"
+                "Write-Output ('ME=' + ($me -gt 0)); Write-Output ('ORDER=' + ($kid -gt $me))\n"
+                "Write-Output ('EXACT=' + ([MlvHeapDumpWatch.Debugger]::Sequence([uint32]$PID, $created) -eq $me))\n"
+                "Write-Output ('OFF=' + [MlvHeapDumpWatch.Debugger]::Sequence([uint32]$PID, $created + 1))\n"
+                # an exited process stays openable (with its own number) while any handle holds it, and its pid is not reused until then;
+                # a pid no process has is 0
+                "$child.Kill(); [void]$child.WaitForExit(10000)\n"
+                "Write-Output ('GONE=' + [MlvHeapDumpWatch.Debugger]::Sequence([uint32]4294967292, 0L))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["ME"], out["ORDER"], out["EXACT"], out["OFF"], out["GONE"]), ("True", "True", "True", "0", "0"), proc.stdout)
 
     # r12 (adversary c525ecbc A3): a native x64 target's attach break 0x80000003 is taken; a later RaiseException(0x4000001F) is the app's own exception
     # and passes on unhandled (False), so its second chance is captured

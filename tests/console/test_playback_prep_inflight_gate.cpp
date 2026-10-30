@@ -74,20 +74,25 @@ TEST(PlaybackPrepInFlightGate, CoreMutationDrainNeverReturnsWhileWorkerIsInFligh
 {
     std::mutex queueMutex;
     PlaybackPrepInFlightGate gate;
-    std::atomic<bool> taken{ false };
     std::atomic<bool> left{ false };
+    // r13 (adversary A4): the promise latch master's tests use, not a sleep, holds the worker in
+    // flight; only the timeout callback releases it, so the bounded wait always runs out first.
+    std::promise<void> taken;
+    std::promise<void> release;
+    std::future<void> takenSignal = taken.get_future();
+    std::shared_future<void> releaseSignal = release.get_future().share();
     std::thread worker( [&]() {
         {
             std::lock_guard<std::mutex> lk( queueMutex );
             gate.beginLocked( 11 );
         }
-        taken.store( true );
-        std::this_thread::sleep_for( std::chrono::milliseconds( 200 ) );
+        taken.set_value();
+        releaseSignal.wait();
         std::lock_guard<std::mutex> lk( queueMutex );
         left.store( true );
         gate.endLocked();
     } );
-    while( !taken.load() ) std::this_thread::yield();
+    takenSignal.wait();
 
     int timeouts = 0;
     bool workerInFlightAtTimeout = false;
@@ -99,9 +104,13 @@ TEST(PlaybackPrepInFlightGate, CoreMutationDrainNeverReturnsWhileWorkerIsInFligh
         drainedInTime = gate.drainForCoreMutationLocked( lk, 20, [&]() {
             ++timeouts;
             workerInFlightAtTimeout = !left.load();
-            // The callback runs with the queue mutex released, so it may log without deadlock.
-            std::unique_lock<std::mutex> probe( queueMutex, std::try_to_lock );
-            lockFreeAtTimeout = probe.owns_lock();
+            {
+                // The callback runs with the queue mutex released, so it may log without deadlock.
+                std::unique_lock<std::mutex> probe( queueMutex, std::try_to_lock );
+                lockFreeAtTimeout = probe.owns_lock();
+            }
+            // The worker may leave only now; the drain must still wait for it.
+            release.set_value();
         } );
         inFlightAfter = gate.inFlightLocked();
     }

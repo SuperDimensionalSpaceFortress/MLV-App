@@ -1540,20 +1540,31 @@ function Publish-AttrCudaText {
     identity is journalled from the creating handle before the text is written, so the job can later
     delete it by proof (Remove-AttrCudaPartialFile -OwnedJournal). Without it nothing is recorded and
     a later delete helper will leave the name.
+    -PassThruFileId (CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r13, adversary 9621fe1e A1): the file is created with
+    CreateNew and its identity is read off that creating handle, then { Path; FileId } is returned instead of
+    the path. The identity is the file this call wrote, never a later lookup of the name (an ancestor swapped
+    for a junction after the write would point that lookup at another file).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][object]$Value,
-        [string]$OwnedJournal = ''
+        [string]$OwnedJournal = '',
+        [switch]$PassThruFileId
     )
 
     $slot = Assert-AttrCudaWritableFileSlot -Path $Path
     $text = if ($null -eq $Value) { '' } else { (@($Value) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine }
-    if ($OwnedJournal -ne '') {
+    if ($OwnedJournal -ne '' -or $PassThruFileId) {
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + [Environment]::NewLine)
-        $stream = New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal
-        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        $stream = if ($OwnedJournal -ne '') { New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal }
+            else { [IO.FileStream]::new($slot, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read, 65536) }
+        $fileId = $null
+        try {
+            if ($PassThruFileId) { $fileId = Get-AttrCudaFileId -Stream $stream }
+            $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true)
+        } finally { $stream.Dispose() }
+        if ($PassThruFileId) { return [pscustomobject]@{ Path = $slot; FileId = $fileId } }
         return $slot
     }
     [IO.File]::WriteAllText($slot, $text + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
@@ -2785,6 +2796,7 @@ function Start-AttrCudaHeapDumpWatch {
             [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle file, System.Text.StringBuilder path, uint length, uint flags);
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, int infoClass, ref byte deleteFile, uint size);
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsWow64Process(IntPtr process, out bool wow64);
+            [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process, int infoClass, IntPtr info, int length, out int returned);
             // BY_HANDLE_FILE_INFORMATION: thirteen DWORDs (each FILETIME is two)
             [StructLayout(LayoutKind.Sequential)] struct FileIdentity { public uint Attributes, C0, C1, A0, A1, W0, W1, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
             const uint DBG_CONTINUE = 0x00010002;
@@ -2881,6 +2893,34 @@ function Start-AttrCudaHeapDumpWatch {
                 if (bit == 0 || (seen & bit) != 0) return false;
                 seen |= bit;
                 return true;
+            }
+
+            // r13 (adversary 9621fe1e A3): the process now on pid, by its kernel sequence number (ProcessTelemetryIdInformation, class 64: ProcessId @4,
+            // CreateTime @16, ProcessSequenceNumber @40). The kernel numbers processes in creation order and never reuses a number before a reboot, and
+            // no clock enters it, so a parent whose number is not below its child's took the pid after the child was made, whatever the clock did.
+            // expectedCreated (FILETIME, UTC; 0 = any) must equal the process's own creation time exactly. 0 when the process is gone or does not match.
+            public static long Sequence(uint pid, long expectedCreated) {
+                IntPtr process = OpenProcess(0x1000, false, pid);
+                if (process == IntPtr.Zero) return 0L;
+                try {
+                    int size = 1024;
+                    for (int attempt = 0; attempt < 4; attempt++) {
+                        IntPtr buffer = Marshal.AllocHGlobal(size);
+                        try {
+                            int returned;
+                            int status = NtQueryInformationProcess(process, 64, buffer, size, out returned);
+                            if (status == 0) {
+                                if (returned < 48 || (uint)Marshal.ReadInt32(buffer, 4) != pid) return 0L;
+                                if (expectedCreated != 0L && Marshal.ReadInt64(buffer, 16) != expectedCreated) return 0L;
+                                long sequence = Marshal.ReadInt64(buffer, 40);
+                                return sequence > 0L ? sequence : 0L;
+                            }
+                            if (returned <= size || returned > 1048576) return 0L;
+                            size = returned;
+                        } finally { Marshal.FreeHGlobal(buffer); }
+                    }
+                    return 0L;
+                } finally { CloseHandle(process); }
             }
 
             // r10 (adversary r10 A5): expectedCreationFileTime is the creation time (FILETIME, UTC) of the process the watcher selected. The handle just opened must
@@ -2996,10 +3036,12 @@ function Start-AttrCudaHeapDumpWatch {
         $notBeforeUtc = [DateTime]::UtcNow
         $requestLine = $notBeforeUtc.ToString('o') + ' WATCH_REQUESTED'
         [void](New-AttrCudaDirectory -Path $DumpDir)
-        $logSlot = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine
-        # r12 (adversary c525ecbc A1, b20cc814 A3): the identity of the file just published; the watcher writes only through a handle that is this file
-        $logId = Get-AttrCudaFileId -Path $logSlot
-        if ($logId.IsReparsePoint -or $logId.IsDirectory -or $logId.NumberOfLinks -ne 1) { throw 'ATTRCUDA_HEAPDUMP_LOG_UNPROVEN the published watcher log is not one plain file' }
+        # r12 (adversary c525ecbc A1, b20cc814 A3): the identity of the file just published; the watcher writes only through a handle that is this file.
+        # r13 (adversary 9621fe1e A1): read off the handle that created it, never by its name again (an ancestor swapped for a junction after the write
+        # would make a lookup by name pin the outside file).
+        $logPublished = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine -PassThruFileId
+        $logId = $logPublished.FileId
+        if ($null -eq $logId -or $logId.IsReparsePoint -or $logId.IsDirectory -or $logId.NumberOfLinks -ne 1) { throw 'ATTRCUDA_HEAPDUMP_LOG_UNPROVEN the published watcher log is not one plain file' }
         # r12 (adversary b20cc814 A6): the owner's own creation time, read now while it is running; a later process on its pid is never the owner,
         # whatever the clock did in between
         $ownerCreated = (Get-Process -Id $OwnerPid -ErrorAction Stop).StartTime.ToUniversalTime().ToFileTimeUtc()
@@ -3041,7 +3083,13 @@ function Start-AttrCudaHeapDumpWatch {
             # (it made it): a process that took the owner's pid after the owner exited was created after notBefore and never counts as the owner.
             # r12 (adversary b20cc814 A6): a clock stepped back can date a recycled pid before notBefore, so the owner link must also be the very process
             # Start ran in: its creation time is the one Start read (WMI truncates it to the microsecond: at most 9 ticks earlier, never later).
-            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { $budget = Left; if ($budget -lt 1) { return $false }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; if ([int]$c.ParentProcessId -eq $ownerPid) { $skew = $ownerCreated - $n.CreationDate.ToUniversalTime().ToFileTimeUtc(); return ($skew -ge 0 -and $skew -le 9 -and $n.CreationDate.ToUniversalTime() -le $notBefore) }; $c = $n }; return $false }'
+            # r13 (adversary 9621fe1e A3): dates order nothing once the clock steps, for ANY link. Each link is ordered by kernel sequence number (Seq: the
+            # process now on that pid, numbered in creation order, no clock): a parent whose number is not below its child's took the pid after the child
+            # was made. The owner link is the process Start ran in by identity: $ownerSeq is read once, here, off the process on $ownerPid whose creation
+            # time is exactly the one Start read, and the owner link must carry that very number.
+            'function Seq([int]$id, [long]$created) { [MlvHeapDumpWatch.Debugger]::Sequence([uint32]$id, $created) }'
+            '$ownerSeq = Seq $ownerPid $ownerCreated'
+            'function Owned($p) { $c = $p; $cSeq = Seq ([int]$p.ProcessId) 0; for ($i = 0; $i -lt 8 -and $null -ne $c -and $cSeq -gt 0; $i++) { $budget = Left; if ($budget -lt 1) { return $false }; $parentId = [int]$c.ParentProcessId; if ($parentId -eq $ownerPid) { $nSeq = Seq $parentId $ownerCreated; return ($ownerSeq -gt 0 -and $nSeq -eq $ownerSeq -and $nSeq -lt $cSeq) }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $parentId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n) { return $false }; $nSeq = Seq $parentId 0; if ($nSeq -lt 1 -or $nSeq -ge $cSeq) { return $false }; $c = $n; $cSeq = $nSeq }; return $false }'
             'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$target = $null'
             'while ($null -eq $target) {'
