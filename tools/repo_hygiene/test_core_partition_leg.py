@@ -30,6 +30,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.repo_hygiene import test_dual_venue_evidence as dve
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
 from tools.repo_hygiene.test_dual_venue_evidence import (
     DV,
@@ -3275,6 +3276,13 @@ class CorePartitionSpecTests(unittest.TestCase):
 # generatorArgs.playbackMaxThreads (1..16) -> Invoke-VenueLeg -PlaybackMaxThreads -> the smoke runner's EXISTING -Threads <n> (which sets
 # MLVAPP_PLAYBACK_MAX_THREADS for the app and records playbackMaxThreads in its result.json). FAIL CLOSED: the leg is INVALID
 # (WORKER_THREADS_NOT_HONOURED) unless the measured session's worker_threads= and the job's proof fields all say n.
+# PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r4 (forced companion), kept through the r8 master merge: this tree's default (HEAVY) job carries the bracketed
+# HEAVY-FRAME-LOG-1 region, counted with the SAME helper test_dual_venue_evidence's BASELINE_COMMIT comparison uses. Master's seam-off comparison below
+# needs no stripping (both sides come from this tree's generator and carry the region), so the region is pinned here as a count instead.
+def strip_dve_regions(text: str) -> tuple[str, dict[str, int]]:
+    return dve.GeneratorByteIdentityAndVariantTests.strip_regions(text)
+
+
 # A job generated without the key (or with 0) is byte-for-byte the job this tree's generator emits with its one cap seam ($playbackMaxThreadsEmit)
 # off. (r12 of BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: this replaced a byte comparison with a frozen base commit's generator, 293b0b81, which every
 # later legitimate edit to the generator or a module it embeds turned red -- the class r6 fixed for the core-partition pin above.)
@@ -3347,6 +3355,10 @@ class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
         or in a module it embeds moves both sides; only cap text that escapes the seam, or cap text in a job without a cap, makes this red."""
         self.assertEqual(self.seam_sites, 1, "the generator must carry exactly one $playbackMaxThreadsEmit seam line")
         for name in THREADS_SHAPES:
+            for key in (f"head-{name}", f"zero-{name}"):
+                with self.subTest(job=key, check="heavy-frame-log-region"):
+                    _stripped, counts = strip_dve_regions(self.job(key))
+                    self.assertEqual(counts["heavy-frame-log"], dve.GeneratorByteIdentityAndVariantTests.HEAVY_FRAME_LOG_REGIONS, f"{key}: the default (HEAVY) job carries its bracketed HEAVY-FRAME-LOG-1 region")
             plain = self.job(f"off-{name}")
             # Control: the seam-off copy differs from the generator under test by nothing a job without a cap can see.
             # Then: an absent or zero cap is that job; a cap of 12 with the seam off is that job too (the cap reaches the job only through the seam).

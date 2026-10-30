@@ -177,6 +177,10 @@ AGXOFF_UNPACED_NOFAST_LEGS = {"legs/m16-1243-look-scale2-cinematic-agxoff-unpace
                               "legs/m16-1243-pace-cinematic-agxoff-unpaced-nofast.json": AGXOFF_UNPACED_PACE_LEG}
 AGXOFF_REMEASURE_LEGS = (AGXOFF_UNPACED_PACE_LEG, *AGXOFF_UNPACED_NOFAST_LEGS)
 SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
+# PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1: the one leg that BOTH routes a cpu leg's frames down the Processed8 branch (playbackProcessing receipt) AND keeps the
+# per-frame playback_smoke.frame rows (telemetryArm HEAVY): the cpu-reduced pace twin at fullscreen s4 with the frame log kept.
+CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
+SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -417,6 +421,16 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_10S_OPEN = "HFR-10S-1 >>>"
     HFR_10S_CLOSE = "HFR-10S-1 <<<"
     HFR_10S_REGIONS = 2
+    # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2: the one HEAVY-arm environment entry (MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0) and its comment, so an
+    # inherited 1 cannot suppress the per-frame rows. One region in the template's HEAVY branch; the LIGHT branch and every baseline line stay verbatim outside it.
+    HEAVY_FRAME_LOG_OPEN = "HEAVY-FRAME-LOG-1 >>>"
+    HEAVY_FRAME_LOG_CLOSE = "HEAVY-FRAME-LOG-1 <<<"
+    HEAVY_FRAME_LOG_REGIONS = 1
+    # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block (the GL viewport/window env clear plus the Processed8 route gate and its summary fields) is three
+    # regions in every cpu job (the env-clear edit, the route-gate edit, the summary-field edit); a cuda job carries none, and no baseline commit carries any.
+    CPU_GL_ENV_CLEAR_OPEN = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>"
+    CPU_GL_ENV_CLEAR_CLOSE = "PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<"
+    CPU_GL_ENV_CLEAR_REGIONS = 3
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -428,7 +442,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
                     "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
-                    "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE)}
+                    "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
+                    "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
+                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -479,6 +495,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-10s-floor"], self.HFR_10S_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-CLIP-LENGTH-HFR-10S-1 regions")
         self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
+        self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
+        self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
+        self.assertEqual((new_counts["cpu-gl-env-clear"], old_counts["cpu-gl-env-clear"]), (0, 0), "a cuda job carries no cpu GL-viewport env-clear region, and neither does the baseline")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -6724,6 +6743,34 @@ class LegSpecSchemaTests(unittest.TestCase):
             for key in ("clipId", "playSeconds", "backends", "scaleFactor", "displayMode", "timeouts", "criteria"):
                 self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
 
+    def test_the_cpu_receipt_heavy_leg_is_the_cpu_reduced_pace_twin_with_the_frame_log_kept(self) -> None:
+        """PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1: the leg that routes a cpu leg's frames to Processed8 (playbackProcessing receipt; the default subset
+        routes them to Debayered16) AND logs per-frame rows (telemetryArm HEAVY; LIGHT disables the playback_smoke.frame line). It is the cpu-reduced fullscreen
+        s4 pace twin except legId, card and telemetryArm, so a later edit cannot quietly make it LIGHT, subset, or a cuda leg, or switch Look Assist off."""
+        arm = json.loads((DV / CPU_RECEIPT_HEAVY_LEG).read_text(encoding="utf-8"))
+        self.jsonschema.validate(arm, self.schema)
+        self.assertEqual(arm["legId"], Path(CPU_RECEIPT_HEAVY_LEG).stem)
+        self.assertEqual(arm["legType"], "speed")
+        self.assertEqual(arm["generatorArgs"]["telemetryArm"], "HEAVY")
+        self.assertEqual(arm["generatorArgs"]["playbackProcessing"], "receipt")
+        self.assertEqual(arm["backends"], ["cpu"])
+        self.assertEqual((arm["scaleFactor"], arm["displayMode"], arm["playSeconds"]), (4, "fullscreen", 25))
+        self.assertIs(arm["generatorArgs"]["forceLookAssist"], True, "Look Assist stays ON (D4b: the owner shape)")
+        self.assertEqual(arm["generatorArgs"]["lookFlavor"], "cinematic")
+        self.assertIn({"metric": "lookAssistForced", "op": "eq", "value": True}, arm["criteria"]["acceptance"]["cpu"])
+        self.assertIn({"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}, arm["criteria"]["acceptance"]["cpu"])
+        base = json.loads((DV / "legs" / "m16-1243-pace-cinematic-cpu-reduced-fullscreen-s4.json").read_text(encoding="utf-8"))
+        self.assertEqual(base["generatorArgs"]["telemetryArm"], "LIGHT")
+        self.assertEqual(arm["generatorArgs"].pop("telemetryArm"), "HEAVY")
+        base["generatorArgs"].pop("telemetryArm")
+        self.assertEqual(dict(arm, legId=base["legId"], card=base["card"]), base)
+        # the schema takes the combination as it stands: HEAVY and receipt together are valid, and each field still rejects a value outside its enum
+        for key, value in (("telemetryArm", "MEDIUM"), ("playbackProcessing", "fast")):
+            bad = json.loads((DV / CPU_RECEIPT_HEAVY_LEG).read_text(encoding="utf-8"))
+            bad["generatorArgs"][key] = value
+            with self.assertRaises(self.jsonschema.ValidationError, msg=key):
+                self.jsonschema.validate(bad, self.schema)
+
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
         generatorArgs.playbackRenderLookaheadFrames."""
@@ -6933,6 +6980,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+            elif spec["card"] == "PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1":   # the cpu receipt pace leg that keeps the per-frame log, named by its cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertEqual(spec["legId"], "m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
@@ -7753,6 +7803,12 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PLAYBACK-CLIP-LENGTH-HFR-10S-1's region: in the new job only (the base predates the owner's 2026-10-15 amendment).
                 self.assertEqual((new_counts.pop("hfr-10s-floor"), old_counts.pop("hfr-10s-floor")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_10S_REGIONS, 0), name)
+                # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2's region: in the new job only (the base predates the HEAVY frame-log opt-out).
+                self.assertEqual((new_counts.pop("heavy-frame-log"), old_counts.pop("heavy-frame-log")),
+                                 (GeneratorByteIdentityAndVariantTests.HEAVY_FRAME_LOG_REGIONS, 0), name)
+                # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r6: the r5 cpu block is in every cpu job (its three bracketed regions) and in no cuda job; the base predates it.
+                self.assertEqual((new_counts.pop("cpu-gl-env-clear"), old_counts.pop("cpu-gl-env-clear")),
+                                 (GeneratorByteIdentityAndVariantTests.CPU_GL_ENV_CLEAR_REGIONS if name.startswith("cpu") else 0, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)

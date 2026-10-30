@@ -288,7 +288,7 @@ function Wait-QueueGate([string]$Name) {
         $now = Get-Date
         if ($now -gt $gateEnd) { Write-Gate "GATE_BUSY $Name waitedSec=$([int]($now - $t0).TotalSeconds)"; $script:GateState = 'BUSY'; return }
         # (the poll never sleeps past the end of the gate, so the wait ends when the deadline does)
-        Start-Sleep -Milliseconds ([int][Math]::Max(10, [Math]::Min($GatePollSec * 1000, ($gateEnd - $now).TotalMilliseconds + 10)))
+        Start-Sleep -Milliseconds ([int][Math]::Max(10.0, [Math]::Min([double]($GatePollSec * 1000), ($gateEnd - $now).TotalMilliseconds + 10)))
     }
 }
 
