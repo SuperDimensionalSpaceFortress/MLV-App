@@ -96,6 +96,9 @@ public:
     /* PLAYBACK-PRESENT-TAIL-TIMING-1: the active window's last recon present tail (default when none is active).
      * GUI-thread only; read it right after presentGpuPlaybackReconAmazePostWbTextureIfActive. */
     static GpuPresentTailTiming lastPresentTailTimingIfActive(void);
+    /* PLAYBACK-PRESENT-TAIL-TIMING-1 r3: the smoke runner slept sleptNs on the GUI thread (MainWindow::
+     * sleepGuiThreadForSmokeRunner); counted inside the active window's open tail window, never as GUI work. */
+    static void noteSmokeRunnerSleepIfActive(qint64 sleptNs);
     /* PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B: warm the playback recon texture route while paused (program compile,
      * one AMaZE run at texWidth x texHeight on temporary textures, then freed). Changes nothing on screen. GUI-thread
      * only; summary receives one "ok=... program_ms=... amaze_ms=..." fragment for the log.
@@ -349,18 +352,11 @@ private:
     GpuPreviewProcessingLutTextureSet m_lutSet;
     GpuPresentSetupTiming m_lastPresentSetupTiming;
     /* PLAYBACK-PRESENT-TAIL-TIMING-1: the recon present tail and the window from a path-3 swap return to the next
-     * setup start (m_tailSwapReturnNs >= 0 while that window is open). All on m_tailClock; POD only. */
+     * setup start (GpuPresentTailWindow.h; open while m_tailWindow.isOpen()). All on m_tailClock; POD only. */
     QElapsedTimer m_tailClock;
-    qint64 m_tailSwapReturnNs = -1;
-    qint64 m_tailBlockStartNs = -1;
-    qint64 m_tailIdleNs = 0;
+    GpuPresentTailWindow m_tailWindow;
     qint64 m_qtPaintStartNs = -1;
-    int m_tailQtPaintSwaps = 0;
-    qint64 m_tailQtPaintSwapMaxNs = 0;
-    int m_tailGrabSwaps = 0;
     bool m_tailIdleProbe = false;
-    double m_tailPrevPaintMs = 0.0;
-    double m_tailPrevSwapMs = 0.0;
     GpuPresentTailTiming m_lastPresentTailTiming;
     // Presentation options captured at the most recent recon-texture submit; consumed
     // by paintGL() when it draws that texture (paintGL runs later / can run twice --

@@ -895,7 +895,7 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
     ASSERT_FALSE(body.isEmpty());
     const QString setupStamp = QStringLiteral("const qint64 tailSetupStartNs = m_tailClock.nsecsElapsed();");
     const QString paintStamp = QStringLiteral("const double postPaintStartMs = elapsedMs();");
-    const QString swapStamp = QStringLiteral("m_tailSwapReturnNs = m_tailClock.nsecsElapsed();");
+    const QString swapStamp = QStringLiteral("const qint64 tailSwapReturnNs = m_tailClock.nsecsElapsed();");
     const QString swapCall = QStringLiteral("glContext->swapBuffers(this);");
     const QString swapCallMsLine = QStringLiteral("const double swapCallMs = elapsedMs() - swapCallStartMs;");
     ASSERT_EQ(1, countOccurrences(body, setupStamp));
@@ -924,12 +924,18 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
     const int setupStampAt = body.indexOf(setupStamp);
     ASSERT_TRUE(setupStartAt >= 0 && setupStampAt > setupStartAt && ensureAt > setupStampAt);
     const QString r2 = body.mid(setupStampAt, ensureAt - setupStampAt);
-    ASSERT_TRUE(r2.contains(QStringLiteral("m_tailSwapReturnNs = -1;")));
-    ASSERT_TRUE(r2.contains(QStringLiteral("m_tailBlockStartNs = -1;")));
+    // r3: the close lives in GpuPresentTailWindow::close (executed by test_playback_slip_histogram.cpp's lifecycle
+    // tests); this site only hands it the setup-start reading.
+    ASSERT_TRUE(r2.contains(QStringLiteral(
+        "m_tailWindow.close(tailSetupStartNs, m_tailIdleProbe, m_lastPresentTailTiming);")));
+    const QString windowHeader = readRepoFile(QStringLiteral("platform/qt/GpuPresentTailWindow.h"));
     // Adversary A2: a block still open at setup start never reported its wake, so its span is not idle.
-    ASSERT_TRUE(r2.contains(QStringLiteral("tail.gui_idle_known = m_tailIdleProbe && m_tailBlockStartNs < 0;")));
-    ASSERT_TRUE(r2.contains(QStringLiteral("tail.gui_idle_ms = static_cast<double>(m_tailIdleNs) / 1000000.0;")));
-    ASSERT_EQ(0, countOccurrences(r2, QStringLiteral("- m_tailBlockStartNs")));
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral("tail.gui_idle_known = idleProbe && blockStartNs < 0;")));
+    // The path-3 swap opens the window with the swap-return reading, right after the stamp.
+    const QString r1Open = QStringLiteral(
+        "m_tailWindow.open(tailSwapReturnNs, swapCallStartMs - postPaintStartMs, swapCallMs);");
+    ASSERT_EQ(1, countOccurrences(body, r1Open));
+    ASSERT_TRUE(body.indexOf(r1Open) > body.indexOf(swapStamp));
 
     // Adversary A2 sibling and ADV-A1: only the dispatcher whose awake follows the wait before any dispatch gets a probe;
     // on every other one a wake's events run before the next awake, so the idle stays not known.
@@ -959,9 +965,51 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
         ASSERT_EQ(0, glCallCount(region));
     }
 
-    const QString header = readRepoFile(QStringLiteral("platform/qt/GpuPreviewProcessing.h"));
-    ASSERT_TRUE(header.contains(QStringLiteral(
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral(
         "static_assert(std::is_trivially_copyable<GpuPresentTailTiming>::value")));
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral(
+        "static_assert(std::is_trivially_copyable<GpuPresentTailWindow>::value")));
+    const QString windowStruct = regionBetween(windowHeader, QStringLiteral("struct GpuPresentTailWindow"),
+                                               QStringLiteral("\n};"));
+    assertNoGlSyncAndNoAllocation(windowStruct);
+    ASSERT_EQ(0, glCallCount(windowStruct));
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 r3: the two call sites the executed lifecycle tests cannot reach. G1: every refusal
+// goes through fail(), which drops an open window before it returns, so a refused call is never inside the next
+// window. B1: every smoke-runner sleep reaches the active window's open tail window, timed around the sleep itself.
+TEST(GpuPresentTailTiming, RefusalsAbandonTheWindowAndRunnerSleepsReachIt)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString failLambda = regionBetween(body, QStringLiteral("auto fail = [&](const QString &why) -> bool"),
+                                             QStringLiteral("return false;"));
+    ASSERT_TRUE(failLambda.contains(QStringLiteral("m_tailWindow.abandon();")));
+    // Every refusal before the setup start uses fail(): no bare "return false;" between the lambda and the close.
+    const int lambdaEnd = body.indexOf(QStringLiteral("};"), body.indexOf(QStringLiteral("auto fail = [&]")));
+    const int closeAt = body.indexOf(QStringLiteral("m_tailWindow.close("));
+    ASSERT_TRUE(lambdaEnd > 0 && closeAt > lambdaEnd);
+    ASSERT_EQ(0, countOccurrences(body.mid(lambdaEnd, closeAt - lambdaEnd), QStringLiteral("return false;")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("m_tailWindow.abandon();")));
+
+    const QString note = functionBody(source,
+        QStringLiteral("void GpuDisplayWindow::noteSmokeRunnerSleepIfActive(qint64 sleptNs)"),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16TextureIfActive("));
+    ASSERT_TRUE(note.contains(QStringLiteral("if ( win ) win->m_tailWindow.runnerSlept(sleptNs);")));
+
+    const QString main = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int helperAt = main.indexOf(QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
+    ASSERT_TRUE(helperAt >= 0);
+    const int helperEnd = main.indexOf(QStringLiteral("\n}"), helperAt);
+    const QString helper = main.mid(helperAt, helperEnd - helperAt);
+    const int startAt = helper.indexOf(QStringLiteral("slept.start();"));
+    const int sleepAt = helper.indexOf(QStringLiteral("QThread::msleep( ms );"));
+    const int readAt = helper.indexOf(QStringLiteral("const qint64 sleptNs = slept.nsecsElapsed();"));
+    const int noteAt = helper.indexOf(QStringLiteral("GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );"));
+    ASSERT_TRUE(startAt >= 0 && sleepAt > startAt && readAt > sleepAt && noteAt > readAt);
 }
 
 // PLAYBACK-PRESENT-TAIL-TIMING-1 (W1): slip_summary appends the max-setup tail keys after present_setup_first_ms (the

@@ -144,6 +144,9 @@ struct PresentTailSample
     int grabSwaps = 0;
     bool guiIdleKnown = false;
     double guiIdleMs = 0.0;
+    int guiIdleWaits = 0;        // r3 (B1): dispatcher block/wake pairs closed inside the window
+    double runnerSleepMs = 0.0;  // r3 (B1): the smoke runner's own sleep inside the window
+    int runnerSleeps = 0;
 };
 
 /*! One texture-present setup block. partsMs is indexed by SetupPart up to (not including) Untimed. */
@@ -159,9 +162,11 @@ struct PresentSetupSample
 };
 
 /*! PLAYBACK-PRESENT-TAIL-TIMING-1: what the window before a setup block held. Pre-registered, first match wins
- *  (presentSetupBucket); None only when a session has no setup block after the first. */
+ *  (presentSetupBucket); None only when a session has no setup block after the first. r3 (B1): IdleUnmeasured is a
+ *  window over kGuiBusyBucketMs in which the GUI thread showed no yield at all (no dispatcher wait, no smoke-runner
+ *  sleep): its idle is a structural zero, not a measurement, so it names no fix row. */
 inline constexpr double kGuiBusyBucketMs = 20.0;   // GUI_BUSY needs busy > this (strict)
-enum class SetupBucket { SetupAfterSwap = 0, GuiBusy, SwapPath1, SwapPath2, Unknown, None };
+enum class SetupBucket { SetupAfterSwap = 0, GuiBusy, SwapPath1, SwapPath2, Unknown, None, IdleUnmeasured };
 
 inline const char *setupBucketName( SetupBucket b )
 {
@@ -172,15 +177,20 @@ inline const char *setupBucketName( SetupBucket b )
     case SetupBucket::SwapPath1: return "swap_path1";
     case SetupBucket::SwapPath2: return "swap_path2";
     case SetupBucket::Unknown: return "unknown";
+    case SetupBucket::IdleUnmeasured: return "idle_unmeasured";
     default: return "none";
     }
 }
 
-/*! The window's busy ms (window minus event-loop idle), or -1 when the window or its idle probe is not known. */
+/*! The window's busy ms (window minus event-loop idle minus smoke-runner sleep), or -1 when the window or its idle
+ *  probe is not known, or when the window showed no yield (no dispatcher wait and no runner sleep): a smoke runner's
+ *  non-blocking processEvents never blocks, so a zero idle there is structural, not measured (r3 B1). */
 inline double presentSetupGuiBusyMs( const PresentSetupSample &s )
 {
     if( !s.tailKnown || !s.tail.prevKnown || !s.tail.guiIdleKnown ) return -1.0;
-    return s.tail.swapReturnToSetupMs - s.tail.guiIdleMs;
+    if( s.tail.guiIdleWaits <= 0 && s.tail.runnerSleeps <= 0 ) return -1.0;
+    const double busy = s.tail.swapReturnToSetupMs - s.tail.guiIdleMs - s.tail.runnerSleepMs;
+    return busy > 0.0 ? busy : 0.0;   // the runner sleep is timed on its own clock: never below zero
 }
 
 inline SetupBucket presentSetupBucket( const PresentSetupSample &s )
@@ -189,6 +199,9 @@ inline SetupBucket presentSetupBucket( const PresentSetupSample &s )
     if( s.tail.grabSwaps >= 1 ) return SetupBucket::SwapPath2;
     if( s.tail.qtPaintSwaps >= 1 ) return SetupBucket::SwapPath1;
     const double busy = presentSetupGuiBusyMs( s );
+    // No yield seen: a window too short to hold GUI_BUSY's busy is still setup_after_swap; a longer one names nothing.
+    if( busy < 0.0 )
+        return s.tail.swapReturnToSetupMs > kGuiBusyBucketMs ? SetupBucket::IdleUnmeasured : SetupBucket::SetupAfterSwap;
     if( busy > kGuiBusyBucketMs && 2.0 * busy >= s.tail.swapReturnToSetupMs ) return SetupBucket::GuiBusy;
     return SetupBucket::SetupAfterSwap;
 }

@@ -4948,13 +4948,18 @@ void MainWindow::endGuiPresentIdleWait( void )
 
 // A smoke runner's sleep on the GUI thread is neither GUI work nor dispatcher idle: inside an
 // open gap it is reported on its own (avg_gui_present_gap_runner_sleep_ms), never as busy. No
-// gap opens or closes during the sleep (both run on this thread).
+// gap opens or closes during the sleep (both run on this thread). PLAYBACK-PRESENT-TAIL-TIMING-1
+// r3 (B1): likewise inside GpuDisplayWindow's open present-tail window.
 void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 {
     const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
+    QElapsedTimer slept;
+    slept.start();
     QThread::msleep( ms );
+    const qint64 sleptNs = slept.nsecsElapsed();
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
         m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
+    GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
 }
 
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
@@ -26343,6 +26348,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             setupSample.tail.grabSwaps = tail.grab_swaps;
             setupSample.tail.guiIdleKnown = tail.gui_idle_known;
             setupSample.tail.guiIdleMs = tail.gui_idle_ms;
+            setupSample.tail.guiIdleWaits = tail.gui_idle_waits;
+            setupSample.tail.runnerSleepMs = tail.runner_sleep_ms;
+            setupSample.tail.runnerSleeps = tail.runner_sleeps;
             setupSample.fullscreen = isFullScreen();
             m_playbackSlipHistogram.notePresentSetup( setupSample );
         }
@@ -29418,7 +29426,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                       : slip.presentSetupMaxFullscreen       ? QStringLiteral("fullscreen")
                                                              : QStringLiteral("windowed") )
                << QStringLiteral("present_setup_max_bucket=%1").arg(
-                      QLatin1String( playback_slip::setupBucketName( slip.presentSetupMaxBucket ) ) );
+                      QLatin1String( playback_slip::setupBucketName( slip.presentSetupMaxBucket ) ) )
+               // r3 (B1): the window's yields, so a probe that saw none reads as such (gui_busy_ms is then -1)
+               << QStringLiteral("present_setup_max_gui_idle_ms=%1").arg( maxTail.guiIdleMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_gui_idle_waits=%1").arg( maxTail.guiIdleWaits )
+               << QStringLiteral("present_setup_max_runner_sleep_ms=%1").arg( maxTail.runnerSleepMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_runner_sleeps=%1").arg( maxTail.runnerSleeps );
         qInfo().noquote() << fields.join( QLatin1Char(' ') );
         for( const SlipRecord &r : slip.slipLines )
         {

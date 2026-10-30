@@ -4,6 +4,7 @@
 // count every lost frame once, at the present that skipped it, with one cause.
 #include "../common/minitest.h"
 
+#include "../../platform/qt/GpuPresentTailWindow.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSlipHistogram.h"
 
@@ -599,6 +600,7 @@ playback_slip::PresentSetupSample tailSample( double totalMs, double windowMs, d
     s.tail.guiIdleMs = idleMs;
     s.tail.qtPaintSwaps = qtPaintSwaps;
     s.tail.grabSwaps = grabSwaps;
+    s.tail.guiIdleWaits = 1;   // r3: a window whose probe saw a yield (the no-yield cases build their own)
     return s;
 }
 }
@@ -679,4 +681,236 @@ TEST(PlaybackSlipHistogram, PresentSetupFirstTailIsExcludedAndAnEmptySessionBuck
     SlipHistogram empty;
     empty.reset( 0, kNativeFps );
     ASSERT_TRUE( empty.finish( 1000.0, 0 ).presentSetupMaxBucket == SetupBucket::None );
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 r3 (key3 B1): a window in which the GUI thread showed no yield at all -- the smoke
+// runner's non-blocking processEvents never reaches aboutToBlock, and no runner sleep was counted -- has a structural
+// zero idle. It must never name GUI_BUSY's fix row, and its busy is not known. Built from the fields 7fce5df1 already
+// had, so this test compiles there and fails there (busy 30, gui_busy).
+TEST(PlaybackSlipHistogram, PresentSetupWindowWithNoYieldNeverBucketsGuiBusy)
+{
+    playback_slip::PresentSetupSample s = setupSample( 60.0 );
+    s.tailKnown = true;
+    s.tail.prevKnown = true;
+    s.tail.guiIdleKnown = true;
+    s.tail.swapReturnToSetupMs = 30.0;
+    s.tail.guiIdleMs = 0.0;
+    ASSERT_FALSE( playback_slip::presentSetupBucket( s ) == playback_slip::SetupBucket::GuiBusy );
+    ASSERT_NEAR( -1.0, playback_slip::presentSetupGuiBusyMs( s ), 1e-12 );
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 r3: the window lifecycle GpuDisplayWindow drives (GpuPresentTailWindow.h), executed
+// event by event, then bucketed the way notePlaybackSmokePresentedFrame feeds the histogram.
+namespace
+{
+constexpr qint64 kMs = 1000000;
+
+playback_slip::PresentSetupSample sampleFromTail( double totalMs, const GpuPresentTailTiming &t )
+{
+    playback_slip::PresentSetupSample s = setupSample( totalMs );
+    s.tailKnown = true;
+    s.tail.prevKnown = t.prev_known;
+    s.tail.prevPostPaintMs = t.prev_post_paint_ms;
+    s.tail.prevPostSwapMs = t.prev_post_swap_ms;
+    s.tail.swapReturnToSetupMs = t.swap_return_to_setup_ms;
+    s.tail.qtPaintSwaps = t.qt_paint_swaps;
+    s.tail.qtPaintSwapMaxMs = t.qt_paint_swap_max_ms;
+    s.tail.grabSwaps = t.grab_swaps;
+    s.tail.guiIdleKnown = t.gui_idle_known;
+    s.tail.guiIdleMs = t.gui_idle_ms;
+    s.tail.guiIdleWaits = t.gui_idle_waits;
+    s.tail.runnerSleepMs = t.runner_sleep_ms;
+    s.tail.runnerSleeps = t.runner_sleeps;
+    return s;
+}
+}
+
+TEST(GpuPresentTailWindow, LifecycleAccumulatesInsideOneWindowAndResetsAtEveryPath3Swap)
+{
+    GpuPresentTailWindow w;
+    // Nothing open yet: every event is ignored and a setup reports no previous window.
+    w.blocked( 1 * kMs );
+    w.awake( 5 * kMs );
+    w.runnerSlept( 10 * kMs );
+    w.qtPaintSwap( 3 * kMs );
+    w.grabSwap();
+    GpuPresentTailTiming t0;
+    w.close( 20 * kMs, true, t0 );
+    ASSERT_FALSE( t0.prev_known );
+    ASSERT_EQ( 0, w.idleWaits );
+    ASSERT_EQ( 0, w.runnerSleeps );
+    ASSERT_EQ( 0, w.grabSwaps );
+
+    // Present 1's path-3 swap returns at 100 ms; its window holds two block/wake pairs, one runner sleep, two path-1
+    // pairs, one path-2 grab and a stray awake with no block before it.
+    w.open( 100 * kMs, 7.0, 16.0 );
+    ASSERT_TRUE( w.isOpen() );
+    w.blocked( 102 * kMs );
+    w.awake( 110 * kMs );
+    w.runnerSlept( 10 * kMs );
+    w.blocked( 125 * kMs );
+    w.awake( 129 * kMs );
+    w.awake( 131 * kMs );
+    w.qtPaintSwap( 2 * kMs );
+    w.qtPaintSwap( 5 * kMs );
+    w.grabSwap();
+    GpuPresentTailTiming t1;
+    w.close( 140 * kMs, true, t1 );
+    ASSERT_FALSE( w.isOpen() );
+    ASSERT_TRUE( t1.prev_known );
+    ASSERT_TRUE( t1.gui_idle_known );
+    ASSERT_NEAR( 40.0, t1.swap_return_to_setup_ms, 1e-9 );
+    ASSERT_NEAR( 12.0, t1.gui_idle_ms, 1e-9 );
+    ASSERT_EQ( 2, t1.gui_idle_waits );
+    ASSERT_NEAR( 10.0, t1.runner_sleep_ms, 1e-9 );
+    ASSERT_EQ( 1, t1.runner_sleeps );
+    ASSERT_EQ( 2, t1.qt_paint_swaps );
+    ASSERT_NEAR( 5.0, t1.qt_paint_swap_max_ms, 1e-9 );
+    ASSERT_EQ( 1, t1.grab_swaps );
+    ASSERT_NEAR( 7.0, t1.prev_post_paint_ms, 1e-9 );
+    ASSERT_NEAR( 16.0, t1.prev_post_swap_ms, 1e-9 );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( sampleFromTail( 60.0, t1 ) ) == playback_slip::SetupBucket::SwapPath2 );
+
+    // Between that setup and the next swap no window is open: nothing counts.
+    w.runnerSlept( 10 * kMs );
+    w.blocked( 150 * kMs );
+    w.awake( 160 * kMs );
+    w.grabSwap();
+    w.qtPaintSwap( 9 * kMs );
+
+    // Present 2's swap opens a fresh window: nothing from window 1 or from the gap carries over.
+    w.open( 200 * kMs, 3.0, 9.0 );
+    GpuPresentTailTiming t2;
+    w.close( 205 * kMs, true, t2 );
+    ASSERT_TRUE( t2.prev_known );
+    ASSERT_NEAR( 5.0, t2.swap_return_to_setup_ms, 1e-9 );
+    ASSERT_NEAR( 0.0, t2.gui_idle_ms, 1e-12 );
+    ASSERT_EQ( 0, t2.gui_idle_waits );
+    ASSERT_NEAR( 0.0, t2.runner_sleep_ms, 1e-12 );
+    ASSERT_EQ( 0, t2.runner_sleeps );
+    ASSERT_EQ( 0, t2.qt_paint_swaps );
+    ASSERT_NEAR( 0.0, t2.qt_paint_swap_max_ms, 1e-12 );
+    ASSERT_EQ( 0, t2.grab_swaps );
+    ASSERT_NEAR( 3.0, t2.prev_post_paint_ms, 1e-9 );
+    ASSERT_NEAR( 9.0, t2.prev_post_swap_ms, 1e-9 );
+    // A short window with no yield is still setup_after_swap: its busy cannot reach GUI_BUSY's edge.
+    ASSERT_TRUE( playback_slip::presentSetupBucket( sampleFromTail( 60.0, t2 ) )
+                 == playback_slip::SetupBucket::SetupAfterSwap );
+
+    // A second setup with no swap between reports no previous window.
+    GpuPresentTailTiming t3;
+    w.close( 300 * kMs, true, t3 );
+    ASSERT_FALSE( t3.prev_known );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( sampleFromTail( 60.0, t3 ) ) == playback_slip::SetupBucket::Unknown );
+}
+
+TEST(GpuPresentTailWindow, SetupDuringAnOpenBlockLeavesIdleNotKnownAndDropsTheBlock)
+{
+    GpuPresentTailWindow w;
+    w.open( 0, 4.0, 8.0 );
+    w.blocked( 2 * kMs );   // no awake before the setup: this thread is running, so the block's span is not idle
+    GpuPresentTailTiming t;
+    w.close( 30 * kMs, true, t );
+    ASSERT_TRUE( t.prev_known );
+    ASSERT_FALSE( t.gui_idle_known );
+    ASSERT_NEAR( 0.0, t.gui_idle_ms, 1e-12 );
+    ASSERT_EQ( 0, t.gui_idle_waits );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( sampleFromTail( 60.0, t ) ) == playback_slip::SetupBucket::Unknown );
+    ASSERT_NEAR( -1.0, playback_slip::presentSetupGuiBusyMs( sampleFromTail( 60.0, t ) ), 1e-12 );
+
+    // The close dropped the open block: its late awake is never charged to the next window.
+    w.awake( 31 * kMs );
+    w.open( 40 * kMs, 4.0, 8.0 );
+    w.awake( 42 * kMs );
+    GpuPresentTailTiming next;
+    w.close( 45 * kMs, true, next );
+    ASSERT_TRUE( next.gui_idle_known );
+    ASSERT_NEAR( 0.0, next.gui_idle_ms, 1e-12 );
+    ASSERT_EQ( 0, next.gui_idle_waits );
+
+    // Without the idle probe (not QEventDispatcherWin32, or swap telemetry off) idle is never known.
+    w.open( 50 * kMs, 4.0, 8.0 );
+    w.blocked( 51 * kMs );
+    w.awake( 60 * kMs );
+    GpuPresentTailTiming noProbe;
+    w.close( 90 * kMs, false, noProbe );
+    ASSERT_FALSE( noProbe.gui_idle_known );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( sampleFromTail( 60.0, noProbe ) )
+                 == playback_slip::SetupBucket::Unknown );
+}
+
+TEST(GpuPresentTailWindow, SmokeRunnerSleepIsNeverCountedAsGuiBusy)
+{
+    // Key3 catalogue row: the measured smoke loop is processEvents(AllEvents), which never blocks (no aboutToBlock),
+    // then msleep(10). A 30.6 ms window of three runner sleeps and no real GUI work.
+    GpuPresentTailWindow w;
+    w.open( 0, 6.0, 16.0 );
+    for( int i = 0; i < 3; ++i ) w.runnerSlept( 10 * kMs + 100000 );
+    GpuPresentTailTiming t;
+    w.close( 30 * kMs + 600000, true, t );
+    ASSERT_TRUE( t.gui_idle_known );
+    ASSERT_EQ( 0, t.gui_idle_waits );
+    ASSERT_EQ( 3, t.runner_sleeps );
+    ASSERT_NEAR( 30.3, t.runner_sleep_ms, 1e-9 );
+    const playback_slip::PresentSetupSample s = sampleFromTail( 60.0, t );
+    ASSERT_NEAR( 0.3, playback_slip::presentSetupGuiBusyMs( s ), 1e-9 );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( s ) == playback_slip::SetupBucket::SetupAfterSwap );
+
+    // The same 30 ms window with no yield observed at all: idle is a structural zero, so it is unmeasured, not busy.
+    GpuPresentTailTiming none;
+    w.open( 100 * kMs, 6.0, 16.0 );
+    w.close( 130 * kMs, true, none );
+    const playback_slip::PresentSetupSample n = sampleFromTail( 60.0, none );
+    ASSERT_NEAR( -1.0, playback_slip::presentSetupGuiBusyMs( n ), 1e-12 );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( n ) == playback_slip::SetupBucket::IdleUnmeasured );
+    ASSERT_EQ( std::string( "idle_unmeasured" ),
+               std::string( playback_slip::setupBucketName( playback_slip::SetupBucket::IdleUnmeasured ) ) );
+
+    // Real GUI work still buckets GUI_BUSY: 60 ms window, one 10 ms runner sleep and a 5 ms wait leave 45 ms busy.
+    GpuPresentTailTiming work;
+    w.open( 200 * kMs, 6.0, 16.0 );
+    w.runnerSlept( 10 * kMs );
+    w.blocked( 230 * kMs );
+    w.awake( 235 * kMs );
+    w.close( 260 * kMs, true, work );
+    const playback_slip::PresentSetupSample b = sampleFromTail( 60.0, work );
+    ASSERT_NEAR( 45.0, playback_slip::presentSetupGuiBusyMs( b ), 1e-9 );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( b ) == playback_slip::SetupBucket::GuiBusy );
+
+    // A runner sleep timed a hair longer than the window on its own clock never reads as negative busy.
+    GpuPresentTailTiming over;
+    w.open( 300 * kMs, 6.0, 16.0 );
+    w.runnerSlept( 10 * kMs + 1000 );
+    w.close( 310 * kMs, true, over );
+    ASSERT_NEAR( 0.0, playback_slip::presentSetupGuiBusyMs( sampleFromTail( 60.0, over ) ), 1e-12 );
+}
+
+TEST(GpuPresentTailWindow, RefusedPresentAbandonsTheOpenWindow)
+{
+    // Key3 G1: present N swaps (window opens), present N+1 is refused before its setup start (fail()), present N+2
+    // sets up. N+2's window must not span the refused call: it reports no previous window.
+    GpuPresentTailWindow w;
+    w.open( 0, 5.0, 12.0 );
+    w.runnerSlept( 10 * kMs );
+    w.blocked( 12 * kMs );
+    w.abandon();
+    ASSERT_FALSE( w.isOpen() );
+    w.awake( 20 * kMs );         // the open block went with the window
+    w.runnerSlept( 10 * kMs );
+    w.grabSwap();
+    GpuPresentTailTiming t;
+    w.close( 80 * kMs, true, t );
+    ASSERT_FALSE( t.prev_known );
+    ASSERT_TRUE( playback_slip::presentSetupBucket( sampleFromTail( 60.0, t ) ) == playback_slip::SetupBucket::Unknown );
+
+    // A refusal with no window open changes nothing, and the next path-3 swap opens a clean window.
+    w.abandon();
+    w.open( 100 * kMs, 5.0, 12.0 );
+    w.runnerSlept( 10 * kMs );
+    GpuPresentTailTiming next;
+    w.close( 112 * kMs, true, next );
+    ASSERT_TRUE( next.prev_known );
+    ASSERT_NEAR( 12.0, next.swap_return_to_setup_ms, 1e-9 );
+    ASSERT_EQ( 1, next.runner_sleeps );
+    ASSERT_EQ( 0, next.grab_swaps );
 }
