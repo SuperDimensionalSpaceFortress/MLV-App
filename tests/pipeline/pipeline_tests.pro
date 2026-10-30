@@ -29,6 +29,7 @@ SOURCES += \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.cpp \
     $$REPO_ROOT/platform/qt/GpuDebayer.cpp \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetry.cpp \
+    $$REPO_ROOT/platform/qt/GpuDeviceLossBreaker.cpp \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.cpp \
     $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.cpp \
     $$REPO_ROOT/platform/qt/ReceiptSettings.cpp \
@@ -131,7 +132,10 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp \
     $$REPO_ROOT/tests/pipeline/test_debayered16_honour_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp \
-    $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp
+    $$REPO_ROOT/tests/pipeline/test_prep_pointwise_fast.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_playback_recon_preload.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
@@ -152,9 +156,14 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetry.h \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
+    $$REPO_ROOT/platform/qt/GpuDeviceLossBreaker.h \
+    $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h \
+    $$REPO_ROOT/platform/qt/AutomationSettings.h \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.h \
     $$REPO_ROOT/platform/qt/GpuPreviewHostRoute.h \
+    $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackReconWarmRun.h \
     $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
     $$REPO_ROOT/tests/pipeline/dualiso_mesh_metrics.h \

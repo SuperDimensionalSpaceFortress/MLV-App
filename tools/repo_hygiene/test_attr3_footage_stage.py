@@ -1546,8 +1546,21 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
     # ownership (above) makes a collision safe by construction anyway.
     # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1: Wait-VenueQuiet.ps1 (the read-only cooldown probe) is the third. Re-examined the same way: every probe
     # submission carries a fresh JobId (venue-quiet-probe-<UTC to the millisecond>), it never resubmits one, and claim-first ownership holds anyway.
+    # UM-REGULAR-BASELINE-STAGE-1: Invoke-VenueStageNightly.ps1 (the nightly BUILD stager; it never touches footage) is the fourth. Re-examined: its JobIds
+    # are deterministic per sha and single-use BY DESIGN (that is its #508 idempotency), so the property kept here is "never resubmits one", not "fresh":
+    # it reads each JobId's outbox result by name before submitting and never submits a spent one, an UMRUN_JOBID_IN_USE refusal is never resubmitted under
+    # the same id (one suffixed stage re-try, then STAGE_FAILED), an UNRESOLVED um-run is never retried, one driver per venue runs at a time (named mutex),
+    # and claim-first ownership makes a collision with any other submitter safe anyway. test_venue_stage_nightly.py pins "no JobId twice in one call".
+    # BACHELOR-LEASE-BATCH-LEGS-1: Invoke-VenueLeaseBatch.ps1 (the lease-batch runner) is the fifth. Re-examined: it submits only its two trivial per-batch jobs,
+    # lease-batch-open-<UTC stamp>-lb<token> and lease-batch-close-<UTC stamp>-lb<token> (plus ONE light caps probe per run,
+    # venue-quiet-probe-caps-<UTC stamp>, which prints Bachelor's lease config and takes no lease; BACHELOR-DEDICATED-CAPS-RUNNER-1), where the token is 12 hex of a fresh GUID per batch, so every JobId is
+    # fresh; each is submitted ONCE (an open um-run gave up on is read back by name from the outbox, never resubmitted; a RETRACTED / UNRESOLVED open ends
+    # the batch), and claim-first ownership holds anyway. There is no shared submit API to route it through: like the four above, it calls um-run.ps1 directly
+    # (um-run is the only writer to a venue share). test_venue_lease_batch.py pins "no JobId twice in one run".
     KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1",
-                                ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1"}
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1",
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1",
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"}
 
     def _production_um_run_references(self) -> set[Path]:
         proc = subprocess.run(

@@ -12,8 +12,8 @@ exact text is compared with a pinned string. Adding an exemption therefore means
 
 ENFORCE-3 (sol r2 hardening, owner rule 2026-10-01 "20 s means 20 s of source frames"): the scan now also pins
 
-* the COMPLETE request expression of every ``programmaticPlay(`` call (not a prefix: ``kMinPlayWindowSeconds / 20.0``
-  or ``kMinPlayWindowSeconds - 19`` no longer pass),
+* the COMPLETE request expression of every ``programmaticPlay(`` call (not a prefix: ``playGateMinPlayWindowSeconds() / 20.0``
+  or ``playGateMinPlayWindowSeconds() - 19`` no longer pass),
 * EVERY automation stop site by enclosing function and count -- a raw ``actionPlay->setChecked( false )``,
   ``on_actionPlay_triggered( false )`` or ``programmaticStop(`` inserted anywhere (``playbackClock.restart()`` or
   not) changes a pinned count and is reported,
@@ -46,8 +46,8 @@ HEADER_SOURCE = "platform/qt/MainWindow.h"
 # not just its first token -- fails the scan.
 REVIEWED_PROGRAMMATIC_PLAY_SITES = {
     "autoplay": (1, "autoplaySeconds"),                                          # MLVAPP_AUTOPLAY_* hook (normal GUI)
-    "profile-look-assist-settle": (1, "playback_frame_range::kMinPlayWindowSeconds"),
-    "profile-exercise-play-action": (1, "playback_frame_range::kMinPlayWindowSeconds"),
+    "profile-look-assist-settle": (1, "playGateMinPlayWindowSeconds()"),      # HFR-10S-1: the clip's own floor
+    "profile-exercise-play-action": (1, "playGateMinPlayWindowSeconds()"),
     "gui-smoke-measured": (1, "playback_frame_range::smokePlayRequestSeconds( options.durationMs, "
                               "options.targetPresentedFrames, presentedTargetFps )"),
 }
@@ -161,9 +161,21 @@ PINNED_STOP_STATEMENTS = {
     "MainWindow::checkPlayableWindow": (
         "return playback_frame_range::evaluatePlayableWindow( ui->horizontalSliderPosition->value(), "
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
-        "playback_frame_range::kMinPlayWindowSeconds, !f3CutRangeRepairDisabledByEnvironment(), "
+        "playGateMinPlayWindowSeconds(), !f3CutRangeRepairDisabledByEnvironment(), "
         "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
         "const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;",
+        "const double fps = haveClip ? getPlaybackFramerate() : 0.0;",
+    ),
+    # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the settle / play-action requests and the smoke's clip-aware
+    # floors read the floor through these two helpers; their bodies are the ONE derivation (minPlayWindowSeconds of the loaded
+    # clip's NATIVE fps, 0 -- the 20 s floor -- without a clip). A constant or another fps source here fails the scan.
+    # Merge with PLAYBACK-HFR-CONFORM-DEFAULT-1: checkPlayableWindow measures SECONDS at the playback rate (fps above) and takes
+    # its floor from playGateMinPlayWindowSeconds(), so the floor's value is still the native classification.
+    "MainWindow::playGateNativeFps": (
+        "return ( m_fileLoaded && m_pMlvObject ) ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;",
+    ),
+    "MainWindow::playGateMinPlayWindowSeconds": (
+        "return playback_frame_range::minPlayWindowSeconds( playGateNativeFps() );",
     ),
     "MainWindow::programmaticPlay": (
         "m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter(); "

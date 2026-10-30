@@ -34,6 +34,10 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_frame_compare.cpp \
     $$REPO_ROOT/tests/console/test_phase3_quality_policy.cpp \
     $$REPO_ROOT/tests/console/test_clip_lifecycle_barrier.cpp \
+    $$REPO_ROOT/tests/console/test_playback_stop_lifetime.cpp \
+    $$REPO_ROOT/tests/console/test_playback_prep_inflight_gate.cpp \
+    $$REPO_ROOT/tests/console/test_clip_open_abort_callers.cpp \
+    $$REPO_ROOT/tests/console/test_playback_rgb8_source.cpp \
     $$REPO_ROOT/tests/console/test_export_dimensions.cpp \
     $$REPO_ROOT/tests/console/test_export_process.cpp \
     $$REPO_ROOT/tests/console/test_playback_frame_range.cpp \
@@ -54,6 +58,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gpu_window_swap_telemetry.cpp \
     $$REPO_ROOT/tests/console/test_gpu_window_swap_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_foreground_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_smoke_processed8_liveness_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_fullscreen_wiring.cpp \
     $$REPO_ROOT/tests/console/test_gui_smoke_display_select_wiring.cpp \
     $$REPO_ROOT/tests/console/test_display_device_mapping.cpp \
@@ -76,13 +82,26 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
+    $$REPO_ROOT/tests/console/test_playback_startup_split.cpp \
+    $$REPO_ROOT/tests/console/test_playback_audio_start_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_audio_start_engine.cpp \
+    $$REPO_ROOT/tests/console/test_playback_audio_gate.cpp \
+    $$REPO_ROOT/tests/console/test_playback_env_flags.cpp \
+    $$REPO_ROOT/tests/console/test_playback_first_present_identity.cpp \
+    $$REPO_ROOT/tests/console/test_playback_route_prewarm_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_route_staged_slot_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_recon_warm_run_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_gpu_clock_kick_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_warm_output_reuse_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp \
     $$REPO_ROOT/tests/console/test_playback_swap_interval.cpp \
     $$REPO_ROOT/tests/console/test_cuda_launch_timing.cpp \
     $$REPO_ROOT/tests/console/test_gpu_field_telemetry.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_device_loss_breaker.cpp \
     $$REPO_ROOT/tests/console/test_gpu_launch_budget.cpp \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
-    $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp
+    $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
+    $$REPO_ROOT/tests/console/test_playback_scale_label.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -108,6 +127,9 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/AutomationSettings.h \
     $$REPO_ROOT/platform/qt/HubHostPlaybackGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackSlotRelease.h \
+    $$REPO_ROOT/platform/qt/PlaybackPrepInFlightGate.h \
+    $$REPO_ROOT/platform/qt/ClipOpenAbortPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
     $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \
     $$REPO_ROOT/platform/qt/GpuWindowSwapTelemetry.h \
@@ -117,6 +139,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackConformPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackSourceAdvanceTracker.h \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackScaleLabel.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
@@ -125,11 +148,22 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
     $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
+    $$REPO_ROOT/platform/qt/PlaybackStartupSplit.h \
+    $$REPO_ROOT/platform/qt/PlaybackAudioStartPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackAudioGate.h \
+    $$REPO_ROOT/platform/qt/PlaybackEnvFlags.h \
+    $$REPO_ROOT/platform/qt/PlaybackWorkerJoin.h \
+    $$REPO_ROOT/platform/qt/PlaybackFirstPresentIdentity.h \
+    $$REPO_ROOT/platform/qt/PlaybackRoutePrewarmPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackRouteStagedSlotPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackGpuClockKickPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_budget.h \
-    $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h
+    $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
+    $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

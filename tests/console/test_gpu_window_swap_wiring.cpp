@@ -61,8 +61,9 @@ TEST(GpuWindowSwapWiring, AutomaticSwapPathIsConnectedToTheRecorder)
 TEST(GpuWindowSwapWiring, ManualCaptureSwapPathAlsoCallsTheRecorder)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
-    // Real swap path 2: the explicit swapBuffers() in grabPresentedFramebufferIfActive,
-    // which runs outside Qt's own paint-event cycle so frameSwapped() never fires for it.
+    // Real swap path 2: the explicit swapBuffers() in swapOutsidePaintEventAndRecord (the one
+    // manual swap site; see ForcedCapturePaintReusesTheOneManualSwapSite below), which runs
+    // outside Qt's own paint-event cycle so frameSwapped() never fires for it.
     const int swapBuffersCalls = countOccurrences(source, QStringLiteral("glContext->swapBuffers(win)"));
     const int noteRealSwapCalls = countOccurrences(source, QStringLiteral("win->noteRealSwap()"));
     ASSERT_EQ(1, swapBuffersCalls);
@@ -229,6 +230,49 @@ TEST(GpuWindowSwapWiring, GuiTestsLinkTheOpenMpRuntimeTheSwapClockNeeds)
     // (hosted Windows GUI Pilot, #159 and #161).
     const QString pro = readRepoFile(QStringLiteral("tests/gui/gui_tests.pro"));
     ASSERT_TRUE(pro.contains(QStringLiteral("win32: LIBS += -llibgomp-1")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B1): the --visual-capture-dir forced
+// paint (paintPendingNowIfActive) and the --screenshot grab both paint outside Qt's paint-event
+// cycle. They share ONE manual swap site, so every frame they present is swapped once and the
+// swap recorder sees it; a second inline swapBuffers() is what reddened the pin above.
+
+TEST(GpuWindowSwapWiring, ForcedCapturePaintReusesTheOneManualSwapSite)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString call = QStringLiteral("swapOutsidePaintEventAndRecord(win, glContext);");
+
+    const QString helper = functionBody(source,
+        QStringLiteral("void GpuDisplayWindow::swapOutsidePaintEventAndRecord(GpuDisplayWindow *win, QOpenGLContext *glContext)"),
+        QStringLiteral("bool GpuDisplayWindow::grabPresentedFramebufferIfActive("));
+    ASSERT_FALSE(helper.isEmpty());
+    const int swapAt = helper.indexOf(QStringLiteral("glContext->swapBuffers(win);"));
+    const int noteAt = helper.indexOf(QStringLiteral("if ( swapTelemetryEnabled() ) win->noteRealSwap();"));
+    ASSERT_TRUE(swapAt >= 0);
+    ASSERT_TRUE(noteAt > swapAt);
+
+    // The grab: one paint, one swap through the shared site, and no inline swap.
+    const QString grab = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::grabPresentedFramebufferIfActive("),
+        QStringLiteral("bool GpuDisplayWindow::presentedSerialIfActive("));
+    ASSERT_FALSE(grab.isEmpty());
+    ASSERT_EQ(1, countOccurrences(grab, call));
+    ASSERT_EQ(0, countOccurrences(grab, QStringLiteral("swapBuffers(")));
+    ASSERT_TRUE(grab.indexOf(call) > grab.indexOf(QStringLiteral("win->paintGL();")));
+
+    // The forced capture paint: the same site, once, and only when a submitted frame is still
+    // unpainted -- a frame already painted is never painted or swapped a second time.
+    const QString forced = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::paintPendingNowIfActive(quint64 *presentedSerial)"),
+        QStringLiteral("void GpuDisplayWindow::initializeGL()"));
+    ASSERT_FALSE(forced.isEmpty());
+    ASSERT_EQ(1, countOccurrences(forced, call));
+    ASSERT_EQ(0, countOccurrences(forced, QStringLiteral("swapBuffers(")));
+    ASSERT_EQ(1, countOccurrences(forced, QStringLiteral("win->paintGL();")));
+    const int guardAt = forced.indexOf(QStringLiteral("if ( pending && glContext"));
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(forced.indexOf(QStringLiteral("win->paintGL();")) > guardAt);
+    ASSERT_TRUE(forced.indexOf(call) > forced.indexOf(QStringLiteral("win->paintGL();")));
 }
 
 // Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): superseded-before-paint wiring. See
@@ -715,4 +759,101 @@ TEST(GpuPresentSetupStall, SteadyStateBlurUploadTakesNoGlGetErrorButTheAllocatio
     ASSERT_TRUE(allocationUploadAt > drainAt);
     ASSERT_TRUE(checkAt > allocationUploadAt);
     ASSERT_TRUE(allocation.mid(checkAt).contains(QStringLiteral("return failClosed();")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2, CoS 6219217683): the --visual-capture-dir forced paint
+// (paintPendingNowIfActive above, or the viewport's repaint()) draws the frame the label names even when the
+// display's own deferred paint never lands, so a forced capture alone can never show a frozen display. Every forced
+// capture kind is therefore paired with an unforced "_unbound" twin, and only the "_unbound" kinds skip the paint.
+// 32626bd5 force-painted every play capture with no twin. The stop and paused twins are taken just before their forced
+// capture, with no event handled in between; the play twins are ordered by the r3 test below.
+TEST(VisualCaptureBinding, EveryForcedStopAndPausedCaptureIsPairedWithAnUnforcedCaptureTakenJustBeforeIt)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+
+    // Only the "_unbound" kinds skip the forced paint.
+    ASSERT_TRUE(block.contains(QStringLiteral("!kind.endsWith( QStringLiteral(\"_unbound\") )")));
+
+    const QString pairs[][2] = {
+        { QStringLiteral("grabVisual( QStringLiteral(\"stop_unbound\"), 0, false );"),
+          QStringLiteral("grabVisual( QStringLiteral(\"stop\"), 0, false );") },
+        { QStringLiteral("grabVisual( QStringLiteral(\"paused_unbound\"), 0, visualSettled );"),
+          QStringLiteral("grabVisual( QStringLiteral(\"paused\"), 0, visualSettled );") },
+    };
+    for (const auto & pair : pairs) {
+        ASSERT_EQ(1, countOccurrences(block, pair[0]));
+        ASSERT_EQ(1, countOccurrences(block, pair[1]));
+        const int unforcedAt = block.indexOf(pair[0]);
+        const int forcedAt = block.indexOf(pair[1]);
+        ASSERT_TRUE(unforcedAt >= 0 && forcedAt > unforcedAt);
+        ASSERT_FALSE(block.mid(unforcedAt, forcedAt - unforcedAt).contains(QStringLiteral("processEvents(")));
+    }
+    // No forced kind exists without its twin: three forced grabs, three unforced, nothing else.
+    ASSERT_EQ(6, countOccurrences(block, QStringLiteral("grabVisual( QStringLiteral(")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): r2 took unforced play k and then forced play k in each
+// slice. A forced paint stays on screen when the display's own deferred paint never lands, so unforced k+1 showed
+// forced k (trace initial,F0..F4): six moving pictures over a frozen display. Every forced play capture now comes
+// before the first unforced one, no forced capture falls between two unforced play captures or between the last of
+// them and stop_unbound, and every capture records how many forced paints preceded it (forced_paints_before) so the
+// runner judges only an interval no forced paint entered.
+TEST(VisualCaptureBinding, NoForcedPaintFallsInsideTheUnforcedPlayObservationInterval)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+
+    const QString forcedPlay = QStringLiteral("grabVisual( QStringLiteral(\"play\"), k, false );");
+    const QString unforcedPlay = QStringLiteral("grabVisual( QStringLiteral(\"play_unbound\"), k, false );");
+    const QString stopUnforced = QStringLiteral("grabVisual( QStringLiteral(\"stop_unbound\"), 0, false );");
+    ASSERT_EQ(1, countOccurrences(block, forcedPlay));
+    ASSERT_EQ(1, countOccurrences(block, unforcedPlay));
+    const int forcedAt = block.indexOf(forcedPlay);
+    const int unforcedAt = block.indexOf(unforcedPlay);
+    const int stopUnforcedAt = block.indexOf(stopUnforced);
+    ASSERT_TRUE(forcedAt >= 0 && unforcedAt > forcedAt && stopUnforcedAt > unforcedAt);
+    // The two play captures sit in two separate loops: the forced loop closes before the unforced one opens.
+    const QString forcedToUnforced = block.mid(forcedAt, unforcedAt - forcedAt);
+    ASSERT_EQ(1, countOccurrences(forcedToUnforced, QStringLiteral("for( int k = 0; k < visualPlayFrames; ++k )")));
+    // From the unforced play capture to stop_unbound: no other capture, only the pause.
+    const QString interval = block.mid(unforcedAt, stopUnforcedAt - unforcedAt);
+    ASSERT_EQ(1, countOccurrences(interval, QStringLiteral("grabVisual(")));
+    ASSERT_TRUE(interval.contains(QStringLiteral("ui->actionPlay->setChecked( false );")));
+
+    // The ordinal is read before this capture's own paint and advanced only by a forced capture; visual.json carries it.
+    const int lambdaAt = block.indexOf(QStringLiteral("auto grabVisual = [&]"));
+    const int lambdaEnd = block.indexOf(QStringLiteral("visualGrabs.append( grab );"), lambdaAt);
+    ASSERT_TRUE(lambdaAt >= 0 && lambdaEnd > lambdaAt);
+    const QString lambda = block.mid(lambdaAt, lambdaEnd - lambdaAt);
+    const int ordinalAt = lambda.indexOf(QStringLiteral("grab.forcedPaintsBefore = visualForcedPaints;"));
+    const int paintAt = lambda.indexOf(QStringLiteral("paintPresentedFrameForCapture("));
+    const int bumpAt = lambda.indexOf(QStringLiteral("if( forcePaint ) ++visualForcedPaints;"));
+    ASSERT_TRUE(ordinalAt >= 0 && paintAt > ordinalAt && bumpAt > paintAt);
+    ASSERT_EQ(1, countOccurrences(block, QStringLiteral("++visualForcedPaints")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "frameJson.insert( QStringLiteral(\"forced_paints_before\"), grab.forcedPaintsBefore );")));
+}
+
+TEST(VisualCaptureBinding, EveryCaptureNamesWhereItsPaintedSerialCameFrom)
+{
+    // Dot improvement on 60541263: on the pixmap route painted_serial == serial holds by construction, so the
+    // receipt says so (label_bound_basis) instead of passing it off as an independent paint-path record.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("frameJson.insert( QStringLiteral(\"label_bound_basis\"), grab.labelBoundBasis );")));
+    const int helperAt = source.indexOf(QStringLiteral("static bool paintPresentedFrameForCapture("));
+    ASSERT_TRUE(helperAt >= 0);
+    const QString helper = source.mid(helperAt, 2200);
+    const int windowAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"gl_window_paint\");"));
+    const int viewportAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"gl_viewport_paint\");"));
+    const int pixmapAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"pixmap_item_by_construction\");"));
+    ASSERT_TRUE(windowAt >= 0 && viewportAt > windowAt && pixmapAt > viewportAt);
+    // the pixmap-route basis is set only beside the item's own serial, never for a GL route
+    ASSERT_TRUE(helper.lastIndexOf(QStringLiteral("serial = pixmapItemSerial;"), pixmapAt) > viewportAt);
 }

@@ -52,6 +52,22 @@ struct GpuPresentSetupTiming
     double blur_check_ms = 0.0;
     double realloc_ms = 0.0;
     double sampling_ms = 0.0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0: what the window's realloc branch did with the texture
+     * slot ("kept", "realloc", "adopted", "discarded"; "none" outside GpuDisplayWindow), and this call's AMaZE-only
+     * kernel / download time (the download includes the output texture's CUDA-GL register and map). */
+    const char * slot = "none";
+    double amaze_kernel_ms = 0.0;
+    double amaze_download_ms = 0.0;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R3 (PlaybackWarmOutputReusePolicy.h): whether this call
+     * kept the paused warm's AMaZE output ("hit", "miss", "skip"; "none" outside GpuDisplayWindow), why, and the
+     * compare's wall time. */
+    const char * warm_output_reuse = "none";
+    const char * reuse_reason = "none";
+    double reuse_compare_ms = 0.0;
+    bool reuse_verify_ran = false;   // R4: the identity check re-ran this frame's AMaZE after the swap
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-key: both recon states on a state or content miss
+     * (playback_warm_output_reuse::stateFields), else empty. */
+    QString reuse_states;
 };
 
 struct GpuPreviewProcessingConfig
@@ -304,7 +320,25 @@ struct GpuPreviewProcessingCpuSpans
     uint32_t stageMask = 0;
     /* true when >>8 ran inside the pointwise loop (no spatial post-pass). */
     bool fused8 = false;
+    /* CPU-LOOKASSIST-PLAYBACK-COST-1: the pointwise pass ran the fast path; the
+     * OpenMP team size it ran with (read inside the region, 0 when no pass ran);
+     * why the fast path was refused (static string, "" when it ran). */
+    bool pointwiseFast = false;
+    int pointwiseOmpThreads = 0;
+    const char * pointwiseFastRefusal = "";
 };
+/* CPU-LOOKASSIST-PLAYBACK-COST-1: the prep route's pointwise pass
+ * (gpuPreviewProcessingApplyCpuReferenceTimed / ...To8) has a fast path that is
+ * byte-identical to the reference loop: the config's tables resolved once per
+ * frame into raw pointers and per-channel composite tables, and an explicit
+ * team of mlvappEffectivePlaybackWorkerThreadCount() threads.
+ * gpuPreviewProcessingApplyCpuReference (the parity oracle) never takes it.
+ * MLVAPP_DISABLE_PREP_POINTWISE_FAST ("1", "true", "yes", "on") restores the
+ * reference loop. */
+const char * gpuPreviewProcessingPointwiseFastKillSwitchName(void);
+/* "" when the fast path covers every pointwise stage the config enables, else a
+ * stable token naming the first reason it does not. Reads the kill switch. */
+const char * gpuPreviewProcessingPointwiseFastRefusal(const GpuPreviewProcessingConfig & config);
 uint32_t gpuPreviewProcessingCpuStageMask(const GpuPreviewProcessingConfig & config);
 /* Chroma, sharpen or median: the stages that read neighbouring pixels after
  * the pointwise pass. */

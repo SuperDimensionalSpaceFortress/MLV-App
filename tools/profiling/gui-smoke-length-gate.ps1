@@ -9,9 +9,10 @@
 #
 # Typed verdicts (never a path: owner footage is never named in a message):
 #   OK
-#   CLIP_TOO_SHORT       (clip=<s> window=<s>)  clip is shorter than max(20, window) seconds
-#   PLAY_WINDOW_TOO_SHORT (window=<s> required=<s>)  the requested PLAY WINDOW is under 20 s, even
-#                        on a long clip (ENFORCE-2: the window, not only the clip, must be >= 20 s)
+#   CLIP_TOO_SHORT       (clip=<s> window=<s>)  clip is shorter than max(floor, window) seconds
+#   PLAY_WINDOW_TOO_SHORT (window=<s> required=<s>)  the requested PLAY WINDOW is under the floor, even
+#                        on a long clip (ENFORCE-2: the window, not only the clip, must reach the floor)
+# The floor is Get-GuiSmokeMinPlaySeconds of the clip's native fps: 20 s, 10 s for an HFR clip (HFR-10S-1).
 #   CLIP_LENGTH_UNKNOWN  (reason=<token>)       header unreadable / wrong magic / 0 frames / bad fps
 #                                               / spanned set incomplete -- FAIL CLOSED
 #
@@ -25,8 +26,34 @@
 # The clip extension is composed, never spelled as one token: a token ending in it trips this
 # repository's own NA-4 PreToolUse gate even in source text that names no real clip.
 
-$script:GuiSmokeMinClipSeconds = 20.0
-$script:GuiSmokeMinPlayWindowMs = 20000   # the same floor in ms: the lifecycle-stress switch stops Play, so it may not come sooner
+# PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15: "Amend rule so that hfr 60fps clips are allowed to be 10
+# seconds"): the floor is a function of the clip's NATIVE fps. Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds
+# (kStandardMinPlayWindowSeconds, kHfrMinPlayWindowSeconds, kHfrNativeFpsThreshold); a parity test compares them.
+$script:GuiSmokeStandardMinPlaySeconds = 20.0
+$script:GuiSmokeHfrMinPlaySeconds = 10.0
+$script:GuiSmokeHfrNativeFpsThreshold = 50.0
+# Where a stage cannot see the clip yet, it refuses only what NO clip could admit (the HFR floor); the clip's own floor is
+# applied wherever its fps is known (this file's gate and oracles, the app).
+$script:GuiSmokeLowestMinPlaySeconds = $script:GuiSmokeHfrMinPlaySeconds
+
+function Get-GuiSmokeMinPlaySeconds {
+    # THE play floor of a clip, from its NATIVE fps: 10 s at >= 50 fps (HFR), 20 s below; an absent, non-numeric, non-finite
+    # or non-positive fps is 20 s (fail closed, never 10). Seconds are source seconds at the native fps.
+    param([AllowNull()]$NativeFps)
+    $fps = 0.0
+    if ($null -ne $NativeFps -and $NativeFps -isnot [bool] -and
+        [double]::TryParse([string]$NativeFps, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$fps) -and
+        -not [double]::IsNaN($fps) -and -not [double]::IsInfinity($fps) -and $fps -ge $script:GuiSmokeHfrNativeFpsThreshold) {
+        return $script:GuiSmokeHfrMinPlaySeconds
+    }
+    return $script:GuiSmokeStandardMinPlaySeconds
+}
+
+function Get-GuiSmokeMinPlayWindowMs {
+    # The same floor in ms: the lifecycle-stress switch stops Play, so it may not come sooner.
+    param([AllowNull()]$NativeFps)
+    return [int64][Math]::Round((Get-GuiSmokeMinPlaySeconds -NativeFps $NativeFps) * 1000.0)
+}
 # Environment variables that change the range the ENGINE plays, so the app's gate and the engine could disagree
 # (PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2, sol B3). Enumerated from platform/qt: MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR is
 # the only knob that touches the cut range (MainWindow.cpp f3CutRangeRepairDisabledByEnvironment); the others that
@@ -68,17 +95,105 @@ function Read-GuiSmokeMlviHeader {
     }
 }
 
+# GUI-SMOKE-LENGTH-GATE-VIDF-COUNT-1: the app plays the VIDF BLOCKS it indexes, never the MLVI header's videoFrameCount.
+# src/mlv/video_mlv.c walks every part block by block (16-byte mlv_hdr_t: blockType[4] blockSize u32 timestamp u64), counts
+# each "VIDF" into video_frames and assigns that to video->frames, which getMlvFrames returns; a blockSize under 16 makes the
+# app refuse the file (MLV_ERR_INVALID). M16-1243's headers declared 612 frames while 937 VIDF blocks were indexed, so the
+# header-only gate saw a 25.5 s clip where the app plays 39.1 s. The walk is bounded in blocks and seconds (a venue leg must
+# not hang on a huge clip); a walk that cannot finish fails closed (vidf_count_unverified). The app's MAPP sidecar caches
+# this same walk (load_mapp sets video->frames from it), so counting the blocks is the quantity both paths agree on.
+$script:GuiSmokeBlockHeaderBytes = 16
+$script:GuiSmokeVidfWalkMaxBlocks = 2000000
+$script:GuiSmokeVidfWalkMaxSeconds = 30.0
+
+function Get-GuiSmokeMlvVidfCount {
+    <#
+    .SYNOPSIS
+    Counts the VIDF blocks of ONE part file the way the app's block walk does (start at offset 0, skip each block by its
+    blockSize). Returns @{ ok; vidf; blocks; overrun; reason }. ok=$false means the walk did not finish (reason: unreadable,
+    invalid_block_size, truncated_block_header, walk_bound_blocks, walk_bound_seconds); never throws. overrun=$true means some
+    block's declared blockSize reaches past the end of the file (an MLVI block that swallows the file, a cut-off last block).
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [AllowNull()][System.Diagnostics.Stopwatch]$Clock = $null)
+    if ($null -eq $Clock) { $Clock = [System.Diagnostics.Stopwatch]::StartNew() }
+    $hdr = New-Object byte[] $script:GuiSmokeBlockHeaderBytes
+    $vidf = [int64]0
+    $blocks = [int64]0
+    $overrun = $false
+    $fs = $null
+    try {
+        # bufferSize 1 = unbuffered: each seek reads 16 bytes, not a 4 KiB page (a clip on a share is walked block by block).
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+                                              [System.IO.FileShare]::ReadWrite, 1)
+        $size = [int64]$fs.Length
+        $pos = [int64]0
+        while ($pos -lt $size) {
+            if ($blocks -ge $script:GuiSmokeVidfWalkMaxBlocks) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'walk_bound_blocks' } }
+            if (($blocks % 256) -eq 0 -and $Clock.Elapsed.TotalSeconds -gt $script:GuiSmokeVidfWalkMaxSeconds) {
+                return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'walk_bound_seconds' }
+            }
+            if (($size - $pos) -lt $script:GuiSmokeBlockHeaderBytes) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'truncated_block_header' } }
+            [void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+            $got = 0
+            while ($got -lt $hdr.Length) {
+                $n = $fs.Read($hdr, $got, $hdr.Length - $got)
+                if ($n -le 0) { break }
+                $got += $n
+            }
+            if ($got -lt $hdr.Length) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'truncated_block_header' } }
+            $blockSize = [int64][BitConverter]::ToUInt32($hdr, 4)
+            if ($blockSize -lt $script:GuiSmokeBlockHeaderBytes) { return @{ ok = $false; vidf = $vidf; blocks = $blocks; reason = 'invalid_block_size' } }
+            if ($hdr[0] -eq 0x56 -and $hdr[1] -eq 0x49 -and $hdr[2] -eq 0x44 -and $hdr[3] -eq 0x46) { $vidf++ }   # 'VIDF'
+            $blocks++
+            $pos += $blockSize
+            if ($pos -gt $size) { $overrun = $true }
+        }
+    } catch {
+        return @{ ok = $false; vidf = $vidf; blocks = $blocks; overrun = $overrun; reason = 'unreadable' }
+    } finally {
+        if ($null -ne $fs) { $fs.Dispose() }
+    }
+    return @{ ok = $true; vidf = $vidf; blocks = $blocks; overrun = $overrun; reason = '' }
+}
+
+function Get-GuiSmokePartFrames {
+    <#
+    .SYNOPSIS
+    The frames the app plays from ONE part: its VIDF block count, and nothing else -- the header count is never admitted in its
+    place (the app rejects a file with zero indexed frames). Returns @{ ok; frames; reason }. No VIDF block while the header
+    declares frames (a file cut off after the MLVI header, an MLVI block that swallows the file, a random body) is
+    header_vidf_count_mismatch; a walk that cannot finish, or whose last counted block runs past EOF, is vidf_count_unverified.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][int64]$HeaderFrames,
+          [AllowNull()][System.Diagnostics.Stopwatch]$Clock = $null)
+    $walk = Get-GuiSmokeMlvVidfCount -Path $Path -Clock $Clock
+    if (-not $walk.ok) { return @{ ok = $false; frames = [int64]0; reason = 'vidf_count_unverified' } }
+    if ($walk.vidf -le 0 -and $HeaderFrames -gt 0) { return @{ ok = $false; frames = [int64]0; reason = 'header_vidf_count_mismatch' } }
+    if ($walk.overrun -and $walk.vidf -gt 0) { return @{ ok = $false; frames = [int64]0; reason = 'vidf_count_unverified' } }
+    return @{ ok = $true; frames = [int64]$walk.vidf; reason = '' }
+}
+
 function Get-GuiSmokeClipLength {
     <#
     .SYNOPSIS
-    Length of a clip (all spanned parts) from its headers alone. Returns
+    Length of a clip (all spanned parts): the VIDF blocks the app will play (Get-GuiSmokePartFrames), with the MLVI headers
+    for identity, fps and the spanned set. Returns
     [pscustomobject]@{ known; reason; frames; fps; seconds }. known=$false means FAIL CLOSED.
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
     $unknown = { param($why) [pscustomobject]@{ known = $false; reason = $why; frames = 0; fps = 0.0; seconds = 0.0 } }
     $first = Read-GuiSmokeMlviHeader -Path $Path
     if (-not $first.ok) { return (& $unknown $first.reason) }
-    $frames = [int64]$first.videoFrames
+    # Header validity precedes the block walk (as before the walk existed): a zero-fps header reports bad_fps, not the walk's verdict.
+    if ($first.fpsNom -le 0 -or $first.fpsDenom -le 0) { return (& $unknown 'bad_fps') }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $frames = [int64]0
+    if ($first.fileCount -le 1) {
+        # A spanned set walks every part (the first included) in the loop below, so the first part is walked once.
+        $partFrames = Get-GuiSmokePartFrames -Path $Path -HeaderFrames ([int64]$first.videoFrames) -Clock $clock
+        if (-not $partFrames.ok) { return (& $unknown $partFrames.reason) }
+        $frames = [int64]$partFrames.frames
+    }
     if ($first.fileCount -gt 1) {
         # Spanned: the per-file header counts only that file's frames, so the total is the sum over
         # the WHOLE set, and the set must be complete (and one recording) or the length is unknown.
@@ -97,12 +212,13 @@ function Get-GuiSmokeClipLength {
             if ($h.fileGuid -ne $first.fileGuid -or $h.fileNum -ne $idx -or $h.fileCount -ne $first.fileCount) {
                 return (& $unknown 'spanned_set_mismatch')
             }
-            $frames += [int64]$h.videoFrames
+            $pf = Get-GuiSmokePartFrames -Path $part.FullName -HeaderFrames ([int64]$h.videoFrames) -Clock $clock
+            if (-not $pf.ok) { return (& $unknown $pf.reason) }
+            $frames += [int64]$pf.frames
             $idx++
         }
     }
     if ($frames -le 0) { return (& $unknown 'zero_frames') }
-    if ($first.fpsNom -le 0 -or $first.fpsDenom -le 0) { return (& $unknown 'bad_fps') }
     $fps = [double]$first.fpsNom / [double]$first.fpsDenom
     return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps) }
 }
@@ -147,6 +263,14 @@ function Get-GuiSmokeConformEnvOverride {
     switch -CaseSensitive ($value.Trim()) { '1' { return 1 } '0' { return 0 } default { return -1 } }
 }
 
+function Get-GuiSmokeClipPlayFloorSeconds {
+    # The play floor of ONE clip, from the Get-GuiSmokeClipLength result: Get-GuiSmokeMinPlaySeconds of its header fps, and the
+    # 20 s floor when the header cannot be read (the length gate then refuses it as CLIP_LENGTH_UNKNOWN). The one place a launcher
+    # that clamps its own window (validate-visible-playback.ps1, run-release-playback-profile.ps1) takes the floor from.
+    param([Parameter(Mandatory = $true)]$ClipLength)
+    return (Get-GuiSmokeMinPlaySeconds -NativeFps $(if ($ClipLength.known) { $ClipLength.fps } else { $null }))
+}
+
 function Test-GuiSmokeClipLength {
     <#
     .SYNOPSIS
@@ -159,7 +283,8 @@ function Test-GuiSmokeClipLength {
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][double]$WindowSeconds,
         [int]$StartFrame = 0,
-        [double]$MinSeconds = $script:GuiSmokeMinClipSeconds,
+        # HFR-10S-1: < 0 (the default) = the clip's own floor, Get-GuiSmokeMinPlaySeconds of its header fps.
+        [double]$MinSeconds = -1,
         # -ClipOnly: the caller plays NOTHING itself (a decode-only benchmark, a clip that is only opened);
         # only the clip floor applies. Every caller that plays passes its real -WindowSeconds, and that
         # window must itself be >= MinSeconds (PLAYBACK-CLIP-LENGTH-ENFORCE-2).
@@ -174,8 +299,10 @@ function Test-GuiSmokeClipLength {
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $fmt = { param($v) ([double]$v).ToString('0.###', $inv) }
     $len = Get-GuiSmokeClipLength -Path $Path
+    if ($MinSeconds -lt 0) { $MinSeconds = Get-GuiSmokeClipPlayFloorSeconds -ClipLength $len }
     # A caller that plays measures the footage at the rate the app plays it (Get-GuiSmokePlaybackFps); a -ClipOnly caller
-    # plays nothing, so its floor stays the clip's native length.
+    # plays nothing, so its footage stays the clip's native length. The floor above is the clip's own (classified by its NATIVE
+    # fps, HFR-10S-1), taken before the conversion, as the app's playGateMinPlayWindowSeconds() does.
     if ($len.known -and -not $ClipOnly) {
         $playFps = Get-GuiSmokePlaybackFps -ClipFps $len.fps -ConformEnvOverride $ConformEnvOverride
         $len = [pscustomobject]@{ known = $true; reason = ''; frames = $len.frames; fps = $playFps; seconds = ([double]$len.frames / $playFps) }
@@ -183,7 +310,7 @@ function Test-GuiSmokeClipLength {
     $required = [Math]::Max($MinSeconds, $WindowSeconds)
     $out = [pscustomobject]@{
         verdict = 'OK'; message = 'OK'; clipSeconds = $len.seconds; windowSeconds = $WindowSeconds
-        requiredSeconds = $required; frames = $len.frames; fps = $len.fps
+        requiredSeconds = $required; frames = $len.frames; fps = $len.fps; minSeconds = $MinSeconds
     }
     if (-not $len.known) {
         $out.verdict = 'CLIP_LENGTH_UNKNOWN'
@@ -379,8 +506,10 @@ function Get-GuiSmokeGateExitCode {
 }
 
 function Get-GuiSmokeMinPresentedFrames {
-    # The smallest --presented-frames target that still plays the 20 s floor at this frame rate.
-    param([Parameter(Mandatory = $true)][double]$Fps, [double]$MinSeconds = $script:GuiSmokeMinClipSeconds)
+    # The smallest --presented-frames target that still plays the clip's floor at this frame rate (HFR-10S-1: < 0, the
+    # default, = Get-GuiSmokeMinPlaySeconds of -Fps).
+    param([Parameter(Mandatory = $true)][double]$Fps, [double]$MinSeconds = -1)
+    if ($MinSeconds -lt 0) { $MinSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $Fps }
     return [int][Math]::Ceiling($MinSeconds * $Fps)
 }
 
@@ -715,6 +844,8 @@ function Get-GuiSmokeSourceFramesVerdict {
     $nativeFps = & $prop 'native_fps'
     $paceFps = & $prop 'pace_fps'
     $fpsOverride = & $prop 'fps_override'
+    # HFR-10S-1: the floor is the clip's own, Get-GuiSmokeMinPlaySeconds of native_fps (10 s at >= 50 fps, else 20 s).
+    $floorSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $nativeFps
     if ($null -eq $Summary) {
         $failures += "INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary, so no source frames can be proven."
     } elseif ($null -eq $advanced -or $null -eq $required) {
@@ -723,16 +854,16 @@ function Get-GuiSmokeSourceFramesVerdict {
     } elseif ([int64]$required -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ([int64]$advanced -lt [int64]$required) {
-        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under $floorSeconds s of real footage is never playback evidence."
     }
-    # ENFORCE-4: the oracle re-derives the 20 s floor itself and does not trust the app's own requirement. A receipt
-    # whose required_source_frames is under ceil(20 s x native fps) (the 0.02 absorbs the fps printed to 3 decimals) was
-    # admitted for less than 20 s of footage, and a native_fps of 0 cannot say what 20 s is.
+    # ENFORCE-4: the oracle re-derives the floor itself and does not trust the app's own requirement. A receipt
+    # whose required_source_frames is under ceil(floor x native fps) (the 0.02 absorbs the fps printed to 3 decimals) was
+    # admitted for less than the floor of footage, and a native_fps of 0 cannot say what the floor is.
     if ($null -ne $Summary -and $null -ne $nativeFps -and [double]$nativeFps -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeFps; the clip's native frame rate is unknown, so 20 s of footage cannot be measured."
     } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $required -and [int64]$required -gt 0 -and
-              [int64]$required -lt [int64][Math]::Ceiling($script:GuiSmokeMinClipSeconds * [double]$nativeFps - 0.02)) {
-        $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeFps); the Play was admitted for less than 20 s of source footage."
+              [int64]$required -lt [int64][Math]::Ceiling($floorSeconds * [double]$nativeFps - 0.02)) {
+        $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil($floorSeconds s x native_fps=$nativeFps); the Play was admitted for less than $floorSeconds s of source footage."
     }
     # ENFORCE-4: the pace and override fields are REQUIRED, not optional extras of a source-frame count.
     $absent = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('native_fps', 'pace_fps', 'fps_override'))
@@ -820,9 +951,11 @@ function Get-GuiSmokeLoopVerdict {
         if ($null -ne $firstPresented -and $null -ne $lastPresented -and [int64]$lastPresented -lt [int64]$firstPresented) {
             $failures += "INVALID_LOOPED: the last presented frame ($lastPresented) is before the first ($firstPresented); the timeline wrapped."
         }
+        # HFR-10S-1: the clip's own floor, from the native_fps the app reported (absent = 20 s).
+        $clipFloorSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps (& $prop 'native_fps')
         if ($null -ne $clipSeconds -and [double]$clipSeconds -gt 0 -and
-            [double]$clipSeconds -lt [Math]::Max($script:GuiSmokeMinClipSeconds, $WindowSeconds)) {
-            $failures += "INVALID_LOOPED: the app reports clip_seconds=$clipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$WindowSeconds)."
+            [double]$clipSeconds -lt [Math]::Max($clipFloorSeconds, $WindowSeconds)) {
+            $failures += "INVALID_LOOPED: the app reports clip_seconds=$clipSeconds, under max($clipFloorSeconds, window=$WindowSeconds)."
         }
         # ENFORCE-3: the source-frame oracle (source_advanced >= required_source_frames, native pace, no override).
         $sourceFramesVerdict = Get-GuiSmokeSourceFramesVerdict -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce -ConformLine $ConformLine
@@ -934,7 +1067,8 @@ function Get-GuiSmokeEvidencePlayVerdict {
         [AllowNull()]$Summary,
         [AllowNull()][object]$ExitCode,
         [bool]$KilledByLauncher = $false,
-        [double]$WindowSeconds = $script:GuiSmokeMinClipSeconds,
+        # HFR-10S-1: 0 (the default) = no window of the caller's own; the clip's floor (from native_fps) still applies.
+        [double]$WindowSeconds = 0.0,
         [int64]$ClipFrames = 0,
         [string]$AppMessage = '',
         [bool]$RequireAdmission = $false,

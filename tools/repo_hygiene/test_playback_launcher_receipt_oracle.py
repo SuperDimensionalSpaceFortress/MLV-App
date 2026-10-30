@@ -126,6 +126,47 @@ class ReceiptOracleFunctionTests(unittest.TestCase):
                 self.assertEqual(verdict["exitCode"], EXIT_INVALID)
                 self.assertIn(token, json.dumps(verdict["failures"]))
 
+    def test_hfr_evidence_needs_ten_seconds_of_source_frames_and_every_other_clip_twenty(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): "Amend rule so that hfr 60fps clips are allowed to be 10 seconds".
+        hfr = dict(total_frames=720, clip_seconds=12.012, presented_frames=600, native_fps=59.94, pace_fps=59.94)
+        self.assertFalse(_oracle(_good_line(**hfr, source_advanced=600, required_source_frames=600), window=10)["invalid"])   # 59.94 10 s
+        fifty = dict(total_frames=600, clip_seconds=12.0, presented_frames=500, native_fps=50.0, pace_fps=50.0)
+        self.assertFalse(_oracle(_good_line(**fifty, source_advanced=500, required_source_frames=500), window=10)["invalid"])  # 50 fps 10 s
+        refused = {
+            "59.94 fps admitted for 9.9 s": (_good_line(**hfr, source_advanced=594, required_source_frames=594), "INVALID_SOURCE_FRAMES"),
+            "23.976 fps for 10 s": (_good_line(source_advanced=240, required_source_frames=240), "INVALID_SOURCE_FRAMES"),
+            "native fps unknown": (_good_line(**{**hfr, "native_fps": 0}, source_advanced=600, required_source_frames=600), "INVALID_SOURCE_FRAMES"),
+            "an HFR clip looped to reach 10 s": (_good_line(**{**hfr, "total_frames": 300, "clip_seconds": 5.005}, wrapped=1, wrap_count=2,
+                                                            source_advanced=600, required_source_frames=600), "INVALID_LOOPED"),
+        }
+        for name, (line, token) in refused.items():
+            with self.subTest(name):
+                verdict = _oracle(line, window=10)
+                self.assertTrue(verdict["invalid"], verdict)
+                self.assertEqual(verdict["exitCode"], EXIT_INVALID)
+                self.assertIn(token, json.dumps(verdict["failures"]))
+        # 23.976 fps 20 s stays valid
+        self.assertFalse(_oracle(_good_line(), window=20)["invalid"])
+
+    def test_the_hfr_floor_rounding_boundary_is_exact_on_both_sides(self) -> None:
+        # CoS pr-457 (low-confidence gap): the floor is ceil(10 s x native_fps - 0.02), applied at native_fps >= 50.0. Pin one frame either side of
+        # each edge: the integer product (50.0), the 0.02-frame tolerance (50.001: 10 x fps = 500.01 still needs only 500), and the HFR threshold (49.99 keeps 20 s).
+        def line(native: float, required: int) -> str:
+            return _good_line(total_frames=1200, clip_seconds=24.0, presented_frames=500, native_fps=native, pace_fps=native,
+                              source_advanced=required, required_source_frames=required)
+        admitted = {"50.0 fps at exactly 500 frames": (50.0, 500), "50.001 fps at 500 frames (the 0.02-frame tolerance)": (50.001, 500),
+                    "59.94 fps at 600 frames": (59.94, 600), "49.99 fps at ceil(20 s x 49.99 - 0.02) = 1000 frames": (49.99, 1000)}
+        for name, (native, required) in admitted.items():
+            with self.subTest(name):
+                self.assertFalse(_oracle(line(native, required), window=10)["invalid"], name)
+        refused = {"50.0 fps at 499 frames": (50.0, 499), "50.001 fps at 499 frames": (50.001, 499), "59.94 fps at 599 frames": (59.94, 599),
+                   "49.99 fps at 500 frames (just under the HFR threshold keeps the 20 s floor)": (49.99, 500)}
+        for name, (native, required) in refused.items():
+            with self.subTest(name):
+                verdict = _oracle(line(native, required), window=10)
+                self.assertTrue(verdict["invalid"], verdict)
+                self.assertIn("INVALID_SOURCE_FRAMES", json.dumps(verdict["failures"]))
+
     def test_a_non_zero_exit_names_the_apps_typed_reason(self) -> None:
         verdict = _oracle(None, exit_code=14, message="[GUI-SMOKE] ERROR: SOURCE_FRAMES_SHORT (source_advanced=200)")
         self.assertIn("SOURCE_FRAMES_SHORT", json.dumps(verdict["failures"]))
@@ -244,6 +285,8 @@ _FAKE_APP_IMPL = r'''
 import json, os, re, sys
 spec = json.load(open(sys.argv[1], encoding="utf-8"))
 args = sys.argv[2:]
+if spec.get("args_file"):
+    open(spec["args_file"], "w", encoding="utf-8").write(json.dumps(args))
 if spec.get("silent_on_help") and any(a in ("--help", "-h") for a in args):
     sys.exit(0)
 nonce = os.environ.get("MLVAPP_RUN_NONCE", "")
@@ -280,15 +323,15 @@ sys.exit(int(spec["exit_code"]))
 
 
 def _make_fake_app(tmp: Path, *, exit_code: int, copies: tuple[tuple[Path, str], ...] = (), stderr_text: str = "",
-                   nonce_mode: str = "echo", silent_on_help: bool = False) -> Path:
+                   nonce_mode: str = "echo", silent_on_help: bool = False, args_file: Path | None = None) -> Path:
     """A stand-in for MLVApp.exe: copies the given files to the given destinations (shell expressions that may name the
     MLVAPP_CRASH_FORENSICS_LOG_DIR the launcher exports), echoing the run nonce per `nonce_mode`, optionally writes to
-    stderr, exits with `exit_code`."""
+    stderr, optionally records its argv (JSON list) to `args_file`, exits with `exit_code`."""
     impl = tmp / "fake_app_impl.py"
     impl.write_text(_FAKE_APP_IMPL, encoding="utf-8")
     spec = tmp / "fake_app_spec.json"
     spec.write_text(json.dumps({"exit_code": exit_code, "stderr": stderr_text, "nonce_mode": nonce_mode, "silent_on_help": silent_on_help,
-                                "default_nonce": RUN_NONCE, "copies": [[str(source), destination] for source, destination in copies]}),
+                                "args_file": str(args_file) if args_file else "", "default_nonce": RUN_NONCE, "copies": [[str(source), destination] for source, destination in copies]}),
                     encoding="utf-8")
     if os.name == "nt":
         path = tmp / "fake_app.cmd"
@@ -373,7 +416,7 @@ class CaptureReferenceFrameLauncherTests(_LauncherCase):
 
     def test_a_non_zero_app_exit_is_a_failure_with_the_typed_reason_never_a_candidate(self) -> None:
         proc, _ = self.run_capture(None, exit_code=14, stderr_text="SOURCE_FRAMES_SHORT")
-        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 47, proc.stdout + proc.stderr)   # REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: an app exit has its own code; 4 is never-started
         self.assertIn("exe exited 14", proc.stdout)
         self.assertNotIn("CANDIDATE", proc.stdout)
 
@@ -494,6 +537,51 @@ class VisiblePlaybackLauncherTests(_LauncherCase):
         proc = self.run_visible(_good_line(source_advanced=240), script=mutated)
         self.assertEqual(proc.returncode, 0, "with the oracle gone the launcher reports a normal result: that is the bug")
 
+    # ---- PLAYBACK-CLIP-LENGTH-HFR-10S-1 r2, sol's catalogue row M-04: the launcher's own window floor is the clip's ----------
+    # The launcher used to clamp -Seconds up to a hard-coded 20 BEFORE the shared gate, so the owner's 10 s HFR allowance
+    # ("Amend rule so that hfr 60fps clips are allowed to be 10 seconds") never reached it. It now takes the floor from
+    # Get-GuiSmokeMinPlaySeconds of the clip's header fps. The fake app records its argv; MLVApp is never launched.
+
+    def run_visible_window(self, clip: Path, seconds: int) -> tuple[subprocess.CompletedProcess, list[str] | None]:
+        args_file = self.tmp / "app-args.json"
+        args_file.unlink(missing_ok=True)
+        fake = _make_fake_app(self.tmp, exit_code=0, args_file=args_file)
+        proc = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(VISIBLE),
+             "-ExePath", str(fake), "-ClipPath", str(clip), "-OutDir", str(self.tmp / "visible-out"), "-Captures", "4",
+             "-IntervalMs", "1000", "-SettleMs", "1000", "-Seconds", str(seconds)],
+            capture_output=True, text=True, timeout=300)
+        recorded = json.loads(args_file.read_text(encoding="utf-8")) if args_file.is_file() else None
+        return proc, recorded
+
+    @staticmethod
+    def window_of(recorded: list[str] | None) -> str | None:
+        return recorded[recorded.index("--seconds") + 1] if recorded and "--seconds" in recorded else None
+
+    def test_m04_an_hfr_clip_keeps_the_10_second_request_and_passes_pre_launch_admission(self) -> None:
+        hfr = write_synthetic_mlv(self.tmp / ("hfr" + MLV_EXTENSION), 720, fps_nom=60000, fps_denom=1001)   # 12.012 s at 59.94
+        proc, recorded = self.run_visible_window(hfr, 10)
+        self.assertNotIn("CLIP_TOO_SHORT", proc.stderr, proc.stdout + proc.stderr)
+        self.assertNotIn(proc.returncode, (41, 42, 44), proc.stdout + proc.stderr)
+        self.assertEqual(self.window_of(recorded), "10", f"the 10 s request must reach the app unchanged: {recorded}")
+
+    def test_m04_every_other_clip_keeps_the_20_second_floor(self) -> None:
+        # byte-identical non-HFR behaviour: a 40 s 23.976 clip asked for 10 s is clamped up to 20 and admitted ...
+        proc, recorded = self.run_visible_window(self.clip, 10)
+        self.assertNotIn(proc.returncode, (41, 42, 44), proc.stdout + proc.stderr)
+        self.assertEqual(self.window_of(recorded), "20", recorded)
+        # ... and a 12 s 23.976 clip is refused before launch, whatever the request.
+        short = write_synthetic_mlv(self.tmp / ("short" + MLV_EXTENSION), 288)
+        proc, recorded = self.run_visible_window(short, 10)
+        self.assertEqual(proc.returncode, 41, proc.stdout + proc.stderr)
+        self.assertIn("CLIP_TOO_SHORT (clip=12.012 window=20)", proc.stderr)
+        self.assertIsNone(recorded, "a refused clip never launches the app")
+        # an unknowable fps fails closed to the 20 s floor, never 10
+        nofps = write_synthetic_mlv(self.tmp / ("nofps" + MLV_EXTENSION), 720, fps_nom=60000, fps_denom=0)
+        proc, recorded = self.run_visible_window(nofps, 10)
+        self.assertEqual(proc.returncode, 42, proc.stdout + proc.stderr)
+        self.assertIsNone(recorded)
+
 
 class VisiblePlaybackLauncherStaticTests(unittest.TestCase):
     """The blocker's own anatomy, pinned as text (these run on every OS)."""
@@ -513,6 +601,22 @@ class VisiblePlaybackLauncherStaticTests(unittest.TestCase):
         kill_at = code.index("$proc.Kill($true)")
         self.assertLess(loop_end, wait_at)
         self.assertLess(wait_at, kill_at)
+
+    def test_m04_the_script_holds_no_literal_20_second_clamp(self) -> None:
+        code = _strip_comments(self.TEXT)
+        self.assertNotRegex(code, r"\$Seconds\s*-lt\s*20\b")
+        self.assertNotRegex(code, r"\$Seconds\s*=\s*20\b")
+        self.assertIn("Get-GuiSmokeClipPlayFloorSeconds -ClipLength $clipHeaderLength", code)
+        self.assertIn("if ($Seconds -lt $playFloorSeconds)", code)
+        # the clamp reads the clip header and runs after the gate is dot-sourced, before the gate call
+        self.assertLess(code.index("gui-smoke-length-gate.ps1"), code.index("Get-GuiSmokeClipLength -Path $clip"))
+        self.assertLess(code.index("if ($Seconds -lt $playFloorSeconds)"), code.index("Test-GuiSmokeClipLength -Path $clip"))
+
+    def test_m04_the_profile_wrapper_window_is_the_clips_floor_not_a_literal_20(self) -> None:
+        code = _strip_comments(PROFILE_WRAPPER.read_text(encoding="utf-8"))
+        self.assertNotRegex(code, r"-WindowSeconds\s+20\b")
+        self.assertEqual(code.count("-WindowSeconds $profileWindowSeconds"), 2, "the length gate and the receipt verdict share one window")
+        self.assertIn("Get-GuiSmokeClipPlayFloorSeconds -ClipLength (Get-GuiSmokeClipLength", code)
 
     def test_the_process_budget_is_the_apps_safety_net_not_the_capture_schedule(self) -> None:
         code = _strip_comments(self.TEXT)
@@ -808,6 +912,22 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
         gate = GATE.read_text(encoding="utf-8")
         self.assertIn(f"$script:GuiSmokeMinSustainedPaceFraction = {fraction}", gate)
         self.assertIn(f"$script:GuiSmokePlaySafetyMarginMs = {margin}", gate)
+
+    def test_the_powershell_play_floor_mirrors_the_cpp_derivation(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: one derivation (minPlayWindowSeconds); every PowerShell carrier mirrors its constants.
+        header = HEADER.read_text(encoding="utf-8")
+        values = {name: re.search(rf"constexpr double {name} = ([0-9.]+);", header).group(1)
+                  for name in ("kStandardMinPlayWindowSeconds", "kHfrMinPlayWindowSeconds", "kHfrNativeFpsThreshold")}
+        self.assertEqual(values, {"kStandardMinPlayWindowSeconds": "20.0", "kHfrMinPlayWindowSeconds": "10.0", "kHfrNativeFpsThreshold": "50.0"})
+        self.assertIn("isHighFrameRate( nativeFps ) ? kHfrMinPlayWindowSeconds : kStandardMinPlayWindowSeconds", header)
+        gate = GATE.read_text(encoding="utf-8")
+        self.assertIn(f"$script:GuiSmokeStandardMinPlaySeconds = {values['kStandardMinPlayWindowSeconds']}", gate)
+        self.assertIn(f"$script:GuiSmokeHfrMinPlaySeconds = {values['kHfrMinPlayWindowSeconds']}", gate)
+        self.assertIn(f"$script:GuiSmokeHfrNativeFpsThreshold = {values['kHfrNativeFpsThreshold']}", gate)
+        attr = (ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
+        self.assertIn("} elseif ($nativeForFloor -ge 50.0 -and -not [double]::IsInfinity($nativeForFloor)) {", attr)
+        self.assertIn("[int64][Math]::Ceiling(10.0 * $nativeForFloor - 0.02)", attr)
+        self.assertIn("[int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)", attr)
 
     @requires_pwsh
     def test_the_powershell_safety_budget_is_the_formula_the_app_uses(self) -> None:

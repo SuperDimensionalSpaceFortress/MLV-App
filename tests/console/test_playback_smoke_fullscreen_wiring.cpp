@@ -89,7 +89,7 @@ TEST(PlaybackSmokeFullscreenWiring, EntryAndExitAreCalledExactlyOnceAndOnlyFromG
 
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     ASSERT_TRUE(smokeBody.contains(QStringLiteral("enterPlaybackSmokeFullscreen( displayTarget );")));
     ASSERT_TRUE(smokeBody.contains(QStringLiteral("PlaybackSmokeFullscreenGuard")));
@@ -122,7 +122,7 @@ TEST(PlaybackSmokeFullscreenWiring, OrderIsForegroundThenFullscreenThenReverifie
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int targetFramesAt = smokeBody.indexOf(QStringLiteral("m_playbackSmokeTargetPresentedFrames ="));
@@ -159,7 +159,7 @@ TEST(PlaybackSmokeFullscreenWiring, GuardRestoresOnEveryPathIncludingEarlyReturn
     // guard's destructor to actually protect, not just the final success return.
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     const int guardAt = smokeBody.indexOf(QStringLiteral("PlaybackSmokeFullscreenGuard"));
     ASSERT_TRUE(guardAt >= 0);
@@ -286,7 +286,7 @@ TEST(PlaybackSmokeFullscreenWiring, PlaybackClockStartsAfterTheFullscreenPreambl
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int fullscreenAt = smokeBody.indexOf(QStringLiteral("enterPlaybackSmokeFullscreen( displayTarget );"));
@@ -315,7 +315,7 @@ TEST(PlaybackSmokeFullscreenWiring, UnverifiedFullscreenFailsClosedBeforeTheTrig
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // UM-DISPLAY-SELECT-AND-LOG-1 round 1b: enterPlaybackSmokeFullscreen() is now one
@@ -356,7 +356,7 @@ TEST(PlaybackSmokeFullscreenWiring, FullscreenLossMidSessionFailsClosedAfterTheD
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int loopAt = smokeBody.indexOf(
@@ -442,7 +442,7 @@ TEST(PlaybackSmokeFullscreenWiring, LatchIsArmedOnlyAfterVerificationAndImmediat
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // Every windowState transition before verification (entry into full screen and its
@@ -468,7 +468,7 @@ TEST(PlaybackSmokeFullscreenWiring, LatchIsDisarmedAtLoopExitBeforeTheGateCheckA
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int loopAt = smokeBody.indexOf(
@@ -501,7 +501,7 @@ TEST(PlaybackSmokeFullscreenWiring, GateFailsClosedOnLostCountEvenWhenFinalState
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // The point-sample isFullScreen() check alone is no longer sufficient: a genuinely
@@ -522,7 +522,7 @@ TEST(PlaybackSmokeFullscreenWiring, FailureHelperReportsTheLostCount)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     ASSERT_TRUE(smokeBody.contains(
         QStringLiteral("<< \" lost_count=\" << m_playbackSmokeFullscreenLostCount")));

@@ -229,7 +229,7 @@
      </widget>
      <widget class="QMenu" name="menuPlaybackScaleFactor">
       <property name="title">
-       <string>Scale Factor</string>
+       <string>Playback Resolution</string>
       </property>
       <addaction name="actionPlaybackScaleAuto"/>
       <addaction name="actionPlaybackScale1"/>
@@ -2828,7 +2828,7 @@ QGroupBox::indicator:checked:disabled {
                    <item row="3" column="0" colspan="4">
                     <widget class="QComboBox" name="comboBoxLookAssistFlavor">
                      <property name="toolTip">
-                      <string>Look Assist flavor. Classic is the standard conservative look. Cinematic lays a gentle S-curve, controlled highlights and modest colour over the same analysis; white balance is the same as Classic's. Changing it re-runs Look Assist on the current clip.</string>
+                      <string>Look Assist flavor. Classic is the standard conservative look. Cinematic lays a gentle S-curve, controlled highlights and modest colour over the same analysis. Film grade adds cool shadows and warm highlights. Kodak Vision3 50D adds crisp contrast and richer colour with a neutral balance. White balance is the same as Classic's in every flavor. Changing it re-runs Look Assist on the current clip.</string>
                      </property>
                      <item>
                       <property name="text">
@@ -2843,6 +2843,11 @@ QGroupBox::indicator:checked:disabled {
                      <item>
                       <property name="text">
                        <string>Film grade</string>
+                      </property>
+                     </item>
+                     <item>
+                      <property name="text">
+                       <string>Kodak Vision3 50D</string>
                       </property>
                      </item>
                     </widget>
@@ -11175,7 +11180,7 @@ QGroupBox::indicator:checked:disabled {
     <string>Sharp / Smooth Preview</string>
    </property>
    <property name="toolTip">
-    <string>Favor non-blocky preview quality. x4 HQ keeps the conservative full-reconstruction path; x8 remains an explicit deep preview.</string>
+    <string>Favor non-blocky preview quality. Quarter res (0.25x) HQ keeps the conservative full-reconstruction path; Custom res (1/8) remains an explicit deep preview.</string>
    </property>
    <property name="statusTip">
     <string>Preview Mode: sharper, smoother playback preview with conservative scaling shortcuts.</string>
@@ -11189,7 +11194,7 @@ QGroupBox::indicator:checked:disabled {
     <string>Aggressive Performance Preview</string>
    </property>
    <property name="toolTip">
-    <string>Prefer earliest reduced-resolution work for throughput. Enables early x4 HQ reduction and x8 Dual ISO decode overlap.</string>
+    <string>Prefer earliest reduced-resolution work for throughput. Enables early Quarter res (0.25x) HQ reduction and Custom res (1/8) Dual ISO decode overlap.</string>
    </property>
    <property name="statusTip">
     <string>Preview Mode: fastest reduced-resolution playback, accepting coarser preview tradeoffs.</string>
@@ -11203,10 +11208,10 @@ QGroupBox::indicator:checked:disabled {
     <string>Auto</string>
    </property>
    <property name="toolTip">
-    <string>Use the playback scale chosen by the current quality mode and auto sampler.</string>
+    <string>Use the playback resolution chosen by the current quality mode and auto sampler.</string>
    </property>
    <property name="statusTip">
-    <string>Playback scale: follow the current quality mode and auto sampler.</string>
+    <string>Playback resolution: follow the current quality mode and auto sampler.</string>
    </property>
   </action>
   <action name="actionPlaybackScale1">
@@ -11214,13 +11219,13 @@ QGroupBox::indicator:checked:disabled {
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>x1</string>
+    <string>Full res (1x)</string>
    </property>
    <property name="toolTip">
     <string>Force full-resolution playback scaling.</string>
    </property>
    <property name="statusTip">
-    <string>Playback scale: force x1.</string>
+    <string>Playback resolution: force Full res (1x).</string>
    </property>
   </action>
   <action name="actionPlaybackScale2">
@@ -11228,13 +11233,13 @@ QGroupBox::indicator:checked:disabled {
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>x2</string>
+    <string>Half res (0.5x)</string>
    </property>
    <property name="toolTip">
     <string>Force half-resolution playback scaling.</string>
    </property>
    <property name="statusTip">
-    <string>Playback scale: force x2.</string>
+    <string>Playback resolution: force Half res (0.5x).</string>
    </property>
   </action>
   <action name="actionPlaybackScale4">
@@ -11242,13 +11247,13 @@ QGroupBox::indicator:checked:disabled {
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>x4</string>
+    <string>Quarter res (0.25x)</string>
    </property>
    <property name="toolTip">
     <string>Force quarter-resolution playback scaling for the smoothest preview.</string>
    </property>
    <property name="statusTip">
-    <string>Playback scale: force x4.</string>
+    <string>Playback resolution: force Quarter res (0.25x).</string>
    </property>
   </action>
   <action name="actionPlaybackScale8">
@@ -11256,13 +11261,13 @@ QGroupBox::indicator:checked:disabled {
     <bool>true</bool>
    </property>
    <property name="text">
-    <string>x8</string>
+    <string>Custom res (1/8)</string>
    </property>
    <property name="toolTip">
     <string>Force one-eighth-resolution playback scaling for the deepest reduced-resolution preview.</string>
    </property>
    <property name="statusTip">
-    <string>Playback scale: force x8.</string>
+    <string>Playback resolution: force Custom res (1/8).</string>
    </property>
   </action>
   <action name="actionPlaybackPreviewResAuto">

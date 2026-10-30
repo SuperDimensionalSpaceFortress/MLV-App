@@ -118,6 +118,8 @@ win32{
     # gdi32: PLAYBACK-VISUAL-INSPECTION-1's PrintWindow window capture (CreateDIBSection et al.);
     # MinGW only links it by default under -mwindows, which qmake does not pass.
     LIBS += -lgdi32
+    # ole32: PLAYBACK-STARTUP-WAIT-PREWARM-1's audio thread initialises COM (CoInitializeEx) for its WASAPI sink.
+    LIBS += -lole32
     greaterThan(QT_MAJOR_VERSION, 5){
         QMAKE_CXXFLAGS += -fopenmp -mssse3 -std=c++17 -ftree-vectorize
     }
@@ -201,6 +203,7 @@ SOURCES += \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
     GpuFieldTelemetry.cpp \
+    GpuDeviceLossBreaker.cpp \
         main.cpp \
         MainWindow.cpp \
     ../../src/debayer/amaze_demosaic.c \
@@ -381,7 +384,21 @@ HEADERS += MainWindow.h \
            Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
+           PlaybackStartupSplit.h \
+           PlaybackAudioStartPolicy.h \
+           PlaybackFirstPresentIdentity.h \
+           PlaybackRoutePrewarmPolicy.h \
+           PlaybackRouteStagedSlotPolicy.h \
+           PlaybackReconWarmRunPolicy.h \
+           PlaybackReconWarmRun.h \
+           PlaybackGpuClockKickPolicy.h \
+           PlaybackAudioGate.h \
+           PlaybackEnvFlags.h \
+           PlaybackWorkerJoin.h \
+           PlaybackPrepInFlightGate.h \
+           ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
+           PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
@@ -402,6 +419,8 @@ HEADERS += MainWindow.h \
     GpuDisplayWindow.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
+    GpuDeviceLossBreaker.h \
+    GpuDeviceLossBreakerCore.h \
     ../../tools/gpu/igpu_cuda_error.h \
     ../../src/debayer/debayer.h \
     ../../src/debayer/helpersse2.h \
@@ -463,6 +482,8 @@ HEADERS += MainWindow.h \
            ReconWorker.h \
            ResizeLabel.h \
     GraphicsZoomView.h \
+    PreviewPaintTiming.h \
+    GuiPresentGapIdle.h \
     DarkStyle.h \
     JumpSlider.h \
     AudioPlayback.h \

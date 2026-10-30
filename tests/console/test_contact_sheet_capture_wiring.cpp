@@ -76,7 +76,7 @@ TEST(ContactSheetCaptureWiring, CaptureBlockIsGatedOnBothDirAndFramesBeingSet)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     ASSERT_TRUE(smokeBody.contains(
         QStringLiteral("if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 )")));
@@ -101,7 +101,7 @@ TEST(ContactSheetCaptureWiring, FileWritingRunsStrictlyAfterPlaybackStopsAndAfte
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int timedLoopAt = smokeBody.indexOf(
@@ -144,7 +144,7 @@ TEST(ContactSheetCaptureWiring, EachSidecarCarriesTheFieldsTheComposerAndOwnerNe
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     static const char * kRequiredFields[] = {
         "index", "captured_utc", "serial", "display_frame", "elapsed_ms",
@@ -184,7 +184,7 @@ static QString smokeBodyOf(const QString & source)
 {
     return sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
 }
 
 static const char * kInPassArmMarker =
@@ -264,6 +264,41 @@ TEST(ContactSheetCaptureWiring, InPassHookOnlyReadsBackAndTimesTheGrabInsideTheM
     ASSERT_FALSE(hookBody.contains(QStringLiteral(".save(")));
     ASSERT_FALSE(hookBody.contains(QStringLiteral("QFile")));
     ASSERT_FALSE(hookBody.contains(QStringLiteral("toJson(")));
+}
+
+// VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): the hook decides through the ONE predicate the header tests execute
+// (test_playback_frame_range.cpp), keyed to source frames exactly when the run is unpaced the way the pace guard and
+// the pace_unpaced disclosure define it; each sidecar records which basis made it due; and a short sheet still exits 14.
+TEST(ContactSheetCaptureWiring, UnpacedInPassTargetsAreSourceFramesThroughTheSharedPredicateAndAShortSheetStillExits14)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    ASSERT_FALSE(smokeBody.isEmpty());
+    const int armAt = smokeBody.indexOf(QString::fromLatin1(kInPassArmMarker));
+    const int armEndAt = smokeBody.indexOf(QStringLiteral("m_contactSheetCaptureActive = true;"), armAt);
+    ASSERT_TRUE(armAt >= 0 && armEndAt > armAt);
+    const QString armBlock = smokeBody.mid(armAt, armEndAt - armAt);
+    ASSERT_TRUE(armBlock.contains(QStringLiteral(
+        "m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();")));
+    ASSERT_TRUE(armBlock.contains(QStringLiteral("playback_frame_range::contactSheetInPassTargetSourceFrames(")));
+    ASSERT_TRUE(armBlock.contains(QStringLiteral("m_playRequiredSourceFrames")));
+
+    const QString hookBody = sliceBetween(source,
+        QStringLiteral("void MainWindow::noteContactSheetPresentedFrame("),
+        QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry"));
+    ASSERT_FALSE(hookBody.isEmpty());
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("playback_frame_range::contactSheetInPassTargetDue(")));
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("m_sourceAdvance.consumed()")));
+    ASSERT_FALSE(hookBody.contains(QStringLiteral("if( grabElapsedMs < m_contactSheetCaptureTargetMs")));
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("QStringLiteral(\"target_basis\")")));
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("QStringLiteral(\"source_frames\") : QStringLiteral(\"wall_clock\")")));
+
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral("in-pass targets were presented before the measured Play stopped")));
+    const int incompleteAt = smokeBody.indexOf(QStringLiteral("contact sheet capture incomplete; requested="));
+    ASSERT_TRUE(incompleteAt >= 0);
+    const int returnAt = smokeBody.indexOf(QStringLiteral("return "), incompleteAt);
+    ASSERT_TRUE(returnAt > incompleteAt);
+    ASSERT_EQ(returnAt, smokeBody.indexOf(QStringLiteral("return 14;"), incompleteAt));
 }
 
 TEST(ContactSheetCaptureWiring, InPassWriterRecordsTheGrabCostAndWhetherEachGrabFellInTheMeasuredInterval)
@@ -347,7 +382,7 @@ TEST(ContactSheetCaptureWiring, DefaultOffOptionsPresentFlagIsSetOnlyInsideTheCo
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // CONTACT-SHEET-PLAYBACK-PARITY-1: the only capture that needs the per-present hook is the
@@ -384,7 +419,7 @@ TEST(ContactSheetCaptureWiring, SeekModeSidecarRecordsPlaybackPathFalse)
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     // Not sliceBetween(..., "else"): the seek branch's own body contains several inner
     // if/else fallback chains, whose first "else" would truncate the slice long before the
@@ -403,7 +438,7 @@ TEST(ContactSheetCaptureWiring, GpuWindowReadbackIsTriedBeforeAnyCpuPathFallback
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     const int guardAt = smokeBody.indexOf(
         QStringLiteral("if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 )"));
@@ -468,7 +503,7 @@ TEST(ContactSheetCaptureWiring, H1_SeekAndSettleKeepsItsBoundedTimeoutParameterA
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // seekAndSettleLoadedClip keeps its optional timeoutMs parameter (default 8000) for the stress seeks
@@ -522,7 +557,7 @@ TEST(ContactSheetCaptureWiring, H3_SidecarPathFieldIsRelativeNeverAbsolute)
 
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     const QString seekBranch = sliceBetween(smokeBody,
         QString::fromLatin1(kSeekMarker),
@@ -539,7 +574,7 @@ TEST(ContactSheetCaptureWiring, B4_DoneLineOmitsFramesWrittenFieldEntirelyWhenOp
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int doneLineAt = smokeBody.indexOf(QStringLiteral("out << \"[GUI-SMOKE] DONE"));
@@ -606,7 +641,7 @@ TEST(ContactSheetCaptureWiring, MeasuredSessionMarkerIsLoggedOnceRightAfterTheMe
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int measuredTriggerAt = smokeBody.indexOf(QStringLiteral("forcePlaybackSmokeWindowForeground();"));
@@ -712,7 +747,7 @@ TEST(ContactSheetCaptureWiring, PlaybackModeNoLongerTouchesDropFrameModeBecauseT
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     // The in-pass (default) capture rides the measured Play as configured: neither its arm block
     // nor its write block touches drop-frame mode.
@@ -740,7 +775,7 @@ TEST(ContactSheetCaptureWiring, ContactSheetTargetFramesAreComputedByTheSharedPu
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // Both capture modes share ONE target list built from the same real, executable-tested
@@ -758,7 +793,7 @@ TEST(ContactSheetCaptureWiring, WrappedSpanIsOverriddenToTheLoopCutInCutOutRange
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // The span snapshot reads m_playbackSmokeWrapped and, when set, overrides BOTH
@@ -801,7 +836,7 @@ TEST(ContactSheetCaptureWiring, PlaybackModeSidecarAndDoneLineCarrySpanStartEndA
     // ended, so the writer (after the stop) stamps the measured span's end and wrap flag.
     const QString inPassSmokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     const QString writeBranch = sliceBetween(inPassSmokeBody,
         QString::fromLatin1(kInPassWriteMarker), QString::fromLatin1(kSeekMarker));
     ASSERT_TRUE(writeBranch.contains(
@@ -815,7 +850,7 @@ TEST(ContactSheetCaptureWiring, PlaybackModeSidecarAndDoneLineCarrySpanStartEndA
     // a given sidecar.
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     const QString seekBranch = sliceBetween(smokeBody,
         QString::fromLatin1(kSeekMarker),

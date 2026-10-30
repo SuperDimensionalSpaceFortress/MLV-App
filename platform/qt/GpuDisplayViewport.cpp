@@ -9,6 +9,7 @@
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
 #include "PlaybackSwapInterval.h"
+#include "PreviewPaintTiming.h"
 
 #include <algorithm>
 #include <cmath>
@@ -384,6 +385,8 @@ GpuDisplayViewport::GpuDisplayViewport(QWidget *parent)
     , m_program(nullptr)
     , m_texture(nullptr)
     , m_gpuReconSourceTexture(nullptr)
+    , m_paintedSerial(0)
+    , m_paintedSerialValid(false)
 {
     QSurfaceFormat requestedFormat = format();
     requestedFormat.setSwapInterval(playbackSwapInterval());
@@ -463,6 +466,8 @@ bool GpuDisplayViewport::eventFilter(QObject *watched, QEvent *event)
     {
         // Invoke Qt's paint-event path, which binds the widget FBO, calls paintGL,
         // and schedules composition. Calling paintGL directly skips that setup.
+        // Consumed here, so GraphicsZoomView::paintEvent never sees it: time it here.
+        const preview_paint_timing::Scope paintTiming;
         QOpenGLWidget::event(event);
         return true;
     }
@@ -496,6 +501,14 @@ bool GpuDisplayViewport::isTexturePresentationActive(const QGraphicsView *view)
 {
     const GpuDisplayViewport *viewport = from(view);
     return viewport && viewport->m_texturePresentationActive;
+}
+
+bool GpuDisplayViewport::paintedSerialFor(const QGraphicsView *view, quint64 *serial)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    const bool valid = viewport && viewport->m_paintedSerialValid;
+    if ( serial ) *serial = valid ? viewport->m_paintedSerial : 0;
+    return valid;
 }
 
 GpuDisplayViewport::SamplingMode GpuDisplayViewport::samplingModeFor(const QGraphicsView *view)
@@ -1011,6 +1024,10 @@ void GpuDisplayViewport::initializeGL()
 
 void GpuDisplayViewport::paintGL()
 {
+    // grab()/grabFramebuffer() call paintGL with no Paint event: time it here too (counted once).
+    const preview_paint_timing::Scope paintTiming;
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: set again below only when this paint draws a frame.
+    m_paintedSerialValid = false;
     const QColor clearColor = m_view
         ? m_view->backgroundBrush().color()
         : palette().color(QPalette::Window);
@@ -1119,6 +1136,8 @@ void GpuDisplayViewport::paintGL()
     gpuPreviewProcessingReleaseDisplayTextures(m_lutSet, previewProcessingReady);
     m_program->release();
     m_texturePresentationActive = true;
+    m_paintedSerial = m_presentationOptions.presentationSerial;
+    m_paintedSerialValid = m_paintedSerial != 0;
 
     // Bug A on-screen present A/B (V4): force the dGPU to flush/complete this frame
     // before Qt blits the FBO and presents it, in case the Optimus cross-adapter

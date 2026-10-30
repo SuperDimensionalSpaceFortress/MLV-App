@@ -22,6 +22,45 @@ and every wrap, jump-to-first-frame and restart is counted and invalidates the r
 The tracked fixtures (`tiny_dual_iso`, 2 frames; `large_dual_iso`, 16 frames, about 0.1-0.7 s) are for unit
 tests and non-playing checks only. They are never played on a venue.
 
+## Amendment 2026-10-15 (owner): HFR clips need 10 s
+
+> "Amend rule so that hfr 60fps clips are allowed to be 10 seconds"
+
+(PLAYBACK-CLIP-LENGTH-HFR-10S-1.) The floor is now a function of the clip's **native** frame rate:
+
+| Clip | Floor |
+|---|---|
+| high frame rate: native fps >= 50 (50, 59.94, 60, ...) | **10 s** of real footage |
+| every other clip (23.976, 24, 25, 29.97, 30, ...) | 20 s, unchanged |
+| native fps unknown / unreadable / not positive / not finite | 20 s (fail closed, never 10) |
+
+Seconds are SOURCE seconds at the native fps: 10 s of a 59.94 clip is ceil(10 x 59.94) = 600 source frames, and a
+conformed (for example 24 fps) play of an HFR clip still has to advance those 600 source frames. Everything else in
+this rule is unchanged: never loop, never replay, one programmatic Play per process, the window never exceeds the clip,
+a wrap / jump / restart invalidates the run, the app is the gate and refuses BEFORE Play, and the tracked fixtures are
+never played on a venue. Where this document says "20 s" below, read "the clip's floor".
+
+There is ONE derivation, `playback_frame_range::minPlayWindowSeconds(nativeFps)` in `platform/qt/PlaybackFrameRange.h`;
+nothing else spells the floor. Where a script cannot load that header it carries a mirror that a parity test compares
+with it and executes on one table: `Get-GuiSmokeMinPlaySeconds` (`tools/profiling/gui-smoke-length-gate.ps1`),
+`Get-DvMinPlaySeconds` (`tools/profiling/dual-venue/DualVenueRunner.psm1`), and the HFR branch of the attribution job's
+embedded oracle (`Get-AttrCudaSourceFramesVerdict`, inside `PLAYBACK-CLIP-LENGTH-HFR-10S-1` sentinels).
+
+| Enforcement point | How it applies the floor |
+|---|---|
+| `evaluatePlayableWindow` (the app's gate, `MainWindow::checkPlayableWindow`) | `minPlayWindowSeconds` of the loaded clip's native fps |
+| profile Look Assist settle, `--exercise-play-action` | request `playGateMinPlayWindowSeconds()` (the clip's floor) |
+| GUI smoke: `--seconds`, the clip guard, `--presented-frames`, the stress switch, the second (switch) clip | the clip's floor once it is open (`runGuiPlaybackSmoke`), before Play |
+| `main.cpp` argument parse, `Invoke-VenueLeg.ps1`, the attribution job generator's `-PlaySeconds`, `leg-spec.schema.json` | the clip is not open (a leg names a clip id, never its fps), so they refuse only what NO clip could admit: under 10 s (`kLowestMinPlayWindowSeconds`). The clip's own floor is then applied by the runner (header) and the app |
+| `run-release-gui-smoke.ps1` / `Test-GuiSmokeClipLength` | the clip header's fps |
+| receipt oracles (`Get-GuiSmokeSourceFramesVerdict`, `Get-GuiSmokeLoopVerdict`, `Get-DvPlaybackProblems`, `Get-AttrCudaSourceFramesVerdict`) | `required_source_frames >= ceil(floor x native_fps)` from the receipt's own `native_fps` (absent or 0 is INVALID, as before) |
+
+Pinned (RED on the 2026-10-15 master, GREEN after): 59.94 fps 10 s accepted; 59.94 fps 9.9 s refused; 23.976 fps
+10 s refused; 23.976 fps 20 s accepted; unknown fps 10 s refused; 50 fps 10 s accepted; an HFR clip looped to reach 10 s
+refused (`CLIP_TOO_SHORT` before Play, `INVALID_LOOPED` in the oracle). Tests: `HfrPlayFloor.*` in
+`tests/console/test_playback_frame_range.cpp`, `HFR_SOURCE_FRAME_CASES` and `test_hfr_pins_from_the_clip_header` in
+`tools/repo_hygiene/test_playback_clip_length_gate.py`, and the dual-venue / launcher oracle tests.
+
 ## THE APP IS THE GATE (ENFORCE-2)
 
 Why ENFORCE-1 was parked: the tool-side gates read the clip's HEADER, but the app starts playback before any
@@ -188,7 +227,7 @@ and reported as `PLAY_SAFETY_TIMEOUT`), then reads the app's receipt and applies
 |---|---|---|
 | `run-release-gui-smoke.ps1` (the choke point; its process budget is `Get-GuiSmokePlaySafetyMs` + open / settle) | `playback_smoke.summary` | exit 43 (`validation.ok = false`) |
 | `validate-visible-playback.ps1` (the filmstrip capturer; it used to kill the app after `SettleMs + Captures x IntervalMs`, ~14 s) | `playback_smoke.summary` in its log dir | exit 43 |
-| `capture-reference-frame.ps1` | `playback_smoke.summary` in `-OutDir`; the manifest records `sourceFrames` | exit 43 (a non-zero app exit stays exit 4) |
+| `capture-reference-frame.ps1` | `playback_smoke.summary` in `-OutDir`; the manifest records `sourceFrames` | exit 43 (failures have one code each: 4 process-never-started, 45 exit-code-lost, 46 PINNED_FRAME_NOT_PRESENTED, 47 any other non-zero app exit) |
 | `run-release-playback-profile.ps1` (a play-capable option) | `metadata` of the `--output` profile receipt: `programmatic_play_admitted` must be PRESENT and > 0 (ENFORCE-4: an absent field is INVALID, never "nothing was played") plus every oracle field | exit 43 |
 | `lookassist-wb-determinism.ps1`, `lookassist-wb-multiclip-probe.ps1`, `measure-wb-solve-distribution.ps1` (consumers; see ENFORCE-4) | the launcher's exit code | an invalid run is excluded and the SCRIPT exits 43 |
 | `bachelor/playback-attr-3-cuda-job.ps1` | the measured session's summary line | exit 29 |
@@ -237,9 +276,12 @@ self-test). A new consumer is neither, so it fails until a reviewer classifies i
 | `run-release-cuda-playback-ab.ps1` | baseline / candidate exit codes are proof failures |
 | `run-ultramagnus-p3-validation.ps1` | a non-zero smoke exit is a clip failure |
 | `bachelor/playback-attr-3-cuda-job.ps1` | a non-zero runner exit is `SMOKE_RUN_FAILED` |
+| `bachelor/reference-frame-runner-job.ps1` (VENUE-REFERENCE-FRAME-JOB-1) | runs `capture-reference-frame.ps1` from a hash-pinned bundle under the gate profile; the capture's exit code is the job's exit code (`CAPTURE_FAILED`, 43 included), and only exit 0 writes `candidate-unreviewed`; a capture voided by a changed footage view (225) gets a sibling `reference-frame-candidate.invalid` marker (written first, independent of the manifest) and a best effort in-place invalid stamp; a reader honours the marker whatever the manifest says (`frame_provenance.py` does), and if neither layer can be written the manifest is moved out of the candidate name to a numbered `.INVALID` target (best effort as well: if that move throws, `candidateQuarantined` is `false`, the manifest keeps the candidate name, and the job still exits 225) |
 | `run-shipping-guard-smoke.ps1`, `run-local-cuda-playback-dng-smoke.ps1`, `invoke-ultramagnus-p3-evidence.ps1`, `export-release-cuda-dogfood-kit.ps1` | callers of the consumers above: each turns a child's exit code into its own status / exit |
 | `dual-venue/Invoke-VenueLeg.ps1` (DUAL-VENUE-EVIDENCE-1 r2) | submits the attribution job through um-run and reads the job's exit code: a printed capture with a non-zero exit is `INVALID`; a PASS/FAIL receipt also needs the job oracle's verdict (`source_advanced`, `required_source_frames`, run nonce, wrap, clip id) or it is `INVALID`. Legs name a clip id, never a path; a fixture is refused by the length gate before anything is generated; a venue without an owner-typed record in `venue-clip-consent.json` refuses before submitting (`docs/dual-venue-evidence.md`) |
 | `dual-venue/Invoke-VenueChain.ps1` (VENUE-CHAIN-RUNNER-1 r2) | runs each leg through `Invoke-VenueLeg.ps1` and reads its exit code: a leg that exits non-zero is `LEG_FAILED` / `INVALID` (whatever `DVE_OUTCOME` it printed first), never `RAN`, and the chain exits 7 |
+| `dual-venue/Invoke-VenueLeaseBatch.ps1` (BACHELOR-LEASE-BATCH-LEGS-1) | the same rule inside one quiet lease per batch: a leg that exits non-zero is `LEG_FAILED` / `INVALID`, never `RAN` or counted, and the run exits 7 |
+| `dual-venue/Invoke-VenueBaseline.ps1` (UM-REGULAR-BASELINE-1 r2) | runs the chain once per backend as a child process and reads its exit code before any trend row is built: a leg is `RAN` with figures only when the chain ended on its own with exit 0 that agrees with its `CHAIN_RESULT`, the leg's receipt is readable and its validator verdict is `ADVISORY` / `VERIFIED*`; otherwise the row is `EVIDENCE_INCOMPLETE` (`EVIDENCE_INVALID` for an `INVALID` verdict) / `INVALID` with no figures. Figures are copied only when the receipt outcome is `PASS` or `FAIL` and the verdict is `ADVISORY` / `VERIFIED*`: a `NO_SIGNAL` verdict or any other outcome (a writer-refused `INVALID` with its metrics kept included) gives an `EVIDENCE_INCOMPLETE` row with the receipt's own outcome, no figures and a `RECEIPT_NO_SIGNAL` / `RECEIPT_OUTCOME_<outcome>` failure. An undocumented or disagreeing chain exit exits `CHAIN_FAILED` (27); a documented non-zero exit (7, 3, gate) keeps its own typed exit and its legs carry no figures; an unreadable or refused receipt exits `LEG_FAILED` (25). `-Fetch` runs `git fetch` bounded by `-MaxTotalSec` (`FETCH_TIMEOUT`, 28) and `-WhatIf` never fetches |
 
 `app_play_scan.py` also pins every WRITE of the autoplay latch (one arm in the constructor, one fail, one resolve; the
 retired `m_automationVerdictExitCode` int cannot return), of the safety budget `m_playRequestedSeconds` and of the engine
@@ -257,7 +299,7 @@ without playing (`--exercise-play-action --help` returns 0 before it writes anyt
 launcher that judges a receipt, with three independent layers (each one alone rejects the repro; the tests remove each in
 turn and a stale receipt is accepted only with all removed):
 
-1. **Set aside.** A pre-existing receipt or output (`-Output`, `reference-frame.png` and its candidate manifest, last run's
+1. **Set aside.** A pre-existing receipt or output (`-Output`, `reference-frame.png`, its candidate manifest and its `.invalid` marker, last run's
    `cap-NNN.png`, the runner's result JSON) is renamed `STALE-<utc>-<name>` BEFORE the launch (`Move-GuiSmokeStaleReceiptAside`;
    never deleted, and a stale file that cannot be moved stops the launch with exit 43).
 2. **Nonce.** The launcher generates `New-GuiSmokeRunNonce` (`n` + a GUID), hands it to the app as `MLVAPP_RUN_NONCE`

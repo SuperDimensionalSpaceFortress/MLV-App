@@ -1,6 +1,7 @@
 #include "../common/minitest.h"
 #include "../../platform/qt/PlaybackFrameRange.h"
 
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -172,6 +173,77 @@ TEST( PlaybackFrameRange, ContactSheetInPassTargetsAreSliceCentresStrictlyInside
     ASSERT_EQ( static_cast<long long>( 22917 ), playback_frame_range::contactSheetInPassTargetMs( 5, 6, windowMs ) );
     ASSERT_EQ( static_cast<long long>( 12500 ), playback_frame_range::contactSheetInPassTargetMs( 0, 1, windowMs ) );
     ASSERT_EQ( static_cast<long long>( 0 ), playback_frame_range::contactSheetInPassTargetMs( 0, 0, windowMs ) );
+}
+
+namespace
+{
+// One measured Play as runGuiPlaybackSmoke runs it: frame k is presented at k*1000/fps ms with k+1 source frames
+// consumed; the present hook (noteContactSheetPresentedFrame) takes each due target, then the wait loop asks
+// evaluatePlayStop and stops on Reached. Returns the in-pass targets captured before the stop.
+int simulateInPassCaptures( bool unpaced, double fps, int frameCount, double playSeconds, double nativeFps )
+{
+    const int64_t required = playback_frame_range::requiredSourceFrames( nativeFps, playSeconds );
+    const long long windowMs = std::llround( playSeconds * 1000.0 );
+    const int64_t safetyMs = playback_frame_range::playSafetyMs( playSeconds );
+    int next = 0;
+    for( int64_t k = 0; ; ++k )
+    {
+        const int64_t elapsedMs = static_cast<int64_t>( std::llround( static_cast<double>( k ) * 1000.0 / fps ) );
+        const int64_t consumed = k + 1;
+        // The hook takes at most one target per present.
+        if( next < frameCount
+         && playback_frame_range::contactSheetInPassTargetDue(
+                unpaced, elapsedMs, playback_frame_range::contactSheetInPassTargetMs( next, frameCount, windowMs ),
+                consumed, playback_frame_range::contactSheetInPassTargetSourceFrames( next, frameCount, required ) ) )
+        {
+            ++next;
+        }
+        const playback_frame_range::PlayStopState state = playback_frame_range::evaluatePlayStop(
+            consumed, required, true, elapsedMs, safetyMs, playback_frame_range::PlayPaceMode::MeasuredInformational );
+        if( state != playback_frame_range::PlayStopState::Continue ) return next;
+    }
+}
+} // namespace
+
+// VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1 counterexample): the shipped unpaced look leg
+// (m16-1243-look-scale2-cinematic-agxoff-unpaced.json: playSeconds 20, contactSheetFrames 1) on a 24 fps clip
+// needs 480 source frames. Unpaced at 60 fps it stops at 8000 ms; its one wall-clock target is 10000 ms, so zero of
+// one were captured and the healthy faster run exited 14. Declared ceiling: every fps up to 120 must capture all of
+// its targets (and below the paced rate too); frameCount 1 and 6 both.
+TEST( PlaybackFrameRange, UnpacedInPassTargetsAreReachedBeforeTheSourceFrameStopAtAnyFpsUpTo120 )
+{
+    ASSERT_EQ( static_cast<int64_t>( 480 ), playback_frame_range::requiredSourceFrames( 24.0, 20.0 ) );
+    ASSERT_EQ( static_cast<int64_t>( 240 ), playback_frame_range::contactSheetInPassTargetSourceFrames( 0, 1, 480 ) );
+    ASSERT_EQ( 1, simulateInPassCaptures( true, 60.0, 1, 20.0, 24.0 ) );
+    for( int fps = 12; fps <= 120; ++fps )
+    {
+        ASSERT_EQ( 1, simulateInPassCaptures( true, static_cast<double>( fps ), 1, 20.0, 24.0 ) );
+        ASSERT_EQ( 6, simulateInPassCaptures( true, static_cast<double>( fps ), 6, 20.0, 24.0 ) );
+    }
+    // Every unpaced target is strictly inside the required frames, ascending.
+    int64_t previous = 0;
+    for( int i = 0; i < 6; ++i )
+    {
+        const int64_t target = playback_frame_range::contactSheetInPassTargetSourceFrames( i, 6, 480 );
+        ASSERT_TRUE( target > previous );
+        ASSERT_TRUE( target < 480 );
+        previous = target;
+    }
+    ASSERT_EQ( static_cast<int64_t>( 0 ), playback_frame_range::contactSheetInPassTargetSourceFrames( 0, 0, 480 ) );
+    ASSERT_EQ( static_cast<int64_t>( 0 ), playback_frame_range::contactSheetInPassTargetSourceFrames( 0, 1, 0 ) );
+    // Never due on an unknown requirement, whatever the wall clock says.
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( true, 999999, 10000, 999, 0 ) );
+}
+
+// The paced rule is unchanged: a PACED Play that stops before a wall-clock target leaves that target uncaptured, so
+// the sheet stays short and runGuiPlaybackSmoke still exits 14 ("only %1 of %2 in-pass targets" in MainWindow.cpp,
+// pinned by test_contact_sheet_capture_wiring.cpp). Source frames never make a paced target due.
+TEST( PlaybackFrameRange, PacedInPassTargetsStayOnTheWallClockAndAMissedOneStaysMissed )
+{
+    ASSERT_EQ( 0, simulateInPassCaptures( false, 60.0, 1, 20.0, 24.0 ) );
+    ASSERT_EQ( 1, simulateInPassCaptures( false, 24.0, 1, 20.0, 24.0 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( false, 8000, 10000, 480, 240 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( false, 10000, 10000, 1, 240 ) );
 }
 
 // The grabs run on the GUI thread inside the measured interval, so the honest figure next to the
@@ -648,15 +720,113 @@ TEST( PlayableWindow, WithTheRepairDisabledAnInvertedRangeIsMeasuredAsTheEngineS
 // sol B2: the lifecycle stress switch stops Play, so it may only happen after the floor.
 TEST( PlayableWindow, TheLifecycleStressSwitchMayOnlyHappenAfterTheTwentySecondFloor )
 {
-    using playback_frame_range::kMinPlayWindowMs;
+    using playback_frame_range::minPlayWindowMs;
+    using playback_frame_range::minPlayWindowSeconds;
     using playback_frame_range::stressSwitchReachesFloor;
-    ASSERT_EQ( 20000, kMinPlayWindowMs );
-    ASSERT_FALSE( stressSwitchReachesFloor( 0 ) );
-    ASSERT_FALSE( stressSwitchReachesFloor( 1000 ) );      // the pre-fix default: Play stopped after ~1 s
-    ASSERT_FALSE( stressSwitchReachesFloor( 19999 ) );
-    ASSERT_TRUE( stressSwitchReachesFloor( 20000 ) );
-    ASSERT_TRUE( stressSwitchReachesFloor( 24000 ) );
-    ASSERT_FALSE( stressSwitchReachesFloor( -1 ) );
+    ASSERT_EQ( 20000, minPlayWindowMs( 23.976 ) );
+    const double floor = minPlayWindowSeconds( 23.976 );
+    ASSERT_FALSE( stressSwitchReachesFloor( 0, floor ) );
+    ASSERT_FALSE( stressSwitchReachesFloor( 1000, floor ) );      // the pre-fix default: Play stopped after ~1 s
+    ASSERT_FALSE( stressSwitchReachesFloor( 19999, floor ) );
+    ASSERT_TRUE( stressSwitchReachesFloor( 20000, floor ) );
+    ASSERT_TRUE( stressSwitchReachesFloor( 24000, floor ) );
+    ASSERT_FALSE( stressSwitchReachesFloor( -1, floor ) );
+    // HFR-10S-1: an HFR clip's switch may come at its own 10 s floor, never sooner; an unknown fps keeps 20 s.
+    ASSERT_EQ( 10000, minPlayWindowMs( 59.94 ) );
+    ASSERT_FALSE( stressSwitchReachesFloor( 9999, minPlayWindowSeconds( 59.94 ) ) );
+    ASSERT_TRUE( stressSwitchReachesFloor( 10000, minPlayWindowSeconds( 59.94 ) ) );
+    ASSERT_FALSE( stressSwitchReachesFloor( 10000, minPlayWindowSeconds( 0.0 ) ) );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): "Amend rule so that hfr 60fps clips are allowed to
+// be 10 seconds". The floor is minPlayWindowSeconds( NATIVE fps ): 10 s at >= 50 fps, 20 s below, 20 s unknown.
+// ---------------------------------------------------------------------------------------------------------
+TEST( HfrPlayFloor, TheFloorIsTenSecondsAtFiftyFpsAndAboveAndTwentyEverywhereElse )
+{
+    using playback_frame_range::minPlayWindowSeconds;
+    using playback_frame_range::isHighFrameRate;
+    ASSERT_NEAR( 10.0, minPlayWindowSeconds( 59.94 ), 1e-12 );
+    ASSERT_NEAR( 10.0, minPlayWindowSeconds( 60.0 ), 1e-12 );
+    ASSERT_NEAR( 10.0, minPlayWindowSeconds( 50.0 ), 1e-12 );
+    ASSERT_NEAR( 10.0, minPlayWindowSeconds( 120.0 ), 1e-12 );
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( 49.999 ), 1e-12 );
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( 29.97 ), 1e-12 );
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( 23.976 ), 1e-12 );
+    // fail closed: an unknown / unusable fps is the 20 s floor, never 10
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( 0.0 ), 1e-12 );
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( -60.0 ), 1e-12 );
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( std::numeric_limits<double>::quiet_NaN() ), 1e-12 );
+    ASSERT_NEAR( 20.0, minPlayWindowSeconds( std::numeric_limits<double>::infinity() ), 1e-12 );
+    ASSERT_FALSE( isHighFrameRate( std::numeric_limits<double>::quiet_NaN() ) );
+    ASSERT_NEAR( 10.0, playback_frame_range::kLowestMinPlayWindowSeconds, 1e-12 );
+}
+
+TEST( HfrPlayFloor, PinnedWindowsAcceptedAndRefusedBeforePlay )
+{
+    // 59.94 fps 10 s ACCEPTED (12 s clip; ceil(10 x 59.94) = 600 source frames).
+    const PlayableWindowVerdict a = evaluatePlayableWindow( 0, 1, 720, 720, 59.94, 10.0 );
+    ASSERT_TRUE( a.ok );
+    ASSERT_EQ( 600, a.requiredFrames );
+    ASSERT_NEAR( 10.0, a.floorSeconds, 1e-12 );
+    // 59.94 fps 9.9 s REFUSED.
+    const PlayableWindowVerdict b = evaluatePlayableWindow( 0, 1, 720, 720, 59.94, 9.9 );
+    ASSERT_FALSE( b.ok );
+    ASSERT_EQ( std::string( "PLAY_DURATION_TOO_SHORT" ), std::string( b.reason ) );
+    // ...and an HFR clip under 10 s of footage is CLIP_TOO_SHORT however long the request.
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( evaluatePlayableWindow( 0, 1, 599, 599, 59.94, 10.0 ).reason ) );
+    // 23.976 fps 10 s REFUSED; 23.976 fps 20 s ACCEPTED.
+    const PlayableWindowVerdict c = evaluatePlayableWindow( 0, 1, 720, 720, 23.976, 10.0 );
+    ASSERT_FALSE( c.ok );
+    ASSERT_EQ( std::string( "PLAY_DURATION_TOO_SHORT" ), std::string( c.reason ) );
+    ASSERT_NEAR( 20.0, c.floorSeconds, 1e-12 );
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, 23.976, 20.0 ).ok );
+    // unknown fps 10 s REFUSED (the 20 s floor applies before the length is even looked at).
+    const PlayableWindowVerdict e = evaluatePlayableWindow( 0, 1, 720, 720, 0.0, 10.0 );
+    ASSERT_FALSE( e.ok );
+    ASSERT_EQ( std::string( "PLAY_DURATION_TOO_SHORT" ), std::string( e.reason ) );
+    // 50 fps 10 s ACCEPTED (500 source frames).
+    const PlayableWindowVerdict f = evaluatePlayableWindow( 0, 1, 600, 600, 50.0, 10.0 );
+    ASSERT_TRUE( f.ok );
+    ASSERT_EQ( 500, f.requiredFrames );
+    // A presented-frames target is judged by the clip's own floor too.
+    ASSERT_TRUE( playback_frame_range::presentedFramesTargetReachesFloor( 600, 59.94 ) );
+    ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 599, 59.94 ) );
+    ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 300, 29.97 ) );
+}
+
+TEST( HfrPlayFloor, AConformedPlayOfAnHfrClipStillAdvancesTenSecondsOfSourceFrames )
+{
+    // The engine paced at a 24 fps conform: the requirement is still ceil(10 x NATIVE 59.94) = 600 source frames, and
+    // the pace must reach them inside the safety budget (599 / 24 = 25 s <= 10 / 0.5 + 15 = 35 s).
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 720, 59.94, 10.0, playback_frame_range::kFloorFromNativeFps,
+                                                            true, 24.0 );
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 600, v.requiredFrames );
+    ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 599, v.requiredFrames, true, 20000, 35000 ) == playback_frame_range::PlayStopState::Continue );
+    ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 600, v.requiredFrames, true, 25000, 35000 ) == playback_frame_range::PlayStopState::Reached );
+}
+
+TEST( HfrPlayFloor, AnHfrClipLoopedToReachTenSecondsIsRefusedAndNeverCountsAsPlayed )
+{
+    // A 5 s HFR clip cannot be looped to 10 s: refused before Play ...
+    const PlayableWindowVerdict g = evaluatePlayableWindow( 0, 1, 300, 300, 59.94, 10.0 );
+    ASSERT_FALSE( g.ok );
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( g.reason ) );
+    // ... and an engine that wrapped it anyway never counts a wrapped frame: the 600-frame requirement is never
+    // Reached and the wrap recorder marks the run looped (the receipt oracle turns that into INVALID_LOOPED).
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    counter.begin( 0 );
+    for( int lap = 0; lap < 3; ++lap )
+    {
+        for( int frame = 0; frame < 299; ++frame ) counter.noteEngineTick( frame, frame + 1, false );
+        counter.noteEngineTick( 299, 0, true );
+        recorder.noteEngineWrap();
+    }
+    ASSERT_EQ( 300, counter.consumed() );
+    ASSERT_TRUE( playback_frame_range::evaluatePlayStop( counter.consumed(), 600, true, 1000, 60000 ) != playback_frame_range::PlayStopState::Reached );
+    ASSERT_TRUE( recorder.wrapped() );
 }
 
 // ENFORCE-3: the ENFORCE-2 wall-clock hold (playHoldReachedFloor: "20000 ms elapsed") is GONE -- it is exactly
@@ -862,7 +1032,7 @@ TEST( PlayStopDecision, TheSafetyNetScalesWithTheMinimumSustainedPaceNotAFixedMa
     ASSERT_EQ( 55000, playSafetyMs( 20.0 ) );
     ASSERT_EQ( 63000, playSafetyMs( 24.0 ) );
     ASSERT_EQ( 95000, playSafetyMs( 40.0 ) );
-    ASSERT_TRUE( playSafetyMs( 20.0 ) > playback_frame_range::kMinPlayWindowMs );
+    ASSERT_TRUE( playSafetyMs( 20.0 ) > playback_frame_range::minPlayWindowMs( 23.976 ) );
     ASSERT_TRUE( playSafetyMs( 20.0 ) >= static_cast<int64_t>( 20000 / playback_frame_range::kMinSustainedPaceFraction ) );
 }
 

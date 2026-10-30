@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "why": "CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest measured windows classes run in the job repo-hygiene-python-windows-unittest-heavy, split into `parts` legs; the windows 7-way partition excludes exactly these. CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the windows suite weighs 12047 s, more than the 9666 s that 7 shards and 2 parts hold at the 85 % limit, so parts went 2 -> 6 (5 cannot hold the open #705 and #709 additions) and the set was re-balanced so every shard and part is expected under that limit. LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: #705's 69 test_artifact_preflight_* cases (545.9 s hosted, run 40861273862) left VenueLeaseBatchLegPlanTests at 1131 s, past one part, so they run in their own class VenueLeaseBatchArtifactPreflightTests, which joins this set. test_ci_unittest_shard.HeavySetTests and ShardDurationBudgetTests pin both sides.",
+  "profiles": {
+    "windows": {
+      "parts": 6,
+      "classes": [
+        "tools.repo_hygiene.test_attr3_spliced_body_scan.SplicedBodyScanOnRealSourcesTests",
+        "tools.repo_hygiene.test_bachelor_agent_heavy_slot_gate.BachelorAgentHeavySlotGateUnit",
+        "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests",
+        "tools.repo_hygiene.test_core_partition_leg.CorePartitionGeneratorTests",
+        "tools.repo_hygiene.test_core_partition_leg.PlaybackMaxThreadsGeneratorTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.EvidenceBoundReceiptTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.ProductFailureTerminalsAreReceiptableTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.VenueProbeIdentityNoArgumentTextR5Tests",
+        "tools.repo_hygiene.test_dual_venue_evidence.VenueQuietAttributionTests",
+        "tools.repo_hygiene.test_hub_vm_no_local_playback.PromptLintTests",
+        "tools.repo_hygiene.test_playback_clip_length_gate.RuntimeBackstopBehaviourTests",
+        "tools.repo_hygiene.test_um_presentmon_orphan_sweep.SweepExecutedTests",
+        "tools.repo_hygiene.test_venue_baseline.VenueBaselineTests",
+        "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests",
+        "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests",
+        "tools.repo_hygiene.test_venue_claim_fifo.VenueClaimFifoTests",
+        "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchArtifactPreflightTests",
+        "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchLegPlanEarlyRoundTests",
+        "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchLegPlanTests",
+        "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchRunnerTests",
+        "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests"
+      ]
+    }
+  }
+}

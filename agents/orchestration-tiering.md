@@ -24,7 +24,7 @@ own output, or the resolver, proved actually ran), never a copy of one for the o
 | tier | model | effort | does | never does |
 |---|---|---|---|---|
 | judgement | Fable (`fable` alias row in `tools/coordination/Invoke-Lane.ps1`, or a Fable chat session) | high, and only high (LANE-MODEL-CURRENCY-1 round 2: `Invoke-Lane.ps1` now refuses with a typed `lane-effort-must-be-high` failure receipt before ever starting a real lane at any other effort) | consequential reviews, design, doctrine-fold decisions, one hard adjudication per packet | implement, ratification loops, routine cards, the hub loop |
-| judgement, cross-family | Codex Astra (`astra` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-astra` slug at launch) | high (LANE-MODEL-CURRENCY-1 superseded the earlier xhigh choice: every lane, astra included, runs at high, never max/xhigh) | one pre-implementation design pass per substantive packet; one arbiter seat when consequential verdicts conflict; one doctrine seam when a packet exposes a reusable policy defect | anything routine; a loop, heartbeat, cadence wake, recon, or edit; the `solVerdictPath` key; astra is deliberately absent from `Invoke-Workstream.ps1` and `Invoke-WorkstreamLoop.ps1`'s own `-Lane` lists, so nothing on a timer can reach this tier. Reachable and measured: codex-cli 0.154.0, `xhigh` accepted via `%APPDATA%\npm\codex.cmd`, probed 2026-09-15T23:16Z (superseding the earlier 0.147.0 unreachable finding); effort itself is now high, per LANE-MODEL-CURRENCY-1. |
+| judgement, cross-family | Codex Sol tier (`sol` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-sol` slug at launch). Astra (`astra` tier row, `gpt-*-astra`) is an OPTIONAL diversity seat only (MODEL-POSTURE-2026-10-22, bus R19.1: never a default, never a gate, never the only Codex seat a procedure waits for; a round that uses it records `astra: diversity`) | high (LANE-MODEL-CURRENCY-1 superseded the earlier xhigh choice: every lane, astra included, runs at high, never max/xhigh) | one pre-implementation design pass per substantive packet; one arbiter seat when consequential verdicts conflict; one doctrine seam when a packet exposes a reusable policy defect (these roles name the Sol tier; an extra optional Astra seat beside it is `astra: diversity`) | anything routine; a loop, heartbeat, cadence wake, recon, or edit; the `solVerdictPath` key; making Astra a default, a gate, or a required seat; astra is deliberately absent from `Invoke-Workstream.ps1` and `Invoke-WorkstreamLoop.ps1`'s own `-Lane` lists, so nothing on a timer can reach this tier. Reachable and measured: codex-cli 0.154.0, `xhigh` accepted via `%APPDATA%\npm\codex.cmd`, probed 2026-09-15T23:16Z (superseding the earlier 0.147.0 unreachable finding); effort itself is now high, per LANE-MODEL-CURRENCY-1. |
 | hub | Opus | high | derive board, pick ONE packet, dispatch ONE editing lane in an isolated worktree, verify the receipt, refresh the checkpoint, reconcile queue rows through the verified writer | edit product source, build, run probes itself |
 | adjudication swarm | Opus, three briefs (against the default; what outranks it; post-mortem and evidence binding) | high (LANE-MODEL-CURRENCY-1 round 2: no real lane, this swarm included, can run below high) | any blocker or "what next"; a new class of owner grant or a trust-boundary design | ruling on procedure alone (Haiku with script-first pre-filtering is admitted for that) |
 | reviewer | Sol (`sol` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-sol` slug at launch) | high, and only high (LANE-MODEL-CURRENCY-1 round 2 retired the earlier low-for-PR-review carve-out) | final PR review bound to the exact head; adversarial verification | editing; sole authority on a contract claim |
@@ -84,3 +84,27 @@ with a disposable shim and so can never reach a real model regardless of the val
   does not run concurrently with a high-effort Sol lane.
 - Before scaling Sonnet dispatch, land HOOK-FALSE-POSITIVE-1: the project hook's shell-text rule
   denied ordinary diagnostic commands and cost 14 of 27 editing runs on 2026-09-07.
+
+## A citation is not a review leg
+
+A key verdict cited in a commit message, a PR body or a ledger line never counts as a review leg.
+Only one of three published forms counts, each bound to the PR's exact current head SHA:
+
+1. a `review/<seat>` commit status on the head SHA (success = APPROVE, failure or error = CHANGES_REQUESTED);
+2. a `[[pub:<id>]]` JSON comment whose `head_sha` equals the head;
+3. a GitHub review whose `commit_id` equals the head.
+
+A merge needs two legs on the current head: one from a Claude-family seat and one from a Codex-family
+seat; the newest leg per family decides. Two legs from the same family are one family's verdict, not two
+legs.
+
+Never write "keyed" or "APPROVE" for a PR in a summary or an ACK unless one of the three exists on its
+current head; a later push moves the head and voids earlier legs. The factory is stricter than the CoS
+ask on purpose: a free-text seat-verdict PR comment naming seat, full SHA and verdict is not counted by
+the gate, because it cannot be bound mechanically to the head; the key run's `[[pub:]]` JSON comment is
+a form that counts. All three forms count as legs for a summary, an ACK and the CoS check. The
+merge-enqueue guard, `.claude-state/fleet-runs/hub-tools/merge-enqueue.ps1` status gate (rule TIP_LEGS),
+counts only form 1, the `review/<seat>` status, and refuses a head that has only forms 2 or 3
+(REFUSED_LEGS), so every key run must publish its status. The gate is board-local and
+untracked, so it is not in this repo: a reader of the repo alone cannot inspect or test it.
+Origin: CoS ask 6219052910 on PR 454, hub ACK 6223438673.

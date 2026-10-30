@@ -2299,7 +2299,8 @@ function Add-AttrCudaPresentMonEventsLostDetail {
 function Add-AttrCudaPresentMonEventsLostDetailToReport {
     <#
     .SYNOPSIS
-    A PresentMon display report (a pscustomobject with a `reason`) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
+    A PresentMon display report whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add. A pscustomobject comes back as a pscustomobject copy;
+    a dictionary as a NEW canonical report with one `reason` (r11: the report helper contract in the body, restated in docs/dual-venue-evidence.md).
     .DESCRIPTION
     UM-PRESENTMON-ORPHAN-SWEEP-1: the display-report failure branch reads `$displayReport.reason` in two places, and the scanned template may not assign to a member (R5), so the
     report is replaced by a copy (properties and their order unchanged, only `reason` different) -- a plain variable assignment at the call site.
@@ -2310,12 +2311,264 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         [AllowNull()][object]$EventsLost
     )
 
-    $current = [string]$Report.reason
+    if ($Report -is [System.Collections.IDictionary]) {
+        # the typed detail alone (the scalar helper given no reason): empty when nothing was lost or there is no record, and the report comes back as it is
+        $detail = [string](Add-AttrCudaPresentMonEventsLostDetail -Reason '' -EventsLost $EventsLost)
+        if ([string]::IsNullOrEmpty($detail)) { return $Report }
+        # r11 (sol r10 B1/B2 on 218fceaa; fable key3 REPORT-HELPER-ACCUMULATION-EXACT-DEDUPE-1; hub convergence ruling). Report helper contract (r11): this block is the same in both
+        # report helpers and is restated in docs/dual-venue-evidence.md. A dictionary report comes back as a NEW canonical report, never the input dictionary with the detail added:
+        #   reason-like key: a string key OrdinalIgnoreCase-equal to `reason`, or one the report's own public Comparer calls equal to `reason`. A report whose comparer is not readable
+        #     (Hashtable, OrderedDictionary) and whose own lookup holds a `reason` that no such key explains names the ONE string key holding the text that lookup returns
+        #   fold: every reason-like entry becomes ONE key, `reason`, at the place of the first; its text is their non-empty texts in enumeration order, a text EQUAL (ordinal) to an
+        #     earlier one left out -- never containment -- then ` [<detail>]` appended unless the folded text already carries exactly this detail (is it, begins `<detail> [`, or holds
+        #     `[<detail>]`). No early return skips the write
+        #   copy: every other key with its value (a non-string key under its string form) into an [ordered] table (OrdinalIgnoreCase on pwsh 7), returned as a pscustomobject when
+        #     every key can be a member name (the r3 shape) and as the table otherwise. Keys that collide in that table (case variants such as status/Status, or a string form equal to
+        #     another key) drop no value: the report is an exact-key OrderedDictionary with every original key instead, the reason-like ones folded into `reason` the same way
+        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), a report with string keys whose own `reason` lookup throws (r13), or an exact-key copy its keys cannot build
+        $keyList = @($Report.PSBase.Keys)
+        $valueList = @($Report.PSBase.Values)
+        $like = @(foreach ($key in $keyList) { $key -is [string] -and [string]::Equals($key, 'reason', [StringComparison]::OrdinalIgnoreCase) })
+        $comparerProperty = $Report.PSObject.Properties['Comparer']
+        $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
+        $asked = $false
+        if ($null -ne $comparer) {
+            try {
+                $matched = $null
+                if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Equals($key, 'reason') }) }
+                elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Compare($key, 'reason') -eq 0 }) }
+                if ($null -ne $matched) {
+                    for ($index = 0; $index -lt $keyList.Count; $index++) { if ($matched[$index]) { $like[$index] = $true } }
+                    $asked = $true
+                }
+            } catch { $asked = $false }
+        }
+        if (-not $asked -and @($like | Where-Object { $_ }).Count -eq 0) {
+            # r13 (sol r12 B1 on d32a71f0; REPORT-HELPER-TYPED-KEY-DICTIONARY-THROW-1): a dictionary whose key type is not string and that shows no public Comparer (ReadOnlyDictionary[int,object],
+            # ImmutableDictionary[int,object]) cannot be asked for 'reason' -- ContainsKey binds to its key type and throws. With no string key among its keys it holds no `reason` by
+            # definition, so it takes the canonical route below; a report that does have string keys and still cannot answer fails closed (the input comes back unchanged, as in r8)
+            $held = $false
+            try { $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') } }
+            catch { if (@($keyList | Where-Object { $_ -is [string] }).Count -gt 0) { return $Report } }
+            if ($held) {
+                $heldText = [string]$Report['reason']
+                $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $heldText, [StringComparison]::Ordinal)) { $index } })
+                # r8 (r7 adversary A2 on 6d30ac14): two holders of the text, so no rule names the key the report's lookup matched: fail closed, every entry as it was
+                if ($holders.Count -ne 1) { return $Report }
+                $like[$holders[0]] = $true
+            }
+        }
+        $texts = @()
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                $text = [string]$valueList[$index]
+                $repeat = [string]::IsNullOrEmpty($text)
+                foreach ($kept in $texts) { if ([string]::Equals($kept, $text, [StringComparison]::Ordinal)) { $repeat = $true } }
+                if (-not $repeat) { $texts += $text }
+            }
+        }
+        $folded = [string]($texts -join ' ')
+        $carried = [string]::Equals($folded, $detail, [StringComparison]::Ordinal) -or $folded.StartsWith("$detail [", [StringComparison]::Ordinal) -or $folded.Contains("[$detail]")
+        $reason = if ($carried) { $folded } elseif ([string]::IsNullOrEmpty($folded)) { $detail } else { "$folded [$detail]" }
+        $canonical = [ordered]@{}
+        $collides = $false
+        $placed = $false
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                if (-not $placed) { $placed = $true; if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+            } else {
+                $name = [string]$keyList[$index]
+                if ($canonical.Contains($name)) { $collides = $true } else { $canonical.Add($name, $valueList[$index]) }
+            }
+        }
+        if (-not $placed) { if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+        if (-not $collides) {
+            # a key no pscustomobject can carry (the empty name) throws in the conversion: the [ordered] table is the report then
+            $shaped = $null
+            try { $shaped = [pscustomobject]$canonical; if (@($shaped.PSObject.Properties).Count -ne $canonical.Count) { $shaped = $null } } catch { $shaped = $null }
+            if ($null -ne $shaped) { return $shaped }
+            return $canonical
+        }
+        try {
+            # an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1'); `reason` is its only reason-like key, so `.reason` reads it
+            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+            $placed = $false
+            for ($index = 0; $index -lt $keyList.Count; $index++) {
+                if (-not $like[$index]) { $exact.Add($keyList[$index], $valueList[$index]) }
+                elseif (-not $placed) { $exact.Add('reason', $reason); $placed = $true }
+            }
+            if (-not $placed) { $exact.Add('reason', $reason) }
+        } catch { return $Report }
+        return $exact
+    }
+    # a pscustomobject (the job's own shape, Get-AttrCudaPresentMonDisplayReport) is unchanged by r11: its reason is read by its property, and the detail is appended unless that reason
+    # already carries the PRESENTMON_EVENTS_LOST token
+    $current = ''
+    $reasonKey = 'reason'
+    $property = $Report.PSObject.Properties['reason']
+    if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
-    if ($detailed -ceq $current) { return $Report }
+    if ([string]::Equals($detailed, $current, [StringComparison]::Ordinal)) { return $Report }
     $copy = [ordered]@{}
     foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
-    $copy['reason'] = $detailed
+    $copy[$reasonKey] = $detailed
+    return [pscustomobject]$copy
+}
+
+function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
+    <#
+    .SYNOPSIS
+    A PresentMon display report whose reason carries the typed PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail when the pre-capture orphan sweep did not leave the host clean; the same object otherwise.
+    .DESCRIPTION
+    BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): 16 of 16 cuda legs ended "PresentMon output does not exist" while an orphaned MLVAttr3-* session starved every capture and the
+    sweep had been skipped on every leg -- the summary named the symptom and never the sweep. The detail names what was left: skipped=<reason>, aborted=<reason>, remaining=<names>,
+    deferred=<names>, listError, error, and the live PresentMon pids. A sweep that ran and left nothing (or no sweep record at all) adds nothing. Like
+    Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy: a pscustomobject by a pscustomobject (properties and their order unchanged, only `reason` different;
+    a reason that already carries the token is never given it twice), a dictionary by a NEW canonical report with one `reason` (r11: the report helper contract in the body, restated in
+    docs/dual-venue-evidence.md). A sweep record that cannot be read adds recordUnreadable=<message> (r5, sol B3).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Report,
+        [AllowNull()][object]$Sweep
+    )
+
+    if ($null -eq $Sweep) { return $Report }
+    # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name.
+    # r2: copied into a plain table first (no call operator: the job splices this body and the spliced-body scan, R3, rejects `& <scriptblock>`); an absent key reads as $null
+    $field = @{}
+    $parts = @()
+    try {
+        # r5 (sol B3 on 2c226cd8): a generic Dictionary[string,object] implements IDictionary.Contains explicitly, so `$Sweep.Contains($name)` threw and the catch dropped the whole detail:
+        # a dictionary with ContainsKey (Dictionary, Hashtable, any generic IDictionary) is asked by it, another IDictionary (OrderedDictionary) by Contains, anything else by its properties
+        $hasContainsKey = ($null -ne $Sweep.PSObject.Methods['ContainsKey'])
+        foreach ($name in @('skippedReason', 'abortedReason', 'remaining', 'deferred', 'newlyListed', 'listError', 'error', 'livePresentMonProcessIds')) {
+            if ($hasContainsKey) { if ($Sweep.ContainsKey($name)) { $field[$name] = $Sweep[$name] } }
+            elseif ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($name)) { $field[$name] = $Sweep[$name] } }
+            else { $property = $Sweep.PSObject.Properties[$name]; if ($null -ne $property) { $field[$name] = $property.Value } }
+        }
+        $skipped = [string]$field['skippedReason']
+        if (-not [string]::IsNullOrEmpty($skipped)) { $parts += "skipped=$skipped" }
+        $aborted = [string]$field['abortedReason']
+        if (-not [string]::IsNullOrEmpty($aborted)) { $parts += "aborted=$aborted" }
+        $remaining = @(@($field['remaining']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($remaining.Count -gt 0) { $parts += "remaining=$($remaining -join ',')" }
+        $deferred = @(@($field['deferred']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($deferred.Count -gt 0) { $parts += "deferred=$($deferred -join ',')" }
+        # r2 (adversary A2): a session the final listing shows that the first did not (another job's capture, or an orphan its kill left mid-sweep) means the host was never verified clean
+        $newlyListed = @(@($field['newlyListed']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($newlyListed.Count -gt 0) { $parts += "newlyListed=$($newlyListed -join ',')" }
+        $listError = [string]$field['listError']
+        if (-not [string]::IsNullOrEmpty($listError)) { $parts += "listError=$listError" }
+        $sweepError = [string]$field['error']
+        if (-not [string]::IsNullOrEmpty($sweepError)) { $parts += "error=$sweepError" }
+        if ($parts.Count -eq 0) { return $Report }
+        $livePids = @(@($field['livePresentMonProcessIds']) | Where-Object { $null -ne $_ })
+        if ($livePids.Count -gt 0) { $parts += "livePids=$($livePids -join ',')" }
+    } catch {
+        # r5 (sol B3): a record that cannot be read is no clean sweep -- the typed detail is kept and names the read failure (it never silently returns the bare report)
+        $parts = @("recordUnreadable=$($_.Exception.Message -replace '\s+', ' ')")
+    }
+    $detail = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: $($parts -join ' ')"
+    if ($Report -is [System.Collections.IDictionary]) {
+        # r11 (sol r10 B1/B2 on 218fceaa; fable key3 REPORT-HELPER-ACCUMULATION-EXACT-DEDUPE-1; hub convergence ruling). Report helper contract (r11): this block is the same in both
+        # report helpers and is restated in docs/dual-venue-evidence.md. A dictionary report comes back as a NEW canonical report, never the input dictionary with the detail added:
+        #   reason-like key: a string key OrdinalIgnoreCase-equal to `reason`, or one the report's own public Comparer calls equal to `reason`. A report whose comparer is not readable
+        #     (Hashtable, OrderedDictionary) and whose own lookup holds a `reason` that no such key explains names the ONE string key holding the text that lookup returns
+        #   fold: every reason-like entry becomes ONE key, `reason`, at the place of the first; its text is their non-empty texts in enumeration order, a text EQUAL (ordinal) to an
+        #     earlier one left out -- never containment -- then ` [<detail>]` appended unless the folded text already carries exactly this detail (is it, begins `<detail> [`, or holds
+        #     `[<detail>]`). No early return skips the write
+        #   copy: every other key with its value (a non-string key under its string form) into an [ordered] table (OrdinalIgnoreCase on pwsh 7), returned as a pscustomobject when
+        #     every key can be a member name (the r3 shape) and as the table otherwise. Keys that collide in that table (case variants such as status/Status, or a string form equal to
+        #     another key) drop no value: the report is an exact-key OrderedDictionary with every original key instead, the reason-like ones folded into `reason` the same way
+        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), a report with string keys whose own `reason` lookup throws (r13), or an exact-key copy its keys cannot build
+        $keyList = @($Report.PSBase.Keys)
+        $valueList = @($Report.PSBase.Values)
+        $like = @(foreach ($key in $keyList) { $key -is [string] -and [string]::Equals($key, 'reason', [StringComparison]::OrdinalIgnoreCase) })
+        $comparerProperty = $Report.PSObject.Properties['Comparer']
+        $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
+        $asked = $false
+        if ($null -ne $comparer) {
+            try {
+                $matched = $null
+                if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Equals($key, 'reason') }) }
+                elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Compare($key, 'reason') -eq 0 }) }
+                if ($null -ne $matched) {
+                    for ($index = 0; $index -lt $keyList.Count; $index++) { if ($matched[$index]) { $like[$index] = $true } }
+                    $asked = $true
+                }
+            } catch { $asked = $false }
+        }
+        if (-not $asked -and @($like | Where-Object { $_ }).Count -eq 0) {
+            # r13 (sol r12 B1 on d32a71f0; REPORT-HELPER-TYPED-KEY-DICTIONARY-THROW-1): a dictionary whose key type is not string and that shows no public Comparer (ReadOnlyDictionary[int,object],
+            # ImmutableDictionary[int,object]) cannot be asked for 'reason' -- ContainsKey binds to its key type and throws. With no string key among its keys it holds no `reason` by
+            # definition, so it takes the canonical route below; a report that does have string keys and still cannot answer fails closed (the input comes back unchanged, as in r8)
+            $held = $false
+            try { $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') } }
+            catch { if (@($keyList | Where-Object { $_ -is [string] }).Count -gt 0) { return $Report } }
+            if ($held) {
+                $heldText = [string]$Report['reason']
+                $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $heldText, [StringComparison]::Ordinal)) { $index } })
+                # r8 (r7 adversary A2 on 6d30ac14): two holders of the text, so no rule names the key the report's lookup matched: fail closed, every entry as it was
+                if ($holders.Count -ne 1) { return $Report }
+                $like[$holders[0]] = $true
+            }
+        }
+        $texts = @()
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                $text = [string]$valueList[$index]
+                $repeat = [string]::IsNullOrEmpty($text)
+                foreach ($kept in $texts) { if ([string]::Equals($kept, $text, [StringComparison]::Ordinal)) { $repeat = $true } }
+                if (-not $repeat) { $texts += $text }
+            }
+        }
+        $folded = [string]($texts -join ' ')
+        $carried = [string]::Equals($folded, $detail, [StringComparison]::Ordinal) -or $folded.StartsWith("$detail [", [StringComparison]::Ordinal) -or $folded.Contains("[$detail]")
+        $reason = if ($carried) { $folded } elseif ([string]::IsNullOrEmpty($folded)) { $detail } else { "$folded [$detail]" }
+        $canonical = [ordered]@{}
+        $collides = $false
+        $placed = $false
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                if (-not $placed) { $placed = $true; if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+            } else {
+                $name = [string]$keyList[$index]
+                if ($canonical.Contains($name)) { $collides = $true } else { $canonical.Add($name, $valueList[$index]) }
+            }
+        }
+        if (-not $placed) { if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+        if (-not $collides) {
+            # a key no pscustomobject can carry (the empty name) throws in the conversion: the [ordered] table is the report then
+            $shaped = $null
+            try { $shaped = [pscustomobject]$canonical; if (@($shaped.PSObject.Properties).Count -ne $canonical.Count) { $shaped = $null } } catch { $shaped = $null }
+            if ($null -ne $shaped) { return $shaped }
+            return $canonical
+        }
+        try {
+            # an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1'); `reason` is its only reason-like key, so `.reason` reads it
+            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+            $placed = $false
+            for ($index = 0; $index -lt $keyList.Count; $index++) {
+                if (-not $like[$index]) { $exact.Add($keyList[$index], $valueList[$index]) }
+                elseif (-not $placed) { $exact.Add('reason', $reason); $placed = $true }
+            }
+            if (-not $placed) { $exact.Add('reason', $reason) }
+        } catch { return $Report }
+        return $exact
+    }
+    # a pscustomobject (the job's own shape, Get-AttrCudaPresentMonDisplayReport) is unchanged by r11: its reason is read by its property
+    $current = ''
+    $reasonKey = 'reason'
+    $property = $Report.PSObject.Properties['reason']
+    if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name }
+    # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
+    # r7: the prefix is compared ordinally (String.StartsWith(string) is culture-sensitive: a soft hyphen inside the token would read as the token and drop the detail)
+    if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:', [StringComparison]::Ordinal) -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
+    $reason = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
+    $copy = [ordered]@{}
+    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+    $copy[$reasonKey] = $reason
     return [pscustomobject]$copy
 }
 
@@ -2460,9 +2713,11 @@ function Get-AttrCudaPresentMonWindowResult {
 function Publish-AttrCudaVisualCaptures {
     <#
     .SYNOPSIS
-    Publish the job's visual-capture request record and the app's window captures (play-<k>.png, stop.png, paused.png, visual.json) under
-    $PubRoot\visual -- the record always (it says whether the option was forwarded and why not), the captures only when they exist.
-    Returns the published directory.
+    Publish the job's visual-capture request record and the app's window captures (play-<k>.png, stop-unbound.png, stop.png, paused.png,
+    visual.json) under $PubRoot\visual -- the record always (it says whether the option was forwarded and why not), the captures only when
+    they exist. Returns the published directory. (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: stop-unbound.png is the unforced paused-instant
+    capture a binding build keeps beside the bound stop.png; TIMING-2 r2: play-unbound-<k>.png and paused-unbound.png likewise
+    beside each forced play-<k>.png and paused.png.)
     #>
     param($Record, [string]$SourceDir, [string]$PubRoot)
     if ($null -eq $Record) { return $null }
@@ -2470,7 +2725,7 @@ function Publish-AttrCudaVisualCaptures {
     [void](New-AttrCudaDirectory -Path $pubDir)
     [void](Publish-AttrCudaText -Path (Join-Path $pubDir 'visual-capture-request.json') -Value ($Record | ConvertTo-Json -Depth 4))
     if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
-        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|stop|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
+        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
             [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name))
         }
     }
@@ -3146,6 +3401,201 @@ function New-AttrCudaOwnedRoot {
     }
     Add-AttrCudaOwnedRecord -Journal $OwnedJournal -Path $full -FileId $id -Kind root
     [pscustomobject]@{ Path = $full; Swept = $swept; Quarantined = $quarantined }
+}
+
+function Get-AttrCudaSelfHealMetricNames {
+    <#
+    .SYNOPSIS
+    GPU-DEVICE-LOSS-SELF-HEAL-1 r6: the names, in order, of the self-heal metrics a job with -PreLaunchCount
+    pre-launches publishes in its success summary.json (Get-AttrCudaSelfHealMetrics fills them; the generator
+    emits one summary line per name). L<n> is pre-launch n; L<PreLaunchCount + 1> is the measured run.
+    r10: each metric read from a counter, a fault code or a rate has a <metric>CouldNotCheck partner, $null unless that
+    metric could not be read; Test-DvCriteria puts its typed reason in the leg verdict.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int]$PreLaunchCount)
+    $names = @('selfHealPreLaunches', 'selfHealMeasuredPresentedFps')
+    foreach ($n in 1..$PreLaunchCount) {
+        foreach ($suffix in 'Rc', 'PreLaunchOk', 'InjectedFaultCode', 'BreakerTrip', 'SafeStartFlag', 'SafeStartRoute', 'CudaFrames', 'CpuFrames',
+                            'GpuPreviewFrames', 'RefusedGpuPlaybackRecon', 'PresentedFps', 'FpsRatio') {
+            $names += "selfHealL$n$suffix"
+        }
+        foreach ($suffix in 'InjectedFaultCode', 'CudaFrames', 'CpuFrames', 'GpuPreviewFrames', 'RefusedGpuPlaybackRecon', 'FpsRatio') {
+            $names += "selfHealL$n$($suffix)CouldNotCheck"
+        }
+    }
+    $names += "selfHealL$($PreLaunchCount + 1)FlagCleared"
+    $names += 'selfHealSettingsStoreDeleted'
+    $names
+}
+
+function Get-AttrCudaSelfHealMetrics {
+    <#
+    .SYNOPSIS
+    GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437): the L1..L4 facts of the self-heal proof, as flat scalar metrics
+    for the measured run's summary.json, so the leg's criteria gate them (and the receipt validator re-derives
+    them) like every other metric. Read from what the job published under <SelfHealDir>: pre-<n>\ (pre-launch.json,
+    the smoke result.json, the run log result.json.run.log, the GPU field log, the shared store's INI after the
+    launch) and main\ (the measured run's GPU field log and INI, settings-dir.json).
+    .DESCRIPTION
+    A fact that cannot be read is $null, never a default: a criterion on an absent metric fails, so a skipped,
+    failed or underivable pre-launch fails the leg. Per pre-launch n:
+      Rc                      the smoke runner's exit code (raw).
+      PreLaunchOk             1 when the launch ran (record present, no error) and the smoke runner passed, or
+                              failed ONLY on gpu_texture_route_readback_regression: the CUDA texture-route assertion
+                              a launch that leaves CUDA by design fails by construction. 0 otherwise.
+      InjectedFaultCode       the cuda code of the injected device-loss fault in its GPU field log (0: none).
+      BreakerTrip             1 when the log records device_loss/cuda_suppressed_session.
+      SafeStartFlag           1 when the shared INI holds SafeStartEnabled=true after the launch.
+      SafeStartRoute          1 when the log records safe_start/cpu_route (the launch started on the CPU).
+      CudaFrames / CpuFrames / GpuPreviewFrames   the measured session's playback_smoke.gpu_summary counts
+                              (CUDA = recon readback + texture readback + texture no-readback).
+      RefusedGpuPlaybackRecon the measured session's debayered16_recon_reuse_summary refused_gpu_playback_recon.
+      PresentedFps / FpsRatio its playback_smoke.summary presented_fps, and that over the measured run's.
+    and FlagCleared (the measured run): 1 when its log records safe_start_flag/cleared_env and the INI after it
+    has no SafeStartEnabled=true. SettingsStoreDeleted: 1 when settings-dir.json proves the store was removed.
+    r10 (CoS #437, Dot c503450a): a counter is a fact only when its key is present and its value is a decimal count. [long] of
+    an absent key, an empty value or '0x0' is 0, so a gpu_summary that omitted its CUDA and preview counters read as zero CUDA
+    and zero preview frames and passed L3 without measuring anything. An unreadable counter, fault code or rate now leaves its
+    metric $null (its criterion fails) and names why in <metric>CouldNotCheck: 'COULD-NOT-CHECK <TOKEN> <source>', TOKEN one of
+    LINE_ABSENT, COUNTER_ABSENT, COUNTER_NULL, COUNTER_NOT_NUMERIC, FAULT_CODE_ABSENT, FAULT_CODE_NOT_NUMERIC, MEASURED_FPS_UNUSABLE.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SelfHealDir,
+        [Parameter(Mandatory = $true)][string[]]$PreLaunches,
+        [AllowEmptyString()][string]$MeasuredLogText = '',
+        [AllowEmptyString()][string]$MeasuredSessionId = ''
+    )
+
+    $m = [ordered]@{}
+    foreach ($name in (Get-AttrCudaSelfHealMetricNames -PreLaunchCount $PreLaunches.Count)) { $m[$name] = $null }
+    $readText = {
+        param([string]$Path)
+        if (Test-Path -LiteralPath $Path -PathType Leaf) { [IO.File]::ReadAllText($Path) } else { $null }
+    }
+    $readJson = {
+        param([string]$Path)
+        $t = & $readText $Path
+        if ($null -eq $t) { return $null }
+        try { $t | ConvertFrom-Json } catch { $null }
+    }
+    # key=value fields of the LAST <marker> line of the session the smoke runner measured (playback_smoke.measured_session id=<n>)
+    $sessionLine = {
+        param([string]$LogText, [string]$Session, [string]$Marker)
+        if ([string]::IsNullOrEmpty($LogText)) { return $null }
+        if ([string]::IsNullOrEmpty($Session)) {
+            $sm = [regex]::Match($LogText, 'playback_smoke\.measured_session id=(\d+)')
+            if (-not $sm.Success) { return $null }
+            $Session = $sm.Groups[1].Value
+        }
+        $found = $null
+        foreach ($lm in [regex]::Matches($LogText, '(?m)' + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        if ($null -eq $found) { return $null }
+        $fields = @{}
+        foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }
+        $fields
+    }
+    $telemetry = {
+        param([string]$Dir)
+        $faults = @{}
+        $recoveries = @{}
+        foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Filter 'gpu-field-telemetry.jsonl*' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            foreach ($line in [IO.File]::ReadAllLines($f.FullName)) {
+                try { $j = $line | ConvertFrom-Json } catch { continue }
+                if ($j.kind -ceq 'fault' -and $j.device_loss -eq $true -and $j.site -ceq 'MLVAPP_GPU_FAULT_INJECT') { $faults[[string]$j.fault_utc_ms] = $(if ($null -ne $j.PSObject.Properties['cuda_code']) { $j.cuda_code } else { $null }) }
+                elseif ($j.kind -ceq 'recovery') { $recoveries["$($j.what)/$($j.outcome)"] = $true }
+            }
+        }
+        [pscustomobject]@{ faults = $faults; recoveries = $recoveries }
+    }
+    $iniFlag = {
+        param([string]$Path)
+        $t = & $readText $Path
+        if ($null -eq $t) { return $null }
+        $(if ([regex]::IsMatch($t, '(?m)^SafeStartEnabled=true\s*$')) { 1 } else { 0 })
+    }
+    # r10: one value of a <marker> line, strictly: { value; reason }. value is $null whenever reason is set (never a cast default).
+    $field = {
+        param($Fields, [string]$Marker, [string]$Key, [string]$Pattern, [type]$Type)
+        $at = "$($Marker -replace '^playback_smoke\.', '').$Key"
+        if ($null -eq $Fields) { return [pscustomobject]@{ value = $null; reason = "LINE_ABSENT $Marker" } }
+        if (-not $Fields.ContainsKey($Key)) { return [pscustomobject]@{ value = $null; reason = "COUNTER_ABSENT $at" } }
+        $raw = [string]$Fields[$Key]
+        if ($raw.Length -eq 0 -or $raw -ceq 'null') { return [pscustomobject]@{ value = $null; reason = "COUNTER_NULL $at" } }
+        $parsed = $null
+        if ($raw -cnotmatch $Pattern -or -not $Type::TryParse($raw, [Globalization.NumberStyles]::AllowDecimalPoint, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+            return [pscustomobject]@{ value = $null; reason = "COUNTER_NOT_NUMERIC $at='$raw'" }
+        }
+        [pscustomobject]@{ value = $parsed; reason = $null }
+    }
+    $count = { param($Fields, [string]$Marker, [string]$Key) & $field $Fields $Marker $Key '^[0-9]+$' ([long]) }
+    $fps = { param($Fields) & $field $Fields 'playback_smoke.summary' 'presented_fps' '^[0-9]+(\.[0-9]+)?$' ([double]) }
+    # a metric from readings: their sum when every one was read, else $null and the typed reasons in <Name>CouldNotCheck
+    $setRead = {
+        param([string]$Name, [object[]]$Readings)
+        $why = @($Readings | Where-Object { $null -ne $_.reason } | ForEach-Object { $_.reason })
+        if ($why.Count -gt 0) { $m["$($Name)CouldNotCheck"] = 'COULD-NOT-CHECK ' + ($why -join '; '); return }
+        $sum = 0L
+        foreach ($r in $Readings) { $sum += $r.value }
+        $m[$Name] = $sum
+    }
+
+    $measured = & $fps (& $sessionLine $MeasuredLogText $MeasuredSessionId 'playback_smoke.summary')
+    $measuredFps = $measured.value
+    $m['selfHealMeasuredPresentedFps'] = $measuredFps
+    $records = 0
+    for ($n = 1; $n -le $PreLaunches.Count; $n++) {
+        $dir = Join-Path $SelfHealDir "pre-$n"
+        $record = & $readJson (Join-Path $dir 'pre-launch.json')
+        if ($null -eq $record) { continue }
+        $records++
+        $p = "selfHealL$n"
+        $rc = $(if ($null -ne $record.rc) { [int]$record.rc } else { $null })
+        $m["$($p)Rc"] = $rc
+        $failures = $null
+        $smoke = & $readJson (Join-Path $dir 'result.json')
+        if ($null -ne $smoke -and $null -ne $smoke.PSObject.Properties['validation'] -and $null -ne $smoke.validation) { $failures = @($smoke.validation.failures | Where-Object { $null -ne $_ }) }
+        $ok = $null -eq $record.error -and $null -ne $rc -and (
+            $rc -eq 0 -or ($rc -eq 1 -and $null -ne $failures -and $failures.Count -gt 0 -and
+                           @($failures | Where-Object { -not ([string]$_).StartsWith('gpu_texture_route_readback_regression:') }).Count -eq 0))
+        $m["$($p)PreLaunchOk"] = $(if ($ok) { 1 } else { 0 })
+        $tel = & $telemetry $dir
+        if ($tel.faults.Count -eq 0) { $m["$($p)InjectedFaultCode"] = 0 }
+        else {
+            # r10: a fault row without an integer cuda_code was [int]$null = 0, i.e. "no injected fault"
+            $code = @($tel.faults.Values)[0]
+            # a JSON integer past Int32 parses as Int64 and [int] on it throws: only a code an Int32 can hold is a fault code
+            if (($code -is [int] -or $code -is [long]) -and [long]$code -ge [int]::MinValue -and [long]$code -le [int]::MaxValue) { $m["$($p)InjectedFaultCode"] = [int]$code }
+            elseif ($null -eq $code) { $m["$($p)InjectedFaultCodeCouldNotCheck"] = 'COULD-NOT-CHECK FAULT_CODE_ABSENT gpu-field-telemetry fault.cuda_code' }
+            else { $m["$($p)InjectedFaultCodeCouldNotCheck"] = "COULD-NOT-CHECK FAULT_CODE_NOT_NUMERIC gpu-field-telemetry fault.cuda_code='$code'" }
+        }
+        $m["$($p)BreakerTrip"] = $(if ($tel.recoveries.ContainsKey('device_loss/cuda_suppressed_session')) { 1 } else { 0 })
+        $m["$($p)SafeStartRoute"] = $(if ($tel.recoveries.ContainsKey('safe_start/cpu_route')) { 1 } else { 0 })
+        $m["$($p)SafeStartFlag"] = & $iniFlag (Join-Path $dir 'MLVApp.ini')
+        $log = & $readText (Join-Path $dir 'result.json.run.log')
+        $gpuMarker = 'playback_smoke.gpu_summary'
+        $gpu = & $sessionLine $log '' $gpuMarker
+        & $setRead "$($p)CudaFrames" @(foreach ($k in 'gpu_recon_readback_frames', 'gpu_texture_readback_frames', 'gpu_texture_no_readback_frames') { & $count $gpu $gpuMarker $k })
+        & $setRead "$($p)CpuFrames" @(& $count $gpu $gpuMarker 'cpu_frames')
+        & $setRead "$($p)GpuPreviewFrames" @(& $count $gpu $gpuMarker 'gpu_preview_frames')
+        $reuseMarker = 'playback_smoke.debayered16_recon_reuse_summary'
+        & $setRead "$($p)RefusedGpuPlaybackRecon" @(& $count (& $sessionLine $log '' $reuseMarker) $reuseMarker 'refused_gpu_playback_recon')
+        $launch = & $fps (& $sessionLine $log '' 'playback_smoke.summary')
+        $launchFps = $launch.value
+        $m["$($p)PresentedFps"] = $launchFps
+        if ($null -ne $launch.reason) { $m["$($p)FpsRatioCouldNotCheck"] = "COULD-NOT-CHECK $($launch.reason)" }
+        elseif ($null -eq $measuredFps -or $measuredFps -le 0) { $m["$($p)FpsRatioCouldNotCheck"] = "COULD-NOT-CHECK MEASURED_FPS_UNUSABLE $(if ($null -ne $measured.reason) { $measured.reason } else { "summary.presented_fps=$measuredFps" })" }
+        else { $m["$($p)FpsRatio"] = [Math]::Round($launchFps / $measuredFps, 4) }
+    }
+    $m['selfHealPreLaunches'] = $records
+    $main = Join-Path $SelfHealDir 'main'
+    $mainTel = & $telemetry $main
+    $mainFlag = & $iniFlag (Join-Path $main 'MLVApp.ini')
+    if ($null -ne $mainFlag) { $m["selfHealL$($PreLaunches.Count + 1)FlagCleared"] = $(if ($mainTel.recoveries.ContainsKey('safe_start_flag/cleared_env') -and $mainFlag -eq 0) { 1 } else { 0 }) }
+    $store = & $readJson (Join-Path $main 'settings-dir.json')
+    if ($null -ne $store) { $m['selfHealSettingsStoreDeleted'] = $(if ($store.treeRemoved -eq $true -and $store.stillExists -eq $false) { 1 } else { 0 }) }
+    $m
 }
 
 function Initialize-AttrCudaFileIdNative {
@@ -6774,6 +7224,16 @@ function Get-AttrCudaSourceFramesVerdict {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ($advanced -lt $required) {
         $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+        # HFR-10S-1 >>>
+        # Text only (the verdict never reads it): an HFR source (>= 50 fps native) is admitted at 10 s, so the message names that floor.
+        # Every other rate keeps the base line above verbatim.
+        if ($fields.ContainsKey('native_fps')) {
+            $nativeForText = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+            if ($nativeForText -ge 50.0 -and -not [double]::IsInfinity($nativeForText)) {
+                $failures[-1] = $failures[-1] -replace 'under 20 s of real footage', 'under 10 s of real footage'
+            }
+        }
+        # HFR-10S-1 <<<
     }
     # ENFORCE-4: the oracle re-derives the 20 s floor itself (see Get-GuiSmokeSourceFramesVerdict): a requirement under
     # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
@@ -6781,6 +7241,15 @@ function Get-AttrCudaSourceFramesVerdict {
         $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
         if ($nativeForFloor -le 0) {
             $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
+        # HFR-10S-1 >>>
+        # Owner amendment 2026-10-15: footage of >= 50 fps native (HFR) needs 10 s, ceil(10 x native fps) source frames; every other
+        # rate keeps the 20 s branch below. Mirrors platform/qt/PlaybackFrameRange.h minPlayWindowSeconds (the emitted job cannot
+        # dot-source gui-smoke-length-gate.ps1's Get-GuiSmokeMinPlaySeconds); a parity test executes all copies on one table.
+        } elseif ($nativeForFloor -ge 50.0 -and -not [double]::IsInfinity($nativeForFloor)) {
+            if ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(10.0 * $nativeForFloor - 0.02)) {
+                $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(10 s x native_fps=$nativeForFloor); the Play was admitted for less than 10 s of HFR footage."
+            }
+        # HFR-10S-1 <<<
         } elseif ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)) {
             $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeForFloor); the Play was admitted for less than 20 s of footage."
         }
@@ -6902,6 +7371,8 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
 
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
+    Get-AttrCudaSelfHealMetricNames, `
+    Get-AttrCudaSelfHealMetrics, `
     New-AttrCudaBuildInfoHeader, `
     Get-AttrCudaEmbeddedFunctionSource, `
     Expand-AttrCudaTemplate, `
@@ -6938,6 +7409,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaPresentMonEventsLost, `
     Add-AttrCudaPresentMonEventsLostDetail, `
     Add-AttrCudaPresentMonEventsLostDetailToReport, `
+    Add-AttrCudaPresentMonOrphanSweepDetailToReport, `
     Get-AttrCudaEtsSessionListing, `
     Invoke-AttrCudaLogman, `
     Get-AttrCudaTextEncodingFromHead, `

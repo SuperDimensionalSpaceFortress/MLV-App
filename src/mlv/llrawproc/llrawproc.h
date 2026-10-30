@@ -87,6 +87,9 @@ int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: a reduced-dims run on a recon DLL without
  * igpu_recon_set_reduced_iso_notch, refused so a meshy frame is never shown. */
 #define LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH 8
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: refused without any CUDA call because CUDA is
+ * suppressed process-wide after a device loss (llrpSetGpuCudaSuppressed). */
+#define LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED (-20)
 #define LLRP_GPU_RETAINED_OUTSTANDING_MAX 32
 
 typedef struct
@@ -270,6 +273,29 @@ size_t llrpGpuPlaybackReconGetLastInputBayer16(uint16_t * output,
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
 /* As above, waiting at most wait_ms for the backend lock; 0 if it ran out. */
 int llrpGpuPlaybackReconGetBackendInfoWithin(llrpGpuPlaybackReconBackendInfo_t * info, int wait_ms);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: load and create the playback recon backend now (while
+ * paused) instead of on the first Play frame's render thread. Exactly the mutex-guarded loader the playback runs
+ * use, with the same prefer_playback_dll=1, so the first run neither releases nor reloads it. Never configures a
+ * clip or LUTs and never runs. 1 when the backend is available; load_ms (may be NULL) receives the call's wall
+ * time. Always 0 in a build without the GPU recon loader. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms);
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: the paused recon warm run (platform/qt/PlaybackReconWarmRun.h) runs the
+ * Play frame-0 prepare-only recon on the recon worker thread. Save moves this thread's last-run playback recon state
+ * (what the llrpGpuPlaybackReconGetLast* calls return) aside and leaves it empty; Restore drops what the warm left and
+ * puts the saved state back, so nothing on the thread can read the warm's prepared state or retained output. Save
+ * returns an opaque heap snapshot (NULL when it cannot allocate: the warm then skips); Restore frees it. */
+void * llrpGpuPlaybackReconSaveLastRunState(void);
+void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot);
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-a: the shared dual-ISO runtime state every run is seeded from
+ * (the ISO pattern, the auto / ev / black-delta exposure match and the DNG levels), read under llrawproc_mutex. A run
+ * publishes it when it changed, so the paused warm reads it before and after its run: a change means the warm solved
+ * the match that Play frame 0 will start from, settled. 0 when video or out is NULL. Equal compares every field
+ * exactly (auto included). */
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out);
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs);
+/* The calling thread's last recon run's set_clip / set_luts wall time (0 when that run needed neither). */
+double llrpGpuPlaybackReconLastSetClipMilliseconds(void);
+double llrpGpuPlaybackReconLastSetLutsMilliseconds(void);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);
@@ -333,6 +359,10 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
  * "recon:uncaptured", rc 0, role "orphan", with its own site, never as the new
  * call's. dropped (r5) is the number of notes the channel's queue dropped
  * since the previous drain, carried by the first record of that drain.
+ * noted_utc_ms (GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1) is the note's own
+ * igpu_cuda_error_t.utc_ms, the wall clock when the DLL noted the code: an
+ * orphan can be drained a call, a view close or an app exit later. 0 when
+ * there is no note (a success, or a failure with no code noted).
  * A failed async preupload (llrpGpuPlaybackReconPreuploadFrame) is reported as
  * "recon:preupload" on the preupload's own thread, failure only; its "no free
  * slot" back-pressure return is not reported unless a CUDA code was noted.
@@ -341,9 +371,28 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
 typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double ms,
                                             int cuda_code, const char * cuda_name,
                                             const char * site, const char * role,
-                                            unsigned long long dropped);
+                                            unsigned long long dropped, double noted_utc_ms);
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: one process-wide flag, set by
+ * GpuDeviceLossBreaker after a device loss or from the persisted safe-start
+ * flag. While set, every CUDA entry refuses before taking any lock or touching
+ * the backend: the recon run (rc LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED),
+ * the playback recon gate, the async preupload and the GL copy, and every CUDA
+ * AMaZE entry in GpuDebayer.cpp. r6: each one reads the flag again once its
+ * serializing lock is held (and an AMaZE run after its telemetry entry), so a
+ * caller queued through a loss never submits. Release, destroy and teardown
+ * are never gated. One aligned load per check. GPU-LOSS-EMIT-BEFORE-UNLOCK-1:
+ * the backend's serializing sections set the flag before releasing the lock
+ * when a captured code is a device loss, so no caller can enter between the
+ * faulting call's unlock and its emit. */
+void llrpSetGpuCudaSuppressed(int suppressed);
+int llrpGpuCudaSuppressed(void);
+/* GPU-LOSS-EMIT-BEFORE-UNLOCK-1: returns non-zero for a device-loss CUDA code. Set by
+ * GpuDeviceLossBreaker::install(); NULL (no breaker) = no suppression before unlock. Must be
+ * pure: no lock, no Qt. */
+typedef int (*llrpGpuDeviceLossClassifier_t)(int cuda_code);
+void llrpSetGpuDeviceLossClassifier(llrpGpuDeviceLossClassifier_t classifier);
 /* r6 terminal drain: a code noted after the last captured call has no later
  * call to drain it at entry. llrpGpuPlaybackReconResetGlTextureResources (the
  * GPU view releasing its GL resources) drains both channels after its reset,

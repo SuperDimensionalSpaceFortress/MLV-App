@@ -597,7 +597,7 @@ under `platform/qt/FFmpeg/` and `platform/qt/raw2mlv/`:
 | Windows 64 | `ffmpegWin64.zip` | `raw2mlvWin64.zip` |
 | Windows 32 | `ffmpegWin32.zip` | `raw2mlvWin32.zip` |
 | macOS Intel | `ffmpegOSX.zip` | `raw2mlvOSX.zip` |
-| macOS Apple Silicon | `ffmpegOSX.zip` | `raw2mlvMacOsArm.zip` |
+| macOS Apple Silicon | `ffmpegOSXarm.zip` | `raw2mlvMacOsArm.zip` |
 | Linux | `ffmpegLinux.tar.xz` | `raw2mlvLinux.tar.xz` |
 
 Unpack rules:
@@ -1024,9 +1024,16 @@ All workflows live under `.github/workflows/`.
 
 `tests.yml` reports more check runs than there are required checks: the hygiene suite
 runs as `Repo Hygiene Python ubuntu shard N/4` and `Repo Hygiene Python windows shard N/8`
-jobs, and the product oracles as `Windows Product Oracles part N/3` jobs (none required by
-name); an aggregator per required name needs every one of its shards and carries the
-required name. The unittest shards are sets of whole test classes weighted by measured
+jobs, plus a `Repo Hygiene Python windows lane containment` job that runs
+`tests/coordination/test_lane_containment.py` in parallel (windows shard 8 ignores that
+file, so it is collected in exactly one job), a `Repo Hygiene Python windows coordination heavy`
+job that runs the four slowest coordination test files (`test_doctrine_outbox.py`, `_concerns.py`,
+`_hooks.py` and `test_retire_lane_worktree.py`, about 14 min hosted) in parallel (windows shard 8
+ignores those files too), and the product oracles as
+`Windows Product Oracles part N/3` jobs (none required by name); an aggregator per
+required name needs every one of its shards (the windows one also the containment and
+coordination heavy jobs) and
+carries the required name. The unittest shards are sets of whole test classes weighted by measured
 seconds (`tools/repo_hygiene/ci_unittest_shard_weights.json`, regenerated from CI job logs
 with `tools/repo_hygiene/ci_unittest_shard_timings.py`), and every shard job proves the
 shards together hold exactly the ids `unittest discover` collects. **Five check names are

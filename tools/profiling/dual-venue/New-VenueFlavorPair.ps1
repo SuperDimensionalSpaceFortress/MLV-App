@@ -44,15 +44,20 @@
 # composer creates it before its first output and (--keep-marker) leaves it until the trio record is written, so a trio that dies in between, the record
 # write included, is the typed exit 17 with the half record named, never PAIR_RECORD_EXISTS. -RecoverIncomplete is refused with -FilmReceipt (the
 # composer quarantines only the pair's outputs), so a dead trio's way forward is a new -OutDir.
+# LOOK-ASSIST-KODAK-VISION-50D-1: -ThirdFlavor vision50d makes the third receipt the Kodak Vision3 50D flavor (default 'film', unchanged): the
+# third receipt's lookFlavor must be it, the composer checks that flavor's report and grade (--third-flavor), and the record carries thirdFlavor. The
+# record's keys stay "film" (the grade side) either way.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ClassicReceipt,
     [Parameter(Mandatory = $true)][string]$CinematicReceipt,
     [string]$FilmReceipt = '',
+    [ValidateSet('film', 'vision50d')][string]$ThirdFlavor = 'film',
     [Parameter(Mandatory = $true)][string]$OutDir,
     [switch]$RecoverIncomplete
 )
 $trio = -not [string]::IsNullOrWhiteSpace($FilmReceipt)
+if (-not $trio -and $ThirdFlavor -cne 'film') { throw "PAIR_THIRD_FLAVOR_NEEDS_TRIO -ThirdFlavor $ThirdFlavor names the third receipt's flavor; pass that receipt as -FilmReceipt" }
 if ($trio -and $RecoverIncomplete) { throw 'PAIR_RECOVER_NOT_FOR_TRIO -RecoverIncomplete applies to the two-side pair only: the composer quarantines only the pair''s outputs, so a dead trio attempt (exit 17) is left as it is; use a new -OutDir' }
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
@@ -153,17 +158,17 @@ foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
 if ([string]$classic.subject.backend -cne 'cpu') { throw "PAIR_BACKEND_NOT_CPU the flavor pair is a cpu benchmark; the receipts are backend '$($classic.subject.backend)'" }
 if ([string]$classic.metrics.sourceCommit -cne [string]$cinematic.metrics.sourceCommit) { throw 'PAIR_SUBJECT_DIFFERS the receipts differ in metrics.sourceCommit' }
 if ([string]$classic.venue.name -cne [string]$cinematic.venue.name -or [string]$classic.card -cne [string]$cinematic.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the receipts are not the same venue/card' }
-if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the receipts rendered at different effective scales ($($classic.scale.effectiveScale) vs $($cinematic.scale.effectiveScale))" }
+if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the receipts rendered at different effective scales ($(Get-DvScaleLabel -Factor $classic.scale.effectiveScale) vs $(Get-DvScaleLabel -Factor $cinematic.scale.effectiveScale))" }
 $film = $null
 if ($trio) {
     $film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path) | ConvertFrom-Json
-    if ([string]$film.subject.lookFlavor -cne 'film') { throw "PAIR_FLAVORS_WRONG the third receipt must be the film flavor (got '$($film.subject.lookFlavor)')" }
+    if ([string]$film.subject.lookFlavor -cne $ThirdFlavor) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
     }
     if ([string]$classic.metrics.sourceCommit -cne [string]$film.metrics.sourceCommit) { throw 'PAIR_SUBJECT_DIFFERS the film receipt differs in metrics.sourceCommit' }
     if ([string]$classic.venue.name -cne [string]$film.venue.name -or [string]$classic.card -cne [string]$film.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the film receipt is not the same venue/card' }
-    if ([string]$classic.scale.effectiveScale -cne [string]$film.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the film receipt rendered at a different effective scale ($($classic.scale.effectiveScale) vs $($film.scale.effectiveScale))" }
+    if ([string]$classic.scale.effectiveScale -cne [string]$film.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the film receipt rendered at a different effective scale ($(Get-DvScaleLabel -Factor $classic.scale.effectiveScale) vs $(Get-DvScaleLabel -Factor $film.scale.effectiveScale))" }
 }
 
 # The repo whose COMMITTED consent and venue table a receipt is verified against is the one this script lives in (never a caller's).
@@ -270,6 +275,7 @@ if ($trio) {
     # The three-side composer keeps the attempt marker for this script's trio record, as the pair does; it has no --recover-incomplete.
     $pyArgs += @('--film-frames', $stageDirs['film'], '--film-listed', $stageListings['film'], '--film-sliders', $sliderFiles['film'],
         '--film-flavor-reported', $reported['film'], '--film-receipt-id', [string]$film.receiptId, '--keep-marker')
+    if ($ThirdFlavor -cne 'film') { $pyArgs += @('--third-flavor', $ThirdFlavor) }
 } else {
     $pyArgs += '--keep-marker'
     if ($RecoverIncomplete) { $pyArgs += '--recover-incomplete' }
@@ -317,6 +323,7 @@ if ($trio) {
         owner_verdict = $null
         model_verdicts = @()
     }
+    if ($ThirdFlavor -cne 'film') { $record.Insert(1, 'thirdFlavor', $ThirdFlavor) }   # a Film trio's record is unchanged
     $recordPath = Join-Path $OutDir "flavor-trio-$($classic.legId)-$($cinematic.legId)-$($film.legId)-$($classic.venue.name).json"
     $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)   # append-only: never overwrite
     try { $bytes = $utf8.GetBytes(($record | ConvertTo-Json -Depth 8) + "`n"); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }

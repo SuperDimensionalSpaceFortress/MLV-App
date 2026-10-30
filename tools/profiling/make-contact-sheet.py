@@ -329,6 +329,17 @@ def _majority_render_path(frames):
     return counts.most_common(1)[0][0]
 
 
+# scale_label must stay self-contained (builtins only, no module-level helpers): the mirror test execs this one function alone because the hosted runner has no numpy.
+def scale_label(scale):
+    """The words a person reads for a playback scale FACTOR on the sheet header (SCALE-LABEL-CLARITY-1 r2): '1' -> 'Full res (1x)', '2' -> 'Half res (0.5x)',
+    '4' -> 'Quarter res (0.25x)', other whole numbers -> 'Custom res (1/N)'. Mirrors PlaybackScaleLabel::resolutionLabel (platform/qt/PlaybackScaleLabel.h); text that is
+    not a whole factor (empty, 'unknown', already words) is returned as given. The stats sidecar keeps the raw --scale value."""
+    text = str(scale).strip()
+    if not text.isascii() or not text.isdigit() or int(text) < 1:
+        return text
+    return {1: "Full res (1x)", 2: "Half res (0.5x)", 4: "Quarter res (0.25x)"}.get(int(text), f"Custom res (1/{int(text)})")
+
+
 def build_header_lines(args, frames):
     """Pure text form of the header strip -- kept separate from build_header (which only
     draws it) so its content is assertable without rendering an image."""
@@ -365,7 +376,7 @@ def build_header_lines(args, frames):
             gpu=args.gpu or "unknown",
             build_sha=args.build_sha or "unknown",
             backend=args.backend or "unknown",
-            scale=args.scale or "unknown",
+            scale=scale_label(args.scale) if args.scale else "unknown",
         ),
         f"look_assist: {look_assist_summary}",
         f"render_path(majority)={_majority_render_path(frames)}  playback_path={sheet_playback_path(frames)}",
