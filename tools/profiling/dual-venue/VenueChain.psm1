@@ -300,8 +300,8 @@ function Get-VenueTickets {
                     $why = Get-VenueTicketStaleReason -Ticket $t -NowUtc $now
                     if ($why) { $row.state = 'STALE'; $row.reason = $why }
                     $c = ConvertTo-VenueUtc $t.createdUtc; $b = ConvertTo-VenueUtc $t.heartbeatUtc
-                    if ($null -ne $c) { $row.ageSec = [int][Math]::Max(0, ($now - $c).TotalSeconds) }
-                    if ($null -ne $b) { $row.heartbeatAgeSec = [int][Math]::Max(0, ($now - $b).TotalSeconds) }
+                    if ($null -ne $c) { $row.ageSec = [int][Math]::Max(0.0, ($now - $c).TotalSeconds) }
+                    if ($null -ne $b) { $row.heartbeatAgeSec = [int][Math]::Max(0.0, ($now - $b).TotalSeconds) }
                 }
             }
             $rows.Add([pscustomobject]$row)
@@ -437,7 +437,7 @@ function Format-VenueClaimStatus {
     $held = ''
     if ($c.claim) {
         $claimed = ConvertTo-VenueUtc $c.claim.claimedUtc
-        $age = $(if ($null -ne $claimed) { [int][Math]::Max(0, ((ConvertTo-VenueUtc $Status.nowUtc) - $claimed).TotalSeconds) } else { 'UNKNOWN' })
+        $age = $(if ($null -ne $claimed) { [int][Math]::Max(0.0, ((ConvertTo-VenueUtc $Status.nowUtc) - $claimed).TotalSeconds) } else { 'UNKNOWN' })
         $held = " holderPid=$($c.claim.ownerPid) runDir=$($c.claim.runDir) purpose=$($c.claim.purpose) ageSec=$age expiresUtc=$((ConvertTo-VenueUtc $c.claim.expiresUtc).ToString('o'))"
     }
     "CLAIM_STATUS venue=$($Status.venue) state=$($c.state)$(if ($c.reason) { " reason=$($c.reason)" })$held"
@@ -605,7 +605,12 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null)
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1)
+    # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
+    # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
+    # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
+    $callClock = [Diagnostics.Stopwatch]::StartNew()
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
     $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
@@ -630,6 +635,8 @@ function Get-VenueStagedBuildManifest {
                 foreach ($k in 'packageZip', 'exe', 'dll') {
                     $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
                     'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the digest itself, for -VerifyArtifacts (the same bytes as the facts above)
+                    if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'H:' + $k + '=' + $v.ToLowerInvariant() }
                 }
             } })
     $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
@@ -649,9 +656,79 @@ function Get-VenueStagedBuildManifest {
                 elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }
                 else { '' })
         }
-        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem }
+        # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 (Dot 6440180395): a manifest whose digests are well-formed is not yet a build the leg job can run -- it hashes the CACHED exe, dll and
+        # package zip against them (playback-attr-3-cuda-job.ps1 $manifestChecks) and throws after the lease opened when one is absent or differs. With -VerifyArtifacts the same
+        # hash is taken here, once the manifest content is sound: artifactProblem is '' (all three match), BUILD_ARTIFACT_MISSING or BUILD_ARTIFACT_MISMATCH (first word = the typed
+        # code), or $null (not asked, or the digests were not read). An artifact read that does not answer is UNREACHABLE, as a manifest read that does not answer is.
+        $artifactProblem = $null
+        if ($VerifyArtifacts -and $problem -ceq '') {
+            $names = Get-VenueStagedArtifactNames -SourceCommit $SourceCommit
+            $cacheDir = $AgentShare.TrimEnd('\') + '\cache'
+            $items = @(foreach ($k in 'packageZip', 'exe', 'dll') {
+                    $h = @($r.value | Select-Object -Skip 1 | ForEach-Object { [string]$_ } | Where-Object { $_.StartsWith("H:$k=") }) | Select-Object -First 1
+                    @{ label = $k; name = $names[$k]; path = ($cacheDir + '\' + $names[$k]); sha = $h.Substring(("H:$k=").Length) }
+                })
+            $probe = $(if ($null -ne $ArtifactProbeScript) { $ArtifactProbeScript } else {
+                    {
+                        param($items)
+                        # a read that fails ends the read (UNREACHABLE), never "absent": an unreadable file is not a missing one
+                        $ErrorActionPreference = 'Stop'
+                        foreach ($i in $items) {
+                            # r7 adversary A2: -ArtifactMinSec is the least EACH file's read may start with, not only the first: a slow packageZip left the exe and the dll under it
+                            if ($null -ne $i.clock -and ($i.endSec - $i.clock.Elapsed.TotalSeconds) -lt $i.minSec) { 'NOTIME:' + $i.label + ':' + $i.name; break }
+                            if (-not (Test-Path -LiteralPath $i.path -PathType Leaf)) { 'MISSING:' + $i.label + ':' + $i.name; continue }
+                            # r8b adversary A1: the existence check can take the time too, so the minimum is checked again before the open and the hash start
+                            if ($null -ne $i.clock -and ($i.endSec - $i.clock.Elapsed.TotalSeconds) -lt $i.minSec) { 'NOTIME:' + $i.label + ':' + $i.name; break }
+                            # r8b adversary A1: FileShare.Read, as the leg job hashes it (AttrCudaArtifacts.psm1 Get-Sha): a writer holding the file open fails this read as it would fail the leg
+                            $fs = [IO.File]::Open($i.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                            try {
+                                # r10 adversary A1: the open can take the time too (an SMB open), so the minimum is checked once more with the file open, before the hash starts
+                                if ($null -ne $i.clock -and ($i.endSec - $i.clock.Elapsed.TotalSeconds) -lt $i.minSec) { 'NOTIME:' + $i.label + ':' + $i.name; break }
+                                $sha = [Security.Cryptography.SHA256]::Create()
+                                try { $got = ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                            } finally { $fs.Dispose() }
+                            if ($got -cne $i.sha) { 'MISMATCH:' + $i.label + ':' + $i.name + ':' + $got }
+                        }
+                    } })
+            # adversary r2 A2: with no explicit bound the hash gets what is LEFT of -TimeoutSec, and none when less than -ArtifactMinSec is left (a 1 s floor would run the call past its own bound)
+            $artSec = $ArtifactTimeoutSec
+            if ($artSec -le 0) {
+                # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
+                $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
+                # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
+                # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
+                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+                $artSec = $left
+            }
+            # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
+            $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
+            foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
+            $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
+            if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+            $lines = @($ar.value | ForEach-Object { [string]$_ })
+            $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
+            $differs = @($lines | Where-Object { $_.StartsWith('MISMATCH:') } | ForEach-Object { $p = $_.Split(':', 4); "$($p[1]) $($p[2]) hashes to $($p[3])" })
+            $notime = @($lines | Where-Object { $_.StartsWith('NOTIME:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
+            # a file found absent or different before the time ran out is still that typed problem; with none, a file never started is a hash that did not finish (UNREACHABLE)
+            if (-not $missing.Count -and -not $differs.Count -and $notime.Count) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) to start hashing $($notime[0]) (under $ArtifactMinSec s left)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
+            $artifactProblem = $(if ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
+                elseif ($differs.Count) { "BUILD_ARTIFACT_MISMATCH the cached artifact does not hash to the build manifest's digest in ${cacheDir}: $($differs -join '; ') (the leg job throws after the lease opened)" }
+                else { '' })
+        }
+        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem; artifactProblem = $artifactProblem }
     }
-    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null }
+    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null; artifactProblem = $null }
+}
+
+function Get-VenueStagedArtifactNames {
+    <#
+    .SYNOPSIS
+    The cached artifact file names for a build, by the formulas Get-AttrCudaArtifactNames (tools/profiling/bachelor/AttrCudaArtifacts.psm1) derives and the leg job reads from the
+    agent cache. Kept here as a copy because this module imports nothing from the bachelor tree; test_venue_lease_batch.py pins the two together.
+    #>
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit)
+    $s = $SourceCommit.Substring(0, 12)
+    @{ exe = "MLVApp-playback-attr-3-cuda-$s.exe"; dll = "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"; packageZip = "MLVApp-playback-attr-3-cuda-$s-pkg.zip" }
 }
 
 $script:VenueAbandonedReads = 0
@@ -675,7 +752,8 @@ function Invoke-VenueBoundedRead {
     .OUTPUTS
     [pscustomobject]@{ answered; value (the script's output as an array); error }
     #>
-    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1, 600)][int]$TimeoutSec)
+    # r7 (sol r6 B1): -TimeoutSec keeps its fraction (a caller's exact remainder), so no bound is rounded up past the caller's deadline or down under its minimum
+    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec)
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
@@ -686,7 +764,7 @@ function Invoke-VenueBoundedRead {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
-            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $TimeoutSec s" }
+            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $([Math]::Round($TimeoutSec, 2)) s" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {
@@ -1232,6 +1310,6 @@ function Get-VenueDriverScriptMissing {
 Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
-    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
+    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
     Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness
