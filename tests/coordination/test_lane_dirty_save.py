@@ -60,8 +60,8 @@ def test_dead_lane_patch_is_byte_exact_applies_cleanly_and_untracked_is_listed(r
     head8 = git(repo, "rev-parse", "HEAD").decode().strip()[:8]
     patch, listed = (tmp_path / "run" / f"dirty-save-{head8}.{e}" for e in ("patch", "untracked.txt"))
     assert patch.read_bytes() == git(repo, "diff", "HEAD", "--binary")
-    assert listed.read_bytes() == git(repo, "ls-files", "--others", "--exclude-standard")
-    assert listed.read_bytes() == b"untracked.txt\n"
+    assert listed.read_bytes() == git(repo, "ls-files", "-z", "--others", "--exclude-standard")  # NUL-separated (CoS G1 on #722)
+    assert listed.read_bytes() == b"untracked.txt\0"
     assert json.loads(r.stdout.strip().splitlines()[-1])["patch"] == patch.name
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(repo), str(clone)], check=True, capture_output=True)
@@ -106,7 +106,28 @@ def test_a_live_explicit_pid_is_never_judged_by_another_pids_created_utc(repo, t
 def test_a_non_ascii_untracked_name_is_listed_raw_not_octal_quoted(repo, tmp_path):  # dot CI-B3 on #722 (DG-GIT-PATHLIST)
     (repo / "café.txt").write_text("u\n")
     assert save(repo, "-LanePid", str(dead_pid())).returncode == 0
-    assert "café.txt\n".encode() in next((tmp_path / "run").glob("*.untracked.txt")).read_bytes()
+    assert "café.txt\0".encode() in next((tmp_path / "run").glob("*.untracked.txt")).read_bytes()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason='NTFS forbids " TAB and LF in a file name; the NUL-format assertion in the first test is the Windows case')
+def test_names_git_would_c_quote_are_listed_byte_exact(repo, tmp_path):  # CoS G1 on #722: core.quotepath=false does not stop quoting of ", \, TAB, LF
+    names = ['a"b.txt', "tab\there.txt", "new\nline.txt", "back\\slash.txt"]
+    for n in names:
+        (repo / n).write_text("u\n")
+    assert save(repo, "-LanePid", str(dead_pid())).returncode == 0
+    listed = next((tmp_path / "run").glob("*.untracked.txt")).read_bytes()
+    assert listed.endswith(b"\0") and sorted(listed.split(b"\0")[:-1]) == sorted(n.encode() for n in names)
+
+
+def test_the_receipt_and_header_say_untracked_contents_are_not_saved(repo, tmp_path):  # CoS G2 on #722: the saver keeps untracked NAMES only
+    (repo / "u.txt").write_text("secret contents\n")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    receipt = json.loads(r.stdout.strip().splitlines()[-1])
+    assert receipt["untrackedContents"] == "not-saved" and receipt["untrackedFormat"] == "nul-separated"
+    assert not any(b"secret contents" in p.read_bytes() for p in (tmp_path / "run").iterdir())
+    header = "\n".join(SCRIPT.read_text(encoding="utf-8").splitlines()[:12])
+    assert "NOT preserved" in header and "LANE-DIRTY-SAVE-INVENTORY-ROWS-1" in header
 
 
 def test_clean_tree_writes_nothing(repo):
