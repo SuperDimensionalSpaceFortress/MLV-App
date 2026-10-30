@@ -793,6 +793,11 @@ TEST( HfrPlayFloor, PinnedWindowsAcceptedAndRefusedBeforePlay )
     ASSERT_TRUE( playback_frame_range::presentedFramesTargetReachesFloor( 600, 59.94 ) );
     ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 599, 59.94 ) );
     ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 300, 29.97 ) );
+    // HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (adversary A2): a conformed HFR play passes its presents' rate (24) and its
+    // NATIVE-classified floor (10 s), so 240 presents are the 10 s window --seconds 10 admitted; 239 are not.
+    ASSERT_TRUE( playback_frame_range::presentedFramesTargetReachesFloor( 240, 24.0, 10.0 ) );
+    ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 239, 24.0, 10.0 ) );
+    ASSERT_FALSE( playback_frame_range::presentedFramesTargetReachesFloor( 240, 24.0 ) );   // default: 24 fps -> 20 s
 }
 
 TEST( HfrPlayFloor, AConformedPlayOfAnHfrClipStillAdvancesTenSecondsOfSourceFrames )

@@ -9804,9 +9804,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // The shared gate (programmaticPlay) refuses BEFORE Play -- path-free, typed exit 14 -- unless that
     // window is >= 20 s AND >= the requested window; this is also the one Play of the process.
     // A --presented-frames target ends the Play early after N presented frames, so it is a play window
-    // of N / fps seconds and must reach the 20 s floor too (a pinned run of 24 frames would play ~1 s).
+    // of N / fps seconds and must reach the clip's floor too (a pinned run of 24 frames would play ~1 s).
+    // The floor is the one every gate uses (playGateMinPlayWindowSeconds(): classified by the NATIVE fps), so a
+    // conformed HFR clip's 240 presents at 24 fps are the same 10 s window its --seconds 10 was admitted for.
     const double presentedTargetFps = getPlaybackFramerate();   // presents arrive at the PLAYBACK rate (conform included)
-    if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps ) )
+    if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps,
+                                                                  playGateMinPlayWindowSeconds() ) )
     {
         m_playbackSmokeFullscreenLossLatchArmed = false;
         ++m_programmaticPlayLedger.refused;

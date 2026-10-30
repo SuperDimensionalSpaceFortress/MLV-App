@@ -104,12 +104,32 @@ TEST(PlaybackConformWiring, TimerFrameEventNeverReadsTheExportRate)
     ASSERT_FALSE(body.contains(QStringLiteral("m_frameRate")));
 }
 
+// Master merge (8f22c6d1, CUDA-HEADROOM-1): every guard pace argument goes through playbackPaceGuardFps(), master's one
+// seam for the unpaced automation arm; its body takes the PLAYBACK rate, so the four sites still pace at it.
+TEST(PlaybackConformWiring, PaceGuardHelperPacesAtPlaybackRate)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "return playback_native_pace::guardPaceFps( getPlaybackFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );")));
+    ASSERT_FALSE(source.contains(QStringLiteral("playback_native_pace::guardPaceFps( getFramerate(),")));
+}
+
+// Adversary A2: the --presented-frames early stop takes the same native-classified floor as every other play gate.
+TEST(PlaybackConformWiring, PresentedFramesTargetUsesTheNativeClassifiedFloor)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps,")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral(
+        "                                                                  playGateMinPlayWindowSeconds() ) )")));
+}
+
 TEST(PlaybackConformWiring, LoopWrapPaceGuardUsesPlaybackRate)
 {
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getPlaybackFramerate() ) ) return;")));
+        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;")));
 }
 
 TEST(PlaybackConformWiring, WholeFramePaceGuardUsesPlaybackRate)
@@ -117,7 +137,7 @@ TEST(PlaybackConformWiring, WholeFramePaceGuardUsesPlaybackRate)
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getPlaybackFramerate() ) ) return;")));
+        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;")));
 }
 
 TEST(PlaybackConformWiring, DropFrameGrantUsesPlaybackRateForBothInputs)
@@ -125,7 +145,7 @@ TEST(PlaybackConformWiring, DropFrameGrantUsesPlaybackRateForBothInputs)
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, getPlaybackFramerate() ),")));
+        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
 }
 
 TEST(PlaybackConformWiring, SlipHistogramMovesUsePlaybackRate)
@@ -142,7 +162,7 @@ TEST(PlaybackConformWiring, FirstPresentPaceClockStartUsesPlaybackRate)
 {
     const QString source = mainWindowSource();
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getPlaybackFramerate() );")));
+        "m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );")));
     ASSERT_FALSE(source.contains(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, getFramerate() );")));
 }
 

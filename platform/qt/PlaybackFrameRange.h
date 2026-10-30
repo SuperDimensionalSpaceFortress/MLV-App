@@ -573,11 +573,15 @@ inline PlayableWindowVerdict evaluatePlayableWindow(
 
 // A --presented-frames target ends playback EARLY, after N presented frames: it is itself a play window of
 // N / fps seconds and must reach the floor (a pinned-frame run of 24 frames would play ~1 s). 0 = no early stop.
-// The floor is the clip's own: minPlayWindowSeconds( fps ) (HFR-10S-1).
-inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps )
+// The floor is the clip's own: minPlayWindowSeconds( fps ) (HFR-10S-1) by default. fps is the rate presents arrive at;
+// a conformed play passes the playback fps there and its NATIVE-classified floor as floorSeconds (the app passes
+// playGateMinPlayWindowSeconds()), the same floor the --seconds check and checkPlayableWindow() use.
+inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps,
+                                               double floorSeconds = kFloorFromNativeFps )
 {
     if( targetPresentedFrames <= 0 ) return true;
-    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= minPlayWindowSeconds( fps );
+    if( floorSeconds == kFloorFromNativeFps ) floorSeconds = minPlayWindowSeconds( fps );
+    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= floorSeconds;
 }
 
 // ProgrammaticPlayLedger -- pure. One per process. admit() is the only way a programmatic Play is allowed:
