@@ -2,7 +2,7 @@
 # A dead lane's uncommitted work is the one thing a refusal or a clean-up destroys. When the lane process is dead, this writes into -RunDir:
 #   dirty-save-<head8>.patch   git diff HEAD --binary, byte for byte; .staged.patch = git diff --cached --binary (staged work the tree no longer has)
 #   dirty-save-<head8>.untracked.txt = git ls-files --others --exclude-standard; .receipt.json = one JSON line naming the files of THIS save, also printed
-# The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; a process that started after createdUtc is a reused pid, so the lane is dead).
+# The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; a process that started after createdUtc is a reused pid, so the lane is dead), never both.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed.
 # Never stashes, resets, checks out, cleans or deletes. Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused.
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
@@ -31,10 +31,11 @@ function Invoke-GitBytes([string[]]$GitArgs) {
     } catch { return @{ Code = -1; Bytes = [byte[]]@(); Err = $_.Exception.Message } }
 }
 function Test-LaneAlive {
+    if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
     $procId = $LanePid; $born = $null
     if ($ChildJson) {
         $j = Get-Content -LiteralPath $ChildJson -Raw | ConvertFrom-Json
-        if (-not $procId) { $procId = [int]$j.pid }
+        $procId = [int]$j.pid
         if ($j.createdUtc) { $born = ([datetime]$j.createdUtc).ToUniversalTime() }
     }
     if ($procId -le 0) { throw 'no-lane-pid' }
@@ -64,7 +65,7 @@ try {
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $git = [ordered]@{ head = Invoke-GitBytes @('rev-parse', 'HEAD'); patch = Invoke-GitBytes (@('diff', 'HEAD') + $flags); staged = Invoke-GitBytes (@('diff', '--cached') + $flags)
-    untracked = Invoke-GitBytes @('ls-files', '--others', '--exclude-standard') }
+    untracked = Invoke-GitBytes @('-c', 'core.quotepath=false', 'ls-files', '--others', '--exclude-standard') }
 $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
 if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())"; exit 40 }
 $todo = 'patch', 'staged', 'untracked' | Where-Object { $git[$_].Bytes.Length -gt 0 }

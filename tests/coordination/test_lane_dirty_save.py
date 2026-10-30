@@ -90,6 +90,25 @@ def test_child_json_names_the_lane_and_a_reused_pid_counts_as_dead(repo, tmp_pat
     assert saved(repo) != []
 
 
+def test_a_live_explicit_pid_is_never_judged_by_another_pids_created_utc(repo, tmp_path):  # dot B1 on #722
+    dirty(repo)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        child = tmp_path / "child.json"
+        child.write_text(json.dumps({"pid": dead_pid(), "createdUtc": (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).isoformat()}))
+        r = save(repo, "-LanePid", str(sleeper.pid), "-ChildJson", str(child))
+        assert r.returncode in (20, 30), r.stdout + r.stderr
+        assert saved(repo) == []
+    finally:
+        sleeper.kill()
+
+
+def test_a_non_ascii_untracked_name_is_listed_raw_not_octal_quoted(repo, tmp_path):  # dot CI-B3 on #722 (DG-GIT-PATHLIST)
+    (repo / "café.txt").write_text("u\n")
+    assert save(repo, "-LanePid", str(dead_pid())).returncode == 0
+    assert "café.txt\n".encode() in next((tmp_path / "run").glob("*.untracked.txt")).read_bytes()
+
+
 def test_clean_tree_writes_nothing(repo):
     r = save(repo, "-LanePid", str(dead_pid()))
     assert r.returncode == 10, r.stdout + r.stderr
@@ -175,9 +194,10 @@ def test_relative_paths_resolve_where_powershell_is_not_where_dotnet_is(repo, tm
     assert saved(repo) != []
 
 
-def test_a_missing_git_is_exit_40_not_a_powershell_throw(repo):  # adversary A7
+def test_a_missing_git_is_exit_40_not_a_powershell_throw(repo, tmp_path):  # adversary A7; dot B2: an empty PATH dir, no Windows-only SystemRoot
     dirty(repo)
-    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "PATH": str(Path(os.environ["SystemRoot"]) / "System32")})
+    (tmp_path / "nogit").mkdir()
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "PATH": str(tmp_path / "nogit")})
     assert r.returncode == 40, r.stdout + r.stderr
     assert saved(repo) == []
 
