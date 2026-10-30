@@ -668,7 +668,7 @@ TEST(PlaybackSlipHistogram, PresentSetupFirstTailIsExcludedAndAnEmptySessionBuck
     ASSERT_TRUE( f.presentSetupMaxBucket == SetupBucket::None );
     ASSERT_EQ( 0, f.presentSetupMaxTail.grabSwaps );
     ASSERT_EQ( 0, f.presentSetupMaxTail.qtPaintSwaps );
-    ASSERT_NEAR( 0.0, f.presentSetupMaxTail.swapReturnToSetupMs, 1e-12 );
+    ASSERT_FALSE( f.presentSetupMaxTail.prevKnown );
     ASSERT_NEAR( -1.0, f.presentSetupMaxGuiBusyMs, 1e-12 );
     ASSERT_FALSE( f.presentSetupMaxFullscreen );
 
