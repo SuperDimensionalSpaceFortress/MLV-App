@@ -48,6 +48,27 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
         return f"<read failed: errno {exc.errno} {exc.strerror}>"
 
 
+def _kill_tree(proc: subprocess.Popen) -> str:
+    """Kill proc's whole tree and say how it went; a failing cleanup step is reported, never allowed to replace the timeout verdict."""
+    problems = []
+    try:
+        taskkill = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if taskkill.returncode != 0:
+            problems.append(f"taskkill exited {taskkill.returncode}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        problems.append(f"taskkill failed: {exc!r}")
+    try:
+        proc.kill()
+    except OSError as exc:
+        problems.append(f"kill failed: {exc!r}")
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        problems.append("the root process was still running 30 s after the kill")
+    return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
+
+
 def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, str]:
     """Run argv under a real wall-clock bound and return (returncode, stdout, stderr).
 
@@ -61,6 +82,7 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
     out_path, err_path = Path(tmp) / "stdout.txt", Path(tmp) / "stderr.txt"
     started = time.monotonic()
     timed_out = False
+    kill_note = ""
     try:
         with open(out_path, "wb") as out, open(err_path, "wb") as err:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
@@ -68,10 +90,7 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-                proc.kill()
-                proc.wait(timeout=30)
+                kill_note = _kill_tree(proc)
         elapsed = time.monotonic() - started
         # After a timeout the case-named verdict below is the failure, so a read error (a Windows sharing violation on a file the
         # killed tree still holds) is recorded in the text instead of replacing it. Without a timeout the read error surfaces.
@@ -80,8 +99,8 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if timed_out:
-        raise AssertionError(f"{case} exceeded its {timeout:g} s wall-clock bound (ran {elapsed:.0f} s) and its process tree was "
-                             f"killed.\nstdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}")
+        raise AssertionError(f"{case} exceeded its {timeout:g} s wall-clock bound (ran {elapsed:.0f} s) and {kill_note}.\n"
+                             f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}")
     return proc.returncode, stdout, stderr
 
 
@@ -174,6 +193,16 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn('-Phase "pre-launch"', refusal)
         self.assertRegex(refusal, r"\breturn\b")
         self.assertIn("Add-HeavySlotHolderLossToAdmission -JobId $jobId -Admission $script:Admission", body)
+
+    def test_the_fifo_suite_bound_kills_its_child_through_a_bounded_taskkill(self) -> None:
+        # sol adversary A2: `& taskkill.exe` after a WaitForExit timeout had no bound of its own, so a hung taskkill held back the
+        # suite-named failure. The kill is now a Start-Process with its own WaitForExit, and the message does not claim a kill that failed.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        self.assertNotIn("& taskkill.exe", fifo)
+        self.assertIn("Start-Process -FilePath 'taskkill.exe'", fifo)
+        self.assertIn("$k.WaitForExit(60000)", fifo)
+        self.assertIn("process tree kill is NOT confirmed", fifo)
+        self.assertIn("and $killNote; output so far", fifo)
 
     def test_light_probes_stay_exempt_and_deploy_gate_string_matches(self) -> None:
         self.assertIn("[string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$'", self.text)
@@ -425,6 +454,42 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn("<read failed: errno 13", str(caught))
+
+    def _run_failing_cleanup(self, *, taskkill: object, second_wait_expires: bool = False) -> BaseException:
+        # sol adversary A1: the cleanup steps after a timeout must not replace the case-named verdict either.
+        proc = self._TimedOutProc()
+        if second_wait_expires:
+            def wait(timeout: float | None = None) -> int:
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            proc.wait = wait  # type: ignore[method-assign]
+        if isinstance(taskkill, BaseException):
+            run = mock.Mock(side_effect=taskkill)
+        else:
+            run = mock.Mock(return_value=subprocess.CompletedProcess(["taskkill"], taskkill))
+        with mock.patch.object(subprocess, "Popen", return_value=proc), mock.patch.object(subprocess, "run", run):
+            try:
+                run_bounded(["child"], 3, "stub-hang-case")
+            except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                return exc
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_taskkill_hangs_or_fails(self) -> None:
+        for label, kwargs, expect in (
+                ("taskkill timeout", {"taskkill": subprocess.TimeoutExpired(["taskkill"], 60)}, "taskkill failed"),
+                ("taskkill missing", {"taskkill": FileNotFoundError(2, "no taskkill")}, "taskkill failed"),
+                ("taskkill rc 1", {"taskkill": 1}, "taskkill exited 1"),
+                ("root wait timeout", {"taskkill": 0, "second_wait_expires": True}, "still running 30 s after the kill")):
+            caught = self._run_failing_cleanup(**kwargs)
+            self.assertIsInstance(caught, AssertionError, f"{label}: {caught!r}")
+            self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught), label)
+            self.assertIn("process tree kill is NOT confirmed", str(caught), label)
+            self.assertIn(expect, str(caught), label)
+            self.assertNotIn("process tree was killed", str(caught), label)
+
+    def test_a_confirmed_kill_still_says_the_tree_was_killed(self) -> None:
+        caught = self._run_failing_cleanup(taskkill=0)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("and its process tree was killed.", str(caught))
 
     def test_a_read_failure_without_a_timeout_still_surfaces_as_the_oserror(self) -> None:
         # The non-timeout path is unchanged: with no verdict to protect, the read error is the failure.

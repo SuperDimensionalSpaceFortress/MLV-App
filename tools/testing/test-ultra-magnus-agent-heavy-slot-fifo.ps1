@@ -491,9 +491,19 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
         $null = $p.Handle   # keeps ExitCode readable after the exit
         $t0 = Get-Date
         $finished = $p.WaitForExit($TimeoutSec * 1000)
-        if (-not $finished) { & taskkill.exe /F /T /PID $p.Id *> $null }
+        $killNote = 'its process tree was killed'
+        if (-not $finished) {
+            # The kill itself is bounded (sol adversary A2): a hung taskkill.exe must not hold the suite-named failure back.
+            try {
+                $k = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/F', '/T', '/PID', [string]$p.Id) -NoNewWindow -PassThru
+                if (-not $k.WaitForExit(60000)) { $k.Kill(); $killNote = 'its process tree kill is NOT confirmed (taskkill.exe still running after 60 s)' }
+                elseif ($k.ExitCode -ne 0) { $killNote = "its process tree kill is NOT confirmed (taskkill.exe exited $($k.ExitCode))" }
+            }
+            catch { $killNote = "its process tree kill is NOT confirmed (taskkill.exe failed: $($_.Exception.Message))" }
+            try { $p.Kill() } catch { }
+        }
         $text = ((Get-Content -LiteralPath $outF -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $errF -ErrorAction SilentlyContinue)) -join ' | '
-        Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound (ran $([int]((Get-Date) - $t0).TotalSeconds) s) and its process tree was killed; output so far: $text"
+        Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound (ran $([int]((Get-Date) - $t0).TotalSeconds) s) and $killNote; output so far: $text"
         return [pscustomobject]@{ ExitCode = $p.ExitCode; Json = ((Get-Content -LiteralPath $outF -ErrorAction SilentlyContinue) -join "`n"); Text = $text }
     }
     finally { Remove-Item -LiteralPath $outF, $errF -Force -ErrorAction SilentlyContinue }
