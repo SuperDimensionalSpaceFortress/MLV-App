@@ -12,7 +12,8 @@
 #   pinwarn    print heavy-slot's own PIN MISMATCH warning, then behave as run
 #   readyorphan  a holder child writes the ready file and ends (after STUB_HEAVY_SLOT_CHILD_S seconds, default 0), while
 #              heavy-slot itself stays up STUB_HEAVY_SLOT_HOLD_S
-#              seconds (its release work after the child), then exits STUB_HEAVY_SLOT_CODE (default 0)
+#              seconds (its release work after the child), then exits STUB_HEAVY_SLOT_CODE (default 0).
+#              STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT=1 publishes the ready file only once that child has ended (see the mode).
 #   locklog    hold this run's log open with read access and no read sharing, print the PIN MISMATCH warning, then run
 #   readypartial  publish the ready file in two writes, like a reader catching it half written: first only the ticket and
 #              holder lines (no owner, no 'end'), then after STUB_HEAVY_SLOT_CHILD_S seconds (default 2) the complete record,
@@ -71,8 +72,14 @@ switch ($mode) {
     'readyorphan' {
         $ready = (Get-StubReadyPath) -replace "'", "''"
         $childS = if ($env:STUB_HEAVY_SLOT_CHILD_S) { [double]$env:STUB_HEAVY_SLOT_CHILD_S } else { 0 }
+        # STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT=1: the child writes a staging file and this stub publishes it as the ready file only
+        # after the child has ended, so the guard's first read of the ready file always finds its holder already gone (the
+        # guard polls every 250 ms, and a holder that is still shutting down when it is read is an admission, not a requeue).
+        $readyPath = $ready -replace "''", "'"
+        if ($env:STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT -eq '1') { $ready = ($readyPath + '.staging') -replace "'", "''" }
         $record.childStart = [DateTime]::UtcNow.ToString('o')
         & $command[0] -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '$ready' -Value @('${ticket}:$PID', ('holder={0}@{1}' -f `$PID, (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks), 'owner=none', 'end') -Encoding ascii; Start-Sleep -Seconds $childS"
+        if ($env:STUB_HEAVY_SLOT_PUBLISH_AFTER_EXIT -eq '1') { Move-Item -LiteralPath ($readyPath + '.staging') -Destination $readyPath -Force }
         $record.childEnd = [DateTime]::UtcNow.ToString('o')
         if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
         $code = $stubCode
