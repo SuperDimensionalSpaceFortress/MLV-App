@@ -8728,8 +8728,10 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
                 "$clock = [pscustomobject]@{}; $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { [TimeSpan]::FromSeconds($script:t) }\n"
                 "function Get-CimInstance { param([Parameter(Position = 0)]$ClassName, $Filter, $OperationTimeoutSec, $ErrorAction)\n"
                 "    $script:t += 0.9; $script:q++; [pscustomobject]@{ ParentProcessId = 100 + $script:q; CreationDate = ([datetime]'2026-01-01').AddSeconds(-$script:q) } }\n"
+                # r13: every link is ordered by kernel sequence number; each parent read here is numbered below its child, so only the deadline stops the walk
+                "$script:s = 1000; function Seq([int]$id, [long]$created) { $script:s--; [long]$script:s }\n"
                 "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
-                "$owned = Owned ([pscustomobject]@{ ParentProcessId = 100; CreationDate = [datetime]'2026-01-01' })\n"
+                "$owned = Owned ([pscustomobject]@{ ProcessId = 99; ParentProcessId = 100; CreationDate = [datetime]'2026-01-01' })\n"
                 "Write-Output ('DEFS=' + $defs.Count); Write-Output ('OWNED=' + $owned); Write-Output ('QUERIES=' + $script:q); Write-Output ('ELAPSED=' + $script:t)")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
