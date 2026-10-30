@@ -8411,7 +8411,7 @@ class HeapDumpGeneratorTests(unittest.TestCase):
         self.assertIsNone(inside, "unclosed heap-dump region")
         self.assertEqual(len(regions), 2)
         self.assertEqual("\n".join(kept), base, "the two regions are the ONLY difference from the job without -HeapCorruptionDump")
-        for fn in ("Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch"):
+        for fn in ("Publish-AttrCudaTextWithFileId", "Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch"):
             self.assertIn(f"function {fn} {{", "\n".join(regions[0]), "the helpers are spliced in the first region, never into the default embed list")
         # the order the job runs them in: every feature probe and PresentMon, then the watcher, the launch, its completion, then any early exit
         launch = '& "$env:ProgramFiles\\PowerShell\\7\\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd'
@@ -8802,7 +8802,7 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
         self.assertIn("[void](New-AttrCudaDirectory -Path $DumpDir)", start)
         # r12 (adversary c525ecbc A1): the identity of that published file is what OpenLog proves the handle against. r13 (adversary 9621fe1e A1): it
         # is read off the handle that created the file, never by looking the name up again
-        self.assertIn("$logPublished = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine -PassThruFileId", start)
+        self.assertIn("$logPublished = Publish-AttrCudaTextWithFileId -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine", start)
         self.assertIn("$logId = $logPublished.FileId", start)
         self.assertNotIn("Get-AttrCudaFileId -Path", start)
         self.assertIn("$watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher", start)
@@ -9024,17 +9024,16 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
                 "$attr = Get-Module AttrCudaArtifacts\n"
                 # the swaps happen inside the module, around each publish call Start makes
                 "& $attr { param($victimDir)\n"
-                "    $script:r13Publish = ${function:Publish-AttrCudaText}; $script:r13Victim = $victimDir\n"
+                "    $script:r13Publish = ${function:Publish-AttrCudaText}; $script:r13PublishId = ${function:Publish-AttrCudaTextWithFileId}; $script:r13Victim = $victimDir\n"
                 "    function script:R13Swap([string]$dir) { Rename-Item -LiteralPath $dir -NewName 'hd.moved'; [void](New-Item -ItemType Junction -Path $dir -Target $script:r13Victim) }\n"
                 "    function script:R13Unswap([string]$dir) { [IO.Directory]::Delete($dir); Rename-Item -LiteralPath ($dir + '.moved') -NewName 'hd' }\n"
-                "    function script:Publish-AttrCudaText { [CmdletBinding()] param([string]$Path, [AllowEmptyString()][AllowNull()][object]$Value, [string]$OwnedJournal = '', [switch]$PassThruFileId)\n"
-                "        $dir = Split-Path -Parent $Path; $leaf = Split-Path -Leaf $Path\n"
-                "        if ($leaf -in @('heap-dump-watcher.ps1', 'heap-dump.json')) { R13Unswap $dir }\n"
-                "        $out = & $script:r13Publish @PSBoundParameters\n"
-                "        if ($leaf -in @('watcher.log', 'heap-dump-watcher.ps1')) {\n"
-                "            Copy-Item -LiteralPath $Path -Destination (Join-Path $script:r13Victim $leaf) -Force\n"
-                "            R13Swap $dir }\n"
-                "        $out } } $victimDir\n"
+                "    function script:R13Before([string]$Path) { if ((Split-Path -Leaf $Path) -in @('heap-dump-watcher.ps1', 'heap-dump.json')) { R13Unswap (Split-Path -Parent $Path) } }\n"
+                "    function script:R13After([string]$Path) { $leaf = Split-Path -Leaf $Path; if ($leaf -in @('watcher.log', 'heap-dump-watcher.ps1')) {\n"
+                "        Copy-Item -LiteralPath $Path -Destination (Join-Path $script:r13Victim $leaf) -Force; R13Swap (Split-Path -Parent $Path) } }\n"
+                "    function script:Publish-AttrCudaText { [CmdletBinding()] param([string]$Path, [AllowEmptyString()][AllowNull()][object]$Value, [string]$OwnedJournal = '')\n"
+                "        R13Before $Path; $out = & $script:r13Publish @PSBoundParameters; R13After $Path; $out }\n"
+                "    function script:Publish-AttrCudaTextWithFileId { [CmdletBinding()] param([string]$Path, [AllowEmptyString()][AllowNull()][object]$Value)\n"
+                "        R13Before $Path; $out = & $script:r13PublishId @PSBoundParameters; R13After $Path; $out } } $victimDir\n"
                 f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
                 "Write-Output ('STARTED=' + ($null -ne $r.watcherPid))\n"
                 "$deadline = (Get-Date).AddSeconds(60); while ($null -ne $r.watcherProcess -and (Get-Date) -lt $deadline -and -not $r.watcherProcess.HasExited) { Start-Sleep -Milliseconds 250 }\n"
@@ -9048,21 +9047,23 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertEqual(out["CAPTURE"], "STOP_FAILED", proc.stdout)
             self.assertTrue(out["REASON"].startswith("WATCHER_LOG_UNPROVEN"), proc.stdout)
 
-    # r13 (adversary 9621fe1e A1): -PassThruFileId returns the identity of the very file the call created (the creating handle), and refuses an occupied
-    # multi-link slot like every publish
-    def test_r13_a1_publish_passthru_file_id_is_the_written_file(self) -> None:
+    # r13 (adversary 9621fe1e A1): Publish-AttrCudaTextWithFileId returns the identity of the very file the call created (the creating handle). It is
+    # spliced only into a heap-dump job: Publish-AttrCudaText, which every job embeds, is unchanged (the default jobs stay byte-identical).
+    def test_r13_a1_publish_with_file_id_is_the_written_file(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heap-pubid-") as d:
             proc = self.run_module(
                 "$attr = Get-Module AttrCudaArtifacts\n"
-                f"$p = & $attr {{ Publish-AttrCudaText -Path '{d}\\a.log' -Value 'REQ' -PassThruFileId }}\n"
+                f"$p = & $attr {{ Publish-AttrCudaTextWithFileId -Path '{d}\\a.log' -Value 'REQ' }}\n"
                 f"$byName = & $attr {{ Get-AttrCudaFileId -Path '{d}\\a.log' }}\n"
                 "Write-Output ('PATH=' + $p.Path); Write-Output ('SAME=' + ($p.FileId.VolumeSerialNumber -eq $byName.VolumeSerialNumber -and $p.FileId.FileIndexHigh -eq $byName.FileIndexHigh -and $p.FileId.FileIndexLow -eq $byName.FileIndexLow))\n"
                 "Write-Output ('LINKS=' + $p.FileId.NumberOfLinks)\n"
-                f"Write-Output ('TEXT=' + ([IO.File]::ReadAllText('{d}\\a.log')).Trim())\n"
-                f"$plain = & $attr {{ Publish-AttrCudaText -Path '{d}\\b.log' -Value 'X' }}; Write-Output ('PLAIN=' + ($plain -is [string]))\n")
+                f"Write-Output ('TEXT=' + ([IO.File]::ReadAllText('{d}\\a.log')).Trim())\n")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
-            self.assertEqual((out["PATH"], out["SAME"], out["LINKS"], out["TEXT"], out["PLAIN"]), (f"{d}\\a.log", "True", "1", "REQ", "True"), proc.stdout)
+            # the slot is the full path (a runner's temp dir may be an 8.3 short name), so the two are compared resolved
+            self.assertEqual(Path(out["PATH"]).resolve(), (Path(d) / "a.log").resolve(), proc.stdout)
+            self.assertEqual((out["SAME"], out["LINKS"], out["TEXT"]), ("True", "1", "REQ"), proc.stdout)
+        self.assertNotIn("PassThruFileId", ATTR_MODULE.read_text(encoding="utf-8"))
 
     # r13 (adversary 9621fe1e A3): Sequence reads the kernel's creation-ordered number of the process on a pid: a child started later has a larger number,
     # the exact creation time binds it (one tick off is 0), and a pid with no process is 0

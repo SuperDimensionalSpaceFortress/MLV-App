@@ -6534,7 +6534,7 @@ $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $cor
 if ($HeapCorruptionDump) {
     $heapOpen = '# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>'
     $heapClose = '# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<'
-    $heapFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Start-AttrCudaHeapDumpWatch', 'Stop-AttrCudaHeapDumpWatch')
+    $heapFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Publish-AttrCudaTextWithFileId', 'Start-AttrCudaHeapDumpWatch', 'Stop-AttrCudaHeapDumpWatch')
     $launchAnchor = "`$smokeRc = `$null`n`$smokeLaunchException = `$null"
     $text = Edit-DualVenueTemplate $text $launchAnchor ($heapOpen + "`n" + $heapFunctions + "`n" + @'
 $heapDumpRecord = Start-AttrCudaHeapDumpWatch -ExePath $exePath -DumpDir (Join-Path $Pub 'heapdump')

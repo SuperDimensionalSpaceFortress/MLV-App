@@ -1540,35 +1540,53 @@ function Publish-AttrCudaText {
     identity is journalled from the creating handle before the text is written, so the job can later
     delete it by proof (Remove-AttrCudaPartialFile -OwnedJournal). Without it nothing is recorded and
     a later delete helper will leave the name.
-    -PassThruFileId (CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r13, adversary 9621fe1e A1): the file is created with
-    CreateNew and its identity is read off that creating handle, then { Path; FileId } is returned instead of
-    the path. The identity is the file this call wrote, never a later lookup of the name (an ancestor swapped
-    for a junction after the write would point that lookup at another file).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][object]$Value,
-        [string]$OwnedJournal = '',
-        [switch]$PassThruFileId
+        [string]$OwnedJournal = ''
     )
 
     $slot = Assert-AttrCudaWritableFileSlot -Path $Path
     $text = if ($null -eq $Value) { '' } else { (@($Value) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine }
-    if ($OwnedJournal -ne '' -or $PassThruFileId) {
+    if ($OwnedJournal -ne '') {
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + [Environment]::NewLine)
-        $stream = if ($OwnedJournal -ne '') { New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal }
-            else { [IO.FileStream]::new($slot, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read, 65536) }
-        $fileId = $null
-        try {
-            if ($PassThruFileId) { $fileId = Get-AttrCudaFileId -Stream $stream }
-            $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true)
-        } finally { $stream.Dispose() }
-        if ($PassThruFileId) { return [pscustomobject]@{ Path = $slot; FileId = $fileId } }
+        $stream = New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
         return $slot
     }
     [IO.File]::WriteAllText($slot, $text + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     return $slot
+}
+
+function Publish-AttrCudaTextWithFileId {
+    <#
+    .SYNOPSIS
+    Publish-AttrCudaText for a file whose identity the caller hands on: the file is created CreateNew in the
+    slot Assert-AttrCudaWritableFileSlot proves, and { Path; FileId } is returned, FileId read off that
+    creating handle.
+    .DESCRIPTION
+    CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r13 (adversary 9621fe1e A1): the identity is the file this call wrote,
+    never a later lookup of the name (an ancestor swapped for a junction after the write would point that
+    lookup at another file). Spliced only into a heap-dump job, beside Start-AttrCudaHeapDumpWatch, so every
+    other emitted job stays byte-identical.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][object]$Value
+    )
+
+    $slot = Assert-AttrCudaWritableFileSlot -Path $Path
+    $text = if ($null -eq $Value) { '' } else { (@($Value) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + [Environment]::NewLine)
+    $stream = [IO.FileStream]::new($slot, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read, 65536)
+    try {
+        $fileId = Get-AttrCudaFileId -Stream $stream
+        $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true)
+    } finally { $stream.Dispose() }
+    return [pscustomobject]@{ Path = $slot; FileId = $fileId }
 }
 
 function Read-AttrCudaBase64Payload {
@@ -3039,7 +3057,7 @@ function Start-AttrCudaHeapDumpWatch {
         # r12 (adversary c525ecbc A1, b20cc814 A3): the identity of the file just published; the watcher writes only through a handle that is this file.
         # r13 (adversary 9621fe1e A1): read off the handle that created it, never by its name again (an ancestor swapped for a junction after the write
         # would make a lookup by name pin the outside file).
-        $logPublished = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine -PassThruFileId
+        $logPublished = Publish-AttrCudaTextWithFileId -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine
         $logId = $logPublished.FileId
         if ($null -eq $logId -or $logId.IsReparsePoint -or $logId.IsDirectory -or $logId.NumberOfLinks -ne 1) { throw 'ATTRCUDA_HEAPDUMP_LOG_UNPROVEN the published watcher log is not one plain file' }
         # r12 (adversary b20cc814 A6): the owner's own creation time, read now while it is running; a later process on its pid is never the owner,
@@ -7883,6 +7901,7 @@ Export-ModuleMember -Function `
     ConvertTo-AttrCudaUtf8String, `
     Publish-AttrCudaBytes, `
     Publish-AttrCudaText, `
+    Publish-AttrCudaTextWithFileId, `
     Publish-AttrCudaFileCopy, `
     Publish-AttrCudaBoundedTextCopy, `
     Publish-AttrCudaPresentMonCaptureEvidence, `
