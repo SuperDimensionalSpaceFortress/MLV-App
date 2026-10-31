@@ -750,12 +750,53 @@ def test_a_slow_image_copy_spends_the_lane_timeout_budget_and_leaves_no_partial_
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
     cmd[cmd.index("-TimeoutSec")+1]="4"
     r=run_lane(cmd+["-ImagePaths",str(png)],env)
-    # A launch-phase throw lands as a failed receipt (the same way codex-tier-resolution-failed does), not as stderr.
-    assert r.returncode!=0,(r.stdout,r.stderr)
+    # pass-2b A3: an exhausted budget is a TIMEOUT (timedOut=true, exit 124), the same booking launch-budget-exhausted gets,
+    # not a generic launch failure (exit 127).
+    assert r.returncode==124,(r.stdout,r.stderr)
     q=json.loads(receipt.read_text(encoding="utf-8"))
-    assert q["state"]=="failed" and "image-copy-timeout" in receipt.read_text(encoding="utf-8"),(r.stdout,r.stderr)
+    assert q["timedOut"] is True,(r.stdout,r.stderr)
     assert not (root/"args.json").exists()
     assert not list(receipt.parent.glob("terra-001.image-*")), list(receipt.parent.iterdir())
+
+
+def test_an_image_that_is_already_the_snapshot_path_is_never_deleted_by_the_failed_copy_cleanup(fixture_tree):
+    # pass-2b A1: a caller file named like the generated snapshot (terra-001.image-01.png inside the run dir) used to be
+    # opened as the source, collide on CreateNew, and then be deleted by the cleanup of the "partial" destination.
+    root=fixture_tree["root"]
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    receipt.parent.mkdir(parents=True,exist_ok=True)
+    victim=receipt.parent/"terra-001.image-01.png"; sha=_write_png(victim,b"callers own file")
+    r=run_lane(cmd+["-ImagePaths",str(victim)],env)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert victim.exists() and hashlib.sha256(victim.read_bytes()).hexdigest()==sha, "the caller's image was deleted"
+
+
+def test_a_source_read_that_never_returns_is_cut_at_the_deadline(tmp_path):
+    # pass-2b A2: Copy-ImageSnapshot is exercised alone against a named pipe that accepts the reader and never writes a byte,
+    # the stand-in for a share whose read stalls. A synchronous Read would hang here; the cancellable read ends at the budget.
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Copy-ImageSnapshot"); b=text.index("# END Copy-ImageSnapshot")
+    harness=tmp_path/"stall.ps1"; dest=tmp_path/"snap.png"
+    harness.write_text(text[a:b]+f'''
+$ErrorActionPreference = 'Stop'
+$name = 'mlv-stall-' + $PID
+$srv = [System.IO.Pipes.NamedPipeServerStream]::new($name, [System.IO.Pipes.PipeDirection]::Out, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
+$null = $srv.WaitForConnectionAsync()
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source "\\\\.\\pipe\\$name" -Dest '{dest}' -Clock $clock -LimitMs 1500; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+'ELAPSED ' + [int]$clock.ElapsedMilliseconds
+'DEST ' + [System.IO.File]::Exists('{dest}')
+$srv.Dispose()
+''',encoding="utf-8")
+    r=subprocess.run(["pwsh","-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=60)
+    out=r.stdout
+    assert "CAUGHT TimeoutException image-copy-timeout" in out,(out,r.stderr)
+    elapsed=int(re.search(r"ELAPSED (\d+)",out).group(1))
+    assert 1400<=elapsed<8000,(elapsed,out)
+    assert "DEST False" in out,out
 
 
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):

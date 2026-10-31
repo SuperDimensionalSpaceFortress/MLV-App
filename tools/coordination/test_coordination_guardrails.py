@@ -1564,6 +1564,10 @@ def test_image_paths_is_keyed_on_engine_and_attached_with_the_codex_image_flag()
     # lane deadline, and no -Force-less Get-Item/Get-FileHash metadata read of the (possibly Hidden) snapshot remains.
     assert "image-path-empty" in body and "Where-Object { -not [string]::IsNullOrWhiteSpace($_) })" not in body.split("$ImagePathsGiven =")[1].split("\n")[0]
     assert "image-copy-timeout" in body and "$Clock.Elapsed.TotalMilliseconds -ge $LimitMs" in body
+    # pass-2b A1-A3: only a file this call created is deleted, reads are cancellable at the deadline, and the deadline is a TimeoutException.
+    assert "-not $ok -and $created -and [System.IO.File]::Exists($Dest)" in body and "image-snapshot-collision" in body
+    assert "$in.ReadAsync($buf, 0, $buf.Length, $cts.Token)" in body and "[System.IO.FileOptions]::Asynchronous" in body
+    assert 'throw [System.TimeoutException]::new("image-copy-timeout' in body
     assert "(Get-Item -LiteralPath $snapshot)" not in body and "Get-FileHash -LiteralPath $snapshot" not in body
     assert "foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }" in body
     i_images = body.index("$argv = @('exec') + $imageArgs + @(")

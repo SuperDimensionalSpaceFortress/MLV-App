@@ -1013,19 +1013,36 @@ if ($ImagePathsGiven.Count -gt 0) {
 # BEGIN Copy-ImageSnapshot (VISUAL-JUDGE-TERRA-LANE-1 r2, adversary A2 + A3)
 # Copies Source to Dest in 256 KiB chunks, hashing the very bytes it writes (one read, so sha256/bytes cannot drift from the copy), and
 # checks Clock against LimitMs between chunks so a slow share spends the lane's -TimeoutSec budget instead of an unbounded wall (A3).
-# Plain .NET streams only: Get-Item without -Force throws on a Hidden snapshot (A2). A failed copy deletes its partial file.
-# A single read that never returns is not interruptible from here; a share that trickles is cut at the next chunk.
+# Plain .NET streams only: Get-Item without -Force throws on a Hidden snapshot (A2). A failed copy deletes ONLY the partial file this
+# call created (pass-2b A1: a Dest that already existed, e.g. the caller's own file, is never touched). The source is read through an
+# overlapped FileStream and every read carries a CancellationToken that fires at the deadline, so a read that never returns is cut at
+# the lane budget instead of holding the lane (pass-2b A2). The deadline is raised as a TimeoutException, the type the lane books as
+# timedOut=true / exit 124 (launch-budget-exhausted uses the same one; pass-2b A3).
 function Copy-ImageSnapshot {
     param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
+    if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "image-snapshot-collision: the image snapshot path is the source file itself: $Source"
+    }
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    $in = $null; $out = $null; $total = [long]0; $ok = $false
+    $in = $null; $out = $null; $total = [long]0; $ok = $false; $created = $false
     try {
-        $in  = [System.IO.File]::Open($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $in  = [System.IO.FileStream]::new($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
         $out = [System.IO.File]::Open($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $created = $true
         $buf = New-Object byte[] 262144
         while ($true) {
-            if ($Clock.Elapsed.TotalMilliseconds -ge $LimitMs) { throw "image-copy-timeout: copying the image snapshot spent the lane's -TimeoutSec budget: $Source" }
-            $n = $in.Read($buf, 0, $buf.Length)
+            $remainingMs = $LimitMs - $Clock.Elapsed.TotalMilliseconds
+            if ($remainingMs -le 0) { throw [System.TimeoutException]::new("image-copy-timeout: copying the image snapshot spent the lane's -TimeoutSec budget: $Source") }
+            $cts = [System.Threading.CancellationTokenSource]::new()
+            try {
+                $cts.CancelAfter([int][math]::Min(2147483647.0, [math]::Ceiling($remainingMs)))
+                $n = $in.ReadAsync($buf, 0, $buf.Length, $cts.Token).GetAwaiter().GetResult()
+            } catch {
+                if ($cts.IsCancellationRequested -or $Clock.Elapsed.TotalMilliseconds -ge $LimitMs -or $_.Exception.GetBaseException() -is [System.OperationCanceledException]) {
+                    throw [System.TimeoutException]::new("image-copy-timeout: a read of the image snapshot source did not return inside the lane's -TimeoutSec budget: $Source")
+                }
+                throw
+            } finally { $cts.Dispose() }
             if ($n -le 0) { break }
             $out.Write($buf, 0, $n)
             [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
@@ -1038,7 +1055,7 @@ function Copy-ImageSnapshot {
     } finally {
         if ($null -ne $out) { $out.Dispose() }
         if ($null -ne $in) { $in.Dispose() }
-        if (-not $ok -and [System.IO.File]::Exists($Dest)) { try { [System.IO.File]::Delete($Dest) } catch { } }
+        if (-not $ok -and $created -and [System.IO.File]::Exists($Dest)) { try { [System.IO.File]::Delete($Dest) } catch { } }
     }
     return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant()); bytes = $total }
 }
