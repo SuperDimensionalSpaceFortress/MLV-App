@@ -6713,16 +6713,6 @@ void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error)
     g_mlv_debayered16_reduced_bit_shift_error_for_testing = error;
 }
 
-/* CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1: test-only switch back to the bilinear
- * debayerBasicU16 on the reduced entry (the fringe test's mutation). Production
- * leaves it 0. */
-static int g_mlv_debayered16_reduced_bilinear_for_testing = 0;
-
-void mlvSetDebayered16ReducedBilinearForTesting(int on)
-{
-    g_mlv_debayered16_reduced_bilinear_for_testing = on ? 1 : 0;
-}
-
 /* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: one saved copy per thread of every
  * decode record the reconned debayers clear (MLV_LAST_RAW_STAGE_TELEMETRY) and of
  * llrawproc's last-run records (llrpSaveLastRunTimingForCurrentThread). */
@@ -6784,16 +6774,10 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
 
     const int bit_shift = (reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel))
                         + g_mlv_debayered16_reduced_bit_shift_error_for_testing;
-    /* The demosaic applies a nonzero bit shift to its input in place; the
-     * caller's reduced Bayer is not read again after this frame. Bilinear at the
-     * reduced size fringes every vertical edge (CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1),
-     * so the reduced Bayer is demosaiced by colour difference instead. */
-    if (g_mlv_debayered16_reduced_bilinear_for_testing)
-        debayerBasicU16(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
-                        getMlvCpuCores(video), bit_shift);
-    else
-        debayerReducedColourDiffU16(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth,
-                                    reducedHeight, getMlvCpuCores(video), bit_shift);
+    /* debayerBasicU16 applies a nonzero bit shift to its input in place; the
+     * caller's reduced Bayer is not read again after this frame. */
+    debayerBasicU16(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
+                    getMlvCpuCores(video), bit_shift);
     /* Rows the kernel's block crop dropped repeat the last reconstructed row,
      * as getMlvProcessedFrame8ScaledFromReducedReconnedRaw16 does. */
     const size_t row_words = (size_t)out_w * 3u;

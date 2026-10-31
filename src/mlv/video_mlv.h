@@ -259,9 +259,6 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     int * outHeight);
 /* Test-only: an error added to the reduced entry's bit shift (0 in production). */
 void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error);
-/* CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1: 1 restores the bilinear debayerBasicU16
- * on the reduced entry (test-only; production leaves it 0). */
-void mlvSetDebayered16ReducedBilinearForTesting(int on);
 /* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the reconned debayers clear the calling
  * thread's last decode and llrawproc records (getMlvLastRawUint16*, llrpGetLast*).
  * A thread that decoded and reconstructed the frame itself saves them before the
