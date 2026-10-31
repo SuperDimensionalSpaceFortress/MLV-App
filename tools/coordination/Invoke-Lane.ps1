@@ -48,7 +48,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')]
+    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')]
     [string]$Lane,
 
     [string]$Prompt,
@@ -149,6 +149,11 @@ param(
     # launch. This lane then writes a 'linked' row naming its receipt instead of a second
     # 'reserved' row, so the product-ratio guard counts the launch once.
     [string]$DispatchReservationId = '',
+    # VISUAL-JUDGE-TERRA-LANE-1: image files attached to the initial prompt (`codex exec -i <FILE>`, from
+    # `codex exec --help` on the pinned codex 0.160.1). CODEX ENGINE ONLY: a claude lane given any path
+    # fails closed with the typed error image-paths-codex-only before a run dir or receipt exists.
+    # Each path must exist and be a .png or .jpg; the receipt's `imagePaths` lists path, sha256 and bytes.
+    [string[]]$ImagePaths = @(),
     [switch]$KeepScratch
 )
 
@@ -221,6 +226,10 @@ $LANES = @{
     # guardrail test pins it). It is a machine-readable label, NOT current routing authority; the
     # posture is the comment block above (optional diversity seat; design/arbiter duties -> sol).
     astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }
+    # VISUAL-JUDGE-TERRA-LANE-1 (owner directive 2026-10-31): terra is the visual-judge seat -- it reads image
+    # strips (-ImagePaths) and answers a JSON verdict. Read-only like every codex row (codex-lane-never-edits),
+    # high effort, tier resolved at launch to the highest listed gpt-<ver>-terra slug.
+    terra  = @{ engine = 'codex';  tier = 'terra';   effort = 'high'; role = 'visual-judge' }
 }
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
@@ -961,6 +970,35 @@ try {
 if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
     throw "codex-lane-never-edits: -Lane $Lane with -AllowEdits (no Claude hook is visible to codex exec)"
 }
+# (a2) VISUAL-JUDGE-TERRA-LANE-1: -ImagePaths is a codex-engine feature (`codex exec -i <FILE>`); the claude
+# argv has no image flag, so a claude lane given one would silently judge nothing. Fail closed, typed, before any
+# run dir or receipt exists. Every path must exist as a file and be a .png or .jpg; sha256 + size are taken HERE,
+# once, so the receipt names the exact bytes the lane was handed. Keyed on ENGINE, not lane name.
+$ImageAttachments = @()
+# `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
+# -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
+# single -ImagePaths value (`-ImagePaths 'a.png|b.png'`); a real array from `&`/dot-calls works unchanged.
+$ImagePathsGiven = @($ImagePaths | ForEach-Object { [string]$_ -split '\|' } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($ImagePathsGiven.Count -gt 0) {
+    if ($LANES[$Lane].engine -ne 'codex') {
+        throw "image-paths-codex-only: -Lane $Lane is a $($LANES[$Lane].engine)-engine lane; -ImagePaths is accepted only by codex-engine lanes"
+    }
+    foreach ($imagePath in $ImagePathsGiven) {
+        if (-not (Test-Path -LiteralPath $imagePath -PathType Leaf)) {
+            throw "image-path-missing: -ImagePaths entry is not an existing file: $imagePath"
+        }
+        $imageFull = (Resolve-Path -LiteralPath $imagePath).Path
+        $imageExt = [System.IO.Path]::GetExtension($imageFull).ToLowerInvariant()
+        if ($imageExt -ne '.png' -and $imageExt -ne '.jpg') {
+            throw "image-path-bad-extension: -ImagePaths accepts only .png or .jpg (got '$imageExt'): $imageFull"
+        }
+        $ImageAttachments += [ordered]@{
+            path   = $imageFull
+            sha256 = (Get-FileHash -LiteralPath $imageFull -Algorithm SHA256).Hash.ToLowerInvariant()
+            bytes  = (Get-Item -LiteralPath $imageFull).Length
+        }
+    }
+}
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -1611,7 +1649,12 @@ if ($cfg.engine -eq 'claude') {
         $mcpDisable = Get-CodexMcpDisableArgs -CodexExe $exe -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
         $mcpServers = 'disabled'; $mcpDisabledServers = @($mcpDisable.Servers); $mcpArgs = @($mcpDisable.Args)
     }
-    $argv = @('exec',
+    # VISUAL-JUDGE-TERRA-LANE-1: `-i, --image <FILE>...` is VARIADIC on codex 0.160.1 (codex-image-flag.txt), so
+    # each `-i <path>` pair sits BEFORE `-m` (a flag token always ends the list) and is never the last option
+    # before the '-' stdin marker, which a trailing variadic could otherwise swallow as one more "file".
+    $imageArgs = @()
+    foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }
+    $argv = @('exec') + $imageArgs + @(
               '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
               '-s', $sandbox) + $windowsSandboxArgs + $mcpArgs + @(
@@ -2505,6 +2548,9 @@ $receipt = [ordered]@{
 }
 # Present only on a typed no-child launch, so every other receipt keeps its exact shape.
 if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
+# VISUAL-JUDGE-TERRA-LANE-1: present only when -ImagePaths was given, so every other receipt keeps its exact shape.
+# Each entry is {path, sha256, bytes} of the image handed to `codex exec -i`, hashed before launch.
+if ($ImageAttachments.Count -gt 0) { $receipt['imagePaths'] = @($ImageAttachments) }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {

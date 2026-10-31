@@ -10,7 +10,7 @@ receipts and answers two questions per lane, inside a recency window (--since-ho
                  for that model FAMILY -- "twice in a row", so one run that was already in flight
                  when a new model shipped does not raise it. Families compare by family, never by
                  lane: 'claude-opus' / 'claude-sonnet' / 'claude-fable' for the claude CLI, the
-                 tier ('sol', 'luna', 'astra') for a codex slug 'gpt-<version>-<tier>'. Versions
+                 tier ('sol', 'luna', 'astra', 'terra') for a codex slug 'gpt-<version>-<tier>'. Versions
                  compare numerically ('6.1' beats '6'; 'claude-opus-5-5' beats 'claude-opus-5').
   * BAD-EFFORT   any receipt in the window whose recorded effort is anything but 'high'. A receipt
                  that recorded no effort (an old schema) is listed under `unrecordedEffort`, never

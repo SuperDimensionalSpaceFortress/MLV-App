@@ -60,6 +60,13 @@ class ParseModelIdTests(unittest.TestCase):
         self.assertLess(check.parse_model_id("gpt-6-sol")[1], check.parse_model_id("gpt-6.1-sol")[1])
         self.assertLess(check.parse_model_id("gpt-5.6-sol")[1], check.parse_model_id("gpt-6-sol")[1])
 
+    def test_terra_is_its_own_codex_family(self):
+        # VISUAL-JUDGE-TERRA-LANE-1: the visual-judge tier. 'gpt-6.1-terra' belongs to family 'terra'
+        # (never 'sol'), and versions compare numerically inside it like every other codex tier.
+        self.assertEqual(check.parse_model_id("gpt-6.1-terra"), ("terra", (6, 1)))
+        self.assertLess(check.parse_model_id("gpt-5.6-terra")[1], check.parse_model_id("gpt-6.1-terra")[1])
+        self.assertNotEqual(check.parse_model_id("gpt-6.1-terra")[0], check.parse_model_id("gpt-6.1-sol")[0])
+
     def test_unknown_null_and_garbage_are_not_models(self):
         for value in ("unknown", None, "", 7, "opus", "gpt-sol", "claude-opus"):
             self.assertIsNone(check.parse_model_id(value), value)
@@ -85,6 +92,18 @@ class StaleModelTests(CurrencyFixture):
         self.assertEqual(entry["reasons"][0]["newest"], "gpt-6.1-sol")
         self.assertEqual(entry["reasons"][0]["ranModels"], ["gpt-6-sol", "gpt-6-sol"])
         self.assertEqual(result["verdict"], "STALE")
+
+    def test_a_terra_lane_is_judged_against_the_terra_family_only(self):
+        # A newer SOL id must never make the terra lane stale, and two runs on an older terra id while a
+        # newer terra id exists must (twice in a row, same rule as every other family).
+        self.receipt("terra", "gpt-5.6-terra", 30)
+        self.receipt("terra", "gpt-5.6-terra", 20)
+        self.receipt("sol", "gpt-7-sol", 10)
+        self.assertEqual(self.evaluate()["lanes"]["terra"]["verdict"], "CURRENT")
+        self.receipt("peer", "gpt-6.1-terra", 5)
+        entry = self.evaluate()["lanes"]["terra"]
+        self.assertEqual(entry["verdict"], "STALE")
+        self.assertEqual(entry["reasons"][0]["newest"], "gpt-6.1-terra")
 
     def test_one_stale_run_between_current_runs_is_not_stale(self):
         self.receipt("opus", "claude-opus-5-5", 30)

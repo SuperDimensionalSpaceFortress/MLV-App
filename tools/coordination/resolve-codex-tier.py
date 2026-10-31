@@ -1,4 +1,4 @@
-"""Resolve a Codex model TIER (e.g. 'sol') to the current highest-version slug.
+"""Resolve a Codex model TIER (e.g. 'sol'; also 'luna', 'astra' and the visual-judge 'terra') to the current highest-version slug.
 
 LANE-MODEL-CURRENCY-1: the fleet lane table names a TIER, never a pinned model id, for
 every codex-engine lane -- Codex has no floating alias the way the claude CLI's

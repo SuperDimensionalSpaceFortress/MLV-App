@@ -45,10 +45,39 @@ class ResolveCodexTierUnitTests(unittest.TestCase):
 
     def test_rejects_a_near_name_tier(self):
         cache = Path(self._tmp()) / "models_cache.json"
-        _write_cache(cache, ["gpt-6-solar", "gpt-5.6-terra"])
+        # VISUAL-JUDGE-TERRA-LANE-1: 'gpt-5.6-terra' used to sit here as an arbitrary non-sol slug. terra
+        # is now a lane tier of its own, so the same cache must (a) still refuse 'sol' for both near names
+        # and (b) resolve 'terra' to exactly that slug -- a near name like 'terrace' still must not match it.
+        _write_cache(cache, ["gpt-6-solar", "gpt-5.6-terra", "gpt-7-terrace"])
         resolved, error = resolve_codex_tier.resolve("sol", str(cache))
         self.assertIsNone(resolved)
         self.assertEqual(error, "no-tier-match:sol")
+        resolved, error = resolve_codex_tier.resolve("terra", str(cache))
+        self.assertIsNone(error)
+        self.assertEqual(resolved, "gpt-5.6-terra")
+
+    def test_picks_the_highest_numeric_version_among_terra_matches(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        _write_cache(cache, ["gpt-5.6-terra", "gpt-6.1-terra", "gpt-6-terra", "gpt-7-sol"])
+        resolved, error = resolve_codex_tier.resolve("terra", str(cache))
+        self.assertIsNone(error)
+        self.assertEqual(resolved, "gpt-6.1-terra")
+
+    def test_terra_fails_closed_when_no_terra_model_is_listed(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        _write_cache(cache, ["gpt-6.1-sol", "gpt-6-luna"])
+        resolved, error = resolve_codex_tier.resolve("terra", str(cache))
+        self.assertIsNone(resolved)
+        self.assertEqual(error, "no-tier-match:terra")
+
+    def test_a_hidden_or_low_effort_only_terra_is_not_a_candidate(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        _write_cache(cache, None, entries=[_entry("gpt-7-terra", visibility="hide"),
+                                           _entry("gpt-6.2-terra", levels=("low", "medium")),
+                                           _entry("gpt-6.1-terra")])
+        resolved, error = resolve_codex_tier.resolve("terra", str(cache))
+        self.assertIsNone(error)
+        self.assertEqual(resolved, "gpt-6.1-terra")
 
     def test_fails_closed_on_missing_cache(self):
         missing = Path(self._tmp()) / "does-not-exist.json"
@@ -230,12 +259,13 @@ class ResolveCodexTierUnitTests(unittest.TestCase):
         cache = Path(self._tmp()) / "models_cache.json"
         full = ("low", "medium", "high", "xhigh", "max", "ultra")
         entries = [_entry("gpt-6.1-sol", levels=full), _entry("gpt-6-astra", levels=full),
+                   _entry("gpt-6.1-terra", levels=full), _entry("gpt-5.6-terra", levels=full),
                    _entry("gpt-6-sol", levels=full), _entry("gpt-6-luna"), _entry("gpt-reserve", "hide"),
                    _entry("gpt-5.6-sol", levels=full), _entry("gpt-5.6-luna"), _entry("gpt-5.5", "hide")]
         _write_cache(cache, None, entries=entries)
-        got = {t: resolve_codex_tier.resolve(t, str(cache)) for t in ("sol", "astra", "luna")}
+        got = {t: resolve_codex_tier.resolve(t, str(cache)) for t in ("sol", "astra", "luna", "terra")}
         self.assertEqual(got, {"sol": ("gpt-6.1-sol", None), "astra": ("gpt-6-astra", None),
-                               "luna": ("gpt-6-luna", None)})
+                               "luna": ("gpt-6-luna", None), "terra": ("gpt-6.1-terra", None)})
 
     def _tmp(self):
         import tempfile

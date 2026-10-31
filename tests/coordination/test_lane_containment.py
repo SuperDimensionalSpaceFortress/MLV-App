@@ -638,6 +638,72 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
     assert q["codexModelsClientVersion"]==CODEX_MODELS_CACHE_CLIENT_VERSION
 
 
+def _write_png(path, payload):
+    # Not a decodable picture: the fixture shim never opens it. Distinct payloads give distinct sha256 values.
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + payload)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_terra_lane_resolves_its_tier_and_attaches_each_image_with_i_before_the_model_flag(fixture_tree):
+    # VISUAL-JUDGE-TERRA-LANE-1: terra is a codex-engine tier row. The tier resolves to the highest listed
+    # gpt-<ver>-terra slug (a sol slug with a higher version must not win), every -ImagePaths entry reaches
+    # `codex exec` as its own `-i <path>` pair BEFORE `-m` (the flag is variadic: a flag token ends the list),
+    # the prompt still arrives on stdin ('-' last), and the receipt hashes the exact bytes handed over.
+    root=fixture_tree["root"]
+    cache=root/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-5.6-terra","gpt-6.1-terra","gpt-6-terra","gpt-7-sol")),encoding="utf-8")
+    first=root/"strip one.png"; second=root/"strip-two.jpg"
+    sha_first=_write_png(first,b"one"); second.write_bytes(b"\xff\xd8\xff-two"); sha_second=hashlib.sha256(second.read_bytes()).hexdigest()
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    # `pwsh -File` hands -ImagePaths ONE string; '|' (illegal in a Windows file name) separates the paths.
+    r=run_lane(cmd+["-ImagePaths",str(first)+"|"+str(second)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-m")+1]=="gpt-6.1-terra"
+    image_flags=[i for i,a in enumerate(argv) if a=="-i"]
+    assert [argv[i+1] for i in image_flags]==[str(first),str(second)]
+    assert max(image_flags)+1<argv.index("-m"), argv
+    assert argv[-1]=="-" and argv[0]=="exec", argv
+    assert argv[argv.index("-s")+1]=="read-only", argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert (q["lane"],q["engine"],q["role"],q["requestedModel"],q["effort"])==("terra","codex","visual-judge","terra","low")
+    assert q["resolvedModel"]=="gpt-6.1-terra"
+    assert [(e["path"],e["sha256"],e["bytes"]) for e in q["imagePaths"]]==[
+        (str(first),sha_first,first.stat().st_size),(str(second),sha_second,second.stat().st_size)]
+
+
+def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
+    cache=fixture_tree["root"]/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert "-i" not in argv and "--image" not in argv
+    assert "imagePaths" not in json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_a_claude_lane_with_image_paths_fails_closed_before_any_receipt(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"x")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode!=0 and "image-paths-codex-only" in r.stderr, (r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"child.json").exists()
+
+
+def test_image_paths_must_exist_and_be_png_or_jpg(fixture_tree):
+    root=fixture_tree["root"]
+    gif=root/"strip.gif"; gif.write_bytes(b"GIF89a")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")   # every refusal precedes the receipt slot, so one fixture serves all cases
+    for bad,token in ((str(root/"absent.png"),"image-path-missing"),(str(gif),"image-path-bad-extension"),(str(root),"image-path-missing")):
+        r=run_lane(cmd+["-ImagePaths",bad],env)
+        assert r.returncode!=0 and token in r.stderr, (bad,r.stdout,r.stderr)
+        assert not receipt.exists() and not (root/"child.json").exists(), bad
+        assert not (root/"args.json").exists(), "a refused image path must never reach the codex launch"
+
+
 def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="luna")
     cmd=cmd+["-ModelOverride","gpt-9-luna-pinned-for-test"]

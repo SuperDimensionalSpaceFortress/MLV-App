@@ -1500,7 +1500,7 @@ def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
     # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }" in body
-    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')" in body
+    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')" in body
 
 
 def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
@@ -1511,7 +1511,7 @@ def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
     lane_lines = [ln for ln in lanes_block.splitlines() if "engine = " in ln]
-    assert len(lane_lines) == 6, "expected six lane rows (opus, sonnet, fable, sol, luna, astra)"
+    assert len(lane_lines) == 7, "expected seven lane rows (opus, sonnet, fable, sol, luna, astra, terra)"
     for line in lane_lines:
         assert not re.search(r"model = 'claude-[a-z0-9.-]+'", line), (
             "a claude-engine row pins a versioned model id instead of a floating alias: %s" % line
@@ -1524,6 +1524,56 @@ def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
             assert "model = '" in line and "tier = " not in line
         else:
             assert "tier = '" in line and "model = " not in line
+
+
+def test_terra_lane_row_is_a_read_only_high_effort_codex_visual_judge():
+    # VISUAL-JUDGE-TERRA-LANE-1: terra names a TIER (resolved at launch to the highest listed
+    # gpt-<ver>-terra slug, today gpt-6.1-terra), never a pinned slug; high effort; and, being a
+    # codex-engine row, read-only by construction (codex-lane-never-edits).
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "terra  = @{ engine = 'codex';  tier = 'terra';   effort = 'high'; role = 'visual-judge' }" in body
+
+
+def test_invoke_lane_terra_edit_is_refused_before_any_rundir_is_created(tmp_path):
+    cmd = (
+        "try { & '%s' -Lane terra -Prompt 'x' -WorkDir '%s' -AllowEdits -AllowedTools 'Read' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    assert "codex-lane-never-edits" in (result.stdout + result.stderr), result.stdout + result.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+
+
+def test_image_paths_is_keyed_on_engine_and_attached_with_the_codex_image_flag():
+    # VISUAL-JUDGE-TERRA-LANE-1: `codex exec -i, --image <FILE>...` (pinned codex 0.160.1 help). The
+    # guard reads the engine from the lane table (never a lane name), and the codex argv puts the
+    # variadic -i pairs ahead of -m so a flag token ends the list before the '-' stdin marker.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "[string[]]$ImagePaths = @()," in body
+    assert "if ($LANES[$Lane].engine -ne 'codex') {" in body
+    assert "image-paths-codex-only" in body and "image-path-missing" in body and "image-path-bad-extension" in body
+    assert "$imageExt -ne '.png' -and $imageExt -ne '.jpg'" in body
+    assert "foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }" in body
+    i_images = body.index("$argv = @('exec') + $imageArgs + @(")
+    i_model = body.index("'-m', $codexLaunchModel,")
+    assert i_images < i_model
+    assert "$receipt['imagePaths'] = @($ImageAttachments)" in body
+    argv_block = body[i_images:body.index("# ---------------------------------------------------------------- run, bounded")]
+    assert "terra" not in argv_block and "$Lane -eq" not in argv_block, (
+        "the codex argv build must stay lane-name-agnostic"
+    )
+
+
+def test_invoke_lane_claude_lane_with_image_paths_is_refused_with_a_typed_error(tmp_path):
+    png = tmp_path / "strip.png"
+    png.write_bytes(b"\x89PNG")
+    cmd = (
+        "try { & '%s' -Lane sonnet -Prompt 'x' -WorkDir '%s' -ImagePaths '%s' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix(), png.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    assert "image-paths-codex-only" in (result.stdout + result.stderr), result.stdout + result.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
 
 
 def test_astra_reuses_the_engine_generic_codex_argv_branch_verbatim():
@@ -1640,6 +1690,9 @@ def test_astra_is_absent_from_the_timer_reachable_lane_lists():
     assert "ValidateSet('', 'opus', 'sonnet', 'fable', 'sol', 'luna')" in loop_body
     assert "astra" not in workstream_body
     assert "astra" not in loop_body
+    # VISUAL-JUDGE-TERRA-LANE-1: terra is likewise reachable only by an explicit Invoke-Lane call.
+    assert "terra" not in workstream_body
+    assert "terra" not in loop_body
 
 
 # =============================================================================================
