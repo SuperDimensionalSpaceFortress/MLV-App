@@ -925,13 +925,13 @@ TEST(GpuPresentTailWindow, ProfilePlayHoldSleepsAreRunnerSleepsNotGuiBusy)
     w.blocked( 0 );
     w.awake( 100 * kMs );
     for( int i = 0; i < 15; ++i ) w.runnerSlept( 10 * kMs );
-    GpuPresentTailTiming t;
-    w.close( 250 * kMs, true, t );
-    ASSERT_EQ( 1, t.gui_idle_waits );
-    ASSERT_EQ( 15, t.runner_sleeps );
-    const playback_slip::PresentSetupSample s = sampleFromTail( 60.0, t );
-    ASSERT_NEAR( 0.0, playback_slip::presentSetupGuiBusyMs( s ), 1e-9 );
-    ASSERT_FALSE( playback_slip::presentSetupBucket( s ) == playback_slip::SetupBucket::GuiBusy );
+    GpuPresentTailTiming hold;
+    w.close( 250 * kMs, true, hold );
+    ASSERT_EQ( 1, hold.gui_idle_waits );
+    ASSERT_EQ( 15, hold.runner_sleeps );
+    const playback_slip::PresentSetupSample holdSample = sampleFromTail( 60.0, hold );
+    ASSERT_NEAR( 0.0, playback_slip::presentSetupGuiBusyMs( holdSample ), 1e-9 );
+    ASSERT_FALSE( playback_slip::presentSetupBucket( holdSample ) == playback_slip::SetupBucket::GuiBusy );
 }
 
 TEST(GpuPresentTailWindow, AnUnswappedPaintNeverPairsWithALaterWindowsSwap)
@@ -941,34 +941,34 @@ TEST(GpuPresentTailWindow, AnUnswappedPaintNeverPairsWithALaterWindowsSwap)
     GpuPresentTailWindow w;
     w.open( 0, 5.0, 12.0 );
     w.qtPaintStarted( 4 * kMs );
-    GpuPresentTailTiming t1;
-    w.close( 10 * kMs, true, t1 );
-    ASSERT_EQ( 0, t1.qt_paint_swaps );
+    GpuPresentTailTiming unswapped;
+    w.close( 10 * kMs, true, unswapped );
+    ASSERT_EQ( 0, unswapped.qt_paint_swaps );
     w.open( 100 * kMs, 5.0, 12.0 );
     w.qtPaintSwapped( 103 * kMs );
-    GpuPresentTailTiming t2;
-    w.close( 110 * kMs, true, t2 );
-    ASSERT_TRUE( t2.prev_known );
-    ASSERT_EQ( 0, t2.qt_paint_swaps );
-    ASSERT_NEAR( 0.0, t2.qt_paint_swap_max_ms, 1e-12 );
+    GpuPresentTailTiming later;
+    w.close( 110 * kMs, true, later );
+    ASSERT_TRUE( later.prev_known );
+    ASSERT_EQ( 0, later.qt_paint_swaps );
+    ASSERT_NEAR( 0.0, later.qt_paint_swap_max_ms, 1e-12 );
 
     // Inside one window a paint and its swap still pair, once.
     w.open( 200 * kMs, 5.0, 12.0 );
     w.qtPaintStarted( 202 * kMs );
     w.qtPaintSwapped( 205 * kMs );
     w.qtPaintSwapped( 207 * kMs );
-    GpuPresentTailTiming t3;
-    w.close( 210 * kMs, true, t3 );
-    ASSERT_EQ( 1, t3.qt_paint_swaps );
-    ASSERT_NEAR( 3.0, t3.qt_paint_swap_max_ms, 1e-9 );
+    GpuPresentTailTiming paired;
+    w.close( 210 * kMs, true, paired );
+    ASSERT_EQ( 1, paired.qt_paint_swaps );
+    ASSERT_NEAR( 3.0, paired.qt_paint_swap_max_ms, 1e-9 );
 
     // A session start or stop drops an unswapped stamp inside an open window.
     w.open( 300 * kMs, 5.0, 12.0 );
     w.qtPaintStarted( 301 * kMs );
     w.dropQtPaintStamp();
     w.qtPaintSwapped( 340 * kMs );
-    GpuPresentTailTiming t4;
-    w.close( 350 * kMs, true, t4 );
-    ASSERT_EQ( 0, t4.qt_paint_swaps );
-    ASSERT_NEAR( 0.0, t4.qt_paint_swap_max_ms, 1e-12 );
+    GpuPresentTailTiming dropped;
+    w.close( 350 * kMs, true, dropped );
+    ASSERT_EQ( 0, dropped.qt_paint_swaps );
+    ASSERT_NEAR( 0.0, dropped.qt_paint_swap_max_ms, 1e-12 );
 }
