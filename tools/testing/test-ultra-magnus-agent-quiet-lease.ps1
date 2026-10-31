@@ -845,8 +845,8 @@ try {
         function Read-JobNotAfterSidecar { param([Parameter(Mandatory = $true)][string]$JobId) if ($null -ne $script:SidecarReadHook) { & $script:SidecarReadHook $JobId }; return (& $script:RealReadSidecar -JobId $JobId) }
     }
     # QL_TEST_RENEW_STALL_SEC (a hand-set stall for liveness-renewed-across-exit75; CI leaves it unset): "" or 0 = no stall. Otherwise a
-    # number of seconds LONGER than the renewal window (the stall must outlast it, which Invoke-RenewedAcrossExit75 asserts later) whose
-    # millisecond conversion fits an Int32 (Start-Sleep -Milliseconds). Anything else is a typed refusal, not a late assertion or a cast
+    # number of seconds whose CONVERTED milliseconds are longer than the renewal window's (the stall must outlast it, which
+    # Invoke-RenewedAcrossExit75 asserts later) and fit an Int32 (Start-Sleep -Milliseconds). Anything else is a typed refusal, not a late assertion or a cast
     # overflow. Returns @{ ok; sec; why }.
     $script:RenewTtlSec = 3
     $script:RenewStallMaxSec = 20   # the stall sits inside Invoke-RenewedAcrossExit75's 40 s queue guard with ~9 s of waiting around it
@@ -859,8 +859,12 @@ try {
         # A nonzero mantissa that parsed to 0 underflowed (1e-400): refused, never read as "no stall".
         if ($v -eq 0 -and ($Raw.Trim() -replace '[eE].*$', '') -match '[1-9]') { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC '$($Raw -replace '[^\x20-\x7E]', '?')' underflows to 0 s: not a usable number of seconds (write 0 for no stall)" } }
         if ($v -eq 0) { return [pscustomobject]@{ ok = $true; sec = [double]0; why = '0: no stall' } }
-        if ($v -le $TtlSec) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s must be longer than the $TtlSec s renewal window (or 0/unset for none): a shorter stall cannot lapse the sidecar and would fail the stall assertion late" } }
-        if ([Math]::Round($v * 1000) -gt [int]::MaxValue) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s overflows the Int32 millisecond conversion (at most $([int]::MaxValue / 1000) s)" } }
+        if ($v -lt 0) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s is negative (write 0, or leave it unset, for no stall)" } }
+        # Validated on the CONVERTED millisecond duration, the one Start-Sleep actually sleeps and the assertion compares: 3.0001 s is
+        # longer than the window as a double, but converts to 3000 ms, which does not outlast it.
+        $ms = [Math]::Round($v * 1000)
+        if ($ms -le [Math]::Round($TtlSec * 1000)) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s ($ms ms after conversion) must be longer than the $TtlSec s renewal window (or 0/unset for none): a shorter stall cannot lapse the sidecar and would fail the stall assertion late" } }
+        if ($ms -gt [int]::MaxValue) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s overflows the Int32 millisecond conversion (at most $([int]::MaxValue / 1000) s)" } }
         if ($v -gt $script:RenewStallMaxSec) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s exceeds the $($script:RenewStallMaxSec) s ceiling (the case runs under a 40 s queue guard; a longer stall ends it queue-expired)" } }
         return [pscustomobject]@{ ok = $true; sec = $v; why = "$v s stall" }
     }
@@ -872,7 +876,7 @@ try {
         function Get-JobNotAfterVerdict {
             param([Parameter(Mandatory = $true)]$Metadata, [DateTime]$NowUtc = [DateTime]::MinValue, $Sidecar = $null)
             $pin = $script:VerdictNowPin
-            if ($null -ne $pin -and -not $PSBoundParameters.ContainsKey('NowUtc') -and $null -ne $Sidecar -and [string]$Sidecar.jobId -ceq $pin.jobId) { $script:VerdictNowPin = $null; $NowUtc = $pin.utc }
+            if ($null -ne $pin -and -not $PSBoundParameters.ContainsKey('NowUtc') -and $null -ne $Sidecar -and [string]$Sidecar.jobId -ceq $pin.jobId) { $script:VerdictNowPin = $null; $NowUtc = $pin.utc; $script:RenewSt.pinned++ }
             return (& $script:RealVerdict -Metadata $Metadata -NowUtc $NowUtc -Sidecar $Sidecar)
         }
     }
@@ -880,9 +884,9 @@ try {
     # the first $MaxRenews reads, then stops. $StallSec > 0 sleeps once in the gate's heartbeat after two renewals (a runner stall
     # between renewals, longer than the window). Reset-Case clears both hooks. Returns the state the case asserts on.
     function Start-SidecarRenewOnRead([string]$JobId, [int]$MaxRenews, [double]$StallSec, [double]$PostRenewPauseSec = 0) {
-        $st = @{ jobId = $JobId; max = $MaxRenews; ttl = $script:RenewTtlSec; renews = 0; reads = 0; seq = 1; lastRenewUtc = $null; stallSec = $StallSec; stalled = $false; postPauseSec = $PostRenewPauseSec; postPaused = $false }
+        $st = @{ jobId = $JobId; max = $MaxRenews; ttl = $script:RenewTtlSec; renews = 0; reads = 0; seq = 1; lastRenewUtc = $null; stallSec = $StallSec; stalled = $false; postPauseSec = $PostRenewPauseSec; postPaused = $false; pinned = 0; firstWriteUtc = [DateTime]::UtcNow }
         $script:RenewSt = $st
-        $null = Write-Sidecar $JobId ([DateTime]::UtcNow.AddSeconds($st.ttl)) 1
+        $null = Write-Sidecar $JobId ($st.firstWriteUtc.AddSeconds($st.ttl)) 1
         $script:SidecarReadHook = {
             param($Id)
             $s = $script:RenewSt
@@ -922,8 +926,17 @@ try {
         $r75 = @($adm.leaseRefusals | Where-Object { $_.reason -eq 'refused' -and $_.rc -eq 75 })
         Assert-True ($adm.label -eq 'clear' -and $adm.livenessState -ceq 'live' -and $adm.notAfterSource -ceq 'meta') "${Name}: admitted clear under a live sidecar: label=$($adm.label) livenessState=$($adm.livenessState) source=$($adm.notAfterSource) why=$($adm.why)"
         Assert-True ($r75.Count -eq 2 -and $reqs.Count -eq 3) "${Name}: two exit-75 refusals, then the third request turned active: refusals=$($r75.Count) requests=$($reqs.Count)"
-        Assert-True ($elapsed -gt 9 -and $st.renews -ge 8 -and $st.reads -ge $st.renews -and [long]$adm.livenessSeq -gt 3 -and [long]$adm.livenessSeq -eq $st.seq) "${Name}: the wait ($([Math]::Round($elapsed, 1)) s) outlasted 3x the $($st.ttl) s window and the gate admitted on the latest renewal, not the first write: renews=$($st.renews) reads=$($st.reads) seq=$($st.seq) admittedSeq=$($adm.livenessSeq)"
-        if ($StallSec -gt 0) { Assert-True ($st.stalled -and $StallSec -gt $st.ttl) "${Name}: a stall longer than the window ($StallSec s) ran between renewals: stalled=$($st.stalled)" }
+        # The renewal-count claim is made on the event sequence, not on a read count: a count of gate reads (the old renews >= 8) is a
+        # function of how many poll ticks a loaded host let the gate run in its >= 9 s wait, so a long gate pause could leave it at 7.
+        # What is asserted instead is that the gate admitted on the LAST renewal it was handed (admittedSeq == seq, seq > 3) and that
+        # renewal was made more than two windows after the first write, so the first write alone would have lapsed. The only
+        # wall-clock terms left are lower bounds (elapsed > 9 s, span > 2 windows) that a slower host can only make more true.
+        $span = if ($null -ne $st.lastRenewUtc) { ($st.lastRenewUtc - $st.firstWriteUtc).TotalSeconds } else { 0 }
+        Assert-True ($elapsed -gt 9 -and $st.reads -ge $st.renews -and [long]$adm.livenessSeq -gt 3 -and [long]$adm.livenessSeq -eq $st.seq -and $span -gt (2 * $st.ttl)) "${Name}: the wait ($([Math]::Round($elapsed, 1)) s) outlasted 3x the $($st.ttl) s window and the gate admitted on the latest renewal ($([Math]::Round($span, 1)) s after the first write), not the first write: renews=$($st.renews) reads=$($st.reads) seq=$($st.seq) admittedSeq=$($adm.livenessSeq)"
+        # The verdict pin is what makes the renewal an event. A seam that stopped pinning would leave these cases to the host's
+        # scheduling (flaking only under load), so every renewal must have been judged as of its write: pinned verdicts >= renews.
+        Assert-True ($st.pinned -ge $st.renews -and $st.renews -gt 0) "${Name}: every renewal's verdict was pinned to the renewal write (the seam is engaged): pinned=$($st.pinned) renews=$($st.renews)"
+        if ($StallSec -gt 0) { Assert-True ($st.stalled -and [int]($StallSec * 1000) -gt [int]($st.ttl * 1000)) "${Name}: a stall longer than the window ($StallSec s = $([int]($StallSec * 1000)) ms, window $([int]($st.ttl * 1000)) ms) ran between renewals: stalled=$($st.stalled)" }
         if ($PostRenewPauseSec -gt 0) { Assert-True ($st.postPaused -and $PostRenewPauseSec -ge 4) "${Name}: a pause of >= 4 s ($PostRenewPauseSec s, longer than the $($st.ttl) s window) ran right after the first renewal write: paused=$($st.postPaused)" }
         Exit-HeavySlot
         return [ordered]@{ label = $adm.label; elapsedSec = [Math]::Round($elapsed, 1); renews = $st.renews; reads = $st.reads; admittedSeq = $adm.livenessSeq; stallSec = $StallSec; postRenewPauseSec = $PostRenewPauseSec }
@@ -945,6 +958,8 @@ try {
         $tEnd = [DateTime]::UtcNow
         Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -ceq 'pending' -and $adm.notAfterSource -ceq 'sidecar' -and $adm.livenessState -ceq 'lapsed') "${Name}: renewal stopped, so the sidecar lapsed and the pending request was released: label=$($adm.label) phase=$($adm.phase) source=$($adm.notAfterSource) liveness=$($adm.livenessState) renews=$($st.renews) reads=$($st.reads)"
         Assert-True ($st.renews -eq 3 -and $st.reads -gt 3 -and (Get-Released).Count -eq 1) "${Name}: exactly 3 renewals, more reads than renewals, one release: renews=$($st.renews) reads=$($st.reads) released=$((Get-Released).Count)"
+        # Each of the 3 renewals was judged as of its write; once renewal stopped nothing was pinned, so the lapse above is the real clock's.
+        Assert-True ($st.pinned -eq $st.renews) "${Name}: exactly the renewals were pinned, none after renewal stopped: pinned=$($st.pinned) renews=$($st.renews)"
         $sinceRenew = ($tEnd - $st.lastRenewUtc).TotalSeconds
         Assert-True ($sinceRenew -ge 2.9) "${Name}: the lapse is called only after the last renewal's $($st.ttl) s window ($([Math]::Round($sinceRenew, 2)) s after it)"
         if ($PostRenewPauseSec -gt 0) { Assert-True ($st.postPaused -and $PostRenewPauseSec -ge 4) "${Name}: a pause of >= 4 s ($PostRenewPauseSec s) ran right after the first renewal write: paused=$($st.postPaused)" }
@@ -1835,12 +1850,12 @@ function Exit-HeavySlot {
 
     # ------------------------------------------------------------ liveness-renew-stall-override-bound: the hand-set stall is bounded
     if (Test-Case 'liveness-renew-stall-override-bound') {
-        $okVec = [ordered]@{ '' = 0; '   ' = 0; '0' = 0; '0.0' = 0; '3.001' = 3.001; '4' = 4; ' 4 ' = 4; '20' = 20; '0e5' = 0 }
+        $okVec = [ordered]@{ '' = 0; '   ' = 0; '0' = 0; '0.0' = 0; '3.001' = 3.001; '3.0006' = 3.0006; '4' = 4; ' 4 ' = 4; '20' = 20; '0e5' = 0; '-0' = 0 }
         foreach ($k in $okVec.Keys) {
             $r = Get-RenewStallOverride $k
             Assert-True ($r.ok -and $r.sec -eq $okVec[$k]) "liveness-renew-stall-override-bound: '$k' is accepted as $($okVec[$k]) s: ok=$($r.ok) sec=$($r.sec) why=$($r.why)"
         }
-        $badVec = [ordered]@{ '1' = 'longer than the 3 s renewal window'; '3' = 'longer than the 3 s renewal window'; '-4' = 'longer than the 3 s renewal window'; '2147483.648' = 'overflows the Int32'; '1e12' = 'overflows the Int32'
+        $badVec = [ordered]@{ '1' = 'longer than the 3 s renewal window'; '3' = 'longer than the 3 s renewal window'; '3.0001' = 'longer than the 3 s renewal window'; '3.0004' = 'longer than the 3 s renewal window'; '-4' = 'is negative'; '-0.5' = 'is negative'; '-1e12' = 'is negative'; '2147483.648' = 'overflows the Int32'; '1e12' = 'overflows the Int32'
             'abc' = 'not a finite number'; 'NaN' = 'not a finite number'; 'Infinity' = 'not a finite number'; '4s' = 'not a finite number'
             '1e-400' = 'underflows to 0 s'; '20.001' = 'exceeds the 20 s ceiling'; '60' = 'exceeds the 20 s ceiling'; '2147483.647' = 'exceeds the 20 s ceiling' }
         foreach ($k in $badVec.Keys) {
