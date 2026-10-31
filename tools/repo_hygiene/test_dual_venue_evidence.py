@@ -7494,6 +7494,13 @@ NO_PACE_TWIN_BY_DESIGN = {
        for flavor in ("cinematic", "film", "vision50d")},
     "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced (an unpaced pace leg carrying the receipt in generatorArgs), which this paced-only rule does not see",
     "m16-1243-look-scale2-cinematic-agxoff-unpaced-nofast": "the unpaced AgX-off leg with the #680 fast path killed; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced-nofast, which this paced-only rule does not see",
+    # HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r5 (CI-1, Dot 6541731407): the four #420 conform cells. Their pace claim is the conform pace proof
+    # (Get-DvConformPaceProof: the playback_smoke.conform line's conform_active and configured playback_fps against the pace guard's pace_fps), which is
+    # read from settings, not timed, so a contact-sheet grab cannot move it; no PR cites a measured fps / drop / jitter figure from them.
+    **{f"m16-1456-conform-{mode}-s1": "NOT RUNNABLE (2026-10-30 hub ruling: the 16.2 s M16-1456 clip is shorter than the 25 s window); hfr-conform-m16-1457 replaces it"
+       for mode in ("fullscreen", "windowed")},
+    **{f"m16-1457-conform-{mode}-s1": "conform look cell; its pace claim is the configured-rate conform pace proof, not a timed figure, and no PR cites a measured fps from it, so a capture-free conform twin waits for the first PR that does"
+       for mode in ("fullscreen", "windowed")},
 }
 
 
