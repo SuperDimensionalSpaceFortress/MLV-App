@@ -1435,10 +1435,22 @@ TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerSt
         resetMlvCachedFrame(fixture.video());
         const int scale = route == 0 ? 2 : 4;
         const size_t scaledWords = static_cast<size_t>(fixture.width() / scale) * static_cast<size_t>(fixture.height() / scale) * 3u;
+        // The fixture sizes its output up front and a failed scaled render zeroes it, so the
+        // render's success is proved by its fill (adversary r2 A1), not by the size.
+        size_t nonzero = 0;
         if (route == 0)
-            ASSERT_EQ(scaledWords, fixture.renderFrame16Scaled(2, kCpuCores, scale).size());
+        {
+            const std::vector<uint16_t> out16 = fixture.renderFrame16Scaled(2, kCpuCores, scale);
+            ASSERT_EQ(scaledWords, out16.size());
+            nonzero = static_cast<size_t>(std::count_if(out16.begin(), out16.end(), [](uint16_t v) { return v != 0; }));
+        }
         else
-            ASSERT_EQ(scaledWords, fixture.renderFrame8Scaled(3, kCpuCores, scale).size());
+        {
+            const std::vector<uint8_t> out8 = fixture.renderFrame8Scaled(3, kCpuCores, scale);
+            ASSERT_EQ(scaledWords, out8.size());
+            nonzero = static_cast<size_t>(std::count_if(out8.begin(), out8.end(), [](uint8_t v) { return v != 0; }));
+        }
+        ASSERT_TRUE(nonzero > scaledWords / 2);
         const double scaledWbPrepareMs = getMlvLastDebayerWbPrepareMilliseconds();
         const double scaledCaMs = getMlvLastDebayerCaMilliseconds();
         const double scaledKernelMs = getMlvLastDebayerKernelMilliseconds();

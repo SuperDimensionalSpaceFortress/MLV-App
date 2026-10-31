@@ -2585,9 +2585,9 @@
       "anchor": "ASSERT_TRUE ( scaledWbPrepareMs == 0.0 ) ;",
       "class": "not_run_proof_structural",
       "clock": "omp_get_wtime_direct",
-      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no wb-prepare stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by ASSERT_EQ(scaledWords, ...size()) on the scaled entry's output, not by the duration.",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no wb-prepare stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by its output fill, ASSERT_TRUE(nonzero > scaledWords / 2) (a failed scaled render zeroes its output), not by the duration.",
       "lines": [
-        1449
+        1461
       ]
     },
     {
@@ -2595,9 +2595,9 @@
       "anchor": "ASSERT_TRUE ( scaledCaMs == 0.0 ) ;",
       "class": "not_run_proof_structural",
       "clock": "omp_get_wtime_direct",
-      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no CA stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by ASSERT_EQ(scaledWords, ...size()), not by the duration.",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no CA stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by its output fill, ASSERT_TRUE(nonzero > scaledWords / 2), not by the duration.",
       "lines": [
-        1450
+        1462
       ]
     },
     {
@@ -2605,9 +2605,9 @@
       "anchor": "ASSERT_TRUE ( scaledWbUndoMs == 0.0 ) ;",
       "class": "not_run_proof_structural",
       "clock": "omp_get_wtime_direct",
-      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no wb-undo stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by ASSERT_EQ(scaledWords, ...size()), not by the duration.",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no wb-undo stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by its output fill, ASSERT_TRUE(nonzero > scaledWords / 2), not by the duration.",
       "lines": [
-        1451
+        1463
       ]
     }
   ]
