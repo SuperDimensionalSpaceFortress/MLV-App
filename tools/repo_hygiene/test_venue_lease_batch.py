@@ -6959,8 +6959,10 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         if made.returncode != 0:
             self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
         got = self.judge(["C:\\fake\\agent-share"], {"via-junction": str(state / "to-target" / "receipts"), "plain": str(state / "plain" / "receipts")})
-        self.assertEqual(os.path.normcase(got["via-junction"]), os.path.normcase(str(target / "receipts")), f"the certified path is the junction's TARGET, not the spelling that reached it: {got}")
-        self.assertEqual(os.path.normcase(got["plain"]), os.path.normcase(str(state / "plain" / "receipts")))
+        # compared by real path (a runner's temp dir is spelled with an 8.3 short name, e.g. RUNNER~1, while the link target comes back in long form), plus the junction's own name must be gone
+        self.assertTrue(self.same_path(got["via-junction"], target / "receipts"), f"the certified path is the junction's TARGET: {got}")
+        self.assertNotIn("to-target", got["via-junction"].lower(), f"the certified path must not keep the spelling that reached the junction: {got}")
+        self.assertTrue(self.same_path(got["plain"], state / "plain" / "receipts"), got)
 
     def test_adversary_r5_g6_the_real_leg_strip_dir_is_the_certified_spelling_before_any_branch_uses_it(self) -> None:
         # Grok G6: `$stripDir = $stripCert` ran only inside the primary-strip branch, so the self-heal loop (which tests `$stripCert`, not the primary strip) could write to the UNCERTIFIED spelling.
