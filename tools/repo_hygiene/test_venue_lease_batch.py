@@ -6537,6 +6537,25 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         want = self.case / "rel" / ".claude-state" / "dual-venue" / "receipts"
         self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2)
 
+    def test_adversary_a1_a_relative_receipt_root_resolves_against_the_powershell_location_like_rundir_does(self) -> None:
+        # adversary f1c42e80 A1: the process directory (what [IO.Path]::GetFullPath uses) and the PowerShell location (what Resolve-Path -RunDir uses) differ once a caller has
+        # done Set-Location. The script is run in-process from a session whose location is cwd-b while the process directory is cwd-a: the root belongs under cwd-b.
+        proc_dir, ps_dir = self.case / "cwd-a", self.case / "cwd-b"
+        proc_dir.mkdir()
+        ps_dir.mkdir()
+        rel = os.path.join("rel", ".claude-state", "dual-venue", "receipts")
+        args, e = self.batch_cmd(None, "-ReceiptRoot", rel)
+        i = args.index("-File")
+        runner, rest = args[i + 1], args[i + 2:]
+        call = " ".join(x if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", x) else f"'{psq(x)}'" for x in rest)
+        command = f"Set-Location -LiteralPath '{psq(ps_dir)}'; & '{psq(runner)}' {call}; exit $LASTEXITCODE"
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=600, env=e, cwd=str(proc_dir))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        want = ps_dir / "rel" / ".claude-state" / "dual-venue" / "receipts"
+        self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2, r.stdout + r.stderr)
+        self.assertEqual(len(self.files_under(want)), 2)
+        self.assertFalse((proc_dir / "rel").exists(), "the root was resolved against the process directory")
+
     # (b) RED on the old script for the explicit empty/blank spellings (an unknown parameter); the omitted spelling is the byte-for-byte guard
     def test_an_empty_or_blank_receipt_root_forwards_no_argument(self) -> None:
         for spelling in (None, "", "   "):
