@@ -913,7 +913,9 @@ function Get-DvSmokeSummaryFields {
     $isolated = $false
     $conformLine = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        $lines = $LogText -split "`r?`n"
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 and advisory A3 on #726): every line is read as its record body, so a build path in a Qt
+        # location suffix never selects the session or a line, and never adds a summary or conform field.
+        $lines = Get-DvLogRecordBodies -LogText $LogText
         foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
         if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
         if ($null -ne $session) {
@@ -1222,7 +1224,7 @@ function Get-DvScaleEvidence {
         $clampFlag = ConvertTo-DvInt64 $f['gpu_texture_route_scale_clamp_active']
         if ($null -ne $clampFlag) { $clampActive = ($clampFlag -ne 0) }
         if ($null -eq $effective) {
-            foreach ($line in ($LogText -split "`r?`n")) {
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($line -match 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)') { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
             }
         }
@@ -1351,6 +1353,9 @@ function Get-DvWorkerThreadsEvidence {
     the proof (only the success summary gains it), and it is then judged on the run log; a summary with no result or any other result must carry it
     (adversary r1 A1). A leg that does not ask never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the
     hashed run log and summary.json.
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A2 on #726): a start line that carries worker_threads= more than once is refused
+    (DUPLICATE_START_FIELD), never last-key-wins; and a failure terminal that omits a proof field is UNPROVEN (blocks = false, so its FAIL stands), never
+    HONOURED, because the run log alone was forgeable by a launcher env value on a build before r2.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()]$Summary)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
@@ -1360,13 +1365,16 @@ function Get-DvWorkerThreadsEvidence {
     $reason = $null
     if ($null -ne $raw) {
         $verdict = 'NOT_HONOURED'
-        $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'start'
+        $read = Get-DvSmokeSessionLineRead -LogText $LogText -Marker 'start'
+        $f = $read.fields
         $observed = ConvertTo-DvInt64 $f['worker_threads']
         $resultToken = Get-DvProp $Summary 'result'
         $mayOmit = ($resultToken -is [string]) -and ($resultToken -cin $script:FailureTerminals)
+        $omitted = [System.Collections.Generic.List[string]]::new()
         $problems = [System.Collections.Generic.List[string]]::new()
         if ($null -eq $requested -or $requested -lt 1 -or $requested -gt 16) { $problems.Add("the spec's playbackMaxThreads '$raw' is not an integer from 1 to 16") }
-        elseif ($f.Count -eq 0) { $problems.Add('the worker count is unreadable: the run log has no playback_smoke.start line for the measured session') }
+        elseif (-not $read.found) { $problems.Add('the worker count is unreadable: the run log has no playback_smoke.start line for the measured session') }
+        elseif ($read.duplicates -contains 'worker_threads') { $problems.Add("DUPLICATE_START_FIELD: the measured session's playback_smoke.start line carries worker_threads= more than once, so the worker count is unreadable (a second one can only come from a launcher env value)") }
         elseif ($null -eq $observed) { $problems.Add("the worker count is unreadable: the measured session's playback_smoke.start line has no integer worker_threads= ('$($f['worker_threads'])')") }
         elseif ($observed -ne $requested) { $problems.Add("the measured session's playback_smoke.start says worker_threads=$observed, not the $requested the leg names") }
         if ($null -eq $Summary) { $problems.Add('the worker count is unreadable: the job published no summary.json to carry its proof') }
@@ -1374,13 +1382,77 @@ function Get-DvWorkerThreadsEvidence {
             foreach ($name in @('playbackMaxThreadsRequested', 'playbackMaxThreadsSmoke', 'playbackWorkerThreadsRead')) {
                 $has = ($Summary -is [System.Collections.IDictionary] -and $Summary.Contains($name)) -or ($Summary -isnot [System.Collections.IDictionary] -and $null -ne $Summary.PSObject.Properties[$name])
                 $value = Get-DvProp $Summary $name
-                if (-not $has -and $mayOmit) { continue }
+                if (-not $has -and $mayOmit) { $omitted.Add($name); continue }
                 if ($null -eq $value) { $problems.Add("the worker count is unreadable: summary.json $name is $(if ($has) { 'null' } else { 'absent' })"); continue }
                 $parsed = ConvertTo-DvInt64 $value
                 if ($null -eq $parsed -or $parsed -ne $requested) { $problems.Add("summary.json $name is '$value', not $requested") }
             }
         }
-        if ($problems.Count -eq 0) { $verdict = 'HONOURED' } else { $reason = $problems -join '; ' }
+        if ($problems.Count -gt 0) { $reason = $problems -join '; ' }
+        elseif ($omitted.Count -gt 0) {
+            $verdict = 'UNPROVEN'
+            $reason = "WORKER_PROOF_ABSENT: the job ended $resultToken and its summary.json omits $($omitted -join ', '); the run log alone does not prove the worker count, so it is not honoured (the failure terminal's own FAIL stands)"
+        }
+        else { $verdict = 'HONOURED' }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
+function Get-DvPrepConflatedMoveEvidence {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: did a leg that asks for the #397 prep-conflated-move switch (generatorArgs.prepConflatedMove = true, which sets
+    MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1) run with the switch active? Read ONLY from the app's own `playback_smoke.prep_route session=<n>
+    prep_conflated_move_active=<0|1>` record for the MEASURED session (the app's decision, on a line that carries no env-derived text), never from the start line,
+    the spec, the launcher's env block or the job's summary: a switch value in a receipt is a request, not engagement. FAIL CLOSED: `blocks` is true when the leg
+    asked and there is no such record, or it says anything but a clean 1. A binary that emits no prep_route record (#397 5fb4b801 and every build before r2 of
+    this card) therefore never counts; its reason says ROUTE_NOT_ENGAGED. A leg that does NOT ask blocks only when the app reports the switch on (the OFF arm
+    inherited the variable: PREP_CONFLATED_MOVE_INHERITED) or a prep_route record is present but unreadable; with no record, or a clean 0, it is unchanged.
+    Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'prepConflatedMove'
+    $requested = ($raw -is [bool]) -and $raw
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    # adversary r1 A1 (r2): the start line carries launcher env values, and an app before r2 let CR/LF in one of them become a separator, so a field read there
+    # can be forged. Engagement is read from the prep_route record only, matched against the WHOLE line: an optional log prefix ([utc] [LEVEL] [0xthread]),
+    # the marker, the measured session, the one field with the value 0 or 1, an optional Qt location suffix, and nothing else. A prep_route text embedded in
+    # another record (after a separator an old app wrote) never matches, and a second record for the session is unreadable, never a PASS.
+    # r3 (sol ADV-A1 on #726) and r4 (r3 adversary A1 and A2, Grok G1): every line is read as its record body (Get-DvLogRecordBodies strips the Qt location
+    # suffix from its first ` (`, whatever the path holds) BEFORE a mention is counted or the record matched, so a build path like `C:/build (x/` keeps the
+    # reported state and a path holding `playback_smoke.prep_route session=<n>` adds no mention. A mention inside another record's BODY still counts.
+    $records = 0
+    $mentions = 0
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
+                ' prep_conflated_move_active=(?<v>[01])$'
+            $mention = 'playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) + '( |$)'
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if ($l -cnotmatch $mention) { continue }
+                $mentions++
+                $m = [regex]::Match($l, $whole)
+                if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
+            }
+        }
+    }
+    if ($records -ne 1 -or $mentions -ne 1) { $observed = $null }
+    $unreadable = 'the switch state is unreadable: the measured session''s playback_smoke.prep_route record is not exactly one whole line of the form playback_smoke.prep_route session=<n> prep_conflated_move_active=<0|1>, or there is more than one'
+    if ($requested) {
+        $verdict = 'NOT_HONOURED'
+        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the run log has no playback_smoke.prep_route record for the measured session, so the binary does not report which prep queue ran' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($observed -ne 1) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.prep_route says prep_conflated_move_active=$observed, not the 1 the leg names" }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($mentions -gt 0) {
+        # adversary r1 A1: an absent key sets nothing, so a launcher that already carries the variable runs the OFF arm ON. A leg that does not ask counts only if the
+        # app does not report the switch on (a binary that emits no record, or says 0, is unchanged).
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -eq 1) { $verdict = 'NOT_HONOURED'; $reason = 'PREP_CONFLATED_MOVE_INHERITED: the leg does not ask for the switch but the app reports prep_conflated_move_active=1 (the variable came from the launcher''s environment), so this run is not the OFF arm' }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
@@ -1401,7 +1473,8 @@ function Get-DvLookAssistEvidence {
     if ($requested) {
         $found = $null
         if (-not [string]::IsNullOrEmpty($LogText)) {
-            foreach ($line in ($LogText -split "`r?`n")) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+            # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
@@ -1491,18 +1564,104 @@ function Get-DvSmokeSessionLineFields {
     <#
     .SYNOPSIS
     The key=value fields of the LAST `playback_smoke.<Marker> session=<n>` line of the MEASURED session in the app's run log (the session Get-DvSmokeSummaryFields picks),
-    or an empty table. Marker is e.g. 'pace_summary' or 'cpu_summary'.
+    or an empty table. Marker is e.g. 'pace_summary' or 'cpu_summary'. A key the line carries more than once is left out (Get-DvSmokeSessionLineRead), so it
+    reads as absent: fail closed, never last-key-wins.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Marker)
+    (Get-DvSmokeSessionLineRead -LogText $LogText -Marker $Marker).fields
+}
+
+function Get-DvSmokeSessionLineRead {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A2 on #726): the LAST `playback_smoke.<Marker> session=<n>` line of the MEASURED session, read as
+    key=value tokens separated by single ASCII spaces. Returns @{ found = the line was there; fields = each key seen ONCE; duplicates = the keys seen more than
+    once }. A launcher env value that an app before r2 let through with a CR/LF (or a Unicode space a \S+ reader splits on) could add a second worker_threads=
+    after the genuine one, and the old reader kept the last; a duplicated key is now dropped from `fields` and named in `duplicates` so a caller can refuse it.
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Marker)
     $fields = @{}
-    if ([string]::IsNullOrEmpty($LogText)) { return $fields }
-    $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
-    if ($null -eq $session) { return $fields }
-    $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+    # keys compare case-insensitively, like the @{} table every caller indexes
+    $duplicates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $found = $null
-    foreach ($line in ($LogText -split "`r?`n")) { if ($line -match $pattern) { $found = $line } }
-    if ($null -ne $found) { foreach ($m in [regex]::Matches($found, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
-    $fields
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
+            # `playback_smoke.<Marker> session=<n>` is never selected
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }
+        }
+    }
+    if ($null -ne $found) {
+        $seen = @{}
+        # r3 (sol ADV-A2 on #726): a key counts whatever its value, EMPTY included, so `worker_threads=8 worker_threads=` (either order, either case) is a
+        # duplicate too; $found is already the record body (no Qt location suffix), so a build path never adds a token.
+        foreach ($m in [regex]::Matches($found, '(?<![^ ])(?<k>[A-Za-z0-9_]+)=(?<v>[^ ]*)')) {
+            $k = $m.Groups['k'].Value
+            if ($seen.ContainsKey($k)) { [void]$duplicates.Add($k) }
+            else { $seen[$k] = $m.Groups['v'].Value }
+        }
+        foreach ($k in $seen.Keys) { if (-not $duplicates.Contains($k)) { $fields[$k] = $seen[$k] } }
+    }
+    @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
+}
+
+# r5 (sol r4 B1 on #726): what Get-DvLogRecordBody puts in place of a location it cannot read. It holds no `=` and no record marker, so no field or
+# marker is read from it, and a whole-line match (the prep_route record) fails on it: the record is unreadable, never absent and never forged.
+$script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
+
+function Get-DvLogRecordBody {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 (#726): one run-log line without the Qt location suffix CrashForensics::writeLogLine appends after the message
+    (` (<file>:<line>)`, only when the message context carries a file; CrashForensics.cpp writeLogLine). r4 (r3 adversary A1 = Grok G1): the suffix starts at
+    the FIRST ` (` of the line and runs to a closing `:<digits>)` at its very end; nothing is paired, so the path may hold spaces and parentheses, balanced or
+    not (`C:/build (x/`, `C:/build x)/`), and any text at all, record markers included. That is exact because a record body never holds ` (`: the
+    prefix is `[utc] [LEVEL] [0x<thread>] `, record keys are [A-Za-z0-9_]+, every value from outside the app goes through log_line_field::fieldValue (which
+    maps every space), and the one app value with spaces (summary gui_fps_status_text, "Playback: <n> fps") holds no parenthesis. The location is written
+    last, so what precedes its first ` (` is the body the app wrote. A line with no ` (` is returned unchanged; a line whose tail is not a readable location
+    is refused as described under r5 below. Every dual-venue reader of the app's run log strips the
+    suffix through this helper (or Get-DvLogRecordBodies) BEFORE it matches a record marker or a field.
+    r5 (sol r4 B1 and H1 on #726): a writer before r5 built the location with chained QString::arg calls, so a path holding `%1` took the line number and
+    the location ended `:%2)`; that suffix was left in the body, where marker text in the path selected the session, the start line, the visual state and
+    the summary fields. The rule now: the body is the text before the first ` (`, always (the location is written last and the body never holds ` (`,
+    so that text is the app's own and the path's text never reaches a reader). The tail decides whether the record is readable: `:<digits>)` (this
+    writer) or `:%2)` (the old writer's only other ending: its path held a lower-numbered marker, and the body before the location is unaffected) with a
+    path of at least one character gives the body; any other tail (no line number, text after the `)`, an empty path, a message that held a marker on the
+    old writer) gives the body plus ' (LOCATION_UNREADABLE)', which refuses a whole-line match and supplies no field or marker. It may refuse; it never
+    forges. The scan is linear: one IndexOf and one right-to-left walk over the digits, no regex (the r4 regex was super-linear on repeated ` (`).
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $Line }
+    $open = $Line.IndexOf(' (', [StringComparison]::Ordinal)
+    if ($open -lt 0) { return $Line }
+    $body = $Line.Substring(0, $open)
+    $end = $Line.Length - 1
+    $colon = -1
+    if ($Line[$end] -ceq [char]')') {
+        $i = $end - 1
+        while ($i -gt $open + 1 -and $Line[$i] -ge [char]'0' -and $Line[$i] -le [char]'9') { $i-- }
+        if ($i -lt $end - 1 -and $Line[$i] -ceq [char]':') { $colon = $i }
+        elseif ($Line.EndsWith(':%2)', [StringComparison]::Ordinal)) { $colon = $end - 3 }
+    }
+    # the path is everything between `(` (at $open + 1) and the colon, and must not be empty
+    if ($colon -gt $open + 2) { return $body }
+    $body + $script:DvLocationUnreadable
+}
+
+function Get-DvLogRecordBodies {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 on #726): every line of a run log as its record body (Get-DvLogRecordBody), in order, so a
+    reader matches record markers on the body only and a build path that holds `playback_smoke.<marker> session=<n>` never adds or selects a record.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText)
+    if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
+    $lines = $LogText -split "`r?`n"
+    # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
+    , [string[]]$lines
 }
 
 function Get-DvMatrixRates {
@@ -2549,6 +2708,20 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedWorkerThreads) { $invalid.Add('WORKER_THREADS_NOT_FROM_EVIDENCE: the receipt carries a workerThreads block but its committed leg spec names no playbackMaxThreads') }
+            # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: a leg that asks for the prep-conflated-move switch the app did not report active (or whose report is unreadable, or absent
+            # because the binary emits none) is no measurement of that arm; the receipt's own prepConflatedMove block is re-derived like the workerThreads block.
+            $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $ev.logText
+            if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason); a run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm") }
+            $storedPrepConflatedMove = Get-DvProp $Receipt 'prepConflatedMove'
+            if ($prepConflatedMoveVerdict.requested) {
+                if ($null -eq $storedPrepConflatedMove) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no prepConflatedMove block (requested / observed / verdict) and its committed spec names a prepConflatedMove') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedPrepConflatedMove $f) $prepConflatedMoveVerdict[$f])) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: prepConflatedMove.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedPrepConflatedMove) { $invalid.Add('PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: the receipt carries a prepConflatedMove block but its committed leg spec names no prepConflatedMove') }
         }
 
         # ---- the CONFORM ARM the run played under: re-derived from the HASHED run log and the COMMITTED spec (HFR-NATIVE-60FPS-FULLRES-1) ----
@@ -3125,6 +3298,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

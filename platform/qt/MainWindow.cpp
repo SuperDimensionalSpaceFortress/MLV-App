@@ -18,6 +18,7 @@
 #include "PlaybackScaleLabel.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
+#include "LogLineField.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -718,13 +719,19 @@ static int playbackScopeUpdateIntervalMs()
     return 150;
 }
 
+// PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A1/A2): every control, Unicode space, format character and '%' is
+// mapped, not only space and tab, so an inherited value cannot write a field of its own (LogLineField.h).
 static QString envValueForLog( const char *name )
 {
-    QString value = qEnvironmentVariable( name );
-    if( value.isEmpty() ) return QStringLiteral("unset");
-    value.replace( QLatin1Char(' '), QLatin1Char('_') );
-    value.replace( QLatin1Char('\t'), QLatin1Char('_') );
-    return value;
+    return log_line_field::envFieldValue( name );
+}
+
+// PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep-conflated-move route this binary runs, reported once per playback session
+// on playback_smoke.prep_route. This build has no such route (it is #397's MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE opt-in), so the
+// variable is ignored and the answer is always 0; a build that carries the route returns its own decision here.
+static bool playbackPrepConflatedMoveActive()
+{
+    return false;
 }
 
 static double telemetryDoubleValue( const QJsonObject &telemetry,
@@ -4942,17 +4949,24 @@ void MainWindow::endGuiPresentIdleWait( void )
 
 // A smoke runner's sleep on the GUI thread is neither GUI work nor dispatcher idle: inside an
 // open gap it is reported on its own (avg_gui_present_gap_runner_sleep_ms), never as busy. No
-// gap opens or closes during the sleep (both run on this thread).
+// gap opens or closes during the sleep (both run on this thread). PLAYBACK-PRESENT-TAIL-TIMING-1
+// r3 (B1): likewise inside GpuDisplayWindow's open present-tail window.
 void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )
 {
     const qint64 startNs = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapClock.nsecsElapsed() : -1;
+    QElapsedTimer slept;
+    slept.start();
     QThread::msleep( ms );
+    const qint64 sleptNs = slept.nsecsElapsed();
     if( startNs >= 0 && m_guiPresentGapStartNs >= 0 )
         m_guiPresentGapRunnerSleepNs += m_guiPresentGapClock.nsecsElapsed() - startNs;
+    GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );
 }
 
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
 {
+    m_lastPresentTailTiming = GpuPresentTailTiming();   // PLAYBACK-PRESENT-TAIL-TIMING-1: never a previous frame's
+    m_lastPresentTailTimingKnown = false;
     const PlaybackPrepTask &task = result.task;
     RenderFrameThread::ReadyFrame readyFrame = task.readyFrame;
     const uint64_t display_frame = task.displayFrame;
@@ -5397,6 +5411,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 texturePresentSetupTiming =
                     GpuDisplayWindow::lastPresentSetupTimingIfActive();
                 texturePresentSetupTimingKnown = true;
+                m_lastPresentTailTiming = GpuDisplayWindow::lastPresentTailTimingIfActive();
+                m_lastPresentTailTimingKnown = true;
                 gpuPlaybackReconAmazeTexturePresentedByWindow =
                     framePresentedByViewport;
             }
@@ -8192,15 +8208,15 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             autoSettleClock.start();
             // ENFORCE-3: the settle holds Play until the engine has CONSUMED the source frames of the 20 s window
             // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
-            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
-            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
+            // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): this pinned ENFORCE-3 stop statement's sleep is a runner sleep
+            // like every other (Play presents run in it, so a GPU window's present-tail window is open across it).
             const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
             while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                QThread::msleep( 10 );
+                sleepGuiThreadForSmokeRunner( 10 );
             }
             programmaticStop( "profile-look-assist-settle" );
             if( autoSettleState != playback_frame_range::PlayStopState::Reached )
@@ -8556,14 +8572,14 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             // ENFORCE-3: hold until the engine has CONSUMED the source frames of the 20 s window; a Play the
             // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
-            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
-            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
+            // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): this pinned ENFORCE-3 stop statement's sleep is a runner sleep
+            // like every other (Play presents run in it, so a GPU window's present-tail window is open across it).
             const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                QThread::msleep( 10 );
+                sleepGuiThreadForSmokeRunner( 10 );
             }
             playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;
             playActionSmokeTimedOut = playActionState == playback_frame_range::PlayStopState::SafetyTimeout;
@@ -25991,6 +26007,12 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) )
                .arg( envValueForLog( "MLVAPP_PLAYBACK_CONFORM" ) );
 
+    // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep route's engagement on a line of its own that carries no env-derived
+    // text; the dual-venue runner reads engagement from this line only, never from the start line's env_* fields.
+    qInfo().noquote()
+        << log_line_field::prepRouteLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),
+                                          playbackPrepConflatedMoveActive() );
+
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
     // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState
     // is unconditional and not gated on telemetry; this line is just its record).
@@ -26493,6 +26515,22 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             const QByteArray lutMiss = timing.value(
                 QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss") ).toString().toLatin1();
             setupSample.lutMiss = lutMiss.constData();   // copied by notePresentSetup before lutMiss goes away
+            // PLAYBACK-PRESENT-TAIL-TIMING-1: this frame's own tail (presentPlaybackPreparedFrame read it for this frame)
+            const GpuPresentTailTiming &tail = m_lastPresentTailTiming;
+            setupSample.tailKnown = m_lastPresentTailTimingKnown;
+            setupSample.tail.prevKnown = tail.prev_known;
+            setupSample.tail.prevPostPaintMs = tail.prev_post_paint_ms;
+            setupSample.tail.prevPostSwapMs = tail.prev_post_swap_ms;
+            setupSample.tail.swapReturnToSetupMs = tail.swap_return_to_setup_ms;
+            setupSample.tail.qtPaintSwaps = tail.qt_paint_swaps;
+            setupSample.tail.qtPaintSwapMaxMs = tail.qt_paint_swap_max_ms;
+            setupSample.tail.grabSwaps = tail.grab_swaps;
+            setupSample.tail.guiIdleKnown = tail.gui_idle_known;
+            setupSample.tail.guiIdleMs = tail.gui_idle_ms;
+            setupSample.tail.guiIdleWaits = tail.gui_idle_waits;
+            setupSample.tail.runnerSleepMs = tail.runner_sleep_ms;
+            setupSample.tail.runnerSleeps = tail.runner_sleeps;
+            setupSample.fullscreen = isFullScreen();
             m_playbackSlipHistogram.notePresentSetup( setupSample );
         }
     }
@@ -29553,6 +29591,26 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                                                                 ? QStringLiteral("none")
                                                                 : missFields.join( QLatin1Char(',') ) )
                << QStringLiteral("present_setup_first_ms=%1").arg( slip.presentSetupFirstMs, 0, 'f', 3 );
+        // PLAYBACK-PRESENT-TAIL-TIMING-1: the max-setup present's own tail window (previous swap return -> its setup)
+        const playback_slip::PresentTailSample &maxTail = slip.presentSetupMaxTail;
+        fields << QStringLiteral("present_setup_max_prev_paint_ms=%1").arg( maxTail.prevPostPaintMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_prev_swap_ms=%1").arg( maxTail.prevPostSwapMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_swap_return_to_setup_ms=%1").arg( maxTail.swapReturnToSetupMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_gui_busy_ms=%1").arg( slip.presentSetupMaxGuiBusyMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_qt_paint_swaps=%1").arg( maxTail.qtPaintSwaps )
+               << QStringLiteral("present_setup_max_qt_paint_swap_max_ms=%1").arg( maxTail.qtPaintSwapMaxMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_grab_swaps=%1").arg( maxTail.grabSwaps )
+               << QStringLiteral("present_setup_max_display=%1").arg(
+                      slip.presentSetupSamplesAfterFirst == 0 ? QStringLiteral("none")
+                      : slip.presentSetupMaxFullscreen       ? QStringLiteral("fullscreen")
+                                                             : QStringLiteral("windowed") )
+               << QStringLiteral("present_setup_max_bucket=%1").arg(
+                      QLatin1String( playback_slip::setupBucketName( slip.presentSetupMaxBucket ) ) )
+               // r3 (B1): the window's yields, so a probe that saw none reads as such (gui_busy_ms is then -1)
+               << QStringLiteral("present_setup_max_gui_idle_ms=%1").arg( maxTail.guiIdleMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_gui_idle_waits=%1").arg( maxTail.guiIdleWaits )
+               << QStringLiteral("present_setup_max_runner_sleep_ms=%1").arg( maxTail.runnerSleepMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_runner_sleeps=%1").arg( maxTail.runnerSleeps );
         qInfo().noquote() << fields.join( QLatin1Char(' ') );
         for( const SlipRecord &r : slip.slipLines )
         {
