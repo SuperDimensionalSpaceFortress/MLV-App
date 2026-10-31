@@ -6816,7 +6816,8 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         cases = {
             "junction-onto-share": str(links["to-share"] / "receipts"),
             "junction-onto-share-subdir": str(links["to-share"] / "inner" / "deeper" / "receipts"),
-            "junction-onto-a-local-dir-stays-allowed": str(links["to-other"] / "receipts"),
+            # r6 G7 / ADV-A3 (inverted from r4's "stays-allowed"): the junction's target has no .claude-state component, so the location actually written is outside the marker
+            "junction-onto-a-local-dir-outside-claude-state-is-refused": str(links["to-other"] / "receipts"),
             "share-extended-spelling": "\\\\?\\" + str(share / ".claude-state" / "r"),
             "share-upper-case-and-trailing-separator": str(share / ".claude-state" / "r").upper() + "\\",
             "share-forward-slashes": str(share / ".claude-state" / "r").replace("\\", "/"),
@@ -6830,7 +6831,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         for name in ("junction-onto-share", "junction-onto-share-subdir", "share-extended-spelling", "share-upper-case-and-trailing-separator", "share-forward-slashes", "share-dot-dot-detour", "share-8dot3-alias"):
             if name in cases:
                 self.assertIsNone(got[name], f"{name}: {cases[name]} reaches the venue share and must be refused")
-        self.assertTrue(self.same_path(got["junction-onto-a-local-dir-stays-allowed"], links["to-other"] / "receipts"), got)
+        self.assertIsNone(got["junction-onto-a-local-dir-outside-claude-state-is-refused"], got)
         self.assertTrue(self.same_path(got["sibling-of-share-stays-allowed"], base / "agent-share-long-name-2" / ".claude-state" / "r"), got)
 
     def test_adversary_r3_a4_a_device_path_is_refused_everywhere_and_only_the_c_drive_extended_form_is_local(self) -> None:
@@ -6950,18 +6951,25 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
 
     def test_adversary_r5_g5_the_helper_returns_the_resolved_path_it_judged(self) -> None:
         # Grok G5: the helper judged the link-resolved path and returned the original spelling, so a writer followed the link on its own. The value checked is the value written.
+        # r6 G7 / Dot 6546717175 / ADV-A3 (INVERTED): a junction target with no .claude-state component is REFUSED (r5 certified it, outside the marker); the resolved-path return is kept
+        # for a target that is itself under .claude-state.
         base = self.clean_base()
         target = base / "link-target-dir"
         target.mkdir()
+        marked = base / "marked" / ".claude-state" / "link-target-dir"
+        marked.mkdir(parents=True)
         state = base / ".claude-state"
         state.mkdir()
-        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / "to-target"), str(target)], capture_output=True, text=True)
-        if made.returncode != 0:
-            self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
-        got = self.judge(["C:\\fake\\agent-share"], {"via-junction": str(state / "to-target" / "receipts"), "plain": str(state / "plain" / "receipts")})
+        for name, tgt in (("to-target", target), ("to-marked", marked)):
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / name), str(tgt)], capture_output=True, text=True)
+            if made.returncode != 0:
+                self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        got = self.judge(["C:\\fake\\agent-share"], {"via-junction": str(state / "to-target" / "receipts"), "via-junction-marked": str(state / "to-marked" / "receipts"),
+                                                     "plain": str(state / "plain" / "receipts")})
+        self.assertIsNone(got["via-junction"], f"the junction's target is outside every .claude-state component: {got}")
         # compared by real path (a runner's temp dir is spelled with an 8.3 short name, e.g. RUNNER~1, while the link target comes back in long form), plus the junction's own name must be gone
-        self.assertTrue(self.same_path(got["via-junction"], target / "receipts"), f"the certified path is the junction's TARGET: {got}")
-        self.assertNotIn("to-target", got["via-junction"].lower(), f"the certified path must not keep the spelling that reached the junction: {got}")
+        self.assertTrue(self.same_path(got["via-junction-marked"], marked / "receipts"), f"the certified path is the junction's TARGET: {got}")
+        self.assertNotIn("to-marked", got["via-junction-marked"].lower(), f"the certified path must not keep the spelling that reached the junction: {got}")
         self.assertTrue(self.same_path(got["plain"], state / "plain" / "receipts"), got)
 
     def test_adversary_r5_g6_the_real_leg_strip_dir_is_the_certified_spelling_before_any_branch_uses_it(self) -> None:
@@ -6974,6 +6982,198 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         self.assertLess(cert + assign.start(), primary, "the replacement must come BEFORE the primary-strip branch")
         for m in re.finditer(r"Join-Path \$stripDir ", text):
             self.assertGreater(m.start(), cert + assign.start(), "no strip copy path may be built from $stripDir before it is the certified spelling")
+
+    # ---- r6 CONVERGENCE (Grok G7 6546677256 = Dot 6546717175 = r5 ADV-A3; r5 ADV-A1, ADV-A2, ADV-A4): ONE invariant, judged on the spelling AND on the FINAL link-resolved path,
+    # which is the path returned and the path written. Fixtures are real junctions under a clean base OUTSIDE .claude-state.
+    def make_junction(self, link: Path, target: Path) -> Path:
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        return link
+
+    @staticmethod
+    def files_in(d: Path) -> list:
+        return sorted(str(p) for p in d.rglob("*")) if d.exists() else []
+
+    def link_fixture(self) -> dict:
+        base = self.clean_base()
+        outside = base / "published"   # no .claude-state component anywhere on its path
+        outside.mkdir()
+        real = base / "other" / ".claude-state" / "real"   # a target that is itself under .claude-state
+        real.mkdir(parents=True)
+        state = base / "review" / ".claude-state"
+        state.mkdir(parents=True)
+        self.make_junction(state / "to-public", outside)
+        self.make_junction(state / "to-real", real)
+        (base / "cs").mkdir()
+        cs = self.make_junction(base / "cs" / ".claude-state", outside)   # a `.claude-state` component that IS a junction onto the outside directory
+        return {"base": base, "outside": outside, "real": real, "state": state, "cs": cs}
+
+    def test_r6_g7_a3_the_marker_is_judged_on_the_final_link_resolved_path(self) -> None:
+        f = self.link_fixture()
+        got = self.judge(["C:\\fake\\agent-share"], {
+            "a3-literal-junction-out": str(f["state"] / "to-public" / "sheets"),
+            "claude-state-is-a-junction-out": str(f["cs"] / "dual-venue" / "receipts"),
+            "junction-onto-a-claude-state-target": str(f["state"] / "to-real" / "sheets"),
+        })
+        self.assertIsNone(got["a3-literal-junction-out"], f"certified outside the marker: {got}")
+        self.assertIsNone(got["claude-state-is-a-junction-out"], f"certified outside the marker: {got}")
+        self.assertTrue(self.same_path(got["junction-onto-a-claude-state-target"], f["real"] / "sheets"), got)
+        self.assertNotIn("to-real", got["junction-onto-a-claude-state-target"].lower(), got)
+        self.assertEqual(self.files_in(f["outside"]), [], "the helper writes nothing")
+
+    def test_r6_every_certificate_re_judges_to_itself(self) -> None:
+        # idempotence: helper(helper(x)) == helper(x), so a caller that re-judges a certified value (the leg's strip dir re-judges -SheetCopyDir) accepts its own certificate
+        f = self.link_fixture()
+        base = f["base"]
+        local = str(base / "plain" / ".claude-state" / "dual-venue" / "receipts")
+        cases = {"plain": local, "forward": local.replace("\\", "/"), "extended": "\\\\?\\" + local, "trailing": local + "\\", "relative": "rel\\.claude-state\\receipts",
+                 "dot-dot": str(base / "plain" / "x" / ".." / ".claude-state" / "r"), "via-junction-onto-a-claude-state-target": str(f["state"] / "to-real" / "sheets")}
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(base), buf, 1024) and buf.value.lower() != str(base).lower():
+            cases["short-name-base"] = str(Path(buf.value) / "plain" / ".claude-state" / "r")
+        shares = ["C:\\fake\\agent-share"]
+        first = self.judge(shares, cases, location=base, process_dir=base)
+        for name, value in first.items():
+            self.assertIsNotNone(value, f"{name} must be accepted: {first}")
+        self.assertEqual(self.judge(shares, first), first, "a certificate must re-judge to itself")
+
+    def leg_strip_block_ps(self, sheet_copy_dir: str, receipt_root: str, evidence_dir: Path, png: Path) -> str:
+        """PowerShell that runs the REAL strip-copy and self-heal block of Invoke-VenueLeg.ps1 (its own text, from `$stripDir = $(if` through the self-heal loop) with stub captures."""
+        return (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            f"$legText = [IO.File]::ReadAllText('{psq(DV / 'Invoke-VenueLeg.ps1')}')\n"
+            "$a = $legText.IndexOf('    $stripDir = $(if')\n"
+            "$e = $(if ($a -ge 0) { $legText.IndexOf('Write-Output \"DVE_VISUAL_$($preDir.Name)', $a) } else { -1 })\n"
+            "if ($a -lt 0 -or $e -lt 0) { throw 'the leg strip block was not found' }\n"
+            "$e = $legText.IndexOf(\"`n\", $e)\n"
+            "$block = $legText.Substring($a, $e - $a) + \"`n        }`n    }`n\"\n"
+            "function global:Read-DvVisualCaptures { param($Requested, $ArtifactsDir, $EvidenceDir, $LegId, $Header) "
+            f"[pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null; verdict = 'OK'; reason = '' }} }}\n"
+            f"$receipt = [ordered]@{{ visual = [pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null }} }}\n"
+            "$spec = [pscustomobject]@{ legId = 'leg-r6' }; $Venue = 'bachelor'; $Backend = 'cuda'; $SourceCommit = '0123456789abcdef0123'; $runStamp = '20261031T000000Z'; $OfflineTestMode = $false\n"
+            f"$SheetCopyDir = '{psq(sheet_copy_dir)}'; $ReceiptRoot = '{psq(receipt_root)}'; $evidenceDir = '{psq(evidence_dir)}'\n"
+            "$null = . ([scriptblock]::Create($block))\n"
+            "'PRIMARY=' + [string]$receipt.visual.stripCopyPath\n"
+            "foreach ($k in @($receipt['selfHealVisual'].Keys)) { 'SELFHEAL ' + $k + '=' + [string]$receipt['selfHealVisual'][$k].stripCopyPath }\n"
+        )
+
+    def strip_inputs(self, base: Path) -> tuple:
+        png = base / "captures" / "strip.png"
+        png.parent.mkdir(parents=True)
+        png.write_bytes(b"\x89PNG\r\n\x1a\nr6")
+        evidence = base / "ev" / ".claude-state" / "evidence" / "rid"
+        (evidence / "self-heal" / "pre-1").mkdir(parents=True)
+        return png, evidence
+
+    def test_r6_g7_the_real_leg_strip_copy_and_self_heal_write_nothing_through_a_marker_junction_onto_an_outside_dir(self) -> None:
+        f = self.link_fixture()
+        png, evidence = self.strip_inputs(f["base"])
+        # (1) -SheetCopyDir through the junction: the leg's own entry guard throws before anything
+        bad_sheets = str(f["state"] / "to-public" / "sheets")
+        guard = self.run_ps(
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            f"$legText = [IO.File]::ReadAllText('{psq(DV / 'Invoke-VenueLeg.ps1')}')\n"
+            "$m = [regex]::Match($legText, '(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}')\n"
+            "if (-not $m.Success) { throw 'the leg SheetCopyDir guard was not found' }\n"
+            f"$SheetCopyDir = '{psq(bad_sheets)}'\n"
+            "try { . ([scriptblock]::Create($m.Value)); 'ACCEPTED ' + $SheetCopyDir } catch { 'REFUSED ' + $_.Exception.Message }\n")
+        self.assertTrue(guard.startswith("REFUSED DVE_SHEET_COPY_MUST_STAY_LOCAL"), guard)
+        # (2) the strip block itself, primary strip AND self-heal pre-launch, by both routes: -SheetCopyDir given, and the default <receipts>\..\sheets beside a junctioned root
+        for label, sheet_dir, root in (("sheet-copy-dir", bad_sheets, str(f["base"] / "x" / ".claude-state" / "receipts")),
+                                       ("default-beside-root", "", str(f["state"] / "to-public" / "receipts"))):
+            with self.subTest(route=label):
+                out = self.run_ps(self.leg_strip_block_ps(sheet_dir, root, evidence, png))
+                self.assertIn("PRIMARY=\n", out + "\n", out)
+                self.assertIn("SELFHEAL pre-1=", out)
+                self.assertNotRegex(out, r"SELFHEAL pre-1=\S", out)
+                self.assertEqual(self.files_in(f["outside"]), [], f"{label}: owner strip images were written outside .claude-state")
+
+    def test_r6_g7_the_real_leg_strip_copy_writes_through_a_junction_whose_target_is_under_claude_state(self) -> None:
+        f = self.link_fixture()
+        png, evidence = self.strip_inputs(f["base"])
+        out = self.run_ps(self.leg_strip_block_ps("", str(f["state"] / "to-real" / "receipts"), evidence, png))
+        written = [Path(p) for p in self.files_in(f["base"] / "other") if p.endswith(".png")]
+        self.assertEqual(len(written), 2, out)   # the primary strip and the self-heal pre-1 strip
+        for p in written:
+            self.assertTrue(self.same_path(str(p.parent), f["real"] / "sheets"), written)
+        self.assertRegex(out, r"PRIMARY=\S")
+        self.assertNotIn("to-real", out.lower(), "the copy path is built from the certificate (the resolved target), not the spelling that reached the junction")
+
+    def test_r6_d_a_batch_whose_claude_state_is_a_junction_onto_an_outside_dir_refuses_before_side_effects(self) -> None:
+        f = self.link_fixture()
+        r = self.run_batch(None, "-ReceiptRoot", str(f["cs"] / "dual-venue" / "receipts"))
+        self.assert_nothing_started(r)
+        self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+        self.assertEqual(self.files_in(f["outside"]), [])
+        # the real leg entry refuses the same root
+        got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(f["cs"] / "dual-venue" / "receipts")))
+        self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_r6_adv_a1_an_aliased_spelling_of_a_share_is_refused(self) -> None:
+        # ADV-A1 literal: AgentShares = the lane worktree; Path = '<worktree> \.claude-state\receipt-r5' (trailing space) and '<worktree>. \...'. Win32 strips a trailing space or dot
+        # from a name, so such a component is an alias: every component must be a name the file system writes as spelled.
+        wt = str(ROOT)
+        got = self.judge([wt], {"literal-trailing-space": wt + " \\.claude-state\\receipt-r5", "literal-dot-space": wt + ". \\.claude-state\\receipt-r5",
+                                "trailing-dot": wt + ".\\.claude-state\\receipt-r5", "as-spelled": wt + "\\.claude-state\\receipt-r5"})
+        for name, value in got.items():
+            self.assertIsNone(value, f"{name}: {got}")
+        base = self.clean_base()
+        share = base / "lane-share"
+        (share / ".claude-state").mkdir(parents=True)
+        cases = {"space": str(share) + " \\.claude-state\\r", "dot-space": str(share) + ". \\.claude-state\\r", "space-in-tail": str(base / "x" / ".claude-state" / "r ") + "\\a",
+                 "dot-in-tail": str(base / "x" / ".claude-state" / "r. ") + "\\a"}
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(share), buf, 1024) and buf.value.lower() != str(share).lower():
+            cases["short-name"] = str(Path(buf.value) / ".claude-state" / "r")
+        got = self.judge([str(share)], {**cases, "sibling-stays-allowed": str(base / "lane-share-2" / ".claude-state" / "r")})
+        for name in cases:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertTrue(self.same_path(got["sibling-stays-allowed"], base / "lane-share-2" / ".claude-state" / "r"), got)
+
+    def test_r6_adv_a2_a_powershell_drive_naming_a_unc_is_refused_in_every_spelling(self) -> None:
+        # ADV-A2 literal: a non-persistent FileSystem PSDrive Q: whose Root is \\bachelor\mlv-agent (stubbed, as the adversary did: no share is touched), SheetCopyDir '\\?\Q:\.claude-state\sheets'
+        stub = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "function global:Get-PSDrive { [CmdletBinding()] param([string]$Name)\n"
+            "  if ($Name -eq 'Q') { return [pscustomobject]@{ Name = 'Q'; Provider = [pscustomobject]@{ Name = 'FileSystem' }; Root = '\\\\bachelor\\mlv-agent\\'; DisplayRoot = '' } }\n"
+            "  Microsoft.PowerShell.Management\\Get-PSDrive @PSBoundParameters }\n"
+        )
+        cases = {"extended-literal": "\\\\?\\Q:\\.claude-state\\sheets", "plain": "Q:\\.claude-state\\sheets", "forward": "Q:/.claude-state/sheets"}
+        script = stub + "$o = [ordered]@{}\n" + "".join(f"$o['{k}'] = Test-DvLocalReceiptRoot -Path '{psq(v)}' -AgentShares @('C:\\fake\\agent-share')\n" for k, v in cases.items())
+        script += "$o['c-drive-still-local'] = Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\sheets' -AgentShares @('C:\\fake\\agent-share')\n$o | ConvertTo-Json -Compress\n"
+        got = json.loads(self.run_ps(script))
+        for name in cases:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["c-drive-still-local"].lower(), "c:\\x\\.claude-state\\sheets")
+        # the real leg -SheetCopyDir entry, on the literal input
+        leg = self.run_ps(stub +
+            f"$legText = [IO.File]::ReadAllText('{psq(DV / 'Invoke-VenueLeg.ps1')}')\n"
+            "$m = [regex]::Match($legText, '(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}')\n"
+            "if (-not $m.Success) { throw 'the leg SheetCopyDir guard was not found' }\n"
+            "$SheetCopyDir = '\\\\?\\Q:\\.claude-state\\sheets'\n"
+            "try { . ([scriptblock]::Create($m.Value)); 'ACCEPTED ' + $SheetCopyDir } catch { 'REFUSED ' + $_.Exception.Message }\n")
+        self.assertTrue(leg.startswith("REFUSED DVE_SHEET_COPY_MUST_STAY_LOCAL"), leg)
+
+    def test_r6_adv_a4_an_unparsable_destination_fails_closed_before_any_batch_side_effect(self) -> None:
+        # ADV-A4 literal: ReceiptRoot 'C:\x\.claude-state\bad<root>' (also bad|root, bad"root, bad?root); plus DOS device names, which the file system never writes as a directory
+        bad = {"lt": "C:\\x\\.claude-state\\bad<root>", "pipe": "C:\\x\\.claude-state\\bad|root", "quote": "C:\\x\\.claude-state\\bad\"root", "question": "C:\\x\\.claude-state\\bad?root",
+               "star": "C:\\x\\.claude-state\\bad*root", "control": "C:\\x\\.claude-state\\bad\u0001root", "nul": "C:\\x\\.claude-state\\NUL\\r", "con-ext": "C:\\x\\.claude-state\\con.txt\\r",
+               "com1": "C:\\x\\.claude-state\\COM1"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "fine": "C:\\x\\.claude-state\\good-root"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        base = self.clean_base()
+        for name in ("lt", "pipe"):
+            with self.subTest(entry="batch", name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(base / ".claude-state" / bad[name].rsplit("\\", 1)[1]))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=name):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", bad[name]))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
 
     def test_adversary_dot_a1_no_boundary_directory_name_is_compared_with_a_culture_aware_operator(self) -> None:
         # the class, not the instance: every PowerShell file under tools/ that tests a path component against .claude-state goes through [string]::Equals(..., Ordinal)

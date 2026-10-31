@@ -746,6 +746,11 @@ function Test-DvLocalReceiptRoot {
     #   - a path equal to or under a venue agentShare from venues.json is refused (OrdinalIgnoreCase, full-path normalised, trailing separators trimmed) BOTH as spelled and after every symbolic link / junction on the way is
     #     followed to its final target (r4 A3), AND the same canonical form is applied to each share (r5 ADV-A2): an extended-prefix share, and a share that is itself reached through a link, match the candidate that sits under them;
     #   - a path on a mapped NETWORK drive ([IO.DriveInfo].DriveType), as spelled and as resolved.
+    # r6 CONVERGENCE (Grok G7 / Dot 6546717175 / ADV-A3, ADV-A1, ADV-A2, ADV-A4): ONE invariant, judged on the spelling AND on the FINAL link-resolved path (the value returned and written):
+    #   it is under an exact `.claude-state` component, it is local ($isLocal: no UNC/device, no agentShare, no network drive, and its PowerShell drive -- whatever spelling reached it, `\\?\X:\` included --
+    #   is a plain file-system drive rooted at its own letter), and every component is WELL-FORMED: no invalid file-name character (`<>:"|?*`, controls), no trailing space or dot (Win32 strips
+    #   them, so such a name is an alias of another directory), no DOS device name (NUL, CON, COM1, ...). GetFullPath expands an existing 8.3 short name, so the canonical long form is what is
+    #   compared. A drive root is never a certificate. The result is idempotent: Test-DvLocalReceiptRoot (Test-DvLocalReceiptRoot x) returns the same path, so a re-judging caller accepts its own certificate.
     # FAIL CLOSED: an unreadable venues.json, an unparsable path or a link that cannot be read is a refusal. Nothing is created, opened or written here; reading drive types, attributes and link targets is the only I/O.
     # This function reaches no engine-session API (the attr3 splice scan, test_attr3_spliced_body_scan, counts any such reference in this file as an unprovable extractor binding): the location comes from Get-Location, the drive from Get-PSDrive.
     param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
@@ -756,12 +761,7 @@ function Test-DvLocalReceiptRoot {
             $full = $Path.Substring(4)
         }
         elseif ($Path -match '^[\\/]\?\?[\\/]') { return $null }   # the NT object-manager prefix \??\
-        elseif ($Path -match '^[A-Za-z]:[\\/]') {
-            # a drive-letter value: the PowerShell drive of that name, if any, must be a file-system drive rooted at the letter itself (not `New-PSDrive X -Root \\bachelor\share`)
-            $psd = Get-PSDrive -Name $Path.Substring(0, 1) -ErrorAction SilentlyContinue
-            if ($null -ne $psd -and ($psd.Provider.Name -cne 'FileSystem' -or -not [string]::IsNullOrEmpty([string]$psd.DisplayRoot) -or -not ([string]$psd.Root).StartsWith($Path.Substring(0, 2), [StringComparison]::OrdinalIgnoreCase))) { return $null }
-            $full = $Path
-        }
+        elseif ($Path -match '^[A-Za-z]:[\\/]') { $full = $Path }   # its PowerShell drive is judged by $isLocal below, like every other drive-letter spelling (r6 ADV-A2)
         elseif ($Path.Contains(':')) { return $null }   # provider-qualified (HKLM:\, Env:\, Module\Provider::path) or drive-relative (C:rel): a colon anywhere in a value that is not a drive-letter path
         else {
             # rooted-on-the-current-drive (`\x`, `/x`) or relative: resolved once against the POWERSHELL location, on the FileSystem provider only
@@ -829,11 +829,22 @@ function Test-DvLocalReceiptRoot {
                 $shareKeys += (& $norm $kr)
             }
         }
+        $badNameChars = [IO.Path]::GetInvalidFileNameChars()
         $isLocal = {
-            # judges ONE concrete spelling: UNC / device / agentShare / network drive. Returns $true when it is a local, non-share path.
+            # judges ONE concrete spelling: well-formed components / UNC / device / PowerShell drive / agentShare / network drive. Returns $true when it is a local, non-share path.
             param($p)
             if ($p -match '^[\\/]{2}') { return $false }
             if ($p -notmatch '^[A-Za-z]:\\') { return $false }
+            # r6 ADV-A4 / ADV-A1: every component is a name the file system writes as spelled (no invalid character, no trailing space or dot alias, no DOS device name)
+            foreach ($c in @($p.Substring(3).Split([char]92))) {
+                if ($c.Length -eq 0) { continue }
+                if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
+                if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
+                if ($c -cmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]|CONIN\$|CONOUT\$)(\..*)?$') { return $false }
+            }
+            # r6 ADV-A2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted at the letter itself (not `New-PSDrive X -Root \\host\share`)
+            $psd = Get-PSDrive -Name $p.Substring(0, 1) -ErrorAction SilentlyContinue
+            if ($null -ne $psd -and ($psd.Provider.Name -cne 'FileSystem' -or -not [string]::IsNullOrEmpty([string]$psd.DisplayRoot) -or -not ([string]$psd.Root).StartsWith($p.Substring(0, 2), [StringComparison]::OrdinalIgnoreCase))) { return $false }
             $k = & $norm $p
             foreach ($s in $shareKeys) {
                 if ($k.Equals($s, [StringComparison]::OrdinalIgnoreCase) -or $k.StartsWith($s + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
@@ -844,8 +855,14 @@ function Test-DvLocalReceiptRoot {
         if (-not (& $isLocal $plain)) { return $null }
         $final = & $walk $plain $true
         if ($null -eq $final) { return $null }
-        # G5: the path that was judged is the path that is returned (the link-resolved one; $plain itself when no component is a link)
-        return $final.TrimEnd([char]92)
+        # G5: the path that was judged is the path that is returned (the link-resolved one; $plain itself when no component is a link).
+        # r6 G7 / Dot 6546717175 / ADV-A3: the FINAL path is judged by the WHOLE rule again -- the `.claude-state` marker too, not only locality -- so a `.claude-state` component that is a
+        # junction onto a directory outside every `.claude-state` is refused, and the certificate re-judges to itself (idempotent). A drive root is never a certificate.
+        $final = $final.TrimEnd([char]92)
+        if ($final -notmatch '^[A-Za-z]:\\.') { return $null }
+        if (-not (Test-DvUnderClaudeState -Path $final)) { return $null }
+        if (-not (& $isLocal $final)) { return $null }
+        return $final
     } catch { return $null }
 }
 
