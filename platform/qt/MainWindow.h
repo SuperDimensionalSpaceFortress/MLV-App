@@ -1105,6 +1105,10 @@ private:
     bool m_conformEnabledSetting = playback_conform::kDefaultEnabled;
     double m_conformTargetFps = playback_conform::kDefaultTargetFps;
     double m_conformThresholdFps = playback_conform::kDefaultThresholdFps;
+    // MERGE-MASTER r5 (AUDIO-A1): the clip's conform state and playback rate just BEFORE a conform control changed
+    // them (noteConformStateBeforeChange), so applyPlaybackConformSettings touches a pending audio start only on a change.
+    bool m_conformActiveBeforeChange = false;
+    double m_conformPlaybackFpsBeforeChange = 0.0;
     QActionGroup *m_conformTargetGroup = nullptr;
     QActionGroup *m_conformThresholdGroup = nullptr;
     // PRESENTED-frame timeline advance (source fps, max jump) for playback_smoke.conform. m_sourceAdvance counts
@@ -1959,6 +1963,7 @@ private:
     int effectivePlaybackAutoTargetFps( void );
     void requestPlaybackAudioSync( void );
     void setupPlaybackConformMenu( void );
+    void noteConformStateBeforeChange( void );
     void applyPlaybackConformSettings( bool persist );
     void refreshPlaybackFpsStatus( void );
     double playbackPaceGuardFps( void );

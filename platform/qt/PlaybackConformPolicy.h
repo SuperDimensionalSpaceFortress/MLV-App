@@ -202,6 +202,29 @@ inline bool audioSyncAllowed( bool conformActive )
     return !conformActive;
 }
 
+/*! MERGE-MASTER r5 (AUDIO-A1): what a Playback > High Frame Rate Conform
+ *  control change (enable toggle, target, threshold) does to a PENDING audio
+ *  start (Play raised it; the first present has not consumed it yet). Only a
+ *  change of the clip's effective conform state or playback rate touches it:
+ *  - Clear  when the clip is conformed after the change (audio is muted);
+ *  - Rearm  when it was conformed and no longer is, or its rate moved (the
+ *           audio follows the native rate again and must re-anchor);
+ *  - Keep   otherwise: a 23.976 clip stays non-conformed under a target or
+ *           threshold change, so its pending start must survive.
+ *  A non-finite rate on either side counts as a change (fail toward a
+ *  re-sync, never toward silently keeping a start at an unknown rate). */
+enum class PendingAudioStart { Keep, Clear, Rearm };
+
+inline PendingAudioStart pendingAudioStartOnConformChange( bool wasConformActive, double wasPlaybackFps,
+                                                           bool nowConformActive, double nowPlaybackFps )
+{
+    if( !audioSyncAllowed( nowConformActive ) ) return PendingAudioStart::Clear;
+    if( !audioSyncAllowed( wasConformActive ) ) return PendingAudioStart::Rearm;
+    if( !std::isfinite( wasPlaybackFps ) || !std::isfinite( nowPlaybackFps )
+     || wasPlaybackFps != nowPlaybackFps ) return PendingAudioStart::Rearm;
+    return PendingAudioStart::Keep;
+}
+
 inline QString audioMutedStatusText()
 {
     return QStringLiteral( "audio muted (conform)" );

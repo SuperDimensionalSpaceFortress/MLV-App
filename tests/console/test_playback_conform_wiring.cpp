@@ -338,8 +338,9 @@ TEST(PlaybackConformWiring, AudioSyncFlagIsRaisedInExactlyOneGatedPlace)
 TEST(PlaybackConformWiring, PlayStartLoopWrapSeekAndCutInPathsAllRouteThroughTheHelper)
 {
     const QString source = mainWindowSource();
-    // play start, loop wrap (x2: last-frame loop and drop-frame wrap), seek (slider), go-to-first
-    ASSERT_EQ(5, countOccurrences(source, QStringLiteral("requestPlaybackAudioSync();")));
+    // play start, loop wrap (x2: last-frame loop and drop-frame wrap), seek (slider), go-to-first,
+    // and (MERGE-MASTER r5, AUDIO-A1) the re-arm when a conform control un-conforms the clip during playback
+    ASSERT_EQ(6, countOccurrences(source, QStringLiteral("requestPlaybackAudioSync();")));
     const QString handling = playbackHandlingBody(source);
     ASSERT_EQ(2, countOccurrences(handling, QStringLiteral("requestPlaybackAudioSync();")));
 }
@@ -355,6 +356,66 @@ TEST(PlaybackConformWiring, AudioSyncConsumerIsGatedOnConformToo)
     const int counterAt = source.indexOf(QStringLiteral("++m_playbackAudioSyncRequestCount;"));
     ASSERT_TRUE(counterAt > at);
     ASSERT_EQ(1, countOccurrences(source, QStringLiteral("++m_playbackAudioSyncRequestCount;")));
+}
+
+// MERGE-MASTER r5 (AUDIO-A1, r4 adversary successor ADV-A1, Dot 6542640078): a conform target/threshold/toggle change before
+// the first present cleared the pending audio start unconditionally (m_tryToSyncAudio = false), even for a 23.976 clip it
+// left non-conformed; with Loop off no drop-frame tick re-armed it, so the prepared sink stayed silent. The change now goes
+// through playback_conform::pendingAudioStartOnConformChange (behaviour: PlaybackConformPendingAudio.*), fed the state each
+// control recorded BEFORE it changed the settings.
+TEST(PlaybackConformWiring, ConformControlTouchesThePendingAudioStartOnlyOnAConformChange)
+{
+    const QString source = mainWindowSource();
+    const QString apply = functionBody(source,
+        QStringLiteral("void MainWindow::applyPlaybackConformSettings( bool persist )"),
+        QStringLiteral("//Paint the Audio Track Wave to GUI"));
+    ASSERT_FALSE(apply.isEmpty());
+    // the FULL argument list, so negating any argument (e.g. !playbackConformActive()) breaks the pin
+    const int decide = apply.indexOf(QStringLiteral(
+        "switch( playback_conform::pendingAudioStartOnConformChange( m_conformActiveBeforeChange, m_conformPlaybackFpsBeforeChange,\n"
+        "                                                                playbackConformActive(), m_pMlvObject ? getPlaybackFramerate() : 0.0 ) )"));
+    ASSERT_TRUE(decide >= 0);
+    // nothing before the decision writes the pending flag (the unconditional clear is gone)
+    ASSERT_FALSE(apply.left(decide).contains(QStringLiteral("m_tryToSyncAudio")));
+    const QString decision = apply.mid(decide);
+    const int clear = decision.indexOf(QStringLiteral("case playback_conform::PendingAudioStart::Clear:"));
+    const int rearm = decision.indexOf(QStringLiteral("case playback_conform::PendingAudioStart::Rearm:"));
+    const int keep = decision.indexOf(QStringLiteral("case playback_conform::PendingAudioStart::Keep:"));
+    ASSERT_TRUE(clear > 0);
+    ASSERT_TRUE(rearm > clear);
+    ASSERT_TRUE(keep > rearm);
+    ASSERT_TRUE(decision.mid(clear, rearm - clear).contains(QStringLiteral("m_tryToSyncAudio = false;")));
+    // the re-arm goes through the conform-gated helper, under the same play/audio/drop-frame gate as go-to-first
+    const QString rearmBody = decision.mid(rearm, keep - rearm);
+    ASSERT_TRUE(rearmBody.contains(QStringLiteral("requestPlaybackAudioSync();")));
+    ASSERT_TRUE(rearmBody.contains(QStringLiteral("ui->actionPlay->isChecked()")));
+    ASSERT_TRUE(rearmBody.contains(QStringLiteral("ui->actionAudioOutput->isChecked()")));
+    ASSERT_TRUE(rearmBody.contains(QStringLiteral("ui->actionDropFrameMode->isChecked()")));
+    // Keep leaves the pending start alone
+    const int keepEnd = decision.indexOf(QStringLiteral("break;"), keep);
+    ASSERT_TRUE(keepEnd > keep);
+    ASSERT_FALSE(decision.mid(keep, keepEnd - keep).contains(QStringLiteral("m_tryToSyncAudio")));
+
+    // every conform control records the before-state FIRST, then changes the settings, then applies them
+    const QString menu = functionBody(source,
+        QStringLiteral("void MainWindow::setupPlaybackConformMenu( void )"),
+        QStringLiteral("void MainWindow::applyPlaybackConformSettings( bool persist )"));
+    ASSERT_FALSE(menu.isEmpty());
+    ASSERT_EQ(3, countOccurrences(menu, QStringLiteral("noteConformStateBeforeChange();")));
+    ASSERT_EQ(3, countOccurrences(menu, QStringLiteral("applyPlaybackConformSettings( true );")));
+    for (const char * mutation : { "m_conformEnabledSetting = on;", "m_conformTargetFps = target;", "m_conformThresholdFps = threshold;" }) {
+        const int at = menu.indexOf(QString::fromLatin1(mutation));
+        ASSERT_TRUE(at > 0);
+        const int note = menu.lastIndexOf(QStringLiteral("noteConformStateBeforeChange();"), at);
+        ASSERT_TRUE(note >= 0);
+        ASSERT_TRUE(at - note < 80);
+        ASSERT_TRUE(menu.indexOf(QStringLiteral("applyPlaybackConformSettings( true );"), at) > at);
+    }
+    const QString note = functionBody(source,
+        QStringLiteral("void MainWindow::noteConformStateBeforeChange( void )"),
+        QStringLiteral("void MainWindow::setupPlaybackConformMenu( void )"));
+    ASSERT_TRUE(note.contains(QStringLiteral("m_conformActiveBeforeChange = playbackConformActive();")));
+    ASSERT_TRUE(note.contains(QStringLiteral("m_conformPlaybackFpsBeforeChange = m_pMlvObject ? getPlaybackFramerate() : 0.0;")));
 }
 
 TEST(PlaybackConformWiring, SavedAudioOutputChoiceIsNeverUncheckedByConform)

@@ -261,3 +261,131 @@ TEST(PlaybackConformPolicy, StatusTextShowsConformSuffixOnlyWhenConforming)
     ASSERT_EQ(std::string("Playback: 0.0 fps"),
               playbackFpsStatusText(-3.0, 30.0, 30.0).toStdString());
 }
+
+// MERGE-MASTER r5 (AUDIO-A1, Dot 6542640078): a conform control change before the first present must not cancel the pending
+// audio start of a clip it leaves non-conformed. Each case runs the trace end to end on the pure functions: Play raised the
+// pending start (non-conformed), the control changes the settings, the decision is applied, and the gated consumer
+// (audioSyncAllowed(conformActive), MainWindow.cpp's syncAndPlay gate) either starts the audio or not.
+namespace
+{
+struct ConformControls
+{
+    bool enabled;
+    double target;
+    double threshold;
+};
+
+struct PendingTrace
+{
+    PendingAudioStart decision;
+    bool pendingAfter;  // m_tryToSyncAudio after applyPlaybackConformSettings (play, audio output and drop frame are on)
+    bool audioStarts;   // the first present's gated consumer starts the audio
+};
+
+PendingTrace runControlChange( double clipFps, const ConformControls & before, const ConformControls & after )
+{
+    const bool wasActive = conformApplies( clipFps, before.enabled, before.target, before.threshold );
+    const double wasFps = playbackFps( clipFps, before.enabled, before.target, before.threshold );
+    bool pending = audioSyncAllowed( wasActive ); // Play: requestPlaybackAudioSync() raises it only when not conformed
+    const bool nowActive = conformApplies( clipFps, after.enabled, after.target, after.threshold );
+    const double nowFps = playbackFps( clipFps, after.enabled, after.target, after.threshold );
+    const PendingAudioStart decision = pendingAudioStartOnConformChange( wasActive, wasFps, nowActive, nowFps );
+    if( decision == PendingAudioStart::Clear ) pending = false;
+    if( decision == PendingAudioStart::Rearm ) pending = audioSyncAllowed( nowActive );
+    return { decision, pending, pending && audioSyncAllowed( nowActive ) };
+}
+
+constexpr double kClip23976 = 24000.0 / 1001.0;
+constexpr double kClip5994 = 60000.0 / 1001.0;
+} // namespace
+
+TEST(PlaybackConformPendingAudio, NonConformedThresholdChangeKeepsThePendingStart)
+{
+    // Dot's trace: 23.976 clip, threshold 30 -> 50 (and back) before the first present; the clip stays non-conformed.
+    const PendingTrace up = runControlChange( kClip23976, { kOn, 24.0, 30.0 }, { kOn, 24.0, 50.0 } );
+    ASSERT_TRUE(up.decision == PendingAudioStart::Keep);
+    ASSERT_TRUE(up.pendingAfter);
+    ASSERT_TRUE(up.audioStarts);
+    const PendingTrace down = runControlChange( kClip23976, { kOn, 24.0, 50.0 }, { kOn, 24.0, 30.0 } );
+    ASSERT_TRUE(down.decision == PendingAudioStart::Keep);
+    ASSERT_TRUE(down.audioStarts);
+}
+
+TEST(PlaybackConformPendingAudio, NonConformedTargetChangeKeepsThePendingStart)
+{
+    for( const double target : { 24.0, 25.0, 30.0 } )
+    {
+        const PendingTrace t = runControlChange( kClip23976, { kOn, 24.0, 30.0 }, { kOn, target, 30.0 } );
+        ASSERT_TRUE(t.decision == PendingAudioStart::Keep);
+        ASSERT_TRUE(t.audioStarts);
+    }
+}
+
+TEST(PlaybackConformPendingAudio, NonConformedToggleKeepsThePendingStart)
+{
+    const PendingTrace off = runControlChange( kClip23976, { kOn, 24.0, 30.0 }, { kOff, 24.0, 30.0 } );
+    ASSERT_TRUE(off.decision == PendingAudioStart::Keep);
+    ASSERT_TRUE(off.audioStarts);
+    const PendingTrace on = runControlChange( kClip23976, { kOff, 24.0, 30.0 }, { kOn, 24.0, 30.0 } );
+    ASSERT_TRUE(on.decision == PendingAudioStart::Keep);
+    ASSERT_TRUE(on.audioStarts);
+}
+
+TEST(PlaybackConformPendingAudio, BecomingConformedClearsThePendingStart)
+{
+    // toggle on for a 59.94 clip
+    const PendingTrace toggle = runControlChange( kClip5994, { kOff, 24.0, 30.0 }, { kOn, 24.0, 30.0 } );
+    ASSERT_TRUE(toggle.decision == PendingAudioStart::Clear);
+    ASSERT_FALSE(toggle.pendingAfter);
+    ASSERT_FALSE(toggle.audioStarts);
+    // threshold 50 -> 30 conforms a 48 fps clip
+    const PendingTrace threshold = runControlChange( 48.0, { kOn, 24.0, 50.0 }, { kOn, 24.0, 30.0 } );
+    ASSERT_TRUE(threshold.decision == PendingAudioStart::Clear);
+    ASSERT_FALSE(threshold.audioStarts);
+}
+
+TEST(PlaybackConformPendingAudio, StayingConformedAtAnotherTargetKeepsAudioMuted)
+{
+    const PendingTrace t = runControlChange( kClip5994, { kOn, 24.0, 30.0 }, { kOn, 30.0, 30.0 } );
+    ASSERT_TRUE(t.decision == PendingAudioStart::Clear);
+    ASSERT_FALSE(t.pendingAfter);
+    ASSERT_FALSE(t.audioStarts);
+}
+
+TEST(PlaybackConformPendingAudio, LeavingConformRearmsTheStart)
+{
+    // toggle off for a 59.94 clip: Play never raised the start (muted); the clip now plays at its native rate with audio
+    const PendingTrace toggle = runControlChange( kClip5994, { kOn, 24.0, 30.0 }, { kOff, 24.0, 30.0 } );
+    ASSERT_TRUE(toggle.decision == PendingAudioStart::Rearm);
+    ASSERT_TRUE(toggle.pendingAfter);
+    ASSERT_TRUE(toggle.audioStarts);
+    // threshold 30 -> 50 un-conforms a 48 fps clip
+    const PendingTrace threshold = runControlChange( 48.0, { kOn, 24.0, 30.0 }, { kOn, 24.0, 50.0 } );
+    ASSERT_TRUE(threshold.decision == PendingAudioStart::Rearm);
+    ASSERT_TRUE(threshold.audioStarts);
+    // the menu's targets (24/25/30) never reach a clip above the lowest threshold (30), so a target change alone keeps a
+    // conformed clip conformed and its audio muted (31 fps clip, target 24 -> 30)
+    const PendingTrace target = runControlChange( 31.0, { kOn, 24.0, 30.0 }, { kOn, 30.0, 30.0 } );
+    ASSERT_TRUE(target.decision == PendingAudioStart::Clear);
+    ASSERT_FALSE(target.audioStarts);
+}
+
+TEST(PlaybackConformPendingAudio, UnchangedOrMovedRatesWithoutConform)
+{
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, 23.976, false, 23.976 ) == PendingAudioStart::Keep);
+    // a rate move with conform inactive on both sides re-anchors the audio
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, 23.976, false, 25.0 ) == PendingAudioStart::Rearm);
+    // conformed now always clears, whatever the rates
+    ASSERT_TRUE(pendingAudioStartOnConformChange( true, 24.0, true, 24.0 ) == PendingAudioStart::Clear);
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, 23.976, true, 24.0 ) == PendingAudioStart::Clear);
+}
+
+TEST(PlaybackConformPendingAudio, NonFiniteRatesNeverKeepSilently)
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, nan, false, nan ) == PendingAudioStart::Rearm);
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, 23.976, false, inf ) == PendingAudioStart::Rearm);
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, -inf, false, 23.976 ) == PendingAudioStart::Rearm);
+    ASSERT_TRUE(pendingAudioStartOnConformChange( false, nan, true, nan ) == PendingAudioStart::Clear);
+}

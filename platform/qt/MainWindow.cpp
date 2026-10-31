@@ -19436,6 +19436,14 @@ void MainWindow::refreshPlaybackFpsStatus( void )
                                   : QString() );
 }
 
+// MERGE-MASTER r5 (AUDIO-A1): every conform control records the clip's conform state and playback rate before it changes
+// them; applyPlaybackConformSettings compares the two (playback_conform::pendingAudioStartOnConformChange).
+void MainWindow::noteConformStateBeforeChange( void )
+{
+    m_conformActiveBeforeChange = playbackConformActive();
+    m_conformPlaybackFpsBeforeChange = m_pMlvObject ? getPlaybackFramerate() : 0.0;
+}
+
 //Playback > High Frame Rate Conform: enable, target rate and threshold, persisted under
 //Playback/Conform* (deliberately not Playback/AutoTargetFps, which is the Auto quality budget).
 //Read and written through automation_settings::openAppSettings(), so an automation run uses its
@@ -19464,6 +19472,7 @@ void MainWindow::setupPlaybackConformMenu( void )
     connect( enable, &QAction::toggled, this, [this]( bool on )
     {
         // MERGE-MASTER r3 (adversary A2): the toggle persists the user's choice, and MLVAPP_PLAYBACK_CONFORM=0|1 still wins for this process.
+        noteConformStateBeforeChange();
         m_conformEnabledSetting = on;
         m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), on );
         applyPlaybackConformSettings( true );
@@ -19482,6 +19491,7 @@ void MainWindow::setupPlaybackConformMenu( void )
         m_conformTargetGroup->addAction( a );
         connect( a, &QAction::triggered, this, [this, target]()
         {
+            noteConformStateBeforeChange();
             m_conformTargetFps = target;
             applyPlaybackConformSettings( true );
         } );
@@ -19500,6 +19510,7 @@ void MainWindow::setupPlaybackConformMenu( void )
         m_conformThresholdGroup->addAction( a );
         connect( a, &QAction::triggered, this, [this, threshold]()
         {
+            noteConformStateBeforeChange();
             m_conformThresholdFps = threshold;
             applyPlaybackConformSettings( true );
         } );
@@ -19522,7 +19533,28 @@ void MainWindow::applyPlaybackConformSettings( bool persist )
     // A conform change mid-playback: audio that was already running must stop (it cannot follow
     // the new rate); the next play start / wrap / seek re-syncs it when conform is inactive.
     if( m_pAudioPlayback && playbackConformActive() ) m_pAudioPlayback->stop();
-    m_tryToSyncAudio = false;
+    // MERGE-MASTER r5 (AUDIO-A1): a pending audio start (raised at Play, not yet consumed by the first present) is
+    // touched only when this change moved the clip's effective conform state or playback rate. A 23.976 clip stays
+    // non-conformed under a target or threshold change, so its pending start survives (the drop-frame tick re-arms
+    // only on a wrap, so a cleared start never came back with Loop off).
+    switch( playback_conform::pendingAudioStartOnConformChange( m_conformActiveBeforeChange, m_conformPlaybackFpsBeforeChange,
+                                                                playbackConformActive(), m_pMlvObject ? getPlaybackFramerate() : 0.0 ) )
+    {
+    case playback_conform::PendingAudioStart::Clear:
+        m_tryToSyncAudio = false;
+        break;
+    case playback_conform::PendingAudioStart::Rearm:
+        m_tryToSyncAudio = false;
+        if( ui->actionAudioOutput->isChecked()
+         && ui->actionDropFrameMode->isChecked()
+         && ui->actionPlay->isChecked() )
+        {
+            requestPlaybackAudioSync();
+        }
+        break;
+    case playback_conform::PendingAudioStart::Keep:
+        break;
+    }
     if( m_fileLoaded && m_pMlvObject )
     {
         killTimer( m_timerId );
