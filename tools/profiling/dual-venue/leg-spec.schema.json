@@ -83,7 +83,8 @@
         "contactSheetFrames": { "type": "integer", "minimum": 1, "maximum": 60 },
         "lookFlavor": { "enum": ["classic", "cinematic", "film", "vision50d"], "default": "classic" },
         "receipt": { "type": "string", "pattern": "^look-receipts/[a-z0-9-]+\\.marxml$", "description": "OPTIONAL (LOOK-ASSIST-FILM-FLAVOR-2 r2): a receipt file relative to tools/profiling/dual-venue/. The GUI smoke applies it before playback (--receipt). The runner reads it as COMMITTED at the admission head, never from the working copy. A measurement instrument (for example AgX off, so a capture can be re-graded frame-locked), not a product setting." },
-        "receiptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the committed receipt bytes. legSpecSha256 binds this hash, and so the receipt's bytes; a mismatch refuses the leg (LOOK_RECEIPT_UNBOUND)." }
+        "receiptSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the committed receipt bytes. legSpecSha256 binds this hash, and so the receipt's bytes; a mismatch refuses the leg (LOOK_RECEIPT_UNBOUND)." },
+        "pairedSeek": { "type": "boolean", "description": "OPTIONAL (CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1): true adds the generator's -ContactSheetPairedSeek, so after the measured Play the job seeks back to each in-pass frame and captures it paused (capture_mode=seek, playback_path=false), published apart under paired-seek\\contact-sheet\\raw. The runner copies those frames to <evidence>\\paired-seek\\contact-sheet\\raw and records their path, count and per-file sha256 in the receipt (look.pairedSeek). Absent or false: nothing is passed and the job is the text it was before." }
       },
       "dependentRequired": { "receipt": ["receiptSha256"], "receiptSha256": ["receipt"] },
       "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."

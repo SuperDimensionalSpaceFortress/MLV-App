@@ -189,6 +189,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
                             for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: the quality-1 look cells with look.pairedSeek true (the same frames captured paused after the Play), keyed to
+# the cell each one copies (legId, card and look.pairedSeek are the only differences).
+Q1_CPU_LOOK_PAIRED_LEGS = {f"legs/m16-1243-q1-cpu-look-paired-{mode}-s{scale}.json": f"legs/m16-1243-q1-cpu-look-{mode}-s{scale}.json"
+                           for mode in ("fullscreen", "windowed") for scale in (2, 4)}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *Q1_CPU_LOOK_PAIRED_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -7063,6 +7068,11 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
+            elif spec["card"] == "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1":   # the paired-seek copies of the quality-1 Look Assist legs
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-paired-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
+                self.assertIs(spec["look"]["pairedSeek"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -7259,6 +7269,8 @@ NO_PACE_TWIN_BY_DESIGN = {
     **{f"m16-1243-display-{mode}-s{scale}-vsync1": "swapInterval 1 A/B arm; no merged PR cites an absolute figure from it, so a swapInterval 1 pace twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
     **{f"m16-1243-q1-cpu-look-{mode}-s{scale}": "quality-1 A/B arm of the inline reduced recon: its figures compare the arms of one leg, and no capture-free pace leg runs at quality mode 1"
+       for mode in ("fullscreen", "windowed") for scale in (2, 4)},
+    **{f"m16-1243-q1-cpu-look-paired-{mode}-s{scale}": "paired-seek copy of a quality-1 look cell: playing vs paused frames of one leg, and no capture-free pace leg runs at quality mode 1"
        for mode in ("fullscreen", "windowed") for scale in (2, 4)},
     "m16-1243-look": "Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-scale2": "Classic flavor-parity contact-sheet leg at scale 2; pace claims use the Cinematic display-matrix twins",
