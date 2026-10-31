@@ -11519,6 +11519,89 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                           "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
                          {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
 
+    # r5 (sol r4 B1 on #726): the writer before r5 built the location with `.arg(file).arg(line)`, so a legal path holding `%1` took the line number and
+    # the location ended `:%2)` (`C:/build %1/MainWindow.cpp`, line 25846 -> ` (C:/build 25846/MainWindow.cpp:%2)`). The reader left that suffix in the
+    # record body: a clean OFF record read as unreadable, and marker text in the path selected the session, the start line, the visual state and fields.
+    OLD_LOC = " (C:/build 25846/MainWindow.cpp:%2)"
+
+    def test_an_old_writer_location_ending_in_an_unsubstituted_marker_keeps_the_route_state(self) -> None:
+        for loc in (self.OLD_LOC, " (C:/b 7 (x/sub dir/MainWindow.cpp:%2)"):
+            with self.subTest(loc=loc, arm="OFF"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("0") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
+            with self.subTest(loc=loc, arm="ON"):
+                v = self.verdict(self.ON, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "HONOURED", False), v)
+            with self.subTest(loc=loc, arm="OFF inherited ON"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "NOT_HONOURED", True), v)
+
+    def test_an_unreadable_location_refuses_the_record_and_never_supplies_a_marker_or_field(self) -> None:
+        # r5: a tail that is neither `:<digits>)` nor `:%2)` leaves the body before the first ` (` plus ' (LOCATION_UNREADABLE)': refused, never forged.
+        for loc in (" (C:/b x/MainWindow.cpp:%3)", " (C:/b x/MainWindow.cpp:%2) tail", " (C:/b x/MainWindow.cpp:)", " (:%2)",
+                    " (C:/b playback_smoke.prep_route session=3 prep_conflated_move_active=1 x/MainWindow.cpp:%1)"):
+            for spec, name in ((self.ON, "ON"), ({}, "OFF")):
+                with self.subTest(loc=loc, arm=name):
+                    v = self.verdict(spec, self.log(self.PREFIX + self.route("0" if name == "OFF" else "1") + loc))
+                    self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+        proc, out = run_pwsh_json("@(" + ", ".join(f"(Get-DvLogRecordBody -Line '{line}')" for line in (
+            "a=1 (C:/b id=9 x/M.cpp:%2)", "a=1 (C:/b id=9 x/M.cpp:%3)", "a=1 (C:/b id=9 x/M.cpp:12)", "a=1", "a=1 (C:/b id=9 x/M.cpp:12) b=2")) + ") | ConvertTo-Json -Compress")
+        self.assertEqual(out, ["a=1", "a=1 (LOCATION_UNREADABLE)", "a=1", "a=1", "a=1 (LOCATION_UNREADABLE)"], proc.stdout + proc.stderr)
+
+    def test_record_markers_inside_an_old_writer_location_never_forge_a_session_or_field(self) -> None:
+        # sol r4 B1 class probes: an earlier line's `:%2)` location holding `playback_smoke.measured_session id=9` selected session 9 (the OFF gate then read
+        # NOT_REQUESTED despite a genuine session-3 active=1), and `:%2)` locations holding worker_threads=2, look_assist_enabled=1 and presented_fps=999
+        # were read as the start line, the visual state and the summary rate.
+        session_loc = " (C:/b playback_smoke.measured_session id=9 25846/MainWindow.cpp:%2)"
+        for value, spec, expected in (("0", {}, (0, "NOT_REQUESTED", False)), ("1", {}, (1, "NOT_HONOURED", True)), ("1", self.ON, (1, "HONOURED", False))):
+            for tail in (session_loc, session_loc + " x", session_loc.replace(":%2)", ")")):
+                with self.subTest(case="measured_session marker in an earlier line's location", value=value, requested=bool(spec), tail=tail):
+                    v = self.verdict(spec, self.PREFIX + "interaction_trace event=automation.start" + tail + "\n" + self.log(self.route(value)))
+                    self.assertEqual((v["observed"], v["verdict"], v["blocks"]), expected, v)
+        start_loc = " (C:/build playback_smoke.start session=3 worker_threads=2 25846/MainWindow.cpp:%2)"
+        for name, end in (("old writer :%2)", ""), ("unreadable tail", " x")):
+            with self.subTest(case=name):
+                log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8 (C:/a/MainWindow.cpp:1)",
+                                 self.PREFIX + "interaction_trace event=gui_smoke.visual_state look_assist_enabled=0 (C:/a/MainWindow.cpp:2)",
+                                 "playback_smoke.summary session=3 reason=reached presented_frames=600 presented_fps=24"
+                                 + start_loc.replace("worker_threads=2", "presented_fps=999") + end,
+                                 "playback_smoke.pace_summary session=3 timeline_fps_after_first_present=59.9" + start_loc
+                                 + " event=gui_smoke.visual_state look_assist_enabled=1 (y/MainWindow.cpp:%2)" + end]) + "\n"
+                proc, out = run_pwsh_json("$s = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'start'\n"
+                                          "$l = Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $env:DVE_LOG\n"
+                                          "[ordered]@{ workers = $s.fields['worker_threads']; look = $l.reported; rates = (Get-DvMatrixRates -LogText $env:DVE_LOG);"
+                                          " summary = (Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).fields['presented_fps'] } | ConvertTo-Json -Compress -Depth 4",
+                                          DVE_LOG=log)
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertEqual({"workers": out["workers"], "look": out["look"], "summary": out["summary"], "presentedFps": out["rates"]["presentedFps"],
+                                  "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
+                                 {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
+
+    def test_a_long_run_of_open_parentheses_is_read_in_one_pass(self) -> None:
+        # r5 (sol r4 H1 on #726): the r4 suffix regex was super-linear on repeated ` (` (10000: ~0.9 s, 30000: ~6.7 s, 100000: more than 8 s). The scan is
+        # linear now. No duration is asserted: the payloads below must simply come back, with these bodies, inside the test's process bound.
+        script = ("$big = ' (' * 100000\n"
+                  "$route = 'playback_smoke.prep_route session=3 prep_conflated_move_active=1'\n"
+                  "$log = \"playback_smoke.measured_session id=3`n\" + $route + $big + \"C:/x.cpp:1)`nplayback_smoke.summary session=3 reason=reached presented_frames=600`n\"\n"
+                  "[ordered]@{\n"
+                  " bare = (Get-DvLogRecordBody -Line $big)\n"
+                  " summary = (Get-DvLogRecordBody -Line ('playback_smoke.summary session=3 presented_fps=24' + $big))\n"
+                  " located = (Get-DvLogRecordBody -Line ($route + $big + 'x:1)'))\n"
+                  " old = (Get-DvLogRecordBody -Line ($route + $big + 'x:%2)'))\n"
+                  # Get-DvLogRecordBodies is not exported: called in the module's scope
+                  " bodies = [string[]](& (Get-Module DualVenueRunner) { param($t) Get-DvLogRecordBodies -LogText $t } (\"x\" + $big + \"`nplain line`n\"))\n"
+                  " verdict = (Get-DvPrepConflatedMoveEvidence -Spec (@{ generatorArgs = @{ prepConflatedMove = $true } }) -LogText $log).verdict\n"
+                  "} | ConvertTo-Json -Compress")
+        try:
+            proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], timeout=120)
+        except subprocess.TimeoutExpired:
+            self.fail("Get-DvLogRecordBody did not return on a 100000-repeat ' (' payload within the test's 120 s process bound")
+        out = json.loads(proc.stdout) if proc.stdout.strip() else None
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        route = "playback_smoke.prep_route session=3 prep_conflated_move_active=1"
+        self.assertEqual(out, {"bare": " (LOCATION_UNREADABLE)", "summary": "playback_smoke.summary session=3 presented_fps=24 (LOCATION_UNREADABLE)",
+                               "located": route, "old": route, "bodies": ["x (LOCATION_UNREADABLE)", "plain line", ""], "verdict": "HONOURED"})
+
     def test_the_shared_line_reader_counts_an_empty_valued_duplicate_for_every_caller(self) -> None:
         # r3 (sol ADV-A2 on #726): `active=1 active=` read as active=1 because the reader skipped an empty value; every caller of the shared reader now sees
         # the key as absent and the duplicate named, and a Qt location suffix adds no token.

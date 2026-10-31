@@ -1549,8 +1549,9 @@ function Get-DvSmokeSessionLineRead {
     @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
 }
 
-# The Qt location suffix (Get-DvLogRecordBody): from the first ` (` to a closing `:<digits>)` at the end of the line.
-$script:DvLocationSuffix = ' \(.+:[0-9]+\)\z'
+# r5 (sol r4 B1 on #726): what Get-DvLogRecordBody puts in place of a location it cannot read. It holds no `=` and no record marker, so no field or
+# marker is read from it, and a whole-line match (the prep_route record) fails on it: the record is unreadable, never absent and never forged.
+$script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
 
 function Get-DvLogRecordBody {
     <#
@@ -1561,13 +1562,34 @@ function Get-DvLogRecordBody {
     not (`C:/build (x/`, `C:/build x)/`), and any text at all, record markers included. That is exact because a record body never holds ` (`: the
     prefix is `[utc] [LEVEL] [0x<thread>] `, record keys are [A-Za-z0-9_]+, every value from outside the app goes through log_line_field::fieldValue (which
     maps every space), and the one app value with spaces (summary gui_fps_status_text, "Playback: <n> fps") holds no parenthesis. The location is written
-    last, so what precedes its first ` (` is the body the app wrote. A line with no such suffix (no ` (`, no `:<digits>)` at the end, nothing between `(` and
-    the colon, or text after the `)`) is returned unchanged, so it still fails a whole-line match. Every dual-venue reader of the app's run log strips the
+    last, so what precedes its first ` (` is the body the app wrote. A line with no ` (` is returned unchanged; a line whose tail is not a readable location
+    is refused as described under r5 below. Every dual-venue reader of the app's run log strips the
     suffix through this helper (or Get-DvLogRecordBodies) BEFORE it matches a record marker or a field.
+    r5 (sol r4 B1 and H1 on #726): a writer before r5 built the location with chained QString::arg calls, so a path holding `%1` took the line number and
+    the location ended `:%2)`; that suffix was left in the body, where marker text in the path selected the session, the start line, the visual state and
+    the summary fields. The rule now: the body is the text before the first ` (`, always (the location is written last and the body never holds ` (`,
+    so that text is the app's own and the path's text never reaches a reader). The tail decides whether the record is readable: `:<digits>)` (this
+    writer) or `:%2)` (the old writer's only other ending: its path held a lower-numbered marker, and the body before the location is unaffected) with a
+    path of at least one character gives the body; any other tail (no line number, text after the `)`, an empty path, a message that held a marker on the
+    old writer) gives the body plus ' (LOCATION_UNREADABLE)', which refuses a whole-line match and supplies no field or marker. It may refuse; it never
+    forges. The scan is linear: one IndexOf and one right-to-left walk over the digits, no regex (the r4 regex was super-linear on repeated ` (`).
     #>
     param([AllowNull()][AllowEmptyString()][string]$Line)
     if ([string]::IsNullOrEmpty($Line)) { return $Line }
-    [regex]::Replace($Line, $script:DvLocationSuffix, '')
+    $open = $Line.IndexOf(' (', [StringComparison]::Ordinal)
+    if ($open -lt 0) { return $Line }
+    $body = $Line.Substring(0, $open)
+    $end = $Line.Length - 1
+    $colon = -1
+    if ($Line[$end] -ceq [char]')') {
+        $i = $end - 1
+        while ($i -gt $open + 1 -and $Line[$i] -ge [char]'0' -and $Line[$i] -le [char]'9') { $i-- }
+        if ($i -lt $end - 1 -and $Line[$i] -ceq [char]':') { $colon = $i }
+        elseif ($Line.EndsWith(':%2)', [StringComparison]::Ordinal)) { $colon = $end - 3 }
+    }
+    # the path is everything between `(` (at $open + 1) and the colon, and must not be empty
+    if ($colon -gt $open + 2) { return $body }
+    $body + $script:DvLocationUnreadable
 }
 
 function Get-DvLogRecordBodies {
@@ -1579,7 +1601,8 @@ function Get-DvLogRecordBodies {
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
     $lines = $LogText -split "`r?`n"
-    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].Length -gt 0) { $lines[$i] = [regex]::Replace($lines[$i], $script:DvLocationSuffix, '') } }
+    # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
     , [string[]]$lines
 }
 

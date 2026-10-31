@@ -92,6 +92,40 @@ TEST(LogLineField, TheRecordFoldKeepsOneLine)
     ASSERT_TRUE(log_line_field::prepRouteLine(7, true) == QStringLiteral("playback_smoke.prep_route session=7 prep_conflated_move_active=1"));
 }
 
+TEST(LogLineField, ALocationPathHoldingAnArgMarkerIsWrittenVerbatim)
+{
+    // r5 (sol r4 B1 on #726): the chained `.arg(file).arg(line)` substituted the line number into a path holding `%1` and left `:%2)`, so the
+    // dual-venue reader could not strip the location and a valid OFF record read as unreadable (or marker text in the path selected a record).
+    using log_line_field::locationSuffix;
+    ASSERT_TRUE(locationSuffix("C:/build %1/MainWindow.cpp", 25846) == QStringLiteral(" (C:/build %1/MainWindow.cpp:25846)"));
+    ASSERT_TRUE(locationSuffix("C:/build %2/MainWindow.cpp", 25846) == QStringLiteral(" (C:/build %2/MainWindow.cpp:25846)"));
+    ASSERT_TRUE(locationSuffix("C:/b %1 %2/x %L1 %99/MainWindow.cpp", 7) == QStringLiteral(" (C:/b %1 %2/x %L1 %99/MainWindow.cpp:7)"));
+    ASSERT_TRUE(locationSuffix("MainWindow.cpp", 25848) == QStringLiteral(" (MainWindow.cpp:25848)"));
+    ASSERT_TRUE(locationSuffix(nullptr, 1).isEmpty());
+    ASSERT_TRUE(locationSuffix("", 1).isEmpty());
+}
+
+TEST(LogLineField, ARecordLineKeepsItsMessageAndLocationVerbatim)
+{
+    // r5: the record format was five chained `.arg` calls too, so a message holding `%1`..`%5` took the location (or the location took it).
+    using log_line_field::locationSuffix;
+    using log_line_field::recordLine;
+    const QString ts = QStringLiteral("2026-10-31T00:00:00.000Z");
+    const QString loc = locationSuffix("C:/build %1 playback_smoke.measured_session id=9 worker_threads=2 look_assist_enabled=1 presented_fps=999/MainWindow.cpp", 25846);
+    ASSERT_TRUE(loc == QStringLiteral(" (C:/build %1 playback_smoke.measured_session id=9 worker_threads=2 look_assist_enabled=1 presented_fps=999/MainWindow.cpp:25846)"));
+    const QString route = log_line_field::prepRouteLine(3, false);
+    ASSERT_TRUE(recordLine(ts, QStringLiteral("INFO"), QStringLiteral("0x1"), route, loc)
+                == QStringLiteral("[2026-10-31T00:00:00.000Z] [INFO] [0x1] ") + route + loc + QLatin1Char('\n'));
+    for (const char *message : { "rate 50%1 done %5", "%4%5", "%1 %2 %3", "100%" })
+    {
+        const QString m = QString::fromLatin1(message);
+        ASSERT_TRUE(recordLine(ts, QStringLiteral("INFO"), QStringLiteral("0x1"), m, loc)
+                    == QStringLiteral("[2026-10-31T00:00:00.000Z] [INFO] [0x1] ") + m + loc + QLatin1Char('\n'));
+        ASSERT_TRUE(recordLine(ts, QStringLiteral("INFO"), QStringLiteral("0x1"), m, QString())
+                    == QStringLiteral("[2026-10-31T00:00:00.000Z] [INFO] [0x1] ") + m + QLatin1Char('\n'));
+    }
+}
+
 TEST(LogLineField, TheHostileEnvironmentLogsHoldNoForgedField)
 {
     for (const auto & variant : log_line_field_fixture::variants())
@@ -132,6 +166,10 @@ TEST(LogLineField, TheAppRoutesItsLogTextThroughTheSanitizer)
     ASSERT_TRUE(mainWindow.contains(QStringLiteral("<< log_line_field::prepRouteLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),")));
     const QString forensics = readRepoText(QStringLiteral("platform/qt/CrashForensics.cpp"));
     ASSERT_TRUE(forensics.contains(QStringLiteral("const QString sanitized = log_line_field::recordMessage(message);")));
+    // r5 (sol r4 B1): the writer composes its location and record with the helpers the tests above run, never with chained arg calls
+    ASSERT_TRUE(forensics.contains(QStringLiteral("const QString location = log_line_field::locationSuffix(ctx.file, ctx.line);")));
+    ASSERT_TRUE(forensics.contains(QStringLiteral("log_line_field::recordLine(timestamp, levelTag(type), thread, sanitized, location);")));
+    ASSERT_FALSE(forensics.contains(QStringLiteral(".arg(QString::fromLocal8Bit(ctx.file))")));
     const QString viewport = readRepoText(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
     ASSERT_FALSE(viewport.contains(QStringLiteral("qgetenv(\"MLVAPP_VIEWPORT_AB_SWAP\").constData()")));
     ASSERT_FALSE(viewport.contains(QStringLiteral("qgetenv(\"MLVAPP_VIEWPORT_AB_FLUSH\").constData()")));

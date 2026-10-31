@@ -79,6 +79,24 @@ inline QString recordMessage( const QString &message )
     return sanitized;
 }
 
+// CrashForensics::writeLogLine's Qt location suffix ` (<file>:<line>)`, empty when the message context names no file.
+// PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r5 (sol r4 B1 on #726): ONE multi-argument QString::arg call, which substitutes every marker
+// in one pass and never rescans what it inserted, so the path is written verbatim. The chained `.arg(file).arg(line)` it replaces
+// substituted the line number into a path holding `%1` (`C:/build %1/MainWindow.cpp` -> ` (C:/build 25846/MainWindow.cpp:%2)`).
+inline QString locationSuffix( const char *file, int line )
+{
+    if( !file || !*file ) return QString();
+    return QStringLiteral( " (%1:%2)" ).arg( QString::fromLocal8Bit( file ), QString::number( line ) );
+}
+
+// One record of the run log as CrashForensics::writeLogLine writes it: `[<utc>] [<LEVEL>] [0x<thread>] <message><location>\n`.
+// r5: one multi-argument arg call for the same reason, so a message holding `%1`..`%5` neither takes the location nor moves it.
+inline QString recordLine( const QString &timestamp, const QString &level, const QString &thread, const QString &message,
+                           const QString &location )
+{
+    return QStringLiteral( "[%1] [%2] [%3] %4%5\n" ).arg( timestamp, level, thread, message, location );
+}
+
 // The engagement record of the prep-conflated-move route for one playback session. It carries no text from outside the app, so
 // nothing a launcher sets can forge it; the dual-venue runner reads engagement from this line only (Get-DvPrepConflatedMoveEvidence).
 inline QString prepRouteLine( qulonglong session, bool prepConflatedMoveActive )

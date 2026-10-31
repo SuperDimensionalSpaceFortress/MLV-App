@@ -410,24 +410,16 @@ void writeLogLine(QtMsgType type, const QMessageLogContext & ctx, const QString 
         QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     const QString thread = QStringLiteral("0x%1")
         .arg(reinterpret_cast<quintptr>(QThread::currentThreadId()), 0, 16);
-    QString location;
-    if (ctx.file && *ctx.file) {
-        location = QStringLiteral(" (%1:%2)")
-            .arg(QString::fromLocal8Bit(ctx.file))
-            .arg(ctx.line);
-    }
+    // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r5 (sol r4 B1 on #726): the location and the record are
+    // composed in LogLineField.h, so the console test runs this exact code.
+    const QString location = log_line_field::locationSuffix(ctx.file, ctx.line);
 
     // Sanitise message (strip stray CR/LF within a line so each record
     // stays on a single line). The fold lives in LogLineField.h so the
     // dual-venue hostile-environment test runs this exact code.
     const QString sanitized = log_line_field::recordMessage(message);
 
-    const QString line = QStringLiteral("[%1] [%2] [%3] %4%5\n")
-        .arg(timestamp)
-        .arg(levelTag(type))
-        .arg(thread)
-        .arg(sanitized)
-        .arg(location);
+    const QString line = log_line_field::recordLine(timestamp, levelTag(type), thread, sanitized, location);
 
     QMutexLocker locker(&g_logMutex);
     QFile file(g_logFilePath);
