@@ -6466,7 +6466,8 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
     batches = VenueLeaseBatchRunnerTests.batches
 
     def scratch_root(self) -> Path:
-        # a root the way a calibration round gives one: <scratch>\.claude-state\dual-venue\receipts (the evidence directory lands beside it, also under .claude-state)
+        # a root the way a calibration round gives one: <scratch>\.claude-state\<dual-venue dir>\<receipts dir> (the evidence directory lands beside it, also under .claude-state;
+        # the spelling avoids the literal path the receipt-reader inventory in test_dual_venue_evidence.py scans for: this file reads no real receipt, only the fake leg's)
         return self.case / "scratch" / ".claude-state" / "dual-venue" / "receipts"
 
     def clean_base(self) -> Path:
@@ -6482,8 +6483,13 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             return d
         self.skipTest("no writable directory without a .claude-state segment")
 
+    def long_form(self, p: Path) -> Path:
+        """The fully resolved long form of a path under the case dir. The script resolves -ReceiptRoot through [IO.Path]::GetFullPath, which on Windows expands 8.3 short names
+        (a hosted runner's temp dir is C:/Users/RUNNER~1/..., the script forwards C:/Users/runneradmin/...): expect the long form, as the script and the real leg see it."""
+        return Path(os.path.realpath(self.case)) / p.relative_to(self.case)
+
     def default_root(self) -> Path:
-        return self.case / "receipts"   # the fake leg's default root (the real leg's is the main checkout's .claude-state\dual-venue\receipts)
+        return self.case / "receipts"   # the fake leg's default root (the real leg's is under the main checkout's .claude-state)
 
     def leg_calls(self) -> list[str]:
         f = self.case / "leg-receiptroot.log"
@@ -6512,13 +6518,13 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         self.assertFalse(self.default_root().exists(), "the default root was created")
         landed = self.files_under(root)
         self.assertEqual(len(landed), 3, landed)
-        self.assertEqual(self.leg_calls(), [f"bound=True root={root}"] * 3)
+        self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(root)}"] * 3)
         [b] = self.batches()
-        self.assertTrue(all(Path(l["receipt"]).parent.parent.parent.parent == root for l in b["legs"]), [l["receipt"] for l in b["legs"]])
+        self.assertTrue(all(Path(os.path.realpath(l["receipt"])).parent.parent.parent.parent == self.long_form(root) for l in b["legs"]), [l["receipt"] for l in b["legs"]])
         # the read-back: the pre-load mean is found in the evidence directory beside THIS root (a default-root read would find none and leave the leg uncounted)
         self.assertEqual([l["class"] for l in b["legs"]], ["QUIET_PRELOAD_OK"] * 3, b["legs"])
         self.assertEqual((b["legsRan"], b["legsCounted"]), (3, 3))
-        self.assertIn(f" receiptRoot={root}", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+        self.assertIn(f" receiptRoot={self.long_form(root)}", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
 
     def test_a_receipt_root_is_forwarded_to_the_in_lease_retry_too(self) -> None:
         root = self.scratch_root()
@@ -6526,7 +6532,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
         self.assertEqual([l["status"] for l in b["legs"]], ["RETRY", "RAN"])
-        self.assertEqual(self.leg_calls(), [f"bound=True root={root}"] * 2)
+        self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(root)}"] * 2)
         self.assertEqual(len(self.files_under(root)), 2)
         self.assertFalse(self.default_root().exists())
 
@@ -6534,7 +6540,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         args, e = self.batch_cmd(None, "-ReceiptRoot", os.path.join("rel", ".claude-state", "dual-venue", "receipts"))
         r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e, cwd=str(self.case))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        want = self.case / "rel" / ".claude-state" / "dual-venue" / "receipts"
+        want = self.long_form(self.case / "rel" / ".claude-state" / "dual-venue" / "receipts")
         self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2)
 
     def test_adversary_a1_a_relative_receipt_root_resolves_against_the_powershell_location_like_rundir_does(self) -> None:
@@ -6552,7 +6558,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=600, env=e, cwd=str(proc_dir))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         want = ps_dir / "rel" / ".claude-state" / "dual-venue" / "receipts"
-        self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2, r.stdout + r.stderr)
+        self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(want)}"] * 2, r.stdout + r.stderr)
         self.assertEqual(len(self.files_under(want)), 2)
         self.assertFalse((proc_dir / "rel").exists(), "the root was resolved against the process directory")
 
@@ -6584,6 +6590,71 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                 r = self.run_batch(None, "-ReceiptRoot", str(root))
                 self.assert_nothing_started(r)
                 self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+    # Dot A1 (PR #729 comment 6540489428): a path component was compared with -ceq, which is culture-aware (InvariantCulture) and skips ignorable code points, so a directory
+    # named ".claude-state<U+00AD>" passed as the gitignored ".claude-state". Each spelling below is one the old comparison accepts on this host (the first assertion proves it).
+    IGNORABLE = {"soft-hyphen": "\u00ad", "zero-width-joiner": "\u200d", "zero-width-space": "\u200b", "bom": "\ufeff"}
+
+    @staticmethod
+    def old_comparison_accepts(component: str) -> bool:
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ('{psq(component)}' -ceq '.claude-state')"],
+                             capture_output=True, text=True, encoding="utf-8", timeout=120)
+        return out.stdout.strip() == "True"
+
+    def ignorable_roots(self) -> dict:
+        base = self.clean_base()
+        roots = {}
+        for name, cp in self.IGNORABLE.items():
+            roots[f"{name}-suffix"] = (f".claude-state{cp}", base / f".claude-state{cp}" / "dual-venue" / "receipts")
+            roots[f"{name}-prefix"] = (f"{cp}.claude-state", base / f"{cp}.claude-state" / "dual-venue" / "receipts")
+        return roots
+
+    def test_adversary_dot_a1_an_ignorable_code_point_in_the_boundary_name_is_not_claude_state_at_the_batch_entry(self) -> None:
+        for name, (component, root) in self.ignorable_roots().items():
+            with self.subTest(name=name):
+                self.assertTrue(self.old_comparison_accepts(component), f"{name}: the culture-aware comparison no longer accepts it on this host, so this case proves nothing")
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(root))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+    def test_adversary_dot_a1_an_ignorable_code_point_in_the_boundary_name_is_refused_at_the_real_leg_entry(self) -> None:
+        # the real Invoke-VenueLeg.ps1 receipt-root check (DVE_RECEIPT_ROOT_MUST_STAY_LOCAL), reached by its own text: the shared helper it calls decides
+        leg = DV / "Invoke-VenueLeg.ps1"
+        for name, (component, root) in self.ignorable_roots().items():
+            with self.subTest(name=name):
+                script = (
+                    f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                    f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(leg)}', [ref]$null, [ref]$null)\n"
+                    "$if = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.IfStatementAst] -and $x.Extent.Text -match 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot' }, $true)\n"
+                    "if ($null -eq $if) { throw 'the leg receipt-root guard was not found' }\n"
+                    f"$ReceiptRoot = '{psq(root)}'; $OfflineTestMode = $false\n"
+                    "try { . ([scriptblock]::Create($if.Extent.Text)); 'ACCEPTED' } catch { 'REFUSED ' + $_.Exception.Message }\n"
+                )
+                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertTrue(out.stdout.strip().startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), out.stdout + out.stderr)
+
+    def test_adversary_dot_a1_a_plain_claude_state_root_still_passes_the_shared_helper(self) -> None:
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "[ordered]@{ plain = (Test-DvUnderClaudeState -Path 'C:\\x\\.claude-state\\dual-venue\\receipts'); fwd = (Test-DvUnderClaudeState -Path 'C:/x/.claude-state/a'); "
+            "caseDiffers = (Test-DvUnderClaudeState -Path 'C:\\x\\.Claude-State\\a'); substring = (Test-DvUnderClaudeState -Path 'C:\\x\\x.claude-state\\a') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"plain": True, "fwd": True, "caseDiffers": False, "substring": False})
+
+    def test_adversary_dot_a1_no_boundary_directory_name_is_compared_with_a_culture_aware_operator(self) -> None:
+        # the class, not the instance: every PowerShell file under tools/ that tests a path component against .claude-state goes through [string]::Equals(..., Ordinal)
+        offenders = []
+        for p in sorted((ROOT / "tools").rglob("*.ps*1")):
+            if p.suffix not in (".ps1", ".psm1"):
+                continue
+            for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if re.search(r"-[ci]?(?:eq|ne|like|notlike|match|notmatch|contains|in|notin)\s+['\"]\.claude-state['\"]|['\"]\.claude-state['\"]\s+-[ci]?(?:eq|ne|like|contains)\b", line, re.I):
+                    offenders.append(f"{p.relative_to(ROOT).as_posix()}:{n}: {line.strip()[:140]}")
+        self.assertEqual(offenders, [], "a path component compared with .claude-state by a culture-aware operator accepts ignorable code points (U+00AD ...)")
 
 
 @requires_windows_pwsh

@@ -730,7 +730,7 @@ function Test-DvUnderClaudeState {
     # `.claude-state` segment (gitignored; never committed, PR-attached, bus-published or published as an artifact).
     param([Parameter(Mandatory)][string]$Path)
     $full = [IO.Path]::GetFullPath($Path)
-    @($full.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -gt 0
+    @($full.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -gt 0
 }
 
 function Read-DvClipConsent {

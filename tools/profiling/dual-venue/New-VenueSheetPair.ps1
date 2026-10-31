@@ -41,7 +41,7 @@ $cpu = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CpuReceipt).Path) | Co
 if ($cuda.subject.backend -ne 'cuda' -or $cpu.subject.backend -ne 'cpu') { throw 'PAIR_BACKENDS_WRONG the first receipt must be the cuda backend and the second the cpu backend' }
 # The sheet is owner footage: it may only be written where it stays local.
 $outFull = [IO.Path]::GetFullPath($OutDir)
-if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
+if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -eq 0) {
     throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
 }
 # The repo whose COMMITTED consent and venue table a receipt is verified against is the one this script lives in (never a caller's).

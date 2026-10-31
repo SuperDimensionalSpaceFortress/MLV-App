@@ -64,7 +64,7 @@ Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 
 # The sheet is owner footage: it may only be written where it stays local.
 $outFull = [IO.Path]::GetFullPath($OutDir)
-if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
+if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -eq 0) {
     throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
 }
 
@@ -84,7 +84,7 @@ while ($footageScan -and -not $footageHolder) {
         $clipHere = @(Get-ChildItem -LiteralPath $footageScan -File -Force -Recurse:$isOutDir -ErrorAction Stop | Where-Object { Test-OwnerFootageName $_.Name } | Select-Object -First 1)
         if ($clipHere.Count -gt 0) { $footageHolder = $footageScan }
     }
-    if ([IO.Path]::GetFileName($footageScan) -ceq '.claude-state') { break }
+    if ([string]::Equals([IO.Path]::GetFileName($footageScan), '.claude-state', [StringComparison]::Ordinal)) { break }
     $footageScan = [IO.Path]::GetDirectoryName($footageScan)
 }
 if ($footageHolder) {
@@ -143,7 +143,7 @@ if (Test-Path -LiteralPath $outFull -PathType Container) {
 }
 # Staging sits beside OutDir, never in it; it holds owner footage, so its parent must be under .claude-state too.
 $stageParent = [IO.Path]::GetDirectoryName($outFull.TrimEnd('\', '/'))
-if (-not $stageParent -or @($stageParent.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
+if (-not $stageParent -or @($stageParent.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -eq 0) {
     throw 'PAIR_OUTDIR_NEEDS_LOCAL_PARENT -OutDir must be a subdirectory of a .claude-state path (its staging is a sibling directory, and owner footage stays local)'
 }
 $classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
