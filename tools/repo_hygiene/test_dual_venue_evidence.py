@@ -181,6 +181,12 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
 # per-frame playback_smoke.frame rows (telemetryArm HEAVY): the cpu-reduced pace twin at fullscreen s4 with the frame log kept.
 CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
+# PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B (generatorArgs.prepConflatedMove true -> MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1),
+# one per capture-free pace cell the CPU route runs at s2 and s4 (a speed leg, so the post-play visual strips are on by default), keyed to the cell it twins. The
+# OFF arm is the twinned cell itself (env unset).
+PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
+                            for mode in ("fullscreen", "windowed") for scale in (2, 4)}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -957,6 +963,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disablePrepPointwiseFast"]["type"], "boolean")
+
+    def test_the_prep_conflated_move_switch_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: -PrepConflatedMove adds MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1 to the app's env list exactly once;
+        absent, the job is the text it was (the OFF arm sets nothing: the app reads the variable as set-and-not-0). The runner maps
+        generatorArgs.prepConflatedMove true for any leg (outside the forceLookAssist branch); the schema declares it as the constant true."""
+        plain = self.generate(GENERATOR, "pcm-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE", plain)
+        job = self.generate(GENERATOR, "pcm-on.job.ps1", ["-PrepConflatedMove"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1',\n"
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] "
+                   "-and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["prepConflatedMove"]["const"], True)
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -6961,6 +6989,7 @@ class LegSpecSchemaTests(unittest.TestCase):
                 # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS; -missdump: the warm-reuse miss dump on,
                 # MISSDUMP_LEGS)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump)?$", path.name)
+                self.assertNotIn("prepConflatedMove", spec.get("generatorArgs") or {}, path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -6979,7 +7008,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(spec["generatorArgs"].get("disablePrepPointwiseFast", False), spec["legId"].endswith("-nofast"), path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?(-pcm)?$", path.name)
+                # -pcm: the cell with the #397 prep-conflated-move switch on (PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, PREP_CONFLATED_MOVE_LEGS); no other leg sets it
+                self.assertEqual(spec["generatorArgs"].get("prepConflatedMove", False), spec["legId"].endswith("-pcm"), path.name)
             elif spec["card"] == "PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1":   # the cpu receipt pace leg that keeps the per-frame log, named by its cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertEqual(spec["legId"], "m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy", path.name)
@@ -11263,6 +11294,332 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
         self.assertAdvisory(receipt, repo)
         repo, receipt = self.production(None, self.BLOCK)
         self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
+
+
+class PrepConflatedMoveLegSpecTests(unittest.TestCase):
+    """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it
+    twins only in legId and that key, so no receipted cell changes a byte."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_the_schema_names_the_key_as_the_constant_true(self) -> None:
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["prepConflatedMove"]["const"], True)
+
+    def test_each_on_twin_differs_from_its_cell_only_in_the_leg_id_and_the_key(self) -> None:
+        self.assertEqual(len(PREP_CONFLATED_MOVE_LEGS), 4, "fullscreen and windowed, s2 and s4")
+        for rel, cell_rel in PREP_CONFLATED_MOVE_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("prepConflatedMove", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-pcm")
+                self.assertIs(twin["generatorArgs"].pop("prepConflatedMove"), True)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertIn("cpu", twin["backends"], "the A/B runs on the CPU route")
+
+    def test_the_key_must_be_the_constant_true_so_an_off_arm_is_the_absent_key(self) -> None:
+        twin = json.loads((DV / next(iter(PREP_CONFLATED_MOVE_LEGS))).read_text(encoding="utf-8"))
+        for bad in (False, 0, 1, "1", "on", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], prepConflatedMove=bad)), self.schema)
+
+    def test_the_runner_and_the_validator_both_gate_on_the_apps_own_readback(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED:', module)
+        self.assertIn("Get-DvPrepConflatedMoveEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("PREP_CONFLATED_MOVE_NOT_HONOURED", runner)
+
+
+@requires_windows_pwsh
+class PrepConflatedMoveEvidenceTests(unittest.TestCase):
+    """Get-DvPrepConflatedMoveEvidence, pure: a leg that asks for the switch counts only when the measured session's own playback_smoke.prep_route record
+    reports prep_conflated_move_active=1. A switch value in the launcher's env block is a request, not engagement (ruling 2026-10-28T15:50:51Z), and the binary
+    under test at the time of this card (#397 5fb4b801) emits no such record, so every ON leg on it is NOT_HONOURED rather than an unproven PASS.
+    r2 (adversary A1 on #726): the record has a line of its own with no env-derived text, matched as a whole line; the start line is never read for it, because a
+    CR/LF in an inherited env value used to become a separator there (tools/repo_hygiene/test_log_line_field_e2e.py runs the real app logging end to end)."""
+
+    ON = {"generatorArgs": {"prepConflatedMove": True}}
+    START = "playback_smoke.start session=3 position=0 scale_request=2 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0"
+    PREFIX = "[2026-10-31T00:00:00.000Z] [INFO] [0x1a2b] "
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvPrepConflatedMoveEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @classmethod
+    def log(cls, *records: str, start: str | None = None) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", start or cls.START, *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    @staticmethod
+    def route(value: str, session: int = 3) -> str:
+        return f"playback_smoke.prep_route session={session} prep_conflated_move_active={value}"
+
+    def test_honoured_only_when_the_measured_session_reports_the_switch_active(self) -> None:
+        for name, record in (("bare", self.route("1")), ("crash-forensics prefix", self.PREFIX + self.route("1")),
+                             ("prefix and Qt location", self.PREFIX + self.route("1") + " (MainWindow.cpp:25848)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(record))
+                self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, 1, "HONOURED", False))
+
+    def test_the_binary_that_emits_no_field_is_not_engaged(self) -> None:
+        v = self.verdict(self.ON, self.log())
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
+        # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.
+        v = self.verdict(self.ON, self.log(start=self.START + " prep_conflated_move_active=1"))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_any_other_report_blocks_never_passes(self) -> None:
+        for name, log in (("switch off", self.log(self.route("0"))),
+                          ("not a number", self.log(self.route("yes"))),
+                          ("unset text", self.log(self.route("unset"))),
+                          ("value with a sign", self.log(self.route("+1"))),
+                          ("value with a suffix", self.log(self.route("1x"))),
+                          ("a trailing field", self.log(self.route("1") + " extra=1")),
+                          ("a no-break space before the value", self.log(self.route("1").replace("active=", "active= "))),
+                          ("another session's record", self.log(self.route("1", session=2))),
+                          ("two records", self.log(self.route("1"), self.route("1"))),
+                          ("off then on", self.log(self.route("0"), self.route("1"))),
+                          ("embedded in another record after a separator an old app wrote",
+                           self.log(start=self.START + " env_playback_scope_interval_ms=150 | " + self.route("1"))),
+                          ("embedded after a forged prefix", self.log(start=self.START + " env_x=150 " + self.PREFIX + self.route("1"))),
+                          ("no log", "")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_leg_that_does_not_ask_is_unchanged_unless_the_app_reports_the_switch_on(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}):
+            for name, log in (("old binary, no record", self.log()),
+                              ("record off", self.log(self.route("0"))),
+                              ("a start-line field is not a record", self.log(start=self.START + " prep_conflated_move_active=1")),
+                              ("no log", "")):
+                with self.subTest(spec=spec, case=name):
+                    v = self.verdict(spec, log)
+                    self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), v)
+
+    def test_the_off_arm_that_inherited_the_switch_from_the_launcher_does_not_count_as_off(self) -> None:
+        # adversary r1 A1 (6bd2a183): an absent key emits no removal of MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE, so a launcher that already carries it ran the OFF arm
+        # ON; the gate returned NOT_REQUESTED/blocks=false even though the app reported active=1. A leg that does not ask counts only if the app does not say it is on.
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}):
+            with self.subTest(spec=spec):
+                v = self.verdict(spec, self.log(self.route("1")))
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
+                self.assertIn("PREP_CONFLATED_MOVE_INHERITED", v["reason"])
+
+    def test_a_forged_field_in_an_env_value_never_honours_a_leg(self) -> None:
+        # adversary r1 A2 (6bd2a183) and r2 A1: an env value that carries a no-break or em space (or, on a build before r2, a CR/LF) puts
+        # prep_conflated_move_active=1 on the start line as a token of its own. The start line is never read for engagement, so none of these counts either way.
+        for tail in ("env_force_threads=0 prep_conflated_move_active=1", "env_force_threads=0 prep_conflated_move_active=1",
+                     "env_force_threads=0 prep_conflated_move_active=1 env_raw_uint16_prefetch_decoders=unset",
+                     "env_playback_scope_interval_ms=150 | prep_conflated_move_active=1"):
+            with self.subTest(requested=True, tail=ascii(tail)):
+                v = self.verdict(self.ON, self.log(start=self.START + " " + tail))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+            with self.subTest(requested=False, tail=ascii(tail)):
+                v = self.verdict({}, self.log(start=self.START + " " + tail))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        for name, record in (("duplicate key", self.route("0") + " prep_conflated_move_active=1"),
+                             ("a no-break space inside the record", self.route("1").replace(" prep_", " prep_")),
+                             ("value with a sign", self.route("+1")),
+                             ("value with a suffix", self.route("1x"))):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(record))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_genuine_field_among_ordinary_fields_is_still_honoured(self) -> None:
+        v = self.verdict(self.ON, self.log(self.PREFIX + "playback_smoke.display_required session=3 display_required=1", self.PREFIX + self.route("1"),
+                                           start=self.START + " env_raw_uint16_prefetch_decoders=unset"))
+        self.assertEqual((v["verdict"], v["observed"], v["blocks"]), ("HONOURED", 1, False), v)
+
+    def test_an_unreadable_record_blocks_a_leg_that_does_not_ask(self) -> None:
+        for name, log in (("not a number", self.log(self.route("yes"))), ("two records", self.log(self.route("0"), self.route("0"))),
+                          ("embedded mention", self.log(start=self.START + " env_x=1 | " + self.route("0")))):
+            with self.subTest(case=name):
+                v = self.verdict({}, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("unreadable", v["reason"])
+
+    def test_a_qt_location_whose_path_holds_spaces_and_parentheses_keeps_the_reported_state(self) -> None:
+        # r3 (sol ADV-A1 on #726, CR 6538542792): the suffix class [^()] refused `(C:/build (x)/MainWindow.cpp:25848)`, so a clean OFF record read as
+        # unreadable (NOT_HONOURED, blocks) and a clean ON record never honoured.
+        # r4 (r3 adversary A1 = Grok G1 on #726): pairing the parentheses from the right refused a path with an UNBALANCED parenthesis, which Windows allows. A
+        # record body never holds ` (` (keys are [A-Za-z0-9_]+ and fieldValue maps every space), so the suffix starts at the FIRST ` (` and runs to a closing
+        # `:<digits>)` at the end of the line, whatever the path holds, record markers and `) (` included.
+        for loc in (" (C:/build (x)/MainWindow.cpp:25848)", " (C:/b (1) (y)/sub dir/MainWindow.cpp:7)", " (MainWindow.cpp:25848)",
+                    " (C:/build (x/MainWindow.cpp:25848)", " (C:/build x)/M.cpp:1)", " (C:/a) prep_conflated_move_active=1 (b/MainWindow.cpp:9)",
+                    " (C:/build playback_smoke.prep_route session=3 x/MainWindow.cpp:25848)"):
+            with self.subTest(loc=loc, arm="OFF"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("0") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
+            with self.subTest(loc=loc, arm="ON"):
+                v = self.verdict(self.ON, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "HONOURED", False), v)
+            with self.subTest(loc=loc, arm="OFF inherited ON"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "NOT_HONOURED", True), v)
+        for name, record in (("a suffix without a line number", self.route("1") + " (C:/build (x)/MainWindow.cpp)"),
+                             ("a field after the suffix", self.route("1") + " (C:/x.cpp:1) extra=1"),
+                             ("a suffix with no space before it", self.route("1") + "(C:/x.cpp:1)"),
+                             ("an empty path", self.route("1") + " (:1)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(record))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+
+    def test_record_markers_inside_a_qt_location_never_count_or_select_a_record(self) -> None:
+        # r4 (r3 adversary A2 on #726): markers were matched on the RAW line, before the location suffix was stripped, so a build path holding
+        # `playback_smoke.prep_route session=3` added mentions (four mentions, one record: a clean OFF leg read as unreadable and blocked), and a path holding
+        # `playback_smoke.start session=3` or `playback_smoke.measured_session id=9` selected the wrong line or the wrong session. Every dual-venue reader now
+        # strips the suffix first and matches markers on the record body only.
+        def marked(loc: str, *records: str) -> str:
+            return "\n".join(r + loc for r in records) + "\n"
+        prep_loc = " (C:/build playback_smoke.prep_route session=3 x/MainWindow.cpp:25848)"
+        for value, spec, expected in (("0", {}, (0, "NOT_REQUESTED", False)), ("1", self.ON, (1, "HONOURED", False))):
+            with self.subTest(case="prep_route marker in every location", value=value):
+                v = self.verdict(spec, marked(prep_loc, "playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8",
+                                                    self.route(value), "playback_smoke.summary session=3 reason=reached presented_frames=600"))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), expected, v)
+        with self.subTest(case="measured_session marker in an earlier line's location"):
+            log = (self.PREFIX + "interaction_trace event=automation.start (C:/b playback_smoke.measured_session id=9 x/MainWindow.cpp:1)\n"
+                   + self.log(self.route("0")))
+            v = self.verdict({}, log)
+            self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
+        start_loc = " (C:/build playback_smoke.start session=3 worker_threads=2 x/MainWindow.cpp:25848)"
+        log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8 (C:/a/MainWindow.cpp:1)",
+                         self.PREFIX + "interaction_trace event=gui_smoke.visual_state look_assist_enabled=0 (C:/a/MainWindow.cpp:2)",
+                         "playback_smoke.summary session=3 reason=reached presented_frames=600 presented_fps=24" + start_loc.replace("worker_threads=2", "presented_fps=999"),
+                         "playback_smoke.pace_summary session=3 timeline_fps_after_first_present=59.9" + start_loc
+                         + " event=gui_smoke.visual_state look_assist_enabled=1 (y/MainWindow.cpp:3)"]) + "\n"
+        proc, out = run_pwsh_json("$s = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'start'\n"
+                                  "$l = Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $env:DVE_LOG\n"
+                                  "[ordered]@{ workers = $s.fields['worker_threads']; look = $l.reported; rates = (Get-DvMatrixRates -LogText $env:DVE_LOG);"
+                                  " summary = (Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).fields['presented_fps'] } | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        # workers / look: a marker in a later line's location selects nothing; summary / presentedFps: the summary's location adds no field (r3 advisory A3)
+        self.assertEqual({"workers": out["workers"], "look": out["look"], "summary": out["summary"], "presentedFps": out["rates"]["presentedFps"],
+                          "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
+                         {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
+
+    # r5 (sol r4 B1 on #726): the writer before r5 built the location with `.arg(file).arg(line)`, so a legal path holding `%1` took the line number and
+    # the location ended `:%2)` (`C:/build %1/MainWindow.cpp`, line 25846 -> ` (C:/build 25846/MainWindow.cpp:%2)`). The reader left that suffix in the
+    # record body: a clean OFF record read as unreadable, and marker text in the path selected the session, the start line, the visual state and fields.
+    OLD_LOC = " (C:/build 25846/MainWindow.cpp:%2)"
+
+    def test_an_old_writer_location_ending_in_an_unsubstituted_marker_keeps_the_route_state(self) -> None:
+        for loc in (self.OLD_LOC, " (C:/b 7 (x/sub dir/MainWindow.cpp:%2)"):
+            with self.subTest(loc=loc, arm="OFF"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("0") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
+            with self.subTest(loc=loc, arm="ON"):
+                v = self.verdict(self.ON, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "HONOURED", False), v)
+            with self.subTest(loc=loc, arm="OFF inherited ON"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "NOT_HONOURED", True), v)
+
+    def test_an_unreadable_location_refuses_the_record_and_never_supplies_a_marker_or_field(self) -> None:
+        # r5: a tail that is neither `:<digits>)` nor `:%2)` leaves the body before the first ` (` plus ' (LOCATION_UNREADABLE)': refused, never forged.
+        for loc in (" (C:/b x/MainWindow.cpp:%3)", " (C:/b x/MainWindow.cpp:%2) tail", " (C:/b x/MainWindow.cpp:)", " (:%2)",
+                    " (C:/b playback_smoke.prep_route session=3 prep_conflated_move_active=1 x/MainWindow.cpp:%1)"):
+            for spec, name in ((self.ON, "ON"), ({}, "OFF")):
+                with self.subTest(loc=loc, arm=name):
+                    v = self.verdict(spec, self.log(self.PREFIX + self.route("0" if name == "OFF" else "1") + loc))
+                    self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+        proc, out = run_pwsh_json("@(" + ", ".join(f"(Get-DvLogRecordBody -Line '{line}')" for line in (
+            "a=1 (C:/b id=9 x/M.cpp:%2)", "a=1 (C:/b id=9 x/M.cpp:%3)", "a=1 (C:/b id=9 x/M.cpp:12)", "a=1", "a=1 (C:/b id=9 x/M.cpp:12) b=2")) + ") | ConvertTo-Json -Compress")
+        self.assertEqual(out, ["a=1", "a=1 (LOCATION_UNREADABLE)", "a=1", "a=1", "a=1 (LOCATION_UNREADABLE)"], proc.stdout + proc.stderr)
+
+    def test_record_markers_inside_an_old_writer_location_never_forge_a_session_or_field(self) -> None:
+        # sol r4 B1 class probes: an earlier line's `:%2)` location holding `playback_smoke.measured_session id=9` selected session 9 (the OFF gate then read
+        # NOT_REQUESTED despite a genuine session-3 active=1), and `:%2)` locations holding worker_threads=2, look_assist_enabled=1 and presented_fps=999
+        # were read as the start line, the visual state and the summary rate.
+        session_loc = " (C:/b playback_smoke.measured_session id=9 25846/MainWindow.cpp:%2)"
+        for value, spec, expected in (("0", {}, (0, "NOT_REQUESTED", False)), ("1", {}, (1, "NOT_HONOURED", True)), ("1", self.ON, (1, "HONOURED", False))):
+            for tail in (session_loc, session_loc + " x", session_loc.replace(":%2)", ")")):
+                with self.subTest(case="measured_session marker in an earlier line's location", value=value, requested=bool(spec), tail=tail):
+                    v = self.verdict(spec, self.PREFIX + "interaction_trace event=automation.start" + tail + "\n" + self.log(self.route(value)))
+                    self.assertEqual((v["observed"], v["verdict"], v["blocks"]), expected, v)
+        start_loc = " (C:/build playback_smoke.start session=3 worker_threads=2 25846/MainWindow.cpp:%2)"
+        for name, end in (("old writer :%2)", ""), ("unreadable tail", " x")):
+            with self.subTest(case=name):
+                log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8 (C:/a/MainWindow.cpp:1)",
+                                 self.PREFIX + "interaction_trace event=gui_smoke.visual_state look_assist_enabled=0 (C:/a/MainWindow.cpp:2)",
+                                 "playback_smoke.summary session=3 reason=reached presented_frames=600 presented_fps=24"
+                                 + start_loc.replace("worker_threads=2", "presented_fps=999") + end,
+                                 "playback_smoke.pace_summary session=3 timeline_fps_after_first_present=59.9" + start_loc
+                                 + " event=gui_smoke.visual_state look_assist_enabled=1 (y/MainWindow.cpp:%2)" + end]) + "\n"
+                proc, out = run_pwsh_json("$s = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'start'\n"
+                                          "$l = Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $env:DVE_LOG\n"
+                                          "[ordered]@{ workers = $s.fields['worker_threads']; look = $l.reported; rates = (Get-DvMatrixRates -LogText $env:DVE_LOG);"
+                                          " summary = (Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).fields['presented_fps'] } | ConvertTo-Json -Compress -Depth 4",
+                                          DVE_LOG=log)
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertEqual({"workers": out["workers"], "look": out["look"], "summary": out["summary"], "presentedFps": out["rates"]["presentedFps"],
+                                  "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
+                                 {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
+
+    def test_a_long_run_of_open_parentheses_is_read_in_one_pass(self) -> None:
+        # r5 (sol r4 H1 on #726): the r4 suffix regex was super-linear on repeated ` (` (10000: ~0.9 s, 30000: ~6.7 s, 100000: more than 8 s). The scan is
+        # linear now. No duration is asserted: the payloads below must simply come back, with these bodies, inside the test's process bound.
+        script = ("$big = ' (' * 100000\n"
+                  "$route = 'playback_smoke.prep_route session=3 prep_conflated_move_active=1'\n"
+                  "$log = \"playback_smoke.measured_session id=3`n\" + $route + $big + \"C:/x.cpp:1)`nplayback_smoke.summary session=3 reason=reached presented_frames=600`n\"\n"
+                  "[ordered]@{\n"
+                  " bare = (Get-DvLogRecordBody -Line $big)\n"
+                  " summary = (Get-DvLogRecordBody -Line ('playback_smoke.summary session=3 presented_fps=24' + $big))\n"
+                  " located = (Get-DvLogRecordBody -Line ($route + $big + 'x:1)'))\n"
+                  " old = (Get-DvLogRecordBody -Line ($route + $big + 'x:%2)'))\n"
+                  # Get-DvLogRecordBodies is not exported: called in the module's scope
+                  " bodies = [string[]](& (Get-Module DualVenueRunner) { param($t) Get-DvLogRecordBodies -LogText $t } (\"x\" + $big + \"`nplain line`n\"))\n"
+                  " verdict = (Get-DvPrepConflatedMoveEvidence -Spec (@{ generatorArgs = @{ prepConflatedMove = $true } }) -LogText $log).verdict\n"
+                  "} | ConvertTo-Json -Compress")
+        try:
+            proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], timeout=120)
+        except subprocess.TimeoutExpired:
+            self.fail("Get-DvLogRecordBody did not return on a 100000-repeat ' (' payload within the test's 120 s process bound")
+        out = json.loads(proc.stdout) if proc.stdout.strip() else None
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        route = "playback_smoke.prep_route session=3 prep_conflated_move_active=1"
+        self.assertEqual(out, {"bare": " (LOCATION_UNREADABLE)", "summary": "playback_smoke.summary session=3 presented_fps=24 (LOCATION_UNREADABLE)",
+                               "located": route, "old": route, "bodies": ["x (LOCATION_UNREADABLE)", "plain line", ""], "verdict": "HONOURED"})
+
+    def test_the_shared_line_reader_counts_an_empty_valued_duplicate_for_every_caller(self) -> None:
+        # r3 (sol ADV-A2 on #726): `active=1 active=` read as active=1 because the reader skipped an empty value; every caller of the shared reader now sees
+        # the key as absent and the duplicate named, and a Qt location suffix adds no token.
+        log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.pace_unpaced session=3 active=1 drop_frame=0 active=",
+                         "playback_smoke.pace_summary session=3 timeline_fps_after_first_present=59.9 TIMELINE_FPS_AFTER_FIRST_PRESENT=",
+                         "playback_smoke.cpu_summary session=3 avg_llrawproc_dual_iso_ms=4.5 (C:/b x=1 (y)/MainWindow.cpp:9)",
+                         "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+        proc, out = run_pwsh_json("$u = Get-DvUnpacedEvidence -Spec (@{ generatorArgs = @{ unpaced = $true } }) -LogText $env:DVE_LOG\n"
+                                  "$r = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'pace_unpaced'\n"
+                                  "$c = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'cpu_summary'\n"
+                                  "[ordered]@{ unpaced = $u.verdict; duplicates = @($r.duplicates); rates = (Get-DvMatrixRates -LogText $env:DVE_LOG); cpuKeys = @($c.fields.Keys | Sort-Object) } | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["unpaced"], "NOT_HONOURED")
+        self.assertEqual(out["duplicates"], ["active"])
+        self.assertIsNone(out["rates"]["timelineFpsAfterFirstPresent"])
+        self.assertEqual(out["rates"]["dualIsoMs"], 4.5)
+        self.assertEqual(out["cpuKeys"], ["avg_llrawproc_dual_iso_ms", "session"], "the location suffix's path adds no field")
 
 
 if __name__ == "__main__":

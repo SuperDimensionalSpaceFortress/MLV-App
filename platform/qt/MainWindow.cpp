@@ -18,6 +18,7 @@
 #include "PlaybackScaleLabel.h"
 #include "AutomationSettings.h"
 #include "PlaybackEnvFlags.h"
+#include "LogLineField.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -726,13 +727,19 @@ static int playbackScopeUpdateIntervalMs()
     return 150;
 }
 
+// PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A1/A2): every control, Unicode space, format character and '%' is
+// mapped, not only space and tab, so an inherited value cannot write a field of its own (LogLineField.h).
 static QString envValueForLog( const char *name )
 {
-    QString value = qEnvironmentVariable( name );
-    if( value.isEmpty() ) return QStringLiteral("unset");
-    value.replace( QLatin1Char(' '), QLatin1Char('_') );
-    value.replace( QLatin1Char('\t'), QLatin1Char('_') );
-    return value;
+    return log_line_field::envFieldValue( name );
+}
+
+// PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep-conflated-move route this binary runs, reported once per playback session
+// on playback_smoke.prep_route. This build has no such route (it is #397's MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE opt-in), so the
+// variable is ignored and the answer is always 0; a build that carries the route returns its own decision here.
+static bool playbackPrepConflatedMoveActive()
+{
+    return false;
 }
 
 static double telemetryDoubleValue( const QJsonObject &telemetry,
@@ -25842,6 +25849,12 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                    playbackQualityAutoDecisionReasonName(
                        m_playbackQualityAutoDecisionReason ) ) )
                .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) );
+
+    // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep route's engagement on a line of its own that carries no env-derived
+    // text; the dual-venue runner reads engagement from this line only, never from the start line's env_* fields.
+    qInfo().noquote()
+        << log_line_field::prepRouteLine( static_cast<qulonglong>( m_playbackSmokeSessionId ),
+                                          playbackPrepConflatedMoveActive() );
 
     // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
     // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState
