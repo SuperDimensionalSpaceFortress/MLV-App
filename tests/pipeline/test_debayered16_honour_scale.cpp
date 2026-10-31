@@ -581,13 +581,18 @@ struct InlineStep
     ThreadRecords afterDebayer;
 };
 
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: `playing` is the request's
+// PresentationContext::playbackActive (ui->actionPlay->isChecked()), read by the admission,
+// the inline decision and the reuse policy. renderPlaying >= 0 overrides the reuse's copy
+// alone: a slot reconned while playing, rendered by a request that is not.
 InlineStep inlineStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, ProductionSlot & slot,
-                      Debayered16ReconReuseCounters * counters, bool admittedByRequest = true)
+                      Debayered16ReconReuseCounters * counters, bool admittedByRequest = true, bool playing = true,
+                      int renderPlaying = -1)
 {
     const size_t n = fullPixels(fixture);
     InlineStep step;
     Debayered16HonourScaleInputs in;
-    in.playbackActive = true;
+    in.playbackActive = playing;
     in.cpuPreviewRoute = true;
     in.amazeDebayer = doesMlvAlwaysUseAmaze(fixture.video()) != 0;
     in.requestedScale = scale;
@@ -599,7 +604,7 @@ InlineStep inlineStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, P
     Debayered16InlineReducedReconInputs decide;
     decide.phase3Disabled = true;
     decide.honourScaleAdmitted = admitted;
-    decide.playbackActive = true;
+    decide.playbackActive = playing;
     decide.scale = scale;
     decide.frameCacheMayServe = mlvRawDebayerCacheMayServeFrame(fixture.video(), frame) != 0;
     step.wanted = debayered16InlineReducedReconWanted(decide);
@@ -620,7 +625,7 @@ InlineStep inlineStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, P
     }
 
     Debayered16ReconReuseInputs reuse;
-    reuse.playbackActive = true;
+    reuse.playbackActive = renderPlaying < 0 ? playing : renderPlaying != 0;
     reuse.reducedReconScale = slot.reducedReconScale;
     reuse.honourScaleAdmitted = admitted && slot.reducedReconScale == scale;
     if (slot.reducedReconScale > 1)
@@ -867,6 +872,127 @@ TEST(Debayered16ReconReuse, HonourScaleInlinePlaybackLeavesExportUntouched)
     ASSERT_TRUE(playedPaused == fresh.renderDebayeredFrame16(frame));
     ASSERT_TRUE(playedExport16 == fresh.renderFrame16(frame));
     ASSERT_TRUE(playedExport8 == fresh.renderFrame8(frame));
+}
+
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 T-S1 (HUB RULING CPU-DUALISO-REDUCED-RECON-S4-DECISION-1):
+// the reduced recon runs only while playing. A request built with Play unchecked (pause, seek,
+// scrub, single-step, open) renders today's full recon at s2 and s4, word for word. Positive
+// control on the SAME fixture and slot: a playing frame is reduced, and the still of that frame
+// rendered right after it (the pause transition) is full again.
+TEST(Debayered16ReconReuse, HonourScaleStillFrameRunsTheFullRecon)
+{
+    EnvGuard guard;
+    const int frames = 2;
+    std::vector<std::vector<uint16_t>> today;
+    for (int f = 0; f < frames; ++f) today.push_back(todaysFrame(static_cast<uint64_t>(f), false));
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        ProductionSlot slot;
+        const auto expectFull = [&](const char * label, int f, const InlineStep & s) {
+            printInlineStep(label, f, scale, s);
+            ASSERT_TRUE(s.admission == Debayered16HonourScaleRefusal::NotPlaying);
+            ASSERT_FALSE(s.wanted);
+            ASSERT_FALSE(s.recon.reconstructed);
+            ASSERT_EQ(1, s.dims.reducedScale);
+            ASSERT_EQ(fixture.width(), s.dims.width);
+            ASSERT_EQ(fixture.height(), s.dims.height);
+            const std::vector<uint16_t> got = presentedWords(slot, s.dims);
+            const std::vector<uint16_t> & expected = today[static_cast<size_t>(f)];
+            ASSERT_EQ(expected.size(), got.size());
+            ASSERT_EQ(0, std::memcmp(expected.data(), got.data(), got.size() * sizeof(uint16_t)));
+        };
+        for (int f = 0; f < frames; ++f)
+            expectFull("still", f, inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr, true, false));
+        for (int f = 0; f < frames; ++f)
+        {
+            const InlineStep played = inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr);
+            printInlineStep("playing", f, scale, played);
+            ASSERT_TRUE(played.admission == Debayered16HonourScaleRefusal::None);
+            ASSERT_TRUE(played.wanted);
+            ASSERT_TRUE(played.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, played.dims.reducedScale);
+            ASSERT_EQ(fixture.width() / scale, played.dims.width);
+            expectFull("paused after playing", f,
+                       inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr, true, false));
+        }
+    }
+}
+
+// T-S2: a slot that holds an admitted reduced recon, rendered by a request with Play unchecked,
+// is refused NotPlaying and renders today's full frame (it is never consumed).
+TEST(Debayered16ReconReuse, HonourScaleReducedSlotRenderedNotPlayingIsTheFullRecon)
+{
+    EnvGuard guard;
+    const uint64_t frame = 1;
+    const std::vector<uint16_t> today = todaysFrame(frame, false);
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        ProductionSlot slot;
+        Debayered16ReconReuseCounters counters;
+        const InlineStep s = inlineStep(fixture, frame, scale, slot, &counters, true, true, 0);
+        printInlineStep("reduced slot, render not playing", static_cast<int>(frame), scale, s);
+        ASSERT_TRUE(s.wanted);
+        ASSERT_TRUE(s.recon.reconstructed);
+        ASSERT_EQ(scale, slot.reducedReconScale);
+        ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::NotPlaying);
+        ASSERT_EQ(1, s.dims.reducedScale);
+        ASSERT_EQ(fixture.width(), s.dims.width);
+        ASSERT_EQ(fixture.height(), s.dims.height);
+        ASSERT_EQ(static_cast<uint64_t>(0), counters.consumed());
+        const std::vector<uint16_t> got = presentedWords(slot, s.dims);
+        ASSERT_EQ(today.size(), got.size());
+        ASSERT_EQ(0, std::memcmp(today.data(), got.data(), got.size() * sizeof(uint16_t)));
+    }
+}
+
+// T-E2: the export call (getMlvProcessedFrame16 / 8) after an s4 reduced playing frame equals the
+// same call on a fresh object, with the exposure match settled, unsettled before the play (the
+// plan refuses), and unsettled after it (llrawproc publishes shared dual-ISO match state; lesson
+// warm-run-writes-shared-dualiso-match).
+TEST(Debayered16ReconReuse, HonourScaleExportAfterAReducedPlayingFrameEqualsAFreshExport)
+{
+    EnvGuard guard;
+    const uint64_t frame = 1;
+    const int scale = 4;
+    enum class Match { Settled, UnsettledBeforePlay, UnsettledAfterPlay };
+    for (const Match match : { Match::Settled, Match::UnsettledBeforePlay, Match::UnsettledAfterPlay })
+    {
+        MlvPipelineFixture played;
+        ASSERT_TRUE(openLargeHq(played));
+        if (match == Match::UnsettledBeforePlay) unsettleExposureMatch(played);
+        ProductionSlot slot;
+        const InlineStep s = inlineStep(played, frame, scale, slot, nullptr);
+        printInlineStep(match == Match::Settled ? "export, settled"
+                        : match == Match::UnsettledBeforePlay ? "export, unsettled before play"
+                                                              : "export, unsettled after play",
+                        static_cast<int>(frame), scale, s);
+        ASSERT_TRUE(s.wanted);
+        if (match == Match::UnsettledBeforePlay)
+        {
+            ASSERT_FALSE(s.recon.reconstructed);
+        }
+        else
+        {
+            ASSERT_TRUE(s.recon.reconstructed);
+            ASSERT_EQ(scale, s.dims.reducedScale);
+        }
+        if (match == Match::UnsettledAfterPlay) unsettleExposureMatch(played);
+        const std::vector<uint16_t> playedExport16 = played.renderFrame16(frame);
+        const std::vector<uint8_t> playedExport8 = played.renderFrame8(frame);
+
+        MlvPipelineFixture fresh;
+        ASSERT_TRUE(openLargeHq(fresh));
+        if (match != Match::Settled) unsettleExposureMatch(fresh);
+        const std::vector<uint16_t> freshExport16 = fresh.renderFrame16(frame);
+        const std::vector<uint8_t> freshExport8 = fresh.renderFrame8(frame);
+        ASSERT_EQ(freshExport16.size(), playedExport16.size());
+        ASSERT_TRUE(playedExport16 == freshExport16);
+        ASSERT_TRUE(playedExport8 == freshExport8);
+    }
 }
 
 // The reduced debayer clears the thread's llrawproc timing, so the recon's own is captured

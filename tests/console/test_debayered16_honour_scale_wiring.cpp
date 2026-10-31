@@ -10,8 +10,12 @@
 #include "../common/repo_paths.h"
 
 #include <QCryptographicHash>
+#include <QDir>
+#include <QDirIterator>
 #include <QFile>
+#include <QFileInfo>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 namespace
@@ -205,4 +209,121 @@ TEST(Debayered16HonourScaleWiring, InlineReducedReconRunsBeforeTheDispatchAndKee
     ASSERT_TRUE(reducedAt > saveAt);
     ASSERT_TRUE(restoreAt > reducedAt);
     ASSERT_EQ(1, render.count(QStringLiteral("mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread")));
+}
+
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 T-S3 (HUB RULING CPU-DUALISO-REDUCED-RECON-S4-DECISION-1): the
+// reduced recon runs only during active playback. Each of the four gates reads the request's
+// playbackActive, which MainWindow sets from the Play action alone, and stopping Play re-renders the
+// stopped frame after the prep is invalidated, so the last frame Play presented (perhaps reduced) is
+// replaced by the full recon. The pipeline tests Debayered16ReconReuse.HonourScaleStillFrame* and
+// HonourScaleReducedSlotRenderedNotPlaying* drive the gates' behaviour.
+TEST(Debayered16HonourScaleWiring, ReducedReconIsPlayOnlyAndPlayStopRefreshesTheFullRecon)
+{
+    const QString mainWindow = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(1, mainWindow.count(QStringLiteral("requestContext.playbackActive = ui->actionPlay->isChecked();")));
+    ASSERT_EQ(1, mainWindow.count(QStringLiteral("honourScale.playbackActive = requestContext.playbackActive;")));
+    const QString render = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_EQ(1, render.count(QStringLiteral(
+        "inlineReduced.playbackActive = m_activePresentationContext.playbackActive;")));
+    ASSERT_EQ(1, render.count(QStringLiteral("reuse.playbackActive = m_activePresentationContext.playbackActive;")));
+    const QString worker = functionBody(render, QStringLiteral("void RenderFrameThread::reconFrameForWorker("));
+    const int notPlayingAt = worker.indexOf(QStringLiteral("else if( !reconContext.playbackActive )"));
+    const int cpuRunAt = worker.indexOf(QStringLiteral("mlvDualIsoPreviewScaleReconRun("));
+    ASSERT_TRUE(notPlayingAt >= 0);
+    ASSERT_TRUE(cpuRunAt > notPlayingAt);
+
+    const QString toggled = functionBody(mainWindow, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"));
+    const int invalidateAt = toggled.indexOf(QStringLiteral("invalidatePlaybackPrepForDisplayChange("));
+    const int applyAt = toggled.indexOf(QStringLiteral("applyEffectiveDualIsoPlaybackSettings();"));
+    const int refreshAt = toggled.indexOf(QStringLiteral(
+        "if( !checked ) requestFrameRefresh( false, \"play-stop-full-recon\" );"));
+    ASSERT_TRUE(invalidateAt >= 0);
+    ASSERT_TRUE(applyAt > invalidateAt);
+    ASSERT_TRUE(refreshAt > applyAt);
+    ASSERT_EQ(1, mainWindow.count(QStringLiteral("\"play-stop-full-recon\"")));
+}
+
+// T-E1: export never reaches the reduced route. The reduced entries are named only by the files
+// that run playback (plus one llrawproc.h doc comment), and no export body names them or renders
+// through the playback renderer.
+TEST(Debayered16HonourScaleWiring, ExportNeverNamesTheReducedReconEntries)
+{
+    const QStringList entries = {
+        QStringLiteral("mlvDualIsoPreviewScaleReconRun"),
+        QStringLiteral("mlvDualIsoGpuPreviewScaleReconRun"),
+        QStringLiteral("getMlvRawFrameDebayeredFromReducedReconnedRaw16"),
+        QStringLiteral("getMlvProcessedFrame8ScaledFromReducedReconnedRaw16"),
+        QStringLiteral("debayered16RunInlineReducedRecon"),
+    };
+    const QString root = repo_file_path(QStringLiteral("."));
+    ASSERT_FALSE(root.isEmpty());
+    const QDir rootDir(root);
+    const QStringList suffixes = { QStringLiteral("c"), QStringLiteral("cpp"), QStringLiteral("h"),
+                                   QStringLiteral("hpp"), QStringLiteral("mm"), QStringLiteral("m") };
+    QStringList naming;
+    for (const QString & dir : { QStringLiteral("platform/qt"), QStringLiteral("src/mlv"), QStringLiteral("src/batch") })
+    {
+        QDirIterator it(rootDir.filePath(dir), QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext())
+        {
+            const QString path = it.next();
+            const QString rel = rootDir.relativeFilePath(path);
+            // Build output (an in-tree qmake build dir) is not source.
+            bool buildOutput = false;
+            for (const QString & segment : rel.split(QLatin1Char('/')).mid(0, rel.count(QLatin1Char('/'))))
+            {
+                if (segment.startsWith(QStringLiteral("build")) || segment == QStringLiteral("release")
+                    || segment == QStringLiteral("debug"))
+                    buildOutput = true;
+            }
+            if (buildOutput) continue;
+            if (!suffixes.contains(QFileInfo(path).suffix())) continue;
+            QFile file(path);
+            ASSERT_TRUE(file.open(QIODevice::ReadOnly | QIODevice::Text));
+            const QString text = QString::fromUtf8(file.readAll());
+            for (const QString & name : entries)
+            {
+                if (text.contains(name))
+                {
+                    naming.append(rel);
+                    break;
+                }
+            }
+        }
+    }
+    naming.sort();
+    const QStringList expected = {
+        QStringLiteral("platform/qt/Debayered16ReconReusePolicy.h"),
+        QStringLiteral("platform/qt/PlaybackReconWarmRun.h"),
+        QStringLiteral("platform/qt/RenderFrameThread.cpp"),
+        QStringLiteral("src/mlv/llrawproc/llrawproc.h"),
+        QStringLiteral("src/mlv/video_mlv.c"),
+        QStringLiteral("src/mlv/video_mlv.h"),
+    };
+    ASSERT_EQ(expected.join(QLatin1Char(',')).toStdString(), naming.join(QLatin1Char(',')).toStdString());
+    // llrawproc.h names the CPU reduced run in one doc comment only.
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.h"));
+    ASSERT_EQ(1, llrawproc.count(QStringLiteral("mlvDualIsoPreviewScaleReconRun")));
+    ASSERT_TRUE(llrawproc.contains(QStringLiteral(" * reduced route (mlvDualIsoPreviewScaleReconRun) passes it;")));
+    for (const QString & name : entries) ASSERT_FALSE(llrawproc.contains(name + QLatin1Char('(')));
+
+    const QString mainWindow = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    QStringList exportBodies;
+    for (const QString & signature : { QStringLiteral("void MainWindow::startExportPipe("),
+                                       QStringLiteral("void MainWindow::startExportCdng("),
+                                       QStringLiteral("void MainWindow::startExportMlv("),
+                                       QStringLiteral("void MainWindow::startExportAVFoundation("),
+                                       QStringLiteral("void MainWindow::on_actionExportCurrentFrame_triggered(") })
+    {
+        exportBodies.append(functionBody(mainWindow, signature));
+    }
+    exportBodies.append(readRepoFile(QStringLiteral("platform/qt/SingleFrameExportDialog.cpp")));
+    // The two frame-reading export bodies call the export entry, not a playback one.
+    ASSERT_TRUE(exportBodies.at(0).contains(QStringLiteral("getMlvProcessedFrame16(")));
+    for (const QString & body : exportBodies)
+    {
+        ASSERT_TRUE(body.size() > 0);
+        for (const QString & name : entries) ASSERT_FALSE(body.contains(name));
+        ASSERT_FALSE(body.contains(QStringLiteral("renderFrame(")));
+    }
 }
