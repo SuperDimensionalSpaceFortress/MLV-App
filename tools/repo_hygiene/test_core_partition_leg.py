@@ -3668,6 +3668,20 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         v = self.verdict(self.CAPPED, self.log(self.start("12") + " env_force_singlethread=0 worker_threads=8"), self.PROOF)
         self.assertEqual((v["observed"], v["verdict"]), (12, "HONOURED"), "a value with a Unicode space stays inside its own field")
 
+    def test_an_empty_valued_duplicate_is_refused_in_either_order_and_case(self) -> None:
+        # r3 (sol ADV-A2 on #726, CR 6538542792): `worker_threads=12 worker_threads=` returned duplicates=[] and HONOURED because the reader skipped an empty
+        # value. A key counts whatever its value, in either order and either case, and a Qt location suffix adds no token.
+        for name, line in (("empty after", self.start("12") + " worker_threads="), ("empty before", self.start("12").replace("worker_threads=12", "worker_threads= worker_threads=12")),
+                           ("empty upper case after", self.start("12") + " WORKER_THREADS="),
+                           ("empty upper case before", self.start("12").replace("worker_threads=12", "WORKER_THREADS= worker_threads=12")),
+                           ("empty before a location suffix", self.start("12") + " worker_threads= (C:/build (x)/MainWindow.cpp:25848)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, self.log(line), self.PROOF)
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+                self.assertIn("DUPLICATE_START_FIELD", v["reason"])
+        v = self.verdict(self.CAPPED, self.log("[2026-10-31T00:00:00.000Z] [INFO] [0x1] " + self.start("12") + " (C:/build (x)/MainWindow.cpp:25848)"), self.PROOF)
+        self.assertEqual((v["observed"], v["verdict"]), (12, "HONOURED"), "one genuine count with a location suffix still honours")
+
     def test_only_a_recognised_failure_terminal_may_omit_the_proof(self) -> None:
         # adversary r1 A1 (2166f68a): a summary with no result, or a result that is not exactly a capture or a known failure terminal, skipped the proof
         # checks and PASSed on the run log alone. Only the runner's own $script:FailureTerminals may omit the proof fields.

@@ -45,6 +45,28 @@ TEST(LogLineField, EveryCharacterThatCouldEndAFieldIsMapped)
     }
 }
 
+TEST(LogLineField, ASupplementaryFormatCharacterOrALoneSurrogateIsMapped)
+{
+    // r3 (sol A3 and fable on #726): U+E0001 is two UTF-16 surrogate halves, and neither half is Other_Format, so a walk by code unit kept it.
+    using log_line_field::fieldValue;
+    for (char32_t u : { char32_t(0xe0001), char32_t(0xe0020), char32_t(0xe007f), char32_t(0x1bca0), char32_t(0x1d173) })
+    {
+        const QString value = QStringLiteral("0") + QString::fromUcs4(&u, 1) + QStringLiteral("worker_threads=8");
+        ASSERT_TRUE(fieldValue(value) == QStringLiteral("0_worker_threads=8"));
+    }
+    for (ushort half : { 0xd800, 0xdbff, 0xdc00, 0xdfff })
+    {
+        const QString value = QStringLiteral("0") + QChar(half) + QStringLiteral("worker_threads=8");
+        ASSERT_TRUE(fieldValue(value) == QStringLiteral("0_worker_threads=8"));
+    }
+    // a low half before a high half is two unpaired surrogates
+    ASSERT_TRUE(fieldValue(QStringLiteral("0") + QChar(0xdc01) + QChar(0xdb40) + QStringLiteral("1")) == QStringLiteral("0__1"));
+    // a supplementary character that is not a separator is kept whole
+    const char32_t emoji = 0x1f600;
+    const QString kept = QStringLiteral("a") + QString::fromUcs4(&emoji, 1) + QStringLiteral("b");
+    ASSERT_TRUE(fieldValue(kept) == kept);
+}
+
 TEST(LogLineField, OrdinaryValuesAreUnchanged)
 {
     using log_line_field::fieldValue;

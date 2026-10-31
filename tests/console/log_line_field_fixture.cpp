@@ -26,7 +26,13 @@ int main( int argc, char **argv )
     {
         QFile file( QDir( outDir ).filePath( prefix + QLatin1Char( '-' ) + QString::fromLatin1( variant.name ) + QStringLiteral( ".log" ) ) );
         if( !file.open( QIODevice::WriteOnly | QIODevice::Truncate ) ) return 1;
-        file.write( log_line_field_fixture::runLog( variant, withPrepRoute ) );
+        // r3 (sol on #726): a failed or short write is a failed fixture, never a success exit.
+        const QByteArray bytes = log_line_field_fixture::runLog( variant, withPrepRoute );
+        if( file.write( bytes ) != bytes.size() || !file.flush() )
+        {
+            std::fprintf( stderr, "log_line_field_fixture: short write to %s\n", qPrintable( file.fileName() ) );
+            return 1;
+        }
         std::printf( "%s\n", qPrintable( file.fileName() ) );
     }
     return 0;

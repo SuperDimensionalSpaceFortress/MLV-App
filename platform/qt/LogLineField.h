@@ -22,13 +22,15 @@
 namespace log_line_field
 {
 
-inline bool breaksField( QChar c )
+// One code point. r3 (sol A3 and fable on #726): judged by code point, not by UTF-16 unit, so a supplementary-plane format character
+// (U+E0001 is two surrogate halves, neither of them Other_Format) is caught; a surrogate that reaches here is unpaired and breaks too.
+inline bool breaksField( uint u )
 {
-    const ushort u = c.unicode();
     if( u < 0x20 || u == 0x7f || ( u >= 0x80 && u <= 0x9f ) ) return true;   // C0, DEL, C1
     if( u == '%' ) return true;
-    if( c.isSpace() ) return true;
-    switch( c.category() )
+    if( u >= 0xd800 && u <= 0xdfff ) return true;   // an unpaired surrogate
+    if( QChar::isSpace( u ) ) return true;
+    switch( QChar::category( u ) )
     {
     case QChar::Separator_Space:
     case QChar::Separator_Line:
@@ -41,12 +43,23 @@ inline bool breaksField( QChar c )
     }
 }
 
-// A value written as one field: every character that breaksField() is '_'. Empty stays empty.
+// A value written as one field: every code point that breaksField() is one '_'. Empty stays empty.
 inline QString fieldValue( const QString &raw )
 {
-    QString value = raw;
-    for( int i = 0; i < value.size(); ++i )
-        if( breaksField( value.at( i ) ) ) value[i] = QLatin1Char( '_' );
+    QString value;
+    value.reserve( raw.size() );
+    for( qsizetype i = 0; i < raw.size(); ++i )
+    {
+        const QChar c = raw.at( i );
+        if( c.isHighSurrogate() && i + 1 < raw.size() && raw.at( i + 1 ).isLowSurrogate() )
+        {
+            const QChar low = raw.at( ++i );
+            if( breaksField( QChar::surrogateToUcs4( c, low ) ) ) value += QLatin1Char( '_' );
+            else { value += c; value += low; }
+        }
+        else if( breaksField( c.unicode() ) ) value += QLatin1Char( '_' );
+        else value += c;
+    }
     return value;
 }
 

@@ -11458,6 +11458,46 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
                 self.assertIn("unreadable", v["reason"])
 
+    def test_a_qt_location_whose_path_holds_spaces_and_parentheses_keeps_the_reported_state(self) -> None:
+        # r3 (sol ADV-A1 on #726, CR 6538542792): the suffix class [^()] refused `(C:/build (x)/MainWindow.cpp:25848)`, so a clean OFF record read as
+        # unreadable (NOT_HONOURED, blocks) and a clean ON record never honoured. The suffix is one trailing ` (<path>:<digits>)` group matched from the right.
+        for loc in (" (C:/build (x)/MainWindow.cpp:25848)", " (C:/b (1) (y)/sub dir/MainWindow.cpp:7)", " (MainWindow.cpp:25848)"):
+            with self.subTest(loc=loc, arm="OFF"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("0") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
+            with self.subTest(loc=loc, arm="ON"):
+                v = self.verdict(self.ON, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "HONOURED", False), v)
+            with self.subTest(loc=loc, arm="OFF inherited ON"):
+                v = self.verdict({}, self.log(self.PREFIX + self.route("1") + loc))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (1, "NOT_HONOURED", True), v)
+        for name, record in (("a suffix without a line number", self.route("1") + " (C:/build (x)/MainWindow.cpp)"),
+                             ("a field after the suffix", self.route("1") + " (C:/x.cpp:1) extra=1"),
+                             ("a suffix with no space before it", self.route("1") + "(C:/x.cpp:1)"),
+                             ("an empty path", self.route("1") + " (:1)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(record))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+
+    def test_the_shared_line_reader_counts_an_empty_valued_duplicate_for_every_caller(self) -> None:
+        # r3 (sol ADV-A2 on #726): `active=1 active=` read as active=1 because the reader skipped an empty value; every caller of the shared reader now sees
+        # the key as absent and the duplicate named, and a Qt location suffix adds no token.
+        log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.pace_unpaced session=3 active=1 drop_frame=0 active=",
+                         "playback_smoke.pace_summary session=3 timeline_fps_after_first_present=59.9 TIMELINE_FPS_AFTER_FIRST_PRESENT=",
+                         "playback_smoke.cpu_summary session=3 avg_llrawproc_dual_iso_ms=4.5 (C:/b x=1 (y)/MainWindow.cpp:9)",
+                         "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+        proc, out = run_pwsh_json("$u = Get-DvUnpacedEvidence -Spec (@{ generatorArgs = @{ unpaced = $true } }) -LogText $env:DVE_LOG\n"
+                                  "$r = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'pace_unpaced'\n"
+                                  "$c = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'cpu_summary'\n"
+                                  "[ordered]@{ unpaced = $u.verdict; duplicates = @($r.duplicates); rates = (Get-DvMatrixRates -LogText $env:DVE_LOG); cpuKeys = @($c.fields.Keys | Sort-Object) } | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["unpaced"], "NOT_HONOURED")
+        self.assertEqual(out["duplicates"], ["active"])
+        self.assertIsNone(out["rates"]["timelineFpsAfterFirstPresent"])
+        self.assertEqual(out["rates"]["dualIsoMs"], 4.5)
+        self.assertEqual(out["cpuKeys"], ["avg_llrawproc_dual_iso_ms", "session"], "the location suffix's path adds no field")
+
 
 if __name__ == "__main__":
     unittest.main()

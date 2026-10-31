@@ -1360,17 +1360,20 @@ function Get-DvPrepConflatedMoveEvidence {
     # can be forged. Engagement is read from the prep_route record only, matched against the WHOLE line: an optional log prefix ([utc] [LEVEL] [0xthread]),
     # the marker, the measured session, the one field with the value 0 or 1, an optional Qt location suffix, and nothing else. A prep_route text embedded in
     # another record (after a separator an old app wrote) never matches, and a second record for the session is unreadable, never a PASS.
+    # r3 (sol ADV-A1 on #726): the location suffix is stripped by Get-DvLogRecordBody (one trailing ` (<path>:<line>)` group, the path may hold spaces and
+    # parentheses) before the body is matched, so a build path like `C:/build (x)/` keeps the reported state.
     $records = 0
     $mentions = 0
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
             $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
-                ' prep_conflated_move_active=(?<v>[01])( \([^()]*\))?$'
+                ' prep_conflated_move_active=(?<v>[01])$'
             $mention = 'playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) + '( |$)'
             foreach ($l in ($LogText -split "`r?`n")) {
-                if ($l -cmatch $mention) { $mentions++ }
-                $m = [regex]::Match($l, $whole)
+                if ($l -cnotmatch $mention) { continue }
+                $mentions++
+                $m = [regex]::Match((Get-DvLogRecordBody -Line $l), $whole)
                 if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
             }
         }
@@ -1528,7 +1531,9 @@ function Get-DvSmokeSessionLineRead {
     }
     if ($null -ne $found) {
         $seen = @{}
-        foreach ($m in [regex]::Matches($found, '(?<![^ ])(?<k>[A-Za-z0-9_]+)=(?<v>[^ ]+)')) {
+        # r3 (sol ADV-A2 on #726): a key counts whatever its value, EMPTY included, so `worker_threads=8 worker_threads=` (either order, either case) is a
+        # duplicate too; the Qt location suffix is stripped first (Get-DvLogRecordBody) so a build path never adds a token.
+        foreach ($m in [regex]::Matches((Get-DvLogRecordBody -Line $found), '(?<![^ ])(?<k>[A-Za-z0-9_]+)=(?<v>[^ ]*)')) {
             $k = $m.Groups['k'].Value
             if ($seen.ContainsKey($k)) { [void]$duplicates.Add($k) }
             else { $seen[$k] = $m.Groups['v'].Value }
@@ -1536,6 +1541,32 @@ function Get-DvSmokeSessionLineRead {
         foreach ($k in $seen.Keys) { if (-not $duplicates.Contains($k)) { $fields[$k] = $seen[$k] } }
     }
     @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
+}
+
+function Get-DvLogRecordBody {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r3 (sol ADV-A1 on #726): one run-log line without the Qt location suffix CrashForensics::writeLogLine appends
+    (` (<file>:<line>)`, only when the message context carries a file). The suffix is ONE trailing group anchored at the end of the line and matched from the
+    right: the closing `)` is paired with its opening `(` by depth, so a path that holds spaces and balanced parentheses (`C:/build (x)/MainWindow.cpp`) is
+    removed whole, and the opening `(` must follow a space and enclose `<path>:<digits>`. A line with no such suffix is returned unchanged. Every reader
+    that matches or tokenises a playback_smoke record strips the suffix through this one helper.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line) -or $Line -cnotmatch ':[0-9]+\)$') { return $Line }
+    $depth = 0
+    for ($i = $Line.Length - 1; $i -ge 0; $i--) {
+        $c = $Line[$i]
+        if ($c -ceq ')') { $depth++ }
+        elseif ($c -ceq '(') {
+            $depth--
+            if ($depth -ne 0) { continue }
+            $inner = $Line.Substring($i + 1, $Line.Length - $i - 2)
+            if ($i -ge 1 -and $Line[$i - 1] -ceq ' ' -and $inner -cmatch '^.+:[0-9]+$') { return $Line.Substring(0, $i - 1) }
+            return $Line
+        }
+    }
+    $Line
 }
 
 function Get-DvMatrixRates {
@@ -3165,6 +3196,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
