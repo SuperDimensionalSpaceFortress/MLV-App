@@ -11541,6 +11541,9 @@ int MainWindow::openMlv( QString fileName )
 
     //Reset audio engine
     m_pAudioPlayback->resetAudioEngine();
+    // MERGE-MASTER r7 (sol r6 B2): the reset closes the engine the last applied sync started, and Play can survive a
+    // reopen (rename), so forget that sync: the new clip's first requested sync is applied, never dropped as a duplicate.
+    forgetAppliedPlaybackAudioSync();
 
     /* Destroy it just for simplicity... and make a new one */
     if( !freeActiveMlvObjectAfterLifecycleBarrier( "clip-open" ) )
@@ -11722,6 +11725,9 @@ int MainWindow::openMlv( QString fileName )
         applyPlaybackDebayerSelection();
     }
 
+    // MERGE-MASTER r7 (sol r6 B2): the new engine below has applied no sync (one consumed while the open pumped events
+    // went to the reset engine), so the memo is forgotten again right before it.
+    forgetAppliedPlaybackAudioSync();
     //Init audio playback engine
     m_pAudioPlayback->initAudioEngine( m_pMlvObject );
     armPlaybackRoutePrewarm();
@@ -19446,7 +19452,8 @@ void MainWindow::noteConformStateBeforeChange( void )
 
 // MERGE-MASTER r6 (AUDIO-A1 residual, Dot 6544364013): the consumer's duplicate-sync memo describes audio that still runs
 // from the last applied sync (playback_audio_start::isDuplicateSync). A stop outside the consumer forgets it, so the next
-// requested sync is applied: the play stop, and a conform change that stops the audio while Play stays on.
+// requested sync is applied: the play stop, and a conform change that stops the audio while Play stays on. r7 (sol r6 B2):
+// so does every engine reset or re-init outside the consumer (clip open: resetAudioEngine and initAudioEngine).
 void MainWindow::forgetAppliedPlaybackAudioSync( void )
 {
     m_lastPlaybackAudioSyncFrame = -1;

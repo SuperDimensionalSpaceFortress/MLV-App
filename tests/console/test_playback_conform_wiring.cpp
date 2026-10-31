@@ -450,8 +450,9 @@ TEST(PlaybackConformWiring, AConformStopForgetsTheAppliedSyncSoARearmIsApplied)
     ASSERT_TRUE(forget.contains(QStringLiteral("m_lastPlaybackAudioSyncTime = 0.0;")));
     ASSERT_EQ(2, countOccurrences(source, QStringLiteral("m_lastPlaybackAudioSyncFrame = ")));
     ASSERT_EQ(2, countOccurrences(source, QStringLiteral("m_lastPlaybackAudioSyncTime = ")));
-    // the play stop (resize, end of clip and Play off all uncheck actionPlay) forgets through the same helper
-    ASSERT_EQ(2, countOccurrences(source, QStringLiteral("forgetAppliedPlaybackAudioSync();")));
+    // the play stop (resize, end of clip and Play off all uncheck actionPlay) forgets through the same helper, and so do
+    // the two clip-open engine sites (r7, PlaybackConformWiring.AnEngineResetOrReinitForgetsTheAppliedSync)
+    ASSERT_EQ(4, countOccurrences(source, QStringLiteral("forgetAppliedPlaybackAudioSync();")));
 
     // the consumer: the duplicate test is the pure helper, fed the memo, the presented sync frame and the clock
     const int consumer = source.indexOf(QStringLiteral("if( m_tryToSyncAudio && m_pAudioPlayback"));
@@ -465,6 +466,66 @@ TEST(PlaybackConformWiring, AConformStopForgetsTheAppliedSyncSoARearmIsApplied)
     // the census of audio stops: destructor, resize, end of clip, conform, Play off, and the legacy consumer. A new one
     // must decide whether it forgets the applied sync (it does when Play can stay on after it).
     ASSERT_EQ(6, countOccurrences(source, QStringLiteral("m_pAudioPlayback->stop()")));
+}
+
+// MERGE-MASTER r7 (sol r6 B2): the stop census above missed the engine RESETS. resetAudioEngine at clip open closes the
+// engine the last applied sync started, and a rename/reopen can keep Play on, so the new clip's slider-reset sync at the
+// same frame within 100 ms was dropped as a duplicate and the new engine never started. Every live reset / re-init of the
+// engine outside the consumer is pinned here and forgets the applied sync next to it (right after the reset, right before
+// the re-init); a new reset or init site changes the census and must decide the same.
+namespace
+{
+// positions of needle that are not on a // comment line
+QList<int> liveOccurrences(const QString & source, const QString & needle)
+{
+    QList<int> out;
+    for (int at = source.indexOf(needle); at >= 0; at = source.indexOf(needle, at + needle.length())) {
+        const int lineStart = source.lastIndexOf(QLatin1Char('\n'), at) + 1;
+        if (!source.mid(lineStart, at - lineStart).trimmed().startsWith(QStringLiteral("//"))) out.append(at);
+    }
+    return out;
+}
+}
+
+TEST(PlaybackConformWiring, AnEngineResetOrReinitForgetsTheAppliedSync)
+{
+    const QString source = mainWindowSource();
+    const QList<int> resets = liveOccurrences(source, QStringLiteral("m_pAudioPlayback->resetAudioEngine("));
+    const QList<int> inits = liveOccurrences(source, QStringLiteral("m_pAudioPlayback->initAudioEngine("));
+    // the census: one live reset and one live (re-)init, both in openMlv; the destructor's shutdownWorkerThread is teardown
+    ASSERT_EQ(1, resets.size());
+    ASSERT_EQ(1, inits.size());
+    ASSERT_EQ(1, liveOccurrences(source, QStringLiteral("m_pAudioPlayback->shutdownWorkerThread(")).size());
+    const QString open = functionBody(source, QStringLiteral("int MainWindow::openMlv( QString fileName )"),
+                                      QStringLiteral("m_pAudioPlayback->initAudioEngine( m_pMlvObject );"));
+    ASSERT_FALSE(open.isEmpty());
+    ASSERT_TRUE(open.contains(QStringLiteral("m_pAudioPlayback->resetAudioEngine();")));
+    // the forget is the statement right after the reset, and right before the re-init (whose next line the route-prewarm
+    // wiring pins as armPlaybackRoutePrewarm()); only comment or blank lines may sit between
+    const QString forgetCall = QStringLiteral("forgetAppliedPlaybackAudioSync();");
+    auto onlyCommentsBetween = [&source](int from, int to) {
+        if (to < from - 1) return false;
+        if (to < from) return true;   // adjacent lines
+        for (const QString & line : source.mid(from, to - from).split(QLatin1Char('\n'))) {
+            const QString trimmed = line.trimmed();
+            if (!trimmed.isEmpty() && !trimmed.startsWith(QStringLiteral("//"))) return false;
+        }
+        return true;
+    };
+    for (const int at : resets) {
+        const int lineEnd = source.indexOf(QLatin1Char('\n'), at);
+        const int forget = source.indexOf(forgetCall, lineEnd);
+        ASSERT_TRUE(lineEnd > at && forget > lineEnd);
+        ASSERT_TRUE(onlyCommentsBetween(lineEnd + 1, source.lastIndexOf(QLatin1Char('\n'), forget)));
+    }
+    for (const int at : inits) {
+        const int lineStart = source.lastIndexOf(QLatin1Char('\n'), at);
+        const int forget = source.lastIndexOf(forgetCall, lineStart);
+        ASSERT_TRUE(forget >= 0);
+        ASSERT_TRUE(onlyCommentsBetween(source.indexOf(QLatin1Char('\n'), forget) + 1, lineStart));
+    }
+    // the sync flag is still raised in exactly one place
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("m_tryToSyncAudio = true")));
 }
 
 TEST(PlaybackConformWiring, SavedAudioOutputChoiceIsNeverUncheckedByConform)
