@@ -11460,8 +11460,13 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
 
     def test_a_qt_location_whose_path_holds_spaces_and_parentheses_keeps_the_reported_state(self) -> None:
         # r3 (sol ADV-A1 on #726, CR 6538542792): the suffix class [^()] refused `(C:/build (x)/MainWindow.cpp:25848)`, so a clean OFF record read as
-        # unreadable (NOT_HONOURED, blocks) and a clean ON record never honoured. The suffix is one trailing ` (<path>:<digits>)` group matched from the right.
-        for loc in (" (C:/build (x)/MainWindow.cpp:25848)", " (C:/b (1) (y)/sub dir/MainWindow.cpp:7)", " (MainWindow.cpp:25848)"):
+        # unreadable (NOT_HONOURED, blocks) and a clean ON record never honoured.
+        # r4 (r3 adversary A1 = Grok G1 on #726): pairing the parentheses from the right refused a path with an UNBALANCED parenthesis, which Windows allows. A
+        # record body never holds ` (` (keys are [A-Za-z0-9_]+ and fieldValue maps every space), so the suffix starts at the FIRST ` (` and runs to a closing
+        # `:<digits>)` at the end of the line, whatever the path holds, record markers and `) (` included.
+        for loc in (" (C:/build (x)/MainWindow.cpp:25848)", " (C:/b (1) (y)/sub dir/MainWindow.cpp:7)", " (MainWindow.cpp:25848)",
+                    " (C:/build (x/MainWindow.cpp:25848)", " (C:/build x)/M.cpp:1)", " (C:/a) prep_conflated_move_active=1 (b/MainWindow.cpp:9)",
+                    " (C:/build playback_smoke.prep_route session=3 x/MainWindow.cpp:25848)"):
             with self.subTest(loc=loc, arm="OFF"):
                 v = self.verdict({}, self.log(self.PREFIX + self.route("0") + loc))
                 self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
@@ -11478,6 +11483,41 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
             with self.subTest(case=name):
                 v = self.verdict(self.ON, self.log(record))
                 self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+
+    def test_record_markers_inside_a_qt_location_never_count_or_select_a_record(self) -> None:
+        # r4 (r3 adversary A2 on #726): markers were matched on the RAW line, before the location suffix was stripped, so a build path holding
+        # `playback_smoke.prep_route session=3` added mentions (four mentions, one record: a clean OFF leg read as unreadable and blocked), and a path holding
+        # `playback_smoke.start session=3` or `playback_smoke.measured_session id=9` selected the wrong line or the wrong session. Every dual-venue reader now
+        # strips the suffix first and matches markers on the record body only.
+        def marked(loc: str, *records: str) -> str:
+            return "\n".join(r + loc for r in records) + "\n"
+        prep_loc = " (C:/build playback_smoke.prep_route session=3 x/MainWindow.cpp:25848)"
+        for value, spec, expected in (("0", {}, (0, "NOT_REQUESTED", False)), ("1", self.ON, (1, "HONOURED", False))):
+            with self.subTest(case="prep_route marker in every location", value=value):
+                v = self.verdict(spec, marked(prep_loc, "playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8",
+                                                    self.route(value), "playback_smoke.summary session=3 reason=reached presented_frames=600"))
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), expected, v)
+        with self.subTest(case="measured_session marker in an earlier line's location"):
+            log = (self.PREFIX + "interaction_trace event=automation.start (C:/b playback_smoke.measured_session id=9 x/MainWindow.cpp:1)\n"
+                   + self.log(self.route("0")))
+            v = self.verdict({}, log)
+            self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (0, "NOT_REQUESTED", False), v)
+        start_loc = " (C:/build playback_smoke.start session=3 worker_threads=2 x/MainWindow.cpp:25848)"
+        log = "\n".join(["playback_smoke.measured_session id=3", "playback_smoke.start session=3 worker_threads=8 (C:/a/MainWindow.cpp:1)",
+                         self.PREFIX + "interaction_trace event=gui_smoke.visual_state look_assist_enabled=0 (C:/a/MainWindow.cpp:2)",
+                         "playback_smoke.summary session=3 reason=reached presented_frames=600 presented_fps=24" + start_loc.replace("worker_threads=2", "presented_fps=999"),
+                         "playback_smoke.pace_summary session=3 timeline_fps_after_first_present=59.9" + start_loc
+                         + " event=gui_smoke.visual_state look_assist_enabled=1 (y/MainWindow.cpp:3)"]) + "\n"
+        proc, out = run_pwsh_json("$s = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'start'\n"
+                                  "$l = Get-DvLookAssistEvidence -Spec (@{ generatorArgs = @{ forceLookAssist = $true } }) -LogText $env:DVE_LOG\n"
+                                  "[ordered]@{ workers = $s.fields['worker_threads']; look = $l.reported; rates = (Get-DvMatrixRates -LogText $env:DVE_LOG);"
+                                  " summary = (Get-DvSmokeSummaryFields -LogText $env:DVE_LOG).fields['presented_fps'] } | ConvertTo-Json -Compress -Depth 4",
+                                  DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        # workers / look: a marker in a later line's location selects nothing; summary / presentedFps: the summary's location adds no field (r3 advisory A3)
+        self.assertEqual({"workers": out["workers"], "look": out["look"], "summary": out["summary"], "presentedFps": out["rates"]["presentedFps"],
+                          "timelineFpsAfterFirstPresent": out["rates"]["timelineFpsAfterFirstPresent"]},
+                         {"workers": "8", "look": "0", "summary": "24", "presentedFps": 24, "timelineFpsAfterFirstPresent": 59.9})
 
     def test_the_shared_line_reader_counts_an_empty_valued_duplicate_for_every_caller(self) -> None:
         # r3 (sol ADV-A2 on #726): `active=1 active=` read as active=1 because the reader skipped an empty value; every caller of the shared reader now sees

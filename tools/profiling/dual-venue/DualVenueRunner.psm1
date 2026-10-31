@@ -913,7 +913,9 @@ function Get-DvSmokeSummaryFields {
     $isolated = $false
     $conformLine = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        $lines = $LogText -split "`r?`n"
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 and advisory A3 on #726): every line is read as its record body, so a build path in a Qt
+        # location suffix never selects the session or a line, and never adds a summary or conform field.
+        $lines = Get-DvLogRecordBodies -LogText $LogText
         foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
         if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
         if ($null -ne $session) {
@@ -1164,7 +1166,7 @@ function Get-DvScaleEvidence {
         $clampFlag = ConvertTo-DvInt64 $f['gpu_texture_route_scale_clamp_active']
         if ($null -ne $clampFlag) { $clampActive = ($clampFlag -ne 0) }
         if ($null -eq $effective) {
-            foreach ($line in ($LogText -split "`r?`n")) {
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($line -match 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)') { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
             }
         }
@@ -1360,8 +1362,9 @@ function Get-DvPrepConflatedMoveEvidence {
     # can be forged. Engagement is read from the prep_route record only, matched against the WHOLE line: an optional log prefix ([utc] [LEVEL] [0xthread]),
     # the marker, the measured session, the one field with the value 0 or 1, an optional Qt location suffix, and nothing else. A prep_route text embedded in
     # another record (after a separator an old app wrote) never matches, and a second record for the session is unreadable, never a PASS.
-    # r3 (sol ADV-A1 on #726): the location suffix is stripped by Get-DvLogRecordBody (one trailing ` (<path>:<line>)` group, the path may hold spaces and
-    # parentheses) before the body is matched, so a build path like `C:/build (x)/` keeps the reported state.
+    # r3 (sol ADV-A1 on #726) and r4 (r3 adversary A1 and A2, Grok G1): every line is read as its record body (Get-DvLogRecordBodies strips the Qt location
+    # suffix from its first ` (`, whatever the path holds) BEFORE a mention is counted or the record matched, so a build path like `C:/build (x/` keeps the
+    # reported state and a path holding `playback_smoke.prep_route session=<n>` adds no mention. A mention inside another record's BODY still counts.
     $records = 0
     $mentions = 0
     if (-not [string]::IsNullOrEmpty($LogText)) {
@@ -1370,10 +1373,10 @@ function Get-DvPrepConflatedMoveEvidence {
             $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
                 ' prep_conflated_move_active=(?<v>[01])$'
             $mention = 'playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) + '( |$)'
-            foreach ($l in ($LogText -split "`r?`n")) {
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($l -cnotmatch $mention) { continue }
                 $mentions++
-                $m = [regex]::Match((Get-DvLogRecordBody -Line $l), $whole)
+                $m = [regex]::Match($l, $whole)
                 if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
             }
         }
@@ -1412,7 +1415,8 @@ function Get-DvLookAssistEvidence {
     if ($requested) {
         $found = $null
         if (-not [string]::IsNullOrEmpty($LogText)) {
-            foreach ($line in ($LogText -split "`r?`n")) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+            # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
@@ -1526,14 +1530,16 @@ function Get-DvSmokeSessionLineRead {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
             $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
-            foreach ($line in ($LogText -split "`r?`n")) { if ($line -match $pattern) { $found = $line } }
+            # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
+            # `playback_smoke.<Marker> session=<n>` is never selected
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }
         }
     }
     if ($null -ne $found) {
         $seen = @{}
         # r3 (sol ADV-A2 on #726): a key counts whatever its value, EMPTY included, so `worker_threads=8 worker_threads=` (either order, either case) is a
-        # duplicate too; the Qt location suffix is stripped first (Get-DvLogRecordBody) so a build path never adds a token.
-        foreach ($m in [regex]::Matches((Get-DvLogRecordBody -Line $found), '(?<![^ ])(?<k>[A-Za-z0-9_]+)=(?<v>[^ ]*)')) {
+        # duplicate too; $found is already the record body (no Qt location suffix), so a build path never adds a token.
+        foreach ($m in [regex]::Matches($found, '(?<![^ ])(?<k>[A-Za-z0-9_]+)=(?<v>[^ ]*)')) {
             $k = $m.Groups['k'].Value
             if ($seen.ContainsKey($k)) { [void]$duplicates.Add($k) }
             else { $seen[$k] = $m.Groups['v'].Value }
@@ -1543,30 +1549,38 @@ function Get-DvSmokeSessionLineRead {
     @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
 }
 
+# The Qt location suffix (Get-DvLogRecordBody): from the first ` (` to a closing `:<digits>)` at the end of the line.
+$script:DvLocationSuffix = ' \(.+:[0-9]+\)\z'
+
 function Get-DvLogRecordBody {
     <#
     .SYNOPSIS
-    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r3 (sol ADV-A1 on #726): one run-log line without the Qt location suffix CrashForensics::writeLogLine appends
-    (` (<file>:<line>)`, only when the message context carries a file). The suffix is ONE trailing group anchored at the end of the line and matched from the
-    right: the closing `)` is paired with its opening `(` by depth, so a path that holds spaces and balanced parentheses (`C:/build (x)/MainWindow.cpp`) is
-    removed whole, and the opening `(` must follow a space and enclose `<path>:<digits>`. A line with no such suffix is returned unchanged. Every reader
-    that matches or tokenises a playback_smoke record strips the suffix through this one helper.
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 (#726): one run-log line without the Qt location suffix CrashForensics::writeLogLine appends after the message
+    (` (<file>:<line>)`, only when the message context carries a file; CrashForensics.cpp writeLogLine). r4 (r3 adversary A1 = Grok G1): the suffix starts at
+    the FIRST ` (` of the line and runs to a closing `:<digits>)` at its very end; nothing is paired, so the path may hold spaces and parentheses, balanced or
+    not (`C:/build (x/`, `C:/build x)/`), and any text at all, record markers included. That is exact because a record body never holds ` (`: the
+    prefix is `[utc] [LEVEL] [0x<thread>] `, record keys are [A-Za-z0-9_]+, every value from outside the app goes through log_line_field::fieldValue (which
+    maps every space), and the one app value with spaces (summary gui_fps_status_text, "Playback: <n> fps") holds no parenthesis. The location is written
+    last, so what precedes its first ` (` is the body the app wrote. A line with no such suffix (no ` (`, no `:<digits>)` at the end, nothing between `(` and
+    the colon, or text after the `)`) is returned unchanged, so it still fails a whole-line match. Every dual-venue reader of the app's run log strips the
+    suffix through this helper (or Get-DvLogRecordBodies) BEFORE it matches a record marker or a field.
     #>
     param([AllowNull()][AllowEmptyString()][string]$Line)
-    if ([string]::IsNullOrEmpty($Line) -or $Line -cnotmatch ':[0-9]+\)$') { return $Line }
-    $depth = 0
-    for ($i = $Line.Length - 1; $i -ge 0; $i--) {
-        $c = $Line[$i]
-        if ($c -ceq ')') { $depth++ }
-        elseif ($c -ceq '(') {
-            $depth--
-            if ($depth -ne 0) { continue }
-            $inner = $Line.Substring($i + 1, $Line.Length - $i - 2)
-            if ($i -ge 1 -and $Line[$i - 1] -ceq ' ' -and $inner -cmatch '^.+:[0-9]+$') { return $Line.Substring(0, $i - 1) }
-            return $Line
-        }
-    }
-    $Line
+    if ([string]::IsNullOrEmpty($Line)) { return $Line }
+    [regex]::Replace($Line, $script:DvLocationSuffix, '')
+}
+
+function Get-DvLogRecordBodies {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 on #726): every line of a run log as its record body (Get-DvLogRecordBody), in order, so a
+    reader matches record markers on the body only and a build path that holds `playback_smoke.<marker> session=<n>` never adds or selects a record.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText)
+    if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
+    $lines = $LogText -split "`r?`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].Length -gt 0) { $lines[$i] = [regex]::Replace($lines[$i], $script:DvLocationSuffix, '') } }
+    , [string[]]$lines
 }
 
 function Get-DvMatrixRates {
