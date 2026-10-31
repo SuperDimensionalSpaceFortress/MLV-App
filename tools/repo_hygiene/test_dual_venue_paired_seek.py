@@ -108,60 +108,62 @@ class PairedSeekRunnerTests(RunnerHarness, unittest.TestCase):
                 self.assertIsNone(receipt["look"]["pairedSeek"])
 
 
+PAIRED_PUBLISH = "-SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))"
+
+
+def paired_seek_publish_region() -> str:
+    """The job's CONTACT-SHEET-PLAYBACK-PARITY-1 region that publishes the paired seek frames, verbatim."""
+    text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+    at = text.index(PAIRED_PUBLISH)
+    start = text.rindex("# CONTACT-SHEET-PLAYBACK-PARITY-1 >>>", 0, at)
+    end = text.index("# CONTACT-SHEET-PLAYBACK-PARITY-1 <<<", at)
+    return text[start:end]
+
+
 @requires_pwsh
 class PairedSeekPublishTests(unittest.TestCase):
     """Adversary A1 (r1 pass on 4d446b3d): the job publishes the seek frames with -PubRoot $Pub\\paired-seek, a directory nothing had
     created, and New-AttrCudaDirectory refuses a missing parent (ATTRCUDA_DIR_PARENT_MISSING), so every paired-seek leg lost its paused
-    frames. The publisher now creates its own -PubRoot (whose parent, $Pub, always exists) before contact-sheet."""
+    frames. The job's own bracketed region now creates $Pub\\paired-seek when there are seek frames to publish. The region runs here
+    verbatim, against the real module, on a fresh $Pub (the spliced module text, and so the default job's bytes, are unchanged)."""
 
-    def test_the_job_publishes_seek_frames_under_a_fresh_paired_seek_root(self) -> None:
-        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
-        self.assertIn("-SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))", text)
-
-    def test_publishing_into_a_paired_seek_root_that_does_not_exist_yet_succeeds(self) -> None:
+    def run_region(self, with_frames: bool, paired_seek: bool = True) -> tuple[object, Path]:
         tmp = tempfile.TemporaryDirectory(prefix="paired-seek-publish-")
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
-        source = root / "work" / "contact-sheet-seek"
-        source.mkdir(parents=True)
-        for name, data in SEEK_FRAMES.items():
-            (source / name).write_bytes(data)
+        work = root / "work"
+        work.mkdir()
+        if with_frames:
+            (work / "contact-sheet-seek").mkdir()
+            for name, data in SEEK_FRAMES.items():
+                (work / "contact-sheet-seek" / name).write_bytes(data)
         pub = root / "pub"
         pub.mkdir()
-        paired_root = pub / "paired-seek"
-        self.assertFalse(paired_root.exists())
         script = root / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{MODULE}' -Force\n"
-            f"$result = Publish-AttrCudaContactSheetRawCaptures -Enabled $true -SourceDir '{source}' -PubRoot '{paired_root}'\n"
-            "Write-Output \"RESULT=$result\"\n",
+            f"$Work = '{work}'\n$Pub = '{pub}'\n$ContactSheetEnabled = $true\n"
+            f"$ContactSheetPairedSeek = ${'true' if paired_seek else 'false'}\n"
+            + paired_seek_publish_region() + "\nWrite-Output 'REGION_DONE'\n",
             encoding="utf-8",
         )
-        proc = _run_pwsh_file(script)
+        return _run_pwsh_file(script), pub
+
+    def test_the_region_publishes_seek_frames_into_a_fresh_pub(self) -> None:
+        proc, pub = self.run_region(with_frames=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        raw = paired_root / "contact-sheet" / "raw"
-        self.assertIn(f"RESULT={raw}", proc.stdout)
+        self.assertIn("REGION_DONE", proc.stdout)
+        raw = pub / "paired-seek" / "contact-sheet" / "raw"
         for name, data in SEEK_FRAMES.items():
             self.assertEqual((raw / name).read_bytes(), data)
 
-    def test_a_disabled_or_empty_paired_seek_publish_creates_nothing(self) -> None:
-        tmp = tempfile.TemporaryDirectory(prefix="paired-seek-publish-noop-")
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        pub = root / "pub"
-        pub.mkdir()
-        script = root / "probe.ps1"
-        script.write_text(
-            "$ErrorActionPreference = 'Stop'\n"
-            f"Import-Module '{MODULE}' -Force\n"
-            f"[void](Publish-AttrCudaContactSheetRawCaptures -Enabled $false -SourceDir '{root}' -PubRoot '{pub / 'paired-seek'}')\n"
-            f"[void](Publish-AttrCudaContactSheetRawCaptures -Enabled $true -SourceDir '{root / 'missing'}' -PubRoot '{pub / 'paired-seek'}')\n",
-            encoding="utf-8",
-        )
-        proc = _run_pwsh_file(script)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse((pub / "paired-seek").exists())
+    def test_no_seek_frames_or_paired_seek_off_creates_nothing(self) -> None:
+        for with_frames, paired_seek in ((False, True), (True, False)):
+            with self.subTest(with_frames=with_frames, paired_seek=paired_seek):
+                proc, pub = self.run_region(with_frames=with_frames, paired_seek=paired_seek)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertFalse((pub / "paired-seek").exists())
 
 
 if __name__ == "__main__":

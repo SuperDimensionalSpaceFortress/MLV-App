@@ -4312,6 +4312,9 @@ if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $con
     # The paired seek capture, when asked for, publishes under its own labelled root
     # (paired-seek\contact-sheet\raw), never mixed into the in-pass frames above.
     if ($ContactSheetPairedSeek) {
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 A1: nothing else creates $Pub\paired-seek, and the publisher's
+        # New-AttrCudaDirectory refuses a missing parent; create it only when there are seek frames to publish.
+        if (Test-Path -LiteralPath (Join-Path $Work 'contact-sheet-seek')) { [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'paired-seek')) }
         [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))
     }
     # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
