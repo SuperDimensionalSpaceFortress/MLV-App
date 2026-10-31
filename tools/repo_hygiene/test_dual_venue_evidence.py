@@ -5107,6 +5107,68 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         _, receipt, _ = self.leg("on", [conform_line(active=1, env_override=1)])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
 
+    # MERGE-MASTER r4 (Dot / adversary ADV-A1): an HFR run whose engine paced at the native 59.94 and whose measured-session conform line says
+    # conform_active=1 but carries a rate that cannot PROVE the conformed pace. Before r4 the 'on' arm checked conform_active only and the playback
+    # block fell back to the native pace rule, so each of these was valid=true, paceRule=native, and the leg PASSED.
+    HFR_NATIVE_PACE = {"native_fps": "59.940", "pace_fps": "59.940"}
+    UNPROVEN_ON_ARMS = (
+        ("playback NaN", [conform_line(clip="59.940", play="NaN", active=1, env_override=1)]),
+        ("playback +Infinity", [conform_line(clip="59.940", play="Infinity", active=1, env_override=1)]),
+        ("playback -Infinity", [conform_line(clip="59.940", play="-Infinity", active=1, env_override=1)]),
+        ("playback 0", [conform_line(clip="59.940", play="0", active=1, env_override=1)]),
+        ("playback negative", [conform_line(clip="59.940", play="-24.000", active=1, env_override=1)]),
+        ("clip NaN", [conform_line(clip="NaN", play="24.000", active=1, env_override=1)]),
+        ("clip +Infinity", [conform_line(clip="Infinity", play="24.000", active=1, env_override=1)]),
+        ("playback the engine did not pace at", [conform_line(clip="59.940", play="24.000", active=1, env_override=1)]),
+        ("a sound rate from another session only", [conform_line(session=1, clip="59.940", play="59.940", active=1, env_override=1),
+                                                    conform_line(clip="59.940", play="NaN", active=1, env_override=1)]),
+    )
+
+    def test_a_conform_leg_whose_conformed_rate_is_not_proven_fails_closed(self) -> None:
+        for name, lines in self.UNPROVEN_ON_ARMS:
+            with self.subTest(name):
+                self.write_artifacts(line=self.HFR_NATIVE_PACE, extra_log_lines=lines)
+                _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertFalse(receipt["playback"]["valid"], receipt["playback"])
+                self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in r for r in receipt["playback"]["invalidReasons"]), receipt["playback"]["invalidReasons"])
+
+    def test_a_sound_hfr_conform_leg_still_passes(self) -> None:
+        """The control: native 59.94 conformed to 24 (engine paced at 24, the conform line says so) is the proven shape."""
+        self.write_artifacts(line={"native_fps": "59.940", "pace_fps": "24.000"}, extra_log_lines=[conform_line(clip="59.940", play="24.000", active=1, env_override=1)])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["playback"]["valid"], receipt["playback"]["paceRule"]), (True, "conform"))
+
+    def test_the_on_arm_verdict_needs_the_conform_pace_proof(self) -> None:
+        """Get-DvConformArmVerdict, pure: 'on' blocks unless Get-DvConformPaceProof proves the conformed pace (NaN, +-Infinity, 0, negative, another session)."""
+        base = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=1, conformEnvOverride=1, nativeFps=59.94, paceFps=59.94)
+        rows = [("NaN", dict(base, conformClipFps=59.94, conformPlaybackFps="NaN")), ("+Inf", dict(base, conformClipFps=59.94, conformPlaybackFps="Infinity")),
+                ("-Inf", dict(base, conformClipFps=59.94, conformPlaybackFps="-Infinity")), ("zero", dict(base, conformClipFps=59.94, conformPlaybackFps=0)),
+                ("negative", dict(base, conformClipFps=59.94, conformPlaybackFps=-24)), ("clip NaN", dict(base, conformClipFps="NaN", conformPlaybackFps=24)),
+                ("pace NaN", dict(base, paceFps="NaN", conformClipFps=59.94, conformPlaybackFps=24)),
+                ("another session", dict(base, conformSession="1", conformClipFps=59.94, conformPlaybackFps=59.94)),
+                ("sound", dict(base, paceFps=24.0, conformClipFps=59.94, conformPlaybackFps=24.0))]
+        proc, out = run_pwsh_json("$rows = $env:DVE_ROWS | ConvertFrom-Json; $spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = 'on' } }\n"
+                                  "@($rows | ForEach-Object { $v = Get-DvConformArmVerdict -Spec $spec -Playback $_.block; [pscustomobject]@{ name = $_.name; blocks = $v.blocks; reason = [string]$v.reason } }) | ConvertTo-Json -Compress",
+                                  DVE_ROWS=json.dumps([{"name": n, "block": b} for n, b in rows]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        got = {r["name"]: r for r in out}
+        for name, _ in rows:
+            with self.subTest(name):
+                self.assertEqual(got[name]["blocks"], name != "sound", got[name]["reason"])
+
+    def test_the_production_validator_fails_closed_on_an_unproven_conform_arm(self) -> None:
+        spec = self.write_spec(generator_args={"playbackConform": "on"})
+        repo = self.prod_repo(spec=spec)
+        cases = []
+        for name, line in (("sound", conform_line(clip="23.976", play="23.976", active=1, env_override=1)), ("nan", conform_line(clip="23.976", play="NaN", active=1, env_override=1))):
+            ev = self.evidence("pcon-" + name, backend="cuda", extra_log_lines=[line])
+            cases.append((self.receipt_for(repo, ev, backend="cuda"), ev))
+        sound, nan = self.status_batch(repo, cases)
+        self.expect(sound, "ADVISORY", "sound")
+        self.expect(nan, "INVALID", "nan", needle="CONFORM_PACE_NOT_PROVEN")
+
     def test_the_production_validator_re_derives_the_verdict(self) -> None:
         spec = self.write_spec(generator_args={"playbackConform": "off"})
         repo = self.prod_repo(spec=spec)

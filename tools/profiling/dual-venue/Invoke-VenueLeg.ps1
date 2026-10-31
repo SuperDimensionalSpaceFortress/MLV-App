@@ -690,7 +690,8 @@ if ($null -ne $summary) { $receipt.metrics = Get-DvVerbatimMetrics -Summary $sum
 # itself) and cross-checked against the job's own block.
 $playback = $null
 if ($null -ne $summary -or $null -ne $runLogText) {
-    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $resultJson -LogText $runLogText -LogSha256 $runLogSha -ExpectedClipId ([string]$spec.clipId)
+    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $resultJson -LogText $runLogText -LogSha256 $runLogSha -ExpectedClipId ([string]$spec.clipId) `
+        -RequestedConform ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'playbackConform'))
     $receipt.playback = $playback
 }
 # The scale the app RENDERED at, from its own run log (never from the spec): the receipt carries both numbers and the leg cannot PASS under a scale it did not render at.

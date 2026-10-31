@@ -7239,7 +7239,8 @@ function Get-AttrCudaSourceFramesVerdict {
     # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
     if ($fields.ContainsKey('native_fps')) {
         $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
-        if ($nativeForFloor -le 0) {
+        # MERGE-MASTER r4 (Grok G1): a NaN / Infinity rate fails every ordered comparison, so it is unknown, never a pass (5.1-safe: no IsFinite).
+        if ([double]::IsNaN($nativeForFloor) -or [double]::IsInfinity($nativeForFloor) -or $nativeForFloor -le 0) {
             $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
         # HFR-10S-1 >>>
         # Owner amendment 2026-10-15: footage of >= 50 fps native (HFR) needs 10 s, ceil(10 x native fps) source frames; every other
@@ -7265,7 +7266,7 @@ function Get-AttrCudaSourceFramesVerdict {
     }
     if ($fields.ContainsKey('pace_fps')) {
         $pace = [double]::Parse($fields['pace_fps'], [Globalization.CultureInfo]::InvariantCulture)
-        if ($pace -le 0) {
+        if ([double]::IsNaN($pace) -or [double]::IsInfinity($pace) -or $pace -le 0) {
             # ENFORCE-4 r2 (fable H5): a PRESENT pace that is not positive is unknown, never "pace unchecked".
             $failures += "INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
         } elseif ($fields.ContainsKey('native_fps')) {
@@ -7333,13 +7334,17 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
             $conformPlaybackFps = $cn['playback_fps']
             $summarySession = ''
             if ($fields.ContainsKey('session')) { $summarySession = [string]$fields['session'] }
+            # MERGE-MASTER r4 (Grok G1): NaN / Infinity fail every ordered comparison, so the rate checks below reject them first, as
+            # Get-DvConformPaceProof does (IsNaN / IsInfinity: Windows PowerShell 5.1 has no IsFinite).
             if ($summarySession -eq '' -or [string]$cf['session'] -cne $summarySession) {
                 $conformWhy = "the playback_smoke.conform line is for session $($cf['session']), not the measured session $summarySession"
             } elseif ($cn['conform_active'] -ne 1) {
                 $conformWhy = "conform_active=$($cf['conform_active']); the run was not conformed"
-            } elseif (-not $nativeKnown -or $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)) {
+            } elseif (-not $nativeKnown -or [double]::IsNaN($native) -or [double]::IsInfinity($native) -or [double]::IsNaN($conformSourceFps) -or [double]::IsInfinity($conformSourceFps) -or
+                      $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)) {
                 $conformWhy = "conform source rate=$conformSourceFps does not match native_fps=$native"
-            } elseif (-not $paceKnown -or 0 -ge $pace -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
+            } elseif (-not $paceKnown -or [double]::IsNaN($pace) -or [double]::IsInfinity($pace) -or [double]::IsNaN($conformPlaybackFps) -or [double]::IsInfinity($conformPlaybackFps) -or
+                      0 -ge $pace -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps does not match pace_fps=$pace"
             } elseif ($conformPlaybackFps -gt ($conformSourceFps * 1.005)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps is above the source rate $conformSourceFps; conform never speeds a recording up"

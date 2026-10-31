@@ -22,6 +22,7 @@ enforcement card was never built), so every new lane re-broke it. This file is t
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -1232,6 +1233,19 @@ CONFORM_CASES = [
      dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="30.000"),
      _conform_line(clip_fps="23.976", playback_fps="30.000"), True, [PACE_TEXT, "never speeds"], [], "native"),
     ("h4: an fps override is still INVALID under a proven conform", dict(HFR_RUN, fps_override=1), _conform_line(), True, ["override"], [PACE_TEXT], "conform"),
+    # MERGE-MASTER r4 (Grok G1 / adversary A3): NaN and Infinity parse as doubles and fail every ordered comparison, so before r4 the gui-smoke
+    # and AttrCuda oracles PROVED a conform line carrying them (and accepted a NaN summary pace); every oracle now rejects them first.
+    ("i1: conform playback_fps=NaN -> INVALID", HFR_RUN, _conform_line(playback_fps="NaN"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i2: conform playback_fps=Infinity -> INVALID", HFR_RUN, _conform_line(playback_fps="Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i3: conform playback_fps=-Infinity -> INVALID", HFR_RUN, _conform_line(playback_fps="-Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i4: conform clip_fps=NaN -> INVALID", HFR_RUN, _conform_line(clip_fps="NaN"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i5: conform clip_fps=Infinity -> INVALID", HFR_RUN, _conform_line(clip_fps="Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i6: summary pace_fps=NaN under a sound conform line -> INVALID", dict(HFR_RUN, pace_fps="NaN"), _conform_line(), True,
+     ["pace_fps=NaN", "present engine pace that is not positive"], [], "native"),
+    ("i7: summary pace_fps=NaN with no conform line -> INVALID", dict(HFR_RUN, pace_fps="NaN"), None, True, ["pace_fps=NaN", "present engine pace that is not positive"], [], "native"),
+    ("i8: summary pace_fps=Infinity -> INVALID", dict(HFR_RUN, pace_fps="Infinity"), _conform_line(), True, ["present engine pace that is not positive"], [], "native"),
+    ("i9: summary native_fps=NaN -> INVALID", dict(HFR_RUN, native_fps="NaN"), _conform_line(), True, ["native_fps=NaN", "native frame rate is unknown"], [], "native"),
+    ("i10: summary native_fps=Infinity -> INVALID", dict(HFR_RUN, native_fps="Infinity"), _conform_line(), True, ["native frame rate is unknown"], [], "native"),
 ]
 
 
@@ -1246,17 +1260,21 @@ def _run_oracle_table(script_body: str, cases: list[dict]) -> list[dict]:
 
 
 def _dv_block(summary: dict, conform: str | None) -> dict:
-    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line)."""
+    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line).
+    A non-finite rate stays its log text ('NaN', 'Infinity'): JSON has no NaN, and ConvertTo-DvDouble parses the text to the same double."""
+    def rate(v: object) -> float | str:
+        x = float(v)  # type: ignore[arg-type]
+        return x if math.isfinite(x) else str(v)
     block = dict(sourceAdvanced=int(summary["source_advanced"]), requiredSourceFrames=int(summary["required_source_frames"]),
-                 nativeFps=float(summary["native_fps"]), paceFps=float(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
+                 nativeFps=rate(summary["native_fps"]), paceFps=rate(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
                  wrapped=False, wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE,
                  logShaBound=True, settingsIsolated=True, jobFailures=[], fixtureRehearsal=False, clipId="CLIP",
                  summarySession=str(summary["session"]), conformLinePresent=conform is not None)
     if conform is not None:
         f = dict(re.findall(r"(\w+)=(\S+)", conform))
         block.update(conformSession=f.get("session"), conformActive=int(f["conform_active"]) if "conform_active" in f else None,
-                     conformClipFps=float(f["clip_fps"]) if "clip_fps" in f else None,
-                     conformPlaybackFps=float(f["playback_fps"]) if "playback_fps" in f else None)
+                     conformClipFps=rate(f["clip_fps"]) if "clip_fps" in f else None,
+                     conformPlaybackFps=rate(f["playback_fps"]) if "playback_fps" in f else None)
     return block
 
 
