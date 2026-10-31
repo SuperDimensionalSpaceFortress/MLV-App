@@ -1048,7 +1048,8 @@ class RepoHygieneTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("  pull_request:\n", trigger_section)
-        self.assertIn("  push:\n    branches:\n      - master\n", trigger_section)
+        # Master integration is the merge-group run on the exact master sha (CI-PUSH-MASTER-DEDUP-1).
+        self.assertIn("  merge_group:\n    types: [checks_requested]\n", trigger_section)
         self.assertNotRegex(
             trigger_section,
             r"(?m)^\s+paths(?:-ignore)?:",
