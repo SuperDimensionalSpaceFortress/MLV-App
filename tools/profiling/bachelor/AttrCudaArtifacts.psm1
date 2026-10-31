@@ -7239,8 +7239,7 @@ function Get-AttrCudaSourceFramesVerdict {
     # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
     if ($fields.ContainsKey('native_fps')) {
         $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
-        # MERGE-MASTER r4 (Grok G1): a NaN / Infinity rate fails every ordered comparison, so it is unknown, never a pass (5.1-safe: no IsFinite).
-        if ([double]::IsNaN($nativeForFloor) -or [double]::IsInfinity($nativeForFloor) -or $nativeForFloor -le 0) {
+        if ($nativeForFloor -le 0) {
             $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
         # HFR-10S-1 >>>
         # Owner amendment 2026-10-15: footage of >= 50 fps native (HFR) needs 10 s, ceil(10 x native fps) source frames; every other
@@ -7266,7 +7265,7 @@ function Get-AttrCudaSourceFramesVerdict {
     }
     if ($fields.ContainsKey('pace_fps')) {
         $pace = [double]::Parse($fields['pace_fps'], [Globalization.CultureInfo]::InvariantCulture)
-        if ([double]::IsNaN($pace) -or [double]::IsInfinity($pace) -or $pace -le 0) {
+        if ($pace -le 0) {
             # ENFORCE-4 r2 (fable H5): a PRESENT pace that is not positive is unknown, never "pace unchecked".
             $failures += "INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
         } elseif ($fields.ContainsKey('native_fps')) {
@@ -7355,8 +7354,23 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
     }
     $judged = $SummaryLine
     if ($conformProven) { $judged = [regex]::Replace($SummaryLine, '(?<=(^|\s)pace_fps=)\S+', [string]$fields['native_fps']) }
+    # MERGE-MASTER r4 (Grok G1 / adversary A3): a NaN / Infinity summary native_fps or pace_fps fails every ordered comparison, so the oracle above
+    # (whose lines stay the baseline's bytes) would pass a NaN pace and throw on a NaN native floor. It is judged here as the 0 the oracle above
+    # already rejects as unknown, and the failure then names the logged value. A non-finite rate never proves a conform (the checks above).
+    $nonFiniteRates = @{}
+    foreach ($rateName in @('native_fps', 'pace_fps')) {
+        $rateValue = 0.0
+        if ($fields.ContainsKey($rateName) -and [double]::TryParse([string]$fields[$rateName], [Globalization.NumberStyles]::Float, $inv, [ref]$rateValue) -and
+            ([double]::IsNaN($rateValue) -or [double]::IsInfinity($rateValue))) {
+            $nonFiniteRates[$rateName] = [string]$fields[$rateName]
+            $judged = [regex]::Replace($judged, '(?<=(^|\s)' + $rateName + '=)\S+', '0')
+        }
+    }
     $base = Get-AttrCudaSourceFramesVerdict -SummaryLine $judged -ExpectedRunNonce $ExpectedRunNonce
     $failures = @($base.failures)
+    foreach ($rateName in @($nonFiniteRates.Keys)) {
+        $failures = @($failures | ForEach-Object { ([string]$_).Replace("$rateName=0;", "$rateName=$($nonFiniteRates[$rateName]);") })
+    }
     if ($conformPresent -and -not $conformProven) {
         $failures = @($failures | ForEach-Object { if ([string]$_ -like '*the engine paced at pace_fps=*') { "$_ (conform relaxation not applied: $conformWhy)" } else { $_ } })
     }
