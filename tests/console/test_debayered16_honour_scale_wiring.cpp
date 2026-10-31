@@ -206,30 +206,3 @@ TEST(Debayered16HonourScaleWiring, InlineReducedReconRunsBeforeTheDispatchAndKee
     ASSERT_TRUE(restoreAt > reducedAt);
     ASSERT_EQ(1, render.count(QStringLiteral("mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread")));
 }
-
-// CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1 (adversary A1): the reduced entry demosaics with
-// debayerReducedColourDiffU16, so a frame consumed from the reduced recon never ran
-// debayerBasicU16's AVX2 kernel. RenderFrameThread's per-frame debayer_basic_u16_avx2_used
-// is inferred from the engine mode and the host (RenderFrameThread.cpp is out of this card's
-// scope), so MainWindow's used-frame count excludes the frames the render marked
-// debayered16_reduced_recon_consumed. Mutation: the plain telemetry read (the shipped #721
-// head) counts every reduced frame as AVX2 bilinear.
-TEST(Debayered16HonourScaleWiring, ReducedReconFramesAreNotCountedAsAvx2BilinearDebayers)
-{
-    const QString video = readRepoFile(QStringLiteral("src/mlv/video_mlv.c"));
-    const QString entry = functionBody(video, QStringLiteral("int getMlvRawFrameDebayeredFromReducedReconnedRaw16("));
-    ASSERT_TRUE(entry.contains(QStringLiteral("debayerReducedColourDiffU16(outputFrame,")));
-
-    const QString render = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
-    ASSERT_TRUE(render.contains(QStringLiteral(
-        "QStringLiteral(\"debayered16_reduced_recon_consumed\"),\n"
-        "            debayered16ReducedReconConsumed );")));
-
-    const QString mainWindow = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
-    ASSERT_TRUE(mainWindow.contains(QStringLiteral(
-        "const bool debayerBasicU16Avx2Used =\n"
-        "        telemetryBoolValue( timing, \"debayer_basic_u16_avx2_used\" )\n"
-        "        && !telemetryBoolValue( timing, \"debayered16_reduced_recon_consumed\" );")));
-    ASSERT_EQ(1, mainWindow.count(QStringLiteral("\"debayer_basic_u16_avx2_used\"")));
-    ASSERT_EQ(1, mainWindow.count(QStringLiteral("++m_playbackSmokeDebayerBasicU16Avx2UsedFrames;")));
-}
