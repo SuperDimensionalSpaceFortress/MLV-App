@@ -958,8 +958,9 @@ function Get-DvConformPaceProof {
     if ($absent.Count -gt 0) { $out.reason = "the playback_smoke.conform line is malformed (absent or unreadable: $($absent -join ' / '))"; return $out }
     if ($summarySession -eq '' -or $conformSession -cne $summarySession) { $out.reason = "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession"; return $out }
     if ($active -ne 1) { $out.reason = "conform_active=$active; the run was not conformed"; return $out }
-    if ($null -eq $native -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
-    if ($null -eq $pace -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
+    # MERGE-MASTER r3 (adversary A4): NaN / Infinity parse as doubles and fail every ordered comparison, so they are rejected first.
+    if ($null -eq $native -or -not [double]::IsFinite($native) -or -not [double]::IsFinite($clip) -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
+    if ($null -eq $pace -or -not [double]::IsFinite($pace) -or -not [double]::IsFinite($play) -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
     if ($play -gt ($clip * 1.005)) { $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"; return $out }
     $out.proven = $true
     $out.reason = ''
@@ -996,7 +997,7 @@ function Get-DvConformArmVerdict {
     elseif ([string]$requested -ceq 'off') {
         if ($active -ne 0) { $why = 'conform was active' }
         elseif ($envOverride -ne 0) { $why = 'the app did not report MLVAPP_PLAYBACK_CONFORM=0' }
-        elseif ($null -eq $clip -or $null -eq $play -or $clip -le 0 -or [Math]::Abs($play - $clip) -gt (0.005 * $clip)) { $why = 'playback_fps is not within 0.5 % of clip_fps' }
+        elseif ($null -eq $clip -or $null -eq $play -or -not [double]::IsFinite($clip) -or -not [double]::IsFinite($play) -or $clip -le 0 -or [Math]::Abs($play - $clip) -gt (0.005 * $clip)) { $why = 'playback_fps is not within 0.5 % of clip_fps' }
     }
     elseif ([string]$requested -ceq 'on') {
         if ($active -ne 1) { $why = 'conform was not active' }

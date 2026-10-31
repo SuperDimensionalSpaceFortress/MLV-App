@@ -5081,6 +5081,13 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertIn("CONFORM_ARM_NOT_HONOURED", receipt["outcomeDetail"])
         self.assertIn("playback_fps is not within 0.5 % of clip_fps", receipt["outcomeDetail"])
 
+    def test_a_native_leg_with_a_non_finite_rate_is_invalid(self) -> None:
+        """MERGE-MASTER r3 (adversary A4): NaN / Infinity parse as doubles and every ordered comparison against them is false, so they slipped the 0.5 % check."""
+        for clip, play in (("59.940", "NaN"), ("Infinity", "24.000"), ("NaN", "NaN")):
+            _, receipt, _ = self.leg("off", [conform_line(clip=clip, play=play)])
+            self.assertEqual(receipt["outcome"], "INVALID", (clip, play, receipt["outcomeDetail"]))
+            self.assertIn("playback_fps is not within 0.5 % of clip_fps", receipt["outcomeDetail"], (clip, play))
+
     def test_a_native_leg_whose_app_did_not_see_the_env_is_invalid(self) -> None:
         for override in (-1, None):
             _, receipt, _ = self.leg("off", [conform_line(env_override=override)])
@@ -6938,14 +6945,20 @@ class LegSpecSchemaTests(unittest.TestCase):
 
     def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
         """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
-        numbers compare with the matrix cell's; the leg set names exactly these legs and the card's roles are declared."""
+        numbers compare with the matrix cell's; the leg set names exactly these legs and the card's roles are declared.
+        HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r3 (adversary A1): each conform leg also requests playbackConform 'on', so a venue whose environment carries
+        MLVAPP_PLAYBACK_CONFORM=0 cannot pass a native run as conform evidence (CONFORM_ARM_NOT_HONOURED); every *-conform-* leg on disk is one of these."""
+        on_disk = sorted(f"legs/{p.name}" for p in (DV / "legs").glob("*-conform-*.json"))
+        self.assertEqual(on_disk, sorted((*HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457)))
         for rel in (*HFR_CONFORM_LEGS, *HFR_CONFORM_LEGS_1457):
             leg = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(leg, self.schema)
+            self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on", rel)
             cell = json.loads((DV / "legs" / f"m16-1243-display-{leg['displayMode']}-s1.json").read_text(encoding="utf-8"))
             self.assertEqual((leg["legId"], leg["card"], leg["clipId"], leg["backends"]),
                              (Path(rel).stem, "PLAYBACK-HFR-CONFORM-DEFAULT-1", "M16-" + Path(rel).stem[4:8], ["cuda"]), rel)
             cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"]} for role, per in cell["criteria"].items()})
+            cell_cuda["generatorArgs"] = dict(cell["generatorArgs"], playbackConform="on")
             self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
         for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
             doc = json.loads((DV / "legsets" / f"{name}.json").read_text(encoding="utf-8"))
