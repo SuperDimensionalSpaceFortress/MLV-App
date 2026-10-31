@@ -972,8 +972,11 @@ if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
 }
 # (a2) VISUAL-JUDGE-TERRA-LANE-1: -ImagePaths is a codex-engine feature (`codex exec -i <FILE>`); the claude
 # argv has no image flag, so a claude lane given one would silently judge nothing. Fail closed, typed, before any
-# run dir or receipt exists. Every path must exist as a file and be a .png or .jpg; sha256 + size are taken HERE,
-# once, so the receipt names the exact bytes the lane was handed. Keyed on ENGINE, not lane name.
+# run dir or receipt exists. Every path must exist as a FileSystem file, be a .png or .jpg and carry no ',' (codex
+# 0.160.1 splits an `-i` value on commas, so `strip,one.png` would attach two other files: adversary A1). The path is
+# the NATIVE one (.ProviderPath: `Provider::C:/dir/x.png` would pass Test-Path but not File.Exists: A3). Hashing is NOT done
+# here: the launch copies each image into the run dir and hashes THAT copy, so the receipt names the exact bytes the
+# lane was handed even if the source is replaced after validation (A2). Keyed on ENGINE, not lane name.
 $ImageAttachments = @()
 # `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
 # -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
@@ -987,16 +990,19 @@ if ($ImagePathsGiven.Count -gt 0) {
         if (-not (Test-Path -LiteralPath $imagePath -PathType Leaf)) {
             throw "image-path-missing: -ImagePaths entry is not an existing file: $imagePath"
         }
-        $imageFull = (Resolve-Path -LiteralPath $imagePath).Path
+        $imageResolved = Resolve-Path -LiteralPath $imagePath
+        if ($imageResolved.Provider.Name -ne 'FileSystem') {
+            throw "image-path-missing: -ImagePaths entry is not on the FileSystem provider ($($imageResolved.Provider.Name)): $imagePath"
+        }
+        $imageFull = $imageResolved.ProviderPath
         $imageExt = [System.IO.Path]::GetExtension($imageFull).ToLowerInvariant()
         if ($imageExt -ne '.png' -and $imageExt -ne '.jpg') {
             throw "image-path-bad-extension: -ImagePaths accepts only .png or .jpg (got '$imageExt'): $imageFull"
         }
-        $ImageAttachments += [ordered]@{
-            path   = $imageFull
-            sha256 = (Get-FileHash -LiteralPath $imageFull -Algorithm SHA256).Hash.ToLowerInvariant()
-            bytes  = (Get-Item -LiteralPath $imageFull).Length
+        if ($imageFull.Contains(',')) {
+            throw "image-path-bad-character: -ImagePaths entry contains ',' (codex splits an -i value on commas); copy the file to a name without one: $imageFull"
         }
+        $ImageAttachments += [ordered]@{ source = $imageFull; path = $null; sha256 = $null; bytes = $null; ext = $imageExt }
     }
 }
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
@@ -1652,6 +1658,21 @@ if ($cfg.engine -eq 'claude') {
     # VISUAL-JUDGE-TERRA-LANE-1: `-i, --image <FILE>...` is VARIADIC on codex 0.160.1 (codex-image-flag.txt), so
     # each `-i <path>` pair sits BEFORE `-m` (a flag token always ends the list) and is never the last option
     # before the '-' stdin marker, which a trailing variadic could otherwise swallow as one more "file".
+    # Snapshot every image into the run dir and attach THE COPY, hashed after the copy: the receipt's sha256/bytes
+    # describe the very bytes codex reads, whatever happens to the source afterwards (adversary A2). The copies stay
+    # in the run dir as evidence of exactly what the judge saw.
+    $imageSeq = 0
+    foreach ($attachment in $ImageAttachments) {
+        $imageSeq++
+        $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
+        if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
+        [System.IO.File]::Copy($attachment.source, $snapshot, $false)
+        # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
+        if (-not [System.IO.File]::Exists($snapshot)) { throw "image-path-missing: the image snapshot is not a native file path: $snapshot" }
+        $attachment.path   = $snapshot
+        $attachment.sha256 = (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()
+        $attachment.bytes  = (Get-Item -LiteralPath $snapshot).Length
+    }
     $imageArgs = @()
     foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }
     $argv = @('exec') + $imageArgs + @(
@@ -2549,7 +2570,8 @@ $receipt = [ordered]@{
 # Present only on a typed no-child launch, so every other receipt keeps its exact shape.
 if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
 # VISUAL-JUDGE-TERRA-LANE-1: present only when -ImagePaths was given, so every other receipt keeps its exact shape.
-# Each entry is {path, sha256, bytes} of the image handed to `codex exec -i`, hashed before launch.
+# Each entry is {source, path, sha256, bytes, ext}: `source` is the caller's file, `path` the run-dir COPY handed to
+# `codex exec -i`, sha256/bytes are of that copy (hashed after copying). Null path/sha256 = the launch failed first.
 if ($ImageAttachments.Count -gt 0) { $receipt['imagePaths'] = @($ImageAttachments) }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))

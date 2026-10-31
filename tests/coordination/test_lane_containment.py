@@ -662,15 +662,54 @@ def test_terra_lane_resolves_its_tier_and_attaches_each_image_with_i_before_the_
     argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
     assert argv[argv.index("-m")+1]=="gpt-6.1-terra"
     image_flags=[i for i,a in enumerate(argv) if a=="-i"]
-    assert [argv[i+1] for i in image_flags]==[str(first),str(second)]
+    # The lane is handed a SNAPSHOT of each image in the run dir (adversary A2), never the caller's file.
+    snap_first=receipt.parent/"terra-001.image-01.png"; snap_second=receipt.parent/"terra-001.image-02.jpg"
+    assert [argv[i+1] for i in image_flags]==[str(snap_first),str(snap_second)]
+    assert snap_first.read_bytes()==first.read_bytes() and snap_second.read_bytes()==second.read_bytes()
     assert max(image_flags)+1<argv.index("-m"), argv
     assert argv[-1]=="-" and argv[0]=="exec", argv
     assert argv[argv.index("-s")+1]=="read-only", argv
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert (q["lane"],q["engine"],q["role"],q["requestedModel"],q["effort"])==("terra","codex","visual-judge","terra","low")
     assert q["resolvedModel"]=="gpt-6.1-terra"
-    assert [(e["path"],e["sha256"],e["bytes"]) for e in q["imagePaths"]]==[
-        (str(first),sha_first,first.stat().st_size),(str(second),sha_second,second.stat().st_size)]
+    assert [(e["source"],e["path"],e["sha256"],e["bytes"]) for e in q["imagePaths"]]==[
+        (str(first),str(snap_first),sha_first,first.stat().st_size),(str(second),str(snap_second),sha_second,second.stat().st_size)]
+
+
+def test_the_receipt_hash_describes_the_snapshot_even_if_the_source_changes_afterwards(fixture_tree):
+    # adversary A2: hashing the SOURCE at validation and attaching it later lets a replaced file be judged under the old hash.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    png.write_bytes(b"replaced after the run")
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    entry=q["imagePaths"][0]
+    assert entry["sha256"]==sha and hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest()==sha
+    assert entry["path"]!=str(png) and entry["source"]==str(png)
+
+
+def test_a_provider_qualified_image_path_resolves_to_the_native_path(fixture_tree):
+    # adversary A3: Test-Path accepts `Microsoft.PowerShell.Core\FileSystem::C:\x.png`, native File.Exists does not.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"native")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths","Microsoft.PowerShell.Core\\FileSystem::"+str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert entry["source"]==str(png) and "::" not in entry["source"] and entry["sha256"]==sha
+
+
+def test_an_image_path_with_a_comma_is_refused_because_codex_splits_i_values_on_commas(fixture_tree):
+    # adversary A1: codex 0.160.1 declares a comma value delimiter for -i, so `strip,one.png` would attach two other files.
+    root=fixture_tree["root"]; png=root/"strip,one.png"; _write_png(png,b"comma")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode!=0 and "image-path-bad-character" in r.stderr,(r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"args.json").exists()
 
 
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
