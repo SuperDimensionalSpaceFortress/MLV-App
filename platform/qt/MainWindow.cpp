@@ -26123,8 +26123,11 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         : -1;
     const bool debayerBasicU16Avx2Available =
         telemetryBoolValue( timing, "debayer_basic_u16_avx2_available" );
+    // CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1: a frame consumed from the reduced recon
+    // was demosaiced by debayerReducedColourDiffU16, never debayerBasicU16's AVX2 kernel.
     const bool debayerBasicU16Avx2Used =
-        telemetryBoolValue( timing, "debayer_basic_u16_avx2_used" );
+        telemetryBoolValue( timing, "debayer_basic_u16_avx2_used" )
+        && !telemetryBoolValue( timing, "debayered16_reduced_recon_consumed" );
     const double debayerWbPrepareMs =
         telemetryDoubleValue( timing, "debayer_wb_prepare_ms" );
     const double debayerCaMs =
