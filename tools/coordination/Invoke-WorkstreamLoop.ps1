@@ -90,7 +90,7 @@ $TaskName   = 'MLV-WorkstreamLoop'
 # is a LOAD-BEARING worktree, not sweep debris: it is recreated on demand and its
 # absence is a CANNOT-DETERMINE, never a silent no-op.
 $DriverRoot   = 'C:\mlvtmp\ws-driver'
-$TargetRef    = 'fork/master'
+$TargetRef    = 'refs/remotes/fork/master'   # full refname: a same-named tag would win the bare name in worktree add / reset --hard
 $Dispatcher   = Join-Path $DriverRoot 'tools\coordination\Invoke-Workstream.ps1'
 
 function Get-ReservationBudget {

@@ -225,9 +225,26 @@ function Select-MergeGroupJobsRun {
             # its source and carries that caveat: a missing newer success proves nothing about freshness. Every
             # newer COMPLETED run (the export is completed-only) whose headSha is not the tip is counted, whatever
             # its current conclusion - a landed run with a failed rerun is still a newer off-tip run.
+            # "Newer" means createdAt STRICTLY GREATER than the selected run's, compared as parsed UTC instants:
+            # never by array position (rows sharing a createdAt sort in arbitrary order) and never by string
+            # order. A row whose createdAt does not parse cannot be shown newer, so it is not counted; when the
+            # selected run's own createdAt does not parse nothing can be shown newer either.
             $label = 'landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)'
-            $newerOff = @($sorted[0..([array]::IndexOf($sorted, $landed[0]))] |
-                Where-Object { $_.headSha -ne $MasterSha })
+            $toUtc = {
+                param($v)
+                if ($v -is [datetime]) { return $v.ToUniversalTime() }
+                $o = [datetimeoffset]::MinValue
+                if ([datetimeoffset]::TryParse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$o)) { return $o.UtcDateTime }
+                return $null
+            }
+            $selAt = & $toUtc $landed[0].createdAt
+            $newerOff = @()
+            if ($null -ne $selAt) {
+                $newerOff = @($sorted | Where-Object {
+                    $t = & $toUtc $_.createdAt
+                    $_.headSha -ne $MasterSha -and $null -ne $t -and $t -gt $selAt
+                })
+            }
             if ($newerOff.Count -gt 0) {
                 $label += "; $($newerOff.Count) newer completed run(s) not at the local tip"
             }
@@ -1417,8 +1434,10 @@ $fence
         # discarded. The previous `worktree remove --force` after a porcelain-only check
         # also deleted git-ignored evidence and never looked for unpushed commits.
         # MergeTarget is the ref baseSha was resolved from: local master can lag fork/master,
-        # which would wrongly keep a worktree whose HEAD is still exactly baseSha.
-        $disp = Invoke-RetireLaneWorktree -WorkDir $WorkDirToCheck -MergeTarget 'fork/master' `
+        # which would wrongly keep a worktree whose HEAD is still exactly baseSha. It is the FULL refname
+        # refs/remotes/fork/master: a same-named tag refs/tags/fork/master would win the bare name in
+        # `merge-base --is-ancestor`, so a tag could make an unmerged HEAD read as merged.
+        $disp = Invoke-RetireLaneWorktree -WorkDir $WorkDirToCheck -MergeTarget 'refs/remotes/fork/master' `
             -QuarantineRoot (Join-Path $RepoRoot ('.claude-state\disk-hygiene\quarantine\lane-exit\' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')))
         $script:LastWorktreeDisposition = $disp
         if ($disp.action -eq 'retired') { return $true }

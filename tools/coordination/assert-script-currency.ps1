@@ -27,7 +27,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ScriptPath,
-    [string]$Ref = 'fork/master',
+    [string]$Ref = 'refs/remotes/fork/master',   # full refname: a same-named tag would win the bare name in rev-parse
     [switch]$PassThru
 )
 $ErrorActionPreference = 'Continue'

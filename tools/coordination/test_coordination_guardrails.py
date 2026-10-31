@@ -5184,6 +5184,62 @@ def test_the_merge_group_export_uses_the_selector_and_names_its_label_not_a_fixe
     assert re.search(r"(?m)^\s*\} catch \{\s*\n\s*\$ghRows \+= .*\(job graph\)", text), "the export's own try/catch shape is gone"
 
 
+# --- r3 (sol B1 / adversary ADV-A1): "newer" is STRICTLY greater createdAt, never array position ----------
+# Rows that share the selected run's createdAt are not newer. Sorting ties and slicing by position used to
+# count every off-tip row that happened to sort ahead of the selected one.
+
+MGRS_TS = "2026-10-31T17:00:00Z"
+
+
+def test_equal_created_at_off_tip_rows_are_not_counted_as_newer_runs(tmp_path):
+    """sol's two-row repro: the off-tip row (id 2) sorts first but carries the SAME createdAt."""
+    rows = [
+        _mgrs_row(2, MGRS_TS, MGRS_OTHER, "success"),
+        _mgrs_row(1, MGRS_TS, MGRS_TIP, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 1, picked
+    assert "newer completed run" not in picked["label"], picked
+    assert picked == {"id": 1, "label": MGRS_LABEL_LANDED}, picked
+
+
+def test_a_seventeen_row_equal_timestamp_sample_counts_zero_newer_runs(tmp_path):
+    """sol's 17-row case: ids 17..1 all at one createdAt, all success, id 16 is at the tip, the rest off it."""
+    rows = [_mgrs_row(i, MGRS_TS, MGRS_TIP if i == 16 else MGRS_OTHER, "success") for i in range(17, 0, -1)]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 16, picked
+    assert "newer completed run" not in picked["label"], picked
+    assert picked["label"] == MGRS_LABEL_LANDED, picked
+
+
+def test_only_the_strictly_newer_off_tip_run_is_counted_among_equal_timestamp_rows(tmp_path):
+    rows = [
+        _mgrs_row(5, "2026-10-31T18:00:00Z", MGRS_EJECTED, "failure"),   # strictly newer, off tip: counted
+        _mgrs_row(4, MGRS_TS, MGRS_OTHER, "success"),                    # equal createdAt, off tip: not counted
+        _mgrs_row(3, MGRS_TS, MGRS_OTHER, "failure"),                    # equal createdAt, off tip: not counted
+        _mgrs_row(2, MGRS_TS, MGRS_TIP, "success"),                      # selected
+        _mgrs_row(1, "2026-10-31T16:00:00Z", MGRS_OTHER, "success"),     # older: not counted
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 2, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}
+
+
+def test_a_row_whose_created_at_does_not_parse_is_not_counted_as_newer(tmp_path):
+    rows = [
+        _mgrs_row(3, "not-a-timestamp", MGRS_OTHER, "success"),
+        _mgrs_row(2, MGRS_TS, MGRS_TIP, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 2, picked
+    assert "newer completed run" not in picked["label"], picked
+
+
+def test_the_newer_count_in_the_selector_has_no_positional_slice():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    start = text.index("function Select-MergeGroupJobsRun")
+    body = text[start:text.index("function Get-Prop", start)]
+    assert "IndexOf" not in body and "[0..(" not in body, "the newer count is positional again"
+
+
 # --- r2 (adversary A1): the master tip is read by FULL refname, never the bare "fork/master" ---------------
 # A same-named lightweight tag refs/tags/fork/master outranks refs/remotes/fork/master for the bare name, so
 # `git rev-parse fork/master` can return a tag target while the remote-tracking tip is somewhere else. The
@@ -5243,3 +5299,95 @@ def test_the_fork_master_tip_reads_use_the_full_refname_in_source():
         text = path.read_text(encoding="utf-8")
         assert "rev-parse fork/master" not in text, path.name
         assert "refs/remotes/fork/master^{commit}" in text, path.name
+    # r3 (G1): the merge-target and driver-ref sites and the currency guard default carry the full refname too
+    for label, ref in _g1_ref_sites():
+        assert ref == "refs/remotes/fork/master", (label, ref)
+    guard = (ROOT / "tools" / "coordination" / "assert-script-currency.ps1").read_text(encoding="utf-8")
+    assert "[string]$Ref = 'refs/remotes/fork/master'" in guard
+
+
+# --- r3 (Grok G1, hub ACK 6548301889): every consumer of the fork/master TIP gets the FULL refname --------
+# Same-named tag refs/tags/fork/master outranks refs/remotes/fork/master for the bare name, so a merge-base
+# --is-ancestor test or a `reset --hard` against the bare name follows the TAG. The ref string is lifted out of
+# each shipped script and then handed to real git in a throwaway repo.
+
+COORD = ROOT / "tools" / "coordination"
+RETIRE = COORD / "Retire-LaneWorktree.ps1"
+LOOP = COORD / "Invoke-WorkstreamLoop.ps1"
+FULL_FORK_MASTER = "refs/remotes/fork/master"
+
+
+def _g1_ref_sites():
+    """(label, ref string) for each consumer, read from source."""
+    ws = WORKSTREAM.read_text(encoding="utf-8")
+    ret = RETIRE.read_text(encoding="utf-8")
+    loop = LOOP.read_text(encoding="utf-8")
+    m_ws = re.search(r"Invoke-RetireLaneWorktree -WorkDir \$WorkDirToCheck -MergeTarget '([^']+)'", ws)
+    sweep = ret[ret.index("function Invoke-SweepMergedLaneWorktrees"):]
+    m_sw = re.search(r"\[string\]\$MergeTarget = '([^']+)'", sweep)
+    m_lp = re.search(r"(?m)^\$TargetRef\s*=\s*'([^']+)'", loop)
+    assert m_ws and m_sw and m_lp, (bool(m_ws), bool(m_sw), bool(m_lp))
+    return [
+        ("Invoke-Workstream -MergeTarget", m_ws.group(1)),
+        ("Retire sweep default MergeTarget", m_sw.group(1)),
+        ("Invoke-WorkstreamLoop TargetRef", m_lp.group(1)),
+    ]
+
+
+def test_the_merge_target_and_driver_ref_sites_use_the_full_refname_in_source():
+    for label, ref in _g1_ref_sites():
+        assert ref == FULL_FORK_MASTER, (label, ref)
+    ws = WORKSTREAM.read_text(encoding="utf-8")
+    # the comment that promises "the ref baseSha was resolved from" is true again
+    comment_to_call = ws[ws.index("# MergeTarget is the ref baseSha was resolved from"):ws.index("$disp = Invoke-RetireLaneWorktree")]
+    assert "refs/remotes/fork/master" in comment_to_call
+
+
+def _g1_tag_collision_repo(tmp_path):
+    repo = tmp_path / "g1repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    git(repo, "add", "f.txt")
+    git(repo, "commit", "-q", "-m", "R")
+    remote_sha = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("2", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "T")
+    tag_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "tag", "fork/master", tag_sha)                       # lightweight tag shadowing the bare name
+    git(repo, "update-ref", "refs/remotes/fork/master", remote_sha)
+    return repo, remote_sha, tag_sha
+
+
+def test_the_merge_target_and_driver_ref_follow_the_remote_tracking_ref_not_a_same_named_tag(tmp_path):
+    repo, remote_sha, tag_sha = _g1_tag_collision_repo(tmp_path)
+    # the throwaway repo really is ambiguous for the bare name (the fixture would pass vacuously otherwise)
+    bare = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "fork/master^{commit}"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    assert bare == tag_sha
+    for label, ref in _g1_ref_sites():
+        # Retire-LaneWorktree's gate: `merge-base --is-ancestor <head> <MergeTarget>`. The tag commit T is NOT
+        # an ancestor of the remote-tracking tip R (exit 1); followed through the tag it would read as merged (exit 0).
+        anc = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", tag_sha, ref],
+                             capture_output=True, text=True)
+        assert anc.returncode == 1, (label, ref, anc.returncode, anc.stderr)
+        # The loop driver's `worktree add --detach` / `reset --hard` target resolves to the remote-tracking commit.
+        res = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", ref + "^{commit}"],
+                             capture_output=True, text=True)
+        assert res.returncode == 0 and res.stdout.strip() == remote_sha, (label, ref, res.stdout, res.stderr)
+
+
+def test_the_loop_driver_reset_hard_follows_the_remote_tracking_ref_in_a_throwaway_worktree(tmp_path):
+    """`git worktree add --detach <path> <TargetRef>` then `reset --hard <TargetRef>` with the ref lifted from
+    Invoke-WorkstreamLoop.ps1, run only inside a temp repo (never the real board)."""
+    repo, remote_sha, tag_sha = _g1_tag_collision_repo(tmp_path)
+    ref = dict(_g1_ref_sites())["Invoke-WorkstreamLoop TargetRef"]
+    drv = tmp_path / "driver"
+    git(repo, "worktree", "add", "--detach", str(drv), ref)
+    assert git(drv, "rev-parse", "HEAD") == remote_sha
+    git(drv, "reset", "--hard", tag_sha, "--quiet")           # move it away from the target
+    assert git(drv, "rev-parse", "HEAD") == tag_sha
+    git(drv, "reset", "--hard", ref, "--quiet")
+    assert git(drv, "rev-parse", "HEAD") == remote_sha

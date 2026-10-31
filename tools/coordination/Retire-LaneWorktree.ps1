@@ -1623,7 +1623,7 @@ function Invoke-SweepMergedLaneWorktrees {
     param(
         [Parameter(Mandatory = $true)][string]$RepoRoot,
         [string]$Root = 'C:\mlvtmp',
-        [string]$MergeTarget = 'fork/master',
+        [string]$MergeTarget = 'refs/remotes/fork/master',   # full refname: a same-named tag would win the bare name
         [string]$QuarantineRoot = '',
         [string[]]$Exclude = @(),
         [string[]]$ProtectPath = @(),
