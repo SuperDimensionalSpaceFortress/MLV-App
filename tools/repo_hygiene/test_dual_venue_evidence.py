@@ -742,7 +742,7 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackConform"]["enum"], ["on", "off"])
-        self.assertRegex(GENERATOR.read_text(encoding="utf-8"), r"\[ValidateSet\('', 'on', 'off'\)\]\s+\[string\]\$PlaybackConform = ''")
+        self.assertRegex(GENERATOR.read_text(encoding="utf-8"), r"\[ValidateSet\('', 'on', 'off', IgnoreCase = \$false\)\]\s+\[string\]\$PlaybackConform = ''")
 
     def test_the_present_trace_reaches_the_apps_env_only_when_asked(self) -> None:
         """PLAYBACK-STARTUP-CATCHUP-BURST-1 r7: -PresentTrace adds MLVAPP_PLAYBACK_PRESENT_TRACE=1 to the app's env list; absent, the job is
