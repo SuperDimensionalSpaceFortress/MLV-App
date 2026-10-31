@@ -230,6 +230,21 @@ $playSeconds = 25
 if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$spec.playSeconds }
 $lookFlavor = $null
 if ($isLook) { $lookFlavor = [string]$spec.look.lookFlavor; if ([string]::IsNullOrWhiteSpace($lookFlavor)) { $lookFlavor = 'classic' } }
+# r3 (sol B2 tooling): look.pairedSeekFrames, the display_frames the paused stills must show (one per contact-sheet frame, in order). It needs
+# look.pairedSeek true and distinct non-negative integers; anything else is refused here, before anything is generated or submitted.
+$pairedSeekFramesRequested = $null
+if ($isLook -and $null -ne $spec.look.PSObject.Properties['pairedSeekFrames']) {
+    $listed = $spec.look.pairedSeekFrames
+    $items = @($listed)
+    $bad = $(if ($listed -isnot [array]) { 'is not an array' }
+        elseif (-not ($spec.look.PSObject.Properties['pairedSeek'] -and $spec.look.pairedSeek -is [bool] -and $spec.look.pairedSeek)) { 'needs look.pairedSeek true' }
+        elseif (@($items | Where-Object { -not ($_ -is [int] -or $_ -is [long]) -or $_ -lt 0 }).Count -gt 0) { 'must hold non-negative integers' }
+        elseif (@($items | Sort-Object -Unique).Count -ne $items.Count) { 'must not repeat a frame' }
+        elseif ($items.Count -ne [int]$spec.look.contactSheetFrames) { "names $($items.Count) frame(s) but look.contactSheetFrames is $($spec.look.contactSheetFrames)" }
+        else { $null })
+    if ($null -ne $bad) { throw "DVE_LEG_SPEC_INVALID look.pairedSeekFrames $bad" }
+    $pairedSeekFramesRequested = [long[]]$items
+}
 # PLAYBACK-VISUAL-INSPECTION-1: every SPEED leg keeps window captures unless its spec opts out (visualCapture false + a reason); a look leg never.
 $visualRequest = Get-DvVisualCaptureRequest -Spec $spec
 
@@ -375,6 +390,19 @@ function Stop-Leg([string]$Outcome, [string]$Detail) {
     # A terminal reached mid-flow. Thrown (not exited) so every terminal funnels through the one catch below and
     # Complete-Receipt writes the receipt.
     throw [System.Management.Automation.RuntimeException]::new("DVE_TERMINAL|$Outcome|$Detail")
+}
+
+function Invoke-DvCollect([string]$Step, [string]$Path, [scriptblock]$Action) {
+    # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r3 (sol B1): ONE evidence-collection step (copy, hash, list, read, write, mkdir) of step 7. A step
+    # that throws -- a published file held with FileShare.None, a file that vanished or turned unreadable after its Test-Path -- is re-thrown
+    # tagged with the step and the path, and step 7's one guard turns it into a typed UNRESOLVED receipt
+    # ('collection-failed: <step> <path> <reason>'). A leg that ran never ends without a receipt. Returns what the action returns.
+    try { & $Action }
+    catch {
+        $reason = ([string]$_.Exception.Message) -replace '\s+', ' '
+        if ($reason.StartsWith('DVE_COLLECTION|')) { throw }
+        throw [System.Management.Automation.RuntimeException]::new("DVE_COLLECTION|$Step|$Path|$reason")
+    }
 }
 
 $workDirResolved = if ([string]::IsNullOrWhiteSpace($WorkDir)) { Join-Path ([IO.Path]::GetTempPath()) "dve-$runStamp-$([guid]::NewGuid().ToString('N').Substring(0,8))" } else { $WorkDir }
@@ -611,6 +639,10 @@ if ($run.umOutcome -in @('RETRACTED', 'UNRESOLVED')) {
 }
 if ($run.umOutcome -ne 'RECEIPT') { Complete-Receipt 'UNRESOLVED' "um-run ended in an unexpected error: $($run.message)" }
 
+# r3 (sol B1): step 7 runs inside ONE guard (it closes just before the final Complete-Receipt below). A collection step that throws ends the leg
+# UNRESOLVED with 'collection-failed: <step> <path> <reason>' (Invoke-DvCollect tags it); anything else that throws here is a RUNNER_ERROR. Either
+# way Complete-Receipt runs: the leg ran, so it ends in a typed receipt.
+try {
 $stdout = [string]$run.result.stdout
 $exitCode = [int]$run.result.exitCode
 $token = Get-DvResultToken $stdout
@@ -621,18 +653,20 @@ $summary = $null; $manifest = $null
 $resultJson = $null; $runLogText = $null; $runLogSha = $null
 $evidenceDir = Join-Path $evidenceBase $receipt.receiptId
 if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
-    New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+    Invoke-DvCollect 'mkdir' $evidenceDir { New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null }
     # The run's OWN records are copied into the LOCAL evidence directory (under .claude-state in production: they name an owner clip's
     # run and stay local), hashed THERE, and everything below is parsed from those local copies -- so the receipt's sha256 claims
     # are over the exact bytes the proof was derived from, and Test-DvReceiptValid can re-hash and re-derive it later.
     foreach ($name in 'summary.json', 'evidence-manifest.json', 'artifact-index.json', 'result.json') {
         $src = Join-Path $artifactsShare $name
-        if (Test-Path -LiteralPath $src -PathType Leaf) { Copy-Item -LiteralPath $src -Destination (Join-Path $evidenceDir $name) }
+        if (Test-Path -LiteralPath $src -PathType Leaf) { Invoke-DvCollect 'copy' $src { Copy-Item -LiteralPath $src -Destination (Join-Path $evidenceDir $name) } }
     }
     $logShare = Join-Path $artifactsShare 'logs\smoke-run.log'
     if (Test-Path -LiteralPath $logShare -PathType Leaf) {
-        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
-        Copy-Item -LiteralPath $logShare -Destination (Join-Path $evidenceDir 'logs\smoke-run.log')
+        Invoke-DvCollect 'copy' $logShare {
+            New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
+            Copy-Item -LiteralPath $logShare -Destination (Join-Path $evidenceDir 'logs\smoke-run.log')
+        }
     }
     # DVE-LEG-TERMINALS-1 item 3: a failed smoke run's FULL stdout and stderr (the job publishes them on SMOKE_RUN_FAILED; the typed tail in summary.json is only
     # the last 4000 chars) are kept beside the rest of the evidence and named by sha256 in the receipt, so the receipt can say why. The located app log of a run
@@ -640,32 +674,37 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     foreach ($smokeFile in 'smoke-stderr.txt', 'smoke-stdout.txt') {
         $smokeSrc = Join-Path $artifactsShare $smokeFile
         if (Test-Path -LiteralPath $smokeSrc -PathType Leaf) {
-            Copy-Item -LiteralPath $smokeSrc -Destination (Join-Path $evidenceDir $smokeFile)
-            $receipt.evidence[$(if ($smokeFile -ceq 'smoke-stderr.txt') { 'smokeStderrSha256' } else { 'smokeStdoutSha256' })] = Get-DvSha256OfFile (Join-Path $evidenceDir $smokeFile)
+            Invoke-DvCollect 'copy' $smokeSrc { Copy-Item -LiteralPath $smokeSrc -Destination (Join-Path $evidenceDir $smokeFile) }
+            $smokeLocal = Join-Path $evidenceDir $smokeFile
+            $receipt.evidence[$(if ($smokeFile -ceq 'smoke-stderr.txt') { 'smokeStderrSha256' } else { 'smokeStdoutSha256' })] = Invoke-DvCollect 'hash' $smokeLocal { Get-DvSha256OfFile $smokeLocal }
         }
     }
     $failedAppLogShare = Join-Path $artifactsShare 'logs\smoke-failed-app.log'
     if (Test-Path -LiteralPath $failedAppLogShare -PathType Leaf) {
-        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
-        Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
+        Invoke-DvCollect 'copy' $failedAppLogShare {
+            New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
+            Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
+        }
     }
     # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
     # re-derivable (a capture that exited non-zero is not evidence).
     $umRunLocal = Join-Path $evidenceDir 'um-run.json'
     $umRunBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-um-run/v1'; exitCode = $exitCode; resultToken = $token } | ConvertTo-Json -Compress) + "`n")
-    [IO.File]::WriteAllBytes($umRunLocal, $umRunBytes)
+    Invoke-DvCollect 'write' $umRunLocal { [IO.File]::WriteAllBytes($umRunLocal, $umRunBytes) }
     $receipt.evidence.umRunJsonSha256 = Get-DvSha256OfBytes $umRunBytes
     $summaryLocal = Join-Path $evidenceDir 'summary.json'
     $manifestLocal = Join-Path $evidenceDir 'evidence-manifest.json'
     $resultLocal = Join-Path $evidenceDir 'result.json'
     $logLocal = Join-Path $evidenceDir 'logs\smoke-run.log'
     if (Test-Path -LiteralPath $summaryLocal) {
-        $receipt.evidence.summaryJsonSha256 = Get-DvSha256OfFile $summaryLocal
-        $summary = [IO.File]::ReadAllText($summaryLocal) | ConvertFrom-Json
+        $receipt.evidence.summaryJsonSha256 = Invoke-DvCollect 'hash' $summaryLocal { Get-DvSha256OfFile $summaryLocal }
+        $summaryText = Invoke-DvCollect 'read' $summaryLocal { [IO.File]::ReadAllText($summaryLocal) }
+        $summary = $summaryText | ConvertFrom-Json
     }
     if (Test-Path -LiteralPath $manifestLocal) {
-        $receipt.evidence.evidenceManifestSha256 = Get-DvSha256OfFile $manifestLocal
-        $manifest = [IO.File]::ReadAllText($manifestLocal) | ConvertFrom-Json
+        $receipt.evidence.evidenceManifestSha256 = Invoke-DvCollect 'hash' $manifestLocal { Get-DvSha256OfFile $manifestLocal }
+        $manifestText = Invoke-DvCollect 'read' $manifestLocal { [IO.File]::ReadAllText($manifestLocal) }
+        $manifest = $manifestText | ConvertFrom-Json
     }
     $receipt.evidence.artifactIndexPath = $artifactsShare.TrimEnd('\') + '\artifact-index.json'
     $receipt.evidence.localEvidenceDir = $evidenceDir
@@ -673,17 +712,20 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     # log and INI; the measured run's GPU field log and INI; the store's delete record); it is fetched back into the local evidence. Absent on every other leg.
     $selfHealShare = Join-Path $artifactsShare 'self-heal'
     if (Test-Path -LiteralPath $selfHealShare -PathType Container) {
-        Copy-Item -LiteralPath $selfHealShare -Destination (Join-Path $evidenceDir 'self-heal') -Recurse
-        Write-Output "DVE_SELF_HEAL=$(Join-Path $evidenceDir 'self-heal') FILES=$(@(Get-ChildItem -LiteralPath (Join-Path $evidenceDir 'self-heal') -File -Recurse).Count)"
+        Invoke-DvCollect 'copy' $selfHealShare { Copy-Item -LiteralPath $selfHealShare -Destination (Join-Path $evidenceDir 'self-heal') -Recurse }
+        $selfHealCount = Invoke-DvCollect 'list' (Join-Path $evidenceDir 'self-heal') { @(Get-ChildItem -LiteralPath (Join-Path $evidenceDir 'self-heal') -File -Recurse).Count }
+        Write-Output "DVE_SELF_HEAL=$(Join-Path $evidenceDir 'self-heal') FILES=$selfHealCount"
     }
     # The launcher's result.json (the nonce it generated, the sha256 of the run-log snapshot) and the app's run log (the summary line
     # the proof is re-derived from).
     if (Test-Path -LiteralPath $resultLocal -PathType Leaf) {
-        $receipt.evidence.resultJsonSha256 = Get-DvSha256OfFile $resultLocal
-        try { $resultJson = [IO.File]::ReadAllText($resultLocal) | ConvertFrom-Json } catch { $resultJson = $null }
+        $receipt.evidence.resultJsonSha256 = Invoke-DvCollect 'hash' $resultLocal { Get-DvSha256OfFile $resultLocal }
+        $resultText = Invoke-DvCollect 'read' $resultLocal { [IO.File]::ReadAllText($resultLocal) }
+        try { $resultJson = $resultText | ConvertFrom-Json } catch { $resultJson = $null }
     }
     if (Test-Path -LiteralPath $logLocal -PathType Leaf) {
-        $logBytes = [IO.File]::ReadAllBytes($logLocal)
+        # (the comma keeps the byte[] one object: a pipeline would unroll it byte by byte)
+        $logBytes = [byte[]](Invoke-DvCollect 'read' $logLocal { , [IO.File]::ReadAllBytes($logLocal) })
         $runLogSha = Get-DvSha256OfBytes $logBytes
         $receipt.evidence.logSha256 = $runLogSha
         $runLogText = [Text.Encoding]::UTF8.GetString($logBytes)
@@ -742,21 +784,22 @@ if ($isLook -and $artifactsShare) {
     if (-not (Test-Path -LiteralPath $rawShare -PathType Container)) { $rawShare = Join-Path $artifactsShare 'contact-sheet\raw' }
     $composeShare = Join-Path $artifactsShare 'contact-sheet\compose-status.txt'
     if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf)) {
-        New-Item -ItemType Directory -Force -Path $sheetDir | Out-Null
+        Invoke-DvCollect 'mkdir' $sheetDir { New-Item -ItemType Directory -Force -Path $sheetDir | Out-Null }
         foreach ($n in 'stats.json', 'compose-status.txt') {
             $s = Join-Path $artifactsShare "contact-sheet\$n"
-            if (Test-Path -LiteralPath $s -PathType Leaf) { Copy-Item -LiteralPath $s -Destination (Join-Path $sheetDir $n) }
+            if (Test-Path -LiteralPath $s -PathType Leaf) { Invoke-DvCollect 'copy' $s { Copy-Item -LiteralPath $s -Destination (Join-Path $sheetDir $n) } }
         }
         if (Test-Path -LiteralPath $rawShare -PathType Container) {
-            Copy-Item -LiteralPath $rawShare -Destination (Join-Path $sheetDir 'raw') -Recurse
+            Invoke-DvCollect 'copy' $rawShare { Copy-Item -LiteralPath $rawShare -Destination (Join-Path $sheetDir 'raw') -Recurse }
             $rawLocal = Join-Path $sheetDir 'raw'
             # Hash EVERY captured frame and sidecar into a manifest the receipt names (sol r1 B4): the sheet reader takes only what it lists.
             # Top-level entries by NAME (never by a path prefix: a hosted runner's temp dir is an 8.3 short path whose FullName prefix differs). A
             # directory is listed as "<name>\" with a zero hash: that is not a plain frame name, so the validator refuses it (nothing nested is ever composed).
-            $listing = @(Get-ChildItem -LiteralPath $rawLocal -Force | Sort-Object Name | ForEach-Object {
-                [ordered]@{ name = $(if ($_.PSIsContainer) { $_.Name + '\' } else { $_.Name }); sha256 = $(if ($_.PSIsContainer) { '0' * 64 } else { (Get-DvSha256OfFile $_.FullName) }) } })
+            $listing = @(Invoke-DvCollect 'hash' $rawLocal { Get-ChildItem -LiteralPath $rawLocal -Force | Sort-Object Name | ForEach-Object {
+                [ordered]@{ name = $(if ($_.PSIsContainer) { $_.Name + '\' } else { $_.Name }); sha256 = $(if ($_.PSIsContainer) { '0' * 64 } else { (Get-DvSha256OfFile $_.FullName) }) } } })
             $framesBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-contact-frames/v1'; files = $listing } | ConvertTo-Json -Depth 4) + "`n")
-            [IO.File]::WriteAllBytes((Join-Path $evidenceDir 'contact-frames.json'), $framesBytes)
+            $framesLocal = Join-Path $evidenceDir 'contact-frames.json'
+            Invoke-DvCollect 'write' $framesLocal { [IO.File]::WriteAllBytes($framesLocal, $framesBytes) }
             $receipt.evidence.contactFramesJsonSha256 = Get-DvSha256OfBytes $framesBytes
         }
     }
@@ -770,24 +813,57 @@ if ($isLook -and $artifactsShare) {
         $seekFiles = @()
         if (Test-Path -LiteralPath $seekShare -PathType Container) {
             $seekParent = Join-Path $evidenceDir 'paired-seek\contact-sheet'
-            New-Item -ItemType Directory -Force -Path $seekParent | Out-Null
-            Copy-Item -LiteralPath $seekShare -Destination (Join-Path $seekParent 'raw') -Recurse
+            Invoke-DvCollect 'mkdir' $seekParent { New-Item -ItemType Directory -Force -Path $seekParent | Out-Null }
+            Invoke-DvCollect 'copy' $seekShare { Copy-Item -LiteralPath $seekShare -Destination (Join-Path $seekParent 'raw') -Recurse }
             $seekLocal = Join-Path $seekParent 'raw'
-            $seekFiles = @(Get-ChildItem -LiteralPath $seekLocal -Force -File | Sort-Object Name | ForEach-Object {
-                [ordered]@{ name = $_.Name; sha256 = (Get-DvSha256OfFile $_.FullName) } })
+            $seekFiles = @(Invoke-DvCollect 'hash' $seekLocal { Get-ChildItem -LiteralPath $seekLocal -Force -File | Sort-Object Name | ForEach-Object {
+                [ordered]@{ name = $_.Name; sha256 = (Get-DvSha256OfFile $_.FullName) } } })
         }
         $pairedSeekInfo = [ordered]@{ path = $seekLocal; count = $seekFiles.Count; files = $seekFiles }
+        # r3 (sol B2 tooling): look.pairedSeekFrames names the display_frame each paused still must show (still i = frame-<ii>, the app's own
+        # numbering), so an H and a C leg compare the SAME frames. Each still's sidecar display_frame is read back and recorded; a still that is
+        # missing, has no readable display_frame or shows another frame makes framesHonoured false, and the gate below FAILS CLOSED on it.
+        if ($null -ne $pairedSeekFramesRequested) {
+            $reported = [System.Collections.Generic.List[object]]::new()
+            $mismatches = [System.Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $pairedSeekFramesRequested.Count; $i++) {
+                $stillName = 'frame-{0:D2}' -f $i
+                $shown = $null
+                $sidecar = $(if ($null -ne $seekLocal) { Join-Path $seekLocal "$stillName.json" } else { $null })
+                if ($null -ne $sidecar -and (Test-Path -LiteralPath $sidecar -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $seekLocal "$stillName.png") -PathType Leaf)) {
+                    $sidecarText = Invoke-DvCollect 'read' $sidecar { [IO.File]::ReadAllText($sidecar) }
+                    $parsed = $null
+                    try { $parsed = $sidecarText | ConvertFrom-Json } catch { $parsed = $null }
+                    if ($null -ne $parsed -and $null -ne $parsed.PSObject.Properties['display_frame']) {
+                        $value = $parsed.display_frame
+                        if ($value -is [int] -or $value -is [long]) { $shown = [long]$value }
+                    }
+                }
+                $reported.Add($shown)
+                if ($null -eq $shown) { $mismatches.Add("$stillName reported no display_frame, requested $($pairedSeekFramesRequested[$i])") }
+                elseif ($shown -ne [long]$pairedSeekFramesRequested[$i]) { $mismatches.Add("$stillName reported display_frame $shown, requested $($pairedSeekFramesRequested[$i])") }
+            }
+            $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested)
+            $pairedSeekInfo['reportedFrames'] = $reported.ToArray()
+            $pairedSeekInfo['framesHonoured'] = ($mismatches.Count -eq 0)
+            $pairedSeekInfo['frameMismatches'] = $mismatches.ToArray()
+        }
     }
     if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {
-        Copy-Item -LiteralPath $sheetShare -Destination (Join-Path $sheetDir 'sheet.png')
         $sheetLocal = Join-Path $sheetDir 'sheet.png'
-        $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = (Get-DvSha256OfFile $sheetLocal); bytes = (Get-Item -LiteralPath $sheetLocal).Length; frames = [int]$spec.look.contactSheetFrames; backend = $Backend; rawFramesDir = $rawLocal }
+        Invoke-DvCollect 'copy' $sheetShare { Copy-Item -LiteralPath $sheetShare -Destination $sheetLocal }
+        $sheetSha = Invoke-DvCollect 'hash' $sheetLocal { Get-DvSha256OfFile $sheetLocal }
+        $sheetBytes = Invoke-DvCollect 'size' $sheetLocal { (Get-Item -LiteralPath $sheetLocal).Length }
+        $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = $sheetSha; bytes = $sheetBytes; frames = [int]$spec.look.contactSheetFrames; backend = $Backend; rawFramesDir = $rawLocal }
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
-            New-Item -ItemType Directory -Force -Path $SheetCopyDir | Out-Null
-            Copy-Item -LiteralPath $sheetLocal -Destination (Join-Path $SheetCopyDir "sheet-$($spec.legId)-$Venue-$Backend-$lookFlavor.png") -Force
+            $sheetCopy = Join-Path $SheetCopyDir "sheet-$($spec.legId)-$Venue-$Backend-$lookFlavor.png"
+            Invoke-DvCollect 'copy' $sheetCopy {
+                New-Item -ItemType Directory -Force -Path $SheetCopyDir | Out-Null
+                Copy-Item -LiteralPath $sheetLocal -Destination $sheetCopy -Force
+            }
         }
     } elseif (Test-Path -LiteralPath $composeShare -PathType Leaf) {
-        $marker = ([IO.File]::ReadAllText($composeShare) -split "`r?`n")[0]
+        $marker = ((Invoke-DvCollect 'read' $composeShare { [IO.File]::ReadAllText($composeShare) }) -split "`r?`n")[0]
         if ($marker -match '^CONTACT_SHEET_COMPOSE_UNAVAILABLE') { $composeUnavailable = $marker }
     }
     # The flavor the APP says it applied (the job copies gui_smoke.visual_state look_assist_flavor into its summary): honoured only
@@ -816,9 +892,11 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
     $stripDir = $(if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $SheetCopyDir } else { Join-Path (Split-Path -Parent $ReceiptRoot) 'sheets' })
     if ($receipt.visual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
-        New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
         $stripCopy = Join-Path $stripDir "strip-$($spec.legId)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
-        Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
+        Invoke-DvCollect 'copy' $stripCopy {
+            New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
+            Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
+        }
         $receipt.visual.stripCopyPath = $stripCopy
     }
     # GPU-DEVICE-LOSS-SELF-HEAL-1 r5: each self-heal pre-launch (the fallback runs L1-L3) published its own captures under self-heal\pre-<n>\visual; each gets the
@@ -830,9 +908,11 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
             $preVisual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected') -LegId "$($spec.legId)-$($preDir.Name)" `
                 -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
             if ($preVisual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
-                New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
                 $preStripCopy = Join-Path $stripDir "strip-$($spec.legId)-$($preDir.Name)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
-                Copy-Item -LiteralPath $preVisual.stripPath -Destination $preStripCopy -Force
+                Invoke-DvCollect 'copy' $preStripCopy {
+                    New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
+                    Copy-Item -LiteralPath $preVisual.stripPath -Destination $preStripCopy -Force
+                }
                 $preVisual.stripCopyPath = $preStripCopy
             }
             $receipt['selfHealVisual'][$preDir.Name] = $preVisual
@@ -898,6 +978,16 @@ if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but LOOK_ASSIST_NOT_HONOURED: $($lookAssistVerdict.reason). A leg that did not run the look it names is no measurement under it"
     $outcome = 'INVALID'
 }
+# r3 (sol B2 tooling), FAIL CLOSED: a leg that names look.pairedSeekFrames counts only when every paused still reports its requested display_frame;
+# a still that is missing or shows another frame cannot be compared with the other arm's still of that frame: a typed INVALID, never a PASS or FAIL.
+if ($outcome -in @('PASS', 'FAIL') -and $null -ne $pairedSeekFramesRequested) {
+    $seekBlock = $(if ($null -ne $receipt.look) { $receipt.look.pairedSeek } else { $null })
+    if ($null -eq $seekBlock -or -not $seekBlock['framesHonoured']) {
+        $why = $(if ($null -eq $seekBlock) { 'no paired-seek block was recorded' } else { $seekBlock['frameMismatches'] -join '; ' })
+        $detail = "INVALID: the job result was $outcome ($detail) but PAIRED_SEEK_FRAMES_NOT_HONOURED: $why. A paused still that is not the requested frame is no same-frame comparison"
+        $outcome = 'INVALID'
+    }
+}
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
 # enough is not a product result either. A product FAIL the job reached AFTER its oracle passed (GPU_RECON_FRAMES_ZERO,
@@ -960,5 +1050,14 @@ if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
         $detail = "INVALID: the job result was $outcome ($detail) but " + ($badLaunches -join '; ') + '. A fallback run whose picture is not OK is not counted, whatever the measured run says'
         $outcome = 'INVALID'
     }
+}
+} catch {
+    # (the close of step 7's one guard, r3 sol B1: see its opening above)
+    $message = [string]$_.Exception.Message
+    if ($message.StartsWith('DVE_COLLECTION|')) {
+        $parts = $message.Split('|', 4)
+        Complete-Receipt 'UNRESOLVED' "collection-failed: $($parts[1]) $($parts[2]) $($parts[3])"
+    }
+    Complete-Receipt 'UNRESOLVED' "RUNNER_ERROR: $message"
 }
 Complete-Receipt $outcome $detail

@@ -108,6 +108,174 @@ class PairedSeekRunnerTests(RunnerHarness, unittest.TestCase):
                 self.assertIsNone(receipt["look"]["pairedSeek"])
 
 
+def hold_exclusive(test: unittest.TestCase, path: Path) -> None:
+    """Open `path` with share mode 0 (FileShare.None) until the test ends: any other open of it fails with a sharing violation."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)   # GENERIC_READ, no sharing, OPEN_EXISTING
+    test.assertNotEqual(handle, wintypes.HANDLE(-1).value, f"could not hold {path} (error {ctypes.get_last_error()})")
+    test.addCleanup(kernel32.CloseHandle, handle)
+
+
+@requires_windows_pwsh
+class CollectionFailureReceiptTests(RunnerHarness, unittest.TestCase):
+    """r3 (sol B1, adversary A1): a leg that ran ALWAYS ends in a typed receipt. A copy, hash or listing step of the evidence collection that
+    throws (a published file held with FileShare.None, a file that vanishes or turns unreadable) ends the leg UNRESOLVED with
+    `collection-failed: <step> <path> <reason>`, never a runner that exits with no receipt."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+    def paired_spec(self, leg_id: str) -> Path:
+        path = self.write_spec(leg_type="look", leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec["look"]["pairedSeek"] = True
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def write_seek_frames(self) -> Path:
+        seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
+        seek.mkdir(parents=True, exist_ok=True)
+        for name, data in SEEK_FRAMES.items():
+            (seek / name).write_bytes(data)
+        return seek
+
+    def assert_collection_failed(self, proc, receipt, step: str, path_fragment: str) -> str:
+        self.assertIsNotNone(receipt, "a collection failure must still write a receipt:\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "UNRESOLVED", receipt["outcomeDetail"])
+        detail = receipt["outcomeDetail"]
+        self.assertTrue(detail.startswith(f"collection-failed: {step} "), detail)
+        self.assertIn(path_fragment, detail)
+        self.assertIn("DVE_OUTCOME=UNRESOLVED", proc.stdout)
+        return detail
+
+    def test_a_published_seek_frame_held_with_file_share_none_ends_in_a_typed_receipt(self) -> None:
+        self.write_artifacts(sheet=True, raw_frames=True)
+        seek = self.write_seek_frames()
+        hold_exclusive(self, seek / "frame-00.png")
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.paired_spec("locked-seek"), extra=["-Backend", "cpu"])
+        detail = self.assert_collection_failed(proc, receipt, "copy", "paired-seek")
+        self.assertIn("frame-00.png", detail, "the reason names the file the copy could not read")
+
+    def test_a_seek_frame_whose_hash_step_fails_ends_in_a_typed_receipt(self) -> None:
+        # The copy succeeds; hashing the local copy throws (injected in a COPY of the runner's module, the runner itself unchanged).
+        dv = self.mutated_runner([("DualVenueRunner.psm1", "function Get-DvSha256OfFile([string]$Path) {\n",
+                                   "function Get-DvSha256OfFile([string]$Path) {\n    if ($Path -match 'paired-seek') { throw 'INJECTED_HASH_FAILURE' }\n")])
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_frames()
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.paired_spec("hash-seek"), extra=["-Backend", "cpu"], dv=dv)
+        detail = self.assert_collection_failed(proc, receipt, "hash", "paired-seek")
+        self.assertIn("INJECTED_HASH_FAILURE", detail)
+
+    def test_every_sibling_collection_copy_ends_in_a_typed_receipt(self) -> None:
+        # The class sweep: a published smoke record, the in-pass raw frames and the composed sheet are collected the same guarded way.
+        # (summary.json and the manifest are rewritten by the harness just before the leg runs, so they cannot be held from here.)
+        for rel, fragment in (("smoke-stderr.txt", "smoke-stderr.txt"), ("artifacts/contact-sheet/raw/frame-00.png", "raw"), ("contact-sheet/sheet.png", "sheet.png")):
+            with self.subTest(file=rel):
+                self.doCleanups()
+                self.make_harness()
+                self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+                self.write_artifacts(sheet=True, raw_frames=True)
+                target = self.artifacts / Path(rel)
+                if not target.exists():
+                    target.write_bytes(b"stderr of the smoke run\n")
+                hold_exclusive(self, target)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.paired_spec("locked-" + target.stem.replace(".", "-")), extra=["-Backend", "cpu"])
+                self.assert_collection_failed(proc, receipt, "copy", fragment)
+
+
+def seek_sidecar(display_frame: int) -> bytes:
+    return json.dumps({"capture_mode": "seek", "playback_path": False, "display_frame": display_frame}).encode("utf-8")
+
+
+@requires_windows_pwsh
+class PairedSeekFrameListTests(RunnerHarness, unittest.TestCase):
+    """r3 (sol B2 tooling): look.pairedSeekFrames names the display_frames every arm's paused stills must show, so an H and a C leg compare the
+    SAME frames. The runner records the requested and the reported display_frame per still and FAILS CLOSED: a still that does not report its
+    requested display_frame (or is missing) turns a PASS/FAIL into a typed INVALID (PAIRED_SEEK_FRAMES_NOT_HONOURED)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+    def frame_list_spec(self, frames: object, leg_id: str, paired_seek: object = True) -> Path:
+        path = self.write_spec(leg_type="look", leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec["look"]["pairedSeek"] = paired_seek
+        spec["look"]["pairedSeekFrames"] = frames
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def write_seek_stills(self, display_frames: list[int | None]) -> None:
+        seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
+        seek.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(display_frames):
+            (seek / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-%d" % i)
+            if frame is not None:
+                (seek / f"frame-{i:02d}.json").write_bytes(seek_sidecar(frame))
+
+    def test_the_schema_types_paired_seek_frames(self) -> None:
+        prop = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))["properties"]["look"]["properties"]["pairedSeekFrames"]
+        self.assertEqual(prop["type"], "array")
+        self.assertEqual(prop["items"], {"type": "integer", "minimum": 0})
+        self.assertIs(prop["uniqueItems"], True)
+
+    def test_stills_that_report_the_requested_frames_pass_and_are_recorded(self) -> None:
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([50, 150])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.frame_list_spec([50, 150], "list-ok"), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        info = receipt["look"]["pairedSeek"]
+        self.assertEqual(info["requestedFrames"], [50, 150])
+        self.assertEqual(info["reportedFrames"], [50, 150])
+        self.assertIs(info["framesHonoured"], True)
+
+    def test_a_still_at_another_frame_fails_closed(self) -> None:
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([50, 131])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.frame_list_spec([50, 150], "list-off"), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertIn("frame-01 reported display_frame 131, requested 150", receipt["outcomeDetail"])
+        self.assertEqual(receipt["look"]["pairedSeek"]["reportedFrames"], [50, 131])
+        self.assertIs(receipt["look"]["pairedSeek"]["framesHonoured"], False)
+
+    def test_missing_stills_or_sidecars_fail_closed(self) -> None:
+        for stills, leg_id, needle in (([50, None], "list-nosidecar", "frame-01 reported no display_frame"),
+                                       (None, "list-nostills", "frame-00 reported no display_frame")):
+            with self.subTest(case=leg_id):
+                self.doCleanups()
+                self.make_harness()
+                self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+                self.write_artifacts(sheet=True, raw_frames=True)
+                if stills is not None:
+                    self.write_seek_stills(stills)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.frame_list_spec([50, 150], leg_id), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn(needle, receipt["outcomeDetail"])
+
+    def test_a_malformed_frame_list_is_refused_before_anything_runs(self) -> None:
+        for frames, paired, leg_id in (([50, 150], False, "bad-notpaired"), ([50], True, "bad-count"), ([50, 50], True, "bad-dupe"),
+                                       ([50, -1], True, "bad-negative"), ("50,150", True, "bad-type")):
+            with self.subTest(case=leg_id):
+                proc, receipt, submitted = self.run_leg("ultra-magnus", self.frame_list_spec(frames, leg_id, paired), extra=["-Backend", "cpu"])
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("DVE_LEG_SPEC_INVALID", proc.stdout + proc.stderr)
+                self.assertIn("pairedSeekFrames", proc.stdout + proc.stderr)
+                self.assertEqual(submitted, [], "nothing is submitted")
+                self.assertEqual(self.generator_calls(), [], "nothing is generated")
+
+
 PAIRED_PUBLISH = "-SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))"
 
 
