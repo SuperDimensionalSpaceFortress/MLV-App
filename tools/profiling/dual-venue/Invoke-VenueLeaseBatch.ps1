@@ -280,8 +280,12 @@ else {
             if ($rrProvider.Name -cne 'FileSystem') { throw "it names the $($rrProvider.Name) provider, not the file system" }
             [IO.Path]::GetFullPath($rrFull)
         } catch { Stop-Usage "RECEIPT_ROOT_INVALID -ReceiptRoot is not a usable path: $($_.Exception.Message -replace '\s+', ' ')" })
-    if (-not (Test-DvLocalReceiptRoot -Path $ReceiptRoot)) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run' }
-    if (-not (Test-DvLocalReceiptRoot -Path (Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence'))) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be a LOCAL path (no UNC, venue agentShare or network drive) under a .claude-state directory: the run evidence names an owner clip''s run' }
+    # r4 A2-A4: the helper RETURNS the normalised full path it certified (a device path is refused, a link onto a share is followed) and THAT is what every leg is handed
+    $rrCert = Test-DvLocalReceiptRoot -Path $ReceiptRoot
+    if (-not $rrCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run' }
+    $ReceiptRoot = $rrCert
+    $evCert = Test-DvLocalReceiptRoot -Path (Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence')
+    if (-not $evCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: the run evidence names an owner clip''s run' }
 }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path

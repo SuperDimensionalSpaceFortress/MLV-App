@@ -283,7 +283,9 @@ if ($null -eq $umEntry) { Stop-Nightly 'USAGE' "venues.json has no venue 'ultra-
 $share = $(if ($AgentShare) { $AgentShare } else { [string]$venueEntry.Value.agentShare }).TrimEnd('\')
 $dllShare = $(if ($AgentShare) { $AgentShare } else { [string]$umEntry.Value.agentShare }).TrimEnd('\')
 $agentRoot = [string]$venueEntry.Value.agentRoot
-if (-not (Test-DvLocalReceiptRoot -Path $ReceiptFile)) { Stop-Nightly 'USAGE' "-ReceiptFile must be under a .claude-state directory (board-local state): $ReceiptFile" }
+$receiptCert = Test-DvLocalReceiptRoot -Path $ReceiptFile
+if (-not $receiptCert) { Stop-Nightly 'USAGE' "-ReceiptFile must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory (board-local state): $ReceiptFile" }
+$ReceiptFile = $receiptCert   # r4 A2: write to the path that was certified
 if (-not $AgentShare -and [IO.Path]::GetFullPath($ReceiptFile) -ine $canonicalReceipt) {
     Stop-Nightly 'USAGE' "the real $Venue share takes only the canonical receipt $canonicalReceipt (the once-per-night reservations live there and nowhere else); -ReceiptFile '$ReceiptFile' is refused"
 }

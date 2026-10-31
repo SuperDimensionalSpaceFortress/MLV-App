@@ -63,10 +63,11 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 
 # The sheet is owner footage: it may only be written where it stays local.
-$outFull = [IO.Path]::GetFullPath($OutDir)
-if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -eq 0) {
-    throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
+$outFull = Test-DvLocalReceiptRoot -Path $OutDir
+if (-not $outFull) {
+    throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
 }
+$OutDir = $outFull   # every write below goes to the certified path, not the raw value
 
 # -OutDir is caller-controlled, and the one delete this script owns (the attempt marker, at the end) must never run inside a directory that holds owner footage.
 # Decided before ANY write, stage or delete: -OutDir (and everything under it) and every ancestor up to and including the nearest .claude-state directory are
@@ -143,7 +144,8 @@ if (Test-Path -LiteralPath $outFull -PathType Container) {
 }
 # Staging sits beside OutDir, never in it; it holds owner footage, so its parent must be under .claude-state too.
 $stageParent = [IO.Path]::GetDirectoryName($outFull.TrimEnd('\', '/'))
-if (-not $stageParent -or @($stageParent.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -eq 0) {
+$stageParent = $(if ($stageParent) { Test-DvLocalReceiptRoot -Path $stageParent } else { $null })
+if (-not $stageParent) {
     throw 'PAIR_OUTDIR_NEEDS_LOCAL_PARENT -OutDir must be a subdirectory of a .claude-state path (its staging is a sibling directory, and owner footage stays local)'
 }
 $classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
