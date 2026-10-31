@@ -136,7 +136,7 @@ PINNED_STOP_STATEMENTS = {
         "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
         "while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
-        "sleepGuiThreadForSmokeRunner( 10 ); } playActionEndedEarly =playActionState == playback_frame_range::PlayStopState::EndedEarly;",
+        "sleepGuiThreadForSmokeRunner( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",
         "isolateAutomationPacing( \"profile-entry\" );",
         # r2 (sol BLOCKER): the profile JSON echoes the launcher's per-run nonce (see finishPlaybackSmokeTelemetry below).
         "metadata.insert( QStringLiteral(\"run_nonce\"), automationRunNonce() );",
