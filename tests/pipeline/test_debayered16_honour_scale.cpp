@@ -1361,6 +1361,41 @@ TEST(Debayered16ReconReuse, HonourScaleCoreEntryRefusalsAndRowFill)
     }
 }
 
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 adversary A2: the reduced entry reset this thread's
+// debayer kernel time and then ran its debayer without recording it, so every reduced frame
+// published debayer_kernel_ms = 0. The clock may tick coarsely, so a call may legitimately read
+// 0 ms; the entry must record a nonzero time on some call within 64 (it never did before).
+TEST(Debayered16ReconReuse, HonourScaleReducedEntryRecordsItsDebayerKernelTime)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    WorkerState worker;
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        std::vector<uint16_t> reduced;
+        ASSERT_TRUE(reducedRecon(fixture, 1, scale, worker, &plan, &reduced));
+        const size_t outWords = static_cast<size_t>(fixture.width() / scale) * static_cast<size_t>(fixture.height() / scale) * 3u;
+        std::vector<uint16_t> out(outWords);
+        const int hq = llrpHQDualIso(fixture.video()) ? 1 : 0;
+        int calls = 0;
+        double kernelMs = 0.0;
+        while (calls < 64 && kernelMs <= 0.0)
+        {
+            std::vector<uint16_t> bayer(reduced); // the entry shifts its input in place
+            int w = -1, h = -1;
+            ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, bayer.data(), plan.reducedWidth,
+                                                                         plan.reducedHeight, scale, out.data(), hq, &w, &h));
+            ++calls;
+            kernelMs = getMlvLastDebayerKernelMilliseconds();
+        }
+        std::printf("[debayered16-honour-scale] reduced entry x%d: debayer_kernel_ms=%.4f after %d call(s)\n", scale, kernelMs,
+                    calls);
+        ASSERT_TRUE(kernelMs > 0.0);
+    }
+}
+
 // The prep's reduced-source config: only a SourceAlreadyReduced decision at x2/x4 whose
 // source is exactly the clip divided by that scale; otherwise nothing is built.
 TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyReducedSource)
