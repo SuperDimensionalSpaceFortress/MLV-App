@@ -1629,8 +1629,7 @@ TEST(GpuDualIsoPreviewScale, CpuReducedDebayerVerticalEdgeChroma)
                     uint32_t sum = 0;
                     for (int j = 0; j < scale; ++j)
                         for (int i = 0; i < scale; ++i)
-                            sum += fullRgb[((static_cast<size_t>(scale) * y + j) * fullW
-                                            + static_cast<size_t>(scale) * x + i) * 3u + c];
+                            sum += fullRgb[(static_cast<size_t>(scale * y + j) * fullW + scale * x + i) * 3u + c];
                     ref[(static_cast<size_t>(y) * outW + x) * 3u + c] =
                         static_cast<uint16_t>((sum + scale * scale / 2) / (scale * scale));
                 }
