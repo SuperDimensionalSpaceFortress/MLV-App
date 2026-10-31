@@ -195,7 +195,7 @@ $venueEntry = $table.venues.PSObject.Properties[$Venue]
 if ($null -eq $venueEntry) { Stop-Baseline 'USAGE' "venues.json has no venue '$Venue'" }
 # The trend rows name receipt paths of owner-clip runs: they stay under a .claude-state directory, like the receipts themselves.
 foreach ($p in @(@('-TrendFile', $TrendFile), @('-RunDir', $RunDir))) {
-    if (-not (Test-DvUnderClaudeState -Path $p[1])) { Stop-Baseline 'USAGE' "$($p[0]) must be under a .claude-state directory: a row names the receipt of an owner-clip run and stays local" }
+    if (-not (Test-DvLocalReceiptRoot -Path $p[1])) { Stop-Baseline 'USAGE' "$($p[0]) must be under a .claude-state directory: a row names the receipt of an owner-clip run and stays local" }
 }
 
 $legs = [System.Collections.Generic.List[object]]::new()

@@ -6645,6 +6645,73 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"plain": True, "fwd": True, "caseDiffers": False, "substring": False})
 
+    # Dot A2 (PR #729 comment 6542192087) + adversary A1: a path component named .claude-state is satisfied INSIDE a network share. The refusal must come before any write:
+    # these roots name a share that does not exist for the test, and a UNC GetFullPath does no network I/O, so a regression here would fail on a missing share, never write one.
+    NETWORK_ROOTS = {
+        "production-agent-share": "\\\\bachelor\\mlv-agent\\.claude-state\\receipts",
+        "admin-share-of-localhost": "\\\\localhost\\c$\\mlvtmp\\.claude-state\\receipts",
+        "forward-slash-unc": "//bachelor/mlv-agent/.claude-state/receipts",
+        "extended-unc": "\\\\?\\UNC\\bachelor\\mlv-agent\\.claude-state\\receipts",
+        "agent-share-itself": "\\\\bachelor\\mlv-agent\\receipts\\.claude-state",
+    }
+
+    def test_adversary_dot_a2_a_receipt_root_on_a_network_share_is_refused_at_the_batch_entry(self) -> None:
+        for name, root in self.NETWORK_ROOTS.items():
+            with self.subTest(name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", root)
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+    def test_adversary_dot_a2_a_receipt_root_on_a_network_share_is_refused_at_the_real_leg_entry(self) -> None:
+        leg = DV / "Invoke-VenueLeg.ps1"
+        for name, root in self.NETWORK_ROOTS.items():
+            with self.subTest(name=name):
+                script = (
+                    f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                    f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(leg)}', [ref]$null, [ref]$null)\n"
+                    "$if = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.IfStatementAst] -and $x.Extent.Text -match 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot' }, $true)\n"
+                    "if ($null -eq $if) { throw 'the leg receipt-root guard was not found' }\n"
+                    f"$ReceiptRoot = '{psq(root)}'; $OfflineTestMode = $false\n"
+                    "try { . ([scriptblock]::Create($if.Extent.Text)); 'ACCEPTED' } catch { 'REFUSED ' + $_.Exception.Message }\n"
+                )
+                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertTrue(out.stdout.strip().startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), out.stdout + out.stderr)
+
+    def test_adversary_dot_a2_the_shared_locality_helper_refuses_a_venue_share_prefix_and_keeps_local_roots(self) -> None:
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "$shares = @('C:\\fake\\agent-share', '\\\\bachelor\\mlv-agent')\n"
+            "function L($p) { Test-DvLocalReceiptRoot -Path $p -AgentShares $shares }\n"
+            "[ordered]@{\n"
+            "  localPlain = (L 'C:\\x\\.claude-state\\dual-venue\\receipts'); localFwd = (L 'C:/x/.claude-state/a'); localLongPrefix = (L '\\\\?\\C:\\x\\.claude-state\\a')\n"
+            "  underShare = (L 'C:\\fake\\agent-share\\.claude-state\\receipts'); underShareCase = (L 'c:\\FAKE\\Agent-Share\\.claude-state\\receipts'); underShareFwd = (L 'C:/fake/agent-share/.claude-state/r')\n"
+            "  shareItself = (L 'C:\\fake\\agent-share'); siblingOfShare = (L 'C:\\fake\\agent-share2\\.claude-state\\receipts')\n"
+            "  unc = (L '\\\\bachelor\\mlv-agent\\.claude-state\\r'); uncOther = (L '\\\\localhost\\c$\\x\\.claude-state\\r'); deviceNonDrive = (L '\\\\?\\GLOBALROOT\\x\\.claude-state\\r')\n"
+            "  noMarker = (L 'C:\\x\\receipts'); ignorable = (L \"C:\\x\\.claude-state$([char]0xAD)\\r\")\n"
+            "  configured = (Test-DvLocalReceiptRoot -Path '\\\\bachelor\\mlv-agent\\.claude-state\\r')\n"
+            "} | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {
+            "localPlain": True, "localFwd": True, "localLongPrefix": True,
+            "underShare": False, "underShareCase": False, "underShareFwd": False,
+            "shareItself": False, "siblingOfShare": True,
+            "unc": False, "uncOther": False, "deviceNonDrive": False,
+            "noMarker": False, "ignorable": False, "configured": False,
+        })
+
+    def test_adversary_dot_a2_every_write_root_guard_goes_through_the_locality_helper(self) -> None:
+        # the class, not the instance: no script outside the helper itself asks Test-DvUnderClaudeState alone about a root that is written to
+        offenders = []
+        for p in sorted(DV.glob("*.ps1")):
+            for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if "Test-DvUnderClaudeState" in line and not line.lstrip().startswith("#") and "Test-DvLocalReceiptRoot" not in line and "Import-Module" not in line:
+                    offenders.append(f"{p.name}:{n}: {line.strip()[:140]}")
+        self.assertEqual(offenders, [], "a write-root guard that tests only for the marker directory name accepts the same name inside a network share")
+
     def test_adversary_dot_a1_no_boundary_directory_name_is_compared_with_a_culture_aware_operator(self) -> None:
         # the class, not the instance: every PowerShell file under tools/ that tests a path component against .claude-state goes through [string]::Equals(..., Ordinal)
         offenders = []

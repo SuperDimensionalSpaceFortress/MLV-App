@@ -733,6 +733,40 @@ function Test-DvUnderClaudeState {
     @($full.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -gt 0
 }
 
+function Test-DvLocalReceiptRoot {
+    # LEASE-BATCH-RECEIPT-ROOT-1 r3 (Dot A2 6542192087, adversary A1): the ONE admission rule for a directory or file that owner-footage evidence is WRITTEN to (a receipt root and the
+    # evidence directory beside it, a sheet/strip copy directory, a trend file, a baseline or nightly state file). It must be (1) under a `.claude-state` segment (Test-DvUnderClaudeState)
+    # AND (2) a LOCAL file-system path: a segment name alone is satisfied by a `.claude-state` folder INSIDE a network share, and um-run.ps1 is the only writer to a venue share.
+    # Refused: any UNC (two leading separators of either slash, the `\\?\UNC\` form, a `\\localhost\c$\` admin share), any other device path (GLOBALROOT, Volume GUID; `\\?\C:\` is a local
+    # path and is read as `C:\`), any path equal to or under a venue agentShare from venues.json (OrdinalIgnoreCase after full-path normalisation), and a path on a mapped NETWORK drive
+    # ([IO.DriveInfo].DriveType). FAIL CLOSED: an unreadable venues.json or an unparsable path is a refusal. Nothing is created, opened or written here; a drive-type read is the only I/O.
+    param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
+    try {
+        if (-not (Test-DvUnderClaudeState -Path $Path)) { return $false }
+        $plain = [IO.Path]::GetFullPath($Path)
+        if ($plain.StartsWith('\\?\', [StringComparison]::Ordinal) -or $plain.StartsWith('\\.\', [StringComparison]::Ordinal)) {
+            $plain = $plain.Substring(4)
+            if ($plain.StartsWith('UNC\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+            if ($plain -notmatch '^[A-Za-z]:(\\|$)') { return $false }
+        }
+        if ($plain.StartsWith('\\', [StringComparison]::Ordinal) -or $plain.StartsWith('//', [StringComparison]::Ordinal)) { return $false }
+        if ($null -eq $AgentShares) {
+            $doc = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'venues.json')) | ConvertFrom-Json
+            $AgentShares = @($doc.venues.PSObject.Properties | ForEach-Object { [string]$_.Value.agentShare } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        $norm = { param($x) ([IO.Path]::GetFullPath($x) -replace '/', '\').TrimEnd('\') }
+        $plainNorm = & $norm $plain
+        foreach ($share in @($AgentShares)) {
+            $s = & $norm $share
+            if ($plainNorm.Equals($s, [StringComparison]::OrdinalIgnoreCase) -or $plainNorm.StartsWith($s + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        }
+        if ($plain -match '^[A-Za-z]:') {
+            if ([IO.DriveInfo]::new($plain.Substring(0, 1)).DriveType -eq [IO.DriveType]::Network) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
 function Read-DvClipConsent {
     <#
     .SYNOPSIS
@@ -3059,7 +3093,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
+    Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
