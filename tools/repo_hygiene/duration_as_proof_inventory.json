@@ -2536,6 +2536,27 @@
       "lines": [
         950
       ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "while ( calls < 64 && kernelMs <= 0.0 )",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 adversary A2: a retry bound for a coarse clock (about 1 ms ticks on the lane host); each call's run is proved by ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(...)) inside the loop, not by the duration.",
+      "lines": [
+        1384
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( kernelMs > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "omp_get_wtime_direct",
+      "flag": "getMlvRawFrameDebayeredFromReducedReconnedRaw16 returned 1",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 adversary A2: the debayer's run is proved by the entry returning 1 on every call; this assert's subject is the telemetry record itself (the entry used to reset debayer_kernel_ms and never write it), which is the defect under test.",
+      "lines": [
+        1395
+      ]
     }
   ]
 }
