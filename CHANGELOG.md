@@ -161,3 +161,16 @@ maintained in this format.
     thread could let that thread start the warm on the freed clip. Closing
     a clip now drops a warm that has not started, and waits for one that
     has.
+- High frame rate clips now conform to 24 fps playback by default: a clip
+  above 30 fps plays as slow motion at 24 fps, so every recorded frame is
+  shown (Drop Frame Mode can still skip one to catch up after a stall).
+  Configure it under **Playback → High Frame Rate Conform** (enable,
+  conform to 24/25/30 fps, for clips above 30/50 fps). Export, metadata and
+  timecode keep the clip's own rate. The environment variable
+  `MLVAPP_PLAYBACK_CONFORM=0|1` overrides the setting for one process (the
+  native-HFR measurement arm) and is never saved.
+- The Export Settings frame rate override now changes the export rate only;
+  interactive playback paces at the clip's own (or conformed) rate.
+- Automated play windows (`--seconds`, `--presented-frames`, the clip-length
+  gates) still count seconds of the clip's own footage when it is conformed,
+  so a conformed run takes longer on the clock than its window.

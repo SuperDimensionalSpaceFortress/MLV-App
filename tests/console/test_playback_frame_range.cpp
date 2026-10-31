@@ -246,6 +246,24 @@ TEST( PlaybackFrameRange, PacedInPassTargetsStayOnTheWallClockAndAMissedOneStays
     ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( false, 10000, 10000, 1, 240 ) );
 }
 
+// MERGE-MASTER r3 (adversary A3 input): M16-1457, 1499 required source frames at 59.94 fps conformed to 24 fps
+// (62.4 s of wall clock), six in-pass frames. The targets are the source-window centres 125 .. 1374, not the
+// wall-clock centres of a 25 s window (~source frames 50 .. 550). Paced native keeps the wall clock; unpaced is unchanged.
+TEST( PlaybackFrameRange, ConformedInPassTargetsAreSourceFrameCentresOfTheWholeSourceWindow )
+{
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, true, 1499 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, false, 1499 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( true, false, 1499 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( true, false, 0 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, true, 0 ) );
+    const int64_t expected[] = { 125, 375, 625, 874, 1124, 1374 };
+    for( int i = 0; i < 6; ++i )
+        ASSERT_EQ( expected[i], playback_frame_range::contactSheetInPassTargetSourceFrames( i, 6, 1499 ) );
+    // Due on source frames consumed, whatever the wall clock: the last target is reached after 57 s of a 62 s Play.
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( true, 22917, 22917, 551, 1374 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( true, 57250, 22917, 1374, 1374 ) );
+}
+
 // The grabs run on the GUI thread inside the measured interval, so the honest figure next to the
 // leg's fps is the fps with their recorded cost taken out of the elapsed time. It can only be the
 // same or higher, and it equals the measured fps when nothing was grabbed.
@@ -805,6 +823,33 @@ TEST( HfrPlayFloor, AConformedPlayOfAnHfrClipStillAdvancesTenSecondsOfSourceFram
     ASSERT_EQ( 600, v.requiredFrames );
     ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 599, v.requiredFrames, true, 20000, 35000 ) == playback_frame_range::PlayStopState::Continue );
     ASSERT_TRUE( playback_frame_range::evaluatePlayStop( 600, v.requiredFrames, true, 25000, 35000 ) == playback_frame_range::PlayStopState::Reached );
+}
+
+TEST( HfrPlayFloor, AConformedPlayCannotStretchAShortHfrClipIntoALongerWindow )
+{
+    // HFR-NATIVE-60FPS-FULLRES-1 (HUB RULING 2026-10-30T22:17:51Z): 971 frames at 59.94 are 16.2 s of SOURCE. A 24 fps
+    // conform plays them for 40.5 s, but a 25 s window still needs ceil(25 x 59.94) = 1499 source frames: refused.
+    const PlayableWindowVerdict shortClip = evaluatePlayableWindow( 0, 1, 971, 971, 59.94, 25.0,
+                                                                    playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_FALSE( shortClip.ok );
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( shortClip.reason ) );
+    ASSERT_EQ( 1499, shortClip.requiredFrames );
+    // The 27.8 s clip (1667 frames) is admitted at the 24 fps pace: 1498 / 24 = 62.4 s <= 25 / 0.5 + 15 = 65 s.
+    const PlayableWindowVerdict longClip = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0,
+                                                                   playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( longClip.ok );
+    ASSERT_EQ( 1499, longClip.requiredFrames );
+}
+
+TEST( HfrPlayFloor, AConformTooSlowForTheSourceWindowIsRefusedBeforePlay )
+{
+    // The ruling's recorded side effect, fail closed: a 120 fps clip conformed to 24 needs 1200 source frames for its
+    // 10 s floor, 1199 / 24 = 50 s of Play, over the 10 / 0.5 + 15 = 35 s budget: PLAY_PACE_TOO_SLOW before Play.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 3000, 3000, 120.0, 10.0,
+                                                            playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
+    ASSERT_EQ( 1200, v.requiredFrames );
 }
 
 TEST( HfrPlayFloor, AnHfrClipLoopedToReachTenSecondsIsRefusedAndNeverCountsAsPlayed )

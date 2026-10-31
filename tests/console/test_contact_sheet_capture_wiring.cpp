@@ -278,8 +278,10 @@ TEST(ContactSheetCaptureWiring, UnpacedInPassTargetsAreSourceFramesThroughTheSha
     const int armEndAt = smokeBody.indexOf(QStringLiteral("m_contactSheetCaptureActive = true;"), armAt);
     ASSERT_TRUE(armAt >= 0 && armEndAt > armAt);
     const QString armBlock = smokeBody.mid(armAt, armEndAt - armAt);
+    // MERGE-MASTER r3 (adversary A3): the basis is the shared header predicate, source frames when unpaced OR conformed.
     ASSERT_TRUE(armBlock.contains(QStringLiteral(
-        "m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();")));
+        "m_contactSheetCaptureUnpaced = playback_frame_range::contactSheetInPassTargetsAreSourceFrames(\n"
+        "            m_automationPacingIsolated && mlvappPlaybackUnpacedRequested(), playbackConformActive(), m_playRequiredSourceFrames );")));
     ASSERT_TRUE(armBlock.contains(QStringLiteral("playback_frame_range::contactSheetInPassTargetSourceFrames(")));
     ASSERT_TRUE(armBlock.contains(QStringLiteral("m_playRequiredSourceFrames")));
 

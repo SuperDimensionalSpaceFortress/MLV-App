@@ -7333,13 +7333,17 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
             $conformPlaybackFps = $cn['playback_fps']
             $summarySession = ''
             if ($fields.ContainsKey('session')) { $summarySession = [string]$fields['session'] }
+            # MERGE-MASTER r4 (Grok G1): NaN / Infinity fail every ordered comparison, so the rate checks below reject them first, as
+            # Get-DvConformPaceProof does (IsNaN / IsInfinity: Windows PowerShell 5.1 has no IsFinite).
             if ($summarySession -eq '' -or [string]$cf['session'] -cne $summarySession) {
                 $conformWhy = "the playback_smoke.conform line is for session $($cf['session']), not the measured session $summarySession"
             } elseif ($cn['conform_active'] -ne 1) {
                 $conformWhy = "conform_active=$($cf['conform_active']); the run was not conformed"
-            } elseif (-not $nativeKnown -or $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)) {
+            } elseif (-not $nativeKnown -or [double]::IsNaN($native) -or [double]::IsInfinity($native) -or [double]::IsNaN($conformSourceFps) -or [double]::IsInfinity($conformSourceFps) -or
+                      $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)) {
                 $conformWhy = "conform source rate=$conformSourceFps does not match native_fps=$native"
-            } elseif (-not $paceKnown -or 0 -ge $pace -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
+            } elseif (-not $paceKnown -or [double]::IsNaN($pace) -or [double]::IsInfinity($pace) -or [double]::IsNaN($conformPlaybackFps) -or [double]::IsInfinity($conformPlaybackFps) -or
+                      0 -ge $pace -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps does not match pace_fps=$pace"
             } elseif ($conformPlaybackFps -gt ($conformSourceFps * 1.005)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps is above the source rate $conformSourceFps; conform never speeds a recording up"
@@ -7350,8 +7354,23 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
     }
     $judged = $SummaryLine
     if ($conformProven) { $judged = [regex]::Replace($SummaryLine, '(?<=(^|\s)pace_fps=)\S+', [string]$fields['native_fps']) }
+    # MERGE-MASTER r4 (Grok G1 / adversary A3): a NaN / Infinity summary native_fps or pace_fps fails every ordered comparison, so the oracle above
+    # (whose lines stay the baseline's bytes) would pass a NaN pace and throw on a NaN native floor. It is judged here as the 0 the oracle above
+    # already rejects as unknown, and the failure then names the logged value. A non-finite rate never proves a conform (the checks above).
+    $nonFiniteRates = @{}
+    foreach ($rateName in @('native_fps', 'pace_fps')) {
+        $rateValue = 0.0
+        if ($fields.ContainsKey($rateName) -and [double]::TryParse([string]$fields[$rateName], [Globalization.NumberStyles]::Float, $inv, [ref]$rateValue) -and
+            ([double]::IsNaN($rateValue) -or [double]::IsInfinity($rateValue))) {
+            $nonFiniteRates[$rateName] = [string]$fields[$rateName]
+            $judged = [regex]::Replace($judged, '(?<=(^|\s)' + $rateName + '=)\S+', '0')
+        }
+    }
     $base = Get-AttrCudaSourceFramesVerdict -SummaryLine $judged -ExpectedRunNonce $ExpectedRunNonce
     $failures = @($base.failures)
+    foreach ($rateName in @($nonFiniteRates.Keys)) {
+        $failures = @($failures | ForEach-Object { ([string]$_).Replace("$rateName=0;", "$rateName=$($nonFiniteRates[$rateName]);") })
+    }
     if ($conformPresent -and -not $conformProven) {
         $failures = @($failures | ForEach-Object { if ([string]$_ -like '*the engine paced at pace_fps=*') { "$_ (conform relaxation not applied: $conformWhy)" } else { $_ } })
     }

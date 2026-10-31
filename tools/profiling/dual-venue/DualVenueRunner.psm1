@@ -960,11 +960,62 @@ function Get-DvConformPaceProof {
     if ($absent.Count -gt 0) { $out.reason = "the playback_smoke.conform line is malformed (absent or unreadable: $($absent -join ' / '))"; return $out }
     if ($summarySession -eq '' -or $conformSession -cne $summarySession) { $out.reason = "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession"; return $out }
     if ($active -ne 1) { $out.reason = "conform_active=$active; the run was not conformed"; return $out }
-    if ($null -eq $native -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
-    if ($null -eq $pace -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
+    # MERGE-MASTER r3 (adversary A4): NaN / Infinity parse as doubles and fail every ordered comparison, so they are rejected first.
+    if ($null -eq $native -or -not [double]::IsFinite($native) -or -not [double]::IsFinite($clip) -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
+    if ($null -eq $pace -or -not [double]::IsFinite($pace) -or -not [double]::IsFinite($play) -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
     if ($play -gt ($clip * 1.005)) { $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"; return $out }
     $out.proven = $true
     $out.reason = ''
+    $out
+}
+
+function Get-DvConformArmVerdict {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-60FPS-FULLRES-1. Did the run honour the conform arm the leg REQUESTED (generatorArgs.playbackConform, passed to the app as
+    MLVAPP_PLAYBACK_CONFORM)? Judged from the receipt `playback` block's conform fields (re-derived from the run log by Get-DvPlaybackEvidence).
+      'off' (the native-HFR arm): the measured session's playback_smoke.conform line is present, conform_active=0, conform_env_override=0 and
+            playback_fps is within 0.5 % of clip_fps.
+      'on':  the measured session's conform line is present and conform_active=1.
+    A leg that requests nothing is never blocked (requested = $null). `blocks` is true when the arm was requested and not proven; `reason`
+    carries the requested and the observed values, for the receipt's outcomeDetail (CONFORM_ARM_NOT_HONOURED). Pure: the runner gates on it
+    and Test-DvReceiptValid re-derives it from the hashed run log and the committed spec.
+    #>
+    param($Spec, $Playback)
+    $requested = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackConform'
+    $out = [pscustomobject]@{ requested = $(if ($null -ne $requested) { [string]$requested } else { $null }); honoured = $true; blocks = $false; reason = $null }
+    if ($null -eq $requested) { return $out }
+    $present = ((Get-DvProp $Playback 'conformLinePresent') -eq $true)
+    $summarySession = [string](Get-DvProp $Playback 'summarySession')
+    $conformSession = [string](Get-DvProp $Playback 'conformSession')
+    $active = ConvertTo-DvInt64 (Get-DvProp $Playback 'conformActive')
+    $envOverride = ConvertTo-DvInt64 (Get-DvProp $Playback 'conformEnvOverride')
+    $clip = ConvertTo-DvDouble (Get-DvProp $Playback 'conformClipFps')
+    $play = ConvertTo-DvDouble (Get-DvProp $Playback 'conformPlaybackFps')
+    $observed = "conform_line_present=$([int]$present) session=$conformSession measured_session=$summarySession conform_active=$active conform_env_override=$envOverride clip_fps=$clip playback_fps=$play"
+    $why = $null
+    if (-not $present) { $why = 'no playback_smoke.conform line for the run' }
+    elseif ($summarySession -eq '' -or $conformSession -cne $summarySession) { $why = 'the conform line is not the measured session''s' }
+    elseif ([string]$requested -ceq 'off') {
+        if ($active -ne 0) { $why = 'conform was active' }
+        elseif ($envOverride -ne 0) { $why = 'the app did not report MLVAPP_PLAYBACK_CONFORM=0' }
+        elseif ($null -eq $clip -or $null -eq $play -or -not [double]::IsFinite($clip) -or -not [double]::IsFinite($play) -or $clip -le 0 -or [Math]::Abs($play - $clip) -gt (0.005 * $clip)) { $why = 'playback_fps is not within 0.5 % of clip_fps' }
+    }
+    elseif ([string]$requested -ceq 'on') {
+        # MERGE-MASTER r4 (ADV-A1): conform_active=1 alone is not proof. A requested conform arm needs the conformed pace PROVEN (finite, positive,
+        # same-session rates; Get-DvConformPaceProof), or it fails closed; it never falls through to the native pace rule.
+        if ($active -ne 1) { $why = 'conform was not active' }
+        else {
+            $proof = Get-DvConformPaceProof -Playback $Playback
+            if (-not $proof.proven) { $why = "the conformed pace is not proven: $($proof.reason)" }
+        }
+    }
+    else { $why = "the requested arm '$requested' is not on/off" }
+    if ($null -ne $why) {
+        $out.honoured = $false
+        $out.blocks = $true
+        $out.reason = "requested playbackConform=$requested; observed $observed ($why)"
+    }
     $out
 }
 
@@ -978,8 +1029,10 @@ function Get-DvPlaybackProblems {
     paced at the native fps (or, only on a PROVEN conform line, the conform playback fps; Get-DvConformPaceProof) with no fps override,
     no wrap, and the nonce the app echoed on its summary line IS the nonce the
     launcher generated for this run (both the real launcher's 32-hex format).
+    -RequestedConform is the leg's generatorArgs.playbackConform: 'on' means the native pace rule is NEVER a fallback (MERGE-MASTER r4, ADV-A1);
+    an unproven conform is CONFORM_PACE_NOT_PROVEN. A non-finite native_fps / pace_fps is unknown, never a pass (NaN fails every comparison).
     #>
-    param($Playback, [string]$ExpectedClipId)
+    param($Playback, [string]$ExpectedClipId, [AllowNull()][AllowEmptyString()][string]$RequestedConform = '')
     $reasons = [System.Collections.Generic.List[string]]::new()
     if ($null -eq $Playback) { $reasons.Add('RECEIPT_FIELD_ABSENT: the receipt carries no source-frame verdict (playback)'); return $reasons.ToArray() }
     $advanced = ConvertTo-DvInt64 (Get-DvProp $Playback 'sourceAdvanced')
@@ -998,13 +1051,13 @@ function Get-DvPlaybackProblems {
         if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under $floorSeconds s of real footage is never evidence") }
     }
     if ($null -eq $native) { $reasons.Add('RECEIPT_FIELD_ABSENT: native_fps') }
-    elseif ($native -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: native_fps=$native; the native frame rate is unknown, so 20 s of footage cannot be measured") }
+    elseif (-not [double]::IsFinite($native) -or $native -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: native_fps=$native; the native frame rate is unknown, so 20 s of footage cannot be measured") }
     elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($floorSeconds * $native - 0.02)) {
         $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil($floorSeconds s x native_fps=$native); the Play was admitted for less than $floorSeconds s of footage")
     }
     if ($null -eq $pace) { $reasons.Add('RECEIPT_FIELD_ABSENT: pace_fps') }
-    elseif ($pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
-    elseif ($null -ne $native -and $native -gt 0) {
+    elseif (-not [double]::IsFinite($pace) -or $pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
+    elseif ($null -ne $native -and [double]::IsFinite($native) -and $native -gt 0) {
         # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: only a PROVEN conform (Get-DvConformPaceProof) moves the pace comparison off the native fps.
         $conformProof = Get-DvConformPaceProof -Playback $Playback
         if ($conformProof.proven) {
@@ -1012,6 +1065,9 @@ function Get-DvPlaybackProblems {
             if ([Math]::Abs($pace - $conformPlayback) -gt (0.005 * $conformPlayback)) {
                 $reasons.Add("INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the conformed playback_fps is $conformPlayback; 20 s of wall clock is not 20 s of footage")
             }
+        } elseif ($RequestedConform -ceq 'on') {
+            # MERGE-MASTER r4 (ADV-A1): the leg ASKED for conform, so the native rule is no fallback; an unproven conform fails closed.
+            $reasons.Add("CONFORM_PACE_NOT_PROVEN: the leg requested playbackConform=on but the run did not prove a conformed pace ($($conformProof.reason)); the native pace rule is never a fallback for a requested conform arm")
         } elseif ([Math]::Abs($pace - $native) -gt (0.005 * $native)) {
             $why = ''
             if ($conformProof.present) { $why = " (conform relaxation not applied: $($conformProof.reason))" }
@@ -1060,9 +1116,10 @@ function Get-DvPlaybackEvidence {
     fps_override, wrapped, wrap_count and the nonce it echoed). The job's own summary.json / manifest supply the clip id, the
     rehearsal flag and a cross-check. Present on every job terminal that published the run log, so a product failure after a
     sound 20 s run (GPU_RECON_FRAMES_ZERO, CPU_FALLBACK_DETECTED, ...) can be a FAIL while a run with no log stays INVALID.
+    -RequestedConform: the leg spec's generatorArgs.playbackConform (Get-DvPlaybackProblems; 'on' never falls back to the native pace rule).
     #>
     param($Summary, $EvidenceManifest, $ResultJson, [AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()][AllowEmptyString()][string]$LogSha256,
-          [Parameter(Mandatory)][string]$ExpectedClipId)
+          [Parameter(Mandatory)][string]$ExpectedClipId, [AllowNull()][AllowEmptyString()][string]$RequestedConform = '')
     $sf = Get-DvProp $Summary 'sourceFrames'
     $manifestLog = Get-DvProp $EvidenceManifest 'smokeRunLog'
     $evidence = Get-DvProp $ResultJson 'evidence'
@@ -1089,6 +1146,7 @@ function Get-DvPlaybackEvidence {
         summarySession = $(if ($null -ne $parsed.session) { [string]$parsed.session } else { $null })
         conformSession = $(if ($conformFields.ContainsKey('session')) { [string]$conformFields['session'] } else { $null })
         conformActive = (ConvertTo-DvInt64 $conformFields['conform_active'])
+        conformEnvOverride = (ConvertTo-DvInt64 $conformFields['conform_env_override'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -1109,7 +1167,7 @@ function Get-DvPlaybackEvidence {
     }
     # Which rule judged the pace, for a key to see (re-derived by Get-DvPlaybackProblems from the same recorded fields, never trusted).
     if ((Get-DvConformPaceProof -Playback $pb).proven) { $pb['paceRule'] = 'conform' }
-    $problems = @(Get-DvPlaybackProblems -Playback $pb -ExpectedClipId $ExpectedClipId)
+    $problems = @(Get-DvPlaybackProblems -Playback $pb -ExpectedClipId $ExpectedClipId -RequestedConform $RequestedConform)
     $pb['valid'] = ($problems.Count -eq 0)
     $pb['invalidReasons'] = $problems
     $pb
@@ -2539,7 +2597,8 @@ function Test-DvReceiptValid {
     foreach ($m in $ev.incomplete) { $incomplete.Add($m) }
     foreach ($m in $ev.invalid) { $invalid.Add($m) }
     if ($ev.complete) {
-        $derived = Get-DvPlaybackEvidence -Summary $ev.summary -EvidenceManifest $ev.manifest -ResultJson $ev.result -LogText $ev.logText -LogSha256 $ev.logSha -ExpectedClipId $clipId
+        $derived = Get-DvPlaybackEvidence -Summary $ev.summary -EvidenceManifest $ev.manifest -ResultJson $ev.result -LogText $ev.logText -LogSha256 $ev.logSha -ExpectedClipId $clipId `
+            -RequestedConform ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'playbackConform'))
         $stored = Get-DvProp $Receipt 'playback'
         if ($null -eq $stored) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no playback block (the source-frame verdict)') }
         else {
@@ -2663,6 +2722,12 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedPrepConflatedMove) { $invalid.Add('PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: the receipt carries a prepConflatedMove block but its committed leg spec names no prepConflatedMove') }
+        }
+
+        # ---- the CONFORM ARM the run played under: re-derived from the HASHED run log and the COMMITTED spec (HFR-NATIVE-60FPS-FULLRES-1) ----
+        if ($production -and $null -ne $spec -and $null -ne $derived) {
+            $conformArm = Get-DvConformArmVerdict -Spec $spec -Playback $derived
+            if ($conformArm.blocks) { $invalid.Add("CONFORM_ARM_NOT_HONOURED: $($conformArm.reason); a leg that did not play under the conform arm it names is not a valid measurement") }
         }
 
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
@@ -3232,7 +3297,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

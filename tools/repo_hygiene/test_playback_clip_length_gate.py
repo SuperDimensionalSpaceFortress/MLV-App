@@ -22,6 +22,7 @@ enforcement card was never built), so every new lane re-broke it. This file is t
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -355,6 +356,45 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(gate(thirty, "")["verdict"], "PLAY_WINDOW_TOO_SHORT")     # window 0 is a window under the floor
         self.assertEqual(gate(thirty, "-ClipOnly")["verdict"], "OK")
         self.assertEqual(gate(self.clip("sixteen", FRAMES_SHORT_FIXTURE), "-ClipOnly")["verdict"], "CLIP_TOO_SHORT")
+
+    def test_a_conformed_high_frame_rate_clip_is_gated_in_source_seconds_at_its_native_fps(self) -> None:
+        """HUB RULING 2026-10-30T22:17:51Z (HFR-10S-1's unit, docs/playback-clip-length-rule.md): a play window is SOURCE seconds at the clip's NATIVE
+        fps, conformed or not -- a 24 fps conform changes the pace, never the footage the window must cover. 969 frames at 59.94 fps (M16-1456's
+        shape) are 16.17 s, so a 25 s window is refused pre-launch; 1667 frames (M16-1457's) are 27.8 s and pass it."""
+        hfr = {"fps_nom": 59940, "fps_denom": 1000}
+        short, long_ = self.clip("hfr969", 969, **hfr), self.clip("hfr1667", 1667, **hfr)
+        refused = _gate(short, 25)
+        self.assertEqual(refused["verdict"], "CLIP_TOO_SHORT", refused)
+        self.assertAlmostEqual(refused["clipSeconds"], 969 / 59.94, places=2)
+        self.assertAlmostEqual(refused["fps"], 59.94, places=3)
+        self.assertEqual(_gate(short, 16)["verdict"], "OK")                          # 16 s of the 16.17 s
+        self.assertEqual(_gate(short, 17)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(long_, 25)["verdict"], "OK")
+        self.assertEqual(_gate(long_, 25, start_frame=168)["verdict"], "OK")         # (1667 - 168) / 59.94 = 25.008 s remain
+        self.assertEqual(_gate(long_, 25, start_frame=169)["verdict"], "CLIP_TOO_SHORT")   # 24.99 s remain
+        # the HFR floor is 10 s of SOURCE: 599 frames = 9.99 s, 600 frames = 10.01 s
+        self.assertEqual(_gate(self.clip("hfr599", 599, **hfr), 10)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(self.clip("hfr600", 600, **hfr), 10)["verdict"], "OK")
+
+    def test_the_length_gate_takes_no_conform_input(self) -> None:
+        """Source seconds do not depend on the playback rate, so conform never reaches the pre-launch gate: Test-GuiSmokeClipLength has no
+        -ConformEnvOverride, there is no playback-rate mirror, and the runner passes none (adversary A3's MLVAPP_PLAYBACK_CONFORM parse went with it)."""
+        proc = _pwsh(f". {_q(GATE)}; (Get-Command Test-GuiSmokeClipLength).Parameters.ContainsKey('ConformEnvOverride'); "
+                     "[bool](Get-Command Get-GuiSmokePlaybackFps -ErrorAction SilentlyContinue); "
+                     "[bool](Get-Command Get-GuiSmokeConformEnvOverride -ErrorAction SilentlyContinue)")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["False", "False", "False"])
+        runner = (ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("ConformEnvOverride", runner)
+
+    def test_a_presented_frames_target_on_a_high_frame_rate_clip_counts_source_frames_at_its_native_fps(self) -> None:
+        clip = self.clip("hfr1667", 1667, fps_nom=59940, fps_denom=1000)
+        def gate(frames: int) -> dict:
+            proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeClipLength -Path {_q(clip)} -WindowSeconds 25 -TargetPresentedFrames {frames} | ConvertTo-Json -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        self.assertEqual(gate(599)["verdict"], "PLAY_WINDOW_TOO_SHORT")   # 599 / 59.94 = 9.99 s of source
+        self.assertEqual(gate(600)["verdict"], "OK")                      # the HFR floor: ceil(10 x 59.94) = 600
 
     def test_a_presented_frames_target_is_a_play_window_and_must_reach_the_floor(self) -> None:
         def gate(frames: int) -> dict:
@@ -1193,6 +1233,19 @@ CONFORM_CASES = [
      dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="30.000"),
      _conform_line(clip_fps="23.976", playback_fps="30.000"), True, [PACE_TEXT, "never speeds"], [], "native"),
     ("h4: an fps override is still INVALID under a proven conform", dict(HFR_RUN, fps_override=1), _conform_line(), True, ["override"], [PACE_TEXT], "conform"),
+    # MERGE-MASTER r4 (Grok G1 / adversary A3): NaN and Infinity parse as doubles and fail every ordered comparison, so before r4 the gui-smoke
+    # and AttrCuda oracles PROVED a conform line carrying them (and accepted a NaN summary pace); every oracle now rejects them first.
+    ("i1: conform playback_fps=NaN -> INVALID", HFR_RUN, _conform_line(playback_fps="NaN"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i2: conform playback_fps=Infinity -> INVALID", HFR_RUN, _conform_line(playback_fps="Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i3: conform playback_fps=-Infinity -> INVALID", HFR_RUN, _conform_line(playback_fps="-Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i4: conform clip_fps=NaN -> INVALID", HFR_RUN, _conform_line(clip_fps="NaN"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i5: conform clip_fps=Infinity -> INVALID", HFR_RUN, _conform_line(clip_fps="Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i6: summary pace_fps=NaN under a sound conform line -> INVALID", dict(HFR_RUN, pace_fps="NaN"), _conform_line(), True,
+     ["pace_fps=NaN", "present engine pace that is not positive"], [], "native"),
+    ("i7: summary pace_fps=NaN with no conform line -> INVALID", dict(HFR_RUN, pace_fps="NaN"), None, True, ["pace_fps=NaN", "present engine pace that is not positive"], [], "native"),
+    ("i8: summary pace_fps=Infinity -> INVALID", dict(HFR_RUN, pace_fps="Infinity"), _conform_line(), True, ["present engine pace that is not positive"], [], "native"),
+    ("i9: summary native_fps=NaN -> INVALID", dict(HFR_RUN, native_fps="NaN"), _conform_line(), True, ["native_fps=NaN", "native frame rate is unknown"], [], "native"),
+    ("i10: summary native_fps=Infinity -> INVALID", dict(HFR_RUN, native_fps="Infinity"), _conform_line(), True, ["native frame rate is unknown"], [], "native"),
 ]
 
 
@@ -1207,17 +1260,21 @@ def _run_oracle_table(script_body: str, cases: list[dict]) -> list[dict]:
 
 
 def _dv_block(summary: dict, conform: str | None) -> dict:
-    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line)."""
+    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line).
+    A non-finite rate stays its log text ('NaN', 'Infinity'): JSON has no NaN, and ConvertTo-DvDouble parses the text to the same double."""
+    def rate(v: object) -> float | str:
+        x = float(v)  # type: ignore[arg-type]
+        return x if math.isfinite(x) else str(v)
     block = dict(sourceAdvanced=int(summary["source_advanced"]), requiredSourceFrames=int(summary["required_source_frames"]),
-                 nativeFps=float(summary["native_fps"]), paceFps=float(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
+                 nativeFps=rate(summary["native_fps"]), paceFps=rate(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
                  wrapped=False, wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE,
                  logShaBound=True, settingsIsolated=True, jobFailures=[], fixtureRehearsal=False, clipId="CLIP",
                  summarySession=str(summary["session"]), conformLinePresent=conform is not None)
     if conform is not None:
         f = dict(re.findall(r"(\w+)=(\S+)", conform))
         block.update(conformSession=f.get("session"), conformActive=int(f["conform_active"]) if "conform_active" in f else None,
-                     conformClipFps=float(f["clip_fps"]) if "clip_fps" in f else None,
-                     conformPlaybackFps=float(f["playback_fps"]) if "playback_fps" in f else None)
+                     conformClipFps=rate(f["clip_fps"]) if "clip_fps" in f else None,
+                     conformPlaybackFps=rate(f["playback_fps"]) if "playback_fps" in f else None)
     return block
 
 

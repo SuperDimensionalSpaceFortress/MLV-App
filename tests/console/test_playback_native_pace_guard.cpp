@@ -840,7 +840,8 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_TRUE(handling.indexOf(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")) < wrapGate);
     // drop-frame mode advances by the GRANTED share, never the raw fps x timeDiff
     ASSERT_TRUE(handling.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+    ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getPlaybackFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_TRUE(handling.contains(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")));
     ASSERT_TRUE(handling.contains(QStringLiteral("m_playbackPaceGuard.reset();"))); // paused: re-arm at next Play
@@ -848,7 +849,7 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     const QString timer = bodyBetween(source, QStringLiteral("void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )"),
                                       QStringLiteral("void MainWindow::timerEvent(QTimerEvent *t)"));
     ASSERT_FALSE(timer.isEmpty());
-    ASSERT_TRUE(timer.contains(QStringLiteral("playback_native_pace::shapedTickTimeDiffMs( timeDiff, getFramerate(), predictivePlaybackAdvance,")));
+    ASSERT_TRUE(timer.contains(QStringLiteral("playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,")));
     ASSERT_FALSE(timer.contains(QStringLiteral("timeDiff = targetFrameMsCeil;"))); // the shaping lives in one place
 
     const QString toggled = bodyBetween(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"),
@@ -935,12 +936,12 @@ TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
         "static const bool requested = environmentFlagEnabled( \"MLVAPP_PLAYBACK_UNPACED\" );")));
     // the interactive app never honours it: the gate needs the automation pacing isolation
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );")));
+        "return playback_native_pace::guardPaceFps( getPlaybackFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );")));
     // the helper is only the guard's pace argument: the loop wrap, every-frame, drop-frame grant and present note
     ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;")));
     ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;")));
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_EQ(1, source.count(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );")));
     ASSERT_EQ(4, source.count(QStringLiteral("playbackPaceGuardFps()")));   // the four calls, and no other caller
     ASSERT_EQ(1, source.count(QStringLiteral("double MainWindow::playbackPaceGuardFps( void )")));

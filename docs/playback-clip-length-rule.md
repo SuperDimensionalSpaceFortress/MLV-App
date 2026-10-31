@@ -149,6 +149,17 @@ FRAME:
   `native_fps`, `pace_fps`, `fps_override`; the receipt oracle turns anything short of the requirement into
   `INVALID_SOURCE_FRAMES`, never a pass.
 
+### High-frame-rate conform (PLAYBACK-HFR-CONFORM-DEFAULT-1): conform changes the pace, never the window
+
+HUB RULING 2026-10-30T22:17:51Z (#420): a clip above 30 fps plays at the 24 fps conform target by default, and its play window is
+still SOURCE seconds at the native fps (the 2026-10-15 amendment above). `checkPlayableWindow`, the GUI-smoke clip guard, the
+`--presented-frames` check and `Test-GuiSmokeClipLength` all measure with the clip's native fps; only the engine pace
+(`getPlaybackFramerate()`) is the conform rate. The receipt oracles already count in this unit. A conformed Play therefore takes longer
+on the clock, inside the same budget `requested / 0.5 + 15 s`. A 25 s window on M16-1457 (1667 frames at 59.94) needs 1499 source
+frames: 62.4 s at 24 fps, inside 65 s. M16-1456 (16.2 s) cannot hold a 25 s window. Under a 24 fps conform, a native rate above
+62.4 fps (for a 25 s window), 66 fps (20 s) or 84 fps (10 s) cannot reach the window inside the budget. Such a Play is refused
+`PLAY_PACE_TOO_SLOW` before it starts (fail closed). No venue clip today is above 59.94 fps.
+
 ### Typed refusals and exit codes
 
 | Token | Where | Exit |

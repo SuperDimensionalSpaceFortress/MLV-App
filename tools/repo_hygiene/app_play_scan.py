@@ -163,7 +163,7 @@ PINNED_STOP_STATEMENTS = {
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
         "playback_frame_range::minPlayWindowSeconds( fps ), !f3CutRangeRepairDisabledByEnvironment(), "
         "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
-        "const double enginePaceFps = getFramerate();",
+        "const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;",
         "const double fps = playGateNativeFps();",
     ),
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the settle / play-action requests and the smoke's clip-aware
