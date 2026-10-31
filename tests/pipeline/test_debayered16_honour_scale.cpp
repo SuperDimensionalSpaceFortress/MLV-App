@@ -1433,10 +1433,12 @@ TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerSt
         // Then a scaled frame on the same thread, on the playback debayer.
         setMlvDontAlwaysUseAmaze(fixture.video());
         resetMlvCachedFrame(fixture.video());
+        const int scale = route == 0 ? 2 : 4;
+        const size_t scaledWords = static_cast<size_t>(fixture.width() / scale) * static_cast<size_t>(fixture.height() / scale) * 3u;
         if (route == 0)
-            ASSERT_TRUE(!fixture.renderFrame16Scaled(2, kCpuCores, 2).empty());
+            ASSERT_EQ(scaledWords, fixture.renderFrame16Scaled(2, kCpuCores, scale).size());
         else
-            ASSERT_TRUE(!fixture.renderFrame8Scaled(3, kCpuCores, 4).empty());
+            ASSERT_EQ(scaledWords, fixture.renderFrame8Scaled(3, kCpuCores, scale).size());
         const double sWbPrepare = getMlvLastDebayerWbPrepareMilliseconds();
         const double sCa = getMlvLastDebayerCaMilliseconds();
         const double sKernel = getMlvLastDebayerKernelMilliseconds();
