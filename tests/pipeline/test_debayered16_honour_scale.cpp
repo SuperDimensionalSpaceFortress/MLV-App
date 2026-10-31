@@ -1396,6 +1396,62 @@ TEST(Debayered16ReconReuse, HonourScaleReducedEntryRecordsItsDebayerKernelTime)
     }
 }
 
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 (Grok G1): the four debayer stage times are this
+// thread's last-run records. The full-resolution entries reset them; the scaled frame entries
+// (getMlvProcessedFrame16Scaled, getMlvProcessedFrame8Scaled, ...) did not, so a mid- or
+// quarter-scale frame rendered after a full-resolution AMaZE+CA frame on the same thread
+// reported that frame's wb-prepare, CA and wb-undo times (and, on a downsample route, its
+// kernel time) as its own. Each scaled frame must report only stages it ran: the three
+// non-kernel stages are 0 (no scaled route runs them) and the kernel time is not the full frame's.
+TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerStageTimes)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    WorkerState worker;
+    const char * const routes[] = { "processed16 x2", "processed8 x4" };
+    for (int route = 0; route < 2; ++route)
+    {
+        // A full-resolution AMaZE frame with CA on: the route that measures all four stages.
+        setMlvAlwaysUseAmaze(fixture.video());
+        fixture.video()->ca_red = 1.0f;
+        double wbPrepare = 0.0, ca = 0.0, kernel = 0.0, wbUndo = 0.0;
+        for (uint64_t frame = 0; frame < 8 && (wbPrepare + ca + wbUndo <= 0.0 || kernel <= 0.0); ++frame)
+        {
+            std::vector<uint16_t> rgb16;
+            ASSERT_TRUE(controlDebayered16(fixture, frame, worker, &rgb16));
+            wbPrepare = getMlvLastDebayerWbPrepareMilliseconds();
+            ca = getMlvLastDebayerCaMilliseconds();
+            kernel = getMlvLastDebayerKernelMilliseconds();
+            wbUndo = getMlvLastDebayerWbUndoMilliseconds();
+        }
+        std::printf("[debayered16-honour-scale] full-res AMaZE+CA: wb_prepare=%.4f ca=%.4f kernel=%.4f wb_undo=%.4f\n",
+                    wbPrepare, ca, kernel, wbUndo);
+        ASSERT_TRUE(wbPrepare + ca + wbUndo > 0.0);
+        ASSERT_TRUE(kernel > 0.0);
+
+        // Then a scaled frame on the same thread, on the playback debayer.
+        setMlvDontAlwaysUseAmaze(fixture.video());
+        resetMlvCachedFrame(fixture.video());
+        if (route == 0)
+            ASSERT_TRUE(!fixture.renderFrame16Scaled(2, kCpuCores, 2).empty());
+        else
+            ASSERT_TRUE(!fixture.renderFrame8Scaled(3, kCpuCores, 4).empty());
+        const double sWbPrepare = getMlvLastDebayerWbPrepareMilliseconds();
+        const double sCa = getMlvLastDebayerCaMilliseconds();
+        const double sKernel = getMlvLastDebayerKernelMilliseconds();
+        const double sWbUndo = getMlvLastDebayerWbUndoMilliseconds();
+        std::printf("[debayered16-honour-scale] %s after full-res: wb_prepare=%.4f ca=%.4f kernel=%.4f wb_undo=%.4f "
+                    "phase4b_path=%d\n",
+                    routes[route], sWbPrepare, sCa, sKernel, sWbUndo, mlv_phase4bv2_last_path_taken());
+        ASSERT_TRUE(sWbPrepare == 0.0);
+        ASSERT_TRUE(sCa == 0.0);
+        ASSERT_TRUE(sWbUndo == 0.0);
+        ASSERT_TRUE(sKernel != kernel);
+        fixture.video()->ca_red = 0.0f;
+    }
+}
+
 // The prep's reduced-source config: only a SourceAlreadyReduced decision at x2/x4 whose
 // source is exactly the clip divided by that scale; otherwise nothing is built.
 TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyReducedSource)
