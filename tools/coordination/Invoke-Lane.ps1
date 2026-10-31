@@ -1018,6 +1018,28 @@ if ($ImagePathsGiven.Count -gt 0) {
 # overlapped FileStream and every read carries a CancellationToken that fires at the deadline, so a read that never returns is cut at
 # the lane budget instead of holding the lane (pass-2b A2). The deadline is raised as a TimeoutException, the type the lane books as
 # timedOut=true / exit 124 (launch-budget-exhausted uses the same one; pass-2b A3).
+# r3 scope statement: only the source READ is cancellable. The source open, the destination open/write and the flush are synchronous, so
+# this is NOT a universal hard-I/O deadline.
+# r3 G2: every other I/O failure is typed with the `image-path-` prefix the validation refusals use, so a failed receipt greps the same:
+#   image-path-missing: source vanished before snapshot (<source>)    the source was deleted between validation and launch
+#   image-path-unreadable: <reason> (<source>)                        the source is locked / unreadable / a read failed
+#   image-path-snapshot-exists: ... (<dest>)                          the destination already existed (left untouched, never deleted)
+#   image-path-snapshot-failed: <reason> (<dest>)                     destination write / flush / close failed
+function Get-ImageIoException {
+    param([System.Management.Automation.ErrorRecord]$Err, [string]$Source, [string]$Dest, [string]$Side)
+    $base = $Err.Exception.GetBaseException()
+    if ($base -is [System.TimeoutException]) { return $base }
+    if ($Side -eq 'dest') {
+        if ($base -is [System.IO.IOException] -and [System.IO.File]::Exists($Dest) -and (($base.HResult -band 0xFFFF) -eq 80 -or ($base.HResult -band 0xFFFF) -eq 183)) {   # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS, locale-independent
+            return [System.IO.IOException]::new("image-path-snapshot-exists: the image snapshot destination already exists and was left untouched ($Dest): $($base.Message)")
+        }
+        return [System.IO.IOException]::new("image-path-snapshot-failed: $($base.Message) ($Dest)")
+    }
+    if ($base -is [System.IO.FileNotFoundException] -or $base -is [System.IO.DirectoryNotFoundException]) {
+        return [System.IO.IOException]::new("image-path-missing: source vanished before snapshot ($Source)")
+    }
+    return [System.IO.IOException]::new("image-path-unreadable: $($base.Message) ($Source)")
+}
 function Copy-ImageSnapshot {
     param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
     if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -1026,8 +1048,13 @@ function Copy-ImageSnapshot {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     $in = $null; $out = $null; $total = [long]0; $ok = $false; $created = $false
     try {
-        $in  = [System.IO.FileStream]::new($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
-        $out = [System.IO.File]::Open($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            $in = [System.IO.FileStream]::new($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source') }
+        try {
+            $out = [System.IO.File]::Open($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # $created turns true only AFTER CreateNew succeeded: a destination that already existed is never this call's to delete (Grok G3).
         $created = $true
         $buf = New-Object byte[] 262144
         while ($true) {
@@ -1041,20 +1068,23 @@ function Copy-ImageSnapshot {
                 if ($cts.IsCancellationRequested -or $Clock.Elapsed.TotalMilliseconds -ge $LimitMs -or $_.Exception.GetBaseException() -is [System.OperationCanceledException]) {
                     throw [System.TimeoutException]::new("image-copy-timeout: a read of the image snapshot source did not return inside the lane's -TimeoutSec budget: $Source")
                 }
-                throw
+                throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source')
             } finally { $cts.Dispose() }
             if ($n -le 0) { break }
-            $out.Write($buf, 0, $n)
+            try { $out.Write($buf, 0, $n) } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
             [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
             $total += $n
             # copy-loop-tick
         }
         [void]$sha.TransformFinalBlock($buf, 0, 0)
-        $out.Flush()
+        # Flush AND close are part of the copy: a quota failure at close must fail the copy (typed), not escape from the finally below.
+        try { $out.Flush(); $out.Dispose() } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
         $ok = $true
     } finally {
-        if ($null -ne $out) { $out.Dispose() }
-        if ($null -ne $in) { $in.Dispose() }
+        # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
+        # handle or the partial-file delete (pass-4 A3).
+        if ($null -ne $out) { try { $out.Dispose() } catch { } }
+        if ($null -ne $in) { try { $in.Dispose() } catch { } }
         if (-not $ok -and $created -and [System.IO.File]::Exists($Dest)) { try { [System.IO.File]::Delete($Dest) } catch { } }
     }
     return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant()); bytes = $total }
@@ -1728,6 +1758,7 @@ if ($cfg.engine -eq 'claude') {
         $attachment.sha256 = $snapshotInfo.sha256
         $attachment.bytes  = $snapshotInfo.bytes
     }
+    # post-snapshot-pre-launch-tick: from here codex reads ONLY the snapshot paths in $attachment.path; the source is never consulted again.
     $imageArgs = @()
     foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }
     $argv = @('exec') + $imageArgs + @(
