@@ -1124,6 +1124,11 @@ int get_mlv_raw_frame_debayered_from_processed_raw_u16( mlvObject_t * video,
     int height = getMlvHeight(video);
     const size_t frame_pixels = (size_t)width * (size_t)height;
 
+    /* CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 (Grok G1): this frame's debayer sets only the
+     * stages it runs, so clear all four first; a stage it skips (bilinear, CA off) reads 0, never
+     * the previous frame's time. */
+    resetMlvLastDebayerStageMilliseconds();
+
     if( debayer_type == 0 )
     {
         uint16_t * raw_frame_u16 = (uint16_t *)temp_memory;

@@ -4348,6 +4348,9 @@ int get_mlv_raw_frame_debayered_isolated_analysis_scaled(mlvObject_t * video,
         return 0;
     }
 
+    /* r2 (Grok G1): this route downsamples without a debayer; clear the four debayer stages. */
+    resetMlvLastDebayerStageMilliseconds();
+
     const int full_w = (int)getMlvWidth(video);
     const int full_h = (int)getMlvHeight(video);
     const int normalized_scale = mlv_effective_playback_scale_factor(video, scaleFactor);
@@ -7572,6 +7575,8 @@ static void getMlvProcessedFrame16_with_scale(mlvObject_t * video,
     mlv_reset_last_raw_stage_telemetry();
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    /* r2 (Grok G1): the scaled routes below set only the kernel time; clear all four stages. */
+    resetMlvLastDebayerStageMilliseconds();
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_cache_store_ms = 0.0;
@@ -7970,6 +7975,7 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
     mlv_reset_last_raw_stage_telemetry();
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8370,6 +8376,7 @@ int getMlvProcessedFrame8ScaledFromRaw16(mlvObject_t * video,
     g_mlv_last_raw_uint16_ms = 0.0;
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8476,6 +8483,7 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_raw_uint16_ms = 0.0;
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8940,6 +8948,7 @@ int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
     g_mlv_last_raw_uint16_ms = 0.0;
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
