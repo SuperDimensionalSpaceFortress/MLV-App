@@ -273,13 +273,8 @@ if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" 
 # (the leg is a child of this process, but a relative root must not depend on the child's directory).
 if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $ReceiptRoot = '' }
 else {
-    # adversary f1c42e80 A1: a relative root is resolved against the POWERSHELL location (as -RunDir is, by Resolve-Path), not the process directory [IO.Path]::GetFullPath uses: the two differ once a caller has done Set-Location
-    $ReceiptRoot = $(try {
-            $rrProvider = $null; $rrDrive = $null
-            $rrFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ReceiptRoot, [ref]$rrProvider, [ref]$rrDrive)
-            if ($rrProvider.Name -cne 'FileSystem') { throw "it names the $($rrProvider.Name) provider, not the file system" }
-            [IO.Path]::GetFullPath($rrFull)
-        } catch { Stop-Usage "RECEIPT_ROOT_INVALID -ReceiptRoot is not a usable path: $($_.Exception.Message -replace '\s+', ' ')" })
+    # r5 ADV-A1: the RAW value goes to the one helper. It judges the raw spelling first (either slash, device forms) and resolves a relative value ONCE, against the POWERSHELL location
+    # (adversary f1c42e80 A1) on the FileSystem provider only; a normalisation of our own here would rewrite `//?/C:/x` or `\/host\share` into a spelling the helper accepts.
     # r4 A2-A4: the helper RETURNS the normalised full path it certified (a device path is refused, a link onto a share is followed) and THAT is what every leg is handed
     $rrCert = Test-DvLocalReceiptRoot -Path $ReceiptRoot
     if (-not $rrCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run' }

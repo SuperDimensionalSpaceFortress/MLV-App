@@ -6884,6 +6884,95 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                     offenders.append(f"{p.name}:{n}: inline marker guard: {code[:120]}")
         self.assertEqual(offenders, [])
 
+    def test_adversary_r5_a1_a_raw_unc_or_device_spelling_of_either_slash_is_refused_before_any_normalisation(self) -> None:
+        # ADV-A1: the provider turned `\/bachelor\...` into a ONE-separator path and GetFullPath rooted it on the current drive (C:\bachelor\...), so the raw refusal never saw it.
+        # The refusal is on the RAW text: two leading separators of EITHER slash is a UNC; the only device spelling kept is `\\?\C:\...` written with backslashes.
+        bad = {
+            "mixed-bs-fs": "\\/bachelor\\mlv-agent\\.claude-state\\r", "mixed-fs-bs": "/\\bachelor\\mlv-agent\\.claude-state\\r", "forward-unc": "//bachelor/mlv-agent/.claude-state/r",
+            "half-forward-unc": "\\\\bachelor/mlv-agent/.claude-state/r", "mixed-device-q": "\\/?\\C:\\x\\.claude-state\\r", "mixed-device-dot": "/\\.\\C:\\x\\.claude-state\\r",
+            "forward-device-q": "//?/C:/x/.claude-state/receipts", "forward-device-dot": "//./C:/x/.claude-state/receipts", "half-forward-device": "\\\\?/C:/x/.claude-state/r",
+            "nt-prefix": "\\??\\C:\\x\\.claude-state\\r", "nt-prefix-fwd": "/??/C:/x/.claude-state/r", "extended-unc-fwd": "//?/UNC/bachelor/mlv-agent/.claude-state/r",
+            "admin-share": "\\\\localhost\\c$\\x\\.claude-state\\r",
+        }
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "extended-c-drive-still-local": "\\\\?\\C:\\x\\.claude-state\\receipts"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {bad[name]!r} was certified as {got[name]!r}")
+        self.assertEqual(got["extended-c-drive-still-local"].lower(), "c:\\x\\.claude-state\\receipts")
+        # the batch entry hands the RAW value to the helper (no normalisation of its own first): the forward-slash device spelling is refused there too
+        for name in ("forward-device-q", "mixed-bs-fs", "forward-unc"):
+            with self.subTest(entry="batch", name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", bad[name])
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_", r.stderr)
+        for name in ("forward-device-q", "mixed-bs-fs", "nt-prefix"):
+            with self.subTest(entry="leg", name=name):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", bad[name]))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+        batch_text = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("GetUnresolvedProviderPathFromPSPath", batch_text, "the batch guard must not normalise -ReceiptRoot before the one helper judges the raw spelling")
+        # a provider-qualified or drive-relative spelling stays refused (the helper resolves a relative value through the file system only)
+        base = self.clean_base()
+        odd = {"registry": "HKLM:\\Software\\.claude-state\\r", "env-drive": "Env:\\x\\.claude-state\\r", "drive-relative": "C:rel\\.claude-state\\r",
+               "provider-qualified": "Microsoft.PowerShell.Core\\FileSystem::" + str(base / ".claude-state" / "r")}
+        got = self.judge(["C:\\fake\\agent-share"], odd, location=base, process_dir=base)
+        for name in odd:
+            self.assertIsNone(got[name], f"{name}: {odd[name]!r} was certified as {got[name]!r}")
+
+    def test_adversary_r5_a2_a_path_equal_to_or_under_a_share_is_refused_across_links_and_extended_spellings(self) -> None:
+        # ADV-A2: the share keys got lexical normalisation only, while the candidate had its extended prefix removed and its links followed, so a share named through a link
+        # (C:\Users\All Users -> C:\ProgramData) or through `\\?\C:\x` never matched the candidate that sits under it.
+        base = self.clean_base()
+        real = base / "real-share-dir"
+        (real / "inner").mkdir(parents=True)
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(base / "share-link"), str(real)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        elsewhere = base / "elsewhere"
+        elsewhere.mkdir()
+        cand_real = str(real / ".claude-state" / "r")
+        cand_under = str(real / "inner" / "deeper" / ".claude-state" / "r")
+        cand_other = str(elsewhere / ".claude-state" / "r")
+        # the share is NAMED through the junction; the candidate is spelled with the junction's target
+        got = self.judge([str(base / "share-link")], {"equal-via-link-share": cand_real, "under-via-link-share": cand_under, "elsewhere": cand_other})
+        self.assertIsNone(got["equal-via-link-share"], got)
+        self.assertIsNone(got["under-via-link-share"], got)
+        self.assertTrue(self.same_path(got["elsewhere"], cand_other), got)
+        # the share is spelled with the extended prefix / forward slashes / device prefix; the candidate is plain
+        for label, share in (("extended-share", "\\\\?\\" + str(real)), ("forward-share", str(real).replace("\\", "/")), ("trailing-share", str(real) + "\\"), ("upper-share", str(real).upper())):
+            got = self.judge([share], {"cand": cand_real, "under": cand_under, "elsewhere": cand_other})
+            self.assertIsNone(got["cand"], f"{label}: {got}")
+            self.assertIsNone(got["under"], f"{label}: {got}")
+            self.assertTrue(self.same_path(got["elsewhere"], cand_other), f"{label}: {got}")
+        # the candidate itself goes through the junction onto the share (r4 A3, kept)
+        got = self.judge([str(real)], {"via-link": str(base / "share-link" / ".claude-state" / "r")})
+        self.assertIsNone(got["via-link"], got)
+
+    def test_adversary_r5_g5_the_helper_returns_the_resolved_path_it_judged(self) -> None:
+        # Grok G5: the helper judged the link-resolved path and returned the original spelling, so a writer followed the link on its own. The value checked is the value written.
+        base = self.clean_base()
+        target = base / "link-target-dir"
+        target.mkdir()
+        state = base / ".claude-state"
+        state.mkdir()
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / "to-target"), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        got = self.judge(["C:\\fake\\agent-share"], {"via-junction": str(state / "to-target" / "receipts"), "plain": str(state / "plain" / "receipts")})
+        self.assertEqual(os.path.normcase(got["via-junction"]), os.path.normcase(str(target / "receipts")), f"the certified path is the junction's TARGET, not the spelling that reached it: {got}")
+        self.assertEqual(os.path.normcase(got["plain"]), os.path.normcase(str(state / "plain" / "receipts")))
+
+    def test_adversary_r5_g6_the_real_leg_strip_dir_is_the_certified_spelling_before_any_branch_uses_it(self) -> None:
+        # Grok G6: `$stripDir = $stripCert` ran only inside the primary-strip branch, so the self-heal loop (which tests `$stripCert`, not the primary strip) could write to the UNCERTIFIED spelling.
+        text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        cert = text.index("$stripCert = $(if ($OfflineTestMode)")
+        assign = re.search(r"if \(\$stripCert\) \{ \$stripDir = \$stripCert \}", text[cert:])
+        self.assertIsNotNone(assign, "the certified strip dir must replace $stripDir as soon as it is certified")
+        primary = text.index("if ($receipt.visual.stripPath -and $stripCert)", cert)
+        self.assertLess(cert + assign.start(), primary, "the replacement must come BEFORE the primary-strip branch")
+        for m in re.finditer(r"Join-Path \$stripDir ", text):
+            self.assertGreater(m.start(), cert + assign.start(), "no strip copy path may be built from $stripDir before it is the certified spelling")
+
     def test_adversary_dot_a1_no_boundary_directory_name_is_compared_with_a_culture_aware_operator(self) -> None:
         # the class, not the instance: every PowerShell file under tools/ that tests a path component against .claude-state goes through [string]::Equals(..., Ordinal)
         offenders = []

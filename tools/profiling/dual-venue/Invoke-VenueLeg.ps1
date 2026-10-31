@@ -799,8 +799,9 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
     $stripDir = $(if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $SheetCopyDir } else { Join-Path (Split-Path -Parent $ReceiptRoot) 'sheets' })
     $stripCert = $(if ($OfflineTestMode) { $stripDir } else { Test-DvLocalReceiptRoot -Path $stripDir })
+    # r5 G6: the certified spelling replaces $stripDir HERE, before either branch (the primary strip and the self-heal loop below) builds a copy path from it
+    if ($stripCert) { $stripDir = $stripCert }
     if ($receipt.visual.stripPath -and $stripCert) {
-        $stripDir = $stripCert
         New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
         $stripCopy = Join-Path $stripDir "strip-$($spec.legId)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
         Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force

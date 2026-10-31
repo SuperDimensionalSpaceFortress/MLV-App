@@ -734,31 +734,42 @@ function Test-DvUnderClaudeState {
 }
 
 function Test-DvLocalReceiptRoot {
-    # LEASE-BATCH-RECEIPT-ROOT-1 r3/r4 (Dot A2 6542192087; adversary A1-A4): the ONE admission rule for a directory or file that owner-footage evidence is WRITTEN to (a receipt root and the
+    # LEASE-BATCH-RECEIPT-ROOT-1 r3/r4/r5 (Dot A2 6542192087; adversary A1-A4, ADV-A1, ADV-A2; Grok G5): the ONE admission rule for a directory or file that owner-footage evidence is WRITTEN to (a receipt root and the
     # evidence directory beside it, a sheet/strip copy directory, a pair/flavor-pair output directory, a trend file, a baseline or nightly state file).
     # RETURNS the normalised full path it certified, or $null for a refusal. EVERY CALLER WRITES TO THE RETURNED PATH, never to the raw value: the value checked is the value written (r4 A2).
-    # A refusal is $null (falsy), so `if (-not (Test-DvLocalReceiptRoot ...))` still reads as a guard.
+    # r5 G5: the returned path is the FINAL, link-resolved path that the locality judgement ran on (not the spelling that reached it). A refusal is $null (falsy), so `if (-not (Test-DvLocalReceiptRoot ...))` still reads as a guard.
     # The path must be (1) under a `.claude-state` segment (Test-DvUnderClaudeState) AND (2) a LOCAL file-system path:
-    #   - a relative value is resolved ONCE, against the POWERSHELL location (the one every later cmdlet resolves it against; r4 A2), through the FileSystem provider only;
-    #   - any device path is refused (`\\.\`, `\\?\UNC\`, `\\?\GLOBALROOT`, `\\?\Volume{...}`, either slash spelling); the one allowed extended form is `\\?\C:\...`, certified and RETURNED as `C:\...` (r4 A4);
-    #   - any UNC (two leading separators of either slash, a `\\localhost\c$\` admin share) is refused;
-    #   - a path equal to or under a venue agentShare from venues.json is refused (OrdinalIgnoreCase, full-path normalised, trailing separators trimmed), BOTH as spelled and after every
-    #     symbolic link / junction on the way is followed to its final target (r4 A3: a local spelling that reaches a share through a link is a share path);
+    #   - the RAW text is judged first, before any normalisation (r5 ADV-A1): two leading separators of EITHER slash is a UNC and is refused; so is every device spelling (`\\.\`, `//?/`, `\/?\`, `\??\`,
+    #     `\\?\UNC\`, GLOBALROOT, Volume GUID) except the one backslash-only form `\\?\C:\...`, which is certified and RETURNED as `C:\...` (r4 A4);
+    #   - a relative value is resolved ONCE, against the POWERSHELL location (the one every later cmdlet resolves it against; r4 A2), and only when that location is on the FileSystem provider; a provider-qualified
+    #     (`HKLM:\`, `Env:\`, `Provider::`) or drive-relative (`C:rel`) value is refused. The file-system drive of a drive-letter value must be a plain local root (a PowerShell drive that names a UNC is refused);
+    #   - a path equal to or under a venue agentShare from venues.json is refused (OrdinalIgnoreCase, full-path normalised, trailing separators trimmed) BOTH as spelled and after every symbolic link / junction on the way is
+    #     followed to its final target (r4 A3), AND the same canonical form is applied to each share (r5 ADV-A2): an extended-prefix share, and a share that is itself reached through a link, match the candidate that sits under them;
     #   - a path on a mapped NETWORK drive ([IO.DriveInfo].DriveType), as spelled and as resolved.
     # FAIL CLOSED: an unreadable venues.json, an unparsable path or a link that cannot be read is a refusal. Nothing is created, opened or written here; reading drive types, attributes and link targets is the only I/O.
+    # This function reaches no engine-session API (the attr3 splice scan, test_attr3_spliced_body_scan, counts any such reference in this file as an unprovable extractor binding): the location comes from Get-Location, the drive from Get-PSDrive.
     param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
     try {
-        # a device-namespace spelling is judged on the RAW text too (the provider resolution below may rewrite its slashes)
-        $deviceOk = { param($x) $x -cmatch '^\\\\\?\\[A-Za-z]:\\[^/]*$' }
-        if ($Path -match '^[\\/]{2}[?.][\\/]' -and -not (& $deviceOk $Path)) { return $null }
-        $prov = $null; $drv = $null
-        $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$prov, [ref]$drv)
-        if ($prov.Name -cne 'FileSystem') { return $null }
-        if ($full -match '^[\\/]{2}[?.][\\/]') {
-            if (-not (& $deviceOk $full)) { return $null }
-            $full = $full.Substring(4)
+        # (1) the RAW text, either slash. Only `\\?\C:\...` (backslashes) is a local device spelling; anything else that starts with two separators (UNC, \\.\, //?/, \/?\, \\?\UNC\) is refused here.
+        if ($Path -match '^[\\/]{2}') {
+            if ($Path -cnotmatch '^\\\\\?\\[A-Za-z]:\\[^/]*$') { return $null }
+            $full = $Path.Substring(4)
         }
-        if ($full.StartsWith('\\', [StringComparison]::Ordinal) -or $full.StartsWith('//', [StringComparison]::Ordinal)) { return $null }
+        elseif ($Path -match '^[\\/]\?\?[\\/]') { return $null }   # the NT object-manager prefix \??\
+        elseif ($Path -match '^[A-Za-z]:[\\/]') {
+            # a drive-letter value: the PowerShell drive of that name, if any, must be a file-system drive rooted at the letter itself (not `New-PSDrive X -Root \\bachelor\share`)
+            $psd = Get-PSDrive -Name $Path.Substring(0, 1) -ErrorAction SilentlyContinue
+            if ($null -ne $psd -and ($psd.Provider.Name -cne 'FileSystem' -or -not [string]::IsNullOrEmpty([string]$psd.DisplayRoot) -or -not ([string]$psd.Root).StartsWith($Path.Substring(0, 2), [StringComparison]::OrdinalIgnoreCase))) { return $null }
+            $full = $Path
+        }
+        elseif ($Path.Contains(':')) { return $null }   # provider-qualified (HKLM:\, Env:\, Module\Provider::path) or drive-relative (C:rel): a colon anywhere in a value that is not a drive-letter path
+        else {
+            # rooted-on-the-current-drive (`\x`, `/x`) or relative: resolved once against the POWERSHELL location, on the FileSystem provider only
+            $here = Get-Location
+            if ($here.Provider.Name -cne 'FileSystem') { return $null }
+            $full = [IO.Path]::GetFullPath($Path, $here.ProviderPath)
+        }
+        if ($full -match '^[\\/]{2}') { return $null }
         $plain = [IO.Path]::GetFullPath($full)
         if ($plain -notmatch '^[A-Za-z]:\\') { return $null }
         if (-not (Test-DvUnderClaudeState -Path $plain)) { return $null }
@@ -767,7 +778,57 @@ function Test-DvLocalReceiptRoot {
             $AgentShares = @($doc.venues.PSObject.Properties | ForEach-Object { [string]$_.Value.agentShare } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         }
         $norm = { param($x) ([IO.Path]::GetFullPath(($x -replace '/', '\'))).TrimEnd('\') }
-        $shareKeys = @(@($AgentShares) | ForEach-Object { & $norm $_ })
+        # a share is judged in the SAME canonical form as the candidate: extended prefix removed (\\?\UNC\h\s -> \\h\s, \\?\C:\x -> C:\x), slashes folded, full-path normalised
+        $shareForm = {
+            param($x)
+            $y = $x -replace '/', '\'
+            if ($y -match '^\\\\[?.]\\UNC\\') { $y = '\\' + $y.Substring(8) }
+            elseif ($y -match '^\\\\[?.]\\') { $y = $y.Substring(4) }
+            & $norm $y
+        }
+        # Follow every symbolic link / junction among the EXISTING components of $start (the rest does not exist yet and is created under the resolved parent). A link whose target
+        # cannot be read, or a chain that does not settle within 16 hops, is a refusal (returns $null). With $judge, each hop is also judged by $isLocal (UNC / agentShare / network drive).
+        $walk = {
+            param($start, $judge)
+            $cur = $start
+            for ($hop = 0; ; $hop++) {
+                if ($hop -ge 16) { return $null }
+                $parts = @($cur.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
+                $acc = $cur.Substring(0, 3).TrimEnd('\')
+                $moved = $false
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $acc = $acc + '\' + $parts[$i]
+                    if (-not [IO.Directory]::Exists($acc) -and -not [IO.File]::Exists($acc)) { break }
+                    if (([IO.File]::GetAttributes($acc) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { continue }
+                    $info = $(if ([IO.Directory]::Exists($acc)) { [IO.DirectoryInfo]::new($acc) } else { [IO.FileInfo]::new($acc) })
+                    $target = $info.ResolveLinkTarget($true)
+                    if ($null -eq $target) { continue }   # a reparse point that is not a link (a cloud placeholder, a dedup stub): not a redirect
+                    $tail = @($(if ($i + 1 -lt $parts.Count) { $parts[($i + 1)..($parts.Count - 1)] } else { @() }))
+                    $t = [string]$target.FullName
+                    if ($t.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+                        if ($t -cnotmatch '^\\\\\?\\[A-Za-z]:\\') { return $null }
+                        $t = $t.Substring(4)
+                    }
+                    if ($t -match '^[\\/]{2}') { return $null }
+                    $cur = [IO.Path]::GetFullPath($(if ($tail.Count -gt 0) { Join-Path $t ($tail -join '\') } else { $t }))
+                    $moved = $true
+                    break
+                }
+                if (-not $moved) { return $cur }
+                if ($judge -and -not (& $isLocal $cur)) { return $null }
+            }
+        }
+        # the share keys: each share as spelled (canonical form) AND, for a drive-letter share, after its own links are followed (a share reached through a link is the same share)
+        $shareKeys = @()
+        foreach ($s in @($AgentShares)) {
+            $k = & $shareForm $s
+            $shareKeys += $k
+            if ($k -match '^[A-Za-z]:\\') {
+                $kr = & $walk $k $false
+                if ($null -eq $kr) { return $null }
+                $shareKeys += (& $norm $kr)
+            }
+        }
         $isLocal = {
             # judges ONE concrete spelling: UNC / device / agentShare / network drive. Returns $true when it is a local, non-share path.
             param($p)
@@ -781,36 +842,10 @@ function Test-DvLocalReceiptRoot {
             return $true
         }
         if (-not (& $isLocal $plain)) { return $null }
-        # Follow every symbolic link / junction among the EXISTING components (the rest does not exist yet and is created under the resolved parent). A link whose target
-        # cannot be read, or a chain that does not settle within 16 hops, is a refusal.
-        $cur = $plain
-        for ($hop = 0; ; $hop++) {
-            if ($hop -ge 16) { return $null }
-            $parts = @($cur.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
-            $acc = $cur.Substring(0, 3).TrimEnd('\')
-            $moved = $false
-            for ($i = 0; $i -lt $parts.Count; $i++) {
-                $acc = $acc + '\' + $parts[$i]
-                if (-not [IO.Directory]::Exists($acc) -and -not [IO.File]::Exists($acc)) { break }
-                if (([IO.File]::GetAttributes($acc) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { continue }
-                $info = $(if ([IO.Directory]::Exists($acc)) { [IO.DirectoryInfo]::new($acc) } else { [IO.FileInfo]::new($acc) })
-                $target = $info.ResolveLinkTarget($true)
-                if ($null -eq $target) { continue }   # a reparse point that is not a link (a cloud placeholder, a dedup stub): not a redirect
-                $tail = @($(if ($i + 1 -lt $parts.Count) { $parts[($i + 1)..($parts.Count - 1)] } else { @() }))
-                $t = [string]$target.FullName
-                if ($t.StartsWith('\\?\', [StringComparison]::Ordinal)) {
-                    if ($t -cnotmatch '^\\\\\?\\[A-Za-z]:\\') { return $null }
-                    $t = $t.Substring(4)
-                }
-                if ($t -match '^[\\/]{2}') { return $null }
-                $cur = [IO.Path]::GetFullPath($(if ($tail.Count -gt 0) { Join-Path $t ($tail -join '\') } else { $t }))
-                $moved = $true
-                break
-            }
-            if (-not $moved) { break }
-            if (-not (& $isLocal $cur)) { return $null }
-        }
-        return $plain.TrimEnd([char]92)
+        $final = & $walk $plain $true
+        if ($null -eq $final) { return $null }
+        # G5: the path that was judged is the path that is returned (the link-resolved one; $plain itself when no component is a link)
+        return $final.TrimEnd([char]92)
     } catch { return $null }
 }
 
