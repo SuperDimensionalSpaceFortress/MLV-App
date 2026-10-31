@@ -2872,7 +2872,7 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
         self.assertTrue((local / "sheet-unit-leg-ultra-magnus-cpu-classic.png").exists())
 
     def test_mutation_without_the_sheet_copy_guard_an_owner_sheet_is_copied_anywhere(self) -> None:
-        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {", "if ($false) {")])
+        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "    $SheetCopyDir = Test-DvLocalReceiptRoot -Path $SheetCopyDir", "    $null = Test-DvLocalReceiptRoot -Path $SheetCopyDir")])
         self.write_artifacts(sheet=True)
         published = self.tmp / "published"
         self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-SheetCopyDir", str(published), "-Backend", "cpu"], dv=mutated)

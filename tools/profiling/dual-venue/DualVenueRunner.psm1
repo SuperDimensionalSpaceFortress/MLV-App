@@ -730,7 +730,88 @@ function Test-DvUnderClaudeState {
     # `.claude-state` segment (gitignored; never committed, PR-attached, bus-published or published as an artifact).
     param([Parameter(Mandatory)][string]$Path)
     $full = [IO.Path]::GetFullPath($Path)
-    @($full.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -gt 0
+    @($full.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -gt 0
+}
+
+function Test-DvLocalReceiptRoot {
+    # LEASE-BATCH-RECEIPT-ROOT-1 r3/r4 (Dot A2 6542192087; adversary A1-A4): the ONE admission rule for a directory or file that owner-footage evidence is WRITTEN to (a receipt root and the
+    # evidence directory beside it, a sheet/strip copy directory, a pair/flavor-pair output directory, a trend file, a baseline or nightly state file).
+    # RETURNS the normalised full path it certified, or $null for a refusal. EVERY CALLER WRITES TO THE RETURNED PATH, never to the raw value: the value checked is the value written (r4 A2).
+    # A refusal is $null (falsy), so `if (-not (Test-DvLocalReceiptRoot ...))` still reads as a guard.
+    # The path must be (1) under a `.claude-state` segment (Test-DvUnderClaudeState) AND (2) a LOCAL file-system path:
+    #   - a relative value is resolved ONCE, against the POWERSHELL location (the one every later cmdlet resolves it against; r4 A2), through the FileSystem provider only;
+    #   - any device path is refused (`\\.\`, `\\?\UNC\`, `\\?\GLOBALROOT`, `\\?\Volume{...}`, either slash spelling); the one allowed extended form is `\\?\C:\...`, certified and RETURNED as `C:\...` (r4 A4);
+    #   - any UNC (two leading separators of either slash, a `\\localhost\c$\` admin share) is refused;
+    #   - a path equal to or under a venue agentShare from venues.json is refused (OrdinalIgnoreCase, full-path normalised, trailing separators trimmed), BOTH as spelled and after every
+    #     symbolic link / junction on the way is followed to its final target (r4 A3: a local spelling that reaches a share through a link is a share path);
+    #   - a path on a mapped NETWORK drive ([IO.DriveInfo].DriveType), as spelled and as resolved.
+    # FAIL CLOSED: an unreadable venues.json, an unparsable path or a link that cannot be read is a refusal. Nothing is created, opened or written here; reading drive types, attributes and link targets is the only I/O.
+    param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
+    try {
+        # a device-namespace spelling is judged on the RAW text too (the provider resolution below may rewrite its slashes)
+        $deviceOk = { param($x) $x -cmatch '^\\\\\?\\[A-Za-z]:\\[^/]*$' }
+        if ($Path -match '^[\\/]{2}[?.][\\/]' -and -not (& $deviceOk $Path)) { return $null }
+        $prov = $null; $drv = $null
+        $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$prov, [ref]$drv)
+        if ($prov.Name -cne 'FileSystem') { return $null }
+        if ($full -match '^[\\/]{2}[?.][\\/]') {
+            if (-not (& $deviceOk $full)) { return $null }
+            $full = $full.Substring(4)
+        }
+        if ($full.StartsWith('\\', [StringComparison]::Ordinal) -or $full.StartsWith('//', [StringComparison]::Ordinal)) { return $null }
+        $plain = [IO.Path]::GetFullPath($full)
+        if ($plain -notmatch '^[A-Za-z]:\\') { return $null }
+        if (-not (Test-DvUnderClaudeState -Path $plain)) { return $null }
+        if ($null -eq $AgentShares) {
+            $doc = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'venues.json')) | ConvertFrom-Json
+            $AgentShares = @($doc.venues.PSObject.Properties | ForEach-Object { [string]$_.Value.agentShare } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        $norm = { param($x) ([IO.Path]::GetFullPath(($x -replace '/', '\'))).TrimEnd('\') }
+        $shareKeys = @(@($AgentShares) | ForEach-Object { & $norm $_ })
+        $isLocal = {
+            # judges ONE concrete spelling: UNC / device / agentShare / network drive. Returns $true when it is a local, non-share path.
+            param($p)
+            if ($p -match '^[\\/]{2}') { return $false }
+            if ($p -notmatch '^[A-Za-z]:\\') { return $false }
+            $k = & $norm $p
+            foreach ($s in $shareKeys) {
+                if ($k.Equals($s, [StringComparison]::OrdinalIgnoreCase) -or $k.StartsWith($s + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+            }
+            if ([IO.DriveInfo]::new($p.Substring(0, 1)).DriveType -eq [IO.DriveType]::Network) { return $false }
+            return $true
+        }
+        if (-not (& $isLocal $plain)) { return $null }
+        # Follow every symbolic link / junction among the EXISTING components (the rest does not exist yet and is created under the resolved parent). A link whose target
+        # cannot be read, or a chain that does not settle within 16 hops, is a refusal.
+        $cur = $plain
+        for ($hop = 0; ; $hop++) {
+            if ($hop -ge 16) { return $null }
+            $parts = @($cur.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
+            $acc = $cur.Substring(0, 3).TrimEnd('\')
+            $moved = $false
+            for ($i = 0; $i -lt $parts.Count; $i++) {
+                $acc = $acc + '\' + $parts[$i]
+                if (-not [IO.Directory]::Exists($acc) -and -not [IO.File]::Exists($acc)) { break }
+                if (([IO.File]::GetAttributes($acc) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { continue }
+                $info = $(if ([IO.Directory]::Exists($acc)) { [IO.DirectoryInfo]::new($acc) } else { [IO.FileInfo]::new($acc) })
+                $target = $info.ResolveLinkTarget($true)
+                if ($null -eq $target) { continue }   # a reparse point that is not a link (a cloud placeholder, a dedup stub): not a redirect
+                $tail = @($(if ($i + 1 -lt $parts.Count) { $parts[($i + 1)..($parts.Count - 1)] } else { @() }))
+                $t = [string]$target.FullName
+                if ($t.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+                    if ($t -cnotmatch '^\\\\\?\\[A-Za-z]:\\') { return $null }
+                    $t = $t.Substring(4)
+                }
+                if ($t -match '^[\\/]{2}') { return $null }
+                $cur = [IO.Path]::GetFullPath($(if ($tail.Count -gt 0) { Join-Path $t ($tail -join '\') } else { $t }))
+                $moved = $true
+                break
+            }
+            if (-not $moved) { break }
+            if (-not (& $isLocal $cur)) { return $null }
+        }
+        return $plain.TrimEnd([char]92)
+    } catch { return $null }
 }
 
 function Read-DvClipConsent {
@@ -3232,7 +3313,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
+    Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
