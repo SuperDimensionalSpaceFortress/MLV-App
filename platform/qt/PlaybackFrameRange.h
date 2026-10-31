@@ -127,6 +127,15 @@ inline int64_t contactSheetInPassTargetSourceFrames( int i, int frameCount, int6
     return std::min<int64_t>( requiredSourceFrames, std::max<int64_t>( 1, centre ) );
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r3 (adversary A3): a CONFORMED Play's window counts SOURCE seconds at the native
+// rate (1499 source frames of a 59.94 fps clip play for 62.4 s at 24 fps), so the wall-clock centres of a 25 s window sample
+// only its first 23 s (source frames ~50..550 of 1499). Conformed, the targets are the source-frame centres, as unpaced.
+// Paced native runs keep the wall clock. A conformed Play with no required source frames keeps the wall clock (never 0 targets).
+inline bool contactSheetInPassTargetsAreSourceFrames( bool unpaced, bool conformActive, int64_t requiredSourceFrames )
+{
+    return unpaced || ( conformActive && requiredSourceFrames > 0 );
+}
+
 // The ONE "is this in-pass target due" decision noteContactSheetPresentedFrame() makes. Paced: the wall clock since the
 // measured Play started, unchanged (a paced target the Play never reaches still leaves the sheet short: exit 14).
 // Unpaced: the distinct source frames consumed.

@@ -9870,7 +9870,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_contactSheetCaptureTargetSourceFrames.clear();
         // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): unpaced, the Play stops at its required source frames,
         // which a fast run reaches before the wall-clock centres; its targets are source-frame centres instead.
-        m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();
+        // MERGE-MASTER r3 (adversary A3): a CONFORMED Play's window counts source seconds, so its targets are source frames too.
+        m_contactSheetCaptureUnpaced = playback_frame_range::contactSheetInPassTargetsAreSourceFrames(
+            m_automationPacingIsolated && mlvappPlaybackUnpacedRequested(), playbackConformActive(), m_playRequiredSourceFrames );
         for( int i = 0; i < options.contactSheetFrames; ++i )
         {
             m_contactSheetCaptureTargetMs.append( static_cast<qint64>(
@@ -19445,8 +19447,9 @@ void MainWindow::setupPlaybackConformMenu( void )
                             "Export is not affected; audio is muted while conforming." ) );
     connect( enable, &QAction::toggled, this, [this]( bool on )
     {
-        m_conformEnabled = on;
+        // MERGE-MASTER r3 (adversary A2): the toggle persists the user's choice, and MLVAPP_PLAYBACK_CONFORM=0|1 still wins for this process.
         m_conformEnabledSetting = on;
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), on );
         applyPlaybackConformSettings( true );
     } );
 

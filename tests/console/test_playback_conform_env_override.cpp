@@ -140,7 +140,24 @@ TEST(PlaybackConformEnvOverride, EnvPathNeverSavesSettings)
     ASSERT_FALSE(apply.contains(QStringLiteral("s.enabled = m_conformEnabled;")));
     ASSERT_TRUE(menu.contains(QStringLiteral("m_conformEnabledSetting = saved.enabled;")));
     ASSERT_TRUE(menu.contains(QStringLiteral(
-        "m_conformEnabled = on;\n        m_conformEnabledSetting = on;\n        applyPlaybackConformSettings( true );")));
+        "m_conformEnabledSetting = on;\n"
+        "        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), on );\n"
+        "        applyPlaybackConformSettings( true );")));
+}
+
+// MERGE-MASTER r3 (adversary A2): MLVAPP_PLAYBACK_CONFORM=0|1 wins over the setting for the WHOLE process, so the menu toggle
+// re-resolves the override and never assigns the effective value straight from the checkbox (env=0 then toggle on stayed 24 fps).
+TEST(PlaybackConformEnvOverride, MenuToggleKeepsTheEnvOverride)
+{
+    const QString menu = setupMenuBody(readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp")));
+    ASSERT_FALSE(menu.isEmpty());
+    ASSERT_FALSE(menu.contains(QStringLiteral("m_conformEnabled = on;")));
+    ASSERT_EQ(menu.count(QStringLiteral("m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(),")), 2);
+    // the resolution the toggle relies on: env 0 / 1 beat either checkbox state, no override follows the checkbox
+    ASSERT_FALSE(playback_conform::resolveConformEnabled(0, true));
+    ASSERT_TRUE(playback_conform::resolveConformEnabled(1, false));
+    ASSERT_TRUE(playback_conform::resolveConformEnabled(-1, true));
+    ASSERT_FALSE(playback_conform::resolveConformEnabled(-1, false));
 }
 
 TEST(PlaybackConformEnvOverride, TelemetryCarriesTheOverride)

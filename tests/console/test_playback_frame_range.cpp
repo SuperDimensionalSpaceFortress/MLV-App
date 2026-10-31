@@ -246,6 +246,24 @@ TEST( PlaybackFrameRange, PacedInPassTargetsStayOnTheWallClockAndAMissedOneStays
     ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( false, 10000, 10000, 1, 240 ) );
 }
 
+// MERGE-MASTER r3 (adversary A3 input): M16-1457, 1499 required source frames at 59.94 fps conformed to 24 fps
+// (62.4 s of wall clock), six in-pass frames. The targets are the source-window centres 125 .. 1374, not the
+// wall-clock centres of a 25 s window (~source frames 50 .. 550). Paced native keeps the wall clock; unpaced is unchanged.
+TEST( PlaybackFrameRange, ConformedInPassTargetsAreSourceFrameCentresOfTheWholeSourceWindow )
+{
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, true, 1499 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, false, 1499 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( true, false, 1499 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( true, false, 0 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetsAreSourceFrames( false, true, 0 ) );
+    const int64_t expected[] = { 125, 375, 625, 874, 1124, 1374 };
+    for( int i = 0; i < 6; ++i )
+        ASSERT_EQ( expected[i], playback_frame_range::contactSheetInPassTargetSourceFrames( i, 6, 1499 ) );
+    // Due on source frames consumed, whatever the wall clock: the last target is reached after 57 s of a 62 s Play.
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( true, 22917, 22917, 551, 1374 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( true, 57250, 22917, 1374, 1374 ) );
+}
+
 // The grabs run on the GUI thread inside the measured interval, so the honest figure next to the
 // leg's fps is the fps with their recorded cost taken out of the elapsed time. It can only be the
 // same or higher, and it equals the measured fps when nothing was grabbed.
