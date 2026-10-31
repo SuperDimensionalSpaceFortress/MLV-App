@@ -981,12 +981,17 @@ $ImageAttachments = @()
 # `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
 # -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
 # single -ImagePaths value (`-ImagePaths 'a.png|b.png'`); a real array from `&`/dot-calls works unchanged.
-$ImagePathsGiven = @($ImagePaths | ForEach-Object { [string]$_ -split '\|' } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+# r2 adversary A1: an empty or blank element is NOT silently dropped. Dropping it let `-ImagePaths ' '` / `'||'` reach a claude
+# lane (or a codex lane) as "no images", bypassing the engine refusal and judging nothing. Any supplied element must be a path.
+$ImagePathsGiven = @($ImagePaths | ForEach-Object { [string]$_ -split '\|' })
 if ($ImagePathsGiven.Count -gt 0) {
     if ($LANES[$Lane].engine -ne 'codex') {
         throw "image-paths-codex-only: -Lane $Lane is a $($LANES[$Lane].engine)-engine lane; -ImagePaths is accepted only by codex-engine lanes"
     }
     foreach ($imagePath in $ImagePathsGiven) {
+        if ([string]::IsNullOrWhiteSpace($imagePath)) {
+            throw "image-path-empty: -ImagePaths carries an empty entry (a stray '|' or a blank value); every entry must be a file path"
+        }
         if (-not (Test-Path -LiteralPath $imagePath -PathType Leaf)) {
             throw "image-path-missing: -ImagePaths entry is not an existing file: $imagePath"
         }
@@ -1005,6 +1010,39 @@ if ($ImagePathsGiven.Count -gt 0) {
         $ImageAttachments += [ordered]@{ source = $imageFull; path = $null; sha256 = $null; bytes = $null; ext = $imageExt }
     }
 }
+# BEGIN Copy-ImageSnapshot (VISUAL-JUDGE-TERRA-LANE-1 r2, adversary A2 + A3)
+# Copies Source to Dest in 256 KiB chunks, hashing the very bytes it writes (one read, so sha256/bytes cannot drift from the copy), and
+# checks Clock against LimitMs between chunks so a slow share spends the lane's -TimeoutSec budget instead of an unbounded wall (A3).
+# Plain .NET streams only: Get-Item without -Force throws on a Hidden snapshot (A2). A failed copy deletes its partial file.
+# A single read that never returns is not interruptible from here; a share that trickles is cut at the next chunk.
+function Copy-ImageSnapshot {
+    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $in = $null; $out = $null; $total = [long]0; $ok = $false
+    try {
+        $in  = [System.IO.File]::Open($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $out = [System.IO.File]::Open($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $buf = New-Object byte[] 262144
+        while ($true) {
+            if ($Clock.Elapsed.TotalMilliseconds -ge $LimitMs) { throw "image-copy-timeout: copying the image snapshot spent the lane's -TimeoutSec budget: $Source" }
+            $n = $in.Read($buf, 0, $buf.Length)
+            if ($n -le 0) { break }
+            $out.Write($buf, 0, $n)
+            [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+            $total += $n
+            # copy-loop-tick
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+        $out.Flush()
+        $ok = $true
+    } finally {
+        if ($null -ne $out) { $out.Dispose() }
+        if ($null -ne $in) { $in.Dispose() }
+        if (-not $ok -and [System.IO.File]::Exists($Dest)) { try { [System.IO.File]::Delete($Dest) } catch { } }
+    }
+    return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant()); bytes = $total }
+}
+# END Copy-ImageSnapshot
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -1666,12 +1704,12 @@ if ($cfg.engine -eq 'claude') {
         $imageSeq++
         $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
         if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
-        [System.IO.File]::Copy($attachment.source, $snapshot, $false)
+        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)
         # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
         if (-not [System.IO.File]::Exists($snapshot)) { throw "image-path-missing: the image snapshot is not a native file path: $snapshot" }
         $attachment.path   = $snapshot
-        $attachment.sha256 = (Get-FileHash -LiteralPath $snapshot -Algorithm SHA256).Hash.ToLowerInvariant()
-        $attachment.bytes  = (Get-Item -LiteralPath $snapshot).Length
+        $attachment.sha256 = $snapshotInfo.sha256
+        $attachment.bytes  = $snapshotInfo.bytes
     }
     $imageArgs = @()
     foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }

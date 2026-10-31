@@ -712,6 +712,52 @@ def test_an_image_path_with_a_comma_is_refused_because_codex_splits_i_values_on_
     assert not receipt.exists() and not (root/"args.json").exists()
 
 
+@pytest.mark.parametrize("lane,value,token",[
+    ("terra"," ","image-path-empty"), ("terra","||","image-path-empty"), ("terra","|a.png","image-path-empty"),
+    ("sonnet"," ","image-paths-codex-only"), ("sonnet","||","image-paths-codex-only")])
+def test_a_blank_image_path_entry_is_refused_not_dropped(fixture_tree,lane,value,token):
+    # r2 adversary A1: blank elements used to vanish before validation, so a claude lane given `-ImagePaths '||'` silently
+    # judged nothing and a codex lane ran with no image flag. A supplied value is validated as supplied.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    r=run_lane(cmd+["-ImagePaths",value],env)
+    assert r.returncode!=0 and token in r.stderr,(r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"args.json").exists()
+
+
+def test_a_hidden_image_is_snapshotted_hashed_and_attached(fixture_tree):
+    # r2 adversary A2: Get-Item without -Force throws on a Hidden snapshot, so a Hidden source failed after the run dir existed.
+    root=fixture_tree["root"]; png=root/"hidden strip.png"; sha=_write_png(png,b"hidden")
+    assert subprocess.run(["attrib","+h",str(png)],capture_output=True).returncode==0
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert entry["sha256"]==sha and entry["bytes"]==png.stat().st_size
+    assert hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest()==sha
+
+
+def test_a_slow_image_copy_spends_the_lane_timeout_budget_and_leaves_no_partial_snapshot(fixture_tree):
+    # r2 adversary A3: the snapshot copy ran outside -TimeoutSec, so a slow share could hold the lane for any length of time.
+    # The fixture stalls every 256 KiB chunk by 1.5 s (a 1 MiB image = 4 chunks = 6 s) under a 4 s budget.
+    root=fixture_tree["root"]; png=root/"slow strip.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n"+os.urandom(1024*1024))
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",
+        mutation=lambda text: text.replace("# copy-loop-tick","Start-Sleep -Milliseconds 1500"))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    cmd[cmd.index("-TimeoutSec")+1]="4"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    # A launch-phase throw lands as a failed receipt (the same way codex-tier-resolution-failed does), not as stderr.
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed" and "image-copy-timeout" in receipt.read_text(encoding="utf-8"),(r.stdout,r.stderr)
+    assert not (root/"args.json").exists()
+    assert not list(receipt.parent.glob("terra-001.image-*")), list(receipt.parent.iterdir())
+
+
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
     cache=fixture_tree["root"]/"models_cache.json"
     cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")

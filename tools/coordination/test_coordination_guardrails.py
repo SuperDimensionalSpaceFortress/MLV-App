@@ -1557,8 +1557,14 @@ def test_image_paths_is_keyed_on_engine_and_attached_with_the_codex_image_flag()
     assert "$imageFull = $imageResolved.ProviderPath" in body and "$imageResolved.Provider.Name -ne 'FileSystem'" in body
     assert "image-path-bad-character" in body and "$imageFull.Contains(',')" in body
     assert "[System.IO.File]::Exists($snapshot)" in body
-    assert "[System.IO.File]::Copy($attachment.source, $snapshot, $false)" in body
-    assert body.index("[System.IO.File]::Copy($attachment.source, $snapshot, $false)") < body.index("$imageArgs += @('-i', $attachment.path)")
+    copy_call = "Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)"
+    assert copy_call in body
+    assert body.index(copy_call) < body.index("$imageArgs += @('-i', $attachment.path)")
+    # r2 adversary A1-A3: empty entries are refused (not filtered away), the snapshot is hashed while it is copied under the
+    # lane deadline, and no -Force-less Get-Item/Get-FileHash metadata read of the (possibly Hidden) snapshot remains.
+    assert "image-path-empty" in body and "Where-Object { -not [string]::IsNullOrWhiteSpace($_) })" not in body.split("$ImagePathsGiven =")[1].split("\n")[0]
+    assert "image-copy-timeout" in body and "$Clock.Elapsed.TotalMilliseconds -ge $LimitMs" in body
+    assert "(Get-Item -LiteralPath $snapshot)" not in body and "Get-FileHash -LiteralPath $snapshot" not in body
     assert "foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }" in body
     i_images = body.index("$argv = @('exec') + $imageArgs + @(")
     i_model = body.index("'-m', $codexLaunchModel,")
