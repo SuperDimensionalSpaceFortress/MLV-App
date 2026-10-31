@@ -186,6 +186,15 @@ def workflow_job_timeouts(workflow_text: str) -> dict[str, int | None]:
     return timeouts
 
 
+def merge_group_trigger_problem(trigger_section: str) -> str | None:
+    """Why the workflow's trigger block is not the merge-group run on every master commit, or None."""
+    if "  merge_group:\n    types: [checks_requested]\n" not in trigger_section:
+        return "merge_group: types: [checks_requested] is missing"
+    if re.search(r"(?m)^  merge_group:\n(?:    .*\n)*?    branches(?:-ignore)?:", trigger_section):
+        return "merge_group carries a branches filter, so a master queue commit may not run"
+    return None
+
+
 class RepoHygieneTests(unittest.TestCase):
     def test_job_timeout_pin_rejects_an_absent_or_unbounded_deadline(self) -> None:
         def workflow(job_header: str) -> str:
@@ -1033,6 +1042,14 @@ class RepoHygieneTests(unittest.TestCase):
         ):
             self.assertIn(required_policy, lock_policy)
 
+    def test_merge_group_trigger_pin_rejects_a_branches_filter(self) -> None:
+        # sol r2 H1: a merge_group branches filter that excludes master used to pass the substring pin.
+        ok = "  merge_group:\n    types: [checks_requested]\n"
+        self.assertIsNone(merge_group_trigger_problem(ok))
+        for extra in ("    branches: [adversary-never-target]\n", "    branches-ignore: [master]\n"):
+            self.assertIsNotNone(merge_group_trigger_problem(ok + extra), extra)
+        self.assertIsNotNone(merge_group_trigger_problem("  pull_request:\n"))
+
     def test_ci_workflow_hardening_is_fail_closed_and_coordination_aware(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
@@ -1049,7 +1066,7 @@ class RepoHygieneTests(unittest.TestCase):
         )
         self.assertIn("  pull_request:\n", trigger_section)
         # Master integration is the merge-group run on the exact master sha (CI-PUSH-MASTER-DEDUP-1).
-        self.assertIn("  merge_group:\n    types: [checks_requested]\n", trigger_section)
+        self.assertIsNone(merge_group_trigger_problem(trigger_section))
         self.assertNotRegex(
             trigger_section,
             r"(?m)^\s+paths(?:-ignore)?:",
