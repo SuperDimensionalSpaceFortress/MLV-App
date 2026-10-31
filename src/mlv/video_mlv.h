@@ -471,6 +471,9 @@ double getMlvLastDebayerWbPrepareMilliseconds(void);
 double getMlvLastDebayerCaMilliseconds(void);
 double getMlvLastDebayerKernelMilliseconds(void);
 double getMlvLastDebayerWbUndoMilliseconds(void);
+/* debayerBasicU16 that records getMlvLastDebayerKernelMilliseconds for this thread. */
+void debayerBasicU16RecordingKernelMilliseconds(uint16_t * output_frame, uint16_t * raw_frame, int width, int height,
+                                                int threads, int bit_shift);
 double getMlvLastProcessingMilliseconds(void);
 double getMlvLastProcessed16TotalMilliseconds(void);
 double getMlvLastProcessed16For8BitMilliseconds(void);
