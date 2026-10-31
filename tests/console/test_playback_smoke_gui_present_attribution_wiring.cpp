@@ -262,9 +262,10 @@ TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
     // Adversary A1 (400865b1): the measured gui-smoke loop is processEvents(AllEvents) then
     // QThread::msleep( 10 ). That sleep never reaches the dispatcher's aboutToBlock, so it was
     // charged as GUI busy. Every runner sleep goes through the accounting helper, the gap keeps
-    // it apart, and busy excludes it. r2: the two Play-poll loops of runHeadlessPlaybackProfile
-    // are pinned ENFORCE-3 stop statements (tools/repo_hygiene/app_play_scan.py
-    // PINNED_STOP_STATEMENTS), so they keep their raw QThread::msleep( 10 ) -- exactly those two.
+    // it apart, and busy excludes it. The two Play-poll loops of runHeadlessPlaybackProfile are
+    // pinned ENFORCE-3 stop statements (tools/repo_hygiene/app_play_scan.py PINNED_STOP_STATEMENTS);
+    // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): their sleep goes through the helper too, because a
+    // GPU window's present-tail window is open across it. No raw sleep is left in either runner.
     const QString source = mainWindowSource();
     const QString smoke = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
@@ -278,11 +279,11 @@ TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"));
     ASSERT_FALSE(profile.isEmpty());
     ASSERT_TRUE(profile.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")) > 0);
-    ASSERT_EQ(2, profile.count(QStringLiteral("QThread::msleep(")));
+    ASSERT_EQ(0, profile.count(QStringLiteral("QThread::msleep(")));
     const QRegularExpression pinnedPoll(QStringLiteral(
         "while\\( \\( (autoSettleState|playActionState) = programmaticPlayState\\([^\\n]*\\)\\s*"
         "== playback_frame_range::PlayStopState::Continue \\)\\s*\\{\\s*"
-        "qApp->processEvents\\( QEventLoop::AllEvents \\);\\s*QThread::msleep\\( 10 \\);\\s*\\}"));
+        "qApp->processEvents\\( QEventLoop::AllEvents \\);\\s*sleepGuiThreadForSmokeRunner\\( 10 \\);\\s*\\}"));
     int pinnedPolls = 0;
     for (QRegularExpressionMatchIterator it = pinnedPoll.globalMatch(profile); it.hasNext(); it.next())
         ++pinnedPolls;

@@ -2415,6 +2415,96 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t2 . gui_idle_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (GpuPresentTailWindow driven with injected nanosecond values, no clock): a fresh path-3 window carries nothing from the previous window, so its idle reads 0. Negative check, paired in the same block with ASSERT_EQ(0, t2.gui_idle_waits) and, for the positive side, window 1's ASSERT_EQ(2, t1.gui_idle_waits) with idle 12.0; the counters, not this value, are the proof of what the probe saw.",
+      "lines": [
+        787
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t2 . runner_sleep_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): the runner sleep counted between windows is not carried into the fresh window. Negative check, paired with ASSERT_EQ(0, t2.runner_sleeps) and window 1's ASSERT_EQ(1, t1.runner_sleeps) with 10.0 ms; the count is the proof a sleep was seen.",
+      "lines": [
+        789
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t2 . qt_paint_swap_max_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): the path-1 pair maximum resets with the window. Negative check, paired with ASSERT_EQ(0, t2.qt_paint_swaps) and window 1's ASSERT_EQ(2, t1.qt_paint_swaps) with max 5.0; the count is the proof a path-1 swap was seen.",
+      "lines": [
+        792
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t . gui_idle_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): a setup during an open dispatcher block never charges the block's span as idle. Negative check, paired with ASSERT_FALSE(t.gui_idle_known) and ASSERT_EQ(0, t.gui_idle_waits); the known flag and the count carry the verdict, and the bucket assert (UNKNOWN) is what the product reads.",
+      "lines": [
+        816
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , next . gui_idle_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): the late awake of a block the previous close dropped is not charged to the next window. Negative check, paired with ASSERT_EQ(0, next.gui_idle_waits) and ASSERT_TRUE(next.gui_idle_known); the count is the proof no wait was closed.",
+      "lines": [
+        828
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playback_slip :: presentSetupGuiBusyMs ( sampleFromTail ( 60.0 , over ) ) , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 (injected values, no clock): presentSetupGuiBusyMs clamps at 0 when a runner sleep timed on its own clock exceeds the window by 1 us. A range/clamp check on a computed value; it never says whether a stage ran (the runner sleep count is asserted in the neighbouring cases).",
+      "lines": [
+        885
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playback_slip :: presentSetupGuiBusyMs ( holdSample ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r4 ADV-A1 (injected values, no clock): a 250 ms window with a 100 ms dispatcher wait and fifteen 10 ms runner sleeps leaves no GUI busy time. Arithmetic on a computed value; it never says whether a stage ran (ASSERT_EQ(1, hold.gui_idle_waits) and ASSERT_EQ(15, hold.runner_sleeps) carry that, and the bucket assert is what the product reads).",
+      "lines": [
+        933
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , later . qt_paint_swap_max_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r4 G2 (injected values, no clock): a path-1 paint with no swap in window 1 never pairs with a swap in window 2, so window 2's pair maximum stays 0. Negative check, paired with ASSERT_EQ(0, later.qt_paint_swaps); the count is the proof no pair was taken.",
+      "lines": [
+        953
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , dropped . qt_paint_swap_max_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r4 G2 (injected values, no clock): a session start/stop drops an unswapped stamp, so the later swap pairs with nothing and the pair maximum stays 0. Negative check, paired with ASSERT_EQ(0, dropped.qt_paint_swaps) and the positive paired case (1 pair, 3.0 ms) just above.",
+      "lines": [
+        973
+      ]
+    },
+    {
       "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
       "anchor": "ASSERT_TRUE ( s . recon . llrawprocMs > 0.0 ) ;",
       "class": "run_proof",

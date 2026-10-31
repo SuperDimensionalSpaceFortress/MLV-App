@@ -484,6 +484,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
         # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg. Only a JSON true arms it (a string "false" is not true).
         if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the #397 prep-conflated-move switch (ON arm), for any leg; judged below by the app's own prep_conflated_move_active readback.
+        if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] -and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
@@ -855,6 +857,16 @@ $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLog
 if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement under the cap this leg names"
+    $outcome = 'INVALID'
+}
+# PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, FAIL CLOSED: a leg that asks for the #397 prep-conflated-move switch counts only when the measured session's own
+# playback_smoke.prep_route record reports prep_conflated_move_active=1 (r2: a line of its own, never the start line's env-derived fields); a value in the
+# launcher's env block is a request, not engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask
+# for it is unchanged.
+$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText
+if ($prepConflatedMoveVerdict.requested) { $receipt['prepConflatedMove'] = [ordered]@{ requested = $true; observed = $prepConflatedMoveVerdict.observed; verdict = $prepConflatedMoveVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason). A run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does

@@ -392,6 +392,7 @@ HEADERS += MainWindow.h \
            PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \
            PlaybackEnvFlags.h \
+           LogLineField.h \
            PlaybackWorkerJoin.h \
            PlaybackPrepInFlightGate.h \
            ClipOpenAbortPolicy.h \
@@ -411,6 +412,7 @@ HEADERS += MainWindow.h \
            DualIsoPatternMapping.h \
            GpuDebayer.h \
            GpuPreviewProcessing.h \
+           GpuPresentTailWindow.h \
            PlaybackPrepCpuRoute.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
