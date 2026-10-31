@@ -1964,6 +1964,7 @@ private:
     void requestPlaybackAudioSync( void );
     void setupPlaybackConformMenu( void );
     void noteConformStateBeforeChange( void );
+    void forgetAppliedPlaybackAudioSync( void );
     void applyPlaybackConformSettings( bool persist );
     void refreshPlaybackFpsStatus( void );
     double playbackPaceGuardFps( void );

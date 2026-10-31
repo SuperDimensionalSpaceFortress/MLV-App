@@ -2345,6 +2345,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackAudioStartPolicy.h",
+      "anchor": "&& lastAppliedSec > 0.0",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r6 isDuplicateSync: lastAppliedSec is the mlv_stage_timing_now() TIMESTAMP of the last applied audio sync, not a duration; 0.0 is the forgotten/never sentinel (forgetAppliedPlaybackAudioSync), filtered so a forgotten memo is never a duplicate. Moved verbatim from MainWindow.cpp's inline m_lastPlaybackAudioSyncTime > 0.0 (a name the scanner did not match); which syncs ran is m_playbackAudioSyncAppliedCount / SkippedCount, never this read.",
+      "lines": [
+        298
+      ]
+    },
+    {
       "path": "tests/console/test_playback_audio_start_engine.cpp",
       "anchor": "if ( static_cast < long long > ( clock ) % periodMs == 0 ) refill ( ) ;",
       "class": "not_run_proof_structural",

@@ -5,6 +5,7 @@
 #include "../common/minitest.h"
 
 #include "../../platform/qt/PlaybackConformPolicy.h"
+#include "../../platform/qt/PlaybackAudioStartPolicy.h"
 
 #include <QDir>
 #include <QFile>
@@ -388,4 +389,105 @@ TEST(PlaybackConformPendingAudio, NonFiniteRatesNeverKeepSilently)
     ASSERT_TRUE(pendingAudioStartOnConformChange( false, 23.976, false, inf ) == PendingAudioStart::Rearm);
     ASSERT_TRUE(pendingAudioStartOnConformChange( false, -inf, false, 23.976 ) == PendingAudioStart::Rearm);
     ASSERT_TRUE(pendingAudioStartOnConformChange( false, nan, true, nan ) == PendingAudioStart::Clear);
+}
+
+// MERGE-MASTER r6 (AUDIO-A1 residual, r5 adversary successor ADV-A1, Dot 6544364013): a sync is applied at frame F; within
+// 100 ms, at F, conform goes ON (the audio stops) and OFF again (Rearm). The consumer clears the pending flag first and then
+// dropped the re-armed request as a duplicate of the sync applied before the stop, so the audio stayed stopped (Loop off:
+// silent to the end). The stop now forgets the applied sync (MainWindow::forgetAppliedPlaybackAudioSync; wiring:
+// PlaybackConformWiring.AConformStopForgetsTheAppliedSyncSoARearmIsApplied). The trace runs MainWindow.cpp's sequence on
+// the pure functions; forgetsOnStop=false is 5b66cf96's stop.
+namespace
+{
+struct PresentSide
+{
+    bool pending = false;     // m_tryToSyncAudio
+    bool audioRunning = false;
+    int lastFrame = -1;       // m_lastPlaybackAudioSyncFrame
+    double lastSec = 0.0;     // m_lastPlaybackAudioSyncTime
+    int applied = 0;          // m_playbackAudioSyncAppliedCount
+};
+
+// finishPresentedFrame's gated consumer (play, audio output and drop frame are on)
+void present( PresentSide & s, bool conformActive, int frame, double nowSec )
+{
+    if( !s.pending || !audioSyncAllowed( conformActive ) ) return;
+    s.pending = false;
+    if( playback_audio_start::isDuplicateSync( s.lastFrame, s.lastSec, frame, nowSec ) ) return;
+    s.lastFrame = frame;
+    s.lastSec = nowSec;
+    s.audioRunning = true;
+    ++s.applied;
+}
+
+// applyPlaybackConformSettings for one control change during playback
+void conformChange( PresentSide & s, double clipFps, const ConformControls & before, const ConformControls & after,
+                    bool forgetsOnStop = true )
+{
+    const bool wasActive = conformApplies( clipFps, before.enabled, before.target, before.threshold );
+    const double wasFps = playbackFps( clipFps, before.enabled, before.target, before.threshold );
+    const bool nowActive = conformApplies( clipFps, after.enabled, after.target, after.threshold );
+    const double nowFps = playbackFps( clipFps, after.enabled, after.target, after.threshold );
+    if( nowActive )
+    {
+        s.audioRunning = false;   // m_pAudioPlayback->stop()
+        if( forgetsOnStop )
+        {
+            s.lastFrame = -1;     // forgetAppliedPlaybackAudioSync()
+            s.lastSec = 0.0;
+        }
+    }
+    const PendingAudioStart decision = pendingAudioStartOnConformChange( wasActive, wasFps, nowActive, nowFps );
+    if( decision == PendingAudioStart::Clear ) s.pending = false;
+    if( decision == PendingAudioStart::Rearm ) s.pending = audioSyncAllowed( nowActive ); // requestPlaybackAudioSync()
+}
+
+PresentSide runConformOnOffAtTheSameFrame( bool forgetsOnStop )
+{
+    const ConformControls off { kOff, 24.0, 30.0 };
+    const ConformControls on { kOn, 24.0, 30.0 };
+    PresentSide s;
+    s.pending = true;                                  // Play on a 59.94 clip, conform off
+    present( s, false, 120, 10.000 );                  // applied at F = 120
+    conformChange( s, kClip5994, off, on, forgetsOnStop );
+    present( s, true, 120, 10.030 );                   // conformed: the consumer is gated off
+    conformChange( s, kClip5994, on, off, forgetsOnStop );
+    present( s, false, 120, 10.060 );                  // 60 ms after the applied sync, same frame
+    return s;
+}
+} // namespace
+
+TEST(PlaybackConformPendingAudio, AConformOnOffToggleWithinTheDuplicateWindowRestartsTheAudio)
+{
+    const PresentSide s = runConformOnOffAtTheSameFrame( true );
+    ASSERT_FALSE(s.pending);
+    ASSERT_TRUE(s.audioRunning);
+    ASSERT_EQ(2, s.applied);
+    ASSERT_EQ(120, s.lastFrame);
+    // 5b66cf96's stop kept the memo: the re-armed start was taken for a duplicate, with the pending flag already cleared
+    const PresentSide old = runConformOnOffAtTheSameFrame( false );
+    ASSERT_FALSE(old.pending);
+    ASSERT_FALSE(old.audioRunning);
+    ASSERT_EQ(1, old.applied);
+}
+
+TEST(PlaybackConformPendingAudio, ADuplicateRequestWhileTheAudioStillRunsStaysOneSync)
+{
+    PresentSide s;
+    s.pending = true;
+    present( s, false, 120, 10.000 );
+    s.pending = true;                    // a second request at the same frame, the audio never stopped
+    present( s, false, 120, 10.050 );
+    ASSERT_EQ(1, s.applied);
+    ASSERT_FALSE(s.pending);
+    // a target change that keeps a 23.976 clip non-conformed stops nothing and keeps the memo
+    conformChange( s, kClip23976, { kOn, 24.0, 30.0 }, { kOn, 25.0, 30.0 } );
+    ASSERT_TRUE(s.audioRunning);
+    ASSERT_EQ(120, s.lastFrame);
+    s.pending = true;
+    present( s, false, 120, 10.080 );
+    ASSERT_EQ(1, s.applied);
+    s.pending = true;                    // outside the window: a new sync
+    present( s, false, 120, 10.200 );
+    ASSERT_EQ(2, s.applied);
 }

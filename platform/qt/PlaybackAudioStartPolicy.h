@@ -284,6 +284,21 @@ private:
     std::atomic<std::uint64_t> m_generation { 0 };
 };
 
+/*! MERGE-MASTER r6 (AUDIO-A1 residual, Dot 6544364013): the first present's consumer drops a requested sync that repeats
+ *  the last APPLIED one (the same frame within kDuplicateSyncWindowMs: two requests for one start). That memo
+ *  (lastAppliedFrame, lastAppliedSec) stands only while the audio still runs from that sync, so a stop outside the
+ *  consumer forgets it (frame -1, time 0) and the next request is applied. A conform change that leaves conform active
+ *  stops the audio mid-play; un-conforming within the window re-arms the start at the same frame, and the consumer has
+ *  already cleared the pending flag, so a swallowed re-arm left the audio silent to the end of a non-looping play. */
+inline constexpr double kDuplicateSyncWindowMs = 100.0;
+
+inline bool isDuplicateSync( int lastAppliedFrame, double lastAppliedSec, int syncFrame, double nowSec )
+{
+    return lastAppliedFrame == syncFrame
+        && lastAppliedSec > 0.0
+        && ( nowSec - lastAppliedSec ) * 1000.0 < kDuplicateSyncWindowMs;
+}
+
 } // namespace playback_audio_start
 
 #endif // PLAYBACKAUDIOSTARTPOLICY_H

@@ -13,6 +13,7 @@
 #include <QString>
 #include <QTextStream>
 
+#include <limits>
 #include <string>
 
 using playback_audio_start::Mode;
@@ -85,6 +86,22 @@ TEST(PlaybackAudioStartPolicy, TheOffsetIsAudioContentMinusVideoTimelineAndAudio
     ASSERT_NEAR(5.0 - 30.0, playback_audio_start::avOffsetEstMs(120, 5.0, 120, 30.0, kFps), 1e-9);
     // re-opened 20 frames ahead, audible 800 ms after the present: 834.2 ms of content for 800 ms of video
     ASSERT_NEAR(20 * 1000.0 / kFps - 800.0, playback_audio_start::avOffsetEstMs(140, 0.0, 120, 800.0, kFps), 1e-9);
+}
+
+// MERGE-MASTER r6 (AUDIO-A1 residual, Dot 6544364013): the consumer's duplicate test, and a forgotten memo (a stop outside
+// the consumer) is never a duplicate. The conform on/off trace that needs it: PlaybackConformPendingAudio.AConformOnOff*.
+TEST(PlaybackAudioStartPolicy, ASecondSyncAtTheSameFrameWithinTheWindowIsTheSameSync)
+{
+    using playback_audio_start::isDuplicateSync;
+    ASSERT_NEAR(100.0, playback_audio_start::kDuplicateSyncWindowMs, 1e-9);
+    ASSERT_TRUE(isDuplicateSync(120, 10.0, 120, 10.0));
+    ASSERT_TRUE(isDuplicateSync(120, 10.0, 120, 10.09));
+    ASSERT_FALSE(isDuplicateSync(120, 10.0, 120, 10.15)); // outside the window: a new sync
+    ASSERT_FALSE(isDuplicateSync(120, 10.0, 121, 10.01)); // another frame: a new sync
+    // the forgotten memo (frame -1, time 0) is never a duplicate, early in the clock or at frame -1
+    ASSERT_FALSE(isDuplicateSync(-1, 0.0, 120, 0.05));
+    ASSERT_FALSE(isDuplicateSync(-1, 0.0, -1, 0.05));
+    ASSERT_FALSE(isDuplicateSync(120, 10.0, 120, std::numeric_limits<double>::quiet_NaN())); // fail toward applying
 }
 
 TEST(PlaybackAudioStartWiring, TheGuiThreadNeverStartsTheAudioDeviceUnlessLegacy)

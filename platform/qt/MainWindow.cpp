@@ -19444,6 +19444,15 @@ void MainWindow::noteConformStateBeforeChange( void )
     m_conformPlaybackFpsBeforeChange = m_pMlvObject ? getPlaybackFramerate() : 0.0;
 }
 
+// MERGE-MASTER r6 (AUDIO-A1 residual, Dot 6544364013): the consumer's duplicate-sync memo describes audio that still runs
+// from the last applied sync (playback_audio_start::isDuplicateSync). A stop outside the consumer forgets it, so the next
+// requested sync is applied: the play stop, and a conform change that stops the audio while Play stays on.
+void MainWindow::forgetAppliedPlaybackAudioSync( void )
+{
+    m_lastPlaybackAudioSyncFrame = -1;
+    m_lastPlaybackAudioSyncTime = 0.0;
+}
+
 //Playback > High Frame Rate Conform: enable, target rate and threshold, persisted under
 //Playback/Conform* (deliberately not Playback/AutoTargetFps, which is the Auto quality budget).
 //Read and written through automation_settings::openAppSettings(), so an automation run uses its
@@ -19530,9 +19539,15 @@ void MainWindow::applyPlaybackConformSettings( bool persist )
         s.thresholdFps = m_conformThresholdFps;
         playback_conform::saveSettings( set, s );
     }
-    // A conform change mid-playback: audio that was already running must stop (it cannot follow
-    // the new rate); the next play start / wrap / seek re-syncs it when conform is inactive.
-    if( m_pAudioPlayback && playbackConformActive() ) m_pAudioPlayback->stop();
+    // A conform change mid-playback that leaves the clip conformed: audio that was already running must stop (it cannot
+    // follow the new rate). The stop forgets the applied sync (MERGE-MASTER r6, AUDIO-A1 residual), so when a later change
+    // un-conforms the clip, the Rearm case below re-requests the start (requestPlaybackAudioSync) and the next present
+    // applies it, even at the same frame within the consumer's 100 ms duplicate window.
+    if( m_pAudioPlayback && playbackConformActive() )
+    {
+        m_pAudioPlayback->stop();
+        forgetAppliedPlaybackAudioSync();
+    }
     // MERGE-MASTER r5 (AUDIO-A1): a pending audio start (raised at Play, not yet consumed by the first present) is
     // touched only when this change moved the clip's effective conform state or playback rate. A 23.976 clip stays
     // non-conformed under a target or threshold change, so its pending start survives (the drop-frame tick re-arms
@@ -30837,8 +30852,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         m_playToFirstFrameTargetFrame = -1;
         m_lastPlayStartPrerollRequested = false;
         m_playbackScopeLastUpdateTime = 0.0;
-        m_lastPlaybackAudioSyncFrame = -1;
-        m_lastPlaybackAudioSyncTime = 0.0;
+        forgetAppliedPlaybackAudioSync();
         resetPlaybackQualityAutoRunState();
     }
     selectDebayerAlgorithm();
@@ -32576,10 +32590,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         ++m_playbackAudioSyncRequestCount;
         const double syncNow = mlv_stage_timing_now();
         const int syncFrame = m_newPosDropMode;
-        const bool duplicateRecentSync =
-            m_lastPlaybackAudioSyncFrame == syncFrame
-         && m_lastPlaybackAudioSyncTime > 0.0
-         && ( syncNow - m_lastPlaybackAudioSyncTime ) * 1000.0 < 100.0;
+        const bool duplicateRecentSync = playback_audio_start::isDuplicateSync( m_lastPlaybackAudioSyncFrame,
+                                                                            m_lastPlaybackAudioSyncTime, syncFrame, syncNow );
         if( duplicateRecentSync )
         {
             ++m_playbackAudioSyncSkippedCount;

@@ -418,6 +418,55 @@ TEST(PlaybackConformWiring, ConformControlTouchesThePendingAudioStartOnlyOnAConf
     ASSERT_TRUE(note.contains(QStringLiteral("m_conformPlaybackFpsBeforeChange = m_pMlvObject ? getPlaybackFramerate() : 0.0;")));
 }
 
+// MERGE-MASTER r6 (AUDIO-A1 residual, r5 adversary successor ADV-A1, Dot 6544364013): a conform change that leaves conform
+// active stops the audio while Play stays on; un-conforming again within 100 ms at the same frame re-armed a start the
+// consumer then dropped as a duplicate of the sync applied before the stop. The stop forgets the applied sync, and the
+// consumer decides through the pure helper (behaviour: PlaybackConformPendingAudio.AConformOnOff*,
+// PlaybackAudioStartPolicy.ASecondSyncAtTheSameFrameWithinTheWindowIsTheSameSync).
+TEST(PlaybackConformWiring, AConformStopForgetsTheAppliedSyncSoARearmIsApplied)
+{
+    const QString source = mainWindowSource();
+    const QString apply = functionBody(source,
+        QStringLiteral("void MainWindow::applyPlaybackConformSettings( bool persist )"),
+        QStringLiteral("//Paint the Audio Track Wave to GUI"));
+    ASSERT_FALSE(apply.isEmpty());
+    const int stop = apply.indexOf(QStringLiteral(
+        "    if( m_pAudioPlayback && playbackConformActive() )\n"
+        "    {\n"
+        "        m_pAudioPlayback->stop();\n"
+        "        forgetAppliedPlaybackAudioSync();\n"
+        "    }\n"));
+    ASSERT_TRUE(stop >= 0);
+    ASSERT_EQ(1, countOccurrences(apply, QStringLiteral("m_pAudioPlayback->stop();")));
+    const int decide = apply.indexOf(QStringLiteral("switch( playback_conform::pendingAudioStartOnConformChange("));
+    ASSERT_TRUE(decide > stop);
+
+    // the helper forgets both halves of the memo, and only it and the consumer write them
+    const QString forget = functionBody(source,
+        QStringLiteral("void MainWindow::forgetAppliedPlaybackAudioSync( void )"),
+        QStringLiteral("void MainWindow::setupPlaybackConformMenu( void )"));
+    ASSERT_FALSE(forget.isEmpty());
+    ASSERT_TRUE(forget.contains(QStringLiteral("m_lastPlaybackAudioSyncFrame = -1;")));
+    ASSERT_TRUE(forget.contains(QStringLiteral("m_lastPlaybackAudioSyncTime = 0.0;")));
+    ASSERT_EQ(2, countOccurrences(source, QStringLiteral("m_lastPlaybackAudioSyncFrame = ")));
+    ASSERT_EQ(2, countOccurrences(source, QStringLiteral("m_lastPlaybackAudioSyncTime = ")));
+    // the play stop (resize, end of clip and Play off all uncheck actionPlay) forgets through the same helper
+    ASSERT_EQ(2, countOccurrences(source, QStringLiteral("forgetAppliedPlaybackAudioSync();")));
+
+    // the consumer: the duplicate test is the pure helper, fed the memo, the presented sync frame and the clock
+    const int consumer = source.indexOf(QStringLiteral("if( m_tryToSyncAudio && m_pAudioPlayback"));
+    ASSERT_TRUE(consumer >= 0);
+    const QString body = source.mid(consumer, 1200);
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "const bool duplicateRecentSync = playback_audio_start::isDuplicateSync( m_lastPlaybackAudioSyncFrame,\n"
+        "                                                                            m_lastPlaybackAudioSyncTime, syncFrame, syncNow );")));
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_tryToSyncAudio = false;")) < body.indexOf(QStringLiteral("duplicateRecentSync")));
+
+    // the census of audio stops: destructor, resize, end of clip, conform, Play off, and the legacy consumer. A new one
+    // must decide whether it forgets the applied sync (it does when Play can stay on after it).
+    ASSERT_EQ(6, countOccurrences(source, QStringLiteral("m_pAudioPlayback->stop()")));
+}
+
 TEST(PlaybackConformWiring, SavedAudioOutputChoiceIsNeverUncheckedByConform)
 {
     const QString source = mainWindowSource();
