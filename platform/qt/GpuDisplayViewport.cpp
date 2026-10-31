@@ -8,6 +8,7 @@
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
+#include "LogLineField.h"
 #include "PlaybackSwapInterval.h"
 #include "PreviewPaintTiming.h"
 
@@ -413,13 +414,14 @@ GpuDisplayViewport::GpuDisplayViewport(QWidget *parent)
         setAttribute(Qt::WA_AlwaysStackOnTop, true);
     if ( abSwapSet || viewportAbAlphaEnabled() || viewportAbStackTopEnabled()
          || viewportAbNativeWindow() || viewportAbPrimeEnabled() || viewportAbFlushMode() != 0 )
+        // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: raw env text never reaches a log line (LogLineField.h).
         qInfo().nospace() << "viewport_ab present probe active: swap="
-            << qgetenv("MLVAPP_VIEWPORT_AB_SWAP").constData()
+            << log_line_field::fieldValue(qEnvironmentVariable("MLVAPP_VIEWPORT_AB_SWAP")).toUtf8().constData()
             << " alpha=" << (viewportAbAlphaEnabled() ? 1 : 0)
             << " stacktop=" << (viewportAbStackTopEnabled() ? 1 : 0)
             << " native=" << (viewportAbNativeWindow() ? 1 : 0)
             << " prime=" << (viewportAbPrimeEnabled() ? 1 : 0)
-            << " flush=" << qgetenv("MLVAPP_VIEWPORT_AB_FLUSH").constData();
+            << " flush=" << log_line_field::fieldValue(qEnvironmentVariable("MLVAPP_VIEWPORT_AB_FLUSH")).toUtf8().constData();
 }
 
 GpuDisplayViewport::~GpuDisplayViewport()

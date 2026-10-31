@@ -7,6 +7,7 @@
  */
 
 #include "CrashForensics.h"
+#include "LogLineField.h"
 
 #include "Phase3Breadcrumbs.h"
 
@@ -417,10 +418,9 @@ void writeLogLine(QtMsgType type, const QMessageLogContext & ctx, const QString 
     }
 
     // Sanitise message (strip stray CR/LF within a line so each record
-    // stays on a single line).
-    QString sanitized = message;
-    sanitized.replace(QLatin1Char('\r'), QLatin1Char(' '));
-    sanitized.replace(QLatin1Char('\n'), QStringLiteral(" | "));
+    // stays on a single line). The fold lives in LogLineField.h so the
+    // dual-venue hostile-environment test runs this exact code.
+    const QString sanitized = log_line_field::recordMessage(message);
 
     const QString line = QStringLiteral("[%1] [%2] [%3] %4%5\n")
         .arg(timestamp)

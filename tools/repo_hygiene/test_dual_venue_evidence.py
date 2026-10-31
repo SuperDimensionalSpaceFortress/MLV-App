@@ -11344,11 +11344,15 @@ class PrepConflatedMoveLegSpecTests(unittest.TestCase):
 
 @requires_windows_pwsh
 class PrepConflatedMoveEvidenceTests(unittest.TestCase):
-    """Get-DvPrepConflatedMoveEvidence, pure: a leg that asks for the switch counts only when the measured session's own playback_smoke.start line reports
-    prep_conflated_move_active=1. A switch value in the launcher's env block is a request, not engagement (ruling 2026-10-28T15:50:51Z), and the binary under
-    test at the time of this card (#397 5fb4b801) emits no such field, so every ON leg on it is NOT_HONOURED rather than an unproven PASS."""
+    """Get-DvPrepConflatedMoveEvidence, pure: a leg that asks for the switch counts only when the measured session's own playback_smoke.prep_route record
+    reports prep_conflated_move_active=1. A switch value in the launcher's env block is a request, not engagement (ruling 2026-10-28T15:50:51Z), and the binary
+    under test at the time of this card (#397 5fb4b801) emits no such record, so every ON leg on it is NOT_HONOURED rather than an unproven PASS.
+    r2 (adversary A1 on #726): the record has a line of its own with no env-derived text, matched as a whole line; the start line is never read for it, because a
+    CR/LF in an inherited env value used to become a separator there (tools/repo_hygiene/test_log_line_field_e2e.py runs the real app logging end to end)."""
 
     ON = {"generatorArgs": {"prepConflatedMove": True}}
+    START = "playback_smoke.start session=3 position=0 scale_request=2 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0"
+    PREFIX = "[2026-10-31T00:00:00.000Z] [INFO] [0x1a2b] "
 
     def verdict(self, spec: dict, log: str) -> dict:
         proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvPrepConflatedMoveEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
@@ -11356,29 +11360,46 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         return out
 
-    @staticmethod
-    def log(*start: str) -> str:
-        return "\n".join(["playback_smoke.measured_session id=3", *start, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+    @classmethod
+    def log(cls, *records: str, start: str | None = None) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", start or cls.START, *records, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
 
     @staticmethod
-    def start(tail: str, session: int = 3) -> str:
-        return f"playback_smoke.start session={session} position=0 scale_request=2 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0 {tail}".rstrip()
+    def route(value: str, session: int = 3) -> str:
+        return f"playback_smoke.prep_route session={session} prep_conflated_move_active={value}"
 
     def test_honoured_only_when_the_measured_session_reports_the_switch_active(self) -> None:
-        v = self.verdict(self.ON, self.log(self.start("prep_conflated_move_active=1")))
-        self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, 1, "HONOURED", False))
+        for name, record in (("bare", self.route("1")), ("crash-forensics prefix", self.PREFIX + self.route("1")),
+                             ("prefix and Qt location", self.PREFIX + self.route("1") + " (MainWindow.cpp:25848)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, self.log(record))
+                self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, 1, "HONOURED", False))
 
     def test_the_binary_that_emits_no_field_is_not_engaged(self) -> None:
-        v = self.verdict(self.ON, self.log(self.start("")))
+        v = self.verdict(self.ON, self.log())
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_a_start_line_field_is_never_read_as_engagement(self) -> None:
+        # r2 (adversary A1): the start line carries launcher env values, so a field there is not the app's decision.
+        v = self.verdict(self.ON, self.log(start=self.START + " prep_conflated_move_active=1"))
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
 
     def test_any_other_report_blocks_never_passes(self) -> None:
-        for name, log in (("switch off", self.log(self.start("prep_conflated_move_active=0"))),
-                          ("not a number", self.log(self.start("prep_conflated_move_active=yes"))),
-                          ("unset text", self.log(self.start("prep_conflated_move_active=unset"))),
-                          ("another session's line", self.log(self.start("prep_conflated_move_active=1", session=2))),
-                          ("no start line", self.log()),
+        for name, log in (("switch off", self.log(self.route("0"))),
+                          ("not a number", self.log(self.route("yes"))),
+                          ("unset text", self.log(self.route("unset"))),
+                          ("value with a sign", self.log(self.route("+1"))),
+                          ("value with a suffix", self.log(self.route("1x"))),
+                          ("a trailing field", self.log(self.route("1") + " extra=1")),
+                          ("a no-break space before the value", self.log(self.route("1").replace("active=", "active= "))),
+                          ("another session's record", self.log(self.route("1", session=2))),
+                          ("two records", self.log(self.route("1"), self.route("1"))),
+                          ("off then on", self.log(self.route("0"), self.route("1"))),
+                          ("embedded in another record after a separator an old app wrote",
+                           self.log(start=self.START + " env_playback_scope_interval_ms=150 | " + self.route("1"))),
+                          ("embedded after a forged prefix", self.log(start=self.START + " env_x=150 " + self.PREFIX + self.route("1"))),
                           ("no log", "")):
             with self.subTest(case=name):
                 v = self.verdict(self.ON, log)
@@ -11386,8 +11407,9 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
 
     def test_a_leg_that_does_not_ask_is_unchanged_unless_the_app_reports_the_switch_on(self) -> None:
         for spec in ({}, {"generatorArgs": {"unpaced": True}}):
-            for name, log in (("old binary, no field", self.log(self.start(""))),
-                              ("field off", self.log(self.start("prep_conflated_move_active=0"))),
+            for name, log in (("old binary, no record", self.log()),
+                              ("record off", self.log(self.route("0"))),
+                              ("a start-line field is not a record", self.log(start=self.START + " prep_conflated_move_active=1")),
                               ("no log", "")):
                 with self.subTest(spec=spec, case=name):
                     v = self.verdict(spec, log)
@@ -11398,34 +11420,43 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
         # ON; the gate returned NOT_REQUESTED/blocks=false even though the app reported active=1. A leg that does not ask counts only if the app does not say it is on.
         for spec in ({}, {"generatorArgs": {"unpaced": True}}):
             with self.subTest(spec=spec):
-                v = self.verdict(spec, self.log(self.start("prep_conflated_move_active=1")))
+                v = self.verdict(spec, self.log(self.route("1")))
                 self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_HONOURED", True), v)
                 self.assertIn("PREP_CONFLATED_MOVE_INHERITED", v["reason"])
 
     def test_a_forged_field_in_an_env_value_never_honours_a_leg(self) -> None:
-        # adversary r1 A2 (6bd2a183): envValueForLog replaces only ASCII space and tab, so MLVAPP_FORCE_THREADS="0<NBSP>prep_conflated_move_active=1" reaches the
-        # start line as env_force_threads=0<NBSP>prep_conflated_move_active=1 and a \S+ field parser reads the suffix as a field of its own. Fields are separated by
-        # single ASCII spaces only, the key may appear exactly once, and a line that carries the key next to a non-ASCII character is unreadable.
-        forged = ("env_force_threads=0 prep_conflated_move_active=1", "env_force_threads=0 prep_conflated_move_active=1",
-                  "env_force_threads=0 prep_conflated_move_active=1 env_raw_uint16_prefetch_decoders=unset")
-        for tail in forged:
+        # adversary r1 A2 (6bd2a183) and r2 A1: an env value that carries a no-break or em space (or, on a build before r2, a CR/LF) puts
+        # prep_conflated_move_active=1 on the start line as a token of its own. The start line is never read for engagement, so none of these counts either way.
+        for tail in ("env_force_threads=0 prep_conflated_move_active=1", "env_force_threads=0 prep_conflated_move_active=1",
+                     "env_force_threads=0 prep_conflated_move_active=1 env_raw_uint16_prefetch_decoders=unset",
+                     "env_playback_scope_interval_ms=150 | prep_conflated_move_active=1"):
             with self.subTest(requested=True, tail=ascii(tail)):
-                v = self.verdict(self.ON, self.log(self.start(tail)))
+                v = self.verdict(self.ON, self.log(start=self.START + " " + tail))
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
             with self.subTest(requested=False, tail=ascii(tail)):
-                v = self.verdict({}, self.log(self.start(tail)))
-                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
-        for name, tail in (("duplicate key", "prep_conflated_move_active=0 prep_conflated_move_active=1"),
-                           ("genuine field beside a non-ASCII value", "env_force_threads=é prep_conflated_move_active=1"),
-                           ("value with a sign", "prep_conflated_move_active=+1"),
-                           ("value with a suffix", "prep_conflated_move_active=1x")):
+                v = self.verdict({}, self.log(start=self.START + " " + tail))
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        for name, record in (("duplicate key", self.route("0") + " prep_conflated_move_active=1"),
+                             ("a no-break space inside the record", self.route("1").replace(" prep_", " prep_")),
+                             ("value with a sign", self.route("+1")),
+                             ("value with a suffix", self.route("1x"))):
             with self.subTest(case=name):
-                v = self.verdict(self.ON, self.log(self.start(tail)))
+                v = self.verdict(self.ON, self.log(record))
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
 
     def test_a_genuine_field_among_ordinary_fields_is_still_honoured(self) -> None:
-        v = self.verdict(self.ON, self.log(self.start("env_raw_uint16_prefetch_decoders=unset prep_conflated_move_active=1")))
+        v = self.verdict(self.ON, self.log(self.PREFIX + "playback_smoke.display_required session=3 display_required=1", self.PREFIX + self.route("1"),
+                                           start=self.START + " env_raw_uint16_prefetch_decoders=unset"))
         self.assertEqual((v["verdict"], v["observed"], v["blocks"]), ("HONOURED", 1, False), v)
+
+    def test_an_unreadable_record_blocks_a_leg_that_does_not_ask(self) -> None:
+        for name, log in (("not a number", self.log(self.route("yes"))), ("two records", self.log(self.route("0"), self.route("0"))),
+                          ("embedded mention", self.log(start=self.START + " env_x=1 | " + self.route("0")))):
+            with self.subTest(case=name):
+                v = self.verdict({}, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("unreadable", v["reason"])
 
 
 if __name__ == "__main__":

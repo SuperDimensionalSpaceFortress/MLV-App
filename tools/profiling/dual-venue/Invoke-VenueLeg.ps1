@@ -858,8 +858,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
     $outcome = 'INVALID'
 }
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, FAIL CLOSED: a leg that asks for the #397 prep-conflated-move switch counts only when the measured session's own
-# playback_smoke.start line reports prep_conflated_move_active=1; a value in the launcher's env block is a request, not engagement, and a binary that emits no
-# such field is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
+# playback_smoke.prep_route record reports prep_conflated_move_active=1 (r2: a line of its own, never the start line's env-derived fields); a value in the
+# launcher's env block is a request, not engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask
+# for it is unchanged.
 $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText
 if ($prepConflatedMoveVerdict.requested) { $receipt['prepConflatedMove'] = [ordered]@{ requested = $true; observed = $prepConflatedMoveVerdict.observed; verdict = $prepConflatedMoveVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
