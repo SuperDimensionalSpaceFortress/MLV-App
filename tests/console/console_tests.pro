@@ -83,6 +83,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_audio_start_engine.cpp \
     $$REPO_ROOT/tests/console/test_playback_audio_gate.cpp \
     $$REPO_ROOT/tests/console/test_playback_env_flags.cpp \
+    $$REPO_ROOT/tests/console/test_log_line_field.cpp \
     $$REPO_ROOT/tests/console/test_playback_first_present_identity.cpp \
     $$REPO_ROOT/tests/console/test_playback_route_prewarm_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_route_staged_slot_policy.cpp \
@@ -146,6 +147,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackAudioStartPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackAudioGate.h \
     $$REPO_ROOT/platform/qt/PlaybackEnvFlags.h \
+    $$REPO_ROOT/platform/qt/LogLineField.h \
+    $$REPO_ROOT/tests/console/log_line_field_fixture.h \
     $$REPO_ROOT/platform/qt/PlaybackWorkerJoin.h \
     $$REPO_ROOT/platform/qt/PlaybackFirstPresentIdentity.h \
     $$REPO_ROOT/platform/qt/PlaybackRoutePrewarmPolicy.h \

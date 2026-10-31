@@ -1259,6 +1259,12 @@ $OWNER_KILL_OUTCOME_KILL_WAIT_TIMEOUT = 'kill-wait-timeout'  # Kill() did not th
 # and a bare `ReadToEndAsync().Result` waits for EOF, not for the process (Process.WaitForExit() does NOT: measured 27 ms against a
 # pipe-holding descendant that kept ReadToEndAsync open for 20 s). Keep the literal on its own line: test_lane_containment.py shortens it.
 $OUTPUT_DRAIN_GRACE_MS = 10000
+# LANE-CONTAINED-CHILD-START-DEADLINE-1: how long the runner waits for the contained host to write <base>.child.json before it books
+# contained-child-start-timeout (-> failure=launch-no-child). It was a fixed 10 s; PR 726 r2/r2b lost the launch after 13.3 s and 28.8 s
+# on a loaded host (commit charge 75-78 %, worktreeSweep 205 s) although the host was merely slow, not broken. Bounded, never unbounded: the
+# wait is still capped by -TimeoutSec at the call site. A retry was rejected because a second host could double-run the prompt.
+# Keep the literal on its own line: test_lane_containment.py shortens it to reach the bound inside a test budget.
+$CONTAINED_CHILD_START_WINDOW_MS = 45000.0
 $OWNER_KILL_OUTCOME_KILL_THREW = 'kill-threw'         # Kill() or WaitForExit itself threw -- see ownerKillDetail for the raw message
 $childIdentity = $null
 $deadlineUtc = $startedUtc.AddSeconds($TimeoutSec)
@@ -1806,7 +1812,7 @@ if ($cfg.engine -eq 'claude') {
     $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath; drainPath=$hostDrainPath; drainGraceMs=$OUTPUT_DRAIN_GRACE_MS } | ConvertTo-Json -Compress -Depth 5
     $awaitingChild = $true
     $proc.StandardInput.WriteLine($launchFrame); $proc.StandardInput.Flush()
-    $controlDeadlineMs = [math]::Min($sw.Elapsed.TotalMilliseconds + 10000.0, $TimeoutSec * 1000.0)
+    $controlDeadlineMs = [math]::Min($sw.Elapsed.TotalMilliseconds + $CONTAINED_CHILD_START_WINDOW_MS, $TimeoutSec * 1000.0)
     while (-not (Test-Path -LiteralPath $controlPath)) {
         if ($proc.HasExited) { throw "contained-host-exited-before-child: $($proc.ExitCode)" }
         if ($sw.Elapsed.TotalMilliseconds -ge $controlDeadlineMs) { throw [TimeoutException]::new('contained-child-start-timeout') }

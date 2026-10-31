@@ -2937,9 +2937,59 @@ def _no_child_launch_mutation(text):
     old = "$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}"
     assert text.count(old) == 1
     text = text.replace(old, "Start-Sleep -Seconds 6\n" + old)
-    win = "$sw.Elapsed.TotalMilliseconds + 10000.0"
-    assert text.count(win) == 1
-    return text.replace(win, "$sw.Elapsed.TotalMilliseconds + 1500.0")
+    return _shorten_child_start_window(text, 1500.0)
+
+
+# LANE-CONTAINED-CHILD-START-DEADLINE-1: the window is the named $CONTAINED_CHILD_START_WINDOW_MS (it was a fixed 10 s literal).
+def _shorten_child_start_window(text, ms):
+    old = "$CONTAINED_CHILD_START_WINDOW_MS = 45000.0"
+    assert text.count(old) == 1, "the child-start window constant has moved; update this fixture mutation"
+    return text.replace(old, "$CONTAINED_CHILD_START_WINDOW_MS = %s" % ms)
+
+
+def _host_delays_launch_frame(seconds):
+    # The host's slowness stands in for a loaded machine: it reads the launch frame (and so writes child.json) `seconds` late.
+    def mutation(text):
+        old = "$line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'launch-frame-missing'}"
+        assert text.count(old) == 1
+        return text.replace(old, "Start-Sleep -Seconds %d\n" % seconds + old)
+    return mutation
+
+
+def test_child_start_window_is_a_named_bounded_value_of_at_least_45_seconds():
+    text = CANDIDATE.read_text(encoding="utf-8")
+    m = re.search(r"^\$CONTAINED_CHILD_START_WINDOW_MS = (\d+(?:\.\d+)?)\s*$", text, re.M)
+    assert m, "the named child-start window is gone"
+    assert float(m.group(1)) >= 45000.0
+    # still bounded by the lane's own budget at the call site (never an unbounded wait)
+    assert "[math]::Min($sw.Elapsed.TotalMilliseconds + $CONTAINED_CHILD_START_WINDOW_MS, $TimeoutSec * 1000.0)" in text
+    assert text.count("contained-child-start-timeout") >= 1
+
+
+def test_host_that_writes_child_json_12_seconds_late_still_launches(fixture_tree):
+    # PR 726 r2/r2b: a loaded host wrote the child control file after the old fixed 10 s window and the launch was booked
+    # launch-no-child with promptDelivered=false although the host was only slow.
+    cmd,env,receipt=prepare(fixture_tree,"normal",mutation=_host_delays_launch_frame(12))
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="complete" and q["complete"] is True
+    assert q.get("failure") is None and "launchNoChild" not in q
+    assert q["containment"]["promptDelivered"] is True and q["containment"]["childPid"] is not None
+
+
+def test_host_that_never_writes_child_json_still_fails_by_the_window_with_the_same_cause(fixture_tree):
+    # The wait stays bounded: a host that never produces the child is reaped at the window and booked with the unchanged cause.
+    def mutation(text):
+        return _shorten_child_start_window(_host_delays_launch_frame(25)(text), 3000.0)
+    cmd,env,receipt=prepare(fixture_tree,"normal",mutation=mutation)
+    r=run_lane(cmd,env)
+    assert r.returncode==127,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["failure"]=="launch-no-child" and q["timedOut"] is False and q["durationSec"]<20
+    assert q["launchNoChild"]["cause"]=="contained-child-start-timeout"
+    assert q["containment"]["promptDelivered"] is False and q["containment"]["childPid"] is None
+    assert not (fixture_tree["root"]/"child.json").exists()
 
 
 def test_child_never_created_is_typed_launch_no_child_not_a_timeout(fixture_tree):
