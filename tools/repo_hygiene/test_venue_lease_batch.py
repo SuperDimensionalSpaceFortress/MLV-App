@@ -6722,7 +6722,8 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
     def judge(self, shares: list, cases: dict, location: Path | None = None, process_dir: Path | None = None) -> dict:
         """Run Test-DvLocalReceiptRoot on each named path with `shares` as the venue agentShares; the value is the certified path or None (a refusal). `location` is the PowerShell location
         and `process_dir` the process directory the helper runs with (they differ once a caller has done Set-Location)."""
-        script = f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+        script = "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"   # r7 G9: a certified path may carry a non-ASCII name (a superscript digit); the OEM code page is not UTF-8
+        script += f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
         if location is not None:
             script += f"Set-Location -LiteralPath '{psq(location)}'\n[Environment]::CurrentDirectory = '{psq(process_dir)}'\n"
         script += (
@@ -7159,7 +7160,10 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         # ADV-A4 literal: ReceiptRoot 'C:\x\.claude-state\bad<root>' (also bad|root, bad"root, bad?root); plus DOS device names, which the file system never writes as a directory
         bad = {"lt": "C:\\x\\.claude-state\\bad<root>", "pipe": "C:\\x\\.claude-state\\bad|root", "quote": "C:\\x\\.claude-state\\bad\"root", "question": "C:\\x\\.claude-state\\bad?root",
                "star": "C:\\x\\.claude-state\\bad*root", "control": "C:\\x\\.claude-state\\bad\u0001root", "nul": "C:\\x\\.claude-state\\NUL\\r", "con-ext": "C:\\x\\.claude-state\\con.txt\\r",
-               "com1": "C:\\x\\.claude-state\\COM1"}
+               "com1": "C:\\x\\.claude-state\\COM1",
+               # r7 G9: Windows also reserves COM and LPT followed by a superscript one, two or three (U+00B9, U+00B2, U+00B3), bare or with an extension
+               "com-sup1": "C:\\x\\.claude-state\\COM\u00b9", "com-sup2-ext": "C:\\x\\.claude-state\\com\u00b2.txt\\r", "com-sup3": "C:\\x\\.claude-state\\COM\u00b3",
+               "lpt-sup1": "C:\\x\\.claude-state\\LPT\u00b9", "lpt-sup2-lower": "C:\\x\\.claude-state\\lpt\u00b2\\r", "lpt-sup3-ext": "C:\\x\\.claude-state\\LPT\u00b3.log"}
         got = self.judge(["C:\\fake\\agent-share"], {**bad, "fine": "C:\\x\\.claude-state\\good-root"})
         for name in bad:
             self.assertIsNone(got[name], f"{name}: {got}")

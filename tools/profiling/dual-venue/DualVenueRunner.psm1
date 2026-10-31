@@ -835,12 +835,12 @@ function Test-DvLocalReceiptRoot {
             param($p)
             if ($p -match '^[\\/]{2}') { return $false }
             if ($p -notmatch '^[A-Za-z]:\\') { return $false }
-            # r6 ADV-A4 / ADV-A1: every component is a name the file system writes as spelled (no invalid character, no trailing space or dot alias, no DOS device name)
+            # r6 ADV-A4 / ADV-A1: every component is a name the file system writes as spelled (no invalid character, no trailing space or dot alias, no DOS device name; r7 G9: COM/LPT with a superscript 1/2/3 are devices too, written as regex escapes so this file stays ASCII)
             foreach ($c in @($p.Substring(3).Split([char]92))) {
                 if ($c.Length -eq 0) { continue }
                 if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
                 if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
-                if ($c -cmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]|CONIN\$|CONOUT\$)(\..*)?$') { return $false }
+                if ($c -cmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)(\..*)?$') { return $false }
             }
             # r6 ADV-A2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted at the letter itself (not `New-PSDrive X -Root \\host\share`)
             $psd = Get-PSDrive -Name $p.Substring(0, 1) -ErrorAction SilentlyContinue
