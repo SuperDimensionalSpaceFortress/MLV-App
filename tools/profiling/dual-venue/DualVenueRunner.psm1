@@ -939,16 +939,23 @@ function Get-DvConformPaceProof {
     .SYNOPSIS
     HFR-CONFORM-AWARE-RECEIPT-ORACLES-1. Did the run PROVE it was conformed? Judged from the receipt `playback` block's own fields (the
     conform line's values, recorded from the run log by Get-DvPlaybackEvidence), so a reader re-derives it without the log. Proven only
-    when the conform line was PRESENT for the measured session (conformSession == summarySession), conformActive == 1, conformClipFps is
-    within 0.5 % of nativeFps, conformPlaybackFps is > 0 and within 0.5 % of paceFps, conformPlaybackFps is not above conformClipFps, and
-    conformPlaybackFps is BELOW conformClipFps by more than 0.5 % (r7: an active conform at the clip rate is native-rate playback, no conform).
-    Absent / malformed / inactive / another session's / inconsistent -> proven=$false and `reason` says why (absence never helps).
+    when the conform line was PRESENT for the measured session (conformSession == summarySession; conformLinePresent a real boolean $true),
+    conformActive == 1, conformClipFps EQUALS nativeFps at print precision (r8: both print one value to 3 decimals), conformPlaybackFps is > 0 and
+    within 0.5 % of paceFps, conformPlaybackFps is not above conformClipFps, conformPlaybackFps is BELOW conformClipFps by more than the reduction
+    margin (r7), and the engine pace paceFps is BELOW nativeFps by more than the same margin (r8: native engine pace is never a conform, however
+    the clip / playback tolerances stack). Absent / malformed / inactive / another session's / inconsistent -> proven=$false and `reason` says why.
     The same decision as Get-GuiSmokeConformPaceProof (gui-smoke-length-gate.ps1) and Get-AttrCudaConformAwareSourceFramesVerdict (AttrCudaArtifacts.psm1);
-    a parity test executes all three on one table.
+    a parity test executes all three on one table, and another pins their two named margins equal.
     #>
     param($Playback)
+    # MERGE-MASTER r8 (sol r7 B1, key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1): the conform proof's two named margins, mirrored verbatim in
+    # Get-GuiSmokeConformPaceProof and Get-AttrCudaConformAwareSourceFramesVerdict (ConformAwareReceiptOracleTests pins the three equal).
+    $conformReductionMargin = 0.005   # a conform lowers playback_fps below clip_fps AND the engine pace below native_fps by more than this fraction
+    $conformPrintTolerance = 0.0005   # clip_fps and native_fps print one value to 3 decimals, so they agree within half a print unit
     $out = [pscustomobject]@{ proven = $false; reason = 'no playback_smoke.conform line for the run'; present = $false }
-    if ((Get-DvProp $Playback 'conformLinePresent') -ne $true) { return $out }
+    # MERGE-MASTER r8 (fable r7 / adversary A3): only a real boolean $true is a present line; an array or a string is absent, never present.
+    $linePresent = Get-DvProp $Playback 'conformLinePresent'
+    if (-not (($linePresent -is [bool]) -and $linePresent)) { return $out }
     $out.present = $true
     $summarySession = [string](Get-DvProp $Playback 'summarySession')
     $conformSession = [string](Get-DvProp $Playback 'conformSession')
@@ -962,13 +969,16 @@ function Get-DvConformPaceProof {
     if ($summarySession -eq '' -or $conformSession -cne $summarySession) { $out.reason = "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession"; return $out }
     if ($active -ne 1) { $out.reason = "conform_active=$active; the run was not conformed"; return $out }
     # MERGE-MASTER r3 (adversary A4): NaN / Infinity parse as doubles and fail every ordered comparison, so they are rejected first.
-    if ($null -eq $native -or -not [double]::IsFinite($native) -or -not [double]::IsFinite($clip) -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
+    if ($null -eq $native -or -not [double]::IsFinite($native) -or -not [double]::IsFinite($clip) -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt $conformPrintTolerance) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
     if ($null -eq $pace -or -not [double]::IsFinite($pace) -or -not [double]::IsFinite($play) -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
     if ($play -gt ($clip * 1.005)) { $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"; return $out }
     # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): conform_active=1 with playback_fps at the clip rate is native-rate playback, not a conform. The app
     # conforms only by LOWERING the rate (PlaybackConformPolicy.h conformApplies: target < clip), so a proof needs playback_fps below clip_fps by more than
-    # the 0.5 % tolerance; within it the run is indistinguishable from native pace.
-    if ($play -ge ($clip * 0.995)) { $out.reason = "conform active but playback_fps=$play equals clip_fps=$clip (within 0.5 %): no conform happened"; return $out }
+    # the reduction margin; within it the run is indistinguishable from native pace. r8 (key3 CONFORM-PROOF-NEAR-NATIVE-REASON-1): the reason says exactly that.
+    if ($play -ge ($clip * (1 - $conformReductionMargin))) { $out.reason = "conform active but playback_fps=$play is within $($conformReductionMargin * 100) % of clip_fps=${clip}: indistinguishable from native pace, so no conform is proven"; return $out }
+    # MERGE-MASTER r8 (sol r7 B1): the clip / native and playback / pace tolerances are independent, so stacked they let native engine pace prove a
+    # conform (native = pace = 59.94, clip 60, playback 59.69). The engine pace itself must sit below the native rate by more than the margin.
+    if ($pace -ge ($native * (1 - $conformReductionMargin))) { $out.reason = "conform active but pace_fps=$pace is within $($conformReductionMargin * 100) % of native_fps=${native}: the engine ran at native pace, so no conform is proven"; return $out }
     $out.proven = $true
     $out.reason = ''
     $out
@@ -982,7 +992,7 @@ function Get-DvConformArmVerdict {
       'off' (the native-HFR arm): the measured session's playback_smoke.conform line is present, conform_active=0, conform_env_override=0 and
             playback_fps is within 0.5 % of clip_fps.
       'on':  the measured session's conform line is present, conform_active=1 and Get-DvConformPaceProof proves the conformed pace (playback_fps
-            below clip_fps by more than 0.5 %, so native-rate playback is never an honoured conform arm).
+            below clip_fps and pace_fps below native_fps by more than 0.5 %, so native-rate playback is never an honoured conform arm).
     A leg that requests nothing is never blocked (requested = $null). `blocks` is true when the arm was requested and not proven; `reason`
     carries the requested and the observed values, for the receipt's outcomeDetail (CONFORM_ARM_NOT_HONOURED). Pure: the runner gates on it
     and Test-DvReceiptValid re-derives it from the hashed run log and the committed spec.
@@ -991,7 +1001,9 @@ function Get-DvConformArmVerdict {
     $requested = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackConform'
     $out = [pscustomobject]@{ requested = $(if ($null -ne $requested) { [string]$requested } else { $null }); honoured = $true; blocks = $false; reason = $null }
     if ($null -eq $requested) { return $out }
-    $present = ((Get-DvProp $Playback 'conformLinePresent') -eq $true)
+    # MERGE-MASTER r8 (fable r7 / adversary A3): a non-boolean flag (an array, a string) is absent, never present and never a throw at [int]$present.
+    $linePresent = Get-DvProp $Playback 'conformLinePresent'
+    $present = [bool](($linePresent -is [bool]) -and $linePresent)
     $summarySession = [string](Get-DvProp $Playback 'summarySession')
     $conformSession = [string](Get-DvProp $Playback 'conformSession')
     $active = ConvertTo-DvInt64 (Get-DvProp $Playback 'conformActive')

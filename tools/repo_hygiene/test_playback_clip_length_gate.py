@@ -1258,6 +1258,26 @@ CONFORM_CASES = [
     ("j3: a 23.976 clip whose conform line claims active=1 at 23.976 proves no conform (the native rule judges it)",
      dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="23.976"),
      _conform_line(clip_fps="23.976", playback_fps="23.976"), False, [], [], "native"),
+    # MERGE-MASTER r8 (sol r7 B1, issuecomment-6549349607): sol's literal row. native = pace = 59.94, clip 60, playback 59.69, conform_active=1. Each tolerance
+    # passed on its own (clip/native 0.06, playback/pace 0.25, 59.69 < 60 x 0.995), so before r8 all three oracles PROVED a conform from native engine pace.
+    # Now the clip must equal native at print precision and the engine pace must sit below native by more than the margin: no proof, the native rule judges.
+    ("k1: sol r7 B1 -- stacked tolerances: native = pace = 59.94, clip 60, playback 59.69, active=1 proves no conform",
+     dict(HFR_RUN, session=3, source_advanced=1499, required_source_frames=1499, native_fps="59.940", pace_fps="59.940"),
+     _conform_line("3", clip_fps="60.000", playback_fps="59.690", conform_env_override=1), False, [], [PACE_TEXT], "native"),
+    # key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1: clip_fps and native_fps print one value to 3 decimals; a real 24-fps conform whose clip is off native by even one
+    # print unit is not proven (before r8 the 0.5 % tolerance proved it), so the native rule judges pace 24 against 59.94.
+    ("k2: clip_fps 60.000 vs native 59.940 under a real 24-fps conform proves no conform",
+     HFR_RUN, _conform_line(clip_fps="60.000"), True, [PACE_TEXT, "does not match native_fps"], [], "native"),
+    ("k3: clip_fps one print unit off native (59.941 vs 59.940) proves no conform",
+     HFR_RUN, _conform_line(clip_fps="59.941"), True, [PACE_TEXT, "does not match native_fps"], [], "native"),
+    # The engine-pace check alone: clip = native = 59.94, playback 59.63 (below 59.94 x 0.995 = 59.6403) agrees with pace 59.90 (|0.27| <= 0.2995), but the
+    # engine paced within 0.5 % of native. Before r8 this proved a conform; now no proof, and the native rule passes it (pace 59.90 vs native 59.94).
+    ("k4: engine pace within 0.5 % of native (59.90 vs 59.94) proves no conform even with playback 59.63 below the clip margin",
+     dict(HFR_RUN, pace_fps="59.900"), _conform_line(playback_fps="59.630"), False, [], [PACE_TEXT], "native"),
+    # The r7 playback/clip check alone (the engine-pace check would pass it): playback 59.65 is within 0.5 % of clip 59.94, the engine paced at 59.40
+    # (|0.25| <= 0.297). No proof, so the native rule judges pace 59.40 against 59.94 and names why the relaxation was refused.
+    ("k5: playback within 0.5 % of the clip rate proves no conform even with the engine pace below the native margin",
+     dict(HFR_RUN, pace_fps="59.400"), _conform_line(playback_fps="59.650"), True, [PACE_TEXT, "indistinguishable from native pace"], [], "native"),
 ]
 
 
@@ -1356,8 +1376,14 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
                    conformPlaybackFps=59.94, nativeFps=59.94, paceFps=59.94, sourceAdvanced=1499, requiredSourceFrames=1499, fpsOverride=0, wrapped=False,
                    wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE, logShaBound=True, settingsIsolated=True,
                    jobFailures=[], fixtureRehearsal=False, clipId="CLIP")
+        # MERGE-MASTER r8 (sol r7 B1): sol's stacked-tolerance repro (clip 60 / playback 59.69 / native = pace = 59.94), the engine-pace-only shape,
+        # and key3's near-native reason (CONFORM-PROOF-NEAR-NATIVE-REASON-1: clip 30.1 played at 30 is indistinguishable from native pace, not "no conform").
         rows = [("sol-on", "on", sol), ("sound-on", "on", dict(sol, conformPlaybackFps=24.0, paceFps=24.0)),
-                ("native-off", "off", dict(sol, conformActive=0, conformEnvOverride=0))]
+                ("native-off", "off", dict(sol, conformActive=0, conformEnvOverride=0)),
+                ("sol-r7-on", "on", dict(sol, conformClipFps=60.0, conformPlaybackFps=59.69)),
+                ("pace-native-on", "on", dict(sol, conformPlaybackFps=59.63, paceFps=59.90)),
+                ("near-native-on", "on", dict(sol, conformClipFps=30.1, nativeFps=30.1, conformPlaybackFps=30.0, paceFps=30.0, requiredSourceFrames=602,
+                                              sourceAdvanced=602))]
         got = {r["name"]: r for r in _run_oracle_table(
             f"Import-Module {_q(self.DV_MODULE)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
             "$spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = $c.arm } }; $proof = Get-DvConformPaceProof -Playback $c.block; "
@@ -1368,11 +1394,62 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
             [{"name": n, "arm": a, "block": b} for n, a, b in rows])}
         s = got["sol-on"]
         self.assertEqual((s["proven"], s["honoured"], s["blocks"], s["valid"]), (False, False, True, False), s)
-        self.assertIn("no conform happened", s["why"])
-        self.assertIn("no conform happened", s["armReason"])
-        self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in p and "no conform happened" in p for p in s["problems"]), s["problems"])
+        self.assertIn("no conform is proven", s["why"])
+        self.assertIn("indistinguishable from native pace", s["armReason"])
+        self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in p and "no conform is proven" in p for p in s["problems"]), s["problems"])
         self.assertEqual((got["sound-on"]["proven"], got["sound-on"]["honoured"], got["sound-on"]["valid"]), (True, True, True), got["sound-on"])
         self.assertEqual((got["native-off"]["honoured"], got["native-off"]["valid"]), (True, True), got["native-off"])
+        # r8: sol's r7 repro -- before r8 proven=true, honoured=true, blocks=false, valid=true.
+        r7 = got["sol-r7-on"]
+        self.assertEqual((r7["proven"], r7["honoured"], r7["blocks"], r7["valid"]), (False, False, True, False), r7)
+        self.assertIn("clip_fps=60 does not match native_fps=59.94", r7["why"])
+        self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in p for p in r7["problems"]), r7["problems"])
+        pn = got["pace-native-on"]
+        self.assertEqual((pn["proven"], pn["honoured"], pn["blocks"], pn["valid"]), (False, False, True, False), pn)
+        self.assertIn("pace_fps=59.9 is within 0.5 % of native_fps=59.94: the engine ran at native pace", pn["why"])
+        nn = got["near-native-on"]
+        self.assertEqual((nn["proven"], nn["honoured"]), (False, False), nn)
+        self.assertIn("is within 0.5 % of clip_fps=30.1: indistinguishable from native pace, so no conform is proven", nn["why"])
+        self.assertNotIn("no conform happened", nn["why"])
+
+    def test_the_three_conform_proofs_share_one_reduction_margin_and_one_print_tolerance(self) -> None:
+        """MERGE-MASTER r8 (sol r7 B1): the 'measurably below native' margin and the clip/native print tolerance are named constants mirrored in the three
+        siblings; this pins them equal, single-assigned, and used by every check that needs them (a sibling that drifts or inlines a literal goes red)."""
+        uses = {"$conformReductionMargin": 3, "$conformPrintTolerance": 2}
+        values: dict[str, set[str]] = {name: set() for name in uses}
+        proofs = ((GATE, "Get-GuiSmokeConformPaceProof"), (self.MODULE, "Get-AttrCudaConformAwareSourceFramesVerdict"), (self.DV_MODULE, "Get-DvConformPaceProof"))
+        for path, function in proofs:
+            whole = path.read_text(encoding="utf-8")
+            start = whole.index(f"function {function} {{")
+            end = whole.find("\nfunction ", start + 1)
+            text = whole[start:] if end < 0 else whole[start:end]
+            for name, min_count in uses.items():
+                with self.subTest(file=path.name, constant=name):
+                    assigned = re.findall(re.escape(name) + r" = ([0-9.]+)\b", text)
+                    self.assertEqual(len(assigned), 1, f"{name} must be assigned exactly once in {path.name}: {assigned}")
+                    values[name].add(assigned[0])
+                    self.assertGreaterEqual(text.count(name), min_count, f"{name} is assigned but not used by every check in {path.name}")
+            for literal in ("0.995", "(0.005 * $native)"):
+                self.assertNotIn(literal, text, f"{path.name} inlines a conform-proof margin instead of the named constant")
+        self.assertEqual(values, {"$conformReductionMargin": {"0.005"}, "$conformPrintTolerance": {"0.0005"}})
+
+    def test_a_non_boolean_conform_line_flag_is_absent_never_present_and_never_a_throw(self) -> None:
+        """MERGE-MASTER r8 (fable r7 hardening / producer adversary A3): conformLinePresent that is not a real boolean (an array, a string) is ABSENT to both the
+        proof and the requested-arm verdict -- never a throw at [int]$present and never a present line that proves a conform."""
+        sound = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=1, conformEnvOverride=1, conformClipFps=59.94,
+                     conformPlaybackFps=24.0, nativeFps=59.94, paceFps=24.0)
+        rows = [("bool", True), ("empty-array", []), ("array-false", [False]), ("array-true", [True]), ("string", "true")]
+        got = {r["name"]: r for r in _run_oracle_table(
+            f"Import-Module {_q(self.DV_MODULE)} -Force -DisableNameChecking\n$spec = [pscustomobject]@{{ generatorArgs = [pscustomobject]@{{ playbackConform = 'on' }} }}\n"
+            "$out = foreach ($c in $cases) { try { $proof = Get-DvConformPaceProof -Playback $c.block; $arm = Get-DvConformArmVerdict -Spec $spec -Playback $c.block; "
+            "[pscustomobject]@{ name = $c.name; proven = [bool]$proof.proven; present = [bool]$proof.present; blocks = [bool]$arm.blocks; err = '' } } "
+            "catch { [pscustomobject]@{ name = $c.name; proven = $null; present = $null; blocks = $null; err = [string]$_ } } }",
+            [{"name": n, "block": dict(sound, conformLinePresent=v)} for n, v in rows])}
+        self.assertEqual((got["bool"]["proven"], got["bool"]["blocks"]), (True, False), got["bool"])
+        for name, _value in rows[1:]:
+            with self.subTest(name):
+                self.assertEqual(got[name]["err"], "", got[name])
+                self.assertEqual((got[name]["proven"], got[name]["present"], got[name]["blocks"]), (False, False, True), got[name])
 
     def test_the_dual_venue_evidence_block_records_the_conform_fields_and_which_rule_judged_the_pace(self) -> None:
         """Get-DvPlaybackEvidence end to end, from the run log: the conform line's values and paceRule land on the block and a key can re-derive them."""
@@ -1422,9 +1499,18 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
             "attr: session not checked": (self.MODULE, "[string]$cf['session'] -cne $summarySession", "$false"),
             "dv: session not checked": (self.DV_MODULE, "$conformSession -cne $summarySession", "$false"),
             # MERGE-MASTER r7 (sol r6 B1): drop the 'no conform happened' check and row j1 proves a conform again.
-            "gate: native-rate conform accepted": (GATE, "} elseif ($play -ge ($clip * 0.995)) {", "} elseif ($false) {"),
-            "attr: native-rate conform accepted": (self.MODULE, "} elseif ($conformPlaybackFps -ge ($conformSourceFps * 0.995)) {", "} elseif ($false) {"),
-            "dv: native-rate conform accepted": (self.DV_MODULE, "if ($play -ge ($clip * 0.995)) {", "if ($false) {"),
+            "gate: native-rate conform accepted": (GATE, "} elseif ($play -ge ($clip * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "attr: native-rate conform accepted": (self.MODULE, "} elseif ($conformPlaybackFps -ge ($conformSourceFps * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "dv: native-rate conform accepted": (self.DV_MODULE, "if ($play -ge ($clip * (1 - $conformReductionMargin))) {", "if ($false) {"),
+            # MERGE-MASTER r8 (sol r7 B1): drop the engine-pace check and k1 / k4 prove a conform again; relax the clip/native match back to the 0.5 %
+            # tolerance (key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1) and k2 / k3 prove a conform again.
+            "gate: native engine pace accepted": (GATE, "} elseif ($pace -ge ($native * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "attr: native engine pace accepted": (self.MODULE, "} elseif ($pace -ge ($native * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "dv: native engine pace accepted": (self.DV_MODULE, "if ($pace -ge ($native * (1 - $conformReductionMargin))) {", "if ($false) {"),
+            "gate: clip off native tolerated": (GATE, "[Math]::Abs($clip - $native) -gt $conformPrintTolerance", "[Math]::Abs($clip - $native) -gt (0.005 * $native)"),
+            "attr: source off native tolerated": (self.MODULE, "[Math]::Abs($conformSourceFps - $native) -gt $conformPrintTolerance",
+                                                  "[Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)"),
+            "dv: clip off native tolerated": (self.DV_MODULE, "[Math]::Abs($clip - $native) -gt $conformPrintTolerance", "[Math]::Abs($clip - $native) -gt (0.005 * $native)"),
         }
         rows = [{"summary": _summary_line(**summary), "conform": conform, "block": _dv_block(summary, conform)} for _n, summary, conform, *_r in CONFORM_CASES]
         with tempfile.TemporaryDirectory(prefix="conform-mutant-") as tmp:

@@ -5135,7 +5135,7 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         # MERGE-MASTER r7 (sol r6 B1): conform_active=1 on a 23.976 clip played at 23.976 is native-rate playback, not a conform (before r7 it PASSED).
         _, receipt, _ = self.leg("on", [conform_line(active=1, env_override=1)])
         self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
-        self.assertIn("no conform happened", receipt["outcomeDetail"])
+        self.assertIn("no conform is proven", receipt["outcomeDetail"])
         # the active conform that actually conformed (59.94 clip played at 24, engine paced at 24) passes
         self.write_artifacts(line={"native_fps": "59.940", "pace_fps": "24.000"}, extra_log_lines=[conform_line(clip="59.940", play="24.000", active=1, env_override=1)])
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
@@ -5158,6 +5158,9 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                                                     conform_line(clip="59.940", play="NaN", active=1, env_override=1)]),
         # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's leg -- active conform at the native rate, the engine paced at 59.94: no conform happened.
         ("native rate, no conform happened", [conform_line(clip="59.940", play="59.940", active=1, env_override=1)]),
+        # MERGE-MASTER r8 (sol r7 B1, issuecomment-6549349607): stacked tolerances -- clip 60 (0.06 off native), playback 59.69 (0.25 off pace, under 60 x 0.995),
+        # engine pace = native = 59.94. Before r8 the leg PASSED (proven, honoured, valid); key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1: clip one print unit off native.
+        ("sol r7: native engine pace with tolerated clip / playback discrepancies", [conform_line(clip="60.000", play="59.690", active=1, env_override=1)]),
     )
 
     def test_a_conform_leg_whose_conformed_rate_is_not_proven_fails_closed(self) -> None:
@@ -5186,6 +5189,10 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                 ("another session", dict(base, conformSession="1", conformClipFps=59.94, conformPlaybackFps=59.94)),
                 # MERGE-MASTER r7 (sol r6 B1): sol's literal row, native = pace = clip = playback = 59.94 with conform_active=1
                 ("native rate", dict(base, conformClipFps=59.94, conformPlaybackFps=59.94)),
+                # MERGE-MASTER r8 (sol r7 B1): the stacked-tolerance repro, the clip one print unit off native under a real 24-fps conform, and engine pace at native
+                ("sol r7 stack", dict(base, conformClipFps=60.0, conformPlaybackFps=59.69)),
+                ("clip off native by a print unit", dict(base, paceFps=24.0, conformClipFps=59.941, conformPlaybackFps=24.0)),
+                ("engine pace at native", dict(base, paceFps=59.90, conformClipFps=59.94, conformPlaybackFps=59.63)),
                 ("sound", dict(base, paceFps=24.0, conformClipFps=59.94, conformPlaybackFps=24.0))]
         proc, out = run_pwsh_json("$rows = $env:DVE_ROWS | ConvertFrom-Json; $spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = 'on' } }\n"
                                   "@($rows | ForEach-Object { $v = Get-DvConformArmVerdict -Spec $spec -Playback $_.block; [pscustomobject]@{ name = $_.name; blocks = $v.blocks; reason = [string]$v.reason } }) | ConvertTo-Json -Compress",
@@ -5211,7 +5218,7 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         sound, nan, native = self.status_batch(repo, cases)
         self.expect(sound, "ADVISORY", "sound")
         self.expect(nan, "INVALID", "nan", needle="CONFORM_PACE_NOT_PROVEN")
-        self.expect(native, "INVALID", "native", needle="no conform happened")
+        self.expect(native, "INVALID", "native", needle="no conform is proven")
 
     def test_the_production_validator_re_derives_the_verdict(self) -> None:
         spec = self.write_spec(generator_args={"playbackConform": "off"})

@@ -7291,8 +7291,10 @@ function Get-AttrCudaSourceFramesVerdict {
 # slow motion at the conform rate, so the engine's pace_fps is that rate and the native-pace rule above would reject every conformed run. Hub ruling:
 # the owner's 20 s of REAL footage is never relaxed (the floor, the override, the wrap and the nonce rules are the oracle above, untouched); the PACE
 # rule is relaxed ONLY when the run PROVES it was conformed -- a present playback_smoke.conform line for the measured session with conform_active=1,
-# the conform line's source-rate field within 0.5 % of native_fps, playback_fps > 0 and within 0.5 % of pace_fps, playback_fps not above that source rate, and playback_fps
-# below that source rate by more than 0.5 % (MERGE-MASTER r7: an active conform at the source rate is native-rate playback, no conform). Absent / malformed / inactive /
+# the conform line's source-rate field EQUAL to native_fps at print precision (MERGE-MASTER r8), playback_fps > 0 and within 0.5 % of pace_fps, playback_fps not above that
+# source rate, playback_fps below that source rate by more than the reduction margin (MERGE-MASTER r7: an active conform at the source rate is native-rate playback, no
+# conform), and pace_fps below native_fps by more than the same margin (MERGE-MASTER r8: native engine pace is never a conform, however the tolerances stack); the two
+# margins are named constants mirrored in the two sibling proofs and pinned equal by ConformAwareReceiptOracleTests. Absent / malformed / inactive /
 # another session's / inconsistent -> the oracle above judges the pace unchanged (absence never helps), and a PRESENT but unproven line adds "conform
 # relaxation not applied: <why>" to the pace failure. On proof the pace is judged against the conform playback_fps: the proof established
 # |playback_fps - pace_fps| <= 0.5 %, so the oracle above is handed the summary with pace_fps at the native fps and its own pace comparison is
@@ -7302,6 +7304,10 @@ function Get-AttrCudaSourceFramesVerdict {
 function Get-AttrCudaConformAwareSourceFramesVerdict {
     [CmdletBinding()]
     param([AllowNull()][AllowEmptyString()][string]$SummaryLine, [AllowNull()][AllowEmptyString()][string]$ExpectedRunNonce = '', [AllowNull()][AllowEmptyString()][string]$ConformLine = '')
+    # MERGE-MASTER r8 (sol r7 B1, key3 source-rate / native exact-match hardening): the conform proof's two named margins, mirrored verbatim in
+    # Get-DvConformPaceProof and Get-GuiSmokeConformPaceProof (ConformAwareReceiptOracleTests pins the three equal).
+    $conformReductionMargin = 0.005   # a conform lowers playback_fps below the source rate AND the engine pace below native_fps by more than this fraction
+    $conformPrintTolerance = 0.0005   # the source rate and native_fps print one value to 3 decimals, so they agree within half a print unit
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $fields = @{}
     if (-not [string]::IsNullOrWhiteSpace($SummaryLine)) {
@@ -7341,16 +7347,19 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
             } elseif ($cn['conform_active'] -ne 1) {
                 $conformWhy = "conform_active=$($cf['conform_active']); the run was not conformed"
             } elseif (-not $nativeKnown -or [double]::IsNaN($native) -or [double]::IsInfinity($native) -or [double]::IsNaN($conformSourceFps) -or [double]::IsInfinity($conformSourceFps) -or
-                      $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)) {
+                      $native -le 0 -or $conformSourceFps -le 0 -or [Math]::Abs($conformSourceFps - $native) -gt $conformPrintTolerance) {
                 $conformWhy = "conform source rate=$conformSourceFps does not match native_fps=$native"
             } elseif (-not $paceKnown -or [double]::IsNaN($pace) -or [double]::IsInfinity($pace) -or [double]::IsNaN($conformPlaybackFps) -or [double]::IsInfinity($conformPlaybackFps) -or
                       0 -ge $pace -or $conformPlaybackFps -le 0 -or [Math]::Abs($conformPlaybackFps - $pace) -gt (0.005 * $pace)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps does not match pace_fps=$pace"
             } elseif ($conformPlaybackFps -gt ($conformSourceFps * 1.005)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps is above the source rate $conformSourceFps; conform never speeds a recording up"
-            } elseif ($conformPlaybackFps -ge ($conformSourceFps * 0.995)) {
+            } elseif ($conformPlaybackFps -ge ($conformSourceFps * (1 - $conformReductionMargin))) {
                 # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): an active conform at the source rate is native-rate playback; the parity contract with Get-DvConformPaceProof.
-                $conformWhy = "conform active but playback_fps=$conformPlaybackFps equals the source rate $conformSourceFps (within 0.5 %): no conform happened"
+                $conformWhy = "conform active but playback_fps=$conformPlaybackFps is within $($conformReductionMargin * 100) % of the source rate ${conformSourceFps}: indistinguishable from native pace, so no conform is proven"
+            } elseif ($pace -ge ($native * (1 - $conformReductionMargin))) {
+                # MERGE-MASTER r8 (sol r7 B1): stacked source / playback tolerances never let native engine pace prove a conform; the parity contract with Get-DvConformPaceProof.
+                $conformWhy = "conform active but pace_fps=$pace is within $($conformReductionMargin * 100) % of native_fps=${native}: the engine ran at native pace, so no conform is proven"
             } else {
                 $conformProven = $true
             }
