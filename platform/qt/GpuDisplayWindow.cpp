@@ -239,6 +239,7 @@ void GpuDisplayWindow::resetSwapTelemetry(quint64 sessionId)
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     if ( !win ) return;
     win->m_swapTelemetryCounters = GpuWindowSwapTelemetryCounters();
+    win->m_tailWindow.dropQtPaintStamp();   // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (G2)
 }
 
 GpuWindowSwapTelemetrySnapshot GpuDisplayWindow::swapTelemetrySnapshot()
@@ -280,6 +281,7 @@ GpuWindowSwapTelemetrySnapshot GpuDisplayWindow::swapTelemetrySnapshot()
 
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     if ( !win ) return snapshot;
+    win->m_tailWindow.dropQtPaintStamp();   // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (G2)
     snapshot.windowActive = true;
     snapshot.summary = GpuWindowSwapTelemetryPolicy::summarize(
         win->m_swapTelemetryCounters, g_swapTelemetrySessionBeginQpcMs, gateQpcMs );
@@ -985,15 +987,14 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
 
 void GpuDisplayWindow::paintUnderGL()
 {
-    if ( swapTelemetryEnabled() ) m_qtPaintStartNs = m_tailClock.nsecsElapsed();
+    if ( swapTelemetryEnabled() ) m_tailWindow.qtPaintStarted(m_tailClock.nsecsElapsed());
 }
 
 void GpuDisplayWindow::noteQtPaintSwap()
 {
-    if ( m_qtPaintStartNs < 0 ) return;
-    const qint64 pairNs = m_tailClock.nsecsElapsed() - m_qtPaintStartNs;
-    m_qtPaintStartNs = -1;
-    m_tailWindow.qtPaintSwap(pairNs);
+    // r4 (G2): the stamp lives in m_tailWindow, so the path-3 open() and the session start/stop drop an unswapped one
+    if ( m_tailWindow.qtPaintStartNs < 0 ) return;
+    m_tailWindow.qtPaintSwapped(m_tailClock.nsecsElapsed());
 }
 
 GpuDisplayWindow::~GpuDisplayWindow()

@@ -355,7 +355,6 @@ private:
      * setup start (GpuPresentTailWindow.h; open while m_tailWindow.isOpen()). All on m_tailClock; POD only. */
     QElapsedTimer m_tailClock;
     GpuPresentTailWindow m_tailWindow;
-    qint64 m_qtPaintStartNs = -1;
     bool m_tailIdleProbe = false;
     GpuPresentTailTiming m_lastPresentTailTiming;
     // Presentation options captured at the most recent recon-texture submit; consumed

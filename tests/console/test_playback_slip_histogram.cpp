@@ -914,3 +914,61 @@ TEST(GpuPresentTailWindow, RefusedPresentAbandonsTheOpenWindow)
     ASSERT_EQ( 1, next.runner_sleeps );
     ASSERT_EQ( 0, next.grab_swaps );
 }
+
+TEST(GpuPresentTailWindow, ProfilePlayHoldSleepsAreRunnerSleepsNotGuiBusy)
+{
+    // r4 (ADV-A1, the r3 adversary's input): a 250 ms window holding a 100 ms modal dispatcher wait and fifteen 10 ms
+    // sleeps of runHeadlessPlaybackProfile's pinned Play-hold loop. Those sleeps now reach the window through
+    // sleepGuiThreadForSmokeRunner (wiring: test_playback_smoke_gui_present_attribution_wiring.cpp), so nothing is busy.
+    GpuPresentTailWindow w;
+    w.open( 0, 6.0, 16.0 );
+    w.blocked( 0 );
+    w.awake( 100 * kMs );
+    for( int i = 0; i < 15; ++i ) w.runnerSlept( 10 * kMs );
+    GpuPresentTailTiming t;
+    w.close( 250 * kMs, true, t );
+    ASSERT_EQ( 1, t.gui_idle_waits );
+    ASSERT_EQ( 15, t.runner_sleeps );
+    const playback_slip::PresentSetupSample s = sampleFromTail( 60.0, t );
+    ASSERT_NEAR( 0.0, playback_slip::presentSetupGuiBusyMs( s ), 1e-9 );
+    ASSERT_FALSE( playback_slip::presentSetupBucket( s ) == playback_slip::SetupBucket::GuiBusy );
+}
+
+TEST(GpuPresentTailWindow, AnUnswappedPaintNeverPairsWithALaterWindowsSwap)
+{
+    // r4 (G2, CoS 6534991791): a path-1 paint in window 1 whose frameSwapped never came, then a path-3 swap opens
+    // window 2 and a frameSwapped arrives there. The stale stamp is gone: window 2 reports no paint+swap pair.
+    GpuPresentTailWindow w;
+    w.open( 0, 5.0, 12.0 );
+    w.qtPaintStarted( 4 * kMs );
+    GpuPresentTailTiming t1;
+    w.close( 10 * kMs, true, t1 );
+    ASSERT_EQ( 0, t1.qt_paint_swaps );
+    w.open( 100 * kMs, 5.0, 12.0 );
+    w.qtPaintSwapped( 103 * kMs );
+    GpuPresentTailTiming t2;
+    w.close( 110 * kMs, true, t2 );
+    ASSERT_TRUE( t2.prev_known );
+    ASSERT_EQ( 0, t2.qt_paint_swaps );
+    ASSERT_NEAR( 0.0, t2.qt_paint_swap_max_ms, 1e-12 );
+
+    // Inside one window a paint and its swap still pair, once.
+    w.open( 200 * kMs, 5.0, 12.0 );
+    w.qtPaintStarted( 202 * kMs );
+    w.qtPaintSwapped( 205 * kMs );
+    w.qtPaintSwapped( 207 * kMs );
+    GpuPresentTailTiming t3;
+    w.close( 210 * kMs, true, t3 );
+    ASSERT_EQ( 1, t3.qt_paint_swaps );
+    ASSERT_NEAR( 3.0, t3.qt_paint_swap_max_ms, 1e-9 );
+
+    // A session start or stop drops an unswapped stamp inside an open window.
+    w.open( 300 * kMs, 5.0, 12.0 );
+    w.qtPaintStarted( 301 * kMs );
+    w.dropQtPaintStamp();
+    w.qtPaintSwapped( 340 * kMs );
+    GpuPresentTailTiming t4;
+    w.close( 350 * kMs, true, t4 );
+    ASSERT_EQ( 0, t4.qt_paint_swaps );
+    ASSERT_NEAR( 0.0, t4.qt_paint_swap_max_ms, 1e-12 );
+}

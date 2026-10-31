@@ -129,14 +129,14 @@ PINNED_STOP_STATEMENTS = {
         "playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue; "
         "while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
-        "QThread::msleep( 10 ); } programmaticStop( \"profile-look-assist-settle\" ); "
+        "sleepGuiThreadForSmokeRunner( 10 ); } programmaticStop( \"profile-look-assist-settle\" ); "
         "if( autoSettleState != playback_frame_range::PlayStopState::Reached )",
         "&& !m_lastLookAssistDiagnosticsValid && playback_frame_range::lookAssistSettleNeedsOwnPlay( "
         "m_programmaticPlayLedger.admitted ) ) {",
         "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
         "while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
-        "QThread::msleep( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",
+        "sleepGuiThreadForSmokeRunner( 10 ); } playActionEndedEarly =playActionState == playback_frame_range::PlayStopState::EndedEarly;",
         "isolateAutomationPacing( \"profile-entry\" );",
         # r2 (sol BLOCKER): the profile JSON echoes the launcher's per-run nonce (see finishPlaybackSmokeTelemetry below).
         "metadata.insert( QStringLiteral(\"run_nonce\"), automationRunNonce() );",

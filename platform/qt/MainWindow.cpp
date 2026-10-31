@@ -8207,15 +8207,15 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             autoSettleClock.start();
             // ENFORCE-3: the settle holds Play until the engine has CONSUMED the source frames of the 20 s window
             // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
-            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
-            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
+            // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): this pinned ENFORCE-3 stop statement's sleep is a runner sleep
+            // like every other (Play presents run in it, so a GPU window's present-tail window is open across it).
             const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
             while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                QThread::msleep( 10 );
+                sleepGuiThreadForSmokeRunner( 10 );
             }
             programmaticStop( "profile-look-assist-settle" );
             if( autoSettleState != playback_frame_range::PlayStopState::Reached )
@@ -8571,14 +8571,14 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             // ENFORCE-3: hold until the engine has CONSUMED the source frames of the 20 s window; a Play the
             // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
-            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: this loop is a pinned ENFORCE-3 stop statement, so its
-            // sleep stays a raw QThread::msleep and is not split out of avg_gui_busy_ms.
+            // PLAYBACK-PRESENT-TAIL-TIMING-1 r4 (ADV-A1): this pinned ENFORCE-3 stop statement's sleep is a runner sleep
+            // like every other (Play presents run in it, so a GPU window's present-tail window is open across it).
             const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                QThread::msleep( 10 );
+                sleepGuiThreadForSmokeRunner( 10 );
             }
             playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;
             playActionSmokeTimedOut = playActionState == playback_frame_range::PlayStopState::SafetyTimeout;

@@ -954,9 +954,23 @@ TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
     // r3-r5: the path-1 paint stamp, its frameSwapped slot and the dispatcher idle lambdas.
     const QString r3 = functionBody(source, QStringLiteral("void GpuDisplayWindow::paintUnderGL()"),
                                     QStringLiteral("void GpuDisplayWindow::noteQtPaintSwap()"));
-    ASSERT_TRUE(r3.contains(QStringLiteral("if ( swapTelemetryEnabled() ) m_qtPaintStartNs = m_tailClock.nsecsElapsed();")));
+    ASSERT_TRUE(r3.contains(QStringLiteral(
+        "if ( swapTelemetryEnabled() ) m_tailWindow.qtPaintStarted(m_tailClock.nsecsElapsed());")));
     const QString r4 = functionBody(source, QStringLiteral("void GpuDisplayWindow::noteQtPaintSwap()"),
                                     QStringLiteral("GpuDisplayWindow::~GpuDisplayWindow()"));
+    // r4 (G2): the stamp lives in the window struct (its open() drops it; executed by test_playback_slip_histogram.cpp),
+    // never in a GpuDisplayWindow member the path-3 open cannot reach, and the swap-telemetry session start and stop drop it.
+    ASSERT_TRUE(r4.contains(QStringLiteral("m_tailWindow.qtPaintSwapped(m_tailClock.nsecsElapsed());")));
+    ASSERT_EQ(0, countOccurrences(source, QStringLiteral("m_qtPaintStartNs")));
+    ASSERT_EQ(0, countOccurrences(readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.h")),
+                                  QStringLiteral("m_qtPaintStartNs")));
+    const QString drop = QStringLiteral("win->m_tailWindow.dropQtPaintStamp();");
+    const QString sessionStart = QStringLiteral("void GpuDisplayWindow::resetSwapTelemetry(quint64 sessionId)");
+    const QString sessionStop = QStringLiteral("GpuWindowSwapTelemetrySnapshot GpuDisplayWindow::swapTelemetrySnapshot()");
+    ASSERT_TRUE(functionBody(source, sessionStart, sessionStop).contains(drop));
+    ASSERT_TRUE(functionBody(source, sessionStop, QStringLiteral("void GpuDisplayWindow::noteRealSwap()")).contains(drop));
+    ASSERT_EQ(2, countOccurrences(source, drop));
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral("qint64 qtPaintStartNs = -1;")));
     const QString r5 = regionBetween(source, QStringLiteral("&QAbstractEventDispatcher::aboutToBlock"),
                                      QStringLiteral("m_tailIdleProbe = true;"));
     ASSERT_TRUE(r5.contains(QStringLiteral("&QAbstractEventDispatcher::awake")));

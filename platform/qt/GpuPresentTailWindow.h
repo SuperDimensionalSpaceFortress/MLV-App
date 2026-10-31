@@ -48,13 +48,15 @@ struct GpuPresentTailWindow
     int runnerSleeps = 0;
     int qtPaintSwaps = 0;
     qint64 qtPaintSwapMaxNs = 0;
+    qint64 qtPaintStartNs = -1; // >= 0 from a path-1 paintUnderGL until its frameSwapped (r4, G2)
     int grabSwaps = 0;
     double prevPaintMs = 0.0;
     double prevSwapMs = 0.0;
 
     bool isOpen() const { return swapReturnNs >= 0; }
 
-    // A path-3 swap returned: a fresh window opens, every count from the previous one gone.
+    // A path-3 swap returned: a fresh window opens, every count from the previous one gone. r4 (G2): that includes an
+    // unswapped path-1 paint stamp, so a paint whose frameSwapped never came is never paired with a later window's swap.
     void open( qint64 nowNs, double paintMs, double swapMs )
     {
         *this = GpuPresentTailWindow();
@@ -87,6 +89,23 @@ struct GpuPresentTailWindow
         if( !isOpen() ) return;
         ++qtPaintSwaps;
         if( pairNs > qtPaintSwapMaxNs ) qtPaintSwapMaxNs = pairNs;
+    }
+    // r4 (G2): paintUnderGL stamps the path-1 paint start; the next frameSwapped consumes it as one pair.
+    void qtPaintStarted( qint64 nowNs )
+    {
+        qtPaintStartNs = nowNs;
+    }
+    void qtPaintSwapped( qint64 nowNs )
+    {
+        if( qtPaintStartNs < 0 ) return;
+        const qint64 pairNs = nowNs - qtPaintStartNs;
+        qtPaintStartNs = -1;
+        qtPaintSwap( pairNs );
+    }
+    // Swap-telemetry session start and stop: a stamp never pairs across a session boundary.
+    void dropQtPaintStamp()
+    {
+        qtPaintStartNs = -1;
     }
     void grabSwap()
     {
