@@ -147,12 +147,21 @@ TEST(PlaybackAudioStartWiring, PlayPostsThePrepareAndTheAudioObjectLivesOnItsOwn
     const QString triggered = bodyBetween(source, QStringLiteral("void MainWindow::on_actionPlay_triggered(bool checked)"),
                                           QStringLiteral("void MainWindow::applyEffectiveDualIsoPlaybackSettings( void )"));
     ASSERT_FALSE(triggered.isEmpty());
-    const int sync = triggered.indexOf(QStringLiteral("m_tryToSyncAudio = true;"));
+    // MERGE-MASTER r5 (CI-2, DISTINGUISH; Dot 6541731407): PLAYBACK-HFR-CONFORM-DEFAULT-1 raises the sync request through
+    // ONE conform-gated helper, requestPlaybackAudioSync(), which is the only writer of "m_tryToSyncAudio = true;"
+    // (PlaybackConformWiring.AudioSyncFlagIsRaisedInExactlyOneGatedPlace pins a count of 1, so the literal can no longer also
+    // sit in this handler). The order guarded here is unchanged: the request comes before the prepare, the prepare is gated
+    // on !legacy, and the helper raises the flag the first present's consumer reads.
+    const int sync = triggered.indexOf(QStringLiteral("requestPlaybackAudioSync();"));
     const int prepare = triggered.indexOf(QStringLiteral(
         "m_pAudioPlayback->prepare( ui->horizontalSliderPosition->value() );"));
     ASSERT_TRUE(sync >= 0);
     ASSERT_TRUE(prepare > sync);
     ASSERT_TRUE(triggered.mid(sync, prepare - sync).contains(QStringLiteral("!mlvappPlaybackAudioSyncLegacyRequested()")));
+    const QString request = bodyBetween(source, QStringLiteral("void MainWindow::requestPlaybackAudioSync( void )"),
+                                        QStringLiteral("void MainWindow::refreshPlaybackFpsStatus( void )"));
+    ASSERT_FALSE(request.isEmpty());
+    ASSERT_TRUE(request.contains(QStringLiteral("m_tryToSyncAudio = true;")));
     // constructed without a parent and moved to its own thread unless legacy; joined (bounded) in the destructor
     // before the mlvObject is freed, and never deleted when the join timed out
     ASSERT_TRUE(source.contains(QStringLiteral(
