@@ -5034,7 +5034,11 @@ def test_fsmonitor_lexer_stays_in_sync_over_the_shipped_lane_script():
 MGRS_TIP = "a" * 40
 MGRS_OTHER = "b" * 40
 MGRS_EJECTED = "c" * 40
-MGRS_LABEL_LANDED = "landed (headSha = master tip)"
+MGRS_LABEL_LANDED = "landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)"
+
+
+def _mgrs_newer(n):
+    return "; %d newer completed run(s) not at the local tip" % n
 MGRS_LABEL_SUCCESS = "newest success; may be a non-landed queue entry"
 MGRS_LABEL_NEWEST = "newest by createdAt; may be a non-landed queue entry"
 
@@ -5067,14 +5071,15 @@ def test_an_ejected_newest_merge_group_entry_loses_to_the_older_landed_run(tmp_p
         _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),       # landed
         _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
     ]
-    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
+    # r2 (adversary A2): the ejected newest FAILURE is a newer completed off-tip run too, so it is counted.
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}
 
 
 def test_a_newer_success_not_at_the_local_tip_puts_a_stale_ref_caveat_in_the_landed_label(tmp_path):
     """adversary A1: the tip is read from the LOCAL fork/master, which can lag hosted master. A newer
     successful run whose headSha is not the local tip may be the real landed run, so the label must
     say the local ref may lag instead of asserting 'landed' flatly. An ejected newest FAILURE (the
-    ordinary case above) must not trigger the caveat."""
+    ordinary case above) is counted as well since r2 (A2)."""
     rows = [
         _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "success"),
         _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "failure"),
@@ -5082,8 +5087,46 @@ def test_a_newer_success_not_at_the_local_tip_puts_a_stale_ref_caveat_in_the_lan
     picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
     assert picked["id"] == 200
     assert picked["label"].startswith(MGRS_LABEL_LANDED), picked
-    assert "1 newer success run(s) not at the local tip" in picked["label"], picked
-    assert "local fork/master may lag" in picked["label"], picked
+    assert picked["label"] == MGRS_LABEL_LANDED + _mgrs_newer(1), picked
+    assert "the local tip can lag hosted master" in picked["label"], picked
+
+
+def test_a_newer_off_tip_run_whose_conclusion_is_failure_still_puts_the_caveat_in_the_label(tmp_path):
+    """adversary A2 (r1 a211ccf4): a landed run that was RERUN and now reads failure sits at a newer
+    createdAt on a headSha that is not the local tip. The r1 caveat counted only conclusion == success, so
+    this gave no caveat. Every newer completed off-tip run counts."""
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 200
+    assert picked["label"].endswith(_mgrs_newer(1)), picked
+
+
+def test_two_newer_off_tip_runs_of_mixed_conclusions_are_both_counted(tmp_path):
+    rows = [
+        _mgrs_row(400, "2026-10-31T18:00:00Z", MGRS_EJECTED, "cancelled"),
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_EJECTED, "failure"),   # OLDER than the landed run: not counted
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _mgrs_newer(2)}
+
+
+def test_a_stale_local_tip_with_no_newer_run_in_the_sample_still_carries_the_lag_caveat(tmp_path):
+    """adversary A2 / Dot #734: the sample may simply not contain the run that landed after the local tip.
+    A missing newer run does not prove freshness, so the exact-match label names its source and the lag
+    caveat even when nothing newer is in the sample, and carries no newer-run count."""
+    rows = [
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked == {"id": 200, "label": MGRS_LABEL_LANDED}, picked
+    assert "local refs/remotes/fork/master tip" in picked["label"]
+    assert "the local tip can lag hosted master" in picked["label"]
+    assert "newer completed run" not in picked["label"]
 
 
 def test_the_newest_of_several_landed_merge_group_runs_is_taken(tmp_path):
@@ -5134,8 +5177,69 @@ def test_the_merge_group_export_uses_the_selector_and_names_its_label_not_a_fixe
     assert "Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha" in text
     assert "newest by createdAt)" not in text, "the jobs row still hard-codes the label"
     assert "$($pick.Label))" in text, "the jobs row does not carry the selector's label"
-    assert "rev-parse fork/master" in text
+    assert "refs/remotes/fork/master^{commit}" in text
     start = text.index("$pick = Select-MergeGroupJobsRun")
     block = text[text.index("$tipSha = ''"):start]
     assert "catch" in block and "gh " not in block and "gh api" not in block, "tip read must be local and non-throwing"
     assert re.search(r"(?m)^\s*\} catch \{\s*\n\s*\$ghRows \+= .*\(job graph\)", text), "the export's own try/catch shape is gone"
+
+
+# --- r2 (adversary A1): the master tip is read by FULL refname, never the bare "fork/master" ---------------
+# A same-named lightweight tag refs/tags/fork/master outranks refs/remotes/fork/master for the bare name, so
+# `git rev-parse fork/master` can return a tag target while the remote-tracking tip is somewhere else. The
+# expression is lifted out of each shipped script and run over a REAL throwaway repo.
+
+MGRS_TIP_READERS = (
+    (WORKSTREAM, 2),
+    (ROOT / "tools" / "coordination" / "Export-PrReviewEvidence.ps1", 1),
+)
+
+
+def _mgrs_tip_read_expressions(path):
+    text = path.read_text(encoding="utf-8")
+    return [m for m in re.findall(r"& git -C \$RepoRoot rev-parse [^\r\n]*?\| Select-Object -First 1", text) if "fork/master" in m]
+
+
+def _mgrs_run_tip_expr(tmp_path, repo, expr):
+    harness = tmp_path / "mgrs-tip-harness.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n$RepoRoot='" + str(repo).replace("'", "''") + "'\n"
+        "$v = (" + expr + ")\nif ($null -eq $v) { '' } else { [string]$v }\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip()
+
+
+def test_the_fork_master_tip_read_ignores_a_same_named_tag(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    git(repo, "add", "f.txt")
+    git(repo, "commit", "-q", "-m", "one")
+    remote_tip = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("2", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "two")
+    tag_target = git(repo, "rev-parse", "HEAD")
+    assert remote_tip != tag_target
+    git(repo, "tag", "fork/master", tag_target)   # lightweight tag named like the remote-tracking branch
+    git(repo, "update-ref", "refs/remotes/fork/master", remote_tip)
+    for path, expected in MGRS_TIP_READERS:
+        exprs = _mgrs_tip_read_expressions(path)
+        assert len(exprs) == expected, (path.name, exprs)
+        for expr in exprs:
+            assert _mgrs_run_tip_expr(tmp_path, repo, expr) == remote_tip, (path.name, expr)
+    # with no remote-tracking ref at all the read must be EMPTY, never the tag target
+    git(repo, "update-ref", "-d", "refs/remotes/fork/master")
+    for path, _ in MGRS_TIP_READERS:
+        for expr in _mgrs_tip_read_expressions(path):
+            assert _mgrs_run_tip_expr(tmp_path, repo, expr) == "", (path.name, expr)
+
+
+def test_the_fork_master_tip_reads_use_the_full_refname_in_source():
+    for path, _ in MGRS_TIP_READERS:
+        text = path.read_text(encoding="utf-8")
+        assert "rev-parse fork/master" not in text, path.name
+        assert "refs/remotes/fork/master^{commit}" in text, path.name

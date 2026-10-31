@@ -211,7 +211,8 @@ $Schedulable = @('queued', 'dispatched', 'in-review', 'waiting-evidence', 'dispa
 # supplies the job graph. On a merge-queue repo the newest COMPLETED merge_group run can be an EJECTED
 # queue entry whose headSha never landed on master; labelling its jobs "newest" lets a reader take them
 # for master's CI. Preference: (a) newest run whose headSha IS the master tip; (b) newest success;
-# (c) newest by createdAt. (b) and (c) say in their label that the run may not be a landed one.
+# (c) newest by createdAt. (a) always says its tip is the local ref and can lag; (b) and (c) say in their
+# label that the run may not be a landed one.
 # Pure: no I/O. $MasterSha is '' when the tip could not be read, which skips (a).
 function Select-MergeGroupJobsRun {
     param([object[]]$Runs, [string]$MasterSha = '')
@@ -220,13 +221,15 @@ function Select-MergeGroupJobsRun {
     if ($MasterSha) {
         $landed = @($sorted | Where-Object { $_.headSha -eq $MasterSha })
         if ($landed.Count -gt 0) {
-            $label = 'landed (headSha = master tip)'
-            # The tip is the LOCAL fork/master and can lag hosted master. A newer SUCCESSFUL run that is not
-            # at the tip may be the real landed run, so say so rather than asserting "landed" flatly.
-            $newerOk = @($sorted[0..([array]::IndexOf($sorted, $landed[0]))] |
-                Where-Object { $_.conclusion -eq 'success' -and $_.headSha -ne $MasterSha })
-            if ($newerOk.Count -gt 0) {
-                $label += "; $($newerOk.Count) newer success run(s) not at the local tip - local fork/master may lag"
+            # The tip is the LOCAL refs/remotes/fork/master and can lag hosted master, so the label ALWAYS names
+            # its source and carries that caveat: a missing newer success proves nothing about freshness. Every
+            # newer COMPLETED run (the export is completed-only) whose headSha is not the tip is counted, whatever
+            # its current conclusion - a landed run with a failed rerun is still a newer off-tip run.
+            $label = 'landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)'
+            $newerOff = @($sorted[0..([array]::IndexOf($sorted, $landed[0]))] |
+                Where-Object { $_.headSha -ne $MasterSha })
+            if ($newerOff.Count -gt 0) {
+                $label += "; $($newerOff.Count) newer completed run(s) not at the local tip"
             }
             return [pscustomobject]@{ Run = $landed[0]; Label = $label }
         }
@@ -882,17 +885,19 @@ if ($needsHostedEvidence) {
             }
         }
 
-        # The job graph is a SECOND call keyed on the first one's newest row, so it can only be made
-        # after the run list lands. Skipped without complaint when that export failed.
+        # The job graph is a SECOND call keyed on the run Select-MergeGroupJobsRun picks from the first
+        # one's rows in this order: master-tip match, then newest success, then newest by createdAt; so it can only be
+        # made after the run list lands. Skipped without complaint when that export failed.
         $runsFile = Join-Path $ghDir 'runs-tests-merge-group-completed.json'
         if (Test-Path -LiteralPath $runsFile) {
             try {
                 $runs = @(Get-Content -LiteralPath $runsFile -Raw | ConvertFrom-Json)
-                # Master tip is read LOCALLY (never the network); an unreadable tip falls through to the
-                # success / createdAt choices inside Select-MergeGroupJobsRun.
+                # Master tip is read LOCALLY (never the network) by FULL refname: a same-named tag
+                # refs/tags/fork/master would win the bare name fork/master. An unreadable tip falls through
+                # to the success / createdAt choices inside Select-MergeGroupJobsRun.
                 $tipSha = ''
                 try {
-                    $tipSha = [string](& git -C $RepoRoot rev-parse fork/master 2>$null | Select-Object -First 1)
+                    $tipSha = [string](& git -C $RepoRoot rev-parse --verify --quiet 'refs/remotes/fork/master^{commit}' 2>$null | Select-Object -First 1)
                     if ($tipSha -notmatch '^[0-9a-f]{40}$') { $tipSha = '' }
                 } catch { $tipSha = '' }
                 $pick = Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha
@@ -1200,7 +1205,7 @@ $fence
 
     $laneWorkDir = Join-Path 'C:\mlvtmp' "lane-$cardId-$stamp"
 
-    $baseSha = (& git -C $RepoRoot rev-parse fork/master 2>$null | Select-Object -First 1)
+    $baseSha = (& git -C $RepoRoot rev-parse --verify --quiet 'refs/remotes/fork/master^{commit}' 2>$null | Select-Object -First 1)
     if (-not $baseSha -or $baseSha -notmatch '^[0-9a-f]{40}$') {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not resolve fork/master to a full sha at $RepoRoot"
         Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-base-sha' -ExitCode 3
