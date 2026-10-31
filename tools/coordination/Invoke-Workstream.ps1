@@ -220,7 +220,15 @@ function Select-MergeGroupJobsRun {
     if ($MasterSha) {
         $landed = @($sorted | Where-Object { $_.headSha -eq $MasterSha })
         if ($landed.Count -gt 0) {
-            return [pscustomobject]@{ Run = $landed[0]; Label = 'landed (headSha = master tip)' }
+            $label = 'landed (headSha = master tip)'
+            # The tip is the LOCAL fork/master and can lag hosted master. A newer SUCCESSFUL run that is not
+            # at the tip may be the real landed run, so say so rather than asserting "landed" flatly.
+            $newerOk = @($sorted[0..([array]::IndexOf($sorted, $landed[0]))] |
+                Where-Object { $_.conclusion -eq 'success' -and $_.headSha -ne $MasterSha })
+            if ($newerOk.Count -gt 0) {
+                $label += "; $($newerOk.Count) newer success run(s) not at the local tip - local fork/master may lag"
+            }
+            return [pscustomobject]@{ Run = $landed[0]; Label = $label }
         }
     }
     $ok = @($sorted | Where-Object { $_.conclusion -eq 'success' })

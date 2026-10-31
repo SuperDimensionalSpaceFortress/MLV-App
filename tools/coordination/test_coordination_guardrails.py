@@ -5052,7 +5052,7 @@ def _mgrs_select(tmp_path, rows, tip):
     harness.write_text(
         "$ErrorActionPreference='Stop'\n" + fn +
         "\n$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
-        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip + "'\n"
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip.replace("'", "''") + "'\n"
         "if ($null -eq $pick) { 'NONE' } else { ([pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress) }\n",
         encoding="utf-8")
     out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
@@ -5070,12 +5070,20 @@ def test_an_ejected_newest_merge_group_entry_loses_to_the_older_landed_run(tmp_p
     assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
 
 
-def test_the_landed_merge_group_run_wins_even_when_its_own_conclusion_is_not_success(tmp_path):
+def test_a_newer_success_not_at_the_local_tip_puts_a_stale_ref_caveat_in_the_landed_label(tmp_path):
+    """adversary A1: the tip is read from the LOCAL fork/master, which can lag hosted master. A newer
+    successful run whose headSha is not the local tip may be the real landed run, so the label must
+    say the local ref may lag instead of asserting 'landed' flatly. An ejected newest FAILURE (the
+    ordinary case above) must not trigger the caveat."""
     rows = [
         _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "success"),
         _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "failure"),
     ]
-    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 200
+    assert picked["label"].startswith(MGRS_LABEL_LANDED), picked
+    assert "1 newer success run(s) not at the local tip" in picked["label"], picked
+    assert "local fork/master may lag" in picked["label"], picked
 
 
 def test_the_newest_of_several_landed_merge_group_runs_is_taken(tmp_path):
