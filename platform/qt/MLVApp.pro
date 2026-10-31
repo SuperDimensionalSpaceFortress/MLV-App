@@ -411,6 +411,7 @@ HEADERS += MainWindow.h \
            DualIsoPatternMapping.h \
            GpuDebayer.h \
            GpuPreviewProcessing.h \
+           GpuPresentTailWindow.h \
            PlaybackPrepCpuRoute.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \

@@ -2185,7 +2185,7 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         """name -> a deliberately broken copy of the real sources the scan must flag."""
         restart = "playbackClock.restart();"
         loop_body = (r"(== playback_frame_range::PlayStopState::Continue \)\s*\{)"
-                     r"(\s*qApp->processEvents\( QEventLoop::AllEvents \);\s*QThread::msleep\( 10 \);)")
+                     r"(\s*qApp->processEvents\( QEventLoop::AllEvents \);\s*sleepGuiThreadForSmokeRunner\( 10 \);)")
         return {
             # sol r2 hardening: a raw stop inserted after the clock restart (the exact repro)
             "raw setChecked(false) after playbackClock.restart()":
