@@ -181,8 +181,10 @@ throw "fake um-run: unexpected job $JobId"
 # share's outbox (admission.leaseBatch on the current lease, or another one when the call index is in FAKE_LEG_LOSE), a receipt and its summary.json
 # (pre-load FAKE_LEG_PRELOADS), and DVE_OUTCOME from FAKE_LEG_OUTCOMES. Each call is logged with UTC ticks and its -LeaseBatch.
 FAKE_LEG = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ReceiptRoot = '')
 $share = $env:FAKE_SHARE
+# LEASE-BATCH-RECEIPT-ROOT-1: one line per call saying whether -ReceiptRoot was passed at all (absent and empty are different: the batch must forward NOTHING when it has none)
+Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'leg-receiptroot.log') -Value ("bound={0} root={1}" -f $PSBoundParameters.ContainsKey('ReceiptRoot'), $ReceiptRoot)
 $st = Get-Content -LiteralPath (Join-Path $share 'fake-agent-state.json') -Raw | ConvertFrom-Json
 $cf = Join-Path $share 'fake-leg-count.txt'
 $k = $(if (Test-Path -LiteralPath $cf) { [int](Get-Content -LiteralPath $cf) } else { 0 })
@@ -225,10 +227,12 @@ if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 
 # writes its receipt (DVE_OUTCOME=UNRESOLVED) and exits 0
 if ($legMode -ne 'unresolved') { $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json") }
 $id = [guid]::NewGuid().ToString()
-$rdir = Join-Path $env:FAKE_LEG_ROOT "receipts\CARD-1\$leaf\$Venue"
+# LEASE-BATCH-RECEIPT-ROOT-1: like the real leg, the receipt goes under -ReceiptRoot when given and its evidence in the directory beside the root (the default root is <case>\receipts)
+$rroot = $(if ($ReceiptRoot) { $ReceiptRoot } else { Join-Path $env:FAKE_LEG_ROOT 'receipts' })
+$rdir = Join-Path $rroot "CARD-1\$leaf\$Venue"
 New-Item -ItemType Directory -Force -Path $rdir | Out-Null
 $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
-$edir = Join-Path $env:FAKE_LEG_ROOT "evidence\$id"; New-Item -ItemType Directory -Force -Path $edir | Out-Null
+$edir = Join-Path (Join-Path (Split-Path -Parent $rroot) 'evidence') $id; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
@@ -6447,6 +6451,122 @@ del _name, _case, _cls
 # [DateTime] of Kind Utc. Get-LeaseEndUtc used to run it through [string] + DateTimeOffset.Parse, which drops the Kind and assumes the HOST's local offset, so on a
 # Central host every lease end landed 5 h early (roomSec=-15301) and no leg ever started. CI hosts are UTC (offset 0), where the old code passes, so the behavioural
 # cases below only go red on a non-UTC host; the source case is the one that guards on UTC.
+@requires_windows_pwsh
+class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
+    """LEASE-BATCH-RECEIPT-ROOT-1: -ReceiptRoot reaches every Invoke-VenueLeg call, an empty one forwards nothing, and a root outside .claude-state is refused before any lease.
+    Same fakes and harness as VenueLeaseBatchRunnerTests (borrowed, not inherited, so its cases are not run a second time); nothing reaches a venue."""
+
+    setUpClass = VenueLeaseBatchRunnerTests.__dict__["setUpClass"]
+    tearDownClass = VenueLeaseBatchRunnerTests.__dict__["tearDownClass"]
+    setUp = VenueLeaseBatchRunnerTests.setUp
+    _init_case = VenueLeaseBatchRunnerTests._init_case
+    run_batch = VenueLeaseBatchRunnerTests.run_batch
+    batch_cmd = VenueLeaseBatchRunnerTests.batch_cmd
+    kinds = VenueLeaseBatchRunnerTests.kinds
+    batches = VenueLeaseBatchRunnerTests.batches
+
+    def scratch_root(self) -> Path:
+        # a root the way a calibration round gives one: <scratch>\.claude-state\dual-venue\receipts (the evidence directory lands beside it, also under .claude-state)
+        return self.case / "scratch" / ".claude-state" / "dual-venue" / "receipts"
+
+    def clean_base(self) -> Path:
+        """A fresh directory whose path has no .claude-state segment (the temp dir may have one: a lane runs with TEMP under its worktree's .claude-state)."""
+        for parent in (Path(tempfile.gettempdir()), ROOT.parent, Path(os.environ.get("SystemDrive", "C:") + "\\")):
+            if ".claude-state" in parent.resolve().parts:
+                continue
+            try:
+                d = Path(tempfile.mkdtemp(prefix="venue-rr-clean-", dir=parent))
+            except OSError:
+                continue
+            self.addCleanup(shutil.rmtree, d, True)
+            return d
+        self.skipTest("no writable directory without a .claude-state segment")
+
+    def default_root(self) -> Path:
+        return self.case / "receipts"   # the fake leg's default root (the real leg's is the main checkout's .claude-state\dual-venue\receipts)
+
+    def leg_calls(self) -> list[str]:
+        f = self.case / "leg-receiptroot.log"
+        return f.read_text(encoding="utf-8").splitlines() if f.exists() else []
+
+    @staticmethod
+    def files_under(root: Path) -> list[Path]:
+        return sorted(p for p in root.rglob("*.json")) if root.exists() else []
+
+    def assert_nothing_started(self, r: subprocess.CompletedProcess) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self.events_text(), "", "a refused root must reach no um-run, quiet probe or leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "a refused root took the venue claim")
+        self.assertFalse(self.run_dir.exists(), "a refused root created the run dir")
+
+    def events_text(self) -> str:
+        return self.events.read_text(encoding="utf-8") if self.events.exists() else ""
+
+    # (a) RED on the old script: it has no -ReceiptRoot, so the leg wrote into the default root
+    def test_a_receipt_root_sends_every_leg_receipt_to_it_and_none_to_the_default_root(self) -> None:
+        root = self.scratch_root()
+        r = self.run_batch(self.specs, "-ReceiptRoot", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.files_under(self.default_root()), [], "a receipt landed in the default root")
+        self.assertFalse(self.default_root().exists(), "the default root was created")
+        landed = self.files_under(root)
+        self.assertEqual(len(landed), 3, landed)
+        self.assertEqual(self.leg_calls(), [f"bound=True root={root}"] * 3)
+        [b] = self.batches()
+        self.assertTrue(all(Path(l["receipt"]).parent.parent.parent.parent == root for l in b["legs"]), [l["receipt"] for l in b["legs"]])
+        # the read-back: the pre-load mean is found in the evidence directory beside THIS root (a default-root read would find none and leave the leg uncounted)
+        self.assertEqual([l["class"] for l in b["legs"]], ["QUIET_PRELOAD_OK"] * 3, b["legs"])
+        self.assertEqual((b["legsRan"], b["legsCounted"]), (3, 3))
+        self.assertIn(f" receiptRoot={root}", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_a_receipt_root_is_forwarded_to_the_in_lease_retry_too(self) -> None:
+        root = self.scratch_root()
+        r = self.run_batch([self.specs[0]], "-ReceiptRoot", str(root), FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual([l["status"] for l in b["legs"]], ["RETRY", "RAN"])
+        self.assertEqual(self.leg_calls(), [f"bound=True root={root}"] * 2)
+        self.assertEqual(len(self.files_under(root)), 2)
+        self.assertFalse(self.default_root().exists())
+
+    def test_a_relative_receipt_root_is_forwarded_as_a_full_path(self) -> None:
+        args, e = self.batch_cmd(None, "-ReceiptRoot", os.path.join("rel", ".claude-state", "dual-venue", "receipts"))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e, cwd=str(self.case))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        want = self.case / "rel" / ".claude-state" / "dual-venue" / "receipts"
+        self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2)
+
+    # (b) RED on the old script for the explicit empty/blank spellings (an unknown parameter); the omitted spelling is the byte-for-byte guard
+    def test_an_empty_or_blank_receipt_root_forwards_no_argument(self) -> None:
+        for spelling in (None, "", "   "):
+            with self.subTest(spelling=spelling):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, *(() if spelling is None else ("-ReceiptRoot", spelling)))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.leg_calls(), ["bound=False root="] * 2, "the leg was handed a -ReceiptRoot it should not have been")
+                self.assertEqual(len(self.files_under(self.default_root())), 2)
+                self.assertNotIn("receiptRoot=", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    # (c) RED on the old script: a root outside .claude-state is refused before the run dir, the claim, the lease or a leg
+    def test_a_receipt_root_outside_claude_state_is_refused_before_any_lease_or_leg(self) -> None:
+        # the case dirs sit in the temp dir, which on a lane (TEMP under the worktree's .claude-state) is itself under .claude-state: the refused roots live in a base with no such segment
+        base = self.clean_base()
+        cases = {
+            "outside": base / "plain" / "dual-venue" / "receipts",
+            # a root that IS .claude-state: the root passes, the evidence directory beside it (<parent>\evidence) does not
+            "evidence-beside-it-outside": base / "scratch" / ".claude-state",
+            # the segment must be a whole directory name, not a substring
+            "substring-only": base / "x.claude-state" / "receipts",
+        }
+        for name, root in cases.items():
+            with self.subTest(name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(root))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+
 @requires_windows_pwsh
 class LeaseEndUtcTimezoneTests(unittest.TestCase):
     ENDED = datetime(2026, 10, 25, 1, 19, 14, 720994, tzinfo=timezone.utc)   # the r7 open result's endedUtc

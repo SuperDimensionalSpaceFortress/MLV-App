@@ -170,6 +170,11 @@ param(
     [ValidateRange(0, 5)][int]$ThermalRequeueMax = 1,
     [string]$Purpose = '',
     [string]$SheetCopyDir = '',
+    # LEASE-BATCH-RECEIPT-ROOT-1: where every leg's receipt (and the evidence directory beside it) goes. Empty (the default) forwards NOTHING and the leg writes to its own
+    # default root, exactly as before. Non-empty: forwarded to EVERY Invoke-VenueLeg.ps1 call (first run and in-lease retry alike), and refused before the run dir, the claim,
+    # the lease or any leg when it is not under a .claude-state directory (the leg's own rule, Test-DvUnderClaudeState, applied to the root and to the evidence directory
+    # beside it). A calibration round points it at a scratch root so its receipts stop landing in the shared CUDA-HEADROOM-1 receipt root.
+    [string]$ReceiptRoot = '',
     # passed through to Wait-VenueQuiet.ps1 (never relaxed here)
     [double]$ThresholdPercent = 20.0,
     [ValidateRange(1, 3600)][int]$RecheckSec = 90,
@@ -215,6 +220,7 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
+Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
 # entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
 $ThermalDispatchGraceSec = 1
@@ -262,6 +268,15 @@ if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-H
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
 if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" }
+# LEASE-BATCH-RECEIPT-ROOT-1: -ReceiptRoot is checked with the leg's own rule (Invoke-VenueLeg.ps1 DVE_RECEIPT_ROOT_MUST_STAY_LOCAL: the root, and the evidence directory beside it)
+# BEFORE the run dir, the claim, the lease or any leg exists, so a bad root takes nothing. A blank root is "not given", as the leg reads it. Given, it is forwarded as a full path
+# (the leg is a child of this process, but a relative root must not depend on the child's directory).
+if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $ReceiptRoot = '' }
+else {
+    $ReceiptRoot = $(try { [IO.Path]::GetFullPath($ReceiptRoot) } catch { Stop-Usage "RECEIPT_ROOT_INVALID -ReceiptRoot is not a usable path: $($_.Exception.Message -replace '\s+', ' ')" })
+    if (-not (Test-DvUnderClaudeState -Path $ReceiptRoot)) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be under a .claude-state directory: a receipt and its evidence name an owner clip''s run' }
+    if (-not (Test-DvUnderClaudeState -Path (Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence'))) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be under a .claude-state directory: the run evidence names an owner clip''s run' }
+}
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
 $jobDir = Join-Path $RunDir 'batch-jobs'
@@ -1551,7 +1566,7 @@ function Write-RunSummary {
     Write-Output $resultLine
 }
 
-L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
+L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($ReceiptRoot) { " receiptRoot=$ReceiptRoot" })$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ([DateTime]::UtcNow -ge $deadline) { Set-Stop 'DEADLINE' 3; break }
@@ -1939,6 +1954,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
+                if ($ReceiptRoot) { $lArgs += @('-ReceiptRoot', $ReceiptRoot) }   # LEASE-BATCH-RECEIPT-ROOT-1: the one leg call site, so an in-lease retry forwards it too; empty adds no argument
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
                 if ($script:RunOutputAliased) { $b.legsAttempted--; Stop-BatchOnSuppression $b; break }   # r7: the RUN line itself was refused: the leg is not started
                 # r8 pass 3 (adversary r8 pass 2 A3): the launch is the leg's dispatch. The guards since the checks above (the output's, the RUN line's) can block on a share, so the
