@@ -207,6 +207,29 @@ $Terminal = @(
 # same class of defect this fix exists to remove, just aimed at a different card.
 $Schedulable = @('queued', 'dispatched', 'in-review', 'waiting-evidence', 'dispatched-untracked-target')
 
+# MERGE-GROUP-EXPORT-LANDED-RUN-SELECT-1 (owed on #732, ACK 6544553789, Grok G1): which merge_group run
+# supplies the job graph. On a merge-queue repo the newest COMPLETED merge_group run can be an EJECTED
+# queue entry whose headSha never landed on master; labelling its jobs "newest" lets a reader take them
+# for master's CI. Preference: (a) newest run whose headSha IS the master tip; (b) newest success;
+# (c) newest by createdAt. (b) and (c) say in their label that the run may not be a landed one.
+# Pure: no I/O. $MasterSha is '' when the tip could not be read, which skips (a).
+function Select-MergeGroupJobsRun {
+    param([object[]]$Runs, [string]$MasterSha = '')
+    $sorted = @($Runs | Where-Object { $null -ne $_ } | Sort-Object -Property createdAt -Descending)
+    if ($sorted.Count -eq 0) { return $null }
+    if ($MasterSha) {
+        $landed = @($sorted | Where-Object { $_.headSha -eq $MasterSha })
+        if ($landed.Count -gt 0) {
+            return [pscustomobject]@{ Run = $landed[0]; Label = 'landed (headSha = master tip)' }
+        }
+    }
+    $ok = @($sorted | Where-Object { $_.conclusion -eq 'success' })
+    if ($ok.Count -gt 0) {
+        return [pscustomobject]@{ Run = $ok[0]; Label = 'newest success; may be a non-landed queue entry' }
+    }
+    return [pscustomobject]@{ Run = $sorted[0]; Label = 'newest by createdAt; may be a non-landed queue entry' }
+}
+
 function Get-Prop($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
     $p = $obj.PSObject.Properties[$name]
@@ -856,10 +879,17 @@ if ($needsHostedEvidence) {
         $runsFile = Join-Path $ghDir 'runs-tests-merge-group-completed.json'
         if (Test-Path -LiteralPath $runsFile) {
             try {
-                $runs = @(Get-Content -LiteralPath $runsFile -Raw | ConvertFrom-Json |
-                          Sort-Object -Property createdAt -Descending)
-                if ($runs.Count -gt 0) {
-                    $newest  = $runs[0].databaseId
+                $runs = @(Get-Content -LiteralPath $runsFile -Raw | ConvertFrom-Json)
+                # Master tip is read LOCALLY (never the network); an unreadable tip falls through to the
+                # success / createdAt choices inside Select-MergeGroupJobsRun.
+                $tipSha = ''
+                try {
+                    $tipSha = [string](& git -C $RepoRoot rev-parse fork/master 2>$null | Select-Object -First 1)
+                    if ($tipSha -notmatch '^[0-9a-f]{40}$') { $tipSha = '' }
+                } catch { $tipSha = '' }
+                $pick = Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha
+                if ($null -ne $pick) {
+                    $newest  = $pick.Run.databaseId
                     $jobsOut = Join-Path $ghDir "jobs-latest-$newest.json"
                     $jobsErr = "$jobsOut.err.txt"
                     & gh api "repos/$ghRepo/actions/runs/$newest/jobs" 1>$jobsOut 2>$jobsErr
@@ -867,7 +897,7 @@ if ($needsHostedEvidence) {
                     $jlen  = if (Test-Path -LiteralPath $jobsOut) { (Get-Item -LiteralPath $jobsOut).Length } else { 0 }
                     if ($jcode -eq 0 -and $jlen -gt 0) {
                         Remove-Item -LiteralPath $jobsErr -ErrorAction SilentlyContinue
-                        $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "$jlen bytes (run $newest, newest by createdAt)" }
+                        $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "$jlen bytes (run $newest, $($pick.Label))" }
                     } else {
                         Remove-Item -LiteralPath $jobsOut -ErrorAction SilentlyContinue
                         $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "FAILED - gh exit $jcode" }

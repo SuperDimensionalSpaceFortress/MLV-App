@@ -5021,3 +5021,113 @@ def test_fsmonitor_lexer_stays_in_sync_over_the_shipped_lane_script():
     flags, ended_in_code = fsmon_code_mask(code)
     assert ended_in_code, "the lexer ended inside a string: it lost sync with Invoke-Lane.ps1"
     assert not fsmon_lane_pin_violation(lane) and not fsmon_end_stop_violation(lane)
+
+
+# --- MERGE-GROUP-EXPORT-LANDED-RUN-SELECT-1: Select-MergeGroupJobsRun in Invoke-Workstream.ps1 --------
+# Owed on PR #732 (ACK 6544553789, Grok G1). On a merge-queue repo the newest completed merge_group run
+# can be an EJECTED queue entry whose headSha never landed on master. The hosted-evidence export used to
+# fetch the job graph of runs[0] (newest by createdAt) and call it "newest", so a reader could take a
+# non-landed run's jobs for master's CI. The selector is pure, so it is extracted by AST and run over
+# fixture rows; Invoke-Workstream itself is never executed (it reads the live queue and writes into real
+# .claude-state).
+
+MGRS_TIP = "a" * 40
+MGRS_OTHER = "b" * 40
+MGRS_EJECTED = "c" * 40
+MGRS_LABEL_LANDED = "landed (headSha = master tip)"
+MGRS_LABEL_SUCCESS = "newest success; may be a non-landed queue entry"
+MGRS_LABEL_NEWEST = "newest by createdAt; may be a non-landed queue entry"
+
+
+def _mgrs_row(run_id, created, sha, conclusion):
+    return {"databaseId": run_id, "createdAt": created, "headSha": sha, "conclusion": conclusion, "displayTitle": "t"}
+
+
+def _mgrs_select(tmp_path, rows, tip):
+    """Run the real function over fixture rows; return {'id': databaseId, 'label': ...} or None."""
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    rows_file = tmp_path / "rows.json"
+    rows_file.write_text(json.dumps(rows), encoding="utf-8")
+    harness = tmp_path / "mgrs-harness.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n" + fn +
+        "\n$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip + "'\n"
+        "if ($null -eq $pick) { 'NONE' } else { ([pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress) }\n",
+        encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    text = out.stdout.strip()
+    return None if text == "NONE" else json.loads(text)
+
+
+def test_an_ejected_newest_merge_group_entry_loses_to_the_older_landed_run(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "failure"),   # newest, never landed
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),       # landed
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
+
+
+def test_the_landed_merge_group_run_wins_even_when_its_own_conclusion_is_not_success(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "success"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "failure"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
+
+
+def test_the_newest_of_several_landed_merge_group_runs_is_taken(tmp_path):
+    rows = [
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_TIP, "success"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
+
+
+def test_no_landed_merge_group_run_falls_to_the_newest_success_with_the_hedged_label(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "failure"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "success"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_SUCCESS}
+
+
+def test_only_failed_merge_group_runs_fall_to_newest_by_created_at_with_the_hedged_label(tmp_path):
+    rows = [
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "failure"),
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "cancelled"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 300, "label": MGRS_LABEL_NEWEST}
+
+
+def test_an_unreadable_master_tip_skips_the_landed_rule(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "failure"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    # tip unknown: the row that happens to carry the tip sha cannot be called landed; the success rule applies.
+    assert _mgrs_select(tmp_path, rows, "") == {"id": 200, "label": MGRS_LABEL_SUCCESS}
+
+
+def test_no_merge_group_rows_selects_nothing(tmp_path):
+    assert _mgrs_select(tmp_path, [], MGRS_TIP) is None
+
+
+def test_the_merge_group_export_uses_the_selector_and_names_its_label_not_a_fixed_newest():
+    """Source pin for the call site (the dispatcher is not executed under test): the old runs[0] choice and
+    the fixed 'newest by createdAt' row text must be gone, the master tip must be read locally, and a
+    failed tip read must never throw out of the export."""
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    assert "$runs[0]" not in text, "the export still takes the newest run by createdAt"
+    assert "Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha" in text
+    assert "newest by createdAt)" not in text, "the jobs row still hard-codes the label"
+    assert "$($pick.Label))" in text, "the jobs row does not carry the selector's label"
+    assert "rev-parse fork/master" in text
+    start = text.index("$pick = Select-MergeGroupJobsRun")
+    block = text[text.index("$tipSha = ''"):start]
+    assert "catch" in block and "gh " not in block and "gh api" not in block, "tip read must be local and non-throwing"
+    assert re.search(r"(?m)^\s*\} catch \{\s*\n\s*\$ghRows \+= .*\(job graph\)", text), "the export's own try/catch shape is gone"
