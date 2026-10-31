@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = $(if ($env:MLV_BOARD_ROOT) { $env:MLV_BOARD_ROOT } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }),
-    [string]$SourceRef = 'fork/master',
+    [string]$SourceRef = 'refs/remotes/fork/master',   # full refname: a same-named tag refs/tags/fork/master would win the bare name in rev-parse
     [long]$AsOfEpoch = 0,
     [string]$ReservationsPath = '',
     [string]$LegacyDispatchPath = '',

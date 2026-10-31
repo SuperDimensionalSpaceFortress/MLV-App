@@ -5326,11 +5326,14 @@ def _g1_ref_sites():
     sweep = ret[ret.index("function Invoke-SweepMergedLaneWorktrees"):]
     m_sw = re.search(r"\[string\]\$MergeTarget = '([^']+)'", sweep)
     m_lp = re.search(r"(?m)^\$TargetRef\s*=\s*'([^']+)'", loop)
-    assert m_ws and m_sw and m_lp, (bool(m_ws), bool(m_sw), bool(m_lp))
+    guard = (COORD / "Test-ProductRatioGuard.ps1").read_text(encoding="utf-8")
+    m_rg = re.search(r"\[string\]\$SourceRef = '([^']+)'", guard)
+    assert m_ws and m_sw and m_lp and m_rg, (bool(m_ws), bool(m_sw), bool(m_lp), bool(m_rg))
     return [
         ("Invoke-Workstream -MergeTarget", m_ws.group(1)),
         ("Retire sweep default MergeTarget", m_sw.group(1)),
         ("Invoke-WorkstreamLoop TargetRef", m_lp.group(1)),
+        ("Test-ProductRatioGuard SourceRef default", m_rg.group(1)),
     ]
 
 
@@ -5391,3 +5394,35 @@ def test_the_loop_driver_reset_hard_follows_the_remote_tracking_ref_in_a_throwaw
     assert git(drv, "rev-parse", "HEAD") == tag_sha
     git(drv, "reset", "--hard", ref, "--quiet")
     assert git(drv, "rev-parse", "HEAD") == remote_sha
+
+
+# --- r4 (Grok G3, hub ACK 6549076936): the product-ratio guard resolves the FULL refname by default ---------
+# Test-ProductRatioGuard.ps1 defaulted $SourceRef to the bare 'fork/master' and ran `git rev-parse --verify
+# "$SourceRef^{commit}"`; Invoke-Workstream calls it without -SourceRef, so a same-named tag
+# refs/tags/fork/master supplied the guard's sourceSha. The default is lifted from source and the real guard is run
+# over a throwaway repo with the tag collision.
+
+RATIO_GUARD = COORD / "Test-ProductRatioGuard.ps1"
+
+
+def test_the_ratio_guard_default_source_ref_is_the_full_refname_in_source():
+    text = RATIO_GUARD.read_text(encoding="utf-8")
+    m = re.search(r"\[string\]\$SourceRef = '([^']+)'", text)
+    assert m, "SourceRef default not found"
+    assert m.group(1) == FULL_FORK_MASTER, m.group(1)
+    # the resolve line still goes through the (now full-refname) parameter, never a re-spelled bare name
+    assert 'rev-parse --verify "$SourceRef^{commit}"' in text
+
+
+def test_the_ratio_guard_resolves_the_remote_tracking_tip_not_a_same_named_tag(tmp_path):
+    repo, remote_sha, tag_sha = _g1_tag_collision_repo(tmp_path)
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(RATIO_GUARD),
+         "-RepoRoot", str(repo), "-AsOfEpoch", "1893456000"],
+        text=True, capture_output=True)
+    lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, (out.returncode, out.stdout, out.stderr)
+    doc = json.loads(lines[0])
+    assert doc["errorCode"] in ("", None) or doc["sourceSha"], doc
+    assert doc["sourceSha"] == remote_sha, (doc["sourceRef"], doc["sourceSha"], remote_sha, tag_sha)
+    assert doc["sourceRef"] == FULL_FORK_MASTER
