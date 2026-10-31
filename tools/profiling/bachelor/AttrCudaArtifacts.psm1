@@ -2600,7 +2600,10 @@ function Publish-AttrCudaContactSheetRawCaptures {
 
     if (-not $Enabled -or -not $SourceDir -or -not (Test-Path -LiteralPath $SourceDir)) { return $null }
     # New-AttrCudaDirectory only (never a raw New-Item -Force) -- matches every other $Pub
-    # subdirectory this job creates.
+    # subdirectory this job creates. $PubRoot itself first: the paired-seek publish passes
+    # $Pub\paired-seek, which nothing else creates (CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 A1);
+    # for $PubRoot = $Pub it is an existing directory and the call only re-checks it.
+    [void](New-AttrCudaDirectory -Path $PubRoot)
     [void](New-AttrCudaDirectory -Path (Join-Path $PubRoot 'contact-sheet'))
     $rawDir = Join-Path $PubRoot 'contact-sheet\raw'
     [void](New-AttrCudaDirectory -Path $rawDir)

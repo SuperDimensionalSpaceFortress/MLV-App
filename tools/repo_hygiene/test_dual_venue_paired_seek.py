@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from tools.repo_hygiene.test_dual_venue_evidence import DV, STUB_GENERATOR, RunnerHarness, requires_windows_pwsh
+from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import ATTRIBUTION_GENERATOR, MODULE, _run_pwsh_file, requires_pwsh
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
 PAIRED_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,[switch]$ContactSheetPairedSeek)")
@@ -104,6 +106,62 @@ class PairedSeekRunnerTests(RunnerHarness, unittest.TestCase):
                 _, receipt, _ = self.run_leg("ultra-magnus", self.look_spec(value, leg_id), extra=["-Backend", "cpu"])
                 self.assertNotIn("ContactSheetPairedSeek", self.generator_calls()[-1])
                 self.assertIsNone(receipt["look"]["pairedSeek"])
+
+
+@requires_pwsh
+class PairedSeekPublishTests(unittest.TestCase):
+    """Adversary A1 (r1 pass on 4d446b3d): the job publishes the seek frames with -PubRoot $Pub\\paired-seek, a directory nothing had
+    created, and New-AttrCudaDirectory refuses a missing parent (ATTRCUDA_DIR_PARENT_MISSING), so every paired-seek leg lost its paused
+    frames. The publisher now creates its own -PubRoot (whose parent, $Pub, always exists) before contact-sheet."""
+
+    def test_the_job_publishes_seek_frames_under_a_fresh_paired_seek_root(self) -> None:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        self.assertIn("-SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))", text)
+
+    def test_publishing_into_a_paired_seek_root_that_does_not_exist_yet_succeeds(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="paired-seek-publish-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        source = root / "work" / "contact-sheet-seek"
+        source.mkdir(parents=True)
+        for name, data in SEEK_FRAMES.items():
+            (source / name).write_bytes(data)
+        pub = root / "pub"
+        pub.mkdir()
+        paired_root = pub / "paired-seek"
+        self.assertFalse(paired_root.exists())
+        script = root / "probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"$result = Publish-AttrCudaContactSheetRawCaptures -Enabled $true -SourceDir '{source}' -PubRoot '{paired_root}'\n"
+            "Write-Output \"RESULT=$result\"\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        raw = paired_root / "contact-sheet" / "raw"
+        self.assertIn(f"RESULT={raw}", proc.stdout)
+        for name, data in SEEK_FRAMES.items():
+            self.assertEqual((raw / name).read_bytes(), data)
+
+    def test_a_disabled_or_empty_paired_seek_publish_creates_nothing(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="paired-seek-publish-noop-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        pub = root / "pub"
+        pub.mkdir()
+        script = root / "probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"[void](Publish-AttrCudaContactSheetRawCaptures -Enabled $false -SourceDir '{root}' -PubRoot '{pub / 'paired-seek'}')\n"
+            f"[void](Publish-AttrCudaContactSheetRawCaptures -Enabled $true -SourceDir '{root / 'missing'}' -PubRoot '{pub / 'paired-seek'}')\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse((pub / "paired-seek").exists())
 
 
 if __name__ == "__main__":
