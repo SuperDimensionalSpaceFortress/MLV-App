@@ -1246,6 +1246,18 @@ CONFORM_CASES = [
     ("i8: summary pace_fps=Infinity -> INVALID", dict(HFR_RUN, pace_fps="Infinity"), _conform_line(), True, ["present engine pace that is not positive"], [], "native"),
     ("i9: summary native_fps=NaN -> INVALID", dict(HFR_RUN, native_fps="NaN"), _conform_line(), True, ["native_fps=NaN", "native frame rate is unknown"], [], "native"),
     ("i10: summary native_fps=Infinity -> INVALID", dict(HFR_RUN, native_fps="Infinity"), _conform_line(), True, ["native frame rate is unknown"], [], "native"),
+    # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's literal row. conform_active=1 with clip = playback = native = pace = 59.94 (target 24, threshold
+    # 30 logged) is native-rate playback: no conform happened, so no oracle may PROVE a conform from it (paceRule native). Before r7 all three proved it.
+    # The source frames here are native-paced and enough, so the source-frame verdict itself is valid; a REQUESTED conform-on arm is INVALID
+    # (ConformAwareReceiptOracleTests.test_a_requested_conform_arm_at_the_native_rate_is_never_honoured).
+    ("j1: sol r6 B1 -- conform_active=1 at the native rate (clip = playback = native = pace = 59.94) proves no conform",
+     dict(HFR_RUN, session=3, source_advanced=1499, required_source_frames=1499, native_fps="59.940", pace_fps="59.940"),
+     _conform_line("3", clip_fps="59.940", playback_fps="59.940", conform_env_override=1), False, [], [PACE_TEXT], "native"),
+    ("j2: a sound conform well inside the clip rate (59.94 clip played at 50) stays proven",
+     dict(HFR_RUN, pace_fps="50.000"), _conform_line(playback_fps="50.000", conform_target="50.000"), False, [], [PACE_TEXT], "conform"),
+    ("j3: a 23.976 clip whose conform line claims active=1 at 23.976 proves no conform (the native rule judges it)",
+     dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="23.976"),
+     _conform_line(clip_fps="23.976", playback_fps="23.976"), False, [], [], "native"),
 ]
 
 
@@ -1335,6 +1347,33 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
             self.assertIn("conform relaxation not applied", " | ".join(results[6]["failures"]))      # d: inactive
             self.assertNotIn("conform relaxation", " | ".join(results[5]["failures"]))               # c: no line at all keeps the native text unchanged
 
+    def test_a_requested_conform_arm_at_the_native_rate_is_never_honoured(self) -> None:
+        """MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's literal repro through the dual-venue arm verdict and the playback block with
+        playbackConform=on: session=3, sourceAdvanced=requiredSourceFrames=1499, native=pace=clip=playback=59.94, conformActive=1,
+        conformEnvOverride=1. Before r7: proven=true, honoured=true, valid=true. Now: not proven (no conform happened), not honoured, INVALID.
+        Controls: the sound 24-fps conform stays proven/honoured/valid, and the conform-OFF native arm stays honoured."""
+        sol = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=1, conformEnvOverride=1, conformClipFps=59.94,
+                   conformPlaybackFps=59.94, nativeFps=59.94, paceFps=59.94, sourceAdvanced=1499, requiredSourceFrames=1499, fpsOverride=0, wrapped=False,
+                   wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE, logShaBound=True, settingsIsolated=True,
+                   jobFailures=[], fixtureRehearsal=False, clipId="CLIP")
+        rows = [("sol-on", "on", sol), ("sound-on", "on", dict(sol, conformPlaybackFps=24.0, paceFps=24.0)),
+                ("native-off", "off", dict(sol, conformActive=0, conformEnvOverride=0))]
+        got = {r["name"]: r for r in _run_oracle_table(
+            f"Import-Module {_q(self.DV_MODULE)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
+            "$spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = $c.arm } }; $proof = Get-DvConformPaceProof -Playback $c.block; "
+            "$arm = Get-DvConformArmVerdict -Spec $spec -Playback $c.block; "
+            "$p = @(Get-DvPlaybackProblems -Playback $c.block -ExpectedClipId 'CLIP' -RequestedConform $c.arm); "
+            "[pscustomobject]@{ name = $c.name; proven = [bool]$proof.proven; why = [string]$proof.reason; honoured = [bool]$arm.honoured; "
+            "blocks = [bool]$arm.blocks; armReason = [string]$arm.reason; valid = ($p.Count -eq 0); problems = @($p) } }",
+            [{"name": n, "arm": a, "block": b} for n, a, b in rows])}
+        s = got["sol-on"]
+        self.assertEqual((s["proven"], s["honoured"], s["blocks"], s["valid"]), (False, False, True, False), s)
+        self.assertIn("no conform happened", s["why"])
+        self.assertIn("no conform happened", s["armReason"])
+        self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in p and "no conform happened" in p for p in s["problems"]), s["problems"])
+        self.assertEqual((got["sound-on"]["proven"], got["sound-on"]["honoured"], got["sound-on"]["valid"]), (True, True, True), got["sound-on"])
+        self.assertEqual((got["native-off"]["honoured"], got["native-off"]["valid"]), (True, True), got["native-off"])
+
     def test_the_dual_venue_evidence_block_records_the_conform_fields_and_which_rule_judged_the_pace(self) -> None:
         """Get-DvPlaybackEvidence end to end, from the run log: the conform line's values and paceRule land on the block and a key can re-derive them."""
         import hashlib
@@ -1382,6 +1421,10 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
             "dv: inactive line accepted": (self.DV_MODULE, "if ($active -ne 1) {", "if ($false) {"),
             "attr: session not checked": (self.MODULE, "[string]$cf['session'] -cne $summarySession", "$false"),
             "dv: session not checked": (self.DV_MODULE, "$conformSession -cne $summarySession", "$false"),
+            # MERGE-MASTER r7 (sol r6 B1): drop the 'no conform happened' check and row j1 proves a conform again.
+            "gate: native-rate conform accepted": (GATE, "} elseif ($play -ge ($clip * 0.995)) {", "} elseif ($false) {"),
+            "attr: native-rate conform accepted": (self.MODULE, "} elseif ($conformPlaybackFps -ge ($conformSourceFps * 0.995)) {", "} elseif ($false) {"),
+            "dv: native-rate conform accepted": (self.DV_MODULE, "if ($play -ge ($clip * 0.995)) {", "if ($false) {"),
         }
         rows = [{"summary": _summary_line(**summary), "conform": conform, "block": _dv_block(summary, conform)} for _n, summary, conform, *_r in CONFORM_CASES]
         with tempfile.TemporaryDirectory(prefix="conform-mutant-") as tmp:

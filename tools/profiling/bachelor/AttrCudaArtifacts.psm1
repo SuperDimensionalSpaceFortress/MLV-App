@@ -7291,7 +7291,8 @@ function Get-AttrCudaSourceFramesVerdict {
 # slow motion at the conform rate, so the engine's pace_fps is that rate and the native-pace rule above would reject every conformed run. Hub ruling:
 # the owner's 20 s of REAL footage is never relaxed (the floor, the override, the wrap and the nonce rules are the oracle above, untouched); the PACE
 # rule is relaxed ONLY when the run PROVES it was conformed -- a present playback_smoke.conform line for the measured session with conform_active=1,
-# the conform line's source-rate field within 0.5 % of native_fps, playback_fps > 0 and within 0.5 % of pace_fps, and playback_fps not above that source rate. Absent / malformed / inactive /
+# the conform line's source-rate field within 0.5 % of native_fps, playback_fps > 0 and within 0.5 % of pace_fps, playback_fps not above that source rate, and playback_fps
+# below that source rate by more than 0.5 % (MERGE-MASTER r7: an active conform at the source rate is native-rate playback, no conform). Absent / malformed / inactive /
 # another session's / inconsistent -> the oracle above judges the pace unchanged (absence never helps), and a PRESENT but unproven line adds "conform
 # relaxation not applied: <why>" to the pace failure. On proof the pace is judged against the conform playback_fps: the proof established
 # |playback_fps - pace_fps| <= 0.5 %, so the oracle above is handed the summary with pace_fps at the native fps and its own pace comparison is
@@ -7347,6 +7348,9 @@ function Get-AttrCudaConformAwareSourceFramesVerdict {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps does not match pace_fps=$pace"
             } elseif ($conformPlaybackFps -gt ($conformSourceFps * 1.005)) {
                 $conformWhy = "conform playback_fps=$conformPlaybackFps is above the source rate $conformSourceFps; conform never speeds a recording up"
+            } elseif ($conformPlaybackFps -ge ($conformSourceFps * 0.995)) {
+                # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): an active conform at the source rate is native-rate playback; the parity contract with Get-DvConformPaceProof.
+                $conformWhy = "conform active but playback_fps=$conformPlaybackFps equals the source rate $conformSourceFps (within 0.5 %): no conform happened"
             } else {
                 $conformProven = $true
             }

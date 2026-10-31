@@ -723,7 +723,8 @@ function Get-GuiSmokeConformPaceProof {
     as slow motion at the conform target, so the engine's pace_fps is the conform rate, not the clip's native fps, and the native-pace
     rule of the source-frame oracle would reject every conformed run. The pace rule is relaxed ONLY on proof; proof is a PRESENT
     `playback_smoke.conform` line for the MEASURED session (-SummarySession) with conform_active=1, clip_fps within 0.5 % of native_fps,
-    playback_fps > 0 and within 0.5 % of pace_fps, and playback_fps not above clip_fps (conform never speeds a clip up).
+    playback_fps > 0 and within 0.5 % of pace_fps, playback_fps not above clip_fps (conform never speeds a clip up), and playback_fps below
+    clip_fps by more than 0.5 % (r7: an active conform at the clip rate is native-rate playback, no conform).
     Absent, malformed, inactive, another session's, or inconsistent -> proven=$false and `reason` says why (absence never helps).
     The 20 s floor is NOT touched here. Same decision as Get-AttrCudaConformAwareSourceFramesVerdict (AttrCudaArtifacts.psm1) and
     Get-DvConformPaceProof (DualVenueRunner.psm1); a parity test executes all three on one table.
@@ -761,6 +762,9 @@ function Get-GuiSmokeConformPaceProof {
         $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"
     } elseif ($play -gt ($clip * 1.005)) {
         $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"
+    } elseif ($play -ge ($clip * 0.995)) {
+        # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): an active conform at the clip rate is native-rate playback; the parity contract with Get-DvConformPaceProof.
+        $out.reason = "conform active but playback_fps=$play equals clip_fps=$clip (within 0.5 %): no conform happened"
     } else {
         $out.proven = $true
     }

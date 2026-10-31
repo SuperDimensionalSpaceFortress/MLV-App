@@ -5132,7 +5132,13 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         _, receipt, _ = self.leg("on", [conform_line(active=0, env_override=1)])
         self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
         self.assertIn("conform was not active", receipt["outcomeDetail"])
+        # MERGE-MASTER r7 (sol r6 B1): conform_active=1 on a 23.976 clip played at 23.976 is native-rate playback, not a conform (before r7 it PASSED).
         _, receipt, _ = self.leg("on", [conform_line(active=1, env_override=1)])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("no conform happened", receipt["outcomeDetail"])
+        # the active conform that actually conformed (59.94 clip played at 24, engine paced at 24) passes
+        self.write_artifacts(line={"native_fps": "59.940", "pace_fps": "24.000"}, extra_log_lines=[conform_line(clip="59.940", play="24.000", active=1, env_override=1)])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(generator_args={"playbackConform": "on"}), extra=["-Backend", "cpu"])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
 
     # MERGE-MASTER r4 (Dot / adversary ADV-A1): an HFR run whose engine paced at the native 59.94 and whose measured-session conform line says
@@ -5150,6 +5156,8 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         ("playback the engine did not pace at", [conform_line(clip="59.940", play="24.000", active=1, env_override=1)]),
         ("a sound rate from another session only", [conform_line(session=1, clip="59.940", play="59.940", active=1, env_override=1),
                                                     conform_line(clip="59.940", play="NaN", active=1, env_override=1)]),
+        # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's leg -- active conform at the native rate, the engine paced at 59.94: no conform happened.
+        ("native rate, no conform happened", [conform_line(clip="59.940", play="59.940", active=1, env_override=1)]),
     )
 
     def test_a_conform_leg_whose_conformed_rate_is_not_proven_fails_closed(self) -> None:
@@ -5176,6 +5184,8 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
                 ("negative", dict(base, conformClipFps=59.94, conformPlaybackFps=-24)), ("clip NaN", dict(base, conformClipFps="NaN", conformPlaybackFps=24)),
                 ("pace NaN", dict(base, paceFps="NaN", conformClipFps=59.94, conformPlaybackFps=24)),
                 ("another session", dict(base, conformSession="1", conformClipFps=59.94, conformPlaybackFps=59.94)),
+                # MERGE-MASTER r7 (sol r6 B1): sol's literal row, native = pace = clip = playback = 59.94 with conform_active=1
+                ("native rate", dict(base, conformClipFps=59.94, conformPlaybackFps=59.94)),
                 ("sound", dict(base, paceFps=24.0, conformClipFps=59.94, conformPlaybackFps=24.0))]
         proc, out = run_pwsh_json("$rows = $env:DVE_ROWS | ConvertFrom-Json; $spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = 'on' } }\n"
                                   "@($rows | ForEach-Object { $v = Get-DvConformArmVerdict -Spec $spec -Playback $_.block; [pscustomobject]@{ name = $_.name; blocks = $v.blocks; reason = [string]$v.reason } }) | ConvertTo-Json -Compress",
@@ -5190,12 +5200,18 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         spec = self.write_spec(generator_args={"playbackConform": "on"})
         repo = self.prod_repo(spec=spec)
         cases = []
-        for name, line in (("sound", conform_line(clip="23.976", play="23.976", active=1, env_override=1)), ("nan", conform_line(clip="23.976", play="NaN", active=1, env_override=1))):
-            ev = self.evidence("pcon-" + name, backend="cuda", extra_log_lines=[line])
+        # MERGE-MASTER r7 (sol r6 B1): the 'sound' row was a 23.976 clip played at 23.976 with conform_active=1 -- native-rate playback, which the validator
+        # now refuses ('native'); the sound row is a real conform (59.94 clip played and paced at 24).
+        hfr24 = {"native_fps": "59.940", "pace_fps": "24.000"}
+        for name, line, summary in (("sound", conform_line(clip="59.940", play="24.000", active=1, env_override=1), hfr24),
+                                    ("nan", conform_line(clip="23.976", play="NaN", active=1, env_override=1), None),
+                                    ("native", conform_line(clip="23.976", play="23.976", active=1, env_override=1), None)):
+            ev = self.evidence("pcon-" + name, backend="cuda", extra_log_lines=[line], line=summary)
             cases.append((self.receipt_for(repo, ev, backend="cuda"), ev))
-        sound, nan = self.status_batch(repo, cases)
+        sound, nan, native = self.status_batch(repo, cases)
         self.expect(sound, "ADVISORY", "sound")
         self.expect(nan, "INVALID", "nan", needle="CONFORM_PACE_NOT_PROVEN")
+        self.expect(native, "INVALID", "native", needle="no conform happened")
 
     def test_the_production_validator_re_derives_the_verdict(self) -> None:
         spec = self.write_spec(generator_args={"playbackConform": "off"})

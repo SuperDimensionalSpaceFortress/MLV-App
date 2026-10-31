@@ -940,7 +940,8 @@ function Get-DvConformPaceProof {
     HFR-CONFORM-AWARE-RECEIPT-ORACLES-1. Did the run PROVE it was conformed? Judged from the receipt `playback` block's own fields (the
     conform line's values, recorded from the run log by Get-DvPlaybackEvidence), so a reader re-derives it without the log. Proven only
     when the conform line was PRESENT for the measured session (conformSession == summarySession), conformActive == 1, conformClipFps is
-    within 0.5 % of nativeFps, conformPlaybackFps is > 0 and within 0.5 % of paceFps, and conformPlaybackFps is not above conformClipFps.
+    within 0.5 % of nativeFps, conformPlaybackFps is > 0 and within 0.5 % of paceFps, conformPlaybackFps is not above conformClipFps, and
+    conformPlaybackFps is BELOW conformClipFps by more than 0.5 % (r7: an active conform at the clip rate is native-rate playback, no conform).
     Absent / malformed / inactive / another session's / inconsistent -> proven=$false and `reason` says why (absence never helps).
     The same decision as Get-GuiSmokeConformPaceProof (gui-smoke-length-gate.ps1) and Get-AttrCudaConformAwareSourceFramesVerdict (AttrCudaArtifacts.psm1);
     a parity test executes all three on one table.
@@ -964,6 +965,10 @@ function Get-DvConformPaceProof {
     if ($null -eq $native -or -not [double]::IsFinite($native) -or -not [double]::IsFinite($clip) -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) { $out.reason = "conform clip_fps=$clip does not match native_fps=$native"; return $out }
     if ($null -eq $pace -or -not [double]::IsFinite($pace) -or -not [double]::IsFinite($play) -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) { $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"; return $out }
     if ($play -gt ($clip * 1.005)) { $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"; return $out }
+    # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): conform_active=1 with playback_fps at the clip rate is native-rate playback, not a conform. The app
+    # conforms only by LOWERING the rate (PlaybackConformPolicy.h conformApplies: target < clip), so a proof needs playback_fps below clip_fps by more than
+    # the 0.5 % tolerance; within it the run is indistinguishable from native pace.
+    if ($play -ge ($clip * 0.995)) { $out.reason = "conform active but playback_fps=$play equals clip_fps=$clip (within 0.5 %): no conform happened"; return $out }
     $out.proven = $true
     $out.reason = ''
     $out
@@ -976,7 +981,8 @@ function Get-DvConformArmVerdict {
     MLVAPP_PLAYBACK_CONFORM)? Judged from the receipt `playback` block's conform fields (re-derived from the run log by Get-DvPlaybackEvidence).
       'off' (the native-HFR arm): the measured session's playback_smoke.conform line is present, conform_active=0, conform_env_override=0 and
             playback_fps is within 0.5 % of clip_fps.
-      'on':  the measured session's conform line is present and conform_active=1.
+      'on':  the measured session's conform line is present, conform_active=1 and Get-DvConformPaceProof proves the conformed pace (playback_fps
+            below clip_fps by more than 0.5 %, so native-rate playback is never an honoured conform arm).
     A leg that requests nothing is never blocked (requested = $null). `blocks` is true when the arm was requested and not proven; `reason`
     carries the requested and the observed values, for the receipt's outcomeDetail (CONFORM_ARM_NOT_HONOURED). Pure: the runner gates on it
     and Test-DvReceiptValid re-derives it from the hashed run log and the committed spec.
