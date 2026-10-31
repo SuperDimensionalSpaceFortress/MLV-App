@@ -451,6 +451,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
         # CPU-DUALISO-REDUCED-ISO-NOTCH-1: the app's playback processing ('receipt' lets a cpu leg reach the CPU reduced dual-ISO recon).
         if ($spec.generatorArgs.PSObject.Properties['playbackProcessing']) { $gen['PlaybackProcessing'] = [string]$spec.generatorArgs.playbackProcessing }
+        # CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the app's quality mode ('hq' runs the default mode, Phase 3 Disabled, on a cpu leg).
+        if ($spec.generatorArgs.PSObject.Properties['qualityMode']) { $gen['QualityMode'] = [string]$spec.generatorArgs.qualityMode }
         # PLAYBACK-VSYNC-DEFAULT-1: the vsync A/B arm, any leg type (the app reads MLVAPP_SWAP_INTERVAL).
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
@@ -502,6 +504,8 @@ try {
     if ($visualRequest.requested) { $gen['VisualCapture'] = $true }
     if ($isLook) {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: the same frames captured paused after the Play (seek), beside the in-pass ones.
+        if ($spec.look.PSObject.Properties['pairedSeek'] -and $spec.look.pairedSeek -is [bool] -and $spec.look.pairedSeek) { $gen['ContactSheetPairedSeek'] = $true }
         $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
         if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
     }
@@ -756,6 +760,24 @@ if ($isLook -and $artifactsShare) {
             $receipt.evidence.contactFramesJsonSha256 = Get-DvSha256OfBytes $framesBytes
         }
     }
+    # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: a look.pairedSeek leg's paused captures (the job's paired-seek\contact-sheet\raw), copied
+    # beside the in-pass frames and listed by name with their sha256. Absent on the share: the receipt says so (pairedSeek.count 0, path null).
+    $pairedSeekInfo = $null
+    if ($spec.look.PSObject.Properties['pairedSeek'] -and $spec.look.pairedSeek -is [bool] -and $spec.look.pairedSeek) {
+        $seekShare = Join-Path $artifactsShare 'artifacts\paired-seek\contact-sheet\raw'
+        if (-not (Test-Path -LiteralPath $seekShare -PathType Container)) { $seekShare = Join-Path $artifactsShare 'paired-seek\contact-sheet\raw' }
+        $seekLocal = $null
+        $seekFiles = @()
+        if (Test-Path -LiteralPath $seekShare -PathType Container) {
+            $seekParent = Join-Path $evidenceDir 'paired-seek\contact-sheet'
+            New-Item -ItemType Directory -Force -Path $seekParent | Out-Null
+            Copy-Item -LiteralPath $seekShare -Destination (Join-Path $seekParent 'raw') -Recurse
+            $seekLocal = Join-Path $seekParent 'raw'
+            $seekFiles = @(Get-ChildItem -LiteralPath $seekLocal -Force -File | Sort-Object Name | ForEach-Object {
+                [ordered]@{ name = $_.Name; sha256 = (Get-DvSha256OfFile $_.FullName) } })
+        }
+        $pairedSeekInfo = [ordered]@{ path = $seekLocal; count = $seekFiles.Count; files = $seekFiles }
+    }
     if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {
         Copy-Item -LiteralPath $sheetShare -Destination (Join-Path $sheetDir 'sheet.png')
         $sheetLocal = Join-Path $sheetDir 'sheet.png'
@@ -781,6 +803,7 @@ if ($isLook -and $artifactsShare) {
         lookFlavorReported = $lookFlavorReported
         lookFlavorHonored = $lookFlavorHonored
         contactSheet = $sheetInfo
+        pairedSeek = $pairedSeekInfo
         composeStatus = $composeUnavailable
         rawFramesDir = $(if ($null -eq $sheetInfo) { $rawLocal } else { $null })
     }

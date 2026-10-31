@@ -152,6 +152,17 @@ double getMlvLastDebayerWbUndoMilliseconds(void)
     return g_mlv_last_debayer_wb_undo_ms;
 }
 
+/* debayerBasicU16 for the reduced and mid-scale routes in video_mlv.c, recording this thread's
+ * debayer kernel time as the full-resolution type-0 route above does
+ * (CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 A2: they used to leave it at its reset 0). */
+void debayerBasicU16RecordingKernelMilliseconds(uint16_t * output_frame, uint16_t * raw_frame, int width, int height,
+                                                int threads, int bit_shift)
+{
+    const double debayer_kernel_start = mlv_debayer_timing_now_seconds();
+    debayerBasicU16(output_frame, raw_frame, width, height, threads, bit_shift);
+    g_mlv_last_debayer_kernel_ms = (mlv_debayer_timing_now_seconds() - debayer_kernel_start) * 1000.0;
+}
+
 void invalidateMlvProcessedPreviewCache(mlvObject_t * video)
 {
     if (!video)

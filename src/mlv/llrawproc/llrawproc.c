@@ -6819,6 +6819,48 @@ void llrpResetLastRunTimingForCurrentThread(void)
     llrpResetLastPreDualIsoFixTelemetry();
 }
 
+/* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: every record the reset above clears.
+ * A thread that ran the llrawproc it then consumes saves them before the
+ * consuming debayer's reset and restores them after (video_mlv.c,
+ * mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread). */
+#define LLRP_LAST_RUN_TIMING(X) \
+    X(double, g_llrawproc_last_shared_lock_ms) \
+    X(double, g_llrawproc_last_dualiso_refine_lock_ms) \
+    X(double, g_llrawproc_last_publish_lock_ms) \
+    X(double, g_llrawproc_last_total_ms) \
+    X(double, g_llrawproc_last_dark_frame_ms) \
+    X(double, g_llrawproc_last_vertical_stripes_ms) \
+    X(double, g_llrawproc_last_focus_pixels_ms) \
+    X(double, g_llrawproc_last_bad_pixels_ms) \
+    X(double, g_llrawproc_last_pattern_noise_ms) \
+    X(double, g_llrawproc_last_dual_iso_ms) \
+    X(double, g_llrawproc_last_chroma_smooth_ms) \
+    X(dualiso_full20bit_timing_t, g_llrawproc_last_dual_iso_full20bit_timing) \
+    X(double, g_llrawproc_last_pre_dualiso_fix_ms) \
+    X(int, g_llrawproc_last_pre_dualiso_fix_completed)
+
+typedef struct
+{
+#define LLRP_SAVED_LAST_RUN_RECORD(type, name) type name;
+    LLRP_LAST_RUN_TIMING(LLRP_SAVED_LAST_RUN_RECORD)
+#undef LLRP_SAVED_LAST_RUN_RECORD
+} llrawproc_saved_last_run_timing_t;
+static MLV_THREAD_LOCAL llrawproc_saved_last_run_timing_t g_llrawproc_saved_last_run_timing;
+
+void llrpSaveLastRunTimingForCurrentThread(void)
+{
+#define LLRP_SAVE_LAST_RUN_RECORD(type, name) g_llrawproc_saved_last_run_timing.name = name;
+    LLRP_LAST_RUN_TIMING(LLRP_SAVE_LAST_RUN_RECORD)
+#undef LLRP_SAVE_LAST_RUN_RECORD
+}
+
+void llrpRestoreLastRunTimingForCurrentThread(void)
+{
+#define LLRP_RESTORE_LAST_RUN_RECORD(type, name) name = g_llrawproc_saved_last_run_timing.name;
+    LLRP_LAST_RUN_TIMING(LLRP_RESTORE_LAST_RUN_RECORD)
+#undef LLRP_RESTORE_LAST_RUN_RECORD
+}
+
 double llrpGetLastDualIsoMilliseconds(void)
 {
     return g_llrawproc_last_dual_iso_ms;
