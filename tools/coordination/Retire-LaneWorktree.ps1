@@ -1432,6 +1432,11 @@ function Invoke-RetireLaneWorktree {
         $u = Run-Git $main @('rev-list', '--count', $d.head, '--not', '--remotes'); if ($u.code) { $d.reason = 'cannot-determine: rev-list --not --remotes'; return [pscustomobject]$d }
         if ([int]$u.out[0] -gt 0) { $d.reason = "unpushed: $($u.out[0]) commit(s) on no remote"; return [pscustomobject]$d }
 
+        if ($MergeTarget -like 'refs/*') {
+            # exact ref: merge-base takes a revision, and for a missing refs/ name git goes on to refs/tags/<name>
+            & git.exe -C $main show-ref --verify --quiet $MergeTarget 2>$null
+            if ($LASTEXITCODE -ne 0) { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
+        }
         & git.exe -C $main merge-base --is-ancestor $d.head $MergeTarget 2>$null
         switch ($LASTEXITCODE) { 0 { } 1 { $d.reason = "unmerged: HEAD not an ancestor of $MergeTarget"; return [pscustomobject]$d } default { $d.reason = "cannot-determine: merge-base ($MergeTarget)"; return [pscustomobject]$d } }
 

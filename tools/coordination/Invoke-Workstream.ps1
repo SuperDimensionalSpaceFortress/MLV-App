@@ -215,8 +215,23 @@ $Schedulable = @('queued', 'dispatched', 'in-review', 'waiting-evidence', 'dispa
 # label that the run may not be a landed one.
 # Pure: no I/O. $MasterSha is '' when the tip could not be read, which skips (a).
 function Select-MergeGroupJobsRun {
-    param([object[]]$Runs, [string]$MasterSha = '')
-    $sorted = @($Runs | Where-Object { $null -ne $_ } | Sort-Object -Property createdAt -Descending)
+    param([object[]]$Runs, [string]$MasterSha = '', [string]$TipReason = '')
+    # createdAt as a parsed UTC instant (a [datetime] is converted, a string is parsed with the invariant
+    # culture; a string with no offset is taken as UTC). $null when it does not parse.
+    $toUtc = {
+        param($v)
+        if ($v -is [datetime]) { return $v.ToUniversalTime() }
+        $o = [datetimeoffset]::MinValue
+        if ([datetimeoffset]::TryParse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$o)) { return $o.UtcDateTime }
+        return $null
+    }
+    # ADV-A2 (r5): sort by the parsed UTC instant, NEVER by the createdAt text: '2026-10-31T18:00:00+02:00'
+    # (16:00Z) sorts after '2026-10-31T17:00:00Z' as a string but is the OLDER run. A value that does not
+    # parse sorts LAST (MinValue under Descending), so it is never picked over a parsable one.
+    $sorted = @($Runs | Where-Object { $null -ne $_ } | Sort-Object -Descending -Property @{ Expression = {
+        $t = & $toUtc $_.createdAt
+        if ($null -eq $t) { [datetime]::MinValue } else { $t }
+    } })
     if ($sorted.Count -eq 0) { return $null }
     if ($MasterSha) {
         $landed = @($sorted | Where-Object { $_.headSha -eq $MasterSha })
@@ -230,13 +245,6 @@ function Select-MergeGroupJobsRun {
             # order. A row whose createdAt does not parse cannot be shown newer, so it is not counted; when the
             # selected run's own createdAt does not parse nothing can be shown newer either.
             $label = 'landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)'
-            $toUtc = {
-                param($v)
-                if ($v -is [datetime]) { return $v.ToUniversalTime() }
-                $o = [datetimeoffset]::MinValue
-                if ([datetimeoffset]::TryParse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$o)) { return $o.UtcDateTime }
-                return $null
-            }
             $selAt = & $toUtc $landed[0].createdAt
             $newerOff = @()
             if ($null -ne $selAt) {
@@ -251,11 +259,31 @@ function Select-MergeGroupJobsRun {
             return [pscustomobject]@{ Run = $landed[0]; Label = $label }
         }
     }
+    # ADV-A1 (r5): when the tip could not be read, the label names the typed reason ($TipReason, for example
+    # 'tip-ref-missing: refs/remotes/fork/master') so a reader sees WHY the landed rule was skipped.
+    $why = if ($TipReason) { "; $TipReason" } else { '' }
     $ok = @($sorted | Where-Object { $_.conclusion -eq 'success' })
     if ($ok.Count -gt 0) {
-        return [pscustomobject]@{ Run = $ok[0]; Label = 'newest success; may be a non-landed queue entry' }
+        return [pscustomobject]@{ Run = $ok[0]; Label = "newest success; may be a non-landed queue entry$why" }
     }
-    return [pscustomobject]@{ Run = $sorted[0]; Label = 'newest by createdAt; may be a non-landed queue entry' }
+    return [pscustomobject]@{ Run = $sorted[0]; Label = "newest by createdAt; may be a non-landed queue entry$why" }
+}
+
+# ADV-A1 (r5): read the local master tip by the EXACT ref, not by a revision lookup. `rev-parse --verify` on
+# the full refname plus a commit peel is a revision lookup: when that ref is ABSENT git's dwim rules go on to try
+# refs/tags/refs/remotes/fork/master, refs/heads/refs/remotes/fork/master and similar names, so a ref with one
+# of those names supplies a valid but false tip. `show-ref --verify --hash` accepts only the exact ref and
+# exits non-zero when it is missing. A missing or unreadable ref returns Sha '' and the typed Reason that
+# Select-MergeGroupJobsRun puts in its label; the selector then falls through to its success / createdAt choices.
+function Get-ForkMasterTip {
+    param([string]$RepoRoot)
+    $ref = 'refs/remotes/fork/master'
+    $sha = ''
+    try {
+        $sha = [string](& git -C $RepoRoot show-ref --verify --hash refs/remotes/fork/master 2>$null | Select-Object -First 1)
+    } catch { $sha = '' }
+    if ($sha -notmatch '^[0-9a-f]{40}$') { return [pscustomobject]@{ Sha = ''; Reason = "tip-ref-missing: $ref" } }
+    return [pscustomobject]@{ Sha = $sha; Reason = '' }
 }
 
 function Get-Prop($obj, [string]$name) {
@@ -913,11 +941,13 @@ if ($needsHostedEvidence) {
                 # refs/tags/fork/master would win the bare name fork/master. An unreadable tip falls through
                 # to the success / createdAt choices inside Select-MergeGroupJobsRun.
                 $tipSha = ''
+                $tipReason = 'tip-ref-missing: refs/remotes/fork/master'
                 try {
-                    $tipSha = [string](& git -C $RepoRoot rev-parse --verify --quiet 'refs/remotes/fork/master^{commit}' 2>$null | Select-Object -First 1)
-                    if ($tipSha -notmatch '^[0-9a-f]{40}$') { $tipSha = '' }
+                    $tip = Get-ForkMasterTip -RepoRoot $RepoRoot
+                    $tipSha = [string]$tip.Sha
+                    $tipReason = [string]$tip.Reason
                 } catch { $tipSha = '' }
-                $pick = Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha
+                $pick = Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha -TipReason $tipReason
                 if ($null -ne $pick) {
                     $newest  = $pick.Run.databaseId
                     $jobsOut = Join-Path $ghDir "jobs-latest-$newest.json"
@@ -1222,7 +1252,7 @@ $fence
 
     $laneWorkDir = Join-Path 'C:\mlvtmp' "lane-$cardId-$stamp"
 
-    $baseSha = (& git -C $RepoRoot rev-parse --verify --quiet 'refs/remotes/fork/master^{commit}' 2>$null | Select-Object -First 1)
+    $baseSha = (& git -C $RepoRoot show-ref --verify --hash refs/remotes/fork/master 2>$null | Select-Object -First 1)   # exact ref: a missing ref must not fall through to refs/tags/refs/remotes/fork/master
     if (-not $baseSha -or $baseSha -notmatch '^[0-9a-f]{40}$') {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not resolve fork/master to a full sha at $RepoRoot"
         Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-base-sha' -ExitCode 3

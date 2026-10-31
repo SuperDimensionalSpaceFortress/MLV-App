@@ -5174,10 +5174,11 @@ def test_the_merge_group_export_uses_the_selector_and_names_its_label_not_a_fixe
     failed tip read must never throw out of the export."""
     text = WORKSTREAM.read_text(encoding="utf-8")
     assert "$runs[0]" not in text, "the export still takes the newest run by createdAt"
-    assert "Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha" in text
+    assert "Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha -TipReason $tipReason" in text
     assert "newest by createdAt)" not in text, "the jobs row still hard-codes the label"
     assert "$($pick.Label))" in text, "the jobs row does not carry the selector's label"
-    assert "refs/remotes/fork/master^{commit}" in text
+    assert "Get-ForkMasterTip -RepoRoot $RepoRoot" in text   # r5 ADV-A1: exact-ref read, not a revision lookup
+    assert "show-ref --verify --hash refs/remotes/fork/master" in text
     start = text.index("$pick = Select-MergeGroupJobsRun")
     block = text[text.index("$tipSha = ''"):start]
     assert "catch" in block and "gh " not in block and "gh api" not in block, "tip read must be local and non-throwing"
@@ -5253,7 +5254,7 @@ MGRS_TIP_READERS = (
 
 def _mgrs_tip_read_expressions(path):
     text = path.read_text(encoding="utf-8")
-    return [m for m in re.findall(r"& git -C \$RepoRoot rev-parse [^\r\n]*?\| Select-Object -First 1", text) if "fork/master" in m]
+    return [m for m in re.findall(r"& git -C \$RepoRoot (?:rev-parse|show-ref) [^\r\n]*?\| Select-Object -First 1", text) if "fork/master" in m]
 
 
 def _mgrs_run_tip_expr(tmp_path, repo, expr):
@@ -5298,7 +5299,8 @@ def test_the_fork_master_tip_reads_use_the_full_refname_in_source():
     for path, _ in MGRS_TIP_READERS:
         text = path.read_text(encoding="utf-8")
         assert "rev-parse fork/master" not in text, path.name
-        assert "refs/remotes/fork/master^{commit}" in text, path.name
+        assert "show-ref --verify --hash refs/remotes/fork/master" in text, path.name   # r5 ADV-A1: exact ref
+        assert "refs/remotes/fork/master^{commit}" not in text, path.name
     # r3 (G1): the merge-target and driver-ref sites and the currency guard default carry the full refname too
     for label, ref in _g1_ref_sites():
         assert ref == "refs/remotes/fork/master", (label, ref)
@@ -5426,3 +5428,177 @@ def test_the_ratio_guard_resolves_the_remote_tracking_tip_not_a_same_named_tag(t
     assert doc["errorCode"] in ("", None) or doc["sourceSha"], doc
     assert doc["sourceSha"] == remote_sha, (doc["sourceRef"], doc["sourceSha"], remote_sha, tag_sha)
     assert doc["sourceRef"] == FULL_FORK_MASTER
+
+
+# --- r5 (hub ACK 6549274873; Dot 6b0ec449; ADV-A1 / ADV-A2) -----------------------------------------------
+# ADV-A1: `git rev-parse --verify refs/remotes/fork/master^{commit}` is a REVISION lookup. With the ref ABSENT, git's
+# dwim rules go on to try refs/tags/<name>, so a tag named refs/tags/refs/remotes/fork/master supplied a valid but
+# false tip. Every full-refname site now checks the EXACT ref (`show-ref --verify`) first.
+# ADV-A2: Select-MergeGroupJobsRun sorted createdAt as text; '...18:00:00+02:00' (16:00Z) sorted ahead of '...17:00:00Z'.
+
+R5_ABSENT_REF_TAG = "refs/tags/refs/remotes/fork/master"
+
+
+def _r5_tag_only_repo(tmp_path):
+    """A real repo with NO refs/remotes/fork/master and the tag refs/tags/refs/remotes/fork/master at commit T."""
+    repo = tmp_path / "r5repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    git(repo, "add", "f.txt")
+    git(repo, "commit", "-q", "-m", "T")
+    tag_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", R5_ABSENT_REF_TAG, tag_sha)
+    # the fixture is only meaningful if the OLD revision lookup really returns the tag's commit
+    old = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "refs/remotes/fork/master^{commit}"],
+                         capture_output=True, text=True)
+    assert old.stdout.strip() == tag_sha, (old.stdout, old.stderr)
+    assert subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet", "refs/remotes/fork/master"]).returncode != 0
+    return repo, tag_sha
+
+
+def test_r5_the_tip_reads_do_not_take_a_tag_named_like_the_absent_full_refname(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    for path, expected in MGRS_TIP_READERS:
+        exprs = _mgrs_tip_read_expressions(path)
+        assert len(exprs) == expected, (path.name, exprs)
+        for expr in exprs:
+            assert _mgrs_run_tip_expr(tmp_path, repo, expr) == "", (path.name, expr)
+
+
+def _r5_ps_str(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _r5_select_with_repo(tmp_path, repo, rows):
+    """Real Get-ForkMasterTip over a real repo feeding the real selector; rows are built in PowerShell with STRING createdAt."""
+    tip_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Get-ForkMasterTip")
+    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    lines = ["$ErrorActionPreference='Stop'", tip_fn, sel_fn, "$rows=@()"]
+    for r in rows:
+        lines.append("$rows += [pscustomobject]@{ databaseId=%d; createdAt=%s; headSha=%s; conclusion=%s }"
+                     % (r[0], _r5_ps_str(r[1]), _r5_ps_str(r[2]), _r5_ps_str(r[3])))
+    lines += [
+        "$tip = Get-ForkMasterTip -RepoRoot " + _r5_ps_str(repo),
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha $tip.Sha -TipReason $tip.Reason",
+        "[pscustomobject]@{ tip = $tip.Sha; id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress",
+    ]
+    harness = tmp_path / "r5-harness.ps1"
+    harness.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+R5_REASON = "tip-ref-missing: refs/remotes/fork/master"
+
+
+def test_r5_a_missing_tip_ref_reads_empty_and_the_label_names_the_typed_reason(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    rows = [
+        (3, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"),
+        (2, "2026-10-31T16:00:00Z", tag_sha, "failure"),   # would be 'landed' if the tag supplied the tip
+    ]
+    got = _r5_select_with_repo(tmp_path, repo, rows)
+    assert got["tip"] == "", got
+    assert got["id"] == 3, got                                   # falls through to choice (c)
+    assert got["label"] == MGRS_LABEL_NEWEST + "; " + R5_REASON, got
+    # choice (b) carries the reason too
+    rows[0] = (3, "2026-10-31T17:00:00Z", MGRS_OTHER, "success")
+    got = _r5_select_with_repo(tmp_path, repo, rows)
+    assert got["label"] == MGRS_LABEL_SUCCESS + "; " + R5_REASON, got
+
+
+def test_r5_a_present_tip_ref_reads_its_sha_and_carries_no_reason(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    git(repo, "update-ref", "refs/remotes/fork/master", tag_sha)
+    got = _r5_select_with_repo(tmp_path, repo, [(2, "2026-10-31T16:00:00Z", tag_sha, "success")])
+    assert got["tip"] == tag_sha and got["id"] == 2, got
+    assert got["label"] == MGRS_LABEL_LANDED, got
+
+
+def test_r5_the_ratio_guard_does_not_resolve_an_absent_full_refname_through_a_tag(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(RATIO_GUARD),
+         "-RepoRoot", str(repo), "-AsOfEpoch", "1893456000"],
+        text=True, capture_output=True)
+    lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, (out.returncode, out.stdout, out.stderr)
+    doc = json.loads(lines[0])
+    assert doc["sourceSha"] in ("", None), doc["sourceSha"]
+    assert doc["errorCode"] == "ERROR_REF_UNRESOLVED", doc["errorCode"]
+    assert doc["sourceRef"] == FULL_FORK_MASTER
+
+
+def test_r5_the_script_currency_guard_does_not_resolve_an_absent_full_refname_through_a_tag(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'x'\n", encoding="utf-8")
+    git(repo, "add", "x.ps1")
+    git(repo, "commit", "-q", "-m", "x")
+    git(repo, "update-ref", R5_ABSENT_REF_TAG, git(repo, "rev-parse", "HEAD"))
+    guard = COORD / "assert-script-currency.ps1"
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(guard),
+         "-ScriptPath", str(script), "-PassThru"],
+        text=True, capture_output=True, env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""})
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "unknown" in out.stdout and "does not exist" in out.stdout, out.stdout
+
+
+def test_r5_the_loop_and_retire_sites_check_the_exact_ref_before_following_it():
+    loop = LOOP.read_text(encoding="utf-8")
+    assert loop.count("show-ref --verify --quiet $TargetRef") == 2, "worktree add and reset --hard both need the exact-ref check"
+    assert loop.index("show-ref --verify --quiet $TargetRef") < loop.index("worktree add --detach $DriverRoot $TargetRef")
+    assert loop.rindex("show-ref --verify --quiet $TargetRef") < loop.index("reset --hard $TargetRef")
+    ret = RETIRE.read_text(encoding="utf-8")
+    guard = ret.index("show-ref --verify --quiet $MergeTarget")
+    assert guard < ret.index("merge-base --is-ancestor $d.head $MergeTarget")
+    assert "merge target ref missing" in ret
+
+
+def _r5_select_strings(tmp_path, rows, tip=MGRS_TIP):
+    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    lines = ["$ErrorActionPreference='Stop'", sel_fn, "$rows=@()"]
+    for r in rows:
+        lines.append("$rows += [pscustomobject]@{ databaseId=%d; createdAt=%s; headSha=%s; conclusion=%s }"
+                     % (r[0], _r5_ps_str(r[1]), _r5_ps_str(r[2]), _r5_ps_str(r[3])))
+        lines.append("if ($rows[-1].createdAt -isnot [string]) { throw 'createdAt must stay a string' }")
+    lines += ["$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha " + _r5_ps_str(tip),
+              "[pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress"]
+    harness = tmp_path / "r5-strings.ps1"
+    harness.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_r5_created_at_is_sorted_as_a_parsed_utc_instant_not_as_text(tmp_path):
+    """Both runs are off-tip failures, so choice (c) decides. '18:00:00+02:00' is 16:00Z (OLDER); text order puts it first."""
+    rows = [
+        (1, "2026-10-31T18:00:00+02:00", MGRS_OTHER, "failure"),   # 16:00Z
+        (2, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"),        # 17:00Z, newer
+    ]
+    got = _r5_select_strings(tmp_path, rows)
+    assert got == {"id": 2, "label": MGRS_LABEL_NEWEST}, got
+    got = _r5_select_strings(tmp_path, list(reversed(rows)))
+    assert got["id"] == 2, got
+
+
+def test_r5_an_unparsable_created_at_sorts_last_and_is_never_picked_over_a_parsable_one(tmp_path):
+    rows = [
+        (9, "not-a-timestamp", MGRS_OTHER, "failure"),
+        (1, "2026-10-31T10:00:00Z", MGRS_OTHER, "failure"),
+    ]
+    assert _r5_select_strings(tmp_path, rows)["id"] == 1
+    assert _r5_select_strings(tmp_path, list(reversed(rows)))["id"] == 1
+
+
+def test_r5_the_selector_sort_uses_the_parsed_instant_in_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "Sort-Object -Property createdAt" not in body, "the sort is by createdAt text again"
+    assert "Sort-Object -Descending -Property @{ Expression" in body

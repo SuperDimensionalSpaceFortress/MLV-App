@@ -51,6 +51,11 @@ $rel = $full.Substring($root.Length).TrimStart([char]92, [char]47).Replace([stri
 if (-not $rel) { Write-Result 'unknown' 'could not derive a repo-relative path'; return }
 
 # Does the reference exist at all? No 'fork' remote (a fresh clone, a lane sandbox) is not drift.
+if ($Ref -like 'refs/*') {
+    # A full refs/ name must exist EXACTLY: rev-parse would fall through to refs/tags/<name> for a missing ref.
+    & git -C $root show-ref --verify --quiet $Ref *> $null
+    if ($LASTEXITCODE -ne 0) { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
+}
 & git -C $root rev-parse --verify --quiet "$Ref^{commit}" *> $null
 if ($LASTEXITCODE -ne 0) { Write-Result 'unknown' "ref '$Ref' does not resolve"; return }
 

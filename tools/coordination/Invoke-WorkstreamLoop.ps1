@@ -235,6 +235,9 @@ function Sync-DriverWorktree {
         if (-not (Test-Path -LiteralPath (Join-Path $DriverRoot '.git'))) {
             if (Test-Path -LiteralPath $DriverRoot) { Remove-Item -LiteralPath $DriverRoot -Recurse -Force }
             Invoke-GitFetchFork | Out-Null
+            # exact ref: a missing refs/remotes/fork/master must not fall through to refs/tags/refs/remotes/fork/master
+            & git -C $RepoRoot show-ref --verify --quiet $TargetRef 2>$null
+            if ($LASTEXITCODE -ne 0) { return "target ref $TargetRef does not exist" }
             & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add --detach $DriverRoot $TargetRef 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { return "could not create driver worktree at $DriverRoot" }
             Disable-DriverFsmonitor
@@ -245,6 +248,8 @@ function Sync-DriverWorktree {
         if (-not $fetch.Ok) { return "git fetch fork failed (exit $($fetch.ExitCode)) after $($fetch.Attempts) attempts; driver worktree may be stale" }
         # Hard reset is safe here and ONLY here: this worktree is tool-owned, is
         # never edited by hand, and holds nothing anyone can lose.
+        & git -C $RepoRoot show-ref --verify --quiet $TargetRef 2>$null   # exact ref, see the worktree-add site above
+        if ($LASTEXITCODE -ne 0) { return "target ref $TargetRef does not exist" }
         & git -C $DriverRoot reset --hard $TargetRef --quiet 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { return "could not reset driver worktree to $TargetRef" }
         return $null
