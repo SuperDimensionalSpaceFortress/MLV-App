@@ -1500,10 +1500,10 @@ double edgeChroma(const std::vector<uint16_t> & rgb, int outW, int rows, int sca
         for (int x = 2; x < outW - 2; ++x)
         {
             const double centre = scale * x + (scale - 1) / 2.0;
-            bool near = false;
+            bool nearEdge = false; // not `near`: windef.h defines it
             for (const int e : edges)
-                if (std::fabs(centre - (e - 0.5)) <= scale) { near = true; break; }
-            if (!near) continue;
+                if (std::fabs(centre - (e - 0.5)) <= scale) { nearEdge = true; break; }
+            if (!nearEdge) continue;
             const uint16_t * px = rgb.data() + (static_cast<size_t>(y) * outW + x) * 3u;
             sum += std::abs(static_cast<int>(px[0]) - static_cast<int>(px[1]))
                  + std::abs(static_cast<int>(px[2]) - static_cast<int>(px[1]));
