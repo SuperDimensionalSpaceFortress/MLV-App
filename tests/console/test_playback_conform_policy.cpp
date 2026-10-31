@@ -7,7 +7,9 @@
 #include "../../platform/qt/PlaybackConformPolicy.h"
 
 #include <QDir>
+#include <QFile>
 #include <QSettings>
+#include <QStringList>
 #include <QTemporaryDir>
 
 #include <cmath>
@@ -134,6 +136,67 @@ TEST(PlaybackConformPolicy, SettingsRoundTripAndDefaultsWhenAbsentOrInvalid)
         ASSERT_EQ(kDefaultTargetFps, bad.targetFps);
         ASSERT_EQ(kDefaultThresholdFps, bad.thresholdFps);
     }
+}
+
+// MERGE-MASTER r4 (adversary ADV-A2, hub ruling): a stored Playback/ConformEnabled that is not a valid bool (an empty or
+// non-bool string, a list, a number other than 0/1, an @Invalid() value) is MISSING and takes the documented default (on);
+// a valid stored false stays false. Before r4, QVariant::toBool turned the empty INI value into false and silently
+// disabled conform (a 59.94 clip played at 59.94 instead of the default 24).
+TEST(PlaybackConformPolicy, InvalidStoredEnabledIsMissingAndTakesTheDefault)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    int n = 0;
+    auto enabledFromIni = [&](const QByteArray &body) {
+        const QString path = QDir(dir.path()).filePath(QStringLiteral("enabled%1.ini").arg(n++));
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly)) return !kDefaultEnabled; // fails the default checks below, never passes silently
+        file.write(body);
+        file.close();
+        QSettings set(path, QSettings::IniFormat);
+        return loadSettings(set).enabled;
+    };
+    // The adversary's input: INI [Playback] followed by "ConformEnabled=" (empty), target and threshold absent.
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=\n"));
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=   \n"));
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=@Invalid()\n"));
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=\"true, false\"\n"));
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=true, false\n")); // a QStringList
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=maybe\n"));
+    ASSERT_EQ(kDefaultEnabled, enabledFromIni("[Playback]\nConformEnabled=2\n"));
+    {
+        QSettings empty(QDir(dir.path()).filePath(QStringLiteral("empty.ini")), QSettings::IniFormat);
+        const Settings s = loadSettings(empty);
+        ASSERT_EQ(kDefaultEnabled, s.enabled); // a missing key: the default
+        ASSERT_EQ(24.0, playbackFps(59.94, s.enabled, s.targetFps, s.thresholdFps));
+    }
+    // A VALID stored value is honoured, false included.
+    ASSERT_FALSE(enabledFromIni("[Playback]\nConformEnabled=false\n"));
+    ASSERT_FALSE(enabledFromIni("[Playback]\nConformEnabled=FALSE\n"));
+    ASSERT_FALSE(enabledFromIni("[Playback]\nConformEnabled=0\n"));
+    ASSERT_TRUE(enabledFromIni("[Playback]\nConformEnabled=true\n"));
+    ASSERT_TRUE(enabledFromIni("[Playback]\nConformEnabled=1\n"));
+    // Typed values (a non-INI store, e.g. the registry): a bool or 0/1 is valid, any other type or number is missing.
+    QSettings typed(QDir(dir.path()).filePath(QStringLiteral("typed.ini")), QSettings::IniFormat);
+    typed.setValue(kKeyEnabled(), false);
+    ASSERT_FALSE(loadSettings(typed).enabled);
+    typed.setValue(kKeyEnabled(), 0);
+    ASSERT_FALSE(loadSettings(typed).enabled);
+    typed.setValue(kKeyEnabled(), 1);
+    ASSERT_TRUE(loadSettings(typed).enabled);
+    typed.setValue(kKeyEnabled(), QStringList{ QStringLiteral("false") });
+    ASSERT_EQ(kDefaultEnabled, loadSettings(typed).enabled);
+    typed.setValue(kKeyEnabled(), 0.0);
+    ASSERT_EQ(kDefaultEnabled, loadSettings(typed).enabled);
+    typed.setValue(kKeyEnabled(), 7);
+    ASSERT_EQ(kDefaultEnabled, loadSettings(typed).enabled);
+    // A round trip of the saved false still reads back false (saveSettings writes a real bool).
+    Settings off;
+    off.enabled = false;
+    saveSettings(typed, off);
+    typed.sync();
+    QSettings reread(QDir(dir.path()).filePath(QStringLiteral("typed.ini")), QSettings::IniFormat);
+    ASSERT_FALSE(loadSettings(reread).enabled);
 }
 
 TEST(PlaybackConformPolicy, SettingsKeysAreNewAndDoNotReuseAutoTargetFps)

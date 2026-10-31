@@ -15,7 +15,8 @@
  * Conform applies only when clipFps > threshold AND target < clipFps, so a
  * clip is never sped up. Invalid target/threshold values (NaN, inf, < 1,
  * absurdly large) fall back to the defaults, like the Auto target-fps
- * setting does for its own invalid saved values.
+ * setting does for its own invalid saved values; an invalid saved enabled
+ * value (not a bool) is missing and takes the default too (storedBoolOr).
  */
 
 #ifndef PLAYBACKCONFORMPOLICY_H
@@ -26,6 +27,7 @@
 #include <QByteArray>
 #include <QSettings>
 #include <QString>
+#include <QVariant>
 #include <QtGlobal>
 
 namespace playback_conform
@@ -114,10 +116,46 @@ struct Settings
     double thresholdFps = kDefaultThresholdFps;
 };
 
+/*! MERGE-MASTER r4 (adversary ADV-A2, hub ruling): a stored value that is not a valid bool -- an empty or
+ *  non-bool string, a list, a number other than 0/1, any other type, an @Invalid() value -- is treated as
+ *  MISSING and yields \a fallback (the documented default); a valid stored false stays false. QVariant::toBool
+ *  alone turns an empty string into false, which silently disabled conform. Valid: a bool, an integer 0/1,
+ *  or the text "true"/"false"/"1"/"0" (trimmed, any case: what QSettings writes for a bool in an INI or the
+ *  registry). */
+inline bool storedBoolOr( const QVariant & stored, bool fallback )
+{
+    if( !stored.isValid() ) return fallback;
+    switch( stored.userType() )
+    {
+    case QMetaType::Bool:
+        return stored.toBool();
+    case QMetaType::Int:
+    case QMetaType::UInt:
+    case QMetaType::LongLong:
+    case QMetaType::ULongLong:
+    {
+        bool ok = false;
+        const qlonglong n = stored.toLongLong( &ok );
+        if( ok && ( n == 0 || n == 1 ) ) return n == 1;
+        return fallback;
+    }
+    case QMetaType::QString:
+    case QMetaType::QByteArray:
+    {
+        const QString text = stored.toString().trimmed().toLower();
+        if( text == QLatin1String( "true" ) || text == QLatin1String( "1" ) ) return true;
+        if( text == QLatin1String( "false" ) || text == QLatin1String( "0" ) ) return false;
+        return fallback;
+    }
+    default:
+        return fallback;
+    }
+}
+
 inline Settings loadSettings( QSettings & set )
 {
     Settings s;
-    s.enabled      = set.value( kKeyEnabled(), kDefaultEnabled ).toBool();
+    s.enabled      = storedBoolOr( set.value( kKeyEnabled() ), kDefaultEnabled );
     bool okTarget = false;
     bool okThreshold = false;
     const double target =
