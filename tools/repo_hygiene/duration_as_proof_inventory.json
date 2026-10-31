@@ -2553,9 +2553,61 @@
       "class": "run_proof",
       "clock": "omp_get_wtime_direct",
       "flag": "getMlvRawFrameDebayeredFromReducedReconnedRaw16 returned 1",
-      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 adversary A2: the debayer's run is proved by the entry returning 1 on every call; this assert's subject is the telemetry record itself (the entry used to reset debayer_kernel_ms and never write it), which is the defect under test.",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 adversary A2 (line 1395) and r2 Grok G1 (line 1431): the debayer's run is proved by the entry returning 1 on every call (1395: getMlvRawFrameDebayeredFromReducedReconnedRaw16; 1431: ASSERT_TRUE(controlDebayered16(...)), i.e. getMlvRawFrameDebayeredFromReconnedRaw16 == 1, inside the loop above it); each assert's subject is the telemetry record itself, which is the defect under test (1431: the full-resolution frame recorded a kernel time for the scaled frame to be compared against).",
       "lines": [
-        1395
+        1395,
+        1431
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "for ( uint64_t frame = 0 ; frame < 8 && ( wbPrepareMs + caMs + wbUndoMs <= 0.0 || kernelMs <= 0.0 ) ; ++ frame )",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a retry bound for a coarse clock (about 1 ms ticks); each frame's run is proved by ASSERT_TRUE(controlDebayered16(...)) inside the loop (getMlvRawFrameDebayeredFromReconnedRaw16 returned 1), not by the duration.",
+      "lines": [
+        1419
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( wbPrepareMs + caMs + wbUndoMs > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "omp_get_wtime_direct",
+      "flag": "controlDebayered16 returned true (getMlvRawFrameDebayeredFromReconnedRaw16 returned 1)",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: the full-resolution AMaZE+CA debayer's run is proved by the entry returning 1; this assert's subject is the telemetry record (a non-zero non-kernel stage time the scaled frame must not inherit), so the test is not vacuous.",
+      "lines": [
+        1430
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( scaledWbPrepareMs == 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no wb-prepare stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by ASSERT_EQ(scaledWords, ...size()) on the scaled entry's output, not by the duration.",
+      "lines": [
+        1449
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( scaledCaMs == 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no CA stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by ASSERT_EQ(scaledWords, ...size()), not by the duration.",
+      "lines": [
+        1450
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( scaledWbUndoMs == 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 Grok G1: a negative-lane check that the scaled frame reports no wb-undo stage (no scaled route runs one) instead of the previous full-resolution frame's record; the scaled render's run is proved by ASSERT_EQ(scaledWords, ...size()), not by the duration.",
+      "lines": [
+        1451
       ]
     }
   ]

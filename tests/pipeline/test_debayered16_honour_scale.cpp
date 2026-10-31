@@ -1415,20 +1415,20 @@ TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerSt
         // A full-resolution AMaZE frame with CA on: the route that measures all four stages.
         setMlvAlwaysUseAmaze(fixture.video());
         fixture.video()->ca_red = 1.0f;
-        double wbPrepare = 0.0, ca = 0.0, kernel = 0.0, wbUndo = 0.0;
-        for (uint64_t frame = 0; frame < 8 && (wbPrepare + ca + wbUndo <= 0.0 || kernel <= 0.0); ++frame)
+        double wbPrepareMs = 0.0, caMs = 0.0, kernelMs = 0.0, wbUndoMs = 0.0;
+        for (uint64_t frame = 0; frame < 8 && (wbPrepareMs + caMs + wbUndoMs <= 0.0 || kernelMs <= 0.0); ++frame)
         {
             std::vector<uint16_t> rgb16;
             ASSERT_TRUE(controlDebayered16(fixture, frame, worker, &rgb16));
-            wbPrepare = getMlvLastDebayerWbPrepareMilliseconds();
-            ca = getMlvLastDebayerCaMilliseconds();
-            kernel = getMlvLastDebayerKernelMilliseconds();
-            wbUndo = getMlvLastDebayerWbUndoMilliseconds();
+            wbPrepareMs = getMlvLastDebayerWbPrepareMilliseconds();
+            caMs = getMlvLastDebayerCaMilliseconds();
+            kernelMs = getMlvLastDebayerKernelMilliseconds();
+            wbUndoMs = getMlvLastDebayerWbUndoMilliseconds();
         }
         std::printf("[debayered16-honour-scale] full-res AMaZE+CA: wb_prepare=%.4f ca=%.4f kernel=%.4f wb_undo=%.4f\n",
-                    wbPrepare, ca, kernel, wbUndo);
-        ASSERT_TRUE(wbPrepare + ca + wbUndo > 0.0);
-        ASSERT_TRUE(kernel > 0.0);
+                    wbPrepareMs, caMs, kernelMs, wbUndoMs);
+        ASSERT_TRUE(wbPrepareMs + caMs + wbUndoMs > 0.0);
+        ASSERT_TRUE(kernelMs > 0.0);
 
         // Then a scaled frame on the same thread, on the playback debayer.
         setMlvDontAlwaysUseAmaze(fixture.video());
@@ -1439,17 +1439,17 @@ TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerSt
             ASSERT_EQ(scaledWords, fixture.renderFrame16Scaled(2, kCpuCores, scale).size());
         else
             ASSERT_EQ(scaledWords, fixture.renderFrame8Scaled(3, kCpuCores, scale).size());
-        const double sWbPrepare = getMlvLastDebayerWbPrepareMilliseconds();
-        const double sCa = getMlvLastDebayerCaMilliseconds();
-        const double sKernel = getMlvLastDebayerKernelMilliseconds();
-        const double sWbUndo = getMlvLastDebayerWbUndoMilliseconds();
+        const double scaledWbPrepareMs = getMlvLastDebayerWbPrepareMilliseconds();
+        const double scaledCaMs = getMlvLastDebayerCaMilliseconds();
+        const double scaledKernelMs = getMlvLastDebayerKernelMilliseconds();
+        const double scaledWbUndoMs = getMlvLastDebayerWbUndoMilliseconds();
         std::printf("[debayered16-honour-scale] %s after full-res: wb_prepare=%.4f ca=%.4f kernel=%.4f wb_undo=%.4f "
                     "phase4b_path=%d\n",
-                    routes[route], sWbPrepare, sCa, sKernel, sWbUndo, mlv_phase4bv2_last_path_taken());
-        ASSERT_TRUE(sWbPrepare == 0.0);
-        ASSERT_TRUE(sCa == 0.0);
-        ASSERT_TRUE(sWbUndo == 0.0);
-        ASSERT_TRUE(sKernel != kernel);
+                    routes[route], scaledWbPrepareMs, scaledCaMs, scaledKernelMs, scaledWbUndoMs, mlv_phase4bv2_last_path_taken());
+        ASSERT_TRUE(scaledWbPrepareMs == 0.0);
+        ASSERT_TRUE(scaledCaMs == 0.0);
+        ASSERT_TRUE(scaledWbUndoMs == 0.0);
+        ASSERT_TRUE(scaledKernelMs != kernelMs);
         fixture.video()->ca_red = 0.0f;
     }
 }
