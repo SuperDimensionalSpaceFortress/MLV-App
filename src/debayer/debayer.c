@@ -506,6 +506,129 @@ void debayerBasicU16(uint16_t * __restrict debayerto,
     memcpy(debayerto + (width * (height - 1) * 3), debayerto + (width * (height - 2) * 3), width * 3 * sizeof(uint16_t));
 }
 
+/* CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1: the G plane scratch, one per calling
+ * thread, grown on demand and reused across frames. */
+static __thread uint16_t * g_debayer_reduced_green = NULL;
+static __thread size_t g_debayer_reduced_green_words = 0;
+
+static inline int debayer_reduced_round_div(int32_t sum, int shift)
+{
+    if (sum <= 0) return 0;
+    return LIMIT16((sum + (1 << (shift - 1))) >> shift);
+}
+
+/* RGGB: R at (even row, even column), B at (odd row, odd column), as
+ * debayer_basic_u16_rows_scalar reads it (its row pairs start at row 1). */
+void debayerReducedColourDiffU16(uint16_t *out,
+                                 uint16_t *bayer,
+                                 int width,
+                                 int height,
+                                 int threads,
+                                 int bit_shift)
+{
+    if (!out || !bayer || width <= 0 || height <= 0) return;
+    const size_t words = (size_t)width * (size_t)height;
+    if (width < 3 || height < 3 || words > g_debayer_reduced_green_words)
+    {
+        uint16_t * grown = (width < 3 || height < 3)
+                         ? NULL
+                         : (uint16_t *)realloc(g_debayer_reduced_green, words * sizeof(uint16_t));
+        if (!grown)
+        {
+            debayerBasicU16(out, bayer, width, height, threads, bit_shift);
+            return;
+        }
+        g_debayer_reduced_green = grown;
+        g_debayer_reduced_green_words = words;
+    }
+    uint16_t * const green = g_debayer_reduced_green;
+
+    if (bit_shift > 0)
+    {
+        const int pixel_count = width * height;
+        #pragma omp parallel for if(threads > 1) num_threads(threads)
+        for (int i = 0; i < pixel_count; ++i)
+        {
+            bayer[i] = (uint16_t)(bayer[i] << bit_shift);
+        }
+    }
+
+    /* Pass 1: G everywhere. Out-of-frame neighbours mirror onto the other side,
+     * which is the same CFA colour. */
+    #pragma omp parallel for if(threads > 1) num_threads(threads) schedule(static)
+    for (int y = 0; y < height; ++y)
+    {
+        const uint16_t * row = bayer + (size_t)y * (size_t)width;
+        const uint16_t * up = bayer + (size_t)(y > 0 ? y - 1 : y + 1) * (size_t)width;
+        const uint16_t * dn = bayer + (size_t)(y < height - 1 ? y + 1 : y - 1) * (size_t)width;
+        uint16_t * g = green + (size_t)y * (size_t)width;
+        for (int x = 0; x < width; ++x)
+        {
+            if (((x ^ y) & 1) != 0)
+            {
+                g[x] = row[x];
+                continue;
+            }
+            const int xl = (x > 0) ? x - 1 : x + 1;
+            const int xr = (x < width - 1) ? x + 1 : x - 1;
+            /* 8 * G = 2 * (Gl + Gr) + (2 * C0 - C(x-2) - C(x+2)) + 2 * (Gu + Gd) */
+            int32_t sum = 2 * ((int32_t)row[xl] + (int32_t)row[xr])
+                        + 2 * ((int32_t)up[x] + (int32_t)dn[x]);
+            if (x >= 2 && x + 2 < width)
+            {
+                sum += 2 * (int32_t)row[x] - (int32_t)row[x - 2] - (int32_t)row[x + 2];
+            }
+            g[x] = (uint16_t)debayer_reduced_round_div(sum, 3);
+        }
+    }
+
+    /* Pass 2: interior RGB. R/B = G + the bilinear (C - G) over debayerBasicU16's
+     * neighbour sets. Columns 0/w-1 then rows 0/h-1 repeat their inner neighbour. */
+    const size_t row_words = (size_t)width * 3u;
+    #pragma omp parallel for if(threads > 1) num_threads(threads) schedule(static)
+    for (int y = 1; y < height - 1; ++y)
+    {
+        const size_t o = (size_t)y * (size_t)width;
+        const uint16_t * c0 = bayer + o;
+        const uint16_t * cu = c0 - width;
+        const uint16_t * cd = c0 + width;
+        const uint16_t * g0 = green + o;
+        const uint16_t * gu = g0 - width;
+        const uint16_t * gd = g0 + width;
+        uint16_t * dst = out + (size_t)y * row_words;
+        for (int x = 1; x < width - 1; ++x)
+        {
+            const int32_t gc = g0[x];
+            /* Diagonal (4), horizontal (2) and vertical (2) colour differences. */
+            const int32_t diag = ((int32_t)cu[x - 1] - gu[x - 1]) + ((int32_t)cu[x + 1] - gu[x + 1])
+                               + ((int32_t)cd[x - 1] - gd[x - 1]) + ((int32_t)cd[x + 1] - gd[x + 1]);
+            const int32_t horz = ((int32_t)c0[x - 1] - g0[x - 1]) + ((int32_t)c0[x + 1] - g0[x + 1]);
+            const int32_t vert = ((int32_t)cu[x] - gu[x]) + ((int32_t)cd[x] - gd[x]);
+            int32_t r, b;
+            if ((y & 1) == 0)
+            {
+                if ((x & 1) == 0) { r = (int32_t)c0[x] * 4; b = gc * 4 + diag; }   /* R site */
+                else { r = gc * 4 + 2 * horz; b = gc * 4 + 2 * vert; }             /* G, R row */
+            }
+            else
+            {
+                if ((x & 1) == 0) { r = gc * 4 + 2 * vert; b = gc * 4 + 2 * horz; } /* G, B row */
+                else { r = gc * 4 + diag; b = (int32_t)c0[x] * 4; }                 /* B site */
+            }
+            uint16_t * px = dst + (size_t)x * 3u;
+            px[0] = (uint16_t)debayer_reduced_round_div(r, 2);
+            px[1] = (uint16_t)gc;
+            px[2] = (uint16_t)debayer_reduced_round_div(b, 2);
+        }
+        memcpy(dst, dst + 3, 3 * sizeof(uint16_t));
+        memcpy(dst + row_words - 3, dst + row_words - 6, 3 * sizeof(uint16_t));
+    }
+
+    memcpy(out, out + row_words, row_words * sizeof(uint16_t));
+    memcpy(out + (size_t)(height - 1) * row_words, out + (size_t)(height - 2) * row_words,
+           row_words * sizeof(uint16_t));
+}
+
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: horizontal Nyquist zero on a reduced recon's
  * debayered RGB16. Per channel, out = (l + 2c + r + 2) >> 2 along the row, with the
  * edge columns mirrored (x-1 -> x+1 at x=0, x+1 -> x-1 at x=w-1). The response is 0

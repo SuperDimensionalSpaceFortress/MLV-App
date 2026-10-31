@@ -22,6 +22,20 @@ void debayerBasicU16(uint16_t * __restrict debayerto,
  * (CPU supports avx2+fma, MLVAPP_DISABLE_AVX2 / MLVAPP_DISABLE_AVX2_DEBAYER
  * not set). Latches via pthread_once on first call. */
 int debayerBasicU16Avx2Active(void);
+/* CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1: the reduced recon's demosaic. Same
+ * contract as debayerBasicU16 (in-place bit shift first, RGGB with R at even
+ * row/even column, RGB16 out, row 0/h-1 and column 0/w-1 repeat their inner
+ * neighbour, odd widths). G at R/B sites is Hamilton-Adams along the row (a
+ * horizontal Laplacian of the site's own colour) averaged with the vertical
+ * bilinear G; there is no row +-2 term, which would cross the dual-ISO row
+ * fields. R and B are G plus the bilinear (C - G) over debayerBasicU16's
+ * neighbour sets. Deterministic for any thread count. */
+void debayerReducedColourDiffU16(uint16_t *out,
+                                 uint16_t *bayer,
+                                 int width,
+                                 int height,
+                                 int threads,
+                                 int bit_shift);
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: [1,2,1]/4 along x per channel of interleaved
  * RGB16, mirrored edge columns; the reduced texture route's horizontal Nyquist zero.
  * out and in must not alias. */

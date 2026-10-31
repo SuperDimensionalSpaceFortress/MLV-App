@@ -77,6 +77,7 @@ struct EnvGuard
     {
         clear();
         mlvSetDebayered16ReducedReconBitShiftErrorForTesting(0);
+        mlvSetDebayered16ReducedBilinearForTesting(0);
     }
     static void clear()
     {
@@ -1458,6 +1459,18 @@ TEST(Debayered16ReconReuse, ReducedDebayerOddWidthReadsStayInsideTheBayerFrame)
         std::printf("[debayered16-honour-scale] debayerBasic %dx%d: guard reads=%ld first offset=%ld\n", c.width,
                     c.height, hits, offset);
         guardReads += hits;
+        // CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1: the reduced entry's demosaic, the same frames.
+        GuardedFrame reducedFrame(pixels * sizeof(uint16_t));
+        ASSERT_TRUE(reducedFrame.ok());
+        uint16_t *reducedBayer = static_cast<uint16_t *>(reducedFrame.data());
+        for (size_t i = 0; i < pixels; ++i)
+            reducedBayer[i] = static_cast<uint16_t>((i * 37u + 1u) & 0x3FFFu);
+        long reducedOffset = -1;
+        const long reducedHits = reducedFrame.run(
+            [&] { debayerReducedColourDiffU16(out.data(), reducedBayer, c.width, c.height, 1, 0); }, &reducedOffset);
+        std::printf("[debayered16-honour-scale] debayerReducedColourDiffU16 %dx%d: guard reads=%ld first offset=%ld\n",
+                    c.width, c.height, reducedHits, reducedOffset);
+        guardReads += reducedHits;
     }
     HONOUR_SCALE_TEST_UNSETENV("MLVAPP_DISABLE_AVX2_DEBAYER");
     debayerBasicU16ReinitDispatchForTesting();
