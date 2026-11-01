@@ -51,7 +51,7 @@ CLOSE = "# CUDA-HEADROOM-UTIL-SAMPLER-1 <<<"
 REGIONS = 5
 REGION = re.compile(r"(?ms)^[ \t]*" + re.escape(OPEN) + r"\n.*?^[ \t]*" + re.escape(CLOSE) + r"\n")
 UTIL_TOKENS = ("utilsample", "util-sample", "gpu-util.csv", "cpu-util.csv")
-QUERY = ("--query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm,pstate,power.draw --format=csv,noheader,nounits -lms 250")
+QUERY = ("--query-gpu=timestamp,utilization.gpu,utilization.memory,clocks.sm,pstate,power.draw --format=csv,noheader,nounits -i 0 -lms 250")
 LAUNCH_LINE = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
 DONE_LINE = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
 # The headroom legs' generator shape (what Invoke-VenueLeg passes for m16-1243-headroom-unpaced-windowed-s1, per backend).
@@ -182,6 +182,13 @@ class UtilSampleGeneratorTests(unittest.TestCase):
                 for site in ("site=smoke-run-failed", "site=smoke-log-unavailable", "$presentMonDoneResult = Wait-PresentMonCapture"):
                     self.assertGreater(text.index(site), starts[1], site)
                 self.assertIn("Stop-UtilSampleAll", text[starts[1]:text.index(CLOSE, starts[1])])
+                # adversary 9d648094 A1/A6/A7: the window comes from the run log, the stop is proven, the stop record reaches the summaries
+                region3 = text[starts[2]:text.index(CLOSE, starts[2])]
+                self.assertIn("Get-UtilSamplePlayWindow $rawLog", region3)
+                self.assertNotIn("windowStartMs", region3)
+                self.assertIn("$utilSampleStopGpu", region3)
+                self.assertIn("$utilSampleStopped = Test-UtilSampleStopped $utilSampleStopRecord", text[starts[1]:text.index(CLOSE, starts[1])])
+                self.assertLess(text.index("$rawLog = [IO.File]::ReadAllText($logPath)"), starts[2], "the run log is read before the scalars")
                 # the outer finally stops and publishes on every other exit
                 finally_at = text.rindex("} finally {\n")
                 self.assertIn("Stop-UtilSampleAll", text[finally_at:])
@@ -264,9 +271,34 @@ $r['scalarsOk'] = $sOk
 $r['scalarsNoWindow'] = Get-UtilSampleScalars $gn $cn $false
 $r['scalarsSkipped'] = Get-UtilSampleScalars (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }) $win) $cs $true
 $r['scalarsNone'] = Get-UtilSampleScalars (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing' }) $win) (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'unavailable'; reason = 'cpu-sampler-start-failed' }) $win) $true
-$r['window'] = Get-UtilSampleWindow ([DateTime]::new(2026, 11, 1, 14, 0, 0, 0, [DateTimeKind]::Utc)) 1500.5 21500.25
-$r['windowNull'] = $null -eq (Get-UtilSampleWindow ([DateTime]::new(2026, 11, 1, 14, 0, 0, 0, [DateTimeKind]::Utc)) $null 21500)
-$r['windowInverted'] = $null -eq (Get-UtilSampleWindow ([DateTime]::new(2026, 11, 1, 14, 0, 0, 0, [DateTimeKind]::Utc)) 9000 100)
+# adversary 9d648094 A1/A2: the window is the measured session's Play span from the run log, never PresentMon's capture offsets
+$log = "[2026-11-01T13:59:58.000Z] [info] [main] app.start`n[2026-11-01T14:00:01.000Z] [info] [main] playback_smoke.start session=1`n" +
+       "[2026-11-01T14:00:05.000Z] [info] [main] playback_smoke.summary session=1 frames=10 elapsed_ms=4000`n" +
+       "[2026-11-01T14:00:09.000Z] [info] [main] playback_smoke.measured_session id=2`n[2026-11-01T14:00:10.001Z] [info] [main] playback_smoke.start session=2`n" +
+       "[2026-11-01T14:00:30.200Z] [info] [main] playback_smoke.summary session=2 frames=480 elapsed_ms=20000 fps=24`n"
+$pw2 = Get-UtilSamplePlayWindow $log
+$r['window'] = @{ startUtc = $pw2.startUtc.ToString('o'); endUtc = $pw2.endUtc.ToString('o'); session = $pw2.session }
+$pw1 = Get-UtilSamplePlayWindow (($log -split "`n" | Where-Object { $_ -notmatch 'measured_session' }) -join "`n")
+$r['windowFirstSummary'] = @{ startUtc = $pw1.startUtc.ToString('o'); endUtc = $pw1.endUtc.ToString('o'); session = $pw1.session }
+$r['windowNull'] = $null -eq (Get-UtilSamplePlayWindow ($log -replace 'playback_smoke\.start session=2', 'other'))
+$r['windowNoElapsed'] = $null -eq (Get-UtilSamplePlayWindow ($log -replace 'elapsed_ms=20000', 'elapsed=20000'))
+$r['windowEmpty'] = $null -eq (Get-UtilSamplePlayWindow '')
+$sb = [Text.StringBuilder]::new('utc,cpuTotalPct,appPid,appCpuCores' + "`n")
+for ($i = 1; $i -le 30; $i++) { if ($i -le 10) { $tv = 90; $cv = 9 } else { $tv = 10; $cv = 1 }; [void]$sb.Append("$([DateTime]::new(2026, 11, 1, 14, 0, $i, 0, [DateTimeKind]::Utc).ToString('o')),$tv,1234,$cv`n") }
+$c30 = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $sb.ToString()) ([ordered]@{ status = 'running'; reason = $null }) $pw2
+$r['cpuPlayOnly'] = @{ status = $c30.status; total = $c30.totalMean; cores = $c30.appCoresMean; inWindow = $c30.rowsInWindow }
+# A3: the repeated fall-back hour is unparseable, never placed at one of its two instants
+$r['gpuAmbiguousLocal'] = (ConvertFrom-UtilSampleGpuCsv "2026/11/01 01:30:00.000, 40, 10, 1800, P2, 50.00`n" $cst).why
+# A7: a sampler that exited before the stop does not cover the window
+$r['gpuExitedEarly'] = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; exitedBeforeStop = $true; exitCode = 0 })).status
+$r['cpuExitedEarly'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $true; exitCode = 0 })).status
+$r['cpuExitNonZero'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 3 })).status
+$r['cpuStopClean'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })).status
+# A8: an overflowing mean is unavailable(non-finite), never ok without a number
+$big = [ordered]@{ rows = [Collections.Generic.List[object]]::new(); why = $null }
+foreach ($ms in 100, 200) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1' }) }
+$r['gpuNonFinite'] = (Get-UtilSampleGpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
+$r['cpuNonFinite'] = (Get-UtilSampleCpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 # T5 fail open
 $t = $env:US_TMP
 $noSmi = Join-Path $t 'no-such\nvidia-smi.exe'
@@ -285,9 +317,34 @@ $dx = Start-UtilSampleGpu 'cpu' $pw (Join-Path $t 'g5.csv') { @{ state = 'absent
 $r['startNoDgpu'] = @{ status = $dx.status; reason = $dx.reason; proc = ($null -eq $dx.proc) }
 $cf = Start-UtilSampleCpu (Join-Path $t 'no-such\pwsh.exe') 'AAAA' (Join-Path $t 'c1.csv') (Join-Path $t 'c1.stop') 'MLVApp' 0 1000 0 0
 $r['cpuStartMissing'] = @{ status = $cf.status; reason = $cf.reason; proc = ($null -eq $cf.proc) }
-$loop = Invoke-UtilSampleCpuLoop (Join-Path $t 'c2.csv') (Join-Path $t 'c2.stop') 'no-such-process-name-xyz' 400 1300 { throw 'counter exploded' } 0 0 0
+$loop = Invoke-UtilSampleCpuLoop (Join-Path $t 'c2.csv') (Join-Path $t 'c2.stop') 'no-such-process-name-xyz' 400 1300 { throw 'counter exploded' } 0 0 0 0
 $lines = @([IO.File]::ReadAllLines((Join-Path $t 'c2.csv')))
 $r['cpuLoopThrowingCounter'] = @{ endedBy = $loop.endedBy; header = $lines[0]; rows = ($lines.Count - 1); firstRow = $(if ($lines.Count -gt 1) { $lines[1] }); errors = $loop.counterErrors }
+# A10: a live pid whose start time is not the parent's is a reused pid: parent-gone
+$loopReused = Invoke-UtilSampleCpuLoop (Join-Path $t 'c3.csv') (Join-Path $t 'c3.stop') 'no-such-process-name-xyz' 400 5000 { 1 } $PID 12345 0 0
+$loopSame = Invoke-UtilSampleCpuLoop (Join-Path $t 'c4.csv') (Join-Path $t 'c4.stop') 'no-such-process-name-xyz' 400 900 { 1 } $PID ((Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks) 0 0
+$r['cpuLoopParent'] = @{ reused = $loopReused.endedBy; same = $loopSame.endedBy }
+# A4 / A5: a cuda leg reads the PnP record too (one NVIDIA adapter or no process); the backend is compared lower-cased
+$ca = Start-UtilSampleGpu 'cuda' $pw (Join-Path $t 'g6.csv') { @{ state = $null; reason = 'multi-dgpu-ambiguous' } }
+$r['cudaAmbiguous'] = @{ status = $ca.status; reason = $ca.reason; proc = ($null -eq $ca.proc) }
+$cn0 = Start-UtilSampleGpu 'cuda' $pw (Join-Path $t 'g7.csv') { @{ state = 'absent'; reason = 'no-dgpu' } }
+$r['cudaNoDgpu'] = @{ status = $cn0.status; reason = $cn0.reason; proc = ($null -eq $cn0.proc) }
+$cu = Start-UtilSampleGpu 'CUDA' $noSmi (Join-Path $t 'g8.csv') { @{ state = 'D3'; reason = $null } }
+$r['cudaUpper'] = @{ status = $cu.status; reason = $cu.reason; disclosure = $cu.wakeDisclosure }
+# A6: a Kill that throws once is retried; a record with a side still running is not stopped
+$script:kills = 0
+$dbl = [pscustomobject]@{ exited = $false }
+$dbl | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $this.exited }
+$dbl | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { 1 }
+$dbl | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.exited }
+$dbl | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:kills++; if ($script:kills -eq 1) { throw [ComponentModel.Win32Exception]::new(5) }; $this.exited = $true }
+$sk = Stop-UtilSampleProcess $dbl 100 $true
+$r['stopKillRetry'] = @{ stopped = $sk.stopped; killed = $sk.killed; kills = $script:kills; early = $sk.exitedBeforeStop }
+$r['stoppedTest'] = @{ both = (Test-UtilSampleStopped ([ordered]@{ gpu = $sk; cpu = [ordered]@{ stopped = $false; why = 'not-started' } }));
+    running = (Test-UtilSampleStopped ([ordered]@{ gpu = [ordered]@{ stopped = $false; why = 'stop-failed: x' }; cpu = $sk })); none = (Test-UtilSampleStopped $null) }
+$early = [pscustomobject]@{ HasExited = $true; ExitCode = 0 }
+$se = Stop-UtilSampleProcess $early 100 $true
+$r['stopEarly'] = @{ stopped = $se.stopped; early = $se.exitedBeforeStop; killed = $se.killed }
 $st = Stop-UtilSampleProcess $null 100
 $r['stopNull'] = @{ stopped = $st.stopped; why = $st.why }
 $r['stopAllNothing'] = (Stop-UtilSampleAll ([ordered]@{ status = 'unavailable'; proc = $null }) ([ordered]@{ status = 'unavailable'; proc = $null }) { param($p) throw 'no stop file' } 100).gpu.why
@@ -350,10 +407,44 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual((none["utilSampleStatus"], none["utilSampleReason"], none["cpuTotalMean"], none["appCpuMeanCores"]),
                          ("unavailable", "gpu:unavailable(nvidia-smi-missing)+cpu:unavailable(cpu-sampler-start-failed)", None, None))
 
-    def test_t4_window_from_the_presentmon_bracket(self) -> None:
-        self.assertEqual(self.r["window"], {"startUtc": "2026-11-01T14:00:01.5005Z", "endUtc": "2026-11-01T14:00:21.50025Z"})
+    def test_t4_window_is_the_measured_sessions_play_span_from_the_run_log(self) -> None:
+        # adversary 9d648094 A1: the run log's measured session start plus its elapsed_ms, not PresentMon's capture offsets
+        self.assertEqual(self.r["window"], {"startUtc": "2026-11-01T14:00:10.0010000Z", "endUtc": "2026-11-01T14:00:30.0010000Z", "session": 2})
+        self.assertEqual(self.r["windowFirstSummary"], {"startUtc": "2026-11-01T14:00:01.0000000Z", "endUtc": "2026-11-01T14:00:05.0000000Z", "session": 1})
         self.assertTrue(self.r["windowNull"])
-        self.assertTrue(self.r["windowInverted"])
+        self.assertTrue(self.r["windowNoElapsed"])
+        self.assertTrue(self.r["windowEmpty"])
+
+    def test_a2_startup_rows_before_play_are_excluded(self) -> None:
+        self.assertEqual(self.r["cpuPlayOnly"], {"status": "ok", "total": 10.0, "cores": 1.0, "inWindow": 20})
+
+    def test_a3_the_repeated_fall_back_hour_is_unparseable(self) -> None:
+        self.assertEqual(self.r["gpuAmbiguousLocal"], "nvidia-smi-unparseable")
+
+    def test_a7_a_sampler_that_died_early_or_failed_is_unavailable(self) -> None:
+        self.assertEqual(self.r["gpuExitedEarly"], "unavailable(nvidia-smi-exited-early)")
+        self.assertEqual(self.r["cpuExitedEarly"], "unavailable(cpu-sampler-exited-early)")
+        self.assertEqual(self.r["cpuExitNonZero"], "unavailable(cpu-sampler-exit-3)")
+        self.assertEqual(self.r["cpuStopClean"], "ok")
+
+    def test_a8_a_non_finite_mean_is_unavailable(self) -> None:
+        self.assertEqual(self.r["gpuNonFinite"], "unavailable(non-finite)")
+        self.assertEqual(self.r["cpuNonFinite"], "unavailable(non-finite)")
+
+    def test_a10_a_reused_parent_pid_is_parent_gone(self) -> None:
+        self.assertEqual(self.r["cpuLoopParent"], {"reused": "parent-gone", "same": "deadline"})
+
+    def test_a4_a5_cuda_reads_the_pnp_record_and_the_backend_is_case_blind(self) -> None:
+        self.assertEqual(self.r["cudaAmbiguous"], {"status": "unavailable", "reason": "multi-dgpu-ambiguous", "proc": True})
+        self.assertEqual(self.r["cudaNoDgpu"], {"status": "unavailable", "reason": "no-dgpu", "proc": True})
+        self.assertEqual(self.r["cudaUpper"]["status"], "unavailable")
+        self.assertEqual(self.r["cudaUpper"]["reason"], "nvidia-smi-missing", "a 'CUDA' leg is a cuda leg, not a D3 skip")
+        self.assertIn("cuda leg", self.r["cudaUpper"]["disclosure"])
+
+    def test_a6_a_throwing_kill_is_retried_and_a_running_side_is_not_stopped(self) -> None:
+        self.assertEqual(self.r["stopKillRetry"], {"stopped": True, "killed": True, "kills": 2, "early": False})
+        self.assertEqual(self.r["stoppedTest"], {"both": True, "running": False, "none": False})
+        self.assertEqual(self.r["stopEarly"], {"stopped": True, "early": True, "killed": False})
 
     def test_t5_every_start_failure_is_typed_and_a_skip_starts_nothing(self) -> None:
         self.assertEqual(self.r["startMissing"]["status"], "unavailable")
