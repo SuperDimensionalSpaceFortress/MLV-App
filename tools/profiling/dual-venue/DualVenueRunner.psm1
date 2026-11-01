@@ -821,8 +821,8 @@ function Test-DvLocalReceiptRoot {
         $rawMax = & $maxComponent $rawLetter
         $rawComponents = @($rawSpelling.Split([char[]]@('\', '/')))
         $rawFrom = $(if ($rawSpelling -match '^[A-Za-z]:[\\/]') { 1 } else { 0 })
-        for ($ri = $rawFrom; $ri -lt $rawComponents.Count; $ri++) {
-            $rc = $rawComponents[$ri]
+        for ($rawIdx = $rawFrom; $rawIdx -lt $rawComponents.Count; $rawIdx++) {
+            $rc = $rawComponents[$rawIdx]
             if ([string]::Equals($rc, '.', [StringComparison]::Ordinal) -or [string]::Equals($rc, '..', [StringComparison]::Ordinal)) { continue }
             if (-not (& $componentWellFormed $rc $rawMax)) { return $null }
         }
