@@ -1570,8 +1570,15 @@ def test_image_paths_is_keyed_on_engine_and_attached_with_the_codex_image_flag()
     assert "[System.IO.FileOptions]::DeleteOnClose" in copy_body and "[MlvImageSnap]::KeepOnClose" in copy_body
     assert "[System.IO.File]::Delete(" not in copy_body and "image-path-snapshot-collision" in body and "image-snapshot-collision" not in body
     # r4 B2: the snapshot is held FileShare.Read until the child exits, then re-hashed; a mismatch is the typed image-snapshot-mutated failure.
-    assert "[System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::None)" in copy_body and "image-snapshot-mutated" in body
+    # r5: the hold is opened Asynchronous so its digest reads are cancellable at the lane deadline (H1).
+    assert "[System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)" in copy_body and "image-snapshot-mutated" in body
     assert body.index("Get-ImageHoldDigest -Hold $ImageHolds[$hi]") > body.index("$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }")
+    # r5 B1: codex is handed the RESOLVED path of the held object (GetFinalPathNameByHandle), with the reparse-ancestor refusal; r5 B2: a
+    # digest I/O failure is typed (image-path-snapshot-unreadable before launch, image-snapshot-unverifiable after it), never a false mutation.
+    assert "[MlvImageSnap]::FinalPath($hold.SafeFileHandle)" in copy_body and "image-path-reparse-ancestor" in copy_body
+    assert "$snapshot = [string]$snapshotInfo.Path" in body
+    assert "image-path-snapshot-unreadable" in copy_body and "image-snapshot-unverifiable" in body and "image-snapshot-path-changed" in body
+    assert "image-digest-timeout" in copy_body
     assert "$in.ReadAsync($buf, 0, $buf.Length, $cts.Token)" in body and "[System.IO.FileOptions]::Asynchronous" in body
     assert 'throw [System.TimeoutException]::new("image-copy-timeout' in body
     assert "(Get-Item -LiteralPath $snapshot)" not in body and "Get-FileHash -LiteralPath $snapshot" not in body

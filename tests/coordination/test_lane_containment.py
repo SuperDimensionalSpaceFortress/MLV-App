@@ -997,6 +997,182 @@ def test_a_snapshot_whose_bytes_differ_after_the_child_exits_is_a_typed_failure_
     assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
 
 
+def _mk_junction(link, target):
+    r=subprocess.run(["cmd","/c","mklink","/J",str(link),str(target)],capture_output=True,text=True)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+_DIGEST_TICK = "# hold-digest-read-tick"
+
+
+def _digest_counter():
+    # Counts digest chunk reads across the whole lane process (strict mode: the variable must be created before it is read).
+    return "$global:hdc = 1 + $(if (Test-Path variable:global:hdc) { $global:hdc } else { 0 });"
+
+
+def test_a_run_dir_junction_retargeted_during_the_child_read_never_certifies_a_file_the_child_did_not_read(fixture_tree):
+    # r5 B1 (sol A1 / ADV-A1): -RunDir is a junction to `good`. After the hold is registered the junction is retargeted to `bad`, which holds
+    # DIFFERENT bytes under the same snapshot name, and restored once the child has exited. The old lane handed codex the junction PATHNAME
+    # (so codex read bad's bytes) while hashing the HELD OBJECT (good's bytes) and reported consumedVerified=true. Invariant: consumedVerified
+    # may be true only when the bytes the child read are the bytes the receipt hashes.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    good=root/"good"; bad=root/"bad"; good.mkdir(); bad.mkdir(); link=root/"run-link"
+    _mk_junction(link,good)
+    (bad/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q, same snapshot name")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text and _AFTER_CHILD_EXIT_ANCHOR in text, "fixture anchors moved"
+        def swap(target):
+            return (f"    $rl = $RunDir; [System.IO.Directory]::Delete($rl); $null = New-Item -ItemType Junction -Path $rl -Target '{target}'\n")
+        text=text.replace(_AFTER_SNAPSHOT_ANCHOR,swap(bad)+_AFTER_SNAPSHOT_ANCHOR,1)
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+swap(good),1)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    cmd[cmd.index("-RunDir")+1]=str(link)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    receipt=good/"terra-001.receipt.json"
+    assert receipt.exists(),(r.stdout,r.stderr,list(good.iterdir()))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    entry=q["imagePaths"][0]
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    assert not (entry.get("consumedVerified") is True and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+    # The mechanism: codex is handed the RESOLVED path of the held object, so the retarget cannot redirect its open.
+    assert Path(seen[0]["path"]).parent.resolve()==good.resolve() and seen[0]["sha256"]==sha, seen
+    assert "run-link" not in entry["path"], entry
+
+
+def test_get_image_reparse_ancestor_names_a_junction_in_the_path_and_is_null_for_a_plain_path(tmp_path):
+    real=tmp_path/"real"; real.mkdir(); (real/"x.png").write_bytes(b"x"); link=tmp_path/"jn"; _mk_junction(link,real)
+    r=_copy_harness(tmp_path,f"""
+'VIA-JUNCTION ' + (Get-ImageReparseAncestor -Path '{link}\\x.png')
+'PLAIN [' + (Get-ImageReparseAncestor -Path '{real}\\x.png') + ']'
+""")
+    assert f"VIA-JUNCTION {link}" in r.stdout and "PLAIN []" in r.stdout,(r.stdout,r.stderr)
+
+
+def _digest_fault_run(fixture_tree, on_call, fault="throw [System.IO.IOException]::new('ERROR_NETNAME_DELETED')"):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _DIGEST_TICK in text, "digest seam moved; update this fixture mutation"
+        return text.replace(_DIGEST_TICK,_digest_counter()+f" if ($global:hdc -eq {on_call}) {{ {fault} }}",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    return r,receipt,root
+
+
+def test_a_digest_io_error_before_launch_is_a_typed_unreadable_image_path_error_with_no_child(fixture_tree):
+    # r5 B2 (sol / ADV-A3): the digest taken when the hold is acquired used to let a raw IOException escape (untyped, no image-path- prefix).
+    r,receipt,root=_digest_fault_run(fixture_tree,1)
+    text=_failure_text(r,receipt)
+    assert r.returncode==127,(r.returncode,text)
+    assert "image-path-snapshot-unreadable" in text and "ERROR_NETNAME_DELETED" in text,text
+    assert "image-snapshot-mutated" not in text,text
+    assert not (root/"args.json").exists(), "a child was launched"
+
+
+def test_a_digest_io_error_after_the_child_exits_is_unverifiable_never_a_false_mutation_claim(fixture_tree):
+    # r5 B2: the same IOException on the post-exit re-read of an UNCHANGED snapshot used to be booked as `image-snapshot-mutated`.
+    r,receipt,root=_digest_fault_run(fixture_tree,2)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and q["state"]=="failed",(r.returncode,text)
+    assert "image-snapshot-unverifiable" in (q["failure"] or ""),q["failure"]
+    assert "image-snapshot-mutated" not in (q["failure"] or ""),q["failure"]
+    entry=q["imagePaths"][0]
+    assert entry["consumedVerified"] is False and "ERROR_NETNAME_DELETED" in entry["consumedVerifyReason"],entry
+
+
+def test_a_stalled_digest_read_before_launch_ends_as_a_timeout_inside_the_deadline(tmp_path):
+    # r5 H1 (ADV-A2): the digest taken at hold time spends the lane budget. The seam sleeps past a 3 s limit after the first chunk is read.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 3000; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+""",lambda block: block.replace(_DIGEST_TICK,"Start-Sleep -Milliseconds 3500",1))
+    assert "CAUGHT TimeoutException image-digest-timeout" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_a_stalled_digest_read_after_the_child_exits_is_unverifiable_with_a_timeout_reason(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    limit_anchor="    $verifyClock = [System.Diagnostics.Stopwatch]::StartNew()\n"
+    def mutation(text):
+        assert _DIGEST_TICK in text and limit_anchor in text, "fixture anchors moved"
+        text=text.replace(limit_anchor,limit_anchor+"    $verifyLimitMs = 500\n",1)
+        return text.replace(_DIGEST_TICK,_digest_counter()+" if ($global:hdc -eq 2) { Start-Sleep -Milliseconds 1500 }",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "image-snapshot-unverifiable" in (q["failure"] or ""),(r.returncode,q["failure"])
+    entry=q["imagePaths"][0]
+    assert entry["consumedVerified"] is False and entry["consumedVerifyReason"].startswith("timeout:"),entry
+
+
+def test_a_held_snapshot_that_moved_from_the_path_codex_was_given_is_a_typed_failure(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_CHILD_EXIT_ANCHOR in text, "child-exit site moved"
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+"if ($ImageAttachments.Count -gt 0) { $ImageAttachments[0].path = $ImageAttachments[0].path + '.elsewhere' }\n",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "image-snapshot-path-changed" in (q["failure"] or ""),(r.returncode,q["failure"])
+    assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
+
+
+_GAP_TICK = "# writer-closed-pre-hold-tick"
+_COMPARE_LINE = "        if ($held.sha256 -ne $copySha -or $held.bytes -ne $total) {\n"
+
+
+def _gap_run(tmp_path, neutralize_compare):
+    # r5 H2 (Grok G5): a writer changes Dest AFTER the copy's writer handle is disposed and BEFORE the hold is acquired.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"
+    def mutation(block):
+        assert _GAP_TICK in block and _COMPARE_LINE in block, "gap seam or comparison moved; update this fixture mutation"
+        block=block.replace(_GAP_TICK,"[System.IO.File]::WriteAllBytes($Dest, [byte[]](1..40))",1)
+        if neutralize_compare: block=block.replace(_COMPARE_LINE,"        if ($false) {\n",1)
+        return block
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$info = $null
+try {{ $info = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 60000; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+'HOLD-RETURNED ' + ($null -ne $info -and $null -ne $info.Hold)
+'DEST-EXISTS ' + [System.IO.File]::Exists('{dest}')
+if ($null -ne $info -and $null -ne $info.Hold) {{ $info.Hold.Dispose() }}
+""",mutation)
+    return r
+
+
+def test_a_write_between_the_writer_close_and_the_hold_open_is_image_snapshot_mutated_with_no_hold(tmp_path):
+    r=_gap_run(tmp_path,False)
+    assert "CAUGHT IOException image-snapshot-mutated" in r.stdout,(r.stdout,r.stderr)
+    assert "HOLD-RETURNED False" in r.stdout and "DEST-EXISTS True" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_the_writer_close_gap_test_is_red_when_the_hold_comparison_is_deleted(tmp_path):
+    # Proof that the test above bites: with the comparison neutralised the changed snapshot is returned as good.
+    r=_gap_run(tmp_path,True)
+    assert "NO-ERROR" in r.stdout and "HOLD-RETURNED True" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_a_huge_timeout_sec_does_not_overflow_the_child_wait(fixture_tree):
+    # r5 A4: WaitForExit([int]$remainingMs) overflowed Int32 for -TimeoutSec above 2147483.
+    # Codex engine only: the claude engine has its own, separate Int32 conversion (host-wait) that this one-line fix does not cover.
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    cmd[cmd.index("-TimeoutSec")+1]="3000000"
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
     cache=fixture_tree["root"]/"models_cache.json"
     cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
