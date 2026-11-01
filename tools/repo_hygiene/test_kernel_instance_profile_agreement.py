@@ -16,7 +16,20 @@ Rules (every one fails closed; "cannot find it" is a failure, never a pass):
 - EACH of those rows is compared on its own: it must name at least one ``code@rN``, and the NEWEST N
   within that row must equal the header's N. A lagging row is reported by name and line number with
   both values, so one row that names the current profile can never mask another that lags.
-- ``code@rN`` must start at a word boundary: ``xcode@r12`` and ``barcode@r3`` are not profiles.
+- ``code@rN`` must sit on a delimited token at BOTH edges, and BOTH edges are fail-closed ALLOWLISTS
+  (CoS #451 comment 6216180890, then PR #467 r2 for the right edge and r3 for the left edge and the digits).
+  Left: a row token counts only when it starts the row or follows whitespace, a backtick, ``(``, ``|``, ``,``,
+  ``*`` or ``[``. ``xcode@r12``, ``barcode@r3``, ``a/code@r11``, ``#code@r11``, ``-code@r11`` and an en dash
+  before ``code@r11`` are therefore not profiles, and neither is anything else the allowlist does not name.
+  Right: the digits must be followed by the end of the row, whitespace, or one of `` ` ) ; | * ] ``, by a comma
+  that is not followed by a digit (``code@r11,5`` is not r11), or by a period that itself ends the sentence
+  (end of row or whitespace after it).
+  ``code@r11beta``, ``code@r11.5``, ``code@r11-rc``, ``code@r11+``, ``code@r11~1``, ``code@r11/x``,
+  ``code@r11#a`` and ``code@r11`` followed by an en dash are therefore not profiles, and neither is anything
+  else the allowlist does not name. A sentence-final ``code@r11.`` IS read, and so are ``**code@r11**``,
+  ``code@r11*`` and ``[code@r11](x)``, matching the emphasis shapes ``_CUTOVER_ROW`` accepts for the K id.
+  The revision N is ASCII 0-9 only (``re.ASCII``): a fullwidth or Arabic-Indic "11" is not r11. The header
+  token already needs its closing backtick right after the digits, so it rejects the same suffixes.
 
 Prevention rule (adopted repo-local, from the r1 -> r2 CoS review of PR #451): an agreement guard
 that reads more than one source row carries one RED fixture per row where THAT row alone lags, plus
@@ -55,8 +68,22 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MAP_FILE = "agents/factory-kernel-instance.md"
 
-_HEADER_PROFILE = re.compile(r"Profile:\s*`(code@r(\d+))`\s+primary")
-_ROW_PROFILE = re.compile(r"(?<![\w-])code@r(\d+)")
+# r3 (Iverson, PR #467): the revision is ASCII 0-9 only. ``\d`` accepted every Unicode digit (fullwidth, Arabic-Indic,
+# Devanagari) and ``int()`` read them, so a fullwidth "11" parsed as r11. Pre-r3: r"Profile:\s*`(code@r(\d+))`\s+primary"
+_HEADER_PROFILE = re.compile(r"Profile:\s*`(code@r([0-9]+))`\s+primary", re.ASCII)
+# [r2 text; r3 amends the delimiter sets below: * and ] join the right edge, a comma needs no digit after it]
+# Right edge is an ALLOWLIST (CoS PR #467): the digits must be followed by the end of the row, whitespace, one of
+# the closing delimiters ` ) , ; |, or a period that itself ends the sentence (end of row or whitespace after it).
+# Live map (agents/factory-kernel-instance.md) follows its tokens with a backtick or a space only; ) , ; | are kept
+# because rows legitimately wrap a token in parentheses or list it in prose. Anything else (+ ~ / # : ' an en dash,
+# letters, digits, - or a period that continues) does NOT end the token, so the row names no profile.
+# r3 (Iverson + CoS nits, PR #467): the LEFT edge is an allowlist too: start of row, whitespace, a backtick, ( | or a
+# comma, plus * and [ so the emphasis and link shapes the right edge allows (**code@r11**, [code@r11](x)) can open a
+# token. The RIGHT edge adds * and ] (matching _CUTOVER_ROW's emphasis handling); a comma closes the token only when
+# no digit follows it, so code@r11,5 is not r11. Revision digits are ASCII 0-9 (see _HEADER_PROFILE).
+# Pre-r3 (left denylist, \d, comma always closing):
+#   r"(?<![\w-])code@r(\d+)(?=$|[\s`),;|]|\.(?:$|\s))"
+_ROW_PROFILE = re.compile(r"(?<![^\s`(|,*\[])code@r([0-9]+)(?=$|[\s`);|*\]]|,(?![0-9])|\.(?:$|\s))", re.ASCII)
 _CUTOVER_ROW = re.compile(r"^[*_`\s]*(K[35])(?![0-9A-Za-z])")
 _REQUIRED_ROWS = ("K3", "K5")
 
@@ -329,6 +356,251 @@ class LeftBoundaryTests(unittest.TestCase):
         problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
         self.assertEqual(problems, [])
         self.assertIn("K5 row code@r11", summary)
+
+
+class RightBoundaryTests(unittest.TestCase):
+    """CoS #451 comment 6216180890: ``code@r11beta`` is not the profile token ``code@r11``."""
+
+    SUFFIXES = ("beta", ".5", "-rc")
+    # What the r1 denylist ``(?![\w.-])`` still read as a bare r11 (CoS probe on PR #467): the plus, tilde,
+    # slash, hash and en dash each continue the token, and ``..`` is not a sentence end.
+    UNLISTED_DELIMITERS = ("+", "~1", "/x", "#a", "–rc", "..", ".x", ":", "'")
+
+    def test_red_row_whose_only_profile_has_a_suffix_names_no_profile(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: code@r11{suffix} kernel r5`")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_k3_row_whose_only_profile_has_a_suffix_names_no_profile(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                k3 = K3_ROW.replace("(code@r11 K3 default)", f"(code@r11{suffix} K3 default)")
+                problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K3 row at line 8 names no", problems[0])
+
+    def test_red_suffixed_row_token_does_not_agree_with_the_same_header_revision(self) -> None:
+        header = HEADER_R11.replace("code@r11", "code@r12", 1)
+        k5 = K5_ROW.replace("code@r11", "code@r12beta")
+        problems, _summary = check_agreement(header + K3_ROW.replace("code@r11", "code@r12") + k5)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_embedded_left_and_suffixed_right_still_names_no_profile(self) -> None:
+        for suffix in self.SUFFIXES + self.UNLISTED_DELIMITERS:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: xcode@r11{suffix} kernel r5`")
+                self.assertIn("K5 row at line 9 names no", check_agreement(HEADER_R11 + K3_ROW + k5)[0][0])
+
+    def test_red_right_edge_only_suffix_names_no_profile(self) -> None:
+        """No left-edge noise at all: the suffix alone must void the token (CoS nit on the :368 left-only test)."""
+        for suffix in ("beta",) + self.UNLISTED_DELIMITERS:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: code@r11{suffix} kernel r5`")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_unlisted_delimiter_row_token_does_not_agree_with_the_same_header_revision(self) -> None:
+        """A denylist reads code@r11+ as r11; the allowlist must not, so the row is never counted as agreeing."""
+        for suffix in self.UNLISTED_DELIMITERS:
+            with self.subTest(suffix=suffix):
+                k3 = K3_ROW.replace("(code@r11 K3 default)", f"(code@r11{suffix} K3 default)")
+                problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K3 row at line 8 names no", problems[0])
+
+    def test_green_suffixed_noise_beside_a_real_token_does_not_count(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                k5 = K5_ROW.replace("| open |", f"| open, see code@r99{suffix} |")
+                self.assertEqual(check_agreement(HEADER_R11 + K3_ROW + k5)[0], [])
+
+    def test_green_delimited_row_tokens_still_count(self) -> None:
+        for tail in ("`", ")", ",", ";", " ", "|"):
+            with self.subTest(tail=tail):
+                k5 = f"| K5 declared profile | gate | (code@r11{tail}kernel | open |\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11", summary)
+
+    def test_green_sentence_ending_period_counts(self) -> None:
+        """A period counts only when it ends the sentence: whitespace or the end of the row follows it."""
+        for tail in (". |", ".  next |", ". Next sentence |"):
+            with self.subTest(tail=tail):
+                k5 = f"| K5 declared profile | gate | now code@r11{tail}\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11", summary)
+
+    def test_green_period_at_the_very_end_of_the_row_counts(self) -> None:
+        self.assertEqual(check_agreement(HEADER_R11 + K3_ROW + "| K5 declared profile | gate | now code@r11.")[0], [])
+
+    def test_red_period_followed_by_text_is_not_a_sentence_end(self) -> None:
+        for tail in (".5", ".x", "..", ".-", ".|", ".`"):
+            with self.subTest(tail=tail):
+                k5 = f"| K5 declared profile | gate | now code@r11{tail} | open |\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_header_token_with_a_suffix_is_not_a_primary_profile(self) -> None:
+        for suffix in self.SUFFIXES:
+            with self.subTest(suffix=suffix):
+                header = HEADER_R11.replace("`code@r11` primary", f"`code@r11{suffix}` primary")
+                problems, summary = check_agreement(header + ROWS)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("header names no primary profile", problems[0])
+
+
+class AsciiDigitTests(unittest.TestCase):
+    """PR #467 r3 (Iverson Improvement 1): ``\\d`` accepts Unicode digits and ``int()`` reads them, so ``code@r<U+FF11><U+FF11>``
+    used to read as r11. The revision is ASCII 0-9 only, in a row and in the Profile header line."""
+
+    # Arabic-Indic, Extended Arabic-Indic, Devanagari and fullwidth "11", then a mixed ASCII/fullwidth "11".
+    NON_ASCII_ELEVENS = ("١١", "۱۱", "११", "１１", "1１", "１1")
+
+    def test_red_row_whose_only_profile_has_non_ascii_digits_names_no_profile(self) -> None:
+        for digits in self.NON_ASCII_ELEVENS:
+            with self.subTest(digits=ascii(digits)):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: code@r{digits} kernel r5`")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_non_ascii_digit_row_token_never_counts_as_agreeing_with_the_header(self) -> None:
+        for digits in self.NON_ASCII_ELEVENS:
+            with self.subTest(digits=ascii(digits)):
+                k3 = K3_ROW.replace("(code@r11 K3 default)", f"(code@r{digits} K3 default)")
+                problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K3 row at line 8 names no", problems[0])
+
+    def test_red_header_token_with_non_ascii_digits_is_not_a_primary_profile(self) -> None:
+        for digits in self.NON_ASCII_ELEVENS:
+            with self.subTest(digits=ascii(digits)):
+                header = HEADER_R11.replace("`code@r11` primary", f"`code@r{digits}` primary")
+                problems, summary = check_agreement(header + ROWS)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("header names no primary profile", problems[0])
+
+    def test_red_regexes_do_not_read_non_ascii_digits_directly(self) -> None:
+        self.assertEqual(_ROW_PROFILE.findall("x code@r１１ y"), [])
+        self.assertIsNone(_HEADER_PROFILE.search("Profile: `code@r１１` primary"))
+
+    def test_green_ascii_digits_still_read(self) -> None:
+        self.assertEqual(_ROW_PROFILE.findall("x code@r11 y"), ["11"])
+        self.assertEqual(_HEADER_PROFILE.search("Profile: `code@r11` primary").group(2), "11")
+
+
+class LeftEdgeAllowlistTests(unittest.TestCase):
+    """PR #467 r3 (Iverson Improvement 2): the left edge was the denylist ``(?<![\\w-])``. It is an allowlist now: start of
+    row, whitespace, a backtick, ``(``, ``|`` or ``,`` (plus ``*`` and ``[`` so the emphasis and link shapes the
+    right edge allows can open a token)."""
+
+    UNLISTED_LEFT = ("a/", "#", "–", "—", ":", "'", '"', "+", "~", "=", ".", "<", "@", " ")
+
+    def test_red_row_whose_only_profile_has_an_unlisted_left_neighbour_names_no_profile(self) -> None:
+        for left in self.UNLISTED_LEFT:
+            with self.subTest(left=ascii(left)):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"`profile: {left}code@r11 kernel r5`")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_red_unlisted_left_neighbour_never_counts_as_agreeing_with_the_header(self) -> None:
+        for left in self.UNLISTED_LEFT:
+            with self.subTest(left=ascii(left)):
+                k3 = K3_ROW.replace("(code@r11 K3 default)", f"({left}code@r11 K3 default)")
+                problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K3 row at line 8 names no", problems[0])
+
+    def test_red_unlisted_left_beside_a_real_token_does_not_count(self) -> None:
+        for left in self.UNLISTED_LEFT:
+            with self.subTest(left=ascii(left)):
+                k5 = K5_ROW.replace("| open |", f"| open, see {left}code@r99 |")
+                self.assertEqual(check_agreement(HEADER_R11 + K3_ROW + k5)[0], [])
+
+    def test_green_listed_left_neighbours_still_read(self) -> None:
+        for left in (" ", "\t", "`", "(", "|", ",", "*", "["):
+            with self.subTest(left=ascii(left)):
+                k5 = f"| K5 declared profile | gate | now{left}code@r11 kernel | open |\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11", summary)
+
+    def test_green_start_of_row_reads(self) -> None:
+        self.assertEqual(_ROW_PROFILE.findall("code@r11 kernel"), ["11"])
+        self.assertEqual(_ROW_PROFILE.findall("code@r11"), ["11"])
+
+    def test_red_start_of_row_with_a_right_suffix_still_does_not_read(self) -> None:
+        self.assertEqual(_ROW_PROFILE.findall("code@r11beta"), [])
+
+
+class RightEdgeEmphasisAndCommaTests(unittest.TestCase):
+    """PR #467 r3 (CoS nits, KERNEL-PROFILE-TOKEN-ALLOWLIST-NITS-1): ``*`` and ``]`` close a token so the shapes
+    ``_CUTOVER_ROW`` already accepts for the K id also work for the profile; a comma closes it only when no digit follows."""
+
+    CLOSED_SHAPES = ("**code@r11**", "code@r11*", "*code@r11*", "[code@r11](x)", "[code@r11]", "[**code@r11**](x)")
+    COMMA_DIGIT = ("code@r11,5", "code@r11,12", "code@r11,0")
+
+    def test_green_emphasis_and_link_shapes_read_as_r11(self) -> None:
+        for shape in self.CLOSED_SHAPES:
+            with self.subTest(shape=shape):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"profile {shape} kernel r5")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11 (line 9)", summary)
+
+    def test_red_emphasis_and_link_shapes_on_a_lagging_row_are_caught_not_dropped(self) -> None:
+        for shape in self.CLOSED_SHAPES:
+            with self.subTest(shape=shape):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"profile {shape.replace('r11', 'r10')} kernel r5")
+                problems, _summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("K5 row at line 9 names code@r10", problems[0])
+
+    def test_green_emphasis_shape_in_the_k3_row_reads_as_r11(self) -> None:
+        k3 = K3_ROW.replace("(code@r11 K3 default)", "(**code@r11** K3 default)")
+        problems, summary = check_agreement(HEADER_R11 + k3 + K5_ROW)
+        self.assertEqual(problems, [])
+        self.assertIn("K3 row code@r11 (line 8)", summary)
+
+    def test_red_comma_followed_by_a_digit_is_not_a_token_end(self) -> None:
+        for shape in self.COMMA_DIGIT:
+            with self.subTest(shape=shape):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"profile {shape} kernel r5")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("K5 row at line 9 names no", problems[0])
+
+    def test_green_comma_not_followed_by_a_digit_still_ends_the_token(self) -> None:
+        for tail in (",", ", 5", ",kernel", ",\t5"):
+            with self.subTest(tail=ascii(tail)):
+                k5 = f"| K5 declared profile | gate | now code@r11{tail} | open |\n"
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(problems, [])
+                self.assertIn("K5 row code@r11", summary)
+
+    def test_green_comma_digit_beside_a_real_token_does_not_count(self) -> None:
+        k5 = K5_ROW.replace("| open |", "| open, see code@r99,5 |")
+        self.assertEqual(check_agreement(HEADER_R11 + K3_ROW + k5)[0], [])
+
+    def test_red_other_suffixes_before_a_closing_star_or_bracket_still_void_the_token(self) -> None:
+        for shape in ("code@r11x*", "code@r11beta*", "code@r11-*", "code@r11+]", "code@r11/x]"):
+            with self.subTest(shape=shape):
+                k5 = K5_ROW.replace("`profile: code@r11 kernel r5`", f"profile {shape} kernel r5")
+                problems, summary = check_agreement(HEADER_R11 + K3_ROW + k5)
+                self.assertEqual(summary, "NOT_FOUND")
+                self.assertIn("K5 row at line 9 names no", problems[0])
 
 
 class ProfileAgreementLiveTreeTests(unittest.TestCase):
