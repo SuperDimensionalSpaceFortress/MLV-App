@@ -1980,13 +1980,29 @@ function Get-DvLegSpecShapeRefusal {
 # every hash-listed file must belong to one of them (an extra still -- a playing one included -- is a mismatch naming it, never ignored); a StillCount
 # that is not a positive integer, or a frame list of another length, is a mismatch. A sidecar whose top level is not ONE JSON object (a one-element
 # array, which ConvertFrom-Json would unwrap) is no sidecar.
+# r8 fix iteration 1 (adversary r8 A1 / A2): every entry ON DISK in -SeekDir must be a plain file the listing names (an extra still a receipt leaves out of
+# its listing is a mismatch, not invisible); and with no frame list, still i must show the display_frame of its IN-PASS partner frame-<ii>.json
+# (-InPassFiles: the hash-verified contact-sheet\raw files, Read-DvContactFrames' .files) -- the app seeks to exactly those frames (MainWindow.cpp
+# contactSheetTargetFrames = inPassDisplayFrames), so a paused still of another frame is no same-frame comparison.
 function Get-DvPairedSeekVerdict {
-    param([string]$SeekDir, $Files, [long[]]$RequestedFrames, $StillCount)
+    param([string]$SeekDir, $Files, [long[]]$RequestedFrames, $StillCount, $InPassFiles)
     $listedSha = @{}
     foreach ($f in @($Files)) { if ($null -ne $f) { $listedSha[[string](Get-DvProp $f 'name')] = [string](Get-DvProp $f 'sha256') } }
     $reported = [System.Collections.Generic.List[object]]::new()
     $mismatches = [System.Collections.Generic.List[string]]::new()
     $show = { param($v) $(if ($null -eq $v) { 'absent' } else { ConvertTo-Json -InputObject $v -Compress }) }
+    $readFrame = { param([byte[]]$b) $o = $null
+        try { $o = ([Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $o = $null }
+        $v = $(if ($o -is [System.Management.Automation.PSCustomObject]) { Get-DvProp $o 'display_frame' } else { $null })
+        $(if ($v -is [int] -or $v -is [long]) { [long]$v } else { $null }) }
+    $inPassBytes = @{}
+    foreach ($f in @($InPassFiles)) { if ($null -ne $f) { $inPassBytes[[string](Get-DvProp $f 'name')] = (Get-DvProp $f 'bytes') } }
+    if (-not [string]::IsNullOrEmpty($SeekDir) -and (Test-Path -LiteralPath $SeekDir -PathType Container)) {
+        foreach ($actual in @(Get-ChildItem -LiteralPath $SeekDir -Force | Sort-Object Name)) {
+            $isReparse = (($actual.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($actual.PSIsContainer -or $isReparse -or -not $listedSha.ContainsKey($actual.Name)) { $mismatches.Add("'$($actual.Name)' is in paired-seek\contact-sheet\raw but the paired-still listing does not name it as a plain file (every collected still is listed and checked)") }
+        }
+    }
     $frameList = $null -ne $RequestedFrames
     $count = $(if (($StillCount -is [int] -or $StillCount -is [long]) -and $StillCount -ge 1) { [int]$StillCount } else { 0 })
     if ($count -eq 0) { $mismatches.Add("the committed look.contactSheetFrames ($(& $show $StillCount)) is not a positive whole number, so the paired stills this leg must hold are unknown") }
@@ -2027,6 +2043,11 @@ function Get-DvPairedSeekVerdict {
                 $problem = "$stillName was not captured paused through the full reconstruction path (its sidecar $stillName.json says capture_mode $(& $show $mode), playback_path $(& $show $playbackPath); a paired still needs capture_mode ""seek"" and playback_path false)$tail"
             }
             elseif ($frameList -and $shown -ne $requested) { $problem = "$stillName reported display_frame $shown$tail" }
+            elseif (-not $frameList) {
+                $partner = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readFrame ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
+                if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying an integer display_frame), so its paused still cannot be shown to be the same frame" }
+                elseif ($shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
+            }
         }
         $reported.Add($shown)
         if ($null -ne $problem) { $mismatches.Add($problem) }
@@ -2684,7 +2705,9 @@ function Test-DvReceiptValid {
         elseif ($null -eq $specFrames -and $null -ne $requestedSeek) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.requestedFrames is present but the committed leg spec names no look.pairedSeekFrames (a receipt cannot narrow or add to the committed stills)') }
         # r7 (adversary r6 A1, Dot 6558329764): the verdict is re-derived for EVERY paired block. r8 (adversary r7 A1 / A2): over the committed spec's
         # stills only -- look.contactSheetFrames of them, at look.pairedSeekFrames when listed -- so every expected still and every listed file is checked.
-        $verdictArgs = @{ SeekDir = $seekDir; Files = $seekEntries; StillCount = (Get-DvProp $specLook 'contactSheetFrames') }
+        # (fix iteration 1, adversary r8 A2: the in-pass partners are the hash-verified contact-sheet\raw frames, read the way every reader reads them)
+        $inPass = Read-DvContactFrames -Receipt $Receipt -EvidenceDir $ev.dir
+        $verdictArgs = @{ SeekDir = $seekDir; Files = $seekEntries; StillCount = (Get-DvProp $specLook 'contactSheetFrames'); InPassFiles = @($inPass.files) }
         $framesUsable = $true
         if ($null -ne $specFrames) {
             try { $verdictArgs['RequestedFrames'] = [long[]]@($specFrames) } catch { $framesUsable = $false; $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: the committed look.pairedSeekFrames is not a list of frame numbers') }

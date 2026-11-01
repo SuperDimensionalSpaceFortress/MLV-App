@@ -28,6 +28,16 @@ SEEK_FRAMES = {"frame-00.json": b'{"capture_mode":"seek","playback_path":false,"
                "frame-01.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":150}', "frame-01.png": b"\x89PNG\r\n\x1a\nseek-1"}
 
 
+def write_in_pass_partners(artifacts: Path, count: int) -> None:
+    """r8 forced fixture (adversary r8 A2): the in-pass partner of each paused still, as the app writes it (contact-sheet\\raw\\frame-<ii>.png and .json,
+    capture_mode in_pass, playback_path true, display_frame 50 + 100*i). With no frame list, still i must show its partner's display_frame."""
+    raw = artifacts / "artifacts" / "contact-sheet" / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw-%d" % i)
+        (raw / f"frame-{i:02d}.json").write_bytes(json.dumps({"capture_mode": "in_pass", "playback_path": True, "display_frame": 50 + 100 * i}).encode("utf-8"))
+
+
 class PairedSeekSpecTests(unittest.TestCase):
     def test_the_schema_types_paired_seek_boolean_and_the_paired_legs_copy_their_cells(self) -> None:
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
@@ -72,6 +82,7 @@ class PairedSeekRunnerTests(RunnerHarness, unittest.TestCase):
         seek.mkdir(parents=True, exist_ok=True)
         for name, data in SEEK_FRAMES.items():
             (seek / name).write_bytes(data)
+        write_in_pass_partners(self.artifacts, 2)
         return seek
 
     def test_a_paired_seek_leg_asks_for_the_seek_frames_and_copies_them_hash_listed(self) -> None:
@@ -91,7 +102,9 @@ class PairedSeekRunnerTests(RunnerHarness, unittest.TestCase):
             self.assertEqual((local / entry["name"]).read_bytes(), data)
         # the in-pass frames stay where they were: the seek frames are never mixed into them
         in_pass = Path(receipt["look"]["contactSheet"]["rawFramesDir"])
-        self.assertEqual(sorted(p.name for p in in_pass.iterdir()), ["frame-00.png"])
+        # (r8 forced fixture: the in-pass raw now holds the in-pass partner of each paused still, as the app writes it; the seek frames are still not among them)
+        self.assertEqual(sorted(p.name for p in in_pass.iterdir()), ["frame-00.json", "frame-00.png", "frame-01.json", "frame-01.png"])
+        self.assertFalse(any((in_pass / n).read_bytes() == d for n, d in SEEK_FRAMES.items()))
 
     def test_a_paired_seek_leg_whose_job_published_no_seek_frames_says_so(self) -> None:
         self.write_artifacts(sheet=True, raw_frames=True)
@@ -496,6 +509,7 @@ class PairedStillsHarness(RunnerHarness):
         for i, sidecar in enumerate(sidecars):
             (seek / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-%d" % i)
             (seek / f"frame-{i:02d}.json").write_bytes(sidecar)
+        write_in_pass_partners(self.artifacts, len(sidecars))
 
     def fresh(self) -> None:
         self.doCleanups()
@@ -605,8 +619,8 @@ class PairedSeekProvenanceTests(PairedStillsHarness, unittest.TestCase):
 
 SHIPPED_LISTLESS_SPEC = DV / "legs" / "m16-1243-q1-cpu-look-paired-windowed-s2.json"
 # r7: the collection-time verdict replaced by one that claims every still honoured, so only the receipt writer's final validation can catch a bad still.
-# r8 forced fixture: the param list gains $StillCount, the committed still count the runner now passes (a splatted key the stub does not declare throws).
-LYING_VERDICT = ("        function Get-DvPairedSeekVerdict { param($SeekDir, $Files, $RequestedFrames, $StillCount) "
+# r8 forced fixture: the param list gains $StillCount and $InPassFiles, which the runner now passes (a splatted key the stub does not declare throws).
+LYING_VERDICT = ("        function Get-DvPairedSeekVerdict { param($SeekDir, $Files, $RequestedFrames, $StillCount, $InPassFiles) "
                  "[pscustomobject]@{ reportedFrames = @(50, 150); framesHonoured = $true; frameMismatches = @() } }\n")
 LISTLESS_BAD_SIDECARS = (("a-in-pass", {"capture_mode": "in_pass"}), ("b-playing", {"playback_path": True}),
                          ("c-no-mode", {"capture_mode": KeyError}), ("d-no-path", {"playback_path": KeyError}),
@@ -897,6 +911,36 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
                 self.fresh()
                 receipt = self.run_case(spec(), sidecars)
                 self.assert_not_a_pass(receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", "frame-00")
+
+    def test_r8_a1_a_collected_still_the_listing_leaves_out_is_not_invisible(self) -> None:
+        # adversary r8 A1: six paused stills plus a playing frame-06 on disk; the listing (and every claim) leaves frame-06 out
+        drop = "        $seekFiles = @($seekFiles | Where-Object { $_.name -notlike 'frame-06*' })\n"
+        extra = {"frame-06.png": b"\x89PNG\r\n\x1a\nextra", "frame-06.json": provenance_sidecar(999, capture_mode="in_pass", playback_path=True)}
+        for final in (False, True):
+            with self.subTest(final_validation=final):
+                self.fresh()
+                mutations = [("Invoke-VenueLeg.ps1", SEEK_INFO_ANCHOR, drop + SEEK_INFO_ANCHOR)]
+                if final:
+                    mutations.append(("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claimed_block(SIX_FRAMES)))
+                dv = self.mutated_runner(mutations)
+                self.write_artifacts(sheet=True, raw_frames=True)
+                self.write_seek_stills([provenance_sidecar(f) for f in SIX_FRAMES])
+                seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
+                for name, data in extra.items():
+                    (seek / name).write_bytes(data)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.shipped_spec("set-hidden" + ("-f" if final else "")), extra=["-Backend", "cpu"], dv=dv)
+                self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+                self.assertEqual([f["name"] for f in receipt["look"]["pairedSeek"]["files"] if f["name"].startswith("frame-06")], [], "the listing left it out")
+                self.assert_not_a_pass(receipt, "frame-06", final=final)
+
+    def test_r8_a2_a_listless_still_of_another_frame_than_its_in_pass_partner_is_not_a_pass(self) -> None:
+        # adversary r8 A2: in-pass frames [50, 150, ...]; valid paused stills at [51, 151, ...]
+        shifted = [f + 1 for f in SIX_FRAMES]
+        for claim in (None, claimed_block(shifted)):
+            with self.subTest(final_validation=claim is not None):
+                self.fresh()
+                receipt = self.run_case(self.shipped_spec("set-shifted" + ("-f" if claim else "")), [provenance_sidecar(f) for f in shifted], claim=claim)
+                self.assert_not_a_pass(receipt, "PAIRED_SEEK", "frame-00", "in-pass partner", final=claim is not None)
 
     def test_the_complete_six_still_paused_control_passes(self) -> None:
         for claim in (None, claimed_block(SIX_FRAMES)):

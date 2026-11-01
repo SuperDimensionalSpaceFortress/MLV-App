@@ -837,7 +837,10 @@ if ($isLook -and $artifactsShare) {
         # collected file must be one of them; the receipt writer re-derives the same contract from the committed spec, never from this block.
         $verdictArgs = @{ SeekDir = $seekLocal; Files = $seekFiles; StillCount = $spec.look.contactSheetFrames }
         if ($null -ne $pairedSeekFramesRequested) { $verdictArgs['RequestedFrames'] = $pairedSeekFramesRequested; $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested) }
-        $seekVerdict = Invoke-DvCollect 'read' ([string]$seekLocal) { Get-DvPairedSeekVerdict @verdictArgs }
+        # (r8 fix iteration 1, adversary r8 A2: with no frame list each paused still must show its hash-listed in-pass partner's display_frame)
+        $seekVerdict = Invoke-DvCollect 'read' ([string]$seekLocal) {
+            $verdictArgs['InPassFiles'] = @((Read-DvContactFrames -Receipt $receipt -EvidenceDir $evidenceDir).files)
+            Get-DvPairedSeekVerdict @verdictArgs }
         $pairedSeekInfo['reportedFrames'] = $seekVerdict.reportedFrames
         $pairedSeekInfo['framesHonoured'] = $seekVerdict.framesHonoured
         $pairedSeekInfo['frameMismatches'] = $seekVerdict.frameMismatches
