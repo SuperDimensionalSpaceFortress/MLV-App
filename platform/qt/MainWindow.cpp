@@ -10978,8 +10978,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 quint64 contactFramePresentedSerial = 0;
                 bool contactFramePresentedSerialValid = false;
                 QString contactFrameRenderPath;
+                bool seekGlWindowActive = false;
+                bool seekTexturePresentationActive = false;
                 if( settled )
                 {
+                    seekGlWindowActive = GpuDisplayWindow::isActive();
+                    seekTexturePresentationActive = GpuDisplayViewport::isTexturePresentationActive( ui->graphicsView )
+                        || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView );
                     const QJsonObject &seekTiming = m_lastPresentedStageTimingTelemetry;
                     const GpuPlaybackPipelineStatus seekPipelineStatus =
                         mainWindowGpuPlaybackPipelineStatus(
@@ -11033,8 +11038,14 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 const QString jsonPath = contactSheetDirInfo.absoluteFilePath(
                     frameBaseName + QStringLiteral(".json") );
 
+                // Adversary A1: with the list, the image must come from the surface that presented the frame
+                // (no fall-through from a refused GL-window readback to an unrelated pixmap or viewport).
+                const bool seekStillImageTied = playback_frame_range::contactSheetSeekStillImageTied(
+                    seekGlWindowActive, seekTexturePresentationActive, contactFrameSource.toStdString(),
+                    contactFramePresentedSerialValid, static_cast<uint64_t>( contactFramePresentedSerial ),
+                    static_cast<uint64_t>( m_lastPresentedRequestSerial ) );
                 bool frameOk = settled && !contactFrameImage.isNull()
-                    && ( options.contactSheetSeekFrames.isEmpty() || seekFrameHonoured )
+                    && ( options.contactSheetSeekFrames.isEmpty() || ( seekFrameHonoured && seekStillImageTied ) )
                     && contactFrameImage.save( pngPath, "PNG" );
 
                 const double elapsedMsForFrame = contactSheetFps > 0.0
@@ -11089,6 +11100,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 {
                     frameJson.insert( QStringLiteral("requested_frame"), targetFrame );
                     frameJson.insert( QStringLiteral("frame_honoured"), seekFrameHonoured );
+                    frameJson.insert( QStringLiteral("image_tied"), seekStillImageTied );
                 }
 
                 if( frameOk )
@@ -11111,6 +11123,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     contactSheetError = QStringLiteral(
                         "seek frame %1 SEEK_FRAME_NOT_HONOURED requested=%2 shown=%3" )
                         .arg( i ).arg( targetFrame ).arg( seekObservedFrame );
+                }
+                if( !options.contactSheetSeekFrames.isEmpty() && settled && !seekStillImageTied && contactSheetError.isEmpty() )
+                {
+                    contactSheetError = QStringLiteral(
+                        "seek frame %1 SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3" )
+                        .arg( i ).arg( contactFrameSource ).arg( contactFrameReadbackReason );
                 }
                 if( !frameOk && contactSheetError.isEmpty() )
                 {

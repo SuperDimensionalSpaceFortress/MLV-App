@@ -965,7 +965,17 @@ TEST(ContactSheetSeekFrameListWiring, EachSeekStillIsHonouredByObservationOrTheR
     ASSERT_EQ(1, seekBranch.count(QStringLiteral("QStringLiteral(\"requested_frame\")")));
     ASSERT_EQ(1, seekBranch.count(QStringLiteral("QStringLiteral(\"frame_honoured\")")));
     // A list still that is not honoured cannot be saved as a good frame.
-    ASSERT_TRUE(seekBranch.contains(QStringLiteral("&& ( options.contactSheetSeekFrames.isEmpty() || seekFrameHonoured )")));
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral(
+        "&& ( options.contactSheetSeekFrames.isEmpty() || ( seekFrameHonoured && seekStillImageTied ) )")));
+    // Adversary A1: the image must come from the surface that presented the frame -- the surface state is
+    // read before the capture chain and the tie is decided on the source the chain actually used.
+    const int surfaceAt = seekBranch.indexOf(QStringLiteral("seekGlWindowActive = GpuDisplayWindow::isActive();"));
+    const int chainAt = seekBranch.indexOf(QStringLiteral("contactFrameSource = QStringLiteral(\"gl_window_framebuffer_readback\");"));
+    const int tieAt = seekBranch.indexOf(QStringLiteral("playback_frame_range::contactSheetSeekStillImageTied("));
+    ASSERT_TRUE(surfaceAt > 0 && chainAt > surfaceAt && tieAt > chainAt);
+    ASSERT_TRUE(seekBranch.mid(tieAt, 400).contains(QStringLiteral("static_cast<uint64_t>( m_lastPresentedRequestSerial )")));
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral("SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3")));
+    ASSERT_EQ(1, seekBranch.count(QStringLiteral("QStringLiteral(\"image_tied\")")));
     // The default (no list) display_frame stays the settled request, byte for byte.
     ASSERT_TRUE(seekBranch.contains(QStringLiteral(
         "frameJson.insert( QStringLiteral(\"display_frame\"), options.contactSheetSeekFrames.isEmpty() ? settledFrame : seekObservedFrame );")));

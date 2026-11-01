@@ -1487,6 +1487,27 @@ TEST( ContactSheetSeekFrameList, AStillIsHonouredOnlyWhenItSettledOnAValidPresen
     ASSERT_FALSE( contactSheetSeekFrameHonoured( 550, true, true, 549 ) );    // the clamp to the last frame
 }
 
+TEST( ContactSheetSeekFrameList, AListStillsImageMustComeFromTheSurfaceThatPresentedTheFrame )
+{
+    // Adversary A1 (r1 pass on 7e252640): a minimized GL window refuses its framebuffer readback and the
+    // capture fell through to an unrelated pixmap / hidden viewport that was then saved as frame_honoured=true.
+    using playback_frame_range::contactSheetSeekStillImageTied;
+    // GL window: only its own framebuffer readback of THIS request's present counts.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( true, false, "gl_window_framebuffer_readback", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "app_internal_presented_pixmap", false, 0, 41 ) );   // A1 input
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "app_internal_viewport_grab", false, 0, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, true, "app_internal_gl_viewport_grab", false, 0, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "gl_window_framebuffer_readback", true, 40, 41 ) );  // an older present
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "gl_window_framebuffer_readback", false, 41, 41 ) ); // no serial to prove it
+    // In-widget texture presentation: its viewport grab, never the pixmap or plain viewport fallbacks.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( false, true, "app_internal_gl_viewport_grab", false, 0, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, true, "app_internal_presented_pixmap", false, 0, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, true, "app_internal_viewport_grab", false, 0, 41 ) );
+    // CPU-presented pixmap: the pixmap itself, never the plain viewport fallback.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( false, false, "app_internal_presented_pixmap", false, 0, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, false, "app_internal_viewport_grab", false, 0, 41 ) );
+}
+
 TEST( ContactSheetSeekFrameList, TheFirstFramePastTheClipIsNamedBeforeAnyPlay )
 {
     using playback_frame_range::firstContactSheetSeekFrameOutOfRange;

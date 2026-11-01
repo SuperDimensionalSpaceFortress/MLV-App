@@ -159,6 +159,20 @@ inline bool contactSheetSeekFrameHonoured( int requested, bool settled, bool pre
     return settled && presentedValid && presented == requested;
 }
 
+// Adversary A1: a list still's IMAGE must come from the surface that presented the frame, never from a
+// fall-through. With the GL preview window active only its own framebuffer readback counts, and only when
+// the readback reports the presentationSerial of the request on record (requestSerial). With in-widget
+// texture presentation only its viewport grab counts; otherwise only the CPU-presented pixmap.
+inline bool contactSheetSeekStillImageTied( bool glWindowActive, bool texturePresentationActive,
+                                            const std::string &source, bool presentedSerialValid,
+                                            uint64_t presentedSerial, uint64_t requestSerial )
+{
+    if( glWindowActive )
+        return source == "gl_window_framebuffer_readback" && presentedSerialValid && presentedSerial == requestSerial;
+    if( texturePresentationActive ) return source == "app_internal_gl_viewport_grab";
+    return source == "app_internal_presented_pixmap";
+}
+
 // The first list frame a clip of frameCount frames cannot show (>= frameCount), or -1 when all fit. A clip
 // of fewer than two frames cannot be seeked at all (seekAndSettleLoadedClip refuses it), so then any frame
 // is out of range.
