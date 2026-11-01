@@ -480,7 +480,12 @@ param(
     # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: the app's playback worker-thread cap for the run, forwarded as the smoke runner's EXISTING -Threads <n> (the
     # runner sets MLVAPP_PLAYBACK_MAX_THREADS=<n> for the app and records playbackMaxThreads in its result.json). 0 (the default) passes nothing: the
     # emitted job is the text it was before this parameter.
-    [ValidateRange(0, 16)][int]$PlaybackMaxThreads = 0
+    [ValidateRange(0, 16)][int]$PlaybackMaxThreads = 0,
+
+    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: attach a minimal debugger (by pid, agent user, no registry; Start-AttrCudaHeapDumpWatch) to the smoke's
+    # MLVApp and keep one full dump of the first heap-corruption exception (c0000374) under the artifacts' heapdump\. Absent: the emitted job
+    # is the text it was before.
+    [switch]$HeapCorruptionDump
 )
 
 $ErrorActionPreference = 'Stop'
@@ -6647,6 +6652,25 @@ $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $cor
 '@ + "`n    $cpClose`n    if (`$OwnerClipDir) {`n")
     $timeBudget['corePartitionSec'] = 90
     $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 90)
+}
+
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a heap-corruption-dump leg gains two bracketed regions around the smoke launch, on the expanded text and
+# only when asked, so every other job is the text it always was: the two module helpers and the watcher start just before the launch (after
+# every feature probe and PresentMon), and the watcher's completion just after it returns (before any early exit, so a failed run keeps its dump).
+if ($HeapCorruptionDump) {
+    $heapOpen = '# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 >>>'
+    $heapClose = '# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 <<<'
+    $heapFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Publish-AttrCudaTextWithFileId', 'Start-AttrCudaHeapDumpWatch', 'Stop-AttrCudaHeapDumpWatch')
+    $launchAnchor = "`$smokeRc = `$null`n`$smokeLaunchException = `$null"
+    $text = Edit-DualVenueTemplate $text $launchAnchor ($heapOpen + "`n" + $heapFunctions + "`n" + @'
+$heapDumpRecord = Start-AttrCudaHeapDumpWatch -ExePath $exePath -DumpDir (Join-Path $Pub 'heapdump')
+Write-JobTrace "step heap-dump-watch watcherPid=$($heapDumpRecord['watcherPid']) debugger=$($heapDumpRecord['debugger']) reason=$($heapDumpRecord['reason'])"
+'@ + "`n" + $heapClose + "`n" + $launchAnchor)
+    $doneAnchor = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
+    $text = Edit-DualVenueTemplate $text $doneAnchor ($doneAnchor + "`n" + $heapOpen + "`n" + @'
+$heapDumpRecord = Stop-AttrCudaHeapDumpWatch -Record $heapDumpRecord
+Write-JobTrace "step heap-dump-done dumps=$(@($heapDumpRecord['dumps']).Count) watcherExited=$($heapDumpRecord['watcherExited']) reason=$($heapDumpRecord['reason'])"
+'@ + "`n" + $heapClose)
 }
 
 $outDir = Split-Path -Parent $OutFile

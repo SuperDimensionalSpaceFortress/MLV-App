@@ -166,6 +166,9 @@ _allow("Assert-AttrCudaWritableFileSlot",
 _allow("Publish-AttrCudaText",
        "publish write into the slot Assert-AttrCudaWritableFileSlot just proved: a journalled CreateNew stream (.Write) with -OwnedJournal, else WriteAllText",
        ("R4", ".Write()", 1), ("R4", "IO.File::WriteAllText", 1))
+_allow("Publish-AttrCudaTextWithFileId",
+       "publish write into the slot Assert-AttrCudaWritableFileSlot just proved: a FileMode.CreateNew stream (.Write) whose identity is read off that creating handle",
+       ("R4", ".Write()", 1), ("R4", "IO.FileStream::new", 1))
 _allow("Publish-AttrCudaBytes",
        "publish write of a byte array into the slot Assert-AttrCudaWritableFileSlot just proved (journalled stream, else WriteAllBytes)",
        ("R4", ".Write()", 1), ("R4", "IO.File::WriteAllBytes", 1))
