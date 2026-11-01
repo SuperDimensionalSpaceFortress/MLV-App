@@ -553,6 +553,54 @@ TEST(PlaybackConformWiring, MutedStatusIsShownWhenPlaybackStartsUnderConform)
     ASSERT_TRUE(refresh.contains(QStringLiteral("playback_conform::audioMutedStatusText()")));
 }
 
+// MERGE-MASTER r11 (ADV-A2): refreshPlaybackFpsStatus() installs the mute tooltip only when playbackConformActive(),
+// which needs m_fileLoaded. On a clip open the status is therefore refreshed AFTER openMlv sets m_fileLoaded (the
+// refresh right after the timer restart runs while it is still false and installs an empty tooltip).
+TEST(PlaybackConformWiring, AdvA2ClipOpenRefreshesTheMuteTooltipOnceTheClipCountsAsLoaded)
+{
+    const QString source = mainWindowSource();
+    const QString open = functionBody(source,
+        QStringLiteral("int MainWindow::openMlv( QString fileName )"),
+        QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
+    ASSERT_FALSE(open.isEmpty());
+    ASSERT_EQ(1, countOccurrences(open, QStringLiteral("m_fileLoaded = true;")));
+    const int loaded = open.indexOf(QStringLiteral("m_fileLoaded = true;"));
+    // the playbackConformActive() gate the tooltip reads is the m_fileLoaded one
+    const QString active = functionBody(source,
+        QStringLiteral("bool MainWindow::playbackConformActive( void )"),
+        QStringLiteral("int MainWindow::effectivePlaybackAutoTargetFps( void )"));
+    ASSERT_TRUE(active.contains(QStringLiteral("return m_fileLoaded && m_pMlvObject")));
+    const int refreshAfter = open.indexOf(QStringLiteral("refreshPlaybackFpsStatus();"), loaded);
+    ASSERT_TRUE(refreshAfter > loaded);
+    // in the same block, before the clip-open function goes on to paint the audio track
+    const int paint = open.indexOf(QStringLiteral("paintAudioTrack();"), loaded);
+    ASSERT_TRUE(paint > refreshAfter);
+}
+
+// MERGE-MASTER r11 (ADV-A1b): every automation wait (autoplay, settle, play action, GUI smoke) reaches the pace probe
+// only through programmaticPlayState, which notes the observation in the Play's pace history and hands the history to
+// the decision; the admitted Play starts a fresh history. The decision itself is executed in test_playback_frame_range.cpp.
+TEST(PlaybackConformWiring, AdvA1bTheStopDecisionJudgesThePaceThePlayHasShown)
+{
+    const QString source = mainWindowSource();
+    const QString state = functionBody(source,
+        QStringLiteral("playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs )"),
+        QStringLiteral("bool MainWindow::programmaticPlayConsumed() const"));
+    ASSERT_FALSE(state.isEmpty());
+    const int note = state.indexOf(QStringLiteral("m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );"));
+    const int decide = state.indexOf(QStringLiteral("automationPlayPaceMode(), m_playPaceHistory );"));
+    ASSERT_TRUE(note >= 0);
+    ASSERT_TRUE(decide > note);
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("playback_frame_range::evaluatePlayStop(")));
+    ASSERT_EQ(5, countOccurrences(source, QStringLiteral("programmaticPlayState(")));   // the 4 waits + the definition
+    const QString play = functionBody(source,
+        QStringLiteral("bool MainWindow::programmaticPlay("),
+        QStringLiteral("void MainWindow::programmaticStop( const char *site )"));
+    const int reset = play.indexOf(QStringLiteral("m_playPaceHistory = playback_frame_range::PlayPaceHistory();"));
+    ASSERT_TRUE(reset >= 0);
+    ASSERT_TRUE(play.indexOf(QStringLiteral("ui->actionPlay->trigger();"), reset) > reset);
+}
+
 // ---- (4) Auto target, status, settings --------------------------------------------------
 
 TEST(PlaybackConformWiring, AutoQualityUsesTheConditionallyCappedTarget)

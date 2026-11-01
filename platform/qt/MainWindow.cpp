@@ -11736,6 +11736,10 @@ int MainWindow::openMlv( QString fileName )
     ++m_lookAssistAsyncGeneration;
     m_fileLoaded = true;
     resetPlaybackQualityAutoRunState();
+    // MERGE-MASTER r11 (ADV-A2): the refresh after the timer restart above ran while m_fileLoaded was still false, so
+    // playbackConformActive() was false and the conform audio-mute tooltip was installed empty. Refresh it once the
+    // clip counts as loaded.
+    refreshPlaybackFpsStatus();
 
     //Audio Track
     paintAudioTrack();
@@ -31064,6 +31068,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
     m_playRequiredSourceFrames = verdict.requiredFrames;
     m_playRequestedSeconds = requestedSeconds;
     m_playPaceFps = verdict.paceFps;
+    m_playPaceHistory = playback_frame_range::PlayPaceHistory();
     ui->actionPlay->trigger();   // allowlisted: the gate's own Play
     return true;
 }
@@ -31076,10 +31081,13 @@ void MainWindow::programmaticStop( const char *site )
 }
 
 // ENFORCE-3: the ONE decision every automation Play wait makes. A wall clock alone is never a pass.
-playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const
+// MERGE-MASTER r11 (ADV-A1b): every wait (autoplay, settle, play action, GUI smoke) reaches the pace probe through here,
+// so each observation is noted in the Play's pace history first and the probe judges the pace the run has shown.
+playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs )
 {
+    m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );
     return playback_frame_range::evaluatePlayStop(
-        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );
+        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );
 }
 
 bool MainWindow::programmaticPlayConsumed() const

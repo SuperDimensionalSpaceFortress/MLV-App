@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <string>
 
 namespace playback_frame_range {
@@ -417,16 +418,94 @@ inline double measuredPaceFps( int64_t consumed, int64_t elapsedMs )
     return static_cast<double>( consumed - 1 ) * 1000.0 / static_cast<double>( elapsedMs );
 }
 
-// True when the pace MEASURED so far (consumed frames over elapsed Play wall clock) cannot reach `required` frames
-// inside the safety budget: the run is already doomed, so it ends now with PLAY_PACE_TOO_SLOW instead of waiting for
-// the timeout. Needs at least two frames (one step) and kPaceProbeMs of Play, so a slow first frame is not a verdict.
+// HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r11 (ADV-A1b; catalogue C-PACE-RECOVERY-01, M-04 measurement-gate false
+// refusal): the pace the engine has DEMONSTRATED during this Play, so the probe can ask "can the run still finish" rather
+// than "does the average since the Play trigger reach the requirement". That average charged a startup wait, or any
+// stall the engine has since recovered from, against every remaining frame (x stepsNeeded / stepsDone, about 9x at 8 s
+// of a conformed 25 s window): a 59.94 fps clip conformed to 24 fps was refused PLAY_PACE_TOO_SLOW whenever its first
+// present came later than about 360 ms after the trigger. kPaceRecentWindowMs is the shortest stretch a pace is
+// measured over (long enough that a poll of up to 50 ms moves it by about 1%).
+constexpr int64_t kPaceRecentWindowMs = 4000;
+
+struct PlayPaceHistory
+{
+    struct Sample
+    {
+        int64_t elapsedMs = 0;
+        int64_t consumed = 0;
+    };
+    bool haveFirstStep = false;
+    Sample firstStep;                   // the first observation with consumed >= 2 (the first forward step)
+    std::deque<Sample> window;          // observations where consumed changed; front = newest at or before now - window
+    double bestWindowPace = 0.0;  // steps per ms: the fastest kPaceRecentWindowMs-or-longer stretch seen so far
+    int64_t lastElapsedMs = -1;
+    int64_t lastConsumed = 0;
+
+    // Called with every observation the stop decision makes. A counter that went back (a new Play re-armed it) or a
+    // clock that went back (another wait's clock) starts the history over: nothing measured before belongs to this run.
+    void note( int64_t consumed, int64_t elapsedMs )
+    {
+        if( elapsedMs < lastElapsedMs || consumed < lastConsumed || consumed < 2 ) *this = PlayPaceHistory();
+        lastElapsedMs = elapsedMs;
+        lastConsumed = consumed;
+        if( consumed < 2 ) return;
+        if( !haveFirstStep )
+        {
+            haveFirstStep = true;
+            firstStep.elapsedMs = elapsedMs;
+            firstStep.consumed = consumed;
+        }
+        if( window.empty() || window.back().consumed != consumed )
+        {
+            Sample s;
+            s.elapsedMs = elapsedMs;
+            s.consumed = consumed;
+            window.push_back( s );
+        }
+        while( window.size() >= 2 && window[1].elapsedMs <= elapsedMs - kPaceRecentWindowMs ) window.pop_front();
+        const Sample &anchor = window.front();
+        const int64_t span = elapsedMs - anchor.elapsedMs;
+        if( span >= kPaceRecentWindowMs )
+        {
+            bestWindowPace = std::max( bestWindowPace,
+                static_cast<double>( consumed - anchor.consumed ) / static_cast<double>( span ) );
+        }
+    }
+
+    // Steps per ms: the better of the pace since the first forward step and the best window. 0 = nothing measured.
+    double bestPace( int64_t consumed, int64_t elapsedMs ) const
+    {
+        double best = bestWindowPace;
+        if( haveFirstStep && elapsedMs > firstStep.elapsedMs && consumed > firstStep.consumed )
+        {
+            best = std::max( best, static_cast<double>( consumed - firstStep.consumed )
+                                 / static_cast<double>( elapsedMs - firstStep.elapsedMs ) );
+        }
+        return best;
+    }
+};
+
+// True when the run cannot reach `required` frames inside the safety budget even at the best pace it has shown: the
+// run is already doomed, so it ends now with PLAY_PACE_TOO_SLOW instead of waiting for the timeout. Needs at least two
+// frames (one step) and kPaceProbeMs of Play, so a slow first frame is not a verdict.
+// r11 (ADV-A1b): the projection is the elapsed wall clock -- every stall so far paid ONCE -- plus the REMAINING steps at
+// the best of: the pace since the Play trigger (master's measure), since the first forward step, and over any
+// kPaceRecentWindowMs stretch (PlayPaceHistory). With no history it is master's elapsed x stepsNeeded / stepsDone
+// exactly, and it is never stricter than that. A pace that cannot finish even so is still refused; a run it lets go on
+// ends at the requirement or at the typed PLAY_SAFETY_TIMEOUT, never a hang.
+inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs,
+                                        const PlayPaceHistory &history )
+{
+    if( required <= 1 || consumed < 2 || elapsedMs < kPaceProbeMs || consumed >= required ) return false;
+    const double sinceTriggerStepsPerMs = static_cast<double>( consumed - 1 ) / static_cast<double>( elapsedMs );
+    const double stepsPerMs = std::max( sinceTriggerStepsPerMs, history.bestPace( consumed, elapsedMs ) );
+    const double projectedMs = static_cast<double>( elapsedMs )
+                             + static_cast<double>( required - consumed ) / stepsPerMs;
+    return projectedMs > static_cast<double>( safetyMs );
+}
 inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs )
 {
-    if( required <= 1 || consumed < 2 || elapsedMs < kPaceProbeMs ) return false;
-    const double stepsDone = static_cast<double>( consumed - 1 );
-    const double stepsNeeded = static_cast<double>( required - 1 );
-    const double projectedMs = static_cast<double>( elapsedMs ) * stepsNeeded / stepsDone;
-    return projectedMs > static_cast<double>( safetyMs );
+    return playPaceProjectsPastBudget( consumed, required, elapsedMs, safetyMs, PlayPaceHistory() );
 }
 
 enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout, PaceTooSlow };
@@ -434,10 +513,12 @@ enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout, PaceToo
 // The ONE decision every automation Play wait makes. Reached (the source frames were consumed) wins over
 // everything, including a Play that ended on that very frame; a Play that ended first is EndedEarly; a wall
 // clock that ran out first is SafetyTimeout; a pace that cannot make it in time is PaceTooSlow. required <= 0 can
-// never be reached.
+// never be reached. r11 (ADV-A1b): `history` is the Play's PlayPaceHistory, noted with this same observation; the
+// app's one caller (MainWindow::programmaticPlayState) always passes it. Without one the pace probe is master's.
 inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool playStillRunning,
                                        int64_t elapsedMs, int64_t safetyMs,
-                                       PlayPaceMode mode = PlayPaceMode::Gated )
+                                       PlayPaceMode mode = PlayPaceMode::Gated,
+                                       const PlayPaceHistory &history = PlayPaceHistory() )
 {
     if( required > 0 && consumed >= required ) return PlayStopState::Reached;
     if( !playStillRunning ) return PlayStopState::EndedEarly;
@@ -445,7 +526,7 @@ inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool 
     // CPU-LOOK-LEG-PACE-ABORT-1: the pace probe is the Gated mode's only; an informational run measures its pace and
     // runs on to the requirement or to the (ceiling) safety timeout above.
     if( mode == PlayPaceMode::Gated
-        && playPaceProjectsPastBudget( consumed, required, elapsedMs, safetyMs ) ) return PlayStopState::PaceTooSlow;
+        && playPaceProjectsPastBudget( consumed, required, elapsedMs, safetyMs, history ) ) return PlayStopState::PaceTooSlow;
     return PlayStopState::Continue;
 }
 

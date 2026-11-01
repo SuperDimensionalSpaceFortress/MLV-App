@@ -1107,6 +1107,242 @@ TEST( PlayStopDecision, ARunTooSlowToFinishInsideTheBudgetEndsEarlyWithTheTypedP
     ASSERT_TRUE( slow.consumed < 480 );
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r11 (ADV-A1b; catalogue C-PACE-RECOVERY-01, M-04): a recovered startup wait
+// or stall must not be projected onto every remaining frame. The repro (sol 6551929282, fable 6552056715, r10
+// adversary A1): a 1667-frame 59.94 fps clip, default 24 fps conform, requestedSeconds 25, gated, Loop off. Admission
+// accepts 1499 source frames (1498 steps / 24 = 62.4 s) inside 65 s. With the first present ~1 s after the trigger and
+// 24 fps after, 8 s in it has consumed ~170, and master projected 8000 x 1498 / 169 = 70.9 s -> PLAY_PACE_TOO_SLOW
+// (GUI smoke exit 14), although the run finishes at ~63.4 s.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+using playback_frame_range::PlayPaceHistory;
+
+struct Stall
+{
+    int64_t atMs;
+    int64_t forMs;
+};
+
+// The engine is held (no advance) until firstPresentMs and inside every stall, and otherwise advances at paceFps. The
+// stop decision is polled every pollEvery ms with the Play's pace history, exactly as MainWindow::programmaticPlayState
+// does. From stopAdvancingAt on (default: never) the engine is held while Play stays on.
+EngineRun runStalledEngine( int64_t firstPresentMs, double paceFps, int64_t required, int64_t safetyMs,
+                            int64_t pollEvery = 10, std::vector<Stall> stalls = std::vector<Stall>(),
+                            int cutOut = 1667,
+                            int64_t stopAdvancingAt = std::numeric_limits<int64_t>::max() )
+{
+    EngineRun run;
+    SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    PlayPaceHistory history;
+    double position = 0.0;
+    const int64_t tickMs = 1;
+    for( int64_t now = 0; now <= 900000; now += tickMs )
+    {
+        if( now % pollEvery == 0 )
+        {
+            const bool playing = position < cutOut - 1;
+            history.note( counter.consumed(), now );
+            run.state = evaluatePlayStop( counter.consumed(), required, playing, now, safetyMs,
+                                          playback_frame_range::PlayPaceMode::Gated, history );
+            if( run.state != PlayStopState::Continue ) { run.elapsedMs = now; break; }
+        }
+        bool held = now < firstPresentMs || now >= stopAdvancingAt;
+        for( const Stall &s : stalls ) held = held || ( now >= s.atMs && now < s.atMs + s.forMs );
+        if( held ) continue;
+        const playback_frame_range::DropFrameTickResult tick =
+            advanceDropFrameTick( position, paceFps * tickMs / 1000.0, 1, cutOut, false );
+        counter.noteEngineTick( position, tick.position, tick.wrapped );
+        if( tick.wrapped ) run.wrapped = true;
+        position = tick.position;
+    }
+    run.consumed = counter.consumed();
+    run.position = position;
+    return run;
+}
+
+PlayPaceHistory historyOf( int64_t firstPresentMs, double paceFps, int64_t untilMs, int64_t pollMs = 10 )
+{
+    PlayPaceHistory history;
+    for( int64_t t = 0; t <= untilMs; t += pollMs )
+    {
+        const int64_t steps = t < firstPresentMs ? 0 : static_cast<int64_t>( ( t - firstPresentMs ) * paceFps / 1000.0 );
+        history.note( 1 + steps, t );
+    }
+    return history;
+}
+}
+
+TEST( PlayPaceRecovery, AdvA1bTheExactReproProjectsPastTheBudgetOnlyUnderTheOldAverage )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    ASSERT_EQ( 65000, budget );
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0, playback_frame_range::kFloorFromNativeFps, true, 24.0 );
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 1499, v.requiredFrames );
+    // master's average since the trigger: 8000 x 1498 / 169 = 70911 ms > 65000 (this is what refused the run)
+    ASSERT_TRUE( playback_frame_range::playPaceProjectsPastBudget( 170, 1499, 8000, budget ) );
+    ASSERT_TRUE( evaluatePlayStop( 170, 1499, true, 8000, budget ) == PlayStopState::PaceTooSlow );
+    // with the Play's history (first present at ~1 s, 24 fps since): 8000 + 1329 steps / 24 fps = 63.4 s -> keep going
+    const PlayPaceHistory h = historyOf( 1000, 24.0, 8000 );
+    ASSERT_TRUE( h.haveFirstStep );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 170, 1499, 8000, budget, h ) );
+    ASSERT_TRUE( evaluatePlayStop( 170, 1499, true, 8000, budget, playback_frame_range::PlayPaceMode::Gated, h )
+                 == PlayStopState::Continue );
+}
+
+TEST( PlayPaceRecovery, AdvA1bAFirstPresentAtSixHundredOrOneThousandMsThen24FpsContinuesAndReachesTheEnd )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 600 ), int64_t( 1000 ) } )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )   // the smoke/settle loops poll at 10 ms, autoplay at 50
+        {
+            const EngineRun run = runStalledEngine( firstPresent, 24.0, 1499, budget, poll );
+            ASSERT_TRUE( run.state == PlayStopState::Reached );
+            ASSERT_TRUE( run.consumed >= 1499 );
+            ASSERT_TRUE( run.elapsedMs < budget );
+            // 1498 steps at 24 fps after the first present: 62.4 s + the wait, paid once
+            ASSERT_TRUE( run.elapsedMs >= firstPresent + 62400 && run.elapsedMs <= firstPresent + 62500 + poll );
+            ASSERT_FALSE( run.wrapped );
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, AdvA1bTheVenueFirstPresentRangeOfCudaReceiptsIsNotRefused )
+{
+    // fable 6552056715: CUDA first presents of 384-1691 ms. 1691 + 62417 = 64.1 s, still inside 65 s.
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 361 ), int64_t( 384 ), int64_t( 1691 ) } )
+    {
+        const EngineRun run = runStalledEngine( firstPresent, 24.0, 1499, budget );
+        ASSERT_TRUE( run.state == PlayStopState::Reached );
+    }
+}
+
+TEST( PlayPaceRecovery, AdvA1bAMidRunTransientStallThatRecoversIsNotRefused )
+{
+    // One second held at 4 s (straddling the 8 s probe's view) and another at 20 s: 62.4 s + 2 s = 64.4 s < 65 s.
+    const int64_t budget = playSafetyMs( 25.0 );
+    std::vector<Stall> stalls;
+    stalls.push_back( Stall{ 4000, 1000 } );
+    stalls.push_back( Stall{ 20000, 1000 } );
+    const EngineRun run = runStalledEngine( 0, 24.0, 1499, budget, 10, stalls );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.elapsedMs < budget );
+    // A stall right at the probe (7-8 s) too, after 7 s of 24 fps.
+    std::vector<Stall> atProbe;
+    atProbe.push_back( Stall{ 7000, 1500 } );
+    ASSERT_TRUE( runStalledEngine( 0, 24.0, 1499, budget, 10, atProbe ).state == PlayStopState::Reached );
+}
+
+TEST( PlayPaceRecovery, AdvA1bAPaceThatTrulyCannotFinishIsStillRefusedWithTheTypedToken )
+{
+    // 20 fps sustained on the same window: 1498 / 20 = 74.9 s > 65 s. Refused at the probe, with or without a wait.
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 0 ), int64_t( 1000 ) } )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+        {
+            const EngineRun run = runStalledEngine( firstPresent, 20.0, 1499, budget, poll );
+            ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+            ASSERT_TRUE( run.consumed < 1499 );
+            ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ),
+                       std::string( playback_frame_range::playStopFailureReason( run.state ) ) );
+        }
+    }
+    // 22 fps (68.1 s) is refused too; 23.5 fps (63.7 s) is not.
+    ASSERT_TRUE( runStalledEngine( 0, 22.0, 1499, budget ).state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( runStalledEngine( 0, 23.5, 1499, budget ).state == PlayStopState::Reached );
+    // A wait too long to repay: first present at 4 s then 24 fps needs 66.4 s -> refused, never a timeout first.
+    const EngineRun late = runStalledEngine( 4000, 24.0, 1499, budget );
+    ASSERT_TRUE( late.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( late.elapsedMs < budget );
+}
+
+TEST( PlayPaceRecovery, AdvA1bAnEngineThatStopsAdvancingNeverPassesAndEndsTyped )
+{
+    // 24 fps for 5 s, then held while Play stays on: refused (or, at worst, the typed timeout), never Reached, never a hang.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const EngineRun run = runStalledEngine( 0, 24.0, 1499, budget, 10, std::vector<Stall>(), 1667, 5000 );
+    ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow || run.state == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( run.elapsedMs <= budget );
+    ASSERT_TRUE( run.consumed < 1499 );
+}
+
+TEST( PlayPaceRecovery, NativeRunsAreUnchangedFromMaster )
+{
+    // Native 59.94 fps (no conform), same window: 1498 / 59.94 = 25 s, tolerated a ~4.9 s startup wait on master.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 1667, 1667, 59.94, 25.0 );
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 1499, v.requiredFrames );
+    ASSERT_TRUE( runStalledEngine( 0, 59.94, 1499, budget ).state == PlayStopState::Reached );
+    ASSERT_TRUE( runStalledEngine( 4900, 59.94, 1499, budget ).state == PlayStopState::Reached );
+    // the existing native tables, through the history-taking path with a real history
+    ASSERT_TRUE( runEngine( 0, 1, 720, 12.0, 480, playSafetyMs( 20.0 ) ).state == PlayStopState::Reached );
+    ASSERT_TRUE( runEngine( 0, 1, 720, 6.0, 480, playSafetyMs( 20.0 ) ).state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( runStalledEngine( 0, 6.0, 480, playSafetyMs( 20.0 ), 10, std::vector<Stall>(), 720 ).state
+                 == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( runStalledEngine( 0, 4.0, 600, budget, 10, std::vector<Stall>(), 720 ).state == PlayStopState::PaceTooSlow );
+    // a steady run from frame 0: the history agrees with master's average, so the verdict is master's
+    for( const double fps : { 4.0, 6.0, 12.0, 24.0, 59.94 } )
+    {
+        const PlayPaceHistory h = historyOf( 0, fps, 9000 );
+        const int64_t consumed = 1 + static_cast<int64_t>( 9000 * fps / 1000.0 );
+        ASSERT_EQ( playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, 9000, budget ),
+                   playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, 9000, budget, h ) );
+    }
+}
+
+TEST( PlayPaceRecovery, TheProjectionIsNeverStricterThanMastersAndWithoutHistoryIsMasters )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t firstPresent : { int64_t( 0 ), int64_t( 500 ), int64_t( 3000 ) } )
+    {
+        for( const double fps : { 10.0, 20.0, 24.0, 30.0 } )
+        {
+            const PlayPaceHistory h = historyOf( firstPresent, fps, 30000 );
+            for( int64_t consumed = 2; consumed < 1499; consumed += 37 )
+            {
+                for( int64_t elapsed = 8000; elapsed < budget; elapsed += 1700 )
+                {
+                    const bool master = playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget );
+                    if( !master ) ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget, h ) );
+                    // the empty history is master's formula: elapsed x stepsNeeded / stepsDone
+                    const double projected = static_cast<double>( elapsed ) * 1498.0 / static_cast<double>( consumed - 1 );
+                    if( std::abs( projected - static_cast<double>( budget ) ) > 1e-3 )
+                        ASSERT_EQ( projected > static_cast<double>( budget ), master );
+                }
+            }
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, TheHistoryStartsOverForANewPlayOrAnotherClock )
+{
+    PlayPaceHistory h = historyOf( 0, 24.0, 9000 );
+    ASSERT_TRUE( h.haveFirstStep );
+    ASSERT_TRUE( h.bestPace( 217, 9000 ) > 0.02 );
+    h.note( 1, 9010 );   // the counter was re-armed (consumed went back)
+    ASSERT_FALSE( h.haveFirstStep );
+    ASSERT_EQ( 0.0, h.bestWindowPace );
+    h = historyOf( 0, 24.0, 9000 );
+    h.note( 300, 50 );   // a clock that went back
+    ASSERT_TRUE( h.haveFirstStep );
+    ASSERT_EQ( int64_t( 50 ), h.firstStep.elapsedMs );
+    ASSERT_EQ( 0.0, h.bestWindowPace );
+    // nothing measured: no pace, so the probe falls back to master's average
+    const PlayPaceHistory empty;
+    ASSERT_EQ( 0.0, empty.bestPace( 170, 8000 ) );
+    // the window is kept bounded: a 60 s steady run holds about one window of change points, not the whole run
+    const PlayPaceHistory longRun = historyOf( 0, 59.94, 60000 );
+    ASSERT_TRUE( longRun.window.size() <= static_cast<size_t>( playback_frame_range::kPaceRecentWindowMs * 59.94 / 1000.0 ) + 8 );
+}
+
 TEST( LookAssistSettle, ASecondSettleNeverAsksForAnotherPlayBecauseTheProcessAdmitsExactlyOne )
 {
     using playback_frame_range::lookAssistSettleNeedsOwnPlay;

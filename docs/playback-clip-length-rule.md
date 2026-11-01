@@ -143,8 +143,19 @@ FRAME:
   safety net, and its expiry is a typed failure. The net **scales with the pace the venue must sustain**:
   `requested / kMinSustainedPaceFraction (0.5) + kPlaySafetyMarginMs (15 s)`, i.e. 55 s for a 20 s window. A venue that
   holds under half the native pace is refused up front when its engine pace is known (`PLAY_PACE_TOO_SLOW`, before
-  Play) and ends early with the **same** token when the pace only shows once Play runs (the measured pace cannot reach
-  the requirement inside the budget; judged after 8 s of Play and two frames) -- never a run that can only time out.
+  Play) and ends early with the **same** token when the pace only shows once Play runs -- never a run that can only time
+  out.
+- **The in-Play pace probe** (`playPaceProjectsPastBudget`, reached by every automation wait through
+  `programmaticPlayState`; Gated mode only) is judged after 8 s of Play and two frames. It asks whether the run can
+  still finish: the elapsed wall clock, with every wait and stall so far counted once, plus the REMAINING steps at the
+  best pace the Play has shown. That pace is the best of the pace since the Play trigger, the pace since the first
+  forward step, and the pace over any 4 s stretch (`PlayPaceHistory`, `kPaceRecentWindowMs`). Only when even that
+  pace cannot finish inside the budget does the run end as `PLAY_PACE_TOO_SLOW`. Anything else runs on to the
+  requirement or to the typed `PLAY_SAFETY_TIMEOUT`. MERGE-MASTER r11 (ADV-A1b, catalogue C-PACE-RECOVERY-01 / M-04)
+  replaced the old projection, `elapsed x stepsNeeded / stepsDone` from the trigger. That form charged a startup wait
+  against every remaining frame (about 9x at 8 s of a conformed 25 s window), so a first present later than about
+  360 ms falsely refused M16-1457 under the 24 fps conform. With no history the new projection is exactly the old one,
+  and it is never stricter.
 - The summary (`playback_smoke.summary`) and the profile receipt carry `source_advanced`, `required_source_frames`,
   `native_fps`, `pace_fps`, `fps_override`; the receipt oracle turns anything short of the requirement into
   `INVALID_SOURCE_FRAMES`, never a pass.
@@ -165,7 +176,7 @@ frames: 62.4 s at 24 fps, inside 65 s. M16-1456 (16.2 s) cannot hold a 25 s wind
 | Token | Where | Exit |
 |---|---|---|
 | `PLAY_DURATION_TOO_SHORT`, `CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, `PLAY_WINDOW_TOO_SHORT` | the app's gate, before Play (ENFORCE-2) | 14 |
-| `PLAY_PACE_TOO_SLOW` | refused before Play (pace known and under the minimum), or the run ended early because the measured pace cannot reach the requirement | 14 |
+| `PLAY_PACE_TOO_SLOW` | refused before Play (pace known and under the minimum), or the run ended early because even the best pace the Play has shown cannot reach the requirement inside the budget (the in-Play probe above) | 14 |
 | `SOURCE_FRAMES_SHORT` | the engine ended the Play (end of range, jump) before the requirement | 14 |
 | `PLAY_SAFETY_TIMEOUT` | the safety net expired; typed, never a pass | 14 |
 | `REPLAY_REFUSED` | a second programmatic Play in the process | 14 |

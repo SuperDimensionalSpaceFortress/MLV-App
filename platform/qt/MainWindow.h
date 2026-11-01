@@ -1199,6 +1199,9 @@ private:
     int64_t m_playRequiredSourceFrames = 0;
     double m_playRequestedSeconds = 0.0;
     double m_playPaceFps = 0.0;
+    // MERGE-MASTER r11 (ADV-A1b): the pace this Play has demonstrated, noted by programmaticPlayState() on every
+    // observation, so a recovered startup wait or stall is paid once and not projected onto every remaining frame.
+    playback_frame_range::PlayPaceHistory m_playPaceHistory;
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
@@ -2023,7 +2026,7 @@ private:
     // ENFORCE-3: the one decision every automation Play wait makes (reached / ended early / safety timeout /
     // keep going) and the "required source frames consumed" predicate the presented-frames stop and the
     // lifecycle stress share. See playback_frame_range::evaluatePlayStop.
-    playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const;
+    playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs );
     bool programmaticPlayConsumed() const;
 public:
     int automationVerdictExitCode() const { return m_automationVerdict.exitCode(); }

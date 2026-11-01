@@ -2408,7 +2408,10 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             "the gate is not told the engine pace": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );", "0.0, automationPlayPaceMode() );"),
             # CPU-LOOK-LEG-PACE-ABORT-1: the pace mode reaches the admission, the stop decision and every safety-net budget
             "the admission is no longer told the pace mode": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );", "enginePaceFps > 0.0 ? enginePaceFps : -1.0 );"),
-            "the stop decision is no longer told the pace mode": self._mutated("elapsedMs, safetyMs, automationPlayPaceMode() );", "elapsedMs, safetyMs );"),
+            "the stop decision is no longer told the pace mode": self._mutated("elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );", "elapsedMs, safetyMs, m_playPaceHistory );"),
+            # MERGE-MASTER r11 (ADV-A1b): the probe judges the pace the Play has shown, so it must be noted and handed over
+            "the stop decision is no longer given the pace history": self._mutated("automationPlayPaceMode(), m_playPaceHistory );", "automationPlayPaceMode() );"),
+            "the observation is no longer noted in the pace history": self._mutated("m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );", ""),
             "the autoplay budget ignores the pace mode": self._mutated(
                 "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );\n                        if( autoplayState",
                 "playback_frame_range::playSafetyMs( m_playRequestedSeconds ) );\n                        if( autoplayState"),
