@@ -1565,7 +1565,13 @@ def test_image_paths_is_keyed_on_engine_and_attached_with_the_codex_image_flag()
     assert "image-path-empty" in body and "Where-Object { -not [string]::IsNullOrWhiteSpace($_) })" not in body.split("$ImagePathsGiven =")[1].split("\n")[0]
     assert "image-copy-timeout" in body and "$Clock.Elapsed.TotalMilliseconds -ge $LimitMs" in body
     # pass-2b A1-A3: only a file this call created is deleted, reads are cancellable at the deadline, and the deadline is a TimeoutException.
-    assert "-not $ok -and $created -and [System.IO.File]::Exists($Dest)" in body and "image-snapshot-collision" in body
+    # r4 B1: no delete BY PATH after the handle is gone (the partial is removed by closing its delete-on-close handle); the collision refusal carries the image-path- prefix.
+    copy_body = body[body.index("# BEGIN Copy-ImageSnapshot"):body.index("# END Copy-ImageSnapshot")]
+    assert "[System.IO.FileOptions]::DeleteOnClose" in copy_body and "[MlvImageSnap]::KeepOnClose" in copy_body
+    assert "[System.IO.File]::Delete(" not in copy_body and "image-path-snapshot-collision" in body and "image-snapshot-collision" not in body
+    # r4 B2: the snapshot is held FileShare.Read until the child exits, then re-hashed; a mismatch is the typed image-snapshot-mutated failure.
+    assert "[System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::None)" in copy_body and "image-snapshot-mutated" in body
+    assert body.index("Get-ImageHoldDigest -Hold $ImageHolds[$hi]") > body.index("$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }")
     assert "$in.ReadAsync($buf, 0, $buf.Length, $cts.Token)" in body and "[System.IO.FileOptions]::Asynchronous" in body
     assert 'throw [System.TimeoutException]::new("image-copy-timeout' in body
     assert "(Get-Item -LiteralPath $snapshot)" not in body and "Get-FileHash -LiteralPath $snapshot" not in body

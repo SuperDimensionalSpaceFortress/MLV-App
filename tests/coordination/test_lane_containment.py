@@ -777,6 +777,8 @@ def test_an_image_that_is_already_the_snapshot_path_is_never_deleted_by_the_fail
     r=run_lane(cmd+["-ImagePaths",str(victim)],env)
     assert r.returncode!=0,(r.stdout,r.stderr)
     assert victim.exists() and hashlib.sha256(victim.read_bytes()).hexdigest()==sha, "the caller's image was deleted"
+    # r4 hardening (sol/opus/Grok G4): the collision refusal carries the same `image-path-` prefix as every other image refusal.
+    assert "image-path-snapshot-collision" in _failure_text(r,receipt), _failure_text(r,receipt)
 
 
 def test_a_source_read_that_never_returns_is_cut_at_the_deadline(tmp_path):
@@ -870,7 +872,7 @@ def test_a_preexisting_snapshot_destination_is_refused_and_left_byte_identical(f
     r=run_lane(cmd+["-ImagePaths",str(png)],env)
     text=_failure_text(r,receipt)
     assert r.returncode!=0,(r.stdout,r.stderr)
-    assert "image-path-" in text, text
+    assert "image-path-snapshot-exists" in text, text
     assert victim.exists() and victim.read_bytes()==before, "the pre-existing destination was deleted or rewritten"
     assert not (root/"args.json").exists()
 
@@ -894,6 +896,105 @@ def test_pre_consumption_mutation_of_the_source_never_reaches_codex(fixture_tree
     assert len(seen)==1 and seen[0]["path"]==entry["path"]!=str(png)
     assert (seen[0]["sha256"],seen[0]["bytes"])==(sha,len(b"\x89PNG\r\n\x1a\n"+b"original bytes")), seen
     assert (entry["sha256"],entry["bytes"])==(seen[0]["sha256"],seen[0]["bytes"])
+
+
+def _copy_harness(tmp_path, body, mutation=None):
+    """Runs Copy-ImageSnapshot (the text between its BEGIN/END markers) alone in a fresh pwsh; `body` is the PowerShell that drives it."""
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Copy-ImageSnapshot"); b=text.index("# END Copy-ImageSnapshot")
+    block=text[a:b]
+    if mutation is not None: block=mutation(block)
+    harness=tmp_path/"copy-harness.ps1"
+    harness.write_text(block+"\n$ErrorActionPreference = 'Stop'\n"+body,encoding="utf-8")
+    return subprocess.run(["pwsh","-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=90)
+
+
+_AFTER_INPUT_RELEASE = "        if ($null -ne $in) { try { $in.Dispose() } catch { } }\n"
+
+
+def test_a_failed_copy_never_deletes_a_replacement_moved_into_the_snapshot_name_after_its_handle_is_released(tmp_path):
+    # r4 B1 (sol): the cleanup used to delete BY PATH after the destination handle was gone, so a file moved into the snapshot
+    # name in that window was deleted instead of the partial. The replacement is injected right after the handles are released
+    # (the old code's window); the failed copy (LimitMs 0 -> TimeoutException after CreateNew) must leave it untouched.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); victim=tmp_path/"victim.png"; victim.write_bytes(b"victim bytes")
+    dest=tmp_path/"snap.png"
+    def mutation(block):
+        assert _AFTER_INPUT_RELEASE in block, "handle-release site moved; update this fixture mutation"
+        hit=("        if ([System.IO.File]::Exists($Dest)) { [System.IO.File]::Move($Dest, $Dest + '.aside') }\n"
+             "        [System.IO.File]::Move($script:victimPath, $Dest)\n")
+        return block.replace(_AFTER_INPUT_RELEASE,_AFTER_INPUT_RELEASE+hit,1)
+    r=_copy_harness(tmp_path,f"""
+$script:victimPath = '{victim}'
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 0; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name }}
+'DEST-EXISTS ' + [System.IO.File]::Exists('{dest}')
+if ([System.IO.File]::Exists('{dest}')) {{ 'DEST-BYTES ' + [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes('{dest}')) }}
+""",mutation)
+    assert "CAUGHT TimeoutException" in r.stdout,(r.stdout,r.stderr)
+    assert "DEST-EXISTS True" in r.stdout and "DEST-BYTES victim bytes" in r.stdout, ("the replacement was deleted by the failed-copy cleanup",r.stdout,r.stderr)
+
+
+def test_the_held_snapshot_refuses_a_write_through_a_hard_link_and_a_delete(tmp_path):
+    # r4 B2 (sol): after the copy the snapshot was writable, so a hard link to it could change the bytes between the hash and codex's read.
+    # The copy now returns a HELD read handle (FileShare.Read: no writer, no delete) that stays open until the child exits.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"; link=tmp_path/"snap-link.png"
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$info = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 60000
+$null = New-Item -ItemType HardLink -Path '{link}' -Target '{dest}'
+try {{ $w = [System.IO.File]::Open('{link}', 'Open', 'Write', 'ReadWrite'); $w.Write([byte[]](1..64), 0, 64); $w.Dispose(); 'LINK-WRITE accepted' }} catch {{ 'LINK-WRITE refused' }}
+try {{ [System.IO.File]::Delete('{dest}'); 'DELETE accepted' }} catch {{ 'DELETE refused' }}
+try {{ $rd = [System.IO.File]::ReadAllBytes('{dest}'); 'READ ok ' + $rd.Length }} catch {{ 'READ refused' }}
+'HOLD ' + ($null -ne $info.Hold)
+if ($null -ne $info.Hold) {{ $info.Hold.Dispose() }}
+""")
+    assert "HOLD True" in r.stdout,(r.stdout,r.stderr)
+    assert "LINK-WRITE refused" in r.stdout and "DELETE refused" in r.stdout and "READ ok" in r.stdout,(r.stdout,r.stderr)
+    assert dest.read_bytes()==src.read_bytes(),"the snapshot bytes changed while held"
+
+
+_AFTER_CHILD_EXIT_ANCHOR = "$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }\n"
+
+
+def test_a_post_copy_write_through_a_hard_link_is_refused_and_the_receipt_describes_the_consumed_bytes(fixture_tree):
+    # r4 B2 end to end: between the snapshot and the launch a hostile writer hard-links the snapshot and tries to overwrite it. The held
+    # handle refuses, so what the fixture's codex hashes at launch equals the receipt's sha256/bytes, and the post-exit re-hash passes.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text, "post-snapshot call site moved; update this fixture mutation"
+        hit=("    $lnk = $ImageAttachments[0].path + '.lnk'\n"
+             "    $null = New-Item -ItemType HardLink -Path $lnk -Target $ImageAttachments[0].path\n"
+             "    try { $w = [System.IO.File]::Open($lnk, 'Open', 'Write', 'ReadWrite'); $w.Write([byte[]](1..64), 0, 64); $w.Dispose(); $hookResult = 'accepted' } catch { $hookResult = 'refused' }\n"
+             "    Set-Content -LiteralPath (Join-Path (Split-Path $ImageAttachments[0].path) 'hook-result.txt') -Value $hookResult\n")
+        return text.replace(_AFTER_SNAPSHOT_ANCHOR,hit+_AFTER_SNAPSHOT_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert (receipt.parent/"hook-result.txt").read_text(encoding="utf-8").strip()=="refused","the write through the hard link was accepted"
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert (seen[0]["sha256"],seen[0]["bytes"])==(entry["sha256"],entry["bytes"])==(sha,len(b"\x89PNG\r\n\x1a\n"+b"original bytes"))
+    assert entry["consumedVerified"] is True, entry
+
+
+def test_a_snapshot_whose_bytes_differ_after_the_child_exits_is_a_typed_failure_never_a_silent_pass(fixture_tree):
+    # r4 B2: the held handle is re-read after the child exits and compared with the hash the receipt carries. A mismatch (here simulated
+    # by corrupting the recorded digest right after the exit, since a real writer is refused) must be `image-snapshot-mutated`.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_CHILD_EXIT_ANCHOR in text, "child-exit site moved; update this fixture mutation"
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+"if ($ImageAttachments.Count -gt 0) { $ImageAttachments[0].sha256 = ('0' * 64) }\n",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert q["state"]=="failed" and "image-snapshot-mutated" in (q["failure"] or ""),q
+    assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
 
 
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):

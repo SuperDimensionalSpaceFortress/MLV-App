@@ -978,6 +978,8 @@ if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
 # here: the launch copies each image into the run dir and hashes THAT copy, so the receipt names the exact bytes the
 # lane was handed even if the source is replaced after validation (A2). Keyed on ENGINE, not lane name.
 $ImageAttachments = @()
+# r4 B2: one held read handle per snapshot, kept open from the copy until the codex child has exited (never serialised into the receipt).
+$ImageHolds = [System.Collections.Generic.List[object]]::new()
 # `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
 # -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
 # single -ImagePaths value (`-ImagePaths 'a.png|b.png'`); a real array from `&`/dot-calls works unchanged.
@@ -1007,7 +1009,7 @@ if ($ImagePathsGiven.Count -gt 0) {
         if ($imageFull.Contains(',')) {
             throw "image-path-bad-character: -ImagePaths entry contains ',' (codex splits an -i value on commas); copy the file to a name without one: $imageFull"
         }
-        $ImageAttachments += [ordered]@{ source = $imageFull; path = $null; sha256 = $null; bytes = $null; ext = $imageExt }
+        $ImageAttachments += [ordered]@{ source = $imageFull; path = $null; sha256 = $null; bytes = $null; ext = $imageExt; consumedVerified = $null }
     }
 }
 # BEGIN Copy-ImageSnapshot (VISUAL-JUDGE-TERRA-LANE-1 r2, adversary A2 + A3)
@@ -1018,13 +1020,51 @@ if ($ImagePathsGiven.Count -gt 0) {
 # overlapped FileStream and every read carries a CancellationToken that fires at the deadline, so a read that never returns is cut at
 # the lane budget instead of holding the lane (pass-2b A2). The deadline is raised as a TimeoutException, the type the lane books as
 # timedOut=true / exit 124 (launch-budget-exhausted uses the same one; pass-2b A3).
+# r4 B1 (sol): the destination is opened with FileOptions.DeleteOnClose and share None, so a failed copy is cleaned up BY THE HANDLE
+# this call owns -- never by path after the handle is gone (a path delete could remove a file someone moved into the name in that
+# window). The delete-on-close flag is cleared through the handle (FileDispositionInfoEx, ON_CLOSE without DELETE) only once the copy is
+# complete. r4 B2 (sol): the success result carries a HELD read handle on the snapshot (FileShare.Read: no writer, no delete, so a write
+# through any hard link fails) that the caller keeps open until the codex child has exited, then re-hashes (Get-ImageHoldDigest).
+# The held handle is opened after the writer closes and its digest is compared with the copy's, so a write that slipped into that gap is
+# a typed `image-snapshot-mutated` failure, not a silent pass.
 # r3 scope statement: only the source READ is cancellable. The source open, the destination open/write and the flush are synchronous, so
 # this is NOT a universal hard-I/O deadline.
 # r3 G2: every other I/O failure is typed with the `image-path-` prefix the validation refusals use, so a failed receipt greps the same:
 #   image-path-missing: source vanished before snapshot (<source>)    the source was deleted between validation and launch
 #   image-path-unreadable: <reason> (<source>)                        the source is locked / unreadable / a read failed
+#   image-path-snapshot-collision: ... (<source>)                    the destination path IS the source file (refused before any open)
 #   image-path-snapshot-exists: ... (<dest>)                          the destination already existed (left untouched, never deleted)
+#   image-snapshot-mutated: ... (<dest>)                             the held snapshot's bytes differ from the digest taken at copy time
 #   image-path-snapshot-failed: <reason> (<dest>)                     destination write / flush / close failed
+if (-not ('MlvImageSnap' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class MlvImageSnap {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool SetFileInformationByHandle(SafeFileHandle h, int infoClass, ref uint info, uint size);
+  // FileDispositionInfoEx (21) with FILE_DISPOSITION_FLAG_ON_CLOSE (8) and no DELETE (1): cancels the delete-on-close the handle was opened with.
+  public static void KeepOnClose(SafeFileHandle h) {
+    uint flags = 8;
+    if (!SetFileInformationByHandle(h, 21, ref flags, 4)) throw new Win32Exception(Marshal.GetLastWin32Error(), "SetFileInformationByHandle(FileDispositionInfoEx)");
+  }
+}
+'@
+}
+# Re-reads a held snapshot from the start through the handle itself and returns its digest.
+function Get-ImageHoldDigest {
+    param([System.IO.FileStream]$Hold)
+    $null = $Hold.Seek(0, [System.IO.SeekOrigin]::Begin)
+    $h = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $b = New-Object byte[] 262144; $len = [long]0
+        while (($n = $Hold.Read($b, 0, $b.Length)) -gt 0) { [void]$h.TransformBlock($b, 0, $n, $null, 0); $len += $n }
+        [void]$h.TransformFinalBlock($b, 0, 0)
+        return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($h.Hash).Replace('-', '').ToLowerInvariant()); bytes = $len }
+    } finally { $h.Dispose() }
+}
 function Get-ImageIoException {
     param([System.Management.Automation.ErrorRecord]$Err, [string]$Source, [string]$Dest, [string]$Side)
     $base = $Err.Exception.GetBaseException()
@@ -1043,16 +1083,16 @@ function Get-ImageIoException {
 function Copy-ImageSnapshot {
     param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
     if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "image-snapshot-collision: the image snapshot path is the source file itself: $Source"
+        throw "image-path-snapshot-collision: the image snapshot path is the source file itself: $Source"
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()
-    $in = $null; $out = $null; $total = [long]0; $ok = $false; $created = $false
+    $in = $null; $out = $null; $hold = $null; $total = [long]0; $ok = $false; $created = $false
     try {
         try {
             $in = [System.IO.FileStream]::new($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
         } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source') }
         try {
-            $out = [System.IO.File]::Open($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $out = [System.IO.FileStream]::new($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
         } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
         # $created turns true only AFTER CreateNew succeeded: a destination that already existed is never this call's to delete (Grok G3).
         $created = $true
@@ -1077,17 +1117,28 @@ function Copy-ImageSnapshot {
             # copy-loop-tick
         }
         [void]$sha.TransformFinalBlock($buf, 0, 0)
-        # Flush AND close are part of the copy: a quota failure at close must fail the copy (typed), not escape from the finally below.
-        try { $out.Flush(); $out.Dispose() } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        $copySha = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant())
+        # Flush, cancel delete-on-close and close are part of the copy: a quota failure at close must fail the copy (typed), not escape
+        # from the finally below. Until KeepOnClose has run, closing the handle deletes the partial file BY HANDLE (r4 B1).
+        try { $out.Flush(); [MlvImageSnap]::KeepOnClose($out.SafeFileHandle); $out.Dispose() } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # r4 B2: hold the snapshot read-only (FileShare.Read: no writer, no delete) from here until the caller releases it, then prove the
+        # held bytes are the bytes that were hashed while copying. The file is no longer delete-on-close, so a mismatch is reported, not deleted.
+        try {
+            $hold = [System.IO.FileStream]::new($Dest, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::None)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        $held = Get-ImageHoldDigest -Hold $hold
+        if ($held.sha256 -ne $copySha -or $held.bytes -ne $total) {
+            throw [System.IO.IOException]::new("image-snapshot-mutated: the image snapshot changed between the copy and the hold (copied $copySha/$total bytes, held $($held.sha256)/$($held.bytes) bytes) ($Dest)")
+        }
         $ok = $true
     } finally {
         # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
-        # handle or the partial-file delete (pass-4 A3).
+        # handle (pass-4 A3). There is NO delete by path here: a partial destination is removed by closing its delete-on-close handle (r4 B1).
         if ($null -ne $out) { try { $out.Dispose() } catch { } }
         if ($null -ne $in) { try { $in.Dispose() } catch { } }
-        if (-not $ok -and $created -and [System.IO.File]::Exists($Dest)) { try { [System.IO.File]::Delete($Dest) } catch { } }
+        if (-not $ok -and $null -ne $hold) { try { $hold.Dispose() } catch { } }
     }
-    return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant()); bytes = $total }
+    return [pscustomobject]@{ sha256 = $copySha; bytes = $total; Hold = $hold }
 }
 # END Copy-ImageSnapshot
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
@@ -1757,6 +1808,7 @@ if ($cfg.engine -eq 'claude') {
         $attachment.path   = $snapshot
         $attachment.sha256 = $snapshotInfo.sha256
         $attachment.bytes  = $snapshotInfo.bytes
+        $ImageHolds.Add($snapshotInfo.Hold)
     }
     # post-snapshot-pre-launch-tick: from here codex reads ONLY the snapshot paths in $attachment.path; the source is never consulted again.
     $imageArgs = @()
@@ -2023,6 +2075,27 @@ if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int]$remainingMs)) {
 $sw.Stop()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
 
+# r4 B2: the codex child has exited (or been killed), so the snapshots it could read have been held read-only since the copy. Re-read each
+# through its held handle and compare with the digest the receipt carries; a mismatch is a typed failure, never a silent pass.
+if ($ImageHolds.Count -gt 0) {
+    $imageMutated = @()
+    for ($hi = 0; $hi -lt $ImageHolds.Count; $hi++) {
+        $verified = $false
+        try {
+            $again = Get-ImageHoldDigest -Hold $ImageHolds[$hi]
+            $verified = ($again.sha256 -eq $ImageAttachments[$hi].sha256 -and $again.bytes -eq $ImageAttachments[$hi].bytes)
+        } catch { $verified = $false }
+        $ImageAttachments[$hi].consumedVerified = $verified
+        if (-not $verified) { $imageMutated += $ImageAttachments[$hi].path }
+    }
+    foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
+    $ImageHolds.Clear()
+    if ($imageMutated.Count -gt 0) {
+        $failure = "image-snapshot-mutated: the image snapshot(s) differ from the receipt's sha256/bytes after the child exited: $($imageMutated -join '; ')"
+        if ($exitCode -eq 0) { $exitCode = 1 }
+    }
+}
+
 # ---------------------------------------------------------------- harvest
 # Bounded: the direct child is gone (or was killed) by here, so only a descendant that inherited a pipe can still hold EOF back.
 # Never report the lane finished before its child exited (the wait above), and never drop the child's exit code ($exitCode is already read).
@@ -2165,6 +2238,8 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
+    foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
+    $ImageHolds.Clear()
     $noChildCause = $_.Exception.Message
     $noChildCauseType = $_.Exception.GetType().Name
     # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
