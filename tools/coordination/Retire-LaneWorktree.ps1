@@ -1448,17 +1448,11 @@ function Invoke-RetireLaneWorktree {
             # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname
             # is REFUSED (kept, fail-closed) with its own reason rather than reported as a missing ref.
             # r10 (sol r9 ADV-A2): only an ACTUAL reflog selector (a `@{` outside a `^{/regex}` search group) is refused.
-            # r14 (sol r13 BLOCKER / adversary A1): git is the parser, not a regex. A suffix holding `@{` anywhere that does NOT resolve
-            # on the exact SHA (`<sha>@{n}` is rejected; a search group holding `@{` resolves) is refused, fail-closed.
-            # The exact ref is read ONCE (r6 B1); the probe and the resolve below both use that one $baseSha.
-            $baseSha = ''
-            if ($mergeBaseIsRef) { $baseSha = [string](& git.exe -C $main show-ref --verify --hash $mergeBase 2>$null | Select-Object -First 1) }
-            $mergeProbe = ''
-            if ($mergeBaseIsRef -and $mergeSuffix -match '@\{' -and $baseSha -match '^[0-9a-f]{40}$') {
-                $mergeProbe = [string](& git.exe -C $main rev-parse --verify --quiet --end-of-options "$baseSha$mergeSuffix^{commit}" 2>$null | Select-Object -First 1)
-            }
-            if ($mergeBaseIsRef -and $mergeSuffix -match '@\{' -and $mergeProbe -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target uses a reflog selector (@{) and is refused ($MergeTarget)"; return [pscustomobject]$d }
+            # r14 (sol r13 BLOCKER / adversary A1): a search group is `^{/` + BRACE-BALANCED text + `}` (see assert-script-currency.ps1);
+            # a `@{` left after stripping balanced groups is an external selector and is refused, fail-closed.
+            if ($mergeBaseIsRef -and [regex]::Replace($mergeSuffix, '(?s)\^\{/(?:[^{}]|\{(?<d>)|\}(?<-d>))*(?(d)(?!))\}', '') -match '@\{') { $d.reason = "cannot-determine: merge target uses a reflog selector (@{) and is refused ($MergeTarget)"; return [pscustomobject]$d }
             if ($mergeBaseIsRef) {
+                $baseSha = [string](& git.exe -C $main show-ref --verify --hash $mergeBase 2>$null | Select-Object -First 1)
                 if ($baseSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
                 $mergeSpec = "$baseSha$mergeSuffix"
             }

@@ -6759,10 +6759,18 @@ def test_r13_the_schema_and_the_c1_range_are_pinned_in_the_selector_source():
 # last brace) and the typed reflog refusal never fired at any of the three sites. A first r14 attempt made the strip NON-greedy
 # (`.*?`), which the r14 adversary (A1) showed wrongly REFUSED a valid search holding `{n}` before its `@{` (`^{/.*|a{1}foo@{1}}`:
 # the group's first `}` is the interval's). No regex over the suffix can tell `^{/a}^{}@{1}` (selector) from `^{/a{1}x@{1}}`
-# (search), so git is the parser: the exact SHA is read once and `<sha><suffix>^{commit}` is resolved. A reflog selector can never
-# resolve on a SHA base (`<sha>@{n}` is rejected) while a search group that merely holds `@{` does. A suffix holding `@{` that
-# does not resolve on the SHA is refused fail-closed at all three sites; one that resolves is a valid non-reflog revision.
+# (search) by shape alone, and a second r14 attempt that let git decide (probe `<sha><suffix>^{commit}`) was refuted too: git itself
+# resolves `<sha>^{}@{1}` and `<sha>^{/.*}^{}@{1}` (adversary A1 on 55f93997), so git is no oracle for the typed-refusal contract.
+# The strip now follows the grammar: a search group is `^{/` + BRACE-BALANCED text + `}` (regex intervals `{n}` balance), matched
+# with the .NET balancing-group pattern `\^\{/(?:[^{}]|\{(?<d>)|\}(?<-d>))*(?(d)(?!))\}`. A `@{` left after stripping balanced
+# groups is an external selector and is refused fail-closed at all three sites; an unbalanced group is not stripped.
 R14_HIDDEN_SELECTORS = [
+    R6_REF + "^{/.*}^{}@{1}",            # adversary A1 (55f93997): the search MATCHES, the old fixtures' searches did not
+    R6_REF + "^{}@{1}",                  # the simplest suffix that git itself resolves on a SHA
+    R6_REF + "^{/B}^{}@{1}",
+    R6_REF + "^{/.*}~1@{1}",
+    R6_REF + "^{/a{1}x}^{}@{1}",         # a search holding {n}, then an external selector
+    R6_REF + "^{/a{b}@{1}",              # unbalanced group: not stripped, its @{ is refused
     R6_REF + "^{/search}^{}@{1}",       # sol's catalogue input
     R6_REF + "^{/search}^{}@{0}",
     R6_REF + "^{/search}^{}@{2}",
@@ -6827,8 +6835,8 @@ def test_r14_a_valid_search_holding_braces_resolves_in_git_and_is_not_refused_by
 
 
 def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
-    # The CLASS: a regex strip of the `^{/...}` group (greedy OR non-greedy) cannot parse git's grammar. Every site probes the
-    # exact SHA with `<sha><suffix>^{commit}` instead, and no tools/ script keeps either strip.
+    # The CLASS: a greedy or non-greedy `.*` strip of the `^{/...}` group cannot parse a brace-balanced search. No tools/ script keeps
+    # either, and every site strips with the brace-balanced pattern.
     offenders = []
     for path in sorted((COORD.parent).rglob("*")):
         if path.suffix.lower() not in (".ps1", ".psm1", ".py", ".mjs") or path.name == "test_coordination_guardrails.py":
@@ -6837,6 +6845,6 @@ def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
             if "\\^\\{/.*" in line:
                 offenders.append("%s:%d" % (path, n))
     assert not offenders, offenders
-    for path, token in ((COORD / "assert-script-currency.ps1", '"$exactSha$refSuffix^{commit}"'), (RATIO_GUARD, '"$exactSha$refSuffix^{commit}"'),
-                        (RETIRE, '"$baseSha$mergeSuffix^{commit}"')):
-        assert token in path.read_text(encoding="utf-8"), (path, "the exact-SHA probe is missing")
+    token = "'(?s)\\^\\{/(?:[^{}]|\\{(?<d>)|\\}(?<-d>))*(?(d)(?!))\\}'"
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        assert token in path.read_text(encoding="utf-8"), (path, "the brace-balanced search-group strip is missing")

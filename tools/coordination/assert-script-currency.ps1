@@ -68,21 +68,18 @@ if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.
     # exact-ref read above would have to be re-resolved by NAME to honour it. No default caller uses reflog syntax, so it
     # is REFUSED, fail-CLOSED, with its own status. It must never fall to 'unknown': this guard is fail-OPEN on unknown.
     # r10 (sol r9 ADV-A2): refuse only an ACTUAL reflog selector - a `@{` outside a `^{/regex}` commit-message search group.
-    # r14 (sol r13 BLOCKER / adversary A1): NO regex parse of the suffix decides this. A greedy `^{/.*}` strip hid an external
-    # selector (`^{/s}^{}@{1}`); the non-greedy one wrongly refused a valid search holding `{n}` (`^{/a{1}foo@{1}}`). Git is the
-    # parser: the exact SHA is read ONCE and `<sha><suffix>^{commit}` is resolved. A reflog selector can never resolve on a SHA
-    # base (`<sha>@{n}` is rejected), while a search group that merely contains `@{` does. So a suffix holding `@{` anywhere that
-    # does NOT resolve on the SHA is refused (fail-closed) - an unresolvable search that holds `@{` is also refused, never 'unknown'.
-    $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
-    if ($refSuffix -match '@\{') {
-        $probe = if ($exactSha -match '^[0-9a-f]{40}$') { [string](& git -C $root rev-parse --verify --quiet --end-of-options "$exactSha$refSuffix^{commit}" 2>$null | Select-Object -First 1) } else { '' }
-        if ($probe -notmatch '^[0-9a-f]{40}$') {
-            $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
-                         "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
-            Write-Result 'refused-reflog' $reflogMsg
-            throw $reflogMsg
-        }
+    # r14 (sol r13 BLOCKER / adversary A1): a search group is `^{/` + BRACE-BALANCED text + `}`. A greedy `.*` strip ran to the last `}`
+    # and hid an external selector (`^{/s}^{}@{1}`); a non-greedy one refused a valid search holding `{n}` (`^{/a{1}foo@{1}}`); and git
+    # itself resolves `<sha>^{}@{1}`, so git cannot be the oracle. The balanced pattern ends the group at the first `}` that returns the
+    # brace depth to 0 (regex intervals `{n}` balance), so a `@{` left after the strip is an external selector. An unbalanced group
+    # is not stripped at all, so a `@{` inside it is refused (fail-closed). Linear: the loop body is single-character alternatives.
+    if ([regex]::Replace($refSuffix, '(?s)\^\{/(?:[^{}]|\{(?<d>)|\}(?<-d>))*(?(d)(?!))\}', '') -match '@\{') {
+        $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
+                     "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
+        Write-Result 'refused-reflog' $reflogMsg
+        throw $reflogMsg
     }
+    $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
     if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
     $refSpec = "$exactSha$refSuffix"
 }
