@@ -5556,7 +5556,7 @@ def test_r5_the_loop_and_retire_sites_check_the_exact_ref_before_following_it():
     assert loop.index("show-ref --verify --hash $TargetRef") < loop.index("worktree add --detach $DriverRoot $tipSha")
     assert loop.rindex("show-ref --verify --hash $TargetRef") < loop.index("reset --hard $tipSha")
     ret = RETIRE.read_text(encoding="utf-8")
-    guard = ret.index("show-ref --verify --hash $MergeTarget")
+    guard = ret.index("show-ref --verify --hash $mergeBase")
     assert guard < ret.index("merge-base --is-ancestor $d.head $mergeRev")
     assert "merge target ref missing" in ret
 
@@ -5749,60 +5749,103 @@ def test_r6_b1_no_site_resolves_the_exact_refname_again_after_reading_it_in_sour
     assert "worktree add --detach $DriverRoot $TargetRef" not in loop and "reset --hard $TargetRef" not in loop
     ratio = RATIO_GUARD.read_text(encoding="utf-8")
     assert "show-ref --verify --quiet $SourceRef" not in ratio and 'rev-parse --verify "$SourceRef^{commit}"' not in ratio
-    assert "show-ref --verify --hash $SourceRef" in ratio
+    assert "show-ref --verify --hash $refBase" in ratio
     cur = (COORD / "assert-script-currency.ps1").read_text(encoding="utf-8")
     assert "show-ref --verify --quiet $Ref" not in cur and 'rev-parse --verify --quiet "$Ref^{commit}"' not in cur
     assert 'cat-file -e "${Ref}:${rel}"' not in cur and 'rev-parse "${Ref}:${rel}"' not in cur
-    assert "show-ref --verify --hash $Ref" in cur
+    assert "show-ref --verify --hash $refBase" in cur
     ret = RETIRE.read_text(encoding="utf-8")
     assert "show-ref --verify --quiet $MergeTarget" not in ret and "merge-base --is-ancestor $d.head $MergeTarget" not in ret
-    assert "show-ref --verify --hash $MergeTarget" in ret
+    assert "show-ref --verify --hash $mergeBase" in ret
 
 
-# r7 (Grok G4): the B2 tests only go RED in a NON-UTC host zone, and hosted runners are UTC. Pin a non-UTC zone for the
-# pwsh child: TZ=America/Chicago on Linux/macOS (.NET reads TZ there). Windows .NET ignores TZ and cannot be re-zoned per
-# process, so the host zone is used as-is; a UTC host (or a Linux image without tzdata) is a stated skip, never a silent pass.
-def _r7_nonutc_env():
-    env = {**os.environ}
-    if sys.platform != "win32":
-        env["TZ"] = "America/Chicago"
-    probe = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
-         "$z = [TimeZoneInfo]::Local; (@($z.GetUtcOffset([datetime]'2026-01-15T12:00:00').TotalMinutes, $z.GetUtcOffset([datetime]'2026-07-15T12:00:00').TotalMinutes) -join ',')"],
-        text=True, capture_output=True, env=env)
-    offsets = [float(x) for x in probe.stdout.strip().split(",") if x.strip()]
-    if not offsets or all(o == 0 for o in offsets):
-        pytest.skip("host zone is UTC and cannot be re-zoned for the pwsh child on this platform (Windows ignores TZ; Linux needs tzdata)")
-    return env
+# r8 (Grok G6/G4): the r6 B2 tests used to depend on the HOST zone (r7: TZ=America/Chicago off Windows, the Windows host zone
+# as-is) and SKIPPED on the hosted Windows runner (UTC, TZ ignored), so a B2 regression could not go RED in CI. The zone is
+# now INJECTED. The production selector text is extracted, and its single `$v.ToUniversalTime()` is replaced by a test-only
+# wrapper that converts an Unspecified-kind [datetime] as a host in the injected zone would ([TimeZoneInfo]::ConvertTimeToUtc
+# with a custom zone) and leaves every other Kind to the real ToUniversalTime. The source-pin test below proves the text
+# the wrapper substitutes is the shipped text. Production is GREEN (its Unspecified branch never reaches the wrapper);
+# the "pre-B2" variant is the SAME text with that branch removed, so it converts through the injected zone and goes RED.
+# G4: the zone/input pair must DISCRIMINATE. With a POSITIVE offset local 16:00 is still older than 17:00Z, so the pre-B2
+# ordering equals the UTC ordering and the test could pass on old code. A NEGATIVE offset (-05:00: 16:00 local = 21:00Z)
+# flips the order; every test asserts that flip on the pre-B2 variant BEFORE it asserts the production result.
+R8_ZONE_HOURS = -5
+R8_ZONE_FN = r"""
+$script:TestZone = [TimeZoneInfo]::CreateCustomTimeZone('Test-Zone', [TimeSpan]::FromHours(__HOURS__), 'Test-Zone', 'Test-Zone')
+function ConvertTo-UtcInTestZone($v) {
+    if ($v.Kind -eq [System.DateTimeKind]::Unspecified) { return [TimeZoneInfo]::ConvertTimeToUtc($v, $script:TestZone) }
+    return $v.ToUniversalTime()
+}
+"""
+R8_UNSPEC_BRANCH = re.compile(r"(?m)^[ \t]*if \(\$v\.Kind -eq \[System\.DateTimeKind\]::Unspecified\) \{ return \[datetime\]::SpecifyKind\(\$v, \[System\.DateTimeKind\]::Utc\) \}\r?\n")
+
+
+def _r8_selector(tmp_path, pre_b2, hours=R8_ZONE_HOURS):
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    # the seam text is pinned by test_r8_g6_the_zone_injection_wrapper_substitutes_the_shipped_text; the branch is deliberately
+    # NOT asserted here, so removing it from production fails these tests on BEHAVIOUR (the zone shift), not on a pin.
+    assert fn.count("$v.ToUniversalTime()") >= 1, "the production conversion text moved: re-pin the zone-injection wrapper"
+    if pre_b2:
+        fn = R8_UNSPEC_BRANCH.sub("", fn)
+    return R8_ZONE_FN.replace("__HOURS__", str(hours)) + fn.replace("$v.ToUniversalTime()", "(ConvertTo-UtcInTestZone $v)")
+
+
+def _r8_pick(tmp_path, selector, setup, name, tail="(Select-MergeGroupJobsRun -Runs $rows -MasterSha '').Run.databaseId\n"):
+    harness = tmp_path / name
+    harness.write_text("$ErrorActionPreference='Stop'\n" + selector + "\n" + setup + "\n" + tail, encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip().splitlines()[-1]
+
+
+def _r8_json_rows_setup(tmp_path, rows):
+    rows_file = tmp_path / "r8-rows.json"
+    rows_file.write_text(json.dumps(rows), encoding="utf-8")
+    return "$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
+
+
+def _r8_require_discriminating(old_pick, utc_pick, hours=R8_ZONE_HOURS):
+    """G4: the pre-B2 (zone-interpreted) order and the UTC order must differ, else the pair proves nothing - a stated skip."""
+    if old_pick == utc_pick:
+        pytest.skip("injected zone %+d h does not discriminate: pre-B2 order == UTC order (id %s); use a negative offset" % (hours, old_pick))
+    assert old_pick == "1" and utc_pick == "2", (old_pick, utc_pick)
 
 
 # B2 / B3 --------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("day", ["2026-10-31", "2026-01-15", "2026-07-15"], ids=["oct", "jan", "jul"])
 def test_r6_b2_offset_free_created_at_orders_as_utc_through_the_production_conversion(tmp_path, day):
     """ConvertFrom-Json (the production read, Invoke-Workstream.ps1) turns '2026-10-31T16:00:00' into an Unspecified
-    [datetime]; ToUniversalTime used to shift it by the HOST zone (Central here: 16:00 -> 21:00Z, newer than 17:00Z)."""
+    [datetime]; ToUniversalTime used to shift it by the HOST zone (injected -05:00: 16:00 -> 21:00Z, newer than 17:00Z)."""
     rows = [_mgrs_row(1, day + "T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, day + "T17:00:00Z", MGRS_OTHER, "failure")]
-    env = _r7_nonutc_env()
     for order in (rows, list(reversed(rows))):
-        got = _mgrs_select(tmp_path, order, "", env=env)
-        assert got["id"] == 2, (day, got)
+        setup = _r8_json_rows_setup(tmp_path, order)
+        old = _r8_pick(tmp_path, _r8_selector(tmp_path, True), setup, "r8-b2-old.ps1")
+        _r8_require_discriminating(old, "2")                       # the pair discriminates BEFORE the production result is judged
+        assert _r8_pick(tmp_path, _r8_selector(tmp_path, False), setup, "r8-b2-new.ps1") == "2", (day, order)
 
 
 def test_r6_b2_an_unspecified_kind_datetime_is_utc_and_never_local(tmp_path):
-    """Zone-independent unit form: an Unspecified-kind [datetime] 16:00 is 16:00Z, so it is OLDER than 17:00Z in any host zone."""
-    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
-    harness = tmp_path / "r6-b2-unit.ps1"
-    harness.write_text(
-        "$ErrorActionPreference='Stop'\n" + sel_fn + "\n"
+    """Unit form: an Unspecified-kind [datetime] 16:00 is 16:00Z, so it is OLDER than 17:00Z in any host zone."""
+    setup = (
         "$u = [datetime]::SpecifyKind([datetime]'2026-10-31T16:00:00', [DateTimeKind]::Unspecified)\n"
         "$z = [datetime]::SpecifyKind([datetime]'2026-10-31T17:00:00', [DateTimeKind]::Utc)\n"
         "$rows = @([pscustomobject]@{ databaseId = 1; createdAt = $u; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' },"
-        " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n"
-        "(Select-MergeGroupJobsRun -Runs $rows -MasterSha '').Run.databaseId\n", encoding="utf-8")
-    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True,
-                         env=_r7_nonutc_env())
-    assert out.returncode == 0, out.stdout + out.stderr
-    assert out.stdout.strip() == "2", out.stdout
+        " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n")
+    old = _r8_pick(tmp_path, _r8_selector(tmp_path, True), setup, "r8-b2u-old.ps1")
+    _r8_require_discriminating(old, "2")
+    assert _r8_pick(tmp_path, _r8_selector(tmp_path, False), setup, "r8-b2u-new.ps1") == "2"
+
+
+@pytest.mark.parametrize("hours,discriminates", [(-5, True), (5, False), (0, False)], ids=["minus5", "plus5", "utc"])
+def test_r8_g4_only_a_negative_offset_separates_the_pre_b2_order_from_the_utc_order(tmp_path, hours, discriminates):
+    """Why the injected zone is -05:00: local 16:00 vs 17:00Z is only reordered by a zone WEST of UTC."""
+    setup = (
+        "$u = [datetime]::SpecifyKind([datetime]'2026-10-31T16:00:00', [DateTimeKind]::Unspecified)\n"
+        "$z = [datetime]::SpecifyKind([datetime]'2026-10-31T17:00:00', [DateTimeKind]::Utc)\n"
+        "$rows = @([pscustomobject]@{ databaseId = 1; createdAt = $u; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' },"
+        " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n")
+    old = _r8_pick(tmp_path, _r8_selector(tmp_path, True, hours), setup, "r8-g4-%d.ps1" % hours)
+    assert (old == "1") is discriminates, (hours, old)
 
 
 def test_r6_b2_the_production_read_expression_keeps_created_at_a_string_and_the_selector_orders_it_as_utc(tmp_path):
@@ -5811,18 +5854,17 @@ def test_r6_b2_the_production_read_expression_keeps_created_at_a_string_and_the_
     m = re.search(r"(?m)^\s*(\$runs = if \(\(Get-Command ConvertFrom-Json\)[^\n]*)$", text)
     assert m, "production read line not found"
     raw = json.dumps([_mgrs_row(1, "2026-10-31T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure")])
-    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
-    harness = tmp_path / "r6-b2-prod.ps1"
-    harness.write_text(
-        "$ErrorActionPreference='Stop'\n" + sel_fn + "\n$runsRaw = '" + raw.replace("'", "''") + "'\n" + m.group(1) + "\n"
-        "$kinds = @($runs | ForEach-Object { $_.createdAt.GetType().Name }) -join ','\n"
-        "$hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')\n"
-        "[pscustomobject]@{ kinds = $kinds; hasDateKind = $hasDateKind; id = (Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId } | ConvertTo-Json -Compress\n",
-        encoding="utf-8")
-    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True,
-                         env=_r7_nonutc_env())
-    assert out.returncode == 0, out.stdout + out.stderr
-    doc = json.loads(out.stdout.strip().splitlines()[-1])
+    raw_line = "$runsRaw = '" + raw.replace("'", "''") + "'\n"
+    # the pre-B2 pair: the plain read (no -DateKind: offset-free text becomes an Unspecified [datetime]) + the pre-B2 selector
+    old = _r8_pick(tmp_path, _r8_selector(tmp_path, True), raw_line + "$runs = @($runsRaw | ConvertFrom-Json)\n", "r8-b2p-old.ps1",
+                   tail="(Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId\n")
+    _r8_require_discriminating(old, "2")
+    out = _r8_pick(
+        tmp_path, _r8_selector(tmp_path, False), raw_line + m.group(1) + "\n", "r8-b2p-new.ps1",
+        tail="$kinds = @($runs | ForEach-Object { $_.createdAt.GetType().Name }) -join ','\n"
+             "$hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')\n"
+             "[pscustomobject]@{ kinds = $kinds; hasDateKind = $hasDateKind; id = (Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId } | ConvertTo-Json -Compress\n")
+    doc = json.loads(out)
     assert doc["id"] == 2, doc
     # r7 (Grok G5): the raw string survives the read only where -DateKind exists (pwsh 7.5+); production falls back to the
     # default conversion on older hosts, where the selector's SpecifyKind/UTC pin keeps the order right (id == 2 above).
@@ -5830,6 +5872,13 @@ def test_r6_b2_the_production_read_expression_keeps_created_at_a_string_and_the_
         assert doc["kinds"] == "String,String", doc
     else:
         assert doc["kinds"] == "DateTime,DateTime", doc
+
+
+def test_r8_g6_the_zone_injection_wrapper_substitutes_the_shipped_text():
+    """Pins the seam the B2 tests evaluate: exactly one ToUniversalTime call and one Unspecified branch in the shipped selector."""
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert body.count("$v.ToUniversalTime()") == 1 and len(R8_UNSPEC_BRANCH.findall(body)) == 1
 
 
 def test_r6_b2_the_production_read_keeps_created_at_as_the_raw_string_where_the_host_can_and_the_helper_pins_utc():
@@ -5919,7 +5968,137 @@ def test_r7_a1_the_retire_merge_gate_resolves_a_revision_expression_under_refs_b
 
 
 def test_r7_a1_every_site_keeps_the_exact_ref_read_for_a_plain_refname_and_resolves_anything_else_once_in_source():
-    for path, var in ((COORD / "assert-script-currency.ps1", "$Ref"), (RATIO_GUARD, "$SourceRef"), (RETIRE, "$MergeTarget")):
+    for path, var in ((COORD / "assert-script-currency.ps1", "$refBase"), (RATIO_GUARD, "$refBase"), (RETIRE, "$mergeBase")):
         text = path.read_text(encoding="utf-8")
         assert "show-ref --verify --hash " + var in text, path
+        assert "rev-parse --verify --quiet --end-of-options" in text, path
+
+
+# --- r8 (sol r7 on c40c2d32: ADV-A1 a revision expression under refs/ resolved its BASE NAME through git's dwim lookup) --
+# r7 sent `refs/remotes/fork/master~1` / `...^{commit}` WHOLE to `rev-parse`. With the exact ref absent and a tag
+# refs/tags/refs/remotes/fork/master present, dwim resolved the base through the tag. r8: split at the FIRST revision
+# operator (~ ^ @{ :); a full-refname base is read ONCE with `show-ref --verify --hash` (missing = the site's typed
+# refusal) and only `<sha><suffix>^{commit}` is resolved. The exact ref is P <- A <- B chain: ref = A, shadow tag = B.
+R8_EXPRS = ["refs/remotes/fork/master~1", "refs/remotes/fork/master^{commit}"]
+
+
+def _r8_repo(tmp_path, ref_present):
+    """P (x.ps1='p') <- A (x.ps1='a') <- B (x.ps1='b'). refs/remotes/fork/master = A (absent unless ref_present); shadow
+    tag refs/tags/refs/remotes/fork/master = B; refs/remotes/other/x = B. Returns (repo, P, A, B). Through the ref: ~1 = P,
+    ^{commit} = A. Through the shadow tag: ~1 = A, ^{commit} = B - every answer differs."""
+    repo = tmp_path / "r8repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name in ("p", "a", "b"):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", name.upper())
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    sha_p, sha_a, sha_b = shas
+    if ref_present:
+        git(repo, "update-ref", R6_REF, sha_a)
+    git(repo, "update-ref", R6_SHADOW_TAG, sha_b)
+    git(repo, "update-ref", "refs/remotes/other/x", sha_b)
+    return repo, sha_p, sha_a, sha_b
+
+
+def _r8_currency(tmp_path, repo, expr, disk, name):
+    script = repo / "x.ps1"
+    script.write_text(disk, encoding="utf-8")
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("try { $res = & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -Ref '" + expr + "' -PassThru } catch { }\n"
+            "if ($null -eq $res) { [pscustomobject]@{ status = 'threw-stale' } | ConvertTo-Json -Compress } else { @($res)[0] | ConvertTo-Json -Compress }\n"
+            "[pscustomobject]@{ r8fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    return _r8_merge_fired(_r6_run(tmp_path, repo, body, name, env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+
+
+def _r8_merge_fired(stdout):
+    """The harness prints the site's JSON, then {r8fired}; merge them so a test can assert the race really fired."""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    doc = json.loads(lines[-2])
+    doc["fired"] = json.loads(lines[-1])["r8fired"]
+    return doc
+
+
+def _r8_ratio(tmp_path, repo, expr, name):
+    body = ("& '" + str(RATIO_GUARD).replace("'", "''") + "' -RepoRoot '" + str(repo).replace("'", "''") + "' -SourceRef '" + expr + "' -AsOfEpoch 1893456000\n"
+            "[pscustomobject]@{ r8fired = $global:R6RaceFired } | ConvertTo-Json -Compress\nexit 0\n")
+    return _r8_merge_fired(_r6_run(tmp_path, repo, body, name))
+
+
+def _r8_retire(tmp_path, repo, wt_sha, expr, name):
+    wt = tmp_path / ("wt-" + name)
+    git(repo, "worktree", "add", "--detach", str(wt), wt_sha)
+    body = (". '" + str(RETIRE).replace("'", "''") + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + str(wt).replace("'", "''") + "' -MergeTarget '" + expr + "' -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason; fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    return _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1"))
+
+
+def test_r8_g7_the_fixture_really_resolves_the_missing_base_through_the_shadow_tag(tmp_path):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    for expr, want in ((R8_EXPRS[0], sha_a), (R8_EXPRS[1], sha_b)):
+        got = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "--end-of-options", expr + "^{commit}"],
+                             capture_output=True, text=True)
+        assert got.returncode == 0 and got.stdout.strip() == want, (expr, got.stdout, got.stderr)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS + ["refs/remotes/fork/master^{commit}^{commit}"])
+def test_r8_g7_the_currency_guard_refuses_an_absent_base_and_never_uses_the_shadow_tag(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    doc = _r8_currency(tmp_path, repo, expr, "'b'\n", "r8-cur-absent.ps1")      # disk == B: the shadow tag would read 'current'
+    assert doc["status"] == "unknown" and "does not exist" in doc["detail"], (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS + ["refs/remotes/fork/master^{commit}^{commit}"])
+def test_r8_g7_the_ratio_guard_refuses_an_absent_base_and_never_uses_the_shadow_tag(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    doc = _r8_ratio(tmp_path, repo, expr, "r8-ratio-absent.ps1")
+    assert doc["errorCode"] == "ERROR_REF_UNRESOLVED" and doc["sourceSha"] == "", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_retire_merge_gate_refuses_an_absent_base_and_never_uses_the_shadow_tag(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    doc = _r8_retire(tmp_path, repo, sha_a if expr.endswith("~1") else sha_b, expr, "r8-ret-absent")
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target ref missing"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_currency_guard_uses_the_captured_sha_when_the_base_vanishes_after_the_read(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=True)
+    # captured A: ~1 is P ('p'), ^{commit} is A ('a'). The shadow tag would give A ('a') and B ('b').
+    disk = "'p'\n" if expr.endswith("~1") else "'a'\n"
+    doc = _r8_currency(tmp_path, repo, expr, disk, "r8-cur-race.ps1")
+    assert doc["fired"] is True, (expr, doc)
+    assert doc["status"] == "current", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_ratio_guard_uses_the_captured_sha_when_the_base_vanishes_after_the_read(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=True)
+    doc = _r8_ratio(tmp_path, repo, expr, "r8-ratio-race.ps1")
+    assert doc["fired"] is True, (expr, doc)
+    assert doc["sourceSha"] == (sha_p if expr.endswith("~1") else sha_a), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_retire_merge_gate_uses_the_captured_sha_when_the_base_vanishes_after_the_read(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=True)
+    # captured A: ~1 = P, ^{commit} = A. A worktree at A is not an ancestor of P; one at B is not an ancestor of A.
+    # Through the shadow tag (~1 = A, ^{commit} = B) each would read as merged.
+    doc = _r8_retire(tmp_path, repo, sha_a if expr.endswith("~1") else sha_b, expr, "r8-ret-race")
+    assert doc["fired"] is True, (expr, doc)
+    assert doc["reason"].startswith("unmerged"), (expr, doc)
+
+
+def test_r8_g7_every_site_splits_at_the_first_revision_operator_and_reads_the_base_once_in_source():
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        text = path.read_text(encoding="utf-8")
+        assert "(?<base>.*?)(?<suffix>(?:[~^:]|@\\{).*)" in text, path
+        assert "show-ref --verify --hash $" in text, path
         assert "rev-parse --verify --quiet --end-of-options" in text, path

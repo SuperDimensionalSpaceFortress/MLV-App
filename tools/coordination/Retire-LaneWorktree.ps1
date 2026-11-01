@@ -1433,20 +1433,29 @@ function Invoke-RetireLaneWorktree {
         if ([int]$u.out[0] -gt 0) { $d.reason = "unpushed: $($u.out[0]) commit(s) on no remote"; return [pscustomobject]$d }
 
         $mergeRev = $MergeTarget
-        # r7 (sol r6 ADV-A1): only a full refname with NO revision operator is read as an exact ref; a revision expression
-        # (refs/remotes/fork/master~1, ...^{commit}) is resolved ONCE to a commit SHA and only that SHA is used afterwards.
-        $mergePlain = ($MergeTarget -match '^refs/[^~^:?*\[\\\s]+$' -and $MergeTarget -notmatch '\.\.|@\{|//|/$')
-        if ($MergeTarget -like 'refs/*' -and -not $mergePlain) {
-            $mergeSha = [string](& git.exe -C $main rev-parse --verify --quiet --end-of-options "$MergeTarget^{commit}" 2>$null | Select-Object -First 1)
-            if ($mergeSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
-            $mergeRev = $mergeSha
-        } elseif ($MergeTarget -like 'refs/*') {
-            # exact ref: merge-base takes a revision, and for a missing refs/ name git goes on to refs/tags/<name>.
-            # r6 (sol B1): read the SHA ONCE and test against that SHA, never the name again - a ref that vanishes between a
-            # check and a second lookup of the name would otherwise be judged through a shadow tag.
-            $mergeSha = [string](& git.exe -C $main show-ref --verify --hash $MergeTarget 2>$null | Select-Object -First 1)
-            if ($mergeSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
-            $mergeRev = $mergeSha
+        # r8 (sol r7 ADV-A1): split the target at the FIRST revision operator (~ ^ @{ :). A base that is a full refname is read
+        # ONCE with show-ref --verify --hash (absent = cannot-determine, even when a shadow tag of that name exists) and
+        # only that SHA is used afterwards: `<sha><suffix>^{commit}` is resolved once for an expression, the SHA itself is
+        # the merge-base operand for a plain refname (r6 B1: a ref that vanishes after the read can never be re-resolved
+        # through a shadow tag). A refs/ target whose base is not a full refname keeps the r7 behaviour (rev-parse, once).
+        $mergeSplit = [regex]::Match($MergeTarget, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
+        $mergeBase = if ($mergeSplit.Success) { $mergeSplit.Groups['base'].Value } else { $MergeTarget }
+        $mergeSuffix = if ($mergeSplit.Success) { $mergeSplit.Groups['suffix'].Value } else { '' }
+        $mergeBaseIsRef = ($mergeBase -match '^refs/[^?*\[\\\s]+$' -and $mergeBase -notmatch '\.\.|//|/$')
+        if ($MergeTarget -like 'refs/*') {
+            $mergeSpec = $MergeTarget
+            if ($mergeBaseIsRef) {
+                $baseSha = [string](& git.exe -C $main show-ref --verify --hash $mergeBase 2>$null | Select-Object -First 1)
+                if ($baseSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
+                $mergeSpec = "$baseSha$mergeSuffix"
+            }
+            if ($mergeSuffix -or -not $mergeBaseIsRef) {
+                $mergeSha = [string](& git.exe -C $main rev-parse --verify --quiet --end-of-options "$mergeSpec^{commit}" 2>$null | Select-Object -First 1)
+                if ($mergeSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
+                $mergeRev = $mergeSha
+            } else {
+                $mergeRev = $mergeSpec
+            }
         }
         & git.exe -C $main merge-base --is-ancestor $d.head $mergeRev 2>$null
         switch ($LASTEXITCODE) { 0 { } 1 { $d.reason = "unmerged: HEAD not an ancestor of $MergeTarget"; return [pscustomobject]$d } default { $d.reason = "cannot-determine: merge-base ($MergeTarget)"; return [pscustomobject]$d } }

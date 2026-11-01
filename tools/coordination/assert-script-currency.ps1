@@ -51,17 +51,20 @@ $rel = $full.Substring($root.Length).TrimStart([char]92, [char]47).Replace([stri
 if (-not $rel) { Write-Result 'unknown' 'could not derive a repo-relative path'; return }
 
 # Does the reference exist at all? No 'fork' remote (a fresh clone, a lane sandbox) is not drift.
-# r7 (sol r6 ADV-A1): resolve ONCE to a commit SHA and use only that SHA afterwards. A full refname with no revision
-# operator must exist EXACTLY (rev-parse would fall through to refs/tags/<name> for a missing ref), so it is read with
-# `show-ref --verify --hash` (r6 B1: a ref that vanishes after the check can never be re-resolved through a shadow tag).
-# Anything else - including a revision EXPRESSION under refs/ such as refs/remotes/fork/master~1 or
-# refs/remotes/fork/master^{commit} - is resolved once by `rev-parse`, exactly as it was accepted before r6.
-$isPlainFullRef = ($Ref -match '^refs/[^~^:?*\[\\\s]+$' -and $Ref -notmatch '\.\.|@\{|//|/$')
+# r8 (sol r7 ADV-A1): resolve ONCE to a commit SHA and use only that SHA afterwards. The input is split at the FIRST
+# revision operator (~ ^ @{ :). A base that is a full refname must exist EXACTLY - rev-parse would fall through to
+# refs/tags/<name> for a missing ref, and does so for the base of an expression too (refs/remotes/fork/master~1 with the
+# ref absent and a tag of that name present) - so the base is read with `show-ref --verify --hash` (r6 B1: a ref that
+# vanishes after the read can never be re-resolved through a shadow tag) and only `<sha><suffix>^{commit}` is resolved.
+# A base that is NOT a full refname keeps the r7 behaviour (the whole input goes to rev-parse once).
 $refSpec = $Ref
-if ($isPlainFullRef) {
-    $exactSha = [string](& git -C $root show-ref --verify --hash $Ref 2>$null | Select-Object -First 1)
+$refSplit = [regex]::Match($Ref, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
+$refBase = if ($refSplit.Success) { $refSplit.Groups['base'].Value } else { $Ref }
+$refSuffix = if ($refSplit.Success) { $refSplit.Groups['suffix'].Value } else { '' }
+if ($refBase -match '^refs/[^?*\[\\\s]+$' -and $refBase -notmatch '\.\.|//|/$') {
+    $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
     if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
-    $refSpec = $exactSha
+    $refSpec = "$exactSha$refSuffix"
 }
 $refCommit = [string](& git -C $root rev-parse --verify --quiet --end-of-options "$refSpec^{commit}" 2>$null | Select-Object -First 1)
 if ($refCommit -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not resolve"; return }
