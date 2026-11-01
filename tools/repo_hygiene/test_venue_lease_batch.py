@@ -53,6 +53,27 @@ MANIFEST = "b" * 64
 ARTIFACT_SHAS = {"packageZip": {"sha256": "a" * 64}, "exe": {"sha256": "b" * 64}, "dll": {"sha256": "c" * 64}}
 ABSENT = object()   # a staged build manifest field left out (stage(): dllPairManifestSha256=ABSENT)
 
+# r13 (PR #729, hosted shard 4/8 job 124969603389): the DOCUMENTED reserved device names, hard-coded from Microsoft's "Naming Files, Paths, and Namespaces" page
+# (https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file): CON, PRN, AUX, NUL, COM1-COM9, COM1-3 superscript, LPT1-LPT9, LPT1-3 superscript; "also avoid these names
+# followed immediately by an extension" (NUL.txt and NUL.tar.gz are NUL). COM0 and LPT0 are not on the list. This is the PRIMARY oracle for the helper's device rule: it does not
+# depend on the host. RtlIsDosDeviceName_U is host-dependent (Windows Server 2025 10.0.26100 returned 0 for every COM/LPT name inside `C:\x\.claude-state\<name>`, where
+# 10.0.19045 returns non-zero), so the native classifier is only a corroborating check, in its own test method.
+DOCUMENTED_DOS_DEVICE_STEMS = frozenset(["CON", "PRN", "AUX", "NUL"] + [f"{p}{d}" for p in ("COM", "LPT") for d in "123456789\u00b9\u00b2\u00b3"])
+
+
+def documented_dos_device(name: str) -> bool:
+    """True when the documented reserved set names this component: the stem before the first dot, with the spaces Win32 drops before an extension removed, compared case-insensitively."""
+    return name.split(".", 1)[0].rstrip(" ").upper() in DOCUMENTED_DOS_DEVICE_STEMS
+
+
+# the device-rule matrix: COM/LPT with every ASCII digit and the three superscripts, bare, with an extension and with spaces before it; the other documented names; lower case;
+# and near misses that are ordinary names (COM10, CONSOLE, NULL, COM1x, a superscript 0/4 and a fullwidth 1 are not on the documented list)
+DEVICE_MATRIX_NAMES = (
+    [f"{p}{d}{tail}" for p in ("COM", "LPT") for d in [str(n) for n in range(10)] + ["\u00b9", "\u00b2", "\u00b3"] for tail in ("", ".txt", " .txt")]
+    + ["CON", "PRN", "AUX", "NUL", "CON.txt", "NUL .txt", "NUL.tar.gz", "AUX  .log", "prn.x", "com1", "lpt\u00b2.log", "nul"]
+    + ["COM10", "LPT10", "CONSOLE", "NULL", "AUXX", "COM1x", "LPT9-a", "COM\u2070", "COM\u2074", "COM\uff11", "CON_", "XCOM1"]
+)
+
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
 param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
@@ -7484,16 +7505,20 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             self.assertEqual(str(got[name]).lower(), value.lower(), f"{name}: {got[name]}")
         for name in refused:
             self.assertIsNone(got[name], f"{name}: {str(got[name])[:200]}")
-        # the rule agrees with the native classifier over the whole COM/LPT digit range (0-9 and the superscripts), bare, with an extension and with spaces before it
-        is_dev = ctypes.windll.ntdll.RtlIsDosDeviceName_U
-        is_dev.argtypes, is_dev.restype = [ctypes.c_wchar_p], ctypes.c_uint32
-        names = [f"{p}{d}{tail}" for p in ("COM", "LPT") for d in [str(n) for n in range(10)] + ["\u00b9", "\u00b2", "\u00b3"] for tail in ("", ".txt", " .txt")]
-        native = {n: bool(is_dev(pre + n)) for n in names}
-        self.assertFalse(native["COM0"] or native["LPT0 .txt"], f"this host classifies COM0/LPT0 as devices: {native}")
-        self.assertTrue(native["COM1"] and native["LPT9"] and native["COM\u00b9"], f"this host does not classify COM1/LPT9/COM<sup1> as devices: {native}")
-        got_all = self.judge(["C:\\fake\\agent-share"], {n: pre + n + "\\r" for n in names})
-        mismatch = {n: (native[n], got_all[n]) for n in names if native[n] != (got_all[n] is None)}
-        self.assertEqual(mismatch, {}, "the helper's device rule and RtlIsDosDeviceName_U disagree (name: (native device, certificate))")
+        # r13: the rule is judged against the DOCUMENTED reserved set (host-independent; the native classifier corroborates in its own method below, so a host whose
+        # RtlIsDosDeviceName_U differs can no longer stop the caller sweep and the batch runs after this point). The oracle's own positive and negative controls first.
+        self.assertTrue(all(documented_dos_device(n) for n in ("COM1", "LPT9", "COM\u00b9", "LPT\u00b3 .log", "NUL", "CON.txt", "aux", "PRN.tar.gz")))
+        self.assertFalse(any(documented_dos_device(n) for n in ("COM0", "LPT0 .txt", "COM10", "CONSOLE", "COM\uff11", "COM\u2070")))
+        # keyed by position: PowerShell property names are case-insensitive, and the matrix holds `COM1` and `com1`
+        got_pos = self.judge(["C:\\fake\\agent-share"], {f"m{i:03d}": pre + n + "\\r" for i, n in enumerate(DEVICE_MATRIX_NAMES)})
+        got_all = {n: got_pos[f"m{i:03d}"] for i, n in enumerate(DEVICE_MATRIX_NAMES)}
+        mismatch = {n: (documented_dos_device(n), got_all[n]) for n in DEVICE_MATRIX_NAMES if documented_dos_device(n) != (got_all[n] is None)}
+        self.assertEqual(mismatch, {}, "the helper's device rule and the documented reserved set disagree (name: (documented device, certificate))")
+        self.assertGreaterEqual(sum(documented_dos_device(n) for n in DEVICE_MATRIX_NAMES), 80, "the matrix lost its reserved-name refusals")
+        self.assertGreaterEqual(sum(not documented_dos_device(n) for n in DEVICE_MATRIX_NAMES), 18, "the matrix lost its ordinary-name positives")
+        # CONIN$ and CONOUT$ are console device names the helper also refuses (stricter than the documented list), middle and terminal
+        got_con = self.judge(["C:\\fake\\agent-share"], {"conin-middle": pre + "CONIN$\\r", "conout-ext-terminal": pre + "conout$.txt"})
+        self.assertEqual(got_con, {"conin-middle": None, "conout-ext-terminal": None})
         # every admission site Sol swept goes through the one helper: the real guard statements of the leg (-ReceiptRoot, -SheetCopyDir), both pair scripts (-OutDir), the baseline
         # (-TrendFile / -RunDir) and the stage nightly (-ReceiptFile), each taken from its own script text
         guards = {
@@ -7529,6 +7554,30 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                 r = self.run_batch(None, "-ReceiptRoot", str(root))
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(self.case / 'scratch' / '.claude-state' / 'receipts')}"] * 2)
+
+    # ---- r13 (hosted shard 4/8 job 124969603389, CoS 6563973648): the native classifier CORROBORATES the documented set, in its own method so a host difference cannot hide the
+    # caller sweep. RtlIsDosDeviceName_U's answer depends on the input form and the OS build: 10.0.19045 classifies the reserved set in every form (bare, `.\`, `C:\x\`, the full
+    # .claude-state path); Windows Server 2025 10.0.26100 returned 0 for all 78 COM/LPT spellings in the full-path form. The corroboration is fed the BARE final component (the form a
+    # path component is reserved in on every documented build); the other forms are recorded as host facts on every run.
+    def test_r13_native_classifier_corroborates_the_documented_device_set_on_the_bare_component(self) -> None:
+        is_dev = ctypes.windll.ntdll.RtlIsDosDeviceName_U
+        is_dev.argtypes, is_dev.restype = [ctypes.c_wchar_p], ctypes.c_uint32
+        forms = {"bare": "{n}", "dot-relative": ".\\{n}", "drive-dir": "C:\\x\\{n}", "full-claude-state": "C:\\x\\.claude-state\\{n}"}
+        native = {f: {n: bool(is_dev(pat.format(n=n))) for n in DEVICE_MATRIX_NAMES} for f, pat in forms.items()}
+        v = sys.getwindowsversion()
+        host = f"os={v.major}.{v.minor}.{v.build} platform={sys.platform}"
+        fact = host + " | " + " | ".join(f"{f}: {sum(m.values())} devices [{' '.join(sorted(n for n, d in m.items() if d))}]" for f, m in native.items())
+        print(f"\nNATIVE-DOS-DEVICE-HOST-FACT {fact}".encode("ascii", "backslashreplace").decode(), file=sys.stderr)
+        positives = ("COM1", "LPT9", "COM\u00b9", "NUL", "CON.txt")
+        self.assertTrue(all(native["bare"][n] for n in positives),
+                        f"HOST-FACT-NATIVE-CLASSIFIER-BLIND-ON-BARE-NAMES: RtlIsDosDeviceName_U does not classify the documented positive controls {positives} even as a bare name on {fact}")
+        mismatch = {n: native["bare"][n] for n in DEVICE_MATRIX_NAMES if native["bare"][n] != documented_dos_device(n)}
+        self.assertEqual(mismatch, {}, f"the documented reserved set and RtlIsDosDeviceName_U on the bare name disagree (name: native device) on {host}")
+        # any other form that classifies the positive controls must agree with the documented set too (on 10.0.19045 every form does)
+        for f, m in native.items():
+            if f != "bare" and all(m[n] for n in positives):
+                with self.subTest(form=f):
+                    self.assertEqual({n: d for n, d in m.items() if d != documented_dos_device(n)}, {}, f"{f} on {host}")
 
     def test_r8_a3_a_link_chain_is_bounded_per_link_sixteen_pass_seventeen_are_refused(self) -> None:
         # opus/sol A3 (ADV-A3): ResolveLinkTarget($true) collapsed a whole chain inside one outer hop, so the stated 16-link bound was never enforced. Real junctions: j00 -> j01 -> ... -> j16 -> final (17 links).
