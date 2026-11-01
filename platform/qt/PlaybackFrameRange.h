@@ -446,6 +446,11 @@ constexpr int64_t kPaceRecentWindowMs = 3000;
 // playing): stalls that keep coming are a slow engine, not a recovered one, and are left to the r11 estimates (which
 // refuse them at the probe). Holds and poll gaps are kept as millisecond histograms up to kPaceHoldBucketMs; a longer
 // hold is always a stall.
+// r13 (sol r12 B2): the share charges only the time a stall hold was really held -- the hold less one ordinary step
+// at the observed playing pace and less one poll gap (its two ends are each seen up to a poll late) -- never the whole
+// hold, so six 400 ms stalls charge at most 2400 ms, not the 2650 ms of their holds. The playing time is the closed
+// playing holds only: the hold still open has no step yet (r13 sol r12 B1: counting it measured 23.87 fps for 24).
+// r13 (sol r12 B1) error band: see PlayPaceHistory::optimisticFinishMs.
 constexpr int64_t kPaceStallPollGaps = 2;
 constexpr int64_t kPaceMinPlayingSteps = 24;
 constexpr int kPaceHoldBucketMs = 1000;
@@ -478,13 +483,16 @@ struct PlayPaceHistory
     int64_t pollGaps = 0;
     int64_t overflowHolds = 0;
     int64_t overflowHoldMs = 0;
+    int64_t overflowHoldSteps = 0;
 
     struct PlayingSplit
     {
         int64_t thresholdMs = 0;    // a hold longer than this is a stall; 0 = no threshold yet
-        int64_t playingMs = 0;
-        int64_t playingSteps = 0;
-        int64_t stallMs = 0;
+        int64_t playingMs = 0;      // the closed holds no longer than the threshold (r13: not the open hold)
+        int64_t playingSteps = 0;   // the steps that ended them
+        int64_t stallMs = 0;        // r13: time really held in the stall holds (closed, and the open one once long)
+        int64_t stallHolds = 0;     // r13: closed stall holds; the playing time is in at most stallHolds + 1 stretches
+        int64_t pollGapMs = 0;      // r13: the median poll gap, the quantum each stretch end can be seen late by
     };
 
     // The smallest d whose cumulative count reaches half of total; -1 when the median is past the last bucket or empty.
@@ -500,8 +508,10 @@ struct PlayPaceHistory
         return -1;
     }
 
-    // The split of the time since the first forward step into playing and stall time, as of elapsedMs. The hold still
-    // open at elapsedMs counts too: as playing time while it is short (never a faster pace), as stall time once long.
+    // The split of the time since the first forward step into playing and stall time, as of elapsedMs. Playing time is
+    // the closed holds no longer than the threshold. Stall time (r13, sol r12 B2) is what the stall holds were really
+    // held: each closed one less one ordinary step at the observed playing pace and less one poll gap, the hold still
+    // open at elapsedMs (once longer than the threshold) less one ordinary step. A short open hold is in neither.
     PlayingSplit playingSplit( int64_t elapsedMs ) const
     {
         PlayingSplit split;
@@ -510,19 +520,30 @@ struct PlayPaceHistory
         const int64_t medianGap = histogramMedian( pollGapCount, pollGaps );
         if( medianHold < 0 || medianGap < 0 ) return split;
         split.thresholdMs = medianHold + kPaceStallPollGaps * medianGap;
+        split.pollGapMs = medianGap;
+        int64_t stallHoldMs = 0;
         for( int64_t d = 0; d <= kPaceHoldBucketMs; ++d )
         {
-            if( d > split.thresholdMs ) split.stallMs += d * holdCount[static_cast<size_t>( d )];
+            if( d > split.thresholdMs )
+            {
+                stallHoldMs += d * holdCount[static_cast<size_t>( d )];
+                split.stallHolds += holdCount[static_cast<size_t>( d )];
+            }
             else
             {
                 split.playingMs += d * holdCount[static_cast<size_t>( d )];
                 split.playingSteps += holdSteps[static_cast<size_t>( d )];
             }
         }
-        split.stallMs += overflowHoldMs;
+        stallHoldMs += overflowHoldMs;
+        split.stallHolds += overflowHolds;
+        // one ordinary step at the observed playing pace (none observed yet: the whole hold is charged)
+        const double stepMs = split.playingSteps > 0
+                            ? static_cast<double>( split.playingMs ) / static_cast<double>( split.playingSteps ) : 0.0;
+        const double ordinary = static_cast<double>( split.stallHolds ) * ( stepMs + static_cast<double>( medianGap ) );
+        split.stallMs = std::max<int64_t>( 0, stallHoldMs - static_cast<int64_t>( ordinary ) );
         const int64_t open = elapsedMs - holdStartMs;
-        if( open > split.thresholdMs ) split.stallMs += open;
-        else split.playingMs += open;
+        if( open > split.thresholdMs ) split.stallMs += std::max<int64_t>( 0, open - static_cast<int64_t>( stepMs ) );
         return split;
     }
 
@@ -556,6 +577,7 @@ struct PlayPaceHistory
             {
                 overflowHolds++;
                 overflowHoldMs += hold;
+                overflowHoldSteps += consumed - previousConsumed;
             }
             else
             {
@@ -587,14 +609,44 @@ struct PlayPaceHistory
         }
     }
 
-    // r12: steps per ms while playing (see kPaceStallPollGaps); 0 = not trusted yet. (A split with no threshold yet has
-    // no playing steps, so the step minimum refuses it.)
+    // r12: whether a split's playing pace is trusted: kPaceRecentWindowMs of playing time, kPaceMinPlayingSteps steps,
+    // and stall time at most a third of the measured time (2 x stall <= playing). (A split with no threshold yet has no
+    // playing steps, so the step minimum refuses it.)
+    static bool playingSplitTrusted( const PlayingSplit &s )
+    {
+        return s.playingSteps >= kPaceMinPlayingSteps && s.playingMs >= kPaceRecentWindowMs
+            && 2 * s.stallMs <= s.playingMs;
+    }
+
+    // r12: steps per ms while playing (see kPaceStallPollGaps); 0 = not trusted yet.
     double playingPace( int64_t elapsedMs ) const
     {
         const PlayingSplit s = playingSplit( elapsedMs );
-        if( s.playingSteps < kPaceMinPlayingSteps || s.playingMs < kPaceRecentWindowMs
-            || 2 * s.stallMs > s.playingMs ) return 0.0;
+        if( !playingSplitTrusted( s ) ) return 0.0;
         return static_cast<double>( s.playingSteps ) / static_cast<double>( s.playingMs );
+    }
+
+    // r13 (sol r12 B1): the EARLIEST time the run can reach `required` at the trusted playing pace, given what the count
+    // can show; -1 = no trusted playing pace. THE BOUND: each stretch of playing holds is measured first sighting to
+    // first sighting, and a step is first seen less than one poll gap after it happens, so a stretch's true length is
+    // more than its measured length less one median poll gap g. With stallHolds + 1 stretches the playing steps took
+    // more than playingMs - (stallHolds + 1) x g, so the step is at least
+    //   stepMin = (playingMs - (stallHolds + 1) x g) / playingSteps.
+    // The last step happened after holdStartMs - g, and none has happened by elapsedMs, so the remaining steps end no
+    // earlier than max(holdStartMs - g + remaining x stepMin, elapsedMs + (remaining - 1) x stepMin). The run is refused
+    // only when even that is past the budget. The band is poll quantization only: a steady 22 fps engine at 8 s (175
+    // steps over 7950 ms) is 22.04 fps at its optimistic end at a 10 ms poll and 22.15 fps at 50 ms, still refused.
+    double optimisticFinishMs( int64_t consumed, int64_t required, int64_t elapsedMs ) const
+    {
+        const PlayingSplit s = playingSplit( elapsedMs );
+        if( !playingSplitTrusted( s ) ) return -1.0;
+        const double shortest = static_cast<double>( s.playingMs )
+                              - static_cast<double>( s.stallHolds + 1 ) * static_cast<double>( s.pollGapMs );
+        if( shortest <= 0.0 ) return -1.0;
+        const double stepMin = shortest / static_cast<double>( s.playingSteps );
+        const double remaining = static_cast<double>( std::max<int64_t>( 0, required - consumed ) );
+        return std::max( static_cast<double>( holdStartMs - s.pollGapMs ) + remaining * stepMin,
+                         static_cast<double>( elapsedMs ) + std::max( 0.0, remaining - 1.0 ) * stepMin );
     }
 
     // Steps per ms: the best of the pace since the first forward step, the best window and (r12) the playing pace.
@@ -617,17 +669,21 @@ struct PlayPaceHistory
 // r11 (ADV-A1b): the projection is the elapsed wall clock -- every stall so far paid ONCE -- plus the REMAINING steps at
 // the best of: the pace since the Play trigger (master's measure), since the first forward step, and over any
 // kPaceRecentWindowMs-or-longer stretch (PlayPaceHistory), and (r12) the playing pace with recovered stalls left out
-// (kPaceStallHoldMs). With no history it is master's elapsed x stepsNeeded / stepsDone
-// exactly, and it is never stricter than that. A pace that cannot finish even so is still refused; a run it lets go on
-// ends at the requirement or at the typed PLAY_SAFETY_TIMEOUT, never a hang.
+// (the adaptive stall threshold, kPaceStallPollGaps). r13 (sol r12 B1): and only when the optimistic end of the playing
+// pace's poll-quantization band (PlayPaceHistory::optimisticFinishMs) misses the budget too. With no history it is
+// master's elapsed x stepsNeeded / stepsDone exactly, and it is never stricter than that. A pace that cannot finish
+// even so is still refused; a run it lets go on ends at the requirement or at the typed PLAY_SAFETY_TIMEOUT, never a
+// hang.
 inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs,
                                         const PlayPaceHistory &history )
 {
     if( required <= 1 || consumed < 2 || elapsedMs < kPaceProbeMs || consumed >= required ) return false;
     const double sinceTriggerStepsPerMs = static_cast<double>( consumed - 1 ) / static_cast<double>( elapsedMs );
     const double stepsPerMs = std::max( sinceTriggerStepsPerMs, history.bestPace( consumed, elapsedMs ) );
-    const double projectedMs = static_cast<double>( elapsedMs )
-                             + static_cast<double>( required - consumed ) / stepsPerMs;
+    double projectedMs = static_cast<double>( elapsedMs )
+                       + static_cast<double>( required - consumed ) / stepsPerMs;
+    const double optimisticMs = history.optimisticFinishMs( consumed, required, elapsedMs );
+    if( optimisticMs >= 0.0 ) projectedMs = std::min( projectedMs, optimisticMs );
     return projectedMs > static_cast<double>( safetyMs );
 }
 inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs )

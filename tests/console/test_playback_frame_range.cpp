@@ -1588,7 +1588,9 @@ TEST( PlayPaceRecovery, R12ThePlayingPaceStartsOverWithTheHistoryAndNeedsEnoughP
     for( int64_t t = 0; t <= 8000; t += 10 ) h.note( stalledCount( t, 1000, 24, dot ), t );
     ASSERT_TRUE( h.playingPace( 8000 ) * 1000.0 >= 23.9 );
     const PlayPaceHistory::PlayingSplit split = h.playingSplit( 8000 );
-    ASSERT_TRUE( split.stallMs >= 1000 && split.stallMs <= 1200 );   // the two holds of ~550 ms each
+    // the two holds of ~550 ms each; r13 (sol r12 B2) charges only the 2 x 500 ms really held, less at most one poll gap
+    // and one step period per stall (it was the whole 1100 ms of holds before r13)
+    ASSERT_TRUE( split.stallMs >= 1000 - 2 * ( 10 + 42 ) && split.stallMs <= 1000 );
     ASSERT_TRUE( split.thresholdMs >= 50 && split.thresholdMs <= 80 );  // median hold 40 ms + 2 x 10 ms polls
     h.note( 1, 8010 );                                                  // a new Play re-armed the counter
     ASSERT_EQ( int64_t( 0 ), h.holds );
@@ -1649,6 +1651,142 @@ TEST( PlayPaceRecovery, R12TheProjectionWithStallsIsNeverStricterThanMasters )
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r13 (sol r12 CHANGES_REQUESTED on d5f0a5e1, PR comment 6554246648; catalogue C-PACE-RECOVERY-01, M-04): two more
+// feasible recovered conformed runs were refused PLAY_PACE_TOO_SLOW. required 1499, safety 65000, 24 fps, Gated.
+// B1 (pace-estimate quantization): first present 1 s, held [1800,2575) and [4800,5575). d5f0a5e1 projected 65305.2 ms
+//   at 8 s from 127 steps over 5320 ms (the open hold's 30 ms counted with no step); the run reaches 1499 at 64970 ms
+//   (10 ms poll) and at 65000 ms (50 ms poll, where Reached wins over the timeout).
+// B2 (stall-share overcharge): first present 10 ms, six 400 ms stalls at 1, 2, ... 6 s. d5f0a5e1 charged the six whole
+//   holds (2650 ms, each a frame period plus the poll quantum more than the 2400 ms really held), crossed the one-third
+//   share cap and fell back to an 84030 ms projection; the run reaches 1499 at 64830 ms.
+// ---------------------------------------------------------------------------------------------------------
+TEST( PlayPaceRecovery, R13SolB1QuantizationOfThePaceEstimateDoesNotRefuseAFeasibleRun )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> b1 = stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } );
+    // sol's c(t) = 1 + floor(24 x max(0, t - 1000 - min(775, max(0, t - 1800)) - min(775, max(0, t - 4800))) / 1000)
+    ASSERT_EQ( int64_t( 131 ), stalledCount( 8000, 1000, 24, b1 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64966, 1000, 24, b1 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64967, 1000, 24, b1 ) );
+    // every poll to completion, at the smoke's 10 ms and the autoplay's 50 ms: never refused, never timed out
+    const PolledRun at10 = pollStalledCount( 1000, 24, b1, 1499, budget, 10 );
+    ASSERT_EQ( int64_t( 131 ), at10.consumedAt8s );
+    ASSERT_TRUE( at10.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64970 ), at10.elapsedMs );
+    const PolledRun at50 = pollStalledCount( 1000, 24, b1, 1499, budget, 50 );
+    ASSERT_TRUE( at50.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 65000 ), at50.elapsedMs );   // the poll that sees 1499 is the budget's own: Reached wins
+    // and through the drop-frame engine model
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const EngineRun engine = runStalledEngine( 1000, 24.0, 1499, budget, poll, b1 );
+        ASSERT_TRUE( engine.state == PlayStopState::Reached );
+        ASSERT_TRUE( engine.elapsedMs <= budget );
+    }
+}
+
+TEST( PlayPaceRecovery, R13SolB2WholeHoldsAreNotChargedAsStallTime )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> b2 = stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                                              Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } );
+    ASSERT_EQ( int64_t( 135 ), stalledCount( 8000, 10, 24, b2 ) );
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 10, 24, b2, 1499, budget, poll );
+        ASSERT_EQ( int64_t( 135 ), run.consumedAt8s );
+        ASSERT_TRUE( run.state == PlayStopState::Reached );
+        ASSERT_TRUE( run.elapsedMs >= 64826 && run.elapsedMs <= budget );
+        const EngineRun engine = runStalledEngine( 10, 24.0, 1499, budget, poll, b2 );
+        ASSERT_TRUE( engine.state == PlayStopState::Reached );
+        ASSERT_TRUE( engine.elapsedMs <= budget );
+    }
+    // the share charged at 8 s is the time really held (2400 ms), never the whole holds: inside one third
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 8000; t += 10 ) h.note( stalledCount( t, 10, 24, b2 ), t );
+    const PlayPaceHistory::PlayingSplit split = h.playingSplit( 8000 );
+    ASSERT_TRUE( split.stallMs <= 2400 );
+    ASSERT_TRUE( split.stallMs >= 2400 - 6 * 10 - 6 * 42 );   // at most one poll gap and one step period per stall less
+    ASSERT_TRUE( 2 * split.stallMs <= split.playingMs );
+    ASSERT_TRUE( h.playingPace( 8000 ) * 1000.0 >= 23.9 );
+}
+
+TEST( PlayPaceRecovery, R13SlowEnginesAreStillRefusedWithTheB1AndB2StallsToo )
+{
+    // negative controls for the r13 band: 20 and 22 fps (74.9 s / 68.1 s) are refused at the probe, steady or with
+    // either of sol's stall sets, at both polls -- the band only absorbs the poll quantum, never a slower engine
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<std::vector<Stall>> sets = {
+        std::vector<Stall>(),
+        stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } ),
+        stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                    Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } ),
+    };
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : sets )
+        {
+            for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+            {
+                const PolledRun run = pollStalledCount( 0, fps, stalls, 1499, budget, poll );
+                ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+                ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+                ASSERT_TRUE( runStalledEngine( 0, static_cast<double>( fps ), 1499, budget, poll, stalls ).state
+                             == PlayStopState::PaceTooSlow );
+            }
+        }
+    }
+    // THE BOUND holds along both of sol's traces and Dot's: at every poll from the probe on, the optimistic finish is
+    // never later than the step that really reaches the requirement (64967 / 64826 / 64417 ms in the count's formula)
+    const std::vector<std::pair<int64_t, std::vector<Stall>>> traces = {
+        { int64_t( 1000 ), stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } ) },
+        { int64_t( 10 ), sets[2] },
+        { int64_t( 1000 ), stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } ) },
+    };
+    for( const auto &trace : traces )
+    {
+        int64_t reachMs = 0;
+        while( stalledCount( reachMs, trace.first, 24, trace.second ) < 1499 ) ++reachMs;
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+        {
+            PlayPaceHistory h;
+            for( int64_t t = 0; t < reachMs; t += poll )
+            {
+                const int64_t c = stalledCount( t, trace.first, 24, trace.second );
+                h.note( c, t );
+                if( t >= playback_frame_range::kPaceProbeMs )
+                    ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= static_cast<double>( reachMs ) );
+            }
+        }
+    }
+    // the trust bounds the band leaves alone (sol r12 INV-6 rows): too little playing time, too few steps, a genuine
+    // share-cap crossing -- each refuses the playing pace, so no optimistic finish is offered either
+    using Split = PlayPaceHistory::PlayingSplit;
+    const auto split = []( int64_t playingMs, int64_t steps, int64_t stallMs )
+    {
+        Split s;
+        s.thresholdMs = 60;
+        s.playingMs = playingMs;
+        s.playingSteps = steps;
+        s.stallMs = stallMs;
+        s.pollGapMs = 10;
+        return s;
+    };
+    ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 2900, 69, 0 ) ) );
+    ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 4000, 23, 0 ) ) );
+    ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 4000, 96, 2100 ) ) );
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( split( 4000, 96, 2000 ) ) );
+    ASSERT_TRUE( PlayPaceHistory().optimisticFinishMs( 170, 1499, 8000 ) < 0.0 );   // no history: no band
+    // 23 fps steady (1498 / 23 = 65.1 s) cannot finish either; it is refused before the budget, typed
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 0, 23, std::vector<Stall>(), 1499, budget, poll );
+        ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( run.elapsedMs < budget );
     }
 }
 
