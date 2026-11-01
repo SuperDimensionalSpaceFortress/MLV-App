@@ -4193,17 +4193,22 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r9_dualiso_a_scalar_leg_spec_whose_legtype_is_not_one_enumerated_string_is_refused_before_the_claim(self) -> None:
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r9 (adversary r8 cc8061a2 A1): legType ["look","speed"] with no look stringified to 'look speed', passed the shared
         # shape predicate, opened the lease, and the leg then indexed the absent look (LEG_FAILED, no receipt). Every non-enum legType is refused before any claim.
+        # fix 1 (adversary r9 a0936637 A2): and a look leg whose look.contactSheetFrames is outside the generator's 1..60, or not a whole number
         base = {k: v for k, v in json.loads(self._valid_leg_spec_text()).items() if k != "look"}
-        for case, value in (("array", ["look", "speed"]), ("object", {"type": "look"}), ("number", 1), ("null", None), ("empty", ""), ("case", "LOOK")):
+        cases = [(case, {**base, "legType": value}, "legType must be one of")
+                 for case, value in (("array", ["look", "speed"]), ("object", {"type": "look"}), ("number", 1), ("null", None), ("empty", ""), ("case", "LOOK"))]
+        cases += [(f"count-{n}", {**base, "legType": "look", "look": {"contactSheetFrames": n, "lookFlavor": "classic"}}, "look.contactSheetFrames must be a whole number")
+                  for n in (61, 0, 1.4)]
+        for case, doc, needle in cases:
             with self.subTest(case=case):
                 for p in (self.events, self.claim_path):
                     p.unlink(missing_ok=True)
                 spec = self.case / f"legtype-{case}.json"
-                spec.write_text(json.dumps({**base, "legType": value}), encoding="utf-8")
+                spec.write_text(json.dumps(doc), encoding="utf-8")
                 r = self.run_batch([spec])
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
-                self.assertIn("legType must be one of", r.stderr)
+                self.assertIn(needle, r.stderr)
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
 

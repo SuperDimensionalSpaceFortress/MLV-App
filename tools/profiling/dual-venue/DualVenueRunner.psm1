@@ -1962,6 +1962,16 @@ function Get-DvLegSpecShapeRefusal {
     # "Cannot index into a null array" after the batch had opened its lease).
     if ($isLookLeg -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }
     $look = Get-DvProp $Spec 'look'
+    # r9 fix 1 (adversary r9 a0936637 A2): a look leg's look.contactSheetFrames is a whole number from 1 to 60 -- the schema's range and the generator's
+    # ValidateRange(1,60) -- refused here, before a lease opens. 61 (with a 61-frame list) and 0 (with []) passed this predicate and the generator refused
+    # them after the lease; 1.4 was generated as [int] 1 and then refused as no whole number after collection; 6.0 likewise. (A JSON number with a
+    # fraction parses to a double, never an int or long.)
+    if ($isLookLeg -and $null -ne $look) {
+        $countValue = Get-DvProp $look 'contactSheetFrames'
+        if (-not (($countValue -is [int] -or $countValue -is [long]) -and $countValue -ge 1 -and $countValue -le 60)) {
+            return "look.contactSheetFrames must be a whole number from 1 to 60 (it is $(if ($null -eq $look.PSObject.Properties['contactSheetFrames']) { 'absent' } else { ConvertTo-Json -InputObject $countValue -Compress -Depth 3 }))"
+        }
+    }
     if (-not $isLookLeg -or $null -eq $look -or $null -eq $look.PSObject.Properties['pairedSeekFrames']) { return $null }
     $listed = $look.pairedSeekFrames
     $items = @($listed)
@@ -2706,10 +2716,19 @@ function Test-DvReceiptValid {
     }
     $specLook = Get-DvProp $contractSpec 'look'
     $specFrames = Get-DvProp $specLook 'pairedSeekFrames'
+    # r9 fix 1 (adversary r9 a0936637 A1): the spec asks for paired stills exactly when the RUNNER asks the generator for them (Invoke-VenueLeg: a look leg,
+    # look.pairedSeek Boolean true). This used `-eq $true`, which a speed leg carrying look.pairedSeek true and a look leg whose pairedSeek is the string
+    # "true" both satisfy; the runner asks neither, so an otherwise good run ended INVALID (RECEIPT_FIELD_ABSENT). A paired block on a receipt whose spec
+    # asks for none is no runner's record either.
+    $specLegType = Get-DvProp $contractSpec 'legType'
+    $specPairedSeek = Get-DvProp $specLook 'pairedSeek'
+    $specAsksPaired = ($specLegType -is [string] -and $specLegType -ceq 'look' -and $specPairedSeek -is [bool] -and $specPairedSeek)
     if ($null -eq $pairedSeek) {
-        if ((Get-DvProp $specLook 'pairedSeek') -eq $true) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the committed leg spec asks for look.pairedSeek but the receipt carries no look.pairedSeek block') }
+        if ($specAsksPaired) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the committed leg spec asks for look.pairedSeek but the receipt carries no look.pairedSeek block') }
     } elseif ($null -eq $specLook) {
         $invalid.Add("PAIRED_SEEK_NOT_FROM_EVIDENCE: the receipt carries a look.pairedSeek block but no committed leg spec look names the paired stills it must hold$(if ($offlineSpecRefused) { " ($offlineSpecRefused)" })")
+    } elseif (-not $specAsksPaired) {
+        $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: the receipt carries a look.pairedSeek block but the committed leg spec asks for no paired stills (a look leg with look.pairedSeek true)')
     } elseif (-not [string]::IsNullOrWhiteSpace($ev.dir) -and (Test-Path -LiteralPath $ev.dir -PathType Container)) {
         $seekDir = Join-Path $ev.dir 'paired-seek\contact-sheet\raw'
         $listedSeek = Get-DvProp $pairedSeek 'files'   # (assigned, then @()-wrapped: see Read-DvContactFrames)

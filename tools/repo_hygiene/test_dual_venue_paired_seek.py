@@ -1042,6 +1042,71 @@ class LegTypeShapeLegTests(RunnerHarness, unittest.TestCase):
                 self.assertEqual(self.generator_calls(), [], "nothing is generated")
 
 
+@requires_pwsh
+class ContactSheetCountShapePreflightTests(unittest.TestCase):
+    """r9 fix 1 (adversary r9 a0936637 A2): a look leg's look.contactSheetFrames is a whole number from 1 to 60 (the schema's range and the generator's
+    ValidateRange(1,60)); a JSON number with a fraction -- 1.4, and 6.0 too, which the paired verdict refuses as no whole number -- is refused. On a0936637
+    the predicate returned null for 61 (with a 61-frame list), 0 (with []) and 1.4 (with [50]), so the batch opened a lease the generator then refused, or
+    a 1.4 sheet was generated with one frame and refused only after collection."""
+
+    def test_r9_fix1_a2_a_count_outside_1_to_60_or_not_whole_is_refused_by_the_preflight(self) -> None:
+        base = json.loads(SHIPPED_LISTLESS_SPEC.read_text(encoding="utf-8"))
+        look = base["look"]
+        cases = {
+            "c61-list": (dict(base, look=dict(look, contactSheetFrames=61, pairedSeekFrames=list(range(61)))), "contactSheetFrames"),
+            "c61": (dict(base, look=dict(look, contactSheetFrames=61)), "contactSheetFrames"),
+            "c0-empty": (dict(base, look=dict(look, contactSheetFrames=0, pairedSeekFrames=[])), "contactSheetFrames"),
+            "c1.4": (dict(base, look=dict(look, contactSheetFrames=1.4, pairedSeekFrames=[50])), "contactSheetFrames"),
+            "c6.0": (dict(base, look=dict(look, contactSheetFrames=6.0)), "contactSheetFrames"),
+            "c-string": (dict(base, look=dict(look, contactSheetFrames="6")), "contactSheetFrames"),
+            "c-absent": (dict(base, look={k: v for k, v in look.items() if k != "contactSheetFrames"}), "contactSheetFrames"),
+            "ok-6": (base, ""),
+            "ok-60": (dict(base, look=dict(look, contactSheetFrames=60)), ""),
+            "ok-1-list": (dict(base, look=dict(look, contactSheetFrames=1, pairedSeekFrames=[50])), ""),
+        }
+        rows = run_preflight_probe(self, cases)
+        for name, (_, needle) in cases.items():
+            with self.subTest(case=name):
+                code, message = rows[name]
+                if needle:
+                    self.assertEqual(code, "LEG_SPEC_INVALID", message)
+                    self.assertIn("look.contactSheetFrames must be a whole number from 1 to 60", message)
+                else:
+                    self.assertEqual(code, "", message)
+
+
+@requires_windows_pwsh
+class PairedSeekRequirementParityTests(PairedStillsHarness, unittest.TestCase):
+    """r9 fix 1 (adversary r9 a0936637 A1): the receipt writer requires a look.pairedSeek block exactly when the runner asks for paired stills -- a LOOK leg
+    whose look.pairedSeek is Boolean true. On a0936637 it required one whenever look.pairedSeek -eq $true, which a speed leg carrying look.pairedSeek true
+    and a look leg whose pairedSeek is the STRING "true" both satisfy; the runner asks neither for stills, so an otherwise good run ended INVALID
+    (RECEIPT_FIELD_ABSENT). Each case must end exactly as its control (the same spec without pairedSeek)."""
+
+    def outcome(self, spec: dict, leg_id: str):
+        self.fresh()
+        self.write_artifacts(sheet=True, raw_frames=True)
+        path = self.tmp / f"parity-{leg_id}.json"
+        path.write_text(json.dumps(dict(spec, legId=leg_id)), encoding="utf-8")
+        proc, receipt, _ = self.run_leg("ultra-magnus", path, extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def test_r9_fix1_a1_a_spec_the_runner_asks_no_paired_stills_of_needs_no_paired_block(self) -> None:
+        look_spec = json.loads(self.write_spec(leg_type="look", leg_id="parity-base").read_text(encoding="utf-8"))
+        speed_spec = json.loads(self.write_spec(leg_type="speed", leg_id="parity-base-speed").read_text(encoding="utf-8"))
+        speed_spec.update(visualCapture=False, visualCaptureOptOutReason="paired-block parity fixture")
+        for case, spec, control in (
+                ("look-string-true", dict(look_spec, look=dict(look_spec["look"], pairedSeek="true")), look_spec),
+                ("speed-bool-true", dict(speed_spec, look={"contactSheetFrames": 2, "lookFlavor": "classic", "pairedSeek": True}),
+                 dict(speed_spec, look={"contactSheetFrames": 2, "lookFlavor": "classic"}))):
+            with self.subTest(case=case):
+                expected = self.outcome(control, f"{case}-control")
+                receipt = self.outcome(spec, case)
+                self.assertNotIn("RECEIPT_FIELD_ABSENT", receipt["outcomeDetail"])
+                self.assertEqual(receipt["outcome"], expected["outcome"], receipt["outcomeDetail"])
+                self.assertIsNone(receipt["look"]["pairedSeek"] if isinstance(receipt.get("look"), dict) else None)
+
+
 IN_PASS_RAW = ("artifacts", "contact-sheet", "raw")
 
 
