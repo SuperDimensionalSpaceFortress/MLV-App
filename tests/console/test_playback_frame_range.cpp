@@ -1773,7 +1773,6 @@ TEST( PlayPaceRecovery, R13SlowEnginesAreStillRefusedWithTheB1AndB2StallsToo )
         s.playingMs = playingMs;
         s.playingSteps = steps;
         s.stallMs = stallMs;
-        s.pollGapMs = 10;
         return s;
     };
     ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 2900, 69, 0 ) ) );
@@ -1787,6 +1786,99 @@ TEST( PlayPaceRecovery, R13SlowEnginesAreStillRefusedWithTheB1AndB2StallsToo )
         const PolledRun run = pollStalledCount( 0, 23, std::vector<Stall>(), 1499, budget, poll );
         ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
         ASSERT_TRUE( run.elapsedMs < budget );
+    }
+}
+
+// r13 adversary pass on ff00e32a (A1, A2): polls are not evenly spaced (a GUI timer can be late), and the band and
+// the stall charge used the MEDIAN poll gap. Each input verbatim: the count, then the poll schedule.
+namespace
+{
+template <typename NextPoll>
+PolledRun pollIrregular( int64_t firstPresentMs, const std::vector<Stall> &stalls, NextPoll next,
+                         int64_t required, int64_t safetyMs, PlayPaceHistory *atProbe = nullptr )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 900000; t = next( t ) )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, 24, stalls );
+        h.note( run.consumed, t );
+        if( atProbe && t >= playback_frame_range::kPaceProbeMs && run.consumedAt8s == 0 )
+        {
+            run.consumedAt8s = run.consumed;
+            *atProbe = h;
+        }
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+}
+
+TEST( PlayPaceRecovery, R13AdversaryA1TheBandUsesTheActualPollGapsNotTheirMedian )
+{
+    // A1: c(t) = 1 + floor(24 x max(0, t - 1400 - clamp(t - 1800, 0, 550) - clamp(t - 4800, 0, 550)) / 1000); observe
+    // at t += 40 when t % 70 == 10, otherwise t += 10. ff00e32a's band (3 x the 10 ms median gap) projected 65307 ms at
+    // 8030 and refused; the run is observed Reached at 64940 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a1 = stallsOf( { Stall{ 1800, 550 }, Stall{ 4800, 550 } } );
+    const auto next = []( int64_t t ) { return t + ( t % 70 == 10 ? 40 : 10 ); };
+    const PolledRun run = pollIrregular( 1400, a1, next, 1499, budget );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64940 ), run.elapsedMs );
+}
+
+TEST( PlayPaceRecovery, R13AdversaryA2AHoldThatOnlyWaitedOutALongPollGapIsNotChargedAsAStall )
+{
+    // A2: c(t) = 1 + floor(24 x max(0, t - 1480 - clamp(t - 1800, 0, 500) - clamp(t - 4800, 0, 500)) / 1000); observe
+    // at t += 50 when t % 100 == 0, otherwise t += 10. ff00e32a charged the 70/80 ms holds that straddle each 50 ms gap
+    // (1910 ms for 1000 ms really held), crossed the share cap and refused at 8000 (74437 ms); Reached at 64900 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a2 = stallsOf( { Stall{ 1800, 500 }, Stall{ 4800, 500 } } );
+    const auto next = []( int64_t t ) { return t + ( t % 100 == 0 ? 50 : 10 ); };
+    PlayPaceHistory probe;
+    const PolledRun run = pollIrregular( 1480, a2, next, 1499, budget, &probe );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64900 ), run.elapsedMs );
+    const PlayPaceHistory::PlayingSplit split = probe.playingSplit( 8000 );
+    ASSERT_TRUE( split.stallMs <= 1000 );   // never more than really held
+    // THE BOUND under both irregular schedules: from the probe on, the optimistic finish is never later than the step
+    // that really reaches the requirement
+    struct Trace { int64_t firstPresentMs; std::vector<Stall> stalls; int schedule; };
+    const std::vector<Trace> traces = { { 1400, stallsOf( { Stall{ 1800, 550 }, Stall{ 4800, 550 } } ), 1 },
+                                        { 1480, a2, 2 } };
+    for( const Trace &tr : traces )
+    {
+        int64_t reachMs = 0;
+        while( stalledCount( reachMs, tr.firstPresentMs, 24, tr.stalls ) < 1499 ) ++reachMs;
+        PlayPaceHistory h;
+        for( int64_t t = 0; t < reachMs; t += ( tr.schedule == 1 ? ( t % 70 == 10 ? 40 : 10 ) : ( t % 100 == 0 ? 50 : 10 ) ) )
+        {
+            const int64_t c = stalledCount( t, tr.firstPresentMs, 24, tr.stalls );
+            h.note( c, t );
+            if( t >= playback_frame_range::kPaceProbeMs )
+                ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= static_cast<double>( reachMs ) );
+        }
+    }
+    // the slow-engine controls under the same two schedules: still refused at the probe
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const int scheduleId : { 1, 2 } )
+        {
+            PlayPaceHistory h;
+            PlayStopState state = PlayStopState::Continue;
+            int64_t t = 0;
+            for( ; t <= budget && state == PlayStopState::Continue; t += ( scheduleId == 1 ? ( t % 70 == 10 ? 40 : 10 )
+                                                                                  : ( t % 100 == 0 ? 50 : 10 ) ) )
+            {
+                const int64_t c = stalledCount( t, 0, fps, std::vector<Stall>() );
+                h.note( c, t );
+                state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+                if( state != PlayStopState::Continue ) break;
+            }
+            ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( t >= playback_frame_range::kPaceProbeMs && t < 9000 );
+        }
     }
 }
 

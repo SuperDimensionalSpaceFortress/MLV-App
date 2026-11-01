@@ -158,9 +158,11 @@ FRAME:
   cannot be seen in the count, so it reads as a slower cadence. It is trusted only after 3 s of playing
   time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
   that keep coming are left to the other estimates, which refuse them at the probe. MERGE-MASTER r13 (sol r12 B1/B2)
-  makes both measures exact to the poll: the stall share charges only the time each stall hold was really held (the
-  hold less one ordinary step and one poll gap), and the playing time leaves out the hold still open, which has no step
-  yet. The playing pace also has an error band, because each playing stretch's ends are seen up to one poll gap late.
+  makes both measures exact to the poll: a hold is judged by its length less the poll gap its ending step could have
+  been seen late by, so a hold that only waited out a late poll is not a stall. The stall share charges only the time
+  each stall hold was really held (that length less one ordinary step), and the playing time leaves out the hold still
+  open, which has no step yet. The playing pace also has an error band, because each playing stretch's end is seen up
+  to the actual poll gap before its sighting late (never the median gap: polls are not evenly spaced).
   The run is refused only when even the band's optimistic end, `PlayPaceHistory::optimisticFinishMs`, cannot finish
   inside the budget. Only when even that pace cannot finish inside the budget does the run end as `PLAY_PACE_TOO_SLOW`. Anything else runs on to the
   requirement or to the typed `PLAY_SAFETY_TIMEOUT`. MERGE-MASTER r11 (ADV-A1b, catalogue C-PACE-RECOVERY-01 / M-04)

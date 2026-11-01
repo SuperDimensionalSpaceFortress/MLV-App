@@ -448,7 +448,7 @@ constexpr int64_t kPaceRecentWindowMs = 3000;
 // refuse them at the probe). Holds and poll gaps are kept as millisecond histograms up to kPaceHoldBucketMs; a longer
 // hold is always a stall.
 // r13 (sol r12 B2): the share charges only the time a stall hold was really held -- the hold less one ordinary step
-// at the observed playing pace and less one poll gap (its two ends are each seen up to a poll late) -- never the whole
+// at the observed playing pace and less the poll gap its ending step could have been seen late by -- never the whole
 // hold, so six 400 ms stalls charge at most 2400 ms, not the 2650 ms of their holds. The playing time is the closed
 // playing holds only: the hold still open has no step yet (r13 sol r12 B1: counting it measured 23.87 fps for 24).
 // r13 (sol r12 B1) error band: see PlayPaceHistory::optimisticFinishMs.
@@ -485,6 +485,17 @@ struct PlayPaceHistory
     int64_t overflowHolds = 0;
     int64_t overflowHoldMs = 0;
     int64_t overflowHoldSteps = 0;
+    // r13 (adversary A1/A2 on ff00e32a: polls are not evenly spaced): a step is first seen less than the poll gap just
+    // before its sighting after it happened. leadGap = that gap for the step that STARTED a hold, endGap = for the step
+    // that ENDED it. A closed hold is binned by its length LESS its end gap (the lateness the poll schedule alone can
+    // add), so an ordinary hold that only waited out a long poll gap is not a stall (A2); holdMsSum keeps the measured
+    // ms per bin, and holdLeadGapSum the lead gaps. holdLeadGapMs is the open hold's.
+    bool observed = false;              // r13: an earlier observation exists (lastElapsedMs is a real time)
+    int64_t holdLeadGapMs = 0;
+    std::vector<int64_t> holdMsSum = std::vector<int64_t>( kPaceHoldBucketMs + 1, 0 );
+    std::vector<int64_t> holdLeadGapSum = std::vector<int64_t>( kPaceHoldBucketMs + 1, 0 );
+    int64_t overflowLeadGapMs = 0;
+    int64_t overflowEndGapMs = 0;
 
     struct PlayingSplit
     {
@@ -493,7 +504,7 @@ struct PlayPaceHistory
         int64_t playingSteps = 0;   // the steps that ended them
         int64_t stallMs = 0;        // r13: time really held in the stall holds (closed, and the open one once long)
         int64_t stallHolds = 0;     // r13: closed stall holds; the playing time is in at most stallHolds + 1 stretches
-        int64_t pollGapMs = 0;      // r13: the median poll gap, the quantum each stretch end can be seen late by
+        int64_t stretchEndLateMs = 0;   // r13: how late, at most, the ends of those stretches were seen, summed
     };
 
     // The smallest d whose cumulative count reaches half of total; -1 when the median is past the last bucket or empty.
@@ -511,8 +522,10 @@ struct PlayPaceHistory
 
     // The split of the time since the first forward step into playing and stall time, as of elapsedMs. Playing time is
     // the closed holds no longer than the threshold. Stall time (r13, sol r12 B2) is what the stall holds were really
-    // held: each closed one less one ordinary step at the observed playing pace and less one poll gap, the hold still
-    // open at elapsedMs (once longer than the threshold) less one ordinary step. A short open hold is in neither.
+    // held: a closed one less one ordinary step at the observed playing pace and less its own end gap (its ending step
+    // happened up to that gap before it was seen; adversary A2: never the median gap, so a hold that only waited out a
+    // long poll gap charges nothing), summed per hold length; the hold still open at elapsedMs (once longer than the
+    // threshold) less one ordinary step. A short open hold is in neither.
     PlayingSplit playingSplit( int64_t elapsedMs ) const
     {
         PlayingSplit split;
@@ -521,30 +534,35 @@ struct PlayPaceHistory
         const int64_t medianGap = histogramMedian( pollGapCount, pollGaps );
         if( medianHold < 0 || medianGap < 0 ) return split;
         split.thresholdMs = medianHold + kPaceStallPollGaps * medianGap;
-        split.pollGapMs = medianGap;
-        int64_t stallHoldMs = 0;
         for( int64_t d = 0; d <= kPaceHoldBucketMs; ++d )
         {
-            if( d > split.thresholdMs )
+            const size_t b = static_cast<size_t>( d );
+            if( d <= split.thresholdMs )
             {
-                stallHoldMs += d * holdCount[static_cast<size_t>( d )];
-                split.stallHolds += holdCount[static_cast<size_t>( d )];
-            }
-            else
-            {
-                split.playingMs += d * holdCount[static_cast<size_t>( d )];
-                split.playingSteps += holdSteps[static_cast<size_t>( d )];
+                split.playingMs += holdMsSum[b];
+                split.playingSteps += holdSteps[b];
             }
         }
-        stallHoldMs += overflowHoldMs;
-        split.stallHolds += overflowHolds;
         // one ordinary step at the observed playing pace (none observed yet: the whole hold is charged)
         const double stepMs = split.playingSteps > 0
                             ? static_cast<double>( split.playingMs ) / static_cast<double>( split.playingSteps ) : 0.0;
-        const double ordinary = static_cast<double>( split.stallHolds ) * ( stepMs + static_cast<double>( medianGap ) );
-        split.stallMs = std::max<int64_t>( 0, stallHoldMs - static_cast<int64_t>( ordinary ) );
+        const auto held = [stepMs]( int64_t holdMs, int64_t count, int64_t endGapMs )
+        {
+            return std::max<int64_t>( 0, holdMs - endGapMs - static_cast<int64_t>( static_cast<double>( count ) * stepMs ) );
+        };
+        for( int64_t d = split.thresholdMs + 1; d <= kPaceHoldBucketMs; ++d )
+        {
+            const size_t b = static_cast<size_t>( d );
+            if( holdCount[b] == 0 ) continue;
+            split.stallMs += held( d * holdCount[b], holdCount[b], 0 );   // d is already less the end gap
+            split.stallHolds += holdCount[b];
+            split.stretchEndLateMs += holdLeadGapSum[b];
+        }
+        split.stallMs += held( overflowHoldMs, overflowHolds, overflowEndGapMs );
+        split.stallHolds += overflowHolds;
+        split.stretchEndLateMs += overflowLeadGapMs + holdLeadGapMs;   // + the last stretch, ended by the open hold's step
         const int64_t open = elapsedMs - holdStartMs;
-        if( open > split.thresholdMs ) split.stallMs += std::max<int64_t>( 0, open - static_cast<int64_t>( stepMs ) );
+        if( open > split.thresholdMs ) split.stallMs += held( open, 1, 0 );
         return split;
     }
 
@@ -555,6 +573,9 @@ struct PlayPaceHistory
         // (nothing is recorded before the first forward step, so only a history that has one needs the reset)
         if( ( elapsedMs < lastElapsedMs || consumed < lastConsumed || consumed < 2 ) && haveFirstStep ) *this = PlayPaceHistory();
         const int64_t previousConsumed = lastConsumed;
+        // the gap just before this observation: a step first seen now happened less than this long ago
+        const int64_t gapMs = observed ? std::max<int64_t>( 0, elapsedMs - lastElapsedMs ) : 0;
+        observed = true;
         if( haveFirstStep && elapsedMs > lastElapsedMs )
         {
             pollGapCount[static_cast<size_t>( std::min<int64_t>( elapsedMs - lastElapsedMs, kPaceHoldBucketMs ) )]++;
@@ -570,23 +591,30 @@ struct PlayPaceHistory
             firstStep.lastSeenMs = elapsedMs;
             firstStep.consumed = consumed;
             holdStartMs = elapsedMs;
+            holdLeadGapMs = gapMs;
         }
         else if( consumed != previousConsumed )
         {
             const int64_t hold = elapsedMs - holdStartMs;
-            if( hold > kPaceHoldBucketMs )
+            const int64_t bin = std::max<int64_t>( 0, hold - gapMs );   // r13: less the end gap (A2)
+            if( bin > kPaceHoldBucketMs )
             {
                 overflowHolds++;
                 overflowHoldMs += hold;
                 overflowHoldSteps += consumed - previousConsumed;
+                overflowLeadGapMs += holdLeadGapMs;
+                overflowEndGapMs += gapMs;
             }
             else
             {
-                holdCount[static_cast<size_t>( hold )]++;
-                holdSteps[static_cast<size_t>( hold )] += consumed - previousConsumed;
+                holdCount[static_cast<size_t>( bin )]++;
+                holdSteps[static_cast<size_t>( bin )] += consumed - previousConsumed;
+                holdMsSum[static_cast<size_t>( bin )] += hold;
+                holdLeadGapSum[static_cast<size_t>( bin )] += holdLeadGapMs;
                 holds++;
             }
             holdStartMs = elapsedMs;
+            holdLeadGapMs = gapMs;
         }
         if( window.empty() || window.back().consumed != consumed )
         {
@@ -628,26 +656,27 @@ struct PlayPaceHistory
     }
 
     // r13 (sol r12 B1): the EARLIEST time the run can reach `required` at the trusted playing pace, given what the count
-    // can show; +infinity = no trusted playing pace (so it never lowers a projection). THE BOUND: each stretch of playing holds is measured first sighting to
-    // first sighting, and a step is first seen less than one poll gap after it happens, so a stretch's true length is
-    // more than its measured length less one median poll gap g. With stallHolds + 1 stretches the playing steps took
-    // more than playingMs - (stallHolds + 1) x g, so the step is at least
-    //   stepMin = (playingMs - (stallHolds + 1) x g) / playingSteps.
-    // The last step happened after holdStartMs - g, and none has happened by elapsedMs, so the remaining steps end no
-    // earlier than max(holdStartMs - g + remaining x stepMin, elapsedMs + (remaining - 1) x stepMin). The run is refused
-    // only when even that is past the budget. The band is poll quantization only: a steady 22 fps engine at 8 s (175
-    // steps over 7950 ms) is 22.04 fps at its optimistic end at a 10 ms poll and 22.15 fps at 50 ms, still refused.
+    // can show; +infinity = no trusted playing pace (so it never lowers a projection). THE BOUND: each stretch of
+    // playing holds is measured first sighting to first sighting. Its start step happened at or before its sighting, and
+    // its end step less than the poll gap just before the end's sighting earlier (that stretch-ending step is the one
+    // that STARTED the next stall hold, or the open hold: its lead gap -- the actual gap, never a median, adversary A1
+    // on ff00e32a). So the playing steps took more than playingMs - stretchEndLateMs, and the step is at least
+    //   stepMin = (playingMs - stretchEndLateMs) / playingSteps.
+    // The last step happened after holdStartMs - holdLeadGapMs, and none has happened by elapsedMs, so the remaining
+    // steps end no earlier than max(holdStartMs - holdLeadGapMs + remaining x stepMin, elapsedMs + (remaining - 1) x
+    // stepMin). The run is refused only when even that is past the budget. The band is poll quantization only: a steady
+    // 22 fps engine at 8 s (175 steps over 7950 ms) is 22.04 fps at its optimistic end at a 10 ms poll and 22.15 fps at
+    // 50 ms, still refused.
     double optimisticFinishMs( int64_t consumed, int64_t required, int64_t elapsedMs ) const
     {
         const double none = std::numeric_limits<double>::infinity();
         const PlayingSplit s = playingSplit( elapsedMs );
         if( !playingSplitTrusted( s ) ) return none;
-        const double shortest = static_cast<double>( s.playingMs )
-                              - static_cast<double>( s.stallHolds + 1 ) * static_cast<double>( s.pollGapMs );
+        const double shortest = static_cast<double>( s.playingMs - s.stretchEndLateMs );
         if( !( shortest > 0.0 ) ) return none;
         const double stepMin = shortest / static_cast<double>( s.playingSteps );
         const double remaining = static_cast<double>( std::max<int64_t>( 0, required - consumed ) );
-        return std::max( static_cast<double>( holdStartMs - s.pollGapMs ) + remaining * stepMin,
+        return std::max( static_cast<double>( holdStartMs - holdLeadGapMs ) + remaining * stepMin,
                          static_cast<double>( elapsedMs ) + std::max( 0.0, remaining - 1.0 ) * stepMin );
     }
 
