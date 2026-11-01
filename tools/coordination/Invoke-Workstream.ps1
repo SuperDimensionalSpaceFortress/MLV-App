@@ -216,22 +216,29 @@ $Schedulable = @('queued', 'dispatched', 'in-review', 'waiting-evidence', 'dispa
 # Pure: no I/O. $MasterSha is '' when the tip could not be read, which skips (a).
 function Select-MergeGroupJobsRun {
     param([object[]]$Runs, [string]$MasterSha = '', [string]$TipReason = '')
-    # createdAt as a parsed UTC instant (a [datetime] is converted, a string is parsed with the invariant
-    # culture; a string with no offset is taken as UTC). $null when it does not parse.
+    # createdAt as a parsed UTC instant. A string is parsed with the invariant culture and an offset-free string is UTC.
+    # r6 (sol B2): a [datetime] of Kind Unspecified is what ConvertFrom-Json makes of an OFFSET-FREE string; ToUniversalTime
+    # would treat it as LOCAL and shift it by the host zone, so it is pinned to UTC instead. Local and Utc kinds are
+    # converted as before. $null when the value does not parse.
     $toUtc = {
         param($v)
-        if ($v -is [datetime]) { return $v.ToUniversalTime() }
+        if ($v -is [datetime]) {
+            if ($v.Kind -eq [System.DateTimeKind]::Unspecified) { return [datetime]::SpecifyKind($v, [System.DateTimeKind]::Utc) }
+            return $v.ToUniversalTime()
+        }
         $o = [datetimeoffset]::MinValue
         if ([datetimeoffset]::TryParse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$o)) { return $o.UtcDateTime }
         return $null
     }
     # ADV-A2 (r5): sort by the parsed UTC instant, NEVER by the createdAt text: '2026-10-31T18:00:00+02:00'
-    # (16:00Z) sorts after '2026-10-31T17:00:00Z' as a string but is the OLDER run. A value that does not
-    # parse sorts LAST (MinValue under Descending), so it is never picked over a parsable one.
-    $sorted = @($Runs | Where-Object { $null -ne $_ } | Sort-Object -Descending -Property @{ Expression = {
-        $t = & $toUtc $_.createdAt
-        if ($null -eq $t) { [datetime]::MinValue } else { $t }
-    } })
+    # (16:00Z) sorts after '2026-10-31T17:00:00Z' as a string but is the OLDER run.
+    # r6 (sol B3): VALIDITY is a sort key of its own, ahead of the instant. A MinValue sentinel for "does not parse" tied a
+    # row whose text is garbage with a genuinely valid '0001-01-01T00:00:00Z'. With validity first, every selection branch
+    # (all three are taken from $sorted) puts a valid row ahead of any invalid one, whatever its instant.
+    $sorted = @($Runs | Where-Object { $null -ne $_ } | Sort-Object -Property @(
+        @{ Expression = { if ($null -eq (& $toUtc $_.createdAt)) { 0 } else { 1 } }; Descending = $true },
+        @{ Expression = { $t = & $toUtc $_.createdAt; if ($null -eq $t) { [datetime]::new(0) } else { $t } }; Descending = $true }
+    ))
     if ($sorted.Count -eq 0) { return $null }
     if ($MasterSha) {
         $landed = @($sorted | Where-Object { $_.headSha -eq $MasterSha })
@@ -936,7 +943,10 @@ if ($needsHostedEvidence) {
         $runsFile = Join-Path $ghDir 'runs-tests-merge-group-completed.json'
         if (Test-Path -LiteralPath $runsFile) {
             try {
-                $runs = @(Get-Content -LiteralPath $runsFile -Raw | ConvertFrom-Json)
+                # r6 (sol B2): keep createdAt as the raw string where the host can (pwsh 7.5+ -DateKind String); the selector
+                # also pins an Unspecified-kind [datetime] to UTC for older hosts.
+                $runsRaw = Get-Content -LiteralPath $runsFile -Raw
+                $runs = if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { @($runsRaw | ConvertFrom-Json -DateKind String) } else { @($runsRaw | ConvertFrom-Json) }
                 # Master tip is read LOCALLY (never the network) by FULL refname: a same-named tag
                 # refs/tags/fork/master would win the bare name fork/master. An unreadable tip falls through
                 # to the success / createdAt choices inside Select-MergeGroupJobsRun.

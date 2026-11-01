@@ -386,13 +386,17 @@ $sourceSha = ''
 try {
     # A full refs/ name must exist EXACTLY: rev-parse is a revision lookup and, for a missing ref, goes on to try
     # refs/tags/<name> and refs/heads/<name> (for example refs/tags/refs/remotes/fork/master).
+    # r6 (sol B1): the exact ref's SHA is read ONCE (show-ref --verify --hash) and only that SHA is peeled below, so a ref
+    # that vanishes after the check can never be re-resolved through a shadow tag.
     $resolved = @()
     $refExists = $true
+    $revision = $SourceRef
     if ($SourceRef -like 'refs/*') {
-        & git -C $RepoRoot show-ref --verify --quiet $SourceRef 2>$null
-        $refExists = ($LASTEXITCODE -eq 0)
+        $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $SourceRef 2>$null | Select-Object -First 1)
+        $refExists = ($exactSha -match '^[0-9a-f]{40}$')
+        if ($refExists) { $revision = $exactSha }
     }
-    if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify "$SourceRef^{commit}" 2>$null) }
+    if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify "$revision^{commit}" 2>$null) }
     if (-not $refExists -or $LASTEXITCODE -ne 0 -or $resolved.Count -ne 1 -or $resolved[0] -notmatch '^[0-9a-fA-F]{40}$') {
         Write-ErrorResult 'ERROR_REF_UNRESOLVED'
     }

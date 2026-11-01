@@ -51,19 +51,23 @@ $rel = $full.Substring($root.Length).TrimStart([char]92, [char]47).Replace([stri
 if (-not $rel) { Write-Result 'unknown' 'could not derive a repo-relative path'; return }
 
 # Does the reference exist at all? No 'fork' remote (a fresh clone, a lane sandbox) is not drift.
+$refRev = $Ref
 if ($Ref -like 'refs/*') {
     # A full refs/ name must exist EXACTLY: rev-parse would fall through to refs/tags/<name> for a missing ref.
-    & git -C $root show-ref --verify --quiet $Ref *> $null
-    if ($LASTEXITCODE -ne 0) { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
+    # r6 (sol B1): read the exact ref's SHA ONCE; every later step uses the commit it names, never the refname again,
+    # so a ref that vanishes after this check cannot be re-resolved through a shadow tag.
+    $exactSha = [string](& git -C $root show-ref --verify --hash $Ref 2>$null | Select-Object -First 1)
+    if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
+    $refRev = $exactSha
 }
-& git -C $root rev-parse --verify --quiet "$Ref^{commit}" *> $null
-if ($LASTEXITCODE -ne 0) { Write-Result 'unknown' "ref '$Ref' does not resolve"; return }
+$refCommit = [string](& git -C $root rev-parse --verify --quiet "$refRev^{commit}" 2>$null | Select-Object -First 1)
+if ($refCommit -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not resolve"; return }
 
 # Is the file tracked on that ref? A NEW file that has not landed yet is not stale.
-& git -C $root cat-file -e "${Ref}:${rel}" *> $null
+& git -C $root cat-file -e "${refCommit}:${rel}" *> $null
 if ($LASTEXITCODE -ne 0) { Write-Result 'untracked-on-ref' "not present at ${Ref}:${rel}"; return }
 
-$refBlob = (& git -C $root rev-parse "${Ref}:${rel}" 2>$null)
+$refBlob = (& git -C $root rev-parse "${refCommit}:${rel}" 2>$null)
 $diskBlob = (& git -C $root hash-object -- $full 2>$null)
 if (-not $refBlob -or -not $diskBlob) { Write-Result 'unknown' 'could not hash one of the two versions'; return }
 $refBlob = $refBlob.Trim(); $diskBlob = $diskBlob.Trim()

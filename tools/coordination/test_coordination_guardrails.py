@@ -5413,7 +5413,7 @@ def test_the_ratio_guard_default_source_ref_is_the_full_refname_in_source():
     assert m, "SourceRef default not found"
     assert m.group(1) == FULL_FORK_MASTER, m.group(1)
     # the resolve line still goes through the (now full-refname) parameter, never a re-spelled bare name
-    assert 'rev-parse --verify "$SourceRef^{commit}"' in text
+    assert 'rev-parse --verify "$revision^{commit}"' in text   # r6: the SHA captured from the exact ref, not the name
 
 
 def test_the_ratio_guard_resolves_the_remote_tracking_tip_not_a_same_named_tag(tmp_path):
@@ -5551,12 +5551,13 @@ def test_r5_the_script_currency_guard_does_not_resolve_an_absent_full_refname_th
 
 def test_r5_the_loop_and_retire_sites_check_the_exact_ref_before_following_it():
     loop = LOOP.read_text(encoding="utf-8")
-    assert loop.count("show-ref --verify --quiet $TargetRef") == 2, "worktree add and reset --hard both need the exact-ref check"
-    assert loop.index("show-ref --verify --quiet $TargetRef") < loop.index("worktree add --detach $DriverRoot $TargetRef")
-    assert loop.rindex("show-ref --verify --quiet $TargetRef") < loop.index("reset --hard $TargetRef")
+    # r6: the exact-ref check IS the read (show-ref --verify --hash), and the captured SHA is what the next call takes
+    assert loop.count("show-ref --verify --hash $TargetRef") == 2, "worktree add and reset --hard both need the exact-ref read"
+    assert loop.index("show-ref --verify --hash $TargetRef") < loop.index("worktree add --detach $DriverRoot $tipSha")
+    assert loop.rindex("show-ref --verify --hash $TargetRef") < loop.index("reset --hard $tipSha")
     ret = RETIRE.read_text(encoding="utf-8")
-    guard = ret.index("show-ref --verify --quiet $MergeTarget")
-    assert guard < ret.index("merge-base --is-ancestor $d.head $MergeTarget")
+    guard = ret.index("show-ref --verify --hash $MergeTarget")
+    assert guard < ret.index("merge-base --is-ancestor $d.head $mergeRev")
     assert "merge target ref missing" in ret
 
 
@@ -5601,4 +5602,238 @@ def test_r5_the_selector_sort_uses_the_parsed_instant_in_source():
     text = WORKSTREAM.read_text(encoding="utf-8")
     body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
     assert "Sort-Object -Property createdAt" not in body, "the sort is by createdAt text again"
-    assert "Sort-Object -Descending -Property @{ Expression" in body
+    assert "Sort-Object -Property @(" in body and "Descending = $true" in body   # r6: validity key, then the parsed instant
+
+
+# --- r6 (sol r5 on 4b07d561: B1 exact-ref TOCTOU, B2 offset-free createdAt, B3 invalid ties a valid minimum) --------
+# B1: `show-ref --verify` followed by a SEPARATE revision lookup of the same name is check-then-use. If the exact ref
+# disappears between the two calls, git's dwim rules resolve refs/tags/refs/remotes/fork/master instead. The fix reads
+# the SHA ONCE (`show-ref --verify --hash <full refname>`) and uses that captured SHA for every later step. The race is
+# reproduced deterministically: a `git` / `git.exe` FUNCTION in the harness wraps the real git and, right after the
+# first successful `show-ref --verify refs/remotes/fork/master`, deletes that ref (once). It is run in-process around the
+# real script / function, so the shipped code is what races.
+
+R6_REF = "refs/remotes/fork/master"
+R6_SHADOW_TAG = "refs/tags/refs/remotes/fork/master"
+R6_RACE_SHIM = r"""
+$global:R6RealGit = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source
+$global:R6RaceRepo = '__REPO__'
+$global:R6RaceFired = $false
+function Invoke-R6RaceGit {
+    $a = @($args)
+    $out = & $global:R6RealGit @a
+    $code = $LASTEXITCODE
+    if (-not $global:R6RaceFired -and $code -eq 0 -and ($a -contains 'show-ref') -and ($a -contains '--verify') -and ($a -contains 'refs/remotes/fork/master')) {
+        $global:R6RaceFired = $true
+        & $global:R6RealGit -C $global:R6RaceRepo update-ref -d refs/remotes/fork/master | Out-Null
+    }
+    $global:LASTEXITCODE = $code
+    $out
+}
+function git { Invoke-R6RaceGit @args }
+function git.exe { Invoke-R6RaceGit @args }
+"""
+
+
+def _r6_race_repo(tmp_path):
+    """Commit A holds x.ps1 = 'a' and is refs/remotes/fork/master; commit B (child of A, x.ps1 = 'b') is the shadow tag
+    refs/tags/refs/remotes/fork/master and also refs/remotes/other/x. Returns (repo, A, B)."""
+    repo = tmp_path / "r6race"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "x.ps1").write_text("'a'\n", encoding="utf-8")
+    git(repo, "add", "x.ps1")
+    git(repo, "commit", "-q", "-m", "A")
+    sha_a = git(repo, "rev-parse", "HEAD")
+    (repo / "x.ps1").write_text("'b'\n", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "B")
+    sha_b = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", R6_REF, sha_a)
+    git(repo, "update-ref", R6_SHADOW_TAG, sha_b)
+    git(repo, "update-ref", "refs/remotes/other/x", sha_b)
+    return repo, sha_a, sha_b
+
+
+def _r6_shim(repo):
+    return R6_RACE_SHIM.replace("__REPO__", str(repo).replace("'", "''"))
+
+
+def _r6_run(tmp_path, repo, body, name="r6-race.ps1", env=None):
+    harness = tmp_path / name
+    harness.write_text("$ErrorActionPreference='Continue'\n" + _r6_shim(repo) + "\n" + body + "\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True,
+                         env=env)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout
+
+
+def _r6_last_json(stdout):
+    return json.loads([ln for ln in stdout.splitlines() if ln.strip()][-1])
+
+
+def test_r6_b1_the_race_fixture_really_flips_the_old_revision_lookup(tmp_path):
+    """The fixture is only meaningful if, once the exact ref is gone, a revision lookup lands on the shadow tag."""
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    git(repo, "update-ref", "-d", R6_REF)
+    old = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", R6_REF + "^{commit}"], capture_output=True, text=True)
+    assert old.stdout.strip() == sha_b, (old.stdout, old.stderr)
+
+
+def _r6_loop_sync(tmp_path, repo, driver_exists):
+    fn = _extract_ps_function(tmp_path, LOOP, "Sync-DriverWorktree")
+    driver = tmp_path / "r6driver"
+    if driver_exists:
+        git(repo, "worktree", "add", "--detach", str(driver), R6_REF)
+    body = (
+        "$RepoRoot='" + str(repo).replace("'", "''") + "'\n$DriverRoot='" + str(driver).replace("'", "''") + "'\n"
+        "$TargetRef='refs/remotes/fork/master'\n"
+        "function Invoke-GitFetchFork { [pscustomobject]@{ Ok = $true; ExitCode = 0; Attempts = 1 } }\n"
+        "function Disable-DriverFsmonitor { }\n" + fn + "\n"
+        "$r = Sync-DriverWorktree\n"
+        "$head = (& $global:R6RealGit -C $DriverRoot rev-parse HEAD)\n"
+        "[pscustomobject]@{ ret = [string]$r; head = [string]$head; fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    return _r6_last_json(_r6_run(tmp_path, repo, body, "r6-loop.ps1"))
+
+
+@pytest.mark.parametrize("driver_exists", [True, False], ids=["reset-hard-branch", "worktree-add-branch"])
+def test_r6_b1_the_loop_driver_uses_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path, driver_exists):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    got = _r6_loop_sync(tmp_path, repo, driver_exists)
+    assert got["fired"] is True, got
+    # captured A - never the shadow tag's commit B
+    assert got["head"] != sha_b, got
+    assert got["head"] == sha_a and got["ret"] == "", got
+
+
+def test_r6_b1_the_ratio_guard_reads_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    body = "& '" + str(RATIO_GUARD).replace("'", "''") + "' -RepoRoot '" + str(repo).replace("'", "''") + "' -AsOfEpoch 1893456000\n"
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r6-ratio.ps1"))
+    assert doc["sourceSha"] != sha_b, doc
+    assert doc["sourceSha"] == sha_a, doc
+
+
+def test_r6_b1_the_currency_guard_compares_against_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'a'\n", encoding="utf-8")        # the disk copy equals A's blob, NOT the shadow tag's
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("try { $res = & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -PassThru } catch { }\n"
+            "if ($null -eq $res) { [pscustomobject]@{ status = 'threw-stale' } | ConvertTo-Json -Compress } else { @($res)[0] | ConvertTo-Json -Compress }\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r6-currency.ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    assert doc["status"] == "current", doc
+
+
+def test_r6_b1_the_retire_merge_gate_uses_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    wt = tmp_path / "r6wt"
+    git(repo, "worktree", "add", "--detach", str(wt), sha_b)
+    body = (". '" + str(RETIRE).replace("'", "''") + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + str(wt).replace("'", "''") + "' -MergeTarget 'refs/remotes/fork/master' -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason; fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r6-retire.ps1"))
+    assert doc["fired"] is True, doc
+    # B is NOT an ancestor of A: judged against the captured A the worktree is unmerged and kept. Judged through the
+    # shadow tag (B is its own ancestor) it would read as merged.
+    assert doc["action"] == "kept" and doc["reason"].startswith("unmerged"), doc
+
+
+def test_r6_b1_no_site_resolves_the_exact_refname_again_after_reading_it_in_source():
+    """One captured SHA per site: show-ref --verify --hash, then the SHA - never `<refname>^{commit}` / `<refname>:path` / `$TargetRef`."""
+    loop = LOOP.read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $TargetRef" not in loop
+    assert loop.count("show-ref --verify --hash $TargetRef") == 2
+    assert "worktree add --detach $DriverRoot $TargetRef" not in loop and "reset --hard $TargetRef" not in loop
+    ratio = RATIO_GUARD.read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $SourceRef" not in ratio and 'rev-parse --verify "$SourceRef^{commit}"' not in ratio
+    assert "show-ref --verify --hash $SourceRef" in ratio
+    cur = (COORD / "assert-script-currency.ps1").read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $Ref" not in cur and 'rev-parse --verify --quiet "$Ref^{commit}"' not in cur
+    assert 'cat-file -e "${Ref}:${rel}"' not in cur and 'rev-parse "${Ref}:${rel}"' not in cur
+    assert "show-ref --verify --hash $Ref" in cur
+    ret = RETIRE.read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $MergeTarget" not in ret and "merge-base --is-ancestor $d.head $MergeTarget" not in ret
+    assert "show-ref --verify --hash $MergeTarget" in ret
+
+
+# B2 / B3 --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("day", ["2026-10-31", "2026-01-15", "2026-07-15"], ids=["oct", "jan", "jul"])
+def test_r6_b2_offset_free_created_at_orders_as_utc_through_the_production_conversion(tmp_path, day):
+    """ConvertFrom-Json (the production read, Invoke-Workstream.ps1) turns '2026-10-31T16:00:00' into an Unspecified
+    [datetime]; ToUniversalTime used to shift it by the HOST zone (Central here: 16:00 -> 21:00Z, newer than 17:00Z)."""
+    rows = [_mgrs_row(1, day + "T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, day + "T17:00:00Z", MGRS_OTHER, "failure")]
+    for order in (rows, list(reversed(rows))):
+        got = _mgrs_select(tmp_path, order, "")
+        assert got["id"] == 2, (day, got)
+
+
+def test_r6_b2_an_unspecified_kind_datetime_is_utc_and_never_local(tmp_path):
+    """Zone-independent unit form: an Unspecified-kind [datetime] 16:00 is 16:00Z, so it is OLDER than 17:00Z in any host zone."""
+    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    harness = tmp_path / "r6-b2-unit.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n" + sel_fn + "\n"
+        "$u = [datetime]::SpecifyKind([datetime]'2026-10-31T16:00:00', [DateTimeKind]::Unspecified)\n"
+        "$z = [datetime]::SpecifyKind([datetime]'2026-10-31T17:00:00', [DateTimeKind]::Utc)\n"
+        "$rows = @([pscustomobject]@{ databaseId = 1; createdAt = $u; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' },"
+        " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n"
+        "(Select-MergeGroupJobsRun -Runs $rows -MasterSha '').Run.databaseId\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.strip() == "2", out.stdout
+
+
+def test_r6_b2_the_production_read_expression_keeps_created_at_a_string_and_the_selector_orders_it_as_utc(tmp_path):
+    """Lift the shipped `$runs = ...` read line out of Invoke-Workstream.ps1 and run it over sol's exact input."""
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    m = re.search(r"(?m)^\s*(\$runs = if \(\(Get-Command ConvertFrom-Json\)[^\n]*)$", text)
+    assert m, "production read line not found"
+    raw = json.dumps([_mgrs_row(1, "2026-10-31T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure")])
+    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    harness = tmp_path / "r6-b2-prod.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n" + sel_fn + "\n$runsRaw = '" + raw.replace("'", "''") + "'\n" + m.group(1) + "\n"
+        "$kinds = @($runs | ForEach-Object { $_.createdAt.GetType().Name }) -join ','\n"
+        "[pscustomobject]@{ kinds = $kinds; id = (Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId } | ConvertTo-Json -Compress\n",
+        encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    doc = json.loads(out.stdout.strip().splitlines()[-1])
+    assert doc["id"] == 2, doc
+    assert doc["kinds"] == "String,String", doc      # pwsh 7.5+ here: the raw string survives the read
+
+
+def test_r6_b2_the_production_read_keeps_created_at_as_the_raw_string_where_the_host_can_and_the_helper_pins_utc():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    assert "ConvertFrom-Json -DateKind String" in text
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "SpecifyKind" in body and "Unspecified" in body
+
+
+R6_MIN_VARIANTS = ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00+00:00", "0001-01-01"]
+
+
+@pytest.mark.parametrize("minimum", R6_MIN_VARIANTS)
+def test_r6_b3_an_invalid_created_at_never_ties_a_valid_minimum_timestamp_in_choice_c(tmp_path, minimum):
+    rows = [(9, "bad", MGRS_OTHER, "failure"), (1, minimum, MGRS_OTHER, "failure")]
+    for order in (rows, list(reversed(rows))):
+        assert _r5_select_strings(tmp_path, order, "")["id"] == 1, (minimum, order)
+
+
+@pytest.mark.parametrize("minimum", R6_MIN_VARIANTS)
+def test_r6_b3_an_invalid_created_at_never_ties_a_valid_minimum_timestamp_in_choice_b_and_a(tmp_path, minimum):
+    ok = [(9, "bad", MGRS_OTHER, "success"), (1, minimum, MGRS_OTHER, "success")]
+    for order in (ok, list(reversed(ok))):
+        assert _r5_select_strings(tmp_path, order, "")["id"] == 1, ("b", minimum, order)
+    landed = [(9, "bad", MGRS_TIP, "failure"), (1, minimum, MGRS_TIP, "failure")]
+    for order in (landed, list(reversed(landed))):
+        assert _r5_select_strings(tmp_path, order, MGRS_TIP)["id"] == 1, ("a", minimum, order)
+
+
+def test_r6_b3_validity_is_a_sort_key_of_its_own_in_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "[datetime]::MinValue" not in body.replace("[datetimeoffset]::MinValue", ""), "the MinValue sentinel is back: it ties 'bad' with a valid 0001-01-01"

@@ -1432,12 +1432,16 @@ function Invoke-RetireLaneWorktree {
         $u = Run-Git $main @('rev-list', '--count', $d.head, '--not', '--remotes'); if ($u.code) { $d.reason = 'cannot-determine: rev-list --not --remotes'; return [pscustomobject]$d }
         if ([int]$u.out[0] -gt 0) { $d.reason = "unpushed: $($u.out[0]) commit(s) on no remote"; return [pscustomobject]$d }
 
+        $mergeRev = $MergeTarget
         if ($MergeTarget -like 'refs/*') {
-            # exact ref: merge-base takes a revision, and for a missing refs/ name git goes on to refs/tags/<name>
-            & git.exe -C $main show-ref --verify --quiet $MergeTarget 2>$null
-            if ($LASTEXITCODE -ne 0) { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
+            # exact ref: merge-base takes a revision, and for a missing refs/ name git goes on to refs/tags/<name>.
+            # r6 (sol B1): read the SHA ONCE and test against that SHA, never the name again - a ref that vanishes between a
+            # check and a second lookup of the name would otherwise be judged through a shadow tag.
+            $mergeSha = [string](& git.exe -C $main show-ref --verify --hash $MergeTarget 2>$null | Select-Object -First 1)
+            if ($mergeSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
+            $mergeRev = $mergeSha
         }
-        & git.exe -C $main merge-base --is-ancestor $d.head $MergeTarget 2>$null
+        & git.exe -C $main merge-base --is-ancestor $d.head $mergeRev 2>$null
         switch ($LASTEXITCODE) { 0 { } 1 { $d.reason = "unmerged: HEAD not an ancestor of $MergeTarget"; return [pscustomobject]$d } default { $d.reason = "cannot-determine: merge-base ($MergeTarget)"; return [pscustomobject]$d } }
 
         $st = Run-Git $main @('stash', 'list'); if ($st.code) { $d.reason = 'cannot-determine: stash list'; return [pscustomobject]$d }
