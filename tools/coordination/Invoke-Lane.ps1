@@ -963,6 +963,13 @@ try {
 } catch { }
 
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)
+# (a0) r7 (sol B3 / ADV-A3): every native wait on the lane budget (WaitForExit, both image-read CancelAfter) takes Int32 milliseconds. A
+# budget above Int32.MaxValue ms was clamped to ONE capped wait whose expiry was booked as timedOut/124 with budget unspent. Instead of
+# looping each wait, the accepted budget is capped where every remaining-ms value derives from it: 2147483 s * 1000 <= 2147483647 ms.
+$MAX_TIMEOUT_SEC = 2147483
+if ($TimeoutSec -gt $MAX_TIMEOUT_SEC) {
+    throw "timeout-sec-too-large: -TimeoutSec $TimeoutSec exceeds $MAX_TIMEOUT_SEC (about 24.8 days, the largest budget a native Int32-millisecond wait can hold in one call)"
+}
 # (a) A codex lane can never be granted write access: no Claude hook is visible to codex exec,
 # so nothing here could enforce NA-1..NA-10 against it. Keyed on ENGINE, not an enumerated list
 # of lane names -- a new codex row (e.g. astra) refuses edits by construction, with nothing left
@@ -1039,6 +1046,12 @@ if ($ImagePathsGiven.Count -gt 0) {
 #   image-path-snapshot-unreadable: <reason> (<dest>)                 r5: the held snapshot could not be read back (an I/O error, not a mismatch)
 #   image-path-reparse-ancestor: ... (<path>)                         r5: the resolved snapshot path has a reparse point in its ancestry
 #   image-digest-timeout: ...                                         r5: a digest read ran past the lane budget (TimeoutException -> timeout/124)
+#   image-path-noncanonical: ...                                      r7: the resolved path, once \\?\ is removed, would open a different object
+#   image-path-bad-character: ... '%', '^' or '&' ...                 r7 (sol B1): cmd.exe (the codex .cmd shim) would rewrite the -i argument
+# r7 (sol B1): ProcessStartInfo quotes an argument only when it has a space or a quote, and the codex launcher is a .cmd shim that forwards
+# %*, so cmd.exe expands %VAR%, drops '^' and splits at '&' in the attached path. Measured on this host: C:\x\%OS%\f.png reached the child
+# as C:\x\Windows_NT\f.png and C:\x\a^b\f.png as C:\x\ab\f.png. The held snapshot would verify while codex read another file: refuse.
+$IMAGE_CMD_META_PATTERN = '[%^&]'
 if (-not ('MlvImageSnap' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -1063,10 +1076,20 @@ public static class MlvImageSnap {
     uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
     if (n >= sb.Capacity) { sb = new StringBuilder((int)n + 1); n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0); }
     if (n == 0) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFinalPathNameByHandle");
-    string p = sb.ToString();
-    if (p.StartsWith("\\\\?\\UNC\\", StringComparison.Ordinal)) return "\\\\" + p.Substring(8);
-    if (p.StartsWith("\\\\?\\", StringComparison.Ordinal)) return p.Substring(4);
-    return p;
+    return StripVerbatim(sb.ToString());
+  }
+  // r7 (opus B1 = sol B2, ADV-A1): removing the \\?\ prefix hands the path back to Win32 normalization, which drops a trailing '.' from a
+  // segment. A held object in a native directory `judge.` would then be named by a string that opens the ordinary sibling `judge`. So the
+  // stripped string must already be canonical (GetFullPath returns it unchanged, ordinal); otherwise it names some other object: refuse.
+  public static string StripVerbatim(string p) {
+    string r = p;
+    if (p.StartsWith("\\\\?\\UNC\\", StringComparison.Ordinal)) r = "\\\\" + p.Substring(8);
+    else if (p.StartsWith("\\\\?\\", StringComparison.Ordinal)) r = p.Substring(4);
+    string full = System.IO.Path.GetFullPath(r);
+    if (!string.Equals(full, r, StringComparison.Ordinal)) {
+      throw new System.IO.IOException("image-path-noncanonical: the held image snapshot's resolved path '" + p + "' is not canonical once its \\\\?\\ prefix is removed (Win32 would open '" + full + "'), so codex could read a different file");
+    }
+    return r;
   }
 }
 '@
@@ -1191,9 +1214,14 @@ function Copy-ImageSnapshot {
         try {
             $finalPath = [MlvImageSnap]::FinalPath($hold.SafeFileHandle)
             $reparse = Get-ImageReparseAncestor -Path $finalPath
-        } catch { throw [System.IO.IOException]::new("image-path-snapshot-failed: could not resolve the held image snapshot path: $($_.Exception.GetBaseException().Message) ($Dest)") }
+        } catch {
+            $fb = $_.Exception.GetBaseException()
+            if ($fb.Message.StartsWith('image-path-noncanonical:', [System.StringComparison]::Ordinal)) { throw $fb }
+            throw [System.IO.IOException]::new("image-path-snapshot-failed: could not resolve the held image snapshot path: $($fb.Message) ($Dest)")
+        }
         if ($null -ne $reparse) { throw [System.IO.IOException]::new("image-path-reparse-ancestor: the resolved image snapshot path has a reparse point in its ancestry ($reparse) ($finalPath)") }
         if ($finalPath.Contains(',')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ',' (codex splits an -i value on commas): $finalPath") }
+        if ($finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains '%', '^' or '&' (codex is launched through a .cmd shim, and cmd.exe rewrites them): $finalPath") }
         $ok = $true
     } finally {
         # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
@@ -1869,6 +1897,7 @@ if ($cfg.engine -eq 'claude') {
         $imageSeq++
         $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
         if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
+        if ($snapshot -match $IMAGE_CMD_META_PATTERN) { throw "image-path-bad-character: the image snapshot path contains '%', '^' or '&' (codex is launched through a .cmd shim, and cmd.exe rewrites them): $snapshot" }
         $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)
         # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
         # r5 B1: that string is the RESOLVED path of the held object (Copy-ImageSnapshot's Path), not the name the copy went through.

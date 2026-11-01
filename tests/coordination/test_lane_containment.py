@@ -1,4 +1,4 @@
-import hashlib, importlib.util, json, os, re, subprocess, sys, threading, time
+import hashlib, importlib.util, json, os, re, shutil, subprocess, sys, threading, time
 from datetime import datetime
 from pathlib import Path
 
@@ -1162,15 +1162,143 @@ def test_the_writer_close_gap_test_is_red_when_the_hold_comparison_is_deleted(tm
     assert "NO-ERROR" in r.stdout and "HOLD-RETURNED True" in r.stdout,(r.stdout,r.stderr)
 
 
-def test_a_huge_timeout_sec_does_not_overflow_the_child_wait(fixture_tree):
-    # r5 A4: WaitForExit([int]$remainingMs) overflowed Int32 for -TimeoutSec above 2147483.
-    # Codex engine only: the claude engine has its own, separate Int32 conversion (host-wait) that this one-line fix does not cover.
+def test_the_largest_accepted_timeout_sec_does_not_overflow_the_child_wait(fixture_tree):
+    # r5 A4: WaitForExit([int]$remainingMs) overflowed Int32 for -TimeoutSec above 2147483. r7: 2147483 is now the largest accepted
+    # budget, and its full millisecond value fits one Int32 wait, so no native wait is ever clamped below the real deadline.
+    assert 2147483*1000<=2**31-1<2147484*1000
     cache=_terra_env(fixture_tree)
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
-    cmd[cmd.index("-TimeoutSec")+1]="3000000"
+    cmd[cmd.index("-TimeoutSec")+1]="2147483"
     r=run_lane(cmd,env)
     assert r.returncode==0,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("lane",["terra","sonnet"])
+@pytest.mark.parametrize("value",["2147484","3000000"])
+def test_a_timeout_sec_above_the_int32_millisecond_budget_is_refused_typed_before_any_receipt(fixture_tree,lane,value):
+    # r7 (sol B3 / ADV-A3): -TimeoutSec 3000000 used to be accepted, then every native wait (WaitForExit and both image-read CancelAfter
+    # sites) was clamped to Int32.MaxValue ms and the lane was booked timedOut/124 with ~852515 s of its budget unspent. The cap refuses it.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    cmd[cmd.index("-TimeoutSec")+1]=value
+    r=run_lane(cmd,env)
+    assert r.returncode!=0 and "timeout-sec-too-large" in r.stderr,(r.returncode,r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"child.json").exists() and not (root/"args.json").exists()
+
+
+_RAW_JUNCTION_PS = r'''
+param([string]$Link, [string]$NtTarget)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class RawJunction {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern SafeFileHandle CreateFileW(string n, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] inBuf, int inSize, IntPtr outBuf, int outSize, out int ret, IntPtr ov);
+  public static void Make(string link, string ntTarget) {
+    System.IO.Directory.CreateDirectory(link);
+    byte[] sub = Encoding.Unicode.GetBytes(ntTarget);
+    int dataLen = 8 + sub.Length + 2 + 2;
+    byte[] buf = new byte[8 + dataLen];
+    BitConverter.GetBytes(0xA0000003u).CopyTo(buf, 0);
+    BitConverter.GetBytes((ushort)dataLen).CopyTo(buf, 4);
+    BitConverter.GetBytes((ushort)0).CopyTo(buf, 8);
+    BitConverter.GetBytes((ushort)sub.Length).CopyTo(buf, 10);
+    BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(buf, 12);
+    BitConverter.GetBytes((ushort)0).CopyTo(buf, 14);
+    sub.CopyTo(buf, 16);
+    using (var h = CreateFileW(link, 0x40000000, 0, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
+      if (h.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      int ret;
+      if (!DeviceIoControl(h, 0x000900A4, buf, buf.Length, IntPtr.Zero, 0, out ret, IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+  }
+}
+"@
+[RawJunction]::Make($Link, $NtTarget)
+'''
+
+
+def _mk_raw_junction(tmp_path, link, nt_target):
+    # mklink /J and New-Item -ItemType Junction both normalize the target (a trailing '.' is dropped), so the keys' repro shape -- a junction
+    # whose stored target is the NATIVE directory `judge.` -- is written directly with FSCTL_SET_REPARSE_POINT (no elevation needed).
+    script=tmp_path/"raw-junction.ps1"; script.write_text(_RAW_JUNCTION_PS,encoding="ascii")
+    r=subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-File",str(script),"-Link",str(link),"-NtTarget",nt_target],capture_output=True,text=True,timeout=90)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+def test_a_run_dir_junction_to_a_native_trailing_dot_directory_never_certifies_the_ordinary_sibling_codex_reads(fixture_tree):
+    # r7 (opus B1 = sol B2, r6 ADV-A1): -RunDir is a junction whose stored target is \??\<root>\judge. (a real directory named `judge.`),
+    # and the ordinary sibling <root>\judge holds DIFFERENT bytes Q under the snapshot name. The snapshot P is written into `judge.`;
+    # FinalPath stripped \\?\ and handed codex <root>\judge.\terra-001.image-01.png, which Win32 normalizes to <root>\judge\..., so codex
+    # read Q while the held-digest compare certified P (consumedVerified=true). The stripped path must be canonical or the run is refused.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
+    judge_dot="\\\\?\\"+str(root/"judge")+"."; os.mkdir(judge_dot)
+    plain=root/"judge"; plain.mkdir()
+    (plain/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q in the ordinary sibling")
+    link=root/"judge-link"
+    try:
+        _mk_raw_junction(root,link,"\\??\\"+str(root/"judge")+".")
+        cache=_terra_env(fixture_tree)
+        cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+        cmd[cmd.index("-RunDir")+1]=str(link)
+        env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+        r=run_lane(cmd+["-ImagePaths",str(png)],env)
+        receipt=link/"terra-001.receipt.json"
+        text=_failure_text(r,receipt)
+        if (root/"image-bytes.json").exists():
+            seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+            entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+            assert not (entry.get("consumedVerified") is True and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+        assert r.returncode!=0 and "image-path-noncanonical" in text,(r.returncode,text)
+        assert not (root/"args.json").exists(), "a non-canonical snapshot path must never reach the codex launch"
+    finally:
+        if link.exists(): os.rmdir(link)
+        shutil.rmtree(judge_dot,ignore_errors=True)
+
+
+@pytest.mark.parametrize("raw,expected",[
+    ("\\\\?\\C:\\x\\judge\\terra-001.image-01.png","C:\\x\\judge\\terra-001.image-01.png"),
+    ("\\\\?\\UNC\\srv\\share\\run\\terra-001.image-01.png","\\\\srv\\share\\run\\terra-001.image-01.png"),
+    ("C:\\x\\run dir\\terra-001.image-01.png","C:\\x\\run dir\\terra-001.image-01.png"),
+    ("\\\\?\\C:\\x\\judge.\\terra-001.image-01.png",None),
+    ("\\\\?\\UNC\\srv\\share\\judge.\\terra-001.image-01.png",None),
+    ("\\\\?\\C:\\x\\judge\\terra-001.image-01.png.",None),
+])
+def test_strip_verbatim_returns_only_a_path_win32_will_not_renormalize(tmp_path,raw,expected):
+    # r7: the extracted check, DOS and UNC prefix-removal branches, with the keys' exact trailing-dot strings (no filesystem access).
+    r=_copy_harness(tmp_path,f"""
+try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGHT ' + $_.Exception.GetBaseException().GetType().Name + ' ' + $_.Exception.GetBaseException().Message }}
+""")
+    if expected is None:
+        assert "CAUGHT IOException image-path-noncanonical" in r.stdout,(r.stdout,r.stderr)
+    else:
+        assert f"OUT [{expected}]" in r.stdout,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("dirname,expanded",[("%OS%","Windows_NT"),("a^b","ab"),("a&b",None)])
+def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded):
+    # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
+    # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
+    run_dir=root/dirname; run_dir.mkdir()
+    if expanded:
+        (root/expanded).mkdir(); (root/expanded/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    receipt=run_dir/"terra-001.receipt.json"
+    text=_failure_text(r,receipt)
+    if (root/"image-bytes.json").exists() and receipt.exists():
+        seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+        entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+        assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+    assert r.returncode!=0 and "image-path-bad-character" in text,(r.returncode,text)
+    assert not (root/"args.json").exists(), "a path cmd.exe would rewrite must never reach the codex launch"
 
 
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
