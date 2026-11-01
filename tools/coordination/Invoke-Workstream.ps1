@@ -242,20 +242,33 @@ function Select-MergeGroupJobsRun {
     # databaseId is not a positive integer (it keys the jobs URL), is excluded from EVERY selection branch (fail closed) and is
     # counted in the label so a reader sees it was ignored. A row that is not an object has none of the properties, so it is
     # malformed too. A null row is not a row and is not counted.
+    # r12 (r11 adversary A1): this file runs under `Set-StrictMode -Version Latest`, where `$row.headSha` on a row WITHOUT that
+    # property (or on a string / number row) THROWS PropertyNotFoundException, and production's catch would then report
+    # "(job graph) FAILED" instead of selecting the usable rows. Every read goes through PSObject.Properties[name], which yields
+    # $null for an absent property on any value, so such a row is counted malformed and the usable rows stay selectable.
+    # The value is returned wrapped (the unary comma) because a scriptblock call unrolls a one-element array into its element, which
+    # would turn a headSha / conclusion / databaseId of ["x"] into the string "x" and defeat the type check below.
+    $get = { param($o, $n) $p = $o.PSObject.Properties[$n]; if ($null -eq $p) { $null } else { , $p.Value } }
+    # r12 (r11 adversary A2): PowerShell's string -eq AND its case-sensitive form both ignore an embedded NUL character, so a
+    # headSha of <tip>+NUL equalled the tip and a conclusion of 'success'+NUL counted as a success. Identity is decided by an
+    # ORDINAL String.Equals, and a headSha or conclusion that carries any control character (NUL included) is refused as malformed.
+    $same = { param([string]$a, [string]$b) [string]::Equals($a, $b, [System.StringComparison]::Ordinal) }
+    $clean = { param($v) ($v -is [string]) -and ($v -notmatch '[\x00-\x1F\x7F]') }
     $present = @($Runs | Where-Object { $null -ne $_ })
     $wellTyped = @($present | Where-Object {
-        ($_.headSha -is [string]) -and ($_.conclusion -is [string]) -and
-        (($_.databaseId -is [int]) -or ($_.databaseId -is [long])) -and ($_.databaseId -gt 0)
+        $id = & $get $_ 'databaseId'
+        (& $clean (& $get $_ 'headSha')) -and (& $clean (& $get $_ 'conclusion')) -and
+        (($id -is [int]) -or ($id -is [long])) -and ($id -gt 0)
     })
     $badRows = $present.Count - $wellTyped.Count
     $bad = if ($badRows -gt 0) { "; $badRows malformed run row(s) ignored (headSha/conclusion not a string or databaseId not a positive integer)" } else { '' }
     $sorted = @($wellTyped | Sort-Object -Property @(
-        @{ Expression = { if ($null -eq (& $toUtc $_.createdAt)) { 0 } else { 1 } }; Descending = $true },
-        @{ Expression = { $t = & $toUtc $_.createdAt; if ($null -eq $t) { [datetime]::new(0) } else { $t } }; Descending = $true }
+        @{ Expression = { if ($null -eq (& $toUtc (& $get $_ 'createdAt'))) { 0 } else { 1 } }; Descending = $true },
+        @{ Expression = { $t = & $toUtc (& $get $_ 'createdAt'); if ($null -eq $t) { [datetime]::new(0) } else { $t } }; Descending = $true }
     ))
     if ($sorted.Count -eq 0) { return $null }
     if ($MasterSha) {
-        $landed = @($sorted | Where-Object { $_.headSha -eq $MasterSha })
+        $landed = @($sorted | Where-Object { & $same (& $get $_ 'headSha') $MasterSha })
         if ($landed.Count -gt 0) {
             # The tip is the LOCAL refs/remotes/fork/master and can lag hosted master, so the label ALWAYS names
             # its source and carries that caveat: a missing newer success proves nothing about freshness. Every
@@ -266,12 +279,12 @@ function Select-MergeGroupJobsRun {
             # order. A row whose createdAt does not parse cannot be shown newer, so it is not counted; when the
             # selected run's own createdAt does not parse nothing can be shown newer either.
             $label = 'landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)'
-            $selAt = & $toUtc $landed[0].createdAt
+            $selAt = & $toUtc (& $get $landed[0] 'createdAt')
             $newerOff = @()
             if ($null -ne $selAt) {
                 $newerOff = @($sorted | Where-Object {
-                    $t = & $toUtc $_.createdAt
-                    $_.headSha -ne $MasterSha -and $null -ne $t -and $t -gt $selAt
+                    $t = & $toUtc (& $get $_ 'createdAt')
+                    (-not (& $same (& $get $_ 'headSha') $MasterSha)) -and $null -ne $t -and $t -gt $selAt
                 })
             }
             if ($newerOff.Count -gt 0) {
@@ -283,7 +296,7 @@ function Select-MergeGroupJobsRun {
     # ADV-A1 (r5): when the tip could not be read, the label names the typed reason ($TipReason, for example
     # 'tip-ref-missing: refs/remotes/fork/master') so a reader sees WHY the landed rule was skipped.
     $why = if ($TipReason) { "; $TipReason" } else { '' }
-    $ok = @($sorted | Where-Object { $_.conclusion -eq 'success' })
+    $ok = @($sorted | Where-Object { & $same (& $get $_ 'conclusion') 'success' })
     if ($ok.Count -gt 0) {
         return [pscustomobject]@{ Run = $ok[0]; Label = "newest success; may be a non-landed queue entry$why$bad" }
     }

@@ -6475,3 +6475,110 @@ def test_r11_the_export_reports_a_failed_row_when_runs_exist_but_none_is_usable(
     start = text.index("$pick = Select-MergeGroupJobsRun")
     tail = text[start:start + 3000]
     assert "elseif (@($runs).Count -gt 0)" in tail and "no usable run row" in tail, "an all-malformed export must surface a FAILED row"
+
+
+# --- r12 (r11 adversary A1 + A2, hub ruling 2026-11-01): StrictMode-safe property reads and an ORDINAL comparison -------------
+# A1: Invoke-Workstream.ps1 runs under `Set-StrictMode -Version Latest`, where `$row.headSha` on a row WITHOUT that property
+# (or on a string / number row) throws PropertyNotFoundException. The r11 harness did not enable strict mode, so its
+# missing-property tests passed while production's catch turned the throw into "(job graph) FAILED" instead of selecting the
+# usable rows. The harness below runs the extracted selector under StrictMode Latest exactly as production does.
+# A2: PowerShell's -eq AND -ceq both ignore an embedded NUL (measured on pwsh 7.6.9: "abc" -ceq ("abc" + [char]0) is True), so
+# `<tip>` + NUL matched the landed tip and `success` + NUL counted as a success. Only [string]::Equals(.., Ordinal) tells them
+# apart, and a value carrying any control character is refused as malformed in the first place.
+def _r12_select(tmp_path, rows, tip, strict=True):
+    """Like _mgrs_select, but the harness runs under Set-StrictMode -Version Latest (production's mode) unless strict=False."""
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    rows_file = tmp_path / "rows-r12.json"
+    rows_file.write_text(json.dumps(rows), encoding="utf-8")
+    harness = tmp_path / "r12-harness.ps1"
+    harness.write_text(
+        ("Set-StrictMode -Version Latest\n" if strict else "") + "$ErrorActionPreference='Stop'\n" + fn +
+        "\n$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip.replace("'", "''") + "'\n"
+        "if ($null -eq $pick) { 'NONE' } else { ([pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress) }\n",
+        encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    text = out.stdout.strip()
+    return None if text == "NONE" else json.loads(text)
+
+
+@pytest.mark.parametrize("missing", ["headSha", "conclusion", "databaseId"])
+def test_r12_a_row_missing_a_property_is_counted_malformed_under_strict_mode(tmp_path, missing):
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP, "success"), missing),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r12_non_object_rows_are_counted_malformed_under_strict_mode(tmp_path):
+    rows = ["not-a-row", 7, True, [1, 2], _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(4)}
+
+
+def test_r12_a_row_without_created_at_stays_usable_and_sorts_last_under_strict_mode(tmp_path):
+    # createdAt is only a sort key: a row lacking it is not malformed (same as before r12), it just ranks behind any row that has one.
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"), "createdAt"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST}
+
+
+@pytest.mark.parametrize("bad,tip", R11_BAD_SHA + [pytest.param(["a" * 40], "a" * 40, id="one-element-array")])
+def test_r12_every_r11_non_string_head_sha_shape_still_holds_under_strict_mode(tmp_path, bad, tip):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", bad, "failure"), _mgrs_row(200, "2026-10-31T16:00:00Z", tip, "success")]
+    assert _r12_select(tmp_path, rows, tip) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R11_BAD_CONCLUSION + [pytest.param(["success"], id="one-element-array-dup")])
+def test_r12_every_r11_non_string_conclusion_shape_still_holds_under_strict_mode(tmp_path, bad):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, bad), _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R11_BAD_ID)
+def test_r12_every_r11_bad_database_id_shape_still_holds_under_strict_mode(tmp_path, bad):
+    rows = [_mgrs_row(bad, "2026-10-31T17:00:00Z", MGRS_TIP, "success"), _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r12_the_real_gh_rows_select_the_same_under_strict_mode(tmp_path):
+    picked = _r12_select(tmp_path, R11_REAL_ROWS, "124de5190698a0b0ffd8ba488f5a9eddb37e3e36")
+    assert picked == {"id": 41225880883, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}, picked
+
+
+R12_CONTROL_SUFFIXES = [
+    pytest.param(chr(0), id="nul"),
+    pytest.param(chr(0) * 2, id="two-nuls"),
+    pytest.param(chr(10), id="lf"),
+    pytest.param(chr(9), id="tab"),
+    pytest.param(chr(31), id="us"),
+    pytest.param(chr(127), id="del"),
+]
+
+
+@pytest.mark.parametrize("suffix", R12_CONTROL_SUFFIXES)
+def test_r12_a_head_sha_with_a_control_character_is_never_the_landed_run(tmp_path, suffix):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP + suffix, "failure"),   # newest; the tip plus a control character
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]            # the genuinely landed run
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("suffix", R12_CONTROL_SUFFIXES)
+def test_r12_a_conclusion_with_a_control_character_is_never_a_success(tmp_path, suffix):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success" + suffix),  # newest; "success" plus a control character
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+            _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success")]           # the real success
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 100, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+def test_r12_a_nul_polluted_row_alone_selects_nothing(tmp_path):
+    # the only row is NUL-polluted in both fields: not landed, not a success, not selectable
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP + chr(0), "success" + chr(0))]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) is None
+
+
+def test_r12_an_ordinal_comparison_is_pinned_in_the_selector_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "StringComparison]::Ordinal" in body, "headSha / conclusion must be compared ordinally ( -eq and -ceq both ignore an embedded NUL )"
+    assert "$_.headSha -eq" not in body and "$_.headSha -ne" not in body and "$_.conclusion -eq" not in body
+    assert "-ceq" not in body and "-cne" not in body, "-ceq still ignores an embedded NUL; use [string]::Equals(.., Ordinal)"
