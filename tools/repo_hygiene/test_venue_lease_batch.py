@@ -7556,9 +7556,12 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                 self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(self.case / 'scratch' / '.claude-state' / 'receipts')}"] * 2)
 
     # ---- r13 (hosted shard 4/8 job 124969603389, CoS 6563973648): the native classifier CORROBORATES the documented set, in its own method so a host difference cannot hide the
-    # caller sweep. RtlIsDosDeviceName_U's answer depends on the input form and the OS build: 10.0.19045 classifies the reserved set in every form (bare, `.\`, `C:\x\`, the full
-    # .claude-state path); Windows Server 2025 10.0.26100 returned 0 for all 78 COM/LPT spellings in the full-path form. The corroboration is fed the BARE final component (the form a
-    # path component is reserved in on every documented build); the other forms are recorded as host facts on every run.
+    # caller sweep. RtlIsDosDeviceName_U's answer depends on the input form and the OS build, MEASURED:
+    #   10.0.19045 (Virtual-Ten): every form (bare, `.\`, `C:\x\`, the full .claude-state path) classifies all 84 documented spellings, extensions and `NAME .ext` included.
+    #   10.0.26100 (hosted windows-2025-vs2026, Tests 41358897524 job 125004796490): bare classifies exactly the 30 bare documented stems (any case, superscripts included) and no
+    #   extension form (CON.txt, `COM1 .txt` are ordinary); every path form classifies NUL only.
+    # So the host-independent corroboration is: the BARE STEMS are devices and agree exactly with the documented set; and in EVERY form, whatever the kernel calls a device is in
+    # the documented set (the helper refuses that set, so it is never looser than the kernel). A form that also classifies the extension controls must agree in full (19045).
     def test_r13_native_classifier_corroborates_the_documented_device_set_on_the_bare_component(self) -> None:
         is_dev = ctypes.windll.ntdll.RtlIsDosDeviceName_U
         is_dev.argtypes, is_dev.restype = [ctypes.c_wchar_p], ctypes.c_uint32
@@ -7568,16 +7571,24 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         host = f"os={v.major}.{v.minor}.{v.build} platform={sys.platform}"
         fact = host + " | " + " | ".join(f"{f}: {sum(m.values())} devices [{' '.join(sorted(n for n, d in m.items() if d))}]" for f, m in native.items())
         print(f"\nNATIVE-DOS-DEVICE-HOST-FACT {fact}".encode("ascii", "backslashreplace").decode(), file=sys.stderr)
-        positives = ("COM1", "LPT9", "COM\u00b9", "NUL", "CON.txt")
+        positives = ("COM1", "LPT9", "COM\u00b9", "LPT\u00b3", "NUL", "CON", "PRN", "AUX", "com1", "nul")
         self.assertTrue(all(native["bare"][n] for n in positives),
                         f"HOST-FACT-NATIVE-CLASSIFIER-BLIND-ON-BARE-NAMES: RtlIsDosDeviceName_U does not classify the documented positive controls {positives} even as a bare name on {fact}")
-        mismatch = {n: native["bare"][n] for n in DEVICE_MATRIX_NAMES if native["bare"][n] != documented_dos_device(n)}
-        self.assertEqual(mismatch, {}, f"the documented reserved set and RtlIsDosDeviceName_U on the bare name disagree (name: native device) on {host}")
-        # any other form that classifies the positive controls must agree with the documented set too (on 10.0.19045 every form does)
+        # (1) bare stems (no dot, no space): the kernel and the documented set agree EXACTLY, both directions (COM0, LPT0, COM10, CONSOLE, fullwidth 1 ... are ordinary)
+        stems = [n for n in DEVICE_MATRIX_NAMES if "." not in n and " " not in n]
+        self.assertGreaterEqual(len(stems), 40)   # 30 documented stems, 14 ordinary near misses
+        mismatch = {n: native["bare"][n] for n in stems if native["bare"][n] != documented_dos_device(n)}
+        self.assertEqual(mismatch, {}, f"the documented reserved set and RtlIsDosDeviceName_U on the bare stem disagree (name: native device) on {fact}")
+        # (2) every form: the kernel never calls a name a device that the documented set (so the helper) treats as ordinary
         for f, m in native.items():
-            if f != "bare" and all(m[n] for n in positives):
-                with self.subTest(form=f):
-                    self.assertEqual({n: d for n, d in m.items() if d != documented_dos_device(n)}, {}, f"{f} on {host}")
+            with self.subTest(form=f, check="native-device-is-documented"):
+                self.assertEqual(sorted(n for n, d in m.items() if d and not documented_dos_device(n)), [], f"{f}: the kernel classifies a name the helper would certify, on {fact}")
+        # (3) a form that also classifies the extension controls must agree with the documented set in full (10.0.19045: every form)
+        ext_positives = ("CON.txt", "NUL .txt", "COM1.txt", "LPT\u00b2 .txt")
+        for f, m in native.items():
+            if all(m[n] for n in positives + ext_positives):
+                with self.subTest(form=f, check="full-agreement"):
+                    self.assertEqual({n: d for n, d in m.items() if d != documented_dos_device(n)}, {}, f"{f} on {fact}")
 
     def test_r8_a3_a_link_chain_is_bounded_per_link_sixteen_pass_seventeen_are_refused(self) -> None:
         # opus/sol A3 (ADV-A3): ResolveLinkTarget($true) collapsed a whole chain inside one outer hop, so the stated 16-link bound was never enforced. Real junctions: j00 -> j01 -> ... -> j16 -> final (17 links).
