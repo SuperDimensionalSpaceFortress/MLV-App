@@ -21,18 +21,18 @@ recompute and the key prompts are unbound), so it gets identity-link credit only
 | K1 roles | FIT | FIT | sonnet/opus producers; sol, opus, fable read-only keys; #726 key3 is the producer's model in a separate run |
 | K2 register | GAP | INSTANCE-FAILURE, still failing | `docs/never-authorized.json` lists prohibitions; owner rulings live in the board ledger only |
 | K3 identity | GAP | INSTANCE-FAILURE, still failing (partly cured) | #732 keys and delivery share tree `f50a8d5b` (identity link only); per distinct PR, 236 of 257 witnessed are `head-only` and 21 `delivered`; no gate refuses them |
-| K4 positive evidence | FIT | FIT | `Invoke-Lane.ps1:2251`, `:2483`; guard `test_coordination_guardrails.py:1327` |
+| K4 positive evidence | GAP (regraded) | FIT | claude lanes conform (`Invoke-Lane.ps1:2251`, `:2483`; guard `test_coordination_guardrails.py:1327`); codex exit 0 with empty, blank or unrelated output is booked complete (`lane-provider-refusal.ps1:88-109`) |
 | K5 declared profile | GAP | INSTANCE-FAILURE, still failing (relapsed) | dispatched rounds declare before work; #728, #730 and #731 were produced by a hub chat and declared retroactively |
 | K6 independent key | FIT | FIT | sol (OpenAI family) on every subject head; hosted CI 35/35 per head; `merge_group` success per landing |
 | K7 delivery | FIT | FIT | enqueue witness per landing; no typed `CLOSURE_INCOMPLETE` |
-| K8 capacity | FIT | FIT | weekly limit 2026-10-27 ~21:57Z: owner rotation, usage probe ok, dead producer continued on a declared r13b |
+| K8 capacity | GAP (regraded) | FIT | 97 refusals in 19 events (last 2026-11-01T07:28Z). Most relaunches followed an ok probe, but 5 identical-prompt re-runs ran before a passed probe (10-17, 10-24, 10-29) and 36 launches had no logged passed probe |
 | K9 resume | UNEXERCISED | UNEXERCISED | `k9_witness` in CI (`tests.yml:135`, `:217`); the rotation resume was same-host |
 | K10 inventory | GAP | INSTANCE-FAILURE, still failing | inventory dated 2026-09-14; no Codex identity; not re-probed after the 2026-10-27 rotation |
 | K11 honest reports | GAP | INSTANCE-FAILURE, still failing (partly cured) | header guard `test_kernel_instance_profile_agreement.py` (#451); K4 citations and the board-local hash table drifted |
 | K12 feedback | GAP | INSTANCE-FAILURE, still failing (partly cured) | a board-local scheduler queued this refile; the 2026-10-15 filing waited 8 days for publication; 17-day window |
 
 Profile rows: subject-identity GAP (still failing, partly cured), acceptance-evidence GAP (still failing, partly cured),
-resource-terminals FIT, delivery-target FIT. Harvest INSTANCE-FAILURE rows cured: 0 of 8. Five are partly cured, and K5 relapsed.
+resource-terminals FIT, delivery-target FIT. Harvest INSTANCE-FAILURE rows cured: 0 of 8. Five are partly cured, and K5 relapsed. Two clauses the harvest graded FIT are regraded in this refile: K4 and K8 (GAP above).
 
 **Instance changes the steward should see (no text change asked).** (1) By owner ruling on 2026-10-29, a PR touching only `tools/` or
 `tests/` and outside the HIGH-RISK path class merges on one authenticated exact-head key, not two. (2) By owner ruling on 2026-10-20,
