@@ -7265,7 +7265,9 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         rel = self.judge(["C:\\fake\\agent-share"], {"rel-middle-dot": "r.\\receipts", "rel-terminal-dot": "receipts.", "rel-fine": "receipts"}, location=loc, process_dir=loc)
         self.assertIsNone(rel["rel-middle-dot"], rel)
         self.assertIsNone(rel["rel-terminal-dot"], rel)
-        self.assertEqual(rel["rel-fine"].lower(), str(loc / "receipts").lower(), rel)
+        # r10 C2: the helper returns the link-resolved (8.3-expanded) path it judged, and a hosted runner's temp dir is the short `RUNNER~1` spelling of `runneradmin`: compare the resolved long
+        # path of BOTH sides (lower-casing is not file-system identity)
+        self.assertEqual(os.path.normcase(os.path.realpath(rel["rel-fine"])), os.path.normcase(os.path.join(os.path.realpath(str(loc)), "receipts")), rel)
         # the batch entry refuses before the run dir, the claim or a leg; the real leg entry refuses the same root
         base = self.clean_base()
         for label, rootp in (("terminal-dot", base / ".claude-state" / "receipts."), ("middle-dot", base / ".claude-state" / "r." / "receipts")):
@@ -7315,8 +7317,11 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         # the same class at Invoke-VenueLeaseBatch.ps1 (the runner-owned leaf names): `-imatch` of `quiet-...` under tr-TR missed the upper-case spelling the file system treats as the same file
         text = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
         self.assertNotIn("-imatch $p", text, "the runner-owned leaf match is a culture-dependent -imatch")
-        self.assertEqual(text.count("[regex]::IsMatch($c.Name, $p, $script:DvCultureFreeIgnoreCase)"), 2, "both leaf-name matches go through the culture-invariant option")
-        self.assertIn("$script:DvCultureFreeIgnoreCase = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'", text, "the script defines the option in ITS scope (the module's $script: is not visible here)")
+        opt = "[System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant"
+        self.assertEqual(text.count(f"[regex]::IsMatch($c.Name, $p, {opt})"), 2, "both leaf-name matches go through the culture-invariant option")
+        self.assertEqual(text.count(f"[regex]::IsMatch($leaf, $p, {opt})"), 1, "the leaf match in the same guard goes through it too")
+        # r10 C1: the claim guard runs these functions in a separate runspace that never receives a $script: variable, so the option is spelled out at the call (a $null third argument has no IsMatch overload)
+        self.assertNotIn("$script:DvCultureFreeIgnoreCase", text, "no $script: option variable: the guard worker runspace would see $null")
         pat = "'^quiet-.+\\.out\\.txt\\z'"
         script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n[System.Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'\n"
                   "$opt = [Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'\n"

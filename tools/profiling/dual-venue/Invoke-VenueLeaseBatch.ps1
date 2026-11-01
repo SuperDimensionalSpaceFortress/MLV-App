@@ -354,7 +354,9 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
 # of them would be overwritten or appended to after the lease opened, so preflight refuses it before any claim. A new output is added HERE and nowhere else: the files named
 # directly in RunDir (leaf patterns, matched whole and case-insensitively) and the subdirectories the runner owns (anything under them).
 # r9 B2: the runner-owned leaf names are matched with THIS option, not -imatch: -imatch follows the process culture (tr-TR: `QUIET-A.OUT.TXT` would not match `^quiet-`), and the file system treats those spellings as one file.
-$script:DvCultureFreeIgnoreCase = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'
+# r10 C1: the option (IgnoreCase -bor CultureInvariant) is spelled out at each call below, never kept in a $script: variable: the claim guard runs these functions in a SEPARATE runspace
+# ($script:GuardWorkerFunctions) that receives only the function bodies and the named values of Invoke-InputGuard's $vars, so a script-scope option read there was $null, and
+# [regex]::IsMatch(string, string, $null) has no overload (every input came back OUTPUT_ZONE_UNRESOLVED / LEG_PLAN_INVALID).
 $script:RunDirOutputLeafPatterns = @(
     '^quiet-.+\.out\.txt\z'     # Invoke-QuietProbe: each probe's output
     '^leg-.+\.out\.txt\z'       # the leg's output (leg-<name>-b<nn>-a<n>.out.txt)
@@ -515,7 +517,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             $linked = @()
             foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
                 $owned = ($c.Name -iin $z.dirs)
-                foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, $script:DvCultureFreeIgnoreCase)) { $owned = $true } }
+                foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { $owned = $true } }
                 if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
             }
             # r12 pass 2 (adversary r12 A1'): and a link BELOW an owned directory (quiet\x.job.ps1 -> a spec, or a junction in it) writes through just the same, whatever the target's link count:
@@ -548,7 +550,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             foreach ($z in $zones) {
                 $scan = [System.Collections.Generic.List[object]]::new()
                 foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -File -ErrorAction Stop)) {
-                    foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, $script:DvCultureFreeIgnoreCase)) { $scan.Add($c); break } }
+                    foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { $scan.Add($c); break } }
                 }
                 foreach ($d in $z.dirs) {
                     $dp = Join-Path $z.root $d
@@ -579,7 +581,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
         }
         if ($parent -ieq $z.root -or ($aboveIds.Count -gt 0 -and $aboveIds[0] -ceq $z.rootId)) {
             $leaf = [IO.Path]::GetFileName($full)
-            foreach ($p in $z.leaf) { if ([regex]::IsMatch($leaf, $p, $script:DvCultureFreeIgnoreCase)) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
+            foreach ($p in $z.leaf) { if ([regex]::IsMatch($leaf, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
         }
         foreach ($d in $z.dirs) {
             if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase) -or ($z.ownedIds.ContainsKey($d) -and $aboveIds -ccontains $z.ownedIds[$d])) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
