@@ -605,7 +605,8 @@ class PairedSeekProvenanceTests(PairedStillsHarness, unittest.TestCase):
 
 SHIPPED_LISTLESS_SPEC = DV / "legs" / "m16-1243-q1-cpu-look-paired-windowed-s2.json"
 # r7: the collection-time verdict replaced by one that claims every still honoured, so only the receipt writer's final validation can catch a bad still.
-LYING_VERDICT = ("        function Get-DvPairedSeekVerdict { param($SeekDir, $Files, $RequestedFrames) "
+# r8 forced fixture: the param list gains $StillCount, the committed still count the runner now passes (a splatted key the stub does not declare throws).
+LYING_VERDICT = ("        function Get-DvPairedSeekVerdict { param($SeekDir, $Files, $RequestedFrames, $StillCount) "
                  "[pscustomobject]@{ reportedFrames = @(50, 150); framesHonoured = $true; frameMismatches = @() } }\n")
 LISTLESS_BAD_SIDECARS = (("a-in-pass", {"capture_mode": "in_pass"}), ("b-playing", {"playback_path": True}),
                          ("c-no-mode", {"capture_mode": KeyError}), ("d-no-path", {"playback_path": KeyError}),
@@ -804,6 +805,109 @@ class MissingLookLegTests(RunnerHarness, unittest.TestCase):
         self.assertIsNone(receipt, "a refused spec writes no receipt (like every other DVE_LEG_SPEC_INVALID)")
         self.assertEqual(submitted, [], "nothing is submitted")
         self.assertEqual(self.generator_calls(), [], "nothing is generated")
+
+
+# r8: the collection-time block, rewritten AFTER the honest verdict: the claims a receipt could carry, so only the receipt writer's final validation can
+# catch them. (The anchor is the last line of the collection block; the edit must apply exactly once, like every mutation here.)
+VERDICT_DONE_ANCHOR = "        $pairedSeekInfo['frameMismatches'] = $seekVerdict.frameMismatches\n"
+SIX_FRAMES = [50, 150, 250, 350, 450, 550]
+
+
+def claimed_block(reported: list[int], requested: list[int] | None = None) -> str:
+    frames = lambda xs: "@(" + ", ".join(str(x) for x in xs) + ")"
+    text = (f"        $pairedSeekInfo['reportedFrames'] = {frames(reported)}; $pairedSeekInfo['framesHonoured'] = $true; "
+            "$pairedSeekInfo['frameMismatches'] = @()\n")
+    if requested is not None:
+        text += f"        $pairedSeekInfo['requestedFrames'] = {frames(requested)}\n"
+    return text
+
+
+@requires_windows_pwsh
+class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
+    """r8 (adversary r7 A2 / A1, Dot on #721 16:25:15Z, hub ACK): the paired stills a leg must hold are the COMMITTED spec's -- look.pairedSeekFrames when
+    it lists them, otherwise look.contactSheetFrames stills frame-00 .. frame-<n-1> (the app's own numbering) -- never the stills that happened to be
+    collected and never the frames a receipt claims. r7 checked only the stills it found: one valid paused still satisfied the shipped six-frame leg
+    (A2), and a receipt whose requestedFrames named one frame narrowed final validation to frame-00 while five playing stills sat hash-listed beside it
+    (A1). Every expected still must be present and paused, every hash-listed file must be one of them, a receipt frame list the committed spec does not
+    carry is a typed mismatch, and a sidecar whose top level is not a JSON object (a one-element array) is no sidecar (adversary r7 A3)."""
+
+    def shipped_spec(self, leg_id: str) -> Path:
+        shipped = json.loads(SHIPPED_LISTLESS_SPEC.read_text(encoding="utf-8"))
+        self.assertEqual((shipped["look"]["contactSheetFrames"], "pairedSeekFrames" in shipped["look"]), (6, False), "the shipped six-frame listless shape")
+        path = self.write_spec(leg_type="look", leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec["look"] = dict(shipped["look"], lookFlavor="classic")
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def run_case(self, spec: Path, sidecars: list[bytes], claim: str | None = None, extra_files: dict[str, bytes] | None = None):
+        runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claim)])} if claim else {}
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills(sidecars)
+        seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
+        for name, data in (extra_files or {}).items():
+            (seek / name).write_bytes(data)
+        proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"], **runner)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def assert_not_a_pass(self, receipt, *needles: str, final: bool = False) -> None:
+        self.assertNotIn(receipt["outcome"], ("PASS", "ADVISORY"), receipt["outcomeDetail"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        if final:
+            self.assertIn("the receipt writer refuses it", receipt["outcomeDetail"])
+        for needle in needles:
+            self.assertIn(needle, receipt["outcomeDetail"])
+
+    def test_a2_one_valid_still_of_the_shipped_six_is_not_a_pass_at_collection(self) -> None:
+        receipt = self.run_case(self.shipped_spec("set-one-of-six"), [provenance_sidecar(50)])
+        self.assert_not_a_pass(receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", "frame-01", "frame-05")
+        info = receipt["look"]["pairedSeek"]
+        self.assertIs(info["framesHonoured"], False)
+        self.assertEqual(len(info["reportedFrames"]), 6, "one entry per committed still, collected or not")
+
+    def test_a2_one_valid_still_of_the_shipped_six_is_not_a_pass_at_final_validation(self) -> None:
+        # the collection block claims what r7 derived from the one still it found (honoured, [50]); the writer re-derives six expected stills
+        receipt = self.run_case(self.shipped_spec("setf-one-of-six"), [provenance_sidecar(50)], claim=claimed_block([50]))
+        self.assert_not_a_pass(receipt, "PAIRED_SEEK", "frame-01", final=True)
+
+    def test_a1_a_receipt_frame_list_cannot_narrow_final_validation(self) -> None:
+        # adversary r7 A1's input: frame-00 paused at 50, frames 01-05 playing (in_pass); the receipt says requestedFrames [50] and every claim agrees
+        playing = [provenance_sidecar(f, capture_mode="in_pass", playback_path=True) for f in SIX_FRAMES[1:]]
+        receipt = self.run_case(self.shipped_spec("setf-narrowed"), [provenance_sidecar(50)] + playing, claim=claimed_block([50], requested=[50]))
+        self.assert_not_a_pass(receipt, "requestedFrames", "frame-01", final=True)
+        self.assertIn("capture_mode", receipt["outcomeDetail"], "the playing stills are provenance-checked, not skipped")
+
+    def test_a1_every_hash_listed_file_is_one_of_the_committed_stills(self) -> None:
+        # an extra playing still beside a complete set: a listed-frame leg (r7 never looked past frame-01) and the shipped listless leg
+        extra = {"frame-0{n}.png": b"\x89PNG\r\n\x1a\nextra", "frame-0{n}.json": provenance_sidecar(999, capture_mode="in_pass", playback_path=True)}
+        for case, spec, sidecars in (("listed", lambda: self.paired_spec("set-extra-listed"), [provenance_sidecar(50), provenance_sidecar(150)]),
+                                     ("listless", lambda: self.shipped_spec("set-extra-listless"), [provenance_sidecar(f) for f in SIX_FRAMES])):
+            with self.subTest(case=case):
+                self.fresh()
+                n = len(sidecars)
+                receipt = self.run_case(spec(), sidecars, extra_files={k.format(n=n): v for k, v in extra.items()})
+                self.assert_not_a_pass(receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", f"frame-0{n}")
+
+    def test_a3_a_sidecar_that_is_a_one_element_array_is_not_a_pass(self) -> None:
+        wrapped = b"[" + provenance_sidecar(50) + b"]"
+        for case, spec, sidecars in (("listed", lambda: self.paired_spec("set-array-listed"), [wrapped, provenance_sidecar(150)]),
+                                     ("listless", lambda: self.shipped_spec("set-array-listless"), [wrapped] + [provenance_sidecar(f) for f in SIX_FRAMES[1:]])):
+            with self.subTest(case=case):
+                self.fresh()
+                receipt = self.run_case(spec(), sidecars)
+                self.assert_not_a_pass(receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", "frame-00")
+
+    def test_the_complete_six_still_paused_control_passes(self) -> None:
+        for claim in (None, claimed_block(SIX_FRAMES)):
+            with self.subTest(final_validation=claim is not None):
+                self.fresh()
+                receipt = self.run_case(self.shipped_spec("set-control" + ("-f" if claim else "")), [provenance_sidecar(f) for f in SIX_FRAMES], claim=claim)
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                info = receipt["look"]["pairedSeek"]
+                self.assertEqual(info["reportedFrames"], SIX_FRAMES)
+                self.assertIs(info["framesHonoured"], True)
+                self.assertNotIn("requestedFrames", info)
 
 
 if __name__ == "__main__":

@@ -282,7 +282,7 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     $receipt.subject.digest = Get-DvSubjectDigest -BuildManifestSha256 $BuildManifestSha256 -LegSpecSha256 $legSpecSha256 `
         -ClipId $spec.clipId -ClipContentSha256 $receipt.subject.clipContentSha256 -Backend $Backend -LookFlavor $lookFlavor
     try {
-        $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
+        $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode -LegSpecBytes $specBytes
     } catch {
         $refusal = [string]$_.Exception.Message
         # DVE-LEG-TERMINALS-1 r2: a leg that ran never ends without a receipt. A PASS/FAIL the production validator refuses -- for ANY reason (a backend the counters
@@ -307,7 +307,7 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
             exit 2
         }
         try {
-            $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
+            $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode -LegSpecBytes $specBytes
         } catch {
             Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
             exit 2
@@ -833,7 +833,9 @@ if ($isLook -and $artifactsShare) {
         # writer's final validation re-derives this block from the files with the same function.
         # r7 (adversary r6 A1, Dot 6558329764, sol r6 key B1): the verdict runs for EVERY paired leg -- a leg with no look.pairedSeekFrames (all four
         # shipped paired legs) still binds each collected still's paused provenance; the frame list only adds the display_frame match.
-        $verdictArgs = @{ SeekDir = $seekLocal; Files = $seekFiles }
+        # r8 (adversary r7 A2 / A1): the stills this leg must hold are the spec's look.contactSheetFrames (frame-00 ..), not the ones that arrived, and every
+        # collected file must be one of them; the receipt writer re-derives the same contract from the committed spec, never from this block.
+        $verdictArgs = @{ SeekDir = $seekLocal; Files = $seekFiles; StillCount = $spec.look.contactSheetFrames }
         if ($null -ne $pairedSeekFramesRequested) { $verdictArgs['RequestedFrames'] = $pairedSeekFramesRequested; $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested) }
         $seekVerdict = Invoke-DvCollect 'read' ([string]$seekLocal) { Get-DvPairedSeekVerdict @verdictArgs }
         $pairedSeekInfo['reportedFrames'] = $seekVerdict.reportedFrames
