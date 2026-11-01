@@ -366,7 +366,8 @@ def test_a_worktree_whose_name_ends_in_a_space_is_saved_not_its_sibling(tmp_path
 
 @pytest.mark.parametrize("raw, want", [
     (b"/w/repo \n", "/w/repo "),         # trailing space survives; the LF is git's terminator
-    (b"/w/repo \r\n", "/w/repo "),       # CR before the terminating LF goes with it
+    (b"/w/repo\r\n", "/w/repo\r"),       # git never emits CRLF, so a CR before the LF is the last byte of the NAME (r6 A1)
+    (b"/w/repo \r\n", "/w/repo \r"),
     (b"/w/repo\n", "/w/repo"),
     (b"/w/ repo\n", "/w/ repo"),         # leading space is part of the name too
     (b"/w/repo  \n\n", "/w/repo  \n"),   # exactly ONE terminator, never a run of whitespace
@@ -377,9 +378,79 @@ def test_the_toplevel_path_loses_only_git_s_line_terminator(raw, want):
     m = re.search(r"^function Remove-GitTerminator.*?^}\n", text, re.MULTILINE | re.DOTALL)
     assert m, "lane-dirty-save.ps1 has no Remove-GitTerminator"  # old code: .Trim() inline, no helper
     prog = m.group(0) + f"$b = [Convert]::FromHexString('{raw.hex()}'); [Console]::Out.Write('[' + (Remove-GitTerminator $b) + ']')"
-    r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, text=True)
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True)  # bytes: text=True would turn a CR into LF
     assert r.returncode == 0, r.stdout + r.stderr
-    assert r.stdout == "[" + want + "]"
+    assert r.stdout.decode("utf-8") == "[" + want + "]"
+
+
+def link_dir(link, target):
+    if sys.platform == "win32":
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)  # a junction needs no privilege
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+@pytest.mark.parametrize("via_ancestor", [False, True])
+def test_a_run_dir_that_reaches_the_worktree_through_a_link_is_bad_arguments(repo, tmp_path, via_ancestor):  # r6 A2
+    (repo / "run").mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    alias = tmp_path / "alias"
+    link_dir(alias, repo if via_ancestor else repo / "run")
+    run_dir = alias / "run" if via_ancestor else alias
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(run_dir), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30, r.stdout + r.stderr
+    assert "run-dir-inside-worktree" in r.stdout and list((repo / "run").iterdir()) == []
+
+
+def test_a_receipt_whose_own_earlier_name_was_unreadable_says_so(repo, tmp_path):  # r6 A3: the receipt used to snapshot comparisonUnreadable before its own save
+    (repo / "a.txt").write_bytes(b"changed\n")
+    pid = str(dead_pid())
+    assert save(repo, "-LanePid", pid).returncode == 0
+    h8 = head8(repo)
+    first_receipt = f"dirty-save-{h8}.receipt.json"
+    held = tmp_path / "run" / first_receipt
+    marker = tmp_path / "held.marker"
+    holder = subprocess.Popen([PWSH, "-NoProfile", "-Command",
+                               f"$fs = [System.IO.File]::Open('{held}', 'Open', 'Read', 'None'); Set-Content -LiteralPath '{marker}' x; Start-Sleep 60"])
+    try:
+        for _ in range(200):
+            if marker.exists():
+                break
+            time.sleep(0.1)
+        assert marker.exists()
+        r = save(repo, "-LanePid", pid)
+        assert r.returncode == 0, r.stdout + r.stderr
+        persisted = (tmp_path / "run" / f"dirty-save-{h8}.2.receipt.json").read_text(encoding="utf-8")
+        assert json.loads(persisted)["comparisonUnreadable"] == [first_receipt]
+        assert persisted.strip() == r.stdout.strip()  # printed == persisted
+    finally:
+        holder.kill()
+
+
+def deny_writes(path):
+    if sys.platform == "win32":
+        subprocess.run(["icacls", str(path), "/deny", "*S-1-1-0:(WD,AD)"], check=True, capture_output=True)
+    else:
+        os.chmod(path, 0o555)
+
+
+def allow_writes(path):
+    if sys.platform == "win32":
+        subprocess.run(["icacls", str(path), "/remove:d", "*S-1-1-0"], check=True, capture_output=True)
+    else:
+        os.chmod(path, 0o755)
+
+
+@pytest.mark.skipif(sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores directory permissions")
+def test_a_run_dir_that_cannot_be_written_exits_50_not_a_powershell_error(repo, tmp_path):  # r6 A4
+    (repo / "a.txt").write_bytes(b"changed\n")
+    deny_writes(tmp_path / "run")
+    try:
+        r = save(repo, "-LanePid", str(dead_pid()))
+    finally:
+        allow_writes(tmp_path / "run")
+    assert r.returncode == 50, r.stdout + r.stderr
+    assert "DIRTY_SAVE_WRITE_FAILED" in r.stdout
 
 
 def test_the_toplevel_path_is_never_trimmed():
@@ -389,7 +460,7 @@ def test_the_toplevel_path_is_never_trimmed():
 # ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
 FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
 # The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.
-LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType\s+HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[System\.IO\.File\]::(?:Move|Replace)", re.IGNORECASE)
+LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType\s+HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.File\]::(?:Move|Replace)", re.IGNORECASE)  # r6 A5: [IO.File] is the same type as [System.IO.File]
 
 
 def walker_violations(text):
@@ -403,6 +474,7 @@ def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_c
 
 
 @pytest.mark.parametrize("mutant", ["NtSetInformationFile(h, out io, info, 24, 11);", "CreateHardLinkW(a, b, 0);", "New-Item -ItemType HardLink -Path $a -Value $b",
-                                    "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)"])
+                                    "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)",
+                                    "[IO.File]::Move($a, $b)", "[IO.File]::Replace($a, $b, $null)"])
 def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
     assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")

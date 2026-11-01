@@ -5,9 +5,9 @@
 #   .receipt.json = one JSON line naming the files of THIS save, also printed; it says untrackedFormat=nul-separated and untrackedContents=not-saved
 # Untracked file CONTENTS are NOT preserved by this saver (names only); copying them is LANE-DIRTY-SAVE-INVENTORY-ROWS-1 / LANE-DIRTY-SAVE-WORKSTREAM-WIRE-1 scope.
 # The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; createdUtc must be an ISO-8601 string, else exit 30; a process that started after it, at full precision, is a reused pid, so the lane is dead), never both.
-# The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree is refused (exit 30): evidence written there would be listed as untracked dirt.
+# The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree (links followed) is refused (exit 30): evidence written there would be listed as untracked dirt.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
-# Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed.
+# Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay).
 # Never stashes, resets, checks out, cleans or deletes. Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
 # a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
@@ -36,10 +36,20 @@ function Invoke-GitBytes([string[]]$GitArgs) {
         return @{ Code = $p.ExitCode; Bytes = $ms.ToArray(); Err = $err.Result }
     } catch { return @{ Code = -1; Bytes = [byte[]]@(); Err = $_.Exception.Message } }
 }
-function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with one LF: strip that (and a CR before it), never other whitespace (r5 ADV-A4: a worktree named 'repo ' is not the sibling 'repo')
+function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exactly one LF (never CRLF, also on Windows): strip that LF and nothing else (r5 ADV-A4: a worktree named 'repo ' is not the sibling 'repo'; r6 A1: a name ending in CR keeps its CR)
     $s = [System.Text.Encoding]::UTF8.GetString($Bytes)
-    if ($s.EndsWith("`n")) { $s = $s.Substring(0, $s.Length - 1); if ($s.EndsWith("`r")) { $s = $s.Substring(0, $s.Length - 1) } }
+    if ($s.EndsWith("`n")) { $s = $s.Substring(0, $s.Length - 1) }
     return $s
+}
+function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # every link (symlink or junction) on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2)
+    if ($Depth -gt 16) { throw 'too-many-links' }
+    $full = [System.IO.Path]::GetFullPath($Path); $root = [System.IO.Path]::GetPathRoot($full); $cur = $root
+    foreach ($seg in $full.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        $cur = [System.IO.Path]::Combine($cur, $seg)
+        $di = [System.IO.DirectoryInfo]::new($cur)
+        if ($di.LinkTarget) { $t = $di.ResolveLinkTarget($true); if ($t) { $cur = Resolve-RealPath $t.FullName ($Depth + 1) } }
+    }
+    return $cur
 }
 function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
@@ -60,8 +70,10 @@ function Test-LaneAlive {
     if (-not $proc) { return $false }
     return -not ($born -and $proc.StartTime.ToUniversalTime() -gt $born)  # Invoke-Lane writes StartTime itself, so equal is the lane and anything later is a reuse
 }
-function Save-Bytes([string]$Ext, [byte[]]$Bytes) {
+function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) {  # $Make rebuilds the bytes for every attempt, so the receipt lists names found unreadable by its OWN earlier attempts (r6 A3)
     for ($n = 1; ; $n++) {
+        if ($Make) { $Bytes = [byte[]](& $Make) }
+        $script:written = $Bytes
         $name = if ($n -eq 1) { "dirty-save-$head8.$Ext" } else { "dirty-save-$head8.$n.$Ext" }
         $f = Join-Path $RunDir $name
         try { $fs = [System.IO.File]::Open($f, 'CreateNew', 'Write', 'None') }
@@ -86,7 +98,7 @@ try {
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
-$rel = [System.IO.Path]::GetRelativePath($WorkDir, $RunDir)
+try { $rel = [System.IO.Path]::GetRelativePath((Resolve-RealPath $WorkDir), (Resolve-RealPath $RunDir)) } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
 $headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()
@@ -103,10 +115,11 @@ if (-not $todo) { Write-Output 'DIRTY_SAVE_NOTHING reason=clean-tree'; exit 10 }
 $head8 = $headFull.Substring(0, 8)
 $ext = @{ patch = 'patch'; staged = 'staged.patch'; untracked = 'untracked.txt' }
 $r = [ordered]@{ schema = 'lane-dirty-save/v1'; head = $headFull; untrackedFormat = 'nul-separated'; untrackedContents = 'not-saved' }
-foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }
-$r.comparisonUnreadable = @($script:unreadable)
-if ($r.Contains('patch')) { $r.patchSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($git.patch.Bytes)).Replace('-', '').ToLowerInvariant() }
-$receipt = $r | ConvertTo-Json -Compress
-[void](Save-Bytes 'receipt.json' ([System.Text.UTF8Encoding]::new($false).GetBytes($receipt + "`n")))
-Write-Output $receipt
+try {
+    foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }
+    if ($r.Contains('patch')) { $r.patchSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($git.patch.Bytes)).Replace('-', '').ToLowerInvariant() }
+    $make = { $r.comparisonUnreadable = @($script:unreadable); [System.Text.UTF8Encoding]::new($false).GetBytes(($r | ConvertTo-Json -Compress) + "`n") }
+    [void](Save-Bytes 'receipt.json' $null $make)
+} catch { Write-Output "DIRTY_SAVE_WRITE_FAILED reason=$($_.Exception.Message)"; exit 50 }  # r6 A4: a read-only or full RunDir ends in a documented status; artifacts already written stay
+Write-Output ([System.Text.UTF8Encoding]::new($false).GetString($script:written).TrimEnd("`n"))
 exit 0
