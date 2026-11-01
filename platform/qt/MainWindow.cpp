@@ -19535,6 +19535,14 @@ void MainWindow::setupPlaybackConformMenu( void )
             applyPlaybackConformSettings( true );
         } );
     }
+
+    // MERGE-MASTER r11 (adversary A2, the ADV-A2 class): the mute tooltip also depends on Audio Output, and nothing else
+    // refreshes it when that is toggled on a loaded clip. Not before a clip is loaded: readSettings checks Audio Output
+    // while m_pMlvObject is still null.
+    connect( ui->actionAudioOutput, &QAction::toggled, this, [this]( bool )
+    {
+        if( m_fileLoaded && m_pMlvObject ) refreshPlaybackFpsStatus();
+    } );
 }
 
 void MainWindow::applyPlaybackConformSettings( bool persist )

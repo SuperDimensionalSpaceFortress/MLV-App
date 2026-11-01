@@ -424,20 +424,25 @@ inline double measuredPaceFps( int64_t consumed, int64_t elapsedMs )
 // stall the engine has since recovered from, against every remaining frame (x stepsNeeded / stepsDone, about 9x at 8 s
 // of a conformed 25 s window): a 59.94 fps clip conformed to 24 fps was refused PLAY_PACE_TOO_SLOW whenever its first
 // present came later than about 360 ms after the trigger. kPaceRecentWindowMs is the shortest stretch a pace is
-// measured over (long enough that a poll of up to 50 ms moves it by about 1%).
-constexpr int64_t kPaceRecentWindowMs = 4000;
+// measured over: short enough that a stall ending up to 5 s into Play leaves one clean stretch by the 8 s probe (r11
+// adversary A1: a 1 s first present plus a 1 s stall at 3 s leaves 4 s), long enough that a 50 ms poll moves it < 2%.
+constexpr int64_t kPaceRecentWindowMs = 3000;
 
 struct PlayPaceHistory
 {
+    // One per distinct consumed value: when it was first and last observed. Every step after `consumed` happened after
+    // lastSeenMs, so a stretch is measured from an anchor's LAST sighting (r11 adversary A1: measuring from the first
+    // sighting charged a stall the count sat through to the stretch after it).
     struct Sample
     {
-        int64_t elapsedMs = 0;
+        int64_t elapsedMs = 0;      // first seen
+        int64_t lastSeenMs = 0;
         int64_t consumed = 0;
     };
     bool haveFirstStep = false;
     Sample firstStep;                   // the first observation with consumed >= 2 (the first forward step)
-    std::deque<Sample> window;          // observations where consumed changed; front = newest at or before now - window
-    double bestWindowPace = 0.0;  // steps per ms: the fastest kPaceRecentWindowMs-or-longer stretch seen so far
+    std::deque<Sample> window;          // front = newest value last seen at or before now - kPaceRecentWindowMs
+    double bestWindowPace = 0.0;        // steps per ms: the fastest kPaceRecentWindowMs-or-longer stretch seen so far
     int64_t lastElapsedMs = -1;
     int64_t lastConsumed = 0;
 
@@ -453,18 +458,24 @@ struct PlayPaceHistory
         {
             haveFirstStep = true;
             firstStep.elapsedMs = elapsedMs;
+            firstStep.lastSeenMs = elapsedMs;
             firstStep.consumed = consumed;
         }
         if( window.empty() || window.back().consumed != consumed )
         {
             Sample s;
             s.elapsedMs = elapsedMs;
+            s.lastSeenMs = elapsedMs;
             s.consumed = consumed;
             window.push_back( s );
         }
-        while( window.size() >= 2 && window[1].elapsedMs <= elapsedMs - kPaceRecentWindowMs ) window.pop_front();
+        else
+        {
+            window.back().lastSeenMs = elapsedMs;
+        }
+        while( window.size() >= 2 && window[1].lastSeenMs <= elapsedMs - kPaceRecentWindowMs ) window.pop_front();
         const Sample &anchor = window.front();
-        const int64_t span = elapsedMs - anchor.elapsedMs;
+        const int64_t span = elapsedMs - anchor.lastSeenMs;
         if( span >= kPaceRecentWindowMs )
         {
             bestWindowPace = std::max( bestWindowPace,
@@ -490,7 +501,7 @@ struct PlayPaceHistory
 // frames (one step) and kPaceProbeMs of Play, so a slow first frame is not a verdict.
 // r11 (ADV-A1b): the projection is the elapsed wall clock -- every stall so far paid ONCE -- plus the REMAINING steps at
 // the best of: the pace since the Play trigger (master's measure), since the first forward step, and over any
-// kPaceRecentWindowMs stretch (PlayPaceHistory). With no history it is master's elapsed x stepsNeeded / stepsDone
+// kPaceRecentWindowMs-or-longer stretch (PlayPaceHistory). With no history it is master's elapsed x stepsNeeded / stepsDone
 // exactly, and it is never stricter than that. A pace that cannot finish even so is still refused; a run it lets go on
 // ends at the requirement or at the typed PLAY_SAFETY_TIMEOUT, never a hang.
 inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs,

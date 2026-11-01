@@ -577,6 +577,25 @@ TEST(PlaybackConformWiring, AdvA2ClipOpenRefreshesTheMuteTooltipOnceTheClipCount
     ASSERT_TRUE(paint > refreshAfter);
 }
 
+// MERGE-MASTER r11 (r11 adversary A2, same class): the tooltip also reads Audio Output, so toggling it on a loaded clip
+// refreshes the status -- and only on a loaded clip (readSettings checks the action while m_pMlvObject is still null).
+TEST(PlaybackConformWiring, AdvA2TogglingAudioOutputOnALoadedClipRefreshesTheMuteTooltip)
+{
+    const QString source = mainWindowSource();
+    const QString menu = functionBody(source,
+        QStringLiteral("void MainWindow::setupPlaybackConformMenu( void )"),
+        QStringLiteral("void MainWindow::applyPlaybackConformSettings( bool persist )"));
+    ASSERT_FALSE(menu.isEmpty());
+    const int at = menu.indexOf(QStringLiteral("connect( ui->actionAudioOutput, &QAction::toggled, this, [this]( bool )"));
+    ASSERT_TRUE(at >= 0);
+    const QString handler = menu.mid(at, 200);
+    ASSERT_TRUE(handler.contains(QStringLiteral("if( m_fileLoaded && m_pMlvObject ) refreshPlaybackFpsStatus();")));
+    const QString refresh = functionBody(source,
+        QStringLiteral("void MainWindow::refreshPlaybackFpsStatus( void )"),
+        QStringLiteral("void MainWindow::noteConformStateBeforeChange( void )"));
+    ASSERT_TRUE(refresh.contains(QStringLiteral("ui->actionAudioOutput->isChecked()")));
+}
+
 // MERGE-MASTER r11 (ADV-A1b): every automation wait (autoplay, settle, play action, GUI smoke) reaches the pace probe
 // only through programmaticPlayState, which notes the observation in the Play's pace history and hands the history to
 // the decision; the admitted Play starts a fresh history. The decision itself is executed in test_playback_frame_range.cpp.

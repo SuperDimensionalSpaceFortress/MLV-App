@@ -1238,6 +1238,37 @@ TEST( PlayPaceRecovery, AdvA1bAMidRunTransientStallThatRecoversIsNotRefused )
     ASSERT_TRUE( runStalledEngine( 0, 24.0, 1499, budget, 10, atProbe ).state == PlayStopState::Reached );
 }
 
+TEST( PlayPaceRecovery, R11AdversaryA1AStallTheCountSatThroughIsNotChargedToTheStretchAfterIt )
+{
+    // r11 adversary A1 (aac1645f), its exact input: polled every 10 ms, consumed(t) = 1 + floor(24 x
+    // max(0, t - 1000 - min(1000, max(0, t - 3000))) / 1000) -- first present at 1 s, held 3..4 s, 24 fps otherwise.
+    // At (8000, 145) the 4..8 s stretch is 24 fps and the run finishes at 64.4 s; aac1645f anchored the window at the
+    // count's FIRST sighting (3000, 49), measured 19.2 fps and refused PaceTooSlow (73.8 s).
+    const int64_t budget = playSafetyMs( 25.0 );
+    PlayPaceHistory h;
+    int64_t consumed = 0;
+    for( int64_t t = 0; t <= 8000; t += 10 )
+    {
+        const int64_t held = std::min<int64_t>( 1000, std::max<int64_t>( 0, t - 3000 ) );
+        consumed = 1 + ( 24 * std::max<int64_t>( 0, t - 1000 - held ) ) / 1000;
+        h.note( consumed, t );
+        ASSERT_TRUE( evaluatePlayStop( consumed, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h )
+                     == PlayStopState::Continue );
+    }
+    ASSERT_EQ( int64_t( 145 ), consumed );
+    ASSERT_TRUE( h.bestPace( consumed, 8000 ) * 1000.0 >= 24.0 );
+    std::vector<Stall> stall;
+    stall.push_back( Stall{ 3000, 1000 } );
+    const EngineRun run = runStalledEngine( 1000, 24.0, 1499, budget, 10, stall );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.elapsedMs < budget );
+    // the same at the autoplay's 50 ms poll, and with the stall ending as late as 5 s
+    ASSERT_TRUE( runStalledEngine( 1000, 24.0, 1499, budget, 50, stall ).state == PlayStopState::Reached );
+    std::vector<Stall> late;
+    late.push_back( Stall{ 4000, 1000 } );
+    ASSERT_TRUE( runStalledEngine( 500, 24.0, 1499, budget, 10, late ).state == PlayStopState::Reached );
+}
+
 TEST( PlayPaceRecovery, AdvA1bAPaceThatTrulyCannotFinishIsStillRefusedWithTheTypedToken )
 {
     // 20 fps sustained on the same window: 1498 / 20 = 74.9 s > 65 s. Refused at the probe, with or without a wait.

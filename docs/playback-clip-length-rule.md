@@ -149,7 +149,9 @@ FRAME:
   `programmaticPlayState`; Gated mode only) is judged after 8 s of Play and two frames. It asks whether the run can
   still finish: the elapsed wall clock, with every wait and stall so far counted once, plus the REMAINING steps at the
   best pace the Play has shown. That pace is the best of the pace since the Play trigger, the pace since the first
-  forward step, and the pace over any 4 s stretch (`PlayPaceHistory`, `kPaceRecentWindowMs`). Only when even that
+  forward step, and the pace over any stretch of 3 s or more, measured from the last time the count was seen at its
+  start value (`PlayPaceHistory`, `kPaceRecentWindowMs`), so a stall the count sat through is not charged to the
+  stretch after it. Only when even that
   pace cannot finish inside the budget does the run end as `PLAY_PACE_TOO_SLOW`. Anything else runs on to the
   requirement or to the typed `PLAY_SAFETY_TIMEOUT`. MERGE-MASTER r11 (ADV-A1b, catalogue C-PACE-RECOVERY-01 / M-04)
   replaced the old projection, `elapsed x stepsNeeded / stepsDone` from the trigger. That form charged a startup wait
