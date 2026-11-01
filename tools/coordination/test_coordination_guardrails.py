@@ -6175,3 +6175,173 @@ def test_r9_adv_a1_every_site_names_its_typed_reflog_refusal_in_source():
         text = path.read_text(encoding="utf-8")
         assert token in text, path
         assert r"@\{" in text, path
+
+
+# --- r10 (sol r9 on feec4eda: ADV-A1 Unicode whitespace in a refname, ADV-A2 `@{` inside a ^{/regex} search) -------------
+# ADV-A1: the full-refname classifier used `\s`, which .NET makes Unicode-aware (NBSP, EM SPACE, ...). Git accepts such a
+# refname, so the classifier said "not a full refname", the exact-ref read and the r9 reflog refusal were skipped, and the
+# whole expression went to rev-parse - which honoured the reflog (fail-open in the currency guard). The class is now
+# ASCII-whitespace-only, so a base is classified the same with or without a non-ASCII space.
+# ADV-A2: r9 refused any `@{` in the suffix, which also refused a valid commit-message search `refs/x^{/foo@{1}}`. Only an
+# actual reflog selector (a `@{` outside a `^{/...}` search group) is refused now.
+R10_UNICODE_SPACES = ["0x00A0", "0x2003"]
+
+
+def _r10_name_ps(cp):
+    return "('refs/remotes/fork/topic' + [char]" + cp + " + 'x')"
+
+
+def _r10_unicode_repo(tmp_path, cp):
+    """A (x.ps1='a') then B (x.ps1='b'); a ref whose NAME holds a Unicode space was set to A, then B: a two-entry reflog."""
+    repo = tmp_path / "r10repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name in ("a", "b"):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", name.upper())
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    ref = "refs/remotes/fork/topic" + chr(int(cp, 16)) + "x"
+    git(repo, "update-ref", "--create-reflog", "-m", "first", ref, shas[0])
+    git(repo, "update-ref", "--create-reflog", "-m", "second", ref, shas[1])
+    return repo, shas[0], shas[1], ref
+
+
+def _r10_site(tmp_path, repo, site, expr_ps, name, disk="'a'\n", wt_sha=None):
+    """Run one of the three sites with a PowerShell expression for the ref; returns the site's result as a dict."""
+    q = lambda p: str(p).replace("'", "''")
+    if site == "currency":
+        script = repo / "x.ps1"
+        script.write_text(disk, encoding="utf-8")
+        body = ("$expr = " + expr_ps + "\n$o = @(); $threw = $false\n"
+                "try { & '" + q(COORD / "assert-script-currency.ps1") + "' -ScriptPath '" + q(script) + "' -Ref $expr -PassThru | ForEach-Object { $o += $_ } } catch { $threw = $true }\n"
+                "[pscustomobject]@{ status = $(if ($o.Count) { [string]$o[0].status } else { 'none' }); threw = $threw } | ConvertTo-Json -Compress\n")
+        return _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    if site == "ratio":
+        body = ("$expr = " + expr_ps + "\n& '" + q(RATIO_GUARD) + "' -RepoRoot '" + q(repo) + "' -SourceRef $expr -AsOfEpoch 1893456000\n"
+                "[pscustomobject]@{ r8fired = $global:R6RaceFired } | ConvertTo-Json -Compress\nexit 0\n")
+        return _r8_merge_fired(_r6_run(tmp_path, repo, body, name + ".ps1"))
+    wt = tmp_path / ("wt-" + name)
+    git(repo, "worktree", "add", "--detach", str(wt), wt_sha)
+    body = ("$expr = " + expr_ps + "\n. '" + q(RETIRE) + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + q(wt) + "' -MergeTarget $expr -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason } | ConvertTo-Json -Compress\n")
+    return _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1"))
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_fixture_ref_with_a_unicode_space_has_a_valid_reflog_git_accepts(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref + "@{1}^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == sha_a, (cp, ok.stdout, ok.stderr)
+    assert subprocess.run(["git", "check-ref-format", ref]).returncode == 0, ref
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_currency_guard_refuses_a_reflog_on_a_unicode_space_refname_fail_closed(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    # disk == A's blob: the bypass reads the reflog entry A, reports 'current' and never throws.
+    doc = _r10_site(tmp_path, repo, "currency", "(" + _r10_name_ps(cp) + " + '@{1}')", "r10-cur-uni")
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (cp, doc)
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_ratio_guard_refuses_a_reflog_on_a_unicode_space_refname(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    doc = _r10_site(tmp_path, repo, "ratio", "(" + _r10_name_ps(cp) + " + '@{1}')", "r10-ratio-uni")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED" and doc["sourceSha"] == "", (cp, doc)
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_retire_merge_gate_refuses_a_reflog_on_a_unicode_space_refname(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    doc = _r10_site(tmp_path, repo, "retire", "(" + _r10_name_ps(cp) + " + '@{1}')", "r10-ret-uni", wt_sha=sha_a)
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (cp, doc)
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_a_unicode_space_refname_gets_the_exact_ref_read_at_every_site(tmp_path, cp):
+    """The ref is ABSENT but a same-named shadow tag exists: the exact-ref read must refuse it, as for an ASCII name."""
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    git(repo, "update-ref", "refs/tags/" + ref, sha_b)
+    git(repo, "update-ref", "refs/remotes/other/x", sha_b)       # keeps the retire gate past its 'unpushed' check (as in r8)
+    git(repo, "update-ref", "-d", ref)
+    expr = "(" + _r10_name_ps(cp) + " + '~1')"
+    cur = _r10_site(tmp_path, repo, "currency", expr, "r10-cur-uni-absent", disk="'a'\n")      # shadow tag ~1 = A would read 'current'
+    assert cur["status"] == "unknown", (cp, cur)
+    rat = _r10_site(tmp_path, repo, "ratio", expr, "r10-ratio-uni-absent")
+    assert rat["errorCode"] == "ERROR_REF_UNRESOLVED" and rat["sourceSha"] == "", (cp, rat)
+    ret = _r10_site(tmp_path, repo, "retire", expr, "r10-ret-uni-absent", wt_sha=sha_a)
+    assert ret["reason"].startswith("cannot-determine: merge target ref missing"), (cp, ret)
+
+
+R10_SEARCH_EXPR = R6_REF + "^{/foo@{1}}"
+
+
+def _r10_search_repo(tmp_path):
+    """A (message 'foo@ A', x.ps1='a') <- B (message 'B', x.ps1='b'); refs/remotes/fork/master = B. The commit-message
+    search `^{/foo@{1}}` (regex foo@ with an interval) names A and contains the characters `@{`. Returns (repo, A, B)."""
+    repo = tmp_path / "r10search"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name, msg in (("a", "foo@ A"), ("b", "B")):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", msg)
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    git(repo, "update-ref", R6_REF, shas[1])
+    return repo, shas[0], shas[1]
+
+
+def test_r10_adv_a2_the_fixture_search_expression_is_a_valid_non_reflog_revision(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", R10_SEARCH_EXPR + "^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == sha_a, (ok.stdout, ok.stderr)
+
+
+def test_r10_adv_a2_the_currency_guard_resolves_a_search_expression_containing_at_brace(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "currency", "'" + R10_SEARCH_EXPR + "'", "r10-cur-search", disk="'a'\n")
+    assert doc["status"] == "current" and doc["threw"] is False, doc          # A's blob; a refusal would be 'refused-reflog'
+
+
+def test_r10_adv_a2_the_ratio_guard_resolves_a_search_expression_containing_at_brace(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + R10_SEARCH_EXPR + "'", "r10-ratio-search")
+    assert doc.get("errorCode") in (None, "") and doc["sourceSha"] == sha_a, doc
+
+
+def test_r10_adv_a2_the_retire_merge_gate_resolves_a_search_expression_containing_at_brace(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + R10_SEARCH_EXPR + "'", "r10-ret-search", wt_sha=sha_a)
+    assert "reflog selector" not in doc["reason"] and "merge target ref missing" not in doc["reason"] and "merge-base" not in doc["reason"], doc
+    assert not doc["reason"].startswith("unmerged"), doc                       # a worktree at A IS an ancestor of A
+
+
+R10_REAL_SELECTOR_BEHIND_A_SEARCH = ["refs/remotes/fork/master@{1}^{/foo}", "refs/remotes/fork/master@{1}^{/foo@{1}}"]
+
+
+@pytest.mark.parametrize("expr", R10_REAL_SELECTOR_BEHIND_A_SEARCH)
+def test_r10_adv_a2_an_actual_reflog_selector_is_still_refused_at_every_site_when_a_search_follows_it(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    cur = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r10-cur-real", disk="'a'\n")
+    assert cur["status"] == "refused-reflog" and cur["threw"] is True, (expr, cur)
+    rat = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r10-ratio-real")
+    assert rat["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, rat)
+    ret = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r10-ret-real", wt_sha=sha_a)
+    assert ret["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, ret)
+
+
+def test_r10_every_site_classifies_a_full_refname_by_ascii_whitespace_and_strips_search_groups_in_source():
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        text = path.read_text(encoding="utf-8")
+        assert r"[^?*\[\\\s]" not in text, (path, "the Unicode-aware \\s is back in the full-refname classifier")
+        assert r"[^?*\[\\ \t\n\v\f\r]" in text, path
+        assert r"\^\{/.*\}" in text, (path, "the ^{/regex} search group is not stripped before the reflog test")

@@ -61,11 +61,14 @@ $refSpec = $Ref
 $refSplit = [regex]::Match($Ref, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
 $refBase = if ($refSplit.Success) { $refSplit.Groups['base'].Value } else { $Ref }
 $refSuffix = if ($refSplit.Success) { $refSplit.Groups['suffix'].Value } else { '' }
-if ($refBase -match '^refs/[^?*\[\\\s]+$' -and $refBase -notmatch '\.\.|//|/$') {
+# r10 (sol r9 ADV-A1): ASCII-whitespace-only class. `\s` is Unicode-aware in .NET, and git accepts a refname holding NBSP / EM SPACE,
+# which then skipped the exact-ref read and the reflog refusal below.
+if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.|//|/$') {
     # r9 (sol r8 ADV-A1 / Grok G8): a reflog selector cannot ride on a SHA (`<sha>@{1}` is rejected by git), and the
     # exact-ref read above would have to be re-resolved by NAME to honour it. No default caller uses reflog syntax, so it
     # is REFUSED, fail-CLOSED, with its own status. It must never fall to 'unknown': this guard is fail-OPEN on unknown.
-    if ($refSuffix -match '@\{') {
+    # r10 (sol r9 ADV-A2): refuse only an ACTUAL reflog selector - a `@{` outside a `^{/regex}` commit-message search group.
+    if ([regex]::Replace($refSuffix, '(?s)\^\{/.*\}', '') -match '@\{') {
         $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
                      "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
         Write-Result 'refused-reflog' $reflogMsg

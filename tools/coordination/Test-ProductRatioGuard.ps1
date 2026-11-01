@@ -397,10 +397,12 @@ try {
     $refSplit = [regex]::Match($SourceRef, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
     $refBase = if ($refSplit.Success) { $refSplit.Groups['base'].Value } else { $SourceRef }
     $refSuffix = if ($refSplit.Success) { $refSplit.Groups['suffix'].Value } else { '' }
-    if ($refBase -match '^refs/[^?*\[\\\s]+$' -and $refBase -notmatch '\.\.|//|/$') {
+    # r10 (sol r9 ADV-A1): ASCII-whitespace-only class (`\s` is Unicode-aware in .NET; git accepts NBSP / EM SPACE in a refname).
+    if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.|//|/$') {
         # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname is
         # REFUSED with its own code (fail-closed, exit 3) instead of surfacing as a misleading ERROR_REF_UNRESOLVED.
-        if ($refSuffix -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
+        # r10 (sol r9 ADV-A2): only an ACTUAL reflog selector (a `@{` outside a `^{/regex}` search group) is refused.
+        if ([regex]::Replace($refSuffix, '(?s)\^\{/.*\}', '') -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
         $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
         $refExists = ($exactSha -match '^[0-9a-f]{40}$')
         if ($refExists) { $revision = "$exactSha$refSuffix" }

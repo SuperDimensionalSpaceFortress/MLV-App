@@ -1441,12 +1441,14 @@ function Invoke-RetireLaneWorktree {
         $mergeSplit = [regex]::Match($MergeTarget, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
         $mergeBase = if ($mergeSplit.Success) { $mergeSplit.Groups['base'].Value } else { $MergeTarget }
         $mergeSuffix = if ($mergeSplit.Success) { $mergeSplit.Groups['suffix'].Value } else { '' }
-        $mergeBaseIsRef = ($mergeBase -match '^refs/[^?*\[\\\s]+$' -and $mergeBase -notmatch '\.\.|//|/$')
+        # r10 (sol r9 ADV-A1): ASCII-whitespace-only class (`\s` is Unicode-aware in .NET; git accepts NBSP / EM SPACE in a refname).
+        $mergeBaseIsRef = ($mergeBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $mergeBase -notmatch '\.\.|//|/$')
         if ($MergeTarget -like 'refs/*') {
             $mergeSpec = $MergeTarget
             # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname
             # is REFUSED (kept, fail-closed) with its own reason rather than reported as a missing ref.
-            if ($mergeBaseIsRef -and $mergeSuffix -match '@\{') { $d.reason = "cannot-determine: merge target uses a reflog selector (@{) and is refused ($MergeTarget)"; return [pscustomobject]$d }
+            # r10 (sol r9 ADV-A2): only an ACTUAL reflog selector (a `@{` outside a `^{/regex}` search group) is refused.
+            if ($mergeBaseIsRef -and [regex]::Replace($mergeSuffix, '(?s)\^\{/.*\}', '') -match '@\{') { $d.reason = "cannot-determine: merge target uses a reflog selector (@{) and is refused ($MergeTarget)"; return [pscustomobject]$d }
             if ($mergeBaseIsRef) {
                 $baseSha = [string](& git.exe -C $main show-ref --verify --hash $mergeBase 2>$null | Select-Object -First 1)
                 if ($baseSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
