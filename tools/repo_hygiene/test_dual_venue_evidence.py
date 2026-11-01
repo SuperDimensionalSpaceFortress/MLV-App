@@ -731,6 +731,18 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
 
+    def test_the_util_sample_mapping_is_armed_only_by_a_json_true(self) -> None:
+        """CUDA-HEADROOM-UTIL-SAMPLER-1: the runner maps generatorArgs.utilSample to the generator's -UtilSample only when it is a JSON true (the
+        strict -is [bool] form; a string "true" is not true), for any leg, outside the forceLookAssist branch. The job text it gates is pinned in
+        test_util_sample_leg.py."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] "
+                   "-and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertEqual(runner.count("$gen['UtilSample']"), 1, "one mapping site")
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+
     # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof's job text (the generator's -GpuFaultInject / -GpuSafeStart / -AutomationSettingsDir / -GpuPreLaunches).
     SELF_HEAL_PRE_OPEN = "# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches"
     SELF_HEAL_OWNER_ANCHOR = "# OWNER-FOOTAGE-NO-HARDLINK-1: the last look before the app can read anything."
