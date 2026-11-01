@@ -1594,7 +1594,8 @@ TEST( PlayPaceRecovery, R12ThePlayingPaceStartsOverWithTheHistoryAndNeedsEnoughP
     ASSERT_TRUE( split.thresholdMs >= 50 && split.thresholdMs <= 80 );  // median hold 40 ms + 2 x 10 ms polls
     h.note( 1, 8010 );                                                  // a new Play re-armed the counter
     ASSERT_EQ( int64_t( 0 ), h.holds );
-    ASSERT_EQ( int64_t( 0 ), h.pollGaps );
+    ASSERT_EQ( int64_t( 0 ), h.overflowHolds );                         // (r14: the poll-gap histogram is gone)
+    ASSERT_EQ( int64_t( 0 ), h.playingSplit( 8010 ).thresholdMs );      // no closed hold: no threshold yet
     ASSERT_EQ( int64_t( 0 ), h.playingSplit( 8010 ).stallMs );
     ASSERT_EQ( 0.0, h.playingPace( 8010 ) );
     // a steady engine at any pace has every hold counted as playing (the threshold follows its own cadence)
@@ -1878,6 +1879,214 @@ TEST( PlayPaceRecovery, R13AdversaryA2AHoldThatOnlyWaitedOutALongPollGapIsNotCha
             }
             ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
             ASSERT_TRUE( t >= playback_frame_range::kPaceProbeMs && t < 9000 );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r14 (r13 adversary A1 on 19a83d2d; Dot cos-feedback/mlv-app/pr-420.md 2026-11-01T15:29:45Z; CoS ask 6559996576, hub
+// ACK 6560188752): uneven polls collapsed the stall threshold. The input verbatim: required 1499, safety 65000, Gated,
+// c(t) = 1 + floor(24 x max(0, t - 800 - clamp(t - 1800, 0, 330) - clamp(t - 4800, 0, 330)) / 1000), observed from t = 0
+// with next(t) = t + (t % 125 < 10 ? 80 : 10), note then decide. 19a83d2d binned 57 of the 113 holds closed by 8 s at 0
+// (each ended by an 80 ms gap), so its median bin was 0 and its threshold 0 + 2 x the 10 ms median gap = 20 ms: the 51
+// ordinary 30/40 ms holds became stalls, 2100 ms of playing time missed the 3 s trust floor and the probe refused at
+// 8000 ms (69540 ms at 21.8 fps), although the count reaches 1499 at 63877 ms. The threshold is now the median hold
+// UPPER bound (hold + the poll gap before its first sighting): 90 ms here, and r12's median bin + 2 poll gaps exactly
+// whenever polls are even. Full trace: the r14 run dir, evidence/uneven-poll-trace.md.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+int64_t r14UnevenNext( int64_t t ) { return t + ( t % 125 < 10 ? 80 : 10 ); }
+
+// the 39cdfc57 adversary A1 schedule: every 10 ms except 1410..1450, 2410..2450, ..., 6410..6450 ms
+int64_t omittedPollNext( int64_t t )
+{
+    int64_t n = t + 10;
+    while( n >= 1410 && n <= 6450 && n % 1000 >= 410 && n % 1000 <= 450 ) n += 10;
+    return n;
+}
+
+// pollIrregular at any whole fps (note, then decide, until a verdict)
+template <typename NextPoll>
+PolledRun pollIrregularAt( int64_t fpsInt, int64_t firstPresentMs, const std::vector<Stall> &stalls, NextPoll next,
+                           int64_t required, int64_t safetyMs )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 900000; t = next( t ) )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, fpsInt, stalls );
+        h.note( run.consumed, t );
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+}
+
+TEST( PlayPaceRecovery, R14AdversaryA1UnevenPollsDoNotTurnOrdinaryHoldsIntoStalls )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a1 = stallsOf( { Stall{ 1800, 330 }, Stall{ 4800, 330 } } );
+    ASSERT_EQ( int64_t( 157 ), stalledCount( 8000, 800, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 63876, 800, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 63877, 800, 24, a1 ) );
+    // every poll to completion: never refused, never timed out, Reached at the first poll that sees 1499
+    PlayPaceHistory probe;
+    const PolledRun run = pollIrregular( 800, a1, r14UnevenNext, 1499, budget, &probe );
+    ASSERT_EQ( int64_t( 157 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 63880 ), run.elapsedMs );
+    // at the probe (t = 8000 is a poll): only the two 330 ms holds are stalls, charged no more than really held, and the
+    // rest is trusted playing time at 24 fps
+    ASSERT_EQ( int64_t( 8000 ), probe.lastElapsedMs );
+    ASSERT_EQ( int64_t( 0 ), PlayPaceHistory::histogramMedian( probe.holdCount, probe.holds + probe.overflowHolds ) );
+    const PlayPaceHistory::PlayingSplit split = probe.playingSplit( 8000 );
+    ASSERT_TRUE( split.thresholdMs > 2 * 10 );            // not 19a83d2d's median bin 0 + 2 x 10 ms
+    ASSERT_EQ( int64_t( 2 ), split.stallHolds );
+    ASSERT_TRUE( split.stallMs <= 2 * 330 );
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( split ) );
+    ASSERT_TRUE( probe.playingPace( 8000 ) * 1000.0 >= 23.9 && probe.playingPace( 8000 ) * 1000.0 <= 24.1 );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 157, 1499, 8000, budget, probe ) );
+    // THE BOUND along this trace: from the probe on, the optimistic finish is never later than the real completion
+    {
+        PlayPaceHistory h;
+        for( int64_t t = 0; t < 63877; t = r14UnevenNext( t ) )
+        {
+            const int64_t c = stalledCount( t, 800, 24, a1 );
+            h.note( c, t );
+            if( t >= playback_frame_range::kPaceProbeMs ) ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= 63877.0 );
+        }
+    }
+    // the "three stalls" set under the same schedule (19a83d2d refused it at 8000 too; it reaches at 64717 ms)
+    const PolledRun three = pollIrregular( 1000, stallsOf( { Stall{ 2500, 500 }, Stall{ 4500, 500 }, Stall{ 6500, 300 } } ),
+                                           r14UnevenNext, 1499, budget );
+    ASSERT_TRUE( three.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64720 ), three.elapsedMs );
+    // a steady engine at any pace, polled on this schedule, has no stall hold and no stall time
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ), int64_t( 60 ) } )
+    {
+        PlayPaceHistory steady;
+        int64_t last = 0;
+        for( int64_t t = 0; t <= 20000; t = r14UnevenNext( t ) ) { steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t ); last = t; }
+        const PlayPaceHistory::PlayingSplit st = steady.playingSplit( last );
+        ASSERT_EQ( int64_t( 0 ), st.stallHolds );
+        ASSERT_EQ( int64_t( 0 ), st.stallMs );
+    }
+    // negative controls under the same schedule: 20 / 22 fps (74.9 s / 68.1 s), steady or with this input's stalls, are
+    // refused at the probe; 23 fps (65.1 s) is refused, typed, before the budget
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : { std::vector<Stall>(), a1 } )
+        {
+            const PolledRun slow = pollIrregularAt( fps, 0, stalls, r14UnevenNext, 1499, budget );
+            ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+        }
+    }
+    const PolledRun at23 = pollIrregularAt( 23, 0, std::vector<Stall>(), r14UnevenNext, 1499, budget );
+    ASSERT_TRUE( at23.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( at23.elapsedMs < budget );
+}
+
+TEST( PlayPaceRecovery, R14WithEvenPollsTheThresholdIsR12sMedianBinPlusTwoPollGapsExactly )
+{
+    // the pace is never stricter than r13 on an even-poll fixture: there the hold upper bound is the bin + 2 poll gaps,
+    // so the median upper bound IS r12/r13's median bin + 2 x the (one) poll gap, at every poll of every fixture
+    const std::vector<std::pair<int64_t, std::vector<Stall>>> fixtures = {
+        { int64_t( 0 ), std::vector<Stall>() },
+        { int64_t( 1000 ), stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } ) },
+        { int64_t( 1000 ), stallsOf( { Stall{ 2500, 200 }, Stall{ 4500, 200 }, Stall{ 6500, 200 } } ) },
+        { int64_t( 1000 ), stallsOf( { Stall{ 1800, 775 }, Stall{ 4800, 775 } } ) },
+        { int64_t( 10 ), stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                                     Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } ) },
+    };
+    for( const auto &fx : fixtures )
+    {
+        for( const int64_t fps : { int64_t( 12 ), int64_t( 22 ), int64_t( 24 ), int64_t( 60 ) } )
+        {
+            for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+            {
+                PlayPaceHistory h;
+                for( int64_t t = 0; t <= 12000; t += poll )
+                {
+                    h.note( stalledCount( t, fx.first, fps, fx.second ), t );
+                    const int64_t medianBin = PlayPaceHistory::histogramMedian( h.holdCount, h.holds + h.overflowHolds );
+                    if( medianBin >= 0 ) ASSERT_EQ( medianBin + 2 * poll, h.playingSplit( t ).thresholdMs );
+                }
+            }
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, R14TheOmittedPollCaseR13FixedHasAConsoleRegression )
+{
+    // 39cdfc57 adversary A1 (fixed in 19a83d2d by binning a hold less its own end gap; no console test until r14):
+    // c(t) = 1 + floor(24 x max(0, t - 10 - sum(i = 1..6, min(400, max(0, t - 1000 i)))) / 1000), observed every 10 ms
+    // except 1410..1450, 2410..2450, ..., 6410..6450 ms. 39cdfc57 charged 2584 ms of stall for the 2400 ms really held,
+    // crossed the one-third share cap and refused at 8000 ms (83888 ms); the count reaches 1499 at 64827 ms.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> b2 = stallsOf( { Stall{ 1000, 400 }, Stall{ 2000, 400 }, Stall{ 3000, 400 },
+                                              Stall{ 4000, 400 }, Stall{ 5000, 400 }, Stall{ 6000, 400 } } );
+    ASSERT_EQ( int64_t( 1010 ), omittedPollNext( 1000 ) );   // the schedule: 1400 is followed by 1460, 6400 by 6460
+    ASSERT_EQ( int64_t( 1460 ), omittedPollNext( 1400 ) );
+    ASSERT_EQ( int64_t( 6460 ), omittedPollNext( 6400 ) );
+    ASSERT_EQ( int64_t( 7410 ), omittedPollNext( 7400 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64826, 10, 24, b2 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64827, 10, 24, b2 ) );
+    PlayPaceHistory probe;
+    const PolledRun run = pollIrregular( 10, b2, omittedPollNext, 1499, budget, &probe );
+    ASSERT_EQ( int64_t( 135 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64830 ), run.elapsedMs );
+    const PlayPaceHistory::PlayingSplit split = probe.playingSplit( 8000 );
+    ASSERT_EQ( int64_t( 6 ), split.stallHolds );
+    ASSERT_TRUE( split.stallMs <= 2400 );                 // never more than really held
+    ASSERT_TRUE( 2 * split.stallMs <= split.playingMs );  // inside the share cap
+    ASSERT_TRUE( probe.playingPace( 8000 ) * 1000.0 >= 23.9 );
+    // slow controls on the same schedule: 20 / 22 fps, steady or with the six stalls, refused at the probe
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : { std::vector<Stall>(), b2 } )
+        {
+            const PolledRun slow = pollIrregularAt( fps, 0, stalls, omittedPollNext, 1499, budget );
+            ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, R14SixShortStallsTheRecoveredClassAndThePinnedResolutionLimit )
+{
+    // the r12 DISTINGUISH (pr-comment-r12: six 100 ms stalls at the autoplay's 50 ms poll are refused), now an explicit
+    // regression on both sides. Six equal stalls at 2, 3, ... 7 s after a 1 s first present, 24 fps: every length here is
+    // feasible (1 s + 6 x len + 62.4 s < 65 s).
+    const int64_t budget = playSafetyMs( 25.0 );
+    for( const int64_t len : { int64_t( 50 ), int64_t( 80 ), int64_t( 100 ), int64_t( 120 ), int64_t( 140 ),
+                               int64_t( 150 ), int64_t( 200 ), int64_t( 250 ) } )
+    {
+        std::vector<Stall> six;
+        for( int64_t at = 2000; at <= 7000; at += 1000 ) six.push_back( Stall{ at, len } );
+        ASSERT_TRUE( stalledCount( 64999, 1000, 24, six ) >= 1499 );
+        // the smoke's 10 ms poll sees every one of them: Reached, inside the budget
+        const PolledRun at10 = pollStalledCount( 1000, 24, six, 1499, budget, 10 );
+        ASSERT_TRUE( at10.state == PlayStopState::Reached );
+        ASSERT_TRUE( at10.elapsedMs < budget );
+        const PolledRun at50 = pollStalledCount( 1000, 24, six, 1499, budget, 50 );
+        if( len >= 140 )
+        {
+            ASSERT_TRUE( at50.state == PlayStopState::Reached );   // the class r12 left open, recovered at 50 ms too
+            ASSERT_TRUE( at50.elapsedMs <= budget );
+        }
+        else
+        {
+            // THE RESOLUTION LIMIT, pinned: a 24 fps engine polled every 50 ms advances at every poll, so an ordinary
+            // hold's upper bound is 50 + 50 = 100 ms. A stall under about 140 ms leaves holds whose LOWER bound (hold less
+            // the 50 ms end gap) is not above 100 ms, so no bound shows they were longer than an ordinary step; telling
+            // them apart would mean assuming a steady engine, which would let an uneven slow engine pass. Such a run
+            // reads as a ~22 fps cadence and is refused, typed, at the probe -- never a timeout, never a hang.
+            ASSERT_TRUE( at50.state == PlayStopState::PaceTooSlow );
+            ASSERT_EQ( int64_t( 8000 ), at50.elapsedMs );
         }
     }
 }

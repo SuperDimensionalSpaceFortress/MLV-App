@@ -152,10 +152,13 @@ FRAME:
   forward step, and the pace over any stretch of 3 s or more, measured from the last time the count was seen at its
   start value (`PlayPaceHistory`, `kPaceRecentWindowMs`), so a stall the count sat through is not charged to the
   stretch after it. MERGE-MASTER r12 (ADV-A1b residual, Dot 6553009018) adds the playing pace: when several
-  recoverable stalls leave no clean 3 s stretch, the steps per second while the count was advancing. Every hold longer
-  than the run's own median hold plus two median poll gaps (`kPaceStallPollGaps`) is a stall, and it is left out along
-  with the step that ends it. A steady engine at any pace has no such hold. A stall shorter than about two poll gaps
-  cannot be seen in the count, so it reads as a slower cadence. It is trusted only after 3 s of playing
+  recoverable stalls leave no clean 3 s stretch, the steps per second while the count was advancing. A hold is a stall
+  when even its shortest possible length is longer than the run's median of each hold's longest possible length (its
+  length plus the poll gap before it was first seen; MERGE-MASTER r14, r13 adversary A1: a median hold plus two MEDIAN
+  poll gaps fell to 20 ms under uneven polls and cast ordinary holds out). A stall is left out along with the step that
+  ends it. A steady engine at any pace, polled on any schedule, has no such hold. A stall shorter than about two poll
+  gaps cannot be seen in the count, so it reads as a slower cadence (six 100 ms stalls at the autoplay's 50 ms poll are
+  still refused; from about 140 ms they are recovered). It is trusted only after 3 s of playing
   time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
   that keep coming are left to the other estimates, which refuse them at the probe. MERGE-MASTER r13 (sol r12 B1/B2)
   makes both measures exact to the poll: a hold is judged by its length less the poll gap its ending step could have
