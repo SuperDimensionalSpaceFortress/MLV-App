@@ -710,14 +710,6 @@ static GpuPlaybackReconLiveVectorDumpResult dumpGpuPlaybackReconLiveVectorOnce(
     return result;
 }
 
-static QString playbackFpsStatusText( double fps )
-{
-    if( fps < 0.0 ) fps = 0.0;
-    return fps < 10.0
-        ? QStringLiteral( "Playback: %1 fps" ).arg( fps, 0, 'f', 1 )
-        : QStringLiteral( "Playback: %1 fps" ).arg( static_cast<int>( fps ) );
-}
-
 static int playbackScopeUpdateIntervalMs()
 {
     bool ok = false;
@@ -2895,7 +2887,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
                                                      hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
         {
-            const QString playbackFpsText = playbackFpsStatusText( 0.0 );
+            const QString playbackFpsText = playback_conform::playbackFpsStatusText(
+                0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
             if( m_lastPlaybackFpsStatusText != playbackFpsText )
             {
                 m_pFpsStatus->setText( playbackFpsText );
@@ -2954,7 +2947,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // An early predictive tick is rounded up to a frame period, and a render-thread stall is never one giant
     // catch-up step. The round-up alone outran native pace on a fast GPU: playbackHandling()'s
     // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
-    timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getFramerate(), predictivePlaybackAdvance,
+    timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,
                                                            ui->actionPlay->isChecked(), hadPendingAdvance );
 
     //Playback
@@ -3044,7 +3037,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             if( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )
             {
                 const double smoothedFps = 1000.0 / m_playbackFpsEmaFrameMs;
-                const QString playbackFpsText = playbackFpsStatusText( smoothedFps );
+                const QString playbackFpsText = playback_conform::playbackFpsStatusText(
+                    smoothedFps, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
                 if( m_lastPlaybackFpsStatusText != playbackFpsText )
                 {
                     m_pFpsStatus->setText( playbackFpsText );
@@ -3056,7 +3050,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         lastTime = nowTime;
 
         //When playback is off, the timeDiff is set to 0 for DropFrameMode
-        if( !ui->actionPlay->isChecked() ) timeDiff = 1000 / getFramerate();
+        if( !ui->actionPlay->isChecked() ) timeDiff = 1000 / getPlaybackFramerate();
     }
     else
     {
@@ -9168,6 +9162,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
     // be at least its floor (HFR-10S-1: 10 s for an HFR clip, else 20 s) and must outlast the play window
     // measured from --start-frame; path-free message.
+    // SOURCE seconds at the NATIVE fps, conformed or not (HUB RULING 2026-10-30T22:17:51Z): a 59.94 fps clip of 971
+    // frames is 16.2 s whatever rate it plays at.
     {
         const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
         const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
@@ -9822,7 +9818,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // The shared gate (programmaticPlay) refuses BEFORE Play -- path-free, typed exit 14 -- unless that
     // window is >= 20 s AND >= the requested window; this is also the one Play of the process.
     // A --presented-frames target ends the Play early after N presented frames, so it is a play window
-    // of N / fps seconds and must reach the 20 s floor too (a pinned run of 24 frames would play ~1 s).
+    // of N / fps seconds and must reach the clip's floor too (a pinned run of 24 frames would play ~1 s).
+    // fps is the NATIVE rate, conformed or not (HUB RULING 2026-10-30T22:17:51Z): each present advances one source
+    // frame, so a conformed HFR clip needs 600 presents for its 10 s floor, as a native one does.
     const double presentedTargetFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
     if( !playback_frame_range::presentedFramesTargetReachesFloor( options.targetPresentedFrames, presentedTargetFps ) )
     {
@@ -9888,7 +9886,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_contactSheetCaptureTargetSourceFrames.clear();
         // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): unpaced, the Play stops at its required source frames,
         // which a fast run reaches before the wall-clock centres; its targets are source-frame centres instead.
-        m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();
+        // MERGE-MASTER r3 (adversary A3): a CONFORMED Play's window counts source seconds, so its targets are source frames too.
+        m_contactSheetCaptureUnpaced = playback_frame_range::contactSheetInPassTargetsAreSourceFrames(
+            m_automationPacingIsolated && mlvappPlaybackUnpacedRequested(), playbackConformActive(), m_playRequiredSourceFrames );
         for( int i = 0; i < options.contactSheetFrames; ++i )
         {
             m_contactSheetCaptureTargetMs.append( static_cast<qint64>(
@@ -9901,7 +9901,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         m_contactSheetPendingGrabs.clear();
         m_contactSheetCaptureNextTargetIndex = 0;
         m_contactSheetCaptureStartFrame = ui->horizontalSliderPosition->value();
-        m_contactSheetCaptureFps = getFramerate();
+        m_contactSheetCaptureFps = getPlaybackFramerate();
         m_contactSheetCaptureError.clear();
         m_contactSheetCaptureClock.start();
         m_contactSheetCaptureActive = true;
@@ -10847,7 +10847,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         if( smokeFirstPresentCaptureRequested() )
             writeFirstPresentIdentity( options.contactSheetDir, m_identityPrePlayFrame );
 
-        const double contactSheetFps = getFramerate();
+        const double contactSheetFps = getPlaybackFramerate();
         const int contactSheetClipFrameCount = loadedFrameCount();
         const int sheetStartFrame = qBound(
             0, contactSheetStartFrame, qMax( 0, contactSheetClipFrameCount - 1 ) );
@@ -11541,6 +11541,9 @@ int MainWindow::openMlv( QString fileName )
 
     //Reset audio engine
     m_pAudioPlayback->resetAudioEngine();
+    // MERGE-MASTER r7 (sol r6 B2): the reset closes the engine the last applied sync started, and Play can survive a
+    // reopen (rename), so forget that sync: the new clip's first requested sync is applied, never dropped as a duplicate.
+    forgetAppliedPlaybackAudioSync();
 
     /* Destroy it just for simplicity... and make a new one */
     if( !freeActiveMlvObjectAfterLifecycleBarrier( "clip-open" ) )
@@ -11678,7 +11681,8 @@ int MainWindow::openMlv( QString fileName )
     ui->horizontalSliderPosition->setMaximum( getMlvFrames( m_pMlvObject ) - 1 );
 
     //Restart timer
-    m_timerId = mlvappStartPlaybackTimer( this, getFramerate() );
+    m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
+    refreshPlaybackFpsStatus();
 
     if( ui->actionDontSwitchDebayerForPlayback->isChecked() )
     {
@@ -11721,6 +11725,9 @@ int MainWindow::openMlv( QString fileName )
         applyPlaybackDebayerSelection();
     }
 
+    // MERGE-MASTER r7 (sol r6 B2): the new engine below has applied no sync (one consumed while the open pumped events
+    // went to the reset engine), so the memo is forgotten again right before it.
+    forgetAppliedPlaybackAudioSync();
     //Init audio playback engine
     m_pAudioPlayback->initAudioEngine( m_pMlvObject );
     armPlaybackRoutePrewarm();
@@ -11729,6 +11736,10 @@ int MainWindow::openMlv( QString fileName )
     ++m_lookAssistAsyncGeneration;
     m_fileLoaded = true;
     resetPlaybackQualityAutoRunState();
+    // MERGE-MASTER r11 (ADV-A2): the refresh after the timer restart above ran while m_fileLoaded was still false, so
+    // playbackConformActive() was false and the conform audio-mute tooltip was installed empty. Refresh it once the
+    // clip counts as loaded.
+    refreshPlaybackFpsStatus();
 
     //Audio Track
     paintAudioTrack();
@@ -11856,7 +11867,7 @@ void MainWindow::playbackHandling(int timeDiff)
                     m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::LoopWrap,
                                                               ui->horizontalSliderPosition->value(), paceNowMs,
                                                               1.0, m_playbackPaceGuard.creditFrames(),
-                                                              getFramerate(), !paceGuardArmedBeforeTick );
+                                                              getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
@@ -11868,7 +11879,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 if( ui->actionAudioOutput->isChecked()
                  && ui->actionDropFrameMode->isChecked() )
                 {
-                    m_tryToSyncAudio = true;
+                    requestPlaybackAudioSync();
                 }
             }
             else
@@ -11895,7 +11906,7 @@ void MainWindow::playbackHandling(int timeDiff)
                         m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
                                                                   ui->horizontalSliderPosition->value(), paceNowMs,
                                                                   1.0, m_playbackPaceGuard.creditFrames(),
-                                                                  getFramerate(), !paceGuardArmedBeforeTick );
+                                                                  getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                     m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also, for mode changing
                     m_frameChanged = true;
                 }
@@ -11910,7 +11921,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
-                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                        m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
@@ -11926,7 +11937,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Sync audio
                 if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {
-                    m_tryToSyncAudio = true;
+                    requestPlaybackAudioSync();
                 }
                 //Because we need it NOW, block slider signals and draw after this function in this timerEvent
                 ui->horizontalSliderPosition->blockSignals( true );
@@ -11939,7 +11950,7 @@ void MainWindow::playbackHandling(int timeDiff)
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
                         grantedDropFrames, m_playbackPaceGuard.creditFrames(),
-                        getFramerate(), !paceGuardArmedBeforeTick );
+                        getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                     // PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames, the skips of the first 2 s after Play.
                     if( !dropFrameTick.wrapped
                      && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
@@ -12280,6 +12291,7 @@ void MainWindow::initGui( void )
              &MainWindow::showPerformanceProfilingDialog );
     ui->menuPlayback->addSeparator();
     ui->menuPlayback->addAction( performanceProfilingAction );
+    setupPlaybackConformMenu();
     connect( ui->actionDropFrameMode,
              &QAction::toggled,
              this,
@@ -12460,9 +12472,10 @@ void MainWindow::initGui( void )
 
     //Set up fps status label
     m_pFpsStatus = new QLabel( statusBar() );
-    m_pFpsStatus->setMaximumWidth( 110 );
-    m_pFpsStatus->setMinimumWidth( 110 );
-    m_pFpsStatus->setText( playbackFpsStatusText( 0.0 ) );
+    // Wide enough for the conform suffix, e.g. "Playback: 24 fps (59.94 -> 24)".
+    m_pFpsStatus->setMaximumWidth( 210 );
+    m_pFpsStatus->setMinimumWidth( 210 );
+    m_pFpsStatus->setText( playback_conform::playbackFpsStatusText( 0.0, 0.0, 0.0 ) );
     m_lastPlaybackFpsStatusText = m_pFpsStatus->text();
     //m_pFpsStatus->setFrameStyle(QFrame::Panel | QFrame::Sunken);
     statusBar()->addWidget( m_pFpsStatus );
@@ -19379,6 +19392,8 @@ void MainWindow::setPreviewMode( void )
 }
 
 //Get the framerate. Override or Original
+//EXPORT / METADATA / TIMECODE rate: the export FPS override lives here and ONLY here. Playback reads
+//getPlaybackFramerate().
 double MainWindow::getFramerate( void )
 {
     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: an automation run (GUI smoke, profile, autoplay hook) never reads the
@@ -19388,12 +19403,212 @@ double MainWindow::getFramerate( void )
     else return getMlvFramerate( m_pMlvObject );
 }
 
+//Get the rate the PLAYBACK timeline runs at (PLAYBACK-HFR-CONFORM-DEFAULT-1): the clip's own
+//rate, or the conform rate for a high-frame-rate clip. No export-override input, by design.
+double MainWindow::getPlaybackFramerate( void )
+{
+    return playback_conform::playbackFps( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );
+}
+
+bool MainWindow::playbackConformActive( void )
+{
+    return m_fileLoaded && m_pMlvObject
+        && playback_conform::conformApplies( getMlvFramerate( m_pMlvObject ), m_conformEnabled, m_conformTargetFps, m_conformThresholdFps );
+}
+
+//Auto quality target: capped by the playback rate ONLY while conform is active, so a clip at or under
+//the threshold (a 23.976 clip included) keeps the user's Auto budget. An explicit env override of the
+//Auto target is a diagnostic and stays authoritative.
+int MainWindow::effectivePlaybackAutoTargetFps( void )
+{
+    if( playback_auto_target_fps_env_override() > 0 ) return m_playbackAutoTargetFps;
+    return playback_conform::effectiveAutoTargetFps( m_playbackAutoTargetFps, m_pMlvObject ? getPlaybackFramerate() : 0.0, playbackConformActive() );
+}
+
+//The ONLY place m_tryToSyncAudio is raised: audio is muted while conform is active (its native
+//rate cannot follow slowed-down picture); the saved actionAudioOutput is left untouched.
+void MainWindow::requestPlaybackAudioSync( void )
+{
+    if( !playback_conform::audioSyncAllowed( playbackConformActive() ) ) return;
+    m_tryToSyncAudio = true;
+}
+
+void MainWindow::refreshPlaybackFpsStatus( void )
+{
+    if( !m_pFpsStatus ) return;
+    const QString text = playback_conform::playbackFpsStatusText(
+        0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
+    m_pFpsStatus->setText( text );
+    m_lastPlaybackFpsStatusText = text;
+    m_pFpsStatus->setToolTip( playbackConformActive() && ui->actionAudioOutput->isChecked()
+                                  && doesMlvHaveAudio( m_pMlvObject )
+                                  ? playback_conform::audioMutedStatusText()
+                                  : QString() );
+}
+
+// MERGE-MASTER r5 (AUDIO-A1): every conform control records the clip's conform state and playback rate before it changes
+// them; applyPlaybackConformSettings compares the two (playback_conform::pendingAudioStartOnConformChange).
+void MainWindow::noteConformStateBeforeChange( void )
+{
+    m_conformActiveBeforeChange = playbackConformActive();
+    m_conformPlaybackFpsBeforeChange = m_pMlvObject ? getPlaybackFramerate() : 0.0;
+}
+
+// MERGE-MASTER r6 (AUDIO-A1 residual, Dot 6544364013): the consumer's duplicate-sync memo describes audio that still runs
+// from the last applied sync (playback_audio_start::isDuplicateSync). A stop outside the consumer forgets it, so the next
+// requested sync is applied: the play stop, and a conform change that stops the audio while Play stays on. r7 (sol r6 B2):
+// so does every engine reset or re-init outside the consumer (clip open: resetAudioEngine and initAudioEngine).
+void MainWindow::forgetAppliedPlaybackAudioSync( void )
+{
+    m_lastPlaybackAudioSyncFrame = -1;
+    m_lastPlaybackAudioSyncTime = 0.0;
+}
+
+//Playback > High Frame Rate Conform: enable, target rate and threshold, persisted under
+//Playback/Conform* (deliberately not Playback/AutoTargetFps, which is the Auto quality budget).
+//Read and written through automation_settings::openAppSettings(), so an automation run uses its
+//run-scoped store and never the owner's settings.
+void MainWindow::setupPlaybackConformMenu( void )
+{
+    {
+        // Invalid saved values fall back to the defaults (playback_conform::loadSettings).
+        auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
+        const playback_conform::Settings saved = playback_conform::loadSettings( set );
+        m_conformEnabledSetting = saved.enabled;
+        // HFR-NATIVE-60FPS-FULLRES-1: MLVAPP_PLAYBACK_CONFORM=0|1 wins for this process and is never persisted.
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), saved.enabled );
+        m_conformTargetFps = saved.targetFps;
+        m_conformThresholdFps = saved.thresholdFps;
+    }
+    QMenu *menu = ui->menuPlayback->addMenu( tr( "High Frame Rate Conform" ) );
+    menu->setToolTipsVisible( true );
+
+    QAction *enable = menu->addAction( tr( "Conform high frame rate clips" ) );
+    enable->setObjectName( QStringLiteral( "actionPlaybackConformEnabled" ) );
+    enable->setCheckable( true );
+    enable->setChecked( m_conformEnabled );
+    enable->setToolTip( tr( "Play clips faster than the threshold as slow motion at the target rate. "
+                            "Export is not affected; audio is muted while conforming." ) );
+    connect( enable, &QAction::toggled, this, [this]( bool on )
+    {
+        // MERGE-MASTER r3 (adversary A2): the toggle persists the user's choice, and MLVAPP_PLAYBACK_CONFORM=0|1 still wins for this process.
+        noteConformStateBeforeChange();
+        m_conformEnabledSetting = on;
+        m_conformEnabled = playback_conform::resolveConformEnabled( playback_conform::conformEnvOverride(), on );
+        applyPlaybackConformSettings( true );
+    } );
+
+    QMenu *targetMenu = menu->addMenu( tr( "Conform to" ) );
+    m_conformTargetGroup = new QActionGroup( this );
+    m_conformTargetGroup->setExclusive( true );
+    const double targets[] = { 24.0, 25.0, 30.0 };
+    for( const double target : targets )
+    {
+        QAction *a = targetMenu->addAction( tr( "%1 fps" ).arg( target, 0, 'g', 4 ) );
+        a->setCheckable( true );
+        a->setData( target );
+        a->setChecked( qFuzzyCompare( target, m_conformTargetFps ) );
+        m_conformTargetGroup->addAction( a );
+        connect( a, &QAction::triggered, this, [this, target]()
+        {
+            noteConformStateBeforeChange();
+            m_conformTargetFps = target;
+            applyPlaybackConformSettings( true );
+        } );
+    }
+
+    QMenu *thresholdMenu = menu->addMenu( tr( "For clips above" ) );
+    m_conformThresholdGroup = new QActionGroup( this );
+    m_conformThresholdGroup->setExclusive( true );
+    const double thresholds[] = { 30.0, 50.0 };
+    for( const double threshold : thresholds )
+    {
+        QAction *a = thresholdMenu->addAction( tr( "%1 fps" ).arg( threshold, 0, 'g', 4 ) );
+        a->setCheckable( true );
+        a->setData( threshold );
+        a->setChecked( qFuzzyCompare( threshold, m_conformThresholdFps ) );
+        m_conformThresholdGroup->addAction( a );
+        connect( a, &QAction::triggered, this, [this, threshold]()
+        {
+            noteConformStateBeforeChange();
+            m_conformThresholdFps = threshold;
+            applyPlaybackConformSettings( true );
+        } );
+    }
+
+    // MERGE-MASTER r11 (adversary A2, the ADV-A2 class): the mute tooltip also depends on Audio Output, and nothing else
+    // refreshes it when that is toggled on a loaded clip. Not before a clip is loaded: readSettings checks Audio Output
+    // while m_pMlvObject is still null.
+    connect( ui->actionAudioOutput, &QAction::toggled, this, [this]( bool )
+    {
+        if( m_fileLoaded && m_pMlvObject ) refreshPlaybackFpsStatus();
+    } );
+}
+
+void MainWindow::applyPlaybackConformSettings( bool persist )
+{
+    m_conformTargetFps = playback_conform::sanitizedTargetFps( m_conformTargetFps );
+    m_conformThresholdFps = playback_conform::sanitizedThresholdFps( m_conformThresholdFps );
+    if( persist )
+    {
+        auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
+        playback_conform::Settings s;
+        s.enabled = m_conformEnabledSetting;
+        s.targetFps = m_conformTargetFps;
+        s.thresholdFps = m_conformThresholdFps;
+        playback_conform::saveSettings( set, s );
+    }
+    // A conform change mid-playback that leaves the clip conformed: audio that was already running must stop (it cannot
+    // follow the new rate). The stop forgets the applied sync (MERGE-MASTER r6, AUDIO-A1 residual), so when a later change
+    // un-conforms the clip, the Rearm case below re-requests the start (requestPlaybackAudioSync) and the next present
+    // applies it, even at the same frame within the consumer's 100 ms duplicate window.
+    if( m_pAudioPlayback && playbackConformActive() )
+    {
+        m_pAudioPlayback->stop();
+        forgetAppliedPlaybackAudioSync();
+    }
+    // MERGE-MASTER r5 (AUDIO-A1): a pending audio start (raised at Play, not yet consumed by the first present) is
+    // touched only when this change moved the clip's effective conform state or playback rate. A 23.976 clip stays
+    // non-conformed under a target or threshold change, so its pending start survives (the drop-frame tick re-arms
+    // only on a wrap, so a cleared start never came back with Loop off).
+    switch( playback_conform::pendingAudioStartOnConformChange( m_conformActiveBeforeChange, m_conformPlaybackFpsBeforeChange,
+                                                                playbackConformActive(), m_pMlvObject ? getPlaybackFramerate() : 0.0 ) )
+    {
+    case playback_conform::PendingAudioStart::Clear:
+        m_tryToSyncAudio = false;
+        break;
+    case playback_conform::PendingAudioStart::Rearm:
+        m_tryToSyncAudio = false;
+        if( ui->actionAudioOutput->isChecked()
+         && ui->actionDropFrameMode->isChecked()
+         && ui->actionPlay->isChecked() )
+        {
+            requestPlaybackAudioSync();
+        }
+        break;
+    case playback_conform::PendingAudioStart::Keep:
+        break;
+    }
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        killTimer( m_timerId );
+        m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
+        resetPlaybackQualityAutoRunState();
+    }
+    refreshPlaybackFpsStatus();
+    if( playbackConformActive() && ui->actionAudioOutput->isChecked()
+     && m_pMlvObject && doesMlvHaveAudio( m_pMlvObject ) )
+    {
+        statusBar()->showMessage( playback_conform::audioMutedStatusText(), 4000 );
+    }
+}
+
 // CUDA-HEADROOM-1: the pace the NativePaceGuard is handed, and nothing else. An automation run that asked for
 // unpaced playback (mlvappPlaybackUnpacedRequested) hands it 0 (no limit) to measure throughput; the interactive
 // app never does.
 double MainWindow::playbackPaceGuardFps( void )
 {
-    return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
+    return playback_native_pace::guardPaceFps( getPlaybackFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
 }
 
 //Paint the Audio Track Wave to GUI
@@ -20327,7 +20542,7 @@ void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
         m_newPosDropMode = position;
         if( ui->actionAudioOutput->isChecked() )
         {
-            m_tryToSyncAudio = true;
+            requestPlaybackAudioSync();
         }
     }
 
@@ -21149,7 +21364,7 @@ void MainWindow::on_actionGoto_First_Frame_triggered()
      && ui->actionDropFrameMode->isChecked()
      && ui->actionPlay->isChecked() )
     {
-        m_tryToSyncAudio = true;
+        requestPlaybackAudioSync();
     }
 }
 
@@ -22187,7 +22402,7 @@ void MainWindow::resetPlaybackQualityAutoRunState( void )
     m_playbackQualityAutoCapabilityTracker.reset();
     m_playbackQualityAutoDecisionBudgetMs =
         1000.0 / static_cast<double>( m_playbackAutoTargetFps > 0
-                                      ? m_playbackAutoTargetFps
+                                      ? effectivePlaybackAutoTargetFps()
                                       : 30 );
     m_playbackQualityAutoHeadroomCapability = false;
     if( m_playbackQualityMode == static_cast<int>( PlaybackQualityMode::Auto )
@@ -23529,7 +23744,7 @@ void MainWindow::on_actionExportSettings_triggered()
     {
         //Restart timer with chosen framerate
         killTimer( m_timerId );
-        m_timerId = mlvappStartPlaybackTimer( this, getFramerate() );
+        m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
 
         //Refresh Timecode Label
         if( m_tcModeDuration )
@@ -24914,14 +25129,20 @@ void MainWindow::on_actionPlay_triggered(bool checked)
     else
     {
         //Start Audio
+        if( ui->actionAudioOutput->isChecked() && playbackConformActive() )
+        {
+            statusBar()->showMessage( playback_conform::audioMutedStatusText(), 4000 );
+        }
         if( ui->actionAudioOutput->isChecked()
          && ui->actionDropFrameMode->isChecked() )
         {
-            m_tryToSyncAudio = true;
+            requestPlaybackAudioSync();
             m_pAudioPlayback->clearStartReport();
             // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row A: open the device now, silently and off the GUI thread, while the
             // first frame renders; the first present only resumes it (finishPresentedFrame).
-            if( !mlvappPlaybackAudioSyncLegacyRequested() )
+            // PLAYBACK-HFR-CONFORM-DEFAULT-1: not while conform mutes the audio (requestPlaybackAudioSync() left it off).
+            if( playback_conform::audioSyncAllowed( playbackConformActive() )
+             && !mlvappPlaybackAudioSyncLegacyRequested() )
                 m_pAudioPlayback->prepare( ui->horizontalSliderPosition->value() );
         }
     }
@@ -25516,6 +25737,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     // is process-cumulative, so a wrap during a warm-up play (Look Assist Auto-warmup settle) still
     // reaches the summary's wrapped=/wrap_count= fields.
     m_playbackSmokeWrapped = false;
+    m_playbackSmokeSourceAdvance.reset();
+    // r16 (adversary A1): engine wraps before this measured Play are not this Play's wraps
+    m_playbackSmokeTrackerEngineWraps = m_playbackWrapRecorder.engineWraps;
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -25536,7 +25760,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
     m_playbackPresentTrace.begin( m_playbackSmokeStartTime * 1000.0, 4096 );   // r7 present trace (no-op when off)
-    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
+    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getPlaybackFramerate() );
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: the timeline owes the wall time since Play only when the legacy startup banks
     // it; otherwise paced playback starts at the first present, and a later skip is a slip, never startup catch-up.
     if( mlvappPlaybackStartupCatchupLegacyRequested() )
@@ -25810,7 +26034,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                "env_quality_mode=%29 env_gpu_playback_recon=%30 "
                "env_gpu_playback_recon_texture_present=%31 "
                "auto_target_fps=%32 auto_reason_start=%33 "
-               "env_raw_uint16_prefetch_decoders=%34" )
+               "env_raw_uint16_prefetch_decoders=%34 env_playback_conform=%35" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeStartPosition )
                .arg( m_playbackSmokeStartCutIn )
@@ -25848,7 +26072,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( QString::fromLatin1(
                    playbackQualityAutoDecisionReasonName(
                        m_playbackQualityAutoDecisionReason ) ) )
-               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) );
+               .arg( envValueForLog( "MLVAPP_RAW_UINT16_PREFETCH_DECODERS" ) )
+               .arg( envValueForLog( "MLVAPP_PLAYBACK_CONFORM" ) );
 
     // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: the prep route's engagement on a line of its own that carries no env-derived
     // text; the dual-venue runner reads engagement from this line only, never from the start line's env_* fields.
@@ -25918,17 +26143,34 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // "went backward" test also fires for an external backward scrub, or a stress seek to an
     // arbitrary earlier frame, during a session where Loop never actually wrapped -- see
     // isContactSheetLoopWrapTransition for why Loop state and jump size now both gate this.
-    if( m_playbackSmokePresentedFrames > 0
+    const bool playbackSmokeWrapNow =
+        m_playbackSmokePresentedFrames > 0
      && playback_frame_range::isContactSheetLoopWrapTransition(
             ui->actionLoop->isChecked(),
             ui->spinBoxCutIn->value() - 1,
             ui->spinBoxCutOut->value() - 1,
             m_playbackSmokeLastPresentedFrame,
-            static_cast<int>( displayFrame ) ) )
+            static_cast<int>( displayFrame ) );
+    if( playbackSmokeWrapNow )
     {
         m_playbackSmokeWrapped = true;
         m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
     }
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
+    // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
+    // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
+    // (presentationIsLoopWrap): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold,
+    // and over a cut range narrower than its tolerance the inference calls any backward seek a wrap.
+    const bool sourceAdvanceWrap = presentationIsLoopWrap( m_playbackWrapRecorder.engineWraps,
+                                                           m_playbackSmokeTrackerEngineWraps,
+                                                           m_playbackSmokePresentedFrames > 0,
+                                                           m_playbackSmokeLastPresentedFrame,
+                                                           static_cast<int>( displayFrame ) );
+    m_playbackSmokeSourceAdvance.notePresented( now,
+                                                static_cast<int>( displayFrame ),
+                                                sourceAdvanceWrap,
+                                                ui->spinBoxCutIn->value() - 1,
+                                                ui->spinBoxCutOut->value() - 1 );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
     if( m_playbackWrapRecorder.replayCount() > 0 ) m_playbackSmokeWrapped = true;
 
@@ -30417,6 +30659,44 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( bool01( m_fpsOverride && !m_automationPacingIsolated ) );
 
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1: conform state + timeline speed. source_fps is source frames advanced per
+    // wall-clock second between the first and last PRESENTED frame (the 24 +/- 3 % acceptance); max_jump == 1
+    // means every source frame was shown (loop wrap excluded). audio_sync_requests must be 0 while
+    // conform_active=1 (audio muted). The export-override value is recorded so a leg proves it never reaches
+    // playback. One line per session, always emitted (the venue legs grep it).
+    {
+        const PlaybackSourceAdvanceTracker & adv = m_playbackSmokeSourceAdvance;
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.conform session=%1 clip_fps=%2 playback_fps=%3 conform_active=%4 "
+                   "conform_enabled=%5 conform_target=%6 conform_threshold=%7 export_fps_override=%8 "
+                   "export_frame_rate=%9 audio_sync_requests=%10 presented=%11 source_advanced=%12 "
+                   "span_s=%13 source_fps=%14 max_jump=%15 wraps=%16 backward=%17 repeats=%18 "
+                   "auto_target_fps=%19 effective_auto_target_fps=%20 conform_env_override=%21" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( smokeClipFps, 0, 'f', 3 )
+                   .arg( m_pMlvObject ? getPlaybackFramerate() : 0.0, 0, 'f', 3 )
+                   .arg( bool01( playbackConformActive() ) )
+                   .arg( bool01( m_conformEnabled ) )
+                   .arg( m_conformTargetFps, 0, 'f', 3 )
+                   .arg( m_conformThresholdFps, 0, 'f', 3 )
+                   .arg( bool01( m_fpsOverride ) )
+                   .arg( m_frameRate, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>(
+                             m_playbackAudioSyncRequestCount - m_playbackSmokeStartAudioSyncRequests ) )
+                   .arg( static_cast<qulonglong>( adv.presented() ) )
+                   .arg( static_cast<qlonglong>( adv.advancedFrames() ) )
+                   .arg( adv.spanSeconds(), 0, 'f', 3 )
+                   .arg( adv.sourceFps(), 0, 'f', 3 )
+                   .arg( adv.maxJump() )
+                   .arg( static_cast<qulonglong>( adv.wraps() ) )
+                   .arg( static_cast<qulonglong>( adv.backwardJumps() ) )
+                   .arg( static_cast<qulonglong>( adv.repeatedFrames() ) )
+                   .arg( m_playbackAutoTargetFps )
+                   .arg( effectivePlaybackAutoTargetFps() )
+                   .arg( playback_conform::conformEnvOverride() );
+    }
+
     // Window foreground state at session begin and at this gate, plus how many times the
     // whole application lost the OS foreground during the session (event-driven via
     // onPlaybackSmokeApplicationStateChanged(), not polled) -- so the joined analysis can
@@ -30601,8 +30881,7 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         m_playToFirstFrameTargetFrame = -1;
         m_lastPlayStartPrerollRequested = false;
         m_playbackScopeLastUpdateTime = 0.0;
-        m_lastPlaybackAudioSyncFrame = -1;
-        m_lastPlaybackAudioSyncTime = 0.0;
+        forgetAppliedPlaybackAudioSync();
         resetPlaybackQualityAutoRunState();
     }
     selectDebayerAlgorithm();
@@ -30685,14 +30964,17 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
     Q_UNUSED( site );
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
+    // The window is SOURCE seconds at the NATIVE fps, conformed or not (HFR-10S-1; HUB RULING 2026-10-30T22:17:51Z):
+    // 20 s of a 59.94 clip is 1199 source frames at any playback rate. Conform changes only the pace below.
     const double fps = playGateNativeFps();
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
-    // ENFORCE-3: the engine's REAL pace (getFramerate(): a persisted fpsOverride when pacing is not isolated)
-    // goes into the verdict -- the window must be consumable at that pace inside the safety budget, else the
-    // Play is refused before it starts. An unusable pace (<= 0) is passed as -1 and fails closed.
-    const double enginePaceFps = getFramerate();
+    // ENFORCE-3: the engine's REAL pace goes into the verdict -- the window must be consumable at that pace
+    // inside the safety budget, else the Play is refused before it starts. The pace is the PLAYBACK rate
+    // (getPlaybackFramerate(): conform included, the export fpsOverride never). An unusable pace (<= 0) is
+    // passed as -1 and fails closed.
+    const double enginePaceFps = haveClip ? getPlaybackFramerate() : 0.0;
     return playback_frame_range::evaluatePlayableWindow(
         ui->horizontalSliderPosition->value(),
         ui->spinBoxCutIn->value(),
@@ -30804,6 +31086,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
     m_playRequiredSourceFrames = verdict.requiredFrames;
     m_playRequestedSeconds = requestedSeconds;
     m_playPaceFps = verdict.paceFps;
+    m_playPaceHistory = playback_frame_range::PlayPaceHistory();
     ui->actionPlay->trigger();   // allowlisted: the gate's own Play
     return true;
 }
@@ -30816,10 +31099,13 @@ void MainWindow::programmaticStop( const char *site )
 }
 
 // ENFORCE-3: the ONE decision every automation Play wait makes. A wall clock alone is never a pass.
-playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const
+// MERGE-MASTER r11 (ADV-A1b): every wait (autoplay, settle, play action, GUI smoke) reaches the pace probe through here,
+// so each observation is noted in the Play's pace history first and the probe judges the pace the run has shown.
+playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs )
 {
+    m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );
     return playback_frame_range::evaluatePlayStop(
-        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );
+        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );
 }
 
 bool MainWindow::programmaticPlayConsumed() const
@@ -32330,16 +32616,15 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     splitStep( playback_startup_split::StepScopes );
 
     const double overlay_start = mlv_stage_timing_now();
-    if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
+    if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked()
+     && playback_conform::audioSyncAllowed( playbackConformActive() ) )
     {
         m_tryToSyncAudio = false;
         ++m_playbackAudioSyncRequestCount;
         const double syncNow = mlv_stage_timing_now();
         const int syncFrame = m_newPosDropMode;
-        const bool duplicateRecentSync =
-            m_lastPlaybackAudioSyncFrame == syncFrame
-         && m_lastPlaybackAudioSyncTime > 0.0
-         && ( syncNow - m_lastPlaybackAudioSyncTime ) * 1000.0 < 100.0;
+        const bool duplicateRecentSync = playback_audio_start::isDuplicateSync( m_lastPlaybackAudioSyncFrame,
+                                                                            m_lastPlaybackAudioSyncTime, syncFrame, syncNow );
         if( duplicateRecentSync )
         {
             ++m_playbackAudioSyncSkippedCount;
@@ -32510,7 +32795,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                             ? m_playbackQualityFrameCounter
                             : PlaybackQualityAutoSampler::kSlidingWindow;
                         decision = playback_auto_force_fast_decision(
-                            m_playbackAutoTargetFps,
+                            effectivePlaybackAutoTargetFps(),
                             sharperHeadroomScaleAllowed,
                             presentedIntervalMs,
                             diagnosticSampleCount );
@@ -32518,7 +32803,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                     else
                     {
                         decision = m_playbackQualitySampler.decideNextSlot(
-                            m_playbackAutoTargetFps,
+                            effectivePlaybackAutoTargetFps(),
                             dualIsoActive,
                             mlvPlaybackAggressivePreviewMode() != 0,
                             sharperHeadroomScaleAllowed );

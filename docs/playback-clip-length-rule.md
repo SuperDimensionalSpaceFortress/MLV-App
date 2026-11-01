@@ -143,18 +143,83 @@ FRAME:
   safety net, and its expiry is a typed failure. The net **scales with the pace the venue must sustain**:
   `requested / kMinSustainedPaceFraction (0.5) + kPlaySafetyMarginMs (15 s)`, i.e. 55 s for a 20 s window. A venue that
   holds under half the native pace is refused up front when its engine pace is known (`PLAY_PACE_TOO_SLOW`, before
-  Play) and ends early with the **same** token when the pace only shows once Play runs (the measured pace cannot reach
-  the requirement inside the budget; judged after 8 s of Play and two frames) -- never a run that can only time out.
+  Play) and ends early with the **same** token when the pace only shows once Play runs -- never a run that can only time
+  out.
+- **The in-Play pace probe** (`playPaceProjectsPastBudget`, reached by every automation wait through
+  `programmaticPlayState`; Gated mode only) is judged after 8 s of Play and two frames. It asks whether the run can
+  still finish: the elapsed wall clock, with every wait and stall so far counted once, plus the REMAINING steps at the
+  best pace the Play has shown. That pace is the best of the pace since the Play trigger, the pace since the first
+  forward step, and the pace over any stretch of 3 s or more, measured from the last time the count was seen at its
+  start value (`PlayPaceHistory`, `kPaceRecentWindowMs`), so a stall the count sat through is not charged to the
+  stretch after it. MERGE-MASTER r12 (ADV-A1b residual, Dot 6553009018) adds the playing pace: when several
+  recoverable stalls leave no clean 3 s stretch, the steps per second while the count was advancing. A hold is a stall
+  when even its shortest possible length is longer than the run's median of each hold's longest possible length (its
+  length plus the poll gap before it was first seen; MERGE-MASTER r14, r13 adversary A1: a median hold plus two MEDIAN
+  poll gaps fell to 20 ms under uneven polls and cast ordinary holds out). A stall is left out along with the step that
+  ends it. A steady engine at any pace, polled on any schedule, has no such hold. That median alone left 100-140 ms
+  stalls at the autoplay's 50 ms poll unseen depending on the phase (r14 adversary A1: six 150 ms stalls refused a run
+  reaching at 64.3 s), so MERGE-MASTER r15 adds a second, phase-independent split (`kPaceCadenceStallFactor`,
+  `PlayPaceHistory::cadenceSplit`): a hold is also a stall when even its shortest possible length is longer than twice
+  an upper bound on the run's mean step since the first forward step. No value that stayed at most twice the mean is
+  cast out, so a steady engine and an uneven slow engine's ordinary jitter stay playing; the probe takes the faster
+  pace and the earlier finish of the two splits, so it is never stricter than r14. r15's bound includes the stalls
+  themselves, so dense ones (Dot 6562596628: ten 150 ms stalls every 640 ms, reaching at 64.4 s) still counted as
+  playing. MERGE-MASTER r16 adds a third split (`PlayPaceHistory::stallFreeSplit`) that judges stalls against the
+  playing stretches only. The bound is computed over the holds kept as playing, each stretch measured with its own
+  start lead. That is an upper bound on the step whichever holds are cast out. The split uses the smallest threshold
+  under which every cast-out hold is longer than twice that bound, so an ended stall is never playing pace once its
+  frame was seen to stay more than twice the playing step. The probe takes the fastest pace and the earliest finish of
+  the three splits, so no earlier split brings back a stricter verdict.
+  **The bound the generated sweep proves** (`R16GeneratedSweep...` in `tests/console/test_playback_frame_range.cpp`):
+  required 1499, budget 65 s, 24/25/30 fps, first present 250-1500 ms, stalls of 100-300 ms every 3 s down to every
+  400 ms, either ended by the probe or never stopping, polled every 50 ms at any phase 0-49 ms. The console grid samples
+  five phases and three first presents; the full grid in the r16 run dir covers every phase and four first presents.
+  On that grid every run whose count really reaches 1499 by the budget is Reached (at the first poll after it), and
+  every run that cannot is refused `PLAY_PACE_TOO_SLOW` before the budget. Off the grid, a run whose true finish lies
+  less than one poll past the budget can still end in the typed `PLAY_SAFETY_TIMEOUT` instead, never a pass.
+  Example: 24 fps, first present 1084 ms, reaching at 65000.7 ms (r16 re-pass A3). There are two pinned exceptions, both refused typed within 200 ms of the
+  probe:
+  (1) the stall share cap below: a burst whose stalls exceed a third of the time to the probe looks, at 8 s, exactly
+  like stalls that keep coming;
+  (2) the two-poll limit: a stall whose frame stays less than three poll gaps (step + stall < 150 ms, so the 100 ms
+  stalls) can be seen by only two polls. That is a 50 ms bin, the same sighting as the 60/70 ms steps of an uneven
+  22 fps engine that must be refused at the probe.
+  It is trusted only after 3 s of playing
+  time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
+  that keep coming are left to the other estimates, which refuse them at the probe. MERGE-MASTER r13 (sol r12 B1/B2)
+  makes both measures exact to the poll: a hold is judged by its length less the poll gap its ending step could have
+  been seen late by, so a hold that only waited out a late poll is not a stall. The stall share charges only the time
+  each stall hold was really held (that length less one ordinary step), and the playing time leaves out the hold still
+  open, which has no step yet. The playing pace also has an error band, because each playing stretch's end is seen up
+  to the actual poll gap before its sighting late (never the median gap: polls are not evenly spaced).
+  The run is refused only when even the band's optimistic end, `PlayPaceHistory::optimisticFinishMs`, cannot finish
+  inside the budget. Only when even that pace cannot finish inside the budget does the run end as `PLAY_PACE_TOO_SLOW`. Anything else runs on to the
+  requirement or to the typed `PLAY_SAFETY_TIMEOUT`. MERGE-MASTER r11 (ADV-A1b, catalogue C-PACE-RECOVERY-01 / M-04)
+  replaced the old projection, `elapsed x stepsNeeded / stepsDone` from the trigger. That form charged a startup wait
+  against every remaining frame (about 9x at 8 s of a conformed 25 s window), so a first present later than about
+  360 ms falsely refused M16-1457 under the 24 fps conform. With no history the new projection is exactly the old one,
+  and it is never stricter.
 - The summary (`playback_smoke.summary`) and the profile receipt carry `source_advanced`, `required_source_frames`,
   `native_fps`, `pace_fps`, `fps_override`; the receipt oracle turns anything short of the requirement into
   `INVALID_SOURCE_FRAMES`, never a pass.
+
+### High-frame-rate conform (PLAYBACK-HFR-CONFORM-DEFAULT-1): conform changes the pace, never the window
+
+HUB RULING 2026-10-30T22:17:51Z (#420): a clip above 30 fps plays at the 24 fps conform target by default, and its play window is
+still SOURCE seconds at the native fps (the 2026-10-15 amendment above). `checkPlayableWindow`, the GUI-smoke clip guard, the
+`--presented-frames` check and `Test-GuiSmokeClipLength` all measure with the clip's native fps; only the engine pace
+(`getPlaybackFramerate()`) is the conform rate. The receipt oracles already count in this unit. A conformed Play therefore takes longer
+on the clock, inside the same budget `requested / 0.5 + 15 s`. A 25 s window on M16-1457 (1667 frames at 59.94) needs 1499 source
+frames: 62.4 s at 24 fps, inside 65 s. M16-1456 (16.2 s) cannot hold a 25 s window. Under a 24 fps conform, a native rate above
+62.4 fps (for a 25 s window), 66 fps (20 s) or 84 fps (10 s) cannot reach the window inside the budget. Such a Play is refused
+`PLAY_PACE_TOO_SLOW` before it starts (fail closed). No venue clip today is above 59.94 fps.
 
 ### Typed refusals and exit codes
 
 | Token | Where | Exit |
 |---|---|---|
 | `PLAY_DURATION_TOO_SHORT`, `CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, `PLAY_WINDOW_TOO_SHORT` | the app's gate, before Play (ENFORCE-2) | 14 |
-| `PLAY_PACE_TOO_SLOW` | refused before Play (pace known and under the minimum), or the run ended early because the measured pace cannot reach the requirement | 14 |
+| `PLAY_PACE_TOO_SLOW` | refused before Play (pace known and under the minimum), or the run ended early because even the best pace the Play has shown cannot reach the requirement inside the budget (the in-Play probe above) | 14 |
 | `SOURCE_FRAMES_SHORT` | the engine ended the Play (end of range, jump) before the requirement | 14 |
 | `PLAY_SAFETY_TIMEOUT` | the safety net expired; typed, never a pass | 14 |
 | `REPLAY_REFUSED` | a second programmatic Play in the process | 14 |

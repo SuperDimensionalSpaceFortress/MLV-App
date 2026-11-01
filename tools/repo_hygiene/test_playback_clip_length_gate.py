@@ -22,6 +22,7 @@ enforcement card was never built), so every new lane re-broke it. This file is t
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -355,6 +356,45 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(gate(thirty, "")["verdict"], "PLAY_WINDOW_TOO_SHORT")     # window 0 is a window under the floor
         self.assertEqual(gate(thirty, "-ClipOnly")["verdict"], "OK")
         self.assertEqual(gate(self.clip("sixteen", FRAMES_SHORT_FIXTURE), "-ClipOnly")["verdict"], "CLIP_TOO_SHORT")
+
+    def test_a_conformed_high_frame_rate_clip_is_gated_in_source_seconds_at_its_native_fps(self) -> None:
+        """HUB RULING 2026-10-30T22:17:51Z (HFR-10S-1's unit, docs/playback-clip-length-rule.md): a play window is SOURCE seconds at the clip's NATIVE
+        fps, conformed or not -- a 24 fps conform changes the pace, never the footage the window must cover. 969 frames at 59.94 fps (M16-1456's
+        shape) are 16.17 s, so a 25 s window is refused pre-launch; 1667 frames (M16-1457's) are 27.8 s and pass it."""
+        hfr = {"fps_nom": 59940, "fps_denom": 1000}
+        short, long_ = self.clip("hfr969", 969, **hfr), self.clip("hfr1667", 1667, **hfr)
+        refused = _gate(short, 25)
+        self.assertEqual(refused["verdict"], "CLIP_TOO_SHORT", refused)
+        self.assertAlmostEqual(refused["clipSeconds"], 969 / 59.94, places=2)
+        self.assertAlmostEqual(refused["fps"], 59.94, places=3)
+        self.assertEqual(_gate(short, 16)["verdict"], "OK")                          # 16 s of the 16.17 s
+        self.assertEqual(_gate(short, 17)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(long_, 25)["verdict"], "OK")
+        self.assertEqual(_gate(long_, 25, start_frame=168)["verdict"], "OK")         # (1667 - 168) / 59.94 = 25.008 s remain
+        self.assertEqual(_gate(long_, 25, start_frame=169)["verdict"], "CLIP_TOO_SHORT")   # 24.99 s remain
+        # the HFR floor is 10 s of SOURCE: 599 frames = 9.99 s, 600 frames = 10.01 s
+        self.assertEqual(_gate(self.clip("hfr599", 599, **hfr), 10)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(self.clip("hfr600", 600, **hfr), 10)["verdict"], "OK")
+
+    def test_the_length_gate_takes_no_conform_input(self) -> None:
+        """Source seconds do not depend on the playback rate, so conform never reaches the pre-launch gate: Test-GuiSmokeClipLength has no
+        -ConformEnvOverride, there is no playback-rate mirror, and the runner passes none (adversary A3's MLVAPP_PLAYBACK_CONFORM parse went with it)."""
+        proc = _pwsh(f". {_q(GATE)}; (Get-Command Test-GuiSmokeClipLength).Parameters.ContainsKey('ConformEnvOverride'); "
+                     "[bool](Get-Command Get-GuiSmokePlaybackFps -ErrorAction SilentlyContinue); "
+                     "[bool](Get-Command Get-GuiSmokeConformEnvOverride -ErrorAction SilentlyContinue)")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["False", "False", "False"])
+        runner = (ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("ConformEnvOverride", runner)
+
+    def test_a_presented_frames_target_on_a_high_frame_rate_clip_counts_source_frames_at_its_native_fps(self) -> None:
+        clip = self.clip("hfr1667", 1667, fps_nom=59940, fps_denom=1000)
+        def gate(frames: int) -> dict:
+            proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeClipLength -Path {_q(clip)} -WindowSeconds 25 -TargetPresentedFrames {frames} | ConvertTo-Json -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        self.assertEqual(gate(599)["verdict"], "PLAY_WINDOW_TOO_SHORT")   # 599 / 59.94 = 9.99 s of source
+        self.assertEqual(gate(600)["verdict"], "OK")                      # the HFR floor: ceil(10 x 59.94) = 600
 
     def test_a_presented_frames_target_is_a_play_window_and_must_reach_the_floor(self) -> None:
         def gate(frames: int) -> dict:
@@ -1193,6 +1233,51 @@ CONFORM_CASES = [
      dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="30.000"),
      _conform_line(clip_fps="23.976", playback_fps="30.000"), True, [PACE_TEXT, "never speeds"], [], "native"),
     ("h4: an fps override is still INVALID under a proven conform", dict(HFR_RUN, fps_override=1), _conform_line(), True, ["override"], [PACE_TEXT], "conform"),
+    # MERGE-MASTER r4 (Grok G1 / adversary A3): NaN and Infinity parse as doubles and fail every ordered comparison, so before r4 the gui-smoke
+    # and AttrCuda oracles PROVED a conform line carrying them (and accepted a NaN summary pace); every oracle now rejects them first.
+    ("i1: conform playback_fps=NaN -> INVALID", HFR_RUN, _conform_line(playback_fps="NaN"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i2: conform playback_fps=Infinity -> INVALID", HFR_RUN, _conform_line(playback_fps="Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i3: conform playback_fps=-Infinity -> INVALID", HFR_RUN, _conform_line(playback_fps="-Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i4: conform clip_fps=NaN -> INVALID", HFR_RUN, _conform_line(clip_fps="NaN"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i5: conform clip_fps=Infinity -> INVALID", HFR_RUN, _conform_line(clip_fps="Infinity"), True, [PACE_TEXT, "conform relaxation not applied"], [], "native"),
+    ("i6: summary pace_fps=NaN under a sound conform line -> INVALID", dict(HFR_RUN, pace_fps="NaN"), _conform_line(), True,
+     ["pace_fps=NaN", "present engine pace that is not positive"], [], "native"),
+    ("i7: summary pace_fps=NaN with no conform line -> INVALID", dict(HFR_RUN, pace_fps="NaN"), None, True, ["pace_fps=NaN", "present engine pace that is not positive"], [], "native"),
+    ("i8: summary pace_fps=Infinity -> INVALID", dict(HFR_RUN, pace_fps="Infinity"), _conform_line(), True, ["present engine pace that is not positive"], [], "native"),
+    ("i9: summary native_fps=NaN -> INVALID", dict(HFR_RUN, native_fps="NaN"), _conform_line(), True, ["native_fps=NaN", "native frame rate is unknown"], [], "native"),
+    ("i10: summary native_fps=Infinity -> INVALID", dict(HFR_RUN, native_fps="Infinity"), _conform_line(), True, ["native frame rate is unknown"], [], "native"),
+    # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's literal row. conform_active=1 with clip = playback = native = pace = 59.94 (target 24, threshold
+    # 30 logged) is native-rate playback: no conform happened, so no oracle may PROVE a conform from it (paceRule native). Before r7 all three proved it.
+    # The source frames here are native-paced and enough, so the source-frame verdict itself is valid; a REQUESTED conform-on arm is INVALID
+    # (ConformAwareReceiptOracleTests.test_a_requested_conform_arm_at_the_native_rate_is_never_honoured).
+    ("j1: sol r6 B1 -- conform_active=1 at the native rate (clip = playback = native = pace = 59.94) proves no conform",
+     dict(HFR_RUN, session=3, source_advanced=1499, required_source_frames=1499, native_fps="59.940", pace_fps="59.940"),
+     _conform_line("3", clip_fps="59.940", playback_fps="59.940", conform_env_override=1), False, [], [PACE_TEXT], "native"),
+    ("j2: a sound conform well inside the clip rate (59.94 clip played at 50) stays proven",
+     dict(HFR_RUN, pace_fps="50.000"), _conform_line(playback_fps="50.000", conform_target="50.000"), False, [], [PACE_TEXT], "conform"),
+    ("j3: a 23.976 clip whose conform line claims active=1 at 23.976 proves no conform (the native rule judges it)",
+     dict(HFR_RUN, source_advanced=480, required_source_frames=480, native_fps="23.976", pace_fps="23.976"),
+     _conform_line(clip_fps="23.976", playback_fps="23.976"), False, [], [], "native"),
+    # MERGE-MASTER r8 (sol r7 B1, issuecomment-6549349607): sol's literal row. native = pace = 59.94, clip 60, playback 59.69, conform_active=1. Each tolerance
+    # passed on its own (clip/native 0.06, playback/pace 0.25, 59.69 < 60 x 0.995), so before r8 all three oracles PROVED a conform from native engine pace.
+    # Now the clip must equal native at print precision and the engine pace must sit below native by more than the margin: no proof, the native rule judges.
+    ("k1: sol r7 B1 -- stacked tolerances: native = pace = 59.94, clip 60, playback 59.69, active=1 proves no conform",
+     dict(HFR_RUN, session=3, source_advanced=1499, required_source_frames=1499, native_fps="59.940", pace_fps="59.940"),
+     _conform_line("3", clip_fps="60.000", playback_fps="59.690", conform_env_override=1), False, [], [PACE_TEXT], "native"),
+    # key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1: clip_fps and native_fps print one value to 3 decimals; a real 24-fps conform whose clip is off native by even one
+    # print unit is not proven (before r8 the 0.5 % tolerance proved it), so the native rule judges pace 24 against 59.94.
+    ("k2: clip_fps 60.000 vs native 59.940 under a real 24-fps conform proves no conform",
+     HFR_RUN, _conform_line(clip_fps="60.000"), True, [PACE_TEXT, "does not match native_fps"], [], "native"),
+    ("k3: clip_fps one print unit off native (59.941 vs 59.940) proves no conform",
+     HFR_RUN, _conform_line(clip_fps="59.941"), True, [PACE_TEXT, "does not match native_fps"], [], "native"),
+    # The engine-pace check alone: clip = native = 59.94, playback 59.63 (below 59.94 x 0.995 = 59.6403) agrees with pace 59.90 (|0.27| <= 0.2995), but the
+    # engine paced within 0.5 % of native. Before r8 this proved a conform; now no proof, and the native rule passes it (pace 59.90 vs native 59.94).
+    ("k4: engine pace within 0.5 % of native (59.90 vs 59.94) proves no conform even with playback 59.63 below the clip margin",
+     dict(HFR_RUN, pace_fps="59.900"), _conform_line(playback_fps="59.630"), False, [], [PACE_TEXT], "native"),
+    # The r7 playback/clip check alone (the engine-pace check would pass it): playback 59.65 is within 0.5 % of clip 59.94, the engine paced at 59.40
+    # (|0.25| <= 0.297). No proof, so the native rule judges pace 59.40 against 59.94 and names why the relaxation was refused.
+    ("k5: playback within 0.5 % of the clip rate proves no conform even with the engine pace below the native margin",
+     dict(HFR_RUN, pace_fps="59.400"), _conform_line(playback_fps="59.650"), True, [PACE_TEXT, "indistinguishable from native pace"], [], "native"),
 ]
 
 
@@ -1207,17 +1292,21 @@ def _run_oracle_table(script_body: str, cases: list[dict]) -> list[dict]:
 
 
 def _dv_block(summary: dict, conform: str | None) -> dict:
-    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line)."""
+    """The receipt `playback` block Get-DvPlaybackEvidence would record from these run-log lines (the conform fields mirror the log line).
+    A non-finite rate stays its log text ('NaN', 'Infinity'): JSON has no NaN, and ConvertTo-DvDouble parses the text to the same double."""
+    def rate(v: object) -> float | str:
+        x = float(v)  # type: ignore[arg-type]
+        return x if math.isfinite(x) else str(v)
     block = dict(sourceAdvanced=int(summary["source_advanced"]), requiredSourceFrames=int(summary["required_source_frames"]),
-                 nativeFps=float(summary["native_fps"]), paceFps=float(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
+                 nativeFps=rate(summary["native_fps"]), paceFps=rate(summary["pace_fps"]), fpsOverride=int(summary["fps_override"]),
                  wrapped=False, wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE,
                  logShaBound=True, settingsIsolated=True, jobFailures=[], fixtureRehearsal=False, clipId="CLIP",
                  summarySession=str(summary["session"]), conformLinePresent=conform is not None)
     if conform is not None:
         f = dict(re.findall(r"(\w+)=(\S+)", conform))
         block.update(conformSession=f.get("session"), conformActive=int(f["conform_active"]) if "conform_active" in f else None,
-                     conformClipFps=float(f["clip_fps"]) if "clip_fps" in f else None,
-                     conformPlaybackFps=float(f["playback_fps"]) if "playback_fps" in f else None)
+                     conformClipFps=rate(f["clip_fps"]) if "clip_fps" in f else None,
+                     conformPlaybackFps=rate(f["playback_fps"]) if "playback_fps" in f else None)
     return block
 
 
@@ -1278,6 +1367,90 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
             self.assertIn("conform relaxation not applied", " | ".join(results[6]["failures"]))      # d: inactive
             self.assertNotIn("conform relaxation", " | ".join(results[5]["failures"]))               # c: no line at all keeps the native text unchanged
 
+    def test_a_requested_conform_arm_at_the_native_rate_is_never_honoured(self) -> None:
+        """MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): sol's literal repro through the dual-venue arm verdict and the playback block with
+        playbackConform=on: session=3, sourceAdvanced=requiredSourceFrames=1499, native=pace=clip=playback=59.94, conformActive=1,
+        conformEnvOverride=1. Before r7: proven=true, honoured=true, valid=true. Now: not proven (no conform happened), not honoured, INVALID.
+        Controls: the sound 24-fps conform stays proven/honoured/valid, and the conform-OFF native arm stays honoured."""
+        sol = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=1, conformEnvOverride=1, conformClipFps=59.94,
+                   conformPlaybackFps=59.94, nativeFps=59.94, paceFps=59.94, sourceAdvanced=1499, requiredSourceFrames=1499, fpsOverride=0, wrapped=False,
+                   wrapCount=0, expectedRunNonce=DV_NONCE, observedRunNonce=DV_NONCE, manifestRunNonce=DV_NONCE, logShaBound=True, settingsIsolated=True,
+                   jobFailures=[], fixtureRehearsal=False, clipId="CLIP")
+        # MERGE-MASTER r8 (sol r7 B1): sol's stacked-tolerance repro (clip 60 / playback 59.69 / native = pace = 59.94), the engine-pace-only shape,
+        # and key3's near-native reason (CONFORM-PROOF-NEAR-NATIVE-REASON-1: clip 30.1 played at 30 is indistinguishable from native pace, not "no conform").
+        rows = [("sol-on", "on", sol), ("sound-on", "on", dict(sol, conformPlaybackFps=24.0, paceFps=24.0)),
+                ("native-off", "off", dict(sol, conformActive=0, conformEnvOverride=0)),
+                ("sol-r7-on", "on", dict(sol, conformClipFps=60.0, conformPlaybackFps=59.69)),
+                ("pace-native-on", "on", dict(sol, conformPlaybackFps=59.63, paceFps=59.90)),
+                ("near-native-on", "on", dict(sol, conformClipFps=30.1, nativeFps=30.1, conformPlaybackFps=30.0, paceFps=30.0, requiredSourceFrames=602,
+                                              sourceAdvanced=602))]
+        got = {r["name"]: r for r in _run_oracle_table(
+            f"Import-Module {_q(self.DV_MODULE)} -Force -DisableNameChecking\n$out = foreach ($c in $cases) {{ "
+            "$spec = [pscustomobject]@{ generatorArgs = [pscustomobject]@{ playbackConform = $c.arm } }; $proof = Get-DvConformPaceProof -Playback $c.block; "
+            "$arm = Get-DvConformArmVerdict -Spec $spec -Playback $c.block; "
+            "$p = @(Get-DvPlaybackProblems -Playback $c.block -ExpectedClipId 'CLIP' -RequestedConform $c.arm); "
+            "[pscustomobject]@{ name = $c.name; proven = [bool]$proof.proven; why = [string]$proof.reason; honoured = [bool]$arm.honoured; "
+            "blocks = [bool]$arm.blocks; armReason = [string]$arm.reason; valid = ($p.Count -eq 0); problems = @($p) } }",
+            [{"name": n, "arm": a, "block": b} for n, a, b in rows])}
+        s = got["sol-on"]
+        self.assertEqual((s["proven"], s["honoured"], s["blocks"], s["valid"]), (False, False, True, False), s)
+        self.assertIn("no conform is proven", s["why"])
+        self.assertIn("indistinguishable from native pace", s["armReason"])
+        self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in p and "no conform is proven" in p for p in s["problems"]), s["problems"])
+        self.assertEqual((got["sound-on"]["proven"], got["sound-on"]["honoured"], got["sound-on"]["valid"]), (True, True, True), got["sound-on"])
+        self.assertEqual((got["native-off"]["honoured"], got["native-off"]["valid"]), (True, True), got["native-off"])
+        # r8: sol's r7 repro -- before r8 proven=true, honoured=true, blocks=false, valid=true.
+        r7 = got["sol-r7-on"]
+        self.assertEqual((r7["proven"], r7["honoured"], r7["blocks"], r7["valid"]), (False, False, True, False), r7)
+        self.assertIn("clip_fps=60 does not match native_fps=59.94", r7["why"])
+        self.assertTrue(any("CONFORM_PACE_NOT_PROVEN" in p for p in r7["problems"]), r7["problems"])
+        pn = got["pace-native-on"]
+        self.assertEqual((pn["proven"], pn["honoured"], pn["blocks"], pn["valid"]), (False, False, True, False), pn)
+        self.assertIn("pace_fps=59.9 is within 0.5 % of native_fps=59.94: the engine ran at native pace", pn["why"])
+        nn = got["near-native-on"]
+        self.assertEqual((nn["proven"], nn["honoured"]), (False, False), nn)
+        self.assertIn("is within 0.5 % of clip_fps=30.1: indistinguishable from native pace, so no conform is proven", nn["why"])
+        self.assertNotIn("no conform happened", nn["why"])
+
+    def test_the_three_conform_proofs_share_one_reduction_margin_and_one_print_tolerance(self) -> None:
+        """MERGE-MASTER r8 (sol r7 B1): the 'measurably below native' margin and the clip/native print tolerance are named constants mirrored in the three
+        siblings; this pins them equal, single-assigned, and used by every check that needs them (a sibling that drifts or inlines a literal goes red)."""
+        uses = {"$conformReductionMargin": 3, "$conformPrintTolerance": 2}
+        values: dict[str, set[str]] = {name: set() for name in uses}
+        proofs = ((GATE, "Get-GuiSmokeConformPaceProof"), (self.MODULE, "Get-AttrCudaConformAwareSourceFramesVerdict"), (self.DV_MODULE, "Get-DvConformPaceProof"))
+        for path, function in proofs:
+            whole = path.read_text(encoding="utf-8")
+            start = whole.index(f"function {function} {{")
+            end = whole.find("\nfunction ", start + 1)
+            text = whole[start:] if end < 0 else whole[start:end]
+            for name, min_count in uses.items():
+                with self.subTest(file=path.name, constant=name):
+                    assigned = re.findall(re.escape(name) + r" = ([0-9.]+)\b", text)
+                    self.assertEqual(len(assigned), 1, f"{name} must be assigned exactly once in {path.name}: {assigned}")
+                    values[name].add(assigned[0])
+                    self.assertGreaterEqual(text.count(name), min_count, f"{name} is assigned but not used by every check in {path.name}")
+            for literal in ("0.995", "(0.005 * $native)"):
+                self.assertNotIn(literal, text, f"{path.name} inlines a conform-proof margin instead of the named constant")
+        self.assertEqual(values, {"$conformReductionMargin": {"0.005"}, "$conformPrintTolerance": {"0.0005"}})
+
+    def test_a_non_boolean_conform_line_flag_is_absent_never_present_and_never_a_throw(self) -> None:
+        """MERGE-MASTER r8 (fable r7 hardening / producer adversary A3): conformLinePresent that is not a real boolean (an array, a string) is ABSENT to both the
+        proof and the requested-arm verdict -- never a throw at [int]$present and never a present line that proves a conform."""
+        sound = dict(conformLinePresent=True, summarySession="3", conformSession="3", conformActive=1, conformEnvOverride=1, conformClipFps=59.94,
+                     conformPlaybackFps=24.0, nativeFps=59.94, paceFps=24.0)
+        rows = [("bool", True), ("empty-array", []), ("array-false", [False]), ("array-true", [True]), ("string", "true")]
+        got = {r["name"]: r for r in _run_oracle_table(
+            f"Import-Module {_q(self.DV_MODULE)} -Force -DisableNameChecking\n$spec = [pscustomobject]@{{ generatorArgs = [pscustomobject]@{{ playbackConform = 'on' }} }}\n"
+            "$out = foreach ($c in $cases) { try { $proof = Get-DvConformPaceProof -Playback $c.block; $arm = Get-DvConformArmVerdict -Spec $spec -Playback $c.block; "
+            "[pscustomobject]@{ name = $c.name; proven = [bool]$proof.proven; present = [bool]$proof.present; blocks = [bool]$arm.blocks; err = '' } } "
+            "catch { [pscustomobject]@{ name = $c.name; proven = $null; present = $null; blocks = $null; err = [string]$_ } } }",
+            [{"name": n, "block": dict(sound, conformLinePresent=v)} for n, v in rows])}
+        self.assertEqual((got["bool"]["proven"], got["bool"]["blocks"]), (True, False), got["bool"])
+        for name, _value in rows[1:]:
+            with self.subTest(name):
+                self.assertEqual(got[name]["err"], "", got[name])
+                self.assertEqual((got[name]["proven"], got[name]["present"], got[name]["blocks"]), (False, False, True), got[name])
+
     def test_the_dual_venue_evidence_block_records_the_conform_fields_and_which_rule_judged_the_pace(self) -> None:
         """Get-DvPlaybackEvidence end to end, from the run log: the conform line's values and paceRule land on the block and a key can re-derive them."""
         import hashlib
@@ -1325,6 +1498,19 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
             "dv: inactive line accepted": (self.DV_MODULE, "if ($active -ne 1) {", "if ($false) {"),
             "attr: session not checked": (self.MODULE, "[string]$cf['session'] -cne $summarySession", "$false"),
             "dv: session not checked": (self.DV_MODULE, "$conformSession -cne $summarySession", "$false"),
+            # MERGE-MASTER r7 (sol r6 B1): drop the 'no conform happened' check and row j1 proves a conform again.
+            "gate: native-rate conform accepted": (GATE, "} elseif ($play -ge ($clip * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "attr: native-rate conform accepted": (self.MODULE, "} elseif ($conformPlaybackFps -ge ($conformSourceFps * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "dv: native-rate conform accepted": (self.DV_MODULE, "if ($play -ge ($clip * (1 - $conformReductionMargin))) {", "if ($false) {"),
+            # MERGE-MASTER r8 (sol r7 B1): drop the engine-pace check and k1 / k4 prove a conform again; relax the clip/native match back to the 0.5 %
+            # tolerance (key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1) and k2 / k3 prove a conform again.
+            "gate: native engine pace accepted": (GATE, "} elseif ($pace -ge ($native * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "attr: native engine pace accepted": (self.MODULE, "} elseif ($pace -ge ($native * (1 - $conformReductionMargin))) {", "} elseif ($false) {"),
+            "dv: native engine pace accepted": (self.DV_MODULE, "if ($pace -ge ($native * (1 - $conformReductionMargin))) {", "if ($false) {"),
+            "gate: clip off native tolerated": (GATE, "[Math]::Abs($clip - $native) -gt $conformPrintTolerance", "[Math]::Abs($clip - $native) -gt (0.005 * $native)"),
+            "attr: source off native tolerated": (self.MODULE, "[Math]::Abs($conformSourceFps - $native) -gt $conformPrintTolerance",
+                                                  "[Math]::Abs($conformSourceFps - $native) -gt (0.005 * $native)"),
+            "dv: clip off native tolerated": (self.DV_MODULE, "[Math]::Abs($clip - $native) -gt $conformPrintTolerance", "[Math]::Abs($clip - $native) -gt (0.005 * $native)"),
         }
         rows = [{"summary": _summary_line(**summary), "conform": conform, "block": _dv_block(summary, conform)} for _n, summary, conform, *_r in CONFORM_CASES]
         with tempfile.TemporaryDirectory(prefix="conform-mutant-") as tmp:
@@ -2222,7 +2408,10 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             "the gate is not told the engine pace": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );", "0.0, automationPlayPaceMode() );"),
             # CPU-LOOK-LEG-PACE-ABORT-1: the pace mode reaches the admission, the stop decision and every safety-net budget
             "the admission is no longer told the pace mode": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );", "enginePaceFps > 0.0 ? enginePaceFps : -1.0 );"),
-            "the stop decision is no longer told the pace mode": self._mutated("elapsedMs, safetyMs, automationPlayPaceMode() );", "elapsedMs, safetyMs );"),
+            "the stop decision is no longer told the pace mode": self._mutated("elapsedMs, safetyMs, automationPlayPaceMode(), m_playPaceHistory );", "elapsedMs, safetyMs, m_playPaceHistory );"),
+            # MERGE-MASTER r11 (ADV-A1b): the probe judges the pace the Play has shown, so it must be noted and handed over
+            "the stop decision is no longer given the pace history": self._mutated("automationPlayPaceMode(), m_playPaceHistory );", "automationPlayPaceMode() );"),
+            "the observation is no longer noted in the pace history": self._mutated("m_playPaceHistory.note( m_sourceAdvance.consumed(), elapsedMs );", ""),
             "the autoplay budget ignores the pace mode": self._mutated(
                 "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );\n                        if( autoplayState",
                 "playback_frame_range::playSafetyMs( m_playRequestedSeconds ) );\n                        if( autoplayState"),

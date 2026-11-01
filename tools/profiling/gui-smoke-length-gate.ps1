@@ -722,14 +722,20 @@ function Get-GuiSmokeConformPaceProof {
     HFR-CONFORM-AWARE-RECEIPT-ORACLES-1. Did the run PROVE it was conformed? PLAYBACK-HFR-CONFORM-DEFAULT-1 plays a clip above 30 fps
     as slow motion at the conform target, so the engine's pace_fps is the conform rate, not the clip's native fps, and the native-pace
     rule of the source-frame oracle would reject every conformed run. The pace rule is relaxed ONLY on proof; proof is a PRESENT
-    `playback_smoke.conform` line for the MEASURED session (-SummarySession) with conform_active=1, clip_fps within 0.5 % of native_fps,
-    playback_fps > 0 and within 0.5 % of pace_fps, and playback_fps not above clip_fps (conform never speeds a clip up).
+    `playback_smoke.conform` line for the MEASURED session (-SummarySession) with conform_active=1, clip_fps EQUAL to native_fps at print
+    precision (r8), playback_fps > 0 and within 0.5 % of pace_fps, playback_fps not above clip_fps (conform never speeds a clip up), playback_fps
+    below clip_fps by more than the reduction margin (r7), and pace_fps below native_fps by more than the same margin (r8: native engine pace is
+    never a conform, however the clip / playback tolerances stack).
     Absent, malformed, inactive, another session's, or inconsistent -> proven=$false and `reason` says why (absence never helps).
     The 20 s floor is NOT touched here. Same decision as Get-AttrCudaConformAwareSourceFramesVerdict (AttrCudaArtifacts.psm1) and
-    Get-DvConformPaceProof (DualVenueRunner.psm1); a parity test executes all three on one table.
+    Get-DvConformPaceProof (DualVenueRunner.psm1); a parity test executes all three on one table, and another pins their two named margins equal.
     Returns [pscustomobject]@{ proven; reason; present; session; clipFps; playbackFps }.
     #>
     param([AllowNull()][AllowEmptyString()][string]$ConformLine, [AllowNull()][string]$SummarySession, $NativeFps, $PaceFps)
+    # MERGE-MASTER r8 (sol r7 B1, key3 CONFORM-PROOF-CLIP-NATIVE-EXACT-1): the conform proof's two named margins, mirrored verbatim in
+    # Get-DvConformPaceProof and Get-AttrCudaConformAwareSourceFramesVerdict (ConformAwareReceiptOracleTests pins the three equal).
+    $conformReductionMargin = 0.005   # a conform lowers playback_fps below clip_fps AND the engine pace below native_fps by more than this fraction
+    $conformPrintTolerance = 0.0005   # clip_fps and native_fps print one value to 3 decimals, so they agree within half a print unit
     $out = [pscustomobject]@{ proven = $false; reason = ''; present = $false; session = $null; clipFps = $null; playbackFps = $null }
     if ([string]::IsNullOrWhiteSpace($ConformLine)) { $out.reason = 'no playback_smoke.conform line for the run'; return $out }
     $out.present = $true
@@ -748,16 +754,25 @@ function Get-GuiSmokeConformPaceProof {
     $native = $null; $pace = $null
     if ($null -ne $NativeFps) { $native = [double]$NativeFps }
     if ($null -ne $PaceFps) { $pace = [double]$PaceFps }
+    # MERGE-MASTER r4 (Grok G1 / adversary A3): NaN / Infinity parse as doubles and fail every ordered comparison, so the rate checks below
+    # reject them first -- the same guard Get-DvConformPaceProof carries (the parity contract). IsNaN / IsInfinity: Windows PowerShell 5.1 has no IsFinite.
+    $nonFinite = { param($v) [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v) }
     if ([string]::IsNullOrWhiteSpace($SummarySession) -or $out.session -cne [string]$SummarySession) {
         $out.reason = "the playback_smoke.conform line is for session $($out.session), not the measured session $SummarySession"
     } elseif ($active -ne 1) {
         $out.reason = "conform_active=$($f['conform_active']); the run was not conformed"
-    } elseif ($null -eq $native -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt (0.005 * $native)) {
+    } elseif ($null -eq $native -or (& $nonFinite $native) -or (& $nonFinite $clip) -or $native -le 0 -or $clip -le 0 -or [Math]::Abs($clip - $native) -gt $conformPrintTolerance) {
         $out.reason = "conform clip_fps=$clip does not match native_fps=$native"
-    } elseif ($null -eq $pace -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) {
+    } elseif ($null -eq $pace -or (& $nonFinite $pace) -or (& $nonFinite $play) -or $pace -le 0 -or $play -le 0 -or [Math]::Abs($play - $pace) -gt (0.005 * $pace)) {
         $out.reason = "conform playback_fps=$play does not match pace_fps=$pace"
     } elseif ($play -gt ($clip * 1.005)) {
         $out.reason = "conform playback_fps=$play is above clip_fps=$clip; conform never speeds a clip up"
+    } elseif ($play -ge ($clip * (1 - $conformReductionMargin))) {
+        # MERGE-MASTER r7 (sol r6 B1, Dot ask 6545453593): an active conform at the clip rate is native-rate playback; the parity contract with Get-DvConformPaceProof.
+        $out.reason = "conform active but playback_fps=$play is within $($conformReductionMargin * 100) % of clip_fps=${clip}: indistinguishable from native pace, so no conform is proven"
+    } elseif ($pace -ge ($native * (1 - $conformReductionMargin))) {
+        # MERGE-MASTER r8 (sol r7 B1): stacked clip / playback tolerances never let native engine pace prove a conform; the parity contract with Get-DvConformPaceProof.
+        $out.reason = "conform active but pace_fps=$pace is within $($conformReductionMargin * 100) % of native_fps=${native}: the engine ran at native pace, so no conform is proven"
     } else {
         $out.proven = $true
     }
@@ -808,7 +823,9 @@ function Get-GuiSmokeSourceFramesVerdict {
     # ENFORCE-4: the oracle re-derives the floor itself and does not trust the app's own requirement. A receipt
     # whose required_source_frames is under ceil(floor x native fps) (the 0.02 absorbs the fps printed to 3 decimals) was
     # admitted for less than the floor of footage, and a native_fps of 0 cannot say what the floor is.
-    if ($null -ne $Summary -and $null -ne $nativeFps -and [double]$nativeFps -le 0) {
+    # MERGE-MASTER r4 (Grok G1): a NaN / Infinity rate fails every ordered comparison, so it is unknown, never a pass (5.1-safe: no IsFinite).
+    $nonFinite = { param($v) [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v) }
+    if ($null -ne $Summary -and $null -ne $nativeFps -and ((& $nonFinite $nativeFps) -or [double]$nativeFps -le 0)) {
         $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeFps; the clip's native frame rate is unknown, so 20 s of footage cannot be measured."
     } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $required -and [int64]$required -gt 0 -and
               [int64]$required -lt [int64][Math]::Ceiling($floorSeconds * [double]$nativeFps - 0.02)) {
@@ -822,9 +839,9 @@ function Get-GuiSmokeSourceFramesVerdict {
     if ($null -ne $Summary -and $null -ne $fpsOverride -and [int]$fpsOverride -ne 0) {
         $failures += "INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override (fps_override=$fpsOverride); evidence is paced at the clip's native fps."
     }
-    if ($null -ne $Summary -and $null -ne $paceFps -and [double]$paceFps -le 0) {
+    if ($null -ne $Summary -and $null -ne $paceFps -and ((& $nonFinite $paceFps) -or [double]$paceFps -le 0)) {
         $failures += "INVALID_SOURCE_FRAMES: pace_fps=$paceFps; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
-    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and [double]$nativeFps -gt 0) {
+    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and -not (& $nonFinite $nativeFps) -and [double]$nativeFps -gt 0) {
         # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: only a PROVEN conform moves the pace comparison off the native fps.
         $conformProof = Get-GuiSmokeConformPaceProof -ConformLine $ConformLine -SummarySession ([string](& $prop 'session')) -NativeFps $nativeFps -PaceFps $paceFps
         if ($conformProof.proven) {

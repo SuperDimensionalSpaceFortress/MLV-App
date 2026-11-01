@@ -62,6 +62,8 @@
 #include "ReceiptCopyMaskDialog.h"
 #include "QRecentFilesMenu.h"
 #include "PlaybackQualityPolicy.h"
+#include "PlaybackConformPolicy.h"
+#include "PlaybackSourceAdvanceTracker.h"
 #include "batch/BatchTypes.h"
 #include <atomic>
 #include <deque>
@@ -1096,6 +1098,22 @@ private:
     uint64_t m_playbackAudioSyncRequestCount = 0;
     uint64_t m_playbackAudioSyncAppliedCount = 0;
     uint64_t m_playbackAudioSyncSkippedCount = 0;
+    /* PLAYBACK-HFR-CONFORM-DEFAULT-1: high-frame-rate clips play at a lower conform rate. */
+    bool m_conformEnabled = playback_conform::kDefaultEnabled;
+    // The persisted value. m_conformEnabled is the effective one (MLVAPP_PLAYBACK_CONFORM may override
+    // it); only a user toggle changes this, so the env value never reaches settings.
+    bool m_conformEnabledSetting = playback_conform::kDefaultEnabled;
+    double m_conformTargetFps = playback_conform::kDefaultTargetFps;
+    double m_conformThresholdFps = playback_conform::kDefaultThresholdFps;
+    // MERGE-MASTER r5 (AUDIO-A1): the clip's conform state and playback rate just BEFORE a conform control changed
+    // them (noteConformStateBeforeChange), so applyPlaybackConformSettings touches a pending audio start only on a change.
+    bool m_conformActiveBeforeChange = false;
+    double m_conformPlaybackFpsBeforeChange = 0.0;
+    QActionGroup *m_conformTargetGroup = nullptr;
+    QActionGroup *m_conformThresholdGroup = nullptr;
+    // PRESENTED-frame timeline advance (source fps, max jump) for playback_smoke.conform. m_sourceAdvance counts
+    // ENGINE ticks and has no clock, so it cannot say whether every source frame reached the screen.
+    PlaybackSourceAdvanceTracker m_playbackSmokeSourceAdvance;
     int m_lastPlaybackAudioSyncFrame = -1;
     double m_lastPlaybackAudioSyncTime = 0.0;
     bool m_playbackSmokeActive = false;
@@ -1154,6 +1172,8 @@ private:
     int m_playbackSmokeTargetPresentedFrames = 0;
     int m_playbackSmokeFirstPresentedFrame = -1;
     int m_playbackSmokeLastPresentedFrame = -1;
+    // r16 (adversary A1): engine wraps the source-advance tracker has taken (presentationIsLoopWrap)
+    int m_playbackSmokeTrackerEngineWraps = 0;
     // CUDA-PLAYBACK-CONTACT-SHEET-2 (BLOCKER fix): set when a presented display_frame goes
     // backwards during the measured session -- the only way that happens is a Loop wrap
     // (cutOut back to cutIn), since playback otherwise only advances. Reset per session in
@@ -1181,6 +1201,9 @@ private:
     int64_t m_playRequiredSourceFrames = 0;
     double m_playRequestedSeconds = 0.0;
     double m_playPaceFps = 0.0;
+    // MERGE-MASTER r11 (ADV-A1b): the pace this Play has demonstrated, noted by programmaticPlayState() on every
+    // observation, so a recovered startup wait or stall is paid once and not projected onto every remaining frame.
+    playback_frame_range::PlayPaceHistory m_playPaceHistory;
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
@@ -1940,6 +1963,15 @@ private:
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );
+    double getPlaybackFramerate( void );
+    bool playbackConformActive( void );
+    int effectivePlaybackAutoTargetFps( void );
+    void requestPlaybackAudioSync( void );
+    void setupPlaybackConformMenu( void );
+    void noteConformStateBeforeChange( void );
+    void forgetAppliedPlaybackAudioSync( void );
+    void applyPlaybackConformSettings( bool persist );
+    void refreshPlaybackFpsStatus( void );
     double playbackPaceGuardFps( void );
     void paintAudioTrack( void );
     uint8_t drawZebras( QImage *image );
@@ -1996,7 +2028,7 @@ private:
     // ENFORCE-3: the one decision every automation Play wait makes (reached / ended early / safety timeout /
     // keep going) and the "required source frames consumed" predicate the presented-frames stop and the
     // lifecycle stress share. See playback_frame_range::evaluatePlayStop.
-    playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const;
+    playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs );
     bool programmaticPlayConsumed() const;
 public:
     int automationVerdictExitCode() const { return m_automationVerdict.exitCode(); }

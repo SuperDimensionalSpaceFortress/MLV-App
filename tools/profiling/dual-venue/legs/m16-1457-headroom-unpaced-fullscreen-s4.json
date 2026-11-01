@@ -12,6 +12,7 @@
   "scaleFactor": 4,
   "displayMode": "fullscreen",
   "generatorArgs": {
+    "playbackConform": "off",
     "telemetryArm": "LIGHT",
     "cpuQuiescenceThresholdPercent": 95,
     "forceLookAssist": true,
