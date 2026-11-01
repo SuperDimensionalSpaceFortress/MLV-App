@@ -1712,6 +1712,19 @@ static int runGuiPlaybackSmoke(QApplication &app)
             return 2;
         }
         options.contactSheetSeekDir = QFileInfo(parser.value(contactSheetSeekDirOpt)).absoluteFilePath();
+        // r2 (adversary A2): the seek capture writes frame-NN.png/json too, so one directory would overwrite
+        // the in-pass sheet while both written counts still pass.
+#ifdef Q_OS_WIN
+        const Qt::CaseSensitivity seekDirCase = Qt::CaseInsensitive;
+#else
+        const Qt::CaseSensitivity seekDirCase = Qt::CaseSensitive;
+#endif
+        if (QDir::cleanPath(options.contactSheetSeekDir).compare(QDir::cleanPath(options.contactSheetDir), seekDirCase) == 0)
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir must differ from --contact-sheet-dir "
+                   "(the seek capture would overwrite the in-pass frames): SEEK_DIR_SAME_AS_CONTACT_SHEET_DIR\n";
+            return 2;
+        }
     }
     // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: explicit seek targets. Refused (exit 2) unless a seek capture
     // is asked for and the list parses; the frames are checked against the clip before the measured Play.

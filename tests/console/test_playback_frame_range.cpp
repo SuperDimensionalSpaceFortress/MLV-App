@@ -1491,21 +1491,50 @@ TEST( ContactSheetSeekFrameList, AListStillsImageMustComeFromTheSurfaceThatPrese
 {
     // Adversary A1 (r1 pass on 7e252640): a minimized GL window refuses its framebuffer readback and the
     // capture fell through to an unrelated pixmap / hidden viewport that was then saved as frame_honoured=true.
+    // r2: every source is certified by ITS OWN surface's presentation serial for the request on record (the
+    // GL window readback serial, the widget's paintedSerialFor after the grab, the pixmap's own serial), never
+    // by texture/recon flags.
     using playback_frame_range::contactSheetSeekStillImageTied;
     // GL window: only its own framebuffer readback of THIS request's present counts.
-    ASSERT_TRUE( contactSheetSeekStillImageTied( true, false, "gl_window_framebuffer_readback", true, 41, 41 ) );
-    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "app_internal_presented_pixmap", false, 0, 41 ) );   // A1 input
-    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "app_internal_viewport_grab", false, 0, 41 ) );
-    ASSERT_FALSE( contactSheetSeekStillImageTied( true, true, "app_internal_gl_viewport_grab", false, 0, 41 ) );
-    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "gl_window_framebuffer_readback", true, 40, 41 ) );  // an older present
-    ASSERT_FALSE( contactSheetSeekStillImageTied( true, false, "gl_window_framebuffer_readback", false, 41, 41 ) ); // no serial to prove it
-    // In-widget texture presentation: its viewport grab, never the pixmap or plain viewport fallbacks.
-    ASSERT_TRUE( contactSheetSeekStillImageTied( false, true, "app_internal_gl_viewport_grab", false, 0, 41 ) );
-    ASSERT_FALSE( contactSheetSeekStillImageTied( false, true, "app_internal_presented_pixmap", false, 0, 41 ) );
-    ASSERT_FALSE( contactSheetSeekStillImageTied( false, true, "app_internal_viewport_grab", false, 0, 41 ) );
-    // CPU-presented pixmap: the pixmap itself, never the plain viewport fallback.
-    ASSERT_TRUE( contactSheetSeekStillImageTied( false, false, "app_internal_presented_pixmap", false, 0, 41 ) );
-    ASSERT_FALSE( contactSheetSeekStillImageTied( false, false, "app_internal_viewport_grab", false, 0, 41 ) );
+    ASSERT_TRUE( contactSheetSeekStillImageTied( true, "gl_window_framebuffer_readback", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "app_internal_presented_pixmap", true, 41, 41 ) );    // r1 A1 input
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "app_internal_viewport_grab", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "app_internal_gl_viewport_grab", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "gl_window_framebuffer_readback", true, 40, 41 ) );  // an older present
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "gl_window_framebuffer_readback", false, 41, 41 ) ); // no serial to prove it
+    // In-widget viewport: its grab counts only when the paint that grab ran drew THIS request's serial.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( false, "app_internal_gl_viewport_grab", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_gl_viewport_grab", true, 40, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_gl_viewport_grab", false, 0, 41 ) );
+    // CPU-presented pixmap: only when the pixmap was set FOR this request.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( false, "app_internal_presented_pixmap", true, 41, 41 ) );
+    // The plain viewport fallback carries no frame identity: never certified.
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_viewport_grab", true, 41, 41 ) );
+    // No request on record: nothing can be proved.
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_presented_pixmap", true, 0, 0 ) );
+}
+
+TEST( ContactSheetSeekFrameList, AWidgetSubmittedFrameWithItsPaintWithheldNeverCertifiesTheOlderFallbackPixmap )
+{
+    // r2 (adversary A1 on ea772731, Dot 6553359245/6553493773): request 41 was accepted by the widget viewport
+    // (presentImage succeeded, so the pixmap was neither updated nor re-serialled), the widget never painted
+    // (minimized), so both texture flags read false and the chain grabbed the OLDER fallback pixmap (set for
+    // request 40). That still must be refused with a typed reason, never image_tied=true.
+    using playback_frame_range::contactSheetSeekStillImageTied;
+    using playback_frame_range::contactSheetSeekStillUntiedReason;
+    const uint64_t pixmapSerial = 40;   // m_graphicsItemPresentedSerial: the last frame the pixmap itself received
+    const uint64_t requestSerial = 41;  // m_lastPresentedRequestSerial: the requested frame, submitted to the widget
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_presented_pixmap", true, pixmapSerial, requestSerial ) );
+    ASSERT_EQ( std::string( "SURFACE_SERIAL_STALE" ),
+               contactSheetSeekStillUntiedReason( false, "app_internal_presented_pixmap", true, pixmapSerial, requestSerial ) );
+    // The other refusals are typed too; a certified still has no reason.
+    ASSERT_EQ( std::string( "SURFACE_SERIAL_UNKNOWN" ),
+               contactSheetSeekStillUntiedReason( false, "app_internal_gl_viewport_grab", false, 0, requestSerial ) );
+    ASSERT_EQ( std::string( "SURFACE_NOT_PRESENTER" ),
+               contactSheetSeekStillUntiedReason( false, "app_internal_viewport_grab", true, requestSerial, requestSerial ) );
+    ASSERT_EQ( std::string( "SURFACE_NOT_PRESENTER" ),
+               contactSheetSeekStillUntiedReason( true, "app_internal_presented_pixmap", true, requestSerial, requestSerial ) );
+    ASSERT_EQ( std::string(), contactSheetSeekStillUntiedReason( false, "app_internal_presented_pixmap", true, 41, 41 ) );
 }
 
 TEST( ContactSheetSeekFrameList, TheFirstFramePastTheClipIsNamedBeforeAnyPlay )

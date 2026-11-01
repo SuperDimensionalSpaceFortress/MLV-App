@@ -160,17 +160,31 @@ inline bool contactSheetSeekFrameHonoured( int requested, bool settled, bool pre
 }
 
 // Adversary A1: a list still's IMAGE must come from the surface that presented the frame, never from a
-// fall-through. With the GL preview window active only its own framebuffer readback counts, and only when
-// the readback reports the presentationSerial of the request on record (requestSerial). With in-widget
-// texture presentation only its viewport grab counts; otherwise only the CPU-presented pixmap.
-inline bool contactSheetSeekStillImageTied( bool glWindowActive, bool texturePresentationActive,
-                                            const std::string &source, bool presentedSerialValid,
-                                            uint64_t presentedSerial, uint64_t requestSerial )
+// fall-through. r2: the tie is bound to the presentation serial OF THE SURFACE THE IMAGE WAS READ FROM, for
+// the request on record (requestSerial), never inferred from texture/recon flags (a widget that accepted a
+// frame but never painted it leaves both flags false while the hidden fallback pixmap still holds an older
+// frame). surfaceSerial is: the GL window readback's presented serial; the widget's paintedSerialFor read
+// after the grab (the grab runs paintGL); or the serial the fallback pixmap was last set for. With the GL
+// window active only its own readback can be certified. The plain viewport grab has no frame identity.
+// Returns "" when certified, otherwise a typed reason.
+inline const char *contactSheetSeekStillUntiedReason( bool glWindowActive, const std::string &source,
+                                                      bool surfaceSerialValid, uint64_t surfaceSerial,
+                                                      uint64_t requestSerial )
 {
-    if( glWindowActive )
-        return source == "gl_window_framebuffer_readback" && presentedSerialValid && presentedSerial == requestSerial;
-    if( texturePresentationActive ) return source == "app_internal_gl_viewport_grab";
-    return source == "app_internal_presented_pixmap";
+    const bool presenter = glWindowActive
+        ? source == "gl_window_framebuffer_readback"
+        : ( source == "app_internal_gl_viewport_grab" || source == "app_internal_presented_pixmap" );
+    if( !presenter ) return "SURFACE_NOT_PRESENTER";
+    if( requestSerial == 0 || !surfaceSerialValid || surfaceSerial == 0 ) return "SURFACE_SERIAL_UNKNOWN";
+    if( surfaceSerial != requestSerial ) return "SURFACE_SERIAL_STALE";
+    return "";
+}
+
+inline bool contactSheetSeekStillImageTied( bool glWindowActive, const std::string &source,
+                                            bool surfaceSerialValid, uint64_t surfaceSerial, uint64_t requestSerial )
+{
+    return contactSheetSeekStillUntiedReason( glWindowActive, source, surfaceSerialValid, surfaceSerial,
+                                              requestSerial )[0] == '\0';
 }
 
 // The first list frame a clip of frameCount frames cannot show (>= frameCount), or -1 when all fit. A clip

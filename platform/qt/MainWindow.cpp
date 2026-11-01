@@ -10979,12 +10979,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 bool contactFramePresentedSerialValid = false;
                 QString contactFrameRenderPath;
                 bool seekGlWindowActive = false;
-                bool seekTexturePresentationActive = false;
+                quint64 seekSurfaceSerial = 0;
+                bool seekSurfaceSerialValid = false;
                 if( settled )
                 {
                     seekGlWindowActive = GpuDisplayWindow::isActive();
-                    seekTexturePresentationActive = GpuDisplayViewport::isTexturePresentationActive( ui->graphicsView )
-                        || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView );
                     const QJsonObject &seekTiming = m_lastPresentedStageTimingTelemetry;
                     const GpuPlaybackPipelineStatus seekPipelineStatus =
                         mainWindowGpuPlaybackPipelineStatus(
@@ -11027,6 +11026,24 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                         contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
                         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
                     }
+                    // r2 (A1): the presentation serial OF THE SURFACE THE IMAGE WAS READ FROM -- never inferred from
+                    // the texture flags. The widget's grab runs its paintGL, so paintedSerialFor names what that grab
+                    // drew; the fallback pixmap carries the serial it was last set for (a widget-accepted frame leaves
+                    // it on an older one).
+                    if( contactFrameSource == QStringLiteral("gl_window_framebuffer_readback") )
+                    {
+                        seekSurfaceSerialValid = contactFramePresentedSerialValid;
+                        seekSurfaceSerial = contactFramePresentedSerial;
+                    }
+                    else if( contactFrameSource == QStringLiteral("app_internal_gl_viewport_grab") )
+                    {
+                        seekSurfaceSerialValid = GpuDisplayViewport::paintedSerialFor( ui->graphicsView, &seekSurfaceSerial );
+                    }
+                    else if( contactFrameSource == QStringLiteral("app_internal_presented_pixmap") )
+                    {
+                        seekSurfaceSerial = static_cast<quint64>( m_graphicsItemPresentedSerial );
+                        seekSurfaceSerialValid = seekSurfaceSerial != 0;
+                    }
                 }
 
                 const QString frameBaseName =
@@ -11039,11 +11056,14 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     frameBaseName + QStringLiteral(".json") );
 
                 // Adversary A1: with the list, the image must come from the surface that presented the frame
-                // (no fall-through from a refused GL-window readback to an unrelated pixmap or viewport).
-                const bool seekStillImageTied = playback_frame_range::contactSheetSeekStillImageTied(
-                    seekGlWindowActive, seekTexturePresentationActive, contactFrameSource.toStdString(),
-                    contactFramePresentedSerialValid, static_cast<uint64_t>( contactFramePresentedSerial ),
-                    static_cast<uint64_t>( m_lastPresentedRequestSerial ) );
+                // (no fall-through from a refused GL-window readback to an unrelated pixmap or viewport), and r2:
+                // that surface must prove by its own serial that it holds the request on record.
+                const QString seekStillUntiedReason = QString::fromLatin1(
+                    playback_frame_range::contactSheetSeekStillUntiedReason(
+                        seekGlWindowActive, contactFrameSource.toStdString(), seekSurfaceSerialValid,
+                        static_cast<uint64_t>( seekSurfaceSerial ),
+                        static_cast<uint64_t>( m_lastPresentedRequestSerial ) ) );
+                const bool seekStillImageTied = settled && seekStillUntiedReason.isEmpty();
                 bool frameOk = settled && !contactFrameImage.isNull()
                     && ( options.contactSheetSeekFrames.isEmpty() || ( seekFrameHonoured && seekStillImageTied ) )
                     && contactFrameImage.save( pngPath, "PNG" );
@@ -11108,9 +11128,15 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     QFile sidecarFile( jsonPath );
                     if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
                     {
-                        sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
+                        // r2 (adversary A3): a frame counts as written only when the whole sidecar reached the disk.
+                        const QByteArray sidecarBytes = QJsonDocument( frameJson ).toJson( QJsonDocument::Indented );
+                        const bool sidecarWritten = sidecarFile.write( sidecarBytes ) == sidecarBytes.size()
+                            && sidecarFile.flush();
                         sidecarFile.close();
-                        ++contactSheetSeekFramesWritten;
+                        if( sidecarWritten && sidecarFile.error() == QFileDevice::NoError )
+                            ++contactSheetSeekFramesWritten;
+                        else
+                            frameOk = false;
                     }
                     else
                     {
@@ -11127,8 +11153,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 if( !options.contactSheetSeekFrames.isEmpty() && settled && !seekStillImageTied && contactSheetError.isEmpty() )
                 {
                     contactSheetError = QStringLiteral(
-                        "seek frame %1 SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3" )
-                        .arg( i ).arg( contactFrameSource ).arg( contactFrameReadbackReason );
+                        "seek frame %1 SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3 untied=%4 surface_serial=%5 request_serial=%6" )
+                        .arg( i ).arg( contactFrameSource ).arg( contactFrameReadbackReason ).arg( seekStillUntiedReason )
+                        .arg( seekSurfaceSerialValid ? QString::number( seekSurfaceSerial ) : QStringLiteral("none") )
+                        .arg( static_cast<qulonglong>( m_lastPresentedRequestSerial ) );
                 }
                 if( !frameOk && contactSheetError.isEmpty() )
                 {
@@ -33602,6 +33630,9 @@ void MainWindow::drawFrameReady()
     task.displayPreviewCachingAllowed = displayPreviewCachingAllowed;
     task.playbackFastScaleActive = readyFrame.playbackFastScaleActive;
     task.gpuPresentationOptions = gpuPresentationOptions;
+    // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1 r2 (A1): every viewport route (texture/recon as well as the CPU image)
+    // carries this request's serial, so the widget's paintedSerialFor can prove which request a paint drew.
+    task.gpuPresentationOptions.presentationSerial = task.requestSerial;
     task.enqueueTime = mlv_stage_timing_now();
     task.preEnqueueMs =
         ( display_start > 0.0 && task.enqueueTime >= display_start )

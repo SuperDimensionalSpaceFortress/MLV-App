@@ -971,7 +971,7 @@ TEST(ContactSheetSeekFrameListWiring, EachSeekStillIsHonouredByObservationOrTheR
     // read before the capture chain and the tie is decided on the source the chain actually used.
     const int surfaceAt = seekBranch.indexOf(QStringLiteral("seekGlWindowActive = GpuDisplayWindow::isActive();"));
     const int chainAt = seekBranch.indexOf(QStringLiteral("contactFrameSource = QStringLiteral(\"gl_window_framebuffer_readback\");"));
-    const int tieAt = seekBranch.indexOf(QStringLiteral("playback_frame_range::contactSheetSeekStillImageTied("));
+    const int tieAt = seekBranch.indexOf(QStringLiteral("playback_frame_range::contactSheetSeekStillUntiedReason("));
     ASSERT_TRUE(surfaceAt > 0 && chainAt > surfaceAt && tieAt > chainAt);
     ASSERT_TRUE(seekBranch.mid(tieAt, 400).contains(QStringLiteral("static_cast<uint64_t>( m_lastPresentedRequestSerial )")));
     ASSERT_TRUE(seekBranch.contains(QStringLiteral("SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3")));
@@ -979,6 +979,70 @@ TEST(ContactSheetSeekFrameListWiring, EachSeekStillIsHonouredByObservationOrTheR
     // The default (no list) display_frame stays the settled request, byte for byte.
     ASSERT_TRUE(seekBranch.contains(QStringLiteral(
         "frameJson.insert( QStringLiteral(\"display_frame\"), options.contactSheetSeekFrames.isEmpty() ? settledFrame : seekObservedFrame );")));
+}
+
+// r2 (adversary A1 on ea772731; Dot 6553359245/6553493773): a widget-submitted requested frame whose paint was
+// withheld leaves both texture flags false, so the chain grabs the OLDER fallback pixmap. Certification must be
+// bound to the serial of the surface the image was READ FROM, never inferred from the flags; a stale or unknown
+// surface serial refuses the still (no PNG, no sidecar) with a typed failure line.
+TEST(ContactSheetSeekFrameListWiring, AWidgetSubmittedFrameWithItsPaintWithheldIsRefusedNotCertifiedFromTheOlderPixmap)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    const QString seekBranch = sliceBetween(smokeBody,
+        QString::fromLatin1(kSeekMarker),
+        QStringLiteral("QStringLiteral(\"gui_smoke.contact_sheet\"),"));
+    ASSERT_FALSE(seekBranch.isEmpty());
+    // The flags no longer decide the tie (they read false when the widget's paint is withheld).
+    ASSERT_FALSE(seekBranch.contains(QStringLiteral("seekTexturePresentationActive")));
+    // Each source's own serial, read after the capture chain ran.
+    const int chainEndAt = seekBranch.indexOf(QStringLiteral("contactFrameSource = QStringLiteral(\"app_internal_viewport_grab\");"),
+                                              seekBranch.indexOf(QStringLiteral("contactFrameSource = QStringLiteral(\"app_internal_presented_pixmap\");")));
+    const int pixmapSerialAt = seekBranch.indexOf(QStringLiteral("seekSurfaceSerial = static_cast<quint64>( m_graphicsItemPresentedSerial );"));
+    const int widgetSerialAt = seekBranch.indexOf(QStringLiteral("seekSurfaceSerialValid = GpuDisplayViewport::paintedSerialFor( ui->graphicsView, &seekSurfaceSerial );"));
+    const int windowSerialAt = seekBranch.indexOf(QStringLiteral("seekSurfaceSerialValid = contactFramePresentedSerialValid;"));
+    const int reasonAt = seekBranch.indexOf(QStringLiteral("playback_frame_range::contactSheetSeekStillUntiedReason("));
+    ASSERT_TRUE(chainEndAt > 0);
+    ASSERT_TRUE(pixmapSerialAt > chainEndAt);
+    ASSERT_TRUE(widgetSerialAt > chainEndAt);
+    ASSERT_TRUE(windowSerialAt > chainEndAt);
+    ASSERT_TRUE(reasonAt > pixmapSerialAt && reasonAt > widgetSerialAt && reasonAt > windowSerialAt);
+    const QString tie = seekBranch.mid(reasonAt, 400);
+    ASSERT_TRUE(tie.contains(QStringLiteral("seekSurfaceSerialValid")));
+    ASSERT_TRUE(tie.contains(QStringLiteral("static_cast<uint64_t>( seekSurfaceSerial )")));
+    ASSERT_TRUE(tie.contains(QStringLiteral("static_cast<uint64_t>( m_lastPresentedRequestSerial )")));
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral("const bool seekStillImageTied = settled && seekStillUntiedReason.isEmpty();")));
+    // The refusal is typed: the reason token and both serials are on the failure line.
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral(
+        "SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3 untied=%4 surface_serial=%5 request_serial=%6")));
+    // Every viewport route carries its request serial, so a texture/recon paint can prove its frame too.
+    ASSERT_TRUE(source.contains(QStringLiteral("task.gpuPresentationOptions.presentationSerial = task.requestSerial;")));
+}
+
+// r2 (adversary A2): one directory for both captures would let the seek stills overwrite the in-pass sheet.
+// r2 (adversary A3): a seek frame counts as written only when its whole sidecar reached the disk.
+TEST(ContactSheetSeekFrameListWiring, TheSeekDirMustDifferAndASeekSidecarCountsOnlyWhenFullyWritten)
+{
+    const QString mainSource = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+    const int seekDirAt = mainSource.indexOf(QStringLiteral("options.contactSheetSeekDir = QFileInfo(parser.value(contactSheetSeekDirOpt)).absoluteFilePath();"));
+    ASSERT_TRUE(seekDirAt > 0);
+    const QString sameDir = mainSource.mid(seekDirAt, 1000);
+    ASSERT_TRUE(sameDir.contains(QStringLiteral(
+        "QDir::cleanPath(options.contactSheetSeekDir).compare(QDir::cleanPath(options.contactSheetDir), seekDirCase) == 0")));
+    ASSERT_TRUE(sameDir.contains(QStringLiteral("SEEK_DIR_SAME_AS_CONTACT_SHEET_DIR")));
+    ASSERT_TRUE(sameDir.contains(QStringLiteral("return 2;")));
+
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString seekBranch = sliceBetween(smokeBodyOf(source),
+        QString::fromLatin1(kSeekMarker),
+        QStringLiteral("QStringLiteral(\"gui_smoke.contact_sheet\"),"));
+    ASSERT_FALSE(seekBranch.isEmpty());
+    const int writeAt = seekBranch.indexOf(QStringLiteral("const bool sidecarWritten = sidecarFile.write( sidecarBytes ) == sidecarBytes.size()"));
+    const int countAt = seekBranch.indexOf(QStringLiteral("++contactSheetSeekFramesWritten;"));
+    ASSERT_TRUE(writeAt > 0 && countAt > writeAt);
+    const QString write = seekBranch.mid(writeAt, countAt - writeAt);
+    ASSERT_TRUE(write.contains(QStringLiteral("&& sidecarFile.flush();")));
+    ASSERT_TRUE(write.contains(QStringLiteral("if( sidecarWritten && sidecarFile.error() == QFileDevice::NoError )")));
 }
 
 TEST(ContactSheetSeekFrameListWiring, TheLogLineNamesTheListOnlyWhenItIsSetAndTheDoneLineIsUnchanged)
