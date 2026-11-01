@@ -144,7 +144,8 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 # CUDA-HEADROOM-1: the unpaced throughput legs (both clips, the D4 cells) and the stage-attribution legs (HEAVY telemetry + CUDA launch timing).
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
-                 "legs/m16-1457-headroom-stage-fullscreen-s1.json")
+                 # CUDA-HEADROOM-HFR-1 r2: the M16-1457 stage leg at s2/s4 (the s1 spec with only legId and scaleFactor changed).
+                 *(f"legs/m16-1457-headroom-stage-fullscreen-s{scale}.json" for scale in (1, 2, 4)))
 # BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
 # (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
 PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
