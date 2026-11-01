@@ -894,7 +894,9 @@ TEST(ContactSheetSeekFrameListWiring, TheCliParsesTheListAndRefusesItWithoutASee
     ASSERT_TRUE(parseAt > 0);
     // The list is validated after the seek dir is resolved, so both seek captures are known.
     ASSERT_TRUE(parseAt > smokeParser.indexOf(QStringLiteral("options.contactSheetSeekDir = QFileInfo(")));
-    const QString validation = smokeParser.mid(parseAt, 2400);
+    const int guardAt = smokeParser.indexOf(QStringLiteral("if (parser.isSet(contactSheetSeekFramesOpt))"));
+    ASSERT_TRUE(guardAt > 0 && guardAt < parseAt);
+    const QString validation = smokeParser.mid(guardAt, 1800);
     ASSERT_TRUE(validation.contains(QStringLiteral("options.contactSheetSeekDir.isEmpty() && !options.contactSheetSeekMode")));
     ASSERT_TRUE(validation.contains(QStringLiteral("--contact-sheet-seek-frames")));
     ASSERT_TRUE(validation.contains(QStringLiteral("errorToken")));

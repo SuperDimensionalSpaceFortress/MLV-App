@@ -9838,6 +9838,22 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    ? options.targetPresentedFrames / presentedTargetFps : 0.0, 'f', 3 ) << ")\n";
         return 14;
     }
+    // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: a --contact-sheet-seek-frames frame the clip cannot show would be
+    // clamped by the seek and reported as honoured, so it is refused here, before the measured Play (exit 14).
+    if( !options.contactSheetSeekFrames.isEmpty() )
+    {
+        const int seekListClipFrames = m_pMlvObject ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
+        const int seekListOutOfRange = playback_frame_range::firstContactSheetSeekFrameOutOfRange(
+            std::vector<int>( options.contactSheetSeekFrames.cbegin(), options.contactSheetSeekFrames.cend() ),
+            seekListClipFrames );
+        if( seekListOutOfRange >= 0 )
+        {
+            m_playbackSmokeFullscreenLossLatchArmed = false;
+            err << "[GUI-SMOKE] ERROR: SEEK_FRAME_OUT_OF_RANGE frame=" << seekListOutOfRange
+                << " frames=" << seekListClipFrames << "\n";
+            return 14;
+        }
+    }
     // PLAYBACK-STARTUP-WAIT-PREWARM-1 (opt-in, default off): the paused start frame as the window shows it, grabbed
     // untimed BEFORE the measured Play; the Play's first present is grabbed by noteContactSheetPresentedFrame().
     if( smokeFirstPresentCaptureRequested() && !options.contactSheetDir.isEmpty() )
@@ -10915,7 +10931,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     .arg( m_contactSheetPendingGrabs.size() ).arg( options.contactSheetFrames );
             }
             m_contactSheetPendingGrabs.clear();
-            // The paired seek capture renders the SAME frames the in-pass sheet shows.
+            // The paired seek capture renders the SAME frames the in-pass sheet shows, unless an explicit
+            // --contact-sheet-seek-frames list overrides them (below, in both modes).
             if( inPassDisplayFrames.size() == options.contactSheetFrames )
                 contactSheetTargetFrames = inPassDisplayFrames;
 
@@ -10926,6 +10943,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 m_playbackSmokePresentedFrames, static_cast<double>( contactSheetMeasuredElapsedMs ),
                 contactSheetGrabTotalMs );
         }
+        // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: the explicit list (validated in main.cpp: exactly
+        // --contact-sheet-frames ascending frames; range-checked before the measured Play) is the seek target.
+        if( !options.contactSheetSeekFrames.isEmpty() )
+            contactSheetTargetFrames = options.contactSheetSeekFrames;
 
         // CONTACT-SHEET-PLAYBACK-PARITY-1: seek capture (explicit, labelled alternative). Never plays.
         const QString seekSheetDir = options.contactSheetSeekMode ? options.contactSheetDir : options.contactSheetSeekDir;
@@ -10945,6 +10966,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 int settledFrame = targetFrame;
                 const bool settled = seekAndSettleLoadedClip(
                     targetFrame, "gui-smoke-contact-sheet-seek", &settledFrame );
+                // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: with an explicit list, the still proves its frame by
+                // observation (the presented request context), never by the clamped request it was sent.
+                const int seekObservedFrame = m_lastPresentedRequestContextValid ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
+                const bool seekFrameHonoured = playback_frame_range::contactSheetSeekFrameHonoured(
+                    targetFrame, settled, m_lastPresentedRequestContextValid, seekObservedFrame );
 
                 QImage contactFrameImage;
                 QString contactFrameSource = QStringLiteral("app_internal_viewport_grab");
@@ -11008,6 +11034,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     frameBaseName + QStringLiteral(".json") );
 
                 bool frameOk = settled && !contactFrameImage.isNull()
+                    && ( options.contactSheetSeekFrames.isEmpty() || seekFrameHonoured )
                     && contactFrameImage.save( pngPath, "PNG" );
 
                 const double elapsedMsForFrame = contactSheetFps > 0.0
@@ -11022,7 +11049,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 frameJson.insert( QStringLiteral("serial"), static_cast<double>(
                     contactFramePresentedSerialValid ? contactFramePresentedSerial
                                                       : m_lastPresentedRequestSerial ) );
-                frameJson.insert( QStringLiteral("display_frame"), settledFrame );
+                frameJson.insert( QStringLiteral("display_frame"), options.contactSheetSeekFrames.isEmpty() ? settledFrame : seekObservedFrame );
                 frameJson.insert( QStringLiteral("elapsed_ms"), elapsedMsForFrame );
                 frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
                 frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
@@ -11058,6 +11085,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     ui->horizontalSliderHighlights->value() );
                 frameJson.insert( QStringLiteral("settled"), settled );
                 frameJson.insert( QStringLiteral("saved"), frameOk );
+                if( !options.contactSheetSeekFrames.isEmpty() )
+                {
+                    frameJson.insert( QStringLiteral("requested_frame"), targetFrame );
+                    frameJson.insert( QStringLiteral("frame_honoured"), seekFrameHonoured );
+                }
 
                 if( frameOk )
                 {
@@ -11074,6 +11106,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     }
                 }
 
+                if( !options.contactSheetSeekFrames.isEmpty() && !seekFrameHonoured && contactSheetError.isEmpty() )
+                {
+                    contactSheetError = QStringLiteral(
+                        "seek frame %1 SEEK_FRAME_NOT_HONOURED requested=%2 shown=%3" )
+                        .arg( i ).arg( targetFrame ).arg( seekObservedFrame );
+                }
                 if( !frameOk && contactSheetError.isEmpty() )
                 {
                     contactSheetError = QStringLiteral(
@@ -11112,7 +11150,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( options.contactSheetSeekMode ? 0 : m_playbackSmokePresentedFrames )
                 .arg( contactSheetFpsMeasured, 0, 'f', 3 )
                 .arg( contactSheetFpsExcludingGrabs, 0, 'f', 3 )
-                .arg( options.contactSheetSeekMode ? 0 : contactSheetSeekFramesWritten ) );
+                .arg( options.contactSheetSeekMode ? 0 : contactSheetSeekFramesWritten )
+            + ( options.contactSheetSeekFrames.isEmpty() ? QString() : QStringLiteral(" seek_targets=list") ) );
 
         if( contactSheetFramesWritten != options.contactSheetFrames
          || ( !options.contactSheetSeekMode && !options.contactSheetSeekDir.isEmpty()

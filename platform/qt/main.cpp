@@ -1286,6 +1286,12 @@ static int runGuiPlaybackSmoke(QApplication &app)
         QStringLiteral("dir"));
     parser.addOption(contactSheetSeekDirOpt);
 
+    const QCommandLineOption contactSheetSeekFramesOpt(
+        QStringLiteral("contact-sheet-seek-frames"),
+        QStringLiteral("Comma-separated, strictly ascending 0-based display_frame indices (1-60, exactly --contact-sheet-frames of them) for the seek capture (--contact-sheet-seek-dir or --contact-sheet-seek-mode). Each still must show its requested frame or the run fails (exit 14). Never plays."),
+        QStringLiteral("list"));
+    parser.addOption(contactSheetSeekFramesOpt);
+
     const QCommandLineOption visualCaptureDirOpt(
         QStringLiteral("visual-capture-dir"),
         QStringLiteral("Optional directory for a post-measurement visual capture: after the measured Play has reached its own stop and its summary is written, Play continues UNTIMED for about 3 s while the window is captured (PrintWindow, PW_RENDERFULLCONTENT) 6 times, then once the instant Play is paused, then once more after the same frame is re-rendered by the paused full-quality path. Writes PNGs and visual.json. Never inside the measured interval."),
@@ -1706,6 +1712,28 @@ static int runGuiPlaybackSmoke(QApplication &app)
             return 2;
         }
         options.contactSheetSeekDir = QFileInfo(parser.value(contactSheetSeekDirOpt)).absoluteFilePath();
+    }
+    // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: explicit seek targets. Refused (exit 2) unless a seek capture
+    // is asked for and the list parses; the frames are checked against the clip before the measured Play.
+    if (parser.isSet(contactSheetSeekFramesOpt))
+    {
+        std::vector<int> seekFrames;
+        std::string errorToken;
+        if (options.contactSheetSeekDir.isEmpty() && !options.contactSheetSeekMode)
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-frames needs a seek capture "
+                   "(--contact-sheet-seek-dir or --contact-sheet-seek-mode): SEEK_FRAMES_NO_SEEK_CAPTURE\n";
+            return 2;
+        }
+        if (!playback_frame_range::parseContactSheetSeekFrameList(
+                parser.value(contactSheetSeekFramesOpt).toStdString(), contactSheetFrames, &seekFrames, &errorToken))
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-frames is invalid: "
+                << QString::fromStdString(errorToken) << "\n";
+            return 2;
+        }
+        for (const int frame : seekFrames)
+            options.contactSheetSeekFrames.append(frame);
     }
     options.visualCaptureDir = parser.value(visualCaptureDirOpt).isEmpty()
         ? QString()
