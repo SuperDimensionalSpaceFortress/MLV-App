@@ -5047,7 +5047,7 @@ def _mgrs_row(run_id, created, sha, conclusion):
     return {"databaseId": run_id, "createdAt": created, "headSha": sha, "conclusion": conclusion, "displayTitle": "t"}
 
 
-def _mgrs_select(tmp_path, rows, tip):
+def _mgrs_select(tmp_path, rows, tip, env=None):
     """Run the real function over fixture rows; return {'id': databaseId, 'label': ...} or None."""
     fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
     rows_file = tmp_path / "rows.json"
@@ -5059,7 +5059,7 @@ def _mgrs_select(tmp_path, rows, tip):
         "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip.replace("'", "''") + "'\n"
         "if ($null -eq $pick) { 'NONE' } else { ([pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress) }\n",
         encoding="utf-8")
-    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True, env=env)
     assert out.returncode == 0, out.stdout + out.stderr
     text = out.stdout.strip()
     return None if text == "NONE" else json.loads(text)
@@ -5413,7 +5413,7 @@ def test_the_ratio_guard_default_source_ref_is_the_full_refname_in_source():
     assert m, "SourceRef default not found"
     assert m.group(1) == FULL_FORK_MASTER, m.group(1)
     # the resolve line still goes through the (now full-refname) parameter, never a re-spelled bare name
-    assert 'rev-parse --verify "$revision^{commit}"' in text   # r6: the SHA captured from the exact ref, not the name
+    assert 'rev-parse --verify --quiet --end-of-options "$revision^{commit}"' in text   # r7: one resolve of the captured SHA (or of a revision expression), never the name twice
 
 
 def test_the_ratio_guard_resolves_the_remote_tracking_tip_not_a_same_named_tag(tmp_path):
@@ -5759,14 +5759,32 @@ def test_r6_b1_no_site_resolves_the_exact_refname_again_after_reading_it_in_sour
     assert "show-ref --verify --hash $MergeTarget" in ret
 
 
+# r7 (Grok G4): the B2 tests only go RED in a NON-UTC host zone, and hosted runners are UTC. Pin a non-UTC zone for the
+# pwsh child: TZ=America/Chicago on Linux/macOS (.NET reads TZ there). Windows .NET ignores TZ and cannot be re-zoned per
+# process, so the host zone is used as-is; a UTC host (or a Linux image without tzdata) is a stated skip, never a silent pass.
+def _r7_nonutc_env():
+    env = {**os.environ}
+    if sys.platform != "win32":
+        env["TZ"] = "America/Chicago"
+    probe = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+         "$z = [TimeZoneInfo]::Local; (@($z.GetUtcOffset([datetime]'2026-01-15T12:00:00').TotalMinutes, $z.GetUtcOffset([datetime]'2026-07-15T12:00:00').TotalMinutes) -join ',')"],
+        text=True, capture_output=True, env=env)
+    offsets = [float(x) for x in probe.stdout.strip().split(",") if x.strip()]
+    if not offsets or all(o == 0 for o in offsets):
+        pytest.skip("host zone is UTC and cannot be re-zoned for the pwsh child on this platform (Windows ignores TZ; Linux needs tzdata)")
+    return env
+
+
 # B2 / B3 --------------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("day", ["2026-10-31", "2026-01-15", "2026-07-15"], ids=["oct", "jan", "jul"])
 def test_r6_b2_offset_free_created_at_orders_as_utc_through_the_production_conversion(tmp_path, day):
     """ConvertFrom-Json (the production read, Invoke-Workstream.ps1) turns '2026-10-31T16:00:00' into an Unspecified
     [datetime]; ToUniversalTime used to shift it by the HOST zone (Central here: 16:00 -> 21:00Z, newer than 17:00Z)."""
     rows = [_mgrs_row(1, day + "T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, day + "T17:00:00Z", MGRS_OTHER, "failure")]
+    env = _r7_nonutc_env()
     for order in (rows, list(reversed(rows))):
-        got = _mgrs_select(tmp_path, order, "")
+        got = _mgrs_select(tmp_path, order, "", env=env)
         assert got["id"] == 2, (day, got)
 
 
@@ -5781,7 +5799,8 @@ def test_r6_b2_an_unspecified_kind_datetime_is_utc_and_never_local(tmp_path):
         "$rows = @([pscustomobject]@{ databaseId = 1; createdAt = $u; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' },"
         " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n"
         "(Select-MergeGroupJobsRun -Runs $rows -MasterSha '').Run.databaseId\n", encoding="utf-8")
-    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True,
+                         env=_r7_nonutc_env())
     assert out.returncode == 0, out.stdout + out.stderr
     assert out.stdout.strip() == "2", out.stdout
 
@@ -5797,13 +5816,20 @@ def test_r6_b2_the_production_read_expression_keeps_created_at_a_string_and_the_
     harness.write_text(
         "$ErrorActionPreference='Stop'\n" + sel_fn + "\n$runsRaw = '" + raw.replace("'", "''") + "'\n" + m.group(1) + "\n"
         "$kinds = @($runs | ForEach-Object { $_.createdAt.GetType().Name }) -join ','\n"
-        "[pscustomobject]@{ kinds = $kinds; id = (Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId } | ConvertTo-Json -Compress\n",
+        "$hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')\n"
+        "[pscustomobject]@{ kinds = $kinds; hasDateKind = $hasDateKind; id = (Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId } | ConvertTo-Json -Compress\n",
         encoding="utf-8")
-    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True,
+                         env=_r7_nonutc_env())
     assert out.returncode == 0, out.stdout + out.stderr
     doc = json.loads(out.stdout.strip().splitlines()[-1])
     assert doc["id"] == 2, doc
-    assert doc["kinds"] == "String,String", doc      # pwsh 7.5+ here: the raw string survives the read
+    # r7 (Grok G5): the raw string survives the read only where -DateKind exists (pwsh 7.5+); production falls back to the
+    # default conversion on older hosts, where the selector's SpecifyKind/UTC pin keeps the order right (id == 2 above).
+    if doc["hasDateKind"]:
+        assert doc["kinds"] == "String,String", doc
+    else:
+        assert doc["kinds"] == "DateTime,DateTime", doc
 
 
 def test_r6_b2_the_production_read_keeps_created_at_as_the_raw_string_where_the_host_can_and_the_helper_pins_utc():
@@ -5837,3 +5863,63 @@ def test_r6_b3_validity_is_a_sort_key_of_its_own_in_source():
     text = WORKSTREAM.read_text(encoding="utf-8")
     body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
     assert "[datetime]::MinValue" not in body.replace("[datetimeoffset]::MinValue", ""), "the MinValue sentinel is back: it ties 'bad' with a valid 0001-01-01"
+
+
+# --- r7 (sol r6 on 3671119d: ADV-A1 revision EXPRESSIONS under refs/ were read as literal refnames) ---------------------
+# r6 sent every refs/* input to `show-ref --verify --hash`, which only knows exact refnames, so `refs/remotes/fork/master~1`
+# and `refs/remotes/fork/master^{commit}` became "does not exist" / unknown and the currency refusal was skipped. r7: a full
+# refname with no revision operator keeps the exact-ref read; anything else resolves ONCE through rev-parse to a commit SHA.
+R7_EXPRS = ["refs/remotes/fork/master~1", "refs/remotes/fork/master^{commit}"]
+
+
+def _r7_repo(tmp_path):
+    """A (x.ps1='a') <- B (x.ps1='b'); refs/remotes/fork/master = B. Returns (repo, A, B). ~1 names A, ^{commit} names B."""
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    git(repo, "update-ref", R6_REF, sha_b)
+    return repo, sha_a, sha_b
+
+
+@pytest.mark.parametrize("expr", R7_EXPRS)
+def test_r7_a1_the_currency_guard_resolves_a_revision_expression_under_refs_and_compares_content(tmp_path, expr):
+    repo, sha_a, sha_b = _r7_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'b'\n", encoding="utf-8")          # the disk copy equals B's blob
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("try { $res = & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -Ref '" + expr + "' -PassThru } catch { }\n"
+            "if ($null -eq $res) { [pscustomobject]@{ status = 'threw-stale' } | ConvertTo-Json -Compress } else { @($res)[0] | ConvertTo-Json -Compress }\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r7-currency.ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    # ~1 is A ('a'): the disk copy differs, so the stale refusal must fire. ^{commit} is B: the disk copy matches.
+    assert doc["status"] == ("threw-stale" if expr.endswith("~1") else "current"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R7_EXPRS)
+def test_r7_a1_the_ratio_guard_resolves_a_revision_expression_under_refs(tmp_path, expr):
+    repo, sha_a, sha_b = _r7_repo(tmp_path)
+    body = ("& '" + str(RATIO_GUARD).replace("'", "''") + "' -RepoRoot '" + str(repo).replace("'", "''") + "' -SourceRef '" + expr + "' -AsOfEpoch 1893456000\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r7-ratio.ps1"))
+    assert doc["sourceSha"] == (sha_a if expr.endswith("~1") else sha_b), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R7_EXPRS)
+def test_r7_a1_the_retire_merge_gate_resolves_a_revision_expression_under_refs_before_the_ancestry_test(tmp_path, expr):
+    repo, sha_a, sha_b = _r7_repo(tmp_path)
+    wt = tmp_path / "r7wt"
+    # ~1 names A: a worktree at B is NOT an ancestor of A (unmerged). ^{commit} names B: a worktree at A IS an ancestor of B.
+    git(repo, "worktree", "add", "--detach", str(wt), sha_b if expr.endswith("~1") else sha_a)
+    body = (". '" + str(RETIRE).replace("'", "''") + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + str(wt).replace("'", "''") + "' -MergeTarget '" + expr + "' -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r7-retire.ps1"))
+    assert "merge target ref missing" not in doc["reason"] and "merge-base" not in doc["reason"], (expr, doc)
+    if expr.endswith("~1"):
+        assert doc["reason"].startswith("unmerged"), (expr, doc)
+    else:
+        assert not doc["reason"].startswith("unmerged"), (expr, doc)
+
+
+def test_r7_a1_every_site_keeps_the_exact_ref_read_for_a_plain_refname_and_resolves_anything_else_once_in_source():
+    for path, var in ((COORD / "assert-script-currency.ps1", "$Ref"), (RATIO_GUARD, "$SourceRef"), (RETIRE, "$MergeTarget")):
+        text = path.read_text(encoding="utf-8")
+        assert "show-ref --verify --hash " + var in text, path
+        assert "rev-parse --verify --quiet --end-of-options" in text, path

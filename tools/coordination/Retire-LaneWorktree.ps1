@@ -1433,7 +1433,14 @@ function Invoke-RetireLaneWorktree {
         if ([int]$u.out[0] -gt 0) { $d.reason = "unpushed: $($u.out[0]) commit(s) on no remote"; return [pscustomobject]$d }
 
         $mergeRev = $MergeTarget
-        if ($MergeTarget -like 'refs/*') {
+        # r7 (sol r6 ADV-A1): only a full refname with NO revision operator is read as an exact ref; a revision expression
+        # (refs/remotes/fork/master~1, ...^{commit}) is resolved ONCE to a commit SHA and only that SHA is used afterwards.
+        $mergePlain = ($MergeTarget -match '^refs/[^~^:?*\[\\\s]+$' -and $MergeTarget -notmatch '\.\.|@\{|//|/$')
+        if ($MergeTarget -like 'refs/*' -and -not $mergePlain) {
+            $mergeSha = [string](& git.exe -C $main rev-parse --verify --quiet --end-of-options "$MergeTarget^{commit}" 2>$null | Select-Object -First 1)
+            if ($mergeSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
+            $mergeRev = $mergeSha
+        } elseif ($MergeTarget -like 'refs/*') {
             # exact ref: merge-base takes a revision, and for a missing refs/ name git goes on to refs/tags/<name>.
             # r6 (sol B1): read the SHA ONCE and test against that SHA, never the name again - a ref that vanishes between a
             # check and a second lookup of the name would otherwise be judged through a shadow tag.

@@ -390,13 +390,15 @@ try {
     # that vanishes after the check can never be re-resolved through a shadow tag.
     $resolved = @()
     $refExists = $true
+    # r7 (sol r6 ADV-A1): only a full refname with NO revision operator takes the exact-ref read; a revision expression
+    # (refs/remotes/fork/master~1, refs/remotes/fork/master^{commit}) is resolved once by rev-parse, as before r6.
     $revision = $SourceRef
-    if ($SourceRef -like 'refs/*') {
+    if ($SourceRef -match '^refs/[^~^:?*\[\\\s]+$' -and $SourceRef -notmatch '\.\.|@\{|//|/$') {
         $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $SourceRef 2>$null | Select-Object -First 1)
         $refExists = ($exactSha -match '^[0-9a-f]{40}$')
         if ($refExists) { $revision = $exactSha }
     }
-    if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify "$revision^{commit}" 2>$null) }
+    if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify --quiet --end-of-options "$revision^{commit}" 2>$null) }
     if (-not $refExists -or $LASTEXITCODE -ne 0 -or $resolved.Count -ne 1 -or $resolved[0] -notmatch '^[0-9a-fA-F]{40}$') {
         Write-ErrorResult 'ERROR_REF_UNRESOLVED'
     }

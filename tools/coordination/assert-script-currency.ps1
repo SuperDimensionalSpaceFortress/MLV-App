@@ -51,16 +51,19 @@ $rel = $full.Substring($root.Length).TrimStart([char]92, [char]47).Replace([stri
 if (-not $rel) { Write-Result 'unknown' 'could not derive a repo-relative path'; return }
 
 # Does the reference exist at all? No 'fork' remote (a fresh clone, a lane sandbox) is not drift.
-$refRev = $Ref
-if ($Ref -like 'refs/*') {
-    # A full refs/ name must exist EXACTLY: rev-parse would fall through to refs/tags/<name> for a missing ref.
-    # r6 (sol B1): read the exact ref's SHA ONCE; every later step uses the commit it names, never the refname again,
-    # so a ref that vanishes after this check cannot be re-resolved through a shadow tag.
+# r7 (sol r6 ADV-A1): resolve ONCE to a commit SHA and use only that SHA afterwards. A full refname with no revision
+# operator must exist EXACTLY (rev-parse would fall through to refs/tags/<name> for a missing ref), so it is read with
+# `show-ref --verify --hash` (r6 B1: a ref that vanishes after the check can never be re-resolved through a shadow tag).
+# Anything else - including a revision EXPRESSION under refs/ such as refs/remotes/fork/master~1 or
+# refs/remotes/fork/master^{commit} - is resolved once by `rev-parse`, exactly as it was accepted before r6.
+$isPlainFullRef = ($Ref -match '^refs/[^~^:?*\[\\\s]+$' -and $Ref -notmatch '\.\.|@\{|//|/$')
+$refSpec = $Ref
+if ($isPlainFullRef) {
     $exactSha = [string](& git -C $root show-ref --verify --hash $Ref 2>$null | Select-Object -First 1)
     if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
-    $refRev = $exactSha
+    $refSpec = $exactSha
 }
-$refCommit = [string](& git -C $root rev-parse --verify --quiet "$refRev^{commit}" 2>$null | Select-Object -First 1)
+$refCommit = [string](& git -C $root rev-parse --verify --quiet --end-of-options "$refSpec^{commit}" 2>$null | Select-Object -First 1)
 if ($refCommit -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not resolve"; return }
 
 # Is the file tracked on that ref? A NEW file that has not landed yet is not stale.
