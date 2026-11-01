@@ -21,6 +21,7 @@
 #include "../../src/batch/MlvTrim.h"
 #include "../../src/batch/EnvFlags.h"
 #include "debug/ForceSingleThread.h"
+#include "OutputDirIdentity.h"   // last: it pulls in <windows.h>
 
 #include <QByteArray>
 #include <QCommandLineParser>
@@ -1723,6 +1724,32 @@ static int runGuiPlaybackSmoke(QApplication &app)
         {
             err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir must differ from --contact-sheet-dir "
                    "(the seek capture would overwrite the in-pass frames): SEEK_DIR_SAME_AS_CONTACT_SHEET_DIR\n";
+            return 2;
+        }
+        // r3 (sol B1): a string is not an identity. A junction, symlink or subst alias of the in-pass directory
+        // passes the check above, so both directories are created now and compared on disk. Only proven
+        // distinct, non-nested directories go on; anything unprovable fails closed.
+        if (!QDir().mkpath(options.contactSheetDir) || !QDir().mkpath(options.contactSheetSeekDir))
+        {
+            err << "[GUI-SMOKE] ERROR: could not create the contact sheet directories to compare them: "
+                   "SEEK_DIR_IDENTITY_UNKNOWN reason=create_failed contact_sheet_dir=" << options.contactSheetDir
+                << " seek_dir=" << options.contactSheetSeekDir << "\n";
+            return 2;
+        }
+        const output_dir_identity::DirComparison seekDirIdentity =
+            output_dir_identity::compareDirectories(options.contactSheetSeekDir, options.contactSheetDir);
+        if (seekDirIdentity.relation != output_dir_identity::DirRelation::Distinct)
+        {
+            const char *seekDirToken =
+                seekDirIdentity.relation == output_dir_identity::DirRelation::Same
+                    ? "SEEK_DIR_SAME_IDENTITY_AS_CONTACT_SHEET_DIR"
+                    : ( seekDirIdentity.relation == output_dir_identity::DirRelation::Unknown
+                            ? "SEEK_DIR_IDENTITY_UNKNOWN"
+                            : "SEEK_DIR_NESTED_WITH_CONTACT_SHEET_DIR" );
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir must be a separate directory from "
+                   "--contact-sheet-dir on disk: " << seekDirToken
+                << " contact_sheet_dir=" << options.contactSheetDir
+                << " seek_dir=" << options.contactSheetSeekDir << " " << seekDirIdentity.detail << "\n";
             return 2;
         }
     }

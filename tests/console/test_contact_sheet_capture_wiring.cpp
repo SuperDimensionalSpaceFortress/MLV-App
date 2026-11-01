@@ -12,8 +12,14 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include "../../platform/qt/OutputDirIdentity.h"
+
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
+#include <QProcess>
 #include <QString>
+#include <QTemporaryDir>
 #include <QTextStream>
 
 namespace
@@ -1043,6 +1049,115 @@ TEST(ContactSheetSeekFrameListWiring, TheSeekDirMustDifferAndASeekSidecarCountsO
     const QString write = seekBranch.mid(writeAt, countAt - writeAt);
     ASSERT_TRUE(write.contains(QStringLiteral("&& sidecarFile.flush();")));
     ASSERT_TRUE(write.contains(QStringLiteral("if( sidecarWritten && sidecarFile.error() == QFileDevice::NoError )")));
+}
+
+// r3 (sol B1): the separation check compares filesystem identity, so a junction or symlink alias of the in-pass
+// directory (or of a directory nested in it) is refused, not just an identical path string.
+namespace
+{
+
+// A directory junction needs no privilege on Windows; a symlink is the POSIX equivalent.
+bool makeDirectoryAlias(const QString & aliasPath, const QString & targetPath)
+{
+#ifdef Q_OS_WIN
+    QProcess mklink;
+    mklink.start(QStringLiteral("cmd.exe"),
+                 { QStringLiteral("/c"), QStringLiteral("mklink"), QStringLiteral("/J"),
+                   QDir::toNativeSeparators(aliasPath), QDir::toNativeSeparators(targetPath) });
+    if (!mklink.waitForFinished(30000)) return false;
+    return mklink.exitStatus() == QProcess::NormalExit && mklink.exitCode() == 0 && QFileInfo(aliasPath).isDir();
+#else
+    return QFile::link(targetPath, aliasPath) && QFileInfo(aliasPath).isDir();
+#endif
+}
+
+} // namespace
+
+TEST(ContactSheetSeekDirIdentity, AJunctionAliasOfTheInPassDirIsTheSameDirectory)
+{
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+    const QString in = root.filePath(QStringLiteral("in"));
+    const QString alias = root.filePath(QStringLiteral("alias"));
+    ASSERT_TRUE(QDir().mkpath(in));
+    ASSERT_TRUE(makeDirectoryAlias(alias, in));
+    // The cleaned strings differ, which is all the b8f6155d check looked at.
+    ASSERT_FALSE(QDir::cleanPath(alias).compare(QDir::cleanPath(in), Qt::CaseInsensitive) == 0);
+
+    using output_dir_identity::DirRelation;
+    ASSERT_EQ(static_cast<int>(DirRelation::Same),
+              static_cast<int>(output_dir_identity::compareDirectories(alias, in).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::Same),
+              static_cast<int>(output_dir_identity::compareDirectories(in, alias).relation));
+}
+
+TEST(ContactSheetSeekDirIdentity, AnAliasOfADirectoryNestedInTheOtherIsRefusedAsNested)
+{
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+    const QString in = root.filePath(QStringLiteral("in"));
+    const QString nested = root.filePath(QStringLiteral("in/sub"));
+    const QString nestedAlias = root.filePath(QStringLiteral("subalias"));
+    const QString inAlias = root.filePath(QStringLiteral("inalias"));
+    ASSERT_TRUE(QDir().mkpath(nested));
+    ASSERT_TRUE(makeDirectoryAlias(nestedAlias, nested));
+    ASSERT_TRUE(makeDirectoryAlias(inAlias, in));
+
+    using output_dir_identity::DirRelation;
+    // seek dir = alias of in\sub, contact sheet dir = in: the first is inside the second.
+    ASSERT_EQ(static_cast<int>(DirRelation::FirstInsideSecond),
+              static_cast<int>(output_dir_identity::compareDirectories(nestedAlias, in).relation));
+    // seek dir = alias of in, contact sheet dir = in\sub: the second is inside the first.
+    ASSERT_EQ(static_cast<int>(DirRelation::SecondInsideFirst),
+              static_cast<int>(output_dir_identity::compareDirectories(inAlias, nested).relation));
+}
+
+TEST(ContactSheetSeekDirIdentity, DistinctSiblingDirectoriesAreAcceptedAndAMissingOneFailsClosed)
+{
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+    const QString in = root.filePath(QStringLiteral("in"));
+    const QString seek = root.filePath(QStringLiteral("seek"));
+    // A sibling whose name starts with the other's ("in" / "in-seek") is not nested.
+    const QString prefixSibling = root.filePath(QStringLiteral("in-seek"));
+    ASSERT_TRUE(QDir().mkpath(in));
+    ASSERT_TRUE(QDir().mkpath(seek));
+    ASSERT_TRUE(QDir().mkpath(prefixSibling));
+
+    using output_dir_identity::DirRelation;
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct),
+              static_cast<int>(output_dir_identity::compareDirectories(seek, in).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct),
+              static_cast<int>(output_dir_identity::compareDirectories(prefixSibling, in).relation));
+    // No identity, no acceptance.
+    const output_dir_identity::DirComparison missing =
+        output_dir_identity::compareDirectories(root.filePath(QStringLiteral("absent")), in);
+    ASSERT_EQ(static_cast<int>(DirRelation::Unknown), static_cast<int>(missing.relation));
+    ASSERT_FALSE(missing.detail.isEmpty());
+}
+
+TEST(ContactSheetSeekDirIdentity, TheCliCreatesBothDirsThenRefusesEveryRelationButDistinctBeforeAnyCapture)
+{
+    const QString mainSource = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+    ASSERT_TRUE(mainSource.contains(QStringLiteral("#include \"OutputDirIdentity.h\"")));
+    const int stringCheckAt = mainSource.indexOf(QStringLiteral("SEEK_DIR_SAME_AS_CONTACT_SHEET_DIR\\n"));
+    const int compareAt = mainSource.indexOf(QStringLiteral("output_dir_identity::compareDirectories(options.contactSheetSeekDir, options.contactSheetDir)"));
+    const int framesAt = mainSource.indexOf(QStringLiteral("if (parser.isSet(contactSheetSeekFramesOpt))"));
+    ASSERT_TRUE(stringCheckAt > 0);
+    ASSERT_TRUE(compareAt > stringCheckAt);
+    ASSERT_TRUE(framesAt > compareAt);
+    const QString identityBlock = mainSource.mid(stringCheckAt, framesAt - stringCheckAt);
+    const int mkpathAt = identityBlock.indexOf(QStringLiteral("QDir().mkpath(options.contactSheetSeekDir)"));
+    ASSERT_TRUE(mkpathAt > 0);
+    ASSERT_TRUE(identityBlock.indexOf(QStringLiteral("output_dir_identity::compareDirectories(")) > mkpathAt);
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("QDir().mkpath(options.contactSheetDir)")));
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("!= output_dir_identity::DirRelation::Distinct")));
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("SEEK_DIR_SAME_IDENTITY_AS_CONTACT_SHEET_DIR")));
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("SEEK_DIR_NESTED_WITH_CONTACT_SHEET_DIR")));
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("SEEK_DIR_IDENTITY_UNKNOWN")));
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("contact_sheet_dir=")));
+    ASSERT_TRUE(identityBlock.contains(QStringLiteral("seek_dir=")));
+    ASSERT_TRUE(identityBlock.count(QStringLiteral("return 2;")) >= 2);
 }
 
 TEST(ContactSheetSeekFrameListWiring, TheLogLineNamesTheListOnlyWhenItIsSetAndTheDoneLineIsUnchanged)

@@ -121,6 +121,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/ExportProcess.h \
     $$REPO_ROOT/platform/qt/DualIsoLevelSyncPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFrameRange.h \
+    $$REPO_ROOT/platform/qt/OutputDirIdentity.h \
     $$REPO_ROOT/platform/qt/AutomationSettings.h \
     $$REPO_ROOT/platform/qt/HubHostPlaybackGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
