@@ -584,7 +584,8 @@ struct PlayPaceHistory
     {
         const PlayingSplit r14 = playingSplit( elapsedMs );
         const int64_t cadence = cadenceThresholdMs();
-        if( r14.thresholdMs <= 0 || cadence <= 0 || cadence >= r14.thresholdMs ) return r14;
+        // (an r14 split with no threshold yet has none below any cadence threshold, so it is returned as it is)
+        if( cadence < 1 || cadence >= r14.thresholdMs ) return r14;
         return splitAtThreshold( elapsedMs, cadence );
     }
 
