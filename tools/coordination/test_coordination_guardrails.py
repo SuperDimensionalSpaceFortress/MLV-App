@@ -6345,3 +6345,133 @@ def test_r10_every_site_classifies_a_full_refname_by_ascii_whitespace_and_strips
         assert r"[^?*\[\\\s]" not in text, (path, "the Unicode-aware \\s is back in the full-refname classifier")
         assert r"[^?*\[\\ \t\n\v\f\r]" in text, path
         assert r"\^\{/.*\}" in text, (path, "the ^{/regex} search group is not stripped before the reflog test")
+
+
+# --- r11 (Dot prior-key B3, old Sol r9 CR 6553630639): type the run rows BEFORE any comparison ---------------
+# `gh run list --json databaseId,conclusion,createdAt,headSha,displayTitle` (gh 2.97.0, captured live in the r11 run's
+# evidence\gh-run-list-merge-group.json: 50 rows) emits headSha / conclusion / createdAt / displayTitle as JSON STRINGS and
+# databaseId as an integer. The export is written to disk and read back with ConvertFrom-Json, so the selector sees whatever
+# the file holds; PowerShell's -eq coerces the RIGHT operand to the left operand's type, so `$true -eq 'success'` and
+# `$true -eq <any non-empty sha>` are both True and an array on the left FILTERS instead of comparing. A row of the wrong
+# shape is therefore excluded from every selection branch and counted in the label (never silently dropped).
+R11_MALFORMED_TEXT = "; %d malformed run row(s) ignored (headSha/conclusion not a string or databaseId not a positive integer)"
+
+# Two rows exactly as `gh run list` printed them (the head of evidence\gh-run-list-merge-group.json, 2026-11-01).
+R11_REAL_ROWS = [
+    {"conclusion": "success", "createdAt": "2026-11-01T04:26:11Z", "databaseId": 41273090820,
+     "displayTitle": "Tests", "headSha": "df039a92e8af57d57b3594d466c09cf2947d3bc7"},
+    {"conclusion": "success", "createdAt": "2026-10-31T17:43:10Z", "databaseId": 41225880883,
+     "displayTitle": "Tests", "headSha": "124de5190698a0b0ffd8ba488f5a9eddb37e3e36"},
+]
+
+
+def _r11_malformed(n):
+    return R11_MALFORMED_TEXT % n
+
+
+def _r11_without(row, key):
+    return {k: v for k, v in row.items() if k != key}
+
+
+def test_r11_real_gh_row_shapes_are_accepted_unchanged(tmp_path):
+    picked = _mgrs_select(tmp_path, R11_REAL_ROWS, "124de5190698a0b0ffd8ba488f5a9eddb37e3e36")
+    assert picked == {"id": 41225880883, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}, picked
+    assert "malformed" not in picked["label"]
+
+
+# every non-string shape a headSha can take after ConvertFrom-Json: Boolean, null, number, array, object
+R11_BAD_SHA = [
+    pytest.param(True, MGRS_TIP, id="bool"),
+    pytest.param(None, MGRS_TIP, id="null"),
+    pytest.param(1, "1", id="number"),
+    pytest.param([MGRS_TIP, "x"], MGRS_TIP, id="array"),
+    pytest.param({"sha": MGRS_TIP}, MGRS_TIP, id="object"),
+]
+
+
+@pytest.mark.parametrize("bad,tip", R11_BAD_SHA)
+def test_r11_a_non_string_head_sha_is_never_the_landed_run_and_is_counted_malformed(tmp_path, bad, tip):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", bad, "failure"),            # newest; wrong-typed headSha
+        _mgrs_row(200, "2026-10-31T16:00:00Z", tip, "success"),            # the genuinely landed run
+    ]
+    assert _mgrs_select(tmp_path, rows, tip) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r11_a_missing_head_sha_property_is_malformed(tmp_path):
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP, "failure"), "headSha"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+R11_BAD_CONCLUSION = [
+    pytest.param(True, id="bool"),
+    pytest.param(None, id="null"),
+    pytest.param(1, id="number"),
+    pytest.param(["success"], id="array"),
+    pytest.param({"c": "success"}, id="object"),
+]
+
+
+@pytest.mark.parametrize("bad", R11_BAD_CONCLUSION)
+def test_r11_a_non_string_conclusion_is_never_a_success_and_is_counted_malformed(tmp_path, bad):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, bad),           # newest; wrong-typed conclusion
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "cancelled"),
+    ]
+    # no landed run and no real success: the newest WELL-TYPED row by createdAt, never the wrong-typed one
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}
+
+
+def test_r11_a_missing_conclusion_property_is_malformed(tmp_path):
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success"), "conclusion"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "success")]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+R11_BAD_ID = [
+    pytest.param(True, id="bool"),
+    pytest.param(None, id="null"),
+    pytest.param("300", id="string"),
+    pytest.param([300], id="array"),
+    pytest.param(1.5, id="fraction"),
+    pytest.param(0, id="zero"),
+    pytest.param(-5, id="negative"),
+]
+
+
+@pytest.mark.parametrize("bad", R11_BAD_ID)
+def test_r11_a_database_id_that_is_not_a_positive_integer_is_never_selected(tmp_path, bad):
+    rows = [
+        _mgrs_row(bad, "2026-10-31T17:00:00Z", MGRS_TIP, "success"),       # newest and landed by sha, but its id cannot key a URL
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r11_every_label_branch_carries_the_malformed_count(tmp_path):
+    bad = _mgrs_row(300, "2026-10-31T17:00:00Z", True, True)
+    landed = _mgrs_select(tmp_path, [bad, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "failure")], MGRS_TIP)
+    success = _mgrs_select(tmp_path, [bad, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "success")], MGRS_TIP)
+    newest = _mgrs_select(tmp_path, [bad, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure")], MGRS_TIP)
+    assert landed == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}, landed
+    assert success == {"id": 200, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}, success
+    assert newest == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}, newest
+
+
+def test_r11_when_every_row_is_malformed_nothing_is_selected(tmp_path):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", True, True), _mgrs_row(200, "2026-10-31T16:00:00Z", None, ["success"])]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) is None
+
+
+def test_r11_a_row_that_is_not_an_object_is_malformed(tmp_path):
+    rows = ["not-a-row", 7, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(2)}
+
+
+def test_r11_the_export_reports_a_failed_row_when_runs_exist_but_none_is_usable():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    start = text.index("$pick = Select-MergeGroupJobsRun")
+    tail = text[start:start + 3000]
+    assert "elseif (@($runs).Count -gt 0)" in tail and "no usable run row" in tail, "an all-malformed export must surface a FAILED row"

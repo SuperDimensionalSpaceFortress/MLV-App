@@ -235,7 +235,21 @@ function Select-MergeGroupJobsRun {
     # r6 (sol B3): VALIDITY is a sort key of its own, ahead of the instant. A MinValue sentinel for "does not parse" tied a
     # row whose text is garbage with a genuinely valid '0001-01-01T00:00:00Z'. With validity first, every selection branch
     # (all three are taken from $sorted) puts a valid row ahead of any invalid one, whatever its instant.
-    $sorted = @($Runs | Where-Object { $null -ne $_ } | Sort-Object -Property @(
+    # r11 (Dot prior-key B3): TYPE every row BEFORE any comparison. `gh run list --json` (gh 2.97.0, captured live) emits
+    # headSha, conclusion and createdAt as JSON strings and databaseId as an integer, but the export is read back from disk, and
+    # PowerShell's -eq coerces the RIGHT operand to the LEFT operand's type: `$true -eq 'success'` and `$true -eq <any sha>` are
+    # True, and an array on the left filters instead of comparing. A row whose headSha or conclusion is not a [string], or whose
+    # databaseId is not a positive integer (it keys the jobs URL), is excluded from EVERY selection branch (fail closed) and is
+    # counted in the label so a reader sees it was ignored. A row that is not an object has none of the properties, so it is
+    # malformed too. A null row is not a row and is not counted.
+    $present = @($Runs | Where-Object { $null -ne $_ })
+    $wellTyped = @($present | Where-Object {
+        ($_.headSha -is [string]) -and ($_.conclusion -is [string]) -and
+        (($_.databaseId -is [int]) -or ($_.databaseId -is [long])) -and ($_.databaseId -gt 0)
+    })
+    $badRows = $present.Count - $wellTyped.Count
+    $bad = if ($badRows -gt 0) { "; $badRows malformed run row(s) ignored (headSha/conclusion not a string or databaseId not a positive integer)" } else { '' }
+    $sorted = @($wellTyped | Sort-Object -Property @(
         @{ Expression = { if ($null -eq (& $toUtc $_.createdAt)) { 0 } else { 1 } }; Descending = $true },
         @{ Expression = { $t = & $toUtc $_.createdAt; if ($null -eq $t) { [datetime]::new(0) } else { $t } }; Descending = $true }
     ))
@@ -263,7 +277,7 @@ function Select-MergeGroupJobsRun {
             if ($newerOff.Count -gt 0) {
                 $label += "; $($newerOff.Count) newer completed run(s) not at the local tip"
             }
-            return [pscustomobject]@{ Run = $landed[0]; Label = $label }
+            return [pscustomobject]@{ Run = $landed[0]; Label = $label + $bad }
         }
     }
     # ADV-A1 (r5): when the tip could not be read, the label names the typed reason ($TipReason, for example
@@ -271,9 +285,9 @@ function Select-MergeGroupJobsRun {
     $why = if ($TipReason) { "; $TipReason" } else { '' }
     $ok = @($sorted | Where-Object { $_.conclusion -eq 'success' })
     if ($ok.Count -gt 0) {
-        return [pscustomobject]@{ Run = $ok[0]; Label = "newest success; may be a non-landed queue entry$why" }
+        return [pscustomobject]@{ Run = $ok[0]; Label = "newest success; may be a non-landed queue entry$why$bad" }
     }
-    return [pscustomobject]@{ Run = $sorted[0]; Label = "newest by createdAt; may be a non-landed queue entry$why" }
+    return [pscustomobject]@{ Run = $sorted[0]; Label = "newest by createdAt; may be a non-landed queue entry$why$bad" }
 }
 
 # ADV-A1 (r5): read the local master tip by the EXACT ref, not by a revision lookup. `rev-parse --verify` on
@@ -972,6 +986,9 @@ if ($needsHostedEvidence) {
                         Remove-Item -LiteralPath $jobsOut -ErrorAction SilentlyContinue
                         $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "FAILED - gh exit $jcode" }
                     }
+                } elseif (@($runs).Count -gt 0) {
+                    # r11: rows were exported but none passed the selector's type check, so no job graph is fetched and the reader is told why.
+                    $ghRows += [pscustomobject]@{ Name = '(job graph)'; Result = 'FAILED - no usable run row (headSha/conclusion must be strings and databaseId a positive integer)' }
                 }
             } catch {
                 $ghRows += [pscustomobject]@{ Name = '(job graph)'; Result = "FAILED - $($_.Exception.Message)" }
