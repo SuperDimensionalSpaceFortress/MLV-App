@@ -761,7 +761,41 @@ function Test-DvLocalReceiptRoot {
     # This function reaches no engine-session API (the attr3 splice scan, test_attr3_spliced_body_scan, counts any such reference in this file as an unprovable extractor binding): the location comes from Get-Location, the drive from Get-PSDrive.
     param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
     try {
-        $rawSpelling = $null
+        $rawSpelling = $null; $here = $null
+        $badNameChars = [IO.Path]::GetInvalidFileNameChars()
+        # r8 B3: the longest name one path component may have on the volume of a drive letter, in UTF-16 code units (GetVolumeInformationW, read once per letter). FAIL CLOSED at 255 -- the limit of every
+        # local file system this tool writes to (NTFS, ReFS, exFAT, FAT) -- when the volume cannot be read; a volume that reports less than 255 is held to its own figure.
+        $volMax = @{}
+        $maxComponent = {
+            param($letter)
+            $key = ([string]$letter).ToUpperInvariant()
+            if (-not $volMax.ContainsKey($key)) {
+                $lim = 255
+                try {
+                    if (-not ('DvR8Vol.Native' -as [type])) {
+                        Add-Type -Namespace DvR8Vol -Name Native -ErrorAction Stop -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern bool GetVolumeInformationW(string root, System.Text.StringBuilder volName, uint volNameSize, out uint serial, out uint maxComponent, out uint flags, System.Text.StringBuilder fsName, uint fsNameSize);'
+                    }
+                    $serial = [uint32]0; $mc = [uint32]0; $fl = [uint32]0
+                    if ([DvR8Vol.Native]::GetVolumeInformationW($key + ':\', $null, 0, [ref]$serial, [ref]$mc, [ref]$fl, $null, 0) -and $mc -gt 0 -and $mc -lt 255) { $lim = [int]$mc }
+                } catch { $lim = 255 }
+                $volMax[$key] = $lim
+            }
+            return $volMax[$key]
+        }
+        # r11 (Dot pr-729 / sol 6559605502 / adversary A1): the ONE component rule, applied to the ORIGINAL spelling's components (before any GetFullPath, which removes `bad\..` and so would hide it) AND to the
+        # final path's components ($isLocal). $true = a name the file system writes as spelled: no longer than $maxLen, no invalid file-name character (`<>:"|?*`, NUL, controls), no trailing space or dot (Win32 strips them, so
+        # such a name is an alias of another directory), no DOS device name. The `.` and `..` navigation tokens are the caller's to skip (they are resolved, never written).
+        # r9 B2: culture-INVARIANT (under tr-TR an inline `(?i:...)` folds `i` to U+0130, so lowercase `conin$` was not a device): RegexOptions.IgnoreCase -bor CultureInvariant, never the process culture.
+        # r7 G9: COM/LPT with a superscript 1/2/3 are devices too, written as regex escapes so this file stays ASCII. r8 B1: Win32 drops any run of spaces between a device stem and its extension, so the stem is followed by `[ ]*`.
+        $componentWellFormed = {
+            param($c, $maxLen)
+            if ($c.Length -eq 0) { return $true }
+            if ($c.Length -gt $maxLen) { return $false }
+            if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
+            if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
+            if ([regex]::IsMatch($c, '^(?:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$', $script:DvCultureFreeIgnoreCase)) { return $false }
+            return $true
+        }
         # (1) the RAW text, either slash. Only `\\?\C:\...` (backslashes) is a local device spelling; anything else that starts with two separators (UNC, \\.\, //?/, \/?\, \\?\UNC\) is refused here.
         if ($Path -match '^[\\/]{2}') {
             if ($Path -cnotmatch '^\\\\\?\\[A-Za-z]:\\[^/]*$') { return $null }
@@ -780,8 +814,17 @@ function Test-DvLocalReceiptRoot {
         # r9 B1 (sol r8): Win32 strips a trailing dot / space from a component, so GetFullPath turns `receipts.` into `receipts` and the normalised-path check below never sees it. The RAW spelling is judged first, on EVERY
         # component (terminal and middle, either slash): a component ending in `.` or ` ` is refused, the `.` and `..` navigation tokens excepted (those are resolved by GetFullPath, not written).
         if ($null -eq $rawSpelling) { $rawSpelling = $full }
-        foreach ($rc in @($rawSpelling.Split([char[]]@('\', '/')))) {
-            if ($rc.Length -gt 0 -and -not [string]::Equals($rc, '.', [StringComparison]::Ordinal) -and -not [string]::Equals($rc, '..', [StringComparison]::Ordinal) -and ($rc.EndsWith(' ') -or $rc.EndsWith('.'))) { return $null }
+        # r11: the same RAW pass judges EVERY original component by the whole component rule (invalid character, NUL, control, length, DOS device name, trailing dot/space), not only the trailing dot/space: GetFullPath
+        # (below) removes `bad<root>\..`, `NUL\..`, a 256-character or control-character name followed by `..`, so judged on the normalised path alone they were certified while the same name without the `..` refused.
+        # The drive spec (`C:`) of a drive-letter spelling is not a name; the length limit is the volume's of that letter (or of the PowerShell location's drive for a relative value; 255 when there is none).
+        $rawLetter = $(if ($rawSpelling -match '^([A-Za-z]):[\\/]') { $Matches[1] } elseif ($here -and ([string]$here.ProviderPath) -match '^([A-Za-z]):') { $Matches[1] } else { 'C' })
+        $rawMax = & $maxComponent $rawLetter
+        $rawComponents = @($rawSpelling.Split([char[]]@('\', '/')))
+        $rawFrom = $(if ($rawSpelling -match '^[A-Za-z]:[\\/]') { 1 } else { 0 })
+        for ($ri = $rawFrom; $ri -lt $rawComponents.Count; $ri++) {
+            $rc = $rawComponents[$ri]
+            if ([string]::Equals($rc, '.', [StringComparison]::Ordinal) -or [string]::Equals($rc, '..', [StringComparison]::Ordinal)) { continue }
+            if (-not (& $componentWellFormed $rc $rawMax)) { return $null }
         }
         if ($full -match '^[\\/]{2}') { return $null }
         $plain = [IO.Path]::GetFullPath($full)
@@ -844,42 +887,16 @@ function Test-DvLocalReceiptRoot {
                 $shareKeys += (& $norm $kr)
             }
         }
-        $badNameChars = [IO.Path]::GetInvalidFileNameChars()
-        # r8 B3: the longest name one path component may have on the volume of a drive letter, in UTF-16 code units (GetVolumeInformationW, read once per letter). FAIL CLOSED at 255 -- the limit of every
-        # local file system this tool writes to (NTFS, ReFS, exFAT, FAT) -- when the volume cannot be read; a volume that reports less than 255 is held to its own figure.
-        $volMax = @{}
-        $maxComponent = {
-            param($letter)
-            $key = ([string]$letter).ToUpperInvariant()
-            if (-not $volMax.ContainsKey($key)) {
-                $lim = 255
-                try {
-                    if (-not ('DvR8Vol.Native' -as [type])) {
-                        Add-Type -Namespace DvR8Vol -Name Native -ErrorAction Stop -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern bool GetVolumeInformationW(string root, System.Text.StringBuilder volName, uint volNameSize, out uint serial, out uint maxComponent, out uint flags, System.Text.StringBuilder fsName, uint fsNameSize);'
-                    }
-                    $serial = [uint32]0; $mc = [uint32]0; $fl = [uint32]0
-                    if ([DvR8Vol.Native]::GetVolumeInformationW($key + ':\', $null, 0, [ref]$serial, [ref]$mc, [ref]$fl, $null, 0) -and $mc -gt 0 -and $mc -lt 255) { $lim = [int]$mc }
-                } catch { $lim = 255 }
-                $volMax[$key] = $lim
-            }
-            return $volMax[$key]
-        }
         $isLocal = {
             # judges ONE concrete spelling: well-formed components / UNC / device / PowerShell drive / agentShare / network drive. Returns $true when it is a local, non-share path.
             param($p)
             if ($p -match '^[\\/]{2}') { return $false }
             if ($p -notmatch '^[A-Za-z]:\\') { return $false }
-            # r6 ADV-A4 / ADV-A1: every component is a name the file system writes as spelled (no invalid character, no trailing space or dot alias, no DOS device name; r7 G9: COM/LPT with a superscript 1/2/3 are devices too, written as regex escapes so this file stays ASCII)
-            # r8 B1: Win32 drops any run of spaces between a device stem and its extension, on EVERY component (`COM1 .txt`, `NUL  .log` are devices), so the stem is followed by `[ ]*` before the optional extension.
-            # r8 B3: no component is longer than the volume's maximum component length (such a directory cannot be created).
+            # r6 ADV-A4 / ADV-A1 / r8 B1 / r8 B3 / r11: every component of the concrete path is well formed ($componentWellFormed: the same rule the ORIGINAL spelling's components were judged by above),
+            # at the volume's maximum component length (such a directory cannot be created).
             $maxLen = & $maxComponent $p.Substring(0, 1)
             foreach ($c in @($p.Substring(3).Split([char]92))) {
-                if ($c.Length -eq 0) { continue }
-                if ($c.Length -gt $maxLen) { return $false }
-                if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
-                if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
-                # r9 B2: culture-INVARIANT (under tr-TR an inline `(?i:...)` folds `i` to U+0130, so lowercase `conin$` was not a device): RegexOptions.IgnoreCase -bor CultureInvariant, never the process culture
-                if ([regex]::IsMatch($c, '^(?:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$', $script:DvCultureFreeIgnoreCase)) { return $false }
+                if (-not (& $componentWellFormed $c $maxLen)) { return $false }
             }
             # r6 ADV-A2 / r8 B2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted EXACTLY at `<letter>:\` -- not `New-PSDrive X -Root \\host\share`, and not
             # `C` re-rooted at `C:\Windows` (the cmdlets would write under that directory while this judgement ran on the literal spelling)

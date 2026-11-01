@@ -7397,6 +7397,74 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(base / ".claude-state" / ("a" * (limit + 1)) / "receipts")))
             self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
 
+    def test_r11_a_malformed_original_component_followed_by_parent_navigation_is_refused_on_every_entry(self) -> None:
+        # Dot (pr-729.md) / sol 6559605502 / adversary A1 (r10 e0104f07): GetFullPath removes `bad\..` BEFORE the character, device and length checks ran, so a malformed ORIGINAL component
+        # followed by `..` was certified (leg ACCEPTED, batch PASSED_BEFORE_RUNDIR) while the same component without the `..` refused. Every ORIGINAL component is judged before any normalisation.
+        drive = os.environ.get("SystemDrive", "C:") + "\\"
+        buf = ctypes.c_uint32(0)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(ctypes.c_wchar_p(drive), None, 0, None, ctypes.byref(buf), None, None, 0)
+        limit = min(255, buf.value) if ok and buf.value else 255
+        classes = {
+            "bad-root-angle": "bad<root>", "bad-root-quote": 'bad"root', "bad-root-pipe": "bad|root", "bad-root-star": "bad*root", "bad-root-question": "bad?root", "bad-root-colon": "bad:root",
+            "device-nul": "NUL", "device-con-ext": "CON.txt", "device-com1-space-ext": "COM1 .txt", "device-superscript": "COM\u00b9", "device-conin": "conin$",
+            "over-volume-max": "a" * (limit + 1),
+            "control-x01": "ctl\x01x", "control-x1f": "ctl\x1fx", "control-tab": "ctl\tx", "control-newline": "ctl\nx", "nul-char": "n\x00x",
+        }
+        pre = "C:\\x\\.claude-state\\"
+        bad: dict[str, str] = {}
+        for name, comp in classes.items():
+            bad[f"{name}/after-marker"] = pre + comp + "\\..\\receipts"
+            bad[f"{name}/after-marker-forward-slash"] = "C:/x/.claude-state/" + comp + "/../receipts"
+            bad[f"{name}/nested-then-two-parents"] = pre + "a\\" + comp + "\\..\\..\\receipts"
+            bad[f"{name}/before-marker"] = "C:\\x\\" + comp + "\\..\\.claude-state\\receipts"
+            bad[f"{name}/dot-then-parent"] = pre + comp + "\\.\\..\\receipts"
+            bad[f"{name}/terminal-with-parent"] = pre + "receipts\\" + comp + "\\.."
+            bad[f"{name}/extended-prefix"] = "\\\\?\\" + pre + comp + "\\..\\receipts"
+        bad["far-over-volume-max/after-marker"] = pre + "a" * 5000 + "\\..\\receipts"   # one case only: the judge script travels on the command line
+        controls = {
+            "fine": pre + "good-root", "parent-nav-over-a-good-name": pre + "a\\..\\receipts", "dot-nav": pre + "a\\.\\r",
+            "com10-is-not-a-device": pre + "COM10\\..\\receipts", "console-is-not-a-device": pre + "CONSOLE\\..\\receipts",
+            "at-limit-then-parent": pre + "b" * limit + "\\..\\receipts", "ordinary-dotted-name": pre + "r.x\\..\\receipts",
+        }
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, **controls})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {str(got[name])[:200]}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        self.assertEqual(got["parent-nav-over-a-good-name"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["dot-nav"].lower(), "c:\\x\\.claude-state\\a\\r")
+        self.assertEqual(got["com10-is-not-a-device"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["console-is-not-a-device"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["at-limit-then-parent"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["ordinary-dotted-name"].lower(), "c:\\x\\.claude-state\\receipts")
+        # a RELATIVE spelling (resolved once against the PowerShell location) is judged component by component too
+        here = self.clean_base()
+        rel_bad = {f"{n}/relative": ".claude-state\\" + c + "\\..\\receipts" for n, c in classes.items() if n in ("bad-root-angle", "device-nul", "over-volume-max", "control-x01", "nul-char")}
+        rel_bad["bad-root-angle/rooted-on-current-drive"] = "\\" + str(here)[3:] + "\\.claude-state\\bad<root>\\..\\receipts"
+        rel_ctl = {"relative-fine": ".claude-state\\a\\..\\receipts"}
+        got_rel = self.judge(["C:\\fake\\agent-share"], {**rel_bad, **rel_ctl}, location=here, process_dir=here)
+        for name in rel_bad:
+            self.assertIsNone(got_rel[name], f"{name}: {str(got_rel[name])[:200]}")
+        self.assertIsNotNone(got_rel["relative-fine"], got_rel)
+        # the batch entry (Invoke-VenueLeaseBatch.ps1 -ReceiptRoot) refuses before the run dir, the claim or any leg; the real leg entry (Invoke-VenueLeg.ps1) refuses the same root.
+        # argv cannot carry a NUL character, so that class is judged by the helper above only.
+        base = self.clean_base()
+        entries = {k: v for k, v in classes.items() if k in ("bad-root-angle", "device-nul", "over-volume-max", "control-x01", "control-x1f", "device-com1-space-ext")}
+        for label, comp in entries.items():
+            root = str(base) + "\\.claude-state\\" + comp + "\\..\\receipts"
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", root)
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=label):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", root))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+        # the same root with the malformed component REMOVED is certified (the refusal is the component, not the `..`)
+        with self.subTest(entry="batch", name="control-good-component-then-parent"):
+            self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+            r = self.run_batch(None, "-ReceiptRoot", str(base) + "\\.claude-state\\a\\..\\receipts")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_r8_a3_a_link_chain_is_bounded_per_link_sixteen_pass_seventeen_are_refused(self) -> None:
         # opus/sol A3 (ADV-A3): ResolveLinkTarget($true) collapsed a whole chain inside one outer hop, so the stated 16-link bound was never enforced. Real junctions: j00 -> j01 -> ... -> j16 -> final (17 links).
         base = self.clean_base()
