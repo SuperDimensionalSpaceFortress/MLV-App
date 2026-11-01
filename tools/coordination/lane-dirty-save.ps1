@@ -43,8 +43,12 @@ function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exa
 }
 function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # every link (symlink or junction) on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2)
     if ($Depth -gt 16) { throw 'too-many-links' }
+    if ($Path.StartsWith('\\?\UNC\')) { $Path = '\\' + $Path.Substring(8) } elseif ($Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\')) { $Path = $Path.Substring(4) }  # the extended-length prefix is another spelling of the same place (r7 A1)
     $full = [System.IO.Path]::GetFullPath($Path); $root = [System.IO.Path]::GetPathRoot($full); $cur = $root
     foreach ($seg in $full.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        if ([System.IO.Path]::DirectorySeparatorChar -eq '\' -and $seg.Contains('~')) {  # an 8.3 short name is a third spelling: ask the parent for the long name
+            try { $hit = [System.IO.DirectoryInfo]::new($cur).GetFileSystemInfos($seg) | Select-Object -First 1; if ($hit) { $seg = $hit.Name } } catch { }
+        }
         $cur = [System.IO.Path]::Combine($cur, $seg)
         $di = [System.IO.DirectoryInfo]::new($cur)
         if ($di.LinkTarget) { $t = $di.ResolveLinkTarget($true); if ($t) { $cur = Resolve-RealPath $t.FullName ($Depth + 1) } }
@@ -95,7 +99,7 @@ try {
     if (-not (Test-Path -LiteralPath $WorkDir -PathType Container) -or -not (Test-Path -LiteralPath $RunDir -PathType Container)) { throw 'no-such-directory' }
     if (Test-LaneAlive) { Write-Output 'DIRTY_SAVE_REFUSED reason=lane-alive'; exit 20 }
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
-$flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
+$flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=none', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
 try { $rel = [System.IO.Path]::GetRelativePath((Resolve-RealPath $WorkDir), (Resolve-RealPath $RunDir)) } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }

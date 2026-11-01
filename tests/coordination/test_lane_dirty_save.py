@@ -402,6 +402,49 @@ def test_a_run_dir_that_reaches_the_worktree_through_a_link_is_bad_arguments(rep
     assert "run-dir-inside-worktree" in r.stdout and list((repo / "run").iterdir()) == []
 
 
+def short_name(path):
+    out = subprocess.run(["cmd", "/c", f'for %I in ("{path}") do @echo %~sI'], capture_output=True, text=True).stdout.strip()
+    return out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="extended-length and 8.3 spellings are Windows path forms")
+@pytest.mark.parametrize("spelling", ["extended", "short"])
+def test_a_run_dir_spelled_extended_or_8dot3_inside_the_worktree_is_bad_arguments(repo, spelling):  # r7 A1
+    inside = repo / "run"
+    inside.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    if spelling == "extended":
+        spelled = "\\\\?\\" + str(inside)
+    else:
+        spelled = short_name(inside)
+        if spelled.lower() == str(inside).lower() or "~" not in spelled:
+            pytest.skip("8.3 short names are disabled on this volume")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", spelled, "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30, r.stdout + r.stderr
+    assert list(inside.iterdir()) == []
+
+
+def test_a_changed_gitlink_is_saved_as_an_applicable_patch_even_when_diff_submodule_is_log(repo, tmp_path):  # r7 A2
+    sha_a, sha_b = "a" * 40, "b" * 40
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{sha_a},sub")
+    git(repo, "commit", "-q", "-m", "gitlink")
+    git(repo, "config", "diff.submodule", "log")
+    git(repo, "update-index", "--cacheinfo", f"160000,{sha_b},sub")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    staged = (tmp_path / "run" / last_receipt(r)["staged"]).read_bytes()
+    assert staged.startswith(b"diff --git a/sub b/sub") and f"-Subproject commit {sha_a}".encode() in staged and f"+Subproject commit {sha_b}".encode() in staged, staged
+
+
+def test_diff_ignore_submodules_config_cannot_hide_a_changed_gitlink(repo, tmp_path):  # r7 A2 class: diff.ignoreSubmodules=all
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},sub")
+    git(repo, "commit", "-q", "-m", "gitlink")
+    git(repo, "config", "diff.ignoreSubmodules", "all")
+    git(repo, "update-index", "--cacheinfo", f"160000,{'b' * 40},sub")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr  # exit 10 would mean "nothing to save"
+
+
 def test_a_receipt_whose_own_earlier_name_was_unreadable_says_so(repo, tmp_path):  # r6 A3: the receipt used to snapshot comparisonUnreadable before its own save
     (repo / "a.txt").write_bytes(b"changed\n")
     pid = str(dead_pid())
@@ -460,7 +503,7 @@ def test_the_toplevel_path_is_never_trimmed():
 # ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
 FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
 # The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.
-LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType\s+HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.File\]::(?:Move|Replace)", re.IGNORECASE)  # r6 A5: [IO.File] is the same type as [System.IO.File]
+LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType\s+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.File\]::\s*(?:Move|Replace)|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
 
 
 def walker_violations(text):
@@ -475,6 +518,7 @@ def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_c
 
 @pytest.mark.parametrize("mutant", ["NtSetInformationFile(h, out io, info, 24, 11);", "CreateHardLinkW(a, b, 0);", "New-Item -ItemType HardLink -Path $a -Value $b",
                                     "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)",
-                                    "[IO.File]::Move($a, $b)", "[IO.File]::Replace($a, $b, $null)"])
+                                    "[IO.File]::Move($a, $b)", "[IO.File]::Replace($a, $b, $null)", "[IO.File]:: Move($a, $b)", "[IO.FileInfo]::new($a).MoveTo($b)",
+                                    "Move-Item -LiteralPath $a -Destination $b", 'New-Item -ItemType "HardLink" -Path $a -Value $b', "Rename-Item $a $b"])
 def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
     assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")
