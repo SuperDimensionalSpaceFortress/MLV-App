@@ -1062,8 +1062,12 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend) {
     # scaleFactor and acceptedEffectiveScale, displayMode), by calling the functions it calls. r5 (key3 F2): and the card and legId it binds to New-DvReceipt's
     # Mandatory [string] parameters. NOT mirrored: the leg's pre-submit REFUSALS (LEG_SPEC_NOT_COMMITTED, the playSeconds floor, clipId admission; OPEN
     # LEASE-BATCH-PLAN-PREFLIGHT-ADMISSION-PARITY-1) and the generatorArgs casts, which sit inside the leg's try and end as a typed receipt.
-    $spec = try { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json } catch { $null }
+    # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6 (adversary r5 A1): the leg's root, control-container and look.pairedSeekFrames refusals, by the SAME
+    # module predicate the leg calls (Get-DvLegSpecShapeRefusal), and -NoEnumerate as the leg reads it (a one-element array root is an array).
+    $spec = try { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate } catch { $null }
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
+    $shapeRefusal = Get-DvLegSpecShapeRefusal -Spec $spec
+    if ($null -ne $shapeRefusal) { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $shapeRefusal" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
     if ($Backend -notin @($spec.backends)) { return 'BAD_BACKEND', "backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', ')) in '$Path'" }
     try {

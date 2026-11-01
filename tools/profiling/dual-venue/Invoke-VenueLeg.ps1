@@ -218,20 +218,14 @@ $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
 # Line endings are normalised on BOTH sides of the committed-spec lookup (Get-DvLegSpecSha256): on this VM's default checkout (autocrlf=true) the working
 # copy is CRLF and the committed blob is LF, and a raw-byte hash would refuse every committed spec as LEG_SPEC_NOT_COMMITTED (fable r1 B2).
 $legSpecSha256 = Get-DvLegSpecSha256 $specBytes
-$spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json
-if ($spec -isnot [System.Management.Automation.PSCustomObject]) { throw 'DVE_LEG_SPEC_INVALID the leg spec must be a single JSON object' }
+# (-NoEnumerate, r6 fable r5 key hardening / adversary r5 A4: a one-element array root is an array, never its inner object)
+$spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B1) / r6 (adversary r5 A1): the root, every control container this runner (and its module) reads
+# members of, and look.pairedSeekFrames are checked by Get-DvLegSpecShapeRefusal -- the predicate the lease batch's preflight calls too -- and a spec it
+# refuses is refused here, typed and naming the field, before anything is generated or submitted.
+$shapeRefusal = Get-DvLegSpecShapeRefusal -Spec $spec
+if ($null -ne $shapeRefusal) { throw "DVE_LEG_SPEC_INVALID $shapeRefusal" }
 if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { throw "DVE_LEG_SPEC_INVALID schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
-# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B1): every control container this runner (and its module) reads members of must be ONE JSON
-# object when present. An array of objects reads through PowerShell's member enumeration for a direct member ($spec.look.contactSheetFrames) but
-# has no PSObject property for a presence check ($spec.look.PSObject.Properties['pairedSeek']), so its controls were dropped silently; null or a
-# scalar has neither. Any of them is refused here, typed and naming the field, before anything is generated or submitted.
-foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria') {
-    $present = $spec.PSObject.Properties[$container]
-    if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
-        $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
-        throw "DVE_LEG_SPEC_INVALID $container must be a single JSON object (it is $shape)"
-    }
-}
 if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backends)[0] }
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
 $isLook = ($spec.legType -eq 'look')
@@ -243,20 +237,9 @@ if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$s
 $lookFlavor = $null
 if ($isLook) { $lookFlavor = [string]$spec.look.lookFlavor; if ([string]::IsNullOrWhiteSpace($lookFlavor)) { $lookFlavor = 'classic' } }
 # r3 (sol B2 tooling): look.pairedSeekFrames, the display_frames the paused stills must show (one per contact-sheet frame, in order). It needs
-# look.pairedSeek true and distinct non-negative integers; anything else is refused here, before anything is generated or submitted.
+# look.pairedSeek true and distinct non-negative integers; anything else was refused above (Get-DvLegSpecShapeRefusal), before anything is generated or submitted.
 $pairedSeekFramesRequested = $null
-if ($isLook -and $null -ne $spec.look.PSObject.Properties['pairedSeekFrames']) {
-    $listed = $spec.look.pairedSeekFrames
-    $items = @($listed)
-    $bad = $(if ($listed -isnot [array]) { 'is not an array' }
-        elseif (-not ($spec.look.PSObject.Properties['pairedSeek'] -and $spec.look.pairedSeek -is [bool] -and $spec.look.pairedSeek)) { 'needs look.pairedSeek true' }
-        elseif (@($items | Where-Object { -not ($_ -is [int] -or $_ -is [long]) -or $_ -lt 0 }).Count -gt 0) { 'must hold non-negative integers' }
-        elseif (@($items | Sort-Object -Unique).Count -ne $items.Count) { 'must not repeat a frame' }
-        elseif ($items.Count -ne [int]$spec.look.contactSheetFrames) { "names $($items.Count) frame(s) but look.contactSheetFrames is $($spec.look.contactSheetFrames)" }
-        else { $null })
-    if ($null -ne $bad) { throw "DVE_LEG_SPEC_INVALID look.pairedSeekFrames $bad" }
-    $pairedSeekFramesRequested = [long[]]$items
-}
+if ($isLook -and $null -ne $spec.look.PSObject.Properties['pairedSeekFrames']) { $pairedSeekFramesRequested = [long[]]@($spec.look.pairedSeekFrames) }
 # PLAYBACK-VISUAL-INSPECTION-1: every SPEED leg keeps window captures unless its spec opts out (visualCapture false + a reason); a look leg never.
 $visualRequest = Get-DvVisualCaptureRequest -Spec $spec
 
@@ -844,41 +827,16 @@ if ($isLook -and $artifactsShare) {
         # r3 (sol B2 tooling): look.pairedSeekFrames names the display_frame each paused still must show (still i = frame-<ii>, the app's own
         # numbering), so an H and a C leg compare the SAME frames. Each still's sidecar display_frame is read back and recorded; a still that is
         # missing, has no readable display_frame or shows another frame makes framesHonoured false, and the gate below FAILS CLOSED on it.
-        # r5 (sol r4 B2): the frame a still reports is read from the HASH-LISTED bytes only. A still counts only when its png and its sidecar are both
-        # in the listing above; the sidecar is read ONCE, those bytes are hashed and must equal its listed sha256 (a file replaced after the hash step
-        # is refused, never interpreted under the hash of the file it replaced), and the display_frame is parsed from those same bytes.
+        # r5 (sol r4 B2): the frame a still reports is read from the HASH-LISTED bytes only. r6 (adversary r5 A2 / A3, Dot 5c6bcd98, sol r5 key B1 / B2):
+        # Get-DvPairedSeekVerdict reads BOTH listed files of each still back and binds each to its listed sha256 (a png missing, replaced or truncated after
+        # the listing is a mismatch naming it), and a still counts only when its sidecar says capture_mode "seek" and playback_path false. The receipt
+        # writer's final validation re-derives this block from the files with the same function.
         if ($null -ne $pairedSeekFramesRequested) {
-            $reported = [System.Collections.Generic.List[object]]::new()
-            $mismatches = [System.Collections.Generic.List[string]]::new()
-            $listedSha = @{}
-            foreach ($f in $seekFiles) { $listedSha[[string]$f.name] = [string]$f.sha256 }
-            for ($i = 0; $i -lt $pairedSeekFramesRequested.Count; $i++) {
-                $stillName = 'frame-{0:D2}' -f $i
-                $shown = $null
-                $changed = $false
-                if ($listedSha.ContainsKey("$stillName.json") -and $listedSha.ContainsKey("$stillName.png")) {
-                    $sidecar = Join-Path $seekLocal "$stillName.json"
-                    # (the leading comma keeps the byte[] one object through the scriptblock's output, an empty file included)
-                    [byte[]]$sidecarBytes = Invoke-DvCollect 'read' $sidecar { , [IO.File]::ReadAllBytes($sidecar) }
-                    if ((Get-DvSha256OfBytes $sidecarBytes) -cne $listedSha["$stillName.json"]) { $changed = $true }
-                    else {
-                        $parsed = $null
-                        try { $parsed = ([Text.Encoding]::UTF8.GetString($sidecarBytes).TrimStart([char]0xFEFF)) | ConvertFrom-Json } catch { $parsed = $null }
-                        if ($null -ne $parsed -and $null -ne $parsed.PSObject.Properties['display_frame']) {
-                            $value = $parsed.display_frame
-                            if ($value -is [int] -or $value -is [long]) { $shown = [long]$value }
-                        }
-                    }
-                }
-                $reported.Add($shown)
-                if ($changed) { $mismatches.Add("$stillName.json changed after it was hash-listed (its bytes no longer hash to the listed sha256), requested $($pairedSeekFramesRequested[$i])") }
-                elseif ($null -eq $shown) { $mismatches.Add("$stillName reported no display_frame, requested $($pairedSeekFramesRequested[$i])") }
-                elseif ($shown -ne [long]$pairedSeekFramesRequested[$i]) { $mismatches.Add("$stillName reported display_frame $shown, requested $($pairedSeekFramesRequested[$i])") }
-            }
+            $seekVerdict = Invoke-DvCollect 'read' ([string]$seekLocal) { Get-DvPairedSeekVerdict -SeekDir $seekLocal -Files $seekFiles -RequestedFrames $pairedSeekFramesRequested }
             $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested)
-            $pairedSeekInfo['reportedFrames'] = $reported.ToArray()
-            $pairedSeekInfo['framesHonoured'] = ($mismatches.Count -eq 0)
-            $pairedSeekInfo['frameMismatches'] = $mismatches.ToArray()
+            $pairedSeekInfo['reportedFrames'] = $seekVerdict.reportedFrames
+            $pairedSeekInfo['framesHonoured'] = $seekVerdict.framesHonoured
+            $pairedSeekInfo['frameMismatches'] = $seekVerdict.frameMismatches
         }
     }
     if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {

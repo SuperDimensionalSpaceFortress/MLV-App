@@ -342,6 +342,12 @@ class ControlContainerShapeTests(RunnerHarness, unittest.TestCase):
                 self.gen_log.write_text("", encoding="utf-8")
                 self.assert_refused(self.spec_with(leg_type, f"shape-{field}-{type(value).__name__}", **{field: value}), field)
 
+    def test_a_one_element_array_root_is_refused(self) -> None:
+        # r6 (fable r5 key hardening, adversary r5 A4): ConvertFrom-Json enumerated a top-level array, so [{<valid spec>}] arrived as the inner object.
+        path = self.write_spec(leg_type="look", leg_id="root-array")
+        path.write_text(json.dumps([json.loads(path.read_text(encoding="utf-8"))]), encoding="utf-8")
+        self.assert_refused(path, "the leg spec")
+
     def test_object_shaped_controls_still_reach_the_generator(self) -> None:
         self.write_artifacts(sheet=True, raw_frames=True)
         look = {"contactSheetFrames": 2, "lookFlavor": "classic", "pairedSeek": True}
@@ -457,6 +463,194 @@ class PairedSeekPublishTests(unittest.TestCase):
                 proc, pub = self.run_region(with_frames=with_frames, paired_seek=paired_seek)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertFalse((pub / "paired-seek").exists())
+
+
+SEEK_PNG = "(Join-Path $evidenceDir 'paired-seek\\contact-sheet\\raw\\frame-01.png')"
+SEEK_JSON = "(Join-Path $evidenceDir 'paired-seek\\contact-sheet\\raw\\frame-01.json')"
+PNG_MUTATIONS = (("deleted", f"Remove-Item -LiteralPath {SEEK_PNG}"),
+                 ("replaced", f"[IO.File]::WriteAllBytes({SEEK_PNG}, [byte[]](1, 2, 3))"),
+                 ("truncated", f"[IO.File]::WriteAllBytes({SEEK_PNG}, [byte[]]::new(0))"))
+
+
+class PairedStillsHarness(RunnerHarness):
+    """The paired-still fixtures the r6 tests share (a mixin: it holds no tests of its own)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+    def paired_spec(self, leg_id: str, frames: list[int] | None = (50, 150)) -> Path:
+        path = self.write_spec(leg_type="look", leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec["look"]["pairedSeek"] = True
+        if frames is not None:
+            spec["look"]["pairedSeekFrames"] = list(frames)
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def write_seek_stills(self, sidecars: list[bytes]) -> None:
+        seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
+        seek.mkdir(parents=True, exist_ok=True)
+        for i, sidecar in enumerate(sidecars):
+            (seek / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-%d" % i)
+            (seek / f"frame-{i:02d}.json").write_bytes(sidecar)
+
+    def fresh(self) -> None:
+        self.doCleanups()
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+
+@requires_windows_pwsh
+class PairedSeekStillBytesTests(PairedStillsHarness, unittest.TestCase):
+    """r6 (adversary A2, Dot 5c6bcd98, sol r5 key B1): a paused still counts only when BOTH its listed files -- the png as well as its sidecar -- are
+    read back and hash to the sha256 the listing recorded. r5 took the png's presence from the cached listing, so a png deleted, replaced or truncated
+    after the listing still left framesHonoured=true. And the receipt writer's final validation re-derives the paired-seek block from the files, so a
+    paired file removed or replaced AFTER collection cannot leave a PASS either."""
+
+    def run_mutated(self, leg_id: str, anchor: str, statement: str, before: bool = False, frames: list[int] | None = (50, 150)):
+        new = ("\n" + statement + anchor) if before else (anchor + "        " + statement + "\n")
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", anchor, new)])
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([seek_sidecar(50), seek_sidecar(150)])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.paired_spec(leg_id, frames), extra=["-Backend", "cpu"], dv=dv)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def test_a_png_deleted_replaced_or_truncated_after_the_listing_is_not_honoured(self) -> None:
+        for case, statement in PNG_MUTATIONS:
+            with self.subTest(case=case):
+                self.fresh()
+                receipt = self.run_mutated(f"png-{case}", SEEK_INFO_ANCHOR, statement)
+                info = receipt["look"]["pairedSeek"]
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+                self.assertIs(info["framesHonoured"], False)
+                self.assertTrue(any("frame-01.png" in m for m in info["frameMismatches"]), info["frameMismatches"])
+                self.assertIn("frame-01.png", receipt["outcomeDetail"], "the mismatch names the file")
+
+    def test_the_unchanged_control_passes(self) -> None:
+        receipt = self.run_mutated("png-control", SEEK_INFO_ANCHOR, "$null = 0")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIs(receipt["look"]["pairedSeek"]["framesHonoured"], True)
+        self.assertEqual(receipt["look"]["pairedSeek"]["frameMismatches"], [])
+
+    def test_a_paired_file_removed_or_replaced_after_collection_is_not_a_usable_pass(self) -> None:
+        # The frame verdict was taken from intact files; the mutation runs just before the receipt is written, so only final validation can see it.
+        replaced_sidecar = f"[IO.File]::WriteAllBytes({SEEK_JSON}, [Text.Encoding]::UTF8.GetBytes('" + seek_sidecar(131).decode("utf-8") + "'))"
+        for case, statement, frames in (("png-removed", f"Remove-Item -LiteralPath {SEEK_PNG}", (50, 150)),
+                                        ("png-replaced", f"[IO.File]::WriteAllBytes({SEEK_PNG}, [byte[]](1, 2, 3))", (50, 150)),
+                                        ("sidecar-replaced", replaced_sidecar, (50, 150)),
+                                        ("png-removed-no-frame-list", f"Remove-Item -LiteralPath {SEEK_PNG}", None)):
+            with self.subTest(case=case):
+                self.fresh()
+                receipt = self.run_mutated(f"final-{case}", FINAL_COMPLETE_ANCHOR, statement, before=True, frames=frames)
+                self.assertNotEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("the receipt writer refuses it", receipt["outcomeDetail"])
+                self.assertIn("PAIRED_SEEK", receipt["outcomeDetail"])
+                self.assertIn("frame-01", receipt["outcomeDetail"])
+
+    def test_the_final_validation_control_passes(self) -> None:
+        for frames in ((50, 150), None):
+            with self.subTest(frames=frames):
+                self.fresh()
+                receipt = self.run_mutated("final-control" + ("" if frames else "-nolist"), FINAL_COMPLETE_ANCHOR, "$null = 0", before=True, frames=frames)
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+
+def provenance_sidecar(display_frame: int, **fields: object) -> bytes:
+    side = {"capture_mode": "seek", "playback_path": False, "display_frame": display_frame}
+    for key, value in fields.items():
+        if value is KeyError:
+            side.pop(key)
+        else:
+            side[key] = value
+    return json.dumps(side).encode("utf-8")
+
+
+@requires_windows_pwsh
+class PairedSeekProvenanceTests(PairedStillsHarness, unittest.TestCase):
+    """r6 (adversary A3, sol r5 key B2): a paused still counts only when its sidecar says it was captured PAUSED through the full reconstruction path,
+    exactly as the app writes a seek capture (capture_mode "seek", playback_path false). An in-pass (playing) frame published as a paired still, or a
+    sidecar that does not say, is a typed mismatch naming the still, never a same-frame comparison."""
+
+    def run_with_sidecars(self, leg_id: str, sidecars: list[bytes]):
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills(sidecars)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.paired_spec(leg_id), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def test_a_still_not_captured_paused_through_the_full_path_is_not_honoured(self) -> None:
+        for case, fields in (("in-pass", {"capture_mode": "in_pass", "playback_path": True}), ("playing-seek", {"playback_path": True}),
+                             ("in-pass-mode", {"capture_mode": "in_pass"}), ("no-mode", {"capture_mode": KeyError}),
+                             ("no-path", {"playback_path": KeyError}), ("string-path", {"playback_path": "false"}),
+                             ("case-mode", {"capture_mode": "Seek"})):
+            with self.subTest(case=case):
+                self.fresh()
+                receipt = self.run_with_sidecars(f"prov-{case}", [provenance_sidecar(50, **fields), provenance_sidecar(150, **fields)])
+                info = receipt["look"]["pairedSeek"]
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+                self.assertIs(info["framesHonoured"], False)
+                self.assertTrue(any(m.startswith("frame-00") and "capture_mode" in m for m in info["frameMismatches"]), info["frameMismatches"])
+
+    def test_the_seek_paused_control_passes(self) -> None:
+        receipt = self.run_with_sidecars("prov-control", [provenance_sidecar(50), provenance_sidecar(150)])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+
+PREFLIGHT_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
+$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $args[0] 'Invoke-VenueLeaseBatch.ps1'), [ref]$null, [ref]$null)
+$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-LegSpecRefusal' }, $true)
+. ([scriptblock]::Create($fn.Extent.Text))
+foreach ($p in @($args | Select-Object -Skip 1)) { $r = @(Get-LegSpecRefusal $p 'cpu'); Write-Output ("ROW|" + (Split-Path -Leaf $p) + "|" + $r[0] + "|" + $r[1]) }
+"""
+
+
+@requires_pwsh
+class BatchPreflightParityTests(unittest.TestCase):
+    """r6 (adversary A1, sol r5 key hardening): the lease batch's preflight (Get-LegSpecRefusal) refuses every leg spec Invoke-VenueLeg would refuse
+    before its terminal try -- a root that is not one object, a control container that is not one object, a malformed look.pairedSeekFrames -- by
+    calling the SAME module predicate, so such a leg is refused before a lease opens instead of failing (LEG_FAILED, no receipt) after it."""
+
+    def test_the_preflight_refuses_what_the_leg_refuses_and_admits_the_committed_paired_leg(self) -> None:
+        base = json.loads((DV / "legs" / "m16-1243-q1-cpu-look-paired-windowed-s2.json").read_text(encoding="utf-8"))
+        look = dict(base["look"], contactSheetFrames=2)
+        cases = {
+            "ok": (base, ""),
+            "ok-frames": (dict(base, look=dict(look, pairedSeekFrames=[50, 150])), ""),
+            "arr-look": (dict(base, look=[base["look"]]), "look must be a single JSON object"),
+            "arr-gen": (dict(base, generatorArgs=[base["generatorArgs"]]), "generatorArgs must be a single JSON object"),
+            "dupe-frames": (dict(base, look=dict(look, pairedSeekFrames=[50, 50])), "pairedSeekFrames must not repeat a frame"),
+            "count-frames": (dict(base, look=dict(look, pairedSeekFrames=[50])), "pairedSeekFrames names 1 frame(s)"),
+            "root-array": ([base], "is not a JSON object"),
+        }
+        tmp = tempfile.TemporaryDirectory(prefix="preflight-parity-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        paths = []
+        for name, (doc, _) in cases.items():
+            (root / f"{name}.json").write_text(json.dumps(doc), encoding="utf-8")
+            paths.append(str(root / f"{name}.json"))
+        script = root / "probe.ps1"
+        script.write_text(PREFLIGHT_PROBE, encoding="utf-8")
+        import subprocess
+        from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import PWSH
+        proc = subprocess.run([PWSH, "-NoProfile", "-File", str(script), str(DV)] + paths, capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {line.split("|")[1][:-5]: line.split("|", 3)[2:] for line in proc.stdout.splitlines() if line.startswith("ROW|")}
+        for name, (_, needle) in cases.items():
+            with self.subTest(case=name):
+                code, message = rows[name]
+                if needle:
+                    self.assertEqual(code, "LEG_SPEC_INVALID", message)
+                    self.assertIn(needle, message)
+                else:
+                    self.assertEqual(code, "", message)
 
 
 if __name__ == "__main__":
