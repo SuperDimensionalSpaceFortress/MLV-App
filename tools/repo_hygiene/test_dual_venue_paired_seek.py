@@ -968,5 +968,146 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
                 self.assertNotIn("requestedFrames", info)
 
 
+# r9 (adversary r8 cc8061a2 A1, Dot pr-721 21:52:55Z, hub ACK 6564543250): legType values that are not ONE string of the schema's enum. Every one of
+# them, with look removed, passed the shared shape predicate on cc8061a2 (the array stringifies to 'look speed'), so the batch opened its lease and the
+# leg then compared the array (truthy) and indexed the absent look before any receipt.
+LEGTYPE_BAD = (("array", ["look", "speed"]), ("one-array", ["look"]), ("object", {"type": "look"}), ("number", 1), ("null", None), ("empty", ""),
+               ("case", "LOOK"))
+
+
+def run_preflight_probe(test: unittest.TestCase, cases: dict) -> dict:
+    tmp = tempfile.TemporaryDirectory(prefix="legtype-shape-")
+    test.addCleanup(tmp.cleanup)
+    root = Path(tmp.name)
+    paths = []
+    for name, (doc, _) in cases.items():
+        (root / f"{name}.json").write_text(json.dumps(doc), encoding="utf-8")
+        paths.append(str(root / f"{name}.json"))
+    (root / "probe.ps1").write_text(PREFLIGHT_PROBE, encoding="utf-8")
+    import subprocess
+    from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import PWSH
+    proc = subprocess.run([PWSH, "-NoProfile", "-File", str(root / "probe.ps1"), str(DV)] + paths, capture_output=True, text=True, timeout=300)
+    test.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+    return {line.split("|")[1][:-5]: line.split("|", 3)[2:] for line in proc.stdout.splitlines() if line.startswith("ROW|")}
+
+
+@requires_pwsh
+class LegTypeShapePreflightTests(unittest.TestCase):
+    """r9 A1: legType must be ONE string of the schema's enum ("speed", "look"; case-sensitive, as the validator compares it). Anything else is a typed
+    shape refusal in the shared predicate, so the lease batch's preflight refuses it before a lease opens. An ABSENT legType stays a speed leg, as the
+    runner has always read it (the lease-batch fixtures rely on it); only a PRESENT value of the wrong shape is refused."""
+
+    def test_r9_a1_a_legtype_that_is_not_one_enumerated_string_is_refused_by_the_preflight(self) -> None:
+        base = json.loads(SHIPPED_LISTLESS_SPEC.read_text(encoding="utf-8"))
+        no_look = {k: v for k, v in base.items() if k != "look"}
+        cases = {f"bad-{name}": (dict(no_look, legType=value), "legType") for name, value in LEGTYPE_BAD}
+        cases["bad-array-with-look"] = (dict(base, legType=["look", "speed"]), "legType")
+        cases["ok-look"] = (base, "")
+        cases["ok-absent"] = ({k: v for k, v in no_look.items() if k != "legType"}, "")
+        rows = run_preflight_probe(self, cases)
+        for name, (_, needle) in cases.items():
+            with self.subTest(case=name):
+                code, message = rows[name]
+                if needle:
+                    self.assertEqual(code, "LEG_SPEC_INVALID", message)
+                    self.assertIn("legType must be one of", message)
+                    self.assertNotIn("Cannot index", message)
+                else:
+                    self.assertEqual(code, "", message)
+
+
+@requires_windows_pwsh
+class LegTypeShapeLegTests(RunnerHarness, unittest.TestCase):
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+    def test_r9_a1_a_legtype_array_is_refused_typed_at_leg_entry(self) -> None:
+        for case, drop_look in (("array-no-look", True), ("array-with-look", False)):
+            with self.subTest(case=case):
+                path = self.write_spec(leg_type="look", leg_id=f"legtype-{case}")
+                spec = json.loads(path.read_text(encoding="utf-8"))
+                spec["legType"] = ["look", "speed"]
+                if drop_look:
+                    del spec["look"]
+                path.write_text(json.dumps(spec), encoding="utf-8")
+                self.gen_log.write_text("", encoding="utf-8")
+                proc, receipt, submitted = self.run_leg("ultra-magnus", path, extra=["-Backend", "cpu"])
+                out = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, out)
+                self.assertIn("DVE_LEG_SPEC_INVALID legType must be one of", out)
+                self.assertNotIn("Cannot index into a null array", out)
+                self.assertIsNone(receipt, "a refused spec writes no receipt (like every other DVE_LEG_SPEC_INVALID)")
+                self.assertEqual(submitted, [], "nothing is submitted")
+                self.assertEqual(self.generator_calls(), [], "nothing is generated")
+
+
+IN_PASS_RAW = ("artifacts", "contact-sheet", "raw")
+
+
+@requires_windows_pwsh
+class PairedSeekInPassPartnerTests(PairedStillsHarness, unittest.TestCase):
+    """r9 (adversary r8 cc8061a2 A2 / A3, Dot pr-721 21:52:55Z, hub ACK 6564543250): a paired still is the paused rendition of a frame the measured pass
+    PRESENTED, so its in-pass partner must be one: contact-sheet\\raw\\frame-<ii>.json saying capture_mode "in_pass" and playback_path Boolean true, as
+    the app writes an in-pass grab (MainWindow.cpp in-pass sidecar writer), AND contact-sheet\\raw\\frame-<ii>.png hash-listed beside it. cc8061a2 read
+    only the partner's display_frame: six paused stills against six paused (seek/false) partners stayed honoured (A2), and six partner sidecars with only
+    frame-00.png stayed honoured (A3). Both are typed mismatches now, at collection and at the receipt writer's final validation. The complete control is
+    PairedSeekCommittedStillSetTests.test_the_complete_six_still_paused_control_passes (unchanged)."""
+
+    def run_partner_case(self, leg_id: str, partner_fields: dict | None = None, partner_of: tuple[int, ...] = tuple(range(6)),
+                         drop_pngs: tuple[int, ...] = (), final: bool = False):
+        runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claimed_block(SIX_FRAMES))])} if final else {}
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([provenance_sidecar(f) for f in SIX_FRAMES])
+        raw = self.artifacts.joinpath(*IN_PASS_RAW)
+        for i in partner_of if partner_fields else ():
+            side = {"capture_mode": "in_pass", "playback_path": True, "display_frame": SIX_FRAMES[i]}
+            for key, value in partner_fields.items():
+                if value is KeyError:
+                    side.pop(key)
+                else:
+                    side[key] = value
+            (raw / f"frame-{i:02d}.json").write_bytes(json.dumps(side).encode("utf-8"))
+        for i in drop_pngs:
+            (raw / f"frame-{i:02d}.png").unlink()
+        spec = PairedSeekCommittedStillSetTests.shipped_spec(self, leg_id + ("-f" if final else ""))
+        proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"], **runner)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def assert_invalid(self, receipt, *needles: str, final: bool = False) -> None:
+        PairedSeekCommittedStillSetTests.assert_not_a_pass(self, receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", *needles, final=final)
+        if not final:
+            self.assertIs(receipt["look"]["pairedSeek"]["framesHonoured"], False)
+
+    def test_r9_a2_a_partner_that_was_not_an_in_pass_playing_grab_is_not_a_pass(self) -> None:
+        for case, fields in (("seek-false", {"capture_mode": "seek", "playback_path": False}), ("no-mode", {"capture_mode": KeyError}),
+                             ("no-path", {"playback_path": KeyError}), ("string-true", {"playback_path": "true"}), ("int-one", {"playback_path": 1}),
+                             ("case-mode", {"capture_mode": "In_Pass"})):
+            for final in ((False, True) if case in ("seek-false", "string-true") else (False,)):
+                with self.subTest(case=case, final_validation=final):
+                    self.fresh()
+                    receipt = self.run_partner_case(f"partner-{case}", partner_fields=fields, final=final)
+                    self.assert_invalid(receipt, "frame-00", "in-pass partner", final=final)
+
+    def test_r9_a3_every_partner_needs_its_own_hash_listed_png(self) -> None:
+        for final in (False, True):
+            with self.subTest(final_validation=final):
+                self.fresh()
+                receipt = self.run_partner_case("partner-pngs", drop_pngs=(1, 2, 3, 4, 5), final=final)
+                self.assert_invalid(receipt, "frame-01", "frame-05", "contact-sheet\\raw\\frame-01.png", final=final)
+
+    def test_r9_combined_a_missing_partner_png_and_a_seek_partner_in_one_receipt_is_not_a_pass(self) -> None:
+        for final in (False, True):
+            with self.subTest(final_validation=final):
+                self.fresh()
+                receipt = self.run_partner_case("partner-combined", partner_fields={"capture_mode": "seek", "playback_path": False}, partner_of=(2,),
+                                                drop_pngs=(1,), final=final)
+                self.assert_invalid(receipt, "frame-01", "frame-02", final=final)
+                if not final:
+                    blamed = sorted({m[:8] for m in receipt["look"]["pairedSeek"]["frameMismatches"]})
+                    self.assertEqual(blamed, ["frame-01", "frame-02"], "each defect is named, the intact stills are not blamed")
+
+
 if __name__ == "__main__":
     unittest.main()

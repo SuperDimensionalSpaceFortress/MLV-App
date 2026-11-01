@@ -4190,6 +4190,23 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
 
+    def test_r9_dualiso_a_scalar_leg_spec_whose_legtype_is_not_one_enumerated_string_is_refused_before_the_claim(self) -> None:
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r9 (adversary r8 cc8061a2 A1): legType ["look","speed"] with no look stringified to 'look speed', passed the shared
+        # shape predicate, opened the lease, and the leg then indexed the absent look (LEG_FAILED, no receipt). Every non-enum legType is refused before any claim.
+        base = {k: v for k, v in json.loads(self._valid_leg_spec_text()).items() if k != "look"}
+        for case, value in (("array", ["look", "speed"]), ("object", {"type": "look"}), ("number", 1), ("null", None), ("empty", ""), ("case", "LOOK")):
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"legtype-{case}.json"
+                spec.write_text(json.dumps({**base, "legType": value}), encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertIn("legType must be one of", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
     def test_r9_a_spec_in_the_run_dir_under_another_name_is_not_refused(self) -> None:
         # the guard names the runner's outputs, not the directory: a spec kept beside them under any other name still runs
         shutil.rmtree(self.run_dir, ignore_errors=True)

@@ -1938,6 +1938,7 @@ function Read-DvContactFrames {
 # leg would refuse is refused before a lease opens, never after it (LEG_FAILED, no receipt). A control container the runner reads members of must be ONE
 # JSON object when present (r5, sol r4 B1: an array reads through member enumeration but has no PSObject property, so its controls were dropped), and
 # look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg. Returns the refusal text, or $null.
+$script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
@@ -1948,11 +1949,20 @@ function Get-DvLegSpecShapeRefusal {
             return "$container must be a single JSON object (it is $shape)"
         }
     }
+    # r9 (adversary r8 cc8061a2 A1, Dot pr-721, hub ACK 6564543250): legType is ONE string of the schema's enum, compared case-sensitively as the validator
+    # compares it. [string] of the array ["look","speed"] is 'look speed', so that spec with no look passed this predicate, the batch opened its lease, and the
+    # leg's -eq against the array was truthy and indexed the absent look before any receipt. An array, object, number, null, empty or other-case value is
+    # refused here, for the leg and every batch preflight alike. An ABSENT legType stays a speed leg, as the runner has always read it.
+    $legTypeProp = $Spec.PSObject.Properties['legType']
+    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
+        return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
+    }
+    $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
     # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
     # "Cannot index into a null array" after the batch had opened its lease).
-    if ([string](Get-DvProp $Spec 'legType') -eq 'look' -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }
+    if ($isLookLeg -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }
     $look = Get-DvProp $Spec 'look'
-    if ([string](Get-DvProp $Spec 'legType') -ne 'look' -or $null -eq $look -or $null -eq $look.PSObject.Properties['pairedSeekFrames']) { return $null }
+    if (-not $isLookLeg -or $null -eq $look -or $null -eq $look.PSObject.Properties['pairedSeekFrames']) { return $null }
     $listed = $look.pairedSeekFrames
     $items = @($listed)
     $bad = $(if ($listed -isnot [array]) { 'is not an array' }
@@ -1991,10 +2001,10 @@ function Get-DvPairedSeekVerdict {
     $reported = [System.Collections.Generic.List[object]]::new()
     $mismatches = [System.Collections.Generic.List[string]]::new()
     $show = { param($v) $(if ($null -eq $v) { 'absent' } else { ConvertTo-Json -InputObject $v -Compress }) }
-    $readFrame = { param([byte[]]$b) $o = $null
+    # r9 (adversary r8 cc8061a2 A2 / A3): the in-pass partner sidecar is read whole -- its display_frame AND its provenance -- not only the frame number
+    $readSidecar = { param([byte[]]$b) $o = $null
         try { $o = ([Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $o = $null }
-        $v = $(if ($o -is [System.Management.Automation.PSCustomObject]) { Get-DvProp $o 'display_frame' } else { $null })
-        $(if ($v -is [int] -or $v -is [long]) { [long]$v } else { $null }) }
+        $(if ($o -is [System.Management.Automation.PSCustomObject]) { $o } else { $null }) }
     $inPassBytes = @{}
     foreach ($f in @($InPassFiles)) { if ($null -ne $f) { $inPassBytes[[string](Get-DvProp $f 'name')] = (Get-DvProp $f 'bytes') } }
     if (-not [string]::IsNullOrEmpty($SeekDir) -and (Test-Path -LiteralPath $SeekDir -PathType Container)) {
@@ -2044,9 +2054,20 @@ function Get-DvPairedSeekVerdict {
             }
             elseif ($frameList -and $shown -ne $requested) { $problem = "$stillName reported display_frame $shown$tail" }
             # fix 2 (adversary r8 fix-1 A2): the in-pass partner binds a listed-frame leg too -- the list adds the requested frame, it never removes the pairing
+            # r9 (adversary r8 cc8061a2 A2 / A3, Dot pr-721 21:52:55Z, hub ACK 6564543250): the partner must be a frame the measured pass PRESENTED -- its
+            # sidecar says capture_mode "in_pass" and playback_path Boolean true, exactly as the app writes an in-pass grab (MainWindow.cpp in-pass sidecar
+            # writer; not the string "true", not 1) -- and its own image contact-sheet\raw\<still>.png must be among the hash-verified in-pass files. cc8061a2
+            # read only the partner's display_frame, so paused-versus-paused pairs, and six partner sidecars beside a single png, stayed honoured.
             else {
-                $partner = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readFrame ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
+                $partnerSide = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readSidecar ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
+                $partnerValue = Get-DvProp $partnerSide 'display_frame'
+                $partner = $(if ($partnerValue -is [int] -or $partnerValue -is [long]) { [long]$partnerValue } else { $null })
+                $partnerMode = Get-DvProp $partnerSide 'capture_mode'; $partnerPath = Get-DvProp $partnerSide 'playback_path'
                 if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying an integer display_frame), so its paused still cannot be shown to be the same frame" }
+                elseif (-not ($partnerMode -is [string] -and $partnerMode -ceq 'in_pass' -and $partnerPath -is [bool] -and $partnerPath)) {
+                    $problem = "$stillName's in-pass partner $stillName.json was not grabbed while playing (it says capture_mode $(& $show $partnerMode), playback_path $(& $show $partnerPath); an in-pass partner needs capture_mode ""in_pass"" and playback_path true), so its paused still is no playing-versus-paused comparison"
+                }
+                elseif (-not $inPassBytes.ContainsKey("$stillName.png")) { $problem = "$stillName's in-pass partner has no image: contact-sheet\raw\$stillName.png is not among the hash-verified in-pass files, so there is no playing frame to compare its paused still with" }
                 elseif ($shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
             }
         }

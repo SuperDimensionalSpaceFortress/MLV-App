@@ -228,7 +228,8 @@ if ($null -ne $shapeRefusal) { throw "DVE_LEG_SPEC_INVALID $shapeRefusal" }
 if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { throw "DVE_LEG_SPEC_INVALID schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
 if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backends)[0] }
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
-$isLook = ($spec.legType -eq 'look')
+# (r9, adversary r8 cc8061a2 A1: Get-DvLegSpecShapeRefusal above refused every legType that is not one enum string, so this compares a string, case-sensitively)
+$isLook = ($spec.legType -ceq 'look')
 # The settled-playback window the job passes to the smoke runner (generator -PlaySeconds). The generator's own default
 # is 25; the owner's floor (20 s, 10 s for an HFR clip: HFR-10S-1) is enforced here, at its lowest, before anything is
 # submitted, and at the clip's own value by the venue's runner and the app.
