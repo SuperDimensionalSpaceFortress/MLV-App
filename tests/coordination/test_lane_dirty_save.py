@@ -1,6 +1,6 @@
 """LANE-DIRTY-SAVE-CORE-1: tools/coordination/lane-dirty-save.ps1 keeps a dead lane's uncommitted work.
 Exit codes: 0 saved, 10 nothing to save, 20 lane alive (refused), 30 bad arguments, 40 git failed."""
-import datetime, json, os, shutil, subprocess, sys
+import datetime, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 import pytest
@@ -230,3 +230,125 @@ def test_diff_context_config_cannot_make_the_patch_unappliable(repo, tmp_path): 
     clone = tmp_path / "clone"
     subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(repo), str(clone)], check=True, capture_output=True)
     git(clone, "apply", "--binary", "--check", str(next((tmp_path / "run").glob("*.patch"))))
+
+# ---- r5: sol r4 B1-B7 on #722 ----
+def head8(wd):
+    return git(wd, "rev-parse", "HEAD").decode().strip()[:8]
+
+
+def last_receipt(r):
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_an_inherited_git_diff_opts_cannot_make_the_patch_unappliable(repo, tmp_path):  # sol r4 B1
+    (repo / "a.txt").write_bytes(b"one\r\nTWO\nthree\n")
+    assert save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "GIT_DIFF_OPTS": "--unified=0"}).returncode == 0
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(repo), str(clone)], check=True, capture_output=True)
+    git(clone, "apply", "--binary", "--check", str(next((tmp_path / "run").glob("*.patch"))))
+
+
+def test_a_process_that_started_after_created_utc_is_dead_even_by_half_a_second(repo, tmp_path):  # sol r4 B2a
+    dirty(repo)
+    born = datetime.datetime.now(datetime.timezone.utc)
+    time.sleep(0.4)
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        child = tmp_path / "child.json"
+        child.write_text(json.dumps({"pid": sleeper.pid, "createdUtc": born.isoformat()}))
+        r = save(repo, "-ChildJson", str(child))
+        assert r.returncode == 0, r.stdout + r.stderr
+    finally:
+        sleeper.kill()
+
+
+@pytest.mark.parametrize("created", [1, 0, "soon", True])
+def test_a_created_utc_that_is_not_an_iso_timestamp_is_bad_arguments_and_saves_nothing(repo, tmp_path, created):  # sol r4 B2b
+    dirty(repo)
+    child = tmp_path / "child.json"
+    child.write_text(json.dumps({"pid": os.getpid(), "createdUtc": created}))
+    r = save(repo, "-ChildJson", str(child))
+    assert r.returncode == 30, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+def test_a_directory_at_an_artifact_name_advances_the_suffix_and_the_receipt_is_written(repo, tmp_path):  # sol r4 B3
+    (repo / "a.txt").write_bytes(b"two\n")
+    git(repo, "add", "a.txt")
+    (repo / "a.txt").write_bytes(b"three\n")
+    (tmp_path / "run" / f"dirty-save-{head8(repo)}.staged.patch").mkdir()
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    receipt = last_receipt(r)
+    assert receipt["staged"].endswith(".2.staged.patch") and (tmp_path / "run" / receipt["staged"]).is_file()
+    assert any(n.endswith(".receipt.json") for n in saved(repo))
+
+
+def test_an_unreadable_existing_artifact_is_never_called_different(repo, tmp_path):  # sol r4 B4
+    (repo / "a.txt").write_bytes(b"changed\n")
+    pid = str(dead_pid())
+    first = last_receipt(save(repo, "-LanePid", pid))
+    held = tmp_path / "run" / first["patch"]
+    marker = tmp_path / "held.marker"
+    holder = subprocess.Popen([PWSH, "-NoProfile", "-Command",
+                               f"$fs = [System.IO.File]::Open('{held}', 'Open', 'Read', 'None'); Set-Content -LiteralPath '{marker}' x; Start-Sleep 60"])
+    try:
+        for _ in range(200):
+            if marker.exists():
+                break
+            time.sleep(0.1)
+        assert marker.exists()
+        r = save(repo, "-LanePid", pid)
+        assert r.returncode == 0, r.stdout + r.stderr
+        second = last_receipt(r)
+        assert second["comparisonUnreadable"] == [first["patch"]]  # it says the comparison was unreadable instead of claiming the bytes differ
+        assert second["patch"] != first["patch"]  # the dirt is still saved (suffixed) rather than lost behind a lock
+    finally:
+        holder.kill()
+
+
+def test_both_diffs_are_pinned_to_the_one_resolved_head_sha():  # sol r4 B5: a HEAD move between the git calls cannot be replayed black-box, so the source is pinned
+    calls = re.findall(r"@\('diff'[^)]*\)", SCRIPT.read_text(encoding="utf-8"))
+    assert len(calls) == 2 and all("$headFull" in c and "'HEAD'" not in c for c in calls), calls
+
+
+def test_a_subdirectory_work_dir_collects_the_whole_worktree_even_with_diff_relative(repo, tmp_path):  # sol r4 B6
+    (repo / "sub").mkdir()
+    (repo / "sub" / "s.txt").write_text("s\n")
+    git(repo, "add", "sub")
+    git(repo, "commit", "-q", "-m", "sub")
+    git(repo, "config", "diff.relative", "true")
+    (repo / "a.txt").write_bytes(b"outside the subdirectory\n")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo / "sub"), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert b"a/a.txt" in (tmp_path / "run" / last_receipt(r)["patch"]).read_bytes()
+
+
+def test_a_run_dir_inside_the_worktree_is_bad_arguments(repo):  # sol r4 hardening: evidence written in the tree would be listed as untracked dirt on the next save
+    (repo / "run").mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(repo / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30, r.stdout + r.stderr
+    assert list((repo / "run").iterdir()) == []
+
+
+# ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
+FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
+# The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.
+LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType\s+HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[System\.IO\.File\]::(?:Move|Replace)", re.IGNORECASE)
+
+
+def walker_violations(text):
+    return LINK_CAPABLE.findall(text)
+
+
+def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_clean():
+    live, frozen = (p.read_bytes().replace(b"\r\n", b"\n") for p in (SCRIPT, FIXTURE))
+    assert frozen == live, f"re-copy: cp {SCRIPT} {FIXTURE}"
+    assert walker_violations(frozen.decode("utf-8")) == []
+
+
+@pytest.mark.parametrize("mutant", ["NtSetInformationFile(h, out io, info, 24, 11);", "CreateHardLinkW(a, b, 0);", "New-Item -ItemType HardLink -Path $a -Value $b",
+                                    "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)"])
+def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
+    assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")
