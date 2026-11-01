@@ -1468,6 +1468,28 @@ TEST( PlayPaceRecovery, R12ThreeStallsStallsOfDifferentLengthsAndAStallStraddlin
     }
 }
 
+TEST( PlayPaceRecovery, R12AdversaryA1StallsShorterThanAFixedThresholdAreStillSeen )
+{
+    // r12 adversary A1 (cc9a1944), its exact input: 1 s first present, held [2500,2700), [4500,4700), [6500,6700), 24 fps
+    // otherwise, polled every 10 or 50 ms. At 8 s consumed = 154; cc9a1944's fixed 250 ms threshold counted the three
+    // ~240 ms holds as playing, measured 22.67 fps and refused PaceTooSlow (67.3 s), although the run finishes at 64.02 s.
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> a1 = stallsOf( { Stall{ 2500, 200 }, Stall{ 4500, 200 }, Stall{ 6500, 200 } } );
+    ASSERT_EQ( int64_t( 154 ), stalledCount( 8000, 1000, 24, a1 ) );
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 1000, 24, a1, 1499, budget, poll );
+        ASSERT_EQ( int64_t( 154 ), run.consumedAt8s );
+        ASSERT_TRUE( run.state == PlayStopState::Reached );
+        ASSERT_TRUE( run.elapsedMs >= 64016 && run.elapsedMs < budget );
+        ASSERT_TRUE( runStalledEngine( 1000, 24.0, 1499, budget, poll, a1 ).state == PlayStopState::Reached );
+    }
+    // shorter still: six 100 ms stalls at the 10 ms poll (finishes at 64.02 s)
+    const std::vector<Stall> six = stallsOf( { Stall{ 2000, 100 }, Stall{ 3000, 100 }, Stall{ 4000, 100 },
+                                               Stall{ 5000, 100 }, Stall{ 6000, 100 }, Stall{ 7000, 100 } } );
+    ASSERT_TRUE( pollStalledCount( 1000, 24, six, 1499, budget ).state == PlayStopState::Reached );
+}
+
 TEST( PlayPaceRecovery, R12ControlsStillEndTypedPaceTooSlow )
 {
     const int64_t budget = playSafetyMs( 25.0 );
@@ -1565,12 +1587,30 @@ TEST( PlayPaceRecovery, R12ThePlayingPaceStartsOverWithTheHistoryAndNeedsEnoughP
     PlayPaceHistory h;
     for( int64_t t = 0; t <= 8000; t += 10 ) h.note( stalledCount( t, 1000, 24, dot ), t );
     ASSERT_TRUE( h.playingPace( 8000 ) * 1000.0 >= 23.9 );
-    ASSERT_TRUE( h.stallMs >= 1000 && h.stallMs <= 1200 );   // the two holds of ~550 ms each
-    h.note( 1, 8010 );                                        // a new Play re-armed the counter
-    ASSERT_EQ( int64_t( 0 ), h.playingMs );
-    ASSERT_EQ( int64_t( 0 ), h.playingSteps );
-    ASSERT_EQ( int64_t( 0 ), h.stallMs );
+    const PlayPaceHistory::PlayingSplit split = h.playingSplit( 8000 );
+    ASSERT_TRUE( split.stallMs >= 1000 && split.stallMs <= 1200 );   // the two holds of ~550 ms each
+    ASSERT_TRUE( split.thresholdMs >= 50 && split.thresholdMs <= 80 );  // median hold 40 ms + 2 x 10 ms polls
+    h.note( 1, 8010 );                                                  // a new Play re-armed the counter
+    ASSERT_EQ( int64_t( 0 ), h.holds );
+    ASSERT_EQ( int64_t( 0 ), h.pollGaps );
+    ASSERT_EQ( int64_t( 0 ), h.playingSplit( 8010 ).stallMs );
     ASSERT_EQ( 0.0, h.playingPace( 8010 ) );
+    // a steady engine at any pace has every hold counted as playing (the threshold follows its own cadence)
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 24 ), int64_t( 60 ) } )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+        {
+            PlayPaceHistory steady;
+            for( int64_t t = 0; t <= 20000; t += poll ) steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t );
+            const PlayPaceHistory::PlayingSplit st = steady.playingSplit( 20000 / poll * poll );
+            ASSERT_EQ( int64_t( 0 ), st.stallMs );
+        }
+    }
+    // holds longer than the histogram are always stalls
+    PlayPaceHistory longHolds;
+    for( int64_t t = 0; t <= 20000; t += 10 ) longHolds.note( 1 + t / 1500, t );
+    ASSERT_TRUE( longHolds.overflowHolds > 0 );
+    ASSERT_EQ( 0.0, longHolds.playingPace( 20000 ) );
     // 2.9 s of playing is not enough; 3 s is
     PlayPaceHistory s;
     for( int64_t t = 0; t <= 2900; t += 10 ) s.note( stalledCount( t, 0, 24, std::vector<Stall>() ), t );
@@ -1578,8 +1618,10 @@ TEST( PlayPaceRecovery, R12ThePlayingPaceStartsOverWithTheHistoryAndNeedsEnoughP
     for( int64_t t = 2910; t <= 3100; t += 10 ) s.note( stalledCount( t, 0, 24, std::vector<Stall>() ), t );
     ASSERT_TRUE( s.playingPace( 3100 ) > 0.0 );
     // an open hold longer than the stall threshold is stall time, not playing time
-    s.note( s.lastConsumed, 3100 + playback_frame_range::kPaceStallHoldMs + 10 );
-    ASSERT_TRUE( s.playingPace( 3100 + playback_frame_range::kPaceStallHoldMs + 10 ) * 1000.0 >= 23.9 );
+    ASSERT_EQ( int64_t( 0 ), s.playingSplit( 3100 ).stallMs );
+    s.note( s.lastConsumed, 3400 );
+    ASSERT_TRUE( s.playingSplit( 3400 ).stallMs >= 250 );
+    ASSERT_TRUE( s.playingPace( 3400 ) * 1000.0 >= 23.9 );
 }
 
 TEST( PlayPaceRecovery, R12TheProjectionWithStallsIsNeverStricterThanMasters )

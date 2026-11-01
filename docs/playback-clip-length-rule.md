@@ -152,8 +152,10 @@ FRAME:
   forward step, and the pace over any stretch of 3 s or more, measured from the last time the count was seen at its
   start value (`PlayPaceHistory`, `kPaceRecentWindowMs`), so a stall the count sat through is not charged to the
   stretch after it. MERGE-MASTER r12 (ADV-A1b residual, Dot 6553009018) adds the playing pace: when several
-  recoverable stalls leave no clean 3 s stretch, the steps per second while the count was advancing, with every hold
-  longer than 250 ms (`kPaceStallHoldMs`) and the step ending it left out. It is trusted only after 3 s of playing
+  recoverable stalls leave no clean 3 s stretch, the steps per second while the count was advancing. Every hold longer
+  than the run's own median hold plus two median poll gaps (`kPaceStallPollGaps`) is a stall, and it is left out along
+  with the step that ends it. A steady engine at any pace has no such hold. A stall shorter than about two poll gaps
+  cannot be seen in the count, so it reads as a slower cadence. It is trusted only after 3 s of playing
   time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
   that keep coming are left to the other estimates, which refuse them at the probe. Only when even that
   pace cannot finish inside the budget does the run end as `PLAY_PACE_TOO_SLOW`. Anything else runs on to the
