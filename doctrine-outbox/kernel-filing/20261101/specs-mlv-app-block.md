@@ -25,7 +25,7 @@ recompute and the key prompts are unbound), so it gets identity-link credit only
 | K5 declared profile | GAP | INSTANCE-FAILURE, still failing (relapsed) | dispatched rounds declare before work; #728, #730 and #731 were produced by a hub chat and declared retroactively |
 | K6 independent key | FIT | FIT | sol (OpenAI family) on every subject head; hosted CI 35/35 per head; `merge_group` success per landing |
 | K7 delivery | FIT | FIT | enqueue witness per landing; no typed `CLOSURE_INCOMPLETE` |
-| K8 capacity | GAP (regraded) | FIT | 97 refusals in 19 events (last 2026-11-01T07:28Z). Most relaunches followed an ok probe, but 5 identical-prompt re-runs ran before a passed probe (10-17, 10-24, 10-29) and 36 launches had no logged passed probe |
+| K8 capacity | GAP (regraded) | FIT | 97 refusals in 19 events (last 2026-11-01T07:28Z). Most relaunches followed an ok probe, but 5 identical-prompt re-runs ran before a passed probe (10-17, 10-24, 10-29) and 33 launches had no ok probe line since the refusal |
 | K9 resume | UNEXERCISED | UNEXERCISED | `k9_witness` in CI (`tests.yml:135`, `:217`); the rotation resume was same-host |
 | K10 inventory | GAP | INSTANCE-FAILURE, still failing | inventory dated 2026-09-14; no Codex identity; not re-probed after the 2026-10-27 rotation |
 | K11 honest reports | GAP | INSTANCE-FAILURE, still failing (partly cured) | header guard `test_kernel_instance_profile_agreement.py` (#451); K4 citations and the board-local hash table drifted |
