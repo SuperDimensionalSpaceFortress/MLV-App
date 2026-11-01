@@ -1160,6 +1160,114 @@ TEST(ContactSheetSeekDirIdentity, TheCliCreatesBothDirsThenRefusesEveryRelationB
     ASSERT_TRUE(identityBlock.count(QStringLiteral("return 2;")) >= 2);
 }
 
+// r4 (Dot item 1 / adversary A1): trailing separators are stripped by the platform's own rule. On POSIX a
+// backslash is an ordinary filename character, so "/captures/in\" is a different directory from "/captures/in".
+// The rules are data, so both run on any host.
+TEST(ContactSheetSeekDirIdentity, EachPlatformStripsOnlyItsOwnTrailingSeparatorsAndKeepsARoot)
+{
+    using namespace output_dir_identity::detail;
+    const PathRules posix = posixPathRules();
+    const PathRules windows = windowsPathRules();
+    const auto strip = [](const QString & path, const PathRules & rules) {
+        return withoutTrailingSeparators(path, rules).toStdString();
+    };
+
+    ASSERT_EQ(std::string("/captures/in\\"), strip(QStringLiteral("/captures/in\\"), posix));
+    ASSERT_EQ(std::string("/captures/in\\"), strip(QStringLiteral("/captures/in\\/"), posix));
+    ASSERT_EQ(std::string("/a"), strip(QStringLiteral("/a/"), posix));
+    ASSERT_EQ(std::string("/a"), strip(QStringLiteral("/a//"), posix));
+    ASSERT_EQ(std::string("/a:"), strip(QStringLiteral("/a:/"), posix));
+    ASSERT_EQ(std::string("/"), strip(QStringLiteral("/"), posix));
+
+    ASSERT_EQ(std::string("C:\\cs\\in"), strip(QStringLiteral("C:\\cs\\in\\"), windows));
+    ASSERT_EQ(std::string("C:\\cs\\in"), strip(QStringLiteral("C:\\cs\\in/"), windows));
+    ASSERT_EQ(std::string("C:\\cs\\in"), strip(QStringLiteral("C:\\cs\\in\\/\\"), windows));
+    ASSERT_EQ(std::string("C:\\"), strip(QStringLiteral("C:\\"), windows));
+    ASSERT_EQ(std::string("\\\\?\\C:\\"), strip(QStringLiteral("\\\\?\\C:\\"), windows));
+    ASSERT_EQ(std::string("\\\\?\\C:\\cs"), strip(QStringLiteral("\\\\?\\C:\\cs\\"), windows));
+    ASSERT_EQ(std::string("\\\\server\\share"), strip(QStringLiteral("\\\\server\\share\\"), windows));
+}
+
+namespace
+{
+
+output_dir_identity::detail::DirIdentity provenIdentity(unsigned long long volume, unsigned long long index,
+                                                        const QString & resolvedPath,
+                                                        const output_dir_identity::detail::PathRules & rules)
+{
+    output_dir_identity::detail::DirIdentity id;
+    id.ok = true;
+    id.volume = volume;
+    id.index = index;
+    id.finalPath = output_dir_identity::detail::withoutTrailingSeparators(resolvedPath, rules);
+    return id;
+}
+
+} // namespace
+
+TEST(ContactSheetSeekDirIdentity, PosixSiblingsThatDifferByATrailingBackslashAreDistinctAndItsChildIsNested)
+{
+    using namespace output_dir_identity::detail;
+    using output_dir_identity::DirRelation;
+    const PathRules posix = posixPathRules();
+    const DirIdentity in = provenIdentity(1, 10, QStringLiteral("/captures/in"), posix);
+    const DirIdentity inBackslash = provenIdentity(1, 11, QStringLiteral("/captures/in\\"), posix);
+    const DirIdentity child = provenIdentity(1, 12, QStringLiteral("/captures/in\\/sub"), posix);
+
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(compareIdentities(inBackslash, in, posix).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(compareIdentities(in, inBackslash, posix).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::FirstInsideSecond),
+              static_cast<int>(compareIdentities(child, inBackslash, posix).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::SecondInsideFirst),
+              static_cast<int>(compareIdentities(inBackslash, child, posix).relation));
+    // The child of "/captures/in\" is not inside "/captures/in".
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(compareIdentities(child, in, posix).relation));
+
+    // Control, Windows rule: the same strings name one directory there, so they are Same.
+    const PathRules windows = windowsPathRules();
+    ASSERT_EQ(static_cast<int>(DirRelation::Same),
+              static_cast<int>(compareIdentities(provenIdentity(1, 11, QStringLiteral("C:\\cs\\in\\"), windows),
+                                                 provenIdentity(1, 10, QStringLiteral("C:\\cs\\in"), windows),
+                                                 windows).relation));
+}
+
+// r4 (adversary A2): Same is decided by object identity on every platform. A POSIX bind mount gives one directory
+// two canonical paths with one st_dev/st_ino; the r3 POSIX branch compared paths only and answered Distinct.
+TEST(ContactSheetSeekDirIdentity, OneFilesystemObjectUnderTwoResolvedPathsIsTheSameDirectoryOnEveryPlatform)
+{
+    using namespace output_dir_identity::detail;
+    using output_dir_identity::DirRelation;
+    for (const PathRules & rules : { posixPathRules(), windowsPathRules() }) {
+        const DirIdentity in = provenIdentity(7, 42, QStringLiteral("/captures/in"), rules);
+        const DirIdentity bindAlias = provenIdentity(7, 42, QStringLiteral("/mnt/seek"), rules);
+        ASSERT_EQ(static_cast<int>(DirRelation::Same), static_cast<int>(compareIdentities(bindAlias, in, rules).relation));
+        ASSERT_EQ(static_cast<int>(DirRelation::Same), static_cast<int>(compareIdentities(in, bindAlias, rules).relation));
+        // Controls: another inode on the same device, or the same inode number on another device, is another directory.
+        ASSERT_EQ(static_cast<int>(DirRelation::Distinct),
+                  static_cast<int>(compareIdentities(provenIdentity(7, 43, QStringLiteral("/mnt/seek"), rules), in, rules).relation));
+        ASSERT_EQ(static_cast<int>(DirRelation::Distinct),
+                  static_cast<int>(compareIdentities(provenIdentity(8, 42, QStringLiteral("/mnt/seek"), rules), in, rules).relation));
+        // No identity, no acceptance.
+        DirIdentity failed;
+        failed.error = QStringLiteral("stat_failed errno=13");
+        const output_dir_identity::DirComparison unknown = compareIdentities(failed, in, rules);
+        ASSERT_EQ(static_cast<int>(DirRelation::Unknown), static_cast<int>(unknown.relation));
+        ASSERT_TRUE(unknown.detail.contains(QStringLiteral("stat_failed errno=13")));
+    }
+
+    // The POSIX identity really is st_dev/st_ino of the canonical path, and a failed stat fails closed.
+    // (Console tests run on Windows only, so the POSIX branch is pinned by its source; Linux and macOS CI compile it.)
+    const QString header = readRepoFile(QStringLiteral("platform/qt/OutputDirIdentity.h"));
+    const int posixAt = header.indexOf(QStringLiteral("#else\ninline DirIdentity identityOf("));
+    ASSERT_TRUE(posixAt > 0);
+    const QString posixBranch = header.mid(posixAt, header.indexOf(QStringLiteral("#endif"), posixAt) - posixAt);
+    ASSERT_TRUE(posixBranch.contains(QStringLiteral("::stat(QFile::encodeName(canonical).constData(), &st)")));
+    ASSERT_TRUE(posixBranch.contains(QStringLiteral("stat_failed errno=")));
+    ASSERT_TRUE(posixBranch.contains(QStringLiteral("id.volume = static_cast<unsigned long long>(st.st_dev);")));
+    ASSERT_TRUE(posixBranch.contains(QStringLiteral("id.index = static_cast<unsigned long long>(st.st_ino);")));
+    ASSERT_TRUE(posixBranch.contains(QStringLiteral("withoutTrailingSeparators(canonical, posixPathRules())")));
+}
+
 TEST(ContactSheetSeekFrameListWiring, TheLogLineNamesTheListOnlyWhenItIsSetAndTheDoneLineIsUnchanged)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));

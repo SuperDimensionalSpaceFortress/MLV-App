@@ -5,7 +5,15 @@
 // A path-string comparison misses junctions, symlinks, subst drives and 8.3 names, so this compares what the
 // filesystem says. Both directories must already exist; anything that cannot be proved answers Unknown, and a
 // caller treats only Distinct as safe.
+//
+// r4: Same is decided by object identity on every platform (Windows: volume serial + file index; POSIX: st_dev +
+// st_ino of the canonical path), so a bind mount or other alias of the same directory compares Same.
+// Supported scope, known limit: nesting is decided from the resolved path strings. A directory that is reachable
+// only through a POSIX bind mount of an ancestor of the other directory is not detected as nested (proving that
+// would need the mount table, which this does not parse). Separators are stripped by the platform's own rule:
+// on POSIX a backslash is an ordinary filename character and is kept.
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QString>
 
@@ -15,6 +23,9 @@
 #endif
 #include <windows.h>
 #include <vector>
+#else
+#include <cerrno>
+#include <sys/stat.h>
 #endif
 
 namespace output_dir_identity {
@@ -32,17 +43,69 @@ namespace detail {
 struct DirIdentity
 {
     bool ok = false;
-    unsigned long long volume = 0;
-    unsigned long long index = 0;
+    unsigned long long volume = 0;   // Windows volume serial / POSIX st_dev
+    unsigned long long index = 0;    // Windows file index / POSIX st_ino
     QString finalPath;   // resolved through every alias, no trailing separator
     QString error;
 };
 
-inline QString withoutTrailingSeparator(QString path)
+// The path rules of one platform, as data, so both rules are testable on any host.
+struct PathRules
 {
-    while (path.size() > 1 && (path.endsWith(QLatin1Char('\\')) || path.endsWith(QLatin1Char('/'))))
+    QString separators;              // every character that separates path components
+    QChar separator;                 // the one a resolved path uses
+    Qt::CaseSensitivity pathCase;
+    bool driveRoots;                 // "C:\" is a root and keeps its separator
+};
+
+inline PathRules windowsPathRules()
+{
+    // Case-insensitive errs toward refusal on a case-sensitive folder.
+    return PathRules{ QStringLiteral("\\/"), QLatin1Char('\\'), Qt::CaseInsensitive, true };
+}
+
+inline PathRules posixPathRules()
+{
+    return PathRules{ QStringLiteral("/"), QLatin1Char('/'), Qt::CaseSensitive, false };
+}
+
+inline PathRules hostPathRules()
+{
+#ifdef Q_OS_WIN
+    return windowsPathRules();
+#else
+    return posixPathRules();
+#endif
+}
+
+// Strips trailing separators of the given rule only; a root ("/", "C:\", "\\?\C:\") is kept intact.
+inline QString withoutTrailingSeparators(QString path, const PathRules &rules)
+{
+    while (path.size() > 1 && rules.separators.contains(path.back())) {
+        if (rules.driveRoots && path.size() >= 2 && path.at(path.size() - 2) == QLatin1Char(':'))
+            break;
         path.chop(1);
+    }
     return path;
+}
+
+inline bool isInside(const QString &inner, const QString &outer, const PathRules &rules)
+{
+    const QString prefix = outer.endsWith(rules.separator) ? outer : outer + rules.separator;
+    return inner.size() > prefix.size() && inner.startsWith(prefix, rules.pathCase);
+}
+
+// Pure: the relation of two identities that were both obtained (ok).
+inline DirRelation relationOf(const DirIdentity &a, const DirIdentity &b, const PathRules &rules)
+{
+    const bool sameObject = a.volume == b.volume && a.index == b.index;
+    if (sameObject || a.finalPath.compare(b.finalPath, rules.pathCase) == 0)
+        return DirRelation::Same;
+    if (isInside(a.finalPath, b.finalPath, rules))
+        return DirRelation::FirstInsideSecond;
+    if (isInside(b.finalPath, a.finalPath, rules))
+        return DirRelation::SecondInsideFirst;
+    return DirRelation::Distinct;
 }
 
 #ifdef Q_OS_WIN
@@ -86,12 +149,11 @@ inline DirIdentity identityOf(const QString &path)
     }
     id.volume = info.dwVolumeSerialNumber;
     id.index = (static_cast<unsigned long long>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
-    id.finalPath = withoutTrailingSeparator(QString::fromWCharArray(buffer.data(), static_cast<int>(length)));
+    id.finalPath = withoutTrailingSeparators(QString::fromWCharArray(buffer.data(), static_cast<int>(length)),
+                                             windowsPathRules());
     id.ok = true;
     return id;
 }
-const QChar kSeparator = QLatin1Char('\\');
-const Qt::CaseSensitivity kPathCase = Qt::CaseInsensitive;   // errs toward refusal on a case-sensitive folder
 #else
 inline DirIdentity identityOf(const QString &path)
 {
@@ -99,48 +161,43 @@ inline DirIdentity identityOf(const QString &path)
     const QFileInfo info(path);
     if (!info.exists()) { id.error = QStringLiteral("does_not_exist"); return id; }
     if (!info.isDir()) { id.error = QStringLiteral("not_a_directory"); return id; }
-    id.finalPath = withoutTrailingSeparator(info.canonicalFilePath());
-    if (id.finalPath.isEmpty()) { id.error = QStringLiteral("canonical_path_failed"); return id; }
+    const QString canonical = info.canonicalFilePath();
+    if (canonical.isEmpty()) { id.error = QStringLiteral("canonical_path_failed"); return id; }
+    // The object identity: a bind mount or any other alias of the same directory has the same st_dev/st_ino.
+    struct stat st;
+    if (::stat(QFile::encodeName(canonical).constData(), &st) != 0) {
+        id.error = QStringLiteral("stat_failed errno=%1").arg(errno);
+        return id;
+    }
+    if (!S_ISDIR(st.st_mode)) { id.error = QStringLiteral("not_a_directory"); return id; }
+    id.volume = static_cast<unsigned long long>(st.st_dev);
+    id.index = static_cast<unsigned long long>(st.st_ino);
+    id.finalPath = withoutTrailingSeparators(canonical, posixPathRules());
     id.ok = true;
     return id;
 }
-const QChar kSeparator = QLatin1Char('/');
-const Qt::CaseSensitivity kPathCase = Qt::CaseSensitive;
 #endif
 
-inline bool isInside(const QString &inner, const QString &outer)
-{
-    const QString prefix = outer.endsWith(kSeparator) ? outer : outer + kSeparator;
-    return inner.size() > prefix.size() && inner.startsWith(prefix, kPathCase);
-}
-
-} // namespace detail
-
-inline DirComparison compareDirectories(const QString &first, const QString &second)
+// Pure: identities in, comparison out (so the pair can be injected by a test).
+inline DirComparison compareIdentities(const DirIdentity &a, const DirIdentity &b, const PathRules &rules)
 {
     DirComparison result;
-    const detail::DirIdentity a = detail::identityOf(first);
-    const detail::DirIdentity b = detail::identityOf(second);
     if (!a.ok || !b.ok) {
         result.detail = QStringLiteral("first=%1 second=%2")
             .arg(a.ok ? QStringLiteral("ok") : a.error, b.ok ? QStringLiteral("ok") : b.error);
         return result;
     }
     result.detail = QStringLiteral("first_final=%1 second_final=%2").arg(a.finalPath, b.finalPath);
-#ifdef Q_OS_WIN
-    const bool sameObject = a.volume == b.volume && a.index == b.index;
-#else
-    const bool sameObject = false;
-#endif
-    if (sameObject || a.finalPath.compare(b.finalPath, detail::kPathCase) == 0)
-        result.relation = DirRelation::Same;
-    else if (detail::isInside(a.finalPath, b.finalPath))
-        result.relation = DirRelation::FirstInsideSecond;
-    else if (detail::isInside(b.finalPath, a.finalPath))
-        result.relation = DirRelation::SecondInsideFirst;
-    else
-        result.relation = DirRelation::Distinct;
+    result.relation = relationOf(a, b, rules);
     return result;
+}
+
+} // namespace detail
+
+inline DirComparison compareDirectories(const QString &first, const QString &second)
+{
+    return detail::compareIdentities(detail::identityOf(first), detail::identityOf(second),
+                                     detail::hostPathRules());
 }
 
 } // namespace output_dir_identity
