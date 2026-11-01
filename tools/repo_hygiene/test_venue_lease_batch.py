@@ -7179,6 +7179,152 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
                 got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", bad[name]))
                 self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
 
+    # ---- r8 (PR #729 r7 keys; sol B1/B2/B3, opus+sol A3, fable G9): the helper's component rule and PowerShell-drive rule, stated against the round-1 contract "a bad root takes no batch resources".
+    def test_r8_b1_a_dos_device_name_with_spaces_before_the_extension_is_refused_on_every_component(self) -> None:
+        # sol B1 literal: RtlIsDosDeviceName_U treats `COM1 .txt`, `NUL .txt`, `LPT<sup2> .log` as devices (a run of spaces between the stem and the extension is dropped). Not only the last component.
+        s1, s2, s3 = "\u00b9", "\u00b2", "\u00b3"
+        bad = {
+            "com1-space-ext-last": "C:\\x\\.claude-state\\COM1 .txt\\receipts", "com1-space-ext-middle": "C:\\x\\.claude-state\\a\\COM1 .txt\\b\\receipts",
+            "com1-space-ext-final": "C:\\x\\.claude-state\\COM1 .txt", "com1-two-spaces-ext": "C:\\x\\.claude-state\\COM1   .txt\\r",
+            "nul-space-ext": "C:\\x\\.claude-state\\NUL .txt\\receipts", "nul-lower-space-ext": "C:\\x\\.claude-state\\nul  .log\\r",
+            "lpt-sup2-space-ext": f"C:\\x\\.claude-state\\LPT{s2} .log\\receipts", "com-sup1-space-ext": f"C:\\x\\.claude-state\\COM{s1} .txt\\receipts", "com-sup3-space-ext": f"C:\\x\\.claude-state\\com{s3} .dat\\r",
+            "con-space-ext": "C:\\x\\.claude-state\\CON .x\\r", "prn-space-ext": "C:\\x\\.claude-state\\PRN .x\\r", "aux-space-ext": "C:\\x\\.claude-state\\AUX .x\\r",
+            "conin-space-ext": "C:\\x\\.claude-state\\CONIN$ .x\\r", "conout-space-ext": "C:\\x\\.claude-state\\CONOUT$ .x\\r",
+            "lpt9-space-dotted-ext": "C:\\x\\.claude-state\\LPT9 .a.b\\r",
+        }
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "com10-is-not-a-device": "C:\\x\\.claude-state\\COM10 .txt\\r", "console-is-not-a-device": "C:\\x\\.claude-state\\CONSOLE .txt\\r",
+                                                      "fine": "C:\\x\\.claude-state\\good-root"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["com10-is-not-a-device"].lower(), "c:\\x\\.claude-state\\com10 .txt\\r", got)
+        self.assertEqual(got["console-is-not-a-device"].lower(), "c:\\x\\.claude-state\\console .txt\\r", got)
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        # the batch entry refuses before the run dir, the claim or a leg; the real leg entry refuses the same root
+        base = self.clean_base()
+        for label, comp in (("com1-space-ext", "COM1 .txt"), ("nul-space-ext", "NUL .txt")):
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(base / ".claude-state" / comp / "receipts"))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=label):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(base / ".claude-state" / comp / "receipts")))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_r8_g9_a_dos_device_name_as_a_middle_component_is_refused_and_the_superscript_class_is_exercised(self) -> None:
+        # fable G9: .NET GetFullPath refuses a superscript device name as the LAST component, so the regex never ran on it; a MIDDLE component reaches the regex
+        s1, s2, s3 = "\u00b9", "\u00b2", "\u00b3"
+        bad = {"com1-middle": "C:\\x\\.claude-state\\COM1\\r", "lpt3-ext-middle": "C:\\x\\.claude-state\\LPT3.log\\r",
+               "com-sup1-middle": f"C:\\x\\.claude-state\\COM{s1}\\r", "com-sup2-middle": f"C:\\x\\.claude-state\\COM{s2}\\r", "com-sup3-middle": f"C:\\x\\.claude-state\\COM{s3}\\r",
+               "lpt-sup1-middle": f"C:\\x\\.claude-state\\LPT{s1}\\r", "lpt-sup2-middle": f"C:\\x\\.claude-state\\LPT{s2}\\r", "lpt-sup3-ext-middle": f"C:\\x\\.claude-state\\LPT{s3}.log\\r",
+               "com-sup1-ext-middle": f"C:\\x\\.claude-state\\com{s1}.txt\\r", "com-sup3-deep-middle": f"C:\\x\\.claude-state\\a\\COM{s3}\\b\\r"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "fine": "C:\\x\\.claude-state\\good-root"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+
+    def test_r8_g9_the_superscript_class_in_the_device_rule_is_all_three_digits_not_one(self) -> None:
+        # mutation proof: with the class cut back to U+00B2 only, the middle-component rows above must go red (the rule is read from the module text, not assumed)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(text.count("COM[0-9\\u00B9\\u00B2\\u00B3]"), 1, "the device rule's COM class changed shape; update this mutation")
+        mutated = text.replace("COM[0-9\\u00B9\\u00B2\\u00B3]", "COM[0-9\\u00B2]").replace("LPT[0-9\\u00B9\\u00B2\\u00B3]", "LPT[0-9\\u00B2]")
+        self.assertNotEqual(mutated, text)
+        d = Path(tempfile.mkdtemp(prefix="venue-rr-mut-", dir=self.clean_base()))
+        shutil.copy2(DV / "venues.json", d / "venues.json")
+        (d / "DualVenueRunner.psm1").write_text(mutated, encoding="utf-8")
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n" f"Import-Module '{psq(d / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  "$o = [ordered]@{}\n"
+                  + "".join(f"$o['{k}'] = [bool](Test-DvLocalReceiptRoot -Path ('C:\\x\\.claude-state\\COM' + [char]0x{c:04X} + '\\r') -AgentShares @('C:\\fake'))\n"
+                            for k, c in (("com-sup1", 0xB9), ("com-sup3", 0xB3)))
+                  + "$o | ConvertTo-Json -Compress\n")
+        got = json.loads(self.run_ps(script))
+        self.assertEqual(got, {"com-sup1": True, "com-sup3": True}, f"the mutated rule still refused a superscript device name (it should accept U+00B9/U+00B3 once cut back): {got}")
+
+    def test_r8_b2_a_powershell_drive_rooted_in_a_subdirectory_of_its_own_letter_is_not_certified(self) -> None:
+        # sol B2 literal, run for real in a CHILD pwsh over a temp directory: the C PSDrive is re-rooted so PowerShell cmdlets resolve `C:\x\...` UNDER that directory (here a venue agentShare), while the
+        # helper certified the literal `C:\x\...`. Nothing is created: the helper only reads. The drive root must be exactly `<letter>:\`.
+        base = self.clean_base()
+        share = base / "agent-share"
+        share.mkdir()
+        letter = os.environ.get("SystemDrive", "C:")[0]
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "$o = [ordered]@{}\n"
+            f"$o['before'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{psq(share)}'))\n"
+            "[void](1 | ConvertTo-Json)\n"   # preload the cmdlet: once the drive is re-rooted, command discovery on it fails
+            "Set-Location Env:\\\n"
+            f"Remove-PSDrive -Name {letter} -Force -ErrorAction Stop\n"
+            f"New-PSDrive -Name {letter} -PSProvider FileSystem -Root '{psq(share)}' -Scope Global -ErrorAction Stop | Out-Null\n"
+            f"$o['writerResolves'] = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('{letter}:\\x\\.claude-state\\sheets')\n"
+            f"$o['rerooted'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{psq(share)}'))\n"
+            f"$o['rerootedAnyShare'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{letter}:\\fake\\agent-share'))\n"
+            f"$o['rerootedExtended'] = [bool](Test-DvLocalReceiptRoot -Path '\\\\?\\{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{letter}:\\fake\\agent-share'))\n"
+            f"$o['rerootedForward'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:/x/.claude-state/sheets' -AgentShares @('{letter}:\\fake\\agent-share'))\n"
+            "$o | ConvertTo-Json -Compress\n"
+        )
+        got = json.loads(self.run_ps(script))
+        self.assertTrue(got["before"], f"the control: an un-remapped drive certifies the path: {got}")
+        self.assertTrue(got["writerResolves"].lower().startswith(str(share).lower()), f"the fixture did not re-root the drive: {got}")
+        for k in ("rerooted", "rerootedAnyShare", "rerootedExtended", "rerootedForward"):
+            self.assertFalse(got[k], f"{k}: a drive rooted in a subdirectory of its own letter was certified: {got}")
+
+    def test_r8_b2_the_drive_root_must_be_exactly_the_letter_root_in_any_case(self) -> None:
+        stub = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "$script:rootFor = 'C:\\'\n"
+            "function global:Get-PSDrive { [CmdletBinding()] param([string]$Name)\n"
+            "  if ($Name -eq 'C') { return [pscustomobject]@{ Name = 'C'; Provider = [pscustomobject]@{ Name = 'FileSystem' }; Root = $global:r8Root; DisplayRoot = '' } }\n"
+            "  Microsoft.PowerShell.Management\\Get-PSDrive @PSBoundParameters }\n"
+            "$o = [ordered]@{}\n"
+        )
+        for key, root in (("exact", "C:\\"), ("lower", "c:\\"), ("windows", "C:\\Windows\\"), ("windows-bare", "C:\\Windows"), ("one-deep", "C:\\x"), ("backslash-less", "C:")):
+            stub += f"$global:r8Root = '{root}'; $o['{key}'] = [bool](Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\sheets' -AgentShares @('C:\\fake\\agent-share'))\n"
+        got = json.loads(self.run_ps(stub + "$o | ConvertTo-Json -Compress\n"))
+        self.assertEqual(got, {"exact": True, "lower": True, "windows": False, "windows-bare": False, "one-deep": False, "backslash-less": False})
+
+    def test_r8_b3_a_component_longer_than_the_volume_maximum_is_refused_before_any_side_effect(self) -> None:
+        # sol B3 literal: a 256-character component is certified though GetVolumeInformationW reports 255 for the volume (such a directory cannot be created)
+        drive = os.environ.get("SystemDrive", "C:") + "\\"
+        buf = ctypes.c_uint32(0)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(ctypes.c_wchar_p(drive), None, 0, None, ctypes.byref(buf), None, None, 0)
+        limit = min(255, buf.value) if ok and buf.value else 255
+        pre = f"{drive}x\\.claude-state\\"
+        astral = "\U0001F600"   # two UTF-16 code units
+        bad = {"over-last": pre + "a" * (limit + 1) + "\\receipts", "over-middle": pre + "a" * (limit + 1) + "\\inner\\receipts", "over-final": pre + "a" * (limit + 1),
+               "over-by-surrogates": pre + astral * (limit // 2 + 1) + "\\r",
+               "far-over": pre + "a" * 5000 + "\\r"}
+        edge = {"at-limit-last": pre + "b" * limit + "\\receipts", "at-limit-final": pre + "b" * limit, "at-limit-surrogates": pre + astral * (limit // 2) + "\\r"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, **edge})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {str(got)[:300]}")
+        for name in edge:
+            self.assertIsNotNone(got[name], f"{name} (a name of exactly the volume's maximum is legal): {str(got)[:300]}")
+        base = self.clean_base()
+        with self.subTest(entry="batch"):
+            self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+            r = self.run_batch(None, "-ReceiptRoot", str(base / ".claude-state" / ("a" * (limit + 1)) / "receipts"))
+            self.assert_nothing_started(r)
+            self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+        with self.subTest(entry="leg"):
+            got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(base / ".claude-state" / ("a" * (limit + 1)) / "receipts")))
+            self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_r8_a3_a_link_chain_is_bounded_per_link_sixteen_pass_seventeen_are_refused(self) -> None:
+        # opus/sol A3 (ADV-A3): ResolveLinkTarget($true) collapsed a whole chain inside one outer hop, so the stated 16-link bound was never enforced. Real junctions: j00 -> j01 -> ... -> j16 -> final (17 links).
+        base = self.clean_base()
+        state = base / "chain" / ".claude-state"
+        final = state / "final"
+        final.mkdir(parents=True)
+        prev = final
+        for n in range(16, -1, -1):
+            prev = self.make_junction(state / f"j{n:02d}", prev)
+        got = self.judge(["C:\\fake\\agent-share"], {"seventeen-links": str(state / "j00" / "receipts"), "sixteen-links": str(state / "j01" / "receipts"), "one-link": str(state / "j16" / "receipts")})
+        self.assertIsNone(got["seventeen-links"], got)
+        self.assertTrue(self.same_path(got["sixteen-links"], final / "receipts"), f"a chain of 16 links settles on its target: {got}")
+        self.assertTrue(self.same_path(got["one-link"], final / "receipts"), got)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertNotIn("ResolveLinkTarget($true)", text, "the walk must follow ONE link per hop (ResolveLinkTarget($false)) or the hop bound counts outer rewrites only")
+
     def test_adversary_dot_a1_no_boundary_directory_name_is_compared_with_a_culture_aware_operator(self) -> None:
         # the class, not the instance: every PowerShell file under tools/ that tests a path component against .claude-state goes through [string]::Equals(..., Ordinal)
         offenders = []

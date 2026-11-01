@@ -751,6 +751,8 @@ function Test-DvLocalReceiptRoot {
     #   is a plain file-system drive rooted at its own letter), and every component is WELL-FORMED: no invalid file-name character (`<>:"|?*`, controls), no trailing space or dot (Win32 strips
     #   them, so such a name is an alias of another directory), no DOS device name (NUL, CON, COM1, ...). GetFullPath expands an existing 8.3 short name, so the canonical long form is what is
     #   compared. A drive root is never a certificate. The result is idempotent: Test-DvLocalReceiptRoot (Test-DvLocalReceiptRoot x) returns the same path, so a re-judging caller accepts its own certificate.
+    # r8 (sol B1/B2/B3, A3): a device name is refused with any run of spaces before its extension, on every component; the PowerShell drive's Root must equal `<letter>:\` exactly (the alternative, certifying the
+    # provider-resolved path, was not taken: one literal rule is judged on the spelling and on the final path alike); no component exceeds the volume's maximum component length (GetVolumeInformationW, 255 when unreadable); a link chain is bounded per link (16).
     # FAIL CLOSED: an unreadable venues.json, an unparsable path or a link that cannot be read is a refusal. Nothing is created, opened or written here; reading drive types, attributes and link targets is the only I/O.
     # This function reaches no engine-session API (the attr3 splice scan, test_attr3_spliced_body_scan, counts any such reference in this file as an unprovable extractor binding): the location comes from Get-Location, the drive from Get-PSDrive.
     param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
@@ -787,12 +789,12 @@ function Test-DvLocalReceiptRoot {
             & $norm $y
         }
         # Follow every symbolic link / junction among the EXISTING components of $start (the rest does not exist yet and is created under the resolved parent). A link whose target
-        # cannot be read, or a chain that does not settle within 16 hops, is a refusal (returns $null). With $judge, each hop is also judged by $isLocal (UNC / agentShare / network drive).
+        # cannot be read, or a chain of more than 16 LINKS, is a refusal (returns $null). r8 A3: ONE link is resolved per hop (ResolveLinkTarget($false)), so $hop counts links, not outer rewrites:
+        # 16 links settle, a 17th is refused. With $judge, each hop is also judged by $isLocal (UNC / agentShare / network drive).
         $walk = {
             param($start, $judge)
             $cur = $start
             for ($hop = 0; ; $hop++) {
-                if ($hop -ge 16) { return $null }
                 $parts = @($cur.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
                 $acc = $cur.Substring(0, 3).TrimEnd('\')
                 $moved = $false
@@ -801,7 +803,7 @@ function Test-DvLocalReceiptRoot {
                     if (-not [IO.Directory]::Exists($acc) -and -not [IO.File]::Exists($acc)) { break }
                     if (([IO.File]::GetAttributes($acc) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { continue }
                     $info = $(if ([IO.Directory]::Exists($acc)) { [IO.DirectoryInfo]::new($acc) } else { [IO.FileInfo]::new($acc) })
-                    $target = $info.ResolveLinkTarget($true)
+                    $target = $info.ResolveLinkTarget($false)
                     if ($null -eq $target) { continue }   # a reparse point that is not a link (a cloud placeholder, a dedup stub): not a redirect
                     $tail = @($(if ($i + 1 -lt $parts.Count) { $parts[($i + 1)..($parts.Count - 1)] } else { @() }))
                     $t = [string]$target.FullName
@@ -815,6 +817,7 @@ function Test-DvLocalReceiptRoot {
                     break
                 }
                 if (-not $moved) { return $cur }
+                if ($hop -ge 16) { return $null }   # this was the 17th link on the way
                 if ($judge -and -not (& $isLocal $cur)) { return $null }
             }
         }
@@ -830,21 +833,45 @@ function Test-DvLocalReceiptRoot {
             }
         }
         $badNameChars = [IO.Path]::GetInvalidFileNameChars()
+        # r8 B3: the longest name one path component may have on the volume of a drive letter, in UTF-16 code units (GetVolumeInformationW, read once per letter). FAIL CLOSED at 255 -- the limit of every
+        # local file system this tool writes to (NTFS, ReFS, exFAT, FAT) -- when the volume cannot be read; a volume that reports less than 255 is held to its own figure.
+        $volMax = @{}
+        $maxComponent = {
+            param($letter)
+            $key = ([string]$letter).ToUpperInvariant()
+            if (-not $volMax.ContainsKey($key)) {
+                $lim = 255
+                try {
+                    if (-not ('DvR8Vol.Native' -as [type])) {
+                        Add-Type -Namespace DvR8Vol -Name Native -ErrorAction Stop -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern bool GetVolumeInformationW(string root, System.Text.StringBuilder volName, uint volNameSize, out uint serial, out uint maxComponent, out uint flags, System.Text.StringBuilder fsName, uint fsNameSize);'
+                    }
+                    $serial = [uint32]0; $mc = [uint32]0; $fl = [uint32]0
+                    if ([DvR8Vol.Native]::GetVolumeInformationW($key + ':\', $null, 0, [ref]$serial, [ref]$mc, [ref]$fl, $null, 0) -and $mc -gt 0 -and $mc -lt 255) { $lim = [int]$mc }
+                } catch { $lim = 255 }
+                $volMax[$key] = $lim
+            }
+            return $volMax[$key]
+        }
         $isLocal = {
             # judges ONE concrete spelling: well-formed components / UNC / device / PowerShell drive / agentShare / network drive. Returns $true when it is a local, non-share path.
             param($p)
             if ($p -match '^[\\/]{2}') { return $false }
             if ($p -notmatch '^[A-Za-z]:\\') { return $false }
             # r6 ADV-A4 / ADV-A1: every component is a name the file system writes as spelled (no invalid character, no trailing space or dot alias, no DOS device name; r7 G9: COM/LPT with a superscript 1/2/3 are devices too, written as regex escapes so this file stays ASCII)
+            # r8 B1: Win32 drops any run of spaces between a device stem and its extension, on EVERY component (`COM1 .txt`, `NUL  .log` are devices), so the stem is followed by `[ ]*` before the optional extension.
+            # r8 B3: no component is longer than the volume's maximum component length (such a directory cannot be created).
+            $maxLen = & $maxComponent $p.Substring(0, 1)
             foreach ($c in @($p.Substring(3).Split([char]92))) {
                 if ($c.Length -eq 0) { continue }
+                if ($c.Length -gt $maxLen) { return $false }
                 if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
                 if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
-                if ($c -cmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)(\..*)?$') { return $false }
+                if ($c -cmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$') { return $false }
             }
-            # r6 ADV-A2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted at the letter itself (not `New-PSDrive X -Root \\host\share`)
+            # r6 ADV-A2 / r8 B2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted EXACTLY at `<letter>:\` -- not `New-PSDrive X -Root \\host\share`, and not
+            # `C` re-rooted at `C:\Windows` (the cmdlets would write under that directory while this judgement ran on the literal spelling)
             $psd = Get-PSDrive -Name $p.Substring(0, 1) -ErrorAction SilentlyContinue
-            if ($null -ne $psd -and ($psd.Provider.Name -cne 'FileSystem' -or -not [string]::IsNullOrEmpty([string]$psd.DisplayRoot) -or -not ([string]$psd.Root).StartsWith($p.Substring(0, 2), [StringComparison]::OrdinalIgnoreCase))) { return $false }
+            if ($null -ne $psd -and ($psd.Provider.Name -cne 'FileSystem' -or -not [string]::IsNullOrEmpty([string]$psd.DisplayRoot) -or -not [string]::Equals([string]$psd.Root, $p.Substring(0, 1) + ':\', [StringComparison]::OrdinalIgnoreCase))) { return $false }
             $k = & $norm $p
             foreach ($s in $shareKeys) {
                 if ($k.Equals($s, [StringComparison]::OrdinalIgnoreCase) -or $k.StartsWith($s + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
