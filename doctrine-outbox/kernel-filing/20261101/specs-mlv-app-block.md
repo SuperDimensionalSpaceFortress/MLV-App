@@ -12,14 +12,15 @@ measured-objective@r3 are unchanged. The board-local meter `hub-autopilot/kernel
 MLV-App bus filing passed 7 days. The window is 2026-10-15T07:32Z .. 2026-11-01T12:45Z, which is 17 days.
 
 **Kernel r5 / code@r11 conformance (DOGFOOD, not ADOPT).** Three subjects were delivered under code@r11 with declarations, keys and
-witnesses: #724, #726 and #732. Only #732 is claimed end-to-end. Its keys bound tree `f50a8d5b`, which is the delivered tree
-(`key_credit=delivered`).
+witnesses: #724, #726 and #732. No subject is claimed end-to-end. #732 is delivered-tree-equal (its keys bound tree `f50a8d5b`, the
+delivered tree, `key_credit=delivered`), but its pre-work acceptance binding is unproven (the r3 declared digest does not
+recompute and the key prompts are unbound), so it gets identity-link credit only.
 
 | Clause | Status | 2026-10-13 harvest | MLV-App evidence |
 |---|---|---|---|
 | K1 roles | FIT | FIT | sonnet/opus producers; sol, opus, fable read-only keys; #726 key3 is the producer's model in a separate run |
 | K2 register | GAP | INSTANCE-FAILURE, still failing | `docs/never-authorized.json` lists prohibitions; owner rulings live in the board ledger only |
-| K3 identity | GAP | INSTANCE-FAILURE, still failing (partly cured) | #732 keys and delivery share tree `f50a8d5b`; 236 of 257 witnessed landings are `head-only`; no gate refuses them |
+| K3 identity | GAP | INSTANCE-FAILURE, still failing (partly cured) | #732 keys and delivery share tree `f50a8d5b` (identity link only); per distinct PR, 236 of 257 witnessed are `head-only` and 21 `delivered`; no gate refuses them |
 | K4 positive evidence | FIT | FIT | `Invoke-Lane.ps1:2251`, `:2483`; guard `test_coordination_guardrails.py:1327` |
 | K5 declared profile | GAP | INSTANCE-FAILURE, still failing (relapsed) | dispatched rounds declare before work; #728, #730 and #731 were produced by a hub chat and declared retroactively |
 | K6 independent key | FIT | FIT | sol (OpenAI family) on every subject head; hosted CI 35/35 per head; `merge_group` success per landing |
