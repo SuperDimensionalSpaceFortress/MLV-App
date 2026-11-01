@@ -102,9 +102,8 @@ struct PresentDriver
     void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; last = -1; }
     void present(double t, int frame, bool loop, int cutIn0, int cutOut0)
     {
-        const bool inferred = presented > 0
-            && playback_frame_range::isContactSheetLoopWrapTransition(loop, cutIn0, cutOut0, last, frame);
-        const bool wrap = presentationIsLoopWrap(inferred, engineWraps, consumed, presented > 0, last, frame);
+        (void)loop;   // the inference (Loop, the jump size) no longer decides the tracker's wrap (re-pass A2)
+        const bool wrap = presentationIsLoopWrap(engineWraps, consumed, presented > 0, last, frame);
         tracker.notePresented(t, frame, wrap, cutIn0, cutOut0);
         last = frame;
         ++presented;
@@ -169,6 +168,16 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     q.present(2 / 24.0, 50, true, 0, 719);
     ASSERT_EQ(0u, q.tracker.wraps());
     ASSERT_EQ(1u, q.tracker.backwardJumps());
+    // r16 re-pass A2 on 215bd10e: Loop + drop-frame, cut 1..8 (0..7), frame 5 then a backward seek to 4 with no
+    // engine wrap. The inference accepts it (a jump of 1 >= 7 - 8), but the tracker takes no wrap and no credit.
+    ASSERT_TRUE(playback_frame_range::isContactSheetLoopWrapTransition(true, 0, 7, 5, 4));
+    PresentDriver tiny;
+    tiny.startMeasuredPlay();
+    tiny.present(1.000, 5, true, 0, 7);
+    tiny.present(1.010, 4, true, 0, 7);
+    ASSERT_EQ(0u, tiny.tracker.wraps());
+    ASSERT_EQ(1u, tiny.tracker.backwardJumps());
+    ASSERT_EQ(0, static_cast<int>(tiny.tracker.advancedFrames()));
     // no Loop, no engine wrap: a backward seek is never a wrap (the inference's own refusal is unchanged)
     PresentDriver s;
     s.startMeasuredPlay();

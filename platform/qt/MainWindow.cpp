@@ -26158,10 +26158,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     }
     // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
     // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
-    // r16 (adversary A1 on ff41b4fa): the wrap is the engine's own count first, the inference only adds
-    // (presentationIsLoopWrap): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold.
-    const bool sourceAdvanceWrap = presentationIsLoopWrap( playbackSmokeWrapNow,
-                                                           m_playbackWrapRecorder.engineWraps,
+    // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
+    // (presentationIsLoopWrap): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold,
+    // and over a cut range narrower than its tolerance the inference calls any backward seek a wrap.
+    const bool sourceAdvanceWrap = presentationIsLoopWrap( m_playbackWrapRecorder.engineWraps,
                                                            m_playbackSmokeTrackerEngineWraps,
                                                            m_playbackSmokePresentedFrames > 0,
                                                            m_playbackSmokeLastPresentedFrame,

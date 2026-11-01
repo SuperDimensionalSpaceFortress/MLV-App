@@ -99,18 +99,20 @@ private:
  *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
  *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
  *  wrap_count. An engine wrap belongs to the NEXT presented transition only: a presentation that goes
- *  backward while an engine wrap noted since the previous presentation is pending IS the wrap, and so is
- *  one the inference recognises. EVERY presentation consumes the pending wraps, the first one of the
- *  measured Play included (r16 re-pass A1 on c9b4ca5e: a wrap before the first presentation stayed pending,
- *  and a later backward seek took it and was credited 719 frames). consumedEngineWraps is the caller's
- *  running count; it is set to the engine's count at every presentation and when the measured Play starts.
+ *  backward while an engine wrap noted since the previous presentation is pending IS the wrap. EVERY
+ *  presentation consumes the pending wraps, the first one of the measured Play included (r16 re-pass A1
+ *  on c9b4ca5e: a wrap before the first presentation stayed pending, and a later backward seek took it and
+ *  was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
+ *  a cut range narrower than its 8-frame tolerance, cut 1..8, it calls any backward seek a wrap, and the
+ *  seek 5 -> 4 was credited 7 frames). consumedEngineWraps is the caller's running count; it is set to the
+ *  engine's count at every presentation and when the measured Play starts.
  *  \param havePrevious a frame was presented before this one in the measured Play */
-inline bool presentationIsLoopWrap( bool inferredWrap, int engineWraps, int &consumedEngineWraps,
+inline bool presentationIsLoopWrap( int engineWraps, int &consumedEngineWraps,
                                     bool havePrevious, int lastFrame, int frame )
 {
     const bool engineWrapPending = engineWraps > consumedEngineWraps;
     consumedEngineWraps = engineWraps;
-    return havePrevious && ( inferredWrap || ( engineWrapPending && frame < lastFrame ) );
+    return havePrevious && engineWrapPending && frame < lastFrame;
 }
 
 #endif // PLAYBACKSOURCEADVANCETRACKER_H

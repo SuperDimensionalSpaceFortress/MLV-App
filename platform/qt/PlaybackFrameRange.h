@@ -518,6 +518,13 @@ struct PlayPaceHistory
     // measure it from (THE CADENCE BOUND)
     bool firstStepLeadKnown = false;
     int64_t firstStepLeadMs = 0;
+    // r16 (re-pass A1 on 215bd10e): the first closed hold -- its bin (-1 = none yet, or longer than the histogram),
+    // its length, its steps and its end gap -- so the stall-free bound can start after it when the first step's lead
+    // gap is unknown (the first observation already showed a step: the autoplay's first poll at 600 ms saw c = 3)
+    int64_t firstHoldBin = -1;
+    int64_t firstHoldMs = 0;
+    int64_t firstHoldSteps = 0;
+    int64_t firstHoldEndGapMs = 0;
 
     struct PlayingSplit
     {
@@ -605,11 +612,15 @@ struct PlayPaceHistory
     // bins seen, so a recovered stall never counts as playing pace whenever its value provably stayed more than twice that
     // bound, however dense the stalls (r15's U, taken over everything, is not used to judge them). Its threshold is the
     // largest with the same closed holds (one below the smallest cast-out bin), so the open hold is held to the same
-    // test. With no step yet, the first step's lead gap unknown, or no consistent theta below the largest bin seen, it is
-    // the r14 split.
+    // test. When the first step's lead gap is unknown (the first observation already showed a step), the first stretch
+    // starts after the first closed hold instead (re-pass A1 on 215bd10e). With no step yet, no closed hold to start
+    // from, or no consistent theta below the largest bin seen, it is the r14 split.
     PlayingSplit stallFreeSplit( int64_t elapsedMs ) const
     {
-        if( !haveFirstStep || !firstStepLeadKnown || elapsedMs < holdStartMs ) return playingSplit( elapsedMs );
+        if( !haveFirstStep || elapsedMs < holdStartMs ) return playingSplit( elapsedMs );
+        // r16 re-pass A1: with the first step's lead gap unknown, the bound starts after the first closed hold (whose
+        // end gap is known); with none closed yet there is no bound
+        if( !firstStepLeadKnown && holds + overflowHolds == 0 ) return playingSplit( elapsedMs );
         const size_t n = static_cast<size_t>( kPaceHoldBucketMs ) + 1;
         // the cast-out holds' end gaps (a closed hold's bin is its length less its end gap exactly): all of them, less
         // the kept ones as theta rises
@@ -628,7 +639,18 @@ struct PlayPaceHistory
             // the smallest cast-out bin: the next bin seen, or (only overflow holds above) more than the histogram
             if( next == n && overflowHolds == 0 ) break;   // nothing above: no stall to find
             const int64_t nextBin = static_cast<int64_t>( next < n ? next : n );
-            if( nextBin * keptSteps > kPaceCadenceStallFactor * ( keptMs + firstStepLeadMs + endGapAbove ) )
+            int64_t boundMs = keptMs + endGapAbove;
+            int64_t boundSteps = keptSteps;
+            if( firstStepLeadKnown ) boundMs += firstStepLeadMs;
+            else if( firstHoldBin >= 0 && firstHoldBin <= static_cast<int64_t>( b ) )
+            {
+                // the first hold is kept but its start is unbounded: the first stretch starts at its END instead
+                boundMs += firstHoldEndGapMs - firstHoldMs;
+                boundSteps -= firstHoldSteps;
+            }
+            // (a cast-out first hold: its end gap is already in endGapAbove, and no kept stretch comes before it)
+            if( boundSteps < 1 ) continue;
+            if( nextBin * boundSteps > kPaceCadenceStallFactor * boundMs )
                 return splitAtThreshold( elapsedMs, std::min<int64_t>( nextBin - 1, kPaceHoldBucketMs ) );
         }
         return playingSplit( elapsedMs );
@@ -701,6 +723,13 @@ struct PlayPaceHistory
             const int64_t bin = std::max<int64_t>( 0, hold - gapMs );   // r13: less the end gap (A2)
             const int64_t upper = hold + holdLeadGapMs;                 // r14: plus the lead gap (the threshold)
             if( upper <= kPaceHoldBucketMs ) holdUpperCount[static_cast<size_t>( upper )]++;
+            if( holds + overflowHolds == 0 )                            // r16: the first closed hold
+            {
+                firstHoldBin = bin > kPaceHoldBucketMs ? -1 : bin;
+                firstHoldMs = hold;
+                firstHoldSteps = consumed - previousConsumed;
+                firstHoldEndGapMs = gapMs;
+            }
             if( bin > kPaceHoldBucketMs )
             {
                 overflowHolds++;

@@ -172,9 +172,12 @@ FRAME:
   the three splits, so no earlier split brings back a stricter verdict.
   **The bound the generated sweep proves** (`R16GeneratedSweep...` in `tests/console/test_playback_frame_range.cpp`):
   required 1499, budget 65 s, 24/25/30 fps, first present 250-1500 ms, stalls of 100-300 ms every 3 s down to every
-  400 ms, either ended by the probe or never stopping, polled every 50 ms at any phase 0-49 ms. Every run whose count
-  really reaches 1499 by the budget is Reached (at the first poll after it), and every run that cannot is refused
-  `PLAY_PACE_TOO_SLOW` before the budget. There are two pinned exceptions, both refused typed within 200 ms of the
+  400 ms, either ended by the probe or never stopping, polled every 50 ms at any phase 0-49 ms. The console grid samples
+  five phases and three first presents; the full grid in the r16 run dir covers every phase and four first presents.
+  On that grid every run whose count really reaches 1499 by the budget is Reached (at the first poll after it), and
+  every run that cannot is refused `PLAY_PACE_TOO_SLOW` before the budget. Off the grid, a run whose true finish lies
+  less than one poll past the budget can still end in the typed `PLAY_SAFETY_TIMEOUT` instead, never a pass.
+  Example: 24 fps, first present 1084 ms, reaching at 65000.7 ms (r16 re-pass A3). There are two pinned exceptions, both refused typed within 200 ms of the
   probe:
   (1) the stall share cap below: a burst whose stalls exceed a third of the time to the probe looks, at 8 s, exactly
   like stalls that keep coming;

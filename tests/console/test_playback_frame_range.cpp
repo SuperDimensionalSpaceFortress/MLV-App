@@ -2335,6 +2335,24 @@ TEST( PlayPaceRecovery, R16DotDensityCaseRecoveredStallsAreNeverPlayingPace )
         ASSERT_TRUE( r.state == PlayStopState::Reached );
         ASSERT_TRUE( r.elapsedMs >= 64417 && r.elapsedMs < 64417 + 50 );
     }
+    // r16 re-pass A1 on 215bd10e: the same input observed only from t = 600 (600, 650, ... ms). The first observation
+    // already shows a step (c = 3), so the first step's lead gap is unknown; 215bd10e fell back to r14 (6200 ms, 132
+    // steps, optimistic 67962.5 ms) and refused at 8000. The bound now starts after the first closed hold.
+    {
+        PlayPaceHistory late;
+        for( int64_t t = 600; t <= 8000; t += 50 ) late.note( stalledCount( t, 500, 24, dense ), t );
+        ASSERT_FALSE( late.firstStepLeadKnown );
+        ASSERT_EQ( int64_t( 3 ), late.firstStep.consumed );
+        const PlayPaceHistory::PlayingSplit lateFree = late.stallFreeSplit( 8000 );
+        ASSERT_EQ( int64_t( 10 ), lateFree.stallHolds );
+        ASSERT_TRUE( late.optimisticFinishMs( 145, 1499, 8000 ) <= 64417.0 );
+        for( int64_t start = 550; start <= 1000; start += 50 )
+        {
+            const PolledRun r = pollPhased( 500, 24, dense, 1499, budget, 50, start );
+            ASSERT_TRUE( r.state == PlayStopState::Reached );
+            ASSERT_TRUE( r.elapsedMs >= 64417 && r.elapsedMs < 64417 + 50 );
+        }
+    }
     // the same stalls never stopping (one every 640 ms to the end: 14 s of stall) cannot finish: refused, typed, before
     // the budget; and the slow controls (20 / 22 fps) with the dense burst are refused at the probe
     const PolledRun forever = pollStalledCount( 500, 24, periodicStalls( 1000, 640, 150, 900000 ), 1499, budget, 50 );
