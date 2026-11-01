@@ -587,11 +587,12 @@ struct PlayPaceHistory
         }
     }
 
-    // r12: steps per ms while playing (see kPaceStallPollGaps); 0 = not trusted yet.
+    // r12: steps per ms while playing (see kPaceStallPollGaps); 0 = not trusted yet. (A split with no threshold yet has
+    // no playing steps, so the step minimum refuses it.)
     double playingPace( int64_t elapsedMs ) const
     {
         const PlayingSplit s = playingSplit( elapsedMs );
-        if( s.thresholdMs <= 0 || s.playingSteps < kPaceMinPlayingSteps || s.playingMs < kPaceRecentWindowMs
+        if( s.playingSteps < kPaceMinPlayingSteps || s.playingMs < kPaceRecentWindowMs
             || 2 * s.stallMs > s.playingMs ) return 0.0;
         return static_cast<double>( s.playingSteps ) / static_cast<double>( s.playingMs );
     }
