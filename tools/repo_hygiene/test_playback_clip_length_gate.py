@@ -1433,6 +1433,15 @@ class AppOptionClassTests(unittest.TestCase):
             "what is played or for how long)")
         self.assertEqual(sorted(set(policy) - declared), [], "the policy names options the app no longer declares")
 
+    def test_the_seek_frame_list_is_allowed_because_it_never_plays(self) -> None:
+        # CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: the list only picks which frames the seek capture AFTER the
+        # stop lands on; it never plays and never changes what is played or for how long.
+        self.assertIn("contact-sheet-seek-frames", _declared_options("static int runGuiPlaybackSmoke("))
+        policy = _policy("script:GuiSmokeOptionPolicy")
+        self.assertEqual(policy.get("contact-sheet-seek-frames"), "allow")
+        ok = _pass_through(["--contact-sheet-seek-frames", "50,150"])
+        self.assertEqual(ok["verdict"], "OK", ok)
+
     def test_the_smoke_refused_set_is_pinned(self) -> None:
         policy = _policy("script:GuiSmokeOptionPolicy")
         self.assertEqual({k for k, v in policy.items() if v == "refuse"}, SMOKE_REFUSED)

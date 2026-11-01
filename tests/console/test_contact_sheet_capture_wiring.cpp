@@ -868,3 +868,122 @@ TEST(ContactSheetCaptureWiring, PlaybackModeSidecarAndDoneLineCarrySpanStartEndA
     ASSERT_TRUE(smokeBody.contains(QStringLiteral("start_frame=%4 end_frame=%5 wrapped=%6")));
     ASSERT_TRUE(smokeBody.contains(QStringLiteral(".arg( bool01( contactSheetSpanWrapped ) )")));
 }
+
+// CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: --contact-sheet-seek-frames <list> seeks the seek stills to an
+// explicit frame list. Each still proves its frame by observation (the presented request context),
+// never by the clamped request; an out-of-range frame is refused before the measured Play.
+TEST(ContactSheetSeekFrameListWiring, TheOptionStructHoldsTheListAndItDefaultsToEmpty)
+{
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    const QString optionsStruct = sliceBetween(header,
+        QStringLiteral("struct GuiPlaybackSmokeOptions"),
+        QStringLiteral("int runHeadlessPlaybackProfile"));
+    ASSERT_FALSE(optionsStruct.isEmpty());
+    ASSERT_TRUE(optionsStruct.contains(QStringLiteral("QVector<int> contactSheetSeekFrames;")));
+}
+
+TEST(ContactSheetSeekFrameListWiring, TheCliParsesTheListAndRefusesItWithoutASeekCapture)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+    const QString smokeParser = sliceBetween(source,
+        QStringLiteral("static int runGuiPlaybackSmoke("),
+        QStringLiteral("return window.runGuiPlaybackSmoke(options);"));
+    ASSERT_FALSE(smokeParser.isEmpty());
+    ASSERT_TRUE(smokeParser.contains(QStringLiteral("QStringLiteral(\"contact-sheet-seek-frames\")")));
+    const int parseAt = smokeParser.indexOf(QStringLiteral("playback_frame_range::parseContactSheetSeekFrameList("));
+    ASSERT_TRUE(parseAt > 0);
+    // The list is validated after the seek dir is resolved, so both seek captures are known.
+    ASSERT_TRUE(parseAt > smokeParser.indexOf(QStringLiteral("options.contactSheetSeekDir = QFileInfo(")));
+    const QString validation = smokeParser.mid(parseAt, 2400);
+    ASSERT_TRUE(validation.contains(QStringLiteral("options.contactSheetSeekDir.isEmpty() && !options.contactSheetSeekMode")));
+    ASSERT_TRUE(validation.contains(QStringLiteral("--contact-sheet-seek-frames")));
+    ASSERT_TRUE(validation.contains(QStringLiteral("errorToken")));
+    ASSERT_TRUE(validation.contains(QStringLiteral("return 2;")));
+    ASSERT_TRUE(validation.contains(QStringLiteral("options.contactSheetSeekFrames.append(")));
+}
+
+TEST(ContactSheetSeekFrameListWiring, TheListOverridesTheTargetsInBothModesBeforeTheFirstSeek)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    ASSERT_FALSE(smokeBody.isEmpty());
+    const int inPassAt = smokeBody.indexOf(QStringLiteral("contactSheetTargetFrames = inPassDisplayFrames;"));
+    const int listAt = smokeBody.indexOf(QStringLiteral("contactSheetTargetFrames = options.contactSheetSeekFrames;"));
+    const int inPassBranchAt = smokeBody.indexOf(QStringLiteral("if( !options.contactSheetSeekMode )"), smokeBody.indexOf(QString::fromLatin1(kInPassWriteMarker)));
+    const int seekMarkerAt = smokeBody.indexOf(QString::fromLatin1(kSeekMarker));
+    const int seekCallAt = smokeBody.indexOf(QStringLiteral("targetFrame, \"gui-smoke-contact-sheet-seek\""));
+    ASSERT_TRUE(inPassAt > 0);
+    ASSERT_TRUE(listAt > inPassAt);
+    ASSERT_TRUE(seekCallAt > listAt);
+    // Outside the in-pass-only branch, so --contact-sheet-seek-mode gets the list too: the
+    // assignment sits after that branch closes (the fps block is its last statement) and before
+    // the seek capture's marker.
+    ASSERT_TRUE(inPassBranchAt > 0 && inPassBranchAt < inPassAt);
+    ASSERT_TRUE(listAt > smokeBody.indexOf(QStringLiteral("contactSheetGrabTotalMs );"), inPassAt));
+    ASSERT_TRUE(listAt < seekMarkerAt);
+    ASSERT_TRUE(smokeBody.mid(listAt - 120, 120).contains(QStringLiteral("if( !options.contactSheetSeekFrames.isEmpty() )")));
+}
+
+TEST(ContactSheetSeekFrameListWiring, AnOutOfRangeFrameIsRefusedBeforeTheMeasuredPlay)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    ASSERT_FALSE(smokeBody.isEmpty());
+    const int refuseAt = smokeBody.indexOf(QStringLiteral("SEEK_FRAME_OUT_OF_RANGE"));
+    const int playAt = smokeBody.indexOf(QStringLiteral("programmaticPlay( \"gui-smoke-measured\""));
+    ASSERT_TRUE(refuseAt > 0);
+    ASSERT_TRUE(playAt > refuseAt);
+    const QString refusal = smokeBody.mid(smokeBody.lastIndexOf(QStringLiteral("firstContactSheetSeekFrameOutOfRange("), refuseAt), 900);
+    ASSERT_TRUE(refusal.contains(QStringLiteral("firstContactSheetSeekFrameOutOfRange(")));
+    ASSERT_TRUE(refusal.contains(QStringLiteral("SEEK_FRAME_OUT_OF_RANGE frame=")));
+    ASSERT_TRUE(refusal.contains(QStringLiteral("m_playbackSmokeFullscreenLossLatchArmed = false;")));
+    ASSERT_TRUE(refusal.contains(QStringLiteral("return 14;")));
+}
+
+TEST(ContactSheetSeekFrameListWiring, EachSeekStillIsHonouredByObservationOrTheRunFailsByName)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    const QString seekBranch = sliceBetween(smokeBody,
+        QString::fromLatin1(kSeekMarker),
+        QStringLiteral("QStringLiteral(\"gui_smoke.contact_sheet\"),"));
+    ASSERT_FALSE(seekBranch.isEmpty());
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral("playback_frame_range::contactSheetSeekFrameHonoured(")));
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral(
+        "m_lastPresentedRequestContextValid ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1")));
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral("SEEK_FRAME_NOT_HONOURED requested=%2 shown=%3")));
+    // The two new sidecar fields exist only under the list; without it the sidecar is unchanged.
+    const int guardAt = seekBranch.indexOf(QStringLiteral("if( !options.contactSheetSeekFrames.isEmpty() )"),
+                                           seekBranch.indexOf(QStringLiteral("frameJson.insert( QStringLiteral(\"settled\"), settled );")) - 2000);
+    const int requestedAt = seekBranch.indexOf(QStringLiteral("frameJson.insert( QStringLiteral(\"requested_frame\"), targetFrame );"));
+    const int honouredAt = seekBranch.indexOf(QStringLiteral("frameJson.insert( QStringLiteral(\"frame_honoured\"), seekFrameHonoured );"));
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(requestedAt > guardAt);
+    ASSERT_TRUE(honouredAt > guardAt);
+    ASSERT_EQ(1, seekBranch.count(QStringLiteral("QStringLiteral(\"requested_frame\")")));
+    ASSERT_EQ(1, seekBranch.count(QStringLiteral("QStringLiteral(\"frame_honoured\")")));
+    // A list still that is not honoured cannot be saved as a good frame.
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral("&& ( options.contactSheetSeekFrames.isEmpty() || seekFrameHonoured )")));
+    // The default (no list) display_frame stays the settled request, byte for byte.
+    ASSERT_TRUE(seekBranch.contains(QStringLiteral(
+        "frameJson.insert( QStringLiteral(\"display_frame\"), options.contactSheetSeekFrames.isEmpty() ? settledFrame : seekObservedFrame );")));
+}
+
+TEST(ContactSheetSeekFrameListWiring, TheLogLineNamesTheListOnlyWhenItIsSetAndTheDoneLineIsUnchanged)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    const QString logBlock = sliceBetween(smokeBody,
+        QStringLiteral("QStringLiteral(\"gui_smoke.contact_sheet\"),"),
+        QStringLiteral("if( contactSheetFramesWritten != options.contactSheetFrames"));
+    ASSERT_FALSE(logBlock.isEmpty());
+    ASSERT_TRUE(logBlock.contains(QStringLiteral(
+        "+ ( options.contactSheetSeekFrames.isEmpty() ? QString() : QStringLiteral(\" seek_targets=list\") )")));
+    // The DONE line keeps its exact shape: the only contact-sheet field on it is still the written count.
+    const QString doneBlock = sliceBetween(smokeBody,
+        QStringLiteral("out << \"[GUI-SMOKE] DONE clip=\""),
+        QStringLiteral("return 0;"));
+    ASSERT_FALSE(doneBlock.isEmpty());
+    ASSERT_FALSE(doneBlock.contains(QStringLiteral("seek")));
+    ASSERT_TRUE(doneBlock.contains(QStringLiteral("out << \" contact_sheet_frames_written=\" << contactSheetFramesWritten;")));
+}
