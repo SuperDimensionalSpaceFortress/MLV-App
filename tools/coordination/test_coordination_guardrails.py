@@ -6344,7 +6344,7 @@ def test_r10_every_site_classifies_a_full_refname_by_ascii_whitespace_and_strips
         text = path.read_text(encoding="utf-8")
         assert r"[^?*\[\\\s]" not in text, (path, "the Unicode-aware \\s is back in the full-refname classifier")
         assert r"[^?*\[\\ \t\n\v\f\r]" in text, path
-        assert r"\^\{/.*\}" in text, (path, "the ^{/regex} search group is not stripped before the reflog test")
+        assert r"\^\{/.*?\}" in text, (path, "the ^{/regex} search group is not stripped (non-greedy, r14) before the reflog test")
 
 
 # --- r11 (Dot prior-key B3, old Sol r9 CR 6553630639): type the run rows BEFORE any comparison ---------------
@@ -6742,3 +6742,56 @@ def test_r13_the_schema_and_the_c1_range_are_pinned_in_the_selector_source():
     body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
     assert "-cmatch '\\A[0-9a-f]{40}\\z'" in body, "headSha must be checked with the case-sensitive, end-anchored 40-hex schema"
     assert "[\\x00-\\x1F\\x7F-\\x9F]" in body, "the control-character predicate must cover C0, DEL and C1"
+
+
+# --- r14 (sol r13 BLOCKER on 47a65674 + r13 adversary A1): a GREEDY `^{/.*}` strip hides an external reflog selector -----
+# r10 stripped `^{/regex}` commit-message-search groups with the greedy `\^\{/.*\}` before testing for `@{`. Greedy `.*` runs to
+# the LAST `}` in the suffix, so `refs/remotes/fork/master^{/search}^{}@{1}` lost its trailing `@{1}` (the `}` of `@{1}` is the
+# last brace) and the typed reflog refusal never fired at any of the three sites. The strip is now NON-greedy (`.*?`): it ends
+# a search group at the FIRST `}`, so every `@{` outside the group - including one after a later `^{}` - is still seen. A search
+# group that itself holds `@{n}` (r10 ADV-A2: `^{/foo@{1}}`) is still a valid non-reflog revision: its `@{1` is consumed with the
+# group. A selector hidden by the strip is refused fail-closed; a leftover `}` can only cause an extra refusal, never a miss.
+R14_HIDDEN_SELECTORS = [
+    R6_REF + "^{/search}^{}@{1}",       # sol's catalogue input
+    R6_REF + "^{/search}^{}@{0}",
+    R6_REF + "^{/search}^{}@{2}",
+    R6_REF + "^{/a}^{/b}@{1}",           # two groups: greedy swallowed the span between them and the selector
+    R6_REF + "^{/a}~1@{1}",
+    R6_REF + "^{/foo@{1}}^{}@{1}",       # a legitimate search followed by a real selector
+]
+R14_PLAIN_REFLOG_CONTROLS = ["refs/remotes/fork/master@{1}", "refs/remotes/fork/master@{0}", "refs/remotes/fork/master@{1}~1"]
+
+
+@pytest.mark.parametrize("expr", R14_HIDDEN_SELECTORS + R14_PLAIN_REFLOG_CONTROLS)
+def test_r14_the_currency_guard_refuses_a_reflog_selector_a_greedy_search_strip_would_hide(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r14-cur", disk="'a'\n")
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R14_HIDDEN_SELECTORS + R14_PLAIN_REFLOG_CONTROLS)
+def test_r14_the_ratio_guard_refuses_a_reflog_selector_a_greedy_search_strip_would_hide(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r14-ratio")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R14_HIDDEN_SELECTORS + R14_PLAIN_REFLOG_CONTROLS)
+def test_r14_the_retire_merge_gate_refuses_a_reflog_selector_a_greedy_search_strip_would_hide(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r14-ret", wt_sha=sha_a)
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
+
+
+def test_r14_no_script_strips_a_search_group_greedily():
+    # The CLASS: any `^{/` strip that ends at the LAST brace. Scan every tracked tools/ script and the workflow for the idiom.
+    offenders = []
+    for path in sorted((COORD.parent).rglob("*")):
+        if path.suffix.lower() not in (".ps1", ".psm1", ".py", ".mjs") or path.name == "test_coordination_guardrails.py":
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if "\^\{/.*\}" in line:
+                offenders.append("%s:%d" % (path, n))
+    assert not offenders, offenders
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        assert "\^\{/.*?\}" in path.read_text(encoding="utf-8"), (path, "the non-greedy search-group strip is missing")
