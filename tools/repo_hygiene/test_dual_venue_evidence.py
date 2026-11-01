@@ -11936,5 +11936,116 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
         self.assertEqual(out["cpuKeys"], ["avg_llrawproc_dual_iso_ms", "session"], "the location suffix's path adds no field")
 
 
+# HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r10 (Dot 6550442583, r8 adversary ADV-A1): a CONFORMED run's summary line carries the status text
+# `gui_fps_status_text="Playback: 24 fps (59.94 -> 24)"` (PlaybackConformPolicy.h playbackFpsStatusText, written at MainWindow.cpp's
+# playback_smoke.summary) BEFORE the evidence fields. The reader cut the record at the first ` (` as if it were the Qt location suffix, so every
+# field after the status text (source counts, rates, wrap fields, the nonce) was lost and a real conformed run read INVALID.
+CONFORM_STATUS = 'gui_fps_status_text="Playback: 24 fps (59.94 -> 24)"'
+CONFORM_LOC = " (C:/build/platform/qt/MainWindow.cpp:29229)"
+
+
+def conformed_summary_line(status: str = CONFORM_STATUS, nonce: str | None = NONCE, drop: tuple[str, ...] = (), **override: str) -> str:
+    """The playback_smoke.summary line a conformed 59.94 -> 24 run prints, in the app's own field order (MainWindow.cpp): the status text, then the tail
+    that holds the wrap fields, the source counts, the rates and the nonce. `override` replaces a tail field's value; `drop` removes a field."""
+    tail = {"wrapped": "0", "total_frames": "1500", "clip_seconds": "25.025", "wrap_count": "0", "jump_to_first_count": "0", "restart_count": "0",
+            "source_advanced": "1499", "required_source_frames": "1499", "native_fps": "59.940", "pace_fps": "24.000", "fps_override": "0",
+            "source_start_frame": "0"}
+    tail.update(override)
+    return ("playback_smoke.summary session=3 reason=play-stop elapsed_ms=30000.000 presented_frames=720 presented_fps=24.000 frame_telemetry=0 "
+            + status + " gui_fps_status_value=24.000 "
+            + " ".join(f"{k}={v}" for k, v in tail.items() if k not in drop)
+            + (f" run_nonce={nonce}" if nonce is not None else ""))
+
+
+@requires_windows_pwsh
+class ConformStatusParenthesisSurvivesTheLogReaderTests(unittest.TestCase):
+    """r10 (ADV-A1): only a genuine TRAILING Qt location suffix is cut from a run-log record. The conform status group `(<clip> -> <rate>)` the app writes
+    inside gui_fps_status_text is part of the body, so the evidence fields after it are read; a tampered copy is still refused by the same nonce, count,
+    rate and wrap checks."""
+
+    CLIP = "M16-1457"
+
+    def evidence(self, summary_line: str, loc: str = "", requested: str = "on", conform_active: int = 1):
+        """Get-DvPlaybackEvidence over a log that holds the conformed summary (+ the conform line), the way Invoke-VenueLeg calls it."""
+        log = "\n".join([
+            "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
+            "playback_smoke.measured_session id=3",
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=%d conform_enabled=%d conform_env_override=1" % (conform_active, conform_active),
+            summary_line + loc]) + "\n"
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false; clipId = $env:DVE_CLIP }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA"
+            " -ExpectedClipId $env:DVE_CLIP -RequestedConform $env:DVE_REQ\n"
+            "[ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); sourceAdvanced = $pb.sourceAdvanced; requiredSourceFrames = $pb.requiredSourceFrames;"
+            " nativeFps = $pb.nativeFps; paceFps = $pb.paceFps; wrapped = $pb.wrapped; wrapCount = $pb.wrapCount; observedRunNonce = $pb.observedRunNonce;"
+            " paceRule = $pb.paceRule } | ConvertTo-Json -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_REQ=requested)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    def assertRecovered(self, out: dict) -> None:
+        self.assertEqual({k: out[k] for k in ("sourceAdvanced", "requiredSourceFrames", "nativeFps", "paceFps", "wrapped", "wrapCount", "observedRunNonce", "paceRule")},
+                         {"sourceAdvanced": 1499, "requiredSourceFrames": 1499, "nativeFps": 59.94, "paceFps": 24.0, "wrapped": False, "wrapCount": 0,
+                          "observedRunNonce": NONCE, "paceRule": "conform"}, out)
+        self.assertEqual((out["valid"], out["reasons"]), (True, []), out)
+
+    def test_a_conformed_summary_with_a_qt_location_suffix_keeps_its_evidence_fields(self) -> None:
+        self.assertRecovered(self.evidence(conformed_summary_line(), CONFORM_LOC))
+
+    def test_a_conformed_summary_with_no_location_suffix_keeps_its_evidence_fields(self) -> None:
+        self.assertRecovered(self.evidence(conformed_summary_line()))
+
+    def test_a_location_path_holding_parentheses_and_a_status_lookalike_is_still_cut_whole(self) -> None:
+        # the suffix is cut at the first ` (` that is NOT the app's status group: a path with its own ` (`, even one shaped like the group, adds nothing
+        for loc in (" (C:/build (x/platform/qt/MainWindow.cpp:29229)", ' (C:/b (3 -> 2)" source_advanced=1 run_nonce=' + "f" * 32 + " x/M.cpp:5)"):
+            with self.subTest(loc=loc):
+                self.assertRecovered(self.evidence(conformed_summary_line(), loc))
+
+    def test_an_unreadable_location_after_a_conformed_summary_keeps_the_fields_before_it(self) -> None:
+        # LOCATION_UNREADABLE stays for a malformed trailing suffix, but it supplies no field and no longer discards the ones that precede it
+        for loc in (" (C:/b x/MainWindow.cpp:%3)", " (C:/b x/MainWindow.cpp:12) tail", " (C:/b x/MainWindow.cpp:)"):
+            with self.subTest(loc=loc):
+                self.assertRecovered(self.evidence(conformed_summary_line(), loc))
+
+    def test_the_record_body_helper_cuts_only_the_trailing_location(self) -> None:
+        line = conformed_summary_line()
+        proc, out = run_pwsh_json(
+            "[ordered]@{ plain = (Get-DvLogRecordBody -Line $env:DVE_LINE);"
+            " located = (Get-DvLogRecordBody -Line ($env:DVE_LINE + $env:DVE_LOC));"
+            " unreadable = (Get-DvLogRecordBody -Line ($env:DVE_LINE + ' (C:/b x/M.cpp:%3)')) } | ConvertTo-Json -Compress",
+            DVE_LINE=line, DVE_LOC=CONFORM_LOC)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"plain": line, "located": line, "unreadable": line + " (LOCATION_UNREADABLE)"})
+
+    def test_a_status_lookalike_that_is_not_the_apps_status_field_is_a_location_not_a_body(self) -> None:
+        # the group is the app's only where it directly follows `gui_fps_status_text="Playback: <n> fps`; after any other field it opens a location
+        base = 'a=1 gui_fps_status_text="Playback: 24 fps" b=2'
+        forged = base + ' (1 -> 2)" source_advanced=9 x.cpp:5)'
+        proc, out = run_pwsh_json("[ordered]@{ forged = (Get-DvLogRecordBody -Line $env:DVE_FORGED) } | ConvertTo-Json -Compress", DVE_FORGED=forged)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out, {"forged": base})
+
+    def test_a_tampered_conformed_summary_is_still_refused_by_the_same_checks(self) -> None:
+        wrong_nonce = "0123456789abcdef0123456789abcdef"
+        cases = {
+            "wrong nonce": (conformed_summary_line(nonce=wrong_nonce), "RECEIPT_NOT_THIS_RUN"),
+            "no nonce": (conformed_summary_line(nonce=None), "RECEIPT_NOT_THIS_RUN"),
+            "missing source count": (conformed_summary_line(drop=("required_source_frames",)), "RECEIPT_FIELD_ABSENT"),
+            "source short of required": (conformed_summary_line(source_advanced="1000"), None),
+            "pace rate that is not the conform rate": (conformed_summary_line(pace_fps="59.940"), None),
+            "wrapped": (conformed_summary_line(wrapped="1", wrap_count="1"), None),
+        }
+        for name, (line, token) in cases.items():
+            for loc in ("", CONFORM_LOC):
+                with self.subTest(case=name, located=bool(loc)):
+                    out = self.evidence(line, loc)
+                    self.assertFalse(out["valid"], out)
+                    if token is not None:
+                        self.assertTrue(any(token in r for r in out["reasons"]), out)
+
+
 if __name__ == "__main__":
     unittest.main()

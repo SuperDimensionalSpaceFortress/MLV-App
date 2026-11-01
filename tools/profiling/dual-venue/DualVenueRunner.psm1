@@ -1629,22 +1629,49 @@ function Get-DvSmokeSessionLineRead {
 # marker is read from it, and a whole-line match (the prep_route record) fails on it: the record is unreadable, never absent and never forged.
 $script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
 
+# r10 (ADV-A1, Dot 6550442583; r8 adversary on 894ef15c): the ONE parenthesis the app writes inside a record body. PlaybackConformPolicy.h
+# playbackFpsStatusText appends ` (<clip> -> <rate>)` (each number QString::number(x, 'g', 5)) to the status text when a clip is conformed, and the
+# playback_smoke.summary line prints it quoted: gui_fps_status_text="Playback: <n> fps (59.94 -> 24)", BEFORE the evidence fields. The group is
+# recognised only in that exact place -- directly after `gui_fps_status_text="Playback: <n> fps` and closed by `)"` -- so a path or message that merely
+# looks like it (after any other text) is still a location. Every length is bounded, so a call costs O(1) and the scan stays linear.
+$script:DvConformStatusGroup = [regex]::new('\G \((?:[0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?) -> (?:[0-9]+(?:\.[0-9]+)?(?:e[+-][0-9]+)?)\)"', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+$script:DvConformStatusKey = 'gui_fps_status_text="Playback: '
+$script:DvConformStatusMeasured = [regex]::new('^[0-9]+(?:\.[0-9])? fps$', [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+
+function Test-DvConformStatusGroupAt {
+    <#
+    .SYNOPSIS
+    r10 (ADV-A1): is the ` (` at $Index of $Line the conform group of the app's own status field (see $script:DvConformStatusGroup above), not a Qt location?
+    True only when the group's grammar matches there AND the text just before it is `gui_fps_status_text="Playback: <n> fps`, the key at the start of the
+    line or after a space. The look-back is bounded (96 characters), so the call is O(1).
+    #>
+    param([Parameter(Mandatory)][string]$Line, [Parameter(Mandatory)][int]$Index)
+    if (-not $script:DvConformStatusGroup.Match($Line, $Index).Success) { return $false }
+    $from = [Math]::Max(0, $Index - 96)
+    $before = $Line.Substring($from, $Index - $from)
+    $k = $before.LastIndexOf($script:DvConformStatusKey, [StringComparison]::Ordinal)
+    if ($k -lt 0) { return $false }
+    if ($from + $k -gt 0 -and ($k -eq 0 -or $before[$k - 1] -cne [char]' ')) { return $false }
+    $script:DvConformStatusMeasured.IsMatch($before.Substring($k + $script:DvConformStatusKey.Length))
+}
+
 function Get-DvLogRecordBody {
     <#
     .SYNOPSIS
     PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 (#726): one run-log line without the Qt location suffix CrashForensics::writeLogLine appends after the message
     (` (<file>:<line>)`, only when the message context carries a file; CrashForensics.cpp writeLogLine). r4 (r3 adversary A1 = Grok G1): the suffix starts at
     the FIRST ` (` of the line and runs to a closing `:<digits>)` at its very end; nothing is paired, so the path may hold spaces and parentheses, balanced or
-    not (`C:/build (x/`, `C:/build x)/`), and any text at all, record markers included. That is exact because a record body never holds ` (`: the
+    not (`C:/build (x/`, `C:/build x)/`), and any text at all, record markers included. That is exact because a record body holds ` (` in ONE place only: the
     prefix is `[utc] [LEVEL] [0x<thread>] `, record keys are [A-Za-z0-9_]+, every value from outside the app goes through log_line_field::fieldValue (which
-    maps every space), and the one app value with spaces (summary gui_fps_status_text, "Playback: <n> fps") holds no parenthesis. The location is written
-    last, so what precedes its first ` (` is the body the app wrote. A line with no ` (` is returned unchanged; a line whose tail is not a readable location
+    maps every space), and the one app value with spaces (summary gui_fps_status_text, "Playback: <n> fps") carries, on a conformed run only, the group
+    ` (<clip> -> <rate>)` (r10, ADV-A1: see Test-DvConformStatusGroupAt, which recognises that group by its place and grammar and the scan steps over it once).
+    The location is written last, so what precedes its first other ` (` is the body the app wrote. A line with no such ` (` is returned unchanged; a line whose tail is not a readable location
     is refused as described under r5 below. Every dual-venue reader of the app's run log strips the
     suffix through this helper (or Get-DvLogRecordBodies) BEFORE it matches a record marker or a field.
     r5 (sol r4 B1 and H1 on #726): a writer before r5 built the location with chained QString::arg calls, so a path holding `%1` took the line number and
     the location ended `:%2)`; that suffix was left in the body, where marker text in the path selected the session, the start line, the visual state and
-    the summary fields. The rule now: the body is the text before the first ` (`, always (the location is written last and the body never holds ` (`,
-    so that text is the app's own and the path's text never reaches a reader). The tail decides whether the record is readable: `:<digits>)` (this
+    the summary fields. The rule now: the body is the text before the first ` (` that is not the status group above, always (the location is written last and
+    the body holds no other ` (`, so that text is the app's own and the path's text never reaches a reader). The tail decides whether the record is readable: `:<digits>)` (this
     writer) or `:%2)` (the old writer's only other ending: its path held a lower-numbered marker, and the body before the location is unaffected) with a
     path of at least one character gives the body; any other tail (no line number, text after the `)`, an empty path, a message that held a marker on the
     old writer) gives the body plus ' (LOCATION_UNREADABLE)', which refuses a whole-line match and supplies no field or marker. It may refuse; it never
@@ -1653,6 +1680,11 @@ function Get-DvLogRecordBody {
     param([AllowNull()][AllowEmptyString()][string]$Line)
     if ([string]::IsNullOrEmpty($Line)) { return $Line }
     $open = $Line.IndexOf(' (', [StringComparison]::Ordinal)
+    # r10 (ADV-A1, Dot 6550442583): the first ` (` is the location's only when it is not the conform group the app writes INSIDE its own status field
+    # (see the r10 note above). That group is skipped once (one gui_fps_status_text per summary line); the next ` (` is the location.
+    if ($open -ge 0 -and (Test-DvConformStatusGroupAt -Line $Line -Index $open)) {
+        $open = $Line.IndexOf(' (', $open + 2, [StringComparison]::Ordinal)
+    }
     if ($open -lt 0) { return $Line }
     $body = $Line.Substring(0, $open)
     $end = $Line.Length - 1
