@@ -7240,6 +7240,89 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
         got = json.loads(self.run_ps(script))
         self.assertEqual(got, {"com-sup1": True, "com-sup3": True}, f"the mutated rule still refused a superscript device name (it should accept U+00B9/U+00B3 once cut back): {got}")
 
+    def test_r9_b1_a_component_that_ends_in_a_dot_or_a_space_is_refused_on_the_raw_spelling_terminal_and_middle(self) -> None:
+        # sol r8 B1 literals: GetFullPath strips a trailing dot / space, so the r8 `EndsWith` check ran on an already-normalised name and never fired. The RAW components are judged before any normalisation.
+        pre = "C:\\x\\.claude-state\\"
+        bad = {
+            "terminal-dot": pre + "receipts.", "terminal-space": pre + "receipts ", "middle-dot": pre + "r.\\receipts", "middle-space": pre + "r \\receipts",
+            "terminal-two-dots": pre + "receipts..", "terminal-three-dots": pre + "receipts...", "terminal-dot-trailing-sep": pre + "receipts.\\",
+            "forward-slash-middle-dot": "C:/x/.claude-state/r./receipts", "extended-prefix-middle-dot": "\\\\?\\C:\\x\\.claude-state\\r.\\receipts",
+            "marker-component-with-dot": "C:\\x\\.claude-state.\\receipts", "outer-component-with-space": "C:\\x \\.claude-state\\receipts",
+            "dotted-before-parent-nav": pre + "r.\\..\\receipts",
+        }
+        controls = {"fine": pre + "good-root", "dot-nav": pre + "a\\.\\r", "dotdot-nav": pre + "a\\..\\r", "inner-dot-name": pre + "r.x\\receipts", "dotted-extension-name": pre + "receipts.d"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, **controls})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        self.assertEqual(got["dot-nav"].lower(), "c:\\x\\.claude-state\\a\\r", got)
+        self.assertEqual(got["dotdot-nav"].lower(), "c:\\x\\.claude-state\\r", got)
+        self.assertEqual(got["inner-dot-name"].lower(), "c:\\x\\.claude-state\\r.x\\receipts", got)
+        self.assertEqual(got["dotted-extension-name"].lower(), "c:\\x\\.claude-state\\receipts.d", got)
+        # a relative spelling is judged raw too (resolved against the PowerShell location only after the components are checked)
+        loc = self.clean_base() / ".claude-state"
+        loc.mkdir()
+        rel = self.judge(["C:\\fake\\agent-share"], {"rel-middle-dot": "r.\\receipts", "rel-terminal-dot": "receipts.", "rel-fine": "receipts"}, location=loc, process_dir=loc)
+        self.assertIsNone(rel["rel-middle-dot"], rel)
+        self.assertIsNone(rel["rel-terminal-dot"], rel)
+        self.assertEqual(rel["rel-fine"].lower(), str(loc / "receipts").lower(), rel)
+        # the batch entry refuses before the run dir, the claim or a leg; the real leg entry refuses the same root
+        base = self.clean_base()
+        for label, rootp in (("terminal-dot", base / ".claude-state" / "receipts."), ("middle-dot", base / ".claude-state" / "r." / "receipts")):
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(rootp))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=label):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(rootp)))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def _tr_tr_child(self, body: str) -> dict:
+        """Run `body` in a FRESH child pwsh whose thread culture is tr-TR BEFORE the module (and so any regex it builds) exists; a regex built under en-US is cached and would hide the defect."""
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+                  "[System.Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'\n[System.Threading.Thread]::CurrentThread.CurrentUICulture = 'tr-TR'\n"
+                  f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  "$o = [ordered]@{ culture = [Globalization.CultureInfo]::CurrentCulture.Name }\n" + body + "$o | ConvertTo-Json -Compress\n")
+        return json.loads(self.run_ps(script))
+
+    def test_r9_b2_the_dos_device_refusal_does_not_depend_on_the_process_culture(self) -> None:
+        # sol r8 B2 literals: under tr-TR the inline `(?i:...)` folded `i` to U+0130, so lowercase `conin$` and `conin$ .txt` were not devices; uppercase `CONIN$` was (the control).
+        pre = "C:\\x\\.claude-state\\"
+        names = {"conin-lower": "conin$", "conin-lower-space-ext": "conin$ .txt", "conin-upper": "CONIN$", "conin-mixed": "Conin$", "conout-lower": "conout$", "conout-upper-space-ext": "CONOUT$ .x",
+                 "nul-lower": "nul", "con-lower": "con", "aux-lower": "aux", "prn-lower": "prn", "com1-lower-space-ext": "com1 .txt", "lpt-upper-middle": "LPT9"}
+        body = ("$cases = '" + psq(json.dumps({k: pre + v + "\\r" for k, v in names.items()}))
+                + "' | ConvertFrom-Json\nforeach ($p in $cases.PSObject.Properties) { $o[$p.Name] = [bool](Test-DvLocalReceiptRoot -Path ([string]$p.Value) -AgentShares @('C:\\fake\\agent-share')) }\n"
+                + "$o['fine'] = [bool](Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\good-root' -AgentShares @('C:\\fake\\agent-share'))\n"
+                + "$o['console-not-a-device'] = [bool](Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\console\\r' -AgentShares @('C:\\fake\\agent-share'))\n")
+        got = self._tr_tr_child(body)
+        self.assertEqual(got["culture"], "tr-TR", got)
+        for name in names:
+            self.assertFalse(got[name], f"{name}: a DOS device name was certified under tr-TR: {got}")
+        self.assertTrue(got["fine"], got)
+        self.assertTrue(got["console-not-a-device"], got)
+
+    def test_r9_b2_the_consent_path_shaped_refusal_does_not_depend_on_the_process_culture(self) -> None:
+        # the same class at DualVenueRunner.psm1 (Read-DvClipConsent): `(?i)[a-z]:` under tr-TR does not match the capital I drive letter, so `I:\clip` was not "path-shaped"
+        body = ("$t = [pscustomobject]@{ venues = [pscustomobject]@{} }\n"
+                "foreach ($txt in @('I:\\a', 'i:\\a', 'C:\\a', 'Z:\\a')) { $o[$txt] = [string](Read-DvClipConsent -Text $txt -Table $t).reason }\n")   # the path-shape check runs before the JSON parse, so a bare value is enough (and no double quote for the command line to mangle)
+        got = self._tr_tr_child(body)
+        for k, v in got.items():
+            if k != "culture":
+                self.assertIn("path-shaped", v, f"{k}: {got}")
+
+    def test_r9_b2_the_runner_output_name_match_does_not_depend_on_the_process_culture(self) -> None:
+        # the same class at Invoke-VenueLeaseBatch.ps1 (the runner-owned leaf names): `-imatch` of `quiet-...` under tr-TR missed the upper-case spelling the file system treats as the same file
+        text = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("-imatch $p", text, "the runner-owned leaf match is a culture-dependent -imatch")
+        self.assertEqual(text.count("[regex]::IsMatch($c.Name, $p, $script:DvCultureFreeIgnoreCase)"), 2, "both leaf-name matches go through the culture-invariant option")
+        self.assertIn("$script:DvCultureFreeIgnoreCase = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'", text, "the script defines the option in ITS scope (the module's $script: is not visible here)")
+        pat = "'^quiet-.+\\.out\\.txt\\z'"
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n[System.Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'\n"
+                  "$opt = [Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'\n"
+                  f"$o = [ordered]@{{ upper = [regex]::IsMatch('QUIET-A.OUT.TXT', {pat}, $opt); lower = [regex]::IsMatch('quiet-a.out.txt', {pat}, $opt) }}\n$o | ConvertTo-Json -Compress\n")
+        self.assertEqual(json.loads(self.run_ps(script)), {"upper": True, "lower": True})
+
     def test_r8_b2_a_powershell_drive_rooted_in_a_subdirectory_of_its_own_letter_is_not_certified(self) -> None:
         # sol B2 literal, run for real in a CHILD pwsh over a temp directory: the C PSDrive is re-rooted so PowerShell cmdlets resolve `C:\x\...` UNDER that directory (here a venue agentShare), while the
         # helper certified the literal `C:\x\...`. Nothing is created: the helper only reads. The drive root must be exactly `<letter>:\`.

@@ -725,6 +725,10 @@ function Resolve-DvAdmissionSources {
     [pscustomobject]$res
 }
 
+# r9 B2: the case-insensitive option every PATH-refusal regex uses. PowerShell's -match / -imatch / -like and an inline (?i) follow the PROCESS culture (tr-TR: `I` does not fold onto `i`), so a refusal rule
+# that must hold on every host builds its regex with this option instead (IgnoreCase + CultureInvariant).
+$script:DvCultureFreeIgnoreCase = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'
+
 function Test-DvUnderClaudeState {
     # Owner footage (a contact sheet, a receipt that names it) is only ever written where it stays local: a path with a
     # `.claude-state` segment (gitignored; never committed, PR-attached, bus-published or published as an artifact).
@@ -757,6 +761,7 @@ function Test-DvLocalReceiptRoot {
     # This function reaches no engine-session API (the attr3 splice scan, test_attr3_spliced_body_scan, counts any such reference in this file as an unprovable extractor binding): the location comes from Get-Location, the drive from Get-PSDrive.
     param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
     try {
+        $rawSpelling = $null
         # (1) the RAW text, either slash. Only `\\?\C:\...` (backslashes) is a local device spelling; anything else that starts with two separators (UNC, \\.\, //?/, \/?\, \\?\UNC\) is refused here.
         if ($Path -match '^[\\/]{2}') {
             if ($Path -cnotmatch '^\\\\\?\\[A-Za-z]:\\[^/]*$') { return $null }
@@ -770,6 +775,13 @@ function Test-DvLocalReceiptRoot {
             $here = Get-Location
             if ($here.Provider.Name -cne 'FileSystem') { return $null }
             $full = [IO.Path]::GetFullPath($Path, $here.ProviderPath)
+            $rawSpelling = $Path
+        }
+        # r9 B1 (sol r8): Win32 strips a trailing dot / space from a component, so GetFullPath turns `receipts.` into `receipts` and the normalised-path check below never sees it. The RAW spelling is judged first, on EVERY
+        # component (terminal and middle, either slash): a component ending in `.` or ` ` is refused, the `.` and `..` navigation tokens excepted (those are resolved by GetFullPath, not written).
+        if ($null -eq $rawSpelling) { $rawSpelling = $full }
+        foreach ($rc in @($rawSpelling.Split([char[]]@('\', '/')))) {
+            if ($rc.Length -gt 0 -and -not [string]::Equals($rc, '.', [StringComparison]::Ordinal) -and -not [string]::Equals($rc, '..', [StringComparison]::Ordinal) -and ($rc.EndsWith(' ') -or $rc.EndsWith('.'))) { return $null }
         }
         if ($full -match '^[\\/]{2}') { return $null }
         $plain = [IO.Path]::GetFullPath($full)
@@ -866,7 +878,8 @@ function Test-DvLocalReceiptRoot {
                 if ($c.Length -gt $maxLen) { return $false }
                 if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
                 if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
-                if ($c -cmatch '^(?i:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$') { return $false }
+                # r9 B2: culture-INVARIANT (under tr-TR an inline `(?i:...)` folds `i` to U+0130, so lowercase `conin$` was not a device): RegexOptions.IgnoreCase -bor CultureInvariant, never the process culture
+                if ([regex]::IsMatch($c, '^(?:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$', $script:DvCultureFreeIgnoreCase)) { return $false }
             }
             # r6 ADV-A2 / r8 B2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted EXACTLY at `<letter>:\` -- not `New-PSDrive X -Root \\host\share`, and not
             # `C` re-rooted at `C:\Windows` (the cmdlets would write under that directory while this judgement ran on the literal spelling)
@@ -914,7 +927,8 @@ function Read-DvClipConsent {
     $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @(); blankets = @() } }
     if ([string]::IsNullOrWhiteSpace($Text)) { return (& $bad 'the consent file is missing or empty') }
     # A consent record names a clip by ID. A drive path or a footage file name anywhere in the file is refused outright.
-    if ($Text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
+    # r9 B2: culture-invariant (tr-TR does not fold the `I` of `I:\` onto `i`)
+    if ([regex]::IsMatch($Text, '[a-z]:[\\/]|\.mlv\b', $script:DvCultureFreeIgnoreCase)) { return (& $bad 'the consent file carries a path-shaped value') }
     try { $doc = $Text | ConvertFrom-Json } catch { return (& $bad 'the consent file is not valid JSON') }
     if ([string](Get-DvProp $doc 'schema') -ne $script:ConsentSchema) { return (& $bad "the consent file schema is not $($script:ConsentSchema)") }
     if ($null -eq $doc.PSObject.Properties['records']) { return (& $bad 'the consent file has no records array') }
