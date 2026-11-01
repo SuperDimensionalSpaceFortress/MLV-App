@@ -6330,12 +6330,21 @@ R10_REAL_SELECTOR_BEHIND_A_SEARCH = ["refs/remotes/fork/master@{1}^{/foo}", "ref
 
 @pytest.mark.parametrize("expr", R10_REAL_SELECTOR_BEHIND_A_SEARCH)
 def test_r10_adv_a2_an_actual_reflog_selector_is_still_refused_at_every_site_when_a_search_follows_it(tmp_path, expr):
-    repo, sha_a, sha_b = _r9_repo(tmp_path)
-    cur = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r10-cur-real", disk="'a'\n")
+    # r14: the refusal now reads the exact ref (show-ref) before it probes, and the r6 shim deletes the ref after the first
+    # show-ref, so each site gets its own repo instead of sharing one that the first site has already emptied.
+    subs = []
+    for site in ("currency", "ratio", "retire"):
+        sub = tmp_path / site
+        sub.mkdir()
+        subs.append((sub,) + tuple(_r9_repo(sub)))
+    (sub, repo, sha_a, sha_b) = subs[0]
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", "r10-cur-real", disk="'a'\n")
     assert cur["status"] == "refused-reflog" and cur["threw"] is True, (expr, cur)
-    rat = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r10-ratio-real")
+    (sub, repo, sha_a, sha_b) = subs[1]
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", "r10-ratio-real")
     assert rat["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, rat)
-    ret = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r10-ret-real", wt_sha=sha_a)
+    (sub, repo, sha_a, sha_b) = subs[2]
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r10-ret-real", wt_sha=sha_a)
     assert ret["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, ret)
 
 
@@ -6344,7 +6353,7 @@ def test_r10_every_site_classifies_a_full_refname_by_ascii_whitespace_and_strips
         text = path.read_text(encoding="utf-8")
         assert r"[^?*\[\\\s]" not in text, (path, "the Unicode-aware \\s is back in the full-refname classifier")
         assert r"[^?*\[\\ \t\n\v\f\r]" in text, path
-        assert r"\^\{/.*?\}" in text, (path, "the ^{/regex} search group is not stripped (non-greedy, r14) before the reflog test")
+        assert r"\^\{/.*" not in text, (path, "r14: no regex strip of the ^{/...} search group may decide the reflog test (see test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix)")
 
 
 # --- r11 (Dot prior-key B3, old Sol r9 CR 6553630639): type the run rows BEFORE any comparison ---------------
@@ -6747,10 +6756,12 @@ def test_r13_the_schema_and_the_c1_range_are_pinned_in_the_selector_source():
 # --- r14 (sol r13 BLOCKER on 47a65674 + r13 adversary A1): a GREEDY `^{/.*}` strip hides an external reflog selector -----
 # r10 stripped `^{/regex}` commit-message-search groups with the greedy `\^\{/.*\}` before testing for `@{`. Greedy `.*` runs to
 # the LAST `}` in the suffix, so `refs/remotes/fork/master^{/search}^{}@{1}` lost its trailing `@{1}` (the `}` of `@{1}` is the
-# last brace) and the typed reflog refusal never fired at any of the three sites. The strip is now NON-greedy (`.*?`): it ends
-# a search group at the FIRST `}`, so every `@{` outside the group - including one after a later `^{}` - is still seen. A search
-# group that itself holds `@{n}` (r10 ADV-A2: `^{/foo@{1}}`) is still a valid non-reflog revision: its `@{1` is consumed with the
-# group. A selector hidden by the strip is refused fail-closed; a leftover `}` can only cause an extra refusal, never a miss.
+# last brace) and the typed reflog refusal never fired at any of the three sites. A first r14 attempt made the strip NON-greedy
+# (`.*?`), which the r14 adversary (A1) showed wrongly REFUSED a valid search holding `{n}` before its `@{` (`^{/.*|a{1}foo@{1}}`:
+# the group's first `}` is the interval's). No regex over the suffix can tell `^{/a}^{}@{1}` (selector) from `^{/a{1}x@{1}}`
+# (search), so git is the parser: the exact SHA is read once and `<sha><suffix>^{commit}` is resolved. A reflog selector can never
+# resolve on a SHA base (`<sha>@{n}` is rejected) while a search group that merely holds `@{` does. A suffix holding `@{` that
+# does not resolve on the SHA is refused fail-closed at all three sites; one that resolves is a valid non-reflog revision.
 R14_HIDDEN_SELECTORS = [
     R6_REF + "^{/search}^{}@{1}",       # sol's catalogue input
     R6_REF + "^{/search}^{}@{0}",
@@ -6783,15 +6794,49 @@ def test_r14_the_retire_merge_gate_refuses_a_reflog_selector_a_greedy_search_str
     assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
 
 
-def test_r14_no_script_strips_a_search_group_greedily():
-    # The CLASS: any `^{/` strip that ends at the LAST brace. Scan every tracked tools/ script and the workflow for the idiom.
+# The adversary's own input and two siblings: valid searches that hold `{n}` and/or `@{n}` and DO resolve in git. They must not be
+# refused by any site. Fixture (_r10_search_repo): A = 'foo@ A' (x.ps1='a'), B = 'B' (x.ps1='b'), refs/remotes/fork/master = B.
+R14_VALID_SEARCHES = [
+    (R6_REF + "^{/.*|a{1}foo@{1}}", "b"),     # adversary A1: `.*` matches the tip B
+    (R6_REF + "^{/(a{1}|foo)@{1}}", "a"),     # `{1}` before the `@{1}`: only A's message has 'foo@'
+    (R6_REF + "^{/foo@{1}}", "a"),            # the r10 control
+]
+
+
+@pytest.mark.parametrize("expr,disk", R14_VALID_SEARCHES)
+def test_r14_a_valid_search_holding_braces_resolves_in_git_and_is_not_refused_by_any_site(tmp_path, expr, disk):
+    def fresh(site):
+        # the r6 shim deletes the ref right after the first show-ref, so each site gets its own repo
+        sub = tmp_path / site
+        sub.mkdir()
+        return sub, _r10_search_repo(sub)
+
+    sub, (repo, sha_a, sha_b) = fresh("currency")
+    want = sha_a if disk == "a" else sha_b
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == want, (expr, ok.stdout, ok.stderr)
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", "r14-cur-valid", disk="'%s'\n" % disk)
+    assert cur["status"] == "current" and cur["threw"] is False, (expr, cur)
+    sub, (repo, sha_a, sha_b) = fresh("ratio")
+    want = sha_a if disk == "a" else sha_b
+    rat =_r10_site(sub, repo, "ratio", "'" + expr + "'", "r14-ratio-valid")
+    assert rat.get("errorCode") in (None, "") and rat["sourceSha"] == want, (expr, rat)
+    sub, (repo, sha_a, sha_b) = fresh("retire")
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r14-ret-valid", wt_sha=sha_a)
+    assert "reflog selector" not in ret["reason"] and "merge target ref missing" not in ret["reason"], (expr, ret)
+
+
+def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
+    # The CLASS: a regex strip of the `^{/...}` group (greedy OR non-greedy) cannot parse git's grammar. Every site probes the
+    # exact SHA with `<sha><suffix>^{commit}` instead, and no tools/ script keeps either strip.
     offenders = []
     for path in sorted((COORD.parent).rglob("*")):
         if path.suffix.lower() not in (".ps1", ".psm1", ".py", ".mjs") or path.name == "test_coordination_guardrails.py":
             continue
         for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-            if "\^\{/.*\}" in line:
+            if "\\^\\{/.*" in line:
                 offenders.append("%s:%d" % (path, n))
     assert not offenders, offenders
-    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
-        assert "\^\{/.*?\}" in path.read_text(encoding="utf-8"), (path, "the non-greedy search-group strip is missing")
+    for path, token in ((COORD / "assert-script-currency.ps1", '"$exactSha$refSuffix^{commit}"'), (RATIO_GUARD, '"$exactSha$refSuffix^{commit}"'),
+                        (RETIRE, '"$baseSha$mergeSuffix^{commit}"')):
+        assert token in path.read_text(encoding="utf-8"), (path, "the exact-SHA probe is missing")

@@ -402,10 +402,14 @@ try {
         # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname is
         # REFUSED with its own code (fail-closed, exit 3) instead of surfacing as a misleading ERROR_REF_UNRESOLVED.
         # r10 (sol r9 ADV-A2): only an ACTUAL reflog selector (a `@{` outside a `^{/regex}` search group) is refused.
-        # r14 (sol r13 BLOCKER): NON-greedy strip - a search group ends at the FIRST `}`, so a selector after it is still seen.
-        if ([regex]::Replace($refSuffix, '(?s)\^\{/.*?\}', '') -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
+        # r14 (sol r13 BLOCKER / adversary A1): git is the parser, not a regex. A suffix holding `@{` anywhere that does NOT resolve
+        # on the exact SHA (`<sha>@{n}` is rejected; a search group holding `@{` resolves) is refused, fail-closed.
         $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
         $refExists = ($exactSha -match '^[0-9a-f]{40}$')
+        if ($refSuffix -match '@\{') {
+            $probe = if ($refExists) { [string](& git -C $RepoRoot rev-parse --verify --quiet --end-of-options "$exactSha$refSuffix^{commit}" 2>$null | Select-Object -First 1) } else { '' }
+            if ($probe -notmatch '^[0-9a-f]{40}$') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
+        }
         if ($refExists) { $revision = "$exactSha$refSuffix" }
     }
     if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify --quiet --end-of-options "$revision^{commit}" 2>$null) }

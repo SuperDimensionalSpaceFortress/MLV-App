@@ -68,15 +68,21 @@ if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.
     # exact-ref read above would have to be re-resolved by NAME to honour it. No default caller uses reflog syntax, so it
     # is REFUSED, fail-CLOSED, with its own status. It must never fall to 'unknown': this guard is fail-OPEN on unknown.
     # r10 (sol r9 ADV-A2): refuse only an ACTUAL reflog selector - a `@{` outside a `^{/regex}` commit-message search group.
-    # r14 (sol r13 BLOCKER / adversary A1): the strip is NON-greedy - a group ends at the FIRST `}`. A greedy `.*` ran to the last
-    # `}` and hid an external selector (`^{/s}^{}@{1}`); a leftover `}` can only add a refusal, never miss one.
-    if ([regex]::Replace($refSuffix, '(?s)\^\{/.*?\}', '') -match '@\{') {
-        $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
-                     "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
-        Write-Result 'refused-reflog' $reflogMsg
-        throw $reflogMsg
-    }
+    # r14 (sol r13 BLOCKER / adversary A1): NO regex parse of the suffix decides this. A greedy `^{/.*}` strip hid an external
+    # selector (`^{/s}^{}@{1}`); the non-greedy one wrongly refused a valid search holding `{n}` (`^{/a{1}foo@{1}}`). Git is the
+    # parser: the exact SHA is read ONCE and `<sha><suffix>^{commit}` is resolved. A reflog selector can never resolve on a SHA
+    # base (`<sha>@{n}` is rejected), while a search group that merely contains `@{` does. So a suffix holding `@{` anywhere that
+    # does NOT resolve on the SHA is refused (fail-closed) - an unresolvable search that holds `@{` is also refused, never 'unknown'.
     $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
+    if ($refSuffix -match '@\{') {
+        $probe = if ($exactSha -match '^[0-9a-f]{40}$') { [string](& git -C $root rev-parse --verify --quiet --end-of-options "$exactSha$refSuffix^{commit}" 2>$null | Select-Object -First 1) } else { '' }
+        if ($probe -notmatch '^[0-9a-f]{40}$') {
+            $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
+                         "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
+            Write-Result 'refused-reflog' $reflogMsg
+            throw $reflogMsg
+        }
+    }
     if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
     $refSpec = "$exactSha$refSuffix"
 }
