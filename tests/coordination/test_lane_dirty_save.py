@@ -332,6 +332,60 @@ def test_a_run_dir_inside_the_worktree_is_bad_arguments(repo):  # sol r4 hardeni
     assert list((repo / "run").iterdir()) == []
 
 
+# ---- r6: only git's output terminator is stripped from the toplevel path (r5 ADV-A4; Dot SHARED BLOCKER 6561896260) ----
+def init_repo(wd, content):
+    wd.mkdir()
+    for a in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "core.autocrlf", "false"]):
+        git(wd, *a)
+    (wd / "a.txt").write_bytes(content)
+    git(wd, "add", ".")
+    git(wd, "commit", "-q", "-m", "base")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows strips a trailing space from a path component, so git cannot even enter such a directory; the POSIX CI leg is the real-repo case and test_the_toplevel_path_loses_only_git_s_line_terminator covers the decoder on every platform")
+@pytest.mark.parametrize("sibling_dirty", [False, True])
+def test_a_worktree_whose_name_ends_in_a_space_is_saved_not_its_sibling(tmp_path, sibling_dirty):
+    selected, sibling = tmp_path / "repo ", tmp_path / "repo"
+    (tmp_path / "run").mkdir()
+    init_repo(selected, b"selected base\n")
+    init_repo(sibling, b"sibling base\n")
+    (selected / "a.txt").write_bytes(b"SELECTED dirt\n")
+    if sibling_dirty:
+        (sibling / "a.txt").write_bytes(b"SIBLING dirt\n")
+    r = save(selected, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr  # old code: toplevel .Trim() -> the sibling: exit 10 (clean) or the sibling's patch
+    receipt = last_receipt(r)
+    patch = tmp_path / "run" / receipt["patch"]
+    assert receipt["head"] == git(selected, "rev-parse", "HEAD").decode().strip()
+    assert b"SELECTED dirt" in patch.read_bytes() and b"SIBLING" not in patch.read_bytes()
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "-c", "core.autocrlf=false", str(selected), str(clone)], check=True, capture_output=True)
+    git(clone, "apply", "--binary", str(patch))  # applies in the SELECTED repo's history
+    assert (clone / "a.txt").read_bytes() == b"SELECTED dirt\n"
+
+
+@pytest.mark.parametrize("raw, want", [
+    (b"/w/repo \n", "/w/repo "),         # trailing space survives; the LF is git's terminator
+    (b"/w/repo \r\n", "/w/repo "),       # CR before the terminating LF goes with it
+    (b"/w/repo\n", "/w/repo"),
+    (b"/w/ repo\n", "/w/ repo"),         # leading space is part of the name too
+    (b"/w/repo  \n\n", "/w/repo  \n"),   # exactly ONE terminator, never a run of whitespace
+    (b"/w/repo ", "/w/repo "),           # no terminator, nothing to strip
+])
+def test_the_toplevel_path_loses_only_git_s_line_terminator(raw, want):
+    text = SCRIPT.read_text(encoding="utf-8")
+    m = re.search(r"^function Remove-GitTerminator.*?^}\n", text, re.MULTILINE | re.DOTALL)
+    assert m, "lane-dirty-save.ps1 has no Remove-GitTerminator"  # old code: .Trim() inline, no helper
+    prog = m.group(0) + f"$b = [Convert]::FromHexString('{raw.hex()}'); [Console]::Out.Write('[' + (Remove-GitTerminator $b) + ']')"
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout == "[" + want + "]"
+
+
+def test_the_toplevel_path_is_never_trimmed():
+    assert not re.search(r"show-toplevel[^\n]*\n[^\n]*\.Trim\(\)", SCRIPT.read_text(encoding="utf-8"))  # r5 ADV-A4: the line after the toplevel call must not Trim the path
+
+
 # ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
 FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
 # The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.

@@ -36,6 +36,11 @@ function Invoke-GitBytes([string[]]$GitArgs) {
         return @{ Code = $p.ExitCode; Bytes = $ms.ToArray(); Err = $err.Result }
     } catch { return @{ Code = -1; Bytes = [byte[]]@(); Err = $_.Exception.Message } }
 }
+function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with one LF: strip that (and a CR before it), never other whitespace (r5 ADV-A4: a worktree named 'repo ' is not the sibling 'repo')
+    $s = [System.Text.Encoding]::UTF8.GetString($Bytes)
+    if ($s.EndsWith("`n")) { $s = $s.Substring(0, $s.Length - 1); if ($s.EndsWith("`r")) { $s = $s.Substring(0, $s.Length - 1) } }
+    return $s
+}
 function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
     $procId = $LanePid; $born = $null
@@ -80,7 +85,7 @@ try {
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
-if ($top.Code -eq 0) { $WorkDir = [System.Text.Encoding]::UTF8.GetString($top.Bytes).Trim() }
+if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
 $rel = [System.IO.Path]::GetRelativePath($WorkDir, $RunDir)
 if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
