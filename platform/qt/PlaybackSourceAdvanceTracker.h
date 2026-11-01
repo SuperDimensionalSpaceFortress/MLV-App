@@ -98,17 +98,19 @@ private:
  *  700 -> 0 jumps back by 700, under its 711. The tracker then counted the wrap as a backward jump and lost
  *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
  *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
- *  wrap_count. A presentation that goes backward while an engine wrap is still unconsumed IS the wrap, and
- *  so is one the inference recognises. consumedEngineWraps is the caller's running count; it is set to the
- *  engine's count whenever a wrap is taken, and when the measured Play starts.
+ *  wrap_count. An engine wrap belongs to the NEXT presented transition only: a presentation that goes
+ *  backward while an engine wrap noted since the previous presentation is pending IS the wrap, and so is
+ *  one the inference recognises. EVERY presentation consumes the pending wraps, the first one of the
+ *  measured Play included (r16 re-pass A1 on c9b4ca5e: a wrap before the first presentation stayed pending,
+ *  and a later backward seek took it and was credited 719 frames). consumedEngineWraps is the caller's
+ *  running count; it is set to the engine's count at every presentation and when the measured Play starts.
  *  \param havePrevious a frame was presented before this one in the measured Play */
 inline bool presentationIsLoopWrap( bool inferredWrap, int engineWraps, int &consumedEngineWraps,
                                     bool havePrevious, int lastFrame, int frame )
 {
-    const bool wrap = havePrevious
-                   && ( inferredWrap || ( engineWraps > consumedEngineWraps && frame < lastFrame ) );
-    if( wrap ) consumedEngineWraps = engineWraps;
-    return wrap;
+    const bool engineWrapPending = engineWraps > consumedEngineWraps;
+    consumedEngineWraps = engineWraps;
+    return havePrevious && ( inferredWrap || ( engineWrapPending && frame < lastFrame ) );
 }
 
 #endif // PLAYBACKSOURCEADVANCETRACKER_H

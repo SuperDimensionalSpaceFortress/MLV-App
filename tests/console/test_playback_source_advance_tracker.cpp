@@ -144,6 +144,31 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     e.present(11 / 24.0, 2, true, 0, 719);
     ASSERT_EQ(1u, e.tracker.wraps());
     ASSERT_EQ(1u, e.tracker.backwardJumps());
+    // r16 re-pass A1 on c9b4ca5e: the measured Play starts at 718, its first tick wraps (718 + 1 -> 0) BEFORE the
+    // first presentation, then 0, 1 and a user seek back to 0. The wrap belongs to the first presentation (which has
+    // no transition), never to the seek: advanced 1, no wrap, one backward jump (c9b4ca5e: 720, 1, 0).
+    const playback_frame_range::DropFrameTickResult first =
+        playback_frame_range::advanceDropFrameTick(718.0, 1.0, 1, 720, true);
+    ASSERT_TRUE(first.wrapped);
+    ASSERT_EQ(0, static_cast<int>(first.position));
+    PresentDriver p;
+    p.startMeasuredPlay();
+    ++p.engineWraps;
+    p.present(0.0, static_cast<int>(first.position), true, 0, 719);
+    p.present(1 / 24.0, 1, true, 0, 719);
+    p.present(2 / 24.0, 0, true, 0, 719);
+    ASSERT_EQ(1, static_cast<int>(p.tracker.advancedFrames()));
+    ASSERT_EQ(0u, p.tracker.wraps());
+    ASSERT_EQ(1u, p.tracker.backwardJumps());
+    // and a wrap followed by a FORWARD presentation is consumed there: a later backward seek is not the wrap
+    PresentDriver q;
+    q.startMeasuredPlay();
+    q.present(0.0, 100, true, 0, 719);
+    ++q.engineWraps;
+    q.present(1 / 24.0, 101, true, 0, 719);
+    q.present(2 / 24.0, 50, true, 0, 719);
+    ASSERT_EQ(0u, q.tracker.wraps());
+    ASSERT_EQ(1u, q.tracker.backwardJumps());
     // no Loop, no engine wrap: a backward seek is never a wrap (the inference's own refusal is unchanged)
     PresentDriver s;
     s.startMeasuredPlay();
