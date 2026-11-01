@@ -62,6 +62,15 @@ $refSplit = [regex]::Match($Ref, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
 $refBase = if ($refSplit.Success) { $refSplit.Groups['base'].Value } else { $Ref }
 $refSuffix = if ($refSplit.Success) { $refSplit.Groups['suffix'].Value } else { '' }
 if ($refBase -match '^refs/[^?*\[\\\s]+$' -and $refBase -notmatch '\.\.|//|/$') {
+    # r9 (sol r8 ADV-A1 / Grok G8): a reflog selector cannot ride on a SHA (`<sha>@{1}` is rejected by git), and the
+    # exact-ref read above would have to be re-resolved by NAME to honour it. No default caller uses reflog syntax, so it
+    # is REFUSED, fail-CLOSED, with its own status. It must never fall to 'unknown': this guard is fail-OPEN on unknown.
+    if ($refSuffix -match '@\{') {
+        $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
+                     "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
+        Write-Result 'refused-reflog' $reflogMsg
+        throw $reflogMsg
+    }
     $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
     if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
     $refSpec = "$exactSha$refSuffix"

@@ -6102,3 +6102,76 @@ def test_r8_g7_every_site_splits_at_the_first_revision_operator_and_reads_the_ba
         assert "(?<base>.*?)(?<suffix>(?:[~^:]|@\\{).*)" in text, path
         assert "show-ref --verify --hash $" in text, path
         assert "rev-parse --verify --quiet --end-of-options" in text, path
+
+
+# --- r9 (sol r8 ADV-A1 / Grok G8 / Dot a71eec35: a reflog suffix cannot ride on a SHA) -----------------------------------
+# r8 rewrote `refs/remotes/fork/master@{1}` to `<sha>@{1}`, which git rejects, so every site read a VALID reflog expression
+# as unresolved - and the currency guard is fail-OPEN on `unknown`. No default caller uses reflog syntax, so r9 REFUSES an
+# expression whose base is a full refname and whose suffix contains `@{`, fail-CLOSED, with a typed site-specific refusal:
+#   assert-script-currency.ps1  status 'refused-reflog' (PassThru) and a THROW (like 'stale'); never 'unknown'
+#   Test-ProductRatioGuard.ps1  errorCode ERROR_REF_REFLOG_REFUSED, exit 3
+#   Retire-LaneWorktree.ps1     kept, reason 'cannot-determine: merge target uses a reflog selector (@{) ...'
+R9_REFLOG_EXPRS = ["refs/remotes/fork/master@{1}", "refs/remotes/fork/master@{1}^{commit}"]
+
+
+def _r9_repo(tmp_path):
+    """A (x.ps1='a') then B (x.ps1='b'); refs/remotes/fork/master was set to A, then to B: a TWO-ENTRY reflog, so git itself
+    resolves refs/remotes/fork/master@{1} to A. Returns (repo, A, B)."""
+    repo = tmp_path / "r9repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name in ("a", "b"):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", name.upper())
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    git(repo, "update-ref", "--create-reflog", "-m", "first", R6_REF, shas[0])
+    git(repo, "update-ref", "--create-reflog", "-m", "second", R6_REF, shas[1])
+    return repo, shas[0], shas[1]
+
+
+def test_r9_adv_a1_the_fixture_has_a_valid_two_entry_reflog(tmp_path):
+    """Only meaningful if git itself resolves the expression: @{1} is A, and <sha>@{1} (the r8 rewrite) is rejected."""
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", R6_REF + "@{1}^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == sha_a, (ok.stdout, ok.stderr)
+    bad = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", sha_b + "@{1}^{commit}"], capture_output=True, text=True)
+    assert bad.returncode != 0, bad.stdout
+
+
+@pytest.mark.parametrize("expr", R9_REFLOG_EXPRS)
+def test_r9_adv_a1_the_currency_guard_refuses_a_reflog_selector_fail_closed_with_its_own_status(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'zzz-stale'\n", encoding="utf-8")        # differs from every ref: only a refusal stops this copy
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("$o = @(); $threw = $false\n"
+            "try { & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -Ref '" + expr + "' -PassThru | ForEach-Object { $o += $_ } } catch { $threw = $true }\n"
+            "[pscustomobject]@{ status = $(if ($o.Count) { [string]$o[0].status } else { 'none' }); threw = $threw } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r9-currency.ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R9_REFLOG_EXPRS)
+def test_r9_adv_a1_the_ratio_guard_refuses_a_reflog_selector_with_its_own_error_code(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r8_ratio(tmp_path, repo, expr, "r9-ratio.ps1")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED" and doc["verdict"] == "ERROR" and doc["sourceSha"] == "", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R9_REFLOG_EXPRS)
+def test_r9_adv_a1_the_retire_merge_gate_refuses_a_reflog_selector_with_its_own_reason(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r8_retire(tmp_path, repo, sha_a, expr, "r9-ret")
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
+
+
+def test_r9_adv_a1_every_site_names_its_typed_reflog_refusal_in_source():
+    for path, token in ((COORD / "assert-script-currency.ps1", "refused-reflog"), (RATIO_GUARD, "ERROR_REF_REFLOG_REFUSED"),
+                        (RETIRE, "merge target uses a reflog selector")):
+        text = path.read_text(encoding="utf-8")
+        assert token in text, path
+        assert r"@\{" in text, path

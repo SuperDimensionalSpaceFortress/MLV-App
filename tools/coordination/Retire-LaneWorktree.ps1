@@ -1444,6 +1444,9 @@ function Invoke-RetireLaneWorktree {
         $mergeBaseIsRef = ($mergeBase -match '^refs/[^?*\[\\\s]+$' -and $mergeBase -notmatch '\.\.|//|/$')
         if ($MergeTarget -like 'refs/*') {
             $mergeSpec = $MergeTarget
+            # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname
+            # is REFUSED (kept, fail-closed) with its own reason rather than reported as a missing ref.
+            if ($mergeBaseIsRef -and $mergeSuffix -match '@\{') { $d.reason = "cannot-determine: merge target uses a reflog selector (@{) and is refused ($MergeTarget)"; return [pscustomobject]$d }
             if ($mergeBaseIsRef) {
                 $baseSha = [string](& git.exe -C $main show-ref --verify --hash $mergeBase 2>$null | Select-Object -First 1)
                 if ($baseSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
