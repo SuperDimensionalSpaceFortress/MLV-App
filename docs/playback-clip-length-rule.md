@@ -156,9 +156,15 @@ FRAME:
   when even its shortest possible length is longer than the run's median of each hold's longest possible length (its
   length plus the poll gap before it was first seen; MERGE-MASTER r14, r13 adversary A1: a median hold plus two MEDIAN
   poll gaps fell to 20 ms under uneven polls and cast ordinary holds out). A stall is left out along with the step that
-  ends it. A steady engine at any pace, polled on any schedule, has no such hold. A stall shorter than about two poll
-  gaps cannot be seen in the count, so it reads as a slower cadence (six 100 ms stalls at the autoplay's 50 ms poll are
-  still refused; from about 140 ms they are recovered). It is trusted only after 3 s of playing
+  ends it. A steady engine at any pace, polled on any schedule, has no such hold. That median alone left 100-140 ms
+  stalls at the autoplay's 50 ms poll unseen depending on the phase (r14 adversary A1: six 150 ms stalls refused a run
+  reaching at 64.3 s), so MERGE-MASTER r15 adds a second, phase-independent split (`kPaceCadenceStallFactor`,
+  `PlayPaceHistory::cadenceSplit`): a hold is also a stall when even its shortest possible length is longer than twice
+  an upper bound on the run's mean step since the first forward step. No value that stayed at most twice the mean is
+  cast out, so a steady engine and an uneven slow engine's ordinary jitter stay playing; the probe takes the faster
+  pace and the earlier finish of the two splits, so it is never stricter than r14. At 24 fps and the 50 ms poll every
+  stall from about 80 ms is recovered at any phase; a shorter one cannot be told from a slower cadence and is still
+  refused, typed, at the probe. It is trusted only after 3 s of playing
   time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
   that keep coming are left to the other estimates, which refuse them at the probe. MERGE-MASTER r13 (sol r12 B1/B2)
   makes both measures exact to the poll: a hold is judged by its length less the poll gap its ending step could have

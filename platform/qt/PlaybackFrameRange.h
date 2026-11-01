@@ -444,7 +444,9 @@ constexpr int64_t kPaceRecentWindowMs = 3000;
 // exceeds the median upper bound: a steady engine at any pace is measured exactly (all its holds count). A hold whose
 // bin exceeds it is a stall. With even polls p the upper bound is the bin + 2p, so the threshold is r12's median bin
 // plus two poll gaps exactly, and a stall is seen once it adds about two poll gaps (20 ms at the smoke's 10 ms poll,
-// 100-140 ms at the autoplay's 50 ms); shorter stalls are below what the count can show and read as a slower cadence.
+// 100-140 ms at the autoplay's 50 ms, depending on the phase); shorter stalls read as a slower cadence. r15: the
+// CADENCE THRESHOLD (kPaceCadenceStallFactor) also counts as a stall any hold whose value provably stayed more than
+// twice the run's mean step, at any phase: at 24 fps and the 50 ms poll that is every stall of about 80 ms or more.
 // r12/r13 added two MEDIAN poll gaps to the median bin, which is no bound once polls are uneven (r13 adversary A1 on
 // 19a83d2d: 80 ms gaps at t % 125 < 10 put most bins at 0, the threshold fell to 20 ms, the ordinary 30/40 ms bins were
 // cast out as stalls and a run reaching 1499 at 63880 ms was refused at 8 s). If stalls are the majority the median is
@@ -461,6 +463,16 @@ constexpr int64_t kPaceRecentWindowMs = 3000;
 // r13 (sol r12 B1) error band: see PlayPaceHistory::optimisticFinishMs.
 constexpr int64_t kPaceMinPlayingSteps = 24;
 constexpr int kPaceHoldBucketMs = 1000;
+// r15 (r14 adversary A1 on 11c27fc1): THE CADENCE THRESHOLD. A hold is also a stall when its bin is longer than
+// kPaceCadenceStallFactor x U, U being an upper bound on the run's mean step period since the first forward step (stalls
+// included; PlayPaceHistory::cadenceThresholdMs). A value's bin is never longer than the time it really stayed the
+// newest, so no hold whose value stayed at most twice the mean step is ever a stall: a steady engine at any pace and
+// poll schedule (every bin <= its step period <= U), and an uneven engine's ordinary jitter, stay playing. Factor 1 would
+// still be sound for a steady engine, but it cast out the slow half of uneven slow engines (30/60 ms alternation,
+// normal jitter around 22 fps) and let them play on to about 60 s before the typed refusal; at 2 they are refused at
+// the probe as before. The cadence split is only ever used to go on (the faster pace and the earlier finish of it and
+// the r14 split), so it is never stricter than r14.
+constexpr int64_t kPaceCadenceStallFactor = 2;
 
 struct PlayPaceHistory
 {
@@ -501,6 +513,10 @@ struct PlayPaceHistory
     int64_t overflowEndGapMs = 0;
     // r14: closed holds by their upper bound, hold + lead gap (THE STALL THRESHOLD); a longer one is only in the total
     std::vector<int32_t> holdUpperCount = std::vector<int32_t>( kPaceHoldBucketMs + 1, 0 );
+    // r15: the poll gap just before the first forward step's sighting, and whether there was an earlier observation to
+    // measure it from (THE CADENCE BOUND)
+    bool firstStepLeadKnown = false;
+    int64_t firstStepLeadMs = 0;
 
     struct PlayingSplit
     {
@@ -533,14 +549,49 @@ struct PlayPaceHistory
     // threshold) less one ordinary step. A short open hold is in neither.
     PlayingSplit playingSplit( int64_t elapsedMs ) const
     {
-        PlayingSplit split;
-        if( !haveFirstStep || elapsedMs < holdStartMs ) return split;
+        if( !haveFirstStep || elapsedMs < holdStartMs ) return PlayingSplit();
         // r14 (r13 adversary A1 on 19a83d2d, CoS ask 6559996576): the median hold's UPPER bound, never median bin + 2 x
         // median gap (uneven polls: 80 ms gaps at t % 125 < 10 put most bins at 0, the threshold fell to 20 ms and the
         // ordinary 30/40 ms holds were cast out as stalls). See THE STALL THRESHOLD above kPaceMinPlayingSteps.
         const int64_t medianUpper = histogramMedian( holdUpperCount, holds + overflowHolds );
-        if( medianUpper < 0 ) return split;
-        split.thresholdMs = medianUpper;
+        if( medianUpper < 0 ) return PlayingSplit();
+        return splitAtThreshold( elapsedMs, medianUpper );
+    }
+
+    // r15 (r14 adversary A1 on 11c27fc1): THE CADENCE THRESHOLD (see kPaceCadenceStallFactor), which does not depend on
+    // where the polls fall. A closed hold's bin (hold less its end gap) is the time from the value's first sighting to
+    // its last, and the value was the newest at both, so a bin is never longer than the time the value really stayed.
+    // The N = consumed(open hold) - consumed(first step) steps from the first forward step to the open hold's step took
+    // D ms in all, mean D / N; the first happened after its sighting less its lead gap and the last at or before the open
+    // hold's first sighting, so D < holdStartMs - firstStep.elapsedMs + firstStepLeadMs and
+    //   U = (holdStartMs - firstStep.elapsedMs + firstStepLeadMs) / N  >  the mean step (a steady engine's step period).
+    // Recovered stalls only make U larger. Returns floor(kPaceCadenceStallFactor x U); -1 = none (no step after the first
+    // yet, or the first step's lead gap is unknown because it was the first observation).
+    int64_t cadenceThresholdMs() const
+    {
+        if( !haveFirstStep || !firstStepLeadKnown ) return -1;
+        const int64_t steps = lastConsumed - firstStep.consumed;
+        if( steps <= 0 ) return -1;
+        return kPaceCadenceStallFactor * ( holdStartMs - firstStep.elapsedMs + firstStepLeadMs ) / steps;
+    }
+
+    // r15: the split with the cadence threshold, capped at the r14 threshold (so it only ever moves a hold from playing
+    // to stall). With 50 ms polls a 24 fps engine advances at every poll, so an ordinary hold's upper bound is 100 ms
+    // and r14 could not tell a 150 ms stall whose bin is 100 ms from an ordinary step (r14 adversary A1: six 150 ms
+    // stalls at irregular phases, three of them binned at 100 ms, measured 22.2 fps and refused a run reaching at
+    // 64317 ms). U is about 48 ms there, the cadence threshold 96 ms, so every one of them is a stall at any phase.
+    PlayingSplit cadenceSplit( int64_t elapsedMs ) const
+    {
+        const PlayingSplit r14 = playingSplit( elapsedMs );
+        const int64_t cadence = cadenceThresholdMs();
+        if( r14.thresholdMs <= 0 || cadence <= 0 || cadence >= r14.thresholdMs ) return r14;
+        return splitAtThreshold( elapsedMs, cadence );
+    }
+
+    PlayingSplit splitAtThreshold( int64_t elapsedMs, int64_t thresholdMs ) const
+    {
+        PlayingSplit split;
+        split.thresholdMs = thresholdMs;
         for( int64_t d = 0; d <= kPaceHoldBucketMs; ++d )
         {
             const size_t b = static_cast<size_t>( d );
@@ -581,6 +632,7 @@ struct PlayPaceHistory
         if( ( elapsedMs < lastElapsedMs || consumed < lastConsumed || consumed < 2 ) && haveFirstStep ) *this = PlayPaceHistory();
         const int64_t previousConsumed = lastConsumed;
         // the gap just before this observation: a step first seen now happened less than this long ago
+        const bool hadEarlierObservation = observed;
         const int64_t gapMs = observed ? std::max<int64_t>( 0, elapsedMs - lastElapsedMs ) : 0;
         observed = true;
         lastElapsedMs = elapsedMs;
@@ -594,6 +646,8 @@ struct PlayPaceHistory
             firstStep.consumed = consumed;
             holdStartMs = elapsedMs;
             holdLeadGapMs = gapMs;
+            firstStepLeadKnown = hadEarlierObservation;
+            firstStepLeadMs = gapMs;
         }
         else if( consumed != previousConsumed )
         {
@@ -651,12 +705,16 @@ struct PlayPaceHistory
             && 2 * s.stallMs <= s.playingMs;
     }
 
-    // r12: steps per ms while playing (see THE STALL THRESHOLD); 0 = not trusted yet.
-    double playingPace( int64_t elapsedMs ) const
+    // r12: steps per ms while playing (see THE STALL THRESHOLD); 0 = not trusted yet. r15: the faster of the r14 split's
+    // and the cadence split's (THE CADENCE BOUND), each only when trusted, so it is never below r14's.
+    static double splitPace( const PlayingSplit &s )
     {
-        const PlayingSplit s = playingSplit( elapsedMs );
         if( !playingSplitTrusted( s ) ) return 0.0;
         return static_cast<double>( s.playingSteps ) / static_cast<double>( s.playingMs );
+    }
+    double playingPace( int64_t elapsedMs ) const
+    {
+        return std::max( splitPace( playingSplit( elapsedMs ) ), splitPace( cadenceSplit( elapsedMs ) ) );
     }
 
     // r13 (sol r12 B1): the EARLIEST time the run can reach `required` at the trusted playing pace, given what the count
@@ -671,10 +729,16 @@ struct PlayPaceHistory
     // stepMin). The run is refused only when even that is past the budget. The band is poll quantization only: a steady
     // 22 fps engine at 8 s (175 steps over 7950 ms) is 22.04 fps at its optimistic end at a 10 ms poll and 22.15 fps at
     // 50 ms, still refused.
+    // r15: the earlier of the r14 split's and the cadence split's (THE CADENCE BOUND); the bound holds for any split,
+    // because the stretches are delimited by whichever holds that split calls stalls and their lead gaps are summed.
     double optimisticFinishMs( int64_t consumed, int64_t required, int64_t elapsedMs ) const
     {
+        return std::min( splitFinishMs( playingSplit( elapsedMs ), consumed, required, elapsedMs ),
+                         splitFinishMs( cadenceSplit( elapsedMs ), consumed, required, elapsedMs ) );
+    }
+    double splitFinishMs( const PlayingSplit &s, int64_t consumed, int64_t required, int64_t elapsedMs ) const
+    {
         const double none = std::numeric_limits<double>::infinity();
-        const PlayingSplit s = playingSplit( elapsedMs );
         if( !playingSplitTrusted( s ) ) return none;
         const double shortest = static_cast<double>( s.playingMs - s.stretchEndLateMs );
         if( !( shortest > 0.0 ) ) return none;

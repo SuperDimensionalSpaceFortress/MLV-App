@@ -2060,7 +2060,7 @@ TEST( PlayPaceRecovery, R14SixShortStallsTheRecoveredClassAndThePinnedResolution
 {
     // the r12 DISTINGUISH (pr-comment-r12: six 100 ms stalls at the autoplay's 50 ms poll are refused), now an explicit
     // regression on both sides. Six equal stalls at 2, 3, ... 7 s after a 1 s first present, 24 fps: every length here is
-    // feasible (1 s + 6 x len + 62.4 s < 65 s).
+    // feasible (1 s + 6 x len + 62.4 s < 65 s). r15: THE CADENCE THRESHOLD moved the limit at 50 ms from 140 to 80 ms.
     const int64_t budget = playSafetyMs( 25.0 );
     for( const int64_t len : { int64_t( 50 ), int64_t( 80 ), int64_t( 100 ), int64_t( 120 ), int64_t( 140 ),
                                int64_t( 150 ), int64_t( 200 ), int64_t( 250 ) } )
@@ -2073,22 +2073,181 @@ TEST( PlayPaceRecovery, R14SixShortStallsTheRecoveredClassAndThePinnedResolution
         ASSERT_TRUE( at10.state == PlayStopState::Reached );
         ASSERT_TRUE( at10.elapsedMs < budget );
         const PolledRun at50 = pollStalledCount( 1000, 24, six, 1499, budget, 50 );
-        if( len >= 140 )
+        if( len >= 80 )
         {
             ASSERT_TRUE( at50.state == PlayStopState::Reached );   // the class r12 left open, recovered at 50 ms too
             ASSERT_TRUE( at50.elapsedMs <= budget );
         }
         else
         {
-            // THE RESOLUTION LIMIT, pinned: a 24 fps engine polled every 50 ms advances at every poll, so an ordinary
-            // hold's upper bound is 50 + 50 = 100 ms. A stall under about 140 ms leaves holds whose LOWER bound (hold less
-            // the 50 ms end gap) is not above 100 ms, so no bound shows they were longer than an ordinary step; telling
-            // them apart would mean assuming a steady engine, which would let an uneven slow engine pass. Such a run
-            // reads as a ~22 fps cadence and is refused, typed, at the probe -- never a timeout, never a hang.
+            // THE RESOLUTION LIMIT, pinned (r15): a 50 ms stall on a 41.7 ms step leaves a value that stayed about
+            // 92 ms, which a 50 ms poll shows as a 50 ms bin at most, under THE CADENCE THRESHOLD (twice the run's mean
+            // step, about 86 ms here). A lower threshold would also cast out an uneven slow engine's ordinary jitter and
+            // let it play on (R15AdversaryA1 jitter controls), so the run reads as a ~23 fps cadence and is refused,
+            // typed, at the probe -- never a timeout, never a hang.
             ASSERT_TRUE( at50.state == PlayStopState::PaceTooSlow );
             ASSERT_EQ( int64_t( 8000 ), at50.elapsedMs );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r15 (r14 adversary A1 on 11c27fc1; CoS ask 6559996576): recoverable ~150 ms stalls at the autoplay's 50 ms poll still
+// refused a feasible conformed run, depending on the phase. The input verbatim: a 1667-frame 59.94 fps clip conformed to
+// 24 fps, requestedSeconds 25, required 1499, safety 65000, Gated, Play running, no loop, polled every 50 ms from t = 0
+// (note, then decide), c(t) = 1 + floor(24 x max(0, t - 1000 - sum(clamp(t - s, 0, 150) for s in [1750, 2620, 3500,
+// 4410, 5380, 6230])) / 1000). At 8000 ms c = 147 and r14's threshold (the median hold upper bound) is 100 ms: three of
+// the six 150 ms stall holds bin at exactly 100 ms and stayed playing (6350 ms, 141 steps, 22.2 fps), so the optimistic
+// finish was 66926.6 ms and the probe refused (PaceTooSlow, exit 14). The count reaches 1499 at 64317 ms.
+// THE CADENCE THRESHOLD (twice an upper bound on the mean step since the first step, about 96 ms here) calls all six
+// stalls, at every phase of the poll; the r14 split is unchanged and the cadence split is only used to go on.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+std::vector<Stall> r15AdversaryStalls( int64_t offsetMs, int64_t lenMs )
+{
+    std::vector<Stall> s;
+    for( const int64_t at : { int64_t( 1750 ), int64_t( 2620 ), int64_t( 3500 ), int64_t( 4410 ), int64_t( 5380 ), int64_t( 6230 ) } )
+        s.push_back( Stall{ at + offsetMs, lenMs } );
+    return s;
+}
+
+// a count driven by a repeating pattern of step periods (ms) after a first present at firstPresentMs
+int64_t dwellPatternCount( int64_t t, int64_t firstPresentMs, const std::vector<int64_t> &dwellMs )
+{
+    int64_t steps = 0;
+    int64_t at = firstPresentMs;
+    for( size_t i = 0;; ++i )
+    {
+        at += dwellMs[i % dwellMs.size()];
+        if( at > t ) break;
+        ++steps;
+    }
+    return 1 + steps;
+}
+}
+
+TEST( PlayPaceRecovery, R15AdversaryA1RecoveredShortStallsAreNotRefusedAtAnyPollPhase )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    ASSERT_EQ( int64_t( 65000 ), budget );
+    const std::vector<Stall> a1 = r15AdversaryStalls( 0, 150 );
+    ASSERT_EQ( int64_t( 147 ), stalledCount( 8000, 1000, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64316, 1000, 24, a1 ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64317, 1000, 24, a1 ) );
+    // the exact input: Reached at the first 50 ms poll that sees 1499, never refused, never timed out
+    const PolledRun run = pollStalledCount( 1000, 24, a1, 1499, budget, 50 );
+    ASSERT_EQ( int64_t( 147 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64350 ), run.elapsedMs );
+    // at the probe: the adversary's r14 split is still what playingSplit reports, and the cadence split sees six stalls
+    PlayPaceHistory probe;
+    for( int64_t t = 0; t <= 8000; t += 50 ) probe.note( stalledCount( t, 1000, 24, a1 ), t );
+    const PlayPaceHistory::PlayingSplit r14 = probe.playingSplit( 8000 );
+    ASSERT_EQ( int64_t( 100 ), r14.thresholdMs );
+    ASSERT_EQ( int64_t( 6350 ), r14.playingMs );
+    ASSERT_EQ( int64_t( 141 ), r14.playingSteps );
+    ASSERT_EQ( int64_t( 315 ), r14.stallMs );
+    ASSERT_EQ( int64_t( 200 ), r14.stretchEndLateMs );
+    const PlayPaceHistory::PlayingSplit cadence = probe.cadenceSplit( 8000 );
+    ASSERT_TRUE( cadence.thresholdMs >= 2 * 42 && cadence.thresholdMs < 100 );
+    ASSERT_EQ( int64_t( 6 ), cadence.stallHolds );
+    ASSERT_TRUE( cadence.stallMs <= 6 * 150 );              // never more than really held
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( cadence ) );
+    // 138 steps over 5900 ms (23.4 fps, r14 22.2): the 50 ms stretch ends are late by up to 350 ms in all, which the
+    // r13 band takes back -- the optimistic finish (62334 ms) is not later than the real 64317 ms
+    ASSERT_TRUE( probe.playingPace( 8000 ) * 1000.0 >= 23.3 );
+    ASSERT_TRUE( probe.optimisticFinishMs( 147, 1499, 8000 ) <= 64317.0 );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 147, 1499, 8000, budget, probe ) );
+    // THE PHASE SWEEP: the stall list offset by 0..49 ms, at the autoplay's 50 ms, a 33 ms and the smoke's 10 ms poll,
+    // and stalls of 80 to 250 ms on the same irregular starts: every run is Reached inside the budget, never before the
+    // count really reaches 1499; and from the probe on the optimistic finish is never later than that (THE BOUND)
+    for( const int64_t len : { int64_t( 80 ), int64_t( 100 ), int64_t( 120 ), int64_t( 150 ), int64_t( 200 ), int64_t( 250 ) } )
+    {
+        for( int64_t off = 0; off < 50; ++off )
+        {
+            const std::vector<Stall> stalls = r15AdversaryStalls( off, len );
+            int64_t reachMs = 0;
+            while( stalledCount( reachMs, 1000, 24, stalls ) < 1499 ) ++reachMs;
+            ASSERT_TRUE( reachMs < budget );
+            for( const int64_t poll : { int64_t( 50 ), int64_t( 33 ), int64_t( 10 ) } )
+            {
+                const PolledRun r = pollStalledCount( 1000, 24, stalls, 1499, budget, poll );
+                ASSERT_TRUE( r.state == PlayStopState::Reached );
+                ASSERT_TRUE( r.elapsedMs >= reachMs && r.elapsedMs <= budget );
+            }
+            if( len == 150 )
+            {
+                PlayPaceHistory h;
+                for( int64_t t = 0; t < reachMs; t += 50 )
+                {
+                    const int64_t c = stalledCount( t, 1000, 24, stalls );
+                    h.note( c, t );
+                    if( t >= playback_frame_range::kPaceProbeMs )
+                        ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= static_cast<double>( reachMs ) );
+                }
+            }
+        }
+    }
+    // a steady engine at any pace, on even and uneven schedules, has no cadence stall: every bin is under its step
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ), int64_t( 60 ) } )
+    {
+        for( const int schedule : { 10, 16, 50, 125 } )
+        {
+            PlayPaceHistory steady;
+            int64_t last = 0;
+            for( int64_t t = 0; t <= 20000; t = ( schedule == 125 ? r14UnevenNext( t ) : t + schedule ) )
+            {
+                steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t );
+                last = t;
+            }
+            const PlayPaceHistory::PlayingSplit st = steady.cadenceSplit( last );
+            ASSERT_EQ( int64_t( 0 ), st.stallHolds );
+            ASSERT_EQ( int64_t( 0 ), st.stallMs );
+        }
+    }
+    // negative controls: 20 / 22 fps with the adversary's stalls are refused at the probe at every poll; 23 fps (which
+    // cannot finish either) is refused, typed, before the budget
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+        {
+            const PolledRun slow = pollStalledCount( 1000, fps, a1, 1499, budget, poll );
+            ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+        }
+        const PolledRun at23 = pollStalledCount( 1000, 23, a1, 1499, budget, poll );
+        ASSERT_TRUE( at23.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( at23.elapsedMs < budget );
+    }
+    // jitter controls (why the factor is 2, not 1): uneven slow engines whose mean step is 45 ms (22.2 fps, 67.4 s) --
+    // 40/50, 30/60 and 20/70 ms alternation -- are refused at the probe as on r14, at the 10, 16 and 50 ms polls: no
+    // ordinary step of theirs stays twice the mean. (Factor 1 let the 30/60 one play to 62 s before the typed refusal.)
+    const std::vector<std::vector<int64_t>> uneven = { { 40, 50 }, { 30, 60 }, { 20, 70 } };
+    for( const std::vector<int64_t> &pattern : uneven )
+    {
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 16 ), int64_t( 50 ) } )
+        {
+            PlayPaceHistory h;
+            PlayStopState state = PlayStopState::Continue;
+            int64_t t = 0;
+            for( ; t <= budget; t += poll )
+            {
+                const int64_t c = dwellPatternCount( t, 0, pattern );
+                h.note( c, t );
+                state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+                if( state != PlayStopState::Continue ) break;
+            }
+            ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( t >= playback_frame_range::kPaceProbeMs && t < 9000 );
+        }
+    }
+    // the first forward step's lead gap must be known: a history whose first observation already had a step has no
+    // cadence bound, and the cadence split is then the r14 split exactly
+    PlayPaceHistory noLead;
+    for( int64_t t = 1500; t <= 8000; t += 50 ) noLead.note( stalledCount( t, 1000, 24, a1 ), t );
+    ASSERT_EQ( int64_t( -1 ), noLead.cadenceThresholdMs() );
+    ASSERT_EQ( noLead.playingSplit( 8000 ).thresholdMs, noLead.cadenceSplit( 8000 ).thresholdMs );
 }
 
 TEST( LookAssistSettle, ASecondSettleNeverAsksForAnotherPlayBecauseTheProcessAdmitsExactlyOne )
