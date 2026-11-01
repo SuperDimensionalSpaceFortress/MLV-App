@@ -151,7 +151,11 @@ FRAME:
   best pace the Play has shown. That pace is the best of the pace since the Play trigger, the pace since the first
   forward step, and the pace over any stretch of 3 s or more, measured from the last time the count was seen at its
   start value (`PlayPaceHistory`, `kPaceRecentWindowMs`), so a stall the count sat through is not charged to the
-  stretch after it. Only when even that
+  stretch after it. MERGE-MASTER r12 (ADV-A1b residual, Dot 6553009018) adds the playing pace: when several
+  recoverable stalls leave no clean 3 s stretch, the steps per second while the count was advancing, with every hold
+  longer than 250 ms (`kPaceStallHoldMs`) and the step ending it left out. It is trusted only after 3 s of playing
+  time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
+  that keep coming are left to the other estimates, which refuse them at the probe. Only when even that
   pace cannot finish inside the budget does the run end as `PLAY_PACE_TOO_SLOW`. Anything else runs on to the
   requirement or to the typed `PLAY_SAFETY_TIMEOUT`. MERGE-MASTER r11 (ADV-A1b, catalogue C-PACE-RECOVERY-01 / M-04)
   replaced the old projection, `elapsed x stepsNeeded / stepsDone` from the trigger. That form charged a startup wait

@@ -1374,6 +1374,242 @@ TEST( PlayPaceRecovery, TheHistoryStartsOverForANewPlayOrAnotherClock )
     ASSERT_TRUE( longRun.window.size() <= static_cast<size_t>( playback_frame_range::kPaceRecentWindowMs * 59.94 / 1000.0 ) + 8 );
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// r12 (ADV-A1b residual; Dot 6553009018, follow-up 6553147568, on e565602e): SEVERAL recoverable stalls before the 8 s
+// probe, so every >= 3 s stretch contains stall time and every r11 estimate stays below the pace the engine plays at.
+// Dot's exact input: required 1499, safety 65000, 24 fps, polled every 10 ms, first present at 1 s, held 3.0-3.5 s and
+// 5.5-6.0 s: c(t) = 1 + floor(24 x max(0, t - 1000 - min(500, max(0, t - 3000)) - min(500, max(0, t - 5500))) / 1000).
+// At 8 s it has consumed 145; continuing at 24 fps it reaches 1499 at 64416.7 ms, inside 65 s.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+// The count Dot's formula gives for a first present, a play rate and any number of stalls (each held [atMs, atMs+forMs)).
+int64_t stalledCount( int64_t t, int64_t firstPresentMs, int64_t fpsInt, const std::vector<Stall> &stalls )
+{
+    int64_t played = t - firstPresentMs;
+    for( const Stall &s : stalls ) played -= std::min<int64_t>( s.forMs, std::max<int64_t>( 0, t - s.atMs ) );
+    return 1 + ( fpsInt * std::max<int64_t>( 0, played ) ) / 1000;
+}
+
+struct PolledRun
+{
+    PlayStopState state = PlayStopState::Continue;
+    int64_t elapsedMs = 0;
+    int64_t consumed = 0;
+    int64_t consumedAt8s = 0;
+};
+
+// Polls the stop decision every pollMs exactly as MainWindow::programmaticPlayState does (note, then decide).
+PolledRun pollStalledCount( int64_t firstPresentMs, int64_t fpsInt, const std::vector<Stall> &stalls,
+                            int64_t required, int64_t safetyMs, int64_t pollMs = 10 )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 900000; t += pollMs )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, fpsInt, stalls );
+        if( t == 8000 ) run.consumedAt8s = run.consumed;
+        h.note( run.consumed, t );
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+
+std::vector<Stall> stallsOf( std::initializer_list<Stall> list ) { return std::vector<Stall>( list ); }
+}
+
+TEST( PlayPaceRecovery, R12DotTwoRecoverableStallsBeforeTheProbeAreNotRefused )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> dot = stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } );
+    // Dot's arithmetic, re-verified: 145 at 8 s; the uninterrupted stretches are 1-3, 3.5-5.5 and 6-8 s (2 s each).
+    ASSERT_EQ( int64_t( 145 ), stalledCount( 8000, 1000, 24, dot ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64417, 1000, 24, dot ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64416, 1000, 24, dot ) );
+    // every poll up to completion: never refused, never timed out, and Reached at 64.42 s
+    const PolledRun run = pollStalledCount( 1000, 24, dot, 1499, budget );
+    ASSERT_EQ( int64_t( 145 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.elapsedMs >= 64416 && run.elapsedMs <= 64430 );
+    // the same through the engine model, at the smoke's 10 ms and the autoplay's 50 ms polls
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const EngineRun engine = runStalledEngine( 1000, 24.0, 1499, budget, poll, dot );
+        ASSERT_TRUE( engine.state == PlayStopState::Reached );
+        ASSERT_TRUE( engine.elapsedMs < budget );
+    }
+}
+
+TEST( PlayPaceRecovery, R12ThreeStallsStallsOfDifferentLengthsAndAStallStraddlingTheWindowAreNotRefused )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    // three stalls (1.3 s in all; stretches of 1.5, 1.5, 1.5 and 1.2 s): finishes at 64.72 s
+    // two stalls of 0.3 and 0.9 s (stretches 1.8, 1.7, 2.3 s): finishes at 64.62 s
+    // a stall ending 2.9 s before the probe, so the last stretch is just short of the 3 s window, plus an earlier one
+    // (stretches 1.0, 2.1, 2.9 s): finishes at 64.42 s
+    const std::vector<std::vector<Stall>> cases = {
+        stallsOf( { Stall{ 2500, 500 }, Stall{ 4500, 500 }, Stall{ 6500, 300 } } ),
+        stallsOf( { Stall{ 2800, 300 }, Stall{ 4800, 900 } } ),
+        stallsOf( { Stall{ 2000, 400 }, Stall{ 4500, 600 } } ),
+    };
+    for( const std::vector<Stall> &stalls : cases )
+    {
+        int64_t stallMs = 0;
+        for( const Stall &s : stalls ) stallMs += s.forMs;
+        for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+        {
+            const PolledRun run = pollStalledCount( 1000, 24, stalls, 1499, budget, poll );
+            ASSERT_TRUE( run.state == PlayStopState::Reached );
+            ASSERT_TRUE( run.elapsedMs < budget );
+            ASSERT_TRUE( run.elapsedMs >= 1000 + stallMs + 62416 );
+            ASSERT_TRUE( runStalledEngine( 1000, 24.0, 1499, budget, poll, stalls ).state == PlayStopState::Reached );
+        }
+    }
+}
+
+TEST( PlayPaceRecovery, R12ControlsStillEndTypedPaceTooSlow )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> dot = stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } );
+    // a genuinely slow engine is refused at the probe, with Dot's stalls or without
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        for( const std::vector<Stall> &stalls : { std::vector<Stall>(), dot } )
+        {
+            const PolledRun run = pollStalledCount( 0, fps, stalls, 1499, budget );
+            ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+            ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+            ASSERT_TRUE( runStalledEngine( 0, static_cast<double>( fps ), 1499, budget, 10, stalls ).state
+                         == PlayStopState::PaceTooSlow );
+        }
+    }
+    // a 4 s first present then 24 fps (66.4 s), with an extra stall too: refused at the probe
+    ASSERT_TRUE( pollStalledCount( 4000, 24, std::vector<Stall>(), 1499, budget ).elapsedMs < 9000 );
+    ASSERT_TRUE( pollStalledCount( 4000, 24, stallsOf( { Stall{ 6000, 300 } } ), 1499, budget ).state == PlayStopState::PaceTooSlow );
+    // stall time that keeps growing (0.5, 1, 2, 4, 8, 16 s): the run really cannot finish inside 65 s. It is refused,
+    // typed, before the budget -- never Reached, never the timeout.
+    const std::vector<Stall> growing = stallsOf( { Stall{ 3000, 500 }, Stall{ 6000, 1000 }, Stall{ 10000, 2000 },
+                                                   Stall{ 16000, 4000 }, Stall{ 26000, 8000 }, Stall{ 40000, 16000 } } );
+    for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
+    {
+        const PolledRun run = pollStalledCount( 500, 24, growing, 1499, budget, poll );
+        ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( run.elapsedMs < budget );
+        ASSERT_TRUE( run.consumed < 1499 );
+        // and at the moment it is refused, even 24 fps from here with no further stall could not make 65 s
+        ASSERT_TRUE( run.elapsedMs + ( 1499 - run.consumed ) * 1000 / 24 > budget );
+    }
+    // a time that is all stalls: one step every 400 ms, or ten steps at once every second -- too few playing frames to
+    // estimate a pace, so the probe is master's and refuses at 8 s
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t c = 1 + t / 400;
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t c = 1 + 10 * ( t / 1000 );
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+    // a single short burst (1 s at 24 fps) and then one step every 600 ms: refused at the probe
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t c = t < 2000 ? stalledCount( t, 1000, 24, std::vector<Stall>() ) : 25 + ( t - 2000 ) / 600;
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+    // stalls that recur all the time (0.6 s of 24 fps, then 0.4 s held, over and over: ~14 fps): refused at the probe
+    {
+        PlayPaceHistory h;
+        PlayStopState state = PlayStopState::Continue;
+        int64_t t = 0;
+        for( ; t <= budget && state == PlayStopState::Continue; t += 10 )
+        {
+            const int64_t played = ( t / 1000 ) * 600 + std::min<int64_t>( 600, t % 1000 );
+            const int64_t c = 1 + 24 * played / 1000;
+            h.note( c, t );
+            state = evaluatePlayStop( c, 1499, true, t, budget, playback_frame_range::PlayPaceMode::Gated, h );
+        }
+        ASSERT_TRUE( state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( t - 10 < 9000 );
+    }
+}
+
+TEST( PlayPaceRecovery, R12ThePlayingPaceStartsOverWithTheHistoryAndNeedsEnoughPlaying )
+{
+    const std::vector<Stall> dot = stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } );
+    PlayPaceHistory h;
+    for( int64_t t = 0; t <= 8000; t += 10 ) h.note( stalledCount( t, 1000, 24, dot ), t );
+    ASSERT_TRUE( h.playingPace( 8000 ) * 1000.0 >= 23.9 );
+    ASSERT_TRUE( h.stallMs >= 1000 && h.stallMs <= 1200 );   // the two holds of ~550 ms each
+    h.note( 1, 8010 );                                        // a new Play re-armed the counter
+    ASSERT_EQ( int64_t( 0 ), h.playingMs );
+    ASSERT_EQ( int64_t( 0 ), h.playingSteps );
+    ASSERT_EQ( int64_t( 0 ), h.stallMs );
+    ASSERT_EQ( 0.0, h.playingPace( 8010 ) );
+    // 2.9 s of playing is not enough; 3 s is
+    PlayPaceHistory s;
+    for( int64_t t = 0; t <= 2900; t += 10 ) s.note( stalledCount( t, 0, 24, std::vector<Stall>() ), t );
+    ASSERT_EQ( 0.0, s.playingPace( 2900 ) );
+    for( int64_t t = 2910; t <= 3100; t += 10 ) s.note( stalledCount( t, 0, 24, std::vector<Stall>() ), t );
+    ASSERT_TRUE( s.playingPace( 3100 ) > 0.0 );
+    // an open hold longer than the stall threshold is stall time, not playing time
+    s.note( s.lastConsumed, 3100 + playback_frame_range::kPaceStallHoldMs + 10 );
+    ASSERT_TRUE( s.playingPace( 3100 + playback_frame_range::kPaceStallHoldMs + 10 ) * 1000.0 >= 23.9 );
+}
+
+TEST( PlayPaceRecovery, R12TheProjectionWithStallsIsNeverStricterThanMasters )
+{
+    // the r11 grid, extended to histories with recoverable stalls (polled through Dot's formula)
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<std::vector<Stall>> stallSets = {
+        std::vector<Stall>(),
+        stallsOf( { Stall{ 3000, 500 }, Stall{ 5500, 500 } } ),
+        stallsOf( { Stall{ 2500, 500 }, Stall{ 4500, 500 }, Stall{ 6500, 300 } } ),
+        stallsOf( { Stall{ 2000, 3000 } } ),
+    };
+    for( const std::vector<Stall> &stalls : stallSets )
+    {
+        for( const int64_t fps : { int64_t( 10 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ) } )
+        {
+            PlayPaceHistory h;
+            for( int64_t t = 0; t <= 30000; t += 10 ) h.note( stalledCount( t, 500, fps, stalls ), t );
+            for( int64_t consumed = 2; consumed < 1499; consumed += 37 )
+            {
+                for( int64_t elapsed = 8000; elapsed < budget; elapsed += 1700 )
+                {
+                    const bool master = playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget );
+                    if( !master ) ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( consumed, 1499, elapsed, budget, h ) );
+                }
+            }
+        }
+    }
+}
+
 TEST( LookAssistSettle, ASecondSettleNeverAsksForAnotherPlayBecauseTheProcessAdmitsExactlyOne )
 {
     using playback_frame_range::lookAssistSettleNeedsOwnPlay;

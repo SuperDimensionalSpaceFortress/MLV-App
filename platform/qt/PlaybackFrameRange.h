@@ -427,6 +427,19 @@ inline double measuredPaceFps( int64_t consumed, int64_t elapsedMs )
 // measured over: short enough that a stall ending up to 5 s into Play leaves one clean stretch by the 8 s probe (r11
 // adversary A1: a 1 s first present plus a 1 s stall at 3 s leaves 4 s), long enough that a 50 ms poll moves it < 2%.
 constexpr int64_t kPaceRecentWindowMs = 3000;
+// r12 (ADV-A1b residual, Dot 6553009018): with SEVERAL recoverable stalls before the probe, every >= 3 s stretch can
+// hold stall time (1 s first present, held 3.0-3.5 and 5.5-6.0 s: the clean stretches are 2 s each), so no r11 estimate
+// sees the 24 fps the engine plays at and a run that finishes at 64.4 s was refused. The PLAYING pace measures only the
+// time the count was advancing: a hold (the time one consumed value stayed the newest) longer than kPaceStallHoldMs is a
+// stall, and the stall AND the step that ends it are left out; every other hold and its steps are the playing pace.
+// kPaceStallHoldMs is 6 frame periods at 24 fps, 3 at the 12 fps floor of a 23.976 clip, 5 polls at the autoplay's 50 ms:
+// a run steady enough to meet any gated requirement never holds that long. Steadier-than-that slow engines (all holds
+// longer) or burst delivery (many steps per long hold) have no playing pace at all and keep r11's estimates. It is only
+// trusted after kPaceRecentWindowMs of playing time and kPaceMinPlayingSteps steps (one short burst cannot justify going
+// on), and only while stalls are at most a third of the measured time (2 x stall <= playing): stalls that keep coming are
+// a slow engine, not a recovered one, and are left to the r11 estimates (which refuse them at the probe).
+constexpr int64_t kPaceStallHoldMs = 250;
+constexpr int64_t kPaceMinPlayingSteps = 24;
 
 struct PlayPaceHistory
 {
@@ -445,12 +458,18 @@ struct PlayPaceHistory
     double bestWindowPace = 0.0;        // steps per ms: the fastest kPaceRecentWindowMs-or-longer stretch seen so far
     int64_t lastElapsedMs = -1;
     int64_t lastConsumed = 0;
+    // r12: the playing pace (kPaceStallHoldMs). holdStartMs = first sighting of the newest value.
+    int64_t holdStartMs = 0;
+    int64_t playingMs = 0;
+    int64_t playingSteps = 0;
+    int64_t stallMs = 0;
 
     // Called with every observation the stop decision makes. A counter that went back (a new Play re-armed it) or a
     // clock that went back (another wait's clock) starts the history over: nothing measured before belongs to this run.
     void note( int64_t consumed, int64_t elapsedMs )
     {
         if( elapsedMs < lastElapsedMs || consumed < lastConsumed || consumed < 2 ) *this = PlayPaceHistory();
+        const int64_t previousConsumed = lastConsumed;
         lastElapsedMs = elapsedMs;
         lastConsumed = consumed;
         if( consumed < 2 ) return;
@@ -460,6 +479,18 @@ struct PlayPaceHistory
             firstStep.elapsedMs = elapsedMs;
             firstStep.lastSeenMs = elapsedMs;
             firstStep.consumed = consumed;
+            holdStartMs = elapsedMs;
+        }
+        else if( consumed != previousConsumed )
+        {
+            const int64_t hold = elapsedMs - holdStartMs;
+            if( hold > kPaceStallHoldMs ) stallMs += hold;
+            else
+            {
+                playingMs += hold;
+                playingSteps += consumed - previousConsumed;
+            }
+            holdStartMs = elapsedMs;
         }
         if( window.empty() || window.back().consumed != consumed )
         {
@@ -483,10 +514,25 @@ struct PlayPaceHistory
         }
     }
 
-    // Steps per ms: the better of the pace since the first forward step and the best window. 0 = nothing measured.
+    // r12: steps per ms while playing (see kPaceStallHoldMs); 0 = not trusted yet. The hold still open at elapsedMs
+    // counts too: as playing time while it is short (never a faster pace), as stall time once it is long.
+    double playingPace( int64_t elapsedMs ) const
+    {
+        if( !haveFirstStep || elapsedMs < holdStartMs ) return 0.0;
+        int64_t playing = playingMs;
+        int64_t stall = stallMs;
+        const int64_t open = elapsedMs - holdStartMs;
+        if( open > kPaceStallHoldMs ) stall += open;
+        else playing += open;
+        if( playingSteps < kPaceMinPlayingSteps || playing < kPaceRecentWindowMs || 2 * stall > playing ) return 0.0;
+        return static_cast<double>( playingSteps ) / static_cast<double>( playing );
+    }
+
+    // Steps per ms: the best of the pace since the first forward step, the best window and (r12) the playing pace.
+    // 0 = nothing measured.
     double bestPace( int64_t consumed, int64_t elapsedMs ) const
     {
-        double best = bestWindowPace;
+        double best = std::max( bestWindowPace, playingPace( elapsedMs ) );
         if( haveFirstStep && elapsedMs > firstStep.elapsedMs && consumed > firstStep.consumed )
         {
             best = std::max( best, static_cast<double>( consumed - firstStep.consumed )
@@ -501,7 +547,8 @@ struct PlayPaceHistory
 // frames (one step) and kPaceProbeMs of Play, so a slow first frame is not a verdict.
 // r11 (ADV-A1b): the projection is the elapsed wall clock -- every stall so far paid ONCE -- plus the REMAINING steps at
 // the best of: the pace since the Play trigger (master's measure), since the first forward step, and over any
-// kPaceRecentWindowMs-or-longer stretch (PlayPaceHistory). With no history it is master's elapsed x stepsNeeded / stepsDone
+// kPaceRecentWindowMs-or-longer stretch (PlayPaceHistory), and (r12) the playing pace with recovered stalls left out
+// (kPaceStallHoldMs). With no history it is master's elapsed x stepsNeeded / stepsDone
 // exactly, and it is never stricter than that. A pace that cannot finish even so is still refused; a run it lets go on
 // ends at the requirement or at the typed PLAY_SAFETY_TIMEOUT, never a hang.
 inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs,
