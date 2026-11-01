@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -627,7 +628,7 @@ struct PlayPaceHistory
     }
 
     // r13 (sol r12 B1): the EARLIEST time the run can reach `required` at the trusted playing pace, given what the count
-    // can show; -1 = no trusted playing pace. THE BOUND: each stretch of playing holds is measured first sighting to
+    // can show; +infinity = no trusted playing pace (so it never lowers a projection). THE BOUND: each stretch of playing holds is measured first sighting to
     // first sighting, and a step is first seen less than one poll gap after it happens, so a stretch's true length is
     // more than its measured length less one median poll gap g. With stallHolds + 1 stretches the playing steps took
     // more than playingMs - (stallHolds + 1) x g, so the step is at least
@@ -638,11 +639,12 @@ struct PlayPaceHistory
     // steps over 7950 ms) is 22.04 fps at its optimistic end at a 10 ms poll and 22.15 fps at 50 ms, still refused.
     double optimisticFinishMs( int64_t consumed, int64_t required, int64_t elapsedMs ) const
     {
+        const double none = std::numeric_limits<double>::infinity();
         const PlayingSplit s = playingSplit( elapsedMs );
-        if( !playingSplitTrusted( s ) ) return -1.0;
+        if( !playingSplitTrusted( s ) ) return none;
         const double shortest = static_cast<double>( s.playingMs )
                               - static_cast<double>( s.stallHolds + 1 ) * static_cast<double>( s.pollGapMs );
-        if( shortest <= 0.0 ) return -1.0;
+        if( !( shortest > 0.0 ) ) return none;
         const double stepMin = shortest / static_cast<double>( s.playingSteps );
         const double remaining = static_cast<double>( std::max<int64_t>( 0, required - consumed ) );
         return std::max( static_cast<double>( holdStartMs - s.pollGapMs ) + remaining * stepMin,
@@ -680,10 +682,9 @@ inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int6
     if( required <= 1 || consumed < 2 || elapsedMs < kPaceProbeMs || consumed >= required ) return false;
     const double sinceTriggerStepsPerMs = static_cast<double>( consumed - 1 ) / static_cast<double>( elapsedMs );
     const double stepsPerMs = std::max( sinceTriggerStepsPerMs, history.bestPace( consumed, elapsedMs ) );
-    double projectedMs = static_cast<double>( elapsedMs )
-                       + static_cast<double>( required - consumed ) / stepsPerMs;
-    const double optimisticMs = history.optimisticFinishMs( consumed, required, elapsedMs );
-    if( optimisticMs >= 0.0 ) projectedMs = std::min( projectedMs, optimisticMs );
+    const double projectedMs = std::min( static_cast<double>( elapsedMs )
+                                         + static_cast<double>( required - consumed ) / stepsPerMs,
+                                         history.optimisticFinishMs( consumed, required, elapsedMs ) );
     return projectedMs > static_cast<double>( safetyMs );
 }
 inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs )

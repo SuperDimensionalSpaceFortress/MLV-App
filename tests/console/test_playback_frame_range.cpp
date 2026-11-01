@@ -1780,7 +1780,7 @@ TEST( PlayPaceRecovery, R13SlowEnginesAreStillRefusedWithTheB1AndB2StallsToo )
     ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 4000, 23, 0 ) ) );
     ASSERT_FALSE( PlayPaceHistory::playingSplitTrusted( split( 4000, 96, 2100 ) ) );
     ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( split( 4000, 96, 2000 ) ) );
-    ASSERT_TRUE( PlayPaceHistory().optimisticFinishMs( 170, 1499, 8000 ) < 0.0 );   // no history: no band
+    ASSERT_TRUE( std::isinf( PlayPaceHistory().optimisticFinishMs( 170, 1499, 8000 ) ) );   // no history: no band
     // 23 fps steady (1498 / 23 = 65.1 s) cannot finish either; it is refused before the budget, typed
     for( const int64_t poll : { int64_t( 10 ), int64_t( 50 ) } )
     {
