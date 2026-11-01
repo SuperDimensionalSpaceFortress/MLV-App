@@ -399,6 +399,13 @@ WRITE_ALLOWED = {
         "already exists (a planted hard link) is refused, never truncated; it never opens footage and names no owner path or view entry.",
     ("playback-attr-3-cuda-job.ps1", "$nf.Write($nb, 0, $nb.Length)"):
         "core-partition helper: writes the marker text / its own counter and affinity observations to that same CreateNew handle, never footage bytes.",
+    # CUDA-HEADROOM-UTIL-SAMPLER-1: the CPU utilisation sampler's one output file, inside its encoded child body (Invoke-UtilSampleCpuLoop).
+    ("playback-attr-3-cuda-job.ps1", "$uf = [IO.File]::Open($CsvPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)"):
+        "CPU utilisation sampler (a bounded pwsh the job spawns), Invoke-UtilSampleCpuLoop: creates its one CSV ('cpu-util.csv', MLV_US_CSV, a fixed "
+        "name in the job's own per-leg output directory $legOut) with FileMode.CreateNew, so a name that already exists (a planted hard link) is "
+        "refused, never truncated; it never opens footage and names no owner path or view entry.",
+    ("playback-attr-3-cuda-job.ps1", "$uf.Write($ub, 0, $ub.Length); $uf.Flush()"):
+        "CPU utilisation sampler: writes its header and its own counter rows (utc, CPU percent, app pids, app cores) to that same CreateNew handle, never footage bytes.",
     # ---- Attr3FootageStageJob.psm1 -------------------------------------------------------------
     ("Attr3FootageStageJob.psm1", "$localDstStream = [IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
         "the target-volume partial, created by THIS attempt with CreateNew under a per-attempt name carrying the "

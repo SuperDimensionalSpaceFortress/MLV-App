@@ -484,6 +484,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
         # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the #397 prep-conflated-move switch (ON arm), for any leg; judged below by the app's own prep_conflated_move_active readback.
         if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] -and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }
+        # CUDA-HEADROOM-UTIL-SAMPLER-1: the opt-in GPU/CPU utilisation sampler around the measured launch, for any leg (fail open: it never changes the verdict). Only a JSON true arms it.
+        if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] -and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }

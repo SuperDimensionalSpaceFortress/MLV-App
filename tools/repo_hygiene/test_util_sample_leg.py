@@ -115,6 +115,10 @@ class UtilSampleGeneratorTests(unittest.TestCase):
         if cls.base_available:
             base_text = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_COMMIT}:{GENERATOR.relative_to(ROOT).as_posix()}"],
                                        capture_output=True, check=True).stdout.decode("utf-8")
+            # the blob is LF; the checked-out generator carries the checkout's line endings, and the job's follow its template's
+            base_text = base_text.replace("\r\n", "\n")
+            if "\r\n" in source:
+                base_text = base_text.replace("\n", "\r\n")
             cls.base_generator = tree_copy("base", base_text)
             requests += [("base-default", cls.base_generator, []), ("base-cpu", cls.base_generator, CPU_SHAPE), ("base-cuda", cls.base_generator, CUDA_SHAPE)]
         commands = []
