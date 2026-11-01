@@ -831,13 +831,14 @@ if ($isLook -and $artifactsShare) {
         # Get-DvPairedSeekVerdict reads BOTH listed files of each still back and binds each to its listed sha256 (a png missing, replaced or truncated after
         # the listing is a mismatch naming it), and a still counts only when its sidecar says capture_mode "seek" and playback_path false. The receipt
         # writer's final validation re-derives this block from the files with the same function.
-        if ($null -ne $pairedSeekFramesRequested) {
-            $seekVerdict = Invoke-DvCollect 'read' ([string]$seekLocal) { Get-DvPairedSeekVerdict -SeekDir $seekLocal -Files $seekFiles -RequestedFrames $pairedSeekFramesRequested }
-            $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested)
-            $pairedSeekInfo['reportedFrames'] = $seekVerdict.reportedFrames
-            $pairedSeekInfo['framesHonoured'] = $seekVerdict.framesHonoured
-            $pairedSeekInfo['frameMismatches'] = $seekVerdict.frameMismatches
-        }
+        # r7 (adversary r6 A1, Dot 6558329764, sol r6 key B1): the verdict runs for EVERY paired leg -- a leg with no look.pairedSeekFrames (all four
+        # shipped paired legs) still binds each collected still's paused provenance; the frame list only adds the display_frame match.
+        $verdictArgs = @{ SeekDir = $seekLocal; Files = $seekFiles }
+        if ($null -ne $pairedSeekFramesRequested) { $verdictArgs['RequestedFrames'] = $pairedSeekFramesRequested; $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested) }
+        $seekVerdict = Invoke-DvCollect 'read' ([string]$seekLocal) { Get-DvPairedSeekVerdict @verdictArgs }
+        $pairedSeekInfo['reportedFrames'] = $seekVerdict.reportedFrames
+        $pairedSeekInfo['framesHonoured'] = $seekVerdict.framesHonoured
+        $pairedSeekInfo['frameMismatches'] = $seekVerdict.frameMismatches
     }
     if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {
         $sheetLocal = Join-Path $sheetDir 'sheet.png'
@@ -970,11 +971,13 @@ if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
 }
 # r3 (sol B2 tooling), FAIL CLOSED: a leg that names look.pairedSeekFrames counts only when every paused still reports its requested display_frame;
 # a still that is missing or shows another frame cannot be compared with the other arm's still of that frame: a typed INVALID, never a PASS or FAIL.
-if ($outcome -in @('PASS', 'FAIL') -and $null -ne $pairedSeekFramesRequested) {
+# r7 (adversary r6 A1, Dot 6558329764): EVERY look.pairedSeek leg, frame list or not -- a still not captured paused through the full path, or no still at all, is no
+# playing-versus-paused comparison either.
+if ($outcome -in @('PASS', 'FAIL') -and $isLook -and $spec.look.PSObject.Properties['pairedSeek'] -and $spec.look.pairedSeek -is [bool] -and $spec.look.pairedSeek) {
     $seekBlock = $(if ($null -ne $receipt.look) { $receipt.look.pairedSeek } else { $null })
     if ($null -eq $seekBlock -or -not $seekBlock['framesHonoured']) {
         $why = $(if ($null -eq $seekBlock) { 'no paired-seek block was recorded' } else { $seekBlock['frameMismatches'] -join '; ' })
-        $detail = "INVALID: the job result was $outcome ($detail) but PAIRED_SEEK_FRAMES_NOT_HONOURED: $why. A paused still that is not the requested frame is no same-frame comparison"
+        $detail = "INVALID: the job result was $outcome ($detail) but PAIRED_SEEK_FRAMES_NOT_HONOURED: $why. A paired still that is not a paused full-reconstruction capture (of its requested frame, when frames are listed) is no playing-versus-paused comparison"
         $outcome = 'INVALID'
     }
 }

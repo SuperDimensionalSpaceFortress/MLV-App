@@ -22,8 +22,10 @@ from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import ATTRIBUTION_G
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
 PAIRED_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,[switch]$ContactSheetPairedSeek)")
-SEEK_FRAMES = {"frame-00.json": b'{"capture_mode":"seek","playback_path":false}', "frame-00.png": b"\x89PNG\r\n\x1a\nseek-0",
-               "frame-01.png": b"\x89PNG\r\n\x1a\nseek-1"}
+# r7: two COMPLETE paused stills (each png with its sidecar, as the app writes a seek capture). The r1-r6 fixture -- a sidecar with no display_frame
+# and a png with no sidecar -- is exactly the listless shape adversary r6 A1 showed passing; it is now a typed mismatch (PairedSeekListlessProvenanceTests).
+SEEK_FRAMES = {"frame-00.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":50}', "frame-00.png": b"\x89PNG\r\n\x1a\nseek-0",
+               "frame-01.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":150}', "frame-01.png": b"\x89PNG\r\n\x1a\nseek-1"}
 
 
 class PairedSeekSpecTests(unittest.TestCase):
@@ -601,6 +603,108 @@ class PairedSeekProvenanceTests(PairedStillsHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
 
 
+SHIPPED_LISTLESS_SPEC = DV / "legs" / "m16-1243-q1-cpu-look-paired-windowed-s2.json"
+# r7: the collection-time verdict replaced by one that claims every still honoured, so only the receipt writer's final validation can catch a bad still.
+LYING_VERDICT = ("        function Get-DvPairedSeekVerdict { param($SeekDir, $Files, $RequestedFrames) "
+                 "[pscustomobject]@{ reportedFrames = @(50, 150); framesHonoured = $true; frameMismatches = @() } }\n")
+LISTLESS_BAD_SIDECARS = (("a-in-pass", {"capture_mode": "in_pass"}), ("b-playing", {"playback_path": True}),
+                         ("c-no-mode", {"capture_mode": KeyError}), ("d-no-path", {"playback_path": KeyError}),
+                         ("e-string-path", {"playback_path": "false"}))
+
+
+@requires_windows_pwsh
+class PairedSeekListlessProvenanceTests(PairedStillsHarness, unittest.TestCase):
+    """r7 (adversary r6 A1, Dot 6558329764, sol r6 key B1): paused provenance is validated for EVERY look.pairedSeek leg, not only one that names
+    look.pairedSeekFrames. The four shipped paired legs name no frame list; r6 ran Get-DvPairedSeekVerdict only when frames were listed, both at
+    collection (Invoke-VenueLeg) and at final validation (Test-DvReceiptValid), so an in-pass (playing) still, or a sidecar that does not say how it
+    was captured, kept a PASS. Every collected still now needs a sidecar with capture_mode "seek" and boolean playback_path false; the frame list
+    stays an additional check. The leg's look block is the shipped spec's (no pairedSeekFrames), with the harness's two frames and classic flavour."""
+
+    def listless_spec(self, leg_id: str) -> Path:
+        shipped = json.loads(SHIPPED_LISTLESS_SPEC.read_text(encoding="utf-8"))
+        self.assertNotIn("pairedSeekFrames", shipped["look"], "the shipped paired leg names no frame list: the shape under test")
+        path = self.write_spec(leg_type="look", leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec["look"] = dict(shipped["look"], contactSheetFrames=2, lookFlavor="classic")
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def run_listless(self, leg_id: str, sidecars: list[bytes] | None, lying_collection: bool = False):
+        runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", SEEK_INFO_ANCHOR, SEEK_INFO_ANCHOR + LYING_VERDICT)])} if lying_collection else {}
+        self.write_artifacts(sheet=True, raw_frames=True)
+        if sidecars is not None:
+            self.write_seek_stills(sidecars)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.listless_spec(leg_id), extra=["-Backend", "cpu"], **runner)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def test_a_listless_still_not_captured_paused_is_not_a_pass_at_collection(self) -> None:
+        for case, fields in LISTLESS_BAD_SIDECARS:
+            with self.subTest(case=case):
+                self.fresh()
+                receipt = self.run_listless(f"ll-{case}", [provenance_sidecar(50, **fields), provenance_sidecar(150, **fields)])
+                self.assertNotIn(receipt["outcome"], ("PASS", "ADVISORY"), receipt["outcomeDetail"])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+                info = receipt["look"]["pairedSeek"]
+                self.assertIs(info["framesHonoured"], False)
+                self.assertTrue(any("frame-00.json" in m and "capture_mode" in m for m in info["frameMismatches"]), info["frameMismatches"])
+
+    def test_a_listless_still_not_captured_paused_is_not_a_pass_at_final_validation(self) -> None:
+        # The collection-time verdict lies (honoured); the receipt writer re-derives the block from the files and refuses it.
+        for case, fields in LISTLESS_BAD_SIDECARS:
+            with self.subTest(case=case):
+                self.fresh()
+                receipt = self.run_listless(f"llf-{case}", [provenance_sidecar(50, **fields), provenance_sidecar(150, **fields)], lying_collection=True)
+                self.assertNotIn(receipt["outcome"], ("PASS", "ADVISORY"), receipt["outcomeDetail"])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("the receipt writer refuses it", receipt["outcomeDetail"])
+                self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+                self.assertIn("frame-00.json", receipt["outcomeDetail"])
+
+    def test_listless_malformed_or_absent_stills_are_not_a_pass(self) -> None:
+        # sol r6 key: a hash-matching sidecar that is not JSON; a png whose sidecar was never published; a paired leg that collected no still at all.
+        for case, sidecars, needle in (("g-malformed", [b"{", provenance_sidecar(150)], "frame-00"),
+                                       ("h-no-stills", None, "no paused still")):
+            for lying in (False, True):
+                with self.subTest(case=case, final_validation=lying):
+                    self.fresh()
+                    receipt = self.run_listless(f"ll{'f' if lying else ''}-{case}", sidecars, lying_collection=lying)
+                    self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                    self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+                    self.assertIn(needle, receipt["outcomeDetail"])
+        self.fresh()
+        self.write_artifacts(sheet=True, raw_frames=True)
+        seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
+        seek.mkdir(parents=True, exist_ok=True)
+        (seek / "frame-00.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-0")
+        (seek / "frame-00.json").write_bytes(provenance_sidecar(50))
+        (seek / "frame-01.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-1")
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.listless_spec("ll-no-sidecar"), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("frame-01.json", receipt["outcomeDetail"])
+
+    def test_the_paused_listless_control_passes(self) -> None:
+        for lying in (False, True):
+            with self.subTest(final_validation=lying):
+                self.fresh()
+                receipt = self.run_listless("ll-control" + ("-f" if lying else ""), [provenance_sidecar(50), provenance_sidecar(150)], lying_collection=lying)
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                info = receipt["look"]["pairedSeek"]
+                self.assertIs(info["framesHonoured"], True)
+                self.assertEqual(info["frameMismatches"], [])
+                self.assertNotIn("requestedFrames", info, "no frame list was requested")
+
+    def test_the_listed_frame_control_passes(self) -> None:
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([provenance_sidecar(50), provenance_sidecar(150)])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.paired_spec("ll-listed-control"), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["look"]["pairedSeek"]["requestedFrames"], [50, 150])
+
+
 PREFLIGHT_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -651,6 +755,55 @@ class BatchPreflightParityTests(unittest.TestCase):
                     self.assertIn(needle, message)
                 else:
                     self.assertEqual(code, "", message)
+
+
+@requires_pwsh
+class MissingLookPreflightTests(unittest.TestCase):
+    """r7 (adversary r6 A2): a look leg with NO look property passed the shared shape predicate, so the batch preflight admitted it, opened its lease,
+    and the leg then threw "Cannot index into a null array" reading look.pairedSeekFrames before any receipt. The predicate now refuses it, typed,
+    so the preflight refuses it before a lease opens and the leg refuses it before anything is generated."""
+
+    def test_the_shipped_paired_spec_minus_its_look_is_refused_by_the_preflight(self) -> None:
+        base = json.loads(SHIPPED_LISTLESS_SPEC.read_text(encoding="utf-8"))
+        cases = {"no-look": ({k: v for k, v in base.items() if k != "look"}, "look"), "with-look": (base, "")}
+        tmp = tempfile.TemporaryDirectory(prefix="missing-look-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        paths = []
+        for name, (doc, _) in cases.items():
+            (root / f"{name}.json").write_text(json.dumps(doc), encoding="utf-8")
+            paths.append(str(root / f"{name}.json"))
+        (root / "probe.ps1").write_text(PREFLIGHT_PROBE, encoding="utf-8")
+        import subprocess
+        from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import PWSH
+        proc = subprocess.run([PWSH, "-NoProfile", "-File", str(root / "probe.ps1"), str(DV)] + paths, capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {line.split("|")[1][:-5]: line.split("|", 3)[2:] for line in proc.stdout.splitlines() if line.startswith("ROW|")}
+        code, message = rows["no-look"]
+        self.assertEqual(code, "LEG_SPEC_INVALID", message)
+        self.assertIn("a look leg needs look", message)
+        self.assertEqual(rows["with-look"][0], "", rows["with-look"][1])
+
+
+@requires_windows_pwsh
+class MissingLookLegTests(RunnerHarness, unittest.TestCase):
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+    def test_a_look_leg_with_no_look_is_refused_typed_before_anything_runs(self) -> None:
+        path = self.write_spec(leg_type="look", leg_id="no-look")
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        del spec["look"]
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        proc, receipt, submitted = self.run_leg("ultra-magnus", path, extra=["-Backend", "cpu"])
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("DVE_LEG_SPEC_INVALID a look leg needs look", out)
+        self.assertNotIn("Cannot index into a null array", out)
+        self.assertIsNone(receipt, "a refused spec writes no receipt (like every other DVE_LEG_SPEC_INVALID)")
+        self.assertEqual(submitted, [], "nothing is submitted")
+        self.assertEqual(self.generator_calls(), [], "nothing is generated")
 
 
 if __name__ == "__main__":
