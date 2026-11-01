@@ -91,4 +91,24 @@ private:
     double m_lastTime = 0.0;
 };
 
+/*! HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r16 (adversary A1 on ff41b4fa): whether a presentation is the
+ *  loop wrap, for notePresented's `wrapped`. The presented-frame inference
+ *  (playback_frame_range::isContactSheetLoopWrapTransition) misses a genuine wrap whenever dropped frames
+ *  leave the last presented frame more than 8 frames short of the cut-out: Loop + drop-frame, cut 1..720,
+ *  700 -> 0 jumps back by 700, under its 711. The tracker then counted the wrap as a backward jump and lost
+ *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
+ *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
+ *  wrap_count. A presentation that goes backward while an engine wrap is still unconsumed IS the wrap, and
+ *  so is one the inference recognises. consumedEngineWraps is the caller's running count; it is set to the
+ *  engine's count whenever a wrap is taken, and when the measured Play starts.
+ *  \param havePrevious a frame was presented before this one in the measured Play */
+inline bool presentationIsLoopWrap( bool inferredWrap, int engineWraps, int &consumedEngineWraps,
+                                    bool havePrevious, int lastFrame, int frame )
+{
+    const bool wrap = havePrevious
+                   && ( inferredWrap || ( engineWraps > consumedEngineWraps && frame < lastFrame ) );
+    if( wrap ) consumedEngineWraps = engineWraps;
+    return wrap;
+}
+
 #endif // PLAYBACKSOURCEADVANCETRACKER_H

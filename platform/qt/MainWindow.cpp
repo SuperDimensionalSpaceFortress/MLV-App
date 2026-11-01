@@ -25738,6 +25738,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     // reaches the summary's wrapped=/wrap_count= fields.
     m_playbackSmokeWrapped = false;
     m_playbackSmokeSourceAdvance.reset();
+    // r16 (adversary A1): engine wraps before this measured Play are not this Play's wraps
+    m_playbackSmokeTrackerEngineWraps = m_playbackWrapRecorder.engineWraps;
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -26156,9 +26158,17 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     }
     // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
     // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
+    // r16 (adversary A1 on ff41b4fa): the wrap is the engine's own count first, the inference only adds
+    // (presentationIsLoopWrap): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold.
+    const bool sourceAdvanceWrap = presentationIsLoopWrap( playbackSmokeWrapNow,
+                                                           m_playbackWrapRecorder.engineWraps,
+                                                           m_playbackSmokeTrackerEngineWraps,
+                                                           m_playbackSmokePresentedFrames > 0,
+                                                           m_playbackSmokeLastPresentedFrame,
+                                                           static_cast<int>( displayFrame ) );
     m_playbackSmokeSourceAdvance.notePresented( now,
                                                 static_cast<int>( displayFrame ),
-                                                playbackSmokeWrapNow,
+                                                sourceAdvanceWrap,
                                                 ui->spinBoxCutIn->value() - 1,
                                                 ui->spinBoxCutOut->value() - 1 );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
