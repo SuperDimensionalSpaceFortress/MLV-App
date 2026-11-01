@@ -219,7 +219,19 @@ $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
 # copy is CRLF and the committed blob is LF, and a raw-byte hash would refuse every committed spec as LEG_SPEC_NOT_COMMITTED (fable r1 B2).
 $legSpecSha256 = Get-DvLegSpecSha256 $specBytes
 $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json
+if ($spec -isnot [System.Management.Automation.PSCustomObject]) { throw 'DVE_LEG_SPEC_INVALID the leg spec must be a single JSON object' }
 if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { throw "DVE_LEG_SPEC_INVALID schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B1): every control container this runner (and its module) reads members of must be ONE JSON
+# object when present. An array of objects reads through PowerShell's member enumeration for a direct member ($spec.look.contactSheetFrames) but
+# has no PSObject property for a presence check ($spec.look.PSObject.Properties['pairedSeek']), so its controls were dropped silently; null or a
+# scalar has neither. Any of them is refused here, typed and naming the field, before anything is generated or submitted.
+foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria') {
+    $present = $spec.PSObject.Properties[$container]
+    if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
+        $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
+        throw "DVE_LEG_SPEC_INVALID $container must be a single JSON object (it is $shape)"
+    }
+}
 if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backends)[0] }
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
 $isLook = ($spec.legType -eq 'look')
@@ -293,19 +305,28 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
         # DVE-LEG-TERMINALS-1 r2: a leg that ran never ends without a receipt. A PASS/FAIL the production validator refuses -- for ANY reason (a backend the counters
         # contradict, a proof that does not re-derive, ...) -- is written as a typed INVALID instead: the receipt already holds the leg's evidence, and the validator's
         # own reasons are named in outcomeDetail. Anything else the writer throws (an unwritable path, a repeat receipt id) still ends the run as DVE_RECEIPT_WRITE_FAILED.
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B4): the two failure classes are kept apart. A read of the hashed evidence that throws while
+        # the writer validates (DVE_EVIDENCE_VALIDATION_IO) is written as a typed UNRESOLVED ('evidence-validation-io: <path> <reason>'); only the
+        # destination itself failing (this second write, or a first write that threw for any other reason) ends the run as DVE_RECEIPT_WRITE_FAILED, exit 2.
         $invalidPrefix = 'DVE_RECEIPT_INVALID '
+        $ioPrefix = 'DVE_EVIDENCE_VALIDATION_IO|'
         if ($Outcome -cin @('PASS', 'FAIL') -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {
             $receipt.outcome = 'INVALID'
             $receipt.outcomeDetail = "INVALID: the job result was $Outcome ($Detail) but the receipt writer refuses it as a ${Outcome}: $($refusal.Substring($invalidPrefix.Length))"
             $Outcome = 'INVALID'
-            try {
-                $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
-            } catch {
-                Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
-                exit 2
-            }
+        } elseif ($refusal.StartsWith($ioPrefix, [StringComparison]::Ordinal)) {
+            $parts = $refusal.Split('|', 3)
+            $receipt.outcome = 'UNRESOLVED'
+            $receipt.outcomeDetail = "evidence-validation-io: $($parts[1]) $($parts[2]) (the job result was ${Outcome}: $Detail)"
+            $Outcome = 'UNRESOLVED'
         } else {
             Write-Output "DVE_RECEIPT_WRITE_FAILED $refusal"
+            exit 2
+        }
+        try {
+            $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
+        } catch {
+            Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
             exit 2
         }
     }
@@ -823,24 +844,35 @@ if ($isLook -and $artifactsShare) {
         # r3 (sol B2 tooling): look.pairedSeekFrames names the display_frame each paused still must show (still i = frame-<ii>, the app's own
         # numbering), so an H and a C leg compare the SAME frames. Each still's sidecar display_frame is read back and recorded; a still that is
         # missing, has no readable display_frame or shows another frame makes framesHonoured false, and the gate below FAILS CLOSED on it.
+        # r5 (sol r4 B2): the frame a still reports is read from the HASH-LISTED bytes only. A still counts only when its png and its sidecar are both
+        # in the listing above; the sidecar is read ONCE, those bytes are hashed and must equal its listed sha256 (a file replaced after the hash step
+        # is refused, never interpreted under the hash of the file it replaced), and the display_frame is parsed from those same bytes.
         if ($null -ne $pairedSeekFramesRequested) {
             $reported = [System.Collections.Generic.List[object]]::new()
             $mismatches = [System.Collections.Generic.List[string]]::new()
+            $listedSha = @{}
+            foreach ($f in $seekFiles) { $listedSha[[string]$f.name] = [string]$f.sha256 }
             for ($i = 0; $i -lt $pairedSeekFramesRequested.Count; $i++) {
                 $stillName = 'frame-{0:D2}' -f $i
                 $shown = $null
-                $sidecar = $(if ($null -ne $seekLocal) { Join-Path $seekLocal "$stillName.json" } else { $null })
-                if ($null -ne $sidecar -and (Test-Path -LiteralPath $sidecar -PathType Leaf) -and (Test-Path -LiteralPath (Join-Path $seekLocal "$stillName.png") -PathType Leaf)) {
-                    $sidecarText = Invoke-DvCollect 'read' $sidecar { [IO.File]::ReadAllText($sidecar) }
-                    $parsed = $null
-                    try { $parsed = $sidecarText | ConvertFrom-Json } catch { $parsed = $null }
-                    if ($null -ne $parsed -and $null -ne $parsed.PSObject.Properties['display_frame']) {
-                        $value = $parsed.display_frame
-                        if ($value -is [int] -or $value -is [long]) { $shown = [long]$value }
+                $changed = $false
+                if ($listedSha.ContainsKey("$stillName.json") -and $listedSha.ContainsKey("$stillName.png")) {
+                    $sidecar = Join-Path $seekLocal "$stillName.json"
+                    # (the leading comma keeps the byte[] one object through the scriptblock's output, an empty file included)
+                    [byte[]]$sidecarBytes = Invoke-DvCollect 'read' $sidecar { , [IO.File]::ReadAllBytes($sidecar) }
+                    if ((Get-DvSha256OfBytes $sidecarBytes) -cne $listedSha["$stillName.json"]) { $changed = $true }
+                    else {
+                        $parsed = $null
+                        try { $parsed = ([Text.Encoding]::UTF8.GetString($sidecarBytes).TrimStart([char]0xFEFF)) | ConvertFrom-Json } catch { $parsed = $null }
+                        if ($null -ne $parsed -and $null -ne $parsed.PSObject.Properties['display_frame']) {
+                            $value = $parsed.display_frame
+                            if ($value -is [int] -or $value -is [long]) { $shown = [long]$value }
+                        }
                     }
                 }
                 $reported.Add($shown)
-                if ($null -eq $shown) { $mismatches.Add("$stillName reported no display_frame, requested $($pairedSeekFramesRequested[$i])") }
+                if ($changed) { $mismatches.Add("$stillName.json changed after it was hash-listed (its bytes no longer hash to the listed sha256), requested $($pairedSeekFramesRequested[$i])") }
+                elseif ($null -eq $shown) { $mismatches.Add("$stillName reported no display_frame, requested $($pairedSeekFramesRequested[$i])") }
                 elseif ($shown -ne [long]$pairedSeekFramesRequested[$i]) { $mismatches.Add("$stillName reported display_frame $shown, requested $($pairedSeekFramesRequested[$i])") }
             }
             $pairedSeekInfo['requestedFrames'] = @($pairedSeekFramesRequested)

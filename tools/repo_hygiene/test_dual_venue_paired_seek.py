@@ -276,6 +276,131 @@ class PairedSeekFrameListTests(RunnerHarness, unittest.TestCase):
                 self.assertEqual(self.generator_calls(), [], "nothing is generated")
 
 
+    def test_a_sidecar_replaced_after_it_was_hash_listed_cannot_pass(self) -> None:
+        # r5 (sol r4 B2): frame-01.json is hash-listed showing 131, then replaced on disk (between the hash step and the read) by one showing 150.
+        # The runner must not report 150 under 131's hash: the bytes it interprets are the hash-listed bytes, or the still fails closed.
+        replaced = ("if ($null -ne $seekLocal) { [IO.File]::WriteAllBytes((Join-Path $seekLocal 'frame-01.json'), [Text.Encoding]::UTF8.GetBytes('"
+                    + seek_sidecar(150).decode("utf-8") + "')) }")
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", SEEK_INFO_ANCHOR, SEEK_INFO_ANCHOR + "        " + replaced + "\n")])
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([50, 131])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.frame_list_spec([50, 150], "list-swap"), extra=["-Backend", "cpu"], dv=dv)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        info = receipt["look"]["pairedSeek"]
+        listed = {f["name"]: f["sha256"].lower() for f in info["files"]}
+        self.assertEqual(listed["frame-01.json"], hashlib.sha256(seek_sidecar(131)).hexdigest(), "the listing hashed the sidecar showing 131")
+        self.assertNotEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("PAIRED_SEEK_FRAMES_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertIs(info["framesHonoured"], False)
+        self.assertNotEqual(info["reportedFrames"][1], 150, "a frame read from bytes that are not the hash-listed ones is never reported")
+
+
+SEEK_INFO_ANCHOR = "        $pairedSeekInfo = [ordered]@{ path = $seekLocal; count = $seekFiles.Count; files = $seekFiles }\n"
+QUALITY_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,[switch]$ContactSheetPairedSeek,$QualityMode)")
+
+
+@requires_windows_pwsh
+class ControlContainerShapeTests(RunnerHarness, unittest.TestCase):
+    """r5 (sol r4 B1): a control container the runner reads members of (look, generatorArgs, acceptedEffectiveScale, timeouts, criteria) that is
+    present but not ONE JSON object is refused before anything is generated or submitted, typed (DVE_LEG_SPEC_INVALID) and naming the field.
+    An array of objects read through PowerShell's member enumeration for direct members but had no PSObject property for the presence checks,
+    so look=[{...pairedSeek...}] and generatorArgs=[{"qualityMode":"hq"}] silently dropped their controls."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(QUALITY_STUB_GENERATOR, encoding="utf-8")
+
+    def spec_with(self, leg_type: str, leg_id: str, **fields: object) -> Path:
+        path = self.write_spec(leg_type=leg_type, leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec.update(fields)
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def assert_refused(self, spec: Path, field: str) -> None:
+        proc, receipt, submitted = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn(f"DVE_LEG_SPEC_INVALID {field} must be a single JSON object", out)
+        self.assertIsNone(receipt, "a refused spec writes no receipt (like every other DVE_LEG_SPEC_INVALID)")
+        self.assertEqual(submitted, [], "nothing is submitted")
+        self.assertEqual(self.generator_calls(), [], "nothing is generated")
+
+    def test_sols_array_shaped_look_is_refused(self) -> None:
+        look = [{"contactSheetFrames": 2, "lookFlavor": "classic", "pairedSeek": True, "pairedSeekFrames": [50, 150]}]
+        self.assert_refused(self.spec_with("look", "arr-look", look=look), "look")
+
+    def test_sols_array_shaped_generator_args_is_refused(self) -> None:
+        self.assert_refused(self.spec_with("speed", "arr-gen", generatorArgs=[{"qualityMode": "hq"}]), "generatorArgs")
+
+    def test_every_sibling_container_that_is_not_one_object_is_refused(self) -> None:
+        for field, value, leg_type in (("look", None, "look"), ("look", "classic", "look"), ("generatorArgs", None, "speed"), ("generatorArgs", [], "speed"),
+                                       ("acceptedEffectiveScale", [{"cuda": 1}], "speed"), ("timeouts", [{"queueWaitSec": 60, "extraClaimedWaitSec": 60}], "speed"),
+                                       ("criteria", [{"acceptance": {"cpu": []}}], "speed")):
+            with self.subTest(field=field, value=value):
+                self.gen_log.write_text("", encoding="utf-8")
+                self.assert_refused(self.spec_with(leg_type, f"shape-{field}-{type(value).__name__}", **{field: value}), field)
+
+    def test_object_shaped_controls_still_reach_the_generator(self) -> None:
+        self.write_artifacts(sheet=True, raw_frames=True)
+        look = {"contactSheetFrames": 2, "lookFlavor": "classic", "pairedSeek": True}
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with("look", "obj-ok", look=look, generatorArgs={"qualityMode": "hq"}), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        call = self.generator_calls()[-1]
+        self.assertIn("ContactSheetPairedSeek=True", call)
+        self.assertIn("QualityMode=hq", call)
+        self.assertIn("ContactSheetFrames=2", call)
+
+
+FINAL_COMPLETE_ANCHOR = "\nComplete-Receipt $outcome $detail\n"
+
+
+@requires_windows_pwsh
+class FinalValidationIoReceiptTests(RunnerHarness, unittest.TestCase):
+    """r5 (sol r4 B4, Dot 4f978e0b): the receipt writer RE-READS the hashed evidence to validate a PASS/FAIL. A read that throws there (summary.json
+    held with FileShare.None after collection) is an evidence-validation I/O failure: the leg ends in a typed UNRESOLVED receipt
+    (`evidence-validation-io: <path> <reason>`), never exit 2 with no receipt. A receipt DESTINATION that cannot be written stays DVE_RECEIPT_WRITE_FAILED, exit 2."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(PAIRED_STUB_GENERATOR, encoding="utf-8")
+
+    def look_spec(self, leg_id: str) -> Path:
+        return self.write_spec(leg_type="look", leg_id=leg_id)
+
+    def test_summary_held_with_file_share_none_at_final_validation_ends_in_a_typed_receipt(self) -> None:
+        hold = "\n$script:dvTestHold = [IO.File]::Open((Join-Path $evidenceDir 'summary.json'), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)"
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", FINAL_COMPLETE_ANCHOR, hold + FINAL_COMPLETE_ANCHOR)])
+        self.write_artifacts(sheet=True, raw_frames=True)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.look_spec("final-io"), extra=["-Backend", "cpu"], dv=dv)
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("DVE_RECEIPT_WRITE_FAILED", out)
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIsNotNone(receipt, "an evidence read failure at final validation must still write a receipt:\n" + out)
+        self.assertEqual(receipt["outcome"], "UNRESOLVED", receipt["outcomeDetail"])
+        detail = receipt["outcomeDetail"]
+        self.assertTrue(detail.startswith("evidence-validation-io: "), detail)
+        self.assertIn("summary.json", detail)
+        self.assertIn("the job result was PASS", detail)
+        self.assertIn("DVE_OUTCOME=UNRESOLVED", proc.stdout)
+
+    def test_the_unheld_control_still_passes(self) -> None:
+        self.write_artifacts(sheet=True, raw_frames=True)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.look_spec("final-ok"), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+    def test_a_receipt_destination_that_cannot_be_written_stays_exit_2(self) -> None:
+        anchor = "    $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew"
+        dv = self.mutated_runner([("DualVenueRunner.psm1", anchor, "    throw 'INJECTED_DESTINATION_FAILURE'\n" + anchor)])
+        self.write_artifacts(sheet=True, raw_frames=True)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.look_spec("dest-fail"), extra=["-Backend", "cpu"], dv=dv)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("DVE_RECEIPT_WRITE_FAILED INJECTED_DESTINATION_FAILURE", proc.stdout)
+        self.assertIsNone(receipt)
+
+
 PAIRED_PUBLISH = "-SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))"
 
 
