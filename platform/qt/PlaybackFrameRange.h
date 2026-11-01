@@ -471,7 +471,8 @@ constexpr int kPaceHoldBucketMs = 1000;
 // still be sound for a steady engine, but it cast out the slow half of uneven slow engines (30/60 ms alternation,
 // normal jitter around 22 fps) and let them play on to about 60 s before the typed refusal; at 2 they are refused at
 // the probe as before. The cadence split is only ever used to go on (the faster pace and the earlier finish of it and
-// the r14 split), so it is never stricter than r14.
+// the r14 split), so it is never stricter than r14. r16: the same factor judges THE STALL-FREE SPLIT
+// (PlayPaceHistory::stallFreeSplit), whose bound is taken over the playing stretches only.
 constexpr int64_t kPaceCadenceStallFactor = 2;
 
 struct PlayPaceHistory
@@ -587,6 +588,50 @@ struct PlayPaceHistory
         // (an r14 split with no threshold yet has none below any cadence threshold, so it is returned as it is)
         if( cadence < 1 || cadence >= r14.thresholdMs ) return r14;
         return splitAtThreshold( elapsedMs, cadence );
+    }
+
+    // r16 (Dot ask 6562596628 on 74a142ef): THE STALL-FREE SPLIT. U above includes every recovered stall, so dense ones
+    // (ten 150 ms stalls every 640 ms at the 50 ms poll: U about 52 ms, 2U = 104 ms, over r14's 100 ms) kept the stalls
+    // binned at 100 ms as playing pace, and the probe refused a run that reaches its count at 64417 ms. The bound is now
+    // taken over the PLAYING STRETCHES ONLY. Cast out every closed hold whose bin is above theta; the kept holds form
+    // stretches, each starting at the first forward step or just after a cast-out hold. A stretch of N_s steps, measured
+    // first sighting to first sighting over S_s ms, took more than N_s x T for an engine whose step is T (a stall inside it
+    // only adds), and its first step happened less than its start lead before its sighting (the first step's lead gap, or
+    // the cast-out hold's END gap), so
+    //   T < U(theta) = (sum S_s + sum lead_s) / sum N_s,
+    // a bound that holds for EVERY theta, whichever holds are cast out. theta is CONSISTENT when every cast-out hold's bin
+    // is above kPaceCadenceStallFactor x U(theta): a cast-out bin then exceeds 2T, and no steady step's bin (at most T)
+    // or ordinary jitter up to twice the kept mean is ever cast out. The split uses the SMALLEST consistent theta over the
+    // bins seen, so a recovered stall never counts as playing pace whenever its value provably stayed more than twice that
+    // bound, however dense the stalls (r15's U, taken over everything, is not used to judge them). Its threshold is the
+    // largest with the same closed holds (one below the smallest cast-out bin), so the open hold is held to the same
+    // test. With no step yet, the first step's lead gap unknown, or no consistent theta below the largest bin seen, it is
+    // the r14 split.
+    PlayingSplit stallFreeSplit( int64_t elapsedMs ) const
+    {
+        if( !haveFirstStep || !firstStepLeadKnown || elapsedMs < holdStartMs ) return playingSplit( elapsedMs );
+        const size_t n = static_cast<size_t>( kPaceHoldBucketMs ) + 1;
+        // the cast-out holds' end gaps (a closed hold's bin is its length less its end gap exactly): all of them, less
+        // the kept ones as theta rises
+        int64_t endGapAbove = overflowEndGapMs;
+        for( size_t b = 0; b < n; ++b ) endGapAbove += holdMsSum[b] - static_cast<int64_t>( b ) * holdCount[b];
+        int64_t keptMs = 0;
+        int64_t keptSteps = 0;
+        for( size_t b = 0; b < n; ++b )
+        {
+            if( holdCount[b] == 0 ) continue;
+            keptMs += holdMsSum[b];
+            keptSteps += holdSteps[b];
+            endGapAbove -= holdMsSum[b] - static_cast<int64_t>( b ) * holdCount[b];
+            size_t next = b + 1;
+            while( next < n && holdCount[next] == 0 ) ++next;
+            // the smallest cast-out bin: the next bin seen, or (only overflow holds above) more than the histogram
+            if( next == n && overflowHolds == 0 ) break;   // nothing above: no stall to find
+            const int64_t nextBin = static_cast<int64_t>( next < n ? next : n );
+            if( nextBin * keptSteps > kPaceCadenceStallFactor * ( keptMs + firstStepLeadMs + endGapAbove ) )
+                return splitAtThreshold( elapsedMs, std::min<int64_t>( nextBin - 1, kPaceHoldBucketMs ) );
+        }
+        return playingSplit( elapsedMs );
     }
 
     PlayingSplit splitAtThreshold( int64_t elapsedMs, int64_t thresholdMs ) const
@@ -713,9 +758,11 @@ struct PlayPaceHistory
         if( !playingSplitTrusted( s ) ) return 0.0;
         return static_cast<double>( s.playingSteps ) / static_cast<double>( s.playingMs );
     }
+    // r16: and the stall-free split's (THE STALL-FREE SPLIT), so neither r14 nor r15 can bring back a stricter verdict.
     double playingPace( int64_t elapsedMs ) const
     {
-        return std::max( splitPace( playingSplit( elapsedMs ) ), splitPace( cadenceSplit( elapsedMs ) ) );
+        return std::max( { splitPace( playingSplit( elapsedMs ) ), splitPace( cadenceSplit( elapsedMs ) ),
+                           splitPace( stallFreeSplit( elapsedMs ) ) } );
     }
 
     // r13 (sol r12 B1): the EARLIEST time the run can reach `required` at the trusted playing pace, given what the count
@@ -732,10 +779,12 @@ struct PlayPaceHistory
     // 50 ms, still refused.
     // r15: the earlier of the r14 split's and the cadence split's (THE CADENCE BOUND); the bound holds for any split,
     // because the stretches are delimited by whichever holds that split calls stalls and their lead gaps are summed.
+    // r16: and the stall-free split's (THE STALL-FREE SPLIT).
     double optimisticFinishMs( int64_t consumed, int64_t required, int64_t elapsedMs ) const
     {
-        return std::min( splitFinishMs( playingSplit( elapsedMs ), consumed, required, elapsedMs ),
-                         splitFinishMs( cadenceSplit( elapsedMs ), consumed, required, elapsedMs ) );
+        return std::min( { splitFinishMs( playingSplit( elapsedMs ), consumed, required, elapsedMs ),
+                           splitFinishMs( cadenceSplit( elapsedMs ), consumed, required, elapsedMs ),
+                           splitFinishMs( stallFreeSplit( elapsedMs ), consumed, required, elapsedMs ) } );
     }
     double splitFinishMs( const PlayingSplit &s, int64_t consumed, int64_t required, int64_t elapsedMs ) const
     {

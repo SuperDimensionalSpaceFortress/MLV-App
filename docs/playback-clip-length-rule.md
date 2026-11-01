@@ -162,9 +162,26 @@ FRAME:
   `PlayPaceHistory::cadenceSplit`): a hold is also a stall when even its shortest possible length is longer than twice
   an upper bound on the run's mean step since the first forward step. No value that stayed at most twice the mean is
   cast out, so a steady engine and an uneven slow engine's ordinary jitter stay playing; the probe takes the faster
-  pace and the earlier finish of the two splits, so it is never stricter than r14. At 24 fps and the 50 ms poll every
-  stall from about 80 ms is recovered at any phase; a shorter one cannot be told from a slower cadence and is still
-  refused, typed, at the probe. It is trusted only after 3 s of playing
+  pace and the earlier finish of the two splits, so it is never stricter than r14. r15's bound includes the stalls
+  themselves, so dense ones (Dot 6562596628: ten 150 ms stalls every 640 ms, reaching at 64.4 s) still counted as
+  playing. MERGE-MASTER r16 adds a third split (`PlayPaceHistory::stallFreeSplit`) that judges stalls against the
+  playing stretches only. The bound is computed over the holds kept as playing, each stretch measured with its own
+  start lead. That is an upper bound on the step whichever holds are cast out. The split uses the smallest threshold
+  under which every cast-out hold is longer than twice that bound, so an ended stall is never playing pace once its
+  frame was seen to stay more than twice the playing step. The probe takes the fastest pace and the earliest finish of
+  the three splits, so no earlier split brings back a stricter verdict.
+  **The bound the generated sweep proves** (`R16GeneratedSweep...` in `tests/console/test_playback_frame_range.cpp`):
+  required 1499, budget 65 s, 24/25/30 fps, first present 250-1500 ms, stalls of 100-300 ms every 3 s down to every
+  400 ms, either ended by the probe or never stopping, polled every 50 ms at any phase 0-49 ms. Every run whose count
+  really reaches 1499 by the budget is Reached (at the first poll after it), and every run that cannot is refused
+  `PLAY_PACE_TOO_SLOW` before the budget. There are two pinned exceptions, both refused typed within 200 ms of the
+  probe:
+  (1) the stall share cap below: a burst whose stalls exceed a third of the time to the probe looks, at 8 s, exactly
+  like stalls that keep coming;
+  (2) the two-poll limit: a stall whose frame stays less than three poll gaps (step + stall < 150 ms, so the 100 ms
+  stalls) can be seen by only two polls. That is a 50 ms bin, the same sighting as the 60/70 ms steps of an uneven
+  22 fps engine that must be refused at the probe.
+  It is trusted only after 3 s of playing
   time and 24 steps (`kPaceMinPlayingSteps`), and only while stalls are at most a third of the measured time; stalls
   that keep coming are left to the other estimates, which refuse them at the probe. MERGE-MASTER r13 (sol r12 B1/B2)
   makes both measures exact to the poll: a hold is judged by its length less the poll gap its ending step could have

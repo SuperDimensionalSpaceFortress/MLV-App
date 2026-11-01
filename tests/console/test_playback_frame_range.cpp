@@ -1,6 +1,7 @@
 #include "../common/minitest.h"
 #include "../../platform/qt/PlaybackFrameRange.h"
 
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <vector>
@@ -2248,6 +2249,195 @@ TEST( PlayPaceRecovery, R15AdversaryA1RecoveredShortStallsAreNotRefusedAtAnyPoll
     for( int64_t t = 1500; t <= 8000; t += 50 ) noLead.note( stalledCount( t, 1000, 24, a1 ), t );
     ASSERT_EQ( int64_t( -1 ), noLead.cadenceThresholdMs() );
     ASSERT_EQ( noLead.playingSplit( 8000 ).thresholdMs, noLead.cadenceSplit( 8000 ).thresholdMs );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r16 (Dot ask 6562596628 on 74a142ef, hub ACK 6562626759): THE DENSITY CASE. required 1499, safety 65000, Gated, a
+// 24 fps conformed run, first present 500 ms, ten 150 ms stalls every 640 ms from 1000 ms, polled every 50 ms from t = 0
+// (note, then decide): c(t) = 1 + floor(24 x max(0, t - 500 - sum(k = 0..9, clamp(t - 1000 - 640 k, 0, 150))) / 1000).
+// At 8 s every stall has ended and c = 145; the count reaches 1499 at 64417 ms (64416.7). 74a142ef: r15's U (about 52
+// ms) includes the stalls, so its cadence threshold (104 ms) is not below r14's 100 ms and the r14 split is used: the
+// four stall holds binned at 100 ms stay playing (6250 ms, 133 steps), the optimistic finish is 68020.3 ms and the probe
+// refuses at 8000 ms. THE STALL-FREE SPLIT judges the stalls against the playing stretches' own bound and casts out all
+// ten.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+std::vector<Stall> periodicStalls( int64_t fromMs, int64_t everyMs, int64_t lenMs, int64_t untilMs )
+{
+    std::vector<Stall> s;
+    for( int64_t at = fromMs; at + lenMs <= untilMs; at += everyMs ) s.push_back( Stall{ at, lenMs } );
+    return s;
+}
+
+// polls every pollMs from phaseMs (note, then decide) until a verdict
+PolledRun pollPhased( int64_t firstPresentMs, int64_t fpsInt, const std::vector<Stall> &stalls, int64_t required,
+                      int64_t safetyMs, int64_t pollMs, int64_t phaseMs )
+{
+    PolledRun run;
+    PlayPaceHistory h;
+    for( int64_t t = phaseMs; t <= 900000; t += pollMs )
+    {
+        run.consumed = stalledCount( t, firstPresentMs, fpsInt, stalls );
+        h.note( run.consumed, t );
+        run.state = evaluatePlayStop( run.consumed, required, true, t, safetyMs, playback_frame_range::PlayPaceMode::Gated, h );
+        if( run.state != PlayStopState::Continue ) { run.elapsedMs = t; break; }
+    }
+    return run;
+}
+}
+
+TEST( PlayPaceRecovery, R16DotDensityCaseRecoveredStallsAreNeverPlayingPace )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    const std::vector<Stall> dense = periodicStalls( 1000, 640, 150, 7399 );
+    ASSERT_EQ( size_t( 10 ), dense.size() );
+    ASSERT_EQ( int64_t( 145 ), stalledCount( 8000, 500, 24, dense ) );
+    ASSERT_EQ( int64_t( 1498 ), stalledCount( 64416, 500, 24, dense ) );
+    ASSERT_EQ( int64_t( 1499 ), stalledCount( 64417, 500, 24, dense ) );
+    // the exact input: Reached at the first 50 ms poll that sees 1499 (74a142ef: PaceTooSlow at 8000)
+    const PolledRun run = pollStalledCount( 500, 24, dense, 1499, budget, 50 );
+    ASSERT_EQ( int64_t( 145 ), run.consumedAt8s );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 64450 ), run.elapsedMs );
+    // at the probe: r14's split and r15's cadence threshold are Dot's numbers; the stall-free split casts out all ten
+    PlayPaceHistory probe;
+    for( int64_t t = 0; t <= 8000; t += 50 ) probe.note( stalledCount( t, 500, 24, dense ), t );
+    const PlayPaceHistory::PlayingSplit r14 = probe.playingSplit( 8000 );
+    ASSERT_EQ( int64_t( 100 ), r14.thresholdMs );
+    ASSERT_EQ( int64_t( 6250 ), r14.playingMs );
+    ASSERT_EQ( int64_t( 133 ), r14.playingSteps );
+    ASSERT_EQ( int64_t( 104 ), probe.cadenceThresholdMs() );
+    ASSERT_EQ( int64_t( 100 ), probe.cadenceSplit( 8000 ).thresholdMs );   // r15 kept r14's split here
+    const PlayPaceHistory::PlayingSplit stallFree = probe.stallFreeSplit( 8000 );
+    ASSERT_EQ( int64_t( 99 ), stallFree.thresholdMs );    // one below the smallest cast-out bin (100 ms)
+    ASSERT_EQ( int64_t( 10 ), stallFree.stallHolds );
+    ASSERT_EQ( int64_t( 5650 ), stallFree.playingMs );
+    ASSERT_EQ( int64_t( 129 ), stallFree.playingSteps );
+    ASSERT_TRUE( stallFree.stallMs <= 10 * 150 );         // never more than really held
+    ASSERT_TRUE( PlayPaceHistory::playingSplitTrusted( stallFree ) );
+    // consistent: 100 ms > 2 x (5650 + the first step's 50 ms lead + the ten cast-out holds' 500 ms of end gaps) / 129
+    ASSERT_TRUE( 100 * 129 > 2 * ( 5650 + 50 + 500 ) );
+    ASSERT_TRUE( probe.optimisticFinishMs( 145, 1499, 8000 ) <= 64417.0 );
+    ASSERT_FALSE( playback_frame_range::playPaceProjectsPastBudget( 145, 1499, 8000, budget, probe ) );
+    // THE BOUND along the trace at every phase: from the probe on, the optimistic finish is never later than the step
+    // that really reaches 1499, and every phase is Reached
+    for( int64_t phase = 0; phase < 50; ++phase )
+    {
+        PlayPaceHistory h;
+        for( int64_t t = phase; t < 64417; t += 50 )
+        {
+            const int64_t c = stalledCount( t, 500, 24, dense );
+            h.note( c, t );
+            if( t >= playback_frame_range::kPaceProbeMs ) ASSERT_TRUE( h.optimisticFinishMs( c, 1499, t ) <= 64417.0 );
+        }
+        const PolledRun r = pollPhased( 500, 24, dense, 1499, budget, 50, phase );
+        ASSERT_TRUE( r.state == PlayStopState::Reached );
+        ASSERT_TRUE( r.elapsedMs >= 64417 && r.elapsedMs < 64417 + 50 );
+    }
+    // the same stalls never stopping (one every 640 ms to the end: 14 s of stall) cannot finish: refused, typed, before
+    // the budget; and the slow controls (20 / 22 fps) with the dense burst are refused at the probe
+    const PolledRun forever = pollStalledCount( 500, 24, periodicStalls( 1000, 640, 150, 900000 ), 1499, budget, 50 );
+    ASSERT_TRUE( forever.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( forever.elapsedMs < budget );
+    for( const int64_t fps : { int64_t( 20 ), int64_t( 22 ) } )
+    {
+        const PolledRun slow = pollStalledCount( 500, fps, dense, 1499, budget, 50 );
+        ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+        ASSERT_TRUE( slow.elapsedMs >= playback_frame_range::kPaceProbeMs && slow.elapsedMs < 9000 );
+    }
+    // a steady engine at any pace and poll (even and uneven) is never split: no stall hold, no stall time
+    for( const int64_t fps : { int64_t( 3 ), int64_t( 12 ), int64_t( 20 ), int64_t( 24 ), int64_t( 30 ), int64_t( 60 ) } )
+    {
+        for( const int schedule : { 10, 16, 33, 50, 125 } )
+        {
+            PlayPaceHistory steady;
+            int64_t last = 0;
+            for( int64_t t = 0; t <= 20000; t = ( schedule == 125 ? r14UnevenNext( t ) : t + schedule ) )
+            {
+                steady.note( stalledCount( t, 0, fps, std::vector<Stall>() ), t );
+                last = t;
+            }
+            const PlayPaceHistory::PlayingSplit st = steady.stallFreeSplit( last );
+            ASSERT_EQ( int64_t( 0 ), st.stallHolds );
+            ASSERT_EQ( int64_t( 0 ), st.stallMs );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// r16: THE GENERATED SWEEP. Every combination of a 24 / 25 / 30 fps conformed run (required 1499, safety 65000), a
+// first present of 250-1500 ms, stalls of 100-300 ms every 3000 ms (sparse) down to every 400 ms, either a burst that
+// has ended by the probe (from 500 ms after the first present, the last ending by 8000 ms) or stalls that never stop,
+// polled every 50 ms at phases 0-49 ms. Ground truth: the first ms the count reaches 1499 (feasible = by the budget).
+// THE BOUND IT PROVES (docs/playback-clip-length-rule.md): every feasible run is Reached, never before the count really
+// reaches 1499, and every infeasible one is refused PLAY_PACE_TOO_SLOW before the budget -- except two pinned classes,
+// each refused typed within 200 ms of the probe: (1) the STALL SHARE CAP: a burst whose stalls are more than a third of the time to the
+// probe is, at 8 s, the same count as stalls that keep coming (R12ControlsStillEndTypedPaceTooSlow); (2) THE TWO-POLL
+// LIMIT: a stall whose frame stays less than three poll gaps (step + stall < 150 ms, i.e. the 100 ms stalls here) can be
+// seen by only two polls -- a 50 ms bin, the same sighting as the 60 / 70 ms steps of the uneven engines that must be
+// refused at the probe (R15AdversaryA1 jitter controls) -- so it can stay playing pace. Evidence of the full grid (every
+// phase 0..49, 7 spacings, 4 first presents): the r16 run dir, evidence/sweep-full-*.txt.
+// ---------------------------------------------------------------------------------------------------------
+TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeasibleOneIsRefused )
+{
+    const int64_t budget = playSafetyMs( 25.0 );
+    int64_t feasibleReached = 0, infeasibleAtProbe = 0, infeasibleLater = 0, shareCapRefused = 0, twoPollRefused = 0;
+    int64_t pinnedReached = 0, pinnedLatestMs = 0;
+    std::vector<int64_t> infeasiblePerFps( 3, 0 );
+    for( const bool burst : { true, false } )
+    for( size_t fi = 0; fi < 3; ++fi )
+    for( const int64_t firstPresent : { int64_t( 250 ), int64_t( 750 ), int64_t( 1500 ) } )
+    for( const int64_t len : { int64_t( 100 ), int64_t( 150 ), int64_t( 200 ), int64_t( 250 ), int64_t( 300 ) } )
+    for( const int64_t every : { int64_t( 3000 ), int64_t( 1200 ), int64_t( 640 ), int64_t( 400 ) } )
+    {
+        const int64_t fps = fi == 0 ? 24 : ( fi == 1 ? 25 : 30 );
+        if( !burst && every == 3000 ) continue;   // sparse stalls that never stop: the burst rows cover them
+        const std::vector<Stall> stalls = periodicStalls( firstPresent + 500, every, len, burst ? 8000 : 900000 );
+        int64_t reach = 0;
+        while( stalledCount( reach, firstPresent, fps, stalls ) < 1499 ) ++reach;
+        const bool feasible = reach <= budget;
+        int64_t stalledBy8s = 0;
+        for( const Stall &s : stalls ) stalledBy8s += std::min<int64_t>( s.forMs, std::max<int64_t>( 0, 8000 - s.atMs ) );
+        const bool overShareCap = 2 * stalledBy8s > 8000 - firstPresent - stalledBy8s;
+        const bool twoPoll = len * fps + 1000 < 150 * fps;   // step + stall < 3 poll gaps
+        if( !feasible ) ++infeasiblePerFps[fi];
+        for( const int64_t phase : { int64_t( 0 ), int64_t( 12 ), int64_t( 25 ), int64_t( 37 ), int64_t( 49 ) } )
+        {
+            const PolledRun r = pollPhased( firstPresent, fps, stalls, 1499, budget, 50, phase );
+            if( !feasible )
+            {
+                ASSERT_TRUE( r.state == PlayStopState::PaceTooSlow );
+                ASSERT_TRUE( r.elapsedMs < budget );
+                ++( r.elapsedMs < playback_frame_range::kPaceProbeMs + 50 ? infeasibleAtProbe : infeasibleLater );
+            }
+            else if( r.state == PlayStopState::Reached )
+            {
+                ASSERT_TRUE( r.elapsedMs >= reach && r.elapsedMs < reach + 50 );
+                ++( overShareCap || twoPoll ? pinnedReached : feasibleReached );
+            }
+            else
+            {
+                // only the two pinned classes, and only typed, within 200 ms of the probe
+                if( !( overShareCap || twoPoll ) || r.state != PlayStopState::PaceTooSlow
+                    || r.elapsedMs >= playback_frame_range::kPaceProbeMs + 200 )
+                    std::printf( "  r16 sweep FAIL: burst=%d fps=%lld first=%lld len=%lld every=%lld phase=%lld reach=%lld -> %d at %lld\n",
+                                 (int)burst, (long long)fps, (long long)firstPresent, (long long)len, (long long)every,
+                                 (long long)phase, (long long)reach, (int)r.state, (long long)r.elapsedMs );
+                ASSERT_TRUE( overShareCap || twoPoll );
+                ASSERT_TRUE( r.state == PlayStopState::PaceTooSlow );
+                ASSERT_TRUE( r.elapsedMs < playback_frame_range::kPaceProbeMs + 200 );   // within 200 ms of the probe
+                pinnedLatestMs = std::max( pinnedLatestMs, r.elapsedMs );
+                ++( overShareCap ? shareCapRefused : twoPollRefused );
+            }
+        }
+    }
+    std::printf( "  r16 sweep: feasible Reached=%lld (+%lld in a pinned class), infeasible refused at the probe=%lld, later=%lld; "
+                 "pinned refusals: share cap=%lld, two-poll=%lld, the latest at %lld ms\n", (long long)feasibleReached,
+                 (long long)pinnedReached, (long long)infeasibleAtProbe, (long long)infeasibleLater, (long long)shareCapRefused,
+                 (long long)twoPollRefused, (long long)pinnedLatestMs );
+    ASSERT_TRUE( feasibleReached > 0 && infeasibleAtProbe > 0 && infeasibleLater > 0 );
+    for( const int64_t n : infeasiblePerFps ) ASSERT_TRUE( n > 0 );   // the spacing reaches truly infeasible at every fps
 }
 
 TEST( LookAssistSettle, ASecondSettleNeverAsksForAnotherPlayBecauseTheProcessAdmitsExactlyOne )
