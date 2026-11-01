@@ -28,14 +28,14 @@ SEEK_FRAMES = {"frame-00.json": b'{"capture_mode":"seek","playback_path":false,"
                "frame-01.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":150}', "frame-01.png": b"\x89PNG\r\n\x1a\nseek-1"}
 
 
-def write_in_pass_partners(artifacts: Path, count: int) -> None:
+def write_in_pass_partners(artifacts: Path, count: int, frames: list[int] | None = None) -> None:
     """r8 forced fixture (adversary r8 A2): the in-pass partner of each paused still, as the app writes it (contact-sheet\\raw\\frame-<ii>.png and .json,
     capture_mode in_pass, playback_path true, display_frame 50 + 100*i). With no frame list, still i must show its partner's display_frame."""
     raw = artifacts / "artifacts" / "contact-sheet" / "raw"
     raw.mkdir(parents=True, exist_ok=True)
     for i in range(count):
         (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw-%d" % i)
-        (raw / f"frame-{i:02d}.json").write_bytes(json.dumps({"capture_mode": "in_pass", "playback_path": True, "display_frame": 50 + 100 * i}).encode("utf-8"))
+        (raw / f"frame-{i:02d}.json").write_bytes(json.dumps({"capture_mode": "in_pass", "playback_path": True, "display_frame": frames[i] if frames else 50 + 100 * i}).encode("utf-8"))
 
 
 class PairedSeekSpecTests(unittest.TestCase):
@@ -235,6 +235,8 @@ class PairedSeekFrameListTests(RunnerHarness, unittest.TestCase):
             (seek / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-%d" % i)
             if frame is not None:
                 (seek / f"frame-{i:02d}.json").write_bytes(seek_sidecar(frame))
+        # r8 fix 2 forced fixture (adversary r8 fix-1 A2): the in-pass partners of the requested frames [50, 150], which a listed-frame still must match too
+        write_in_pass_partners(self.artifacts, len(display_frames))
 
     def test_the_schema_types_paired_seek_frames(self) -> None:
         prop = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))["properties"]["look"]["properties"]["pairedSeekFrames"]
@@ -854,10 +856,13 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
         path.write_text(json.dumps(spec), encoding="utf-8")
         return path
 
-    def run_case(self, spec: Path, sidecars: list[bytes], claim: str | None = None, extra_files: dict[str, bytes] | None = None):
-        runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claim)])} if claim else {}
+    def run_case(self, spec: Path, sidecars: list[bytes], claim: str | None = None, extra_files: dict[str, bytes] | None = None,
+                 partners: list[int] | None = None):
+        runner ={"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claim)])} if claim else {}
         self.write_artifacts(sheet=True, raw_frames=True)
         self.write_seek_stills(sidecars)
+        if partners is not None:
+            write_in_pass_partners(self.artifacts, len(partners), frames=partners)
         seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
         for name, data in (extra_files or {}).items():
             (seek / name).write_bytes(data)
@@ -941,6 +946,15 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
                 self.fresh()
                 receipt = self.run_case(self.shipped_spec("set-shifted" + ("-f" if claim else "")), [provenance_sidecar(f) for f in shifted], claim=claim)
                 self.assert_not_a_pass(receipt, "PAIRED_SEEK", "frame-00", "in-pass partner", final=claim is not None)
+
+    def test_r8_fix2_a2_a_listed_still_must_also_match_its_in_pass_partner(self) -> None:
+        # adversary r8 fix-1 A2: pairedSeekFrames [50, 150] honoured by the paused stills, but the in-pass partners show 51 and 151
+        for claim in (None, claimed_block([50, 150], requested=[50, 150])):
+            with self.subTest(final_validation=claim is not None):
+                self.fresh()
+                receipt = self.run_case(self.paired_spec("set-listed-partner" + ("-f" if claim else "")), [provenance_sidecar(50), provenance_sidecar(150)], claim=claim,
+                                        partners=[51, 151])
+                self.assert_not_a_pass(receipt, "frame-00", "in-pass partner", final=claim is not None)
 
     def test_the_complete_six_still_paused_control_passes(self) -> None:
         for claim in (None, claimed_block(SIX_FRAMES)):

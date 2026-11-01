@@ -2004,7 +2004,7 @@ function Get-DvPairedSeekVerdict {
         }
     }
     $frameList = $null -ne $RequestedFrames
-    $count = $(if (($StillCount -is [int] -or $StillCount -is [long]) -and $StillCount -ge 1) { [int]$StillCount } else { 0 })
+    $count = $(if (($StillCount -is [int] -or $StillCount -is [long]) -and $StillCount -ge 1 -and $StillCount -le 999) { [int]$StillCount } else { 0 })
     if ($count -eq 0) { $mismatches.Add("the committed look.contactSheetFrames ($(& $show $StillCount)) is not a positive whole number, so the paired stills this leg must hold are unknown") }
     elseif ($frameList -and $RequestedFrames.Count -ne $count) { $mismatches.Add("look.pairedSeekFrames names $($RequestedFrames.Count) frame(s) but the committed look.contactSheetFrames is $count") }
     $expectedCount = $(if ($frameList) { $RequestedFrames.Count } else { $count })
@@ -2043,7 +2043,8 @@ function Get-DvPairedSeekVerdict {
                 $problem = "$stillName was not captured paused through the full reconstruction path (its sidecar $stillName.json says capture_mode $(& $show $mode), playback_path $(& $show $playbackPath); a paired still needs capture_mode ""seek"" and playback_path false)$tail"
             }
             elseif ($frameList -and $shown -ne $requested) { $problem = "$stillName reported display_frame $shown$tail" }
-            elseif (-not $frameList) {
+            # fix 2 (adversary r8 fix-1 A2): the in-pass partner binds a listed-frame leg too -- the list adds the requested frame, it never removes the pairing
+            else {
                 $partner = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readFrame ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
                 if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying an integer display_frame), so its paused still cannot be shown to be the same frame" }
                 elseif ($shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }

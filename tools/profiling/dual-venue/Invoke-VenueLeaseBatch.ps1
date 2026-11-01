@@ -1085,9 +1085,11 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the -LegSpec / -LegSet modes run the leg's SHAPE predicate (Get-DvLegSpecShapeRefusal, the one
     # the leg and Get-LegSpecRefusal call) before any claim, read the way the leg reads the spec (-NoEnumerate). A spec that does not parse is left to the
     # existing paths (unchanged); only a shape the leg would throw on after the lease opened is refused here. '' when the shape is runnable.
-    $spec = try { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate } catch { $null }
-    if ($null -eq $spec) { return '' }
-    $refusal = Get-DvLegSpecShapeRefusal -Spec $spec
+    # fix 2 (adversary r8 fix-1 A1): a root the leg rejects is refused too -- bytes that are not JSON (the leg's ConvertFrom-Json throws) and a JSON null (it parses
+    # to $null, which the predicate refuses as not one object); a predicate that throws is a refusal, never an unhandled exit.
+    try { $spec = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
+    catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
+    try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
 
