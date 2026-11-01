@@ -253,11 +253,18 @@ function Select-MergeGroupJobsRun {
     # headSha of <tip>+NUL equalled the tip and a conclusion of 'success'+NUL counted as a success. Identity is decided by an
     # ORDINAL String.Equals, and a headSha or conclusion that carries any control character (NUL included) is refused as malformed.
     $same = { param([string]$a, [string]$b) [string]::Equals($a, $b, [System.StringComparison]::Ordinal) }
-    $clean = { param($v) ($v -is [string]) -and ($v -notmatch '[\x00-\x1F\x7F]') }
+    # r13 (r12 adversary A1): the refused range is C0, DEL AND C1 (U+0080-U+009F). U+0085 (NEL) is a C1 control that r12's
+    # [\x00-\x1F\x7F] left well-formed, so 'failure' + U+0085 could be the newest-by-createdAt fallback with no malformed count.
+    $clean = { param($v) ($v -is [string]) -and ($v -notmatch '[\x00-\x1F\x7F-\x9F]') }
+    # r13 (hub ACK 6560764371, Dot 6561311995): a headSha is a full 40-hex commit id. `gh run list --json headSha` emits it lowercase
+    # (all 50 rows of the live capture), so UPPERCASE hex is malformed by design. -cmatch makes the class case-sensitive (-match is
+    # not), and \A ... \z (not ^ ... $) refuses a trailing newline, which `$` would accept. A headSha outside this schema is
+    # excluded from EVERY branch below (landed filter, newer-off-tip count, success fallback, newest fallback).
+    $isSha = { param($v) ($v -is [string]) -and ($v -cmatch '\A[0-9a-f]{40}\z') }
     $present = @($Runs | Where-Object { $null -ne $_ })
     $wellTyped = @($present | Where-Object {
         $id = & $get $_ 'databaseId'
-        (& $clean (& $get $_ 'headSha')) -and (& $clean (& $get $_ 'conclusion')) -and
+        (& $isSha (& $get $_ 'headSha')) -and (& $clean (& $get $_ 'conclusion')) -and
         (($id -is [int]) -or ($id -is [long])) -and ($id -gt 0)
     })
     $badRows = $present.Count - $wellTyped.Count

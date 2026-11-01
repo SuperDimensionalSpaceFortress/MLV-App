@@ -6383,7 +6383,7 @@ def test_r11_real_gh_row_shapes_are_accepted_unchanged(tmp_path):
 R11_BAD_SHA = [
     pytest.param(True, MGRS_TIP, id="bool"),
     pytest.param(None, MGRS_TIP, id="null"),
-    pytest.param(1, "1", id="number"),
+    pytest.param(1, MGRS_TIP, id="number"),   # r13: the good row's tip must itself be a 40-hex sha (was the unrealistic "1")
     pytest.param([MGRS_TIP, "x"], MGRS_TIP, id="array"),
     pytest.param({"sha": MGRS_TIP}, MGRS_TIP, id="object"),
 ]
@@ -6582,3 +6582,163 @@ def test_r12_an_ordinal_comparison_is_pinned_in_the_selector_source():
     assert "StringComparison]::Ordinal" in body, "headSha / conclusion must be compared ordinally ( -eq and -ceq both ignore an embedded NUL )"
     assert "$_.headSha -eq" not in body and "$_.headSha -ne" not in body and "$_.conclusion -eq" not in body
     assert "-ceq" not in body and "-cne" not in body, "-ceq still ignores an embedded NUL; use [string]::Equals(.., Ordinal)"
+
+
+# All 50 rows of `gh run list --workflow Tests --event merge_group --json databaseId,conclusion,createdAt,headSha,displayTitle`
+# (gh 2.97.0), captured live 2026-11-01 (r11 evidence gh-run-list-merge-group.json), as (databaseId, createdAt, headSha, conclusion).
+R13_REAL_GH_CAPTURE = [
+    (41273090820, "2026-11-01T04:26:11Z", "df039a92e8af57d57b3594d466c09cf2947d3bc7", "success"),
+    (41225880883, "2026-10-31T17:43:10Z", "124de5190698a0b0ffd8ba488f5a9eddb37e3e36", "success"),
+    (41218504235, "2026-10-31T16:11:57Z", "cdc186796424515a80e015f7d940a424e9af83e5", "success"),
+    (41192640007, "2026-10-31T10:24:41Z", "a95d2c5dfcdada8696e2e6b7ac111cfd0a0793b8", "success"),
+    (41191699415, "2026-10-31T10:11:01Z", "b45a065141eeea7395f2569457e8ff595bea7dbc", "success"),
+    (41190240329, "2026-10-31T09:49:22Z", "ea9f2a998337e255a12c7ba6d9031f4619b384d0", "success"),
+    (41187946375, "2026-10-31T09:15:23Z", "4ad66eb4123d1df9c36ca1480c164b606c390f47", "cancelled"),
+    (41176707205, "2026-10-31T06:27:53Z", "0930a3dd68959c46e520415288e1170248eab805", "success"),
+    (41172362927, "2026-10-31T05:22:48Z", "dd1cfc68627c4de41edb0ad5be42f40aaf81533d", "success"),
+    (41167580702, "2026-10-31T04:12:14Z", "c10339878ee9bab3a8724ded95e8430ffafcf90e", "failure"),
+    (41165941673, "2026-10-31T03:48:33Z", "928b89bc895014828fe2ca771296d0f70a54c0ca", "success"),
+    (41139627093, "2026-10-30T22:40:06Z", "1018a13e219c78835609d0e598ae52f2176923a3", "success"),
+    (41139162979, "2026-10-30T22:35:43Z", "08ec1afb9bc58b11e13312d79deff23c0976eba2", "success"),
+    (41108668798, "2026-10-30T18:38:43Z", "8f22c6d15713ec688ce5ae100b66c49ed678140e", "success"),
+    (41084135587, "2026-10-30T15:48:44Z", "524e1f2c1a66a1d09c838e25024b7eac82e7ee22", "success"),
+    (41079011074, "2026-10-30T15:15:26Z", "4313beb3572daf5b6b4ed109866db36e8d254cb2", "success"),
+    (41023754896, "2026-10-30T08:02:05Z", "dd99118ed65dca3292cad9a975d4fb304a997abc", "success"),
+    (41006983968, "2026-10-30T05:11:01Z", "01f0f6d6e9317af83aa7658b6ae229b10bf108ef", "success"),
+    (41003826294, "2026-10-30T04:36:22Z", "7f95a4841deefad6017b5ec040c8e4dd20adc1d8", "failure"),
+    (41003824879, "2026-10-30T04:36:21Z", "c548d7aeea5f4f4343be2454a6abba2deefd2e29", "failure"),
+    (41000650226, "2026-10-30T04:02:28Z", "412af7e65f001eb9144e5212c9c4c5d5692353f0", "failure"),
+    (40997478763, "2026-10-30T03:27:27Z", "d0d63782cb484488d865af09c2b60694886d94c8", "success"),
+    (40961846547, "2026-10-29T21:55:54Z", "49cdb6c01921eb8606bbd51ba3465334e9af5e44", "success"),
+    (40959445779, "2026-10-29T21:38:08Z", "5fef282af8479f43da7f955ec3e28bdab7faafdc", "success"),
+    (40958213988, "2026-10-29T21:29:24Z", "7719271d7b64b6af1a66c8b7c87dfbbeaffb85a3", "success"),
+    (40926624385, "2026-10-29T18:00:01Z", "8b7cb2f28112024fe6b20e67a83afcf7b2cb4b23", "success"),
+    (40925740088, "2026-10-29T17:54:17Z", "0cf275fd75ffa536dc3babd4176e7758fd42738e", "success"),
+    (40871917397, "2026-10-29T12:16:31Z", "a013c733e2fd9d099a76be84d85bd592c4d90c7f", "success"),
+    (40858861385, "2026-10-29T10:36:12Z", "cf598bd2b444b33b6ffb31f46746d2cc7456a696", "success"),
+    (40836854562, "2026-10-29T07:39:38Z", "6281b50fa65844932b34fd9df606349223a47fd9", "success"),
+    (40713497429, "2026-10-28T15:11:55Z", "293b0b818dd268d81bc5aa667b3ae7a021f02b24", "success"),
+    (40713494260, "2026-10-28T15:11:54Z", "55c1405d26663fa63eac6c8e91467d28482e24f5", "success"),
+    (40711418664, "2026-10-28T14:59:35Z", "daf11506e55c658b05158104699030c6320773fc", "failure"),
+    (40710577449, "2026-10-28T14:54:28Z", "8c0ce8d9361eb2af06f391c8a5f703786c871052", "cancelled"),
+    (40705077872, "2026-10-28T14:21:13Z", "27b81a47241905d2a0094c344ed11edd384d0314", "cancelled"),
+    (40616742646, "2026-10-28T01:43:31Z", "038ba3357e262bfc866f82c2e3c9ba4b04f790fc", "success"),
+    (40539446886, "2026-10-27T16:17:27Z", "685b91ad25e07b7b5e8ac46a558470db22021d19", "success"),
+    (40509624873, "2026-10-27T13:09:47Z", "5175855f46b946e3ab180d750171d7229c17e383", "success"),
+    (40509625455, "2026-10-27T13:09:47Z", "82a15395547db26c72f4dc31ae8d6734b54d2242", "success"),
+    (40497267505, "2026-10-27T11:35:17Z", "f32ea2a2e9928d1081cccb9d0b29304825f693ea", "success"),
+    (40458055327, "2026-10-27T05:55:16Z", "0154c55beae29baf06a2db717e675ac560d1cc98", "success"),
+    (40413026689, "2026-10-26T22:30:58Z", "01ef201681f6581f4c6cef53d6419f64c0339393", "success"),
+    (40399274068, "2026-10-26T20:50:58Z", "646b70ab1ddc19760f7ff6d311bc3c10ffc52b23", "success"),
+    (40341411397, "2026-10-26T14:38:00Z", "b59662cd12c2783d3718f7b4da2b17392cd9d51a", "success"),
+    (40303774121, "2026-10-26T09:58:51Z", "7eeef2013a016895b5bf205732b8f4b20d7f50a9", "success"),
+    (40300657207, "2026-10-26T09:34:52Z", "3cc5364bebc5a7ade0960543b2f622538aa1ff33", "success"),
+    (40253427805, "2026-10-26T01:16:36Z", "a235df4d4c47ab77056b0016f8c4a8443811a6a9", "success"),
+    (40249431889, "2026-10-26T00:27:13Z", "5e1b6887c01bcc3f12ab8eb1b13ceef9f203edf5", "success"),
+    (40243119527, "2026-10-25T23:04:54Z", "da8b230e2a08614c2a86eaa5d376ba66aa85cbac", "success"),
+    (40235952520, "2026-10-25T21:32:12Z", "dfbfd54e25e186687b80981b1f1269706ed56083", "success"),
+]
+
+
+# --- r13 (hub ACK 6560764371 / Dot 6561311995 + 6561775338; r12 adversary A1): a headSha SCHEMA and the C1 control range ---------
+# The hub promised a `^[0-9a-f]{40}$` headSha check at every selector branch. `gh run list --json headSha` emits a full lowercase
+# 40-hex commit id (all 50 rows of the live capture below), so a row whose headSha is anything else is malformed: it is excluded
+# from EVERY branch (landed filter, newer-off-tip count, success fallback, newest fallback) and counted in the malformed label.
+# Uppercase hex is deliberately malformed (gh never emits it). r12's control-character predicate omitted U+0080-U+009F, so
+# 'failure' + U+0085 was treated as well-formed and could be the newest-by-createdAt fallback.
+R13_BAD_SHAS = [
+    pytest.param("a" * 39, id="39-hex"),
+    pytest.param("a" * 41, id="41-hex"),
+    pytest.param("A" * 40, id="uppercase-hex"),
+    pytest.param("a" * 39 + "B", id="one-uppercase-char"),
+    pytest.param("a" * 40 + "\n", id="40-hex-plus-lf"),
+    pytest.param("a" * 40 + " ", id="40-hex-plus-space"),
+    pytest.param("a" * 40 + chr(0x85), id="40-hex-plus-c1-nel"),
+    pytest.param(chr(0x80) + "a" * 40, id="c1-prefix"),
+    pytest.param("g" * 40, id="40-non-hex"),
+    pytest.param("zzz", id="zzz"),
+    pytest.param("", id="empty"),
+    pytest.param(1234567890, id="number"),
+]
+
+
+@pytest.mark.parametrize("bad", R13_BAD_SHAS)
+def test_r13_a_head_sha_outside_the_schema_is_not_a_newer_off_tip_run(tmp_path, bad):
+    # landed branch: the bad row is NEWER than the landed run. Before r13 a non-hex headSha with no control character counted
+    # as "1 newer completed run(s) not at the local tip"; it is malformed instead and counted only in the malformed label.
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", bad, "failure"), _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R13_BAD_SHAS)
+def test_r13_a_head_sha_outside_the_schema_is_never_the_success_fallback(tmp_path, bad):
+    # success fallback (no landed run): the bad row is the newest success; the real older success must win.
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", bad, "success"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+            _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 100, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R13_BAD_SHAS)
+def test_r13_a_head_sha_outside_the_schema_is_never_the_newest_fallback(tmp_path, bad):
+    # newest-by-createdAt fallback (no landed run, no success): the bad row is the newest; the well-formed one must win.
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", bad, "failure"), _mgrs_row(200, "2026-11-01T16:00:00Z", MGRS_OTHER, "failure")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}
+
+
+R13_C1_SUFFIXES = [
+    pytest.param(chr(0x80), id="u0080"),
+    pytest.param(chr(0x85), id="u0085-nel"),
+    pytest.param(chr(0x9F), id="u009f"),
+]
+
+
+@pytest.mark.parametrize("suffix", R13_C1_SUFFIXES)
+def test_r13_a_conclusion_with_a_c1_control_is_never_a_success(tmp_path, suffix):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success" + suffix),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+            _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 100, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+def test_r13_fallback_selection_c1_conclusion_row_is_not_the_newest_fallback(tmp_path):
+    # Dot ask 6561775338 (literal inputs): MasterSha = 40 x 'a'; Row A 300 is newer with conclusion 'failure' + U+0085.
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", "b" * 40, "failure" + chr(0x85)),
+            _mgrs_row(200, "2026-11-01T16:00:00Z", "b" * 40, "failure")]
+    picked = _r12_select(tmp_path, rows, "a" * 40)
+    assert picked is not None and picked["id"] == 200, picked
+    assert "1 malformed run row(s) ignored" in picked["label"], picked
+
+
+def test_r13_fallback_selection_zzz_head_sha_row_is_not_the_newest_fallback(tmp_path):
+    # Same shape for headSha: Row A headSha 'zzz', conclusion 'failure', newer.
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", "zzz", "failure"),
+            _mgrs_row(200, "2026-11-01T16:00:00Z", "b" * 40, "failure")]
+    picked = _r12_select(tmp_path, rows, "a" * 40)
+    assert picked is not None and picked["id"] == 200, picked
+    assert "1 malformed run row(s) ignored" in picked["label"], picked
+
+
+def test_r13_an_all_bad_head_sha_export_selects_nothing(tmp_path):
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", "zzz", "success"), _mgrs_row(200, "2026-11-01T16:00:00Z", "A" * 40, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) is None
+
+
+def _r13_real_rows():
+    return [_mgrs_row(i, c, s, k) for (i, c, s, k) in R13_REAL_GH_CAPTURE]
+
+
+def test_r13_control_the_real_50_row_gh_capture_is_all_usable_and_selects_as_before(tmp_path):
+    assert len(R13_REAL_GH_CAPTURE) == 50 and all(re.fullmatch(r"[0-9a-f]{40}", s) for (_, _, s, _) in R13_REAL_GH_CAPTURE)
+    landed = _r12_select(tmp_path, _r13_real_rows(), "124de5190698a0b0ffd8ba488f5a9eddb37e3e36")
+    assert landed == {"id": 41225880883, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}, landed
+    success = _r12_select(tmp_path, _r13_real_rows(), MGRS_TIP)    # no row is at this tip: newest success wins
+    assert success == {"id": 41273090820, "label": MGRS_LABEL_SUCCESS}, success
+    assert "malformed" not in landed["label"] and "malformed" not in success["label"]
+
+
+def test_r13_the_schema_and_the_c1_range_are_pinned_in_the_selector_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "-cmatch '\\A[0-9a-f]{40}\\z'" in body, "headSha must be checked with the case-sensitive, end-anchored 40-hex schema"
+    assert "[\\x00-\\x1F\\x7F-\\x9F]" in body, "the control-character predicate must cover C0, DEL and C1"
