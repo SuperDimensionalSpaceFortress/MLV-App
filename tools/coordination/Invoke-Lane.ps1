@@ -48,7 +48,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')]
+    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')]
     [string]$Lane,
 
     [string]$Prompt,
@@ -149,6 +149,11 @@ param(
     # launch. This lane then writes a 'linked' row naming its receipt instead of a second
     # 'reserved' row, so the product-ratio guard counts the launch once.
     [string]$DispatchReservationId = '',
+    # VISUAL-JUDGE-TERRA-LANE-1: image files attached to the initial prompt (`codex exec -i <FILE>`, from
+    # `codex exec --help` on the pinned codex 0.160.1). CODEX ENGINE ONLY: a claude lane given any path
+    # fails closed with the typed error image-paths-codex-only before a run dir or receipt exists.
+    # Each path must exist and be a .png or .jpg; the receipt's `imagePaths` lists path, sha256 and bytes.
+    [string[]]$ImagePaths = @(),
     [switch]$KeepScratch
 )
 
@@ -221,6 +226,10 @@ $LANES = @{
     # guardrail test pins it). It is a machine-readable label, NOT current routing authority; the
     # posture is the comment block above (optional diversity seat; design/arbiter duties -> sol).
     astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }
+    # VISUAL-JUDGE-TERRA-LANE-1 (owner directive 2026-10-31): terra is the visual-judge seat -- it reads image
+    # strips (-ImagePaths) and answers a JSON verdict. Read-only like every codex row (codex-lane-never-edits),
+    # high effort, tier resolved at launch to the highest listed gpt-<ver>-terra slug.
+    terra  = @{ engine = 'codex';  tier = 'terra';   effort = 'high'; role = 'visual-judge' }
 }
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
@@ -954,6 +963,13 @@ try {
 } catch { }
 
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)
+# (a0) r7 (sol B3 / ADV-A3): every native wait on the lane budget (WaitForExit, both image-read CancelAfter) takes Int32 milliseconds. A
+# budget above Int32.MaxValue ms was clamped to ONE capped wait whose expiry was booked as timedOut/124 with budget unspent. Instead of
+# looping each wait, the accepted budget is capped where every remaining-ms value derives from it: 2147483 s * 1000 <= 2147483647 ms.
+$MAX_TIMEOUT_SEC = 2147483
+if ($TimeoutSec -gt $MAX_TIMEOUT_SEC) {
+    throw "timeout-sec-too-large: -TimeoutSec $TimeoutSec exceeds $MAX_TIMEOUT_SEC (about 24.8 days, the largest budget a native Int32-millisecond wait can hold in one call)"
+}
 # (a) A codex lane can never be granted write access: no Claude hook is visible to codex exec,
 # so nothing here could enforce NA-1..NA-10 against it. Keyed on ENGINE, not an enumerated list
 # of lane names -- a new codex row (e.g. astra) refuses edits by construction, with nothing left
@@ -961,6 +977,262 @@ try {
 if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
     throw "codex-lane-never-edits: -Lane $Lane with -AllowEdits (no Claude hook is visible to codex exec)"
 }
+# (a2) VISUAL-JUDGE-TERRA-LANE-1: -ImagePaths is a codex-engine feature (`codex exec -i <FILE>`); the claude
+# argv has no image flag, so a claude lane given one would silently judge nothing. Fail closed, typed, before any
+# run dir or receipt exists. Every path must exist as a FileSystem file, be a .png or .jpg and carry no ',' (codex
+# 0.160.1 splits an `-i` value on commas, so `strip,one.png` would attach two other files: adversary A1). The path is
+# the NATIVE one (.ProviderPath: `Provider::C:/dir/x.png` would pass Test-Path but not File.Exists: A3). Hashing is NOT done
+# here: the launch copies each image into the run dir and hashes THAT copy, so the receipt names the exact bytes the
+# lane was handed even if the source is replaced after validation (A2). Keyed on ENGINE, not lane name.
+$ImageAttachments = @()
+# r4 B2: one held read handle per snapshot, kept open from the copy until the codex child has exited (never serialised into the receipt).
+$ImageHolds = [System.Collections.Generic.List[object]]::new()
+# `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
+# -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
+# single -ImagePaths value (`-ImagePaths 'a.png|b.png'`); a real array from `&`/dot-calls works unchanged.
+# r2 adversary A1: an empty or blank element is NOT silently dropped. Dropping it let `-ImagePaths ' '` / `'||'` reach a claude
+# lane (or a codex lane) as "no images", bypassing the engine refusal and judging nothing. Any supplied element must be a path.
+$ImagePathsGiven = @($ImagePaths | ForEach-Object { [string]$_ -split '\|' })
+if ($ImagePathsGiven.Count -gt 0) {
+    if ($LANES[$Lane].engine -ne 'codex') {
+        throw "image-paths-codex-only: -Lane $Lane is a $($LANES[$Lane].engine)-engine lane; -ImagePaths is accepted only by codex-engine lanes"
+    }
+    foreach ($imagePath in $ImagePathsGiven) {
+        if ([string]::IsNullOrWhiteSpace($imagePath)) {
+            throw "image-path-empty: -ImagePaths carries an empty entry (a stray '|' or a blank value); every entry must be a file path"
+        }
+        if (-not (Test-Path -LiteralPath $imagePath -PathType Leaf)) {
+            throw "image-path-missing: -ImagePaths entry is not an existing file: $imagePath"
+        }
+        $imageResolved = Resolve-Path -LiteralPath $imagePath
+        if ($imageResolved.Provider.Name -ne 'FileSystem') {
+            throw "image-path-missing: -ImagePaths entry is not on the FileSystem provider ($($imageResolved.Provider.Name)): $imagePath"
+        }
+        $imageFull = $imageResolved.ProviderPath
+        $imageExt = [System.IO.Path]::GetExtension($imageFull).ToLowerInvariant()
+        if ($imageExt -ne '.png' -and $imageExt -ne '.jpg') {
+            throw "image-path-bad-extension: -ImagePaths accepts only .png or .jpg (got '$imageExt'): $imageFull"
+        }
+        if ($imageFull.Contains(',')) {
+            throw "image-path-bad-character: -ImagePaths entry contains ',' (codex splits an -i value on commas); copy the file to a name without one: $imageFull"
+        }
+        $ImageAttachments += [ordered]@{ source = $imageFull; path = $null; sha256 = $null; bytes = $null; ext = $imageExt; consumedVerified = $null }
+    }
+}
+# BEGIN Copy-ImageSnapshot (VISUAL-JUDGE-TERRA-LANE-1 r2, adversary A2 + A3)
+# Copies Source to Dest in 256 KiB chunks, hashing the very bytes it writes (one read, so sha256/bytes cannot drift from the copy), and
+# checks Clock against LimitMs between chunks so a slow share spends the lane's -TimeoutSec budget instead of an unbounded wall (A3).
+# Plain .NET streams only: Get-Item without -Force throws on a Hidden snapshot (A2). A failed copy deletes ONLY the partial file this
+# call created (pass-2b A1: a Dest that already existed, e.g. the caller's own file, is never touched). The source is read through an
+# overlapped FileStream and every read carries a CancellationToken that fires at the deadline, so a read that never returns is cut at
+# the lane budget instead of holding the lane (pass-2b A2). The deadline is raised as a TimeoutException, the type the lane books as
+# timedOut=true / exit 124 (launch-budget-exhausted uses the same one; pass-2b A3).
+# r4 B1 (sol): the destination is opened with FileOptions.DeleteOnClose and share None, so a failed copy is cleaned up BY THE HANDLE
+# this call owns -- never by path after the handle is gone (a path delete could remove a file someone moved into the name in that
+# window). The delete-on-close flag is cleared through the handle (FileDispositionInfoEx, ON_CLOSE without DELETE) only once the copy is
+# complete. r4 B2 (sol): the success result carries a HELD read handle on the snapshot (FileShare.Read: no writer, no delete, so a write
+# through any hard link fails) that the caller keeps open until the codex child has exited, then re-hashes (Get-ImageHoldDigest).
+# The held handle is opened after the writer closes and its digest is compared with the copy's, so a write that slipped into that gap is
+# a typed `image-snapshot-mutated` failure, not a silent pass.
+# r3 scope statement: only the source READ is cancellable. The source open, the destination open/write and the flush are synchronous, so
+# this is NOT a universal hard-I/O deadline.
+# r3 G2: every other I/O failure is typed with the `image-path-` prefix the validation refusals use, so a failed receipt greps the same:
+#   image-path-missing: source vanished before snapshot (<source>)    the source was deleted between validation and launch
+#   image-path-unreadable: <reason> (<source>)                        the source is locked / unreadable / a read failed
+#   image-path-snapshot-collision: ... (<source>)                    the destination path IS the source file (refused before any open)
+#   image-path-snapshot-exists: ... (<dest>)                          the destination already existed (left untouched, never deleted)
+#   image-snapshot-mutated: ... (<dest>)                             the held snapshot's bytes differ from the digest taken at copy time
+#   image-path-snapshot-failed: <reason> (<dest>)                     destination write / flush / close failed
+#   image-path-snapshot-unreadable: <reason> (<dest>)                 r5: the held snapshot could not be read back (an I/O error, not a mismatch)
+#   image-path-reparse-ancestor: ... (<path>)                         r5: the resolved snapshot path has a reparse point in its ancestry
+#   image-digest-timeout: ...                                         r5: a digest read ran past the lane budget (TimeoutException -> timeout/124)
+#   image-path-noncanonical: ...                                      r7: the resolved path, once \\?\ is removed, would open a different object
+#   image-path-bad-character: ... '%', '^' or '&' ...                 r7 (sol B1): cmd.exe (the codex .cmd shim) would rewrite the -i argument
+# r7 (sol B1): ProcessStartInfo quotes an argument only when it has a space or a quote, and the codex launcher is a .cmd shim that forwards
+# %*, so cmd.exe expands %VAR%, drops '^' and splits at '&' in the attached path. Measured on this host: C:\x\%OS%\f.png reached the child
+# as C:\x\Windows_NT\f.png and C:\x\a^b\f.png as C:\x\ab\f.png. The held snapshot would verify while codex read another file: refuse.
+$IMAGE_CMD_META_PATTERN = '[%^&]'
+if (-not ('MlvImageSnap' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class MlvImageSnap {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool SetFileInformationByHandle(SafeFileHandle h, int infoClass, ref uint info, uint size);
+  // FileDispositionInfoEx (21) with FILE_DISPOSITION_FLAG_ON_CLOSE (8) and no DELETE (1): cancels the delete-on-close the handle was opened with.
+  public static void KeepOnClose(SafeFileHandle h) {
+    uint flags = 8;
+    if (!SetFileInformationByHandle(h, 21, ref flags, 4)) throw new Win32Exception(Marshal.GetLastWin32Error(), "SetFileInformationByHandle(FileDispositionInfoEx)");
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder buf, uint len, uint flags);
+  // r5 B1 (sol A1): the path of the OBJECT the handle holds, with every junction/symlink in the chain already resolved (VOLUME_NAME_DOS),
+  // minus the long-path prefix so codex gets an ordinary path (the UNC form becomes \\server\share\...).
+  public static string FinalPath(SafeFileHandle h) {
+    var sb = new StringBuilder(1024);
+    uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+    if (n >= sb.Capacity) { sb = new StringBuilder((int)n + 1); n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0); }
+    if (n == 0) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFinalPathNameByHandle");
+    return StripVerbatim(sb.ToString());
+  }
+  // r7 (opus B1 = sol B2, ADV-A1): removing the \\?\ prefix hands the path back to Win32 normalization, which drops a trailing '.' from a
+  // segment. A held object in a native directory `judge.` would then be named by a string that opens the ordinary sibling `judge`. So the
+  // stripped string must already be canonical (GetFullPath returns it unchanged, ordinal); otherwise it names some other object: refuse.
+  public static string StripVerbatim(string p) {
+    string r = p;
+    if (p.StartsWith("\\\\?\\UNC\\", StringComparison.Ordinal)) r = "\\\\" + p.Substring(8);
+    else if (p.StartsWith("\\\\?\\", StringComparison.Ordinal)) r = p.Substring(4);
+    string full = System.IO.Path.GetFullPath(r);
+    if (!string.Equals(full, r, StringComparison.Ordinal)) {
+      throw new System.IO.IOException("image-path-noncanonical: the held image snapshot's resolved path '" + p + "' is not canonical once its \\\\?\\ prefix is removed (Win32 would open '" + full + "'), so codex could read a different file");
+    }
+    return r;
+  }
+}
+'@
+}
+# Re-reads a held snapshot from the start through the handle itself and returns its digest.
+# r5 H1 (sol/ADV-A2): every read is cancellable and checked against Clock/LimitMs (the hold is opened FileOptions.Asynchronous), so a
+# stalled share ends as a TimeoutException (`image-digest-timeout`) instead of holding the lane. Any other failure propagates as the raw I/O error.
+function Get-ImageHoldDigest {
+    param([System.IO.FileStream]$Hold, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
+    $h = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $null = $Hold.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $b = New-Object byte[] 262144; $len = [long]0
+        while ($true) {
+            $remainingMs = $LimitMs - $Clock.Elapsed.TotalMilliseconds
+            if ($remainingMs -le 0) { throw [System.TimeoutException]::new("image-digest-timeout: re-reading the held image snapshot spent the lane's -TimeoutSec budget") }
+            $cts = [System.Threading.CancellationTokenSource]::new()
+            try {
+                $cts.CancelAfter([int][math]::Min(2147483647.0, [math]::Ceiling($remainingMs)))
+                $n = $Hold.ReadAsync($b, 0, $b.Length, $cts.Token).GetAwaiter().GetResult()
+            } catch {
+                if ($cts.IsCancellationRequested -or $Clock.Elapsed.TotalMilliseconds -ge $LimitMs -or $_.Exception.GetBaseException() -is [System.OperationCanceledException]) {
+                    throw [System.TimeoutException]::new("image-digest-timeout: a read of the held image snapshot did not return inside the lane's -TimeoutSec budget")
+                }
+                throw
+            } finally { $cts.Dispose() }
+            if ($n -le 0) { break }
+            [void]$h.TransformBlock($b, 0, $n, $null, 0); $len += $n
+            # hold-digest-read-tick
+        }
+        [void]$h.TransformFinalBlock($b, 0, 0)
+        return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($h.Hash).Replace('-', '').ToLowerInvariant()); bytes = $len }
+    } finally { $h.Dispose() }
+}
+# r5 B1: the first ancestor directory of Path that is a reparse point (junction / symlink / mount point), or $null. The hold is opened
+# with a name that may pass through one; GetFinalPathNameByHandle resolves it, so a non-null answer for the RESOLVED path is anomalous.
+function Get-ImageReparseAncestor {
+    param([string]$Path)
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    while (-not [string]::IsNullOrEmpty($dir)) {
+        if (([System.IO.File]::GetAttributes($dir) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $dir }
+        $dir = [System.IO.Path]::GetDirectoryName($dir)
+    }
+    return $null
+}
+function Get-ImageIoException {
+    param([System.Management.Automation.ErrorRecord]$Err, [string]$Source, [string]$Dest, [string]$Side)
+    $base = $Err.Exception.GetBaseException()
+    if ($base -is [System.TimeoutException]) { return $base }
+    if ($Side -eq 'dest') {
+        if ($base -is [System.IO.IOException] -and [System.IO.File]::Exists($Dest) -and (($base.HResult -band 0xFFFF) -eq 80 -or ($base.HResult -band 0xFFFF) -eq 183)) {   # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS, locale-independent
+            return [System.IO.IOException]::new("image-path-snapshot-exists: the image snapshot destination already exists and was left untouched ($Dest): $($base.Message)")
+        }
+        return [System.IO.IOException]::new("image-path-snapshot-failed: $($base.Message) ($Dest)")
+    }
+    if ($base -is [System.IO.FileNotFoundException] -or $base -is [System.IO.DirectoryNotFoundException]) {
+        return [System.IO.IOException]::new("image-path-missing: source vanished before snapshot ($Source)")
+    }
+    return [System.IO.IOException]::new("image-path-unreadable: $($base.Message) ($Source)")
+}
+function Copy-ImageSnapshot {
+    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
+    if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "image-path-snapshot-collision: the image snapshot path is the source file itself: $Source"
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $in = $null; $out = $null; $hold = $null; $total = [long]0; $ok = $false; $created = $false; $finalPath = $null
+    try {
+        try {
+            $in = [System.IO.FileStream]::new($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source') }
+        try {
+            $out = [System.IO.FileStream]::new($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # $created turns true only AFTER CreateNew succeeded: a destination that already existed is never this call's to delete (Grok G3).
+        $created = $true
+        $buf = New-Object byte[] 262144
+        while ($true) {
+            $remainingMs = $LimitMs - $Clock.Elapsed.TotalMilliseconds
+            if ($remainingMs -le 0) { throw [System.TimeoutException]::new("image-copy-timeout: copying the image snapshot spent the lane's -TimeoutSec budget: $Source") }
+            $cts = [System.Threading.CancellationTokenSource]::new()
+            try {
+                $cts.CancelAfter([int][math]::Min(2147483647.0, [math]::Ceiling($remainingMs)))
+                $n = $in.ReadAsync($buf, 0, $buf.Length, $cts.Token).GetAwaiter().GetResult()
+            } catch {
+                if ($cts.IsCancellationRequested -or $Clock.Elapsed.TotalMilliseconds -ge $LimitMs -or $_.Exception.GetBaseException() -is [System.OperationCanceledException]) {
+                    throw [System.TimeoutException]::new("image-copy-timeout: a read of the image snapshot source did not return inside the lane's -TimeoutSec budget: $Source")
+                }
+                throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source')
+            } finally { $cts.Dispose() }
+            if ($n -le 0) { break }
+            try { $out.Write($buf, 0, $n) } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+            [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+            $total += $n
+            # copy-loop-tick
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+        $copySha = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant())
+        # Flush, cancel delete-on-close and close are part of the copy: a quota failure at close must fail the copy (typed), not escape
+        # from the finally below. Until KeepOnClose has run, closing the handle deletes the partial file BY HANDLE (r4 B1).
+        try { $out.Flush(); [MlvImageSnap]::KeepOnClose($out.SafeFileHandle); $out.Dispose() } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # r4 B2: hold the snapshot read-only (FileShare.Read: no writer, no delete) from here until the caller releases it, then prove the
+        # held bytes are the bytes that were hashed while copying. The file is no longer delete-on-close, so a mismatch is reported, not deleted.
+# writer-closed-pre-hold-tick
+        try {
+            $hold = [System.IO.FileStream]::new($Dest, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # r5 B2 (sol/ADV-A3): a digest I/O failure is a typed image-path error (never a raw exception), and a deadline is the lane's timeout.
+        try {
+            $held = Get-ImageHoldDigest -Hold $hold -Clock $Clock -LimitMs $LimitMs
+        } catch {
+            $hb = $_.Exception.GetBaseException()
+            if ($hb -is [System.TimeoutException]) { throw $hb }
+            throw [System.IO.IOException]::new("image-path-snapshot-unreadable: the held image snapshot could not be read back: $($hb.Message) ($Dest)")
+        }
+        if ($held.sha256 -ne $copySha -or $held.bytes -ne $total) {
+            throw [System.IO.IOException]::new("image-snapshot-mutated: the image snapshot changed between the copy and the hold (copied $copySha/$total bytes, held $($held.sha256)/$($held.bytes) bytes) ($Dest)")
+        }
+        # r5 B1 (sol A1): hand codex the path of the OBJECT this handle holds (junctions resolved), not the name the copy went through. A
+        # pathname that crosses a junction can be retargeted between the hold and codex's open; the resolved path cannot, because every
+        # directory in it is an ancestor of a file this handle keeps open (Windows refuses to rename or replace such a directory).
+        try {
+            $finalPath = [MlvImageSnap]::FinalPath($hold.SafeFileHandle)
+            $reparse = Get-ImageReparseAncestor -Path $finalPath
+        } catch {
+            $fb = $_.Exception.GetBaseException()
+            if ($fb.Message.StartsWith('image-path-noncanonical:', [System.StringComparison]::Ordinal)) { throw $fb }
+            throw [System.IO.IOException]::new("image-path-snapshot-failed: could not resolve the held image snapshot path: $($fb.Message) ($Dest)")
+        }
+        if ($null -ne $reparse) { throw [System.IO.IOException]::new("image-path-reparse-ancestor: the resolved image snapshot path has a reparse point in its ancestry ($reparse) ($finalPath)") }
+        if ($finalPath.Contains(',')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ',' (codex splits an -i value on commas): $finalPath") }
+        if ($finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains '%', '^' or '&' (codex is launched through a .cmd shim, and cmd.exe rewrites them): $finalPath") }
+        $ok = $true
+    } finally {
+        # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
+        # handle (pass-4 A3). There is NO delete by path here: a partial destination is removed by closing its delete-on-close handle (r4 B1).
+        if ($null -ne $out) { try { $out.Dispose() } catch { } }
+        if ($null -ne $in) { try { $in.Dispose() } catch { } }
+        if (-not $ok -and $null -ne $hold) { try { $hold.Dispose() } catch { } }
+    }
+    return [pscustomobject]@{ sha256 = $copySha; bytes = $total; Hold = $hold; Path = $finalPath }
+}
+# END Copy-ImageSnapshot
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -1259,6 +1531,9 @@ $OWNER_KILL_OUTCOME_KILL_WAIT_TIMEOUT = 'kill-wait-timeout'  # Kill() did not th
 # and a bare `ReadToEndAsync().Result` waits for EOF, not for the process (Process.WaitForExit() does NOT: measured 27 ms against a
 # pipe-holding descendant that kept ReadToEndAsync open for 20 s). Keep the literal on its own line: test_lane_containment.py shortens it.
 $OUTPUT_DRAIN_GRACE_MS = 10000
+# r5 H1: the post-exit re-read of a held image snapshot gets whatever lane budget is left, but never less than this, so a child that used
+# the whole budget can still be verified (a few MB hash in well under a second); a stalled share is still cut at this bound.
+$IMAGE_VERIFY_FLOOR_MS = 5000
 # LANE-CONTAINED-CHILD-START-DEADLINE-1: how long the runner waits for the contained host to write <base>.child.json before it books
 # contained-child-start-timeout (-> failure=launch-no-child). It was a fixed 10 s; PR 726 r2/r2b lost the launch after 13.3 s and 28.8 s
 # on a loaded host (commit charge 75-78 %, worktreeSweep 205 s) although the host was merely slow, not broken. Bounded, never unbounded: the
@@ -1611,7 +1886,32 @@ if ($cfg.engine -eq 'claude') {
         $mcpDisable = Get-CodexMcpDisableArgs -CodexExe $exe -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
         $mcpServers = 'disabled'; $mcpDisabledServers = @($mcpDisable.Servers); $mcpArgs = @($mcpDisable.Args)
     }
-    $argv = @('exec',
+    # VISUAL-JUDGE-TERRA-LANE-1: `-i, --image <FILE>...` is VARIADIC on codex 0.160.1 (codex-image-flag.txt), so
+    # each `-i <path>` pair sits BEFORE `-m` (a flag token always ends the list) and is never the last option
+    # before the '-' stdin marker, which a trailing variadic could otherwise swallow as one more "file".
+    # Snapshot every image into the run dir and attach THE COPY, hashed after the copy: the receipt's sha256/bytes
+    # describe the very bytes codex reads, whatever happens to the source afterwards (adversary A2). The copies stay
+    # in the run dir as evidence of exactly what the judge saw.
+    $imageSeq = 0
+    foreach ($attachment in $ImageAttachments) {
+        $imageSeq++
+        $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
+        if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
+        if ($snapshot -match $IMAGE_CMD_META_PATTERN) { throw "image-path-bad-character: the image snapshot path contains '%', '^' or '&' (codex is launched through a .cmd shim, and cmd.exe rewrites them): $snapshot" }
+        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)
+        # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
+        # r5 B1: that string is the RESOLVED path of the held object (Copy-ImageSnapshot's Path), not the name the copy went through.
+        $snapshot = [string]$snapshotInfo.Path
+        if (-not [System.IO.File]::Exists($snapshot)) { throw "image-path-missing: the image snapshot is not a native file path: $snapshot" }
+        $attachment.path   = $snapshot
+        $attachment.sha256 = $snapshotInfo.sha256
+        $attachment.bytes  = $snapshotInfo.bytes
+        $ImageHolds.Add($snapshotInfo.Hold)
+    }
+    # post-snapshot-pre-launch-tick: from here codex reads ONLY the snapshot paths in $attachment.path; the source is never consulted again.
+    $imageArgs = @()
+    foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }
+    $argv = @('exec') + $imageArgs + @(
               '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
               '-s', $sandbox) + $windowsSandboxArgs + $mcpArgs + @(
@@ -1857,8 +2157,8 @@ if ($cfg.engine -eq 'claude') {
 }
 
 $timedOut = $false
-$remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
-if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int]$remainingMs)) {
+$remainingMs = [math]::Max(0.0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
+if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int][math]::Min(2147483647.0, $remainingMs))) {
     $timedOut = $true
     # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane has no
     # job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
@@ -1872,6 +2172,52 @@ if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int]$remainingMs)) {
 }
 $sw.Stop()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
+
+# r4 B2: the codex child has exited (or been killed), so the snapshots it could read have been held read-only since the copy. Re-read each
+# through its held handle and compare with the digest the receipt carries; a mismatch is a typed failure, never a silent pass.
+if ($ImageHolds.Count -gt 0) {
+    # r5: three distinct outcomes, never conflated. `mutated` = both digests were computed and differ. `unverifiable` = the re-read failed or ran
+    # past its bound (the reason, IOException message included, is kept). `pathchanged` = the held object is no longer at the path codex was
+    # given, or that path gained a reparse-point ancestor: what codex opened may not be what was hashed.
+    $imageMutated = @(); $imageUnverifiable = @(); $imagePathChanged = @()
+    $verifyLimitMs = [math]::Max([double]$IMAGE_VERIFY_FLOOR_MS, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds)
+    $verifyClock = [System.Diagnostics.Stopwatch]::StartNew()
+    for ($hi = 0; $hi -lt $ImageHolds.Count; $hi++) {
+        $verified = $false; $verifyReason = $null
+        try {
+            $nowPath = [MlvImageSnap]::FinalPath($ImageHolds[$hi].SafeFileHandle)
+            $nowReparse = Get-ImageReparseAncestor -Path $nowPath
+            if (-not [string]::Equals($nowPath, [string]$ImageAttachments[$hi].path, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $imagePathChanged += $ImageAttachments[$hi].path
+                $verifyReason = "image-snapshot-path-changed: the held snapshot is now at '$nowPath', not the path codex was given"
+            } elseif ($null -ne $nowReparse) {
+                $imagePathChanged += $ImageAttachments[$hi].path
+                $verifyReason = "image-path-reparse-ancestor: '$nowReparse' became a reparse point in the snapshot path's ancestry"
+            } else {
+                $again = Get-ImageHoldDigest -Hold $ImageHolds[$hi] -Clock $verifyClock -LimitMs $verifyLimitMs
+                $verified = ($again.sha256 -eq $ImageAttachments[$hi].sha256 -and $again.bytes -eq $ImageAttachments[$hi].bytes)
+                if (-not $verified) { $imageMutated += $ImageAttachments[$hi].path; $verifyReason = "image-snapshot-mutated: re-read $($again.sha256)/$($again.bytes) bytes, receipt $($ImageAttachments[$hi].sha256)/$($ImageAttachments[$hi].bytes) bytes" }
+            }
+        } catch {
+            $verified = $false
+            $vb = $_.Exception.GetBaseException()
+            $verifyReason = if ($vb -is [System.TimeoutException]) { "timeout: $($vb.Message)" } else { "$($vb.GetType().Name): $($vb.Message)" }
+            $imageUnverifiable += $ImageAttachments[$hi].path
+        }
+        $ImageAttachments[$hi].consumedVerified = $verified
+        if ($null -ne $verifyReason) { $ImageAttachments[$hi]['consumedVerifyReason'] = $verifyReason }
+    }
+    foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
+    $ImageHolds.Clear()
+    $imageProblems = @()
+    if ($imageMutated.Count -gt 0) { $imageProblems += "image-snapshot-mutated: the image snapshot(s) differ from the receipt's sha256/bytes after the child exited: $($imageMutated -join '; ')" }
+    if ($imageUnverifiable.Count -gt 0) { $imageProblems += "image-snapshot-unverifiable: the image snapshot(s) could not be re-read after the child exited, so consumedVerified is false (see imagePaths[].consumedVerifyReason): $($imageUnverifiable -join '; ')" }
+    if ($imagePathChanged.Count -gt 0) { $imageProblems += "image-snapshot-path-changed: the image snapshot(s) are no longer at the path codex was given (or it gained a reparse-point ancestor): $($imagePathChanged -join '; ')" }
+    if ($imageProblems.Count -gt 0) {
+        $failure = $imageProblems -join ' | '
+        if ($exitCode -eq 0) { $exitCode = 1 }
+    }
+}
 
 # ---------------------------------------------------------------- harvest
 # Bounded: the direct child is gone (or was killed) by here, so only a descendant that inherited a pipe can still hold EOF back.
@@ -2015,6 +2361,8 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
+    foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
+    $ImageHolds.Clear()
     $noChildCause = $_.Exception.Message
     $noChildCauseType = $_.Exception.GetType().Name
     # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
@@ -2505,6 +2853,10 @@ $receipt = [ordered]@{
 }
 # Present only on a typed no-child launch, so every other receipt keeps its exact shape.
 if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
+# VISUAL-JUDGE-TERRA-LANE-1: present only when -ImagePaths was given, so every other receipt keeps its exact shape.
+# Each entry is {source, path, sha256, bytes, ext}: `source` is the caller's file, `path` the run-dir COPY handed to
+# `codex exec -i`, sha256/bytes are of that copy (hashed after copying). Null path/sha256 = the launch failed first.
+if ($ImageAttachments.Count -gt 0) { $receipt['imagePaths'] = @($ImageAttachments) }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {

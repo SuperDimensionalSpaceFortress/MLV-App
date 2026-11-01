@@ -1,4 +1,4 @@
-import hashlib, importlib.util, json, os, re, subprocess, sys, threading, time
+import hashlib, importlib.util, json, os, re, shutil, subprocess, sys, threading, time
 from datetime import datetime
 from pathlib import Path
 
@@ -168,6 +168,12 @@ if($args.Count -ge 1 -and $args[0] -eq '--version'){
 $me=Get-Process -Id $PID
 $t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_CHILD
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
+# VISUAL-JUDGE-TERRA-LANE-1 r3 (env-gated, unset = no-op): record the sha256 + length of every file passed as `-i <file>` AT LAUNCH, i.e. the
+# bytes codex would consume, so a test can compare them with the receipt and with a source mutated after the snapshot.
+if($env:MLV_FIXTURE_IMAGE_BYTES){
+  $seen=@(); for($i=0;$i -lt $args.Count-1;$i++){ if($args[$i] -eq '-i'){ $f=[string]$args[$i+1]; $seen+=[ordered]@{path=$f;sha256=(Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $f -Force).Length} } }
+  ConvertTo-Json -InputObject @($seen) -Depth 4|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_IMAGE_BYTES
+}
 $env:CLAUDE_CODE_EFFORT_LEVEL|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_EFFORT
 $env:CLAUDE_CODE_DISABLE_BACKGROUND_TASKS|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_BGTASKS
 # LANE-PROMPT-ENV-DIRECT-DISPATCH-1: records the MLV_LANE_PROMPT the hook's NA-4 would read in this child (env-gated; no other test reads it).
@@ -636,6 +642,694 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
     assert json.loads(cache.read_text(encoding="utf-8"))["fetched_at"]==q["codexModelsFetchedAt"]
     # ...and the version of the CLI that wrote that shared cache (it can differ from codexExe.version).
     assert q["codexModelsClientVersion"]==CODEX_MODELS_CACHE_CLIENT_VERSION
+
+
+def _write_png(path, payload):
+    # Not a decodable picture: the fixture shim never opens it. Distinct payloads give distinct sha256 values.
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + payload)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_terra_lane_resolves_its_tier_and_attaches_each_image_with_i_before_the_model_flag(fixture_tree):
+    # VISUAL-JUDGE-TERRA-LANE-1: terra is a codex-engine tier row. The tier resolves to the highest listed
+    # gpt-<ver>-terra slug (a sol slug with a higher version must not win), every -ImagePaths entry reaches
+    # `codex exec` as its own `-i <path>` pair BEFORE `-m` (the flag is variadic: a flag token ends the list),
+    # the prompt still arrives on stdin ('-' last), and the receipt hashes the exact bytes handed over.
+    root=fixture_tree["root"]
+    cache=root/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-5.6-terra","gpt-6.1-terra","gpt-6-terra","gpt-7-sol")),encoding="utf-8")
+    first=root/"strip one.png"; second=root/"strip-two.jpg"
+    sha_first=_write_png(first,b"one"); second.write_bytes(b"\xff\xd8\xff-two"); sha_second=hashlib.sha256(second.read_bytes()).hexdigest()
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    # `pwsh -File` hands -ImagePaths ONE string; '|' (illegal in a Windows file name) separates the paths.
+    r=run_lane(cmd+["-ImagePaths",str(first)+"|"+str(second)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-m")+1]=="gpt-6.1-terra"
+    image_flags=[i for i,a in enumerate(argv) if a=="-i"]
+    # The lane is handed a SNAPSHOT of each image in the run dir (adversary A2), never the caller's file.
+    snap_first=receipt.parent/"terra-001.image-01.png"; snap_second=receipt.parent/"terra-001.image-02.jpg"
+    assert [argv[i+1] for i in image_flags]==[str(snap_first),str(snap_second)]
+    assert snap_first.read_bytes()==first.read_bytes() and snap_second.read_bytes()==second.read_bytes()
+    assert max(image_flags)+1<argv.index("-m"), argv
+    assert argv[-1]=="-" and argv[0]=="exec", argv
+    assert argv[argv.index("-s")+1]=="read-only", argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert (q["lane"],q["engine"],q["role"],q["requestedModel"],q["effort"])==("terra","codex","visual-judge","terra","low")
+    assert q["resolvedModel"]=="gpt-6.1-terra"
+    assert [(e["source"],e["path"],e["sha256"],e["bytes"]) for e in q["imagePaths"]]==[
+        (str(first),str(snap_first),sha_first,first.stat().st_size),(str(second),str(snap_second),sha_second,second.stat().st_size)]
+
+
+def test_the_receipt_hash_describes_the_snapshot_even_if_the_source_changes_afterwards(fixture_tree):
+    # adversary A2: hashing the SOURCE at validation and attaching it later lets a replaced file be judged under the old hash.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    png.write_bytes(b"replaced after the run")
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    entry=q["imagePaths"][0]
+    assert entry["sha256"]==sha and hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest()==sha
+    assert entry["path"]!=str(png) and entry["source"]==str(png)
+
+
+def test_a_provider_qualified_image_path_resolves_to_the_native_path(fixture_tree):
+    # adversary A3: Test-Path accepts `Microsoft.PowerShell.Core\FileSystem::C:\x.png`, native File.Exists does not.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"native")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths","Microsoft.PowerShell.Core\\FileSystem::"+str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert entry["source"]==str(png) and "::" not in entry["source"] and entry["sha256"]==sha
+
+
+def test_an_image_path_with_a_comma_is_refused_because_codex_splits_i_values_on_commas(fixture_tree):
+    # adversary A1: codex 0.160.1 declares a comma value delimiter for -i, so `strip,one.png` would attach two other files.
+    root=fixture_tree["root"]; png=root/"strip,one.png"; _write_png(png,b"comma")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode!=0 and "image-path-bad-character" in r.stderr,(r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"args.json").exists()
+
+
+@pytest.mark.parametrize("lane,value,token",[
+    ("terra"," ","image-path-empty"), ("terra","||","image-path-empty"), ("terra","|a.png","image-path-empty"),
+    ("sonnet"," ","image-paths-codex-only"), ("sonnet","||","image-paths-codex-only")])
+def test_a_blank_image_path_entry_is_refused_not_dropped(fixture_tree,lane,value,token):
+    # r2 adversary A1: blank elements used to vanish before validation, so a claude lane given `-ImagePaths '||'` silently
+    # judged nothing and a codex lane ran with no image flag. A supplied value is validated as supplied.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    r=run_lane(cmd+["-ImagePaths",value],env)
+    assert r.returncode!=0 and token in r.stderr,(r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"args.json").exists()
+
+
+def test_a_hidden_image_is_snapshotted_hashed_and_attached(fixture_tree):
+    # r2 adversary A2: Get-Item without -Force throws on a Hidden snapshot, so a Hidden source failed after the run dir existed.
+    root=fixture_tree["root"]; png=root/"hidden strip.png"; sha=_write_png(png,b"hidden")
+    assert subprocess.run(["attrib","+h",str(png)],capture_output=True).returncode==0
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert entry["sha256"]==sha and entry["bytes"]==png.stat().st_size
+    assert hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest()==sha
+
+
+def test_a_slow_image_copy_spends_the_lane_timeout_budget_and_leaves_no_partial_snapshot(fixture_tree):
+    # r2 adversary A3: the snapshot copy ran outside -TimeoutSec, so a slow share could hold the lane for any length of time.
+    # The fixture stalls every 256 KiB chunk by 1.5 s (a 1 MiB image = 4 chunks = 6 s) under a 4 s budget.
+    root=fixture_tree["root"]; png=root/"slow strip.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n"+os.urandom(1024*1024))
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",
+        mutation=lambda text: text.replace("# copy-loop-tick","Start-Sleep -Milliseconds 1500"))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    cmd[cmd.index("-TimeoutSec")+1]="4"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    # pass-2b A3: an exhausted budget is a TIMEOUT (timedOut=true, exit 124), the same booking launch-budget-exhausted gets,
+    # not a generic launch failure (exit 127).
+    assert r.returncode==124,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["timedOut"] is True,(r.stdout,r.stderr)
+    assert not (root/"args.json").exists()
+    assert not list(receipt.parent.glob("terra-001.image-*")), list(receipt.parent.iterdir())
+
+
+def test_an_image_that_is_already_the_snapshot_path_is_never_deleted_by_the_failed_copy_cleanup(fixture_tree):
+    # pass-2b A1: a caller file named like the generated snapshot (terra-001.image-01.png inside the run dir) used to be
+    # opened as the source, collide on CreateNew, and then be deleted by the cleanup of the "partial" destination.
+    root=fixture_tree["root"]
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    receipt.parent.mkdir(parents=True,exist_ok=True)
+    victim=receipt.parent/"terra-001.image-01.png"; sha=_write_png(victim,b"callers own file")
+    r=run_lane(cmd+["-ImagePaths",str(victim)],env)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert victim.exists() and hashlib.sha256(victim.read_bytes()).hexdigest()==sha, "the caller's image was deleted"
+    # r4 hardening (sol/opus/Grok G4): the collision refusal carries the same `image-path-` prefix as every other image refusal.
+    assert "image-path-snapshot-collision" in _failure_text(r,receipt), _failure_text(r,receipt)
+
+
+def test_a_source_read_that_never_returns_is_cut_at_the_deadline(tmp_path):
+    # pass-2b A2: Copy-ImageSnapshot is exercised alone against a named pipe that accepts the reader and never writes a byte,
+    # the stand-in for a share whose read stalls. A synchronous Read would hang here; the cancellable read ends at the budget.
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Copy-ImageSnapshot"); b=text.index("# END Copy-ImageSnapshot")
+    harness=tmp_path/"stall.ps1"; dest=tmp_path/"snap.png"
+    harness.write_text(text[a:b]+f'''
+$ErrorActionPreference = 'Stop'
+$name = 'mlv-stall-' + $PID
+$srv = [System.IO.Pipes.NamedPipeServerStream]::new($name, [System.IO.Pipes.PipeDirection]::Out, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
+$null = $srv.WaitForConnectionAsync()
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source "\\\\.\\pipe\\$name" -Dest '{dest}' -Clock $clock -LimitMs 1500; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+'ELAPSED ' + [int]$clock.ElapsedMilliseconds
+'DEST ' + [System.IO.File]::Exists('{dest}')
+$srv.Dispose()
+''',encoding="utf-8")
+    r=subprocess.run(["pwsh","-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=60)
+    out=r.stdout
+    assert "CAUGHT TimeoutException image-copy-timeout" in out,(out,r.stderr)
+    elapsed=int(re.search(r"ELAPSED (\d+)",out).group(1))
+    assert 1400<=elapsed<8000,(elapsed,out)
+    assert "DEST False" in out,out
+
+
+_AFTER_SNAPSHOT_ANCHOR = "    $imageArgs = @()\n"
+_BEFORE_COPY_ANCHOR = "        $snapshotInfo = Copy-ImageSnapshot "
+
+
+def _terra_env(fixture_tree):
+    cache=fixture_tree["root"]/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    return cache
+
+
+def _failure_text(r, receipt):
+    # The typed error is booked into the receipt's `failure`; the process stderr may carry it too. Either is greppable.
+    text=(r.stdout or "")+(r.stderr or "")
+    if receipt.exists(): text+=receipt.read_text(encoding="utf-8")
+    return text
+
+
+def test_a_source_deleted_between_validation_and_launch_fails_with_a_typed_image_path_missing(fixture_tree):
+    # Grok G2: the validation (Test-Path/Resolve-Path) passes, then the source vanishes before the snapshot opens it. The failure used to be
+    # a raw .NET FileNotFoundException; it must carry the same `image-path-` prefix as the other refusals.
+    root=fixture_tree["root"]; png=root/"vanishing strip.png"; _write_png(png,b"soon gone")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _BEFORE_COPY_ANCHOR in text, "snapshot call site moved; update this fixture mutation"
+        return text.replace(_BEFORE_COPY_ANCHOR,"        Remove-Item -LiteralPath $attachment.source -Force\n"+_BEFORE_COPY_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert "image-path-missing: source vanished before snapshot" in text and png.name in text, text
+    assert not (root/"args.json").exists(), "a vanished image must never reach the codex launch"
+    assert not list(receipt.parent.glob("terra-001.image-*")), "no partial snapshot may remain"
+
+
+def test_a_source_locked_between_validation_and_launch_fails_with_a_typed_image_path_unreadable(fixture_tree):
+    # Grok G2: a source held open exclusively (sharing violation) is an IOException, not a missing file.
+    root=fixture_tree["root"]; png=root/"locked strip.png"; _write_png(png,b"locked")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _BEFORE_COPY_ANCHOR in text, "snapshot call site moved; update this fixture mutation"
+        lock="        $script:fixtureLock = [System.IO.File]::Open($attachment.source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)\n"
+        return text.replace(_BEFORE_COPY_ANCHOR,lock+_BEFORE_COPY_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert "image-path-unreadable:" in text and png.name in text, text
+    assert not (root/"args.json").exists()
+    assert not list(receipt.parent.glob("terra-001.image-*")), "no partial snapshot may remain"
+
+
+def test_a_preexisting_snapshot_destination_is_refused_and_left_byte_identical(fixture_tree):
+    # Grok G3 + Dot eb383f73: the snapshot target already exists (a file this call did not create) and the source is a DIFFERENT file.
+    # CreateNew fails; the cleanup must not delete what it never created, and the refusal is typed `image-path-`.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"the source")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    receipt.parent.mkdir(parents=True,exist_ok=True)
+    victim=receipt.parent/"terra-001.image-01.png"; victim.write_bytes(b"someone elses bytes, not made by this call")
+    before=victim.read_bytes()
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert "image-path-snapshot-exists" in text, text
+    assert victim.exists() and victim.read_bytes()==before, "the pre-existing destination was deleted or rewritten"
+    assert not (root/"args.json").exists()
+
+
+def test_pre_consumption_mutation_of_the_source_never_reaches_codex(fixture_tree):
+    # Dot e64efdb1: the source is rewritten AFTER the snapshot is taken and BEFORE codex consumes it. What the launched process reads
+    # (hashed by the fixture shim at launch) must be the snapshot bytes the receipt describes, never the mutated source.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text, "post-snapshot call site moved; update this fixture mutation"
+        hit="    [System.IO.File]::WriteAllBytes($ImageAttachments[0].source, [byte[]](1..64))\n"
+        return text.replace(_AFTER_SNAPSHOT_ANCHOR,hit+_AFTER_SNAPSHOT_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert hashlib.sha256(png.read_bytes()).hexdigest()!=sha, "the mutation hook did not run"
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert len(seen)==1 and seen[0]["path"]==entry["path"]!=str(png)
+    assert (seen[0]["sha256"],seen[0]["bytes"])==(sha,len(b"\x89PNG\r\n\x1a\n"+b"original bytes")), seen
+    assert (entry["sha256"],entry["bytes"])==(seen[0]["sha256"],seen[0]["bytes"])
+
+
+def _copy_harness(tmp_path, body, mutation=None):
+    """Runs Copy-ImageSnapshot (the text between its BEGIN/END markers) alone in a fresh pwsh; `body` is the PowerShell that drives it."""
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Copy-ImageSnapshot"); b=text.index("# END Copy-ImageSnapshot")
+    block=text[a:b]
+    if mutation is not None: block=mutation(block)
+    harness=tmp_path/"copy-harness.ps1"
+    harness.write_text(block+"\n$ErrorActionPreference = 'Stop'\n"+body,encoding="utf-8")
+    return subprocess.run(["pwsh","-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=90)
+
+
+_AFTER_INPUT_RELEASE = "        if ($null -ne $in) { try { $in.Dispose() } catch { } }\n"
+
+
+def test_a_failed_copy_never_deletes_a_replacement_moved_into_the_snapshot_name_after_its_handle_is_released(tmp_path):
+    # r4 B1 (sol): the cleanup used to delete BY PATH after the destination handle was gone, so a file moved into the snapshot
+    # name in that window was deleted instead of the partial. The replacement is injected right after the handles are released
+    # (the old code's window); the failed copy (LimitMs 0 -> TimeoutException after CreateNew) must leave it untouched.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); victim=tmp_path/"victim.png"; victim.write_bytes(b"victim bytes")
+    dest=tmp_path/"snap.png"
+    def mutation(block):
+        assert _AFTER_INPUT_RELEASE in block, "handle-release site moved; update this fixture mutation"
+        hit=("        if ([System.IO.File]::Exists($Dest)) { [System.IO.File]::Move($Dest, $Dest + '.aside') }\n"
+             "        [System.IO.File]::Move($script:victimPath, $Dest)\n")
+        return block.replace(_AFTER_INPUT_RELEASE,_AFTER_INPUT_RELEASE+hit,1)
+    r=_copy_harness(tmp_path,f"""
+$script:victimPath = '{victim}'
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 0; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name }}
+'DEST-EXISTS ' + [System.IO.File]::Exists('{dest}')
+if ([System.IO.File]::Exists('{dest}')) {{ 'DEST-BYTES ' + [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes('{dest}')) }}
+""",mutation)
+    assert "CAUGHT TimeoutException" in r.stdout,(r.stdout,r.stderr)
+    assert "DEST-EXISTS True" in r.stdout and "DEST-BYTES victim bytes" in r.stdout, ("the replacement was deleted by the failed-copy cleanup",r.stdout,r.stderr)
+
+
+def test_the_held_snapshot_refuses_a_write_through_a_hard_link_and_a_delete(tmp_path):
+    # r4 B2 (sol): after the copy the snapshot was writable, so a hard link to it could change the bytes between the hash and codex's read.
+    # The copy now returns a HELD read handle (FileShare.Read: no writer, no delete) that stays open until the child exits.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"; link=tmp_path/"snap-link.png"
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$info = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 60000
+$null = New-Item -ItemType HardLink -Path '{link}' -Target '{dest}'
+try {{ $w = [System.IO.File]::Open('{link}', 'Open', 'Write', 'ReadWrite'); $w.Write([byte[]](1..64), 0, 64); $w.Dispose(); 'LINK-WRITE accepted' }} catch {{ 'LINK-WRITE refused' }}
+try {{ [System.IO.File]::Delete('{dest}'); 'DELETE accepted' }} catch {{ 'DELETE refused' }}
+try {{ $rd = [System.IO.File]::ReadAllBytes('{dest}'); 'READ ok ' + $rd.Length }} catch {{ 'READ refused' }}
+'HOLD ' + ($null -ne $info.Hold)
+if ($null -ne $info.Hold) {{ $info.Hold.Dispose() }}
+""")
+    assert "HOLD True" in r.stdout,(r.stdout,r.stderr)
+    assert "LINK-WRITE refused" in r.stdout and "DELETE refused" in r.stdout and "READ ok" in r.stdout,(r.stdout,r.stderr)
+    assert dest.read_bytes()==src.read_bytes(),"the snapshot bytes changed while held"
+
+
+_AFTER_CHILD_EXIT_ANCHOR = "$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }\n"
+
+
+def test_a_post_copy_write_through_a_hard_link_is_refused_and_the_receipt_describes_the_consumed_bytes(fixture_tree):
+    # r4 B2 end to end: between the snapshot and the launch a hostile writer hard-links the snapshot and tries to overwrite it. The held
+    # handle refuses, so what the fixture's codex hashes at launch equals the receipt's sha256/bytes, and the post-exit re-hash passes.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text, "post-snapshot call site moved; update this fixture mutation"
+        hit=("    $lnk = $ImageAttachments[0].path + '.lnk'\n"
+             "    $null = New-Item -ItemType HardLink -Path $lnk -Target $ImageAttachments[0].path\n"
+             "    try { $w = [System.IO.File]::Open($lnk, 'Open', 'Write', 'ReadWrite'); $w.Write([byte[]](1..64), 0, 64); $w.Dispose(); $hookResult = 'accepted' } catch { $hookResult = 'refused' }\n"
+             "    Set-Content -LiteralPath (Join-Path (Split-Path $ImageAttachments[0].path) 'hook-result.txt') -Value $hookResult\n")
+        return text.replace(_AFTER_SNAPSHOT_ANCHOR,hit+_AFTER_SNAPSHOT_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert (receipt.parent/"hook-result.txt").read_text(encoding="utf-8").strip()=="refused","the write through the hard link was accepted"
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert (seen[0]["sha256"],seen[0]["bytes"])==(entry["sha256"],entry["bytes"])==(sha,len(b"\x89PNG\r\n\x1a\n"+b"original bytes"))
+    assert entry["consumedVerified"] is True, entry
+
+
+def test_a_snapshot_whose_bytes_differ_after_the_child_exits_is_a_typed_failure_never_a_silent_pass(fixture_tree):
+    # r4 B2: the held handle is re-read after the child exits and compared with the hash the receipt carries. A mismatch (here simulated
+    # by corrupting the recorded digest right after the exit, since a real writer is refused) must be `image-snapshot-mutated`.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_CHILD_EXIT_ANCHOR in text, "child-exit site moved; update this fixture mutation"
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+"if ($ImageAttachments.Count -gt 0) { $ImageAttachments[0].sha256 = ('0' * 64) }\n",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert q["state"]=="failed" and "image-snapshot-mutated" in (q["failure"] or ""),q
+    assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
+
+
+def _mk_junction(link, target):
+    r=subprocess.run(["cmd","/c","mklink","/J",str(link),str(target)],capture_output=True,text=True)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+_DIGEST_TICK = "# hold-digest-read-tick"
+
+
+def _digest_counter():
+    # Counts digest chunk reads across the whole lane process (strict mode: the variable must be created before it is read).
+    return "$global:hdc = 1 + $(if (Test-Path variable:global:hdc) { $global:hdc } else { 0 });"
+
+
+def test_a_run_dir_junction_retargeted_during_the_child_read_never_certifies_a_file_the_child_did_not_read(fixture_tree):
+    # r5 B1 (sol A1 / ADV-A1): -RunDir is a junction to `good`. After the hold is registered the junction is retargeted to `bad`, which holds
+    # DIFFERENT bytes under the same snapshot name, and restored once the child has exited. The old lane handed codex the junction PATHNAME
+    # (so codex read bad's bytes) while hashing the HELD OBJECT (good's bytes) and reported consumedVerified=true. Invariant: consumedVerified
+    # may be true only when the bytes the child read are the bytes the receipt hashes.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    good=root/"good"; bad=root/"bad"; good.mkdir(); bad.mkdir(); link=root/"run-link"
+    _mk_junction(link,good)
+    (bad/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q, same snapshot name")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text and _AFTER_CHILD_EXIT_ANCHOR in text, "fixture anchors moved"
+        def swap(target):
+            return (f"    $rl = $RunDir; [System.IO.Directory]::Delete($rl); $null = New-Item -ItemType Junction -Path $rl -Target '{target}'\n")
+        text=text.replace(_AFTER_SNAPSHOT_ANCHOR,swap(bad)+_AFTER_SNAPSHOT_ANCHOR,1)
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+swap(good),1)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    cmd[cmd.index("-RunDir")+1]=str(link)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    receipt=good/"terra-001.receipt.json"
+    assert receipt.exists(),(r.stdout,r.stderr,list(good.iterdir()))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    entry=q["imagePaths"][0]
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    assert not (entry.get("consumedVerified") is True and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+    # The mechanism: codex is handed the RESOLVED path of the held object, so the retarget cannot redirect its open.
+    assert Path(seen[0]["path"]).parent.resolve()==good.resolve() and seen[0]["sha256"]==sha, seen
+    assert "run-link" not in entry["path"], entry
+
+
+def test_get_image_reparse_ancestor_names_a_junction_in_the_path_and_is_null_for_a_plain_path(tmp_path):
+    real=tmp_path/"real"; real.mkdir(); (real/"x.png").write_bytes(b"x"); link=tmp_path/"jn"; _mk_junction(link,real)
+    r=_copy_harness(tmp_path,f"""
+'VIA-JUNCTION ' + (Get-ImageReparseAncestor -Path '{link}\\x.png')
+'PLAIN [' + (Get-ImageReparseAncestor -Path '{real}\\x.png') + ']'
+""")
+    assert f"VIA-JUNCTION {link}" in r.stdout and "PLAIN []" in r.stdout,(r.stdout,r.stderr)
+
+
+def _digest_fault_run(fixture_tree, on_call, fault="throw [System.IO.IOException]::new('ERROR_NETNAME_DELETED')"):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _DIGEST_TICK in text, "digest seam moved; update this fixture mutation"
+        return text.replace(_DIGEST_TICK,_digest_counter()+f" if ($global:hdc -eq {on_call}) {{ {fault} }}",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    return r,receipt,root
+
+
+def test_a_digest_io_error_before_launch_is_a_typed_unreadable_image_path_error_with_no_child(fixture_tree):
+    # r5 B2 (sol / ADV-A3): the digest taken when the hold is acquired used to let a raw IOException escape (untyped, no image-path- prefix).
+    r,receipt,root=_digest_fault_run(fixture_tree,1)
+    text=_failure_text(r,receipt)
+    assert r.returncode==127,(r.returncode,text)
+    assert "image-path-snapshot-unreadable" in text and "ERROR_NETNAME_DELETED" in text,text
+    assert "image-snapshot-mutated" not in text,text
+    assert not (root/"args.json").exists(), "a child was launched"
+
+
+def test_a_digest_io_error_after_the_child_exits_is_unverifiable_never_a_false_mutation_claim(fixture_tree):
+    # r5 B2: the same IOException on the post-exit re-read of an UNCHANGED snapshot used to be booked as `image-snapshot-mutated`.
+    r,receipt,root=_digest_fault_run(fixture_tree,2)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and q["state"]=="failed",(r.returncode,text)
+    assert "image-snapshot-unverifiable" in (q["failure"] or ""),q["failure"]
+    assert "image-snapshot-mutated" not in (q["failure"] or ""),q["failure"]
+    entry=q["imagePaths"][0]
+    assert entry["consumedVerified"] is False and "ERROR_NETNAME_DELETED" in entry["consumedVerifyReason"],entry
+
+
+def test_a_stalled_digest_read_before_launch_ends_as_a_timeout_inside_the_deadline(tmp_path):
+    # r5 H1 (ADV-A2): the digest taken at hold time spends the lane budget. The seam sleeps past a 3 s limit after the first chunk is read.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 3000; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+""",lambda block: block.replace(_DIGEST_TICK,"Start-Sleep -Milliseconds 3500",1))
+    assert "CAUGHT TimeoutException image-digest-timeout" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_a_stalled_digest_read_after_the_child_exits_is_unverifiable_with_a_timeout_reason(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    limit_anchor="    $verifyClock = [System.Diagnostics.Stopwatch]::StartNew()\n"
+    def mutation(text):
+        assert _DIGEST_TICK in text and limit_anchor in text, "fixture anchors moved"
+        text=text.replace(limit_anchor,limit_anchor+"    $verifyLimitMs = 500\n",1)
+        return text.replace(_DIGEST_TICK,_digest_counter()+" if ($global:hdc -eq 2) { Start-Sleep -Milliseconds 1500 }",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "image-snapshot-unverifiable" in (q["failure"] or ""),(r.returncode,q["failure"])
+    entry=q["imagePaths"][0]
+    assert entry["consumedVerified"] is False and entry["consumedVerifyReason"].startswith("timeout:"),entry
+
+
+def test_a_held_snapshot_that_moved_from_the_path_codex_was_given_is_a_typed_failure(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_CHILD_EXIT_ANCHOR in text, "child-exit site moved"
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+"if ($ImageAttachments.Count -gt 0) { $ImageAttachments[0].path = $ImageAttachments[0].path + '.elsewhere' }\n",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "image-snapshot-path-changed" in (q["failure"] or ""),(r.returncode,q["failure"])
+    assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
+
+
+_GAP_TICK = "# writer-closed-pre-hold-tick"
+_COMPARE_LINE = "        if ($held.sha256 -ne $copySha -or $held.bytes -ne $total) {\n"
+
+
+def _gap_run(tmp_path, neutralize_compare):
+    # r5 H2 (Grok G5): a writer changes Dest AFTER the copy's writer handle is disposed and BEFORE the hold is acquired.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"
+    def mutation(block):
+        assert _GAP_TICK in block and _COMPARE_LINE in block, "gap seam or comparison moved; update this fixture mutation"
+        block=block.replace(_GAP_TICK,"[System.IO.File]::WriteAllBytes($Dest, [byte[]](1..40))",1)
+        if neutralize_compare: block=block.replace(_COMPARE_LINE,"        if ($false) {\n",1)
+        return block
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$info = $null
+try {{ $info = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 60000; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+'HOLD-RETURNED ' + ($null -ne $info -and $null -ne $info.Hold)
+'DEST-EXISTS ' + [System.IO.File]::Exists('{dest}')
+if ($null -ne $info -and $null -ne $info.Hold) {{ $info.Hold.Dispose() }}
+""",mutation)
+    return r
+
+
+def test_a_write_between_the_writer_close_and_the_hold_open_is_image_snapshot_mutated_with_no_hold(tmp_path):
+    r=_gap_run(tmp_path,False)
+    assert "CAUGHT IOException image-snapshot-mutated" in r.stdout,(r.stdout,r.stderr)
+    assert "HOLD-RETURNED False" in r.stdout and "DEST-EXISTS True" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_the_writer_close_gap_test_is_red_when_the_hold_comparison_is_deleted(tmp_path):
+    # Proof that the test above bites: with the comparison neutralised the changed snapshot is returned as good.
+    r=_gap_run(tmp_path,True)
+    assert "NO-ERROR" in r.stdout and "HOLD-RETURNED True" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_the_largest_accepted_timeout_sec_does_not_overflow_the_child_wait(fixture_tree):
+    # r5 A4: WaitForExit([int]$remainingMs) overflowed Int32 for -TimeoutSec above 2147483. r7: 2147483 is now the largest accepted
+    # budget, and its full millisecond value fits one Int32 wait, so no native wait is ever clamped below the real deadline.
+    assert 2147483*1000<=2**31-1<2147484*1000
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    cmd[cmd.index("-TimeoutSec")+1]="2147483"
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("lane",["terra","sonnet"])
+@pytest.mark.parametrize("value",["2147484","3000000"])
+def test_a_timeout_sec_above_the_int32_millisecond_budget_is_refused_typed_before_any_receipt(fixture_tree,lane,value):
+    # r7 (sol B3 / ADV-A3): -TimeoutSec 3000000 used to be accepted, then every native wait (WaitForExit and both image-read CancelAfter
+    # sites) was clamped to Int32.MaxValue ms and the lane was booked timedOut/124 with ~852515 s of its budget unspent. The cap refuses it.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    cmd[cmd.index("-TimeoutSec")+1]=value
+    r=run_lane(cmd,env)
+    assert r.returncode!=0 and "timeout-sec-too-large" in r.stderr,(r.returncode,r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"child.json").exists() and not (root/"args.json").exists()
+
+
+_RAW_JUNCTION_PS = r'''
+param([string]$Link, [string]$NtTarget)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class RawJunction {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern SafeFileHandle CreateFileW(string n, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] inBuf, int inSize, IntPtr outBuf, int outSize, out int ret, IntPtr ov);
+  public static void Make(string link, string ntTarget) {
+    System.IO.Directory.CreateDirectory(link);
+    byte[] sub = Encoding.Unicode.GetBytes(ntTarget);
+    int dataLen = 8 + sub.Length + 2 + 2;
+    byte[] buf = new byte[8 + dataLen];
+    BitConverter.GetBytes(0xA0000003u).CopyTo(buf, 0);
+    BitConverter.GetBytes((ushort)dataLen).CopyTo(buf, 4);
+    BitConverter.GetBytes((ushort)0).CopyTo(buf, 8);
+    BitConverter.GetBytes((ushort)sub.Length).CopyTo(buf, 10);
+    BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(buf, 12);
+    BitConverter.GetBytes((ushort)0).CopyTo(buf, 14);
+    sub.CopyTo(buf, 16);
+    using (var h = CreateFileW(link, 0x40000000, 0, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
+      if (h.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      int ret;
+      if (!DeviceIoControl(h, 0x000900A4, buf, buf.Length, IntPtr.Zero, 0, out ret, IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+  }
+}
+"@
+[RawJunction]::Make($Link, $NtTarget)
+'''
+
+
+def _mk_raw_junction(tmp_path, link, nt_target):
+    # mklink /J and New-Item -ItemType Junction both normalize the target (a trailing '.' is dropped), so the keys' repro shape -- a junction
+    # whose stored target is the NATIVE directory `judge.` -- is written directly with FSCTL_SET_REPARSE_POINT (no elevation needed).
+    script=tmp_path/"raw-junction.ps1"; script.write_text(_RAW_JUNCTION_PS,encoding="ascii")
+    r=subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-File",str(script),"-Link",str(link),"-NtTarget",nt_target],capture_output=True,text=True,timeout=90)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+def test_a_run_dir_junction_to_a_native_trailing_dot_directory_never_certifies_the_ordinary_sibling_codex_reads(fixture_tree):
+    # r7 (opus B1 = sol B2, r6 ADV-A1): -RunDir is a junction whose stored target is \??\<root>\judge. (a real directory named `judge.`),
+    # and the ordinary sibling <root>\judge holds DIFFERENT bytes Q under the snapshot name. The snapshot P is written into `judge.`;
+    # FinalPath stripped \\?\ and handed codex <root>\judge.\terra-001.image-01.png, which Win32 normalizes to <root>\judge\..., so codex
+    # read Q while the held-digest compare certified P (consumedVerified=true). The stripped path must be canonical or the run is refused.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
+    judge_dot="\\\\?\\"+str(root/"judge")+"."; os.mkdir(judge_dot)
+    plain=root/"judge"; plain.mkdir()
+    (plain/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q in the ordinary sibling")
+    link=root/"judge-link"
+    try:
+        _mk_raw_junction(root,link,"\\??\\"+str(root/"judge")+".")
+        cache=_terra_env(fixture_tree)
+        cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+        cmd[cmd.index("-RunDir")+1]=str(link)
+        env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+        r=run_lane(cmd+["-ImagePaths",str(png)],env)
+        receipt=link/"terra-001.receipt.json"
+        text=_failure_text(r,receipt)
+        if (root/"image-bytes.json").exists():
+            seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+            entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+            assert not (entry.get("consumedVerified") is True and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+        assert r.returncode!=0 and "image-path-noncanonical" in text,(r.returncode,text)
+        assert not (root/"args.json").exists(), "a non-canonical snapshot path must never reach the codex launch"
+    finally:
+        if link.exists(): os.rmdir(link)
+        shutil.rmtree(judge_dot,ignore_errors=True)
+
+
+@pytest.mark.parametrize("raw,expected",[
+    ("\\\\?\\C:\\x\\judge\\terra-001.image-01.png","C:\\x\\judge\\terra-001.image-01.png"),
+    ("\\\\?\\UNC\\srv\\share\\run\\terra-001.image-01.png","\\\\srv\\share\\run\\terra-001.image-01.png"),
+    ("C:\\x\\run dir\\terra-001.image-01.png","C:\\x\\run dir\\terra-001.image-01.png"),
+    ("\\\\?\\C:\\x\\judge.\\terra-001.image-01.png",None),
+    ("\\\\?\\UNC\\srv\\share\\judge.\\terra-001.image-01.png",None),
+    ("\\\\?\\C:\\x\\judge\\terra-001.image-01.png.",None),
+])
+def test_strip_verbatim_returns_only_a_path_win32_will_not_renormalize(tmp_path,raw,expected):
+    # r7: the extracted check, DOS and UNC prefix-removal branches, with the keys' exact trailing-dot strings (no filesystem access).
+    r=_copy_harness(tmp_path,f"""
+try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGHT ' + $_.Exception.GetBaseException().GetType().Name + ' ' + $_.Exception.GetBaseException().Message }}
+""")
+    if expected is None:
+        assert "CAUGHT IOException image-path-noncanonical" in r.stdout,(r.stdout,r.stderr)
+    else:
+        assert f"OUT [{expected}]" in r.stdout,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("dirname,expanded",[("%OS%","Windows_NT"),("a^b","ab"),("a&b",None)])
+def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded):
+    # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
+    # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
+    run_dir=root/dirname; run_dir.mkdir()
+    if expanded:
+        (root/expanded).mkdir(); (root/expanded/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    receipt=run_dir/"terra-001.receipt.json"
+    text=_failure_text(r,receipt)
+    if (root/"image-bytes.json").exists() and receipt.exists():
+        seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+        entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+        assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+    assert r.returncode!=0 and "image-path-bad-character" in text,(r.returncode,text)
+    assert not (root/"args.json").exists(), "a path cmd.exe would rewrite must never reach the codex launch"
+
+
+def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
+    cache=fixture_tree["root"]/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert "-i" not in argv and "--image" not in argv
+    assert "imagePaths" not in json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_a_claude_lane_with_image_paths_fails_closed_before_any_receipt(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"x")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode!=0 and "image-paths-codex-only" in r.stderr, (r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"child.json").exists()
+
+
+def test_image_paths_must_exist_and_be_png_or_jpg(fixture_tree):
+    root=fixture_tree["root"]
+    gif=root/"strip.gif"; gif.write_bytes(b"GIF89a")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")   # every refusal precedes the receipt slot, so one fixture serves all cases
+    for bad,token in ((str(root/"absent.png"),"image-path-missing"),(str(gif),"image-path-bad-extension"),(str(root),"image-path-missing")):
+        r=run_lane(cmd+["-ImagePaths",bad],env)
+        assert r.returncode!=0 and token in r.stderr, (bad,r.stdout,r.stderr)
+        assert not receipt.exists() and not (root/"child.json").exists(), bad
+        assert not (root/"args.json").exists(), "a refused image path must never reach the codex launch"
 
 
 def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
@@ -2493,8 +3187,11 @@ def _fail_final_receipt_write(text):
 # the copy of the launcher waits (bounded) for the grandchild's own state file, then lets a 1.5 s deadline run
 # out through the unchanged WaitForExit -> $timedOut -> job-close -> final-write path.
 def _deadline_after_descendants_ready(text):
-    old='$remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
-    assert text.count(old)==1
+    # Anchored on the bounded-wait budget line that feeds `$proc.WaitForExit([int][math]::Min(2147483647.0, $remainingMs))`
+    # (VISUAL-JUDGE-TERRA-LANE-1 r5 made it Max(0.0, ...) so the budget is a double). It must be found exactly once:
+    # a drift here fails the fixture build loudly instead of silently running the real wall-clock budget.
+    old='$remainingMs = [math]::Max(0.0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
+    assert text.count(old)==1, "bounded-wait budget anchor not found exactly once in Invoke-Lane.ps1"
     ready=("$readyWatch = [Diagnostics.Stopwatch]::StartNew(); "
            "while (-not (Test-Path -LiteralPath $env:MLV_FIXTURE_GRAND) -and $readyWatch.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 20 }\n"
            "$remainingMs = 1500")
