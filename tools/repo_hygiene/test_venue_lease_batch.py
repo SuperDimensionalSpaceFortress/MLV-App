@@ -7226,8 +7226,8 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
     def test_r8_g9_the_superscript_class_in_the_device_rule_is_all_three_digits_not_one(self) -> None:
         # mutation proof: with the class cut back to U+00B2 only, the middle-component rows above must go red (the rule is read from the module text, not assumed)
         text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertEqual(text.count("COM[0-9\\u00B9\\u00B2\\u00B3]"), 1, "the device rule's COM class changed shape; update this mutation")
-        mutated = text.replace("COM[0-9\\u00B9\\u00B2\\u00B3]", "COM[0-9\\u00B2]").replace("LPT[0-9\\u00B9\\u00B2\\u00B3]", "LPT[0-9\\u00B2]")
+        self.assertEqual(text.count("COM[1-9\\u00B9\\u00B2\\u00B3]"), 1, "the device rule's COM class changed shape; update this mutation")   # r12: the digit class starts at 1 (COM0 is not a device)
+        mutated = text.replace("COM[1-9\\u00B9\\u00B2\\u00B3]", "COM[1-9\\u00B2]").replace("LPT[1-9\\u00B9\\u00B2\\u00B3]", "LPT[1-9\\u00B2]")
         self.assertNotEqual(mutated, text)
         d = Path(tempfile.mkdtemp(prefix="venue-rr-mut-", dir=self.clean_base()))
         shutil.copy2(DV / "venues.json", d / "venues.json")
@@ -7464,6 +7464,71 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
             r = self.run_batch(None, "-ReceiptRoot", str(base) + "\\.claude-state\\a\\..\\receipts")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # ---- r12 (PR #729 r11 keys; sol INV-5 blocker): the device rule is the Windows reserved set exactly. COM0 and LPT0 are NOT devices (RtlIsDosDeviceName_U = 0), so a root that
+    # names one (bare, with an extension, with spaces before the extension, followed by `..`) is ordinary and certifies; COM1-COM9, LPT1-LPT9 and the superscript forms still refuse.
+    def test_r12_com0_and_lpt0_are_ordinary_names_and_certify_on_every_entry(self) -> None:
+        pre = "C:\\x\\.claude-state\\"
+        legal = {"com0-then-parent": pre + "COM0\\..\\receipts", "lpt0-then-parent": pre + "LPT0\\..\\receipts",
+                 "com0-ext-then-parent": pre + "COM0.txt\\..\\receipts", "lpt0-space-ext-then-parent": pre + "LPT0 .txt\\..\\receipts"}   # sol r11's four literal inputs
+        legal_kept = {"com0-middle": pre + "COM0\\r", "lpt0-lower-middle": pre + "lpt0\\r", "com0-terminal": pre + "COM0", "lpt0-ext-terminal": pre + "LPT0.log"}
+        refused = {"com1-then-parent": pre + "COM1\\..\\receipts", "lpt9-then-parent": pre + "LPT9\\..\\receipts", "nul-then-parent": pre + "NUL\\..\\receipts",
+                   "con-ext-then-parent": pre + "CON.txt\\..\\receipts", "com1-middle": pre + "COM1\\r", "lpt9-middle": pre + "LPT9\\r", "nul-middle": pre + "NUL\\r",
+                   "con-ext-middle": pre + "CON.txt\\r", "com-sup1-then-parent": pre + "COM\u00b9\\..\\receipts", "lpt-sup3-space-ext-then-parent": pre + "LPT\u00b3 .log\\..\\receipts",
+                   # r11 is not weakened: a malformed component followed by `..` still refuses
+                   "ctl-then-parent": pre + "ctl\x01x\\..\\receipts", "over-max-then-parent": pre + "a" * 256 + "\\..\\receipts", "bad-root-then-parent": pre + "bad<root>\\..\\receipts"}
+        got = self.judge(["C:\\fake\\agent-share"], {**legal, **legal_kept, **refused})
+        for name in legal:
+            self.assertEqual(str(got[name]).lower(), "c:\\x\\.claude-state\\receipts", f"{name}: a non-device name was refused: {got[name]}")
+        for name, value in legal_kept.items():
+            self.assertEqual(str(got[name]).lower(), value.lower(), f"{name}: {got[name]}")
+        for name in refused:
+            self.assertIsNone(got[name], f"{name}: {str(got[name])[:200]}")
+        # the rule agrees with the native classifier over the whole COM/LPT digit range (0-9 and the superscripts), bare, with an extension and with spaces before it
+        is_dev = ctypes.windll.ntdll.RtlIsDosDeviceName_U
+        is_dev.argtypes, is_dev.restype = [ctypes.c_wchar_p], ctypes.c_uint32
+        names = [f"{p}{d}{tail}" for p in ("COM", "LPT") for d in [str(n) for n in range(10)] + ["\u00b9", "\u00b2", "\u00b3"] for tail in ("", ".txt", " .txt")]
+        native = {n: bool(is_dev(pre + n)) for n in names}
+        self.assertFalse(native["COM0"] or native["LPT0 .txt"], f"this host classifies COM0/LPT0 as devices: {native}")
+        self.assertTrue(native["COM1"] and native["LPT9"] and native["COM\u00b9"], f"this host does not classify COM1/LPT9/COM<sup1> as devices: {native}")
+        got_all = self.judge(["C:\\fake\\agent-share"], {n: pre + n + "\\r" for n in names})
+        mismatch = {n: (native[n], got_all[n]) for n in names if native[n] != (got_all[n] is None)}
+        self.assertEqual(mismatch, {}, "the helper's device rule and RtlIsDosDeviceName_U disagree (name: (native device, certificate))")
+        # every admission site Sol swept goes through the one helper: the real guard statements of the leg (-ReceiptRoot, -SheetCopyDir), both pair scripts (-OutDir), the baseline
+        # (-TrendFile / -RunDir) and the stage nightly (-ReceiptFile), each taken from its own script text
+        guards = {
+            "leg-receipt-root": (DV / "Invoke-VenueLeg.ps1", "(?s)\\$rrCert = .*?\\$ReceiptRoot = \\$rrCert", "$ReceiptRoot = $v; $OfflineTestMode = $false", "$ReceiptRoot"),
+            "leg-sheet-copy-dir": (DV / "Invoke-VenueLeg.ps1", "(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}", "$SheetCopyDir = $v", "$SheetCopyDir"),
+            "sheet-pair-out-dir": (DV / "New-VenueSheetPair.ps1", "(?s)\\$outFull = Test-DvLocalReceiptRoot.*?\\$OutDir = \\$outFull", "$OutDir = $v", "$OutDir"),
+            "flavor-pair-out-dir": (DV / "New-VenueFlavorPair.ps1", "(?s)\\$outFull = Test-DvLocalReceiptRoot.*?\\$OutDir = \\$outFull", "$OutDir = $v", "$OutDir"),
+            "baseline-trend-and-run-dir": (DV / "Invoke-VenueBaseline.ps1", "(?s)\\$trendCert = Test-DvLocalReceiptRoot.*?\\$RunDir = \\$runDirCert", "$TrendFile = $v; $RunDir = $v", "$TrendFile + '|' + $RunDir"),
+            "nightly-receipt-file": (DV / "Invoke-VenueStageNightly.ps1", "(?s)\\$receiptCert = Test-DvLocalReceiptRoot.*?\\$ReceiptFile = \\$receiptCert", "$ReceiptFile = $v", "$ReceiptFile"),
+        }
+        inputs = {**legal, "com1-then-parent": refused["com1-then-parent"], "nul-then-parent": refused["nul-then-parent"]}
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n" f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  "function Stop-Baseline { param($k, $m) throw \"$k $m\" }\nfunction Stop-Nightly { param($k, $m) throw \"$k $m\" }\n$o = [ordered]@{}\n")
+        for g, (path, pattern, assign, result) in guards.items():
+            script += (f"$m = [regex]::Match([IO.File]::ReadAllText('{psq(path)}'), '{psq(pattern)}')\nif (-not $m.Success) {{ throw 'guard {g} was not found' }}\n$sb = [scriptblock]::Create($m.Value)\n")
+            for k, v in inputs.items():
+                script += f"$v = '{psq(v)}'; {assign}\ntry {{ . $sb; $o['{g}|{k}'] = 'ACCEPTED ' + ({result}) }} catch {{ $o['{g}|{k}'] = 'REFUSED ' + $_.Exception.Message }}\n"
+        script += "$o | ConvertTo-Json -Compress\n"
+        out = json.loads(self.run_ps(script))
+        for g in guards:
+            for k in inputs:
+                with self.subTest(guard=g, name=k):
+                    if k in legal:
+                        self.assertTrue(out[f"{g}|{k}"].startswith("ACCEPTED "), out[f"{g}|{k}"])
+                        self.assertNotIn("..", out[f"{g}|{k}"], "the guard went on with the raw spelling, not the certified one")
+                    else:
+                        self.assertTrue(out[f"{g}|{k}"].startswith("REFUSED "), out[f"{g}|{k}"])
+        # the batch entry runs to the end on a COM0 root and every leg is handed the certified root (the `..` resolved away)
+        for label, comp in (("com0", "COM0"), ("lpt0-space-ext", "LPT0 .txt")):
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                root = self.case / "scratch" / ".claude-state" / comp / ".." / "receipts"
+                r = self.run_batch(None, "-ReceiptRoot", str(root))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(self.case / 'scratch' / '.claude-state' / 'receipts')}"] * 2)
 
     def test_r8_a3_a_link_chain_is_bounded_per_link_sixteen_pass_seventeen_are_refused(self) -> None:
         # opus/sol A3 (ADV-A3): ResolveLinkTarget($true) collapsed a whole chain inside one outer hop, so the stated 16-link bound was never enforced. Real junctions: j00 -> j01 -> ... -> j16 -> final (17 links).

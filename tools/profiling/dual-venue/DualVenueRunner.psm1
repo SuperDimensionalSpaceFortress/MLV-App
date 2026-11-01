@@ -787,13 +787,14 @@ function Test-DvLocalReceiptRoot {
         # such a name is an alias of another directory), no DOS device name. The `.` and `..` navigation tokens are the caller's to skip (they are resolved, never written).
         # r9 B2: culture-INVARIANT (under tr-TR an inline `(?i:...)` folds `i` to U+0130, so lowercase `conin$` was not a device): RegexOptions.IgnoreCase -bor CultureInvariant, never the process culture.
         # r7 G9: COM/LPT with a superscript 1/2/3 are devices too, written as regex escapes so this file stays ASCII. r8 B1: Win32 drops any run of spaces between a device stem and its extension, so the stem is followed by `[ ]*`.
+        # r12 (sol r11 INV-5): the digit class starts at 1. RtlIsDosDeviceName_U returns 0 for COM0, LPT0, COM0.txt and `LPT0 .txt` (measured on 10.0.19045), so a COM0 or LPT0 directory is an ordinary name and stays usable.
         $componentWellFormed = {
             param($c, $maxLen)
             if ($c.Length -eq 0) { return $true }
             if ($c.Length -gt $maxLen) { return $false }
             if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
             if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
-            if ([regex]::IsMatch($c, '^(?:CON|PRN|AUX|NUL|COM[0-9\u00B9\u00B2\u00B3]|LPT[0-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$', $script:DvCultureFreeIgnoreCase)) { return $false }
+            if ([regex]::IsMatch($c, '^(?:CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$', $script:DvCultureFreeIgnoreCase)) { return $false }
             return $true
         }
         # (1) the RAW text, either slash. Only `\\?\C:\...` (backslashes) is a local device spelling; anything else that starts with two separators (UNC, \\.\, //?/, \/?\, \\?\UNC\) is refused here.
