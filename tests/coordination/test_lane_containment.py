@@ -3059,8 +3059,11 @@ def _fail_final_receipt_write(text):
 # the copy of the launcher waits (bounded) for the grandchild's own state file, then lets a 1.5 s deadline run
 # out through the unchanged WaitForExit -> $timedOut -> job-close -> final-write path.
 def _deadline_after_descendants_ready(text):
-    old='$remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
-    assert text.count(old)==1
+    # Anchored on the bounded-wait budget line that feeds `$proc.WaitForExit([int][math]::Min(2147483647.0, $remainingMs))`
+    # (VISUAL-JUDGE-TERRA-LANE-1 r5 made it Max(0.0, ...) so the budget is a double). It must be found exactly once:
+    # a drift here fails the fixture build loudly instead of silently running the real wall-clock budget.
+    old='$remainingMs = [math]::Max(0.0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
+    assert text.count(old)==1, "bounded-wait budget anchor not found exactly once in Invoke-Lane.ps1"
     ready=("$readyWatch = [Diagnostics.Stopwatch]::StartNew(); "
            "while (-not (Test-Path -LiteralPath $env:MLV_FIXTURE_GRAND) -and $readyWatch.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 20 }\n"
            "$remainingMs = 1500")
