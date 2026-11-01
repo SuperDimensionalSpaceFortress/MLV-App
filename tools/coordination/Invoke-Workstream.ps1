@@ -811,9 +811,9 @@ if ($needsHostedEvidence) {
         'branch-protection-master.json' = @(
             'api',"repos/$ghRepo/branches/master/protection")
         'rulesets.json' = @('api',"repos/$ghRepo/rulesets")
-        'runs-tests-master-push-completed.json' = @(
+        'runs-tests-merge-group-completed.json' = @(
             'run','list','--repo',$ghRepo,'--workflow','tests.yml',
-            '--branch','master','--event','push','--status','completed','--limit','50',
+            '--event','merge_group','--status','completed','--limit','50',
             '--json','databaseId,conclusion,createdAt,headSha,displayTitle')
     }
 
@@ -853,7 +853,7 @@ if ($needsHostedEvidence) {
 
         # The job graph is a SECOND call keyed on the first one's newest row, so it can only be made
         # after the run list lands. Skipped without complaint when that export failed.
-        $runsFile = Join-Path $ghDir 'runs-tests-master-push-completed.json'
+        $runsFile = Join-Path $ghDir 'runs-tests-merge-group-completed.json'
         if (Test-Path -LiteralPath $runsFile) {
             try {
                 $runs = @(Get-Content -LiteralPath $runsFile -Raw | ConvertFrom-Json |
