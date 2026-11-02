@@ -1326,9 +1326,16 @@ function Test-CmdShimTextEnablesDelayedExpansion {
     #   below contains a caret.
     # - A logical line whose first token is literally 'rem' or '::' is a comment and is skipped (measured: 'rem x & setlocal
     #   enabledelayedexpansion' and ':: x & setlocal ...' leave expansion off). 'r^em' is not skipped (fail closed).
-    # - '/v' with an optional ':on' (any case) is the cmd.exe switch; '/v:off' is not.
-    # - A setlocal whose arguments are built at run time ('setlocal %E%', measured ON) cannot be read statically and counts as ON.
-    param([AllowEmptyString()][string]$Text)
+    # - r9 fix iteration 1 (adversary A1 on 0da1f4ef): cmd.exe turns delayed expansion on for EVERY '/v' switch except one starting
+    #   '/v:off' (measured: /v /von /v1 /voff /v:of on; /v:off /V:OFF /v:offx off), so that is the only spelling read as off.
+    # - r9 fix iteration 1 (adversary A2 on 0da1f4ef): a static reading cannot see a command built at run time ('%L%local %E%expansion',
+    #   'setlocal %E%', a for variable, call, start, or a nested .cmd/.bat that may enable it before forwarding). Any such construct counts
+    #   as ON (fail closed). Only the forwarded positional references (%*, %0-%9, %~...) are static here.
+    # - The npm cmd-shim template (the real codex.cmd) uses %dp0% / %_prog% / %COMSPEC%, so it is recognised by its exact text instead
+    #   (Test-NpmShimForwardsToNativeNode) and is OFF only when the 'node' it runs is a native .exe/.com, never another batch file.
+    param([AllowEmptyString()][string]$Text, [string]$ShimDir = '', [string]$WorkingDirectory = '')
+    $npm = [regex]::Match(($Text -replace '\r\n', "`n"), $NPM_CMD_SHIM_PATTERN)
+    if ($npm.Success) { return (-not (Test-NpmShimForwardsToNativeNode -ShimDir $ShimDir -WorkingDirectory $WorkingDirectory)) }
     $logical = [System.Collections.Generic.List[object]]::new()
     $buf = $null; $joined = $false
     foreach ($phys in ($Text -split '\r?\n')) {
@@ -1345,8 +1352,36 @@ function Test-CmdShimTextEnablesDelayedExpansion {
         if (-not [bool]$entry[1] -and $raw -match '^[\s@;,=]*(?i:rem(\s|$)|::)') { continue }
         $t = $raw.Replace('^', '')
         if ($t -match '(?i)enabledelayedexpansion') { return $true }
-        if ($t -match '(?i)/v(?!:off(?![a-z0-9]))(?![a-z0-9])') { return $true }
-        if ($t -match '(?i)(?<![a-z0-9_])setlocal(?![a-z0-9_])[^&|]*[%!]') { return $true }
+        if ($t -match '(?i)/v(?!:off)') { return $true }
+        # dynamic text: a percent reference other than %*, %0-%9 and %~... (this includes %NAME%, %NAME:x=y% and a %%x for variable)
+        if ($t -match '%[^%*~0-9\s]') { return $true }
+        if ($t -match '(?i)\.(cmd|bat)(?![a-z0-9_])') { return $true }
+        # keywords outside quoted spans (a quoted internal command is not recognised by cmd.exe, measured with '"setlocal"')
+        $u = [regex]::Replace($t, '"[^"]*("|$)', '""')
+        if ($u -match '(?i)(?<![a-z0-9_.\\/:-])(call|for|start)(?![a-z0-9_.-])') { return $true }
+    }
+    return $false
+}
+# The npm cmd-shim template, exactly as npm writes it (the real %APPDATA%\npm\codex.cmd), with LF line ends; only the target path varies.
+$NPM_CMD_SHIM_PATTERN = '\A@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\nIF EXIST "%dp0%\\node\.exe" \(\n  SET "_prog=%dp0%\\node\.exe"\n\) ELSE \(\n  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;\.JS;=;%\n\)\n\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\[^"%!^&|<>\n]+" %\*\n?\z'
+function Test-NpmShimForwardsToNativeNode {
+    # The template runs "<shim dir>\node.exe" when it exists, else the first 'node' cmd.exe finds: the working directory first, then each
+    # PATH entry, trying each PATHEXT extension in order. The FULL PATHEXT is searched (the template's .JS removal is undone by the
+    # endLocal that runs before the search), which can only find more candidates. True only when that first hit is a native .exe/.com;
+    # a node.cmd / node.bat would parse the forwarded arguments again under its own settings, and no hit at all is unknowable: both false.
+    param([string]$ShimDir, [string]$WorkingDirectory = '')
+    if ([string]::IsNullOrEmpty($ShimDir)) { return $false }
+    try { if ([System.IO.File]::Exists([System.IO.Path]::Combine($ShimDir, 'node.exe'))) { return $true } } catch { return $false }
+    $pathExt = if ([string]::IsNullOrEmpty($env:PATHEXT)) { '.COM;.EXE;.BAT;.CMD' } else { $env:PATHEXT }
+    $exts = @($pathExt -split ';' | Where-Object { $_ })
+    $dirs = @()
+    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $dirs += $WorkingDirectory }
+    $dirs += @(([string]$env:PATH) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+    foreach ($d in $dirs) {
+        foreach ($e in $exts) {
+            try { $c = [System.IO.Path]::Combine($d, 'node' + $e) } catch { continue }
+            if ([System.IO.File]::Exists($c)) { return ($e -ieq '.exe' -or $e -ieq '.com') }
+        }
     }
     return $false
 }
@@ -1354,21 +1389,22 @@ function Test-CmdDelayedExpansion {
     # Delayed expansion is on for the shim's %* forwarding when the effective registry setting is on (Get-CmdRegistryDelayedExpansion) or
     # the shim turns it on itself (Test-CmdShimTextEnablesDelayedExpansion). An unreadable shim counts as ON (fail closed). A shim that
     # enables it and later ends that scope with endlocal still counts as ON: a static reading cannot follow goto/call, so this over-refuses
-    # (typed, visible) rather than guessing.
-    param([Parameter(Mandatory = $true)][string]$Shim)
+    # (typed, visible) rather than guessing. -WorkingDirectory is the codex child's working directory (cmd.exe searches it first).
+    param([Parameter(Mandatory = $true)][string]$Shim, [string]$WorkingDirectory = '')
     if (Get-CmdRegistryDelayedExpansion) { return $true }
     try { $text = [System.IO.File]::ReadAllText($Shim) } catch { return $true }
-    return (Test-CmdShimTextEnablesDelayedExpansion -Text $text)
+    $shimDir = try { [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Shim)) } catch { '' }
+    return (Test-CmdShimTextEnablesDelayedExpansion -Text $text -ShimDir $shimDir -WorkingDirectory $WorkingDirectory)
 }
 function Assert-CodexCommandLineFits {
-    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0, [object]$DelayedExpansion = $null)
+    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0, [object]$DelayedExpansion = $null, [string]$WorkingDirectory = '')
     $len = Get-NativeCommandLineLength -Exe $Exe -Argv $Argv
     $ext = [System.IO.Path]::GetExtension($Exe).ToLowerInvariant()
     $isShim = ($ext -eq '.cmd' -or $ext -eq '.bat')
     if ($isShim) {
         $bad = @($Argv | Where-Object { ([string]$_).Contains('%') })
         if ($bad.Count -eq 0) {
-            if ($null -eq $DelayedExpansion) { $DelayedExpansion = Test-CmdDelayedExpansion -Shim $Exe }
+            if ($null -eq $DelayedExpansion) { $DelayedExpansion = Test-CmdDelayedExpansion -Shim $Exe -WorkingDirectory $WorkingDirectory }
             if ([bool]$DelayedExpansion) { $bad = @($Argv | Where-Object { ([string]$_).Contains('!') }) }
         }
         if ($bad.Count -gt 0) {
@@ -2047,7 +2083,7 @@ if ($cfg.engine -eq 'claude') {
     $imageRefuseBang = $false
     if (@($ImageAttachments).Count -gt 0) {
         $imageExeExt = [System.IO.Path]::GetExtension($exe).ToLowerInvariant()
-        $imageRefuseBang = ($imageExeExt -eq '.cmd' -or $imageExeExt -eq '.bat') -and (Test-CmdDelayedExpansion -Shim $exe)
+        $imageRefuseBang = ($imageExeExt -eq '.cmd' -or $imageExeExt -eq '.bat') -and (Test-CmdDelayedExpansion -Shim $exe -WorkingDirectory $WorkDir)
     }
     foreach ($attachment in $ImageAttachments) {
         $imageSeq++
@@ -2077,7 +2113,7 @@ if ($cfg.engine -eq 'claude') {
               '--skip-git-repo-check',
               '-')
     # r8 (ADV-A2): refuse, typed, a command line cmd.exe would reject, before the child is started (see Assert-CodexCommandLineFits).
-    $null = Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount @($ImageAttachments).Count
+    $null = Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount @($ImageAttachments).Count -WorkingDirectory $WorkDir
     # '-' MEANS "READ THE PROMPT FROM STDIN", and it is not optional here.
     # Passing a multi-line prompt POSITIONALLY is silently TRUNCATED AT THE FIRST
     # NEWLINE, because the launcher is a .cmd batch wrapper and cmd.exe breaks the

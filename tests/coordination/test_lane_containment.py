@@ -1328,12 +1328,16 @@ $p = 'C:\\x\\a' + [string][char]{ord(ch)} + 'b\\terra-001.image-01.png'
 
 
 def _registry_delayed_expansion_on():
+    # read-only. r9 (adversary A3 on 0da1f4ef): the EFFECTIVE setting, HKCU over HKLM, as cmd.exe /? states; the first hive holding the
+    # value decides, so HKCU=0/HKLM=1 is off and the default-run-dir regression below runs instead of skipping.
     import winreg
     for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
         try:
             with winreg.OpenKey(hive, r"Software\Microsoft\Command Processor") as k:
-                if int(winreg.QueryValueEx(k, "DelayedExpansion")[0]) != 0: return True
-        except OSError: pass
+                v=winreg.QueryValueEx(k, "DelayedExpansion")[0]
+        except OSError: continue
+        try: return int(v)!=0
+        except (TypeError,ValueError): return True
     return False
 
 
@@ -1467,9 +1471,10 @@ function Get-ItemProperty {{
 _PLAIN_SHIM = '@echo off\r\n"x.exe" %*\r\n'
 
 
-def _detect(tmp_path, shim_text, hkcu="$null", hklm="$null"):
+def _detect(tmp_path, shim_text, hkcu="$null", hklm="$null", pre="", wd=""):
     shim=tmp_path/"shim.cmd"; shim.write_bytes(shim_text.encode("ascii"))
-    r=_cmdline_harness(tmp_path,_REG_MOCK.format(hkcu=hkcu,hklm=hklm)+f"\n'DETECTED ' + (Test-CmdDelayedExpansion -Shim '{shim}')\n")
+    call=f"Test-CmdDelayedExpansion -Shim '{shim}'"+(f" -WorkingDirectory '{wd}'" if wd else "")
+    r=_cmdline_harness(tmp_path,_REG_MOCK.format(hkcu=hkcu,hklm=hklm)+pre+f"\n'DETECTED ' + ({call})\n")
     m=re.search(r"DETECTED (True|False)",r.stdout)
     assert m,(r.stdout,r.stderr)
     return m.group(1)=="True"
@@ -1493,17 +1498,45 @@ def test_registry_delayed_expansion_is_the_effective_setting_hkcu_over_hklm(tmp_
     # measured on this host: rem and :: swallow a '&' on their own line, so this never runs.
     '@echo off\r\nrem x & setlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
     '@echo off\r\nsetlocal DisableDelayedExpansion\r\ncmd /v:off /c "x.exe" %*\r\n',
+    # measured: '/v:offx' and '/V:OFF' leave it off (cmd.exe reads the '/v:off' prefix)
+    '@echo off\r\ncmd /V:OFF /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /v:offx /c "x.exe" %*\r\n',
+    # forwarded positional references are static: %*, %1, %~dp0
+    '@echo off\r\n"%~dp0x.exe" %1 %*\r\n',
 ])
 def test_comment_lines_and_disabling_spellings_do_not_turn_delayed_expansion_on(tmp_path,shim_text):
     # sol r8 B1: both hives 0 plus a harmless comment refused every default C:\!Layi Wkspc run dir.
     assert _detect(tmp_path,shim_text,"[int]0","[int]0") is False
 
 
+_NPM_SHIM=('@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n'
+           'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n'
+           'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n')
+
+
 def test_the_real_npm_codex_shim_shape_reads_as_delayed_expansion_off(tmp_path):
-    npm=('@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n'
-         'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n'
-         'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n')
-    assert _detect(tmp_path,npm,"[int]0","[int]0") is False
+    # the template is recognised by its exact text; node.exe beside the shim is what it runs.
+    (tmp_path/"node.exe").write_bytes(b"MZ")
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0") is False
+
+
+@pytest.mark.parametrize("first,expected",[("node.exe",False),("node.com",False),("node.cmd",True),("node.bat",True),(None,True)])
+def test_the_npm_shim_is_off_only_when_the_node_it_runs_is_native(tmp_path,first,expected):
+    # r9 fix iteration 1: without node.exe beside the shim the template runs the first 'node' cmd.exe finds (working directory, then PATH).
+    # A node.cmd/.bat would re-parse the forwarded arguments under its own settings; no node at all is unknowable. Both fail closed.
+    wd=tmp_path/"wd"; wd.mkdir(); p1=tmp_path/"p1"; p1.mkdir(); p2=tmp_path/"p2"; p2.mkdir()
+    if first: (p1/first).write_bytes(b"x")
+    (p2/"node.exe").write_bytes(b"MZ") if first else None
+    pre=f"\n$env:PATH = '{p1};{p2}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.JS'\n"
+    if first is None: pre=f"\n$env:PATH = '{p1}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.JS'\n"
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is expected
+
+
+def test_the_npm_shim_searches_the_working_directory_first(tmp_path):
+    wd=tmp_path/"wd"; wd.mkdir(); (wd/"node.cmd").write_bytes(b"x"); p1=tmp_path/"p1"; p1.mkdir(); (p1/"node.exe").write_bytes(b"MZ")
+    pre=f"\n$env:PATH = '{p1}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'\n"
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is True
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre) is False
 
 
 @pytest.mark.parametrize("shim_text",[
@@ -1519,6 +1552,21 @@ def test_the_real_npm_codex_shim_shape_reads_as_delayed_expansion_off(tmp_path):
     '@echo off\r\nrem x ^\r\nsetlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
     # arguments built at run time cannot be read statically (measured: 'setlocal %E%' turned it on)
     '@echo off\r\nset E=enabledelayed\r\nsetlocal %E%expansion\r\n"x.exe" %*\r\n',
+    # r9 adversary A1 on 0da1f4ef: every /v switch but '/v:off...' turns it on (measured /von /v1 /voff /v:of on)
+    '@echo off\r\ncmd /von /c node C:\\pins\\codex.js %*\r\n',
+    '@echo off\r\ncmd /v1 /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /vfoo /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /voff /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /v:of /c "x.exe" %*\r\n',
+    # r9 adversary A2 on 0da1f4ef: a command built at run time, and its siblings (for variables, call, start, a nested batch file)
+    '@echo off\r\nset E=enabledelayed\r\nset L=set\r\n%L%local %E%expansion\r\nnode C:\\pins\\codex.js %*\r\n',
+    '@echo off\r\nfor %%s in (setlocal) do %%s enabledelayed%%xpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\ncall :go %*\r\nexit /b\r\n:go\r\n"x.exe" %*\r\n',
+    '@echo off\r\nstart /b /wait "" "x.exe" %*\r\n',
+    '@echo off\r\n"C:\\tools\\inner.bat" %*\r\n',
+    '@echo off\r\n%COMSPEC% /c "x.exe" %*\r\n',
+    # the npm template is OFF only by its exact text: one changed character makes it an ordinary shim, read with the dynamic rule
+    _NPM_SHIM.replace('title %COMSPEC%','title %X%'),
 ])
 def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
     assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True
