@@ -489,6 +489,18 @@ function ConvertTo-CommandLineArg([string]$Value) {
     # before a quote (and before the closing quote) are doubled, or a RepoRoot ending in "\" escapes its closing quote (adversary r4 A1).
     '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
+# adversary r6 A2: the captured output is read for the suite-named failure, and a stalled temp store (a hung share or a held handle) must
+# not hold that verdict back past the cleanup bound. The read is a Task with its own bound; past it the text says so. $Start is a seam
+# for the test, which hands in a task that never completes.
+$ReadBoundMs = 10000
+function Read-CapturedText([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = { param($p) [IO.File]::ReadAllTextAsync($p) }) {
+    try {
+        $task = & $Start $Path
+        if (-not $task.Wait($BoundMs)) { return "<read timed out: $([IO.Path]::GetFileName($Path)) not readable within $BoundMs ms>" }
+        return [string]$task.Result
+    }
+    catch { return "<read failed: $($_.Exception.Message)>" }
+}
 # The largest bound Invoke-BoundedSuite accepts: the same range the public -QuietLeaseBoundSec / -StageExemptBoundSec carry.
 $SuiteBoundMaxSec = 3600
 function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
@@ -516,7 +528,7 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
             catch { $killNote = "its process tree kill is NOT confirmed (taskkill.exe failed: $($_.Exception.Message))" }
             try { $p.Kill() } catch { }
         }
-        $text = ((Get-Content -LiteralPath $outF -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $errF -ErrorAction SilentlyContinue)) -join ' | '
+        $text = (@((Read-CapturedText $outF), (Read-CapturedText $errF)) | ForEach-Object { $_ -split '\r?\n' } | Where-Object { $_ }) -join ' | '
         Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text"
         # A finished suite's JSON is the result: a read error here must surface, not aggregate as an empty result.
         $json = (Get-Content -LiteralPath $outF -ErrorAction Stop) -join "`n"

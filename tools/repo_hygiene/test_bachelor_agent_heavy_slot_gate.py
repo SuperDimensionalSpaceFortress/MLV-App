@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -50,6 +51,9 @@ CLEANUP_MARGIN_SEC = 10  # scheduling slack on a loaded runner, on top of the bo
 # The largest timeout run_bounded accepts (sol r5 B1). Callers pass 720 s at most; this leaves a wide margin and stays far below
 # threading.TIMEOUT_MAX, above which the Windows wait raises OverflowError after the child is already launched.
 MAX_RUN_BOUNDED_TIMEOUT_SEC = 3600
+# Each captured stream is read under this bound (adversary r6 A2); after a failed wait run_bounded reads two of them.
+READ_BOUND_SEC = 10
+MAX_READ_SEC = 2 * READ_BOUND_SEC
 
 
 def max_run_bounded_sec(timeout: float) -> float:
@@ -58,12 +62,34 @@ def max_run_bounded_sec(timeout: float) -> float:
 
 
 def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        if not tolerate_oserror:
-            raise
-        return f"<read failed: errno {exc.errno} {exc.strerror}>"
+    """Read a captured stream under READ_BOUND_SEC (adversary r6 A2): a stalled temp store must not hold the verdict back.
+
+    The read runs in a daemon thread that is abandoned if it does not finish. After a failed wait the case-named verdict is the
+    failure, so a read error or a stalled read is recorded in the text; otherwise a read error surfaces as itself and a stalled read
+    as a TimeoutError.
+    """
+    box: dict[str, object] = {}
+
+    def read() -> None:
+        try:
+            box["text"] = path.read_text(encoding="utf-8", errors="replace")
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller's thread below
+            box["error"] = exc
+
+    reader = threading.Thread(target=read, name=f"read-{path.name}", daemon=True)
+    reader.start()
+    reader.join(READ_BOUND_SEC)
+    if reader.is_alive():
+        note = f"<read timed out: {path.name} not readable within {READ_BOUND_SEC:g} s>"
+        if tolerate_oserror:
+            return note
+        raise TimeoutError(note)
+    error = box.get("error")
+    if error is not None:
+        if isinstance(error, OSError) and tolerate_oserror:
+            return f"<read failed: errno {error.errno} {error.strerror}>"
+        raise error  # type: ignore[misc]
+    return str(box["text"])
 
 
 def _kill_taskkill_child(taskkill: subprocess.Popen, problems: list[str]) -> None:
@@ -555,6 +581,38 @@ class BoundedRunTests(unittest.TestCase):
         _, bound, message, launched = rows[-1]
         self.assertEqual((message, launched), ("LAUNCH-ATTEMPTED", "1"), "a valid bound must reach the launch")
 
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_the_fifo_suite_reads_its_captured_output_under_a_bound(self) -> None:
+        # adversary r6 A2 (PowerShell half): the suite-named failure reads the captured output through Read-CapturedText, which has its
+        # own bound, so a stalled temp store cannot hold the verdict back. The seam hands in a task that never completes.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        start = fifo.index("function Read-CapturedText")
+        body = fifo[start:fifo.index("\n}\n", start) + 3]
+        self.assertIn("$ReadBoundMs = 10000", fifo)
+        suite = fifo[fifo.index("function Invoke-BoundedSuite"):]
+        suite = suite[:suite.index("\n}\n")]
+        self.assertIn("Read-CapturedText $outF", suite)
+        self.assertIn("Read-CapturedText $errF", suite)
+        self.assertNotIn("SilentlyContinue", suite.replace("Remove-Item -LiteralPath $outF, $errF -Force -ErrorAction SilentlyContinue", ""))
+        fd, good = tempfile.mkstemp(prefix="read-captured-")
+        os.close(fd)
+        try:
+            Path(good).write_text("hello", encoding="ascii")
+            script = ("$ReadBoundMs = 10000\n" + body + "\n"
+                      "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
+                      "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                      "Write-Output ('HUNG|' + (Read-CapturedText 'C:\\x\\stdout.txt' 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                      "Write-Output ('GOOD|' + (Read-CapturedText '" + good.replace("'", "''") + "'))\n"
+                      "Write-Output ('MISSING|' + (Read-CapturedText 'C:\\no-such-dir-r6\\x.txt'))\n")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        finally:
+            os.unlink(good)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = {line.split("|", 1)[0]: line.split("|", 1)[1] for line in proc.stdout.splitlines() if "|" in line}
+        self.assertEqual(lines["HUNG"], "<read timed out: stdout.txt not readable within 300 ms>|True")
+        self.assertEqual(lines["GOOD"], "hello")
+        self.assertTrue(lines["MISSING"].startswith("<read failed: "), lines["MISSING"])
+
     def test_a_finished_run_returns_its_code_and_both_streams(self) -> None:
         rc, out, err = run_bounded([sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err'); sys.exit(3)"], 60, "finished-case")
         self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
@@ -643,6 +701,49 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn("<read failed: errno 13", str(caught))
+
+    def _run_stalled_read(self, *, timeout_expires: bool) -> tuple[BaseException, float]:
+        # adversary r6 A2: after a successful cleanup the captured-output read stalls (a hung share). It must not hold the verdict back.
+        release = threading.Event()
+        proc = self._TimedOutProc()
+        if not timeout_expires:
+            proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
+        real_read_text = Path.read_text
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path.name == "stdout.txt":
+                release.wait(60)
+            return real_read_text(path, *args, **kwargs)
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(subprocess, "Popen", side_effect=self._popen_for(proc, self._FakeTaskkill(0))), \
+                    mock.patch.object(Path, "read_text", read_text), \
+                    mock.patch.object(sys.modules[__name__], "READ_BOUND_SEC", 0.3):
+                try:
+                    run_bounded(["child"], 3, "stalled-read-case")
+                except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                    return exc, time.monotonic() - started
+        finally:
+            release.set()
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_stalled_output_read_after_a_timeout_keeps_the_case_named_verdict_inside_the_read_bound(self) -> None:
+        caught, elapsed = self._run_stalled_read(timeout_expires=True)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("stalled-read-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("<read timed out: stdout.txt not readable within 0.3 s>", str(caught))
+        self.assertLess(elapsed, 10, "the stalled read held the verdict back")
+
+    def test_a_stalled_output_read_without_a_timeout_surfaces_as_a_timeout_error_not_a_hang(self) -> None:
+        caught, elapsed = self._run_stalled_read(timeout_expires=False)
+        self.assertIsInstance(caught, TimeoutError, repr(caught))
+        self.assertIn("stdout.txt not readable within 0.3 s", str(caught))
+        self.assertLess(elapsed, 10)
+
+    def test_the_read_bounds_are_part_of_the_stated_ceiling_arithmetic(self) -> None:
+        self.assertEqual(MAX_READ_SEC, 2 * READ_BOUND_SEC)
+        self.assertGreater(MAX_READ_SEC, 0)
 
     def _run_failing_cleanup(self, *, taskkill: object, second_wait_expires: bool = False,
                              second_wait_raises: BaseException | None = None) -> BaseException:
