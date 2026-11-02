@@ -6229,6 +6229,14 @@ void RenderFrameThread::drawFrame( int slotIndex,
     dualiso_full20bit_timing_t dualIsoFull20 = {};
     llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
     const double llrawprocChromaSmoothMs = llrpGetLastChromaSmoothMilliseconds();
+    /* LLRAWPROC-RESIDUAL-SUBTIMERS-1 (adversary A1): a render that consumed another
+     * thread's recon ran no llrawproc here (every reconned-raw consumer zeroes
+     * getMlvLastLlrawprocMilliseconds, not all of them this thread's llrp record), so
+     * the recon worker's residual fields stay on the slot instead of an empty or
+     * stale record from this thread. */
+    const double llrawprocResidualSubstageMs = llrawprocMs > 0.0
+        ? insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry )
+        : 0.0;
     const double llrawprocKnownMs =
         llrawprocDarkFrameMs +
         llrawprocVerticalStripesMs +
@@ -6237,7 +6245,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
         llrawprocPatternNoiseMs +
         llrawprocDualIsoMs +
         llrawprocChromaSmoothMs +
-        insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry );
+        llrawprocResidualSubstageMs;
     const double llrawprocOtherMs = qMax( 0.0, llrawprocMs - llrawprocKnownMs );
     const double dualIsoPreviewTotalMs =
         slot.dualIsoPreviewHistogramMs +
