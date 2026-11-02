@@ -1359,6 +1359,19 @@ function Test-CmdShimTextEnablesDelayedExpansion {
         # keywords outside quoted spans (a quoted internal command is not recognised by cmd.exe, measured with '"setlocal"')
         $u = [regex]::Replace($t, '"[^"]*("|$)', '""')
         if ($u -match '(?i)(?<![a-z0-9_.\\/:-])(call|for|start)(?![a-z0-9_.-])') { return $true }
+        # r9 fix iteration 2 (adversary A1 on 353df92c): 'C:\pins\inner %*' runs inner.cmd, which can enable it before forwarding. Every
+        # command a shim runs must be a harmless internal command or name a native program by its .exe/.com extension; anything else (an
+        # extensionless or batch target, or if/else, whose inner command is not at the segment start) counts as ON.
+        foreach ($seg in [regex]::Split($t, '[&|()](?=(?:[^"]*"[^"]*")*[^"]*$)')) {
+            $s = $seg.Trim().TrimStart('@').Trim()
+            if ($s -eq '' -or $s.StartsWith(':')) { continue }
+            $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"?|(?<w>[^\s"]+))')
+            $cmd = if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }
+            if ($cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
+            if ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%') { continue }
+            if ($s -match '\A\d?\s*>') { continue }
+            return $true
+        }
     }
     return $false
 }
@@ -1374,16 +1387,22 @@ function Test-NpmShimForwardsToNativeNode {
     try { if ([System.IO.File]::Exists([System.IO.Path]::Combine($ShimDir, 'node.exe'))) { return $true } } catch { return $false }
     $pathExt = if ([string]::IsNullOrEmpty($env:PATHEXT)) { '.COM;.EXE;.BAT;.CMD' } else { $env:PATHEXT }
     $exts = @($pathExt -split ';' | Where-Object { $_ })
-    $dirs = @()
-    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $dirs += $WorkingDirectory }
-    $dirs += @(([string]$env:PATH) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
-    foreach ($d in $dirs) {
-        foreach ($e in $exts) {
-            try { $c = [System.IO.Path]::Combine($d, 'node' + $e) } catch { continue }
-            if ([System.IO.File]::Exists($c)) { return ($e -ieq '.exe' -or $e -ieq '.com') }
+    $pathDirs = @(([string]$env:PATH) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+    # r9 fix iteration 2 (adversary A2 on 353df92c): NoDefaultCurrentDirectoryInExePath makes cmd.exe skip the working directory. Rather
+    # than model that switch, both searches (with and without the working directory first) must find a native node.
+    $searches = @(, $pathDirs)
+    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $searches += , (@($WorkingDirectory) + $pathDirs) }
+    foreach ($dirs in $searches) {
+        $native = $false
+        :search foreach ($d in $dirs) {
+            foreach ($e in $exts) {
+                try { $c = [System.IO.Path]::Combine($d, 'node' + $e) } catch { continue }
+                if ([System.IO.File]::Exists($c)) { $native = ($e -ieq '.exe' -or $e -ieq '.com'); break search }
+            }
         }
+        if (-not $native) { return $false }
     }
-    return $false
+    return $true
 }
 function Test-CmdDelayedExpansion {
     # Delayed expansion is on for the shim's %* forwarding when the effective registry setting is on (Get-CmdRegistryDelayedExpansion) or

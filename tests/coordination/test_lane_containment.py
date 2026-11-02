@@ -1497,10 +1497,10 @@ def test_registry_delayed_expansion_is_the_effective_setting_hkcu_over_hklm(tmp_
     '@echo off\r\n:: cmd /v:on was removed\r\n"x.exe" %*\r\n',
     # measured on this host: rem and :: swallow a '&' on their own line, so this never runs.
     '@echo off\r\nrem x & setlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
-    '@echo off\r\nsetlocal DisableDelayedExpansion\r\ncmd /v:off /c "x.exe" %*\r\n',
+    '@echo off\r\nsetlocal DisableDelayedExpansion\r\ncmd.exe /v:off /c "x.exe" %*\r\n',
     # measured: '/v:offx' and '/V:OFF' leave it off (cmd.exe reads the '/v:off' prefix)
-    '@echo off\r\ncmd /V:OFF /c "x.exe" %*\r\n',
-    '@echo off\r\ncmd /v:offx /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd.exe /V:OFF /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd.exe /v:offx /c "x.exe" %*\r\n',
     # forwarded positional references are static: %*, %1, %~dp0
     '@echo off\r\n"%~dp0x.exe" %1 %*\r\n',
 ])
@@ -1539,6 +1539,14 @@ def test_the_npm_shim_searches_the_working_directory_first(tmp_path):
     assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre) is False
 
 
+def test_the_npm_shim_is_on_when_only_the_working_directory_holds_a_native_node(tmp_path):
+    # r9 adversary A2 on 353df92c: with NoDefaultCurrentDirectoryInExePath set, cmd.exe skips the working directory and runs PATH's
+    # node.cmd. Both searches (with and without the working directory) must find a native node.
+    wd=tmp_path/"wd"; wd.mkdir(); (wd/"node.exe").write_bytes(b"MZ"); adv=tmp_path/"adv"; adv.mkdir(); (adv/"node.cmd").write_bytes(b"x")
+    pre=f"\n$env:PATH = '{adv}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'; $env:NoDefaultCurrentDirectoryInExePath = '1'\n"
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is True
+
+
 @pytest.mark.parametrize("shim_text",[
     # sol r8 B2 (measured: cmd.exe removed the caret and expanded !OS! to Windows_NT)
     '@echo off\r\nsetlocal enable^delayedexpansion\r\n"x.exe" %*\r\n',
@@ -1567,6 +1575,11 @@ def test_the_npm_shim_searches_the_working_directory_first(tmp_path):
     '@echo off\r\n%COMSPEC% /c "x.exe" %*\r\n',
     # the npm template is OFF only by its exact text: one changed character makes it an ordinary shim, read with the dynamic rule
     _NPM_SHIM.replace('title %COMSPEC%','title %X%'),
+    # r9 adversary A1 on 353df92c: an extensionless target resolves to inner.cmd, which enables it before forwarding; and its siblings
+    # (a bare program name, an if/else whose inner command is not at the segment start)
+    '@echo off\r\nC:\\pins\\inner %*\r\n',
+    '@echo off\r\nnode C:\\pins\\codex.js %*\r\n',
+    '@echo off\r\nif exist "C:\\x.exe" C:\\pins\\inner %*\r\n',
 ])
 def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
     assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True
