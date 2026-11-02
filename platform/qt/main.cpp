@@ -1752,8 +1752,8 @@ static int runGuiPlaybackSmoke(QApplication &app)
     // r3 (sol B1): a string is not an identity. A junction, symlink or subst alias of the in-pass directory
     // passes the string check above, so the directories are compared on disk. Only proven distinct, non-nested
     // directories go on; anything unprovable fails closed.
-    // r5 (opus key3 r4): this runs after every other argument check, and a refusal removes each directory it
-    // created, so a refused run leaves no new directory behind.
+    // r5 (opus key3 r4): this runs after every other argument check, and it removes each directory it created
+    // whatever the answer (the capture creates its own), so a refused run leaves no new directory behind.
     if (!options.contactSheetSeekDir.isEmpty())
     {
         const output_dir_identity::DirComparison seekDirIdentity =

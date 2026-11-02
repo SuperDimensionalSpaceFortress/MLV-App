@@ -62,6 +62,9 @@ struct DirIdentity
     QString finalPath;   // resolved through every alias, no trailing separator
     QString identityPath;   // Windows: the final path as \\?\Volume{GUID}\... (else the NT form); empty on POSIX
     QString volumeName;     // Windows: the \\?\Volume{GUID} root of identityPath; empty unless the GUID form was read
+    // The resolved paths can prove Distinct (POSIX canonical paths, or a Windows volume-GUID path). A share or a
+    // volume outside the mount manager cannot: \\localhost\C$\in\seek is nested in C:\in with no path in common.
+    bool pathsComparable = false;
     QString error;
 };
 
@@ -146,6 +149,9 @@ inline DirRelation relationOf(const DirIdentity &a, const DirIdentity &b, const 
     if (isInside(b.finalPath, a.finalPath, rules)
         || (bothInGuidNamespace && isInside(b.identityPath, a.identityPath, rules)))
         return DirRelation::SecondInsideFirst;
+    // r5 pass 6 (A3): Distinct needs both paths in a namespace that can prove it; otherwise fail closed.
+    if (!a.pathsComparable || !b.pathsComparable)
+        return DirRelation::Unknown;
     return DirRelation::Distinct;
 }
 
@@ -222,6 +228,7 @@ inline DirIdentity identityOf(const QString &path)
         id.volumeName = volumeGuidRootOf(id.identityPath);
     else if (!finalPathOf(handle, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &id.identityPath, &finalPathError))
         id.identityPath.clear();
+    id.pathsComparable = !id.volumeName.isEmpty();
     CloseHandle(handle);
     id.volume = info.dwVolumeSerialNumber;
     id.index = (static_cast<unsigned long long>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
@@ -247,6 +254,7 @@ inline DirIdentity identityOf(const QString &path)
     id.volume = static_cast<unsigned long long>(st.st_dev);
     id.index = static_cast<unsigned long long>(st.st_ino);
     id.finalPath = withoutTrailingSeparators(canonical, posixPathRules());
+    id.pathsComparable = true;
     id.ok = true;
     return id;
 }
@@ -265,6 +273,8 @@ inline DirComparison compareIdentities(const DirIdentity &a, const DirIdentity &
     if (!a.identityPath.isEmpty() || !b.identityPath.isEmpty())
         result.detail += QStringLiteral(" first_volume_path=%1 second_volume_path=%2").arg(a.identityPath, b.identityPath);
     result.relation = relationOf(a, b, rules);
+    if (result.relation == DirRelation::Unknown)
+        result.detail += QStringLiteral(" reason=no_comparable_volume_path");
     return result;
 }
 
@@ -298,17 +308,24 @@ inline bool createMissingDirectories(const QString &path, QStringList *created)
     return QFileInfo(path).isDir();
 }
 
-// Removes what createMissingDirectories made, innermost first; rmdir leaves a directory that is no longer empty.
-inline void removeCreatedDirectories(const QStringList &created)
+// Removes what createMissingDirectories made, innermost first, and returns each one still on disk afterwards
+// (rmdir keeps a directory that is no longer empty or that another process holds open without delete sharing).
+inline QStringList removeCreatedDirectories(const QStringList &created)
 {
-    for (auto it = created.crbegin(); it != created.crend(); ++it)
-        QDir().rmdir(*it);
+    QStringList left;
+    for (auto it = created.crbegin(); it != created.crend(); ++it) {
+        if (!QDir().rmdir(*it) && QFileInfo::exists(*it))
+            left.append(*it);
+    }
+    return left;
 }
 
 } // namespace detail
 
-// r5 (opus key3 r4): identity needs both directories on disk, so this creates the missing ones, compares, and
-// removes every directory it created unless the answer is Distinct. A refused run leaves no new directory.
+// r5 (opus key3 r4; pass 6 A1/A2): identity needs both directories on disk, so this creates the missing ones,
+// compares, and then removes every directory it created, whatever the answer: the capture creates its own
+// directories when it starts (MainWindow.cpp, contact sheet branches), so the argument checks create nothing and
+// no later refusal before the capture can leave one. A directory that cannot be removed is named in the detail.
 inline DirComparison prepareSeparateDirectories(const QString &first, const QString &second)
 {
     QStringList created;
@@ -317,8 +334,9 @@ inline DirComparison prepareSeparateDirectories(const QString &first, const QStr
         result.detail = QStringLiteral("reason=create_failed");
     else
         result = compareDirectories(first, second);
-    if (result.relation != DirRelation::Distinct)
-        detail::removeCreatedDirectories(created);
+    const QStringList left = detail::removeCreatedDirectories(created);
+    if (!left.isEmpty())
+        result.detail += QStringLiteral(" cleanup_left=%1").arg(left.join(QLatin1Char(';')));
     return result;
 }
 
