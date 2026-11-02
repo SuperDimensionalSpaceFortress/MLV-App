@@ -621,6 +621,59 @@ def test_a_run_dir_that_cannot_be_written_exits_50_not_a_powershell_error(repo, 
     assert "DIRTY_SAVE_WRITE_FAILED" in r.stdout
 
 
+def test_a_configured_fsmonitor_callback_cannot_overwrite_the_dirt_being_saved(repo, tmp_path):  # r8 sol B1: git runs core.fsmonitor while it reads the index; the saver must not let it
+    dirty(repo)
+    want, a_before, marker = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes(), tmp_path / "fsmonitor-ran"
+    git(repo, "config", "core.fsmonitor", f"printf X >> '{marker.as_posix()}'; printf REPLACED > '{(repo / 'a.txt').as_posix()}'; :")  # no git call from the test after this line
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before  # old code: the callback ran and rewrote the tracked file
+    assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
+
+
+@pytest.mark.parametrize("child", [{"pid": 2147483647}, {"pid": 2147483647, "createdUtc": None}])
+def test_child_json_without_a_created_utc_is_bad_arguments_and_saves_nothing(repo, tmp_path, child):  # r8 sol B3: a missing timestamp used to skip the reuse check and save with exit 0
+    dirty(repo)
+    (tmp_path / "child.json").write_text(json.dumps(child))
+    r = save(repo, "-ChildJson", str(tmp_path / "child.json"))
+    assert r.returncode == 30 and "bad-created-utc" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+def bind_mount(src, dst):
+    for pre in ([], ["sudo", "-n"]):
+        if subprocess.run([*pre, "mount", "--bind", str(src), str(dst)], capture_output=True).returncode == 0:
+            return pre
+    return None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a bind mount is a POSIX construct; the Windows aliases (links, junctions, subst, shares) are covered by the open-handle tests above")
+def test_a_run_dir_that_is_a_bind_mount_of_a_directory_inside_the_worktree_is_bad_arguments(repo, tmp_path):  # r8 sol B2: no symlink LinkTarget, so the name walk saw an outside directory
+    inside, alias = repo / "run", tmp_path / "evidence"
+    inside.mkdir(); alias.mkdir()
+    pre = bind_mount(inside, alias)
+    if pre is None:
+        pytest.skip("cannot create a bind mount here (needs root or passwordless sudo)")
+    try:
+        (repo / "a.txt").write_bytes(b"changed\n")
+        r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(alias), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+        assert r.returncode == 30 and "run-dir-inside-worktree" in r.stdout, r.stdout + r.stderr
+        assert list(inside.iterdir()) == []
+    finally:
+        subprocess.run([*pre, "umount", str(alias)], capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX identity check shells out to find and stat; Windows asks the kernel through an open handle")
+def test_a_posix_run_dir_whose_identity_cannot_be_proven_is_bad_arguments_not_accepted(repo, tmp_path):  # r8 sol B2: unprovable is exit 30, never accept
+    dirty(repo)
+    tools = tmp_path / "onlygit"
+    tools.mkdir()
+    (tools / "git").symlink_to(shutil.which("git"))  # git present, find and stat absent
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "PATH": str(tools)})
+    assert r.returncode == 30 and "run-dir-identity-unprovable" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
 def test_the_toplevel_path_is_never_trimmed():
     assert not re.search(r"show-toplevel[^\n]*\n[^\n]*\.Trim\(\)", SCRIPT.read_text(encoding="utf-8"))  # r5 ADV-A4: the line after the toplevel call must not Trim the path
 
@@ -628,7 +681,7 @@ def test_the_toplevel_path_is_never_trimmed():
 # ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
 FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
 # The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.
-LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType[\s:]+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.File\]::\s*(?:Move|Replace)|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
+LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType[\s:]+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.(?:File|Directory)\]::\s*(?:Move|Replace)|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
 
 
 def walker_violations(text):
@@ -644,6 +697,7 @@ def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_c
 @pytest.mark.parametrize("mutant", ["NtSetInformationFile(h, out io, info, 24, 11);", "CreateHardLinkW(a, b, 0);", "New-Item -ItemType HardLink -Path $a -Value $b",
                                     "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)",
                                     "[IO.File]::Move($a, $b)", "[IO.File]::Replace($a, $b, $null)", "[IO.File]:: Move($a, $b)", "[IO.FileInfo]::new($a).MoveTo($b)",
-                                    "Move-Item -LiteralPath $a -Destination $b", 'New-Item -ItemType "HardLink" -Path $a -Value $b', "Rename-Item $a $b", "New-Item -ItemType:HardLink -Path $a -Value $b", "New-Item -ItemType: HardLink -Path $a -Value $b"])
+                                    "Move-Item -LiteralPath $a -Destination $b", 'New-Item -ItemType "HardLink" -Path $a -Value $b', "Rename-Item $a $b", "New-Item -ItemType:HardLink -Path $a -Value $b", "New-Item -ItemType: HardLink -Path $a -Value $b",
+                                    "[IO.Directory]::Move($a, $b)", "[System.IO.Directory]::Move($a, $b)"])  # r8 sol hardening: directory moves
 def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
     assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")

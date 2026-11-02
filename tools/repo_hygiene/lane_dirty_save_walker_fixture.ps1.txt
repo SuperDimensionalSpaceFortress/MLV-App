@@ -4,10 +4,10 @@
 #   dirty-save-<head8>.untracked.txt = git ls-files -z --others --exclude-standard: untracked file NAMES only, NUL-separated and never C-quoted (git quotes " \ TAB LF even with core.quotepath=false)
 #   .receipt.json = one JSON line naming the files of THIS save, also printed; it says untrackedFormat=nul-separated and untrackedContents=not-saved
 # Untracked file CONTENTS are NOT preserved by this saver (names only); copying them is LANE-DIRTY-SAVE-INVENTORY-ROWS-1 / LANE-DIRTY-SAVE-WORKSTREAM-WIRE-1 scope.
-# The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; createdUtc must be an ISO-8601 string, else exit 30; a process that started after it, at full precision, is a reused pid, so the lane is dead), never both.
+# The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; createdUtc is required and must be an ISO-8601 string, else exit 30 before any write; a process that started after it, at full precision, is a reused pid, so the lane is dead), never both.
 # The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree (links followed) is refused (exit 30): evidence written there would be listed as untracked dirt.
 # Paths are split on the platform's own separators only (a POSIX backslash is a filename character), and the RunDir that passes the containment test is the resolved path every artifact is then written through.
-# Windows resolves both directories through an open handle (GetFinalPathNameByHandle: links, junctions, subst drives, 8.3 and \\?\ spellings in any case) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX walks symlinks by name; a swap in that window is not closed there.
+# Windows resolves both directories through an open handle (GetFinalPathNameByHandle: links, junctions, subst drives, 8.3 and \\?\ spellings in any case) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX walks symlinks by name, then also refuses a RunDir (or ancestor) whose st_dev:st_ino is the worktree root or any directory inside it, so a bind mount cannot alias it; if that cannot be proven (no find/stat, unreadable tree) it exits 30. A swap between check and write is not closed on POSIX.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay).
 # Never stashes, resets, checks out, cleans or deletes. Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
@@ -25,7 +25,7 @@ $script:unreadable = @()
 function Invoke-GitBytes([string[]]$GitArgs) {
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-        foreach ($a in (@('-C', $WorkDir) + $GitArgs)) { $psi.ArgumentList.Add($a) }
+        foreach ($a in (@('-C', $WorkDir, '-c', 'core.fsmonitor=false') + $GitArgs)) { $psi.ArgumentList.Add($a) }  # core.fsmonitor is a command git runs while it reads the index; it must not rewrite the dirt being saved (sol r7 B1)
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
         foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS') { [void]$psi.Environment.Remove($k) }
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
@@ -53,6 +53,29 @@ function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # POSIX: every syml
         if ($di.LinkTarget) { $t = $di.ResolveLinkTarget($true); if ($t) { $cur = Resolve-RealPath $t.FullName ($Depth + 1) } }
     }
     return $cur
+}
+function Invoke-Capture([string]$Exe, [string[]]$CmdArgs) {  # one child's stdout lines; $null when it cannot start or exits non-zero (unknown is never "clear")
+    try {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($Exe)
+        foreach ($a in $CmdArgs) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $err = $p.StandardError.ReadToEndAsync(); $out = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+        if ($p.ExitCode -ne 0) { return $null }
+        return , @($out -split "`n" | Where-Object { $_ })
+    } catch { return $null }
+}
+function Get-DirIds([string[]]$Dirs, [bool]$Tree) {  # POSIX 'st_dev:st_ino' of each of $Dirs, or of every directory under $Dirs[0]. GNU stat (-c) and BSD stat (-f) are told apart first, because GNU's -f prints filesystem data shaped like an id. $null = unprovable
+    $fmt = if ($null -ne (Invoke-Capture 'stat' @('--version'))) { '-c' } else { '-f' }
+    $lines = if ($Tree) { Invoke-Capture 'find' @($Dirs[0], '-type', 'd', '-exec', 'stat', '-L', $fmt, '%d:%i', '{}', '+') } else { Invoke-Capture 'stat' (@('-L', $fmt, '%d:%i', '--') + $Dirs) }
+    if ($null -eq $lines -or @($lines).Count -lt 1 -or @($lines | Where-Object { $_ -notmatch '^\d+:\d+$' }).Count) { return $null }
+    return , @($lines)
+}
+function Assert-RunDirNotAlias([string]$Run, [string]$Work) {  # POSIX: a bind mount has no link target, so names cannot see it; compare file identity instead. The RunDir and each ancestor must not BE the worktree root or any directory inside it (sol r7 B2). Not provable = refused
+    $chain = @(); for ($d = $Run; $d; $d = [System.IO.Path]::GetDirectoryName($d)) { $chain += $d }
+    $mine = Get-DirIds $chain $false; $inside = Get-DirIds @($Work) $true
+    if ($null -eq $mine -or $mine.Count -ne $chain.Count -or $null -eq $inside) { throw 'run-dir-identity-unprovable' }
+    if (@($mine | Where-Object { $inside -contains $_ }).Count) { throw 'run-dir-inside-worktree' }
 }
 function ConvertTo-NativePath([string]$Path) {  # Windows: \\?\ and \\.\ (any case, either slash) are one spelling, rewritten to \\?\ and KEPT: stripping it would let Win32 trim a trailing dot or space and open the sibling directory (r7 fix-2 A1). A form with no drive or UNC meaning is refused, never guessed
     if (-not $script:onWin) { return $Path }
@@ -84,13 +107,10 @@ function Test-LaneAlive {
     if ($ChildJson) {
         $j = Get-Content -LiteralPath $ChildJson -Raw | ConvertFrom-Json
         $procId = [int]$j.pid
-        $c = $j.PSObject.Properties['createdUtc']
-        if ($c) {
-            $v = $c.Value
-            if ($v -is [datetime]) { $born = $v.ToUniversalTime() }
-            elseif ($v -is [string] -and $v -match '^\d{4}-\d\d-\d\dT\d\d:\d\d') { $born = [datetime]::Parse($v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
-            else { throw 'bad-created-utc' }  # a number (1 casts to year 0001) or prose is no timestamp (sol r4 B2)
-        }
+        $v = if ($j.PSObject.Properties['createdUtc']) { $j.createdUtc } else { $null }
+        if ($v -is [datetime]) { $born = $v.ToUniversalTime() }
+        elseif ($v -is [string] -and $v -match '^\d{4}-\d\d-\d\dT\d\d:\d\d') { $born = [datetime]::Parse($v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
+        else { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001) or prose is no timestamp: without it a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
     }
     if ($procId -le 0) { throw 'no-lane-pid' }
     $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
@@ -132,7 +152,7 @@ try {
         $shareOf = { param($p) if ($p.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { [System.IO.Path]::GetPathRoot($p).ToLowerInvariant() } else { '' } }
         if ((& $shareOf $RunDir) -ne (& $shareOf $realWork)) { throw 'run-dir-namespace-unprovable' }  # a share can expose a local folder (\\localhost\C$), and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
     }
-    else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir }
+    else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir; if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }
     $rel = [System.IO.Path]::GetRelativePath($realWork, $RunDir)
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
 if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
