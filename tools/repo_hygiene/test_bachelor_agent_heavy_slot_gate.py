@@ -39,6 +39,18 @@ PWSH = shutil.which("pwsh")
 # the sum). Measured 349 s locally, 282 s on the hosted runner.
 UNIT_RUN_TIMEOUT_SEC = 720
 FIFO_UNIT_CASES_SEC = 30  # the fifo script's own unit cases, before its two bounded sub-suites
+# run_bounded's cleanup after a timeout (_kill_tree). One source of truth: the helper waits with exactly these bounds and the
+# regressions derive their elapsed ceiling from them, so any cleanup the helper allows passes and no other number is hand-tuned.
+TASKKILL_BOUND_SEC = 60  # taskkill /F /T gets this long to exit
+TASKKILL_REAP_SEC = 5  # a taskkill that outlived its bound is killed and gets this long to be reaped
+ROOT_REAP_SEC = 30  # the root process gets this long to be reaped after its kill
+CLEANUP_BOUND_SEC = TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC + ROOT_REAP_SEC
+CLEANUP_MARGIN_SEC = 10  # scheduling slack on a loaded runner, on top of the bounds
+
+
+def max_run_bounded_sec(timeout: float) -> float:
+    """The longest run_bounded(timeout=...) may take before it must have raised: the run bound plus the whole cleanup bound."""
+    return timeout + CLEANUP_BOUND_SEC
 
 
 def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
@@ -50,24 +62,50 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
         return f"<read failed: errno {exc.errno} {exc.strerror}>"
 
 
-def _kill_tree(proc: subprocess.Popen) -> str:
-    """Kill proc's whole tree and say how it went; a failing cleanup step is reported, never allowed to replace the timeout verdict."""
-    problems = []
+def _kill_taskkill_child(taskkill: subprocess.Popen, problems: list[str]) -> None:
+    """A taskkill that did not exit in time is killed and reaped under its own bound; a hung reap is reported, never waited on."""
     try:
-        taskkill = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        if taskkill.returncode != 0:
-            problems.append(f"taskkill exited {taskkill.returncode}")
+        taskkill.kill()
+    except OSError as exc:
+        problems.append(f"taskkill kill failed: {exc!r}")
+    try:
+        taskkill.wait(timeout=TASKKILL_REAP_SEC)
+    except subprocess.TimeoutExpired:
+        problems.append(f"taskkill was still running {TASKKILL_REAP_SEC} s after its kill")
+    except OSError as exc:
+        problems.append(f"waiting for taskkill failed: {exc!r}")
+
+
+def _kill_tree(proc: subprocess.Popen) -> str:
+    """Kill proc's whole tree and say how it went; a failing cleanup step is reported, never allowed to replace the timeout verdict.
+
+    Every wait below carries a timeout (subprocess.run(timeout=) does not: on expiry CPython kills the child and then waits for it
+    with no timeout), so the whole cleanup stays inside CLEANUP_BOUND_SEC.
+    """
+    problems: list[str] = []
+    try:
+        taskkill = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
         problems.append(f"taskkill failed: {exc!r}")
+    else:
+        try:
+            returncode = taskkill.wait(timeout=TASKKILL_BOUND_SEC)
+            if returncode != 0:
+                problems.append(f"taskkill exited {returncode}")
+        except subprocess.TimeoutExpired:
+            problems.append(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s")
+            _kill_taskkill_child(taskkill, problems)
+        except OSError as exc:
+            problems.append(f"taskkill failed: {exc!r}")
     try:
         proc.kill()
     except OSError as exc:
         problems.append(f"kill failed: {exc!r}")
     try:
-        proc.wait(timeout=30)
+        proc.wait(timeout=ROOT_REAP_SEC)
     except subprocess.TimeoutExpired:
-        problems.append("the root process was still running 30 s after the kill")
+        problems.append(f"the root process was still running {ROOT_REAP_SEC} s after the kill")
     except OSError as exc:
         problems.append(f"waiting for the root process failed: {exc!r}")
     return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
@@ -427,7 +465,9 @@ class BoundedRunTests(unittest.TestCase):
         started = time.monotonic()
         with self.assertRaises(AssertionError) as caught:
             run_bounded([sys.executable, "-c", self.HUNG_TREE], 3, "stub-hang-case")
-        self.assertLess(time.monotonic() - started, 30)
+        # sol r4b B2: the ceiling is the helper's own bounds (run bound + whole cleanup bound) plus a stated margin, so a slow but
+        # successful taskkill (27 s, 31 s, up to its 60 s bound) is not a false CI failure.
+        self.assertLess(time.monotonic() - started, max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC)
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught.exception))
 
     @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -496,6 +536,37 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         def kill(self) -> None:
             pass
 
+    class _FakeTaskkill:
+        """The taskkill child: exits with returncode, or never exits (every bounded wait expires; a wait with no bound is a test failure)."""
+
+        def __init__(self, returncode: int | None, *, never_exits: bool = False) -> None:
+            self.returncode = returncode
+            self.never_exits = never_exits
+            self.wait_timeouts: list[float | None] = []
+            self.killed = False
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeouts.append(timeout)
+            if timeout is None:
+                raise AssertionError("an unbounded wait on taskkill")
+            if self.never_exits:
+                raise subprocess.TimeoutExpired(["taskkill"], timeout)
+            return self.returncode  # type: ignore[return-value]
+
+        def kill(self) -> None:
+            self.killed = True
+
+    @staticmethod
+    def _popen_for(root: object, taskkill: object, *, taskkill_launch_error: BaseException | None = None):
+        """A subprocess.Popen stand-in: the taskkill launch gets the taskkill fake (or raises), anything else is the root process."""
+        def popen(argv: list[str], *args: object, **kwargs: object) -> object:
+            if argv and argv[0] == "taskkill":
+                if taskkill_launch_error is not None:
+                    raise taskkill_launch_error
+                return taskkill
+            return root
+        return popen
+
     def _run_failing_read(self, failing_name: str, *, timeout_expires: bool = True) -> BaseException:
         proc = self._TimedOutProc()
         if not timeout_expires:
@@ -507,8 +578,7 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
                 raise PermissionError(13, "sharing violation")
             return real_read_text(path, *args, **kwargs)
 
-        with mock.patch.object(subprocess, "Popen", return_value=proc), \
-                mock.patch.object(subprocess, "run"), \
+        with mock.patch.object(subprocess, "Popen", side_effect=self._popen_for(proc, self._FakeTaskkill(0))), \
                 mock.patch.object(Path, "read_text", read_text):
             try:
                 run_bounded(["child"], 3, "stub-hang-case")
@@ -544,11 +614,13 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
                     raise subprocess.TimeoutExpired(["child"], timeout)
                 raise second_wait_raises
             proc.wait = wait  # type: ignore[method-assign]
-        if isinstance(taskkill, BaseException):
-            run = mock.Mock(side_effect=taskkill)
+        if isinstance(taskkill, subprocess.TimeoutExpired):
+            popen = self._popen_for(proc, self._FakeTaskkill(None, never_exits=True))
+        elif isinstance(taskkill, BaseException):
+            popen = self._popen_for(proc, None, taskkill_launch_error=taskkill)
         else:
-            run = mock.Mock(return_value=subprocess.CompletedProcess(["taskkill"], taskkill))
-        with mock.patch.object(subprocess, "Popen", return_value=proc), mock.patch.object(subprocess, "run", run):
+            popen = self._popen_for(proc, self._FakeTaskkill(taskkill))
+        with mock.patch.object(subprocess, "Popen", side_effect=popen):
             try:
                 run_bounded(["child"], 3, "stub-hang-case")
             except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
@@ -590,6 +662,98 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         for name in ("stdout.txt", "stderr.txt"):
             caught = self._run_failing_read(name, timeout_expires=False)
             self.assertIsInstance(caught, PermissionError, f"{name}: {caught!r}")
+
+
+class BoundedCleanupTests(unittest.TestCase):
+    """sol r4b B1 / B2: the cleanup after a timeout is bounded end to end, and the regression's ceiling is derived from that bound.
+
+    Everything runs on a virtual clock with in-memory process fakes: a fake wait advances the clock by what it would have waited
+    and expires like the real one, and a wait with no timeout is a test failure (the CPython subprocess.run() recovery path did one).
+    """
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+    class _VirtualProc:
+        """A process on the virtual clock. It exits `exit_after` seconds after its wait begins; None means it never exits."""
+
+        def __init__(self, clock: "BoundedCleanupTests._Clock", exit_after: float | None, *, first_wait_expires: bool = False,
+                     returncode: int = 0) -> None:
+            self.clock = clock
+            self.exit_after = exit_after
+            self.first_wait_expires = first_wait_expires
+            self.returncode = returncode
+            self.pid = 4242
+            self.waits: list[float | None] = []
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits.append(timeout)
+            if timeout is None:
+                raise AssertionError("an unbounded wait")
+            if self.first_wait_expires and len(self.waits) == 1:
+                self.clock.now += timeout
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            if self.exit_after is None or self.exit_after > timeout:
+                self.clock.now += timeout
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            self.clock.now += self.exit_after
+            return self.returncode
+
+        def kill(self) -> None:
+            pass
+
+    def _run(self, taskkill_exit_after: float | None, *, root_exit_after: float | None = 0) -> tuple[AssertionError, float]:
+        """Run run_bounded(timeout=3) against a hung root; return (its verdict, virtual seconds it took)."""
+        clock = self._Clock()
+        root = self._VirtualProc(clock, root_exit_after, first_wait_expires=True)
+        taskkill = self._VirtualProc(clock, taskkill_exit_after)
+
+        def popen(argv: list[str], *args: object, **kwargs: object) -> object:
+            return taskkill if argv and argv[0] == "taskkill" else root
+
+        with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(time, "monotonic", lambda: clock.now):
+            try:
+                run_bounded(["child"], 3, "stub-hang-case")
+            except AssertionError as exc:
+                self.assertTrue(all(w is not None for w in root.waits + taskkill.waits), (root.waits, taskkill.waits))
+                return exc, clock.now
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_taskkill_that_never_exits_and_a_wait_that_never_returns_still_return_inside_the_bound(self) -> None:
+        # sol r4b B1: taskkill never exits, the kill of it is never reaped and the root never exits either. The helper must still
+        # raise the case-named verdict, having waited exactly the sum of its documented bounds and nothing unbounded.
+        caught, elapsed = self._run(None, root_exit_after=None)
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("process tree kill is NOT confirmed", str(caught))
+        self.assertIn(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s", str(caught))
+        self.assertIn(f"taskkill was still running {TASKKILL_REAP_SEC} s after its kill", str(caught))
+        self.assertIn(f"the root process was still running {ROOT_REAP_SEC} s after the kill", str(caught))
+        self.assertEqual(elapsed, max_run_bounded_sec(3))
+
+    def test_the_cleanup_bound_is_the_sum_of_the_waits_the_helper_makes(self) -> None:
+        self.assertEqual(CLEANUP_BOUND_SEC, TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC + ROOT_REAP_SEC)
+        self.assertEqual(max_run_bounded_sec(3), 3 + CLEANUP_BOUND_SEC)
+
+    def test_a_slow_but_successful_taskkill_stays_inside_the_regression_ceiling(self) -> None:
+        # sol r4b B2: taskkill 1 / 26 / 27 / 31 s took the hung-tree regression from 4 / 29 / 30 / 34 s total; the old fixed 30 s
+        # ceiling failed the last two although taskkill succeeded inside its bound. Up to the full bound is a clean, confirmed kill.
+        ceiling = max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC
+        for taskkill_sec in (1, 26, 27, 31, TASKKILL_BOUND_SEC):
+            with self.subTest(taskkill_sec=taskkill_sec):
+                caught, elapsed = self._run(taskkill_sec)
+                self.assertEqual(elapsed, 3 + taskkill_sec)
+                self.assertLess(elapsed, ceiling)
+                self.assertIn("and its process tree was killed.", str(caught))
+
+    def test_a_taskkill_past_its_bound_is_reported_not_waited_for(self) -> None:
+        ceiling = max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC
+        for taskkill_sec in (TASKKILL_BOUND_SEC + 1, 600):
+            with self.subTest(taskkill_sec=taskkill_sec):
+                caught, elapsed = self._run(taskkill_sec)
+                self.assertLess(elapsed, ceiling)
+                self.assertIn("process tree kill is NOT confirmed", str(caught))
+                self.assertIn(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s", str(caught))
 
 
 if __name__ == "__main__":
