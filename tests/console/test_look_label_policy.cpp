@@ -178,9 +178,10 @@ TEST(LookLabelPolicy, PendingAnalysisPinHoldsForEveryRederivation)
     ASSERT_EQ(std::string("cinematic"), outcome.receiptValue(&clip, cinematic).toStdString());
     ASSERT_FALSE(outcome.fellBack(&clip));
     ASSERT_TRUE(outcome.appliedName().isEmpty());
-    // Look Assist off still wins, and another clip's label is not this clip's fallback.
+    // Look Assist off still wins, and another clip's label is not this clip's fallback (nothing landed on it: r9 A1,
+    // the baseline, never the selected flavor).
     ASSERT_EQ(std::string("Look: Off"), shown(false, &clip));
-    ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &otherClip));
+    ASSERT_EQ(std::string("Look: Baseline"), shown(true, &otherClip));
     // It lands applied: the flavor applied.
     outcome.landed(&clip, cinematic, false);
     ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &clip));
@@ -189,10 +190,44 @@ TEST(LookLabelPolicy, PendingAnalysisPinHoldsForEveryRederivation)
     ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &clip));
     outcome.landed(&clip, cinematic, true);
     ASSERT_EQ(baseline, shown(true, &clip));
-    // clear() (Look Assist off, flavor changed) ends the pending run: back to the selector.
+    // clear() (Look Assist off, flavor changed) ends the pending run; the baseline is restored, so the label says so
+    // (r9 A2: it used to name the selector's flavor before the new analysis landed).
     outcome.begin();
     outcome.clear();
-    ASSERT_EQ(std::string("Look: Cinematic"), shown(true, &clip));
+    ASSERT_EQ(std::string("Look: Baseline"), shown(true, &clip));
+}
+
+// r9 adversary A1/A2 (e3704ee7): the label names a flavor only once an analysis LANDED on this receipt.
+// A1: Look Assist on with the analysis never running (MLVAPP_NO_LOOK_ASSIST, or an apply.skip) -- nothing ever lands, the
+//     baseline stays on screen, and the label must not read "Look: Cinematic" forever.
+// A2: a landed fallback, then the flavor changes: the dropdown clears the outcome and restores the baseline, and the new
+//     analysis begin()s from that empty outcome -- every re-derivation until it lands shows the baseline, not "Film grade".
+TEST(LookLabelPolicy, R9AFlavorIsNamedOnlyOnceAnAnalysisLandedOnThisReceipt)
+{
+    int clip = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    const QString film = QStringLiteral("film");
+    const auto shown = [&](const lookassist::LookAssistFlavorOutcome &o, const QString &selected) {
+        return look_label::shownText(true, o, &clip, selected).toStdString();
+    };
+
+    lookassist::LookAssistFlavorOutcome never;                    // A1: no analysis ever ran
+    ASSERT_EQ(std::string("Look: Baseline"), shown(never, cinematic));
+    // The receipt and the telemetry keep the selector's value: only the label changed.
+    ASSERT_EQ(std::string("cinematic"), never.receiptValue(&clip, cinematic).toStdString());
+
+    lookassist::LookAssistFlavorOutcome outcome;                  // A2
+    outcome.landed(&clip, cinematic, true);
+    ASSERT_EQ(std::string("Look: Baseline (fallback)"), shown(outcome, cinematic));
+    outcome.clear();                                              // on_comboBoxLookAssistFlavor_currentIndexChanged
+    ASSERT_EQ(std::string("Look: Baseline"), shown(outcome, film));
+    outcome.begin();                                              // the replacement analysis is pending
+    ASSERT_EQ(std::string("Look: Baseline"), shown(outcome, film));
+    ASSERT_TRUE(shown(outcome, film).find("Film") == std::string::npos);
+    outcome.landed(&clip, film, false);                           // it lands applied
+    ASSERT_EQ(std::string("Look: Film grade"), shown(outcome, film));
+    // Off still wins.
+    ASSERT_EQ(std::string("Look: Off"), look_label::shownText(false, outcome, &clip, film).toStdString());
 }
 
 TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)

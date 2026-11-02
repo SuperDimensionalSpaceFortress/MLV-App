@@ -63,12 +63,22 @@ inline QString appliedText( bool lookAssistEnabled, const QString &appliedFlavor
 
 /*! \brief The ONE label derivation (MainWindow::updateLookLabel; every caller -- fullscreen toggle, setSliders, the
  *  switch, the flavor, a landed analysis -- goes through it). It reads the outcome on screen: while an analysis is
- *  pending, the one that last landed, so a re-derivation mid-analysis never names the selected flavor early. */
+ *  pending, the one that last landed, so a re-derivation mid-analysis never names the selected flavor early.
+ *  r9 (adversary A1/A2 on e3704ee7): a flavor is named only once an analysis has LANDED on this receipt. With nothing
+ *  landed on it -- analysis disabled (MLVAPP_NO_LOOK_ASSIST) or skipped, a clip whose analysis has not landed yet, or a
+ *  flavor change, which clears the outcome and restores the baseline -- the baseline sliders are what is on screen, so
+ *  the label says "Look: Baseline", never the selected flavor. `selectedFlavorName` is not read here: the selector's
+ *  value is the receipt's and the telemetry's fallback (LookAssistFlavorOutcome::receiptValue), not what the screen shows. */
 inline QString shownText( bool lookAssistEnabled, const lookassist::LookAssistFlavorOutcome &outcome,
                           const void *receipt, const QString &selectedFlavorName )
 {
+    Q_UNUSED( selectedFlavorName );
+    if( !lookAssistEnabled ) return text( false, QString() );
     const lookassist::LookAssistFlavorOutcome onScreen = outcome.shown();
-    return appliedText( lookAssistEnabled, onScreen.receiptValue( receipt, selectedFlavorName ), onScreen.fellBack( receipt ) );
+    if( onScreen.fellBack( receipt ) ) return appliedText( true, QString(), true );
+    // Empty unless an analysis landed on this receipt and applied a flavor.
+    const QString landedFlavor = onScreen.receiptValue( receipt, QString() );
+    return landedFlavor.isEmpty() ? QStringLiteral( "Look: Baseline" ) : text( true, landedFlavor );
 }
 
 /*! \brief The corner label is drawn only in fullscreen, and only while the setting shows it. */
