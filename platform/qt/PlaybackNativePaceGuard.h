@@ -95,7 +95,9 @@ inline int skippedFrames( double fromPosition, double toPosition )
  *  the next whole source frame, in (0, 1]. A position on a whole frame needs a whole frame. */
 inline double framesToNextWholeFrame( double position )
 {
-    return std::floor( position + 1e-9 ) + 1.0 - position;
+    // adversary r1 A2: no epsilon -- the slider truncates m_newPosDropMode (setValue, currentPlaybackAdvanceTarget), so
+    // 7.9999999999 shows frame 7 and is 1e-10 from frame 8
+    return std::floor( position ) + 1.0 - position;
 }
 
 /*! CUDA-HEADROOM-1: the pace handed to the guard. A pace of 0 or less is already "unknown, leave the request
@@ -156,7 +158,9 @@ public:
             if( needed > kMaxCarryFrames ) needed = kMaxCarryFrames;
         }
         if( credit + kEpsilonFrames >= needed ) return 0.0;
-        return ( needed - credit ) * 1000.0 / paceFps;
+        // adversary r1 A5: before the clock's last accrual nothing accrues, so a query from earlier waits for that instant first
+        const double notYetAccruingMs = nowMs < m_lastMs ? m_lastMs - nowMs : 0.0;
+        return notYetAccruingMs + ( needed - credit ) * 1000.0 / paceFps;
     }
 
     /*! Drop-frame mode: the share of \a requestedFrames (a fractional source-frame

@@ -1092,7 +1092,7 @@ CadenceRun simulateCudaPresentCadence( double fps, double drawMs, double tickLag
         position += granted;
         run.sourceAdvanced += granted;
         lastTime = t;
-        const long frame = static_cast<long>( std::floor( position + 1e-9 ) );
+        const long frame = static_cast<long>( position ); // the slider's frame: setValue truncates (adversary r1 A2)
         if( frame == lastDrawn ) return false; // the duplicate-present guard
         lastDrawn = frame;
         return true;
@@ -1215,18 +1215,70 @@ TEST(PlaybackDueWake, MsUntilCreditRespectsTheFirstPresentCarryCap)
     ASSERT_TRUE(guard.msUntilCredit(3.0, 10000.0, kHfrFps) == 0.0);
 }
 
+TEST(PlaybackDueWake, AQueryBeforeTheClocksLastAccrualWaitsForThatInstantFirst)
+{
+    // adversary r1 A5: grant(1,100,60); notePresent(100,60); msUntilCredit(1,90,60). The guard accrues nothing until 100 ms,
+    // so a whole frame is due at 100 + 16.667 ms, i.e. 26.667 ms after 90 -- not 16.667.
+    NativePaceGuard guard;
+    guard.grant(1.0, 100.0, 60.0);
+    guard.notePresent(100.0, 60.0);
+    ASSERT_TRUE(std::fabs(guard.msUntilCredit(1.0, 90.0, 60.0) - (10.0 + 1000.0 / 60.0)) < 1e-9);
+    ASSERT_FALSE(guard.grantWholeFrame(90.0 + 1000.0 / 60.0, 60.0));
+}
+
+TEST(PlaybackDueWakeWiring, ATailTickThatDidNotReachANewFrameStillArmsTheWake)
+{
+    // adversary r1 A1 input: CPU route, drop frame, credit 0.9 at 1000 ms, position 10.2, slider 10, a non-predictive tail tick at
+    // 1001 ms with timeDiff 1 advances only to 10.26 and dispatches no frame. The next frame then needs 0.74 <= 0.9 credit: due 0.
+    NativePaceGuard guard;
+    guard.grant(0.0, 0.0, 60.0);
+    guard.grant(60.1, 1000.0, 60.0);                          // 61 frames accrued by 1000 ms: leaves the credit at 0.9
+    ASSERT_TRUE(std::fabs(guard.creditFrames() - 0.9) < 1e-9);
+    const double granted = guard.grant(60.0 * 1.0 / 1000.0, 1001.0, 60.0);   // the tail tick: 0.06 frame
+    const double position = 10.2 + granted;
+    ASSERT_EQ(10, static_cast<int>(position));                 // no new frame dispatched
+    ASSERT_TRUE(guard.msUntilCredit(framesToNextWholeFrame(position), 1001.0, 60.0) == 0.0);
+    // so the arm must not skip on "the tail tick ran": only a tail advance that reached a new frame has nothing left to wake for
+    const QString source = mainWindowSource();
+    ASSERT_EQ(0, source.count(QStringLiteral("m_playbackTailAdvanceRan")));
+    ASSERT_EQ(1, source.count(QStringLiteral("if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;")));
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "m_playbackTailAdvanceMovedFrame = ui->horizontalSliderPosition->value() != tailAdvancePositionBefore;")));
+    const int tail = source.indexOf(QStringLiteral(
+        "m_playbackTailAdvanceMovedFrame = ui->horizontalSliderPosition->value() != tailAdvancePositionBefore;"));
+    const int call = source.lastIndexOf(QStringLiteral("            timerFrameEvent();\n"), tail);
+    ASSERT_TRUE(call > 0 && tail - call < 200);                // set right after the tail's own timerFrameEvent()
+}
+
+TEST(PlaybackDueWakeWiring, TheSummaryReportsTheResolutionThePlayRanAt)
+{
+    // adversary r1 A4: endPlay() drops the raised resolution before finishPlaybackSmokeTelemetry() prints the line, so the line
+    // reports what the wake ran on when it was armed, not what is left after Play stopped
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral("m_playbackDueWakeHiRes = m_playbackDueWake->hiResActive();")));
+    ASSERT_EQ(1, source.count(QStringLiteral(".arg( m_playbackDueWakeHiRes ? 1 : 0 )")));
+}
+
 TEST(PlaybackDueWake, FramesToNextWholeFrameCoversIntegerFractionalAndNearInteger)
 {
     ASSERT_TRUE(framesToNextWholeFrame(0.0) == 1.0);
     ASSERT_TRUE(framesToNextWholeFrame(7.0) == 1.0);
     ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.25) - 0.75) < 1e-12);
     ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.999) - 0.001) < 1e-9);
-    // a position a hair under a whole frame (floating-point drift) is on that frame: a whole frame is needed
-    ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.9999999999) - 1.0) < 1e-6);
+    // adversary r1 A2: the boundary is the slider's, which TRUNCATES m_newPosDropMode (setValue / currentPlaybackAdvanceTarget's
+    // static_cast<int>): 7.9999999999 shows frame 7 and is 1e-10 from frame 8, not a whole frame away
+    ASSERT_TRUE(std::fabs(framesToNextWholeFrame(7.9999999999) - 1e-10) < 1e-9);
     for( double p = 0.0; p < 5.0; p += 0.037 )
     {
         const double need = framesToNextWholeFrame(p);
         ASSERT_TRUE(need > 0.0 && need <= 1.0 + 1e-9);
+    }
+    for( const double p : { 0.0, 0.5, 6.9999999999, 7.0, 7.0000000001, 7.9999999999, 41.25 } )
+    {
+        // advancing by exactly the helper's frames lands on the slider's next frame, never short of it and never past it
+        const double need = framesToNextWholeFrame(p);
+        ASSERT_EQ(static_cast<int>(p) + 1, static_cast<int>(p + need + 1e-12));
+        ASSERT_EQ(static_cast<int>(p), static_cast<int>(p + need * 0.5));
     }
 }
 

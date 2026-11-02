@@ -19537,8 +19537,9 @@ void MainWindow::armPlaybackDueWake( void )
         : 1.0;
     const double nowMs = mlv_stage_timing_now() * 1000.0;
     const double dueMs = m_playbackPaceGuard.msUntilCredit( framesNeeded, nowMs, paceFps );
-    // already covered and the tail advance already ran for this present: nothing is waiting on a tick
-    if( !( dueMs > 0.0 ) && m_playbackTailAdvanceRan ) return;
+    // already covered and this present's tail advance already reached a new frame (its render is in flight): nothing is
+    // waiting on a tick. A tail tick that ran but stayed on its frame still needs the wake (adversary r1 A1).
+    if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;
     if( !m_playbackDueWake )
     {
         m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); } ) );
@@ -19547,6 +19548,8 @@ void MainWindow::armPlaybackDueWake( void )
     m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
     m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
     ++m_playbackDueWakeArmed;
+    // adversary r1 A4: what the wake runs on during this Play (endPlay() drops a raised resolution before the summary line)
+    m_playbackDueWakeHiRes = m_playbackDueWake->hiResActive();
 }
 
 void MainWindow::onPlaybackDueWake( void )
@@ -19602,6 +19605,7 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeAdvanced = 0;
     m_playbackDueWakeRearmed = 0;
     m_playbackDueWakeBusyDeferred = 0;
+    m_playbackDueWakeHiRes = false;
     m_playbackDueWakeLatenessMs.clear();
 }
 
@@ -19627,7 +19631,7 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( m_playbackDueWakeBusyDeferred )
         .arg( p50, 0, 'f', 3 )
         .arg( p95, 0, 'f', 3 )
-        .arg( ( m_playbackDueWake && m_playbackDueWake->hiResActive() ) ? 1 : 0 )
+        .arg( m_playbackDueWakeHiRes ? 1 : 0 )
         .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 );
 }
 
@@ -32904,7 +32908,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     if( m_pRenderThread && !releasePresentedFrameEarly )
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
-    m_playbackTailAdvanceRan = false;   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: read by armPlaybackDueWake()
+    m_playbackTailAdvanceMovedFrame = false;   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: read by armPlaybackDueWake()
     if( ui->actionPlay->isChecked() )
     {
         const bool suppressTailAdvanceAfterGpuTexNrEarlyAdvance =
@@ -32936,8 +32940,9 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                     readyFrame.frameReadyEmitStageTime;
                 m_playbackTimelineSourceDrawBeginStageTime = displayStart;
             }
-            m_playbackTailAdvanceRan = true;
+            const int tailAdvancePositionBefore = ui->horizontalSliderPosition->value();
             timerFrameEvent();
+            m_playbackTailAdvanceMovedFrame = ui->horizontalSliderPosition->value() != tailAdvancePositionBefore;
             const double advance_return = mlv_stage_timing_now();
             m_lastDrawFrameReadyAdvanceMs =
                 (advance_return - advance_start) * 1000.0;

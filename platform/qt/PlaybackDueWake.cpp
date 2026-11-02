@@ -22,8 +22,10 @@
 namespace
 {
 // A delivery more than this before the armed due time belongs to an earlier arm (its signal was already in flight
-// when the wake was re-armed): it is dropped, and the re-armed timer delivers again.
-constexpr qint64 kStaleDeliveryNs = 500000;
+// when the wake was re-armed): it is dropped, and the re-armed timer delivers again. Waitable timers and the
+// rounded-up Qt timer never fire early, so the tolerance only absorbs clock-read skew (adversary r1 A3: at 500 us a
+// stale delivery right after arm(0.25) was taken as the new wake).
+constexpr qint64 kStaleDeliveryNs = 50000;
 }
 
 struct PlaybackDueWake::Impl

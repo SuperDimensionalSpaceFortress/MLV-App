@@ -1190,7 +1190,8 @@ private:
     // next whole frame (msUntilCredit), so the advance never waits for the 10-16 ms Windows poll tick. The poll timer
     // stays as the fallback. MLVAPP_PLAYBACK_DUE_WAKE=0 is the kill switch. Counters: playback_due_wake line.
     std::unique_ptr<PlaybackDueWake> m_playbackDueWake;
-    bool m_playbackTailAdvanceRan = false;      // finishPresentedFrame's tail timerFrameEvent ran for this present
+    bool m_playbackTailAdvanceMovedFrame = false;   // finishPresentedFrame's tail timerFrameEvent reached a new frame
+    bool m_playbackDueWakeHiRes = false;            // the wake ran on a high-resolution timer this Play (summary line)
     double m_playbackDueWakeDueAtMs = 0.0;      // stage-time ms the armed wake is due
     int m_playbackDueWakeRearmsThisPresent = 0;
     int m_playbackDueWakeArmed = 0;
