@@ -103,6 +103,23 @@
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
 #         and buildManifestSha256; the LEG ... RUN line names them; <RunDir>\leg-plan.json (written once the claim is held) keeps the validated plan in run order and each build's staged state.
+#  10. THERMAL (BACHELOR-THERMAL-GATE-WAIT-1, VenueThermalGate.psm1). In PR493-CONTROL-ARM-QUIET-AB-1 r1, 3 of 36 legs ran and were discarded THERMAL_HOT, each
+#      directly after a CPU-saturating leg. a. WAIT FOR COOL: a QUIET in-lease probe whose own "tele heat" reading (the agent's heavy-slot feed and hot rule)
+#      is hot is re-probed every -ThermalPollSec for up to -ThermalWaitCapSec (180) from its first hot reading in the batch; still hot then, the leg is
+#      THERMAL_HOT_SKIPPED and re-queued at the end of the run (at most -ThermalRequeueMax times; past that it stays THERMAL_HOT_SKIPPED, uncounted, exit 7).
+#      THE CAP IS A SOFT BUDGET, cap + one probe (Dot P2 on a523d461; r3): ONE function (VenueThermalGate.psm1 Get-VenueThermalProbeBudget) decides whether another
+#      probe may start, from the deadline (cap from the first hot reading) and the slowest RE-probe seen in this wait, and every probe start of the wait goes through it
+#      (the hot poll sleep and the busy-probe retry sleep alike: -ClaimPollSec no longer outruns the cap). The probe that made the first hot reading is not counted, so the
+#      first hot reading always gets a cooling sleep and one re-probe (Dot B2). A re-probe's wait for quiet is cut to what is left of the cap, but a probe's own remote
+#      sample window and job queue limits (Wait-VenueQuiet.ps1) cannot be bounded from here, so a probe slower than the slowest before it can end past the cap.
+#      thermalWaitOvershootSec records exactly that (0 inside the cap). r4 (adversary r3 pass 2 A1, Dot c5946322): the sleep is only a plan, and a log append that stalls or a
+#      wakeup that comes late moves the real start past it. The sleep is therefore re-evaluated AFTER the log write, and the deadline is checked on the monotonic clock
+#      IMMEDIATELY before every re-probe dispatch (the same function, mayDispatchNow): an expired wait ends as THERMAL_HOT_SKIPPED (expiredBeforeProbe=1) with no further
+#      probe. The soft budget is cap + at most one probe already started before the deadline (+ 1 s of timer granularity); runner delay never buys another probe.
+#      Unknown heat is not gated. Each RAN row records thermalWaitSec, thermalWaitOvershootSec, heatAtProbe (the first reading), heatAtLaunch and the agent's
+#      heatAtGrant; a skipped row records thermalWaitSec and thermalWaitOvershootSec; the batch receipt counts thermalWaits and thermalSkips. b. SPREAD: -PlanOrder ThermalSpread -HeatFrom <earlier run dirs> measures heavy leg keys from those
+#      receipts (a key whose next leg on the same lease read hot) and orders the plan so no two heavy legs are adjacent (leg-plan.json thermalSpread).
+#      The inter-lease cooldown (CAPS b) is untouched.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegSpec a.json,b.json -Backend cpu -RunDir <rd> `
@@ -112,7 +129,7 @@
 # Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold,
 # or a refused -LegPlan: LEG_PLAN_REFUSED);
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
-# non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
+# non-zero (LEG_FAILED), was killed at the lease's end (LEASE_EXPIRED) or stayed THERMAL_HOT_SKIPPED past its re-queues (item 10; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE, or its job file could not be written here:
 # OPEN_JOB_WRITE_FAILED, or refused at its dispatch because the agent could admit it after the claim's last good expiry while the keeper is not renewing the claim:
 # OPEN_OUTLIVES_CLAIM (CLAIM_LOST when the keeper found it lost), no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
@@ -143,9 +160,21 @@ param(
     [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
     # LEASE-BATCH-MULTI-BUILD-1 (item 9): an ordered leg plan, each leg with its own build, backend and arm, run in ONE batched lease series
     [Parameter(ParameterSetName = 'Plan', Mandatory = $true)][string]$LegPlan,
-    [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave')][string]$PlanOrder = 'AsGiven',
+    [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave', 'ThermalSpread')][string]$PlanOrder = 'AsGiven',
+    # BACHELOR-THERMAL-GATE-WAIT-1 (item 10): the earlier lease-batch run dirs whose receipts measure which legs are heavy (-PlanOrder ThermalSpread)
+    [Parameter(ParameterSetName = 'Plan')][string[]]$HeatFrom = @(),
+    # item 10: a QUIET probe that reads hot is re-probed for up to this long before the leg is THERMAL_HOT_SKIPPED and re-queued (0 = no thermal gate).
+    # A SOFT budget, cap + one probe: a probe's own sample window cannot be bounded from here (receipts name the overshoot as thermalWaitOvershootSec)
+    [ValidateRange(0, 1800)][int]$ThermalWaitCapSec = 180,
+    [ValidateRange(1, 600)][int]$ThermalPollSec = 30,
+    [ValidateRange(0, 5)][int]$ThermalRequeueMax = 1,
     [string]$Purpose = '',
     [string]$SheetCopyDir = '',
+    # LEASE-BATCH-RECEIPT-ROOT-1: where every leg's receipt (and the evidence directory beside it) goes. Empty (the default) forwards NOTHING and the leg writes to its own
+    # default root, exactly as before. Non-empty: forwarded to EVERY Invoke-VenueLeg.ps1 call (first run and in-lease retry alike), and refused before the run dir, the claim,
+    # the lease or any leg when it is not under a .claude-state directory (the leg's own rule, Test-DvUnderClaudeState, applied to the root and to the evidence directory
+    # beside it). A calibration round points it at a scratch root so its receipts stop landing in the shared CUDA-HEADROOM-1 receipt root.
+    [string]$ReceiptRoot = '',
     # passed through to Wait-VenueQuiet.ps1 (never relaxed here)
     [double]$ThresholdPercent = 20.0,
     [ValidateRange(1, 3600)][int]$RecheckSec = 90,
@@ -190,12 +219,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
+Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
+Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
+# r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
+# entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
+$ThermalDispatchGraceSec = 1
 
 $script:summaryBeforeExit = $null   # r3: set once a refusal ends a run that already has a batch receipt; the typed refusal prints the summary just before its exit 2
 function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("BATCH_USAGE $Message"); if ($script:summaryBeforeExit) { & $script:summaryBeforeExit }; exit 2 }
 
 # `pwsh -File` passes an array argument as ONE string, so -LegSpec a.json,b.json is split on commas (an entry that is itself an existing path is kept whole;
 # PWSH-FILE-ARRAY-PASSTHRU-1, test_pwsh_string_array_file_params.py).
+# adversary r2b A5: a $null list (-HeatFrom $null) or null entry binds, and Test-Path -LiteralPath $null throws: nulls are dropped first, on their own line so the pinned line below is unchanged
+$LegSpec = @($LegSpec | Where-Object { $_ })
 $LegSpec = @($LegSpec | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if (-not $QuietScript) { $QuietScript = Join-Path $here 'Wait-VenueQuiet.ps1' }
 if (-not $LegScript) { $LegScript = Join-Path $here 'Invoke-VenueLeg.ps1' }
@@ -224,10 +260,28 @@ if (2 * $ClaimRenewSec -gt $ClaimTtlSec) { Stop-Usage "-ClaimRenewSec $ClaimRene
 if (2 * $LivenessRenewSec -gt $LivenessWindowSec) { Stop-Usage "-LivenessRenewSec $LivenessRenewSec is over half of -LivenessWindowSec ${LivenessWindowSec}: one late write would lapse a live runner" }
 $legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
 # -PlanOrder binds case-insensitively; every later test of it is case-sensitive, so name the canonical spelling once (sol r3 A1)
-$PlanOrder = @('AsGiven', 'Interleave') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
+$PlanOrder = @('AsGiven', 'Interleave', 'ThermalSpread') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
+$HeatFrom = @($HeatFrom | Where-Object { $_ })
+# r3 pass 2 A5: a path Test-Path cannot probe (a NUL in it) is not an existing path, never a throw
+$HeatFrom = @($HeatFrom | ForEach-Object { $p = $_; $isPath = $(try { [bool](Test-Path -LiteralPath $p) } catch { $false }); if ($isPath) { $p } else { $p -split ',' | ForEach-Object { $_.Trim() } } } | Where-Object { $_ })
+if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-HeatFrom is read only by -PlanOrder ThermalSpread' }
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
 if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" }
+# LEASE-BATCH-RECEIPT-ROOT-1: -ReceiptRoot is checked with the leg's own rule (Invoke-VenueLeg.ps1 DVE_RECEIPT_ROOT_MUST_STAY_LOCAL: the root, and the evidence directory beside it)
+# BEFORE the run dir, the claim, the lease or any leg exists, so a bad root takes nothing. A blank root is "not given", as the leg reads it. Given, it is forwarded as a full path
+# (the leg is a child of this process, but a relative root must not depend on the child's directory).
+if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $ReceiptRoot = '' }
+else {
+    # r5 ADV-A1: the RAW value goes to the one helper. It judges the raw spelling first (either slash, device forms) and resolves a relative value ONCE, against the POWERSHELL location
+    # (adversary f1c42e80 A1) on the FileSystem provider only; a normalisation of our own here would rewrite `//?/C:/x` or `\/host\share` into a spelling the helper accepts.
+    # r4 A2-A4: the helper RETURNS the normalised full path it certified (a device path is refused, a link onto a share is followed) and THAT is what every leg is handed
+    $rrCert = Test-DvLocalReceiptRoot -Path $ReceiptRoot
+    if (-not $rrCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run' }
+    $ReceiptRoot = $rrCert
+    $evCert = Test-DvLocalReceiptRoot -Path (Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence')
+    if (-not $evCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: the run evidence names an owner clip''s run' }
+}
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
 $jobDir = Join-Path $RunDir 'batch-jobs'
@@ -299,6 +353,10 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
 # r9 (Sol r8 / Dot B7 / card LEASE-BATCH-RUNDIR-OUTPUT-COLLISION-GUARD-1): every file this runner writes under -RunDir, in ONE place. An input (a plan, a leg spec) that resolves to one
 # of them would be overwritten or appended to after the lease opened, so preflight refuses it before any claim. A new output is added HERE and nowhere else: the files named
 # directly in RunDir (leaf patterns, matched whole and case-insensitively) and the subdirectories the runner owns (anything under them).
+# r9 B2: the runner-owned leaf names are matched with THIS option, not -imatch: -imatch follows the process culture (tr-TR: `QUIET-A.OUT.TXT` would not match `^quiet-`), and the file system treats those spellings as one file.
+# r10 C1: the option (IgnoreCase -bor CultureInvariant) is spelled out at each call below, never kept in a $script: variable: the claim guard runs these functions in a SEPARATE runspace
+# ($script:GuardWorkerFunctions) that receives only the function bodies and the named values of Invoke-InputGuard's $vars, so a script-scope option read there was $null, and
+# [regex]::IsMatch(string, string, $null) has no overload (every input came back OUTPUT_ZONE_UNRESOLVED / LEG_PLAN_INVALID).
 $script:RunDirOutputLeafPatterns = @(
     '^quiet-.+\.out\.txt\z'     # Invoke-QuietProbe: each probe's output
     '^leg-.+\.out\.txt\z'       # the leg's output (leg-<name>-b<nn>-a<n>.out.txt)
@@ -459,7 +517,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             $linked = @()
             foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
                 $owned = ($c.Name -iin $z.dirs)
-                foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $owned = $true } }
+                foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { $owned = $true } }
                 if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
             }
             # r12 pass 2 (adversary r12 A1'): and a link BELOW an owned directory (quiet\x.job.ps1 -> a spec, or a junction in it) writes through just the same, whatever the target's link count:
@@ -492,7 +550,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             foreach ($z in $zones) {
                 $scan = [System.Collections.Generic.List[object]]::new()
                 foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -File -ErrorAction Stop)) {
-                    foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $scan.Add($c); break } }
+                    foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { $scan.Add($c); break } }
                 }
                 foreach ($d in $z.dirs) {
                     $dp = Join-Path $z.root $d
@@ -523,7 +581,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
         }
         if ($parent -ieq $z.root -or ($aboveIds.Count -gt 0 -and $aboveIds[0] -ceq $z.rootId)) {
             $leaf = [IO.Path]::GetFileName($full)
-            foreach ($p in $z.leaf) { if ($leaf -imatch $p) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
+            foreach ($p in $z.leaf) { if ([regex]::IsMatch($leaf, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
         }
         foreach ($d in $z.dirs) {
             if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase) -or ($z.ownedIds.ContainsKey($d) -and $aboveIds -ccontains $z.ownedIds[$d])) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
@@ -1107,6 +1165,15 @@ if ($legPlanMode) {
             if ($st.artifactProblem) { $ap = $st.artifactProblem -split ' ', 2; Stop-PlanRefused $ap[0] $it.item "the staged build for ${short}: $($ap[1])" }
         }
         $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+        $spread = $null
+        if ($PlanOrder -ceq 'ThermalSpread') {
+            # item 10: heavy is measured from the -HeatFrom receipts (a leg key whose next leg on the same lease read hot), never a hand-kept list
+            $hh = Read-VenueLegHeatHistory -RunDir $HeatFrom
+            $hk = Get-VenueHeavyLegKeys -Rows @($hh.rows)
+            $sp = Get-VenueThermalSpreadOrder -Items @($items) -Heavy ([bool[]]@($items | ForEach-Object { $hk.Contains("$($_.legId)|$($_.backend)") }))
+            $ordered = @($sp.items)
+            $spread = [ordered]@{ heatFrom = @($HeatFrom); heatRows = @($hh.rows).Count; skipped = @($hh.skipped); heavyKeys = @($hk.Keys); heavyAdjacentBefore = $sp.heavyAdjacentBefore; heavyAdjacent = $sp.heavyAdjacent }
+        }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
                     arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
@@ -1114,6 +1181,7 @@ if ($legPlanMode) {
         $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
             legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
             builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
+        if ($null -ne $spread) { $planRecord.thermalSpread = $spread }
     } catch {
         # sol r3 second pass A2: whatever else a plan item makes the validation throw on is still the typed refusal of the whole plan (exit 2, BATCH_USAGE), never an exit 1.
         Stop-PlanRefused 'LEG_PLAN_INVALID' 0 "the plan could not be validated: $($_.Exception.Message -replace '\s+', ' ')"
@@ -1193,22 +1261,41 @@ function Get-ProbeLaunchVerdict([int]$MaxWaitSec) {
     [pscustomobject]@{ verdict = $null; maxWait = [int][Math]::Max(0, [Math]::Min($MaxWaitSec, $roomAtLaunch - $legBudget)) }
 }
 
-function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
+function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $ThermalState = $null) {
     # One Wait-VenueQuiet run (its probe job is light: the agent runs it under the parked batch lease). verdict: QUIET | COOLDOWN_UNMET | GATE_BUSY |
     # GATE_UNREADABLE | HOST_MISMATCH | USAGE | VENUE_QUIET_UNKNOWN (not measured). The same exit-code reading as Invoke-VenueChain's probe.
     $out = Join-Path $RunDir "quiet-$Name-$Phase.out.txt"
-    if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; foreignFloor = $false } }
+    if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $Venue, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', '120')
     # r7: the probe writes its output here, and Wait-VenueQuiet its gate log and work folder: each is asked first (a refusal runs no probe: the batch ends in its typed stop)
     # r8 pass 3 (adversary r8 pass 2 A3): these guards can block on a share, so the claim is asked again after them, at the probe's launch itself (no probe without the claim)
     # r9 (adversary r9 A2): and the lease's room (Get-ProbeLaunchVerdict), which also cuts the probe's wait to the room left then
+    # BACHELOR-THERMAL-GATE-WAIT-1 r6 (merge with #704): a thermal re-probe is a probe launch too, so it passes the same guards and the same launch-time claim and lease check
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
-    if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false } }
-    $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $qArgs[$qArgs.IndexOf('-MaxWaitSec') + 1] = [string]$lv.maxWait
-    & $pwshExe @qArgs *> $out
-    $code = $LASTEXITCODE
-    $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
+    if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
+    $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $wait = [int]$lv.maxWait
+    # adversary r4 pass 2 A2: during a thermal wait the deadline is checked HERE, the last statement before the process starts (the Test-Path and the write guards above can stall on a
+    # share): an expired wait dispatches nothing and the caller skips on the reading it already has
+    # r6 (adversary r5 A1): the quiet-wait allowance is made HERE too, from the same clock reading, after every check that can stall: min(-ProbeMaxWaitSec, the lease room left
+    # (Get-ProbeLaunchVerdict), the cap left). Fixed at the loop top, a stall in between dispatched a wait that outlived the cap.
+    if ($null -ne $ThermalState) {
+        $el = Get-ThermalElapsedSec $ThermalState -Ceiling
+        $wait = [int][Math]::Max(0, [Math]::Min($wait, $ThermalWaitCapSec - $el))
+    }
+    $qArgs[$qArgs.IndexOf('-MaxWaitSec') + 1] = [string]$wait
+    if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec $el -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
+        return [pscustomobject]@{ expiredBeforeDispatch = $true }
+    }
+    # r5 pass 1 A2: the probe's output is CAPTURED, not redirected to the file: a `*>` file redirect opens (creates) the file after the admission above, and that open can stall on a share (a
+    # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
+    $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
+    # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,
+    # and that time is part of the thermal wait, never left out of it)
+    $code = $LASTEXITCODE; $endTs = [Diagnostics.Stopwatch]::GetTimestamp(); $endUtc = [DateTime]::UtcNow
+    # r6 (merge with #704 r7): the write guard is asked again right before the probe's evidence write, as before every -RunDir write
+    if (Test-RunDirWrite $out) { try { Set-Content -LiteralPath $out -Value $captured -Encoding utf8 } catch { L "QUIET_OUT_UNWRITABLE path=$out reason=$($_.Exception.Message -replace '\s+', ' ')" } }
+    $lines = $captured
     $v = $lines | Where-Object { $_ -match '^(QUIET|COOLDOWN_UNMET) mean=' } | Select-Object -Last 1
     $u = $lines | Where-Object { $_ -like 'VENUE_QUIET_UNKNOWN *' } | Select-Object -Last 1
     $ff = $lines | Where-Object { $_ -match '^FOREIGN_FLOOR ' } | Select-Object -Last 1
@@ -1223,7 +1310,10 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
         default { $reason = "undocumented-exit-$code"; 'VENUE_QUIET_UNKNOWN' }
     }
     if ($v -and $v -match '\bmean=([0-9.]+)%') { $mean = [double]$Matches[1] }
-    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff }
+    # item 10: the probe's own reading of the agent's heavy-slot feed (its "tele heat" line): the reading the thermal gate polls
+    $ht = ConvertFrom-VenueProbeHeatLine -Lines $lines
+    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff; heat = $ht.heat; heatText = $ht.text
+        endTs = $endTs; endUtc = $endUtc; maxWaitSec = $wait }
 }
 
 function Get-OpenDispatchRefusal([string]$NotAfterUtc) {
@@ -1312,7 +1402,14 @@ foreach ($p in $plan) { $pending.Add($p) }
 # r5 (V-01, Invoke-VenueChain's r4 rule): leg name -> the first FOREIGN_FLOOR line any probe of that leg printed, in any attempt or batch. Sticky: a leg
 # once seen contended is COOLDOWN_UNMET (uncounted) whatever a later QUIET probe reads; it never carries into the next leg.
 $legForeign = @{}
-$results = [System.Collections.Generic.List[object]]::new()
+# item 10: leg name -> its thermal gate state (first heat read, first hot reading in this batch, the wait, skips so far)
+$legThermal = @{}
+# r4: whole seconds since the leg's first hot reading in this batch, on the monotonic clock, read NOW (so a site that logs or sleeps reads it again afterwards)
+function Get-ThermalElapsedSec($Th, [switch]$Ceiling) {
+    if ($null -eq $Th.firstHotUtc) { return 0 }
+    Get-VenueThermalElapsedSec -FirstHotTimestamp $Th.firstHotTs -NowTimestamp ([Diagnostics.Stopwatch]::GetTimestamp()) -Ceiling:$Ceiling
+}
+$results =[System.Collections.Generic.List[object]]::new()
 $batches = [System.Collections.Generic.List[object]]::new()
 $exitCode = 0
 $stopReason = $null
@@ -1461,6 +1558,7 @@ function Write-RunSummary {
         ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
         failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
         leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
+        thermalSkipped = @($results | Where-Object { $_.status -ceq 'THERMAL_HOT_SKIPPED' }).Count
         batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
     }
     if ($script:outputRedirect) { $summary.outputRedirect = $script:outputRedirect }
@@ -1477,7 +1575,7 @@ function Write-RunSummary {
     Write-Output $resultLine
 }
 
-L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
+L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($ReceiptRoot) { " receiptRoot=$ReceiptRoot" })$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ([DateTime]::UtcNow -ge $deadline) { Set-Stop 'DEADLINE' 3; break }
@@ -1492,6 +1590,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         endReason = $null; endDetail = $null; legs = [System.Collections.Generic.List[object]]::new(); closeJobId = $null; closeOutcome = $null; agent = $null; endedUtc = $null
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
         openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; openLivenessReadback = $null; claimRenew = $null
+        thermalWaits = 0; thermalSkips = 0
     }
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
@@ -1684,7 +1783,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         } elseif (($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME') -or $null -eq $op.result -or [int]$op.result.exitCode -ne 0 -or $null -eq $adm -or [string]$adm.label -cne 'clear') {
             $b.endReason = 'OPEN_FAILED'; $b.endDetail = "outcome=$($op.outcome) exit=$(if ($op.result) { $op.result.exitCode }) label=$(if ($adm) { $adm.label }) $($op.message)".Trim()
             Set-Stop 'OPEN_FAILED' 9
-        } elseif ($null -eq $adm.leaseBatch -or [string]$adm.leaseBatch.token -cne $token -or -not $adm.leaseBatch.leaseId) {
+        } elseif ($null -eq $adm.leaseBatch -or -not [string]::Equals([string]$adm.leaseBatch.token, $token, [StringComparison]::Ordinal) -or -not $adm.leaseBatch.leaseId) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
         } elseif ($openHit) {
@@ -1727,18 +1826,62 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $attempt++
                 $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
-                $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
+                # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap. Its fixed sample window and the remote
+                # job's own queue limits still run and are not bounded here: the cap is a soft budget (cap + one probe), see the Get-VenueThermalProbeBudget comment
+                # r6 (adversary r5 A1): that cut is made at the dispatch (Invoke-QuietProbe), after every check that can stall, never here at the loop top
+                $thw = $legThermal[$leg.name]
+                $thermalActive = ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo)
+                # r4 (adversary r3 pass 2 A1, Dot c5946322): the deadline is checked against the monotonic clock IMMEDIATELY before the dispatch. $thw.reprobePending is set by the sites
+                # that log, then sleep, then come back here to re-probe (the poll sleep and the busy retry), so the elapsed time they spent counts: a stalled log append or a late
+                # wakeup that carried the wait past the deadline ends it as the same typed skip the cap makes, with no further probe (the previous probe's reading, $q, is the one skipped on).
+                $expiredBeforeProbe = $false
+                if ($thermalActive -and $thw.reprobePending) {
+                    $thw.reprobePending = $false
+                    $expiredBeforeProbe = -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $thw -Ceiling) -SlowestReprobeSec $thw.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow
+                }
+                $probeEndUtc = $null; $probeEndTs = 0L
+                if ($expiredBeforeProbe) { $probeSec = 0 } else {
+                $tProbeTs = [Diagnostics.Stopwatch]::GetTimestamp()
+                $qNew = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait $(if ($thermalActive) { $thw } else { $null })
+                if ($qNew.expiredBeforeDispatch) { $expiredBeforeProbe = $true; $probeSec = 0 } else {
+                $q = $qNew
+                $probeSec = [int][Math]::Ceiling([Math]::Max(0.0, ([Diagnostics.Stopwatch]::GetTimestamp() - $tProbeTs) / [double][Diagnostics.Stopwatch]::Frequency))   # adversary r2b A2: monotonic
                 if ($q.verdict -ceq 'WRITE_REFUSED' -or $script:RunOutputAliased) { Stop-BatchOnSuppression $b; break }   # r7: the probe's outputs were refused
                 if ($q.verdict -ceq 'CLAIM_LOST') { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=probe-launch $($q.reason)"; break }
                 # r9 (adversary r9 A2): the lease ended while the probe's guards ran: no probe, the leg goes to the next batch, and that is no budget the lease cannot hold ($launchShort)
                 if ($q.verdict -ceq 'LEASE_SHORT') { $launchShort = $true; $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason): it goes to the next batch"; break }
+                # adversary r4 A2: the instant the probe returned is the instant of its reading: the first hot reading starts the cap there, not after the QUIET log line below.
+                # r6 (adversary r5 A2): and not after the probe's evidence write either: the instant is the one Invoke-QuietProbe took when it observed the child's result
+                $probeEndTs = $q.endTs; $probeEndUtc = $q.endUtc
+                if ($null -ne $q.maxWaitSec) { $probeWait = $q.maxWaitSec }   # the wait the probe was given (cut at its dispatch), for the QUIET line
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
+                }
+                }
                 if ($q.verdict -ceq 'USAGE') { $b.endReason = 'PROBE_USAGE'; Set-Stop 'USAGE' 2; break }
                 if ($q.verdict -ceq 'GATE_UNREADABLE') { $b.endReason = 'PROBE_GATE_UNREADABLE'; Set-Stop 'GATE_UNREADABLE' 4; break }
                 if ($q.verdict -ceq 'HOST_MISMATCH') { $b.endReason = 'PROBE_HOST_MISMATCH'; Set-Stop 'HOST_MISMATCH' 5; break }
                 if ($q.verdict -ceq 'VENUE_QUIET_UNKNOWN') { $b.endReason = 'PROBE_VENUE_QUIET_UNKNOWN'; $b.endDetail = $q.reason; Set-Stop 'VENUE_QUIET_UNKNOWN' 6; break }
-                if ($q.verdict -cne 'QUIET') {
+                # adversary r2b A3: the leg's thermal state is made here, so the first KNOWN heat reading counts even from a busy (COOLDOWN_UNMET) probe: heatAtProbe is
+                # the leg's reading right after its predecessor, which the spread measures heavy keys from
+                $th = $legThermal[$leg.name]
+                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; firstHotTs = 0L; batch = $batchNo; waitSec = 0; slowProbeSec = 0; reprobePending = $false; doneWaitSec = 0; doneOvershootSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
+                # adversary r1 A6: the first reading belongs to the leg's CURRENT predecessor, so it is taken again after a re-queue or in a new batch
+                if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.firstHeat = $null; $th.slowProbeSec = 0; $th.doneWaitSec = 0; $th.doneOvershootSec = 0; $th.batch = $batchNo }
+                # r9 (sol r8 B1): the first KNOWN reading is kept: an unknown first reading (its leg then returned VENUE_NOT_QUIESCENT, never played) is replaced by the retry's known
+                # one, which still follows the same predecessor. The RETRY row already written keeps the unknown it was written with.
+                if (($null -eq $th.firstHeat -and ($q.verdict -ceq 'QUIET' -or $q.heat -cne 'unknown')) -or ($th.firstHeat -ceq 'unknown' -and [string]$q.heat -cin @('hot', 'clear'))) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
+                # adversary r3 A1 / Dot B2: ONE function (Get-VenueThermalProbeBudget) decides whether another probe may start. A probe that ran DURING the wait is a re-probe and feeds
+                # the slowest-so-far; the probe that made the first hot reading is not counted, so the first hot reading always gets a cooling sleep and one re-probe
+                if ($thermalActive) { $th.slowProbeSec = [int][Math]::Max($th.slowProbeSec, $probeSec) }
+                $thElapsed = $(if ($thermalActive) { Get-ThermalElapsedSec $th } else { 0 })
+                $thBudget = $(if ($thermalActive) { Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec $thElapsed -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $ThermalPollSec } else { $null })
+                # adversary r2b A1: while a thermal wait is active, a busy (non-QUIET) probe is the cap's business when it reads hot, and ALWAYS once the cap has run out
+                # (whatever its heat): such probes used to retry here without limit, past the cap and unrecorded. They fall through to the gate below as hot, which
+                # waits (cap not reached) or skips the leg (cap reached): a leg is never launched on a busy probe, and no probe starts after the cap but the one that
+                # ended it.
+                $noMoreProbe = ($thermalActive -and -not $thBudget.mayStartProbe)
+                if ($q.verdict -cne 'QUIET' -and -not ($thermalActive -and ($q.heat -ceq 'hot' -or $noMoreProbe))) {
                     # COOLDOWN_UNMET (a measured busy desktop, a foreign floor included) or GATE_BUSY: retry INSIDE this lease, never a release and a new request.
                     $b.retries++; $b.probeRetries++
                     # r3 (fable r2): with less room left after the leg's budget than one -RecheckSec, a busy probe ends the batch (the leg goes to the next one)
@@ -1749,9 +1892,68 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                         break
                     }
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=$($q.verdict) mean=$(Format-Mean $q.mean) roomSec=$room"
-                    if ($q.verdict -ceq 'GATE_BUSY') { Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))) }
+                    if ($thermalActive) { $th.reprobePending = $true }   # r4: the next iteration re-checks the deadline right before it dispatches (the log write above may have stalled)
+                    if ($q.verdict -ceq 'GATE_BUSY') {
+                        $busySleep = [int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))
+                        # adversary r3 A1: during a thermal wait the next probe starts no later than the deadline less the slowest re-probe (the same budget function as the poll sleep).
+                        # r4: read the clock AFTER the log write, so a stalled append shortens (or removes) the sleep instead of being added to it
+                        if ($thermalActive) { $busySleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $busySleep).sleepSec }
+                        if ($busySleep -gt 0) { Start-Sleep -Seconds $busySleep }
+                    }
                     continue
                 }
+                # item 10 (BACHELOR-THERMAL-GATE-WAIT-1): WAIT FOR COOL. The QUIET probe's heat reading (the agent's feed and rule) must be clear before launch:
+                # hot -> re-probe every -ThermalPollSec up to -ThermalWaitCapSec from the first hot reading in this batch; still hot then -> THERMAL_HOT_SKIPPED and
+                # re-queued at the end (at most -ThermalRequeueMax times, then the leg is THERMAL_HOT_SKIPPED for good), never run and discarded. Unknown heat runs.
+                $gateHeat = $(if ($q.verdict -cne 'QUIET') { 'hot' } else { $q.heat })   # a busy probe reaches here only on the hot / cap-ran-out route above
+                # adversary r4 A2: a first hot reading is anchored at the probe's return ($probeEndUtc / $probeEndTs), and the gate is asked with the monotonic time since it, so whatever the
+                # runner spent between the probe and here (a stalled log append) is already part of the wait
+                $gFirstUtc = $th.firstHotUtc; $gFirstTs = $th.firstHotTs
+                if ($null -eq $gFirstUtc -and $gateHeat -ceq 'hot' -and $null -ne $probeEndUtc) { $gFirstUtc = $probeEndUtc; $gFirstTs = $probeEndTs }
+                $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $gateHeat -FirstHotUtc $gFirstUtc -NowUtc $(if ($null -ne $gFirstUtc) { Get-VenueThermalNowUtc -FirstHotUtc $gFirstUtc -FirstHotTimestamp $gFirstTs -NowTimestamp ([Diagnostics.Stopwatch]::GetTimestamp()) } else { [DateTime]::UtcNow }) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
+                if ($null -eq $th.firstHotUtc -and $null -ne $gs.firstHotUtc) { $th.firstHotTs = $gFirstTs }
+                $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
+                # adversary r1 A9 / r1b A2, r3 (Dot B2): a re-probe is started only if the SLOWEST re-probe so far says it can end inside the cap: the sleep is shortened to fit,
+                # and only when not even a 1 s sleep fits is the leg skipped now. The probe that made the first hot reading is not a re-probe and is not counted, so the first
+                # hot reading always gets one cooling sleep (Get-VenueThermalProbeBudget). r2 (Dot P2): that is an estimate, not a guarantee. The probe's remote sample window
+                # and job queue limits cannot be bounded from here, so a later probe slower than the one before can end past the cap. The cap is therefore a SOFT
+                # budget, cap + one probe: a leg still hot then is skipped (never run hot), and a leg that reads clear then runs, and the receipt records the excess
+                # as thermalWaitOvershootSec (max(0, waitSec - cap)) so no row claims a wait inside the cap that was not
+                $gb = Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec ([int]$gs.waitSec) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $ThermalPollSec
+                if ($gs.step -ceq 'WAIT' -and (-not $gb.mayStartProbe -or $expiredBeforeProbe)) { $gs = [pscustomobject]@{ step = 'SKIP'; firstHotUtc = $gs.firstHotUtc; waitSec = $gs.waitSec; remainingSec = 0 } }
+                if ($gs.step -ceq 'WAIT') {
+                    # r1b A4: counted before the room check, so a batch that ran short waiting for heat never reads as LEG_BUDGET_EXCEEDS_LEASE
+                    $th.polls++; $b.thermalWaits++
+                    $roomNow = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
+                    if (($roomNow - $legBudget) -lt 1) {
+                        $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "waiting for heat ($($q.heatText), waitSec=$($gs.waitSec)) roomSec=$roomNow - legBudgetSec=${legBudget}: leg $($leg.name) goes to the next batch"
+                        break
+                    }
+                    $sleep = [int][Math]::Max(1, [Math]::Min($gb.sleepSec, $roomNow - $legBudget))
+                    L "THERMAL_WAIT leg=$($leg.name) batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec sleepSec=$sleep roomSec=$roomNow"
+                    # r4 (adversary r3 pass 2 A1, Dot c5946322): the sleep was planned BEFORE the log write above, which may have stalled. The budget is asked again with the clock read
+                    # now and the sleep is cut to what is left of the allowance (none at all when it is gone); the next iteration then re-checks the deadline before it dispatches.
+                    $th.reprobePending = $true
+                    $sleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -DispatchGraceSec $ThermalDispatchGraceSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $sleep).sleepSec
+                    if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
+                    continue
+                }
+                if ($gs.step -ceq 'SKIP') {
+                    $th.skips++; $requeue = ($th.skips -le $ThermalRequeueMax); $th.firstHotUtc = $null; $th.slowProbeSec = 0
+                    $skipFirstHeat = $th.firstHeat; $skipFirstHeatText = $th.firstHeatText; $th.firstHeat = $null; $th.firstHeatText = $null
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'THERMAL_HOT_SKIPPED'; outcome = 'NOT_RUN'; class = 'THERMAL_HOT_SKIPPED'; counted = $false
+                        thermalWaitSec = $gs.waitSec; thermalWaitOvershootSec = [int][Math]::Max(0, $gs.waitSec - $ThermalWaitCapSec); heatAtProbe = $skipFirstHeat; heatAtProbeText = $skipFirstHeatText; heatAtSkip = $q.heatText; skips = $th.skips; requeued = $requeue }
+                    $b.legs.Add([pscustomobject]$row); Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg; $b.thermalSkips++
+                    $pending.RemoveAt(0)
+                    if ($requeue) { $pending.Add($leg) } else { Add-Result $leg 'THERMAL_HOT_SKIPPED' $row; if ($exitCode -eq 0) { $exitCode = 7 } }
+                    L "LEG $($leg.name) THERMAL_HOT_SKIPPED batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec overshootSec=$([int][Math]::Max(0, $gs.waitSec - $ThermalWaitCapSec)) softBudget=cap+oneProbe$(if ($expiredBeforeProbe) { ' expiredBeforeProbe=1' }) skips=$($th.skips) requeued=$requeue (not run: never run and discarded)"
+                    continue
+                }
+                # adversary r4 A1: the wait ends here (the reading was clear, or the gate is off): a retry of this leg after VENUE_NOT_QUIESCENT starts from no wait, and a hot
+                # reading then starts a fresh one. Left set, the finished wait's deadline would govern the retry's probe (no admission, a quiet wait clamped to 0).
+                # adversary r4 pass 2 A5: what that wait cost stays in the leg's receipt totals (a retry's fresh gate overwrote waitSec with 0 and the receipt lost it)
+                $th.doneWaitSec = [int]($th.doneWaitSec + $th.waitSec); $th.doneOvershootSec = [int]($th.doneOvershootSec + [Math]::Max(0, $th.waitSec - $ThermalWaitCapSec)); $th.waitSec = 0
+                $th.firstHotUtc = $null; $th.slowProbeSec = 0; $th.reprobePending = $false
                 # QUIET under the lease: the leg, on the same lease (r5b, Grok G1: while the claim is still this run's).
                 $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
                 if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "before leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=leg $($cl.detail)"; break }
@@ -1761,6 +1963,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
+                if ($ReceiptRoot) { $lArgs += @('-ReceiptRoot', $ReceiptRoot) }   # LEASE-BATCH-RECEIPT-ROOT-1: the one leg call site, so an in-lease retry forwards it too; empty adds no argument
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
                 if ($script:RunOutputAliased) { $b.legsAttempted--; Stop-BatchOnSuppression $b; break }   # r7: the RUN line itself was refused: the leg is not started
                 # r8 pass 3 (adversary r8 pass 2 A3): the launch is the leg's dispatch. The guards since the checks above (the output's, the RUN line's) can block on a share, so the
@@ -1801,7 +2004,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
                     # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.
                     $cx = $(if ($legJobId) { Request-VenueJobCancel -AgentShare $AgentShare -JobId $legJobId } else { [pscustomobject]@{ state = 'UNKNOWN'; error = 'the leg printed no job id' } })
-                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state }
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2): a launched row keeps the reading the spread measures heavy keys from
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
@@ -1811,7 +2014,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
-                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec }
+                    # r6 (adversary r6 A2): the row keeps heatAtProbe. r7: this note sits on its own line, because the failing-action body pin
+                    # (test_playback_receipt_run_binding.CONSUMER_FAILING_ACTION) reads the row's closing brace straight into $b.legs.Add.
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
@@ -1830,7 +2035,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $ja = $(if ($jr.state -ceq 'FOUND') { $jr.result.admission } else { $null })
                 $jobLease = $(if ($null -ne $ja -and $null -ne $ja.leaseBatch) { [string]$ja.leaseBatch.leaseId } else { $null })
-                $onLease = ($null -ne $jobLease -and $jobLease -ceq $b.leaseId -and [string]$ja.slotContinuity -cne 'lost')
+                # r12 (adversary r11 A2): the lease id is compared ORDINALLY (-ceq is case-sensitive but culture-aware: a soft hyphen made another lease the batch's own); blank is no lease
+                $onLease = ($null -ne $jobLease -and -not [string]::IsNullOrWhiteSpace([string]$b.leaseId) -and [string]::Equals($jobLease, [string]$b.leaseId, [StringComparison]::Ordinal) -and [string]$ja.slotContinuity -cne 'lost')
                 if ($onLease) { $e2 = Get-LeaseEndUtc $jr.result; if ($null -ne $e2 -and $e2 -lt $leaseEnd) { $leaseEnd = $e2; $b.leaseEndUtc = $leaseEnd.ToString('o') } }
                 # CAPS e: the longest gap between the lease's successful renews up to this leg's end (the agent's own measure). Over -RenewGapMaxSec heavy-slot.py
                 # demoted the lease, so this leg and every later one did not have it exclusively: never counted, and the batch ends.
@@ -1847,7 +2053,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($outcome -ceq 'VENUE_NOT_QUIESCENT') {
                     # The leg's own <= 20 % re-check at its start failed: it never played. Retry INSIDE the same lease (on a lost or demoted lease, in the next batch).
                     $b.retries++; $b.legRetries++
-                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw })
+                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; thermalWaitSec = $th.doneWaitSec; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText })   # r6 (adversary r6 A2)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
@@ -1863,6 +2069,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; legSec = $legSec; legExit = $legCode; exit75Refusals = $legRef; foreignFloor = $legFF }
                 if ($legFF) { $row['foreignFloorLine'] = $legForeign[$leg.name] }
                 if ($detail) { $row['outcomeDetail'] = $detail }
+                # item 10: the thermal gate's receipt per leg: how long it waited for heat, the first and the launch reading, and the agent's own at grant
+                $row['thermalWaitSec'] = $th.doneWaitSec; $row['thermalWaitOvershootSec'] = $th.doneOvershootSec; $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
+                $row['heatAtGrant'] = $(if ($null -ne $ja -and $ja.PSObject.Properties['heat'] -and $ja.heat) { [string]$ja.heat } else { 'unknown' })
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
@@ -1874,7 +2083,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
             if ($null -eq $b.endReason -and $pending.Count -eq 0) { $b.endReason = 'ALL_LEGS_DONE' }
             # A FRESH lease with no room for even one leg can never run it: stop rather than open lease after lease.
-            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0 -and -not $launchShort) {   # r8 pass 3: room the guards ate at the launch is no budget the lease cannot hold
+            # adversary r1 A1: a batch that ran out of room WAITING FOR HEAT (or skipping hot legs) had room for a leg: not a leg budget no lease can hold
+            # r8 pass 3 (#704): nor is room the guards ate at the launch
+            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0 -and $b.thermalWaits -eq 0 -and $b.thermalSkips -eq 0 -and -not $launchShort) {
                 $b.endReason = 'LEG_BUDGET_EXCEEDS_LEASE'; Set-Stop 'LEG_BUDGET_EXCEEDS_LEASE' 2
             }
         }
@@ -1892,6 +2103,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         try {
             if ($null -ne $inFlightLeg -and $pending.Contains($inFlightLeg)) {
                 $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; reason = 'BATCH_ERROR'; detail = $b.endDetail; counted = $false }
+                $ith = $legThermal[$inFlightLeg.name]; if ($null -ne $ith) { $row['heatAtProbe'] = $ith.firstHeat; $row['heatAtProbeText'] = $ith.firstHeatText }   # r6 (adversary r6 A2)
                 $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
             }

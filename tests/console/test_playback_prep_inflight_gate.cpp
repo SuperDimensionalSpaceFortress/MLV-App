@@ -68,6 +68,76 @@ TEST(PlaybackPrepInFlightGate, DrainTimesOutInsteadOfHanging)
     ASSERT_TRUE( gate.inFlightLocked() );
 }
 
+// r9 (adversary A1): a core mutation's drain that outlives its timeout must still not return
+// while the worker is in flight -- MainWindow mutates the processing state right after it.
+TEST(PlaybackPrepInFlightGate, CoreMutationDrainNeverReturnsWhileWorkerIsInFlight)
+{
+    std::mutex queueMutex;
+    PlaybackPrepInFlightGate gate;
+    std::atomic<bool> left{ false };
+    // r13 (adversary A4): the promise latch master's tests use, not a sleep, holds the worker in
+    // flight; only the timeout callback releases it, so the bounded wait always runs out first.
+    std::promise<void> taken;
+    std::promise<void> release;
+    std::future<void> takenSignal = taken.get_future();
+    std::shared_future<void> releaseSignal = release.get_future().share();
+    std::thread worker( [&]() {
+        {
+            std::lock_guard<std::mutex> lk( queueMutex );
+            gate.beginLocked( 11 );
+        }
+        taken.set_value();
+        releaseSignal.wait();
+        std::lock_guard<std::mutex> lk( queueMutex );
+        left.store( true );
+        gate.endLocked();
+    } );
+    takenSignal.wait();
+
+    int timeouts = 0;
+    bool workerInFlightAtTimeout = false;
+    bool lockFreeAtTimeout = false;
+    bool drainedInTime = true;
+    bool inFlightAfter = true;
+    {
+        std::unique_lock<std::mutex> lk( queueMutex );
+        drainedInTime = gate.drainForCoreMutationLocked( lk, 20, [&]() {
+            ++timeouts;
+            workerInFlightAtTimeout = !left.load();
+            {
+                // The callback runs with the queue mutex released, so it may log without deadlock.
+                std::unique_lock<std::mutex> probe( queueMutex, std::try_to_lock );
+                lockFreeAtTimeout = probe.owns_lock();
+            }
+            // The worker may leave only now; the drain must still wait for it.
+            release.set_value();
+        } );
+        inFlightAfter = gate.inFlightLocked();
+    }
+    const bool leftWhenDrainReturned = left.load();
+    worker.join();
+
+    ASSERT_FALSE( drainedInTime );
+    ASSERT_EQ( 1, timeouts );
+    ASSERT_TRUE( workerInFlightAtTimeout );
+    ASSERT_TRUE( lockFreeAtTimeout );
+    ASSERT_TRUE( leftWhenDrainReturned );
+    ASSERT_FALSE( inFlightAfter );
+}
+
+TEST(PlaybackPrepInFlightGate, CoreMutationDrainWithinTimeoutNeverCallsOnTimeout)
+{
+    std::mutex queueMutex;
+    PlaybackPrepInFlightGate gate;
+    std::unique_lock<std::mutex> lk( queueMutex );
+    gate.beginLocked( 5 );
+    gate.endLocked();
+    int timeouts = 0;
+    ASSERT_TRUE( gate.drainForCoreMutationLocked( lk, 2000, [&]() { ++timeouts; } ) );
+    ASSERT_EQ( 0, timeouts );
+    ASSERT_TRUE( lk.owns_lock() );
+}
+
 TEST(PlaybackPrepInFlightGate, DrainWithNothingInFlightReturnsAtOnce)
 {
     std::mutex queueMutex;

@@ -725,12 +725,203 @@ function Resolve-DvAdmissionSources {
     [pscustomobject]$res
 }
 
+# r9 B2: the case-insensitive option every PATH-refusal regex uses. PowerShell's -match / -imatch / -like and an inline (?i) follow the PROCESS culture (tr-TR: `I` does not fold onto `i`), so a refusal rule
+# that must hold on every host builds its regex with this option instead (IgnoreCase + CultureInvariant).
+$script:DvCultureFreeIgnoreCase = [System.Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'
+
 function Test-DvUnderClaudeState {
     # Owner footage (a contact sheet, a receipt that names it) is only ever written where it stays local: a path with a
     # `.claude-state` segment (gitignored; never committed, PR-attached, bus-published or published as an artifact).
     param([Parameter(Mandatory)][string]$Path)
     $full = [IO.Path]::GetFullPath($Path)
-    @($full.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -gt 0
+    @($full.Split([char[]]@('\', '/')) | Where-Object { [string]::Equals($_, '.claude-state', [StringComparison]::Ordinal) }).Count -gt 0
+}
+
+function Test-DvLocalReceiptRoot {
+    # LEASE-BATCH-RECEIPT-ROOT-1 r3/r4/r5 (Dot A2 6542192087; adversary A1-A4, ADV-A1, ADV-A2; Grok G5): the ONE admission rule for a directory or file that owner-footage evidence is WRITTEN to (a receipt root and the
+    # evidence directory beside it, a sheet/strip copy directory, a pair/flavor-pair output directory, a trend file, a baseline or nightly state file).
+    # RETURNS the normalised full path it certified, or $null for a refusal. EVERY CALLER WRITES TO THE RETURNED PATH, never to the raw value: the value checked is the value written (r4 A2).
+    # r5 G5: the returned path is the FINAL, link-resolved path that the locality judgement ran on (not the spelling that reached it). A refusal is $null (falsy), so `if (-not (Test-DvLocalReceiptRoot ...))` still reads as a guard.
+    # The path must be (1) under a `.claude-state` segment (Test-DvUnderClaudeState) AND (2) a LOCAL file-system path:
+    #   - the RAW text is judged first, before any normalisation (r5 ADV-A1): two leading separators of EITHER slash is a UNC and is refused; so is every device spelling (`\\.\`, `//?/`, `\/?\`, `\??\`,
+    #     `\\?\UNC\`, GLOBALROOT, Volume GUID) except the one backslash-only form `\\?\C:\...`, which is certified and RETURNED as `C:\...` (r4 A4);
+    #   - a relative value is resolved ONCE, against the POWERSHELL location (the one every later cmdlet resolves it against; r4 A2), and only when that location is on the FileSystem provider; a provider-qualified
+    #     (`HKLM:\`, `Env:\`, `Provider::`) or drive-relative (`C:rel`) value is refused. The file-system drive of a drive-letter value must be a plain local root (a PowerShell drive that names a UNC is refused);
+    #   - a path equal to or under a venue agentShare from venues.json is refused (OrdinalIgnoreCase, full-path normalised, trailing separators trimmed) BOTH as spelled and after every symbolic link / junction on the way is
+    #     followed to its final target (r4 A3), AND the same canonical form is applied to each share (r5 ADV-A2): an extended-prefix share, and a share that is itself reached through a link, match the candidate that sits under them;
+    #   - a path on a mapped NETWORK drive ([IO.DriveInfo].DriveType), as spelled and as resolved.
+    # r6 CONVERGENCE (Grok G7 / Dot 6546717175 / ADV-A3, ADV-A1, ADV-A2, ADV-A4): ONE invariant, judged on the spelling AND on the FINAL link-resolved path (the value returned and written):
+    #   it is under an exact `.claude-state` component, it is local ($isLocal: no UNC/device, no agentShare, no network drive, and its PowerShell drive -- whatever spelling reached it, `\\?\X:\` included --
+    #   is a plain file-system drive rooted at its own letter), and every component is WELL-FORMED: no invalid file-name character (`<>:"|?*`, controls), no trailing space or dot (Win32 strips
+    #   them, so such a name is an alias of another directory), no DOS device name (NUL, CON, COM1, ...). GetFullPath expands an existing 8.3 short name, so the canonical long form is what is
+    #   compared. A drive root is never a certificate. The result is idempotent: Test-DvLocalReceiptRoot (Test-DvLocalReceiptRoot x) returns the same path, so a re-judging caller accepts its own certificate.
+    # r8 (sol B1/B2/B3, A3): a device name is refused with any run of spaces before its extension, on every component; the PowerShell drive's Root must equal `<letter>:\` exactly (the alternative, certifying the
+    # provider-resolved path, was not taken: one literal rule is judged on the spelling and on the final path alike); no component exceeds the volume's maximum component length (GetVolumeInformationW, 255 when unreadable); a link chain is bounded per link (16).
+    # FAIL CLOSED: an unreadable venues.json, an unparsable path or a link that cannot be read is a refusal. Nothing is created, opened or written here; reading drive types, attributes and link targets is the only I/O.
+    # This function reaches no engine-session API (the attr3 splice scan, test_attr3_spliced_body_scan, counts any such reference in this file as an unprovable extractor binding): the location comes from Get-Location, the drive from Get-PSDrive.
+    param([Parameter(Mandatory)][string]$Path, [string[]]$AgentShares)
+    try {
+        $rawSpelling = $null; $here = $null
+        $badNameChars = [IO.Path]::GetInvalidFileNameChars()
+        # r8 B3: the longest name one path component may have on the volume of a drive letter, in UTF-16 code units (GetVolumeInformationW, read once per letter). FAIL CLOSED at 255 -- the limit of every
+        # local file system this tool writes to (NTFS, ReFS, exFAT, FAT) -- when the volume cannot be read; a volume that reports less than 255 is held to its own figure.
+        $volMax = @{}
+        $maxComponent = {
+            param($letter)
+            $key = ([string]$letter).ToUpperInvariant()
+            if (-not $volMax.ContainsKey($key)) {
+                $lim = 255
+                try {
+                    if (-not ('DvR8Vol.Native' -as [type])) {
+                        Add-Type -Namespace DvR8Vol -Name Native -ErrorAction Stop -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern bool GetVolumeInformationW(string root, System.Text.StringBuilder volName, uint volNameSize, out uint serial, out uint maxComponent, out uint flags, System.Text.StringBuilder fsName, uint fsNameSize);'
+                    }
+                    $serial = [uint32]0; $mc = [uint32]0; $fl = [uint32]0
+                    if ([DvR8Vol.Native]::GetVolumeInformationW($key + ':\', $null, 0, [ref]$serial, [ref]$mc, [ref]$fl, $null, 0) -and $mc -gt 0 -and $mc -lt 255) { $lim = [int]$mc }
+                } catch { $lim = 255 }
+                $volMax[$key] = $lim
+            }
+            return $volMax[$key]
+        }
+        # r11 (Dot pr-729 / sol 6559605502 / adversary A1): the ONE component rule, applied to the ORIGINAL spelling's components (before any GetFullPath, which removes `bad\..` and so would hide it) AND to the
+        # final path's components ($isLocal). $true = a name the file system writes as spelled: no longer than $maxLen, no invalid file-name character (`<>:"|?*`, NUL, controls), no trailing space or dot (Win32 strips them, so
+        # such a name is an alias of another directory), no DOS device name. The `.` and `..` navigation tokens are the caller's to skip (they are resolved, never written).
+        # r9 B2: culture-INVARIANT (under tr-TR an inline `(?i:...)` folds `i` to U+0130, so lowercase `conin$` was not a device): RegexOptions.IgnoreCase -bor CultureInvariant, never the process culture.
+        # r7 G9: COM/LPT with a superscript 1/2/3 are devices too, written as regex escapes so this file stays ASCII. r8 B1: Win32 drops any run of spaces between a device stem and its extension, so the stem is followed by `[ ]*`.
+        # r12 (sol r11 INV-5): the digit class starts at 1. RtlIsDosDeviceName_U returns 0 for COM0, LPT0, COM0.txt and `LPT0 .txt` (measured on 10.0.19045), so a COM0 or LPT0 directory is an ordinary name and stays usable.
+        $componentWellFormed = {
+            param($c, $maxLen)
+            if ($c.Length -eq 0) { return $true }
+            if ($c.Length -gt $maxLen) { return $false }
+            if ($c.IndexOfAny($badNameChars) -ge 0) { return $false }
+            if ($c.EndsWith(' ') -or $c.EndsWith('.')) { return $false }
+            if ([regex]::IsMatch($c, '^(?:CON|PRN|AUX|NUL|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3]|CONIN\$|CONOUT\$)[ ]*(\..*)?$', $script:DvCultureFreeIgnoreCase)) { return $false }
+            return $true
+        }
+        # (1) the RAW text, either slash. Only `\\?\C:\...` (backslashes) is a local device spelling; anything else that starts with two separators (UNC, \\.\, //?/, \/?\, \\?\UNC\) is refused here.
+        if ($Path -match '^[\\/]{2}') {
+            if ($Path -cnotmatch '^\\\\\?\\[A-Za-z]:\\[^/]*$') { return $null }
+            $full = $Path.Substring(4)
+        }
+        elseif ($Path -match '^[\\/]\?\?[\\/]') { return $null }   # the NT object-manager prefix \??\
+        elseif ($Path -match '^[A-Za-z]:[\\/]') { $full = $Path }   # its PowerShell drive is judged by $isLocal below, like every other drive-letter spelling (r6 ADV-A2)
+        elseif ($Path.Contains(':')) { return $null }   # provider-qualified (HKLM:\, Env:\, Module\Provider::path) or drive-relative (C:rel): a colon anywhere in a value that is not a drive-letter path
+        else {
+            # rooted-on-the-current-drive (`\x`, `/x`) or relative: resolved once against the POWERSHELL location, on the FileSystem provider only
+            $here = Get-Location
+            if ($here.Provider.Name -cne 'FileSystem') { return $null }
+            $full = [IO.Path]::GetFullPath($Path, $here.ProviderPath)
+            $rawSpelling = $Path
+        }
+        # r9 B1 (sol r8): Win32 strips a trailing dot / space from a component, so GetFullPath turns `receipts.` into `receipts` and the normalised-path check below never sees it. The RAW spelling is judged first, on EVERY
+        # component (terminal and middle, either slash): a component ending in `.` or ` ` is refused, the `.` and `..` navigation tokens excepted (those are resolved by GetFullPath, not written).
+        if ($null -eq $rawSpelling) { $rawSpelling = $full }
+        # r11: the same RAW pass judges EVERY original component by the whole component rule (invalid character, NUL, control, length, DOS device name, trailing dot/space), not only the trailing dot/space: GetFullPath
+        # (below) removes `bad<root>\..`, `NUL\..`, a 256-character or control-character name followed by `..`, so judged on the normalised path alone they were certified while the same name without the `..` refused.
+        # The drive spec (`C:`) of a drive-letter spelling is not a name; the length limit is the volume's of that letter (or of the PowerShell location's drive for a relative value; 255 when there is none).
+        $rawLetter = $(if ($rawSpelling -match '^([A-Za-z]):[\\/]') { $Matches[1] } elseif ($here -and ([string]$here.ProviderPath) -match '^([A-Za-z]):') { $Matches[1] } else { 'C' })
+        $rawMax = & $maxComponent $rawLetter
+        $rawComponents = @($rawSpelling.Split([char[]]@('\', '/')))
+        $rawFrom = $(if ($rawSpelling -match '^[A-Za-z]:[\\/]') { 1 } else { 0 })
+        for ($rawIdx = $rawFrom; $rawIdx -lt $rawComponents.Count; $rawIdx++) {
+            $rc = $rawComponents[$rawIdx]
+            if ([string]::Equals($rc, '.', [StringComparison]::Ordinal) -or [string]::Equals($rc, '..', [StringComparison]::Ordinal)) { continue }
+            if (-not (& $componentWellFormed $rc $rawMax)) { return $null }
+        }
+        if ($full -match '^[\\/]{2}') { return $null }
+        $plain = [IO.Path]::GetFullPath($full)
+        if ($plain -notmatch '^[A-Za-z]:\\') { return $null }
+        if (-not (Test-DvUnderClaudeState -Path $plain)) { return $null }
+        if ($null -eq $AgentShares) {
+            $doc = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'venues.json')) | ConvertFrom-Json
+            $AgentShares = @($doc.venues.PSObject.Properties | ForEach-Object { [string]$_.Value.agentShare } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+        $norm = { param($x) ([IO.Path]::GetFullPath(($x -replace '/', '\'))).TrimEnd('\') }
+        # a share is judged in the SAME canonical form as the candidate: extended prefix removed (\\?\UNC\h\s -> \\h\s, \\?\C:\x -> C:\x), slashes folded, full-path normalised
+        $shareForm = {
+            param($x)
+            $y = $x -replace '/', '\'
+            if ($y -match '^\\\\[?.]\\UNC\\') { $y = '\\' + $y.Substring(8) }
+            elseif ($y -match '^\\\\[?.]\\') { $y = $y.Substring(4) }
+            & $norm $y
+        }
+        # Follow every symbolic link / junction among the EXISTING components of $start (the rest does not exist yet and is created under the resolved parent). A link whose target
+        # cannot be read, or a chain of more than 16 LINKS, is a refusal (returns $null). r8 A3: ONE link is resolved per hop (ResolveLinkTarget($false)), so $hop counts links, not outer rewrites:
+        # 16 links settle, a 17th is refused. With $judge, each hop is also judged by $isLocal (UNC / agentShare / network drive).
+        $walk = {
+            param($start, $judge)
+            $cur = $start
+            for ($hop = 0; ; $hop++) {
+                $parts = @($cur.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
+                $acc = $cur.Substring(0, 3).TrimEnd('\')
+                $moved = $false
+                for ($i = 0; $i -lt $parts.Count; $i++) {
+                    $acc = $acc + '\' + $parts[$i]
+                    if (-not [IO.Directory]::Exists($acc) -and -not [IO.File]::Exists($acc)) { break }
+                    if (([IO.File]::GetAttributes($acc) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { continue }
+                    $info = $(if ([IO.Directory]::Exists($acc)) { [IO.DirectoryInfo]::new($acc) } else { [IO.FileInfo]::new($acc) })
+                    $target = $info.ResolveLinkTarget($false)
+                    if ($null -eq $target) { continue }   # a reparse point that is not a link (a cloud placeholder, a dedup stub): not a redirect
+                    $tail = @($(if ($i + 1 -lt $parts.Count) { $parts[($i + 1)..($parts.Count - 1)] } else { @() }))
+                    $t = [string]$target.FullName
+                    if ($t.StartsWith('\\?\', [StringComparison]::Ordinal)) {
+                        if ($t -cnotmatch '^\\\\\?\\[A-Za-z]:\\') { return $null }
+                        $t = $t.Substring(4)
+                    }
+                    if ($t -match '^[\\/]{2}') { return $null }
+                    $cur = [IO.Path]::GetFullPath($(if ($tail.Count -gt 0) { Join-Path $t ($tail -join '\') } else { $t }))
+                    $moved = $true
+                    break
+                }
+                if (-not $moved) { return $cur }
+                if ($hop -ge 16) { return $null }   # this was the 17th link on the way
+                if ($judge -and -not (& $isLocal $cur)) { return $null }
+            }
+        }
+        # the share keys: each share as spelled (canonical form) AND, for a drive-letter share, after its own links are followed (a share reached through a link is the same share)
+        $shareKeys = @()
+        foreach ($s in @($AgentShares)) {
+            $k = & $shareForm $s
+            $shareKeys += $k
+            if ($k -match '^[A-Za-z]:\\') {
+                $kr = & $walk $k $false
+                if ($null -eq $kr) { return $null }
+                $shareKeys += (& $norm $kr)
+            }
+        }
+        $isLocal = {
+            # judges ONE concrete spelling: well-formed components / UNC / device / PowerShell drive / agentShare / network drive. Returns $true when it is a local, non-share path.
+            param($p)
+            if ($p -match '^[\\/]{2}') { return $false }
+            if ($p -notmatch '^[A-Za-z]:\\') { return $false }
+            # r6 ADV-A4 / ADV-A1 / r8 B1 / r8 B3 / r11: every component of the concrete path is well formed ($componentWellFormed: the same rule the ORIGINAL spelling's components were judged by above),
+            # at the volume's maximum component length (such a directory cannot be created).
+            $maxLen = & $maxComponent $p.Substring(0, 1)
+            foreach ($c in @($p.Substring(3).Split([char]92))) {
+                if (-not (& $componentWellFormed $c $maxLen)) { return $false }
+            }
+            # r6 ADV-A2 / r8 B2: the PowerShell drive of this letter (what New-Item / Copy-Item resolve it through), if any, is a file-system drive rooted EXACTLY at `<letter>:\` -- not `New-PSDrive X -Root \\host\share`, and not
+            # `C` re-rooted at `C:\Windows` (the cmdlets would write under that directory while this judgement ran on the literal spelling)
+            $psd = Get-PSDrive -Name $p.Substring(0, 1) -ErrorAction SilentlyContinue
+            if ($null -ne $psd -and ($psd.Provider.Name -cne 'FileSystem' -or -not [string]::IsNullOrEmpty([string]$psd.DisplayRoot) -or -not [string]::Equals([string]$psd.Root, $p.Substring(0, 1) + ':\', [StringComparison]::OrdinalIgnoreCase))) { return $false }
+            $k = & $norm $p
+            foreach ($s in $shareKeys) {
+                if ($k.Equals($s, [StringComparison]::OrdinalIgnoreCase) -or $k.StartsWith($s + '\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+            }
+            if ([IO.DriveInfo]::new($p.Substring(0, 1)).DriveType -eq [IO.DriveType]::Network) { return $false }
+            return $true
+        }
+        if (-not (& $isLocal $plain)) { return $null }
+        $final = & $walk $plain $true
+        if ($null -eq $final) { return $null }
+        # G5: the path that was judged is the path that is returned (the link-resolved one; $plain itself when no component is a link).
+        # r6 G7 / Dot 6546717175 / ADV-A3: the FINAL path is judged by the WHOLE rule again -- the `.claude-state` marker too, not only locality -- so a `.claude-state` component that is a
+        # junction onto a directory outside every `.claude-state` is refused, and the certificate re-judges to itself (idempotent). A drive root is never a certificate.
+        $final = $final.TrimEnd([char]92)
+        if ($final -notmatch '^[A-Za-z]:\\.') { return $null }
+        if (-not (Test-DvUnderClaudeState -Path $final)) { return $null }
+        if (-not (& $isLocal $final)) { return $null }
+        return $final
+    } catch { return $null }
 }
 
 function Read-DvClipConsent {
@@ -754,7 +945,8 @@ function Read-DvClipConsent {
     $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @(); blankets = @() } }
     if ([string]::IsNullOrWhiteSpace($Text)) { return (& $bad 'the consent file is missing or empty') }
     # A consent record names a clip by ID. A drive path or a footage file name anywhere in the file is refused outright.
-    if ($Text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
+    # r9 B2: culture-invariant (tr-TR does not fold the `I` of `I:\` onto `i`)
+    if ([regex]::IsMatch($Text, '[a-z]:[\\/]|\.mlv\b', $script:DvCultureFreeIgnoreCase)) { return (& $bad 'the consent file carries a path-shaped value') }
     try { $doc = $Text | ConvertFrom-Json } catch { return (& $bad 'the consent file is not valid JSON') }
     if ([string](Get-DvProp $doc 'schema') -ne $script:ConsentSchema) { return (& $bad "the consent file schema is not $($script:ConsentSchema)") }
     if ($null -eq $doc.PSObject.Properties['records']) { return (& $bad 'the consent file has no records array') }
@@ -913,7 +1105,9 @@ function Get-DvSmokeSummaryFields {
     $isolated = $false
     $conformLine = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
-        $lines = $LogText -split "`r?`n"
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 and advisory A3 on #726): every line is read as its record body, so a build path in a Qt
+        # location suffix never selects the session or a line, and never adds a summary or conform field.
+        $lines = Get-DvLogRecordBodies -LogText $LogText
         foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
         if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
         if ($null -ne $session) {
@@ -1164,7 +1358,7 @@ function Get-DvScaleEvidence {
         $clampFlag = ConvertTo-DvInt64 $f['gpu_texture_route_scale_clamp_active']
         if ($null -ne $clampFlag) { $clampActive = ($clampFlag -ne 0) }
         if ($null -eq $effective) {
-            foreach ($line in ($LogText -split "`r?`n")) {
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) {
                 if ($line -match 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)') { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
             }
         }
@@ -1293,6 +1487,9 @@ function Get-DvWorkerThreadsEvidence {
     the proof (only the success summary gains it), and it is then judged on the run log; a summary with no result or any other result must carry it
     (adversary r1 A1). A leg that does not ask never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the
     hashed run log and summary.json.
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A2 on #726): a start line that carries worker_threads= more than once is refused
+    (DUPLICATE_START_FIELD), never last-key-wins; and a failure terminal that omits a proof field is UNPROVEN (blocks = false, so its FAIL stands), never
+    HONOURED, because the run log alone was forgeable by a launcher env value on a build before r2.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()]$Summary)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
@@ -1302,13 +1499,16 @@ function Get-DvWorkerThreadsEvidence {
     $reason = $null
     if ($null -ne $raw) {
         $verdict = 'NOT_HONOURED'
-        $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'start'
+        $read = Get-DvSmokeSessionLineRead -LogText $LogText -Marker 'start'
+        $f = $read.fields
         $observed = ConvertTo-DvInt64 $f['worker_threads']
         $resultToken = Get-DvProp $Summary 'result'
         $mayOmit = ($resultToken -is [string]) -and ($resultToken -cin $script:FailureTerminals)
+        $omitted = [System.Collections.Generic.List[string]]::new()
         $problems = [System.Collections.Generic.List[string]]::new()
         if ($null -eq $requested -or $requested -lt 1 -or $requested -gt 16) { $problems.Add("the spec's playbackMaxThreads '$raw' is not an integer from 1 to 16") }
-        elseif ($f.Count -eq 0) { $problems.Add('the worker count is unreadable: the run log has no playback_smoke.start line for the measured session') }
+        elseif (-not $read.found) { $problems.Add('the worker count is unreadable: the run log has no playback_smoke.start line for the measured session') }
+        elseif ($read.duplicates -contains 'worker_threads') { $problems.Add("DUPLICATE_START_FIELD: the measured session's playback_smoke.start line carries worker_threads= more than once, so the worker count is unreadable (a second one can only come from a launcher env value)") }
         elseif ($null -eq $observed) { $problems.Add("the worker count is unreadable: the measured session's playback_smoke.start line has no integer worker_threads= ('$($f['worker_threads'])')") }
         elseif ($observed -ne $requested) { $problems.Add("the measured session's playback_smoke.start says worker_threads=$observed, not the $requested the leg names") }
         if ($null -eq $Summary) { $problems.Add('the worker count is unreadable: the job published no summary.json to carry its proof') }
@@ -1316,13 +1516,77 @@ function Get-DvWorkerThreadsEvidence {
             foreach ($name in @('playbackMaxThreadsRequested', 'playbackMaxThreadsSmoke', 'playbackWorkerThreadsRead')) {
                 $has = ($Summary -is [System.Collections.IDictionary] -and $Summary.Contains($name)) -or ($Summary -isnot [System.Collections.IDictionary] -and $null -ne $Summary.PSObject.Properties[$name])
                 $value = Get-DvProp $Summary $name
-                if (-not $has -and $mayOmit) { continue }
+                if (-not $has -and $mayOmit) { $omitted.Add($name); continue }
                 if ($null -eq $value) { $problems.Add("the worker count is unreadable: summary.json $name is $(if ($has) { 'null' } else { 'absent' })"); continue }
                 $parsed = ConvertTo-DvInt64 $value
                 if ($null -eq $parsed -or $parsed -ne $requested) { $problems.Add("summary.json $name is '$value', not $requested") }
             }
         }
-        if ($problems.Count -eq 0) { $verdict = 'HONOURED' } else { $reason = $problems -join '; ' }
+        if ($problems.Count -gt 0) { $reason = $problems -join '; ' }
+        elseif ($omitted.Count -gt 0) {
+            $verdict = 'UNPROVEN'
+            $reason = "WORKER_PROOF_ABSENT: the job ended $resultToken and its summary.json omits $($omitted -join ', '); the run log alone does not prove the worker count, so it is not honoured (the failure terminal's own FAIL stands)"
+        }
+        else { $verdict = 'HONOURED' }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
+function Get-DvPrepConflatedMoveEvidence {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: did a leg that asks for the #397 prep-conflated-move switch (generatorArgs.prepConflatedMove = true, which sets
+    MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1) run with the switch active? Read ONLY from the app's own `playback_smoke.prep_route session=<n>
+    prep_conflated_move_active=<0|1>` record for the MEASURED session (the app's decision, on a line that carries no env-derived text), never from the start line,
+    the spec, the launcher's env block or the job's summary: a switch value in a receipt is a request, not engagement. FAIL CLOSED: `blocks` is true when the leg
+    asked and there is no such record, or it says anything but a clean 1. A binary that emits no prep_route record (#397 5fb4b801 and every build before r2 of
+    this card) therefore never counts; its reason says ROUTE_NOT_ENGAGED. A leg that does NOT ask blocks only when the app reports the switch on (the OFF arm
+    inherited the variable: PREP_CONFLATED_MOVE_INHERITED) or a prep_route record is present but unreadable; with no record, or a clean 0, it is unchanged.
+    Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'prepConflatedMove'
+    $requested = ($raw -is [bool]) -and $raw
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    # adversary r1 A1 (r2): the start line carries launcher env values, and an app before r2 let CR/LF in one of them become a separator, so a field read there
+    # can be forged. Engagement is read from the prep_route record only, matched against the WHOLE line: an optional log prefix ([utc] [LEVEL] [0xthread]),
+    # the marker, the measured session, the one field with the value 0 or 1, an optional Qt location suffix, and nothing else. A prep_route text embedded in
+    # another record (after a separator an old app wrote) never matches, and a second record for the session is unreadable, never a PASS.
+    # r3 (sol ADV-A1 on #726) and r4 (r3 adversary A1 and A2, Grok G1): every line is read as its record body (Get-DvLogRecordBodies strips the Qt location
+    # suffix from its first ` (`, whatever the path holds) BEFORE a mention is counted or the record matched, so a build path like `C:/build (x/` keeps the
+    # reported state and a path holding `playback_smoke.prep_route session=<n>` adds no mention. A mention inside another record's BODY still counts.
+    $records = 0
+    $mentions = 0
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $whole = '^(\[[^\]]*\] \[[A-Za-z]+\] (\[0x[0-9A-Fa-f]+\] )?)?playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) +
+                ' prep_conflated_move_active=(?<v>[01])$'
+            $mention = 'playback_smoke\.prep_route session=' + [regex]::Escape([string]$session) + '( |$)'
+            foreach ($l in (Get-DvLogRecordBodies -LogText $LogText)) {
+                if ($l -cnotmatch $mention) { continue }
+                $mentions++
+                $m = [regex]::Match($l, $whole)
+                if ($m.Success) { $records++; $observed = [int]$m.Groups['v'].Value }
+            }
+        }
+    }
+    if ($records -ne 1 -or $mentions -ne 1) { $observed = $null }
+    $unreadable = 'the switch state is unreadable: the measured session''s playback_smoke.prep_route record is not exactly one whole line of the form playback_smoke.prep_route session=<n> prep_conflated_move_active=<0|1>, or there is more than one'
+    if ($requested) {
+        $verdict = 'NOT_HONOURED'
+        if ($mentions -eq 0) { $reason = 'ROUTE_NOT_ENGAGED: the run log has no playback_smoke.prep_route record for the measured session, so the binary does not report which prep queue ran' }
+        elseif ($null -eq $observed) { $reason = $unreadable }
+        elseif ($observed -ne 1) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.prep_route says prep_conflated_move_active=$observed, not the 1 the leg names" }
+        else { $verdict = 'HONOURED' }
+    }
+    elseif ($mentions -gt 0) {
+        # adversary r1 A1: an absent key sets nothing, so a launcher that already carries the variable runs the OFF arm ON. A leg that does not ask counts only if the
+        # app does not report the switch on (a binary that emits no record, or says 0, is unchanged).
+        if ($null -eq $observed) { $verdict = 'NOT_HONOURED'; $reason = $unreadable }
+        elseif ($observed -eq 1) { $verdict = 'NOT_HONOURED'; $reason = 'PREP_CONFLATED_MOVE_INHERITED: the leg does not ask for the switch but the app reports prep_conflated_move_active=1 (the variable came from the launcher''s environment), so this run is not the OFF arm' }
     }
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
@@ -1343,7 +1607,8 @@ function Get-DvLookAssistEvidence {
     if ($requested) {
         $found = $null
         if (-not [string]::IsNullOrEmpty($LogText)) {
-            foreach ($line in ($LogText -split "`r?`n")) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+            # r4 (r3 adversary A2 on #726): matched on the record body, so a Qt location path never selects (or answers for) the visual_state line
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
         }
         $verdict = 'NOT_HONOURED'
         if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
@@ -1433,18 +1698,104 @@ function Get-DvSmokeSessionLineFields {
     <#
     .SYNOPSIS
     The key=value fields of the LAST `playback_smoke.<Marker> session=<n>` line of the MEASURED session in the app's run log (the session Get-DvSmokeSummaryFields picks),
-    or an empty table. Marker is e.g. 'pace_summary' or 'cpu_summary'.
+    or an empty table. Marker is e.g. 'pace_summary' or 'cpu_summary'. A key the line carries more than once is left out (Get-DvSmokeSessionLineRead), so it
+    reads as absent: fail closed, never last-key-wins.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Marker)
+    (Get-DvSmokeSessionLineRead -LogText $LogText -Marker $Marker).fields
+}
+
+function Get-DvSmokeSessionLineRead {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A2 on #726): the LAST `playback_smoke.<Marker> session=<n>` line of the MEASURED session, read as
+    key=value tokens separated by single ASCII spaces. Returns @{ found = the line was there; fields = each key seen ONCE; duplicates = the keys seen more than
+    once }. A launcher env value that an app before r2 let through with a CR/LF (or a Unicode space a \S+ reader splits on) could add a second worker_threads=
+    after the genuine one, and the old reader kept the last; a duplicated key is now dropped from `fields` and named in `duplicates` so a caller can refuse it.
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Marker)
     $fields = @{}
-    if ([string]::IsNullOrEmpty($LogText)) { return $fields }
-    $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
-    if ($null -eq $session) { return $fields }
-    $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+    # keys compare case-insensitively, like the @{} table every caller indexes
+    $duplicates = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $found = $null
-    foreach ($line in ($LogText -split "`r?`n")) { if ($line -match $pattern) { $found = $line } }
-    if ($null -ne $found) { foreach ($m in [regex]::Matches($found, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
-    $fields
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+        if ($null -ne $session) {
+            $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
+            # `playback_smoke.<Marker> session=<n>` is never selected
+            foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }
+        }
+    }
+    if ($null -ne $found) {
+        $seen = @{}
+        # r3 (sol ADV-A2 on #726): a key counts whatever its value, EMPTY included, so `worker_threads=8 worker_threads=` (either order, either case) is a
+        # duplicate too; $found is already the record body (no Qt location suffix), so a build path never adds a token.
+        foreach ($m in [regex]::Matches($found, '(?<![^ ])(?<k>[A-Za-z0-9_]+)=(?<v>[^ ]*)')) {
+            $k = $m.Groups['k'].Value
+            if ($seen.ContainsKey($k)) { [void]$duplicates.Add($k) }
+            else { $seen[$k] = $m.Groups['v'].Value }
+        }
+        foreach ($k in $seen.Keys) { if (-not $duplicates.Contains($k)) { $fields[$k] = $seen[$k] } }
+    }
+    @{ found = ($null -ne $found); fields = $fields; duplicates = @($duplicates | Sort-Object) }
+}
+
+# r5 (sol r4 B1 on #726): what Get-DvLogRecordBody puts in place of a location it cannot read. It holds no `=` and no record marker, so no field or
+# marker is read from it, and a whole-line match (the prep_route record) fails on it: the record is unreadable, never absent and never forged.
+$script:DvLocationUnreadable = ' (LOCATION_UNREADABLE)'
+
+function Get-DvLogRecordBody {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 (#726): one run-log line without the Qt location suffix CrashForensics::writeLogLine appends after the message
+    (` (<file>:<line>)`, only when the message context carries a file; CrashForensics.cpp writeLogLine). r4 (r3 adversary A1 = Grok G1): the suffix starts at
+    the FIRST ` (` of the line and runs to a closing `:<digits>)` at its very end; nothing is paired, so the path may hold spaces and parentheses, balanced or
+    not (`C:/build (x/`, `C:/build x)/`), and any text at all, record markers included. That is exact because a record body never holds ` (`: the
+    prefix is `[utc] [LEVEL] [0x<thread>] `, record keys are [A-Za-z0-9_]+, every value from outside the app goes through log_line_field::fieldValue (which
+    maps every space), and the one app value with spaces (summary gui_fps_status_text, "Playback: <n> fps") holds no parenthesis. The location is written
+    last, so what precedes its first ` (` is the body the app wrote. A line with no ` (` is returned unchanged; a line whose tail is not a readable location
+    is refused as described under r5 below. Every dual-venue reader of the app's run log strips the
+    suffix through this helper (or Get-DvLogRecordBodies) BEFORE it matches a record marker or a field.
+    r5 (sol r4 B1 and H1 on #726): a writer before r5 built the location with chained QString::arg calls, so a path holding `%1` took the line number and
+    the location ended `:%2)`; that suffix was left in the body, where marker text in the path selected the session, the start line, the visual state and
+    the summary fields. The rule now: the body is the text before the first ` (`, always (the location is written last and the body never holds ` (`,
+    so that text is the app's own and the path's text never reaches a reader). The tail decides whether the record is readable: `:<digits>)` (this
+    writer) or `:%2)` (the old writer's only other ending: its path held a lower-numbered marker, and the body before the location is unaffected) with a
+    path of at least one character gives the body; any other tail (no line number, text after the `)`, an empty path, a message that held a marker on the
+    old writer) gives the body plus ' (LOCATION_UNREADABLE)', which refuses a whole-line match and supplies no field or marker. It may refuse; it never
+    forges. The scan is linear: one IndexOf and one right-to-left walk over the digits, no regex (the r4 regex was super-linear on repeated ` (`).
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Line)
+    if ([string]::IsNullOrEmpty($Line)) { return $Line }
+    $open = $Line.IndexOf(' (', [StringComparison]::Ordinal)
+    if ($open -lt 0) { return $Line }
+    $body = $Line.Substring(0, $open)
+    $end = $Line.Length - 1
+    $colon = -1
+    if ($Line[$end] -ceq [char]')') {
+        $i = $end - 1
+        while ($i -gt $open + 1 -and $Line[$i] -ge [char]'0' -and $Line[$i] -le [char]'9') { $i-- }
+        if ($i -lt $end - 1 -and $Line[$i] -ceq [char]':') { $colon = $i }
+        elseif ($Line.EndsWith(':%2)', [StringComparison]::Ordinal)) { $colon = $end - 3 }
+    }
+    # the path is everything between `(` (at $open + 1) and the colon, and must not be empty
+    if ($colon -gt $open + 2) { return $body }
+    $body + $script:DvLocationUnreadable
+}
+
+function Get-DvLogRecordBodies {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 on #726): every line of a run log as its record body (Get-DvLogRecordBody), in order, so a
+    reader matches record markers on the body only and a build path that holds `playback_smoke.<marker> session=<n>` never adds or selects a record.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText)
+    if ([string]::IsNullOrEmpty($LogText)) { return , [string[]]@() }
+    $lines = $LogText -split "`r?`n"
+    # r5: only a line that holds ` (` can carry a location; the rest are returned as they are without a call
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i].IndexOf(' (', [StringComparison]::Ordinal) -ge 0) { $lines[$i] = Get-DvLogRecordBody -Line $lines[$i] } }
+    , [string[]]$lines
 }
 
 function Get-DvMatrixRates {
@@ -2490,6 +2841,20 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedWorkerThreads) { $invalid.Add('WORKER_THREADS_NOT_FROM_EVIDENCE: the receipt carries a workerThreads block but its committed leg spec names no playbackMaxThreads') }
+            # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: a leg that asks for the prep-conflated-move switch the app did not report active (or whose report is unreadable, or absent
+            # because the binary emits none) is no measurement of that arm; the receipt's own prepConflatedMove block is re-derived like the workerThreads block.
+            $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $ev.logText
+            if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason); a run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm") }
+            $storedPrepConflatedMove = Get-DvProp $Receipt 'prepConflatedMove'
+            if ($prepConflatedMoveVerdict.requested) {
+                if ($null -eq $storedPrepConflatedMove) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no prepConflatedMove block (requested / observed / verdict) and its committed spec names a prepConflatedMove') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedPrepConflatedMove $f) $prepConflatedMoveVerdict[$f])) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: prepConflatedMove.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedPrepConflatedMove) { $invalid.Add('PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: the receipt carries a prepConflatedMove block but its committed leg spec names no prepConflatedMove') }
         }
 
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
@@ -3059,7 +3424,7 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
-    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

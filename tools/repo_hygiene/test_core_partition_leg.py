@@ -546,18 +546,44 @@ Write-CorePartitionNewFile $fresh 'ok'
 """
 
 
-# r9 Dot 1 (= adversary r8 aeacec83 A1), the real helper (stand-in exe, never MLVApp). stop-while-alive: the measured pid and the stop file are
-# written while the measured app still runs (an early stop), so the helper's watch ends before the runner's exit. stop-right-after-exit (control):
-# both are written the instant the measured app exits, as the job does after the runner; the helper must still observe that exit.
+# CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1: the test-only hold spliced into the decoded helper just before its stop-file check. Each pass
+# writes pass-N.polled (the count of processes it still tracks after its polls and enumeration) and waits, bounded at 60 s and named on timeout, for
+# pass-N.go, so a driver decides what happens between a pass's polls and its stop check instead of racing the host's scheduler for it.
+COVERAGE_HOLD_ANCHOR = "\nif (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }\n"
+COVERAGE_HOLD_HOOK = r"""
+$cpPass++; $cpHold = [string]$env:CP_HOLD_DIR; $cpHw = [Diagnostics.Stopwatch]::StartNew()
+[IO.File]::WriteAllText("$cpHold\pass-$cpPass.polled", [string]$live.Count)
+while (-not (Test-Path -LiteralPath "$cpHold\pass-$cpPass.go") -and $cpHw.ElapsedMilliseconds -lt 60000) { Start-Sleep -Milliseconds 20 }
+if (-not (Test-Path -LiteralPath "$cpHold\pass-$cpPass.go")) { $errs.Add("hold-timeout: pass $cpPass") }
+"""
+
+
+# r9 Dot 1 (= adversary r8 aeacec83 A1), the real helper (stand-in exe, never MLVApp), CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1: the helper
+# is held after each pass's polls and before its stop-file check (COVERAGE_HOLD_HOOK), so the driver orders its steps by the helper's own passes and
+# never by a sleep. stop-while-alive: the measured pid and the stop file are written while the measured app still runs (an early stop), so the
+# helper's watch ends before the runner's exit. stop-in-a-pass-polled-before-the-exit: the app exits and the stop lands while a pass that polled it
+# alive is held (the hosted-runner shape: a slow pass straddles the exit). stop-after-a-pass-polled-the-exit (control): the stop is written once a
+# pass that began after the exit has polled it, which is the order the job's stop has when the helper is not mid-pass; the helper must have observed it.
 COVERAGE_DRIVER = r"""
 $ErrorActionPreference = 'Stop'
 $out = [ordered]@{}
-foreach ($mode in @('stop-while-alive', 'stop-right-after-exit')) {
+function Wait-HelperPass($Helper, $Dir, $N) {
+    $w = [Diagnostics.Stopwatch]::StartNew(); $f = Join-Path $Dir "pass-$N.polled"
+    while ($true) {
+        $t = try { [IO.File]::ReadAllText($f) } catch { '' }
+        if ($t -match '^\d+$') { return [int]$t }
+        if ($Helper.HasExited -or $w.ElapsedMilliseconds -gt 60000) { throw "helper pass $N never reached its hold (exited=$($Helper.HasExited))" }
+        Start-Sleep -Milliseconds 20
+    }
+}
+function Release-HelperPass($Dir, $N) { [IO.File]::WriteAllText((Join-Path $Dir "pass-$N.go"), 'go') }
+foreach ($mode in @('stop-while-alive', 'stop-in-a-pass-polled-before-the-exit', 'stop-after-a-pass-polled-the-exit')) {
     $dir = Join-Path $env:CP_DIR $mode
     [void](New-Item -ItemType Directory -Path $dir)
     $exe = Join-Path $dir 'mlvfake.exe'
     Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
-    $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+    $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($env:CP_HELPER_FILE)`"")
+    $psi.Environment['CP_HOLD_DIR'] = $dir
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.Environment['MLV_CP_EXE'] = $exe
     $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
@@ -574,12 +600,20 @@ foreach ($mode in @('stop-while-alive', 'stop-right-after-exit')) {
         while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 60000) { Start-Sleep -Milliseconds 100 }
         [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string][DateTime]::UtcNow.Ticks)
         Start-Sleep -Milliseconds 300
-        $measured = Start-Process -FilePath $exe -ArgumentList @('-n', $(if ($mode -eq 'stop-while-alive') { '12' } else { '4' }), '127.0.0.1') -PassThru -WindowStyle Hidden
+        $measured = Start-Process -FilePath $exe -ArgumentList @('-n', '120', '127.0.0.1') -PassThru -WindowStyle Hidden
         $measuredStart = $measured.StartTime.ToUniversalTime().Ticks - 5000000
-        if ($mode -eq 'stop-while-alive') { Start-Sleep -Seconds 2 } else { [void]$measured.WaitForExit(30000) }
+        # hold on the first pass whose polls track the measured app (live count 1); every earlier pass is let go
+        $n = 1; while ((Wait-HelperPass $h $dir $n) -lt 1) { Release-HelperPass $dir $n; $n++ }
+        if ($mode -ne 'stop-while-alive') { $measured.Kill(); [void]$measured.WaitForExit(30000) }
         [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$measured.Id)
+        if ($mode -eq 'stop-after-a-pass-polled-the-exit') {
+            Release-HelperPass $dir $n; $n++
+            if ((Wait-HelperPass $h $dir $n) -ne 0) { throw 'the pass after the exit still tracked the measured app' }
+        }
         [IO.File]::WriteAllText((Join-Path $dir 'stop'), 'stop')
-        if (-not $h.WaitForExit(30000)) { $h.Kill() }
+        Release-HelperPass $dir $n
+        if (-not $h.WaitForExit(30000)) { $h.Kill(); throw "the $mode helper did not end on the stop file" }
+        if (-not $measured.HasExited) { $measured.Kill() }
         [void]$measured.WaitForExit(30000)
         $measuredEnd = [DateTime]::UtcNow.Ticks
         $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
@@ -1087,24 +1121,36 @@ class CorePartitionGeneratorTests(unittest.TestCase):
     def test_a_stop_before_the_helper_observed_the_measured_apps_exit_refuses_its_coverage(self) -> None:
         """r9 Dot 1 (= adversary r8 aeacec83 A1), the real helper: a stop file written while the measured app still runs ends the helper's watch
         before the runner's exit, so its genuinely authenticated record does not cover the window: refused with coverage-stop-before-runner-exit
-        and bench acceptance is false. Control: the stop written the instant the app exits (as the job does) still finds the exit observed."""
+        and bench acceptance is false. Control: the stop written after a pass that began after the app's exit still finds the exit observed.
+        CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1 (hosted sightings: PR 705 5c638a98 run 40861273862 shard 4/8; PR 722): the steps are ordered
+        by the helper's own passes (COVERAGE_HOLD_HOOK), never by sleeps. A stop that lands in a pass which polled the app alive before it exited
+        (a slow hosted pass straddling the exit) is the same refusal as an early stop, pinned as its own negative case, never an accepted record."""
         m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
         self.assertIsNotNone(m)
         work = self.tmp / "coverage-work"
         work.mkdir()
+        # CORE-PARTITION-HELPER-STOPFILE-OBSERVE-FLAKE-1: the real helper with the hold spliced in before its stop-file check
+        src = lf(base64.b64decode(m.group(1)).decode("utf-16-le"))
+        self.assertEqual(src.count(COVERAGE_HOLD_ANCHOR), 1, "the helper's stop-file check moved: the coverage hold has no anchor")
+        helper = self.tmp / "coverage-helper.ps1"
+        helper.write_text(src.replace(COVERAGE_HOLD_ANCHOR, COVERAGE_HOLD_HOOK + COVERAGE_HOLD_ANCHOR), encoding="utf-8")
         driver = self.tmp / "coverage-driver.ps1"
         driver.write_text(LIFT + COVERAGE_DRIVER, encoding="ascii")
-        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1), "CP_GEN": str(GENERATOR)})
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_HELPER_FILE": str(helper), "CP_GEN": str(GENERATOR)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
-        early = got["stop-while-alive"]
-        self.assertEqual(early["app"], early["measuredPid"], early)
-        self.assertEqual(early["endedBy"], "stop-file", early)
-        self.assertIsNone(early["gone"], f"the driver did not stop the helper while the app ran: {early}")
-        self.assertFalse(early["bench"], f"a record whose watch ended before the runner's exit was accepted: {early}")
-        self.assertIsNone(early["observed"], early)
-        self.assertIn("appAffinityObserved=coverage-stop-before-runner-exit", early["why"])
-        control = got["stop-right-after-exit"]
+        # a stop that lands while the app runs, and one that lands in a pass that polled the app alive before it exited (the hosted-runner flake:
+        # endedBy stop-file, observed None), both leave the exit unobserved and are refused, never accepted
+        for case in ("stop-while-alive", "stop-in-a-pass-polled-before-the-exit"):
+            with self.subTest(case=case):
+                early = got[case]
+                self.assertEqual(early["app"], early["measuredPid"], early)
+                self.assertEqual(early["endedBy"], "stop-file", early)
+                self.assertIsNone(early["gone"], f"the helper observed an exit its stop pre-empted: {early}")
+                self.assertFalse(early["bench"], f"a record whose watch ended before the runner's exit was accepted: {early}")
+                self.assertIsNone(early["observed"], early)
+                self.assertIn("appAffinityObserved=coverage-stop-before-runner-exit", early["why"])
+        control = got["stop-after-a-pass-polled-the-exit"]
         self.assertEqual(control["app"], control["measuredPid"], control)
         self.assertIsNotNone(control["gone"], f"the helper ended on the stop file without polling the exited app first: {control}")
         self.assertIsNotNone(control["goneMs"], control)
@@ -3600,10 +3646,41 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         self.assertIn("unreadable", self.verdict(self.CAPPED, self.log(), self.PROOF)["reason"])
 
     def test_a_failure_terminal_summary_without_the_proof_is_judged_on_the_run_log(self) -> None:
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A2 on #726): the run log alone was forgeable by a launcher env value on a build before r2, so a
+        # terminal that omits the proof is UNPROVEN (its FAIL stands, blocks = false), never HONOURED; a mismatch it does show still blocks.
         terminal = {"result": "CPU_FALLBACK_DETECTED"}
-        self.assertEqual(self.verdict(self.CAPPED, self.log(self.start("12")), terminal)["verdict"], "HONOURED")
+        v = self.verdict(self.CAPPED, self.log(self.start("12")), terminal)
+        self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (12, "UNPROVEN", False), v)
+        self.assertIn("WORKER_PROOF_ABSENT", v["reason"])
         self.assertTrue(self.verdict(self.CAPPED, self.log(self.start("16")), terminal)["blocks"])
         self.assertTrue(self.verdict(self.CAPPED, self.log(self.start("12")), dict(terminal, playbackWorkerThreadsRead=16))["blocks"], "a field it does state must agree")
+        self.assertEqual(self.verdict(self.CAPPED, self.log(self.start("12")), dict(self.PROOF, result="CPU_FALLBACK_DETECTED"))["verdict"], "HONOURED",
+                         "a terminal that does carry every proof field is judged on it")
+
+    def test_a_duplicated_worker_count_is_refused_never_last_key_wins(self) -> None:
+        # adversary A2 on #726: MLVAPP_FORCE_SINGLETHREAD="0\rworker_threads=12" on a build before r2 wrote a second worker_threads= after the genuine one.
+        for name, tail in (("forged after", " env_force_singlethread=0 worker_threads=12"), ("forged after a fold", " env_force_singlethread=0 | worker_threads=12"),
+                           ("same value twice", " worker_threads=12")):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, self.log(self.start("8") + tail), self.PROOF)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+                self.assertIn("DUPLICATE_START_FIELD", v["reason"])
+        v = self.verdict(self.CAPPED, self.log(self.start("12") + " env_force_singlethread=0 worker_threads=8"), self.PROOF)
+        self.assertEqual((v["observed"], v["verdict"]), (12, "HONOURED"), "a value with a Unicode space stays inside its own field")
+
+    def test_an_empty_valued_duplicate_is_refused_in_either_order_and_case(self) -> None:
+        # r3 (sol ADV-A2 on #726, CR 6538542792): `worker_threads=12 worker_threads=` returned duplicates=[] and HONOURED because the reader skipped an empty
+        # value. A key counts whatever its value, in either order and either case, and a Qt location suffix adds no token.
+        for name, line in (("empty after", self.start("12") + " worker_threads="), ("empty before", self.start("12").replace("worker_threads=12", "worker_threads= worker_threads=12")),
+                           ("empty upper case after", self.start("12") + " WORKER_THREADS="),
+                           ("empty upper case before", self.start("12").replace("worker_threads=12", "WORKER_THREADS= worker_threads=12")),
+                           ("empty before a location suffix", self.start("12") + " worker_threads= (C:/build (x)/MainWindow.cpp:25848)")):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, self.log(line), self.PROOF)
+                self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+                self.assertIn("DUPLICATE_START_FIELD", v["reason"])
+        v = self.verdict(self.CAPPED, self.log("[2026-10-31T00:00:00.000Z] [INFO] [0x1] " + self.start("12") + " (C:/build (x)/MainWindow.cpp:25848)"), self.PROOF)
+        self.assertEqual((v["observed"], v["verdict"]), (12, "HONOURED"), "one genuine count with a location suffix still honours")
 
     def test_only_a_recognised_failure_terminal_may_omit_the_proof(self) -> None:
         # adversary r1 A1 (2166f68a): a summary with no result, or a result that is not exactly a capture or a known failure terminal, skipped the proof
@@ -3619,7 +3696,8 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
                 self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
         for terminal in ("GPU_RECON_FRAMES_ZERO", "CPU_FALLBACK_DETECTED", "CPU_BACKEND_PATH_MISMATCH", "PRESENTMON_UNAVAILABLE"):
             with self.subTest(terminal=terminal):
-                self.assertEqual(self.verdict(self.CAPPED, log, {"result": terminal})["verdict"], "HONOURED")
+                v = self.verdict(self.CAPPED, log, {"result": terminal})
+                self.assertEqual((v["verdict"], v["blocks"]), ("UNPROVEN", False), v)
 
     def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
         for spec in ({}, {"generatorArgs": {"unpaced": True}}):

@@ -446,6 +446,10 @@ param(
     # runs the reference loop), so one staged build measures the fast path on and off. Absent: nothing is set and the emitted job is the text it
     # was before this parameter.
     [switch]$DisablePrepPointwiseFast,
+    # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the #397 bisect switch that sends drop-frame-on prep work through the move deque instead of master's conflated
+    # slot (MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1; the app reads it as set-and-not-0), so one staged build measures both queues. The OFF arm is this switch
+    # absent: nothing is set and the emitted job is the text it was before this parameter.
+    [switch]$PrepConflatedMove,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -6209,6 +6213,18 @@ if ($DisablePrepPointwiseFast) {
     })
 }
 
+# PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the move-deque arm adds MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1 at the same env-list site, only when asked.
+# The anchor must match exactly once, or the generator throws (a template refactor can never silently run the ON arm with the variable unset; the runner
+# also requires the app's own playback_smoke.start prep_conflated_move_active=1 before the leg counts).
+if ($PrepConflatedMove) {
+    $prepConflatedMoveEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($prepConflatedMoveEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_PREP_CONFLATED_MOVE_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE to' }
+    $text = $prepConflatedMoveEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1'," + $m.Groups['nl'].Value
+    })
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -6666,6 +6682,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     firstPresentCapture = [bool]$FirstPresentCapture
     unpaced = [bool]$Unpaced
     disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
+    prepConflatedMove = [bool]$PrepConflatedMove
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })

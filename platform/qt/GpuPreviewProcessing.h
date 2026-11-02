@@ -2,6 +2,7 @@
 #define GPUPREVIEWPROCESSING_H
 
 #include "../../src/processing/processing_object.h"
+#include "GpuPresentTailWindow.h"   // PLAYBACK-PRESENT-TAIL-TIMING-1: GpuPresentTailTiming
 #include <QByteArray>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>

@@ -380,7 +380,7 @@ function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
     Get-ChildItem -LiteralPath (Join-Path $fx 'notafter') -File -ErrorAction SilentlyContinue | Remove-Item -Force
     $script:Log.Clear(); $script:Beats.Clear(); $script:Age = 0; $script:Exempt = 0
     $script:QuietLease = $null; $script:QuietLeaseWaiting = $null; $script:Admission = $null
-    $script:LogHook = $null; $script:HookFired = $false; $script:BeatHook = $null
+    $script:LogHook = $null; $script:HookFired = $false; $script:BeatHook = $null; $script:SidecarReadHook = $null; $script:VerdictNowPin = $null
 }
 function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) }
 function Wait-Until([scriptblock]$Cond, [double]$TimeoutSec) { $dl = (Get-Date).AddSeconds($TimeoutSec); while (-not (& $Cond) -and (Get-Date) -lt $dl) { Start-Sleep -Milliseconds 100 }; return [bool](& $Cond) }
@@ -801,7 +801,7 @@ try {
         'notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker',
         'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky',
-        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75',
+        'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75', 'liveness-renewed-across-stall', 'liveness-renewal-stops-lapses', 'liveness-renewed-post-renewal-pause', 'liveness-renewal-stops-lapses-post-pause', 'liveness-renew-stall-override-bound',
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
@@ -836,6 +836,134 @@ try {
         $u = $AliveUntilUtc.ToUniversalTime().ToString('o')
         Write-SidecarRaw $JobId (New-SidecarJson $JobId $u -Seq $Seq)
         return $u
+    }
+
+    # CI-FLAKE-HEAVY-SLOT-GATE-QUIET-LEASE-1: renewal driven by the gate's own sidecar reads. Read-JobNotAfterSidecar is wrapped (the
+    # real one is still what reads); with $script:SidecarReadHook set the hook runs first, like the LogHook and BeatHook above.
+    if ($liftMissing -notcontains 'Read-JobNotAfterSidecar') {
+        $script:RealReadSidecar = ${function:Read-JobNotAfterSidecar}
+        function Read-JobNotAfterSidecar { param([Parameter(Mandatory = $true)][string]$JobId) if ($null -ne $script:SidecarReadHook) { & $script:SidecarReadHook $JobId }; return (& $script:RealReadSidecar -JobId $JobId) }
+    }
+    # QL_TEST_RENEW_STALL_SEC (a hand-set stall for liveness-renewed-across-exit75; CI leaves it unset): "" or 0 = no stall. Otherwise a
+    # number of seconds whose CONVERTED milliseconds are longer than the renewal window's (the stall must outlast it, which
+    # Invoke-RenewedAcrossExit75 asserts later) and fit an Int32 (Start-Sleep -Milliseconds). Anything else is a typed refusal, not a late assertion or a cast
+    # overflow. Returns @{ ok; sec; why }.
+    $script:RenewTtlSec = 3
+    $script:RenewStallMaxSec = 20   # the stall sits inside Invoke-RenewedAcrossExit75's 40 s queue guard with ~9 s of waiting around it
+    function Get-RenewStallOverride([string]$Raw, [double]$TtlSec = $script:RenewTtlSec) {
+        if ([string]::IsNullOrWhiteSpace($Raw)) { return [pscustomobject]@{ ok = $true; sec = [double]0; why = 'unset: no stall' } }
+        $v = [double]0
+        if (-not [double]::TryParse($Raw.Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$v) -or [double]::IsNaN($v) -or [double]::IsInfinity($v)) {
+            return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC '$($Raw -replace '[^\x20-\x7E]', '?')' is not a finite number of seconds" }
+        }
+        # A nonzero mantissa that parsed to 0 underflowed (1e-400): refused, never read as "no stall".
+        if ($v -eq 0 -and ($Raw.Trim() -replace '[eE].*$', '') -match '[1-9]') { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC '$($Raw -replace '[^\x20-\x7E]', '?')' underflows to 0 s: not a usable number of seconds (write 0 for no stall)" } }
+        if ($v -eq 0) { return [pscustomobject]@{ ok = $true; sec = [double]0; why = '0: no stall' } }
+        if ($v -lt 0) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s is negative (write 0, or leave it unset, for no stall)" } }
+        # Validated on the CONVERTED millisecond duration, the one Start-Sleep actually sleeps and the assertion compares: 3.0001 s is
+        # longer than the window as a double, but converts to 3000 ms, which does not outlast it.
+        $ms = [Math]::Round($v * 1000)
+        if ($ms -le [Math]::Round($TtlSec * 1000)) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s ($ms ms after conversion) must be longer than the $TtlSec s renewal window (or 0/unset for none): a shorter stall cannot lapse the sidecar and would fail the stall assertion late" } }
+        if ($ms -gt [int]::MaxValue) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s overflows the Int32 millisecond conversion (at most $([int]::MaxValue / 1000) s)" } }
+        if ($v -gt $script:RenewStallMaxSec) { return [pscustomobject]@{ ok = $false; sec = $null; why = "QL_TEST_RENEW_STALL_SEC $v s exceeds the $($script:RenewStallMaxSec) s ceiling (the case runs under a 40 s queue guard; a longer stall ends it queue-expired)" } }
+        return [pscustomobject]@{ ok = $true; sec = $v; why = "$v s stall" }
+    }
+    # The verdict wrapper: with $script:VerdictNowPin set by a renewing read (below) the very next verdict for that job is taken as
+    # of the renewal write (-NowUtc), consumed on use. Absent a pin (every other case, and every read after renewal stopped) it is
+    # the real Get-JobNotAfterVerdict on the real clock, so a lapse is still called when renewal really stops.
+    if ($liftMissing -notcontains 'Get-JobNotAfterVerdict') {
+        $script:RealVerdict = ${function:Get-JobNotAfterVerdict}
+        function Get-JobNotAfterVerdict {
+            param([Parameter(Mandatory = $true)]$Metadata, [DateTime]$NowUtc = [DateTime]::MinValue, $Sidecar = $null)
+            $pin = $script:VerdictNowPin
+            if ($null -ne $pin -and -not $PSBoundParameters.ContainsKey('NowUtc') -and $null -ne $Sidecar -and [string]$Sidecar.jobId -ceq $pin.jobId) { $script:VerdictNowPin = $null; $NowUtc = $pin.utc; $script:RenewSt.pinned++ }
+            return (& $script:RealVerdict -Metadata $Metadata -NowUtc $NowUtc -Sidecar $Sidecar)
+        }
+    }
+    # The runner's renewal as an event: every gate read of <JobId>'s sidecar first rewrites it (aliveUntilUtc = now + ttl, seq++) for
+    # the first $MaxRenews reads, then stops. $StallSec > 0 sleeps once in the gate's heartbeat after two renewals (a runner stall
+    # between renewals, longer than the window). Reset-Case clears both hooks. Returns the state the case asserts on.
+    function Start-SidecarRenewOnRead([string]$JobId, [int]$MaxRenews, [double]$StallSec, [double]$PostRenewPauseSec = 0) {
+        $st = @{ jobId = $JobId; max = $MaxRenews; ttl = $script:RenewTtlSec; renews = 0; reads = 0; seq = 1; lastRenewUtc = $null; stallSec = $StallSec; stalled = $false; postPauseSec = $PostRenewPauseSec; postPaused = $false; pinned = 0; firstWriteUtc = [DateTime]::UtcNow }
+        $script:RenewSt = $st
+        $null = Write-Sidecar $JobId ($st.firstWriteUtc.AddSeconds($st.ttl)) 1
+        $script:SidecarReadHook = {
+            param($Id)
+            $s = $script:RenewSt
+            if ($Id -ne $s.jobId) { return }
+            $s.reads++
+            $script:VerdictNowPin = $null
+            if ($s.renews -lt $s.max) {
+                $s.renews++; $s.seq++; $s.lastRenewUtc = [DateTime]::UtcNow; $null = Write-Sidecar $s.jobId ($s.lastRenewUtc.AddSeconds($s.ttl)) $s.seq
+                # A scheduler pause right after the renewal write, before the gate's verdict samples its clock (sol r1 B1).
+                if ($s.postPauseSec -gt 0 -and -not $s.postPaused) { $s.postPaused = $true; Start-Sleep -Milliseconds ([int]($s.postPauseSec * 1000)) }
+                # The renewal is an EVENT: the verdict that follows this read is taken as of the renewal write, so how long the host
+                # took to get from the write to the verdict (a 4 s pause here, a starved hosted runner there) cannot lapse it.
+                $script:VerdictNowPin = @{ jobId = $s.jobId; utc = $s.lastRenewUtc }
+            }
+        }
+        if ($StallSec -gt 0) {
+            $script:BeatHook = {
+                param($Activity)
+                $s = $script:RenewSt
+                if (-not $s.stalled -and $s.renews -ge 2 -and $Activity -like "gate-wait job=$($s.jobId) *") { $s.stalled = $true; Start-Sleep -Milliseconds ([int]($s.stallSec * 1000)) }
+            }
+        }
+        return $st
+    }
+    # The wait of liveness-renewed-across-exit75 and -across-stall: two exit-75 refusals, then the third request turns active, with the
+    # sidecar renewed on every gate read throughout (a wait of more than 3x the 3 s window).
+    function Invoke-RenewedAcrossExit75([string]$Name, [string]$JobId, [double]$StallSec, [double]$PostRenewPauseSec = 0) {
+        Reset-Case @{ request = 'refuse_then_active'; refuse_count = 2; active_after = 8 }
+        $script:LeaseNotAfterMinAdmitSec = 1
+        $script:AgeAfter = (Get-Date).AddSeconds(40)
+        $mL = New-NotAfterMeta 3600
+        $st = Start-SidecarRenewOnRead $JobId ([int]::MaxValue) $StallSec $PostRenewPauseSec
+        $tR = Get-Date
+        $adm = Wait-QuietLeaseAdmission -JobId $JobId -Job ([pscustomobject]@{}) -Metadata $mL
+        $elapsed = ((Get-Date) - $tR).TotalSeconds
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        $r75 = @($adm.leaseRefusals | Where-Object { $_.reason -eq 'refused' -and $_.rc -eq 75 })
+        Assert-True ($adm.label -eq 'clear' -and $adm.livenessState -ceq 'live' -and $adm.notAfterSource -ceq 'meta') "${Name}: admitted clear under a live sidecar: label=$($adm.label) livenessState=$($adm.livenessState) source=$($adm.notAfterSource) why=$($adm.why)"
+        Assert-True ($r75.Count -eq 2 -and $reqs.Count -eq 3) "${Name}: two exit-75 refusals, then the third request turned active: refusals=$($r75.Count) requests=$($reqs.Count)"
+        # The renewal-count claim is made on the event sequence, not on a read count: a count of gate reads (the old renews >= 8) is a
+        # function of how many poll ticks a loaded host let the gate run in its >= 9 s wait, so a long gate pause could leave it at 7.
+        # What is asserted instead is that the gate admitted on the LAST renewal it was handed (admittedSeq == seq, seq > 3) and that
+        # renewal was made more than two windows after the first write, so the first write alone would have lapsed. The only
+        # wall-clock terms left are lower bounds (elapsed > 9 s, span > 2 windows) that a slower host can only make more true.
+        $span = if ($null -ne $st.lastRenewUtc) { ($st.lastRenewUtc - $st.firstWriteUtc).TotalSeconds } else { 0 }
+        Assert-True ($elapsed -gt 9 -and $st.reads -ge $st.renews -and [long]$adm.livenessSeq -gt 3 -and [long]$adm.livenessSeq -eq $st.seq -and $span -gt (2 * $st.ttl)) "${Name}: the wait ($([Math]::Round($elapsed, 1)) s) outlasted 3x the $($st.ttl) s window and the gate admitted on the latest renewal ($([Math]::Round($span, 1)) s after the first write), not the first write: renews=$($st.renews) reads=$($st.reads) seq=$($st.seq) admittedSeq=$($adm.livenessSeq)"
+        # The verdict pin is what makes the renewal an event. A seam that stopped pinning would leave these cases to the host's
+        # scheduling (flaking only under load), so every renewal must have been judged as of its write: pinned verdicts >= renews.
+        Assert-True ($st.pinned -ge $st.renews -and $st.renews -gt 0) "${Name}: every renewal's verdict was pinned to the renewal write (the seam is engaged): pinned=$($st.pinned) renews=$($st.renews)"
+        if ($StallSec -gt 0) { Assert-True ($st.stalled -and [int]($StallSec * 1000) -gt [int]($st.ttl * 1000)) "${Name}: a stall longer than the window ($StallSec s = $([int]($StallSec * 1000)) ms, window $([int]($st.ttl * 1000)) ms) ran between renewals: stalled=$($st.stalled)" }
+        if ($PostRenewPauseSec -gt 0) { Assert-True ($st.postPaused -and $PostRenewPauseSec -ge 4) "${Name}: a pause of >= 4 s ($PostRenewPauseSec s, longer than the $($st.ttl) s window) ran right after the first renewal write: paused=$($st.postPaused)" }
+        Exit-HeavySlot
+        return [ordered]@{ label = $adm.label; elapsedSec = [Math]::Round($elapsed, 1); renews = $st.renews; reads = $st.reads; admittedSeq = $adm.livenessSeq; stallSec = $StallSec; postRenewPauseSec = $PostRenewPauseSec }
+    }
+
+
+    # The negative case: three renewals, then renewal really stops. The lapse must be called, while the request is pending, and only
+    # after the last renewal's window. $PostRenewPauseSec > 0 adds the post-renewal-write pause after the first renewal.
+    function Invoke-RenewalStopsLapses([string]$Name, [string]$JobId, [double]$PostRenewPauseSec) {
+        Reset-Case @{ request = 'hang' }
+        $script:LeaseNotAfterMinAdmitSec = 1
+        $savedPendingMax = $LeasePendingMaxSec
+        $LeasePendingMaxSec = 1800
+        $script:AgeAfter = (Get-Date).AddSeconds(25)
+        $mL = New-NotAfterMeta 3600
+        $st = Start-SidecarRenewOnRead $JobId 3 0 $PostRenewPauseSec
+        try { $adm = Wait-QuietLeaseAdmission -JobId $JobId -Job ([pscustomobject]@{}) -Metadata $mL }
+        finally { $LeasePendingMaxSec = $savedPendingMax }
+        $tEnd = [DateTime]::UtcNow
+        Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -ceq 'pending' -and $adm.notAfterSource -ceq 'sidecar' -and $adm.livenessState -ceq 'lapsed') "${Name}: renewal stopped, so the sidecar lapsed and the pending request was released: label=$($adm.label) phase=$($adm.phase) source=$($adm.notAfterSource) liveness=$($adm.livenessState) renews=$($st.renews) reads=$($st.reads)"
+        Assert-True ($st.renews -eq 3 -and $st.reads -gt 3 -and (Get-Released).Count -eq 1) "${Name}: exactly 3 renewals, more reads than renewals, one release: renews=$($st.renews) reads=$($st.reads) released=$((Get-Released).Count)"
+        # Each of the 3 renewals was judged as of its write; once renewal stopped nothing was pinned, so the lapse above is the real clock's.
+        Assert-True ($st.pinned -eq $st.renews) "${Name}: exactly the renewals were pinned, none after renewal stopped: pinned=$($st.pinned) renews=$($st.renews)"
+        $sinceRenew = ($tEnd - $st.lastRenewUtc).TotalSeconds
+        Assert-True ($sinceRenew -ge 2.9) "${Name}: the lapse is called only after the last renewal's $($st.ttl) s window ($([Math]::Round($sinceRenew, 2)) s after it)"
+        if ($PostRenewPauseSec -gt 0) { Assert-True ($st.postPaused -and $PostRenewPauseSec -ge 4) "${Name}: a pause of >= 4 s ($PostRenewPauseSec s) ran right after the first renewal write: paused=$($st.postPaused)" }
+        return [ordered]@{ label = $adm.label; phase = $adm.phase; renews = $st.renews; reads = $st.reads; sinceLastRenewSec = [Math]::Round($sinceRenew, 1); postRenewPauseSec = $PostRenewPauseSec }
     }
 
     # ------------------------------------------------------------ notafter-before-request: no request once it has passed / is too near
@@ -1710,47 +1838,57 @@ function Exit-HeavySlot {
     }
 
     # ------------------------------------------------------------ liveness-renewed-across-exit75: renewals, not the first write, carry it
+    # CI-FLAKE-HEAVY-SLOT-GATE-QUIET-LEASE-1: the renewals are EVENTS, not a wall clock. A runspace that rewrote the sidecar every 1 s
+    # (3 s window) lapsed it whenever a loaded runner starved it for 3 s (hosted job 124164592779: label=expired-not-after
+    # livenessState=lapsed). Now each of the gate's own sidecar reads first renews (Start-SidecarRenewOnRead), so what is asserted is
+    # the count of renewals the gate observed and the seq it admitted on, never how many wall-clock seconds passed between writes.
     if (Test-Case 'liveness-renewed-across-exit75') {
-        Reset-Case @{ request = 'refuse_then_active'; refuse_count = 2; active_after = 8 }
-        $script:LeaseNotAfterMinAdmitSec = 1
-        $script:AgeAfter = (Get-Date).AddSeconds(40)
-        $mL = New-NotAfterMeta 3600
-        # The runner's renew thread: an in-process runspace that rewrites the sidecar every 1 s with now + 3 s, seq++.
-        $writer = [hashtable]::Synchronized(@{ stop = $false; seq = 1; writes = 0; errors = 0; path = (Join-Path $notAfterDir 'jLr.json'); lastError = $null })
-        $null = Write-Sidecar 'jLr' ([DateTime]::UtcNow.AddSeconds(3)) 1
-        $ps = [powershell]::Create()
-        $null = $ps.AddScript({
-                param($s)
-                while (-not $s.stop) {
-                    for ($i = 0; $i -lt 10 -and -not $s.stop; $i++) { Start-Sleep -Milliseconds 100 }
-                    if ($s.stop) { break }
-                    try {
-                        $s.seq++
-                        $o = [ordered]@{ schema = 'mlv-app/job-notafter-sidecar/v1'; jobId = 'jLr'; aliveUntilUtc = [DateTime]::UtcNow.AddSeconds(3).ToString('o'); writtenUtc = [DateTime]::UtcNow.ToString('o'); seq = $s.seq; writerPid = $PID; writerHost = 'unit-vm' }
-                        $tmp = "$($s.path).$([guid]::NewGuid().ToString('N')).tmp"
-                        [IO.File]::WriteAllText($tmp, ($o | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-                        [IO.File]::Move($tmp, $s.path, $true)
-                        $s.writes++
-                    }
-                    catch { $s.errors++; $s.lastError = $_.Exception.Message }
-                }
-            }).AddArgument($writer)
-        $tR = Get-Date
-        $handle = $ps.BeginInvoke()
-        try { $adm = Wait-QuietLeaseAdmission -JobId 'jLr' -Job ([pscustomobject]@{}) -Metadata $mL }
-        finally {
-            $writer.stop = $true
-            $null = $handle.AsyncWaitHandle.WaitOne(5000)
-            $ps.Dispose()
+        $ov = Get-RenewStallOverride $env:QL_TEST_RENEW_STALL_SEC
+        Assert-True $ov.ok "liveness-renewed-across-exit75: $($ov.why)"
+        $results.livenessRenewedAcrossExit75 = Invoke-RenewedAcrossExit75 'liveness-renewed-across-exit75' 'jLr' $ov.sec
+    }
+
+    # ------------------------------------------------------------ liveness-renew-stall-override-bound: the hand-set stall is bounded
+    if (Test-Case 'liveness-renew-stall-override-bound') {
+        $okVec = [ordered]@{ '' = 0; '   ' = 0; '0' = 0; '0.0' = 0; '3.001' = 3.001; '3.0006' = 3.0006; '4' = 4; ' 4 ' = 4; '20' = 20; '0e5' = 0; '-0' = 0 }
+        foreach ($k in $okVec.Keys) {
+            $r = Get-RenewStallOverride $k
+            Assert-True ($r.ok -and $r.sec -eq $okVec[$k]) "liveness-renew-stall-override-bound: '$k' is accepted as $($okVec[$k]) s: ok=$($r.ok) sec=$($r.sec) why=$($r.why)"
         }
-        $elapsed = ((Get-Date) - $tR).TotalSeconds
-        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
-        $r75 = @($adm.leaseRefusals | Where-Object { $_.reason -eq 'refused' -and $_.rc -eq 75 })
-        Assert-True ($adm.label -eq 'clear' -and $adm.livenessState -ceq 'live' -and $adm.notAfterSource -ceq 'meta') "liveness-renewed-across-exit75: admitted clear under a live sidecar: label=$($adm.label) livenessState=$($adm.livenessState) source=$($adm.notAfterSource) why=$($adm.why)"
-        Assert-True ($r75.Count -eq 2 -and $reqs.Count -eq 3) "liveness-renewed-across-exit75: two exit-75 refusals, then the third request turned active: refusals=$($r75.Count) requests=$($reqs.Count)"
-        Assert-True ($elapsed -gt 9 -and $writer.writes -ge 8 -and [long]$adm.livenessSeq -gt 3) "liveness-renewed-across-exit75: the wait ($([Math]::Round($elapsed, 1)) s) outlasted 3x the 3 s window, so the renewals carried it: writes=$($writer.writes) errors=$($writer.errors) admittedSeq=$($adm.livenessSeq)"
-        Exit-HeavySlot
-        $results.livenessRenewedAcrossExit75 = [ordered]@{ label = $adm.label; elapsedSec = [Math]::Round($elapsed, 1); writes = $writer.writes; writeErrors = $writer.errors; admittedSeq = $adm.livenessSeq }
+        $badVec = [ordered]@{ '1' = 'longer than the 3 s renewal window'; '3' = 'longer than the 3 s renewal window'; '3.0001' = 'longer than the 3 s renewal window'; '3.0004' = 'longer than the 3 s renewal window'; '-4' = 'is negative'; '-0.5' = 'is negative'; '-1e12' = 'is negative'; '2147483.648' = 'overflows the Int32'; '1e12' = 'overflows the Int32'
+            'abc' = 'not a finite number'; 'NaN' = 'not a finite number'; 'Infinity' = 'not a finite number'; '4s' = 'not a finite number'
+            '1e-400' = 'underflows to 0 s'; '20.001' = 'exceeds the 20 s ceiling'; '60' = 'exceeds the 20 s ceiling'; '2147483.647' = 'exceeds the 20 s ceiling' }
+        foreach ($k in $badVec.Keys) {
+            $r = Get-RenewStallOverride $k
+            Assert-True ((-not $r.ok) -and $null -eq $r.sec -and $r.why -like "QL_TEST_RENEW_STALL_SEC *$($badVec[$k])*") "liveness-renew-stall-override-bound: '$k' is a typed refusal ('$($badVec[$k])'): ok=$($r.ok) why=$($r.why)"
+        }
+        # The ms conversion Start-SidecarRenewOnRead performs holds for the largest accepted value.
+        $big = (Get-RenewStallOverride '20').sec
+        Assert-True ([int]($big * 1000) -eq 20000 -and 20000 -lt [int]::MaxValue) "liveness-renew-stall-override-bound: the largest accepted stall converts to Int32 milliseconds without overflow"
+        $results.livenessRenewStallOverrideBound = [ordered]@{ accepted = $okVec.Count; refused = $badVec.Count }
+    }
+
+    # ------------------------------------------------------------ liveness-renewed-across-stall: a gap longer than the window between renewals
+    # The stall (4 s > the 3 s window) lands in the gate loop's heartbeat, between two renewals. The sidecar is lapsed on disk
+    # meanwhile; the next read renews it first, so the job is still admitted. The stall itself is asserted to have run.
+    if (Test-Case 'liveness-renewed-across-stall') {
+        $results.livenessRenewedAcrossStall = Invoke-RenewedAcrossExit75 'liveness-renewed-across-stall' 'jLs' 4
+    }
+
+    # ------------------------------------------------------------ liveness-renewal-stops-lapses: the negative case, renewal really stops
+    if (Test-Case 'liveness-renewal-stops-lapses') {
+        $results.livenessRenewalStopsLapses = Invoke-RenewalStopsLapses 'liveness-renewal-stops-lapses' 'jLz' 0
+    }
+
+    # ------------------------------------------------------------ the post-renewal-write scheduler pause (sol r1 B1), default inputs
+    # A pause of 4 s right after the first renewal write and before the verdict samples its clock. Without it the verdict reads
+    # the sidecar it was just handed as lapsed (label=expired-not-after livenessState=lapsed); with it the job is still admitted.
+    if (Test-Case 'liveness-renewed-post-renewal-pause') {
+        $results.livenessRenewedPostRenewalPause = Invoke-RenewedAcrossExit75 'liveness-renewed-post-renewal-pause' 'jLp' 0 4
+    }
+    # ... and the negative twin: the same pause, renewal then really stops, so the lapse is still called, still while pending.
+    if (Test-Case 'liveness-renewal-stops-lapses-post-pause') {
+        $results.livenessRenewalStopsLapsesPostPause = Invoke-RenewalStopsLapses 'liveness-renewal-stops-lapses-post-pause' 'jLq' 4
     }
 
     # ------------------------------------------------------------ liveness-absent-unchanged: no sidecar = notAfterUtc alone, as before

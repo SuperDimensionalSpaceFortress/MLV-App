@@ -107,8 +107,10 @@ if ($OfflineTestMode) {
         throw 'DVE_OFFLINE_TEST_REFUSES_REAL_UMRUN offline test mode can never use um-run.ps1 (by path or content): it would submit a job'
     }
 }
-if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {
-    throw 'DVE_SHEET_COPY_MUST_STAY_LOCAL -SheetCopyDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
+# r4 A2: the helper RETURNS the normalised full path it certified and the value used from here on is THAT one (a relative value is resolved once, against the PowerShell location)
+if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
+    $SheetCopyDir = Test-DvLocalReceiptRoot -Path $SheetCopyDir
+    if (-not $SheetCopyDir) { throw 'DVE_SHEET_COPY_MUST_STAY_LOCAL -SheetCopyDir must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory; a sheet of owner footage is never committed, attached or published' }
 }
 
 # --- SET MODE, part 1 (DUAL-VENUE-DISPLAY-MATRIX-1): expand the leg set into its planned legs and print them. -PlanOnly stops here: nothing is generated, probed or submitted. ---
@@ -135,15 +137,19 @@ if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
     $mainRoot = if ($LASTEXITCODE -eq 0 -and $common) { Split-Path -Parent ([string]$common) } else { $RepoRoot }
     $ReceiptRoot = Join-Path $mainRoot '.claude-state\dual-venue\receipts'
 }
-if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $ReceiptRoot)) {
-    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be under a .claude-state directory: a receipt and its evidence name an owner clip''s run'
+$rrCert = $(if ($OfflineTestMode) { $ReceiptRoot } else { Test-DvLocalReceiptRoot -Path $ReceiptRoot })
+if (-not $rrCert) {
+    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run'
 }
+$ReceiptRoot = $rrCert
 # The hashed run evidence (summary, manifest, result, run log, um-run record) goes in a sibling of the receipts directory. It names an
 # owner clip's run too, so in production that directory must ALSO sit under .claude-state (a ReceiptRoot of `.claude-state` itself would not).
 $evidenceBase = Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence'
-if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $evidenceBase)) {
-    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be under a .claude-state directory: the run evidence names an owner clip''s run'
+$evCert = $(if ($OfflineTestMode) { $evidenceBase } else { Test-DvLocalReceiptRoot -Path $evidenceBase })
+if (-not $evCert) {
+    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: the run evidence names an owner clip''s run'
 }
+$evidenceBase = $evCert
 if ([string]::IsNullOrWhiteSpace($Actor)) { $Actor = "dual-venue-runner@$($env:COMPUTERNAME)" }
 $runStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
 
@@ -482,6 +488,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
         # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg. Only a JSON true arms it (a string "false" is not true).
         if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the #397 prep-conflated-move switch (ON arm), for any leg; judged below by the app's own prep_conflated_move_active readback.
+        if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] -and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
@@ -790,7 +798,10 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
     $receipt.visual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $artifactsShare -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) `
         -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
     $stripDir = $(if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $SheetCopyDir } else { Join-Path (Split-Path -Parent $ReceiptRoot) 'sheets' })
-    if ($receipt.visual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+    $stripCert = $(if ($OfflineTestMode) { $stripDir } else { Test-DvLocalReceiptRoot -Path $stripDir })
+    # r5 G6: the certified spelling replaces $stripDir HERE, before either branch (the primary strip and the self-heal loop below) builds a copy path from it
+    if ($stripCert) { $stripDir = $stripCert }
+    if ($receipt.visual.stripPath -and $stripCert) {
         New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
         $stripCopy = Join-Path $stripDir "strip-$($spec.legId)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
         Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
@@ -804,7 +815,7 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         foreach ($preDir in @(Get-ChildItem -LiteralPath $selfHealLocal -Directory | Where-Object { $_.Name -cmatch '^pre-\d+$' } | Sort-Object { [int]$_.Name.Substring(4) })) {
             $preVisual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected') -LegId "$($spec.legId)-$($preDir.Name)" `
                 -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
-            if ($preVisual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+            if ($preVisual.stripPath -and $stripCert) {
                 New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
                 $preStripCopy = Join-Path $stripDir "strip-$($spec.legId)-$($preDir.Name)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
                 Copy-Item -LiteralPath $preVisual.stripPath -Destination $preStripCopy -Force
@@ -853,6 +864,16 @@ $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLog
 if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement under the cap this leg names"
+    $outcome = 'INVALID'
+}
+# PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, FAIL CLOSED: a leg that asks for the #397 prep-conflated-move switch counts only when the measured session's own
+# playback_smoke.prep_route record reports prep_conflated_move_active=1 (r2: a line of its own, never the start line's env-derived fields); a value in the
+# launcher's env block is a request, not engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask
+# for it is unchanged.
+$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText
+if ($prepConflatedMoveVerdict.requested) { $receipt['prepConflatedMove'] = [ordered]@{ requested = $true; observed = $prepConflatedMoveVerdict.observed; verdict = $prepConflatedMoveVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason). A run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does
