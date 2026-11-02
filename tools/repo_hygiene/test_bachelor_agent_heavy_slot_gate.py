@@ -111,8 +111,12 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
         raise TimeoutError(note)
     error = box.get("error")
     if error is not None:
-        if isinstance(error, OSError) and tolerate_oserror:
+        # adversary r7 A2: after a failed wait ANY Exception from the read (MemoryError on a huge stream, ValueError, RuntimeError) is recorded
+        # in the text; only a BaseException that is not an Exception (an interrupt) still propagates.
+        if tolerate_oserror and isinstance(error, OSError):
             return f"<read failed: errno {error.errno} {error.strerror}>"
+        if tolerate_oserror and isinstance(error, Exception):
+            return f"<read failed: {type(error).__name__}: {error}>"
         raise error  # type: ignore[misc]
     return str(box["text"])
 
@@ -716,7 +720,7 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
             return root
         return popen
 
-    def _run_failing_read(self, failing_name: str, *, timeout_expires: bool = True) -> BaseException:
+    def _run_failing_read(self, failing_name: str, *, timeout_expires: bool = True, error: Exception | None = None) -> BaseException:
         proc = self._TimedOutProc()
         if not timeout_expires:
             proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
@@ -724,7 +728,7 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
 
         def read_text(path: Path, *args: object, **kwargs: object) -> str:
             if path.name == failing_name:
-                raise PermissionError(13, "sharing violation")
+                raise error if error is not None else PermissionError(13, "sharing violation")
             return real_read_text(path, *args, **kwargs)
 
         with mock.patch.object(subprocess, "Popen", side_effect=self._popen_for(proc, self._FakeTaskkill(0))), \
@@ -746,6 +750,24 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn("<read failed: errno 13", str(caught))
+
+    def test_a_timeout_keeps_its_case_named_verdict_whatever_exception_the_read_raises(self) -> None:
+        # adversary r7 A2: only OSError was tolerated after a failed wait, so a MemoryError (a huge captured stream under a memory ceiling),
+        # a ValueError or a RuntimeError from the read replaced the case-named verdict. Any Exception is recorded in the text instead.
+        for name in ("stdout.txt", "stderr.txt"):
+            for exc in (MemoryError(), ValueError("bad stream"), RuntimeError("boom"), OSError(5, "I/O error")):
+                with self.subTest(stream=name, exc=repr(exc)):
+                    caught = self._run_failing_read(name, error=exc)
+                    self.assertIsInstance(caught, AssertionError, repr(caught))
+                    self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+                    self.assertIn("<read failed: ", str(caught))
+                    self.assertIn("and its process tree was killed.", str(caught))
+
+    def test_a_read_exception_without_a_timeout_still_surfaces_as_itself(self) -> None:
+        for exc in (MemoryError(), ValueError("bad stream")):
+            with self.subTest(exc=repr(exc)):
+                caught = self._run_failing_read("stdout.txt", timeout_expires=False, error=exc)
+                self.assertIs(caught, exc)
 
     def _run_stalled_read(self, *, timeout_expires: bool) -> tuple[BaseException, float]:
         # adversary r6 A2: after a successful cleanup the captured-output read stalls (a hung share). It must not hold the verdict back.
@@ -1047,6 +1069,27 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("STARTED|0", proc.stdout, "a refused bound must never reach the open or the delete")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_start_seam_that_hands_back_anything_but_one_task_is_a_named_failure_not_a_false_success(self) -> None:
+        # adversary r7 A4: `$task = & $Start` kept an array when the seam emitted two tasks, and `$task.Wait($left)` on that array is a
+        # truthy array, so two pending tasks read as finished (the cleanup reported success; the reader blocked on .Result).
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$two = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task; [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
+                  "$none = { param($p) }\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "Write-Output ('READ-TWO|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $two))\n"
+                  "Write-Output ('READ-NONE|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $none))\n"
+                  "Write-Output ('DEL-TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $two))\n"
+                  "Write-Output ('DEL-NONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $none))\n"
+                  "Write-Output ('FAST|' + ($sw.ElapsedMilliseconds -lt 5000))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for label in ("READ-TWO", "READ-NONE"):
+            self.assertRegex(proc.stdout, label + r"\|<read failed: .*exactly one Task", label)
+        for label in ("DEL-TWO", "DEL-NONE"):
+            self.assertRegex(proc.stdout, label + r"\|capture cleanup failed: .*exactly one Task", label)
+        self.assertIn("FAST|True", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_stalled_capture_cleanup_is_abandoned_and_named(self) -> None:
         # sol r6 B2 (PowerShell half): a delete that never completes is abandoned after the bound and the note names the files.
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
@@ -1086,9 +1129,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "Case 'A' $true $false ''\n"
                   "Case 'B' $true $true ''\n"
                   "Case 'C' $false $false 'capture cleanup abandoned after 10 s: out.tmp'\n"
-                  "Case 'D' $false $true 'capture cleanup abandoned after 10 s: out.tmp'\n")
+                  "Case 'D' $false $true 'capture cleanup abandoned after 10 s: out.tmp'\n"
+                  # adversary r7 A1: a finished suite with an abandoned cleanup must emit ONLY its result object on every PowerShell stream
+                  # (the -UnitOnly stdout is one JSON object); the abandonment note goes to the process's stderr, not Write-Warning.
+                  "$script:finish = $true; $script:stallReads = $false; $script:cleanupNote = 'capture cleanup abandoned after 10 s: out.tmp'\n"
+                  "$all = @(Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' 5 *>&1)\n"
+                  "Write-Output \"E|$($all.Count)|$($all[0].GetType().Name)\"\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("E|1|PSCustomObject", proc.stdout)
+        self.assertIn("capture cleanup abandoned after 10 s: out.tmp", proc.stderr, "the abandonment of a clean run's cleanup is still reported")
         rows = {line.split("|", 1)[0]: line.split("|", 1)[1] for line in proc.stdout.splitlines() if line[:2] in ("A|", "B|", "C|", "D|")}
         self.assertEqual(rows["A"], 'RESULT|0|{"a":1}|reads=2|removed=2', proc.stdout)
         self.assertIn("THROW|FAIL: case-x (C:\\s.ps1) finished but its JSON result could not be read: <read timed out", rows["B"])

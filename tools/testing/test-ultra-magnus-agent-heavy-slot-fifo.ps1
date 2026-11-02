@@ -512,12 +512,19 @@ function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
     # A bound that is below 1 (-1 is an infinite wait to Task.Wait) or above the cap is refused before anything is opened.
     if ($BoundMs -lt 1 -or $BoundMs -gt $CaptureIoMaxMs) { throw "FAIL: $What bound $BoundMs ms is outside 1..$CaptureIoMaxMs ms; nothing was opened" }
 }
+function Get-CaptureTask([scriptblock]$Start, $Argument, [scriptblock]$Default) {
+    # adversary r7 A4: the open/delete factory must hand back exactly ONE Task. An array of tasks makes `$task.Wait($left)` a truthy
+    # array, so pending work read as finished; anything else is refused by name, inside the caller's try.
+    $made = if ($null -eq $Start) { Initialize-BoundedCaptureIo; @(& $Default) } else { @(& $Start $Argument) }
+    if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
+    $made[0]
+}
 function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) {
     Assert-CaptureIoBound 'captured-output read' $BoundMs
     $name = [IO.Path]::GetFileName($Path)
     $clock = [Diagnostics.Stopwatch]::StartNew()   # started BEFORE the open, so a slow start counts against the same bound
     try {
-        if ($null -eq $Start) { Initialize-BoundedCaptureIo; $task = [BoundedCaptureIo]::ReadAllText($Path) } else { $task = & $Start $Path }
+        $task = Get-CaptureTask $Start $Path { [BoundedCaptureIo]::ReadAllText($Path) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
         if (-not $task.Wait($left)) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
         return [pscustomobject]@{ Ok = $true; Text = [string]$task.Result }
@@ -534,7 +541,7 @@ function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBo
     Assert-CaptureIoBound 'capture cleanup' $BoundMs
     $clock = [Diagnostics.Stopwatch]::StartNew()
     try {
-        if ($null -eq $Start) { Initialize-BoundedCaptureIo; $task = [BoundedCaptureIo]::Delete($Paths) } else { $task = & $Start $Paths }
+        $task = Get-CaptureTask $Start $Paths { [BoundedCaptureIo]::Delete($Paths) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
         if ($task.Wait($left)) { return '' }
         return "capture cleanup abandoned after $([Math]::Round($BoundMs / 1000, 3)) s: $($Paths -join ', ')"
@@ -582,7 +589,8 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
     # The removal is bounded too (sol r6 B2) and runs BEFORE the verdict is raised, so its note can be named in it.
     finally { $cleanupNote = Remove-CaptureFiles @($outF, $errF) }
     if ($null -ne $fail) { Assert-True $false "$fail$(if ($cleanupNote) { "; $cleanupNote" })" }
-    if ($cleanupNote) { Write-Warning "$Name ($Script): $cleanupNote" }
+    # stderr, not Write-Warning: under `pwsh -File` the warning stream lands on STDOUT ahead of the -UnitOnly JSON (adversary r7 A1).
+    if ($cleanupNote) { [Console]::Error.WriteLine("WARNING: $Name ($Script): $cleanupNote") }
     return $result
 }
 $leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
