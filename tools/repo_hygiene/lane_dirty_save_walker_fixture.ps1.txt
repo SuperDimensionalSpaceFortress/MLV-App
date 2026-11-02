@@ -54,12 +54,12 @@ function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # POSIX: every syml
     }
     return $cur
 }
-function Remove-ExtendedPrefix([string]$Path) {  # Windows: \\?\ and \\.\ (any case, either slash) spell the same place as the plain path; a form with no drive or UNC meaning is refused, never guessed (r7 A1)
+function ConvertTo-NativePath([string]$Path) {  # Windows: \\?\ and \\.\ (any case, either slash) are one spelling, rewritten to \\?\ and KEPT: stripping it would let Win32 trim a trailing dot or space and open the sibling directory (r7 fix-2 A1). A form with no drive or UNC meaning is refused, never guessed
     if (-not $script:onWin) { return $Path }
     $p = $Path.Replace('/', '\')
-    if ($p -notmatch '^\\\\[?.]\\') { return $Path }
-    if ($p -match '^\\\\[?.]\\UNC\\(?<rest>.+)$') { return '\\' + $Matches['rest'] }
-    if ($p -match '^\\\\[?.]\\(?<rest>[A-Za-z]:\\.*)$') { return $Matches['rest'] }
+    if ($p -notmatch '^\\\\[?.]\\') { return $p }
+    if ($p -match '^\\\\[?.]\\UNC\\(?<rest>.+)$') { return '\\?\UNC\' + $Matches['rest'] }
+    if ($p -match '^\\\\[?.]\\(?<rest>[A-Za-z]:\\.*)$') { return '\\?\' + $Matches['rest'] }
     throw 'unsupported-extended-path'
 }
 function Get-FinalDir([string]$Path) {  # Windows: open the directory and read its true path back, so links, junctions, subst drives, 8.3 and \\?\ spellings are all resolved by the kernel (r7 A1, A2). The handle stays open (no share-delete), so the directory and its parents cannot be renamed or replaced before the artifacts are written (r7 A3)
@@ -71,12 +71,12 @@ public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(stri
 public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle handle, System.Text.StringBuilder buffer, uint length, uint flags);
 '@
     }
-    $h = [LdsNative.Win]::CreateFileW((Remove-ExtendedPrefix $Path), 0x81, 3, [System.IntPtr]::Zero, 3, 0x02000000, [System.IntPtr]::Zero)  # LIST_DIRECTORY+READ_ATTRIBUTES (an attributes-only open is exempt from sharing checks, so it would hold nothing); share read+write, not delete; OPEN_EXISTING; BACKUP_SEMANTICS (a directory)
+    $h = [LdsNative.Win]::CreateFileW((ConvertTo-NativePath $Path), 0x81, 3, [System.IntPtr]::Zero, 3, 0x02000000, [System.IntPtr]::Zero)  # LIST_DIRECTORY+READ_ATTRIBUTES (an attributes-only open is exempt from sharing checks, so it would hold nothing); share read+write, not delete; OPEN_EXISTING; BACKUP_SEMANTICS (a directory)
     if ($h.IsInvalid) { throw 'cannot-open-directory' }
     $sb = [System.Text.StringBuilder]::new(32768)
     $n = [LdsNative.Win]::GetFinalPathNameByHandleW($h, $sb, 32768, 0)
     if ($n -eq 0 -or $n -ge 32768) { $h.Dispose(); throw 'cannot-resolve-directory' }
-    return @{ Path = (Remove-ExtendedPrefix $sb.ToString()); Handle = $h }
+    return @{ Path = $sb.ToString(); Handle = $h }  # the kernel's own spelling, \\?\C:\... or \\?\UNC\..., which Win32 and .NET then use without trimming
 }
 function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
@@ -127,7 +127,11 @@ $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-rel
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
 try {
-    if ($script:onWin) { $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path }
+    if ($script:onWin) {
+        $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path
+        $shareOf = { param($p) if ($p.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { [System.IO.Path]::GetPathRoot($p).ToLowerInvariant() } else { '' } }
+        if ((& $shareOf $RunDir) -ne (& $shareOf $realWork)) { throw 'run-dir-namespace-unprovable' }  # a share can expose a local folder (\\localhost\C$), and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
+    }
     else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir }
     $rel = [System.IO.Path]::GetRelativePath($realWork, $RunDir)
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)

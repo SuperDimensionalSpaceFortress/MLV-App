@@ -469,12 +469,14 @@ def ps_functions(*names):
 
 
 @pytest.mark.parametrize("raw, want", [
-    ("\\\\?\\C:\\a\\b", "C:\\a\\b"),
-    ("\\\\.\\C:\\a", "C:\\a"),
-    ("\\\\?\\UNC\\srv\\sh\\repo\\run", "\\\\srv\\sh\\repo\\run"),
-    ("\\\\?\\unc\\srv\\sh\\repo\\run", "\\\\srv\\sh\\repo\\run"),   # r7 A1: the UNC marker is case-insensitive
-    ("\\\\.\\UNC\\srv\\sh\\repo\\run", "\\\\srv\\sh\\repo\\run"),
-    ("//?/unc/srv/sh/repo/run", "\\\\srv\\sh\\repo\\run"),          # forward slashes spell the same prefix
+    ("\\\\?\\C:\\a\\b", "\\\\?\\C:\\a\\b"),                          # the extended prefix is KEPT: Win32 trims a trailing dot or space from a plain path (r7 fix-2 A1)
+    ("\\\\?\\C:\\a\\run.", "\\\\?\\C:\\a\\run."),
+    ("\\\\.\\C:\\a", "\\\\?\\C:\\a"),
+    ("\\\\?\\UNC\\srv\\sh\\repo\\run", "\\\\?\\UNC\\srv\\sh\\repo\\run"),
+    ("\\\\?\\unc\\srv\\sh\\repo\\run", "\\\\?\\UNC\\srv\\sh\\repo\\run"),   # r7 A1: the UNC marker is case-insensitive
+    ("\\\\.\\UNC\\srv\\sh\\repo\\run", "\\\\?\\UNC\\srv\\sh\\repo\\run"),
+    ("//?/unc/srv/sh/repo/run", "\\\\?\\UNC\\srv\\sh\\repo\\run"),          # forward slashes spell the same prefix
+    ("C:/plain/x", "C:\\plain\\x"),
     ("C:\\plain\\x", "C:\\plain\\x"),
     ("\\\\srv\\sh\\x", "\\\\srv\\sh\\x"),
     ("\\\\?\\Volume{1234}\\x", None),                                # a form with no drive or UNC meaning is refused, not stripped to a local relative path
@@ -482,8 +484,8 @@ def ps_functions(*names):
     ("\\\\.\\PhysicalDrive0", None),
     ("\\\\?\\C:", None),
 ])
-def test_an_extended_length_prefix_is_removed_in_any_case_or_the_path_is_refused(raw, want):  # r7 A1
-    prog = "$script:onWin = $true; " + ps_functions("Remove-ExtendedPrefix") + "try { [Console]::Out.Write('[' + (Remove-ExtendedPrefix $env:LDS_P) + ']') } catch { [Console]::Out.Write('THROWN ' + $_.Exception.Message) }"
+def test_an_extended_length_prefix_is_normalised_in_any_case_and_kept_or_the_path_is_refused(raw, want):  # r7 A1
+    prog = "$script:onWin = $true; " + ps_functions("ConvertTo-NativePath") + "try { [Console]::Out.Write('[' + (ConvertTo-NativePath $env:LDS_P) + ']') } catch { [Console]::Out.Write('THROWN ' + $_.Exception.Message) }"
     r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, "LDS_P": raw})
     assert r.returncode == 0, r.stdout + r.stderr
     assert r.stdout.decode("utf-8") == ("THROWN unsupported-extended-path" if want is None else "[" + want + "]")
@@ -505,11 +507,40 @@ def test_a_run_dir_on_a_subst_drive_that_maps_into_the_worktree_is_bad_arguments
     assert "run-dir-inside-worktree" in r.stdout and list((repo / "run").iterdir()) == []
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="trailing-dot directories and extended-length paths are Windows")
+def test_an_extended_run_dir_with_a_trailing_dot_receives_the_artifacts_not_its_dotless_sibling(repo, tmp_path):  # r7 fix-2 A1
+    (repo / "a.txt").write_bytes(b"changed\n")
+    ext = lambda p: "\\\\?\\" + str(p)
+    dotted, plain = tmp_path / "evid.", tmp_path / "evid"
+    os.mkdir(ext(dotted))
+    plain.mkdir()
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", ext(dotted), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert os.listdir(ext(dotted)) != [] and list(plain.iterdir()) == []  # old code: the prefix was stripped before CreateFile, Win32 trimmed the dot, the sibling got the files
+    finally:
+        for name in os.listdir(ext(dotted)):
+            os.remove(ext(dotted) + "\\" + name)
+        os.rmdir(ext(dotted))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="administrative shares are Windows")
+def test_a_run_dir_reached_through_a_loopback_share_of_the_worktree_drive_is_bad_arguments(repo):  # r7 fix-2 A2
+    (repo / "run").mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    unc = "\\\\localhost\\" + str(repo / "run").replace(":", "$", 1)
+    if not os.path.isdir(unc):
+        pytest.skip("the administrative share of this drive is not reachable by this user")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", unc, "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30, r.stdout + r.stderr  # old code: the UNC and drive spellings were never compared, exit 0 and evidence in the worktree
+    assert list((repo / "run").iterdir()) == []
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="the open directory handle is the Windows remedy; POSIX re-resolves names only (see summary OPEN A3-posix)")
 def test_the_checked_run_dir_cannot_be_renamed_away_while_the_saver_holds_it(tmp_path):  # r7 A3
     target = tmp_path / "run"
     target.mkdir()
-    prog = ("$script:onWin = $true; " + ps_functions("Remove-ExtendedPrefix", "Get-FinalDir") +
+    prog = ("$script:onWin = $true; " + ps_functions("ConvertTo-NativePath", "Get-FinalDir") +
             "$h = Get-FinalDir $env:LDS_P; try { [System.IO.Directory]::Move($env:LDS_P, $env:LDS_P + '.moved'); $o = 'MOVED' } catch { $o = 'BLOCKED' }; "
             "$h.Handle.Dispose(); [Console]::Out.Write($o + ' ' + $h.Path)")
     r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, "LDS_P": str(target)})
