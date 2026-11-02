@@ -7003,19 +7003,26 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
         $lines = @($LogText -split "`r?`n")
         $sid = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        # adversary 693bf053 A3: only a line that starts with the log sink's prefix counts, so a marker quoted in another line's source-location suffix
+        # (a build path such as "C:/b playback_smoke.measured_session id=1 x/MainWindow.cpp:1") is never taken for the measured-session or summary line
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.measured_session id=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
         if ($null -eq $sid) { return $null }
         $stamp = $null
         foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.start session=' + $sid + '(\s|$)'); if ($mm.Success) { $stamp = $mm.Groups['ts'].Value; break } }
         if ($null -eq $stamp) { return $null }
-        $el = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=' + $sid + '\s[^\r\n]*?\belapsed_ms=(?<e>\d+(?:\.\d+)?)(\s|$)'); if ($mm.Success) { $el = $mm.Groups['e'].Value; break } }
+        $el = $null; $sumStamp = $null
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=' + $sid + '\s[^\r\n]*?\belapsed_ms=(?<e>\d+(?:\.\d+)?)(\s|$)'); if ($mm.Success) { $el = $mm.Groups['e'].Value; $sumStamp = $mm.Groups['ts'].Value; break } }
         if ($null -eq $el) { return $null }
         $inv = [Globalization.CultureInfo]::InvariantCulture
-        $pt = [DateTime]::MinValue; $ms = 0.0
+        $pt = [DateTime]::MinValue; $ms = 0.0; $st = [DateTime]::MinValue
         if (-not [DateTime]::TryParse($stamp, $inv, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$pt)) { return $null }
         if (-not [double]::TryParse($el, [Globalization.NumberStyles]::Float, $inv, [ref]$ms) -or [double]::IsInfinity($ms) -or $ms -le 0) { return $null }
+        # adversary 693bf053 A1: the window's end is the start stamp plus a MONOTONIC elapsed_ms; the summary line's own wall-clock stamp must agree with it
+        # (1 s: the sink's ms resolution and scheduling), else the host clock stepped inside the session, the CSV rows' clock no longer maps onto the log's,
+        # and there is no window (the scalars say partial, never an ok number over a few of the rows)
+        if (-not [DateTime]::TryParse($sumStamp, $inv, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$st)) { return $null }
+        if ([math]::Abs((($st.Ticks - $pt.Ticks) / 1e4) - $ms) -gt 1000) { return $null }
         $s = [DateTime]::SpecifyKind($pt, [DateTimeKind]::Utc)
         $e = $s.AddTicks([int64][math]::Round($ms * 10000))
         if ($e -le $s) { return $null }
@@ -7052,6 +7059,8 @@ function Get-UtilSampleGpuSummary($Parsed, $Start, $Window, $Stop = $null) {
         if ($Start.status -cne 'running') { $s.status = "unavailable($($Start.reason))"; return $s }
         $s.rowsTotal = $Parsed.rows.Count
         if ($null -ne $Stop -and $Stop.exitedBeforeStop) { $s.status = 'unavailable(nvidia-smi-exited-early)'; return $s }
+        # adversary 693bf053 A2: a stop that left the process alive (both Kills threw) means the file may still be growing: a typed failure, never ok
+        if ($null -ne $Stop -and -not $Stop.stopped -and $Stop.why -cne 'not-started') { $s.status = 'unavailable(nvidia-smi-stop-failed)'; return $s }
         if ($Parsed.why) { $s.status = "unavailable($($Parsed.why))"; return $s }
         $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
         $s.rowsInWindow = $in.Count
@@ -7078,6 +7087,7 @@ function Get-UtilSampleCpuSummary($Parsed, $Start, $Window, $Stop = $null) {
         $s.rowsTotal = $Parsed.rows.Count
         if ($null -ne $Stop) {
             if ($Stop.exitedBeforeStop) { $s.status = 'unavailable(cpu-sampler-exited-early)'; return $s }
+            if (-not $Stop.stopped -and $Stop.why -cne 'not-started') { $s.status = 'unavailable(cpu-sampler-stop-failed)'; return $s }
             if ($Stop.stopped -and -not $Stop.killed -and $null -ne $Stop.exitCode -and [int]$Stop.exitCode -ne 0) { $s.status = "unavailable(cpu-sampler-exit-$([int]$Stop.exitCode))"; return $s }
         }
         if ($Parsed.why) { $s.status = "unavailable($($Parsed.why))"; return $s }

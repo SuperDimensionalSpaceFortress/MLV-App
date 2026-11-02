@@ -348,6 +348,36 @@ $r['stopEarly'] = @{ stopped = $se.stopped; early = $se.exitedBeforeStop; killed
 $st = Stop-UtilSampleProcess $null 100
 $r['stopNull'] = @{ stopped = $st.stopped; why = $st.why }
 $r['stopAllNothing'] = (Stop-UtilSampleAll ([ordered]@{ status = 'unavailable'; proc = $null }) ([ordered]@{ status = 'unavailable'; proc = $null }) { param($p) throw 'no stop file' } 100).gpu.why
+# r3 adversary 693bf053 A1: a summary stamp that disagrees with start + elapsed_ms (a stepped host clock) is no window, so no ok answer
+$a1log = "[2026-11-02T14:00:00.000Z] [info] [app] playback_smoke.start session=2`n[2026-11-02T14:00:00.001Z] [info] [app] playback_smoke.measured_session id=2`n" +
+         "[2026-11-02T14:01:20.000Z] [info] [app] playback_smoke.summary session=2 reason=play-stop elapsed_ms=20000`n"
+$a1w = Get-UtilSamplePlayWindow $a1log
+$a1csv = "utc,cpuTotalPct,appPid,appCpuCores`n2026-11-02T14:00:01.0000000Z,10,1234,1`n2026-11-02T14:01:02.0000000Z,90,1234,9`n2026-11-02T14:01:19.0000000Z,90,1234,9`n"
+$a1c = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $a1csv) ([ordered]@{ status = 'running'; reason = $null }) $a1w ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })
+$r['r3A1'] = @{ windowNull = ($null -eq $a1w); status = $a1c.status; inWindow = $a1c.rowsInWindow; total = $a1c.rowsTotal }
+$a1ok = Get-UtilSamplePlayWindow ($a1log -replace '14:01:20\.000Z', '14:00:20.400Z')
+$r['r3A1Within'] = @{ windowNull = ($null -eq $a1ok); end = $(if ($a1ok) { $a1ok.endUtc.ToString('o') }) }
+$a1nostamp = Get-UtilSamplePlayWindow ($a1log -replace '\[2026-11-02T14:01:20\.000Z\]', '[not-a-time]')
+$r['r3A1BadSummaryStamp'] = ($null -eq $a1nostamp)
+# r3 A3: a marker quoted inside a source-location suffix is not the measured-session / summary line (only the log sink's line prefix counts)
+$a3log = "[2026-11-02T14:00:00.000Z] [info] [0x1] interaction_trace event=automation.start (C:/b playback_smoke.measured_session id=1 x/MainWindow.cpp:1)`n" +
+         "[2026-11-02T14:00:01.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:05.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=4000`n" +
+         "[2026-11-02T14:00:10.000Z] [info] [0x1] playback_smoke.start session=2 position=0`n[2026-11-02T14:00:10.001Z] [info] [0x1] playback_smoke.measured_session id=2`n" +
+         "[2026-11-02T14:00:30.000Z] [info] [0x1] playback_smoke.summary session=2 reason=play-stop elapsed_ms=20000`n"
+$a3w = Get-UtilSamplePlayWindow $a3log
+$r['r3A3Measured'] = @{ session = $(if ($a3w) { $a3w.session }); start = $(if ($a3w) { $a3w.startUtc.ToString('o') }) }
+$a3log2 = "[2026-11-02T14:00:00.000Z] [info] [0x1] trace (C:/b playback_smoke.summary session=9 elapsed_ms=5 x/MainWindow.cpp:1)`n" +
+          "[2026-11-02T14:00:01.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:05.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=4000`n"
+$a3w2 = Get-UtilSamplePlayWindow $a3log2
+$r['r3A3Summary'] = @{ session = $(if ($a3w2) { $a3w2.session }) }
+# r3 A2: a sampler whose stop failed (stopped=false, a live process after both Kills) is a typed failure, never ok / utilSampleStatus ok
+$a2stop = [ordered]@{ stopped = $false; killed = $false; exitedBeforeStop = $false; exitCode = $null; why = 'stop-failed: Access is denied' }
+$a2g = Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'running'; reason = $null }) $win $a2stop
+$a2c = Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win $a2stop
+$a2s = Get-UtilSampleScalars $a2g $a2c $true
+$r['r3A2'] = @{ gpu = $a2g.status; cpu = $a2c.status; scalarStatus = $a2s.utilSampleStatus; scalarReason = $a2s.utilSampleReason }
+$a2ns = [ordered]@{ stopped = $false; killed = $false; exitedBeforeStop = $false; exitCode = $null; why = 'not-started' }
+$r['r3A2NotStarted'] = @{ gpu = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'running'; reason = $null }) $win $a2ns).status }
 Write-Output (J $r)
 """
 
@@ -440,6 +470,25 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual(self.r["cudaUpper"]["status"], "unavailable")
         self.assertEqual(self.r["cudaUpper"]["reason"], "nvidia-smi-missing", "a 'CUDA' leg is a cuda leg, not a D3 skip")
         self.assertIn("cuda leg", self.r["cudaUpper"]["disclosure"])
+
+    def test_r3_a1_a_summary_stamp_that_disagrees_with_start_plus_elapsed_is_no_window(self) -> None:
+        # adversary 693bf053 A1: the host clock stepped 60 s mid-play, so the log's own stamps span 80 s for a 20 s elapsed_ms; the old window
+        # (start + elapsed_ms) silently kept 1 of 3 rows and said ok
+        a1 = self.r["r3A1"]
+        self.assertTrue(a1["windowNull"], "an unverified clock mapping is no window")
+        self.assertEqual((a1["status"], a1["inWindow"], a1["total"]), ("partial(no_window)", 3, 3))
+        self.assertEqual(self.r["r3A1Within"], {"windowNull": False, "end": "2026-11-02T14:00:20.0000000Z"}, "a 400 ms stamp skew still maps")
+        self.assertTrue(self.r["r3A1BadSummaryStamp"], "an unparseable summary stamp cannot verify the mapping")
+
+    def test_r3_a3_a_marker_quoted_in_a_location_suffix_is_not_the_measured_session(self) -> None:
+        self.assertEqual(self.r["r3A3Measured"], {"session": 2, "start": "2026-11-02T14:00:10.0000000Z"})
+        self.assertEqual(self.r["r3A3Summary"], {"session": 1}, "the fall-back summary line is the log sink's line too")
+
+    def test_r3_a2_a_failed_stop_is_a_typed_failure_not_ok(self) -> None:
+        self.assertEqual(self.r["r3A2"], {"gpu": "unavailable(nvidia-smi-stop-failed)", "cpu": "unavailable(cpu-sampler-stop-failed)",
+                                          "scalarStatus": "unavailable",
+                                          "scalarReason": "gpu:unavailable(nvidia-smi-stop-failed)+cpu:unavailable(cpu-sampler-stop-failed)"})
+        self.assertEqual(self.r["r3A2NotStarted"], {"gpu": "ok"}, "a side that was never started is not a stop failure")
 
     def test_a6_a_throwing_kill_is_retried_and_a_running_side_is_not_stopped(self) -> None:
         self.assertEqual(self.r["stopKillRetry"], {"stopped": True, "killed": True, "kills": 2, "early": False})
