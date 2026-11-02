@@ -23,13 +23,89 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1"
 FIFO_TEST = ROOT / "tools" / "testing" / "test-ultra-magnus-agent-heavy-slot-fifo.ps1"
 PWSH = shutil.which("pwsh")
+# Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s), their two
+# bounded taskkills (2 x 60 s) and its ~30 s of unit cases (670 s), so a hung suite fails by its own name there first (a test pins
+# the sum). Measured 349 s locally, 282 s on the hosted runner.
+UNIT_RUN_TIMEOUT_SEC = 720
+FIFO_UNIT_CASES_SEC = 30  # the fifo script's own unit cases, before its two bounded sub-suites
+
+
+def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        if not tolerate_oserror:
+            raise
+        return f"<read failed: errno {exc.errno} {exc.strerror}>"
+
+
+def _kill_tree(proc: subprocess.Popen) -> str:
+    """Kill proc's whole tree and say how it went; a failing cleanup step is reported, never allowed to replace the timeout verdict."""
+    problems = []
+    try:
+        taskkill = subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if taskkill.returncode != 0:
+            problems.append(f"taskkill exited {taskkill.returncode}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        problems.append(f"taskkill failed: {exc!r}")
+    try:
+        proc.kill()
+    except OSError as exc:
+        problems.append(f"kill failed: {exc!r}")
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        problems.append("the root process was still running 30 s after the kill")
+    except OSError as exc:
+        problems.append(f"waiting for the root process failed: {exc!r}")
+    return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
+
+
+def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, str]:
+    """Run argv under a real wall-clock bound and return (returncode, stdout, stderr).
+
+    subprocess.run(timeout=) is NOT a bound on Windows when the child has children: it kills only the root process and
+    then waits in communicate() for the pipes to close, and any surviving grandchild (the suites here start pwsh agents,
+    fake heavy-slot.py processes and sleepers) keeps them open. Hosted run 40388902288 sat 36 min past a 600 s timeout
+    that way until the job cap cancelled it. So the output goes to files (nothing waits for pipe EOF) and a timeout kills
+    the whole tree, then fails naming the case and the elapsed time.
+    """
+    tmp = tempfile.mkdtemp(prefix="heavy-slot-gate-")
+    out_path, err_path = Path(tmp) / "stdout.txt", Path(tmp) / "stderr.txt"
+    started = time.monotonic()
+    timed_out = False
+    kill_note = ""
+    try:
+        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                kill_note = _kill_tree(proc)
+        elapsed = time.monotonic() - started
+        # After a timeout the case-named verdict below is the failure, so a read error (a Windows sharing violation on a file the
+        # killed tree still holds) is recorded in the text instead of replacing it. Without a timeout the read error surfaces.
+        stdout = _read_captured(out_path, tolerate_oserror=timed_out)
+        stderr = _read_captured(err_path, tolerate_oserror=timed_out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if timed_out:
+        raise AssertionError(f"{case} exceeded its {timeout:g} s wall-clock bound (ran {elapsed:.0f} s) and {kill_note}.\n"
+                             f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}")
+    return proc.returncode, stdout, stderr
 
 
 def _code_lines(text: str) -> list[str]:
@@ -121,6 +197,46 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn('-Phase "pre-launch"', refusal)
         self.assertRegex(refusal, r"\breturn\b")
         self.assertIn("Add-HeavySlotHolderLossToAdmission -JobId $jobId -Admission $script:Admission", body)
+
+    def test_the_fifo_suite_bound_kills_its_child_through_a_bounded_taskkill(self) -> None:
+        # sol adversary A2: `& taskkill.exe` after a WaitForExit timeout had no bound of its own, so a hung taskkill held back the
+        # suite-named failure. The kill is now a Start-Process with its own WaitForExit, and the message does not claim a kill that failed.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        self.assertNotIn("& taskkill.exe", fifo)
+        self.assertIn("Start-Process -FilePath 'taskkill.exe'", fifo)
+        self.assertIn("$k.WaitForExit(60000)", fifo)
+        self.assertIn("process tree kill is NOT confirmed", fifo)
+        self.assertIn("and $killNote; output so far", fifo)
+
+    def test_the_outer_guard_outlasts_every_inner_bound_so_a_hung_suite_fails_by_its_own_name(self) -> None:
+        # adversary r4 A2: the -UnitOnly run is quiet-lease (bound + bounded taskkill) then stage-exempt (bound + bounded taskkill) after
+        # about 30 s of unit cases. If the outer guard is shorter than that worst case, the outer kill reports only the parent test.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        quiet = int(re.search(r"\[int\]\$QuietLeaseBoundSec = (\d+)", fifo).group(1))
+        stage = int(re.search(r"\[int\]\$StageExemptBoundSec = (\d+)", fifo).group(1))
+        taskkill = int(re.search(r"\$k\.WaitForExit\((\d+)000\)", fifo).group(1))
+        worst_case = FIFO_UNIT_CASES_SEC + (quiet + taskkill) + (stage + taskkill)
+        self.assertGreater(UNIT_RUN_TIMEOUT_SEC, worst_case,
+                           f"the outer guard ({UNIT_RUN_TIMEOUT_SEC} s) must outlast unit cases + both sub-suite bounds + both bounded kills ({worst_case} s)")
+
+    def test_the_suite_bounds_are_range_checked_before_any_child_is_launched(self) -> None:
+        # adversary r4 pass 3 A1: -QuietLeaseBoundSec -1 or 2147484 bound as a legal [int], then WaitForExit threw after the child
+        # was launched, skipping the kill block. The range is refused at parameter binding, before any child exists.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        for name in ("QuietLeaseBoundSec", "StageExemptBoundSec"):
+            self.assertRegex(fifo, r"\[ValidateRange\(1, 3600\)\]\s*\[int\]\$" + name + r" = \d+", name)
+
+    def test_a_completed_suite_must_hand_back_its_json_and_its_elapsed_time_is_monotonic(self) -> None:
+        # adversary r4 pass 3 A2 / A3: a captured-output read error was swallowed (SilentlyContinue), so a passing suite could aggregate
+        # as quietLease:null; and the timeout diagnostic subtracted local wall-clock times, which go negative across a DST fall-back.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        body = fifo[fifo.index("function Invoke-BoundedSuite"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("$json = (Get-Content -LiteralPath $outF -ErrorAction Stop) -join \"`n\"", body)
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", body)
+        self.assertNotIn("Get-Date", body)
+        for name in ("lease", "stage"):
+            self.assertIn(f"Assert-True ($null -ne ${name}.Json -and ${name}.Json.Trim().Length -gt 0)", fifo, name)
 
     def test_light_probes_stay_exempt_and_deploy_gate_string_matches(self) -> None:
         self.assertIn("[string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$'", self.text)
@@ -254,10 +370,11 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
     def test_pure_function_cases_pass(self) -> None:
         # A hang guard, not a speed bound. -UnitOnly also runs the quiet-lease and stage-exempt suites in their own processes;
         # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 runs real (fake) status probes there, and the whole run took 312 s on a loaded host.
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly"],
-                              capture_output=True, text=True, timeout=600)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        out = json.loads(proc.stdout)
+        # CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1: run_bounded, because subprocess.run(timeout=) hangs past its timeout here.
+        rc, stdout, stderr = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly"],
+                                         UNIT_RUN_TIMEOUT_SEC, "BachelorAgentHeavySlotGateUnit.test_pure_function_cases_pass")
+        self.assertEqual(rc, 0, stdout + stderr)
+        out = json.loads(stdout)
         self.assertEqual(out["status"], "PASS")
         self.assertEqual(out["results"]["unit"]["thresholds"]["t7"], "hot")
         self.assertEqual(out["results"]["unit"]["verdicts"]["ownSlotExcluded"], "clear")
@@ -297,6 +414,182 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["heartbeat"]["free"], "gate-wait job=j1 state=queued waited=Ns")
         self.assertEqual(unit["heartbeat"]["umRunState"], "queued")
         self.assertLessEqual(unit["heartbeat"]["capped"], 64)
+
+
+@unittest.skipUnless(os.name == "nt", "the bound is a Windows process-tree kill")
+class BoundedRunTests(unittest.TestCase):
+    """run_bounded fails a hung process tree by case name inside its bound (the old subprocess.run(timeout=) did not)."""
+
+    # The root sleeps and so does a grandchild that inherits its stdout/stderr, the shape that kept the pipes open.
+    HUNG_TREE = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); time.sleep(120)"
+
+    def test_a_hung_tree_fails_naming_the_case_and_returns_inside_the_bound(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(AssertionError) as caught:
+            run_bounded([sys.executable, "-c", self.HUNG_TREE], 3, "stub-hang-case")
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught.exception))
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_an_out_of_range_suite_bound_is_refused_at_binding_without_launching_a_child(self) -> None:
+        for flag, value in (("-QuietLeaseBoundSec", "-1"), ("-QuietLeaseBoundSec", "2147484"),
+                            ("-StageExemptBoundSec", "-1"), ("-StageExemptBoundSec", "2147484")):
+            rc, stdout, stderr = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly", flag, value],
+                                             90, f"fifo binding {flag} {value}")
+            self.assertNotEqual(rc, 0, f"{flag} {value}: {stdout}")
+            self.assertIn(flag.lstrip("-"), stdout + stderr, f"{flag} {value}")
+            self.assertNotIn('"status"', stdout, f"{flag} {value}: the suite must not have run")
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_the_fifo_suite_hands_a_trailing_backslash_root_to_its_children_intact(self) -> None:
+        # adversary r4 A1: Invoke-BoundedSuite hand-quotes the child command line, and a RepoRoot that ends in a backslash escaped
+        # its closing quote, so -AgentScript and its value merged into -RepoRoot. The ps1's own quoting function is extracted and its
+        # output is parsed back with the Windows parser (CommandLineToArgvW) the child process uses.
+        import ctypes
+        from ctypes import wintypes
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        start = fifo.index("function ConvertTo-CommandLineArg") if "function ConvertTo-CommandLineArg" in fifo else -1
+        self.assertGreaterEqual(start, 0, "the fifo suite must quote each child argument through ConvertTo-CommandLineArg")
+        body = fifo[start:]
+        body = body[:body.index("\n}") + 2]
+        values = ["C:\\repo root\\", "C:\\repo root", "\\\\server\\share\\dir\\", "C:\\a\\\\", "C:\\plain\\agent.ps1", "a \"quoted\" word\\"]
+        script = body + "\n$v = @(" + ",".join("'" + v.replace("'", "''") + "'" for v in values) + ")\n" \
+                 "($v | ForEach-Object { ConvertTo-CommandLineArg $_ }) -join ' '"
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        command_line = proc.stdout.strip()
+        argv_w = ctypes.windll.shell32.CommandLineToArgvW
+        argv_w.restype = ctypes.POINTER(wintypes.LPWSTR)
+        argv_w.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+        count = ctypes.c_int(0)
+        argv = argv_w("prog.exe " + command_line, ctypes.byref(count))
+        try:
+            parsed = [argv[i] for i in range(1, count.value)]
+        finally:
+            ctypes.windll.kernel32.LocalFree(argv)
+        self.assertEqual(parsed, values, command_line)
+
+    def test_a_finished_run_returns_its_code_and_both_streams(self) -> None:
+        rc, out, err = run_bounded([sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err'); sys.exit(3)"], 60, "finished-case")
+        self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
+
+
+class BoundedRunOutputReadFailureTests(unittest.TestCase):
+    """sol r2 BLOCKER: a captured-output read error after a timeout must not replace the case-named timeout verdict.
+
+    Injected in memory (no real process, no real sharing violation): wait() raises TimeoutExpired, the tree and root cleanup
+    succeed, and one of the two output reads raises PermissionError(13, 'sharing violation').
+    """
+
+    class _TimedOutProc:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            return 1
+
+        def kill(self) -> None:
+            pass
+
+    def _run_failing_read(self, failing_name: str, *, timeout_expires: bool = True) -> BaseException:
+        proc = self._TimedOutProc()
+        if not timeout_expires:
+            proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
+        real_read_text = Path.read_text
+
+        def read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path.name == failing_name:
+                raise PermissionError(13, "sharing violation")
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", return_value=proc), \
+                mock.patch.object(subprocess, "run"), \
+                mock.patch.object(Path, "read_text", read_text):
+            try:
+                run_bounded(["child"], 3, "stub-hang-case")
+            except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                return exc
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_the_stdout_read_fails(self) -> None:
+        caught = self._run_failing_read("stdout.txt")
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("<read failed: errno 13", str(caught))
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_the_stderr_read_fails(self) -> None:
+        caught = self._run_failing_read("stderr.txt")
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("<read failed: errno 13", str(caught))
+
+    def _run_failing_cleanup(self, *, taskkill: object, second_wait_expires: bool = False,
+                             second_wait_raises: BaseException | None = None) -> BaseException:
+        # sol adversary A1: the cleanup steps after a timeout must not replace the case-named verdict either.
+        proc = self._TimedOutProc()
+        if second_wait_expires:
+            def wait(timeout: float | None = None) -> int:
+                raise subprocess.TimeoutExpired(["child"], timeout)
+            proc.wait = wait  # type: ignore[method-assign]
+        elif second_wait_raises is not None:
+            # sol r3 B1: the first wait times out (the hang), the final cleanup wait fails with a Windows handle error.
+            def wait(timeout: float | None = None) -> int:
+                proc.waits += 1
+                if proc.waits == 1:
+                    raise subprocess.TimeoutExpired(["child"], timeout)
+                raise second_wait_raises
+            proc.wait = wait  # type: ignore[method-assign]
+        if isinstance(taskkill, BaseException):
+            run = mock.Mock(side_effect=taskkill)
+        else:
+            run = mock.Mock(return_value=subprocess.CompletedProcess(["taskkill"], taskkill))
+        with mock.patch.object(subprocess, "Popen", return_value=proc), mock.patch.object(subprocess, "run", run):
+            try:
+                run_bounded(["child"], 3, "stub-hang-case")
+            except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                return exc
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_taskkill_hangs_or_fails(self) -> None:
+        for label, kwargs, expect in (
+                ("taskkill timeout", {"taskkill": subprocess.TimeoutExpired(["taskkill"], 60)}, "taskkill failed"),
+                ("taskkill missing", {"taskkill": FileNotFoundError(2, "no taskkill")}, "taskkill failed"),
+                ("taskkill rc 1", {"taskkill": 1}, "taskkill exited 1"),
+                ("root wait timeout", {"taskkill": 0, "second_wait_expires": True}, "still running 30 s after the kill")):
+            caught = self._run_failing_cleanup(**kwargs)
+            self.assertIsInstance(caught, AssertionError, f"{label}: {caught!r}")
+            self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught), label)
+            self.assertIn("process tree kill is NOT confirmed", str(caught), label)
+            self.assertIn(expect, str(caught), label)
+            self.assertNotIn("process tree was killed", str(caught), label)
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_the_final_cleanup_wait_raises_an_oserror(self) -> None:
+        # sol r3 B1: _kill_tree caught OSError on taskkill and on kill() but not on the final root wait, so an
+        # OSError(6, "invalid handle") there escaped and replaced the promised case-named AssertionError.
+        for label, exc in (("invalid handle", OSError(6, "invalid handle")),
+                           ("access denied", PermissionError(5, "denied"))):
+            caught = self._run_failing_cleanup(taskkill=0, second_wait_raises=exc)
+            self.assertIsInstance(caught, AssertionError, f"{label}: {caught!r}")
+            self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught), label)
+            self.assertIn("process tree kill is NOT confirmed", str(caught), label)
+            self.assertIn("waiting for the root process failed", str(caught), label)
+            self.assertNotIn("process tree was killed", str(caught), label)
+
+    def test_a_confirmed_kill_still_says_the_tree_was_killed(self) -> None:
+        caught = self._run_failing_cleanup(taskkill=0)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("and its process tree was killed.", str(caught))
+
+    def test_a_read_failure_without_a_timeout_still_surfaces_as_the_oserror(self) -> None:
+        # The non-timeout path is unchanged: with no verdict to protect, the read error is the failure.
+        for name in ("stdout.txt", "stderr.txt"):
+            caught = self._run_failing_read(name, timeout_expires=False)
+            self.assertIsInstance(caught, PermissionError, f"{name}: {caught!r}")
 
 
 if __name__ == "__main__":
