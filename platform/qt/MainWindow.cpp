@@ -16565,10 +16565,12 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         restoreLookAssistBaseline( receipt );
         syncLookAssistDerivedUiToReceipt( receipt );
     }
-    // r11: only for the receipt the label reads (the active row's); the outcome describes that receipt alone.
+    // r11: only for the receipt the label reads (the active row's). r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- the
+    // outcome is untouched, because setReceipt saves it as the receipt's flavor (receiptValue: "classic" after a fallback);
+    // clearing it would save the selector's flavor over the baseline sliders. The next analysis's begin() forgets the mark.
     if( baselineRestoredUngraded && receipt == activeReceiptAtLoad )
     {
-        m_lookAssistFlavorOutcome.clear();   // the baseline is back and nothing re-grades it: "Look: Baseline"
+        m_lookLabelBaselineReceipt = receipt;   // the baseline is back and nothing re-grades it: "Look: Baseline"
         updateLookLabel();
     }
 
@@ -17216,6 +17218,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
+    m_lookLabelBaselineReceipt = nullptr;   // r12: a re-grade is under way; the label follows the outcome again
     // No updateLookLabel() here on purpose: the previous look is still on screen, so its label stays until this lands.
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
@@ -31527,7 +31530,10 @@ void MainWindow::updateLookLabel( void )
     const bool lookOn = m_fileLoaded && ACTIVE_RECEIPT && ACTIVE_RECEIPT->lookAssistEnabled()
                      && ui->checkBoxLookAssistEnable->isChecked();
     // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
-    const void *lookReceipt = lookOn ? ACTIVE_RECEIPT : nullptr;
+    // r12 (adversary r11 A1 on 4337dad4): a receipt setSliders put back to its baseline with no re-grade to follow is read as
+    // one nothing landed on ("Look: Baseline") until the next analysis begins; the outcome itself is never altered for it.
+    const void *lookReceipt = lookOn && static_cast<const void *>( ACTIVE_RECEIPT ) != m_lookLabelBaselineReceipt
+                            ? ACTIVE_RECEIPT : nullptr;
     const QString text = look_label::shownText(
         lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
     const bool fullscreenShown =

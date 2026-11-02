@@ -843,6 +843,7 @@ private:
     QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
     QString m_lookLabelText;                // the text both labels show (updateLookLabel)
     bool m_lookLabelFullscreenShown = false;
+    const void *m_lookLabelBaselineReceipt = nullptr;   // r12: baseline restored by setSliders, no re-grade yet (label only)
     bool m_lookLabelShowInFullscreen = true; // the persisted "Show Look Label in Fullscreen" setting
     QLabel *m_pPlaybackQualityIndicator = nullptr; // Phase 4E
     // Phase 4F-toolbar: Playback Quality dropdown on the main toolbar. The

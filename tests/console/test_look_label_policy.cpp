@@ -418,23 +418,38 @@ TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
     const int restore = body.indexOf(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );"));
     ASSERT_TRUE(body.lastIndexOf(QStringLiteral("restoreLookAssistBaseline( receipt );"), restore) >= 0);
     const int apply = body.indexOf(QStringLiteral("&& !m_lookAssistApplied.isApplied( receipt ) )"));
-    const int clearAt = body.indexOf(QStringLiteral("if( baselineRestoredUngraded && receipt == activeReceiptAtLoad )"));
-    const int cleared = body.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.clear();"), clearAt);
-    const int relabel = body.indexOf(QStringLiteral("updateLookLabel();"), cleared);
-    printf("[LL11] setSliders: restore=%d apply=%d clearAt=%d cleared=%d relabel=%d\n", restore, apply, clearAt, cleared, relabel);
-    // read BEFORE the apply block marks a fresh grade applied, so a grade applied here is never cleared
+    const int markAt = body.indexOf(QStringLiteral("if( baselineRestoredUngraded && receipt == activeReceiptAtLoad )"));
+    const int marked = body.indexOf(QStringLiteral("m_lookLabelBaselineReceipt = receipt;"), markAt);
+    const int relabel = body.indexOf(QStringLiteral("updateLookLabel();"), marked);
+    printf("[LL11] setSliders: restore=%d apply=%d markAt=%d marked=%d relabel=%d\n", restore, apply, markAt, marked, relabel);
+    // read BEFORE the apply block marks a fresh grade applied, so a grade applied here is never marked as the baseline
     ASSERT_TRUE(restore >= 0);
     ASSERT_TRUE(apply > restore);
-    ASSERT_TRUE(clearAt > apply);
-    ASSERT_TRUE(cleared > clearAt);
-    ASSERT_TRUE(relabel > cleared);
-    // and the policy reads a cleared outcome as the baseline
+    ASSERT_TRUE(markAt > apply);
+    ASSERT_TRUE(marked > markAt);
+    ASSERT_TRUE(relabel > marked);
+    // r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- setSliders never alters the outcome, which setReceipt saves as the
+    // receipt's flavor ("classic" after a fallback must stay "classic").
+    ASSERT_FALSE(body.contains(QStringLiteral("m_lookAssistFlavorOutcome.clear();")));
+    // The label reads the marked receipt as one nothing landed on, and the next analysis's begin() forgets the mark.
+    const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
+    ASSERT_TRUE(update.contains(QStringLiteral("static_cast<const void *>( ACTIVE_RECEIPT ) != m_lookLabelBaselineReceipt")));
+    const int begin = mw.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.begin();"));
+    ASSERT_TRUE(begin >= 0);
+    ASSERT_TRUE(mw.indexOf(QStringLiteral("m_lookLabelBaselineReceipt = nullptr;"), begin) > begin);
+    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelBaselineReceipt = ")));
+    // The policy: a landed flavor is named for its receipt; read through no receipt it is the baseline; the receipt value
+    // (what setReceipt saves) is unchanged by the label's choice.
     lookassist::LookAssistFlavorOutcome outcome;
     int receipt = 0;
-    outcome.landed(&receipt, QStringLiteral("cinematic"), false);
-    ASSERT_EQ(QStringLiteral("Look: Cinematic"), look_label::shownText(true, outcome, &receipt, QStringLiteral("cinematic")));
-    outcome.clear();
-    ASSERT_EQ(QStringLiteral("Look: Baseline"), look_label::shownText(true, outcome, &receipt, QStringLiteral("cinematic")));
+    const QString cinematic = QStringLiteral("cinematic");
+    outcome.landed(&receipt, cinematic, true);
+    ASSERT_EQ(std::string("classic"), outcome.receiptValue(&receipt, cinematic).toStdString());
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, nullptr, cinematic).toStdString());
+    ASSERT_EQ(std::string("classic"), outcome.receiptValue(&receipt, cinematic).toStdString());
+    outcome.landed(&receipt, cinematic, false);
+    ASSERT_EQ(std::string("Look: Cinematic"), look_label::shownText(true, outcome, &receipt, cinematic).toStdString());
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, nullptr, cinematic).toStdString());
 }
 
 // POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1 (master-merge round, 2026-11-02): the bool arguments the window passes to the
