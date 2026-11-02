@@ -6847,12 +6847,14 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
 # otherwise it gets $WaitMs to exit on its own (the stop file) before the kill. Bounded either way.
 # adversary 9d648094: A7 exitedBeforeStop says the process had already ended when the stop came (a sampler that died early); A6 a Kill that throws
 # is retried once; A9 $WaitMs is clamped to 0..60000.
-function Stop-UtilSampleProcess($Proc, [int]$WaitMs, [bool]$Kill) {
+function Stop-UtilSampleProcess($Proc, [int]$WaitMs, [bool]$Kill, $ExitedBefore = $null) {
     $s = [ordered]@{ stopped = $false; killed = $false; exitCode = $null; exitedBeforeStop = $false; why = $null }
     if ($null -eq $Proc) { $s.why = 'not-started'; return $s }
     $WaitMs = [math]::Min(60000, [math]::Max(0, $WaitMs))
     try {
-        if ($Proc.HasExited) { $s.exitedBeforeStop = $true }
+        # adversary e4bc0d80 B1: $ExitedBefore (the caller's HasExited read taken BEFORE it asked the process to stop) decides exitedBeforeStop when
+        # given, so a child that exits on its own after seeing the stop file is a clean stop, not a sampler that died early
+        if ($Proc.HasExited) { $s.exitedBeforeStop = $(if ($null -ne $ExitedBefore) { [bool]$ExitedBefore } else { $true }) }
         else {
             if ($Kill -or -not $Proc.WaitForExit($WaitMs)) {
                 try { $Proc.Kill() } catch { $s.why = 'kill-retried: ' + ([string]$_.Exception.Message -replace '\s+', ' '); $Proc.Kill() }
@@ -6879,8 +6881,12 @@ function Stop-UtilSampleAll($GpuStart, $CpuStart, [scriptblock]$WriteStop, [int]
     $r = [ordered]@{ gpu = $null; cpu = $null; stopFileWhy = $null }
     $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true
     $cp = $(if ($null -ne $CpuStart) { $CpuStart.proc })
-    if ($null -ne $cp) { try { & $WriteStop } catch { $r.stopFileWhy = 'stop-file: ' + ([string]$_.Exception.Message -replace '\s+', ' ') } }
-    $r.cpu = Stop-UtilSampleProcess $cp $WaitMs $false
+    $cpuExitedBefore = $null
+    if ($null -ne $cp) {
+        try { $cpuExitedBefore = [bool]$cp.HasExited } catch { }
+        try { & $WriteStop } catch { $r.stopFileWhy = 'stop-file: ' + ([string]$_.Exception.Message -replace '\s+', ' ') }
+    }
+    $r.cpu = Stop-UtilSampleProcess $cp $WaitMs $false $cpuExitedBefore
     $r
 }
 
@@ -7042,9 +7048,37 @@ function Get-UtilSampleStats($Values) {
     @{ n = $v.Count; mean = [math]::Round($mean, 3); p95 = [math]::Round($sorted[[int][math]::Ceiling(0.95 * $sorted.Count) - 1], 3) }
 }
 
-function Select-UtilSampleWindowRows($Rows, $Window) {
+# $IntervalRows (adversary e4bc0d80 B2): the CPU sampler's row is the mean over the interval that ENDS at its stamp (the counter delta since the previous
+# row), so it counts only when that whole interval lies inside the window: the previous row's stamp must be at or after the window's start too (the
+# file's first row has no known interval start and is left out). GPU rows keep the stamp-only rule (nvidia-smi does not publish its sample period).
+function Select-UtilSampleWindowRows($Rows, $Window, [bool]$IntervalRows = $false) {
     if ($null -eq $Window) { return @($Rows) }
-    @($Rows | Where-Object { $_.utc -ge $Window.startUtc -and $_.utc -le $Window.endUtc })
+    $all = @($Rows)
+    $out = [Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $all.Count; $i++) {
+        $u = $all[$i].utc
+        if ($u -lt $Window.startUtc -or $u -gt $Window.endUtc) { continue }
+        if ($IntervalRows -and ($i -eq 0 -or $all[$i - 1].utc -lt $Window.startUtc)) { continue }
+        $out.Add($all[$i])
+    }
+    @($out)
+}
+
+# adversary e4bc0d80 B3: true when the rows' stamps rise strictly and no step between two rows is longer than 10 s. A host clock excursion (stepped
+# forward and back) inside the window leaves the endpoints agreeing but the stamps out of order or far apart, and a window cut by stamp would then drop
+# genuine Play samples while saying ok; such a stream has no verified mapping onto the log's clock.
+function Test-UtilSampleClockSteady($Rows) {
+    try {
+        $prev = $null
+        foreach ($row in @($Rows)) {
+            if ($null -ne $prev) {
+                $dt = ($row.utc - $prev).TotalMilliseconds
+                if ($dt -le 0 -or $dt -gt 10000) { return $false }
+            }
+            $prev = $row.utc
+        }
+        return $true
+    } catch { return $false }
 }
 
 # gpuUtilStatus: ok | partial(no_window) | skipped_wake_risk | unavailable(<token>). Statistics are utilization.gpu over the rows inside the window.
@@ -7062,6 +7096,7 @@ function Get-UtilSampleGpuSummary($Parsed, $Start, $Window, $Stop = $null) {
         # adversary 693bf053 A2: a stop that left the process alive (both Kills threw) means the file may still be growing: a typed failure, never ok
         if ($null -ne $Stop -and -not $Stop.stopped -and $Stop.why -cne 'not-started') { $s.status = 'unavailable(nvidia-smi-stop-failed)'; return $s }
         if ($Parsed.why) { $s.status = "unavailable($($Parsed.why))"; return $s }
+        if ($null -ne $Window -and -not (Test-UtilSampleClockSteady $Parsed.rows)) { $s.status = 'unavailable(sample-clock-unverified)'; return $s }
         $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
         $s.rowsInWindow = $in.Count
         $st = Get-UtilSampleStats @($in | ForEach-Object { $_.util })
@@ -7091,7 +7126,8 @@ function Get-UtilSampleCpuSummary($Parsed, $Start, $Window, $Stop = $null) {
             if ($Stop.stopped -and -not $Stop.killed -and $null -ne $Stop.exitCode -and [int]$Stop.exitCode -ne 0) { $s.status = "unavailable(cpu-sampler-exit-$([int]$Stop.exitCode))"; return $s }
         }
         if ($Parsed.why) { $s.status = "unavailable($($Parsed.why))"; return $s }
-        $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window)
+        if ($null -ne $Window -and -not (Test-UtilSampleClockSteady $Parsed.rows)) { $s.status = 'unavailable(sample-clock-unverified)'; return $s }
+        $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window $true)
         $s.rowsInWindow = $in.Count
         $tot = Get-UtilSampleStats @($in | ForEach-Object { $_.total })
         $cor = Get-UtilSampleStats @($in | ForEach-Object { $_.cores })
@@ -7174,7 +7210,7 @@ $rt = { if ($null -eq $pc) { throw 'counter-unavailable' }; $pc.NextValue() }
     if ($usEncoded.Length -gt 32000) { throw "DUAL_VENUE_UTIL_SAMPLE_CHILD_TOO_LONG the encoded CPU sampler is $($usEncoded.Length) chars (limit 32000, one command line)" }
     $usAffinity = [int64]0
     if ($CorePartitionHelperMask) { $usAffinity = ConvertFrom-CorePartitionMask $CorePartitionHelperMask 'CorePartitionHelperMask' }
-    $usFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:Start-UtilSampleGpu}, ${function:Start-UtilSampleCpu}, ${function:Stop-UtilSampleProcess}, ${function:Test-UtilSampleStopped}, ${function:Stop-UtilSampleAll},${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:ConvertFrom-UtilSampleGpuRow}, ${function:ConvertFrom-UtilSampleGpuCsv}, ${function:ConvertFrom-UtilSampleCpuRow}, ${function:ConvertFrom-UtilSampleCpuCsv}, ${function:Get-UtilSamplePlayWindow},${function:Get-UtilSampleStats}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleGpuSummary}, ${function:Get-UtilSampleCpuSummary}, ${function:Get-UtilSampleScalars}) "`n"
+    $usFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:Start-UtilSampleGpu}, ${function:Start-UtilSampleCpu}, ${function:Stop-UtilSampleProcess}, ${function:Test-UtilSampleStopped}, ${function:Stop-UtilSampleAll},${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:ConvertFrom-UtilSampleGpuRow}, ${function:ConvertFrom-UtilSampleGpuCsv}, ${function:ConvertFrom-UtilSampleCpuRow}, ${function:ConvertFrom-UtilSampleCpuCsv}, ${function:Get-UtilSamplePlayWindow},${function:Get-UtilSampleStats}, ${function:Select-UtilSampleWindowRows}, ${function:Test-UtilSampleClockSteady}, ${function:Get-UtilSampleGpuSummary}, ${function:Get-UtilSampleCpuSummary}, ${function:Get-UtilSampleScalars}) "`n"
     $usLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
     $usDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $usStart = $usOpen + "`n" + $usFunctions + "`n" + "`$utilSampleBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$utilSampleAffinity = [int64]$usAffinity`n`$utilSampleEncoded = '$usEncoded'`n" + @'

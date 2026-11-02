@@ -296,7 +296,7 @@ $r['cpuExitNonZero'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'runni
 $r['cpuStopClean'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })).status
 # A8: an overflowing mean is unavailable(non-finite), never ok without a number
 $big = [ordered]@{ rows = [Collections.Generic.List[object]]::new(); why = $null }
-foreach ($ms in 100, 200) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1' }) }
+foreach ($ms in 100, 200, 300) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1' }) }
 $r['gpuNonFinite'] = (Get-UtilSampleGpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 $r['cpuNonFinite'] = (Get-UtilSampleCpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 # T5 fail open
@@ -378,6 +378,39 @@ $a2s = Get-UtilSampleScalars $a2g $a2c $true
 $r['r3A2'] = @{ gpu = $a2g.status; cpu = $a2c.status; scalarStatus = $a2s.utilSampleStatus; scalarReason = $a2s.utilSampleReason }
 $a2ns = [ordered]@{ stopped = $false; killed = $false; exitedBeforeStop = $false; exitCode = $null; why = 'not-started' }
 $r['r3A2NotStarted'] = @{ gpu = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'running'; reason = $null }) $win $a2ns).status }
+# r3 adversary e4bc0d80 B1: a CPU child that exits on its own AFTER the stop request (it saw the stop file) was running when the stop came: not exitedBeforeStop
+$b1 = [pscustomobject]@{ exited = $false }
+$b1 | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $this.exited }
+$b1 | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { 0 }
+$b1 | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.exited }
+$b1 | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.exited = $true }
+$b1r = Stop-UtilSampleAll ([ordered]@{ proc = $null }) ([ordered]@{ proc = $b1 }) { $b1.exited = $true } 100
+$b1s = Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win $b1r.cpu
+$b0 = [pscustomobject]@{ exited = $true }
+$b0 | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $this.exited }
+$b0 | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { 0 }
+$b0r = Stop-UtilSampleAll ([ordered]@{ proc = $null }) ([ordered]@{ proc = $b0 }) { } 100
+$r['r3B1'] = @{ stopped = $b1r.cpu.stopped; early = $b1r.cpu.exitedBeforeStop; exit = $b1r.cpu.exitCode; status = $b1s.status; inWindow = $b1s.rowsInWindow; preExitedEarly = $b0r.cpu.exitedBeforeStop }
+# r3 B2: a CPU row is the mean over the interval ENDING at its stamp; the row whose interval opened before Play started is not Play-only
+$b2sb = [Text.StringBuilder]::new('utc,cpuTotalPct,appPid,appCpuCores' + "`n")
+for ($i = 0; $i -le 21; $i++) {
+    if ($i -eq 0) { $tv = 100; $cv = 10 } elseif ($i -eq 1) { $tv = 90; $cv = 9 } else { $tv = 0; $cv = 0 }
+    [void]$b2sb.Append("$([DateTime]::new(2026, 11, 2, 14, 0, $i, 0, [DateTimeKind]::Utc).ToString('o')),$tv,1234,$cv`n")
+}
+$b2win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 2, 14, 0, 0, 900, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 2, 14, 0, 20, 900, [DateTimeKind]::Utc) }
+$b2 = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $b2sb.ToString()) ([ordered]@{ status = 'running'; reason = $null }) $b2win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })
+$r['r3B2'] = @{ status = $b2.status; inWindow = $b2.rowsInWindow; total = $b2.totalMean; cores = $b2.appCoresMean }
+# r3 B3: a +60 s host-clock excursion mid-play and back leaves the endpoints agreeing but the sample stamps out of order: the subset is unverified, not ok
+$b3win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 2, 14, 0, 0, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 2, 14, 0, 20, 0, [DateTimeKind]::Utc) }
+$b3cpu = ConvertFrom-UtilSampleCpuCsv "utc,cpuTotalPct,appPid,appCpuCores`n2026-11-02T14:00:01.0000000Z,10,1234,1`n2026-11-02T14:01:02.0000000Z,90,1234,9`n2026-11-02T14:00:19.0000000Z,10,1234,1`n"
+$b3gpu = ConvertFrom-UtilSampleGpuCsv "2026/11/02 08:00:01.000, 10, 10, 1200, P0, 40`n2026/11/02 08:01:02.000, 90, 10, 1200, P0, 40`n2026/11/02 08:00:19.000, 10, 10, 1200, P0, 40`n" $cst
+$b3run = [ordered]@{ status = 'running'; reason = $null }; $b3stop = [ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 }
+$b3c = Get-UtilSampleCpuSummary $b3cpu $b3run $b3win $b3stop
+$b3g = Get-UtilSampleGpuSummary $b3gpu $b3run $b3win $b3stop
+$r['r3B3'] = @{ cpu = $b3c.status; gpu = $b3g.status; scalar = (Get-UtilSampleScalars $b3g $b3c $true).utilSampleStatus }
+$b3okcpu = ConvertFrom-UtilSampleCpuCsv "utc,cpuTotalPct,appPid,appCpuCores`n2026-11-02T14:00:01.0000000Z,10,1234,1`n2026-11-02T14:00:02.0000000Z,20,1234,2`n2026-11-02T14:00:03.0000000Z,30,1234,3`n"
+$b3ok = Get-UtilSampleCpuSummary $b3okcpu $b3run $b3win $b3stop
+$r['r3B3Steady'] = @{ cpu = $b3ok.status; inWindow = $b3ok.rowsInWindow }
 Write-Output (J $r)
 """
 
@@ -418,7 +451,8 @@ class UtilSamplePureHelperTests(unittest.TestCase):
 
     def test_t4_cpu_rows_and_window(self) -> None:
         self.assertEqual(self.r["cpuParse"], {"rows": 4, "torn": True, "why": None})
-        self.assertEqual(self.r["cpuWin"], {"status": "ok", "total": 50.0, "cores": 3.0, "inWindow": 2, "rows": 4, "pids": "1234"})
+        # r3 B2: the 00.1 row's interval opened at 13:59:59.5, before the window, so only the 00.6 row (whole interval inside, no total) counts
+        self.assertEqual(self.r["cpuWin"], {"status": "ok", "total": None, "cores": 3.5, "inWindow": 1, "rows": 4, "pids": "1234"})
         self.assertEqual(self.r["cpuNoWin"], {"status": "partial(no_window)", "total": 50.0, "cores": 4.667, "inWindow": 4, "pids": "1234;1240"})
         self.assertEqual(self.r["cpuEmpty"], "unavailable(cpu-util-no-rows)")
         self.assertEqual(self.r["cpuNoHeader"], "unavailable(cpu-util-unparseable)")
@@ -427,12 +461,12 @@ class UtilSamplePureHelperTests(unittest.TestCase):
     def test_t4_summary_scalars(self) -> None:
         ok = self.r["scalarsOk"]
         self.assertEqual(list(ok), SCALARS)
-        self.assertEqual([ok[k] for k in SCALARS], ["ok", None, "ok", 60.0, 80.0, 4, 5, None, 50.0, 3.0, 2, 4])
+        self.assertEqual([ok[k] for k in SCALARS], ["ok", None, "ok", 60.0, 80.0, 4, 5, None, None, 3.5, 1, 4])  # r3 B2: one whole-interval cpu row (no total)
         nw = self.r["scalarsNoWindow"]
         self.assertEqual((nw["utilSampleStatus"], nw["utilSampleReason"], nw["gpuUtilStatus"], nw["gpuUtilMean"]), ("partial", "no_window", "partial(no_window)", 69.75))
         sk = self.r["scalarsSkipped"]
         self.assertEqual((sk["utilSampleStatus"], sk["utilSampleReason"], sk["gpuUtilStatus"], sk["gpuUtilMean"], sk["gpuRowsInWindow"], sk["cpuTotalMean"]),
-                         ("ok", "gpu:skipped_wake_risk(dgpu-D3)", "skipped_wake_risk", None, 0, 50.0))
+                         ("ok", "gpu:skipped_wake_risk(dgpu-D3)", "skipped_wake_risk", None, 0, None))
         none = self.r["scalarsNone"]
         self.assertEqual((none["utilSampleStatus"], none["utilSampleReason"], none["cpuTotalMean"], none["appCpuMeanCores"]),
                          ("unavailable", "gpu:unavailable(nvidia-smi-missing)+cpu:unavailable(cpu-sampler-start-failed)", None, None))
@@ -446,7 +480,8 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertTrue(self.r["windowEmpty"])
 
     def test_a2_startup_rows_before_play_are_excluded(self) -> None:
-        self.assertEqual(self.r["cpuPlayOnly"], {"status": "ok", "total": 10.0, "cores": 1.0, "inWindow": 20})
+        # r3 B2: 20 rows end inside the window, but the first (14:00:11) is the interval that opened at 14:00:10, before Play started at 14:00:10.001
+        self.assertEqual(self.r["cpuPlayOnly"], {"status": "ok", "total": 10.0, "cores": 1.0, "inWindow": 19})
 
     def test_a3_the_repeated_fall_back_hour_is_unparseable(self) -> None:
         self.assertEqual(self.r["gpuAmbiguousLocal"], "nvidia-smi-unparseable")
@@ -489,6 +524,17 @@ class UtilSamplePureHelperTests(unittest.TestCase):
                                           "scalarStatus": "unavailable",
                                           "scalarReason": "gpu:unavailable(nvidia-smi-stop-failed)+cpu:unavailable(cpu-sampler-stop-failed)"})
         self.assertEqual(self.r["r3A2NotStarted"], {"gpu": "ok"}, "a side that was never started is not a stop failure")
+
+    def test_r3_b1_a_child_that_exits_on_the_stop_request_is_not_exited_early(self) -> None:
+        self.assertEqual(self.r["r3B1"], {"stopped": True, "early": False, "exit": 0, "status": "ok", "inWindow": 1, "preExitedEarly": True})
+
+    def test_r3_b2_the_cpu_interval_that_opened_before_play_is_not_play_only(self) -> None:
+        # rows 02..20 only: row 00/01 end at or before 14:00:01 (the interval of row 01 opened at 14:00:00 < Play start 14:00:00.9) and row 21 is past the end
+        self.assertEqual(self.r["r3B2"], {"status": "ok", "inWindow": 19, "total": 0.0, "cores": 0.0})
+
+    def test_r3_b3_out_of_order_sample_stamps_are_an_unverified_clock_not_ok(self) -> None:
+        self.assertEqual(self.r["r3B3"], {"cpu": "unavailable(sample-clock-unverified)", "gpu": "unavailable(sample-clock-unverified)", "scalar": "unavailable"})
+        self.assertEqual(self.r["r3B3Steady"], {"cpu": "ok", "inWindow": 2}, "a steady clock still maps (rows 02 and 03 are whole intervals in the window)")
 
     def test_a6_a_throwing_kill_is_retried_and_a_running_side_is_not_stopped(self) -> None:
         self.assertEqual(self.r["stopKillRetry"], {"stopped": True, "killed": True, "kills": 2, "early": False})
