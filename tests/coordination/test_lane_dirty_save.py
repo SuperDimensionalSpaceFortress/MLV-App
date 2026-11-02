@@ -1359,8 +1359,8 @@ def test_a_private_git_dir_whose_parent_cannot_be_searched_is_named_not_called_r
     shutil.rmtree(base, ignore_errors=True)
 
 
-def run_ps_functions(names, expr, **env):
-    prog = ps_functions(*names) + f"[Console]::Out.Write({expr})"
+def run_ps_functions(names, expr, pre="", **env):
+    prog = pre + ps_functions(*names) + f"[Console]::Out.Write({expr})"
     r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, **env})
     assert r.returncode == 0, r.stdout + r.stderr
     return r.stdout.decode("utf-8")
@@ -1369,6 +1369,7 @@ def run_ps_functions(names, expr, **env):
 NOTICE_CRLF = "warning: CRLF will be replaced by LF in {name}.\nThe file will have its original line endings in your working directory\n"
 NOTICE_LF = "warning: in the working copy of '{name}', LF will be replaced by CRLF the next time Git touches it\n"
 DENIED = "warning: could not open directory 'hidden/': Permission denied\n"
+NAME_WITH_TAIL = "x', LF will be replaced by CRLF the next time Git touches it"  # a legal file name on NTFS and POSIX
 
 
 @pytest.mark.parametrize("stderr, want", [
@@ -1380,6 +1381,12 @@ DENIED = "warning: could not open directory 'hidden/': Permission denied\n"
     (DENIED, [DENIED.strip()]),
     ("The file will have its original line endings in your working directory\n", ["The file will have its original line endings in your working directory"]),  # an orphan second line is not a notice
     ("warning: LF will be replaced by CRLF in a.txt. but something else\n", ["warning: LF will be replaced by CRLF in a.txt. but something else"]),
+    (NOTICE_LF.format(name=NAME_WITH_TAIL), []),  # r12 sol r11 B2: the name holds the notice's own tail text; the old lazy match ended inside it and left a fragment
+    (NOTICE_LF.format(name=NAME_WITH_TAIL) + DENIED + NOTICE_LF.format(name=NAME_WITH_TAIL), [DENIED.strip()]),  # a warning between two such notices is neither swallowed nor hidden
+    (NOTICE_CRLF.format(name="x. a.txt"), []),
+    ("warning: x', LF will be replaced by CRLF the next time Git touches it\n", ["warning: x', LF will be replaced by CRLF the next time Git touches it"]),  # the tail alone is no notice
+    ("warning: in the working copy of 'a', LF will be replaced by CRLF the next time Git touches it extra\n", ["warning: in the working copy of 'a', LF will be replaced by CRLF the next time Git touches it extra"]),  # a notice ends at its line end
+    ("junk warning: in the working copy of 'a', LF will be replaced by CRLF the next time Git touches it\n", ["junk warning: in the working copy of 'a', LF will be replaced by CRLF the next time Git touches it"]),  # and begins at its line start
 ])
 def test_only_git_s_line_ending_notices_are_dropped_and_they_are_matched_over_the_whole_text(stderr, want):  # r11 adversary A3 (platform-independent: a file name with a line feed cannot exist on NTFS)
     out = run_ps_functions(["Get-WarningLines"], "(ConvertTo-Json -Compress -InputObject @(Get-WarningLines @($env:LDS_ERR)))", LDS_ERR=stderr)
@@ -1431,3 +1438,121 @@ def test_a_directory_is_reported_present_unless_it_is_really_gone(tmp_path):  # 
     here.mkdir()
     out = run_ps_functions(["Test-DirPresent"], "('' + (Test-DirPresent $env:LDS_A) + ',' + (Test-DirPresent $env:LDS_B))", LDS_A=str(here), LDS_B=str(gone))
     assert out == "True,False"
+
+
+# ---- r12: sol r11 B1-B4 on 288f6820 (path identity is decided after link resolution or not at all; a notice is a whole line; the saver never observes itself, by identity; names are compared byte for byte) ----
+WIN = sys.platform == "win32"
+JUNCTION_HOOK = "[void](New-Item -ItemType Junction -Path ([System.IO.Path]::Combine($WorkDir.Replace('/', '\\'), 'alias')) -Target \"{target}\")"  # git prints the toplevel with forward slashes, which cmd's mklink reads as switches
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("/base/link/../child.json", True),
+    ("C:/base/link/../child.json", True),
+    ("../child.json", True),
+    ("/base/link/..", True),
+    ("/base/./link/child.json", False),
+    ("/base/..x/x../child.json", False),
+    ("/base/\u00ad../child.json", False),  # culture compares ignore U+00AD: these are names, not parent segments
+    ("/base/..\u00ad/child.json", False),
+    ("/base/.../child.json", WIN),  # Win32 trims a segment of only dots and spaces; a POSIX name '...' is a name
+    ("/base/.. /child.json", WIN),
+    ("C:\\base\\link\\..\\child.json", WIN),  # a backslash separates segments on Windows only
+    ("\\\\?\\C:\\base\\..\\child.json", WIN),
+])
+def test_a_parent_segment_in_a_path_is_found_before_any_normalisation(raw, want):  # r12 sol r11 B1 (platform-independent unit)
+    out = run_ps_functions(["Test-HasDotDot"], "('' + (Test-HasDotDot $env:LDS_P))", pre="$script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq [char]92; ", LDS_P=raw)
+    assert out == str(want)
+
+
+@pytest.mark.parametrize("which", ["child-json", "work-dir", "run-dir"])
+def test_a_path_with_a_parent_segment_is_bad_arguments_and_nothing_is_saved(repo, tmp_path, which):  # r12 sol r11 B1: the old saver normalised the path lexically and went on to collect (RED), the new one refuses before any read
+    dirty(repo)
+    (tmp_path / "sub").mkdir()
+    child = tmp_path / "child.json"
+    child.write_text(json.dumps({"pid": dead_pid(), "createdUtc": "2000-01-01T00:00:00Z"}))
+    work, run, cj = str(repo), str(tmp_path / "run"), str(child)
+    if which == "child-json":
+        cj = str(tmp_path / "sub" / ".." / "child.json")
+    elif which == "work-dir":
+        work = str(tmp_path / "sub" / ".." / "wt")
+    else:
+        run = str(tmp_path / "sub" / ".." / "run")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", work, "-RunDir", run, "-ChildJson", cj], capture_output=True, text=True)
+    assert r.returncode == 30 and "reason=dotdot-path" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+    ok = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-ChildJson", str(child)], capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stdout + ok.stderr  # a plain absolute path still works
+
+
+@pytest.mark.skipif(WIN, reason="Windows collapses a parent segment lexically in the OS too; only POSIX follows the link first")
+def test_a_symlink_followed_by_a_parent_segment_cannot_select_a_dead_decoy_record_for_a_live_lane(repo, tmp_path):  # r12 sol r11 B1 end to end (POSIX; never run on the Windows hub VM, first run is ubuntu CI)
+    dirty(repo)
+    target, base = tmp_path / "target", tmp_path / "base"
+    (target / "sub").mkdir(parents=True)
+    base.mkdir()
+    os.symlink(target / "sub", base / "link", target_is_directory=True)
+    (target / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": "2099-01-01T00:00:00Z"}))  # the OS opens this one: a live lane
+    (base / "child.json").write_text(json.dumps({"pid": dead_pid(), "createdUtc": "2000-01-01T00:00:00Z"}))  # the lexical reading opens this one: a dead decoy
+    r = save(repo, "-ChildJson", str(base / "link" / ".." / "child.json"))
+    assert r.returncode in (20, 30) and saved(repo) == [], r.stdout + r.stderr  # old code: 0, the live lane was saved
+
+
+def test_a_file_name_that_holds_the_notice_tail_does_not_make_the_conversion_notice_a_warning(repo, tmp_path):  # r12 sol r11 B2 end to end (the name is legal on NTFS too)
+    commit_lf(repo)
+    git(repo, "config", "core.autocrlf", "true")
+    odd = repo / NAME_WITH_TAIL
+    odd.write_bytes(b"one\n")
+    git(repo, "add", "-A")
+    git(repo, "-c", "core.autocrlf=false", "commit", "-q", "-m", "odd")
+    odd.write_bytes(b"one\nextra\n")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0 and "collection" not in last_receipt(r), r.stdout + r.stderr  # old code: 60, a fragment of the name was counted as a warning
+
+
+@pytest.mark.skipif(not WIN, reason="git walks into a directory junction on Windows; on POSIX it lists a symlink as one file")
+def test_a_junction_made_straight_to_the_private_directory_cannot_put_the_savers_files_in_the_inventory(repo, tmp_path):  # r12 sol r11 B3: alias/HEAD, alias/config, alias/objects/info/alternates carry no GUID component
+    (repo / "u.txt").write_text("u\n")
+    hook = JUNCTION_HOOK.format(target="$($script:sealDir)")  # between the private directory's creation and ls-files, no sleep race
+    r = save_with_hook(repo, tmp_path, hook)
+    assert r.returncode == 0, r.stdout + r.stderr
+    inventory = inventory_of(tmp_path)
+    assert b"alias" not in inventory and b"u.txt" in inventory, inventory  # old code: alias/HEAD, alias/config, alias/objects/info/alternates were named, then deleted
+
+
+@pytest.mark.skipif(not WIN, reason="git walks into a directory junction on Windows")
+def test_a_junction_to_a_folder_inside_the_private_directory_is_also_the_savers_own(repo, tmp_path):  # r12 sol r11 B3 class: the target is inside, not the directory itself
+    (repo / "u.txt").write_text("u\n")
+    hook = JUNCTION_HOOK.format(target="$($script:sealDir)\\objects")
+    r = save_with_hook(repo, tmp_path, hook)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert b"alias" not in inventory_of(tmp_path), inventory_of(tmp_path)
+
+
+@pytest.mark.skipif(not WIN, reason="git walks into a directory junction on Windows")
+def test_a_junction_to_some_other_folder_stays_in_the_inventory(repo, tmp_path):  # r12 B3 guard: only the savers own files are dropped
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "keep.txt").write_text("k\n")
+    link_dir(repo / "alias", other)
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert b"alias/keep.txt" in inventory_of(tmp_path)
+
+
+@pytest.mark.parametrize("raw, own, want", [
+    (b"lane-dirty-save-0f\xad\0", "lane-dirty-save-0f", b"lane-dirty-save-0f\xad\0"),  # r12 sol r11 B4: the name is the saver's own plus a soft hyphen byte, a different name
+    (b"lane-dirty-save-0f\xad/HEAD\0x/lane-dirty-save-0f\xad\0", "lane-dirty-save-0f", b"lane-dirty-save-0f\xad/HEAD\0x/lane-dirty-save-0f\xad\0"),
+    (b"lane-dirty-save-0f\0", "lane-dirty-save-0f", b""),  # the exact name is still dropped
+])
+def test_a_name_that_differs_from_the_savers_own_only_by_an_ignorable_byte_is_kept(raw, own, want):  # r12 sol r11 B4 (a POSIX name may hold byte AD on its own; the helper is platform-independent)
+    out = run_ps_functions(["Remove-OwnNames"], "([System.BitConverter]::ToString((Remove-OwnNames ([System.Convert]::FromHexString($env:LDS_RAW)) $env:LDS_OWN)))", LDS_RAW=raw.hex().upper(), LDS_OWN=own)
+    assert out == "-".join(f"{b:02X}" for b in want)
+
+
+def test_no_name_in_the_saver_is_compared_by_culture():  # r12 sol r11 B4 sweep pin: the linguistic operators and string overloads ignore U+00AD and treat some control characters specially
+    code = "\n".join(re.sub(r"\s#\s.*$", "", ln) for ln in SCRIPT.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+    assert not re.search(r"\s-(?:ceq|ccontains|clike|like|notlike)\s", code), "use [string]::Equals(a, b, [System.StringComparison]::Ordinal), Array.IndexOf, or a StartsWith/EndsWith with an explicit comparison"
+    for m in re.finditer(r"\.(?:StartsWith|EndsWith)\(([^)]*)\)", code):
+        assert "StringComparison" in m.group(1) or "[char]" in m.group(1), m.group(0)  # a bare string argument is a culture compare
+    assert not re.search(r"\.IndexOf\(\s*[\"']", code)  # a string IndexOf is a culture search; use the char overload
+    assert not re.search(r"\s-i?eq\s+['\"][A-Za-z_.]", code)  # an equality operator against a quoted name
