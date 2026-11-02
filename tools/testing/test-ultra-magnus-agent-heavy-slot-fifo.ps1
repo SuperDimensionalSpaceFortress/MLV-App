@@ -483,10 +483,15 @@ $results.unit = $unit
 # heavy-slot.py, so this script's status-mode mocks never meet them. A failure there fails this run.
 # CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1: each sub-suite runs under a wall-clock bound, so a hung one fails by name (and its
 # whole process tree is killed) instead of running to the CI job cap. Measured 272 s (quiet-lease) and 48 s (stage-exempt) locally.
+function ConvertTo-CommandLineArg([string]$Value) {
+    # Start-Process joins -ArgumentList with spaces and quotes nothing, so each value is quoted by the Windows rules: backslashes
+    # before a quote (and before the closing quote) are doubled, or a RepoRoot ending in "\" escapes its closing quote (adversary r4 A1).
+    '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}
 function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
     $outF = [IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
     try {
-        $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { '"' + $_ + '"' }
+        $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { ConvertTo-CommandLineArg $_ }
         $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $suiteArgs -NoNewWindow -PassThru -RedirectStandardOutput $outF -RedirectStandardError $errF
         $null = $p.Handle   # keeps ExitCode readable after the exit
         $t0 = Get-Date

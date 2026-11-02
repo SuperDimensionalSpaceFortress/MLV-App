@@ -34,9 +34,11 @@ ROOT = Path(__file__).resolve().parents[2]
 AGENT = ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1"
 FIFO_TEST = ROOT / "tools" / "testing" / "test-ultra-magnus-agent-heavy-slot-fifo.ps1"
 PWSH = shutil.which("pwsh")
-# Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s) plus
-# its ~30 s of unit cases, so a hung suite fails by its own name there first. Measured 349 s locally, 282 s on the hosted runner.
-UNIT_RUN_TIMEOUT_SEC = 600
+# Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s), their two
+# bounded taskkills (2 x 60 s) and its ~30 s of unit cases (670 s), so a hung suite fails by its own name there first (a test pins
+# the sum). Measured 349 s locally, 282 s on the hosted runner.
+UNIT_RUN_TIMEOUT_SEC = 720
+FIFO_UNIT_CASES_SEC = 30  # the fifo script's own unit cases, before its two bounded sub-suites
 
 
 def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
@@ -205,6 +207,17 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn("$k.WaitForExit(60000)", fifo)
         self.assertIn("process tree kill is NOT confirmed", fifo)
         self.assertIn("and $killNote; output so far", fifo)
+
+    def test_the_outer_guard_outlasts_every_inner_bound_so_a_hung_suite_fails_by_its_own_name(self) -> None:
+        # adversary r4 A2: the -UnitOnly run is quiet-lease (bound + bounded taskkill) then stage-exempt (bound + bounded taskkill) after
+        # about 30 s of unit cases. If the outer guard is shorter than that worst case, the outer kill reports only the parent test.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        quiet = int(re.search(r"\[int\]\$QuietLeaseBoundSec = (\d+)", fifo).group(1))
+        stage = int(re.search(r"\[int\]\$StageExemptBoundSec = (\d+)", fifo).group(1))
+        taskkill = int(re.search(r"\$k\.WaitForExit\((\d+)000\)", fifo).group(1))
+        worst_case = FIFO_UNIT_CASES_SEC + (quiet + taskkill) + (stage + taskkill)
+        self.assertGreater(UNIT_RUN_TIMEOUT_SEC, worst_case,
+                           f"the outer guard ({UNIT_RUN_TIMEOUT_SEC} s) must outlast unit cases + both sub-suite bounds + both bounded kills ({worst_case} s)")
 
     def test_light_probes_stay_exempt_and_deploy_gate_string_matches(self) -> None:
         self.assertIn("[string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$'", self.text)
@@ -397,6 +410,35 @@ class BoundedRunTests(unittest.TestCase):
             run_bounded([sys.executable, "-c", self.HUNG_TREE], 3, "stub-hang-case")
         self.assertLess(time.monotonic() - started, 30)
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught.exception))
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_the_fifo_suite_hands_a_trailing_backslash_root_to_its_children_intact(self) -> None:
+        # adversary r4 A1: Invoke-BoundedSuite hand-quotes the child command line, and a RepoRoot that ends in a backslash escaped
+        # its closing quote, so -AgentScript and its value merged into -RepoRoot. The ps1's own quoting function is extracted and its
+        # output is parsed back with the Windows parser (CommandLineToArgvW) the child process uses.
+        import ctypes
+        from ctypes import wintypes
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        start = fifo.index("function ConvertTo-CommandLineArg") if "function ConvertTo-CommandLineArg" in fifo else -1
+        self.assertGreaterEqual(start, 0, "the fifo suite must quote each child argument through ConvertTo-CommandLineArg")
+        body = fifo[start:]
+        body = body[:body.index("\n}") + 2]
+        values = ["C:\\repo root\\", "C:\\repo root", "\\\\server\\share\\dir\\", "C:\\a\\\\", "C:\\plain\\agent.ps1", "a \"quoted\" word\\"]
+        script = body + "\n$v = @(" + ",".join("'" + v.replace("'", "''") + "'" for v in values) + ")\n" \
+                 "($v | ForEach-Object { ConvertTo-CommandLineArg $_ }) -join ' '"
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        command_line = proc.stdout.strip()
+        argv_w = ctypes.windll.shell32.CommandLineToArgvW
+        argv_w.restype = ctypes.POINTER(wintypes.LPWSTR)
+        argv_w.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+        count = ctypes.c_int(0)
+        argv = argv_w("prog.exe " + command_line, ctypes.byref(count))
+        try:
+            parsed = [argv[i] for i in range(1, count.value)]
+        finally:
+            ctypes.windll.kernel32.LocalFree(argv)
+        self.assertEqual(parsed, values, command_line)
 
     def test_a_finished_run_returns_its_code_and_both_streams(self) -> None:
         rc, out, err = run_bounded([sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err'); sys.exit(3)"], 60, "finished-case")
