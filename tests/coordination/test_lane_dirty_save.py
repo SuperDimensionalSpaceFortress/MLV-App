@@ -1076,3 +1076,56 @@ def test_a_private_git_dir_that_cannot_be_removed_is_named_not_swallowed(repo, t
     left = last_receipt(r)["privateGitDirLeft"]
     assert Path(left).parent == repo / ".git" and Path(left).name.startswith("lane-dirty-save-")
     assert newest_patch(tmp_path) == git(repo, "diff", "HEAD", "--binary")
+
+
+# ---- r10 adversary pass 2 on 7f29a91c ----
+def test_a_boolean_git_accepts_in_another_spelling_and_a_path_with_non_ascii_still_decide_what_is_dirt(repo, tmp_path):  # pass 2 A1 (autocrlf = +1) and A2 (an attributes file by its own name)
+    git(repo, "config", "--unset", "core.autocrlf")
+    (repo / "a.txt").write_bytes(b"one\n")
+    git(repo, "-c", "core.autocrlf=false", "commit", "-q", "-am", "lf")
+    (repo / "a.txt").write_bytes(b"one\r\n")
+    glob = tmp_path / "global.gitconfig"
+    glob.write_text("[core]\n\tautocrlf = +1\n")
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(glob)}
+    assert git_env(repo, env, "diff", "HEAD", "--binary") == b""  # git reads +1 as true, so the CRLF file is clean
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 10 and saved(repo) == [], r.stdout + r.stderr  # pass-1 code dropped +1 and saved a spurious line-ending patch
+    attrs = tmp_path / "attrs-é"  # not ASCII
+    attrs.write_text("a.txt -text\n", encoding="utf-8")
+    git(repo, "config", "core.attributesFile", str(attrs))
+    git(repo, "config", "core.autocrlf", "true")
+    want = git_env(repo, env, "diff", "HEAD", "--binary")
+    assert want  # -text switches the conversion off, so now the CRLF is real dirt
+    assert save(repo, "-LanePid", str(dead_pid()), env=env).returncode == 0
+    assert newest_patch(tmp_path) == want
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a file name that is not UTF-8 needs a POSIX file system")
+def test_an_attributes_file_whose_name_is_not_utf8_is_read_not_its_replacement_sibling(tmp_path):  # pass 2 A2: byte FF became U+FFFD, which names a different file
+    base = tmp_path / "case"
+    base.mkdir()
+    wd = base / "wt"
+    init_repo(wd, b"one\n")
+    (base / "run").mkdir()
+    (wd / "a.txt").write_bytes(b"one\r\n")
+    real, sibling = os.fsencode(str(base)) + b"/attrs\xff", (str(base) + "/attrs\ufffd").encode("utf-8")
+    Path(os.fsdecode(real)).write_text("a.txt -text\n")
+    Path(os.fsdecode(sibling)).write_text("a.txt text\n")
+    subprocess.run([b"git", b"-C", os.fsencode(str(wd)), b"config", b"core.autocrlf", b"true"], check=True)
+    subprocess.run([b"git", b"-C", os.fsencode(str(wd)), b"config", b"core.attributesFile", real], check=True)
+    want = git(wd, "diff", "HEAD", "--binary")
+    assert want  # with `-text` the CRLF is dirt; with the sibling's `text` rule it would be normalised away
+    r = save(wd, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert next((base / "run").glob("*.patch")).read_bytes() == want
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows refuses to delete a directory holding a file another handle has open without delete sharing")
+def test_a_leftover_private_git_dir_is_named_even_when_the_artifacts_cannot_be_written(repo, tmp_path):  # pass 2 A3: exit 50 dropped the note
+    (repo / "a.txt").write_bytes(b"changed\n")
+    deny_writes(tmp_path / "run")
+    try:
+        r = save_with_hook(repo, tmp_path, "$script:hold = [System.IO.File]::Open([System.IO.Path]::Combine($script:sealDir, 'config'), 'Open', 'Read', 'ReadWrite')")
+    finally:
+        allow_writes(tmp_path / "run")
+    assert r.returncode == 50 and "DIRTY_SAVE_WRITE_FAILED" in r.stdout and "privateGitDirLeft=" in r.stdout, r.stdout + r.stderr
