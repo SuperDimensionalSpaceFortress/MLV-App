@@ -1169,15 +1169,24 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "Write-Output ('STALLED|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
                   "$real = [IO.Path]::GetTempFileName()\n"
-                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n"
-                  # adversary r7 A3: a delete that fails (a read-only or held file) is reported, not read as a success.
-                  "$stuck = [IO.Path]::GetTempFileName(); [IO.File]::SetAttributes($stuck, [IO.FileAttributes]::ReadOnly)\n"
-                  "Write-Output ('STUCK|' + (Remove-CaptureFiles @($stuck)) + '|' + (Test-Path -LiteralPath $stuck))\n"
-                  "[IO.File]::SetAttributes($stuck, [IO.FileAttributes]::Normal); Remove-Item -LiteralPath $stuck -Force\n")
+                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("STALLED|capture cleanup abandoned after 0.3 s: C:\\x\\a.txt, C:\\x\\b.txt|True", proc.stdout)
         self.assertIn("CLEAN|[]|False", proc.stdout)
+
+    @unittest.skipUnless(os.name == "nt" and PWSH is not None,
+                         "a read-only attribute blocks File.Delete only on Windows; on POSIX the delete succeeds and nothing is left behind")
+    def test_a_capture_file_that_cannot_be_deleted_is_reported_as_still_present(self) -> None:
+        # adversary r7 A3: a delete that fails (a read-only or held file) is reported, not read as a success. Split out of the STALLED/CLEAN test
+        # (hosted ubuntu CI, run 41485699571): the ReadOnly attribute does not stop a POSIX unlink, so the case printed `STUCK||False` there
+        # and the teardown threw on the already-removed file. The teardown now also tolerates a file that is gone.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$stuck = [IO.Path]::GetTempFileName(); [IO.File]::SetAttributes($stuck, [IO.FileAttributes]::ReadOnly)\n"
+                  "Write-Output ('STUCK|' + (Remove-CaptureFiles @($stuck)) + '|' + (Test-Path -LiteralPath $stuck))\n"
+                  "if (Test-Path -LiteralPath $stuck) { [IO.File]::SetAttributes($stuck, [IO.FileAttributes]::Normal); Remove-Item -LiteralPath $stuck -Force }\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"STUCK\|capture cleanup incomplete: still present: .+\.tmp\|True")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
