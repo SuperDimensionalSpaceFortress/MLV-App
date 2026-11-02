@@ -1296,14 +1296,13 @@ R11_FIX2_NOT_A_PNG = (("rgb-trns-one-byte", ADVERSARY_R11_FIX2_A1),
                       ("gama-repeated", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"gAMA", struct.pack(">I", 45455)) * 2)),
                       ("grey-with-plte", png_of(1, 1, 8, 0, 0, _GREY_1X1, extra=png_chunk(b"PLTE", b"\x10\x20\x30"))),
                       ("palette-trns-longer-than-palette", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x00\x00"))))
-# controls the r11 check must still accept: stored (level 0) deflate blocks, and the fixed-size chunks a Qt-written PNG carries (gAMA, sRGB, pHYs) plus
-# an RGB tRNS and a palette tRNS at their sizes. (r13: r11's "ok-ancillary-chunk" control, a tEXt chunk, is now REFUSED -- the hub's r13 ruling puts
-# no text chunk on the allowlist, because the leg writes none; it moved to R13_NOT_A_PNG as "text-chunk-tEXt".)
+# controls the r11 check must still accept: stored (level 0) deflate blocks, and the fixed-size chunks a Qt-written PNG carries (gAMA, sRGB, pHYs).
+# (r13: r11's "ok-ancillary-chunk" control, a tEXt chunk, is now REFUSED -- the hub's r13 ruling puts no text chunk on the allowlist, because the leg
+# writes none; it moved to R13_NOT_A_PNG as "text-chunk-tEXt". r13 fix 1: so are r11's "ok-rgb-trns" and "ok-palette-trns" -- tRNS and PLTE are off the
+# allowlist too; they moved to R13_FIX1_NOT_A_PNG.)
 R11_PNG_CONTROLS = (("ok-stored-blocks.png", png_of(4, 3, 8, 2, 0, zlib.compress(_RGB_ROWS, 0))),
                     ("ok-gama-srgb-phys.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"sRGB", b"\x00") + png_chunk(b"gAMA", struct.pack(">I", 45455))
-                                                     + png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 1)))),
-                    ("ok-rgb-trns.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tRNS", bytes(6)))),
-                    ("ok-palette-trns.png", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x80"))))
+                                                     + png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 1)))))
 # r12 (adversary r12 e68b3f74): A1 an IDAT chunk whose CRC-32 is wrong (one bit of the verbatim input's CRC flipped; Pillow: bad IDAT checksum) was
 # accepted, because only non-IDAT chunks had their CRC checked. Verbatim, plus the class: a bad CRC on the middle one of three split IDAT chunks, and on
 # the last one. A2 (advisory) an IEND chunk with data, its CRC correct. A3 (advisory, a control): hIST is valid after a suggested palette (PLTE) in an
@@ -1377,12 +1376,29 @@ R13_NOT_A_PNG = (("sol-r12-b1-ztxt-method-1", SOL_R12_B1_ZTXT),
                  ("phys-unit-2", _rgb_with(png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 2)))),
                  ("phys-ppu-over-2-31", _rgb_with(png_chunk(b"pHYs", struct.pack(">IIB", 0x80000000, 3780, 1)))),
                  ("srgb-repeated", _rgb_with(png_chunk(b"sRGB", b"\x00"), png_chunk(b"sRGB", b"\x00"))))
-_ALLOWLIST = "not on the PNG chunk allowlist (IHDR, PLTE, IDAT, IEND, sRGB, gAMA, pHYs, tRNS)"
+# r13 fix 1 (adversary r13 ebd1da64): A1 a 1x1 palette image whose one pixel indexes entry 255 of a one-entry PLTE (the check never decoded palette
+# indices); A2 an RGB image whose tRNS comes BEFORE its suggested PLTE (the order check applied to palette images only). Both verbatim. The leg writes
+# no PLTE and no tRNS (survey), so the fix takes both off the allowlist and refuses a palette image at its IHDR. The class: every PLTE / tRNS shape the
+# r11-r13 controls accepted (an RGB tRNS, a palette tRNS, a suggested palette, a plain palette image).
+ADVERSARY_R13_A1 = bytes.fromhex("89504e470d0a1a0a0000000d494844520000000100000001080300000028cb34bb00000003504c544510203008018aa40000000a49444154789c63f80f0001010100b138f6140000000049454e44ae426082")
+ADVERSARY_R13_A2 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000674524e530000000000006ea6079100000003504c5445000000a77a3dda0000000c49444154789c63606060000000040001f61738550000000049454e44ae426082")
+R13_FIX1_NOT_A_PNG = (("adversary-r13-a1-palette-index-past-plte", ADVERSARY_R13_A1),
+                      ("adversary-r13-a2-trns-before-suggested-plte", ADVERSARY_R13_A2),
+                      ("rgb-trns", _rgb_with(png_chunk(b"tRNS", bytes(6)))),
+                      ("palette-trns", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x80"))),
+                      ("suggested-plte", png_of(1, 1, 8, 2, 0, _RGB_1X1, extra=png_chunk(b"PLTE", b"\x00\x00\x00"))),
+                      ("palette", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30"))),
+                      ("grey-trns", png_of(1, 1, 8, 0, 0, _GREY_1X1, extra=png_chunk(b"tRNS", b"\x00\x80"))))
+_ALLOWLIST = "not on the PNG chunk allowlist (IHDR, IDAT, IEND, sRGB, gAMA, pHYs)"
 R13_TYPED = {"bad-r13-sol-r12-b1-ztxt-method-1.png": f"its zTXt chunk at byte 33 is {_ALLOWLIST}",
              "bad-r13-adversary-r12-empty-iccp.png": f"its iCCP chunk at byte 33 is {_ALLOWLIST}",
              "bad-r13-text-chunk-tEXt.png": f"its tEXt chunk at byte 33 is {_ALLOWLIST}",
              "bad-r13-private-ancillary.png": f"its prVt chunk at byte 33 is {_ALLOWLIST}",
-             "bad-r13-hist-after-suggested-plte.png": f"its hIST chunk at byte 48 is {_ALLOWLIST}",
+             "bad-r13-hist-after-suggested-plte.png": f"its PLTE chunk at byte 33 is {_ALLOWLIST}: the leg writes no palette",
+             "bad-r13f1-adversary-r13-a1-palette-index-past-plte.png": f"its IHDR colour type 3 is a palette image, which needs a PLTE chunk, and PLTE is {_ALLOWLIST}",
+             "bad-r13f1-adversary-r13-a2-trns-before-suggested-plte.png": f"its tRNS chunk at byte 33 is {_ALLOWLIST}",
+             "bad-r13f1-suggested-plte.png": f"its PLTE chunk at byte 33 is {_ALLOWLIST}: the leg writes no palette",
+             "bad-r13f1-grey-trns.png": f"its tRNS chunk at byte 33 is {_ALLOWLIST}",
              "bad-r11-unknown-critical-chunk.png": f"its ABCD chunk at byte 33 is {_ALLOWLIST}: a critical chunk PNG does not define",
              "bad-r13-srgb-intent-4.png": "its sRGB chunk at byte 33 has rendering intent 4",
              "bad-r13-gama-zero.png": "its gAMA chunk at byte 33 has gamma 0",
@@ -1399,7 +1415,7 @@ R13_PNG_CONTROLS = (("ok-r13-survey-grab.png", _rgb_with(_SURVEY_PHYS)),
                     ("ok-r13-srgb-intent-3.png", _rgb_with(png_chunk(b"sRGB", b"\x03"))),
                     ("ok-r13-gama-max.png", _rgb_with(png_chunk(b"gAMA", b"\x7f\xff\xff\xff"))),
                     ("ok-r13-phys-unit-0-max.png", _rgb_with(png_chunk(b"pHYs", struct.pack(">IIB", 0x7FFFFFFF, 0, 0)))),
-                    ("ok-r13-suggested-plte.png", png_of(1, 1, 8, 2, 0, _RGB_1X1, extra=png_chunk(b"PLTE", b"\x00\x00\x00"))))
+                    ("ok-r13-grey-phys.png", png_of(1, 1, 8, 0, 0, _GREY_1X1, extra=_SURVEY_PHYS)))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -1432,13 +1448,15 @@ class PngImageCheckUnitTests(unittest.TestCase):
         hd = png_of(1920, 1080, 8, 2, 0, zlib.compress(hd_rows, 6))
         cases = {**{f"bad-{n}.png": (b, False) for n, b in NOT_A_PNG}, "bad-depth.png": (bad_depth, False),
                  "ok-fixture.png": (_GOOD, True), "ok-grey.png": (grey, True), "ok-rgba16.png": (rgba16, True), "ok-interlaced.png": (laced, True),
-                 "ok-interlaced-5x5.png": (laced5, True), "ok-palette.png": (palette, True), "ok-1bit.png": (onebit, True), "ok-split-idat.png": (split, True),
+                 "ok-interlaced-5x5.png": (laced5, True), "ok-1bit.png": (onebit, True), "ok-split-idat.png": (split, True),
+                 "bad-r13f1-palette-with-plte.png": (palette, False),   # (r13 fix 1: was "ok-palette"; PLTE is off the allowlist)
                  "ok-1920x1080.png": (hd, True),
                  **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{f"bad-r11f2-{n}.png": (b, False) for n, b in R11_FIX2_NOT_A_PNG},
                  **{n: (b, True) for n, b in R11_PNG_CONTROLS},
                  **{f"bad-r12-{n}.png": (b, False) for n, b in R12_NOT_A_PNG}, **{f"bad-r12f2-{n}.png": (b, False) for n, b in R12_FIX2_NOT_A_PNG},
                  **{n: (b, True) for n, b in R12_PNG_CONTROLS},
-                 **{f"bad-r13-{n}.png": (b, False) for n, b in R13_NOT_A_PNG}, **{n: (b, True) for n, b in R13_PNG_CONTROLS}}
+                 **{f"bad-r13-{n}.png": (b, False) for n, b in R13_NOT_A_PNG}, **{n: (b, True) for n, b in R13_PNG_CONTROLS},
+                 **{f"bad-r13f1-{n}.png": (b, False) for n, b in R13_FIX1_NOT_A_PNG}}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
@@ -1525,6 +1543,19 @@ class PairedSeekImageContentTests(PairedStillsHarness, unittest.TestCase):
                         if not final:
                             self.assertIn(f"{'zTXt' if shape == 'ztxt' else 'iCCP'} chunk at byte 33 is not on the PNG chunk allowlist",
                                           " ".join(receipt["look"]["pairedSeek"]["frameMismatches"]))
+
+    def test_r13_fix1_a_palette_or_trns_image_in_either_member_is_not_a_pass(self) -> None:
+        # r13 fix 1 (adversary r13 ebd1da64 A1 / A2): each verbatim input as either member of the same paired probe. On ebd1da64 the image check
+        # returned null for both (honoured); now each is a typed frame-00 mismatch, INVALID, listed, listless and at final validation.
+        for shape, data, why in (("a1", ADVERSARY_R13_A1, "IHDR colour type 3 is a palette image"), ("a2", ADVERSARY_R13_A2, "tRNS chunk at byte 33 is not on the PNG chunk allowlist")):
+            for member in ("paused", "partner"):
+                for listed, final in ((True, False), (False, False), (True, True)):
+                    with self.subTest(shape=shape, member=member, listed=listed, final_validation=final):
+                        self.fresh()
+                        receipt = self.run_image_case(f"r13f1-{shape}-{member[:4]}-{'l' if listed else 'n'}", member, data, listed=listed, final=final)
+                        self.assert_image_mismatch(receipt, member, final)
+                        if not final:
+                            self.assertIn(why, " ".join(receipt["look"]["pairedSeek"]["frameMismatches"]))
 
     def test_r10_the_valid_image_pair_control_passes(self) -> None:
         for listed in (True, False):
