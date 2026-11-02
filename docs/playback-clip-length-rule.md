@@ -170,12 +170,30 @@ FRAME:
   under which every cast-out hold is longer than twice that bound, so an ended stall is never playing pace once its
   frame was seen to stay more than twice the playing step. The probe takes the fastest pace and the earliest finish of
   the three splits, so no earlier split brings back a stricter verdict.
-  **The bound the generated sweep proves** (`R16GeneratedSweep...` in `tests/console/test_playback_frame_range.cpp`):
-  required 1499, budget 65 s, 24/25/30 fps, first present 250-1500 ms, stalls of 100-300 ms every 3 s down to every
-  400 ms, either ended by the probe or never stopping, polled every 50 ms at any phase 0-49 ms. The console grid samples
-  five phases and three first presents; the full grid in the r16 run dir covers every phase and four first presents.
-  On that grid every run whose count really reaches 1499 by the budget is Reached (at the first poll after it), and
-  every run that cannot is refused `PLAY_PACE_TOO_SLOW` before the budget. Off the grid, a run whose true finish lies
+  **The bound, and the two grids that check it.** Both grids use required 1499, a 65 s budget and 50 ms polls (note,
+  then decide). Both are discrete samples. Neither covers a continuous range of fps, first presents, stall lengths,
+  spacings or phases.
+  (a) **The committed test** (`PlayPaceRecovery.R16GeneratedSweep...` in `tests/console/test_playback_frame_range.cpp`,
+  run by every `console_tests` build) asserts exactly this grid:
+  - 24, 25 and 30 fps;
+  - first present at 250, 750 or 1500 ms;
+  - stalls of 100, 150, 200, 250 or 300 ms, every 3000, 1200, 640 or 400 ms;
+  - each spacing as a burst that has ended by the probe, or as stalls that never stop;
+  - phases 0, 12, 25, 37 and 49 ms.
+  That is 360 combinations and 1800 runs. r17 added the 45 never-stopping 3000 ms combinations that r16 skipped.
+  (b) **A separate full-sweep receipt** is not a test and is not in the repo. It is the r17 run dir's
+  `evidence/sweep-full-r17grid-{24,25,30}.txt`, from `evidence/sweepfull-r17.cpp` built against
+  `platform/qt/PlaybackFrameRange.h` at 9c3f57db. It applies the test's own assertions to a wider grid:
+  - first present at 250, 500, 750, 1000 or 1500 ms;
+  - stalls every 3000, 2000, 1200, 900, 640, 500 or 400 ms, as bursts and as never-stopping stalls, with no row
+    skipped;
+  - every phase from 0 to 49 ms.
+  That is 350 combinations and 17500 runs per fps, 52500 in all, with 0 violations. The same run dir also reruns r16's
+  own 39000-run grid unchanged (`evidence/sweep-full-r16grid-*.txt`): four first presents, and the never-stopping
+  3000 ms rows skipped. Its program checks a pinned refusal only against the budget, not the 200 ms limit, and its
+  latest pinned refusal is 8149 ms. It also has 0 violations.
+  On both grids, every run whose count really reaches 1499 by the budget is Reached, at the first poll after it. Every
+  run that cannot is refused `PLAY_PACE_TOO_SLOW` before the budget. Off the grid, a run whose true finish lies
   less than one poll past the budget can still end in the typed `PLAY_SAFETY_TIMEOUT` instead, never a pass.
   Example: 24 fps, first present 1084 ms, reaching at 65000.7 ms (r16 re-pass A3). There are two pinned exceptions, both refused typed within 200 ms of the
   probe:

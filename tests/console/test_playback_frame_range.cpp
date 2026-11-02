@@ -2384,18 +2384,21 @@ TEST( PlayPaceRecovery, R16DotDensityCaseRecoveredStallsAreNeverPlayingPace )
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// r16: THE GENERATED SWEEP. Every combination of a 24 / 25 / 30 fps conformed run (required 1499, safety 65000), a
-// first present of 250-1500 ms, stalls of 100-300 ms every 3000 ms (sparse) down to every 400 ms, either a burst that
-// has ended by the probe (from 500 ms after the first present, the last ending by 8000 ms) or stalls that never stop,
-// polled every 50 ms at phases 0-49 ms. Ground truth: the first ms the count reaches 1499 (feasible = by the budget).
+// r16: THE GENERATED SWEEP. It checks exactly this sampled grid, not a continuous range: a 24 / 25 / 30 fps conformed run
+// (required 1499, safety 65000), first present 250 / 750 / 1500 ms, stalls of 100 / 150 / 200 / 250 / 300 ms every
+// 3000 / 1200 / 640 / 400 ms, either a burst that has ended by the probe (from 500 ms after the first present, the last
+// ending by 8000 ms) or stalls that never stop, polled every 50 ms at phases 0 / 12 / 25 / 37 / 49 ms: 360 combinations,
+// 1800 runs (r17 added the 45 never-stopping 3000 ms combinations the r16 test skipped; about 1.5 s more over the three
+// fps, measured standalone). Ground truth: the first ms the count reaches 1499 (feasible = by the budget).
 // THE BOUND IT PROVES (docs/playback-clip-length-rule.md): every feasible run is Reached, never before the count really
 // reaches 1499, and every infeasible one is refused PLAY_PACE_TOO_SLOW before the budget -- except two pinned classes,
 // each refused typed within 200 ms of the probe: (1) the STALL SHARE CAP: a burst whose stalls are more than a third of the time to the
 // probe is, at 8 s, the same count as stalls that keep coming (R12ControlsStillEndTypedPaceTooSlow); (2) THE TWO-POLL
 // LIMIT: a stall whose frame stays less than three poll gaps (step + stall < 150 ms, i.e. the 100 ms stalls here) can be
 // seen by only two polls -- a 50 ms bin, the same sighting as the 60 / 70 ms steps of the uneven engines that must be
-// refused at the probe (R15AdversaryA1 jitter controls) -- so it can stay playing pace. Evidence of the full grid (every
-// phase 0..49, 7 spacings, 4 first presents): the r16 run dir, evidence/sweep-full-*.txt.
+// refused at the probe (R15AdversaryA1 jitter controls) -- so it can stay playing pace. A wider grid (every phase 0..49,
+// 7 spacings, 5 first presents) is a SEPARATE receipt, not this test: see docs/playback-clip-length-rule.md for its
+// command, grid, counts and head.
 // ---------------------------------------------------------------------------------------------------------
 TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeasibleOneIsRefused )
 {
@@ -2410,7 +2413,6 @@ TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeas
     for( const int64_t every : { int64_t( 3000 ), int64_t( 1200 ), int64_t( 640 ), int64_t( 400 ) } )
     {
         const int64_t fps = fi == 0 ? 24 : ( fi == 1 ? 25 : 30 );
-        if( !burst && every == 3000 ) continue;   // sparse stalls that never stop: the burst rows cover them
         const std::vector<Stall> stalls = periodicStalls( firstPresent + 500, every, len, burst ? 8000 : 900000 );
         int64_t reach = 0;
         while( stalledCount( reach, firstPresent, fps, stalls ) < 1499 ) ++reach;
