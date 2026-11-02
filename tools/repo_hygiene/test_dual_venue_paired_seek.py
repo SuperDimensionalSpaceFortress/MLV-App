@@ -1317,7 +1317,27 @@ R12_NOT_A_PNG = (("idat-bad-crc", ADVERSARY_R12_A1),
                  ("split-idat-middle-bad-crc", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + _SPLIT_IDAT[0] + _bad_crc(_SPLIT_IDAT[1]) + _SPLIT_IDAT[2] + png_chunk(b"IEND", b"")),
                  ("split-idat-last-bad-crc", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + _SPLIT_IDAT[0] + _SPLIT_IDAT[1] + _bad_crc(_SPLIT_IDAT[2]) + png_chunk(b"IEND", b"")),
                  ("iend-with-data", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + png_chunk(b"IDAT", _RGB_STREAM) + png_chunk(b"IEND", b"\x00")))
-R12_PNG_CONTROLS = (("ok-rgb-plte-hist.png", png_of(1, 1, 8, 2, 0, zlib.compress(bytes(4)), extra=png_chunk(b"PLTE", b"\x00\x00\x00") + png_chunk(b"hIST", b"\x00\x01"))),
+
+
+def _rows_whose_adler_ends_in_ff(width: int, height: int) -> bytes:
+    """r12 fix 2: filter-0 RGB scanlines of a width x height image whose zlib Adler-32 ends in 0xFF (searched over the first pixel, deterministic).
+    (Only the LAST trailer byte can be borrowed this way: Adler-32's low 16 bits are a sum mod 65521, never 0xFFFF, so two 0xFF bytes never end it.)"""
+    rest = bytes(3 * width - 3)
+    for v in range(1 << 24):
+        rows = b"".join(b"\x00" + (v.to_bytes(3, "big") if y == 0 else b"\x00\x00\x00") + rest for y in range(height))
+        if zlib.adler32(rows) & 0xFF == 0xFF:
+            return rows
+    raise AssertionError("no such scanline")
+
+
+# r12 fix 2 (adversary r12 0f6daf3a A1): a zlib stream whose Adler-32 trailer is cut short was accepted when the cut byte was 0xFF, because the
+# inflater's synthetic 0xFF tail supplied it. Verbatim, plus the class: the last 0xFF byte cut from a searched 1x1 and a searched 4x3 RGB stream.
+ADVERSARY_R12_FIX2_A1 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000b49444154789c63f8c7c0000002fe002bd6f0e10000000049454e44ae426082")
+R12_FIX2_NOT_A_PNG = (("adler32-last-byte-ff-cut", ADVERSARY_R12_FIX2_A1),
+                      ("adler32-ff-cut-1x1", png_of(1, 1, 8, 2, 0, zlib.compress(_rows_whose_adler_ends_in_ff(1, 1))[:-1])),
+                      ("adler32-ff-cut-4x3", png_of(4, 3, 8, 2, 0, zlib.compress(_rows_whose_adler_ends_in_ff(4, 3))[:-1])))
+R12_PNG_CONTROLS = (("ok-adler32-ends-in-ff-4x3.png", png_of(4, 3, 8, 2, 0, zlib.compress(_rows_whose_adler_ends_in_ff(4, 3)))),
+                    ("ok-adler32-verbatim-uncut.png", png_of(1, 1, 8, 2, 0, bytes.fromhex("789c63f8c7c0000002fe00ff"))),("ok-rgb-plte-hist.png", png_of(1, 1, 8, 2, 0, zlib.compress(bytes(4)), extra=png_chunk(b"PLTE", b"\x00\x00\x00") + png_chunk(b"hIST", b"\x00\x01"))),
                     ("ok-split-idat-r12.png", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + b"".join(_SPLIT_IDAT) + png_chunk(b"IEND", b"")))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
@@ -1355,7 +1375,8 @@ class PngImageCheckUnitTests(unittest.TestCase):
                  "ok-1920x1080.png": (hd, True),
                  **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{f"bad-r11f2-{n}.png": (b, False) for n, b in R11_FIX2_NOT_A_PNG},
                  **{n: (b, True) for n, b in R11_PNG_CONTROLS},
-                 **{f"bad-r12-{n}.png": (b, False) for n, b in R12_NOT_A_PNG}, **{n: (b, True) for n, b in R12_PNG_CONTROLS}}
+                 **{f"bad-r12-{n}.png": (b, False) for n, b in R12_NOT_A_PNG}, **{f"bad-r12f2-{n}.png": (b, False) for n, b in R12_FIX2_NOT_A_PNG},
+                 **{n: (b, True) for n, b in R12_PNG_CONTROLS}}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")

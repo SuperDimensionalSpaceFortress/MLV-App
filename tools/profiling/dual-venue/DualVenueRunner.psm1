@@ -2342,10 +2342,15 @@ function Get-DvPngImageProblem {
     [long]$trailer = ([long]$idatBytes[$idatLength - 4] -shl 24) -bor ([long]$idatBytes[$idatLength - 3] -shl 16) -bor ([long]$idatBytes[$idatLength - 2] -shl 8) -bor [long]$idatBytes[$idatLength - 1]
     $cmf = [int]$idatBytes[0]; $flg = [int]$idatBytes[1]
     if (($cmf -band 0x0F) -ne 8 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header' }
-    $fed = [IO.MemoryStream]::new()
+    # r12 fix 2 (adversary r12 0f6daf3a A1): a stream whose Adler-32 trailer was cut short by ONE byte passed, because the 0xFF tail supplied the
+    # missing byte (the real trailer ended in 0xFF). So the stream is inflated TWICE, once with a 0xFF tail and once with a 0x00 tail, and must pass
+    # both: a trailer byte (or deflate data) borrowed from the tail matches at most one of the two fills, so the verdict cannot depend on bytes that are
+    # not in the file. (A 0x00 tail read as deflate data opens a stored block whose LEN / NLEN do not complement, so a stream that never ends errors.)
     $zType = 'System.IO.Compression.ZLibStream' -as [type]
+    foreach ($tailByte in @(0xFF, 0x00)) {
+    $fed = [IO.MemoryStream]::new()
     if ($null -ne $zType) { $fed.Write($idatBytes, 0, $idatLength) } else { $fed.Write($idatBytes, 2, $idatLength - 2) }   # (.NET before 6: raw deflate after the header)
-    $fed.Write([byte[]](@(0xFF) * 64), 0, 64)
+    $fed.Write([byte[]](@($tailByte) * 64), 0, 64)
     $fed.Position = 0
     $z = $null
     [long]$adlerA = 1; [long]$adlerB = 0
@@ -2374,6 +2379,7 @@ function Get-DvPngImageProblem {
     finally { if ($null -ne $z) { $z.Dispose() }; $fed.Dispose() }
     if ($total -ne $expected) { return "its IDAT data inflates to $total bytes but a $width x $height image needs $expected, so it is truncated" }
     if ($null -eq $zType -and (($adlerB -shl 16) -bor $adlerA) -ne $trailer) { return 'its IDAT data does not end with the Adler-32 of its image data (a zlib stream with no, or a misplaced, trailer)' }
+    }   # (foreach tail byte)
     $null
 }
 
