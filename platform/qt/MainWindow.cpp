@@ -6661,6 +6661,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     if( ui->actionPlay->isChecked() )
         m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the next advance is due when the pace credit covers the next whole
+    // frame, not at the next poll tick (10-16 ms later on Windows).
+    armPlaybackDueWake();
     if( m_playbackPresentTrace.active() )
         m_playbackPresentTrace.notePresentEnd( mlv_stage_timing_now() * 1000.0 );   // r7 present trace
 }
@@ -12055,6 +12058,7 @@ void MainWindow::playbackHandling(int timeDiff)
     {
         m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also when playback is off
         m_playbackPaceGuard.reset();
+        cancelPlaybackDueWake();   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a wake is only due against this clock
     }
 }
 
@@ -19495,6 +19499,136 @@ double MainWindow::getFramerate( void )
 double MainWindow::playbackPaceGuardFps( void )
 {
     return playback_native_pace::guardPaceFps( getFramerate(), m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() );
+}
+
+// HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: MLVAPP_PLAYBACK_DUE_WAKE=0 turns the due wake off (the poll tick alone
+// advances, as before). Default on.
+static bool mlvappPlaybackDueWakeEnabled()
+{
+    static const bool enabled = []() {
+        bool ok = false;
+        const int env = qEnvironmentVariableIntValue( "MLVAPP_PLAYBACK_DUE_WAKE", &ok );
+        return !( ok && env == 0 );
+    }();
+    return enabled;
+}
+
+// The wake lands this long after the credit covers the frame, so the guard's grant at the wake is never a hair short.
+static constexpr double kPlaybackDueWakeSlackMs = 0.25;
+// A wake that found the credit still short (a poll tick took it, or the clock was re-armed) may re-arm this often.
+static constexpr int kPlaybackDueWakeMaxRearms = 2;
+
+// HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: called at the end of every present. On Bachelor CUDA (Qt 6.10.2) the
+// advance after a present waited for the next poll tick, 10.77 ms (fullscreen) / 14.92 ms (windowed) p50 later and
+// never 8 ms or less, while the next frame was ready 2.5 ms after the present; with a ~9 ms draw the cycle was over a
+// frame period, so drop-frame mode stepped over a frame. The wake is armed for when the pace credit covers the next
+// whole frame; the guard still caps the grant, so it can never outrun native.
+void MainWindow::armPlaybackDueWake( void )
+{
+    if( !ui->actionPlay->isChecked() ) return;
+    if( !mlvappPlaybackDueWakeEnabled() ) return;
+    const double paceFps = playbackPaceGuardFps();
+    if( !( paceFps > 0.0 ) || !m_playbackPaceGuard.armed() ) return;   // never when unpaced
+    m_playbackDueWakeRearmsThisPresent = 0;
+    // the wrap at the cut range's last frame (either mode) and every-frame mode both need a whole frame of credit
+    const bool atCutOut = ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1;
+    const double framesNeeded = ( ui->actionDropFrameMode->isChecked() && !atCutOut )
+        ? playback_native_pace::framesToNextWholeFrame( m_newPosDropMode )
+        : 1.0;
+    const double nowMs = mlv_stage_timing_now() * 1000.0;
+    const double dueMs = m_playbackPaceGuard.msUntilCredit( framesNeeded, nowMs, paceFps );
+    // already covered and the tail advance already ran for this present: nothing is waiting on a tick
+    if( !( dueMs > 0.0 ) && m_playbackTailAdvanceRan ) return;
+    if( !m_playbackDueWake )
+    {
+        m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); } ) );
+        m_playbackDueWake->beginPlay();   // created inside a Play: on_actionPlay_toggled could not begin it
+    }
+    m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
+    m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+    ++m_playbackDueWakeArmed;
+}
+
+void MainWindow::onPlaybackDueWake( void )
+{
+    if( !ui->actionPlay->isChecked() ) return;
+    const double nowMs = mlv_stage_timing_now() * 1000.0;
+    ++m_playbackDueWakeFired;
+    m_playbackDueWakeLatenessMs.push_back( nowMs - m_playbackDueWakeDueAtMs );
+    m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    if( m_frameStillDrawing )
+    {
+        // the frameReady / drawFrameReady paths consume the pending advance when the render lands
+        m_playbackFrameAdvancePending = true;
+        ++m_playbackDueWakeBusyDeferred;
+        return;
+    }
+    const int positionBefore = ui->horizontalSliderPosition->value();
+    m_skipImmediateTimecodeLabel = true;
+    // predictive: the tick shaping asks for at least a frame period, and the pace guard caps it to the credit
+    timerFrameEvent( true );
+    m_skipImmediateTimecodeLabel = false;
+    if( ui->horizontalSliderPosition->value() != positionBefore )
+    {
+        ++m_playbackDueWakeAdvanced;
+        return;
+    }
+    // still short of the next whole frame (a poll tick spent the credit first, or rounding): wake again when it is due
+    if( m_playbackDueWakeRearmsThisPresent >= kPlaybackDueWakeMaxRearms || !m_playbackDueWake ) return;
+    const double paceFps = playbackPaceGuardFps();
+    if( !( paceFps > 0.0 ) || !m_playbackPaceGuard.armed() || !ui->actionPlay->isChecked() ) return;
+    const bool atCutOut = ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1;
+    const double framesNeeded = ( ui->actionDropFrameMode->isChecked() && !atCutOut )
+        ? playback_native_pace::framesToNextWholeFrame( m_newPosDropMode )
+        : 1.0;
+    const double rearmNowMs = mlv_stage_timing_now() * 1000.0;
+    const double dueMs = m_playbackPaceGuard.msUntilCredit( framesNeeded, rearmNowMs, paceFps );
+    ++m_playbackDueWakeRearmsThisPresent;
+    ++m_playbackDueWakeRearmed;
+    m_playbackDueWakeDueAtMs = rearmNowMs + dueMs + kPlaybackDueWakeSlackMs;
+    m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+}
+
+void MainWindow::cancelPlaybackDueWake( void )
+{
+    if( m_playbackDueWake && m_playbackDueWake->armed() ) m_playbackDueWake->cancel();
+}
+
+void MainWindow::resetPlaybackDueWakeCounters( void )
+{
+    m_playbackDueWakeRearmsThisPresent = 0;
+    m_playbackDueWakeArmed = 0;
+    m_playbackDueWakeFired = 0;
+    m_playbackDueWakeAdvanced = 0;
+    m_playbackDueWakeRearmed = 0;
+    m_playbackDueWakeBusyDeferred = 0;
+    m_playbackDueWakeLatenessMs.clear();
+}
+
+// One line per measured Play, logged after the timed window has closed (finishPlaybackSmokeTelemetry).
+QString MainWindow::playbackDueWakeSummaryLine( void ) const
+{
+    std::vector<double> late = m_playbackDueWakeLatenessMs;
+    const auto percentile = [&late]( double p ) -> double
+    {
+        if( late.empty() ) return 0.0;
+        const size_t index = static_cast<size_t>( std::floor( p * static_cast<double>( late.size() - 1 ) + 0.5 ) );
+        std::nth_element( late.begin(), late.begin() + static_cast<std::ptrdiff_t>( index ), late.end() );
+        return late[index];
+    };
+    const double p50 = percentile( 0.50 );
+    const double p95 = percentile( 0.95 );
+    return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
+                           "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9" )
+        .arg( m_playbackDueWakeArmed )
+        .arg( m_playbackDueWakeFired )
+        .arg( m_playbackDueWakeAdvanced )
+        .arg( m_playbackDueWakeRearmed )
+        .arg( m_playbackDueWakeBusyDeferred )
+        .arg( p50, 0, 'f', 3 )
+        .arg( p95, 0, 'f', 3 )
+        .arg( ( m_playbackDueWake && m_playbackDueWake->hiResActive() ) ? 1 : 0 )
+        .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 );
 }
 
 //Paint the Audio Track Wave to GUI
@@ -29316,6 +29450,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                          elapsedMs, m_playbackSmokeFirstPresentMs, m_playbackSmokePresentedFrames ), 0, 'f', 3 )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: what the due wake did this Play (elapsedMs is already sampled).
+    qInfo().noquote() << playbackDueWakeSummaryLine();
 
     // PLAYBACK-STARTUP-CATCHUP-BURST-1: Play -> first present, and what the first 2 s skipped for it.
     qInfo().noquote()
@@ -30695,6 +30831,18 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         checked ? "play-start" : "play-stop" );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: a pending due wake belongs to the clock just reset; the counters are
+    // per Play, and only the fallback timer raises the timer resolution, for the duration of Play.
+    cancelPlaybackDueWake();
+    if( checked )
+    {
+        resetPlaybackDueWakeCounters();
+        if( m_playbackDueWake ) m_playbackDueWake->beginPlay();
+    }
+    else if( m_playbackDueWake )
+    {
+        m_playbackDueWake->endPlay();
+    }
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
@@ -32756,6 +32904,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     if( m_pRenderThread && !releasePresentedFrameEarly )
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    m_playbackTailAdvanceRan = false;   // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: read by armPlaybackDueWake()
     if( ui->actionPlay->isChecked() )
     {
         const bool suppressTailAdvanceAfterGpuTexNrEarlyAdvance =
@@ -32787,6 +32936,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                     readyFrame.frameReadyEmitStageTime;
                 m_playbackTimelineSourceDrawBeginStageTime = displayStart;
             }
+            m_playbackTailAdvanceRan = true;
             timerFrameEvent();
             const double advance_return = mlv_stage_timing_now();
             m_lastDrawFrameReadyAdvanceMs =

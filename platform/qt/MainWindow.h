@@ -33,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackDueWake.h"
 #include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
@@ -1185,6 +1186,19 @@ private:
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: after a paced present, a one-shot wake at the guard's due time for the
+    // next whole frame (msUntilCredit), so the advance never waits for the 10-16 ms Windows poll tick. The poll timer
+    // stays as the fallback. MLVAPP_PLAYBACK_DUE_WAKE=0 is the kill switch. Counters: playback_due_wake line.
+    std::unique_ptr<PlaybackDueWake> m_playbackDueWake;
+    bool m_playbackTailAdvanceRan = false;      // finishPresentedFrame's tail timerFrameEvent ran for this present
+    double m_playbackDueWakeDueAtMs = 0.0;      // stage-time ms the armed wake is due
+    int m_playbackDueWakeRearmsThisPresent = 0;
+    int m_playbackDueWakeArmed = 0;
+    int m_playbackDueWakeFired = 0;
+    int m_playbackDueWakeAdvanced = 0;
+    int m_playbackDueWakeRearmed = 0;
+    int m_playbackDueWakeBusyDeferred = 0;
+    std::vector<double> m_playbackDueWakeLatenessMs;
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
@@ -1942,6 +1956,12 @@ private:
     void setPreviewMode( void );
     double getFramerate( void );
     double playbackPaceGuardFps( void );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: wake the paced advance at the frame's due time, not the next poll tick
+    void armPlaybackDueWake( void );
+    void onPlaybackDueWake( void );
+    void cancelPlaybackDueWake( void );
+    void resetPlaybackDueWakeCounters( void );
+    QString playbackDueWakeSummaryLine( void ) const;
     void paintAudioTrack( void );
     uint8_t drawZebras( QImage *image );
     void drawFrameNumberLabel( int frameIndex = -1 );

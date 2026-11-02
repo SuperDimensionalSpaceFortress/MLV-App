@@ -199,6 +199,7 @@ SOURCES += \
     Updater/Updater.cpp \
     GpuPreviewProcessing.cpp \
     PlaybackPrepCpuRoute.cpp \
+    PlaybackDueWake.cpp \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
@@ -383,6 +384,7 @@ HEADERS += MainWindow.h \
            Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
+           PlaybackDueWake.h \
            PlaybackStartupSplit.h \
            PlaybackAudioStartPolicy.h \
            PlaybackFirstPresentIdentity.h \
