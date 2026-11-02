@@ -1772,6 +1772,11 @@ static int runGuiPlaybackSmoke(QApplication &app)
                 << " seek_dir=" << options.contactSheetSeekDir << " " << seekDirIdentity.detail << "\n";
             return 2;
         }
+        // r5 (adversary pass 7 A2): an accepted run still names a directory the check made but could not remove.
+        if (seekDirIdentity.detail.contains(QStringLiteral("cleanup_left=")))
+        {
+            err << "[GUI-SMOKE] WARN: SEEK_DIR_CHECK_CLEANUP_LEFT " << seekDirIdentity.detail << "\n";
+        }
     }
     options.visualCaptureDir = parser.value(visualCaptureDirOpt).isEmpty()
         ? QString()

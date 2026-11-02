@@ -1469,6 +1469,23 @@ TEST(ContactSheetSeekDirIdentity, ARefusedComparisonLeavesNoNewDirectoryBehind)
     const QString mainWindow = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     ASSERT_TRUE(mainWindow.contains(QStringLiteral("if( !inPassDirInfo.exists() && !QDir().mkpath( options.contactSheetDir ) )")));
     ASSERT_TRUE(mainWindow.contains(QStringLiteral("if( !contactSheetDirInfo.exists() && !QDir().mkpath( seekSheetDir ) )")));
+
+    // r5 pass 7 (A1): because the check removed what it made, the seek branch proves the pair again after it creates
+    // the seek dir and before the first seek write; anything but Distinct ends the run by name.
+    const int seekMkpathAt = mainWindow.indexOf(QStringLiteral("if( !contactSheetDirInfo.exists() && !QDir().mkpath( seekSheetDir ) )"));
+    const int seekLoopAt = mainWindow.indexOf(QStringLiteral("for( int i = 0; i < options.contactSheetFrames; ++i )"), seekMkpathAt);
+    ASSERT_TRUE(seekMkpathAt > 0 && seekLoopAt > seekMkpathAt);
+    const QString recheck = mainWindow.mid(seekMkpathAt, seekLoopAt - seekMkpathAt);
+    ASSERT_TRUE(recheck.contains(QStringLiteral("if( !options.contactSheetSeekMode )")));
+    ASSERT_TRUE(recheck.contains(QStringLiteral("output_dir_identity::compareDirectories( seekSheetDir, options.contactSheetDir )")));
+    ASSERT_TRUE(recheck.contains(QStringLiteral("!= output_dir_identity::DirRelation::Distinct")));
+    ASSERT_TRUE(recheck.contains(QStringLiteral("SEEK_DIR_NOT_SEPARATE_AT_CAPTURE")));
+    ASSERT_TRUE(mainWindow.contains(QStringLiteral("#include \"OutputDirIdentity.h\"")));
+
+    // r5 pass 7 (A2): an accepted run names a directory the check could not remove.
+    const QString mainSource = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+    ASSERT_TRUE(mainSource.contains(QStringLiteral("if (seekDirIdentity.detail.contains(QStringLiteral(\"cleanup_left=\")))")));
+    ASSERT_TRUE(mainSource.contains(QStringLiteral("SEEK_DIR_CHECK_CLEANUP_LEFT")));
 }
 
 #ifdef Q_OS_WIN

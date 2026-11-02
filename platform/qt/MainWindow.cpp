@@ -1665,6 +1665,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #endif
 #include <windows.h>
 #endif
+#include "OutputDirIdentity.h"
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
 static uint8_t applyZebrasToImage( QImage *image, bool enableZebras );
@@ -10958,6 +10959,21 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 err << "[GUI-SMOKE] ERROR: failed to create contact sheet directory: "
                     << seekSheetDir << "\n";
                 return 13;
+            }
+            // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1 r5 (adversary pass 7 A1): the CLI check removes the directories it
+            // created, so the paired seek dir is proved separate again here, where both exist, before its first write.
+            if( !options.contactSheetSeekMode )
+            {
+                const output_dir_identity::DirComparison seekDirIdentity =
+                    output_dir_identity::compareDirectories( seekSheetDir, options.contactSheetDir );
+                if( seekDirIdentity.relation != output_dir_identity::DirRelation::Distinct )
+                {
+                    err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir is not a separate directory from "
+                           "--contact-sheet-dir at capture time: SEEK_DIR_NOT_SEPARATE_AT_CAPTURE seek_dir="
+                        << seekSheetDir << " contact_sheet_dir=" << options.contactSheetDir << " "
+                        << seekDirIdentity.detail << "\n";
+                    return 13;
+                }
             }
             for( int i = 0; i < options.contactSheetFrames; ++i )
             {
