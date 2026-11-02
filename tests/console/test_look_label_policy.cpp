@@ -441,7 +441,9 @@ TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
     // r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- setSliders never alters the reported outcome, which setReceipt
     // saves as the receipt's flavor ("classic" after a fallback must stay "classic").
     ASSERT_FALSE(body.contains(QStringLiteral("m_lookAssistFlavorOutcome.clear();")));
-    ASSERT_EQ(1, mw.count(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored(")));
+    // Pin count update (r11, key3 r10 L-07; was 1): setSliders and the Look Assist toggle-ON restore/capture
+    // (LookLabelWiring.L07ToggleOnRestoreIsLabelledBaseline pins the second).
+    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored(")));
     // Pin count update (was ASSERT_EQ(2, count("m_lookLabelBaselineReceipt = "))): the member and both of its writes (the
     // setSliders mark and the begin() reset) are gone; the mark lives in the outcome, so no landing site can forget it.
     ASSERT_EQ(0, mw.count(QStringLiteral("m_lookLabelBaselineReceipt")));
@@ -574,6 +576,67 @@ TEST(LookLabelWiring, R10EveryLandingForgetsTheBaselineMarkInTheSameStep)
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     ASSERT_EQ(5, mw.count(QStringLiteral("m_lookAssistFlavorOutcome.landed(")));
     ASSERT_EQ(0, mw.count(QStringLiteral("m_baselineShownReceipt")));
+}
+
+// r11 -- catalogue L-07, key3 r10 on e5109212. A lands Cinematic; Look Assist is turned off through setSliders (a
+// default-mask paste of a Look-Assist-off receipt, or Reset Receipt to an off default), which restores the baseline but
+// never clears the outcome; ticking Look Assist on restores/captures the baseline again and the frame-ready step
+// dedup_skips (the marker still names A), so nothing lands. The toggle-ON step is modelled from the handler's source:
+// it marks only if the handler does. RED on e5109212 ("Look: Cinematic" over the ungraded baseline).
+TEST(LookLabelPolicy, L07ToggleOnAfterASetSlidersOffNeverNamesTheStaleFlavor)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString handler = functionBody(mw, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"));
+    const int onBranch = handler.indexOf(QStringLiteral("if( checked )"));
+    ASSERT_TRUE(onBranch >= 0);
+    const QString onSync = handler.mid(onBranch, handler.indexOf(QStringLiteral("auto applyAfterBaselineFrame ="), onBranch) - onBranch);
+    const bool toggleOnMarks = onSync.contains(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored( ACTIVE_RECEIPT );"));
+
+    int a = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    lookassist::LookAssistAppliedMarker applied;
+    outcome.landed(&a, cinematic, false);   // open A: Cinematic lands
+    applied.markApplied(&a);
+    ASSERT_EQ(std::string("Look: Cinematic"), look_label::shownText(true, outcome, &a, cinematic).toStdString());
+    // Paste B (Look Assist off) onto A: setSliders' off branch restores the baseline, no mark, no clear.
+    ASSERT_EQ(std::string("Look: Off"), look_label::shownText(false, outcome, &a, cinematic).toStdString());
+    // Tick Look Assist on: the handler restores/captures the baseline (and marks, from r11).
+    if ( toggleOnMarks ) outcome.baselineRestored(&a);
+    // The frame-ready step: isApplied(A) -> dedup_skip, nothing lands.
+    ASSERT_TRUE(applied.isApplied(&a));
+    const std::string shown = look_label::shownText(true, outcome, &a, cinematic).toStdString();
+    printf("[L07] toggleOnMarks=%d shown=%s\n", toggleOnMarks ? 1 : 0, shown.c_str());
+    ASSERT_EQ(std::string("Look: Baseline"), shown);
+    ASSERT_TRUE(shown.find("Cinematic") == std::string::npos);
+    // The receipt value setReceipt saves is unchanged (label only).
+    ASSERT_EQ(std::string("cinematic"), outcome.receiptValue(&a, cinematic).toStdString());
+}
+
+// r11 -- L-07 wiring pin: the toggle-ON branch marks the active receipt AFTER its restore/capture and relabels, BEFORE
+// setReceipt and the frame-ready re-grade (whose landing forgets the mark).
+TEST(LookLabelWiring, L07ToggleOnRestoreIsLabelledBaseline)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString handler = functionBody(mw, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"));
+    ASSERT_FALSE(handler.isEmpty());
+    const int onBranch = handler.indexOf(QStringLiteral("if( checked )"));
+    const int restore = handler.indexOf(QStringLiteral("restoreLookAssistBaseline( ACTIVE_RECEIPT );"), onBranch);
+    const int capture = handler.indexOf(QStringLiteral("captureLookAssistBaseline( ACTIVE_RECEIPT );"), onBranch);
+    const int marked = handler.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored( ACTIVE_RECEIPT );"), onBranch);
+    const int relabel = handler.indexOf(QStringLiteral("updateLookLabel();"), marked);
+    const int save = handler.indexOf(QStringLiteral("setReceipt( ACTIVE_RECEIPT );"), onBranch);
+    const int frameReady = handler.indexOf(QStringLiteral("auto applyAfterBaselineFrame ="), onBranch);
+    printf("[L07W] onBranch=%d restore=%d capture=%d marked=%d relabel=%d save=%d frameReady=%d\n",
+           onBranch, restore, capture, marked, relabel, save, frameReady);
+    ASSERT_TRUE(onBranch >= 0);
+    ASSERT_TRUE(restore > onBranch);
+    ASSERT_TRUE(capture > restore);
+    ASSERT_TRUE(marked > capture);      // after both branches: restored OR captured
+    ASSERT_TRUE(relabel > marked);
+    ASSERT_TRUE(save > relabel);
+    ASSERT_TRUE(frameReady > save);
+    ASSERT_EQ(1, handler.count(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored(")));
 }
 
 // POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1 (master-merge round, 2026-11-02): the bool arguments the window passes to the

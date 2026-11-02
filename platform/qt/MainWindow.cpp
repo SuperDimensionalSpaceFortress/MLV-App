@@ -31634,6 +31634,11 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             restoreLookAssistBaseline( ACTIVE_RECEIPT );
         else
             captureLookAssistBaseline( ACTIVE_RECEIPT );
+        // r11 (key3 r10 L-07 on e5109212): the baseline is on screen until the frame-ready analysis below lands. Look
+        // Assist turned off through setSliders (a paste or Reset Receipt) never clears the outcome, and the frame-ready
+        // step dedup_skips when the marker still names this receipt -- so without the mark the label kept the old flavor.
+        m_lookAssistFlavorOutcome.baselineRestored( ACTIVE_RECEIPT );
+        updateLookLabel();
 
         setReceipt( ACTIVE_RECEIPT );
 
