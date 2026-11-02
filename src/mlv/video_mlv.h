@@ -535,12 +535,14 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * r6 (adversary A1 on a9ae667a): for LJ92 it hashes only the bytes the decoder reads
  * (mlvLj92FrameSourceHash64), so two frames that decode alike are never known to differ. */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
-/* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: FNV-1a 64 over what
- * liblj92 reads -- each DHT and SOF3 segment with its marker, then the scan from its header to its
- * EOI -- walking markers as lj92.c does, so COM/APPn and every other skipped segment, filler between
- * markers and bytes after the EOI are not hashed. Returns 0 and sets *hashOut, or nonzero (no
- * identity) for NULL inputs, a payload under 4 bytes, no SOI, EOI before the scan, or a segment
- * length the decoder would refuse. */
+/* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: FNV-1a 64 over the fields
+ * liblj92 reads -- the last DHT's length, code counts and values; the last SOF3's precision, height,
+ * width and component count; the SOS component count and predictor -- then the entropy-coded data
+ * from the end of the SOS header to its EOI. Markers are walked as lj92.c walks them, so COM/APPn and
+ * every other skipped segment, header bytes the decoder ignores (component ids, selectors), filler
+ * between markers and bytes after the EOI are not hashed. Returns 0 and sets *hashOut, or nonzero
+ * (no identity) for NULL inputs, a payload under 4 bytes, no SOI, EOI before the scan, no DHT or
+ * SOF3 before it, a predictor over 7, or a segment length the decoder would refuse. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
  * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves

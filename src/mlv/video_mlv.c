@@ -4152,7 +4152,16 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut)
 {
     if (!data || !hashOut || length < 4) return 1;
-    uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+    /* r7 (adversary r6 A1/A2 on 1fb39703): the FIELDS liblj92 reads, not whole segments -- and the last DHT / SOF3
+     * before the scan, as each one parsed replaces the decoder's state:
+     *   DHT  (parseHuff): its length, the 16 code counts and the values (huffhead[2], the class/id byte, is
+     *        overwritten as bits[0] = 0 and never read);
+     *   SOF3 (parseSof3): precision, height, width, component count (the per-component specs are not read);
+     *   SOS  (parseScan): component count and predictor -- then the entropy-coded data from the END of the SOS
+     *        header (scanstart + its length) to the EOI that ends it, so header bytes can never stand in for one. */
+    const uint8_t * dht = NULL;
+    size_t dhtLength = 0;
+    const uint8_t * sof = NULL;
     size_t ix = 0;
     int sawSoi = 0;
     for (;;)
@@ -4169,25 +4178,41 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
             continue;
         }
         if (marker == 0xD9) return 1; /* EOI before a scan: the decoder has no picture */
-        if (marker == 0xDA)
-        {
-            /* The scan, from its header (scanstart) to the EOI that ends it: entropy-coded data
-             * stuffs every 0xFF as FF 00, so the first FF D9 is the EOI. No EOI: to the end. */
-            size_t end = ix;
-            while (end + 1 < length && !(data[end] == 0xFF && data[end + 1] == 0xD9)) end++;
-            if (end + 1 >= length) end = length;
-            hash = mlv_source_hash_fnv1a64(hash, &marker, 1);
-            *hashOut = mlv_source_hash_fnv1a64(hash, data + ix, end - ix);
-            return 0;
-        }
         if (ix + 2 > length) return 1;
         const size_t segment = ((size_t)data[ix] << 8) | (size_t)data[ix + 1];
-        if (segment < 2 || ix + segment >= length) return 1; /* parseBlock / parseHuff: corrupt */
-        if (marker == 0xC4 || marker == 0xC3)
+        if (marker == 0xDA)
         {
-            /* DHT and SOF3 are read (the table; height, width, bits, components): hashed with their marker. */
-            hash = mlv_source_hash_fnv1a64(hash, &marker, 1);
-            hash = mlv_source_hash_fnv1a64(hash, data + ix, segment);
+            if (!dht || !sof) return 1; /* the decoder has no table or no frame header to decode with */
+            if (ix + 2 >= length) return 1;
+            const size_t components = data[ix + 2];
+            const size_t predictorAt = ix + 3 + 2 * components;
+            const size_t entropyStart = ix + segment;
+            if (segment < 2 || predictorAt >= length || entropyStart > length) return 1;
+            if (data[predictorAt] > 7) return 1; /* parseScan refuses it */
+            /* Entropy-coded data stuffs every 0xFF as FF 00, so the first FF D9 in it is the EOI. No EOI: to the end. */
+            size_t end = entropyStart;
+            while (end + 1 < length && !(data[end] == 0xFF && data[end + 1] == 0xD9)) end++;
+            if (end + 1 >= length) end = length;
+            uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+            hash = mlv_source_hash_fnv1a64(hash, dht, 2);                  /* DHT length */
+            hash = mlv_source_hash_fnv1a64(hash, dht + 3, dhtLength - 3);  /* counts and values */
+            hash = mlv_source_hash_fnv1a64(hash, sof + 2, 6);              /* precision, height, width, components */
+            hash = mlv_source_hash_fnv1a64(hash, data + ix + 2, 1);        /* scan component count */
+            hash = mlv_source_hash_fnv1a64(hash, data + predictorAt, 1);   /* predictor */
+            *hashOut = mlv_source_hash_fnv1a64(hash, data + entropyStart, end - entropyStart);
+            return 0;
+        }
+        if (segment < 2 || ix + segment >= length) return 1; /* parseBlock / parseHuff: corrupt */
+        if (marker == 0xC4)
+        {
+            if (segment < 19) return 1; /* the decoder reads 16 counts after the class/id byte */
+            dht = data + ix;
+            dhtLength = segment;
+        }
+        else if (marker == 0xC3)
+        {
+            if (segment < 8) return 1; /* parseSof3 reads up to ix + 7 */
+            sof = data + ix;
         }
         ix += segment;
     }

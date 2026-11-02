@@ -125,9 +125,10 @@ Play has stopped (step (4) of the capture block, never in the timed window or th
 the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
 `video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
 own mutex, without decoding, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). For LJ92 it
-hashes only what liblj92 reads (`mlvLj92FrameSourceHash64`): each DHT and SOF3 segment, then the scan up to its EOI. COM, APPn
-and every other skipped segment, filler between markers and bytes after the EOI are left out, so two frames that decode alike
-are never "known to differ".
+hashes only the fields liblj92 reads (`mlvLj92FrameSourceHash64`): the last DHT's table, the last SOF3's precision and size, the
+SOS component count and predictor, then the entropy data from the end of the SOS header up to its EOI. COM, APPn and every other
+skipped segment, header bytes the decoder ignores, filler between markers and bytes after the EOI are left out. So two frames
+that decode alike are never "known to differ", and an `FF D9` inside the SOS header never cuts the entropy data short.
 
 * `frames[].source_id` (play entries only, both the forced `play` and the unforced `play_unbound` captures -- the frozen check is
   judged on the unforced ones whenever they exist): that hash as 16 lowercase hex digits. Absent when it could not be read.
