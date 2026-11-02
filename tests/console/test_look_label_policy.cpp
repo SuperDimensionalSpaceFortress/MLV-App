@@ -371,3 +371,20 @@ TEST(LookLabelWiring, TheLabelNeverTouchesTheGrade)
     ASSERT_FALSE(update.contains(QStringLiteral("setCurrentIndex(")));
     ASSERT_FALSE(update.contains(QStringLiteral("previewProcessing")));
 }
+
+// POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1 (master-merge round, 2026-11-02): the bool arguments the window passes to the
+// policy are pinned at their one call site each, so flipping one (fullscreen vs. windowed, the show-in-fullscreen
+// setting, or the status label's initial "look off" text) fails here rather than only on a venue leg.
+TEST(LookLabelWiring, PolicyCallSitesPassTheWindowStateUnflipped)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );")));
+    const QString overlayCall = QStringLiteral("look_label::fullscreenOverlayShown(");
+    ASSERT_EQ(-1, mw.indexOf(overlayCall, mw.indexOf(overlayCall) + 1));
+    const QString initialText = QStringLiteral("m_pLookLabelStatus->setText( look_label::text( false, QString() ) );");
+    ASSERT_TRUE(mw.contains(initialText));
+    const QString textCall = QStringLiteral("look_label::text(");
+    ASSERT_EQ(-1, mw.indexOf(textCall, mw.indexOf(textCall) + 1));
+}
