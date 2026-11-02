@@ -531,8 +531,17 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * size otherwise), read under main_file_mutex[chunk] without decoding. Returns 0 and sets
  * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs,
  * MCRAW and CinemaDNG-folder sources (MLV containers only), an index out of range, a missing
- * index or file, a zero byte count, or a short read. Not for the playback path: it reads disk. */
+ * index or file, a zero byte count, or a short read. Not for the playback path: it reads disk.
+ * r6 (adversary A1 on a9ae667a): for LJ92 it hashes only the bytes the decoder reads
+ * (mlvLj92FrameSourceHash64), so two frames that decode alike are never known to differ. */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
+/* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: FNV-1a 64 over what
+ * liblj92 reads -- each DHT and SOF3 segment with its marker, then the scan from its header to its
+ * EOI -- walking markers as lj92.c does, so COM/APPn and every other skipped segment, filler between
+ * markers and bytes after the EOI are not hashed. Returns 0 and sets *hashOut, or nonzero (no
+ * identity) for NULL inputs, a payload under 4 bytes, no SOI, EOI before the scan, or a segment
+ * length the decoder would refuse. */
+int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
  * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves
  * no frame a later request could hit. Same return contract (0 = ok). */

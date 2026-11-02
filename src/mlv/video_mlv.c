@@ -4135,6 +4135,64 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
     return 0;
 }
 
+static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, size_t count)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        hash ^= (uint64_t)data[i];
+        hash *= 0x100000001b3ull; /* FNV-1a 64 prime */
+    }
+    return hash;
+}
+
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r6 (adversary A1 on a9ae667a): see video_mlv.h. The walk is
+ * liblj92's own (lj92.c find / parseImage / parseBlock), so two payloads that differ only in bytes
+ * the decoder never reads -- a COM or APPn segment, any other skipped marker segment, filler
+ * between markers, bytes after the scan's EOI -- hash the same and are never "known to differ". */
+int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut)
+{
+    if (!data || !hashOut || length < 4) return 1;
+    uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+    size_t ix = 0;
+    int sawSoi = 0;
+    for (;;)
+    {
+        /* lj92.c find(): the next 0xFF, and the marker is the byte after it. */
+        while (ix < length - 1 && data[ix] != 0xFF) ix++;
+        ix += 2;
+        if (ix >= length) return 1;
+        const uint8_t marker = data[ix - 1];
+        if (!sawSoi)
+        {
+            if (marker != 0xD8) return 1; /* findSoI */
+            sawSoi = 1;
+            continue;
+        }
+        if (marker == 0xD9) return 1; /* EOI before a scan: the decoder has no picture */
+        if (marker == 0xDA)
+        {
+            /* The scan, from its header (scanstart) to the EOI that ends it: entropy-coded data
+             * stuffs every 0xFF as FF 00, so the first FF D9 is the EOI. No EOI: to the end. */
+            size_t end = ix;
+            while (end + 1 < length && !(data[end] == 0xFF && data[end + 1] == 0xD9)) end++;
+            if (end + 1 >= length) end = length;
+            hash = mlv_source_hash_fnv1a64(hash, &marker, 1);
+            *hashOut = mlv_source_hash_fnv1a64(hash, data + ix, end - ix);
+            return 0;
+        }
+        if (ix + 2 > length) return 1;
+        const size_t segment = ((size_t)data[ix] << 8) | (size_t)data[ix + 1];
+        if (segment < 2 || ix + segment >= length) return 1; /* parseBlock / parseHuff: corrupt */
+        if (marker == 0xC4 || marker == 0xC3)
+        {
+            /* DHT and SOF3 are read (the table; height, width, bits, components): hashed with their marker. */
+            hash = mlv_source_hash_fnv1a64(hash, &marker, 1);
+            hash = mlv_source_hash_fnv1a64(hash, data + ix, segment);
+        }
+        ix += segment;
+    }
+}
+
 /* PLAYBACK-SOURCE-FRAME-IDENTITY-1: see video_mlv.h. Reads the same byte span
  * getMlvRawFrameUint16Direct reads for an MLV frame, under the same per-chunk
  * mutex, into its own bounded buffer; it never decodes, never touches the
@@ -4167,6 +4225,21 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
         byte_count = packed_frame_size;
     }
     if (byte_count == 0) return 1;
+
+    if (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
+    {
+        /* r6 (adversary A1 on a9ae667a): the whole payload (the decoder reads it whole too), then
+         * only the bytes liblj92 reads are hashed (mlvLj92FrameSourceHash64). */
+        uint8_t * payload = (uint8_t *)malloc(byte_count);
+        if (!payload) return 1;
+        pthread_mutex_lock(video->main_file_mutex + chunk);
+        file_set_pos(video->file[chunk], entry->frame_offset, SEEK_SET);
+        const size_t got = fread(payload, 1, byte_count, video->file[chunk]);
+        pthread_mutex_unlock(video->main_file_mutex + chunk);
+        const int lj92Failed = got != byte_count || mlvLj92FrameSourceHash64(payload, byte_count, hashOut) != 0;
+        free(payload);
+        return lj92Failed ? 1 : 0;
+    }
 
     const size_t block_capacity = (size_t)1 << 20;
     uint8_t * block = (uint8_t *)malloc(block_capacity);
