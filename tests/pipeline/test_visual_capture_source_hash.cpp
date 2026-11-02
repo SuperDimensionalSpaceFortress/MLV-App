@@ -84,12 +84,11 @@ TEST(VisualCaptureSourceHash, Lj92BytesTheDecoderSkipsAreNotHashed)
     const uint64_t plainHash = lj92Hash(plain, &status);
     ASSERT_EQ(0, status);
 
-    // The adversary's input: a COM segment whose text differs per frame; then an APP1 segment; then bytes after EOI.
+    // The adversary's input: a COM segment whose text differs per frame; then an APP1 segment.
     const std::vector<std::vector<uint8_t>> variants = {
         withSegmentAfterSoi(plain, {0xFF, 0xFE, 0x00, 0x03, 0x41}),
         withSegmentAfterSoi(plain, {0xFF, 0xFE, 0x00, 0x03, 0x42}),
         withSegmentAfterSoi(plain, {0xFF, 0xE1, 0x00, 0x04, 0x12, 0x34}),
-        [&plain]() { std::vector<uint8_t> v = plain; v.push_back(0x00); v.push_back(0x7F); return v; }(),
     };
     for (const std::vector<uint8_t> & variant : variants)
     {
@@ -164,6 +163,48 @@ TEST(VisualCaptureSourceHash, Lj92AnEoiSpelledInTheScanHeaderNeverEndsTheHash)
     const uint64_t secondHash = lj92Hash(second, &status);
     ASSERT_EQ(0, status);
     ASSERT_TRUE(firstHash != secondHash);
+}
+
+// r8 (adversary r7 A2 on abbf1839): liblj92 reads entropy bytes by pixel count and steps over an FF D9 inside them, so
+// the hash never stops at an EOI: every byte after the SOS header counts. A picture that differs only after an FF D9 in
+// the entropy data keeps a different identity ("identical" is never false); unread bytes after the scan read "differ"
+// (the loud direction -- a FROZEN_DISPLAY a person looks at, never a frozen display waived as a static clip).
+TEST(VisualCaptureSourceHash, Lj92BytesAfterAnEoiInTheScanStillCount)
+{
+    // The adversary's stream: 14-bit 64x64, one 1-bit code per category (0: diff 0, 1: diff +-1), predictor 1.
+    const std::vector<uint8_t> header = {
+        0xFF, 0xD8,
+        0xFF, 0xC4, 0x00, 0x15, 0x00,                    // DHT, length 21, class/id
+        2, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  // 16 code counts
+        0, 1,                                            // values
+        0xFF, 0xC3, 0x00, 0x0B, 0x0E, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00,
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00,
+    };
+    std::vector<uint8_t> first = header;
+    first.insert(first.end(), {0xFF, 0xD9});
+    first.insert(first.end(), 512, 0x00);
+    first.insert(first.end(), {0xFF, 0xD9});
+    std::vector<uint8_t> second = header;
+    second.insert(second.end(), {0xFF, 0xD9, 0xC0});
+    second.insert(second.end(), 511, 0x00);
+    second.insert(second.end(), {0xFF, 0xD9});
+    ASSERT_EQ(first.size(), second.size());
+    int status = -1;
+    const uint64_t firstHash = lj92Hash(first, &status);
+    ASSERT_EQ(0, status);
+    const uint64_t secondHash = lj92Hash(second, &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(firstHash != secondHash);
+
+    // Bytes after the scan's EOI are hashed too: conservative, never "identical" for bytes that might be read.
+    const std::vector<uint8_t> plain = encodeLj92(2048, 12288);
+    std::vector<uint8_t> padded = plain;
+    padded.push_back(0x00);
+    padded.push_back(0x7F);
+    const uint64_t plainHash = lj92Hash(plain, &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(lj92Hash(padded, &status) != plainHash);
+    ASSERT_EQ(0, status);
 }
 
 TEST(VisualCaptureSourceHash, Lj92APictureTheDecoderReadsDifferentlyHashesDifferently)

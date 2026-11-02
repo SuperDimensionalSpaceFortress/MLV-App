@@ -4146,9 +4146,10 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
 }
 
 /* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r6 (adversary A1 on a9ae667a): see video_mlv.h. The walk is
- * liblj92's own (lj92.c find / parseImage / parseBlock), so two payloads that differ only in bytes
- * the decoder never reads -- a COM or APPn segment, any other skipped marker segment, filler
- * between markers, bytes after the scan's EOI -- hash the same and are never "known to differ". */
+ * liblj92's own (lj92.c find / parseImage / parseBlock), so two payloads that differ only in header
+ * bytes the decoder never reads -- a COM or APPn segment, any other skipped marker segment, filler
+ * between markers -- hash the same and are never "known to differ". Every byte after the SOS header
+ * is hashed (r8), so no byte the decoder reads is ever left out: "identical" is never false. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut)
 {
     if (!data || !hashOut || length < 4) return 1;
@@ -4157,8 +4158,8 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
      *   DHT  (parseHuff): its length, the 16 code counts and the values (huffhead[2], the class/id byte, is
      *        overwritten as bits[0] = 0 and never read);
      *   SOF3 (parseSof3): precision, height, width, component count (the per-component specs are not read);
-     *   SOS  (parseScan): component count and predictor -- then the entropy-coded data from the END of the SOS
-     *        header (scanstart + its length) to the EOI that ends it, so header bytes can never stand in for one. */
+     *   SOS  (parseScan): component count and predictor -- then every byte from the END of the SOS header
+     *        (scanstart + its length) to the end of the payload (r8: never stopped at an EOI). */
     const uint8_t * dht = NULL;
     size_t dhtLength = 0;
     const uint8_t * sof = NULL;
@@ -4189,10 +4190,11 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
             const size_t entropyStart = ix + segment;
             if (segment < 2 || predictorAt >= length || entropyStart > length) return 1;
             if (data[predictorAt] > 7) return 1; /* parseScan refuses it */
-            /* Entropy-coded data stuffs every 0xFF as FF 00, so the first FF D9 in it is the EOI. No EOI: to the end. */
-            size_t end = entropyStart;
-            while (end + 1 < length && !(data[end] == 0xFF && data[end + 1] == 0xD9)) end++;
-            if (end + 1 >= length) end = length;
+            /* r8 (adversary r7 A2 on abbf1839): to the END of the payload, never to an EOI. liblj92 reads entropy bytes
+             * by pixel count and steps over an FF D9 inside them, so stopping at one could leave read bytes unhashed and
+             * call two different pictures identical (the silent direction: it waives the frozen gate). Unread bytes
+             * after the scan can only make two alike pictures read "differ" (the loud direction). */
+            const size_t end = length;
             uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
             hash = mlv_source_hash_fnv1a64(hash, dht, 2);                  /* DHT length */
             hash = mlv_source_hash_fnv1a64(hash, dht + 3, dhtLength - 3);  /* counts and values */

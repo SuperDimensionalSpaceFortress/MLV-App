@@ -537,10 +537,11 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
 /* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: FNV-1a 64 over the fields
  * liblj92 reads -- the last DHT's length, code counts and values; the last SOF3's precision, height,
- * width and component count; the SOS component count and predictor -- then the entropy-coded data
- * from the end of the SOS header to its EOI. Markers are walked as lj92.c walks them, so COM/APPn and
- * every other skipped segment, header bytes the decoder ignores (component ids, selectors), filler
- * between markers and bytes after the EOI are not hashed. Returns 0 and sets *hashOut, or nonzero
+ * width and component count; the SOS component count and predictor -- then every byte from the end
+ * of the SOS header to the end of the payload (never stopped at an EOI: liblj92 steps over one inside
+ * the entropy data, so "identical" is never false). Markers are walked as lj92.c walks them, so
+ * COM/APPn and every other skipped segment, header bytes the decoder ignores (component ids,
+ * selectors) and filler between markers are not hashed. Returns 0 and sets *hashOut, or nonzero
  * (no identity) for NULL inputs, a payload under 4 bytes, no SOI, EOI before the scan, no DHT or
  * SOF3 before it, a predictor over 7, or a segment length the decoder would refuse. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
