@@ -1988,14 +1988,21 @@ function Get-DvLegSpecShapeRefusal {
 # --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r10: is a paired-comparison image a PNG at all? ONE check for both members of every pair ------------
 # (sol r9 key B1, r9 adversary successor ADV-A1 DualVenueRunner.psm1:2048) A paused still or an in-pass partner whose file hash-matches its listing
 # was honoured whatever its bytes were: a zero-byte frame-00.png (sha256 e3b0c442...b855), a truncated file, a non-PNG renamed .png. A hash binds the
-# bytes to the listing; it says nothing about whether they are an image. This walks the PNG container without decoding pixels (no decoder dependency):
-# the 8-byte signature; a first chunk IHDR of length 13 with width and height 1..2^31-1, a valid bit depth / colour type pair, compression 0, filter 0
-# and interlace 0 or 1; every chunk length inside the file and every chunk type four ASCII letters; at least one IDAT; and an IEND that ends the chunk
-# sequence (a file cut short has none). Returns $null for a well-formed PNG, otherwise the reason. Get-DvPairedSeekVerdict calls it for every paused
-# still and every in-pass partner image, so collection (Invoke-VenueLeg) and final validation (Test-DvReceiptValid) refuse the same files.
+# bytes to the listing; it says nothing about whether they are an image. This checks the PNG container and its image data with the .NET base library
+# only (no image-decoder dependency): the 8-byte signature; a first chunk IHDR of length 13 with width and height 1..2^31-1, a valid bit depth / colour
+# type pair, compression 0, filter 0 and interlace 0 or 1; every chunk length inside the file, every chunk type four ASCII letters and every non-IDAT
+# chunk's CRC-32; a PLTE before the image data of a palette image; at least one IDAT; an IEND that ends the chunk sequence (a file cut short has none);
+# and -- r10 fix 1, adversary r10 77fc99fa A1: a well-formed container whose IDAT inflated to 0 bytes passed -- the concatenated IDAT data must be ONE
+# valid zlib stream (its Adler-32 checked by the inflater) that inflates to exactly the scanline bytes IHDR implies (Adam7 passes included), each
+# scanline led by a filter type 0..4. Returns $null for a decodable PNG, otherwise the reason. Get-DvPairedSeekVerdict calls it for every paused still
+# and every in-pass partner image, so collection (Invoke-VenueLeg) and final validation (Test-DvReceiptValid) refuse the same files.
 $script:PngSignature = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
 $script:PngMinBytes = 8 + 25 + 12 + 12   # signature + IHDR chunk (12 + 13) + an IDAT chunk header + IEND chunk
 $script:PngBitDepths = @{ 0 = @(1, 2, 4, 8, 16); 2 = @(8, 16); 3 = @(1, 2, 4, 8); 4 = @(8, 16); 6 = @(8, 16) }   # colour type -> allowed bit depths
+$script:PngChannels = @{ 0 = 1; 2 = 3; 3 = 1; 4 = 2; 6 = 4 }                                                     # colour type -> samples per pixel
+$script:PngAdam7 = @(@(0, 0, 8, 8), @(4, 0, 8, 8), @(0, 4, 4, 8), @(2, 0, 4, 4), @(0, 2, 2, 4), @(1, 0, 2, 2), @(0, 1, 1, 2))   # xStart, yStart, xStep, yStep
+$script:PngCrcTable = [long[]]::new(256)
+for ($k = 0; $k -lt 256; $k++) { [long]$c = $k; for ($j = 0; $j -lt 8; $j++) { $c = $(if ($c -band 1) { 0xEDB88320L -bxor ($c -shr 1) } else { $c -shr 1 }) }; $script:PngCrcTable[$k] = $c }
 function Get-DvPngImageProblem {
     param([AllowNull()][byte[]]$Bytes)
     if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return 'it is empty (0 bytes)' }
@@ -2010,17 +2017,64 @@ function Get-DvPngImageProblem {
     $depth = [int]$Bytes[24]; $colour = [int]$Bytes[25]
     if (-not ($script:PngBitDepths.ContainsKey($colour) -and $depth -in $script:PngBitDepths[$colour])) { return "its IHDR bit depth $depth with colour type $colour is not a PNG pixel format" }
     if ($Bytes[26] -ne 0 -or $Bytes[27] -ne 0 -or $Bytes[28] -gt 1) { return 'its IHDR compression, filter or interlace method is not one PNG defines' }
-    $at = 8; $sawIdat = $false
+    $interlaced = ($Bytes[28] -eq 1)
+    $at = 8; $sawIdat = $false; $sawPlte = $false
+    $idat = [IO.MemoryStream]::new()
     while ($true) {
         if ($at + 12 -gt $n) { return 'its chunks end without an IEND chunk, so it is truncated' }
         $length = & $u32 $at; $name = & $type ($at + 4)
         if ($name -cnotmatch '^[A-Za-z]{4}$') { return "the chunk at byte $at has no PNG chunk type" }
         if ($length -gt 0x7FFFFFFF -or $at + 12 + $length -gt $n) { return "its $name chunk at byte $at runs past the end of the file ($n bytes), so it is truncated" }
-        if ($name -ceq 'IDAT') { $sawIdat = $true }
+        if ($name -ceq 'IDAT') {
+            if ($colour -eq 3 -and -not $sawPlte) { return 'it is a palette image with no PLTE chunk before its image data' }
+            $sawIdat = $true; $idat.Write($Bytes, $at + 8, [int]$length)
+        }
+        else {   # (IDAT bytes are covered by the zlib stream's own Adler-32 below; every other chunk is small, so its CRC-32 is checked here)
+            [long]$crc = 0xFFFFFFFFL
+            for ($i = $at + 4; $i -lt $at + 8 + $length; $i++) { $crc = $script:PngCrcTable[($crc -bxor $Bytes[$i]) -band 0xFF] -bxor ($crc -shr 8) }
+            if (($crc -bxor 0xFFFFFFFFL) -ne (& $u32 ($at + 8 + [int]$length))) { return "its $name chunk at byte $at fails its CRC-32" }
+        }
+        if ($name -ceq 'PLTE') { $sawPlte = $true }
         if ($name -ceq 'IEND') { break }
         $at += 12 + [int]$length
     }
     if (-not $sawIdat) { return 'it has no IDAT chunk, so it holds no image data' }
+    # The scanlines IHDR implies: one segment per non-empty pass (one pass when not interlaced), each row a filter byte plus ceil(w * bits / 8) bytes
+    $bits = $depth * $script:PngChannels[$colour]
+    $passes = $script:PngAdam7
+    if (-not $interlaced) { $passes = @(, @(0, 0, 1, 1)) }   # (a direct assignment: a $(...) or if-expression would unroll the one pass into four numbers)
+    $segments = [System.Collections.Generic.List[long[]]]::new()
+    foreach ($p in $passes) {
+        $pw = $(if ($width -gt $p[0]) { [Math]::Floor(($width - $p[0] + $p[2] - 1) / $p[2]) } else { 0 })
+        $ph = $(if ($height -gt $p[1]) { [Math]::Floor(($height - $p[1] + $p[3] - 1) / $p[3]) } else { 0 })
+        if ($pw -gt 0 -and $ph -gt 0) { $segments.Add([long[]]@([long]$ph, [long](1 + [Math]::Floor(($pw * $bits + 7) / 8)))) }
+    }
+    [long]$expected = 0; foreach ($s in $segments) { $expected += $s[0] * $s[1] }
+    $idat.Position = 0
+    $zType = 'System.IO.Compression.ZLibStream' -as [type]
+    if ($null -eq $zType) {   # (.NET before 6: check the 2-byte zlib header, then inflate the raw deflate data after it)
+        $cmf = $idat.ReadByte(); $flg = $idat.ReadByte()
+        if ($flg -lt 0 -or ($cmf -band 0x0F) -ne 8 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header' }
+    }
+    $z = $null
+    try {
+        $z = $(if ($null -ne $zType) { $zType::new($idat, [IO.Compression.CompressionMode]::Decompress) } else { [IO.Compression.DeflateStream]::new($idat, [IO.Compression.CompressionMode]::Decompress) })
+        $buf = [byte[]]::new(65536); [long]$total = 0
+        $seg = 0; [long]$rowsLeft = $segments[0][0]; [long]$nextFilter = 0
+        while (($got = $z.Read($buf, 0, $buf.Length)) -gt 0) {
+            if ($total + $got -gt $expected) { return "its IDAT data inflates to more than the $expected bytes a $width x $height image holds" }
+            while ($seg -lt $segments.Count -and $nextFilter -lt $total + $got) {
+                $f = $buf[$nextFilter - $total]
+                if ($f -gt 4) { return "a scanline of its image data has filter type $f (PNG defines 0 .. 4), so it is not image data" }
+                $nextFilter += $segments[$seg][1]; $rowsLeft--
+                if ($rowsLeft -eq 0) { $seg++; if ($seg -lt $segments.Count) { $rowsLeft = $segments[$seg][0] } }
+            }
+            $total += $got
+        }
+    }
+    catch { return "its IDAT data is not a valid zlib stream ($($_.Exception.GetType().Name))" }
+    finally { if ($null -ne $z) { $z.Dispose() }; $idat.Dispose() }
+    if ($total -ne $expected) { return "its IDAT data inflates to $total bytes but a $width x $height image needs $expected, so it is truncated" }
     $null
 }
 

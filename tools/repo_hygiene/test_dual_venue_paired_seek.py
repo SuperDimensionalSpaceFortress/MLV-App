@@ -1210,15 +1210,48 @@ class PairedSeekInPassPartnerTests(PairedStillsHarness, unittest.TestCase):
 # r10 (sol r9 key B1, r9 adversary successor ADV-A1, fable r9 hardening): files that hash-match their listing but are no PNG image. On ac26ee87 every one
 # of them, as a paused still OR as its in-pass partner, was honoured (framesHonoured=true, PASS) at collection and at final validation alike.
 _GOOD = fixture_png("good", width=4, height=3)
+
+
+def png_of(width: int, height: int, depth: int, colour: int, interlace: int, idat: bytes, extra: bytes = b"") -> bytes:
+    """A PNG whose IDAT payload is given verbatim (already zlib-compressed, or deliberately not)."""
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, depth, colour, 0, 0, interlace)) + extra
+            + png_chunk(b"IDAT", idat) + png_chunk(b"IEND", b""))
+
+
+def adam7_raw(width: int, height: int, bytes_per_pixel: int) -> bytes:
+    """The filter-0 scanlines of an Adam7-interlaced image (every non-empty pass, in pass order)."""
+    out = b""
+    for xs, ys, dx, dy in ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)):
+        pw, ph = max(0, -(-(width - xs) // dx)), max(0, -(-(height - ys) // dy))
+        if pw and ph:
+            out += (b"\x00" + bytes((i * 13) & 0xFF for i in range(pw * bytes_per_pixel))) * ph
+    return out
+
+
+_RGB_ROWS = b"".join(b"\x00" + bytes(12) for _ in range(3))   # the 4x3 RGB scanlines _GOOD holds
+_BAD_ADLER = bytearray(zlib.compress(_RGB_ROWS))
+_BAD_ADLER[-1] ^= 0xFF
+# r10 fix 1 (adversary r10 77fc99fa A1): a container that is well-formed but whose IDAT holds no (or not enough, or no valid) image data. 77fc99fa walked
+# the chunks only, so the adversary's 65-byte 1x1 RGB PNG whose IDAT inflates to 0 bytes (Pillow: "image file is truncated") was accepted.
+ADVERSARY_R10_A1 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000849444154789c030000000001480689d20000000049454e44ae426082")
 NOT_A_PNG = (("zero-byte", b""),                                                     # sha256 e3b0c442...b855, sol r9's repro
              ("four-byte-non-png", b"GIF8"),
+             ("idat-inflates-to-nothing", ADVERSARY_R10_A1),                          # adversary r10 77fc99fa A1, verbatim
              ("truncated-no-iend", _GOOD[:-12]),                                     # cut before IEND
              ("truncated-mid-chunk", _GOOD[:len(_GOOD) - 20]),                       # cut inside IDAT
              ("wrong-signature", b"\x89PNX" + _GOOD[4:]),
              ("zero-width-ihdr", fixture_png("w0", width=0, height=3)),
              ("zero-height-ihdr", fixture_png("h0", width=4, height=0)),
              ("renamed-jpeg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01" + bytes(96)),
-             ("no-idat", _GOOD[:8] + _GOOD[8:33] + png_chunk(b"IEND", b"")))
+             ("no-idat", _GOOD[:8] + _GOOD[8:33] + png_chunk(b"IEND", b"")),
+             ("idat-short-two-of-three-rows", png_of(4, 3, 8, 2, 0, zlib.compress(_RGB_ROWS[:26]))),
+             ("idat-one-byte-over", png_of(4, 3, 8, 2, 0, zlib.compress(_RGB_ROWS + b"\x00"))),
+             ("idat-filter-type-9", png_of(4, 3, 8, 2, 0, zlib.compress(b"\x09" + _RGB_ROWS[1:]))),
+             ("idat-not-zlib", png_of(4, 3, 8, 2, 0, bytes(range(40)))),
+             ("idat-bad-adler32", png_of(4, 3, 8, 2, 0, bytes(_BAD_ADLER))),
+             ("ihdr-bad-crc", _GOOD[:29] + bytes(b ^ 0xFF for b in _GOOD[29:33]) + _GOOD[33:]),
+             ("palette-without-plte", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"))),
+             ("interlaced-with-flat-scanlines", png_of(5, 5, 8, 2, 1, zlib.compress(b"".join(b"\x00" + bytes(15) for _ in range(5))))))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -1239,8 +1272,20 @@ class PngImageCheckUnitTests(unittest.TestCase):
         rgba16 = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 16, 6, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(bytes(9))) + png_chunk(b"IEND", b"")
         laced = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 1)) + png_chunk(b"IDAT", zlib.compress(bytes(4))) + png_chunk(b"IEND", b"")
         bad_depth = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 4, 2, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(bytes(4))) + png_chunk(b"IEND", b"")
+        # well-formed controls the stricter r10 fix 1 check must still accept: a properly Adam7-interlaced image, a palette image with its PLTE, a 1-bit
+        # grey image (sub-byte rows), IDAT split across three chunks, and a 1920x1080 RGB frame the size the app grabs (and fast enough at that size)
+        laced5 = png_of(5, 5, 8, 2, 1, zlib.compress(adam7_raw(5, 5, 3)))
+        palette = png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30"))
+        onebit = png_of(9, 2, 1, 0, 0, zlib.compress(b"\x00\xff\x80" * 2))
+        stream = zlib.compress(_RGB_ROWS)
+        split = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 3, 8, 2, 0, 0, 0)) + png_chunk(b"IDAT", stream[:5])
+                 + png_chunk(b"IDAT", stream[5:9]) + png_chunk(b"IDAT", stream[9:]) + png_chunk(b"IEND", b""))
+        hd_rows = b"".join(b"\x01" + bytes((x * 7 + y) & 0xFF for x in range(1920 * 3)) for y in range(1080))
+        hd = png_of(1920, 1080, 8, 2, 0, zlib.compress(hd_rows, 6))
         cases = {**{f"bad-{n}.png": (b, False) for n, b in NOT_A_PNG}, "bad-depth.png": (bad_depth, False),
-                 "ok-fixture.png": (_GOOD, True), "ok-grey.png": (grey, True), "ok-rgba16.png": (rgba16, True), "ok-interlaced.png": (laced, True)}
+                 "ok-fixture.png": (_GOOD, True), "ok-grey.png": (grey, True), "ok-rgba16.png": (rgba16, True), "ok-interlaced.png": (laced, True),
+                 "ok-interlaced-5x5.png": (laced5, True), "ok-palette.png": (palette, True), "ok-1bit.png": (onebit, True), "ok-split-idat.png": (split, True),
+                 "ok-1920x1080.png": (hd, True)}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
@@ -1293,7 +1338,8 @@ class PairedSeekImageContentTests(PairedStillsHarness, unittest.TestCase):
             self.assertEqual(sorted({m[:8] for m in info["frameMismatches"]}), ["frame-00"], "only the frame with the bad image is blamed")
 
     def test_r10_b1_a_zero_byte_or_four_byte_image_in_either_member_is_not_a_pass(self) -> None:
-        for shape, data in NOT_A_PNG[:2]:
+        # (the third shape is adversary r10 77fc99fa A1's verbatim input: a well-formed container whose IDAT inflates to 0 bytes)
+        for shape, data in NOT_A_PNG[:3]:
             for member in ("paused", "partner"):
                 for listed in (True, False):
                     for final in (False, True):
@@ -1303,7 +1349,7 @@ class PairedSeekImageContentTests(PairedStillsHarness, unittest.TestCase):
                             self.assert_image_mismatch(receipt, member, final)
 
     def test_r10_b1_every_other_non_png_shape_in_either_member_is_not_a_pass(self) -> None:
-        for shape, data in NOT_A_PNG[2:]:
+        for shape, data in NOT_A_PNG[3:]:
             for member in ("paused", "partner"):
                 with self.subTest(shape=shape, member=member):
                     self.fresh()
