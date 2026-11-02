@@ -100,13 +100,14 @@ struct PresentDriver
     int presented = 0;
     int last = -1;
     void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; last = -1; }
-    // r17 (adversary A1 on 6451a8d9): MainWindow passes the count stamped when the frame was REQUESTED
-    // (PresentationContext::engineWrapsAtRequest). stampAtRequest < 0 = requested after every wrap so far.
+    // r17 (adversary A1 on 6451a8d9 / eb5af034): MainWindow passes the live count and the count stamped when the
+    // frame was REQUESTED (PresentationContext::engineWrapsAtRequest). stampAtRequest < 0 = requested after
+    // every wrap so far.
     void present(double t, int frame, bool loop, int cutIn0, int cutOut0, int stampAtRequest = -1)
     {
         (void)loop;   // the inference (Loop, the jump size) no longer decides the tracker's wrap (re-pass A2)
         const int stamp = stampAtRequest < 0 ? engineWraps : stampAtRequest;
-        const bool wrap = presentationIsLoopWrap(stamp, consumed, presented > 0, last, frame);
+        const bool wrap = presentationIsLoopWrap(engineWraps, stamp, consumed, presented > 0, last, frame);
         tracker.notePresented(t, frame, wrap, cutIn0, cutOut0);
         last = frame;
         ++presented;
@@ -238,4 +239,42 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1AFrameRequestedBeforeTheWrapNev
     ASSERT_EQ(0u, late.tracker.wraps());
     ASSERT_EQ(1u, late.tracker.backwardJumps());
     ASSERT_EQ(0, static_cast<int>(late.tracker.advancedFrames()));
+}
+
+// r17 (adversary A1 on eb5af034): lookahead 3, Loop on, drop-frame off, cut 1..720. 718 and the speculative 719, 0
+// and 1 are all requested while the count is 0 (a lookahead copies its base request's stamp). The engine wraps, and
+// the reused speculative 0 is presented with stamp 0. eb5af034 judged by the stamp alone (0 > 0 is false): 719 -> 0
+// was backward, advanced 1, wraps 0, 11.111 fps. The live count says a wrap is pending, and 0 goes backward: it IS
+// the wrap.
+TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossTheWrapStillTakesIt)
+{
+    PresentDriver d;
+    d.startMeasuredPlay();
+    const int stamp = d.engineWraps;          // 718, 719, 0, 1 requested together
+    d.present(1.000, 718, true, 0, 719, stamp);
+    ++d.engineWraps;                          // the engine wraps to the cut-in
+    d.present(1.045, 719, true, 0, 719, stamp);
+    d.present(1.090, 0, true, 0, 719, stamp); // the reused speculative frame
+    ASSERT_EQ(2, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(0u, d.tracker.backwardJumps());
+    ASSERT_NEAR(2.0 / 0.090, d.tracker.sourceFps(), 1e-9);
+    d.present(1.135, 1, true, 0, 719, stamp);
+    d.present(1.180, 2, true, 0, 719);        // the first frame requested after the wrap
+    ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1u, d.tracker.wraps());
+    // the wrap was taken once: a later user seek back is a backward jump, not a second wrap
+    d.present(1.225, 0, true, 0, 719);
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(1u, d.tracker.backwardJumps());
+    // the wrap's FORWARD landing (a frame requested after it, still ahead of the last presented frame) consumes
+    // it, so a later seek is not credited as the wrap (r16 c9b4ca5e, with an explicit stamp)
+    PresentDriver f;
+    f.startMeasuredPlay();
+    f.present(0.0, 3, true, 0, 7);
+    ++f.engineWraps;                          // narrow cut 1..8, drop-frame: 3 -> 7 -> wraps -> 5
+    f.present(0.1, 5, true, 0, 7, f.engineWraps);
+    f.present(0.2, 2, true, 0, 7, f.engineWraps);
+    ASSERT_EQ(0u, f.tracker.wraps());
+    ASSERT_EQ(1u, f.tracker.backwardJumps());
 }

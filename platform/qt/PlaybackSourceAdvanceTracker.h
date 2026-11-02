@@ -98,27 +98,34 @@ private:
  *  700 -> 0 jumps back by 700, under its 711. The tracker then counted the wrap as a backward jump and lost
  *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
  *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
- *  wrap_count. An engine wrap belongs to ONE presented transition only: a presentation that goes backward
- *  while a wrap is pending for it IS the wrap. The first presentation of a frame whose request stamp is
- *  above the consumed count consumes the pending wraps, whether it goes backward or not, the first one of
- *  the measured Play included (r16 re-pass A1 on c9b4ca5e: a wrap before the first presentation stayed
- *  pending, and a later backward seek took it and was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
+ *  wrap_count. An engine wrap belongs to ONE presented transition only (the rule is below). The measured
+ *  Play's first presentation consumes the pending wraps (r16 re-pass A1 on c9b4ca5e: a wrap before the
+ *  first presentation stayed pending, and a later backward seek took it and was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
  *  a cut range narrower than its 8-frame tolerance, cut 1..8, it calls any backward seek a wrap, and the
  *  seek 5 -> 4 was credited 7 frames).
- *  r17 (adversary A1 on 6451a8d9): engineWraps is the count stamped when the presented frame was REQUESTED
- *  (RenderFrameThread::ReadyFrame::PresentationContext::engineWrapsAtRequest), never the live count. The draw
- *  runs its early/tail advance before noting the presentation, so with the live count an in-flight frame
- *  requested before the wrap (719 after 718) took the wrap and the real wrap 719 -> 0 counted backward. A wrap
- *  therefore belongs to the first presentation of a frame requested after it. consumedEngineWraps is the
- *  caller's running count. It is set to the live count when the measured Play starts and only ever rises, so
- *  an older request presented late (a stamp below it) never re-opens a consumed wrap.
+ *  r17: neither count alone places the wrap.
+ *  - The LIVE count (liveEngineWraps) is read after the draw's own early/tail advance. That advance can
+ *    wrap the engine before an in-flight frame requested earlier is noted (718, 719, 0: adversary A1 on
+ *    6451a8d9). With the live count alone, 719 took the wrap and 719 -> 0 counted backward.
+ *  - The REQUEST stamp (requestEngineWraps, RenderFrameThread::ReadyFrame::PresentationContext::
+ *    engineWrapsAtRequest) misses a lookahead frame requested across the boundary before the wrap and
+ *    reused after it (speculative 0 stamped 0: adversary A1 on eb5af034).
+ *  So a wrap is PENDING while the live count is above consumedEngineWraps. A pending wrap is taken by the
+ *  first presentation that goes backward: that one IS the wrap. A pending wrap is consumed without counting
+ *  as a wrap by the measured Play's first presentation, or by a frame requested after every wrap so far
+ *  (stamp >= live), which is the wrap's forward landing (r16 c9b4ca5e). It stays pending across a forward
+ *  or repeated frame requested before it (stamp < live): an in-flight frame from before the wrap.
+ *  consumedEngineWraps is the caller's running count. It is set to the live count when the measured Play
+ *  starts and only ever rises.
  *  \param havePrevious a frame was presented before this one in the measured Play */
-inline bool presentationIsLoopWrap( int engineWraps, int &consumedEngineWraps,
+inline bool presentationIsLoopWrap( int liveEngineWraps, int requestEngineWraps, int &consumedEngineWraps,
                                     bool havePrevious, int lastFrame, int frame )
 {
-    const bool engineWrapPending = engineWraps > consumedEngineWraps;
-    if( engineWrapPending ) consumedEngineWraps = engineWraps;
-    return havePrevious && engineWrapPending && frame < lastFrame;
+    if( liveEngineWraps <= consumedEngineWraps ) return false;   // no wrap pending
+    const bool wrap = havePrevious && frame < lastFrame;
+    const bool requestedBeforeTheWrap = requestEngineWraps < liveEngineWraps;
+    if( wrap || !havePrevious || !requestedBeforeTheWrap ) consumedEngineWraps = liveEngineWraps;
+    return wrap;
 }
 
 #endif // PLAYBACKSOURCEADVANCETRACKER_H
