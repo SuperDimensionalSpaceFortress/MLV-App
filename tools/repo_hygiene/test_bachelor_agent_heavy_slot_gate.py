@@ -29,6 +29,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
@@ -37,9 +38,10 @@ AGENT = ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1"
 FIFO_TEST = ROOT / "tools" / "testing" / "test-ultra-magnus-agent-heavy-slot-fifo.ps1"
 PWSH = shutil.which("pwsh")
 # Hang guard for the -UnitOnly run: it must stay above the sum of the fifo script's own per-suite bounds (400 s + 120 s), their two
-# bounded taskkills (2 x 60 s) and its ~30 s of unit cases (670 s), so a hung suite fails by its own name there first (a test pins
-# the sum). Measured 349 s locally, 282 s on the hosted runner.
-UNIT_RUN_TIMEOUT_SEC = 720
+# bounded taskkills (2 x 60 s), their captured-output reads and capture cleanup (2 x (2 x 10 s + 10 s), sol r6 B1/B2) and its ~30 s of
+# unit cases (730 s), so a hung suite fails by its own name there first (a test pins the sum, derived from the script's own constants).
+# Measured 349 s locally, 282 s on the hosted runner.
+UNIT_RUN_TIMEOUT_SEC = 800
 FIFO_UNIT_CASES_SEC = 30  # the fifo script's own unit cases, before its two bounded sub-suites
 # run_bounded's cleanup after a timeout (_kill_tree). One source of truth: the helper waits with exactly these bounds and the
 # regressions derive their elapsed ceiling from them, so any cleanup the helper allows passes and no other number is hand-tuned.
@@ -51,14 +53,37 @@ CLEANUP_MARGIN_SEC = 10  # scheduling slack on a loaded runner, on top of the bo
 # The largest timeout run_bounded accepts (sol r5 B1). Callers pass 720 s at most; this leaves a wide margin and stays far below
 # threading.TIMEOUT_MAX, above which the Windows wait raises OverflowError after the child is already launched.
 MAX_RUN_BOUNDED_TIMEOUT_SEC = 3600
-# Each captured stream is read under this bound (adversary r6 A2); after a failed wait run_bounded reads two of them.
+# Everything run_bounded does AFTER the child is launched is bounded, so the case-named verdict is never held back (sol r5-r6, adversary
+# r6 A2). Waits: the run bound, then CLEANUP_BOUND_SEC for the tree kill. I/O on the capture directory: two reads, each under
+# READ_BOUND_SEC, and the final removal under CAPTURE_CLEANUP_BOUND_SEC. A step that overruns is ABANDONED on a daemon thread and named in
+# the verdict (never awaited). max_run_bounded_sec() is the one place that adds the allowances up, so adding one cannot leave a ceiling behind.
 READ_BOUND_SEC = 10
 MAX_READ_SEC = 2 * READ_BOUND_SEC
+CAPTURE_CLEANUP_BOUND_SEC = 10
+
+
+def max_wait_and_kill_sec(timeout: float) -> float:
+    """The longest the wait plus the tree-kill cleanup of run_bounded(timeout=...) may take (what a virtual clock counts)."""
+    return timeout + CLEANUP_BOUND_SEC
 
 
 def max_run_bounded_sec(timeout: float) -> float:
-    """The longest run_bounded(timeout=...) may take before it must have raised: the run bound plus the whole cleanup bound."""
-    return timeout + CLEANUP_BOUND_SEC
+    """The longest run_bounded(timeout=...) may take before it must have raised: every allowance the helper makes, added up once."""
+    return max_wait_and_kill_sec(timeout) + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
+
+
+def _remove_capture_dir(path: str) -> str:
+    """Remove the capture directory under CAPTURE_CLEANUP_BOUND_SEC (sol r6 B2); return '' or a note naming the abandoned step.
+
+    The removal runs in a daemon thread that is abandoned if it does not finish, so a stalled temp store (a hung share, a slow
+    enumeration, a held handle) cannot hold the verdict back. The note names the step and the path left behind.
+    """
+    remover = threading.Thread(target=lambda: shutil.rmtree(path, ignore_errors=True), name="rmtree-capture", daemon=True)
+    remover.start()
+    remover.join(CAPTURE_CLEANUP_BOUND_SEC)
+    if remover.is_alive():
+        return f"capture cleanup abandoned after {CAPTURE_CLEANUP_BOUND_SEC:g} s: {path}"
+    return ""
 
 
 def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
@@ -162,6 +187,7 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
     failed = False
     verdict = ""
     kill_note = ""
+    cleanup_note = ""
     try:
         with open(out_path, "wb") as out, open(err_path, "wb") as err:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
@@ -185,11 +211,20 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
         stdout = _read_captured(out_path, tolerate_oserror=failed)
         stderr = _read_captured(err_path, tolerate_oserror=failed)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        cleanup_note = _remove_capture_dir(tmp)
     if failed:
         raise AssertionError(f"{case} {verdict} (ran {elapsed:.0f} s) and {kill_note}.\n"
-                             f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}")
+                             f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}"
+                             + (f"\n{cleanup_note}" if cleanup_note else ""))
+    if cleanup_note:
+        warnings.warn(f"{case}: {cleanup_note}", RuntimeWarning, stacklevel=2)
     return proc.returncode, stdout, stderr
+
+
+def _fifo_capture_io_region(fifo: str) -> str:
+    """The fifo script's bounded capture io helpers, between their BEGIN / END markers, ready to dot-source in a bare pwsh."""
+    begin = fifo.index("# BEGIN bounded capture io")
+    return fifo[begin:fifo.index("# END bounded capture io")]
 
 
 def _code_lines(text: str) -> list[str]:
@@ -299,9 +334,14 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         quiet = int(re.search(r"\[int\]\$QuietLeaseBoundSec = (\d+)", fifo).group(1))
         stage = int(re.search(r"\[int\]\$StageExemptBoundSec = (\d+)", fifo).group(1))
         taskkill = int(re.search(r"\$k\.WaitForExit\((\d+)000\)", fifo).group(1))
-        worst_case = FIFO_UNIT_CASES_SEC + (quiet + taskkill) + (stage + taskkill)
+        # sol r6 B1/B2: after the wait and the kill each suite also spends two bounded captured-output reads and one bounded cleanup.
+        read_sec = int(re.search(r"^\$ReadBoundMs = (\d+)000$", fifo, re.M).group(1))
+        cleanup_sec = int(re.search(r"^\$CaptureCleanupBoundMs = (\d+)000$", fifo, re.M).group(1))
+        per_suite_io = 2 * read_sec + cleanup_sec
+        worst_case = FIFO_UNIT_CASES_SEC + (quiet + taskkill + per_suite_io) + (stage + taskkill + per_suite_io)
         self.assertGreater(UNIT_RUN_TIMEOUT_SEC, worst_case,
-                           f"the outer guard ({UNIT_RUN_TIMEOUT_SEC} s) must outlast unit cases + both sub-suite bounds + both bounded kills ({worst_case} s)")
+                           f"the outer guard ({UNIT_RUN_TIMEOUT_SEC} s) must outlast unit cases + both sub-suite bounds + both bounded kills "
+                           f"+ both suites' bounded reads and cleanup ({worst_case} s)")
 
     def test_the_suite_bounds_are_range_checked_before_any_child_is_launched(self) -> None:
         # adversary r4 pass 3 A1: -QuietLeaseBoundSec -1 or 2147484 bound as a legal [int], then WaitForExit threw after the child
@@ -316,7 +356,11 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         fifo = FIFO_TEST.read_text(encoding="ascii")
         body = fifo[fifo.index("function Invoke-BoundedSuite"):]
         body = body[:body.index("\n}\n")]
-        self.assertIn("$json = (Get-Content -LiteralPath $outF -ErrorAction Stop) -join \"`n\"", body)
+        # sol r6 B1: the JSON is no longer re-read (Get-Content had no deadline); the one bounded read feeds the diagnostic and the result,
+        # and a read that did not succeed fails the suite by name instead of aggregating as an empty result.
+        self.assertNotIn("Get-Content", body)
+        self.assertEqual(body.count("Read-CapturedResult $outF"), 1, "stdout is opened and read exactly once")
+        self.assertIn("elseif (-not $outR.Ok) { $fail =", body)
         self.assertIn("[Diagnostics.Stopwatch]::StartNew()", body)
         self.assertNotIn("Get-Date", body)
         for name in ("lease", "stage"):
@@ -586,14 +630,15 @@ class BoundedRunTests(unittest.TestCase):
         # adversary r6 A2 (PowerShell half): the suite-named failure reads the captured output through Read-CapturedText, which has its
         # own bound, so a stalled temp store cannot hold the verdict back. The seam hands in a task that never completes.
         fifo = FIFO_TEST.read_text(encoding="ascii")
-        start = fifo.index("function Read-CapturedText")
-        body = fifo[start:fifo.index("\n}\n", start) + 3]
+        body = _fifo_capture_io_region(fifo)
         self.assertIn("$ReadBoundMs = 10000", fifo)
         suite = fifo[fifo.index("function Invoke-BoundedSuite"):]
         suite = suite[:suite.index("\n}\n")]
-        self.assertIn("Read-CapturedText $outF", suite)
-        self.assertIn("Read-CapturedText $errF", suite)
-        self.assertNotIn("SilentlyContinue", suite.replace("Remove-Item -LiteralPath $outF, $errF -Force -ErrorAction SilentlyContinue", ""))
+        self.assertIn("Read-CapturedResult $outF", suite)
+        self.assertIn("Read-CapturedResult $errF", suite)
+        self.assertIn("Remove-CaptureFiles @($outF, $errF)", suite)
+        self.assertNotIn("Remove-Item", suite, "the capture removal is bounded (Remove-CaptureFiles), never a synchronous Remove-Item")
+        self.assertNotIn("SilentlyContinue", suite)
         fd, good = tempfile.mkstemp(prefix="read-captured-")
         os.close(fd)
         try:
@@ -888,6 +933,173 @@ class BoundedRunInputRangeTests(unittest.TestCase):
         self.assertGreaterEqual(proc.kills, 1)
 
 
+class BoundedCaptureIoTests(unittest.TestCase):
+    """sol r6 B1 / B2: every step after the launch that touches the capture files (open, read, JSON re-read, removal) is bounded,
+    and a step that overruns is abandoned and NAMED in the verdict rather than awaited.
+
+    The Python half injects a stalled rmtree in memory; the PowerShell half drives the script's own helpers in a bare pwsh, with a real
+    named pipe as the stalled file (a client that connects to a pipe nobody writes to blocks in its first read).
+    """
+
+    def _run_with_stalled_rmtree(self, *, timeout_expires: bool) -> tuple[BaseException | None, float, list[warnings.WarningMessage]]:
+        release = threading.Event()
+        real_rmtree = shutil.rmtree
+        proc = BoundedRunOutputReadFailureTests._TimedOutProc()
+        if not timeout_expires:
+            proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
+        seen: list[str] = []
+
+        def stalled_rmtree(path: str, *args: object, **kwargs: object) -> None:
+            seen.append(path)
+            release.wait(60)
+            real_rmtree(path, *args, **kwargs)
+
+        popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
+        started = time.monotonic()
+        caught: BaseException | None = None
+        try:
+            with warnings.catch_warnings(record=True) as recorded, mock.patch.object(subprocess, "Popen", side_effect=popen), \
+                    mock.patch.object(shutil, "rmtree", stalled_rmtree), \
+                    mock.patch.object(sys.modules[__name__], "CAPTURE_CLEANUP_BOUND_SEC", 0.3):
+                warnings.simplefilter("always")
+                try:
+                    run_bounded(["child"], 3, "stalled-cleanup-case")
+                except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                    caught = exc
+        finally:
+            release.set()
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(seen), 1)
+        self._leftover = seen[0]
+        deadline = time.monotonic() + 10
+        while os.path.exists(seen[0]) and time.monotonic() < deadline:  # the abandoned thread finishes once released
+            time.sleep(0.05)
+        return caught, elapsed, recorded
+
+    def test_a_stalled_capture_cleanup_after_a_timeout_returns_the_named_verdict_and_names_the_abandoned_step(self) -> None:
+        caught, elapsed, _ = self._run_with_stalled_rmtree(timeout_expires=True)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("stalled-cleanup-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn(f"capture cleanup abandoned after 0.3 s: {self._leftover}", str(caught))
+        self.assertLess(elapsed, 10, "the stalled removal held the verdict back")
+
+    def test_a_stalled_capture_cleanup_after_a_clean_run_returns_the_result_and_warns(self) -> None:
+        # The run itself succeeded, so its result is returned; the abandoned removal is reported as a warning, not raised.
+        release = threading.Event()
+        real_rmtree = shutil.rmtree
+
+        def stalled_rmtree(path: str, *args: object, **kwargs: object) -> None:
+            release.wait(60)
+            real_rmtree(path, *args, **kwargs)
+
+        started = time.monotonic()
+        try:
+            with warnings.catch_warnings(record=True) as recorded, mock.patch.object(shutil, "rmtree", stalled_rmtree), \
+                    mock.patch.object(sys.modules[__name__], "CAPTURE_CLEANUP_BOUND_SEC", 0.3):
+                warnings.simplefilter("always")
+                result = run_bounded([sys.executable, "-c", "print('ok')"], 60, "clean-run-case")
+        finally:
+            release.set()
+        self.assertEqual((result[0], result[1].strip()), (0, "ok"))
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertTrue(any("capture cleanup abandoned after 0.3 s" in str(w.message) and "clean-run-case" in str(w.message)
+                            for w in recorded), [str(w.message) for w in recorded])
+
+    def test_a_finished_cleanup_adds_no_note_to_the_verdict(self) -> None:
+        caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
+        self.assertNotIn("capture cleanup", str(caught))
+
+    @staticmethod
+    def _pwsh(script: str) -> subprocess.CompletedProcess:
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+
+    @unittest.skipUnless(os.name == "nt" and PWSH is not None, "named pipes and pwsh are Windows-only here")
+    def test_a_stalled_capture_open_is_abandoned_inside_its_bound_and_named(self) -> None:
+        # sol r6 B1: the default reader used to open the file synchronously before its timed wait. Now open + read both run on a pool
+        # thread under one bound. A listening pipe nobody writes to blocks the very first read.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$srv = [IO.Pipes.NamedPipeServerStream]::new('mlv-r7-stall-" + str(os.getpid()) + "', [IO.Pipes.PipeDirection]::Out, 1)\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "$r = Read-CapturedText '\\\\.\\pipe\\mlv-r7-stall-" + str(os.getpid()) + "' 400\n"
+                  "Write-Output ('STALLED|' + $r + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                  "$srv.Dispose()\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"STALLED|<read timed out: mlv-r7-stall-{os.getpid()} not readable within 400 ms>|True", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_non_positive_or_oversized_capture_bound_is_refused_before_anything_is_opened(self) -> None:
+        # sol r6 B1: BoundMs = -1 is an infinite Task.Wait. Every bound outside 1..CaptureIoMaxMs is refused before any open or delete.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$script:started = 0\n"
+                  "$seam = { param($p) $script:started++; [Threading.Tasks.Task]::FromResult('x') }\n"
+                  "foreach ($b in -1, 0, -2147483648, 60001) {\n"
+                  "  try { $null = Read-CapturedText 'C:\\x\\a.txt' $b $seam; Write-Output \"READ|$b|NOT-REFUSED\" } catch { Write-Output \"READ|$b|$($_.Exception.Message)\" }\n"
+                  "  try { $null = Remove-CaptureFiles @('C:\\x\\a.txt') $b $seam; Write-Output \"DEL|$b|NOT-REFUSED\" } catch { Write-Output \"DEL|$b|$($_.Exception.Message)\" }\n"
+                  "}\n"
+                  "Write-Output \"STARTED|$($script:started)\"\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = [line.split("|", 2) for line in proc.stdout.splitlines() if line.startswith(("READ|", "DEL|"))]
+        self.assertEqual(len(rows), 8, proc.stdout)
+        for kind, bound, message in rows:
+            self.assertIn(f"bound {bound} ms is outside 1..60000 ms; nothing was opened", message, f"{kind} {bound}")
+        self.assertIn("STARTED|0", proc.stdout, "a refused bound must never reach the open or the delete")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_stalled_capture_cleanup_is_abandoned_and_named(self) -> None:
+        # sol r6 B2 (PowerShell half): a delete that never completes is abandoned after the bound and the note names the files.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[bool]]::new().Task }\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "Write-Output ('STALLED|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                  "$real = [IO.Path]::GetTempFileName()\n"
+                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STALLED|capture cleanup abandoned after 0.3 s: C:\\x\\a.txt, C:\\x\\b.txt|True", proc.stdout)
+        self.assertIn("CLEAN|[]|False", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_the_suite_json_is_read_once_under_the_bound_and_every_stalled_step_fails_the_suite_by_name(self) -> None:
+        # sol r6 B1/B2 through Invoke-BoundedSuite itself: Start-Process is a stub (no child), the bounded readers and the bounded removal are
+        # stubs that report what a stalled step returns. The suite must (a) read each stream once, (b) fail by name when the JSON read
+        # stalled, (c) name an abandoned cleanup in a timeout verdict, (d) name the timeout even when both reads stalled.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        start = fifo.index("function ConvertTo-CommandLineArg")
+        body = fifo[start:fifo.index("\n}\n", fifo.index("function Invoke-BoundedSuite")) + 3]
+        script = ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'\n"
+                  "function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw \"FAIL: $Message\" } }\n" + body + "\n"
+                  "function Start-Process { param([string]$FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)\n"
+                  "  $fin = if ($FilePath -eq 'taskkill.exe') { $true } else { $script:finish }\n"
+                  "  $o = [pscustomobject]@{ Id = 4242; Handle = 1; ExitCode = 0 }\n"
+                  "  $o | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value ([scriptblock]::Create('param($ms) $' + $fin.ToString().ToLower()))\n"
+                  "  $o | Add-Member -MemberType ScriptMethod -Name Kill -Value { }\n"
+                  "  $o }\n"
+                  "function Read-CapturedResult([string]$Path) { $script:reads++\n"
+                  "  if ($script:stallReads) { [pscustomobject]@{ Ok = $false; Text = '<read timed out: x not readable within 10000 ms>' } } else { [pscustomobject]@{ Ok = $true; Text = '{\"a\":1}' } } }\n"
+                  "function Remove-CaptureFiles([string[]]$Paths) { $script:removed += $Paths.Count; foreach ($f in $Paths) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }; $script:cleanupNote }\n"
+                  "function Case($label, $finish, $stall, $note) {\n"
+                  "  $script:finish = $finish; $script:stallReads = $stall; $script:cleanupNote = $note; $script:reads = 0; $script:removed = 0\n"
+                  "  try { $r = Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' 5 3>$null; Write-Output \"$label|RESULT|$($r.ExitCode)|$($r.Json)|reads=$($script:reads)|removed=$($script:removed)\" }\n"
+                  "  catch { Write-Output \"$label|THROW|$($_.Exception.Message)|reads=$($script:reads)|removed=$($script:removed)\" } }\n"
+                  "Case 'A' $true $false ''\n"
+                  "Case 'B' $true $true ''\n"
+                  "Case 'C' $false $false 'capture cleanup abandoned after 10 s: out.tmp'\n"
+                  "Case 'D' $false $true 'capture cleanup abandoned after 10 s: out.tmp'\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {line.split("|", 1)[0]: line.split("|", 1)[1] for line in proc.stdout.splitlines() if line[:2] in ("A|", "B|", "C|", "D|")}
+        self.assertEqual(rows["A"], 'RESULT|0|{"a":1}|reads=2|removed=2', proc.stdout)
+        self.assertIn("THROW|FAIL: case-x (C:\\s.ps1) finished but its JSON result could not be read: <read timed out", rows["B"])
+        self.assertTrue(rows["B"].endswith("reads=2|removed=2"), rows["B"])
+        self.assertIn("exceeded its 5 s bound", rows["C"])
+        self.assertIn("; capture cleanup abandoned after 10 s: out.tmp", rows["C"])
+        self.assertTrue(rows["C"].endswith("reads=2|removed=2"), rows["C"])
+        self.assertIn("output so far: <read timed out: x not readable within 10000 ms>", rows["D"])
+        self.assertIn("exceeded its 5 s bound", rows["D"])
+
+
 class BoundedCleanupTests(unittest.TestCase):
     """sol r4b B1 / B2: the cleanup after a timeout is bounded end to end, and the regression's ceiling is derived from that bound.
 
@@ -953,11 +1165,39 @@ class BoundedCleanupTests(unittest.TestCase):
         self.assertIn(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s", str(caught))
         self.assertIn(f"taskkill was still running {TASKKILL_REAP_SEC} s after its kill", str(caught))
         self.assertIn(f"the root process was still running {ROOT_REAP_SEC} s after the kill", str(caught))
-        self.assertEqual(elapsed, max_run_bounded_sec(3))
+        self.assertEqual(elapsed, max_wait_and_kill_sec(3))  # the virtual clock counts the waits; the I/O allowances are real-time
 
     def test_the_cleanup_bound_is_the_sum_of_the_waits_the_helper_makes(self) -> None:
         self.assertEqual(CLEANUP_BOUND_SEC, TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC + ROOT_REAP_SEC)
-        self.assertEqual(max_run_bounded_sec(3), 3 + CLEANUP_BOUND_SEC)
+        self.assertEqual(max_wait_and_kill_sec(3), 3 + CLEANUP_BOUND_SEC)
+        # sol r6 B3: the ceiling is every allowance, added in one place. Adding an allowance without adding it here is a red test.
+        self.assertEqual(max_run_bounded_sec(3), 3 + CLEANUP_BOUND_SEC + 2 * READ_BOUND_SEC + CAPTURE_CLEANUP_BOUND_SEC)
+
+    def test_a_run_that_uses_every_allowance_stays_inside_the_ceiling(self) -> None:
+        # sol r6 B3: wait 3 + taskkill wait 60 + taskkill reap 5 + root reap 30 + stdout read 10 + stderr read 10 = 118 s is permitted by
+        # the helper, and the old ceiling (max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC = 108 s) rejected it. Both reads stall for their
+        # full bound on the virtual clock here; the capture removal is an extra allowance on top.
+        clock = self._Clock()
+        root = self._VirtualProc(clock, None, first_wait_expires=True)
+        taskkill = self._VirtualProc(clock, None)
+
+        def popen(argv: list[str], *args: object, **kwargs: object) -> object:
+            return taskkill if argv and argv[0] == "taskkill" else root
+
+        def stalled_read(path: Path, *, tolerate_oserror: bool) -> str:
+            clock.now += READ_BOUND_SEC
+            return f"<read timed out: {path.name} not readable within {READ_BOUND_SEC:g} s>"
+
+        with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(time, "monotonic", lambda: clock.now), \
+                mock.patch.object(sys.modules[__name__], "_read_captured", stalled_read):
+            with self.assertRaises(AssertionError) as caught:
+                run_bounded(["child"], 3, "all-allowances-case")
+        self.assertEqual(clock.now, 3 + CLEANUP_BOUND_SEC + MAX_READ_SEC)
+        self.assertEqual(clock.now, 118)
+        self.assertLessEqual(clock.now, max_run_bounded_sec(3))
+        self.assertLess(clock.now, max_run_bounded_sec(3) + CLEANUP_MARGIN_SEC)
+        self.assertGreater(clock.now, 3 + CLEANUP_BOUND_SEC + CLEANUP_MARGIN_SEC, "the permitted 118 s run must not be the old 108 s ceiling")
+        self.assertIn("all-allowances-case exceeded its 3 s wall-clock bound", str(caught.exception))
 
     def test_a_slow_but_successful_taskkill_stays_inside_the_regression_ceiling(self) -> None:
         # sol r4b B2: taskkill 1 / 26 / 27 / 31 s took the hung-tree regression from 4 / 29 / 30 / 34 s total; the old fixed 30 s

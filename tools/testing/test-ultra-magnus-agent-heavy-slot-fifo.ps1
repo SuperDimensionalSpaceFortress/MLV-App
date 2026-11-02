@@ -489,18 +489,59 @@ function ConvertTo-CommandLineArg([string]$Value) {
     # before a quote (and before the closing quote) are doubled, or a RepoRoot ending in "\" escapes its closing quote (adversary r4 A1).
     '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
-# adversary r6 A2: the captured output is read for the suite-named failure, and a stalled temp store (a hung share or a held handle) must
-# not hold that verdict back past the cleanup bound. The read is a Task with its own bound; past it the text says so. $Start is a seam
-# for the test, which hands in a task that never completes.
+# BEGIN bounded capture io (sol r6 B1/B2, adversary r6 A2). After the child is launched EVERY step before the named verdict (the capture
+# open, the read, the completed suite's JSON and the final removal) runs on a pool thread under its own bound; a step that overruns is
+# ABANDONED and named in the verdict, never awaited. Only plain .NET runs on those threads (a PowerShell scriptblock needs a runspace).
+# The worst case after the wait and the kill is 2 x $ReadBoundMs + $CaptureCleanupBoundMs; a Python pin sums it into the outer guard.
 $ReadBoundMs = 10000
-function Read-CapturedText([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = { param($p) [IO.File]::ReadAllTextAsync($p) }) {
-    try {
-        $task = & $Start $Path
-        if (-not $task.Wait($BoundMs)) { return "<read timed out: $([IO.Path]::GetFileName($Path)) not readable within $BoundMs ms>" }
-        return [string]$task.Result
+$CaptureCleanupBoundMs = 10000
+$CaptureIoMaxMs = 60000
+function Initialize-BoundedCaptureIo {
+    if ('BoundedCaptureIo' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+    using System;
+    using System.IO;
+    using System.Threading.Tasks;
+    public static class BoundedCaptureIo {
+        public static Task<string> ReadAllText(string path) { return Task.Run(() => File.ReadAllText(path)); }
+        public static Task Delete(string[] paths) { return Task.Run(() => { foreach (string p in paths) { try { File.Delete(p); } catch (Exception) { } } }); }
     }
-    catch { return "<read failed: $($_.Exception.Message)>" }
+'@
 }
+function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
+    # A bound that is below 1 (-1 is an infinite wait to Task.Wait) or above the cap is refused before anything is opened.
+    if ($BoundMs -lt 1 -or $BoundMs -gt $CaptureIoMaxMs) { throw "FAIL: $What bound $BoundMs ms is outside 1..$CaptureIoMaxMs ms; nothing was opened" }
+}
+function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) {
+    Assert-CaptureIoBound 'captured-output read' $BoundMs
+    $name = [IO.Path]::GetFileName($Path)
+    $clock = [Diagnostics.Stopwatch]::StartNew()   # started BEFORE the open, so a slow start counts against the same bound
+    try {
+        if ($null -eq $Start) { Initialize-BoundedCaptureIo; $task = [BoundedCaptureIo]::ReadAllText($Path) } else { $task = & $Start $Path }
+        $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
+        if (-not $task.Wait($left)) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
+        return [pscustomobject]@{ Ok = $true; Text = [string]$task.Result }
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) { $inner = $inner.InnerException }
+        return [pscustomobject]@{ Ok = $false; Text = "<read failed: $($inner.Message)>" }
+    }
+}
+function Read-CapturedText([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) { (Read-CapturedResult $Path $BoundMs $Start).Text }
+function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBoundMs, [scriptblock]$Start = $null) {
+    # Returns '' or a note naming the abandoned step and the files left behind.
+    Assert-CaptureIoBound 'capture cleanup' $BoundMs
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        if ($null -eq $Start) { Initialize-BoundedCaptureIo; $task = [BoundedCaptureIo]::Delete($Paths) } else { $task = & $Start $Paths }
+        $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
+        if ($task.Wait($left)) { return '' }
+        return "capture cleanup abandoned after $([Math]::Round($BoundMs / 1000, 3)) s: $($Paths -join ', ')"
+    }
+    catch { return "capture cleanup failed: $($_.Exception.Message): $($Paths -join ', ')" }
+}
+# END bounded capture io
 # The largest bound Invoke-BoundedSuite accepts: the same range the public -QuietLeaseBoundSec / -StageExemptBoundSec carry.
 $SuiteBoundMaxSec = 3600
 function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
@@ -509,6 +550,7 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
     if ($TimeoutSec -lt 1 -or $TimeoutSec -gt $SuiteBoundMaxSec) { throw "FAIL: $Name ($Script) bound $TimeoutSec s is outside 1..$SuiteBoundMaxSec s; no child was started" }
     $waitMs = [int]($TimeoutSec * 1000)
     $outF = [IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
+    $fail = $null; $result = $null; $cleanupNote = ''
     try {
         $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { ConvertTo-CommandLineArg $_ }
         $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $suiteArgs -NoNewWindow -PassThru -RedirectStandardOutput $outF -RedirectStandardError $errF
@@ -528,13 +570,20 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
             catch { $killNote = "its process tree kill is NOT confirmed (taskkill.exe failed: $($_.Exception.Message))" }
             try { $p.Kill() } catch { }
         }
-        $text = (@((Read-CapturedText $outF), (Read-CapturedText $errF)) | ForEach-Object { $_ -split '\r?\n' } | Where-Object { $_ }) -join ' | '
-        Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text"
-        # A finished suite's JSON is the result: a read error here must surface, not aggregate as an empty result.
-        $json = (Get-Content -LiteralPath $outF -ErrorAction Stop) -join "`n"
-        return [pscustomobject]@{ ExitCode = $p.ExitCode; Json = $json; Text = $text }
+        # Each file is opened and read ONCE, under the bound (sol r6 B1): the same text feeds the diagnostic and, for a finished suite, the JSON.
+        $outR = Read-CapturedResult $outF
+        $errR = Read-CapturedResult $errF
+        $text = (@($outR.Text, $errR.Text) | ForEach-Object { $_ -split '\r?\n' } | Where-Object { $_ }) -join ' | '
+        if (-not $finished) { $fail = "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text" }
+        # A finished suite's JSON is the result: a read error or a stalled read here must surface, not aggregate as an empty result.
+        elseif (-not $outR.Ok) { $fail = "$Name ($Script) finished but its JSON result could not be read: $($outR.Text)" }
+        else { $result = [pscustomobject]@{ ExitCode = $p.ExitCode; Json = (($outR.Text.TrimEnd("`r", "`n")) -split '\r?\n') -join "`n"; Text = $text } }
     }
-    finally { Remove-Item -LiteralPath $outF, $errF -Force -ErrorAction SilentlyContinue }
+    # The removal is bounded too (sol r6 B2) and runs BEFORE the verdict is raised, so its note can be named in it.
+    finally { $cleanupNote = Remove-CaptureFiles @($outF, $errF) }
+    if ($null -ne $fail) { Assert-True $false "$fail$(if ($cleanupNote) { "; $cleanupNote" })" }
+    if ($cleanupNote) { Write-Warning "$Name ($Script): $cleanupNote" }
+    return $result
 }
 $leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
 $lease = Invoke-BoundedSuite 'quiet-lease cases' $leaseTest $QuietLeaseBoundSec
