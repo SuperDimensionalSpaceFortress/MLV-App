@@ -1476,6 +1476,49 @@ class PngImageCheckUnitTests(unittest.TestCase):
                     self.assertIn(R13_TYPED[name], rows[name], "r13: the refusal is TYPED -- it names the chunk and why")
 
 
+    def test_r13_fix2_a_zlib_stream_the_check_cannot_place_or_a_header_over_1_gib_is_refused(self) -> None:
+        """r13 fix 2 (adversary r13 8db7736e): A1 a zlib header with CINFO 8 (a 64 KiB window RFC 1950 forbids) and A3 four junk bytes between the deflate
+        data and the Adler-32 both passed on a runtime with no ZLibStream (Windows PowerShell 5.1), whose raw-deflate fallback checked neither. Verbatim,
+        run under powershell.exe: now refused (the fallback is gone; no ZLibStream = cannot verify = refused). Under pwsh the CINFO check is explicit.
+        A2 a 2 x 2^29 1-bit interlaced header passed the one-pass 1 GiB estimate but implies 1.5 GiB (Adam7); it is now refused at the cap, typed,
+        before any inflation (on 8db7736e the reason was a truncation found AFTER inflating)."""
+        tmp = tempfile.TemporaryDirectory(prefix="png-r13f2-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        a1 = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108000000003a7e9b550000000a49444154881c636800000082008101d4fe600000000049454e44ae426082")
+        a3 = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108000000003a7e9b550000000e49444154789c636800000000000000820081151c21590000000049454e44ae426082")
+        a2 = png_of(2, 1 << 29, 1, 0, 1, zlib.compress(b"\x00" * 64))
+        for name, data in (("a1.png", a1), ("a3.png", a3), ("a2.png", a2), ("ok-control.png", _GOOD)):
+            (root / name).write_bytes(data)
+        (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
+        import shutil
+        import subprocess
+        from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import PWSH
+
+        def probe(exe: str, names: list[str]) -> dict[str, str]:
+            proc = subprocess.run([exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "probe.ps1"), str(DV)] + [str(root / n) for n in names],
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return {line.split("|")[1]: line.split("|", 2)[2] for line in proc.stdout.splitlines() if line.startswith("ROW|")}
+
+        rows = probe(PWSH, ["a1.png", "a3.png", "a2.png", "ok-control.png"])
+        with self.subTest(runtime="pwsh", case="a1-cinfo-8"):
+            self.assertIn("does not start with a zlib header", rows["a1.png"])
+        with self.subTest(runtime="pwsh", case="a3-junk-before-adler32"):
+            self.assertNotEqual(rows["a3.png"], "OK")
+        with self.subTest(runtime="pwsh", case="a2-adam7-over-1-gib"):
+            self.assertIn("interlaced, 1610612736 bytes of image data, larger than any still this check reads (1 GiB)", rows["a2.png"])
+        with self.subTest(runtime="pwsh", case="control"):
+            self.assertEqual(rows["ok-control.png"], "OK")
+        ps51 = shutil.which("powershell.exe") or shutil.which("powershell")
+        if ps51 is None:
+            return   # (no Windows PowerShell 5.1 on this host, e.g. hosted ubuntu: the pwsh half above still ran; not a skip)
+        rows51 = probe(ps51, ["a1.png", "a3.png", "ok-control.png"])
+        for name in ("a1.png", "a3.png", "ok-control.png"):
+            with self.subTest(runtime="powershell-5.1", case=name):
+                self.assertIn("cannot be verified here: this runtime has no System.IO.Compression.ZLibStream", rows51[name])
+
+
 SEEK_RAW = ("artifacts", "paired-seek", "contact-sheet", "raw")
 
 

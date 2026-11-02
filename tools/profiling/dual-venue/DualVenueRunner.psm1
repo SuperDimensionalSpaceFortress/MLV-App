@@ -2320,33 +2320,39 @@ function Get-DvPngImageProblem {
         if ($pw -gt 0 -and $ph -gt 0) { $segments.Add([long[]]@([long]$ph, [long](1 + [Math]::Floor(($pw * $bits + 7) / 8)))) }
     }
     [long]$expected = 0; foreach ($s in $segments) { $expected += $s[0] * $s[1] }
+    # r13 fix 2 (adversary r13 8db7736e A2): the 1 GiB cap applies to the EXACT byte count too. The estimate above counts one pass; Adam7 adds a filter
+    # byte per row of every pass and rounds each pass's rows up, so a 2 x 2^29 1-bit interlaced header estimated 1 GiB (admitted) but implies 1.5 GiB,
+    # which was then inflated, twice. (The estimate bounds $expected well inside [long], so this sum cannot overflow.)
+    if ($expected -gt 1GB) { return "its IHDR says $width x $height at $bits bits per pixel$(if ($interlaced) { ', interlaced' }), $expected bytes of image data, larger than any still this check reads (1 GiB)" }
     # r11 fix 1 (adversary r11 b4a4147f A2): the IDAT data must be ONE complete zlib stream whose Adler-32 is checked. The inflater stops without an
     # error when its input runs out, so a stream with no Adler-32 trailer, or whose deflate data never reaches a final block, inflated to the right byte
     # count and passed. The inflater now reads the IDAT data followed by a 64-byte 0xFF tail. A deflate stream that never reaches its final block is fed
     # the tail as more deflate data (0xFF codes literals, or a reserved block type), so it errors or inflates past the image's byte count. One that does
     # end is followed by the 4 bytes ZLibStream (.NET 6+) checks as its Adler-32: the real trailer passes, while a missing one (the tail is read instead)
-    # or a misplaced one (whatever follows the deflate data is read instead) fails with InvalidDataException. The raw DeflateStream of .NET before 6
-    # checks no trailer, so there the last 4 bytes of the IDAT data must equal the Adler-32 of the inflated bytes, computed here.
+    # or a misplaced one (whatever follows the deflate data is read instead) fails with InvalidDataException.
+    # r13 fix 2 (adversary r13 8db7736e A1 / A3): the .NET-before-6 fallback (a raw DeflateStream after the 2-byte header, its Adler-32 compared with the
+    # LAST four bytes of the IDAT data) is gone. A raw DeflateStream does not say where the deflate data ends, so junk between the deflate data and a
+    # trailer at the end passed (A3), and the header's window size was never checked (A1). Without ZLibStream (PowerShell 7 / .NET 6+, which the leg runs
+    # on) the image cannot be verified, so it is refused, fail closed. The header check now also requires CINFO <= 7 (a window of at most 32 KiB, RFC 1950).
+    $zType = 'System.IO.Compression.ZLibStream' -as [type]
+    if ($null -eq $zType) { return 'its IDAT data cannot be verified here: this runtime has no System.IO.Compression.ZLibStream (.NET 6+, PowerShell 7), which the image check needs to find the zlib trailer' }
     $idatLength = $idat.Length
     if ($idatLength -lt 6) { return "its IDAT data is $idatLength bytes, too short for a zlib stream (2-byte header, deflate data, 4-byte Adler-32)" }
     $idatBytes = $idat.ToArray(); $idat.Dispose()
-    [long]$trailer = ([long]$idatBytes[$idatLength - 4] -shl 24) -bor ([long]$idatBytes[$idatLength - 3] -shl 16) -bor ([long]$idatBytes[$idatLength - 2] -shl 8) -bor [long]$idatBytes[$idatLength - 1]
     $cmf = [int]$idatBytes[0]; $flg = [int]$idatBytes[1]
-    if (($cmf -band 0x0F) -ne 8 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header' }
+    if (($cmf -band 0x0F) -ne 8 -or ($cmf -shr 4) -gt 7 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header (deflate, a window of at most 32 KiB, no preset dictionary)' }
     # r12 fix 2 (adversary r12 0f6daf3a A1): a stream whose Adler-32 trailer was cut short by ONE byte passed, because the 0xFF tail supplied the
     # missing byte (the real trailer ended in 0xFF). So the stream is inflated TWICE, once with a 0xFF tail and once with a 0x00 tail, and must pass
     # both: a trailer byte (or deflate data) borrowed from the tail matches at most one of the two fills, so the verdict cannot depend on bytes that are
     # not in the file. (A 0x00 tail read as deflate data opens a stored block whose LEN / NLEN do not complement, so a stream that never ends errors.)
-    $zType = 'System.IO.Compression.ZLibStream' -as [type]
     foreach ($tailByte in @(0xFF, 0x00)) {
     $fed = [IO.MemoryStream]::new()
-    if ($null -ne $zType) { $fed.Write($idatBytes, 0, $idatLength) } else { $fed.Write($idatBytes, 2, $idatLength - 2) }   # (.NET before 6: raw deflate after the header)
+    $fed.Write($idatBytes, 0, $idatLength)
     $fed.Write([byte[]](@($tailByte) * 64), 0, 64)
     $fed.Position = 0
     $z = $null
-    [long]$adlerA = 1; [long]$adlerB = 0
     try {
-        $z = $(if ($null -ne $zType) { $zType::new($fed, [IO.Compression.CompressionMode]::Decompress) } else { [IO.Compression.DeflateStream]::new($fed, [IO.Compression.CompressionMode]::Decompress) })
+        $z = $zType::new($fed, [IO.Compression.CompressionMode]::Decompress)
         $buf = [byte[]]::new(65536); [long]$total = 0
         $seg = 0; [long]$rowsLeft = $segments[0][0]; [long]$nextFilter = 0
         while (($got = $z.Read($buf, 0, $buf.Length)) -gt 0) {
@@ -2357,19 +2363,12 @@ function Get-DvPngImageProblem {
                 $nextFilter += $segments[$seg][1]; $rowsLeft--
                 if ($rowsLeft -eq 0) { $seg++; if ($seg -lt $segments.Count) { $rowsLeft = $segments[$seg][0] } }
             }
-            # (.NET before 6 only) Adler-32 of the inflated bytes, in blocks of at most 5552 (zlib's NMAX: the sums cannot overflow before the modulo)
-            if ($null -eq $zType) { for ($blk = 0; $blk -lt $got; $blk += 5552) {
-                $end = [Math]::Min($got, $blk + 5552)
-                for ($i = $blk; $i -lt $end; $i++) { $adlerA += $buf[$i]; $adlerB += $adlerA }
-                $adlerA %= 65521; $adlerB %= 65521
-            } }
             $total += $got
         }
     }
     catch { return "its IDAT data is not a valid zlib stream ($($_.Exception.GetType().Name))" }
     finally { if ($null -ne $z) { $z.Dispose() }; $fed.Dispose() }
     if ($total -ne $expected) { return "its IDAT data inflates to $total bytes but a $width x $height image needs $expected, so it is truncated" }
-    if ($null -eq $zType -and (($adlerB -shl 16) -bor $adlerA) -ne $trailer) { return 'its IDAT data does not end with the Adler-32 of its image data (a zlib stream with no, or a misplaced, trailer)' }
     }   # (foreach tail byte)
     $null
 }
