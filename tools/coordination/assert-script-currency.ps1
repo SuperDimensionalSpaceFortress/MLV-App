@@ -36,6 +36,36 @@ function Write-Result([string]$status, [string]$detail) {
     if ($PassThru) { Write-Output ([pscustomobject]@{ status = $status; detail = $detail; script = $ScriptPath; ref = $Ref }) }
 }
 
+# r15-PEEL-BEGIN (identical copy in Test-ProductRatioGuard.ps1 and Retire-LaneWorktree.ps1; pinned by test_r15_the_three_peel_helper_copies_are_identical)
+function Get-RevisionSuffixAfterPeel([string]$Suffix) {
+    # r15 (Dot B1 on a49424fb): mirrors git's own end-anchored parse (object-name.c get_oid_1 + peel_onion, read at git master and
+    # checked against git 2.40 by differential fuzz) instead of guessing at brace balance. From the END of the revision suffix:
+    #  - a trailing `~N` / `^N` (digits optional) is an ancestor step: drop it (get_oid_1's has_suffix branch, tried before peel_onion);
+    #  - a trailing `}`: find the LAST `^{` (peel_onion's backwards scan); the text between it and the final `}` is the content.
+    #    Content starting with `/` is a commit-message search: ALL of it is regex text (any `}` `[` `@{` inside), so the whole tail is
+    #    dropped. Content that is empty or exactly commit / tree / blob / tag / object is a peel: dropped. Any other content (for
+    #    example `}@{1` from `^{}@{1}`) is not a peel git can strip, so the loop stops there.
+    # What is left is returned; a `@{` left in it is an external reflog selector and the caller refuses it. git's own check on a type
+    # is a prefix test (`commit}` then ignores the rest); this one is exact, so the odd shapes git ignores are refused (fail-closed).
+    $end = $Suffix.Length
+    while ($end -gt 0) {
+        if ($Suffix[$end - 1] -ceq '}') {
+            if ($end -lt 3) { break }
+            $open = $Suffix.LastIndexOf('^{', $end - 2, [System.StringComparison]::Ordinal)
+            if ($open -lt 0) { break }
+            $content = $Suffix.Substring($open + 2, $end - 3 - $open)
+            if ($content.StartsWith('/', [System.StringComparison]::Ordinal) -or $content -ceq '' -or $content -ceq 'commit' -or $content -ceq 'tree' -or $content -ceq 'blob' -or $content -ceq 'tag' -or $content -ceq 'object') { $end = $open; continue }
+            break
+        }
+        $i = $end
+        while ($i -gt 0 -and $Suffix[$i - 1] -ge [char]'0' -and $Suffix[$i - 1] -le [char]'9') { $i-- }
+        if ($i -gt 0 -and ($Suffix[$i - 1] -ceq '~' -or $Suffix[$i - 1] -ceq '^')) { $end = $i - 1; continue }
+        break
+    }
+    return $Suffix.Substring(0, $end)
+}
+# r15-PEEL-END
+
 if ($env:MLV_ALLOW_STALE_TOOLS -eq '1') { Write-Result 'skipped' 'MLV_ALLOW_STALE_TOOLS=1'; return }
 if (-not (Test-Path -LiteralPath $ScriptPath)) { Write-Result 'unknown' 'script path does not exist'; return }
 
@@ -68,12 +98,11 @@ if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.
     # exact-ref read above would have to be re-resolved by NAME to honour it. No default caller uses reflog syntax, so it
     # is REFUSED, fail-CLOSED, with its own status. It must never fall to 'unknown': this guard is fail-OPEN on unknown.
     # r10 (sol r9 ADV-A2): refuse only an ACTUAL reflog selector - a `@{` outside a `^{/regex}` commit-message search group.
-    # r14 (sol r13 BLOCKER / adversary A1): a search group is `^{/` + BRACE-BALANCED text + `}`. A greedy `.*` strip ran to the last `}`
-    # and hid an external selector (`^{/s}^{}@{1}`); a non-greedy one refused a valid search holding `{n}` (`^{/a{1}foo@{1}}`); and git
-    # itself resolves `<sha>^{}@{1}`, so git cannot be the oracle. The balanced pattern ends the group at the first `}` that returns the
-    # brace depth to 0 (regex intervals `{n}` balance), so a `@{` left after the strip is an external selector. An unbalanced group
-    # is not stripped at all, so a `@{` inside it is refused (fail-closed). Linear: the loop body is single-character alternatives.
-    if ([regex]::Replace($refSuffix, '(?s)\^\{/(?:[^{}]|\{(?<d>)|\}(?<-d>))*(?(d)(?!))\}', '') -match '@\{') {
+    # r14/r15 (sol r13 BLOCKER, adversary A1, Dot B1): the suffix is parsed the way git parses it (see Get-RevisionSuffixAfterPeel above),
+    # not by a regex guess: a greedy `.*` strip hid `^{/s}^{}@{1}`, a non-greedy one refused `^{/a{1}foo@{1}}`, a brace-balanced one
+    # refused `^{/.*|[}]foo@{1}}`, and git itself resolves `<sha>^{}@{1}` so it cannot be the oracle. What the parse leaves behind is
+    # the part git would NOT treat as search text or a peel; a `@{` there is an external selector and is refused (fail-closed).
+    if ((Get-RevisionSuffixAfterPeel $refSuffix) -match '@\{') {
         $reflogMsg = "REFLOG EXPRESSION REFUSED (refused-reflog): -Ref '$Ref' uses a reflog selector (@{}) on a full refname; " +
                      "pass a commit SHA or a ~ / ^ expression instead. Refusing to run $rel rather than treating it as unknown."
         Write-Result 'refused-reflog' $reflogMsg

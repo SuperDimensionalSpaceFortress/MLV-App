@@ -6228,9 +6228,11 @@ def _r10_site(tmp_path, repo, site, expr_ps, name, disk="'a'\n", wt_sha=None):
     git(repo, "worktree", "add", "--detach", str(wt), wt_sha)
     body = ("$expr = " + expr_ps + "\n. '" + q(RETIRE) + "'\n"
             "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
-            "$d = Invoke-RetireLaneWorktree -WorkDir '" + q(wt) + "' -MergeTarget $expr -ProcessSnapshot $snap\n"
-            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason } | ConvertTo-Json -Compress\n")
-    return _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1"))
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + q(wt) + "' -MergeTarget $expr -ProcessSnapshot $snap -WhatIf\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason; workDir = [string]$d.workDir; head = [string]$d.head } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1"))
+    doc["wt"] = str(wt)       # r15: the worktree this call was asked to retire, for the exact-target assertion
+    return doc
 
 
 @pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
@@ -6768,14 +6770,12 @@ R14_HIDDEN_SELECTORS = [
     R6_REF + "^{/.*}^{}@{1}",            # adversary A1 (55f93997): the search MATCHES, the old fixtures' searches did not
     R6_REF + "^{}@{1}",                  # the simplest suffix that git itself resolves on a SHA
     R6_REF + "^{/B}^{}@{1}",
-    R6_REF + "^{/.*}~1@{1}",
+    # r15: `^{/.*}~1@{1}`, `^{/a{b}@{1}`, `^{/a}^{/b}@{1}` and `^{/a}~1@{1}` moved to R15_SEARCH_TEXT_TAILS: git's own end-anchored parse
+    # reads each whole tail as ONE search (the last `^{` opens it and the final `}` closes it), so its `@{` is regex text, not a selector.
     R6_REF + "^{/a{1}x}^{}@{1}",         # a search holding {n}, then an external selector
-    R6_REF + "^{/a{b}@{1}",              # unbalanced group: not stripped, its @{ is refused
     R6_REF + "^{/search}^{}@{1}",       # sol's catalogue input
     R6_REF + "^{/search}^{}@{0}",
     R6_REF + "^{/search}^{}@{2}",
-    R6_REF + "^{/a}^{/b}@{1}",           # two groups: greedy swallowed the span between them and the selector
-    R6_REF + "^{/a}~1@{1}",
     R6_REF + "^{/foo@{1}}^{}@{1}",       # a legitimate search followed by a real selector
 ]
 R14_PLAIN_REFLOG_CONTROLS = ["refs/remotes/fork/master@{1}", "refs/remotes/fork/master@{0}", "refs/remotes/fork/master@{1}~1"]
@@ -6831,12 +6831,23 @@ def test_r14_a_valid_search_holding_braces_resolves_in_git_and_is_not_refused_by
     assert rat.get("errorCode") in (None, "") and rat["sourceSha"] == want, (expr, rat)
     sub, (repo, sha_a, sha_b) = fresh("retire")
     ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r14-ret-valid", wt_sha=sha_a)
-    assert "reflog selector" not in ret["reason"] and "merge target ref missing" not in ret["reason"], (expr, ret)
+    _r15_assert_retired_exactly(ret, sha_a, expr)
+
+
+def _r15_assert_retired_exactly(ret, sha_a, expr):
+    """r15 (hub ACK 6565386601): the valid-search retirement must name the EXACT retirement target and action, not only lack two refusal
+    reasons. The fixture worktree is detached at A (an ancestor of every target the valid searches resolve to) and the call is -WhatIf, so
+    the disposition is action=would-retire, reason=ok, workDir=<the worktree asked for>, head=A, and nothing is removed. (A real retire with
+    no -QuarantineRoot throws at Retire-LaneWorktree.ps1 `Join-Path $QuarantineRoot` after the rename probe - a base defect, recorded as
+    an advisory in the r15 summary - which is why the pre-r15 "no refusal reason" assertion passed over a call that never reached ok.)"""
+    assert ret["action"] == "would-retire" and ret["reason"] == "ok", (expr, ret)
+    assert ret["workDir"] == ret["wt"] and ret["head"] == sha_a, (expr, ret)
+    assert os.path.isdir(ret["wt"]), (expr, "-WhatIf must not remove the worktree", ret)
 
 
 def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
     # The CLASS: a greedy or non-greedy `.*` strip of the `^{/...}` group cannot parse a brace-balanced search. No tools/ script keeps
-    # either, and every site strips with the brace-balanced pattern.
+    # either. (r14c's brace-balanced pattern was refuted in turn by `[}]` - Dot B1 - and is gone too: r15 pins the shared peel helper.)
     offenders = []
     for path in sorted((COORD.parent).rglob("*")):
         if path.suffix.lower() not in (".ps1", ".psm1", ".py", ".mjs") or path.name == "test_coordination_guardrails.py":
@@ -6845,6 +6856,167 @@ def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
             if "\\^\\{/.*" in line:
                 offenders.append("%s:%d" % (path, n))
     assert not offenders, offenders
-    token = "'(?s)\\^\\{/(?:[^{}]|\\{(?<d>)|\\}(?<-d>))*(?(d)(?!))\\}'"
+    balanced = "(?(d)(?!))"
     for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
-        assert token in path.read_text(encoding="utf-8"), (path, "the brace-balanced search-group strip is missing")
+        text = path.read_text(encoding="utf-8")
+        assert balanced not in text, (path, "r15: the brace-balanced regex strip is back; the reflog test must go through Get-RevisionSuffixAfterPeel")
+        assert text.count("Get-RevisionSuffixAfterPeel") == 2, (path, "one definition and one call site")
+
+
+# --- r15 (Dot B1 on a49424fb, delivery 925f2ec1): follow git's OWN end-anchored grammar, not a guess at brace balance ------------------
+# `refs/remotes/fork/master^{/.*|[}]foo@{1}}` is a valid commit-message search (git resolves it). r14c's brace-balanced strip ended the
+# group at the literal `}` inside the character class `[}]`, left `]foo@{1}}`, and refused it as a reflog selector. Four strip designs
+# (greedy, non-greedy, git-probe, brace-balanced) were each refuted by a new shape because none followed git's grammar. r15 mirrors
+# object-name.c: get_oid_1 drops a trailing `~N` / `^N`; peel_onion takes the LAST `^{` as the opener and the final `}` as the closer, and
+# content starting with `/` is search text of ANY shape (`}` `[` `@{` included), while content that is empty or one of the object types is
+# a peel. Anything else stops the parse. A `@{` left over is an external selector (typed refusal). One helper, three identical copies.
+R15_VALID_SEARCHES = [
+    (R6_REF + "^{/.*|[}]foo@{1}}", "b"),          # Dot B1: `.*` matches the tip B
+    (R6_REF + "^{/[}]*foo@{1}}", "a"),            # `}` in a class, then `@{1}` as an interval: A's 'foo@'
+    (R6_REF + "^{/[^}]*foo@{1}}", "a"),           # negated class holding `}`
+    (R6_REF + "^{/(x|[}])*foo@{1}}", "a"),        # alternation + class
+    (R6_REF + "^{/[}]*foo@{1}}~0", "a"),          # a trailing ancestor step after the search
+    (R6_REF + "^{/[}]*foo@{1}}^{commit}", "a"),   # a trailing peel after the search
+]
+# Shapes the r14 tests listed as hidden selectors that git's grammar reads as ONE search (last `^{` .. final `}`): the `@{` is regex text.
+# git resolves none of them (invalid or non-matching pattern), so the sites must report the ref as unresolved - not as a reflog refusal.
+R15_SEARCH_TEXT_TAILS = [
+    R6_REF + "^{/.*}~1@{1}",
+    R6_REF + "^{/a{b}@{1}",
+    R6_REF + "^{/a}^{/b}@{1}",
+    R6_REF + "^{/a}~1@{1}",
+]
+# Real selectors (git consults the reflog, or the suffix cannot be stripped as a peel): all still refused at every site.
+R15_HIDDEN_SELECTORS = [
+    R6_REF + "^{/.*|[}]foo@{1}}^{}@{1}",     # Dot's valid search followed by a real selector
+    R6_REF + "^{/[}]*foo@{1}}^{commit}@{1}",
+    R6_REF + "^{commit}@{1}",
+    R6_REF + "^{tree}@{1}",
+    R6_REF + "^{/x}^{foo}@{1}",              # an unknown peel type stops the parse
+    R6_REF + "^{/x}~1^{}@{1}",
+    R6_REF + "@{1}^{/[}]foo}",               # a real selector BEFORE a search
+]
+
+
+def _r15_check_valid(tmp_path, expr, disk, tag):
+    def fresh(site):
+        sub = tmp_path / site
+        sub.mkdir()
+        return sub, _r10_search_repo(sub)
+
+    sub, (repo, sha_a, sha_b) = fresh("currency")
+    want = sha_a if disk == "a" else sha_b
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == want, (expr, ok.stdout, ok.stderr)
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", tag + "-cur", disk="'%s'\n" % disk)
+    assert cur["status"] == "current" and cur["threw"] is False, (expr, cur)
+    sub, (repo, sha_a, sha_b) = fresh("ratio")
+    want = sha_a if disk == "a" else sha_b       # each site's repo has its own commit ids
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", tag + "-ratio")
+    assert rat.get("errorCode") in (None, "") and rat["sourceSha"] == want, (expr, rat)
+    sub, (repo, sha_a, sha_b) = fresh("retire")
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", tag + "-ret", wt_sha=sha_a)
+    _r15_assert_retired_exactly(ret, sha_a, expr)
+
+
+@pytest.mark.parametrize("expr,disk", R15_VALID_SEARCHES)
+def test_r15_a_valid_search_with_a_brace_in_a_character_class_resolves_in_git_and_at_every_site(tmp_path, expr, disk):
+    _r15_check_valid(tmp_path, expr, disk, "r15-valid")
+
+
+@pytest.mark.parametrize("expr", R15_HIDDEN_SELECTORS)
+def test_r15_the_currency_guard_still_refuses_a_real_selector_after_a_bracketed_brace_search(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r15-cur", disk="'a'\n")
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_HIDDEN_SELECTORS)
+def test_r15_the_ratio_guard_still_refuses_a_real_selector_after_a_bracketed_brace_search(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r15-ratio")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_HIDDEN_SELECTORS)
+def test_r15_the_retire_merge_gate_still_refuses_a_real_selector_after_a_bracketed_brace_search(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r15-ret", wt_sha=sha_a)
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_SEARCH_TEXT_TAILS)
+def test_r15_a_tail_git_reads_as_one_search_is_unresolved_not_a_reflog_refusal_at_every_site(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    probe = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    assert probe.returncode != 0 and probe.stdout.strip() == "", ("git itself must not resolve this tail", expr, probe.stdout)
+    sub = tmp_path / "currency"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", "r15-tail-cur", disk="'a'\n")
+    assert cur["status"] == "unknown" and cur["threw"] is False, (expr, cur)
+    sub = tmp_path / "ratio"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", "r15-tail-ratio")
+    assert rat["errorCode"] == "ERROR_REF_UNRESOLVED" and rat["sourceSha"] == "", (expr, rat)
+    sub = tmp_path / "retire"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r15-tail-ret", wt_sha=sha_a)
+    assert ret["action"] == "kept" and ret["reason"].startswith("cannot-determine: merge target ref missing"), (expr, ret)
+
+
+# (suffix, left an `@{` => refused). Pure helper table, run through the real function text of each site.
+R15_PEEL_TABLE = [
+    ("@{1}", True), ("@{0}", True), ("@{-1}", True), ("@{u}", True), ("@{1}~1", True), ("~1@{1}", True),
+    ("^{}@{1}", True), ("^{/s}^{}@{1}", True), ("^{/.*}^{}@{1}", True), ("^{/.*|a{1}x}^{}@{1}", True),
+    ("^{/.*|[}]foo@{1}}^{}@{1}", True), ("^{commit}@{1}", True), ("^{tree}@{1}", True), ("^{/x}^{foo}@{1}", True),
+    ("^{/x}~1^{}@{1}", True), ("@{1}^{/foo}", True), ("^{commit}^{}@{1}", True), ("^{/a}@{1}^{}@{1}", True),
+    ("^{/.*|[}]foo@{1}}", False), ("^{/.*|a{1}foo@{1}}", False), ("^{/foo@{1}}", False), ("^{/[}]*foo@{1}}~0", False),
+    ("^{/[^}]*foo@{1}}^{commit}", False), ("^{commit}^{/foo@{1}}", False), ("^{tree}^{/x}", False), ("^{/a}~1@{1}", False),
+    ("^{/a}^{/b}@{1}", False), ("^{/a{b}@{1}", False), ("^{/.*}~1@{1}", False), ("^{/x|}@{1}}", False),
+    ("~1", False), ("^", False), ("^2", False), ("^{}", False), ("^{object}~3^{blob}", False), ("~", False), ("", False),
+    ("^{/a", False), ("^{", False), ("}", False), ("^{}}", False),
+]
+
+
+def _r15_peel_run(tmp_path, site_script, cases):
+    inp = tmp_path / "peel-in.json"
+    out = tmp_path / "peel-out.json"
+    inp.write_text(json.dumps(cases), encoding="utf-8")
+    harness = tmp_path / "peel-run.ps1"
+    harness.write_text(
+        "param($Script,$In,$Out)\n"
+        "$t = [System.IO.File]::ReadAllText($Script); $b = $t.IndexOf('# r15-PEEL-BEGIN'); $e = $t.IndexOf('# r15-PEEL-END')\n"
+        "if ($b -lt 0 -or $e -lt $b) { throw 'markers missing' }\n"
+        "Invoke-Expression $t.Substring($b, $e - $b)\n"
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        "$r = foreach ($s in @(Get-Content -LiteralPath $In -Raw | ConvertFrom-Json)) { [bool]((Get-RevisionSuffixAfterPeel ([string]$s)) -match '@\\{') }\n"
+        "[System.IO.File]::WriteAllText($Out, (@{ refused = @($r); ms = $sw.ElapsedMilliseconds } | ConvertTo-Json -Compress))\n",
+        encoding="utf-8")
+    run = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness), "-Script", str(site_script), "-In", str(inp), "-Out", str(out)],
+                         text=True, capture_output=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    return json.loads(out.read_text(encoding="utf-8-sig"))
+
+
+@pytest.mark.parametrize("site", ["assert-script-currency.ps1", "Test-ProductRatioGuard.ps1", "Retire-LaneWorktree.ps1"])
+def test_r15_the_peel_helper_follows_gits_grammar_on_the_table_and_is_linear(tmp_path, site):
+    # The `^{}` x 5000 and `~1` x 5000 tails are 15000 / 10000 characters; a quadratic rescan would take minutes, linear takes milliseconds.
+    cases = [s for s, _ in R15_PEEL_TABLE] + ["^{}" * 5000, "~1" * 5000, "^{/a}" * 3000 + "@{1}", "^{}" * 5000 + "@{1}"]
+    want = [w for _, w in R15_PEEL_TABLE] + [False, False, False, True]
+    got = _r15_peel_run(tmp_path, COORD / site, cases)
+    bad = [(c[:60], w, g) for c, w, g in zip(cases, want, got["refused"]) if w != g]
+    assert not bad, (site, bad)
+    assert got["ms"] < 10000, (site, got["ms"])
+
+
+def test_r15_the_three_peel_helper_copies_are_identical():
+    def block(path):
+        text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        b = text.index("# r15-PEEL-BEGIN")
+        e = text.index("# r15-PEEL-END") + len("# r15-PEEL-END")
+        assert text.count("# r15-PEEL-BEGIN") == 1 and text.count("# r15-PEEL-END") == 1, path
+        return text[b:e]
+
+    blocks = [block(COORD / n) for n in ("assert-script-currency.ps1", "Test-ProductRatioGuard.ps1", "Retire-LaneWorktree.ps1")]
+    assert blocks[0] == blocks[1] == blocks[2], "the three Get-RevisionSuffixAfterPeel copies drifted apart"
+    assert "function Get-RevisionSuffixAfterPeel" in blocks[0]

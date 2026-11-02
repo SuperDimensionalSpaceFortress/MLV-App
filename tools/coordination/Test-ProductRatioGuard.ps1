@@ -56,6 +56,36 @@ function New-Decision {
     }
 }
 
+# r15-PEEL-BEGIN (identical copy in Test-ProductRatioGuard.ps1 and Retire-LaneWorktree.ps1; pinned by test_r15_the_three_peel_helper_copies_are_identical)
+function Get-RevisionSuffixAfterPeel([string]$Suffix) {
+    # r15 (Dot B1 on a49424fb): mirrors git's own end-anchored parse (object-name.c get_oid_1 + peel_onion, read at git master and
+    # checked against git 2.40 by differential fuzz) instead of guessing at brace balance. From the END of the revision suffix:
+    #  - a trailing `~N` / `^N` (digits optional) is an ancestor step: drop it (get_oid_1's has_suffix branch, tried before peel_onion);
+    #  - a trailing `}`: find the LAST `^{` (peel_onion's backwards scan); the text between it and the final `}` is the content.
+    #    Content starting with `/` is a commit-message search: ALL of it is regex text (any `}` `[` `@{` inside), so the whole tail is
+    #    dropped. Content that is empty or exactly commit / tree / blob / tag / object is a peel: dropped. Any other content (for
+    #    example `}@{1` from `^{}@{1}`) is not a peel git can strip, so the loop stops there.
+    # What is left is returned; a `@{` left in it is an external reflog selector and the caller refuses it. git's own check on a type
+    # is a prefix test (`commit}` then ignores the rest); this one is exact, so the odd shapes git ignores are refused (fail-closed).
+    $end = $Suffix.Length
+    while ($end -gt 0) {
+        if ($Suffix[$end - 1] -ceq '}') {
+            if ($end -lt 3) { break }
+            $open = $Suffix.LastIndexOf('^{', $end - 2, [System.StringComparison]::Ordinal)
+            if ($open -lt 0) { break }
+            $content = $Suffix.Substring($open + 2, $end - 3 - $open)
+            if ($content.StartsWith('/', [System.StringComparison]::Ordinal) -or $content -ceq '' -or $content -ceq 'commit' -or $content -ceq 'tree' -or $content -ceq 'blob' -or $content -ceq 'tag' -or $content -ceq 'object') { $end = $open; continue }
+            break
+        }
+        $i = $end
+        while ($i -gt 0 -and $Suffix[$i - 1] -ge [char]'0' -and $Suffix[$i - 1] -le [char]'9') { $i-- }
+        if ($i -gt 0 -and ($Suffix[$i - 1] -ceq '~' -or $Suffix[$i - 1] -ceq '^')) { $end = $i - 1; continue }
+        break
+    }
+    return $Suffix.Substring(0, $end)
+}
+# r15-PEEL-END
+
 function Invoke-GitLines {
     param([Parameter(Mandatory)][string[]]$Arguments)
     $lines = @(& git -C $RepoRoot @Arguments 2>$null)
@@ -402,9 +432,9 @@ try {
         # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname is
         # REFUSED with its own code (fail-closed, exit 3) instead of surfacing as a misleading ERROR_REF_UNRESOLVED.
         # r10 (sol r9 ADV-A2): only an ACTUAL reflog selector (a `@{` outside a `^{/regex}` search group) is refused.
-        # r14 (sol r13 BLOCKER / adversary A1): a search group is `^{/` + BRACE-BALANCED text + `}` (see assert-script-currency.ps1);
-        # a `@{` left after stripping balanced groups is an external selector and is refused, fail-closed.
-        if ([regex]::Replace($refSuffix, '(?s)\^\{/(?:[^{}]|\{(?<d>)|\}(?<-d>))*(?(d)(?!))\}', '') -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
+        # r14/r15 (sol r13 BLOCKER, Dot B1): the suffix is parsed the way git parses it (Get-RevisionSuffixAfterPeel above); a `@{` left
+        # after the search groups and peels are dropped is an external selector and is refused, fail-closed.
+        if ((Get-RevisionSuffixAfterPeel $refSuffix) -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
         $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
         $refExists = ($exactSha -match '^[0-9a-f]{40}$')
         if ($refExists) { $revision = "$exactSha$refSuffix" }
