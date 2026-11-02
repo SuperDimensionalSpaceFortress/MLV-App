@@ -1055,15 +1055,19 @@ if ($ImagePathsGiven.Count -gt 0) {
 # r8 (ADV-A1): the refused set is the CLASS cmd.exe can rewrite in an argument the shim forwards via %*, not a list of observed cases:
 #   %        expanded in the command-line and batch phases, quoted or not
 #   !        expanded (or, unpaired, deleted) by delayed expansion, quoted or not. Delayed expansion is on for every batch the host runs when
-#            HKCU or HKLM 'Software\Microsoft\Command Processor\DelayedExpansion' is 1 (no /V:ON is needed), so it is a property of the
-#            machine at launch time, not of this script: refuse it unconditionally. Measured: C:\x\!OS!\f.png -> C:\x\Windows_NT\f.png under /V:ON.
+#            HKCU or HKLM 'Software\Microsoft\Command Processor\DelayedExpansion' is 1 (no /V:ON is needed), or when the shim turns it on.
+#            Measured: C:\x\!OS!\f.png -> C:\x\Windows_NT\f.png under /V:ON, and unchanged with it off. So '!' is refused exactly when
+#            Test-CmdDelayedExpansion says delayed expansion can be on for the codex shim (-RefuseBang), NOT unconditionally: the default
+#            -RunDir is under C:\!Layi Wkspc\MLV-App, and an unconditional refusal made every default image launch refuse its own snapshot
+#            (r8 iteration-2 adversary A1 on 0f0450d7).
 #   ^ & | < > the escape and the command separators / redirections of an unquoted argument
 #   ( )      block delimiters; measured unchanged through today's npm shim, refused because a shim that forwards %* inside a block splits on ')'
 #   "        quote state: toggles whether every character after it is special
 # '|', '<', '>' and '"' cannot occur in a Windows file name, so for them this is defence in depth. Every other file-name-legal character
 # (space # $ ' + , - . ; = @ [ ] _ ` { } ~) was measured to reach the child unchanged; ',' is refused separately (codex splits on it).
-$IMAGE_CMD_META_PATTERN = '[%!^&|<>()"]'
-$IMAGE_CMD_META_TEXT = "a cmd.exe metacharacter (% ! ^ & | < > ( ) or a double quote; codex is launched through a .cmd shim, and cmd.exe rewrites them -- choose a run dir without them)"
+$IMAGE_CMD_META_PATTERN = '[%^&|<>()"]'
+$IMAGE_CMD_META_TEXT = "a cmd.exe metacharacter (% ^ & | < > ( ) or a double quote; codex is launched through a .cmd shim, and cmd.exe rewrites them -- choose a run dir without them)"
+$IMAGE_CMD_BANG_TEXT = "'!' while cmd.exe delayed expansion can be on for the codex shim (Command Processor\DelayedExpansion, or the shim enables it), which rewrites it -- choose a run dir without '!'"
 if (-not ('MlvImageSnap' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -1163,7 +1167,8 @@ function Get-ImageIoException {
     return [System.IO.IOException]::new("image-path-unreadable: $($base.Message) ($Source)")
 }
 function Copy-ImageSnapshot {
-    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
+    # -RefuseBang: refuse '!' in the resolved path (the launcher passes Test-CmdDelayedExpansion's answer; unset = refuse, fail closed).
+    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs, [bool]$RefuseBang = $true)
     if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "image-path-snapshot-collision: the image snapshot path is the source file itself: $Source"
     }
@@ -1234,6 +1239,7 @@ function Copy-ImageSnapshot {
         if ($null -ne $reparse) { throw [System.IO.IOException]::new("image-path-reparse-ancestor: the resolved image snapshot path has a reparse point in its ancestry ($reparse) ($finalPath)") }
         if ($finalPath.Contains(',')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ',' (codex splits an -i value on commas): $finalPath") }
         if ($finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_META_TEXT}: $finalPath") }
+        if ($RefuseBang -and $finalPath.Contains('!')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_BANG_TEXT}: $finalPath") }
         $ok = $true
     } finally {
         # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
@@ -1986,12 +1992,19 @@ if ($cfg.engine -eq 'claude') {
     # describe the very bytes codex reads, whatever happens to the source afterwards (adversary A2). The copies stay
     # in the run dir as evidence of exactly what the judge saw.
     $imageSeq = 0
+    # r8 iteration 2: '!' is refused only when delayed expansion can be on for this shim (see $IMAGE_CMD_META_PATTERN); a native exe has no cmd.exe.
+    $imageRefuseBang = $false
+    if (@($ImageAttachments).Count -gt 0) {
+        $imageExeExt = [System.IO.Path]::GetExtension($exe).ToLowerInvariant()
+        $imageRefuseBang = ($imageExeExt -eq '.cmd' -or $imageExeExt -eq '.bat') -and (Test-CmdDelayedExpansion -Shim $exe)
+    }
     foreach ($attachment in $ImageAttachments) {
         $imageSeq++
         $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
         if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
         if ($snapshot -match $IMAGE_CMD_META_PATTERN) { throw "image-path-bad-character: the image snapshot path contains ${IMAGE_CMD_META_TEXT}: $snapshot" }
-        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)
+        if ($imageRefuseBang -and $snapshot.Contains('!')) { throw "image-path-bad-character: the image snapshot path contains ${IMAGE_CMD_BANG_TEXT}: $snapshot" }
+        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0) -RefuseBang $imageRefuseBang
         # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
         # r5 B1: that string is the RESOLVED path of the held object (Copy-ImageSnapshot's Path), not the name the copy went through.
         $snapshot = [string]$snapshotInfo.Path

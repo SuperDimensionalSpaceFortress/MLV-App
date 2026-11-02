@@ -1310,8 +1310,9 @@ def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(f
 
 # r8 (ADV-A1): the refused set is the class cmd.exe can rewrite in a %*-forwarded argument. '|', '<', '>' and '"' cannot be in a Windows file
 # name, so they are proved on the extracted pattern; every file-name-legal character measured to survive the shim must still be accepted.
-_CMD_REFUSED = ['%','!','^','&','|','<','>','(',')','"']
-_CMD_SURVIVES = [' ','#','$',"'",'+','-','.',';','=','@','[',']','_','`','{','}','~']
+# '!' is in neither list: it is refused only when delayed expansion can be on (-RefuseBang / Test-CmdDelayedExpansion; tests below).
+_CMD_REFUSED = ['%','^','&','|','<','>','(',')','"']
+_CMD_SURVIVES = [' ','#','$',"'",'+','-','.',';','=','@','[',']','_','`','{','}','~','!']
 
 
 @pytest.mark.parametrize("ch",_CMD_REFUSED+_CMD_SURVIVES)
@@ -1321,6 +1322,47 @@ $p = 'C:\\x\\a' + [string][char]{ord(ch)} + 'b\\terra-001.image-01.png'
 'MATCH ' + ($p -match $IMAGE_CMD_META_PATTERN)
 """)
     assert ("MATCH True" if ch in _CMD_REFUSED else "MATCH False") in r.stdout,(ch,r.stdout,r.stderr)
+
+
+def _registry_delayed_expansion_on():
+    import winreg
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, r"Software\Microsoft\Command Processor") as k:
+                if int(winreg.QueryValueEx(k, "DelayedExpansion")[0]) != 0: return True
+        except OSError: pass
+    return False
+
+
+def test_a_default_style_run_dir_with_a_bang_attaches_and_verifies_when_delayed_expansion_is_off(fixture_tree):
+    # r8 iteration-2 adversary A1 (0f0450d7): the default -RunDir is under C:\!Layi Wkspc\MLV-App, and the unconditional '!' refusal made
+    # every default image launch refuse its own snapshot. With delayed expansion off, cmd.exe passes '!' unchanged (probe-cmd-meta.txt), so
+    # the launch must proceed and the child must read exactly the bytes the receipt certifies.
+    if _registry_delayed_expansion_on(): pytest.skip("this host turns cmd.exe delayed expansion on; the refusal case is covered by the delayed-shim tests")
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    run_dir=root/"!Layi Wkspc"/"run"; run_dir.mkdir(parents=True)
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads((run_dir/"terra-001.receipt.json").read_text(encoding="utf-8"))["imagePaths"][0]
+    assert "!" in entry["path"] and seen[0]["path"]==entry["path"],(entry,seen)
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"]==sha,(entry,seen)
+
+
+def test_copy_image_snapshot_refuses_a_bang_only_when_told_to(tmp_path):
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); d=tmp_path/"a!b"; d.mkdir()
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+foreach ($refuse in $true, $false) {{
+  try {{ $s = Copy-ImageSnapshot -Source '{src}' -Dest ('{d}\\snap-' + $refuse + '.png') -Clock $clock -LimitMs 60000 -RefuseBang $refuse; 'OK ' + $refuse; $s.Hold.Dispose() }}
+  catch {{ 'CAUGHT ' + $refuse + ' ' + $_.Exception.GetBaseException().Message }}
+}}
+""")
+    assert "CAUGHT True image-path-bad-character:" in r.stdout and "OK False" in r.stdout,(r.stdout,r.stderr)
 
 
 def _cmdline_harness(tmp_path, body):
