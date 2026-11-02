@@ -1295,19 +1295,70 @@ function Get-NativeCommandLineLength {
     }
     return $n
 }
-function Test-CmdDelayedExpansion {
-    # cmd.exe /? : delayed expansion is on for every invocation when HKCU or HKLM 'Software\Microsoft\Command Processor' DelayedExpansion is 1
-    # (HKCU wins over HKLM; this check is ON when EITHER is non-zero, which only ever refuses more), and a shim can turn it on itself. An
-    # unreadable shim counts as ON (fail closed).
-    param([Parameter(Mandatory = $true)][string]$Shim)
+function Get-CmdRegistryDelayedExpansion {
+    # r9 (sol B1): the EFFECTIVE registry setting, not "either hive". cmd.exe /? on this host:
+    #   "HKEY_LOCAL_MACHINE\Software\Microsoft\Command Processor\DelayedExpansion and/or
+    #    HKEY_CURRENT_USER\Software\Microsoft\Command Processor\DelayedExpansion to either 0x1 or 0x0. The user specific setting takes
+    #    precedence over the machine setting. The command line switches take precedence over the registry settings."
+    # So HKCU decides when it holds the value; HKLM decides only when HKCU does not. A missing key or value is "not set" (next hive); a value
+    # that is not an integer, or a read that fails for any other reason, is unknowable and counts as ON (fail closed).
     foreach ($hive in 'HKCU:', 'HKLM:') {
         try {
-            $v = (Get-ItemProperty -LiteralPath "$hive\Software\Microsoft\Command Processor" -Name DelayedExpansion -ErrorAction Stop).DelayedExpansion
-            if ($null -ne $v -and [int64]$v -ne 0) { return $true }
-        } catch { }
+            $props = Get-ItemProperty -LiteralPath "$hive\Software\Microsoft\Command Processor" -ErrorAction Stop
+        } catch {
+            if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) { continue }
+            return $true
+        }
+        $p = if ($null -ne $props) { $props.PSObject.Properties['DelayedExpansion'] } else { $null }
+        if ($null -eq $p) { continue }
+        $v = $p.Value
+        if ($v -is [int] -or $v -is [long] -or $v -is [uint32] -or $v -is [uint64]) { return ([int64]$v -ne 0) }
+        return $true
     }
+    return $false
+}
+function Test-CmdShimTextEnablesDelayedExpansion {
+    # r9 (sol B2, fable hardening 2): match the shim the way cmd.exe parses it, not as raw text.
+    # - A physical line ending in an odd run of '^' continues onto the next one; the joined logical line is matched whole and is never
+    #   treated as a comment (measured: 'rem x ^' does not swallow a following 'setlocal enabledelayedexpansion').
+    # - Every '^' is removed before matching. cmd.exe removes the escaping carets outside quotes ('setlocal enable^delayedexpansion' and
+    #   'cmd /v:o^n' both turned expansion on, measured); removing ALL of them can only add matches, never lose one, because no pattern
+    #   below contains a caret.
+    # - A logical line whose first token is literally 'rem' or '::' is a comment and is skipped (measured: 'rem x & setlocal
+    #   enabledelayedexpansion' and ':: x & setlocal ...' leave expansion off). 'r^em' is not skipped (fail closed).
+    # - '/v' with an optional ':on' (any case) is the cmd.exe switch; '/v:off' is not.
+    # - A setlocal whose arguments are built at run time ('setlocal %E%', measured ON) cannot be read statically and counts as ON.
+    param([AllowEmptyString()][string]$Text)
+    $logical = [System.Collections.Generic.List[object]]::new()
+    $buf = $null; $joined = $false
+    foreach ($phys in ($Text -split '\r?\n')) {
+        $tail = [regex]::Match($phys, '\^+$')
+        $continues = $tail.Success -and ($tail.Length % 2 -eq 1)
+        if ($continues) { $phys = $phys.Substring(0, $phys.Length - 1) }
+        if ($null -eq $buf) { $buf = $phys } else { $buf += $phys; $joined = $true }
+        if ($continues) { $joined = $true; continue }
+        $logical.Add(@($buf, $joined)); $buf = $null; $joined = $false
+    }
+    if ($null -ne $buf) { $logical.Add(@($buf, $true)) }
+    foreach ($entry in $logical) {
+        $raw = [string]$entry[0]
+        if (-not [bool]$entry[1] -and $raw -match '^[\s@;,=]*(?i:rem(\s|$)|::)') { continue }
+        $t = $raw.Replace('^', '')
+        if ($t -match '(?i)enabledelayedexpansion') { return $true }
+        if ($t -match '(?i)/v(?!:off(?![a-z0-9]))(?![a-z0-9])') { return $true }
+        if ($t -match '(?i)(?<![a-z0-9_])setlocal(?![a-z0-9_])[^&|]*[%!]') { return $true }
+    }
+    return $false
+}
+function Test-CmdDelayedExpansion {
+    # Delayed expansion is on for the shim's %* forwarding when the effective registry setting is on (Get-CmdRegistryDelayedExpansion) or
+    # the shim turns it on itself (Test-CmdShimTextEnablesDelayedExpansion). An unreadable shim counts as ON (fail closed). A shim that
+    # enables it and later ends that scope with endlocal still counts as ON: a static reading cannot follow goto/call, so this over-refuses
+    # (typed, visible) rather than guessing.
+    param([Parameter(Mandatory = $true)][string]$Shim)
+    if (Get-CmdRegistryDelayedExpansion) { return $true }
     try { $text = [System.IO.File]::ReadAllText($Shim) } catch { return $true }
-    return ($text -match '(?i)enabledelayedexpansion|/v:on')
+    return (Test-CmdShimTextEnablesDelayedExpansion -Text $text)
 }
 function Assert-CodexCommandLineFits {
     param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0, [object]$DelayedExpansion = $null)

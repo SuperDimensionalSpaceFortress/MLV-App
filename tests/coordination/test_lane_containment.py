@@ -1283,12 +1283,15 @@ try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGH
     # r8 (ADV-A1): '!' is expanded by delayed expansion, which HKCU/HKLM Command Processor\DelayedExpansion=1 turns on for every batch file.
     # The fixture shim enables it itself (setlocal enabledelayedexpansion) so the registry is never touched; '(' / ')' are refused as a class.
     ("!OS!","Windows_NT",True),("a!b",None,True),("a(b",None,False),("a)b",None,False),
+    # r9 (sol r8 B2): the shim enables it with an escaped spelling cmd.exe still obeys; r8 read it as off and certified bytes Q never read.
+    ("!OS!","Windows_NT","setlocal enable^delayedexpansion"),
 ])
 def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded,delayed):
     # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
     # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
     if delayed:
-        fixture_tree["shim"].write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+        enable=delayed if isinstance(delayed,str) else "setlocal enabledelayedexpansion"
+        fixture_tree["shim"].write_text(f'@echo off\r\n{enable}\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
     root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
     run_dir=root/dirname; run_dir.mkdir()
     if expanded:
@@ -1443,6 +1446,82 @@ def test_delayed_expansion_is_detected_from_the_shim_itself(tmp_path):
 """)
     assert "ON True" in r.stdout and "MISSING True" in r.stdout,(r.stdout,r.stderr)
     assert re.search(r"PLAIN (True|False)",r.stdout),(r.stdout,r.stderr)
+
+
+# r9: the registry is never read or written by these tests. Get-ItemProperty is shadowed by a script function (a PowerShell function wins over
+# the cmdlet of the same name) that answers from $MockReg; 'absent' means the key exists without a DelayedExpansion value. The mock answers
+# both the r8 call shape (-Name DelayedExpansion, throws when absent) and the r9 one (whole key, value missing), so the RED is behavioural.
+_REG_MOCK = """
+$MockReg = @{{ 'HKCU:' = {hkcu}; 'HKLM:' = {hklm} }}
+function Get-ItemProperty {{
+  [CmdletBinding()] param([string]$LiteralPath, [string[]]$Name)
+  $v = $MockReg[$LiteralPath.Substring(0, 5)]
+  if ($Name) {{
+    if ($null -eq $v) {{ throw [System.Management.Automation.PSArgumentException]::new('Property DelayedExpansion does not exist') }}
+    return [pscustomobject]@{{ DelayedExpansion = $v }}
+  }}
+  if ($null -eq $v) {{ return [pscustomobject]@{{ EnableExtensions = 1 }} }}
+  return [pscustomobject]@{{ EnableExtensions = 1; DelayedExpansion = $v }}
+}}
+"""
+_PLAIN_SHIM = '@echo off\r\n"x.exe" %*\r\n'
+
+
+def _detect(tmp_path, shim_text, hkcu="$null", hklm="$null"):
+    shim=tmp_path/"shim.cmd"; shim.write_bytes(shim_text.encode("ascii"))
+    r=_cmdline_harness(tmp_path,_REG_MOCK.format(hkcu=hkcu,hklm=hklm)+f"\n'DETECTED ' + (Test-CmdDelayedExpansion -Shim '{shim}')\n")
+    m=re.search(r"DETECTED (True|False)",r.stdout)
+    assert m,(r.stdout,r.stderr)
+    return m.group(1)=="True"
+
+
+@pytest.mark.parametrize("hkcu,hklm,expected",[
+    # sol r8 B1 / fable r8 hardening 2: cmd.exe /? "The user specific setting takes precedence over the machine setting."
+    ("[int]0","[int]1",False),("[int]1","[int]0",True),("[int]0","[int]0",False),
+    ("$null","[int]1",True),("[int]1","$null",True),("$null","$null",False),
+    # a value cmd.exe would not read as a DWORD is unknowable: fail closed.
+    ("'0'","[int]0",True),
+])
+def test_registry_delayed_expansion_is_the_effective_setting_hkcu_over_hklm(tmp_path,hkcu,hklm,expected):
+    assert _detect(tmp_path,_PLAIN_SHIM,hkcu,hklm) is expected
+
+
+@pytest.mark.parametrize("shim_text",[
+    '@echo off\r\nrem EnableDelayedExpansion is disabled\r\n"x.exe" %*\r\n',
+    '@echo off\r\n@REM setlocal EnableDelayedExpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\n:: cmd /v:on was removed\r\n"x.exe" %*\r\n',
+    # measured on this host: rem and :: swallow a '&' on their own line, so this never runs.
+    '@echo off\r\nrem x & setlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\nsetlocal DisableDelayedExpansion\r\ncmd /v:off /c "x.exe" %*\r\n',
+])
+def test_comment_lines_and_disabling_spellings_do_not_turn_delayed_expansion_on(tmp_path,shim_text):
+    # sol r8 B1: both hives 0 plus a harmless comment refused every default C:\!Layi Wkspc run dir.
+    assert _detect(tmp_path,shim_text,"[int]0","[int]0") is False
+
+
+def test_the_real_npm_codex_shim_shape_reads_as_delayed_expansion_off(tmp_path):
+    npm=('@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n'
+         'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n'
+         'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n')
+    assert _detect(tmp_path,npm,"[int]0","[int]0") is False
+
+
+@pytest.mark.parametrize("shim_text",[
+    # sol r8 B2 (measured: cmd.exe removed the caret and expanded !OS! to Windows_NT)
+    '@echo off\r\nsetlocal enable^delayedexpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\ncmd /v:o^n /c "x.exe" %*\r\n',
+    # fable r8 hardening 2: a bare /V, and the other spellings of the switch
+    '@echo off\r\ncmd /V /c "x.exe" %*\r\n',
+    '@echo off\r\n%COMSPEC% /V:ON /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd/v /c "x.exe" %*\r\n',
+    '@echo off\r\nsetlocal ^^^\r\nenabledelayedexpansion\r\n"x.exe" %*\r\n',
+    # a comment line continued onto a live line is not a comment (measured: 'rem x ^' did not swallow the setlocal)
+    '@echo off\r\nrem x ^\r\nsetlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
+    # arguments built at run time cannot be read statically (measured: 'setlocal %E%' turned it on)
+    '@echo off\r\nset E=enabledelayed\r\nsetlocal %E%expansion\r\n"x.exe" %*\r\n',
+])
+def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
+    assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True
 
 
 def test_a_model_override_cmd_would_expand_past_the_limit_is_refused_before_the_codex_child_starts(fixture_tree):
