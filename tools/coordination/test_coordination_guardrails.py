@@ -7009,6 +7009,63 @@ def test_r15_the_peel_helper_follows_gits_grammar_on_the_table_and_is_linear(tmp
     assert got["ms"] < 10000, (site, got["ms"])
 
 
+# --- r15 adversary A1 (cb45cce1; = the r14 pass-2 A2): the full-refname classifier is case-insensitive in PowerShell ------------------
+# `-match '^refs/...'` also matches `REFS/` and `Refs/`, which routed them into `show-ref --verify` - a case-sensitive literal-prefix
+# check - so a ref git resolves read as 'unknown' (currency, fail-OPEN), ERROR_REF_UNRESOLVED (ratio) or 'merge target ref missing'
+# (retire). The reflog refusal keeps the case-insensitive classifier (a `REFS/x@{1}` must still be refused); only the EXACT-ref read
+# (show-ref) is limited to a lowercase `refs/` base. A non-lowercase base goes down the r7 path: the whole input to rev-parse, once.
+R15_CASED_REFS = [("REFS/remotes/fork/master", "b"), ("Refs/remotes/fork/master", "b"), ("REFS/remotes/fork/master~1", "a"), ("rEfS/remotes/fork/master^{commit}", "b")]
+R15_CASED_REFLOG = ["REFS/remotes/fork/master@{1}", "Refs/remotes/fork/master@{0}", "REFS/remotes/fork/master^{}@{1}", "Refs/remotes/fork/master~1@{1}"]
+
+
+def _r15_cased_ref_resolves_in_git(repo, expr, want):
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    if ok.returncode != 0:
+        pytest.skip("this filesystem does not resolve a REFS/ spelling of a loose ref: " + expr)
+    assert ok.stdout.strip() == want, (expr, ok.stdout)
+
+
+@pytest.mark.parametrize("expr,tip", R15_CASED_REFS)
+def test_r15_a1_the_currency_guard_resolves_a_non_lowercase_refs_namespace_like_git(tmp_path, expr, tip):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    _r15_cased_ref_resolves_in_git(repo, expr, sha_b if tip == "b" else sha_a)
+    # disk = A's blob: tip B reads 'stale' (and throws), ~1 = A reads 'current'. 'unknown' is the fail-open bug.
+    doc = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r15-a1-cur", disk="'a'\n")
+    want = "stale" if tip == "b" else "current"
+    assert doc["status"] == want and doc["threw"] is (tip == "b"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr,tip", R15_CASED_REFS)
+def test_r15_a1_the_ratio_guard_resolves_a_non_lowercase_refs_namespace_like_git(tmp_path, expr, tip):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    _r15_cased_ref_resolves_in_git(repo, expr, sha_b if tip == "b" else sha_a)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r15-a1-ratio")
+    assert doc.get("errorCode") in (None, "") and doc["sourceSha"] == (sha_b if tip == "b" else sha_a), (expr, doc)
+
+
+@pytest.mark.parametrize("expr,tip", R15_CASED_REFS)
+def test_r15_a1_the_retire_merge_gate_resolves_a_non_lowercase_refs_namespace_like_git(tmp_path, expr, tip):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    _r15_cased_ref_resolves_in_git(repo, expr, sha_b if tip == "b" else sha_a)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r15-a1-ret", wt_sha=sha_a)    # A is an ancestor of B and of A
+    assert doc["action"] == "would-retire" and doc["reason"] == "ok" and doc["workDir"] == doc["wt"] and doc["head"] == sha_a, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_CASED_REFLOG)
+def test_r15_a1_a_non_lowercase_refs_namespace_is_still_refused_when_it_carries_a_reflog_selector(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    cur = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r15-a1-reflog-cur", disk="'a'\n")
+    assert cur["status"] == "refused-reflog" and cur["threw"] is True, (expr, cur)
+    sub = tmp_path / "ratio"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", "r15-a1-reflog-ratio")
+    assert rat["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, rat)
+    sub = tmp_path / "retire"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r15-a1-reflog-ret", wt_sha=sha_a)
+    assert ret["action"] == "kept" and ret["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, ret)
+
+
 def test_r15_the_three_peel_helper_copies_are_identical():
     def block(path):
         text = path.read_text(encoding="utf-8").replace("\r\n", "\n")

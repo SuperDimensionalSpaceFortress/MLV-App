@@ -1481,12 +1481,17 @@ function Invoke-RetireLaneWorktree {
             # r14/r15 (sol r13 BLOCKER, Dot B1): the suffix is parsed the way git parses it (Get-RevisionSuffixAfterPeel above); a `@{` left
             # after the search groups and peels are dropped is an external selector and is refused, fail-closed.
             if ($mergeBaseIsRef -and (Get-RevisionSuffixAfterPeel $mergeSuffix) -match '@\{') { $d.reason = "cannot-determine: merge target uses a reflog selector (@{) and is refused ($MergeTarget)"; return [pscustomobject]$d }
-            if ($mergeBaseIsRef) {
+            # r15 (adversary A1 on cb45cce1): `-match` is case-insensitive, so `REFS/...` is $mergeBaseIsRef too; `show-ref --verify` is a
+            # case-sensitive literal-prefix check and rejects it (a ref git resolves read as 'merge target ref missing'). The reflog refusal
+            # above keeps the case-insensitive class; the exact-ref read is for a lowercase `refs/` base only, any other spelling goes whole
+            # to the rev-parse below (the r7 behaviour).
+            $mergeBaseIsExact = ($mergeBaseIsRef -and $mergeBase -cmatch '^refs/')
+            if ($mergeBaseIsExact) {
                 $baseSha = [string](& git.exe -C $main show-ref --verify --hash $mergeBase 2>$null | Select-Object -First 1)
                 if ($baseSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
                 $mergeSpec = "$baseSha$mergeSuffix"
             }
-            if ($mergeSuffix -or -not $mergeBaseIsRef) {
+            if ($mergeSuffix -or -not $mergeBaseIsExact) {
                 $mergeSha = [string](& git.exe -C $main rev-parse --verify --quiet --end-of-options "$mergeSpec^{commit}" 2>$null | Select-Object -First 1)
                 if ($mergeSha -notmatch '^[0-9a-f]{40}$') { $d.reason = "cannot-determine: merge target ref missing ($MergeTarget)"; return [pscustomobject]$d }
                 $mergeRev = $mergeSha

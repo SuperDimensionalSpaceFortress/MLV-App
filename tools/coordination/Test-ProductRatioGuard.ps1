@@ -435,9 +435,14 @@ try {
         # r14/r15 (sol r13 BLOCKER, Dot B1): the suffix is parsed the way git parses it (Get-RevisionSuffixAfterPeel above); a `@{` left
         # after the search groups and peels are dropped is an external selector and is refused, fail-closed.
         if ((Get-RevisionSuffixAfterPeel $refSuffix) -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
-        $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
-        $refExists = ($exactSha -match '^[0-9a-f]{40}$')
-        if ($refExists) { $revision = "$exactSha$refSuffix" }
+        # r15 (adversary A1 on cb45cce1): `-match` is case-insensitive, so `REFS/...` reached this point too; `show-ref --verify` is a
+        # case-sensitive literal-prefix check and rejects it (a ref git resolves read as unresolved). The reflog refusal above keeps the
+        # case-insensitive class; the exact-ref read is for a lowercase `refs/` base only, any other spelling goes whole to rev-parse below.
+        if ($refBase -cmatch '^refs/') {
+            $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
+            $refExists = ($exactSha -match '^[0-9a-f]{40}$')
+            if ($refExists) { $revision = "$exactSha$refSuffix" }
+        }
     }
     if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify --quiet --end-of-options "$revision^{commit}" 2>$null) }
     if (-not $refExists -or $LASTEXITCODE -ne 0 -or $resolved.Count -ne 1 -or $resolved[0] -notmatch '^[0-9a-fA-F]{40}$') {

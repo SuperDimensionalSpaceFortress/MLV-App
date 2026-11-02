@@ -108,9 +108,15 @@ if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.
         Write-Result 'refused-reflog' $reflogMsg
         throw $reflogMsg
     }
-    $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
-    if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
-    $refSpec = "$exactSha$refSuffix"
+    # r15 (adversary A1 on cb45cce1): `-match` is case-insensitive, so `REFS/...` reached this point too; `show-ref --verify` is a
+    # case-sensitive literal-prefix check and rejects it, which read a ref git resolves as 'unknown' (fail-OPEN). The reflog refusal above
+    # keeps the case-insensitive class; the exact-ref read is for a lowercase `refs/` base only. Any other spelling goes whole to the
+    # rev-parse below, once (the r7 behaviour).
+    if ($refBase -cmatch '^refs/') {
+        $exactSha = [string](& git -C $root show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
+        if ($exactSha -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not exist"; return }
+        $refSpec = "$exactSha$refSuffix"
+    }
 }
 $refCommit = [string](& git -C $root rev-parse --verify --quiet --end-of-options "$refSpec^{commit}" 2>$null | Select-Object -First 1)
 if ($refCommit -notmatch '^[0-9a-f]{40}$') { Write-Result 'unknown' "ref '$Ref' does not resolve"; return }
