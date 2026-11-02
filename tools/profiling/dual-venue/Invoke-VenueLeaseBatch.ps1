@@ -170,6 +170,11 @@ param(
     [ValidateRange(0, 5)][int]$ThermalRequeueMax = 1,
     [string]$Purpose = '',
     [string]$SheetCopyDir = '',
+    # LEASE-BATCH-RECEIPT-ROOT-1: where every leg's receipt (and the evidence directory beside it) goes. Empty (the default) forwards NOTHING and the leg writes to its own
+    # default root, exactly as before. Non-empty: forwarded to EVERY Invoke-VenueLeg.ps1 call (first run and in-lease retry alike), and refused before the run dir, the claim,
+    # the lease or any leg when it is not under a .claude-state directory (the leg's own rule, Test-DvUnderClaudeState, applied to the root and to the evidence directory
+    # beside it). A calibration round points it at a scratch root so its receipts stop landing in the shared CUDA-HEADROOM-1 receipt root.
+    [string]$ReceiptRoot = '',
     # passed through to Wait-VenueQuiet.ps1 (never relaxed here)
     [double]$ThresholdPercent = 20.0,
     [ValidateRange(1, 3600)][int]$RecheckSec = 90,
@@ -215,6 +220,7 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
+Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
 # entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
 $ThermalDispatchGraceSec = 1
@@ -262,6 +268,20 @@ if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-H
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
 if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" }
+# LEASE-BATCH-RECEIPT-ROOT-1: -ReceiptRoot is checked with the leg's own rule (Invoke-VenueLeg.ps1 DVE_RECEIPT_ROOT_MUST_STAY_LOCAL: the root, and the evidence directory beside it)
+# BEFORE the run dir, the claim, the lease or any leg exists, so a bad root takes nothing. A blank root is "not given", as the leg reads it. Given, it is forwarded as a full path
+# (the leg is a child of this process, but a relative root must not depend on the child's directory).
+if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) { $ReceiptRoot = '' }
+else {
+    # r5 ADV-A1: the RAW value goes to the one helper. It judges the raw spelling first (either slash, device forms) and resolves a relative value ONCE, against the POWERSHELL location
+    # (adversary f1c42e80 A1) on the FileSystem provider only; a normalisation of our own here would rewrite `//?/C:/x` or `\/host\share` into a spelling the helper accepts.
+    # r4 A2-A4: the helper RETURNS the normalised full path it certified (a device path is refused, a link onto a share is followed) and THAT is what every leg is handed
+    $rrCert = Test-DvLocalReceiptRoot -Path $ReceiptRoot
+    if (-not $rrCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run' }
+    $ReceiptRoot = $rrCert
+    $evCert = Test-DvLocalReceiptRoot -Path (Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence')
+    if (-not $evCert) { Stop-Usage 'RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: the run evidence names an owner clip''s run' }
+}
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
 $jobDir = Join-Path $RunDir 'batch-jobs'
@@ -333,6 +353,10 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
 # r9 (Sol r8 / Dot B7 / card LEASE-BATCH-RUNDIR-OUTPUT-COLLISION-GUARD-1): every file this runner writes under -RunDir, in ONE place. An input (a plan, a leg spec) that resolves to one
 # of them would be overwritten or appended to after the lease opened, so preflight refuses it before any claim. A new output is added HERE and nowhere else: the files named
 # directly in RunDir (leaf patterns, matched whole and case-insensitively) and the subdirectories the runner owns (anything under them).
+# r9 B2: the runner-owned leaf names are matched with THIS option, not -imatch: -imatch follows the process culture (tr-TR: `QUIET-A.OUT.TXT` would not match `^quiet-`), and the file system treats those spellings as one file.
+# r10 C1: the option (IgnoreCase -bor CultureInvariant) is spelled out at each call below, never kept in a $script: variable: the claim guard runs these functions in a SEPARATE runspace
+# ($script:GuardWorkerFunctions) that receives only the function bodies and the named values of Invoke-InputGuard's $vars, so a script-scope option read there was $null, and
+# [regex]::IsMatch(string, string, $null) has no overload (every input came back OUTPUT_ZONE_UNRESOLVED / LEG_PLAN_INVALID).
 $script:RunDirOutputLeafPatterns = @(
     '^quiet-.+\.out\.txt\z'     # Invoke-QuietProbe: each probe's output
     '^leg-.+\.out\.txt\z'       # the leg's output (leg-<name>-b<nn>-a<n>.out.txt)
@@ -493,7 +517,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             $linked = @()
             foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
                 $owned = ($c.Name -iin $z.dirs)
-                foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $owned = $true } }
+                foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { $owned = $true } }
                 if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
             }
             # r12 pass 2 (adversary r12 A1'): and a link BELOW an owned directory (quiet\x.job.ps1 -> a spec, or a junction in it) writes through just the same, whatever the target's link count:
@@ -526,7 +550,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             foreach ($z in $zones) {
                 $scan = [System.Collections.Generic.List[object]]::new()
                 foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -File -ErrorAction Stop)) {
-                    foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $scan.Add($c); break } }
+                    foreach ($p in $z.leaf) { if ([regex]::IsMatch($c.Name, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { $scan.Add($c); break } }
                 }
                 foreach ($d in $z.dirs) {
                     $dp = Join-Path $z.root $d
@@ -557,7 +581,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
         }
         if ($parent -ieq $z.root -or ($aboveIds.Count -gt 0 -and $aboveIds[0] -ceq $z.rootId)) {
             $leaf = [IO.Path]::GetFileName($full)
-            foreach ($p in $z.leaf) { if ($leaf -imatch $p) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
+            foreach ($p in $z.leaf) { if ([regex]::IsMatch($leaf, $p, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
         }
         foreach ($d in $z.dirs) {
             if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase) -or ($z.ownedIds.ContainsKey($d) -and $aboveIds -ccontains $z.ownedIds[$d])) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
@@ -1551,7 +1575,7 @@ function Write-RunSummary {
     Write-Output $resultLine
 }
 
-L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
+L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($ReceiptRoot) { " receiptRoot=$ReceiptRoot" })$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ([DateTime]::UtcNow -ge $deadline) { Set-Stop 'DEADLINE' 3; break }
@@ -1939,6 +1963,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
+                if ($ReceiptRoot) { $lArgs += @('-ReceiptRoot', $ReceiptRoot) }   # LEASE-BATCH-RECEIPT-ROOT-1: the one leg call site, so an in-lease retry forwards it too; empty adds no argument
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
                 if ($script:RunOutputAliased) { $b.legsAttempted--; Stop-BatchOnSuppression $b; break }   # r7: the RUN line itself was refused: the leg is not started
                 # r8 pass 3 (adversary r8 pass 2 A3): the launch is the leg's dispatch. The guards since the checks above (the output's, the RUN line's) can block on a share, so the

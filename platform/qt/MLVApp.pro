@@ -378,6 +378,7 @@ HEADERS += MainWindow.h \
            AutomationSettings.h \
            HubHostPlaybackGuard.h \
            PlaybackFrameRange.h \
+           OutputDirIdentity.h \
            PlaybackFpsMeterPolicy.h \
            Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
