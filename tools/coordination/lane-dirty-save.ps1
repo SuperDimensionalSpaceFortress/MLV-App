@@ -24,14 +24,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:unreadable = @()
 $script:noCallbacks = @('-c', 'core.fsmonitor=false')  # core.fsmonitor is a command git runs while it reads the index; it must not rewrite the dirt being saved (sol r7 B1). Main adds one empty -c per configured clean/smudge/process filter (adversary r8 A1)
-function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false) {
+function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false, [string]$Dir = $WorkDir) {
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-        foreach ($a in (@('-C', $WorkDir, '--no-replace-objects') + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
+        foreach ($a in (@('-C', $Dir, '--no-replace-objects') + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
         foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR') { [void]$psi.Environment.Remove($k) }  # GIT_CONFIG makes only `git config` read another file, so the filter discovery would miss what the diff later runs (r8 A1); GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4)
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
-        $psi.Environment['GIT_OPTIONAL_LOCKS'] = '0'
+        foreach ($k in 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_PROXY_COMMAND', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_EXEC_PATH') { [void]$psi.Environment.Remove($k) }  # each names a program git may run; a diff over a partial clone's missing blob starts a promisor fetch that runs the ssh one, and exit 40 would be reported only after it rewrote a tracked file (adversary r9 A3)
+        $psi.Environment['GIT_NO_LAZY_FETCH'] = '1'; $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'  # git 2.44+ then never lazy-fetches at all
         $p = [System.Diagnostics.Process]::Start($psi)
         $err = $p.StandardError.ReadToEndAsync()
         $ms = [System.IO.MemoryStream]::new()
@@ -153,11 +154,22 @@ $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-rel
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) {
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
-    $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true  # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1)
-    try { $keys = @([System.Text.UTF8Encoding]::new($false, $true).GetString($f.Bytes) -split "`0" | Where-Object { $_ }) } catch { $keys = @('not-utf8') }  # a name that is not UTF-8 cannot be handed to -c unchanged, and a lossy copy would blank a different driver (r8 A2): refused below
+    # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1).
+    # The diff also scans every submodule through its OWN config, so the search covers each submodule worktree too (adversary r9 A1b); -c reaches those children.
+    $keys = @(); $cfgErr = $null; $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal); $queue = [System.Collections.Generic.Queue[object]]::new(); $queue.Enqueue(@($WorkDir, 0))
+    while ($queue.Count -gt 0 -and -not $cfgErr) {
+        $d, $lvl = $queue.Dequeue()
+        if (-not $visited.Add($d)) { continue }
+        $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true $d
+        $g = Invoke-GitBytes @('ls-files', '-s', '-z') $false $d  # gitlinks are mode 160000. Reads the index, so core.fsmonitor stays off (not Plain)
+        if (($f.Code -ne 0 -and $f.Code -ne 1) -or $g.Code -ne 0) { $cfgErr = "$($f.Err.Trim()) $($g.Err.Trim())".Trim(); break }
+        try { $keys += @([System.Text.UTF8Encoding]::new($false, $true).GetString($f.Bytes) -split "`0" | Where-Object { $_ }) } catch { $keys += 'not-utf8' }  # a name that is not UTF-8 cannot be handed to -c unchanged, and a lossy copy would blank a different driver (r8 A2): refused below
+        try { $links = @([System.Text.UTF8Encoding]::new($false, $true).GetString($g.Bytes) -split "`0" | Where-Object { $_.StartsWith('160000 ', [System.StringComparison]::Ordinal) } | ForEach-Object { $_.Substring($_.IndexOf("`t") + 1) }) } catch { $cfgErr = 'gitlink-paths-not-utf8'; break }
+        foreach ($l in $links) { $sub = [System.IO.Path]::GetFullPath($l, $d); if ($lvl -lt 8 -and [System.IO.Directory]::Exists($sub)) { $queue.Enqueue(@($sub, $lvl + 1)) } }
+    }
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)  # Select-Object -Unique compares by culture and ignoring case, so filter.a and filter.a<U+00AD> (or Rewrite and rewrite), two drivers to git, collapsed to one and the other kept running (adversary r9 A1)
     $names = @($keys | Where-Object { $_ -match '\Afilter\.[^=]+\.[^.=]+\z' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf([char]'.')) } | Where-Object { $seen.Add($_) })
-    if (($f.Code -ne 0 -and $f.Code -ne 1) -or @($keys | Where-Object { $_ -notmatch '\Afilter\.[^=]+\.[^.=]+\z' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $($f.Err.Trim())"; exit 40 }
+    if ($cfgErr -or @($keys | Where-Object { $_ -notmatch '\Afilter\.[^=]+\.[^.=]+\z' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $cfgErr"; exit 40 }
     foreach ($k in $names) { $script:noCallbacks += @('-c', "$k.clean=", '-c', "$k.smudge=", '-c', "$k.process=", '-c', "$k.required=false") }
 }
 try {

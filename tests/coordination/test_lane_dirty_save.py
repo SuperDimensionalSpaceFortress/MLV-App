@@ -695,6 +695,44 @@ def test_two_filter_drivers_whose_names_differ_only_by_an_ignorable_char_or_case
     assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
 
 
+def test_a_clean_filter_configured_only_inside_a_submodule_cannot_overwrite_the_parents_dirt(repo, tmp_path):  # r9 second adversary pass A1: the diff scans the submodule through the submodule's own config, which a root-only search never read
+    src = tmp_path / "subsrc"
+    src.mkdir()
+    for a in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "core.autocrlf", "false"]):
+        git(src, *a)
+    (src / ".gitattributes").write_text("f.txt filter=onlysub\n")
+    (src / "f.txt").write_text("old\n")
+    git(src, "add", ".")
+    git(src, "commit", "-q", "-m", "s")
+    subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(src), "sub"], capture_output=True, check=True)
+    git(repo, "commit", "-q", "-m", "gitlink")
+    marker = tmp_path / "filter-ran"
+    git(repo / "sub", "config", "filter.onlysub.clean", f"printf X >> '{marker.as_posix()}'; printf REPLACED > '{(repo / 'a.txt').as_posix()}'; cat")
+    dirty(repo)
+    time.sleep(1.1)
+    (repo / "sub" / "f.txt").write_text("new\n")  # same size as 'old\n', so git must read the content, which runs the clean filter
+    a_before = (repo / "a.txt").read_bytes()
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before  # old code: the submodule's filter ran and rewrote a.txt
+
+
+def test_an_inherited_ssh_command_cannot_run_when_git_fetches_a_missing_promised_blob(repo, tmp_path):  # r9 second adversary pass A3: a diff over a partial clone's missing blob starts a promisor fetch
+    srv = tmp_path / "srv.git"
+    git(tmp_path, "init", "-q", "--bare", str(srv))
+    git(srv, "config", "uploadpack.allowFilter", "true")
+    git(srv, "config", "uploadpack.allowAnySHA1InWant", "true")
+    git(repo, "push", "-q", str(srv), "HEAD:refs/heads/main")
+    pc = tmp_path / "pc"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none", "--branch", "main", "file:///" + srv.as_posix().lstrip("/"), str(pc)], capture_output=True, check=True)
+    git(pc, "reset", "-q")  # index from HEAD's tree; a.txt is absent on disk and its blob is not here, so diffing it needs the promisor
+    git(pc, "config", "remote.origin.url", "ssh://example.invalid/repo")
+    marker = tmp_path / "ssh-ran"
+    r = save(pc, "-LanePid", str(dead_pid()), env={**os.environ, "GIT_SSH_VARIANT": "ssh", "GIT_SSH_COMMAND": f"printf X >> '{marker.as_posix()}'; false"})
+    assert r.returncode in (0, 40), r.stdout + r.stderr
+    assert not marker.exists()  # old code: the caller's GIT_SSH_COMMAND ran inside the saver's git
+
+
 def test_a_replace_ref_for_head_cannot_change_the_tree_the_patch_is_taken_from(repo, tmp_path):  # r9 adversary A2: with git replace F R, both diffs read R's tree while the receipt names F
     first = git(repo, "rev-parse", "HEAD").decode().strip()
     git(repo, "checkout", "-q", "-b", "alt")
