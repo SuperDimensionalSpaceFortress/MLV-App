@@ -16538,10 +16538,17 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         && receipt->lookAssistEnabled();
 
     m_lastLookAssistDiagnosticsValid = false;
+    // LOOK-FULLSCREEN-PARITY-1 r11 (adversary r10 A1 on 0b840efd): the baseline goes back below while the receipt is
+    // already marked applied, so no analysis re-grades it (applied now, or the frame-ready step, both dedup) -- the screen
+    // shows the baseline. The label must not keep naming the flavor that landed before.
+    bool baselineRestoredUngraded = false;
     if( m_fileLoaded && receipt->lookAssistEnabled() )
     {
         if( receipt->lookAssistBaselineValid() )
+        {
             restoreLookAssistBaseline( receipt );
+            baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );
+        }
         else
             captureLookAssistBaseline( receipt );
 
@@ -16557,6 +16564,12 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     {
         restoreLookAssistBaseline( receipt );
         syncLookAssistDerivedUiToReceipt( receipt );
+    }
+    // r11: only for the receipt the label reads (the active row's); the outcome describes that receipt alone.
+    if( baselineRestoredUngraded && receipt == activeReceiptAtLoad )
+    {
+        m_lookAssistFlavorOutcome.clear();   // the baseline is back and nothing re-grades it: "Look: Baseline"
+        updateLookLabel();
     }
 
     logInteractionEvent(

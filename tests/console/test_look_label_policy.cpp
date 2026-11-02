@@ -407,6 +407,36 @@ TEST(LookLabelWiring, TheLabelNeverTouchesTheGrade)
     ASSERT_FALSE(update.contains(QStringLiteral("previewProcessing")));
 }
 
+// r11 (adversary r10 A1 on 0b840efd): a paste onto the active row (or any setSliders of a receipt already marked applied)
+// puts the baseline back and no analysis re-grades it (the apply and the frame-ready step both dedup). The landed outcome
+// is cleared there, for the active row's receipt only, so the label reads "Look: Baseline", not the flavor that landed.
+TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(mw, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"));
+    ASSERT_FALSE(body.isEmpty());
+    const int restore = body.indexOf(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );"));
+    ASSERT_TRUE(body.lastIndexOf(QStringLiteral("restoreLookAssistBaseline( receipt );"), restore) >= 0);
+    const int apply = body.indexOf(QStringLiteral("&& !m_lookAssistApplied.isApplied( receipt ) )"));
+    const int clearAt = body.indexOf(QStringLiteral("if( baselineRestoredUngraded && receipt == activeReceiptAtLoad )"));
+    const int cleared = body.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.clear();"), clearAt);
+    const int relabel = body.indexOf(QStringLiteral("updateLookLabel();"), cleared);
+    printf("[LL11] setSliders: restore=%d apply=%d clearAt=%d cleared=%d relabel=%d\n", restore, apply, clearAt, cleared, relabel);
+    // read BEFORE the apply block marks a fresh grade applied, so a grade applied here is never cleared
+    ASSERT_TRUE(restore >= 0);
+    ASSERT_TRUE(apply > restore);
+    ASSERT_TRUE(clearAt > apply);
+    ASSERT_TRUE(cleared > clearAt);
+    ASSERT_TRUE(relabel > cleared);
+    // and the policy reads a cleared outcome as the baseline
+    lookassist::LookAssistFlavorOutcome outcome;
+    int receipt = 0;
+    outcome.landed(&receipt, QStringLiteral("cinematic"), false);
+    ASSERT_EQ(QStringLiteral("Look: Cinematic"), look_label::shownText(true, outcome, &receipt, QStringLiteral("cinematic")));
+    outcome.clear();
+    ASSERT_EQ(QStringLiteral("Look: Baseline"), look_label::shownText(true, outcome, &receipt, QStringLiteral("cinematic")));
+}
+
 // POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1 (master-merge round, 2026-11-02): the bool arguments the window passes to the
 // policy are pinned at their one call site each, so flipping one (fullscreen vs. windowed, the show-in-fullscreen
 // setting, or the status label's initial "look off" text) fails here rather than only on a venue leg.
