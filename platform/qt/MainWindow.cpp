@@ -9821,7 +9821,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                && lookLabelClock.elapsed() < 1000 )
         {
             qApp->processEvents( QEventLoop::AllEvents );
-            QThread::msleep( 5 );
+            sleepGuiThreadForSmokeRunner( 5 );   // master: every runner sleep is accounted apart from GUI busy
             lookLabelShown = lookLabelShownText( &lookLabelSurface );
         }
         qInfo().noquote()
