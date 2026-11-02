@@ -66,6 +66,8 @@ def _kill_tree(proc: subprocess.Popen) -> str:
         proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
         problems.append("the root process was still running 30 s after the kill")
+    except OSError as exc:
+        problems.append(f"waiting for the root process failed: {exc!r}")
     return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
 
 
@@ -455,12 +457,21 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn("<read failed: errno 13", str(caught))
 
-    def _run_failing_cleanup(self, *, taskkill: object, second_wait_expires: bool = False) -> BaseException:
+    def _run_failing_cleanup(self, *, taskkill: object, second_wait_expires: bool = False,
+                             second_wait_raises: BaseException | None = None) -> BaseException:
         # sol adversary A1: the cleanup steps after a timeout must not replace the case-named verdict either.
         proc = self._TimedOutProc()
         if second_wait_expires:
             def wait(timeout: float | None = None) -> int:
                 raise subprocess.TimeoutExpired(["child"], timeout)
+            proc.wait = wait  # type: ignore[method-assign]
+        elif second_wait_raises is not None:
+            # sol r3 B1: the first wait times out (the hang), the final cleanup wait fails with a Windows handle error.
+            def wait(timeout: float | None = None) -> int:
+                proc.waits += 1
+                if proc.waits == 1:
+                    raise subprocess.TimeoutExpired(["child"], timeout)
+                raise second_wait_raises
             proc.wait = wait  # type: ignore[method-assign]
         if isinstance(taskkill, BaseException):
             run = mock.Mock(side_effect=taskkill)
@@ -484,6 +495,18 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
             self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught), label)
             self.assertIn("process tree kill is NOT confirmed", str(caught), label)
             self.assertIn(expect, str(caught), label)
+            self.assertNotIn("process tree was killed", str(caught), label)
+
+    def test_a_timeout_keeps_its_case_named_verdict_when_the_final_cleanup_wait_raises_an_oserror(self) -> None:
+        # sol r3 B1: _kill_tree caught OSError on taskkill and on kill() but not on the final root wait, so an
+        # OSError(6, "invalid handle") there escaped and replaced the promised case-named AssertionError.
+        for label, exc in (("invalid handle", OSError(6, "invalid handle")),
+                           ("access denied", PermissionError(5, "denied"))):
+            caught = self._run_failing_cleanup(taskkill=0, second_wait_raises=exc)
+            self.assertIsInstance(caught, AssertionError, f"{label}: {caught!r}")
+            self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught), label)
+            self.assertIn("process tree kill is NOT confirmed", str(caught), label)
+            self.assertIn("waiting for the root process failed", str(caught), label)
             self.assertNotIn("process tree was killed", str(caught), label)
 
     def test_a_confirmed_kill_still_says_the_tree_was_killed(self) -> None:
