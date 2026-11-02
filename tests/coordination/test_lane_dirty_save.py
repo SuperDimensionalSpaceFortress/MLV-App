@@ -801,6 +801,16 @@ def newest_patch(tmp_path):
     return next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes()
 
 
+def save_with_hook(wd, tmp_path, hook):
+    """Run a COPY of the saver with `hook` (PowerShell) run just before its first collecting diff, standing in for another process acting between the saver's steps."""
+    anchor = "$git.patch = Invoke-GitBytes"
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, f"{hook}; {anchor}"), encoding="utf-8")
+    return subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(wd), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+
+
 def test_a_filter_added_between_the_saver_s_steps_cannot_overwrite_the_dirt_being_saved(repo, tmp_path):  # r10 sol r9 B1: the hook stands where the old filter search ended and the first diff began
     commit_attrs(repo, "a.txt filter=late\n")
     dirty(repo)
@@ -1010,3 +1020,59 @@ def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_c
                                     "[IO.Directory]::Move($a, $b)", "[System.IO.Directory]::Move($a, $b)", "[IO.File]::'Move'($a,$b)", "New-Item -Type HardLink -Path $a -Value $b", "cmd /c move a b"])  # r8 sol hardening: directory moves
 def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
     assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")
+
+
+# ---- r10 adversary pass A1-A4 on eabdcc39 ----
+def git_env(wd, env, *args):
+    return subprocess.run(["git", "-C", str(wd), *args], capture_output=True, check=True, env=env).stdout
+
+
+def test_the_global_configs_autocrlf_decides_what_is_dirt_exactly_as_it_does_for_git(repo, tmp_path):  # r10 adversary A1: the sealed git had no global config, so LF->CRLF looked like a change
+    git(repo, "config", "--unset", "core.autocrlf")
+    (repo / "a.txt").write_bytes(b"one\n")
+    git(repo, "-c", "core.autocrlf=false", "commit", "-q", "-am", "lf")
+    (repo / "a.txt").write_bytes(b"one\r\n")
+    glob = tmp_path / "global.gitconfig"
+    glob.write_text("[core]\n\tautocrlf = true\n")
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(glob)}
+    assert git_env(repo, env, "diff", "HEAD", "--binary") == b""  # git itself sees a clean tree
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 10 and saved(repo) == [], r.stdout + r.stderr  # old sealed code: exit 0 with a patch that only flips line endings
+
+
+def test_a_local_excludes_file_is_not_replaced_by_the_default_ignore_file_in_the_sealed_git(repo, tmp_path):  # r10 adversary A2
+    empty = tmp_path / "no-ignores"
+    empty.write_text("")
+    git(repo, "config", "core.excludesFile", empty.as_posix())
+    (tmp_path / "xdg" / "git").mkdir(parents=True)
+    (tmp_path / "xdg" / "git" / "ignore").write_text("u.txt\n")
+    (repo / "u.txt").write_text("u\n")
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(tmp_path / "absent.gitconfig"), "XDG_CONFIG_HOME": str(tmp_path / "xdg")}
+    want = git_env(repo, env, "ls-files", "-z", "--others", "--exclude-standard")
+    assert want == b"u.txt\0"
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 0, r.stdout + r.stderr  # old sealed code: 10, because the default ignore file hid u.txt
+    assert next((tmp_path / "run").glob("*.untracked.txt")).read_bytes() == want
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="NTFS cannot hold a line feed in a directory name")
+def test_a_posix_worktree_path_holding_a_line_feed_is_saved(tmp_path):  # r10 adversary A3: five paths shared one LF-separated answer
+    base = tmp_path / "lds\ncase"
+    base.mkdir()
+    wd = base / "wt"
+    init_repo(wd, b"one\n")
+    (base / "run").mkdir()
+    (wd / "a.txt").write_bytes(b"changed\n")
+    r = save(wd, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert next((base / "run").glob("*.patch")).read_bytes() == git(wd, "diff", "HEAD", "--binary")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows refuses to delete a directory holding a file another handle has open without delete sharing")
+def test_a_private_git_dir_that_cannot_be_removed_is_named_not_swallowed(repo, tmp_path):  # r10 adversary A4
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = save_with_hook(repo, tmp_path, "$script:hold = [System.IO.File]::Open([System.IO.Path]::Combine($script:sealDir, 'config'), 'Open', 'Read', 'ReadWrite')")
+    assert r.returncode == 0, r.stdout + r.stderr  # the patch is saved all the same
+    left = last_receipt(r)["privateGitDirLeft"]
+    assert Path(left).parent == repo / ".git" and Path(left).name.startswith("lane-dirty-save-")
+    assert newest_patch(tmp_path) == git(repo, "diff", "HEAD", "--binary")

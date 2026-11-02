@@ -52,19 +52,23 @@ function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exa
     return $s
 }
 function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call that reads the tree may be able to run a configured callback. Chasing filter NAMES (r8, r9) always missed one: a filter added after the search, or one inside a submodule below the depth cap. So every collecting call runs against a PRIVATE git dir whose config holds no program at all: system and global config are off, the repo's own config is not read (only an allowlist of plain comparison settings is copied as -c), and the objects, index and work tree are the real ones. A filter, textconv, fsmonitor, diff.external or hook defined anywhere then has nothing to be read from.
-    $q = Invoke-GitBytes @('rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-path', 'index', '--git-path', 'objects', '--git-path', 'info/attributes', '--git-path', 'info/exclude')
-    $c = Invoke-GitBytes @('config', '--null', '--list', '--local')
-    if ($q.Code -ne 0 -or $c.Code -ne 0) { throw "$($q.Err.Trim()) $($c.Err.Trim())".Trim() }
-    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
-    $p = $utf8.GetString($q.Bytes).Split("`n")
-    if ($p.Count -ne 6 -or $p[5] -ne '') { throw 'git-paths-unexpected' }
-    $gitDir, $index, $objects, $attr, $excl = $p[0..4]
-    $allow = 'core.filemode', 'core.symlinks', 'core.ignorecase', 'core.autocrlf', 'core.eol', 'core.safecrlf', 'core.precomposeunicode', 'core.trustctime', 'core.checkstat', 'core.protectntfs', 'core.protecthfs', 'core.longpaths', 'core.bigfilethreshold'  # how git compares and converts bytes; none names a program
+    $paths = @()  # one call per path: a POSIX path may hold an LF, so the five cannot share one LF-separated answer (adversary r10 A3)
+    foreach ($pa in @(@('--absolute-git-dir'), @('--git-path', 'index'), @('--git-path', 'objects'), @('--git-path', 'info/attributes'), @('--git-path', 'info/exclude'))) {
+        $q = Invoke-GitBytes (@('rev-parse', '--path-format=absolute') + $pa)
+        if ($q.Code -ne 0) { throw $q.Err.Trim() }
+        $paths += Remove-GitTerminator $q.Bytes
+    }
+    $gitDir, $index, $objects, $attr, $excl = $paths
+    $c = Invoke-GitBytes @('config', '--null', '--list')  # the EFFECTIVE config (system, global, includes, local, worktree), read as data: what git itself would compare and convert by (adversary r10 A1)
+    if ($c.Code -ne 0) { throw $c.Err.Trim() }
+    $allow = 'core.filemode', 'core.symlinks', 'core.ignorecase', 'core.autocrlf', 'core.eol', 'core.safecrlf', 'core.precomposeunicode', 'core.trustctime', 'core.checkstat', 'core.protectntfs', 'core.protecthfs', 'core.longpaths', 'core.bigfilethreshold', 'core.quotepath'  # how git compares and converts bytes; none names a program
+    $files = 'core.excludesfile', 'core.attributesfile'  # a path to a list of RULES (data), passed as written so the sealed git keeps the same ignore and attribute files; unset, git's own default applies identically (adversary r10 A2)
     $vals = [ordered]@{}; $sha256 = $false
     foreach ($e in ([System.Text.Encoding]::Latin1.GetString($c.Bytes) -split "`0" | Where-Object { $_ })) {  # Latin-1: every byte decodes, and the keys wanted here are ASCII (any other entry, a non-UTF-8 filter name included, matches nothing and is never read as a name)
         $i = $e.IndexOf("`n"); $k = if ($i -ge 0) { $e.Substring(0, $i) } else { $e }; $v = if ($i -ge 0) { $e.Substring($i + 1) } else { $null }
         if ($k -ceq 'extensions.objectformat') { $sha256 = ($v -ceq 'sha256') }
         elseif (($allow -ccontains $k) -and ($null -eq $v -or $v -cmatch '\A[A-Za-z0-9_.-]{0,32}\z')) { $vals[$k] = $v }  # last value wins; anything with other characters is left at git's default
+        elseif (($files -ccontains $k) -and $null -ne $v) { $vals[$k] = [System.Text.Encoding]::UTF8.GetString([System.Text.Encoding]::Latin1.GetBytes($v)) }
     }
     $cargs = @(); foreach ($k in $vals.Keys) { $cargs += '-c'; $cargs += $(if ($null -eq $vals[$k]) { $k } else { "$k=$($vals[$k])" }) }
     $sg = [System.IO.Path]::Combine($gitDir, 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg
@@ -72,7 +76,8 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     $enc = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD'), "$HeadFull`n", $enc)
     [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'config'), $(if ($sha256) { "[core]`n`trepositoryformatversion = 1`n[extensions]`n`tobjectformat = sha256`n" } else { "[core]`n`trepositoryformatversion = 0`n" }), $enc)
-    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'), "$objects`n", $enc)
+    $alt = if ($objects.IndexOfAny([char[]]@("`n", "`r", '"', '\')) -ge 0 -or $objects.StartsWith('#', [System.StringComparison]::Ordinal)) { '"' + $objects.Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`r", '\r') + '"' } else { $objects }  # alternates is one path per LINE: a path holding an LF or a quote is written C-quoted (adversary r10 A3)
+    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'), "$alt`n", $enc)
     foreach ($pair in @(, @($attr, 'attributes')) + @(, @($excl, 'exclude'))) {  # attribute and ignore RULES are data; a filter attribute without a configured driver runs nothing
         if ([System.IO.File]::Exists($pair[0])) { $dest = [System.IO.Path]::Combine($sg, 'info', $pair[1]); [System.IO.File]::Copy($pair[0], $dest); [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal) }
     }
@@ -213,14 +218,19 @@ try {
     }
 }
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
-finally { if ($script:sealDir) { try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { } } }  # only the private dir this run made
+finally {  # only the private dir this run made. A handle another process holds open (no delete sharing, Windows) can keep it: retried, then NAMED in the output and the receipt, never swallowed (adversary r10 A4)
+    for ($i = 0; $i -lt 5 -and $script:sealDir -and [System.IO.Directory]::Exists($script:sealDir); $i++) { try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { Start-Sleep -Milliseconds 200 } }
+}
+$left = if ($script:sealDir -and [System.IO.Directory]::Exists($script:sealDir)) { $script:sealDir } else { $null }
+$leftNote = if ($left) { " privateGitDirLeft=$left" } else { '' }
 $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
-if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())"; exit 40 }
+if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())$leftNote"; exit 40 }
 $todo = 'patch', 'staged', 'untracked' | Where-Object { $git[$_].Bytes.Length -gt 0 }
-if (-not $todo) { Write-Output 'DIRTY_SAVE_NOTHING reason=clean-tree'; exit 10 }
+if (-not $todo) { Write-Output "DIRTY_SAVE_NOTHING reason=clean-tree$leftNote"; exit 10 }
 $head8 = $headFull.Substring(0, 8)
 $ext = @{ patch = 'patch'; staged = 'staged.patch'; untracked = 'untracked.txt' }
 $r = [ordered]@{ schema = 'lane-dirty-save/v1'; head = $headFull; untrackedFormat = 'nul-separated'; untrackedContents = 'not-saved'; submodules = "skipped $subs" }
+if ($left) { $r.privateGitDirLeft = $left }
 try {
     foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }
     if ($r.Contains('patch')) { $r.patchSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($git.patch.Bytes)).Replace('-', '').ToLowerInvariant() }
