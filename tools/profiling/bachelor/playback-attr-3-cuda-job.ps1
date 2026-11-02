@@ -4281,9 +4281,12 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     # record body never holds ' ('), so a build path cannot supply the marker or either field.
     $open = $candidateLine.IndexOf(' (', [StringComparison]::Ordinal)
     $body = if ($open -ge 0) { $candidateLine.Substring(0, $open) } else { $candidateLine }
-    if ($body -match ('playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+    # r5 (adversary r4 A1 on 6b564afc): the marker must OPEN the record (after the "[<utc>] [<level>] [<thread>] " prefix), so a
+    # quoted value inside another record that spells it (an eligibility line's DLL path) is never read as this record.
+    if ($body -match ('^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
         $scopeSource = if ($body -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
-        $scopeTapCompleted = if ($body -match '\sscope_tap_completed=(?<v>\d+)') { [int64]$Matches['v'] } else { $null }
+        # r5 (adversary r4 A4): a whole decimal count only (1.5, 1garbage or an overflow stay $null: fail closed, never a guess).
+        $scopeTapCompleted = if ($body -match '\sscope_tap_completed=(?<v>\d{1,18})(\s|$)') { [int64]$Matches['v'] } else { $null }
     }
 }
 # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<

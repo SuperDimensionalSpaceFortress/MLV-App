@@ -1080,6 +1080,21 @@ class MeasuredSessionEligibilityVerdictTests(_PwshCase):
         ], "7")
         self.assertTrue(new["admitted"])
         self.assertEqual(new["r16Reason"], "ok (texture probe passed)")
+        # r5 (adversary r4 A1 on 6b564afc): a QUOTED value inside another record that spells a marker (a DLL path) is never
+        # that record -- the marker must open the record, right after its "[utc] [level] [thread] " prefix.
+        self._second = 0
+        path = ' cuda_backend_description="C:\\gpu playback_smoke.summary session=7 x\\backend.dll"'
+        new, _old = self.verdicts([
+            self.elig(1, 0, "before") + path,
+            self.start(7),
+            self.elig(1, 1) + path,
+            self.summary(7),
+        ], "7")
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertTrue(new["linePresent"])
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["tailLinesIgnored"], 0)
+        self.assertEqual(new["measuredWindowRefusingLines"], 0)
 
 
 @requires_pwsh
@@ -1113,6 +1128,15 @@ class MeasuredSessionScopeFieldsTests(_PwshCase):
                 "scope_tap_w=256 (C:/b scope_source=cpu scope_tap_completed=0/x.cpp:2)\n")
         self.assertEqual(self.scope_fields(real), {"s": "gpu_tap", "c": 3})
         self.assertEqual(self.scope_fields(real, session="70"), {"s": None, "c": None})
+        # r5 (adversary r4 A1): a quoted value in a LATER record spelling the marker never replaces the real record's fields.
+        quoted = (ts + "playback_smoke.cpu_summary_ext session=7 scope_source=none scope_tap_completed=0\n"
+                  + ts + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.cpu_summary_ext session=7 '
+                  'scope_source=gpu_tap scope_tap_completed=1 x\\backend.dll"\n')
+        self.assertEqual(self.scope_fields(quoted), {"s": "none", "c": 0})
+        # r5 (adversary r4 A4): a count that is not a whole decimal number fails closed.
+        for bad in ("1.5", "1garbage", "9223372036854775808"):
+            line = ts + f"playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap scope_tap_completed={bad}\n"
+            self.assertEqual(self.scope_fields(line), {"s": "gpu_tap", "c": None}, bad)
 
 
 # --------------------------------------------------------------------------------------------

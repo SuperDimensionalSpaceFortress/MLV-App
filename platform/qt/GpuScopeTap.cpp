@@ -140,7 +140,19 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
     gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
     if ( slot.capacityBytes < bytes )
     {
+        // r5 (adversary r4 A2 on 6b564afc): the capacity is recorded only once the store exists. A refused allocation
+        // (GL_OUT_OF_MEMORY) leaves an empty store; caching its size would skip every later allocation and never complete
+        // a read-back. Drained first (bounded) so an older error is not mistaken for this one.
+        for ( int drained = 0; drained < 8 && gl->glGetError() != GL_NO_ERROR; ++drained ) {}
         gl->glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+        if ( gl->glGetError() != GL_NO_ERROR )
+        {
+            slot.capacityBytes = 0;   // nothing allocated: the next request allocates again
+            gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
+            ++m_counters.skipped;
+            return;
+        }
         slot.capacityBytes = bytes;
     }
     gl->glPixelStorei(GL_PACK_ALIGNMENT, 4);

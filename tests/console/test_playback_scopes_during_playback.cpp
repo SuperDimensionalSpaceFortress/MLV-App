@@ -697,3 +697,24 @@ TEST(PlaybackScopesDuringPlayback, PGT10_StopSeekClipAndModeChangesDropStaleRead
         "( state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED ) && slot.generation == m_generation")));
     ASSERT_TRUE(tap.contains(QStringLiteral("slot.generation = m_generation;")));
 }
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A2 on 6b564afc): a refused PBO allocation (GL_OUT_OF_MEMORY) is never
+// cached as capacity -- the size is recorded only after glBufferData reports no error, and a refusal skips this request
+// and leaves the capacity at 0, so the next request allocates again once memory is back.
+TEST(PlaybackScopeTapWiring, ARefusedReadBackAllocationIsNotCachedAsCapacity)
+{
+    const QString tap = readRepoFile(QStringLiteral("platform/qt/GpuScopeTap.cpp"));
+    const int drain = tap.indexOf(QStringLiteral("for ( int drained = 0; drained < 8 && gl->glGetError() != GL_NO_ERROR; ++drained ) {}"));
+    const int alloc = tap.indexOf(QStringLiteral("gl->glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);"));
+    const int check = tap.indexOf(QStringLiteral("if ( gl->glGetError() != GL_NO_ERROR )"), alloc);
+    const int reset = tap.indexOf(QStringLiteral("slot.capacityBytes = 0;"), check);
+    const int skip = tap.indexOf(QStringLiteral("++m_counters.skipped;"), reset);
+    const int recorded = tap.indexOf(QStringLiteral("slot.capacityBytes = bytes;"));
+    ASSERT_TRUE(drain >= 0);
+    ASSERT_TRUE(alloc > drain);
+    ASSERT_TRUE(check > alloc);
+    ASSERT_TRUE(reset > check);
+    ASSERT_TRUE(skip > reset);
+    ASSERT_TRUE(recorded > skip);
+    ASSERT_EQ(1, tap.count(QStringLiteral("slot.capacityBytes = bytes;")));
+}

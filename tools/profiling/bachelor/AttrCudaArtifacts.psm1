@@ -4148,20 +4148,24 @@ function Get-AttrCudaEligibilityLineForSession {
     # one. The eligibility FIELDS are read from the whole line, first occurrence of a key winning: its free-text values
     # (r16_reason, r16_renderer, cuda_backend_description; sanitizeLogValue keeps spaces) may hold ' (' before
     # cuda_backend_available, and every key a later location suffix could spell is one the app already wrote earlier.
+    # r5 (adversary r4 A1 on 6b564afc): and the marker must OPEN the record -- right after the writer's
+    # "[<utc>] [<level>] [<thread>] " prefix (optional, for a bare record) -- so a quoted value inside another record (a
+    # cuda_backend_resolved DLL path, say) that spells "playback_smoke.summary session=<id>" is never read as one.
+    $recordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
     $rawLines = @($LogText -split "`r?`n")
     $lines = @($rawLines | ForEach-Object { $open = $_.IndexOf(' (', [StringComparison]::Ordinal); if ($open -ge 0) { $_.Substring(0, $open) } else { $_ } })
     $startIndex = -1
     $summaryIndex = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($startIndex -lt 0 -and $lines[$i] -match ('playback_smoke\.start session=' + $idPattern)) { $startIndex = $i }
-        if ($lines[$i] -match ('playback_smoke\.summary session=' + $idPattern)) { $summaryIndex = $i; break }
+        if ($startIndex -lt 0 -and $lines[$i] -match ($recordStart + 'playback_smoke\.start session=' + $idPattern)) { $startIndex = $i }
+        if ($lines[$i] -match ($recordStart + 'playback_smoke\.summary session=' + $idPattern)) { $summaryIndex = $i; break }
     }
     $sessionValues = $null
     $tailLinesIgnored = 0
     $tailRefused = $false
     $windowRefusing = 0
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -notmatch 'gpu_playback_recon\.eligibility ') { continue }
+        if ($lines[$i] -notmatch ($recordStart + 'gpu_playback_recon\.eligibility ')) { continue }
         $values = @{}
         foreach ($match in [regex]::Matches($rawLines[$i], '(?<key>[A-Za-z0-9_]+)=(?:"(?<quoted>[^"]*)"|(?<bare>[^\s]+))')) {
             $key = $match.Groups['key'].Value
