@@ -69,7 +69,7 @@ function Invoke-Capture([string]$Exe, [string[]]$CmdArgs) {  # one child's stdou
 function Get-DirIds([string[]]$Dirs, [bool]$Tree) {  # POSIX 'st_dev:st_ino' of each of $Dirs, or of every directory under $Dirs[0]. GNU stat (-c) and BSD stat (-f) are told apart first, because GNU's -f prints filesystem data shaped like an id. $null = unprovable
     $fmt = if ($null -ne (Invoke-Capture 'stat' @('--version'))) { '-c' } else { '-f' }
     $lines = if ($Tree) { Invoke-Capture 'find' @($Dirs[0], '-type', 'd', '-exec', 'stat', '-L', $fmt, '%d:%i', '{}', '+') } else { Invoke-Capture 'stat' (@('-L', $fmt, '%d:%i', '--') + $Dirs) }
-    if ($null -eq $lines -or @($lines).Count -lt 1 -or @($lines | Where-Object { $_ -notmatch '^\d+:\d+$' }).Count) { return $null }
+    if ($null -eq $lines -or @($lines).Count -lt 1 -or @($lines | Where-Object { $_ -notmatch '\A[0-9]+:[0-9]+\z' }).Count) { return $null }
     return , @($lines)
 }
 function Assert-RunDirNotAlias([string]$Run, [string]$Work) {  # POSIX: a bind mount has no link target, so names cannot see it; compare file identity instead. The RunDir and each ancestor must not BE the worktree root or any directory inside it (sol r7 B2). Not provable = refused
@@ -82,8 +82,8 @@ function ConvertTo-NativePath([string]$Path) {  # Windows: \\?\ and \\.\ (any ca
     if (-not $script:onWin) { return $Path }
     $p = $Path.Replace('/', '\')
     if ($p -notmatch '^\\\\[?.]\\') { return $p }
-    if ($p -match '^\\\\[?.]\\UNC\\(?<rest>.+)$') { return '\\?\UNC\' + $Matches['rest'] }
-    if ($p -match '^\\\\[?.]\\(?<rest>[A-Za-z]:\\.*)$') { return '\\?\' + $Matches['rest'] }
+    if ($p -match '^\\\\[?.]\\UNC\\(?<rest>.+)\z') { return '\\?\UNC\' + $Matches['rest'] }
+    if ($p -match '^\\\\[?.]\\(?<rest>[A-Za-z]:\\.*)\z') { return '\\?\' + $Matches['rest'] }
     throw 'unsupported-extended-path'
 }
 function Get-FinalDir([string]$Path) {  # Windows: open the directory and read its true path back, so links, junctions, subst drives, 8.3 and \\?\ spellings are all resolved by the kernel (r7 A1, A2). The handle stays open (no share-delete), so the directory and its parents cannot be renamed or replaced before the artifacts are written (r7 A3)
@@ -110,8 +110,11 @@ function Test-LaneAlive {
         $root = [System.Text.Json.JsonDocument]::Parse([System.IO.File]::ReadAllText($ChildJson)).RootElement
         $pe = [System.Text.Json.JsonElement]::new(); $ce = [System.Text.Json.JsonElement]::new()
         if ($root.ValueKind -ne 'Object' -or -not $root.TryGetProperty('pid', [ref]$pe) -or $pe.ValueKind -ne 'Number' -or -not $pe.TryGetInt32([ref]$procId)) { throw 'bad-child-json' }
-        if (-not $root.TryGetProperty('createdUtc', [ref]$ce) -or $ce.ValueKind -ne 'String' -or $ce.GetString() -notmatch '^\d{4}-\d\d-\d\dT\d\d:\d\d') { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001), prose or '/Date(0)/' is no timestamp: without one a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
-        $born = [datetime]::Parse($ce.GetString(), [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        if (-not $root.TryGetProperty('createdUtc', [ref]$ce) -or $ce.ValueKind -ne 'String') { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001), prose or '/Date(0)/' is no timestamp: without one a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
+        $stamp = $ce.GetString(); $when = [datetime]::MinValue
+        # \A...\z, never ^...$ (which lets one trailing LF through), [0-9] not \d (which matches other scripts' digits), then an exact-format parse: a value with an embedded or trailing newline is no timestamp (sol r8b B2)
+        if ($stamp -cnotmatch '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,7})?(Z|[+-][0-9]{2}:[0-9]{2})\z' -or -not [datetime]::TryParseExact($stamp, [string[]]@('yyyy-MM-dd\THH:mm:ssK', 'yyyy-MM-dd\THH:mm:ss.FFFFFFFK'), [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$when)) { throw 'bad-created-utc' }
+        $born = $when.ToUniversalTime()
     }
     if ($procId -le 0) { throw 'no-lane-pid' }
     $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
@@ -141,6 +144,7 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) { 
 try {
     $here = (Get-Location).ProviderPath  # PowerShell's location, not .NET's (adversary A6)
     $WorkDir = [System.IO.Path]::GetFullPath($WorkDir, $here); $RunDir = [System.IO.Path]::GetFullPath($RunDir, $here)  # .NET only: PowerShell's path layer may re-spell a POSIX backslash as '/' (dot B1 on #722)
+    if ($ChildJson) { $ChildJson = [System.IO.Path]::GetFullPath($ChildJson, $here) }  # every path the saver reads is resolved against PowerShell's location before any read: a relative record must never be opened through .NET's current directory, where another lane's record may sit (sol r8b B1)
     if (-not [System.IO.Directory]::Exists($WorkDir) -or -not [System.IO.Directory]::Exists($RunDir)) { throw 'no-such-directory' }
     if (Test-LaneAlive) { Write-Output 'DIRTY_SAVE_REFUSED reason=lane-alive'; exit 20 }
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
@@ -150,8 +154,8 @@ if ($top.Code -eq 0) {
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
     $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true  # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1)
     try { $keys = @([System.Text.UTF8Encoding]::new($false, $true).GetString($f.Bytes) -split "`0" | Where-Object { $_ }) } catch { $keys = @('not-utf8') }  # a name that is not UTF-8 cannot be handed to -c unchanged, and a lossy copy would blank a different driver (r8 A2): refused below
-    $names = @($keys | Where-Object { $_ -match '^filter\.[^=]+\.[^.=]+$' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf('.')) } | Select-Object -Unique)
-    if (($f.Code -ne 0 -and $f.Code -ne 1) -or @($keys | Where-Object { $_ -notmatch '^filter\.[^=]+\.[^.=]+$' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $($f.Err.Trim())"; exit 40 }
+    $names = @($keys | Where-Object { $_ -match '\Afilter\.[^=]+\.[^.=]+\z' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf('.')) } | Select-Object -Unique)
+    if (($f.Code -ne 0 -and $f.Code -ne 1) -or @($keys | Where-Object { $_ -notmatch '\Afilter\.[^=]+\.[^.=]+\z' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $($f.Err.Trim())"; exit 40 }
     foreach ($k in $names) { $script:noCallbacks += @('-c', "$k.clean=", '-c', "$k.smudge=", '-c', "$k.process=", '-c', "$k.required=false") }
 }
 try {
@@ -166,7 +170,7 @@ try {
 if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
 $headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()
-if ($headR.Code -eq 0 -and $headFull -notmatch '^[0-9a-f]{40,64}$') { $headR = @{ Code = -1; Err = "unexpected HEAD '$headFull'" } }
+if ($headR.Code -eq 0 -and $headFull -notmatch '\A[0-9a-f]{40,64}\z') { $headR = @{ Code = -1; Err = "unexpected HEAD '$headFull'" } }
 $git = [ordered]@{ head = $headR }
 if ($headR.Code -eq 0) {
     $git.patch = Invoke-GitBytes (@('diff', $headFull) + $flags); $git.staged = Invoke-GitBytes (@('diff', '--cached', $headFull) + $flags)

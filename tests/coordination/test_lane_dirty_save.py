@@ -640,6 +640,32 @@ def test_child_json_without_a_created_utc_is_bad_arguments_and_saves_nothing(rep
     assert saved(repo) == []
 
 
+def test_a_relative_child_json_is_read_where_powershell_is_not_where_dotnet_is(repo, tmp_path):  # r9 sol r8b B1: ReadAllText follows .NET's directory, where another lane's record (dead pid) may sit while the intended lane is alive
+    jobs, other = tmp_path / "jobs", tmp_path / "elsewhere"
+    jobs.mkdir(); other.mkdir()
+    (jobs / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()}))  # the intended lane: alive (a stamp later than its start)
+    (other / "child.json").write_text(json.dumps({"pid": 2147483647, "createdUtc": "2000-01-01T00:00:00Z"}))  # decoy: pid absent, so dead
+    dirty(repo)
+    cmd = f"Set-Location '{jobs}'; [Environment]::CurrentDirectory = '{other}'; & '{SCRIPT}' -WorkDir '{repo}' -RunDir '{repo.parent / 'run'}' -ChildJson child.json; exit $LASTEXITCODE"
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", cmd], capture_output=True, text=True)
+    assert r.returncode == 20 and "lane-alive" in r.stdout, r.stdout + r.stderr  # old code: read the decoy, exit 0
+    assert saved(repo) == []
+
+
+@pytest.mark.parametrize("created", ["2026-10-30T12:30:00\nZ", "2026-10-30T12:30:00Z\n", "\n2026-10-30T12:30:00Z", "2026-10-30T12:30:00Z ", "2026-13-45T12:30:00Z",
+                                     "2026-10-30T12:30:00", "2026-10-30 12:30:00Z", "٢٠٢٦-10-30T12:30:00Z", ["2026-10-30T12:30:00Z"], {"v": "2026-10-30T12:30:00Z"}])
+def test_a_created_utc_with_whitespace_or_not_exactly_iso_is_bad_arguments_and_saves_nothing(repo, tmp_path, created):  # r9 sol r8b B2: ^...$ lets a trailing LF through and DateTime.Parse then reads a newline inside the value
+    dirty(repo)
+    (tmp_path / "child.json").write_text(json.dumps({"pid": 2147483647, "createdUtc": created}))
+    r = save(repo, "-ChildJson", str(tmp_path / "child.json"))
+    assert r.returncode == 30 and "bad-created-utc" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+def test_no_regex_in_the_saver_is_closed_with_a_dollar_that_lets_a_trailing_newline_through():  # r9: the class behind B2, ^...$ matches before a final LF; \A...\z does not
+    assert not re.search(r"-(?:c?not)?match\s+'[^']*[^\\]\$'", SCRIPT.read_text(encoding="utf-8"))
+
+
 @pytest.mark.parametrize("caller_env", [{}, {"GIT_CONFIG": os.devnull}])  # GIT_CONFIG redirects only `git config`, so a discovery run through it saw no filter (second r8 pass A1)
 def test_a_configured_clean_filter_cannot_overwrite_the_dirt_being_saved(repo, tmp_path, caller_env):  # r8 adversary A1: the same class as fsmonitor, a command git runs on every tracked file it diffs
     (repo / ".gitattributes").write_text("a.txt filter=rewrite\n")
