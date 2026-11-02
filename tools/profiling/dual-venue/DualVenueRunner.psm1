@@ -2219,44 +2219,53 @@ function Get-DvPngCrc32 {
     if ($null -eq $t) { Add-Type -TypeDefinition $script:PngCrc32Source -Language CSharp -ErrorAction Stop; $t = $script:PngCrc32TypeName -as [type] }
     [long]$t::Compute($Bytes, $Offset, $Count)
 }
-# r11 fix 2: the PNG chunks whose length, place or count the image fixes (PNG 1.2 / ISO 15948 section 11.3). $null when the chunk keeps them, else why not.
-# Lengths by colour type (0 grey, 2 RGB, 3 palette, 4 grey+alpha, 6 RGBA); 'P' = the palette's entry count; absent = the chunk is not allowed there.
+# r13 (sol r12 key B1, r12 adversary successor ADV-A1): the chunk ALLOWLIST. Through r12 a chunk this check did not know was SKIPPED, so a PNG with
+# valid CRCs and image data but a malformed ancillary payload (a zTXt with compression method 1, an empty iCCP; Pillow refuses both) passed, and a
+# hash-matching pair of them was honoured. The check now fails CLOSED: a chunk type not on this list is refused, critical or ancillary, and every
+# ancillary on it has its length AND its fields checked to the PNG spec. The list is what the leg's stills and sheets actually carry (survey of the 8853
+# evidence PNGs under .claude-state\dual-venue\evidence and the r1 sheets, r13 run dir png-chunk-survey.txt: IHDR, pHYs, sRGB, gAMA, IDAT, IEND and
+# nothing else), plus PLTE and tRNS, which carry no compressed or text payload and are checked in full. No text, compressed or colour-profile chunk
+# (tEXt, zTXt, iTXt, iCCP) and no private chunk is on it: the leg writes none.
+$script:PngAllowedChunks = @('IHDR', 'PLTE', 'IDAT', 'IEND', 'sRGB', 'gAMA', 'pHYs', 'tRNS')
+# r11 fix 2: the allowlisted ancillary chunks' length, place and count (PNG 1.2 / ISO 15948 section 11.3). $null when the chunk keeps them, else why not.
+# Lengths by colour type (0 grey, 2 RGB, 3 palette, 4 grey+alpha, 6 RGBA); absent = the chunk is not allowed there.
 $script:PngAncillaryLength = @{
-    gAMA = @{ 0 = 4; 2 = 4; 3 = 4; 4 = 4; 6 = 4 }; cHRM = @{ 0 = 32; 2 = 32; 3 = 32; 4 = 32; 6 = 32 }; sRGB = @{ 0 = 1; 2 = 1; 3 = 1; 4 = 1; 6 = 1 }
-    pHYs = @{ 0 = 9; 2 = 9; 3 = 9; 4 = 9; 6 = 9 }; tIME = @{ 0 = 7; 2 = 7; 3 = 7; 4 = 7; 6 = 7 }
-    sBIT = @{ 0 = 1; 2 = 3; 3 = 3; 4 = 2; 6 = 4 }; bKGD = @{ 0 = 2; 2 = 6; 3 = 1; 4 = 2; 6 = 6 }; tRNS = @{ 0 = 2; 2 = 6 }   # (tRNS of a palette image: below)
+    gAMA = @{ 0 = 4; 2 = 4; 3 = 4; 4 = 4; 6 = 4 }; sRGB = @{ 0 = 1; 2 = 1; 3 = 1; 4 = 1; 6 = 1 }; pHYs = @{ 0 = 9; 2 = 9; 3 = 9; 4 = 9; 6 = 9 }
+    tRNS = @{ 0 = 2; 2 = 6 }   # (tRNS of a palette image: below)
 }
-$script:PngBeforePlte = @('gAMA', 'cHRM', 'sRGB', 'iCCP', 'sBIT')
-$script:PngAfterPlte = @('tRNS', 'bKGD', 'hIST')   # (after PLTE when there is one)
-$script:PngBeforeIdat = @('gAMA', 'cHRM', 'sRGB', 'iCCP', 'sBIT', 'tRNS', 'bKGD', 'hIST', 'pHYs', 'sPLT')
+$script:PngBeforePlte = @('gAMA', 'sRGB')
+$script:PngAfterPlte = @('tRNS')   # (after PLTE when there is one)
+$script:PngBeforeIdat = @('gAMA', 'sRGB', 'tRNS', 'pHYs')
 function Get-DvPngAncillaryProblem {
-    param([string]$Name, [int]$Length, [int]$Colour, [int]$Depth, [bool]$SawPlte, [bool]$SawIdat, [int]$PlteEntries, [System.Collections.Generic.HashSet[string]]$Seen)
+    param([string]$Name, [int]$Length, [int]$Colour, [int]$Depth, [bool]$SawPlte, [bool]$SawIdat, [int]$PlteEntries, [System.Collections.Generic.HashSet[string]]$Seen,
+          [byte[]]$Bytes, [int]$DataAt)
+    if ($Name -cin @('IHDR', 'IEND')) { return $null }   # (checked by the caller: IHDR first and 13 bytes, IEND last and empty)
     if ($Name -ceq 'PLTE') {
         if ($Colour -eq 0 -or $Colour -eq 4) { return "is not allowed in a greyscale image (colour type $Colour)" }
         if ($Length -lt 3 -or $Length -gt 768 -or ($Length % 3) -ne 0) { return "is $Length bytes (a palette is 1 .. 256 three-byte entries)" }
         if ($Colour -eq 3 -and ($Length / 3) -gt [Math]::Pow(2, $Depth)) { return "has $($Length / 3) entries, more than a $Depth-bit palette image indexes" }
         return $null
     }
-    if ($Name -cnotin @($script:PngBeforeIdat + 'tIME')) { return $null }   # (text, private and other chunks: variable length, no place PNG fixes)
-    if ($Name -cne 'sPLT' -and $Seen.Contains($Name)) { return 'repeats (PNG allows one)' }
+    if ($Name -cnotin $script:PngBeforeIdat) { return "is not on the PNG chunk allowlist ($($script:PngAllowedChunks -join ', '))" }   # (the caller refuses it first)
+    if ($Seen.Contains($Name)) { return 'repeats (PNG allows one)' }
     if ($Name -cin $script:PngBeforePlte -and $SawPlte) { return 'comes after PLTE (PNG requires it before)' }
     if ($Name -cin $script:PngAfterPlte -and $Colour -eq 3 -and -not $SawPlte) { return 'comes before PLTE (PNG requires it after)' }
-    if ($SawIdat -and $Name -cin $script:PngBeforeIdat) { return 'comes after the image data (PNG requires it before IDAT)' }
-    if (($Name -ceq 'iCCP' -and $Seen.Contains('sRGB')) -or ($Name -ceq 'sRGB' -and $Seen.Contains('iCCP'))) { return 'sits beside an sRGB / iCCP chunk (PNG allows one of the two)' }
+    if ($SawIdat) { return 'comes after the image data (PNG requires it before IDAT)' }
     if ($Name -ceq 'tRNS' -and $Colour -eq 3) {
         if ($Length -lt 1 -or $Length -gt $PlteEntries) { return "is $Length bytes (a palette image's tRNS holds 1 .. $PlteEntries entries, one per palette entry)" }
         return $null
     }
-    if ($Name -ceq 'hIST') {
-        # r12 A3 (advisory): hIST follows a PLTE of any colour type (a suggested palette of an RGB / RGBA image has one too), not only a palette image's
-        if (-not $SawPlte) { return "is not allowed without a palette (no PLTE before it, colour type $Colour)" }
-        if ($Length -ne 2 * $PlteEntries) { return "is $Length bytes (2 per palette entry: $(2 * $PlteEntries))" }
-        return $null
-    }
-    if ($script:PngAncillaryLength.ContainsKey($Name)) {
-        $want = $script:PngAncillaryLength[$Name]
-        if (-not $want.ContainsKey($Colour)) { return "is not allowed in an image of colour type $Colour" }
-        if ($Length -ne $want[$Colour]) { return "is $Length bytes (PNG fixes it at $($want[$Colour]) for colour type $Colour)" }
+    $want = $script:PngAncillaryLength[$Name]
+    if (-not $want.ContainsKey($Colour)) { return "is not allowed in an image of colour type $Colour" }
+    if ($Length -ne $want[$Colour]) { return "is $Length bytes (PNG fixes it at $($want[$Colour]) for colour type $Colour)" }
+    # r13: the enumerated and ranged fields (PNG 1.2 sections 4.2.x; a PNG four-byte unsigned integer is at most 2^31-1)
+    $u32 = { param([int]$o) ([long]$Bytes[$DataAt + $o] -shl 24) -bor ([long]$Bytes[$DataAt + $o + 1] -shl 16) -bor ([long]$Bytes[$DataAt + $o + 2] -shl 8) -bor [long]$Bytes[$DataAt + $o + 3] }
+    if ($Name -ceq 'sRGB' -and $Bytes[$DataAt] -gt 3) { return "has rendering intent $($Bytes[$DataAt]) (PNG defines 0 .. 3)" }
+    if ($Name -ceq 'gAMA') { $g = & $u32 0; if ($g -lt 1 -or $g -gt 0x7FFFFFFF) { return "has gamma $g (PNG requires 1 .. 2^31-1; zero is meaningless)" } }
+    if ($Name -ceq 'pHYs') {
+        $px = & $u32 0; $py = & $u32 4
+        if ($px -gt 0x7FFFFFFF -or $py -gt 0x7FFFFFFF) { return "has pixels per unit $px x $py (PNG allows at most 2^31-1)" }
+        if ($Bytes[$DataAt + 8] -gt 1) { return "has unit specifier $($Bytes[$DataAt + 8]) (PNG defines 0 unknown and 1 metre)" }
     }
     $null
 }
@@ -2287,7 +2296,8 @@ function Get-DvPngImageProblem {
         # ignored); no critical chunk (upper-case first letter) other than IHDR, PLTE, IDAT and IEND; at most one PLTE, and never after the image data;
         # the IDAT chunks consecutive.
         if ($name -ceq 'IHDR' -and $at -ne 8) { return "it has a second IHDR chunk at byte $at" }
-        if ($name -cmatch '^[A-Z]' -and $name -cnotin @('IHDR', 'PLTE', 'IDAT', 'IEND')) { return "its $name chunk at byte $at is a critical chunk PNG does not define" }
+        # r13 (sol r12 B1): fail CLOSED on the chunk type. A chunk not on the allowlist is refused, critical or ancillary (it was skipped through r12).
+        if ($name -cnotin $script:PngAllowedChunks) { return "its $name chunk at byte $at is not on the PNG chunk allowlist ($($script:PngAllowedChunks -join ', '))$(if ($name -cmatch '^[A-Z]') { ': a critical chunk PNG does not define' })" }
         if ($name -ceq 'PLTE' -and ($sawPlte -or $sawIdat)) { return "its PLTE chunk at byte $at $(if ($sawPlte) { 'repeats' } else { 'comes after the image data' })" }
         if ($name -cne 'IDAT' -and $sawIdat) { $idatEnded = $true }
         # r12 A1: the CRC-32 of EVERY chunk (type + data), IDAT included. r12 A2 (advisory): IEND carries no data.
@@ -2303,7 +2313,8 @@ function Get-DvPngImageProblem {
             # it breaks them (a decoder rejects it: a 1-byte tRNS on an RGB image, an empty gAMA, sRGB or pHYs passed). PLTE: 1..256 whole entries, at
             # most 2^depth for a palette image, none for a greyscale one. The others: their length for this colour type, before PLTE / IDAT where PNG
             # requires it, and not repeated.
-            $problem = Get-DvPngAncillaryProblem -Name $name -Length ([int]$length) -Colour $colour -Depth $depth -SawPlte $sawPlte -SawIdat $sawIdat -PlteEntries $plteEntries -Seen $seenChunks
+            # r13: and every allowlisted chunk's fields (sRGB intent, gAMA value, pHYs units), from its bytes
+            $problem = Get-DvPngAncillaryProblem -Name $name -Length ([int]$length) -Colour $colour -Depth $depth -SawPlte $sawPlte -SawIdat $sawIdat -PlteEntries $plteEntries -Seen $seenChunks -Bytes $Bytes -DataAt ($at + 8)
             if ($null -ne $problem) { return "its $name chunk at byte $at $problem" }
             if ($name -ceq 'PLTE') { $plteEntries = [int]($length / 3) }
             [void]$seenChunks.Add($name)

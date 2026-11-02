@@ -32,10 +32,13 @@ def png_chunk(kind: bytes, data: bytes) -> bytes:
 
 def fixture_png(tag: bytes | str, width: int = 2, height: int = 2) -> bytes:
     """r10 forced fixture (sol r9 key B1): a well-formed PNG -- signature, IHDR, IDAT, IEND -- tagged by a tEXt chunk so each still hashes apart. The
-    r6-r9 fixtures were the 8-byte signature plus a tag (no IHDR), the shape r10's image check now refuses, as it refuses a zero-byte png."""
+    r6-r9 fixtures were the 8-byte signature plus a tag (no IHDR), the shape r10's image check now refuses, as it refuses a zero-byte png.
+    r13 forced companion (hub r13 ruling, sol r12 key B1): the tag rode in a tEXt chunk, which the chunk allowlist now refuses (the leg writes no text
+    chunk). It now rides in a pHYs chunk, the one ancillary chunk every Qt grab the leg writes carries: pixels per unit = CRC-32 of the tag (31 bits)."""
     tag = tag.encode("utf-8") if isinstance(tag, str) else tag
     rows = b"".join(b"\x00" + bytes(3 * width) for _ in range(height))
-    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + png_chunk(b"tEXt", b"fixture\x00" + tag)
+    ppu = zlib.crc32(b"fixture\x00" + tag) & 0x7FFFFFFF
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + png_chunk(b"pHYs", struct.pack(">IIB", ppu, ppu, 1))
             + png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
 
 
@@ -1293,10 +1296,10 @@ R11_FIX2_NOT_A_PNG = (("rgb-trns-one-byte", ADVERSARY_R11_FIX2_A1),
                       ("gama-repeated", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"gAMA", struct.pack(">I", 45455)) * 2)),
                       ("grey-with-plte", png_of(1, 1, 8, 0, 0, _GREY_1X1, extra=png_chunk(b"PLTE", b"\x10\x20\x30"))),
                       ("palette-trns-longer-than-palette", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x00\x00"))))
-# controls the r11 check must still accept: stored (level 0) deflate blocks, a valid ancillary chunk between IHDR and IDAT, and the fixed-size chunks a
-# Qt-written PNG carries (gAMA, sRGB, pHYs) plus an RGB tRNS and a palette tRNS at their sizes
+# controls the r11 check must still accept: stored (level 0) deflate blocks, and the fixed-size chunks a Qt-written PNG carries (gAMA, sRGB, pHYs) plus
+# an RGB tRNS and a palette tRNS at their sizes. (r13: r11's "ok-ancillary-chunk" control, a tEXt chunk, is now REFUSED -- the hub's r13 ruling puts
+# no text chunk on the allowlist, because the leg writes none; it moved to R13_NOT_A_PNG as "text-chunk-tEXt".)
 R11_PNG_CONTROLS = (("ok-stored-blocks.png", png_of(4, 3, 8, 2, 0, zlib.compress(_RGB_ROWS, 0))),
-                    ("ok-ancillary-chunk.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tEXt", b"k\x00v"))),
                     ("ok-gama-srgb-phys.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"sRGB", b"\x00") + png_chunk(b"gAMA", struct.pack(">I", 45455))
                                                      + png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 1)))),
                     ("ok-rgb-trns.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tRNS", bytes(6)))),
@@ -1337,8 +1340,66 @@ R12_FIX2_NOT_A_PNG = (("adler32-last-byte-ff-cut", ADVERSARY_R12_FIX2_A1),
                       ("adler32-ff-cut-1x1", png_of(1, 1, 8, 2, 0, zlib.compress(_rows_whose_adler_ends_in_ff(1, 1))[:-1])),
                       ("adler32-ff-cut-4x3", png_of(4, 3, 8, 2, 0, zlib.compress(_rows_whose_adler_ends_in_ff(4, 3))[:-1])))
 R12_PNG_CONTROLS = (("ok-adler32-ends-in-ff-4x3.png", png_of(4, 3, 8, 2, 0, zlib.compress(_rows_whose_adler_ends_in_ff(4, 3)))),
-                    ("ok-adler32-verbatim-uncut.png", png_of(1, 1, 8, 2, 0, bytes.fromhex("789c63f8c7c0000002fe00ff"))),("ok-rgb-plte-hist.png", png_of(1, 1, 8, 2, 0, zlib.compress(bytes(4)), extra=png_chunk(b"PLTE", b"\x00\x00\x00") + png_chunk(b"hIST", b"\x00\x01"))),
+                    ("ok-adler32-verbatim-uncut.png", png_of(1, 1, 8, 2, 0, bytes.fromhex("789c63f8c7c0000002fe00ff"))),
                     ("ok-split-idat-r12.png", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + b"".join(_SPLIT_IDAT) + png_chunk(b"IEND", b"")))
+# (r13: r12's "ok-rgb-plte-hist" control is now REFUSED -- hIST is not on the allowlist; it moved to R13_NOT_A_PNG as "hist-after-suggested-plte".)
+# r13 (sol r12 key B1, r12 adversary successor ADV-A1): a PNG with valid CRCs and image data but a chunk the check did not know was SKIPPED, so a
+# malformed ancillary payload passed and a hash-matching pair of them was honoured. Verbatim: sol's zTXt with compression method 1 and the r12 adversary's
+# empty iCCP (Pillow 12.2.0 refuses both). The check now fails CLOSED on a fixed allowlist (IHDR, PLTE, IDAT, IEND, sRGB, gAMA, pHYs, tRNS: the survey
+# in the r13 run dir's png-chunk-survey.txt). The class: every other chunk type, WELL-formed or not (text, compressed, colour-profile, private, other
+# ancillaries PNG defines), and an allowlisted chunk whose enumerated or ranged field PNG does not define (sRGB intent 4, gAMA 0, pHYs unit 2,
+# pHYs pixels-per-unit over 2^31-1).
+SOL_R12_B1_ZTXT = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de000000047a5458746b000178c845eb4d0000000c49444154789c63606060000000040001f61738550000000049454e44ae426082")
+ADVERSARY_R12_EMPTY_ICCP = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000069434350a589193e0000000c49444154789c63606060000000040001f61738550000000049454e44ae426082")
+_RGB_1X1 = zlib.compress(bytes(4))
+
+
+def _rgb_with(*chunks: bytes) -> bytes:
+    return png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=b"".join(chunks))
+
+
+R13_NOT_A_PNG = (("sol-r12-b1-ztxt-method-1", SOL_R12_B1_ZTXT),
+                 ("adversary-r12-empty-iccp", ADVERSARY_R12_EMPTY_ICCP),
+                 ("text-chunk-tEXt", _rgb_with(png_chunk(b"tEXt", b"k\x00v"))),
+                 ("well-formed-ztxt", _rgb_with(png_chunk(b"zTXt", b"k\x00\x00" + zlib.compress(b"v")))),
+                 ("well-formed-itxt", _rgb_with(png_chunk(b"iTXt", b"k\x00\x00\x00\x00\x00v"))),
+                 ("well-formed-iccp", _rgb_with(png_chunk(b"iCCP", b"p\x00\x00" + zlib.compress(bytes(128))))),
+                 ("hist-after-suggested-plte", png_of(1, 1, 8, 2, 0, _RGB_1X1, extra=png_chunk(b"PLTE", b"\x00\x00\x00") + png_chunk(b"hIST", b"\x00\x01"))),
+                 ("chrm", _rgb_with(png_chunk(b"cHRM", bytes(32)))),
+                 ("time", _rgb_with(png_chunk(b"tIME", bytes.fromhex("07ea0b02150000")))),
+                 ("bkgd", _rgb_with(png_chunk(b"bKGD", bytes(6)))),
+                 ("sbit", _rgb_with(png_chunk(b"sBIT", b"\x08\x08\x08"))),
+                 ("private-ancillary", _rgb_with(png_chunk(b"prVt", b"x"))),
+                 ("exif", _rgb_with(png_chunk(b"eXIf", b"MM\x00\x2a\x00\x00\x00\x08"))),
+                 ("srgb-intent-4", _rgb_with(png_chunk(b"sRGB", b"\x04"))),
+                 ("gama-zero", _rgb_with(png_chunk(b"gAMA", bytes(4)))),
+                 ("gama-over-2-31", _rgb_with(png_chunk(b"gAMA", b"\x80\x00\x00\x00"))),
+                 ("phys-unit-2", _rgb_with(png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 2)))),
+                 ("phys-ppu-over-2-31", _rgb_with(png_chunk(b"pHYs", struct.pack(">IIB", 0x80000000, 3780, 1)))),
+                 ("srgb-repeated", _rgb_with(png_chunk(b"sRGB", b"\x00"), png_chunk(b"sRGB", b"\x00"))))
+_ALLOWLIST = "not on the PNG chunk allowlist (IHDR, PLTE, IDAT, IEND, sRGB, gAMA, pHYs, tRNS)"
+R13_TYPED = {"bad-r13-sol-r12-b1-ztxt-method-1.png": f"its zTXt chunk at byte 33 is {_ALLOWLIST}",
+             "bad-r13-adversary-r12-empty-iccp.png": f"its iCCP chunk at byte 33 is {_ALLOWLIST}",
+             "bad-r13-text-chunk-tEXt.png": f"its tEXt chunk at byte 33 is {_ALLOWLIST}",
+             "bad-r13-private-ancillary.png": f"its prVt chunk at byte 33 is {_ALLOWLIST}",
+             "bad-r13-hist-after-suggested-plte.png": f"its hIST chunk at byte 48 is {_ALLOWLIST}",
+             "bad-r11-unknown-critical-chunk.png": f"its ABCD chunk at byte 33 is {_ALLOWLIST}: a critical chunk PNG does not define",
+             "bad-r13-srgb-intent-4.png": "its sRGB chunk at byte 33 has rendering intent 4",
+             "bad-r13-gama-zero.png": "its gAMA chunk at byte 33 has gamma 0",
+             "bad-r13-phys-unit-2.png": "its pHYs chunk at byte 33 has unit specifier 2",
+             "bad-r13-phys-ppu-over-2-31.png": "its pHYs chunk at byte 33 has pixels per unit 2147483648 x 3780",
+             "bad-r13-srgb-repeated.png": "its sRGB chunk at byte 46 repeats"}
+# r13 controls: the leg's own chunk sequences, byte for byte from the survey (a Qt grab: IHDR pHYs IDAT IEND; a strip: IHDR sRGB gAMA pHYs IDAT IEND;
+# a bare IHDR IDAT IEND), and every field value PNG defines at its edge.
+_SURVEY_PHYS = png_chunk(b"pHYs", bytes.fromhex("00000ec400000ec401"))
+R13_PNG_CONTROLS = (("ok-r13-survey-grab.png", _rgb_with(_SURVEY_PHYS)),
+                    ("ok-r13-survey-strip.png", _rgb_with(png_chunk(b"sRGB", b"\x00"), png_chunk(b"gAMA", bytes.fromhex("0000b18f")),
+                                                          png_chunk(b"pHYs", bytes.fromhex("00000ec300000ec301")))),
+                    ("ok-r13-survey-rgba-grab.png", png_of(1, 1, 8, 6, 0, zlib.compress(bytes(5)), extra=_SURVEY_PHYS)),
+                    ("ok-r13-srgb-intent-3.png", _rgb_with(png_chunk(b"sRGB", b"\x03"))),
+                    ("ok-r13-gama-max.png", _rgb_with(png_chunk(b"gAMA", b"\x7f\xff\xff\xff"))),
+                    ("ok-r13-phys-unit-0-max.png", _rgb_with(png_chunk(b"pHYs", struct.pack(">IIB", 0x7FFFFFFF, 0, 0)))),
+                    ("ok-r13-suggested-plte.png", png_of(1, 1, 8, 2, 0, _RGB_1X1, extra=png_chunk(b"PLTE", b"\x00\x00\x00"))))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -1376,7 +1437,8 @@ class PngImageCheckUnitTests(unittest.TestCase):
                  **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{f"bad-r11f2-{n}.png": (b, False) for n, b in R11_FIX2_NOT_A_PNG},
                  **{n: (b, True) for n, b in R11_PNG_CONTROLS},
                  **{f"bad-r12-{n}.png": (b, False) for n, b in R12_NOT_A_PNG}, **{f"bad-r12f2-{n}.png": (b, False) for n, b in R12_FIX2_NOT_A_PNG},
-                 **{n: (b, True) for n, b in R12_PNG_CONTROLS}}
+                 **{n: (b, True) for n, b in R12_PNG_CONTROLS},
+                 **{f"bad-r13-{n}.png": (b, False) for n, b in R13_NOT_A_PNG}, **{n: (b, True) for n, b in R13_PNG_CONTROLS}}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
@@ -1392,6 +1454,8 @@ class PngImageCheckUnitTests(unittest.TestCase):
                     self.assertEqual(rows[name], "OK")
                 else:
                     self.assertNotEqual(rows[name], "OK", f"{name} is no PNG image")
+                if name in R13_TYPED:
+                    self.assertIn(R13_TYPED[name], rows[name], "r13: the refusal is TYPED -- it names the chunk and why")
 
 
 SEEK_RAW = ("artifacts", "paired-seek", "contact-sheet", "raw")
@@ -1446,6 +1510,21 @@ class PairedSeekImageContentTests(PairedStillsHarness, unittest.TestCase):
                     self.fresh()
                     receipt = self.run_image_case(f"img-{shape}-{member[:4]}", member, data)
                     self.assert_image_mismatch(receipt, member, final=False)
+
+    def test_r13_b1_a_malformed_ancillary_chunk_in_either_member_is_not_a_pass(self) -> None:
+        # r13 (sol r12 key B1): sol's probe -- hash-matching stills, frame 50 first, seek/false paused provenance, in_pass/true partner provenance --
+        # with sol's zTXt (compression method 1) or the r12 adversary's empty iCCP as either member. On d78a0bf9 the reader returned framesHonoured=true
+        # with no mismatch; now each is a typed mismatch naming frame-00, INVALID, on a listed and a listless leg and at final validation.
+        for shape, data in (("ztxt", SOL_R12_B1_ZTXT), ("iccp", ADVERSARY_R12_EMPTY_ICCP)):
+            for member in ("paused", "partner"):
+                for listed, final in ((True, False), (False, False), (True, True)):
+                    with self.subTest(shape=shape, member=member, listed=listed, final_validation=final):
+                        self.fresh()
+                        receipt = self.run_image_case(f"r13-{shape}-{member[:4]}-{'l' if listed else 'n'}", member, data, listed=listed, final=final)
+                        self.assert_image_mismatch(receipt, member, final)
+                        if not final:
+                            self.assertIn(f"{'zTXt' if shape == 'ztxt' else 'iCCP'} chunk at byte 33 is not on the PNG chunk allowlist",
+                                          " ".join(receipt["look"]["pairedSeek"]["frameMismatches"]))
 
     def test_r10_the_valid_image_pair_control_passes(self) -> None:
         for listed in (True, False):
