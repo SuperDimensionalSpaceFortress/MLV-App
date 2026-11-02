@@ -327,6 +327,10 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
         r"\$smokeExit\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$smokeExit\s+-ne\s+0\)\s*\{",
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1":
         r"\$smokeRc\s*=\s*\$LASTEXITCODE[\s\S]*?\$smokeRc\s+-ne\s+0",
+    # VENUE-REFERENCE-FRAME-JOB-1: the venue job that runs capture-reference-frame.ps1 from a hash-pinned bundle under the gate profile. The capture
+    # script's own exit code is the job's exit code and its result status (0 = candidate-unreviewed, anything else = capture-failed, 43 included).
+    "tools/profiling/bachelor/reference-frame-runner-job.ps1":
+        r"\$captureRc\s*=\s*\$LASTEXITCODE[\s\S]*?\$captureRc\s+-ne\s+0",
     "tools/profiling/run-shipping-guard-smoke.ps1":
         r"\$code\s*=\s*\$LASTEXITCODE[\s\S]*?status\s*=\s*if\s*\(\$code\s+-eq\s+0\)",
     "tools/profiling/run-local-cuda-playback-dng-smoke.ps1":
@@ -343,6 +347,18 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
     # LEG_FAILED / INVALID and the chain exits 7, whatever DVE_OUTCOME the dead leg printed (never recorded as a RAN leg).
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1":
         r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
+    # BACHELOR-LEASE-BATCH-LEGS-1: the same rule for the lease-batch runner: a leg process that exits non-zero is LEG_FAILED / INVALID (never RAN,
+    # never counted) and the run exits 7. r3 (sol r2 B2): the exit code is the bounded leg child's own ($lp.exit), not $LASTEXITCODE.
+    "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1":
+        r"\$lp\s*=\s*Invoke-VenueBoundedProcess\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[\s\S]*?\$legCode\s*=\s*\$lp\.exit\b"
+        r"[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
+    # UM-REGULAR-BASELINE-1 r2: runs the chain once per backend as a child process and reads its exit code ($p.ExitCode) BEFORE any trend row is
+    # built. A leg is RAN only when the chain ended on its own with a documented exit that agrees with its CHAIN_RESULT; otherwise the row is
+    # EVIDENCE_INCOMPLETE (no figures) and the run exits CHAIN_FAILED. A dead leg (chain exit 7) stays a typed LEG_FAILED row.
+    "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1":
+        r"\$p\.ExitCode[\s\S]*?\$chainComplete\s*=\s*\(-not\s+\$c\.timedOut\)[\s\S]*?\(\$resultExit\s+-eq\s+\[int\]\$c\.exit\)[\s\S]*?"
+        r"if\s*\(-not\s+\$chainComplete\)\s*\{\s*\$failure\s*=[\s\S]*?'EVIDENCE_INCOMPLETE'[\s\S]*?"
+        r"if\s*\(-not\s+\$chainComplete\)\s*\{[\s\S]*?reason\s*=\s*'CHAIN_FAILED'",
 }
 
 # Scripts that NAME an evidence launcher (or a consumer) and are not consumers that publish a result. Each reason is read
@@ -374,6 +390,8 @@ CONSUMER_EXEMPT: dict[str, str] = {
     "tools/gates/test_output_budget.py": "unit test of compare-output-budget.ps1 (runs it against fakes).",
     "tools/coordination/lane-local-playback-lint.ps1":
         "static prompt-text safety lint: it names the venue chain only to recognise venue routing in a prompt and never launches anything.",
+    "tools/testing/test-ultra-magnus-agent-quiet-lease.ps1":
+        "static self-test: reads playback-attr-3-cuda-job.ps1 as text to pin its quiet-lease call and CPU threshold; it never launches it.",
 }
 
 

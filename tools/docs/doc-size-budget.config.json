@@ -1,0 +1,68 @@
+{
+  "_comment": "MLV-App documentation size budgets, read by the fleet's canonical check-doc-size (bus tools/factory/check-doc-size.py) run BY PIN. This file replaces the CONFIG block of the retired tools/check-doc-size.py (CHECK-DOC-SIZE-SINGLE-SOURCE-1). Run: py -3 tools/docs/run_doc_size.py --warn-only --all. Policy of record: docs/22-doc-fragmentation-policy.md.",
+  "schema": "factory-check-doc-size.v1",
+  "tiers": {
+    "entry": {
+      "soft": 8000,
+      "hard": 12000,
+      "why": "auto-loaded by an agent on every cold session; every byte taxes every session",
+      "globs": ["CLAUDE.md", "AGENTS.md"]
+    },
+    "hub": {
+      "soft": 150000,
+      "hard": 150000,
+      "why": "multi-lane coordination ledgers; re-read on every seat rotation (ratified 150 KB, .claude-state/coordination/COORDINATION-PRUNE-POLICY.md, BINDING 2026-07-15); one trigger, so soft == hard on purpose",
+      "globs": [".claude-state/**"]
+    },
+    "ledger": {
+      "soft": 30000,
+      "hard": 60000,
+      "why": "append-only; the live head is capped and the tail rotates to a dated archive",
+      "globs": [".claude/ANALYSIS_LOG.md"]
+    },
+    "working": {
+      "soft": 25000,
+      "hard": 40000,
+      "why": "read in full by one lane when it picks the item up",
+      "globs": ["docs/**", "tools/**", ".claude/**", "claude/**", "*.md"]
+    }
+  },
+  "tier_order": ["entry", "hub", "ledger", "working"],
+  "fallback_tier": "working",
+  "_exempt": "Exempt by policy, not by oversight. The bus tool matches plain fnmatch, so a leading '**/' (which the retired local tool also let match at the repo root) is spelled twice: with and without the prefix.",
+  "exempt": [
+    "**/*-archive-*.md", "*-archive-*.md",
+    "**/*_ARCHIVE*.md", "*_ARCHIVE*.md",
+    "**/archive/**", "archive/**",
+    "**/*-superseded-*.md", "*-superseded-*.md",
+    "CLOSEOUT-CANONICAL-CONTRACT.md",
+    "platform/qt/avir/**",
+    "README.md",
+    ".claude/profiling/**",
+    ".claude/analysis/**",
+    ".claude-state/profiling/**",
+    ".claude/worktrees/**",
+    ".claude-state/worktrees/**",
+    ".claude-state/closeout/repo-sweep/integration-probes/**",
+    ".claude-state/commit-message-rewrite/**",
+    ".claude-state/llm-playback-*/**",
+    "**/*.bak", "*.bak",
+    ".codex-state/**",
+    "CLAUDE_CODE_PROMPTS.md",
+    ".pytest_cache/**",
+    "tools/agent-bridge/.pytest_cache/**"
+  ],
+  "_exempt_ignored": "The last four entries exist only because 'worktree' scanning also sees git-ignored files outside .claude-state, which the retired tool (git-tracked + a .claude-state walk) never governed: .codex-state/ (.gitignore:101, regenerable lane state), CLAUDE_CODE_PROMPTS.md (.gitignore:70) and the two pytest caches outside .claude-state (a cache under .claude-state stays governed, as it was). Listing them keeps the finding set identical to the retired tool's.",
+  "_scan": "'worktree' (walk the checkout, untracked and git-ignored included) is deliberate: .claude-state is git-ignored and is 58% of this repo's markdown mass, so a git-tracked scan would report compliance while the hottest files sat outside it. It also never decodes git output, so a non-ASCII file name is walked as the str os.walk yields (the bus tool's git-tracked mode decodes `git ls-files` with the locale codec: airmypc/factory-check-doc-size-drops-non-ascii-paths).",
+  "scan": "worktree",
+  "_skip_dirs": "Pruned at any depth by the walk. 'worktrees' keeps the walk out of the untracked full repo copies (.gitignore) that the exempt list already excludes; the rest is the retired tool's WALK_SKIP.",
+  "skip_dirs": [".git", "node_modules", "__pycache__", ".venv", "venv", "worktrees"],
+  "path_domain": "lenient",
+  "measure": "disk",
+  "policy": "docs/22-doc-fragmentation-policy.md",
+  "remedy": [
+    "Over the hard cap -> demote the file to an index IN PLACE and move",
+    "the detail into children. Do NOT rename the parent: every existing",
+    "link and pinned string must keep resolving."
+  ]
+}

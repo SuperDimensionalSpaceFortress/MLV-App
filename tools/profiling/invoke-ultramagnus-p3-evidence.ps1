@@ -172,6 +172,9 @@ function Invoke-RobocopyMirror {
         [Parameter(Mandatory = $true)][string]$Destination
     )
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    # The OS robocopy by full path: the Resource Kit copy can sit first on PATH and rejects /BYTES, ignores /MAXAGE.
+    $robocopyExe = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+    if (-not (Test-Path -LiteralPath $robocopyExe -PathType Leaf)) { throw "robocopy not found at $robocopyExe" }
     $args = @(
         $Source,
         $Destination,
@@ -187,7 +190,7 @@ function Invoke-RobocopyMirror {
         ".scratch",
         ".vs"
     )
-    $output = & robocopy.exe @args 2>&1
+    $output = & $robocopyExe @args 2>&1
     $exitCode = $LASTEXITCODE
     return [pscustomobject]@{
         exitCode = $exitCode

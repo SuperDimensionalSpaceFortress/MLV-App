@@ -1,0 +1,26 @@
+{
+  "schema": "factory-pins.v1",
+  "tools": {
+    "check-doc-size": {
+      "path": "tools/factory/check-doc-size.py",
+      "commit": "0ea9c244b5e1b4e6541eb93688a769637e10a5ff",
+      "blob": "6248533982363d1270ad46b1488166a5be4352dd",
+      "bytes": 15378,
+      "sha256": "3635d4ac79278543f3b36164773c24025be0524d72863047adbfb43ce108fd9b",
+      "interpreter": "python",
+      "reviewer": "FACTORY-PINS-INSTALL-1 r1 sonnet producer (hub-dispatched; pending formal keys)",
+      "reason": "prerequisite for CHECK-DOC-SIZE-SINGLE-SOURCE-1, SESSION-CHECKPOINT-SINGLE-SOURCE-1, OUTBOX-PIN-AWARE-TOOL-AT-REF-1: run bus tools by pin",
+      "pinned_utc": "2026-10-18"
+    }
+  },
+  "runner": {
+    "commit": "0ea9c244b5e1b4e6541eb93688a769637e10a5ff",
+    "path": "tools/factory/pin-runner.py",
+    "blob": "e529119ae5227bb536d598473742fa448127f85d",
+    "bytes": 80889,
+    "sha256": "28fc1ee16949286a94418d2a61b5e729ef0d47a11ddfc74a043d127587440d2d"
+  },
+  "bus_clone": [
+    "C:/!Layi Wkspc/softwarefactory-fleet-doctrine"
+  ]
+}

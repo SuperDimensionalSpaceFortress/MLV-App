@@ -114,6 +114,17 @@ int saveDngFrame(mlvObject_t * mlv_data, dngObject_t * dng_data, uint32_t frame_
 void freeDngObject(dngObject_t * dng_data);
 void resetDngExportProfilerForTesting(void);
 
+/* Test-only: how the async writer's debug hold (MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS,
+ * profiler-gated) ended. dngPayloadWriterDebugWaitHoldResult waits up to wait_ms for a PENDING hold
+ * to end and returns its outcome (PENDING if wait_ms ran out, OFF if the hold is not armed). It waits
+ * on the producer condition, so call it from the producer thread, before finishDngPayloadWriter. */
+#define DNG_PAYLOAD_WRITER_DEBUG_HOLD_OFF 0
+#define DNG_PAYLOAD_WRITER_DEBUG_HOLD_PENDING 1
+#define DNG_PAYLOAD_WRITER_DEBUG_HOLD_FILLED 2
+#define DNG_PAYLOAD_WRITER_DEBUG_HOLD_STOPPED 3
+#define DNG_PAYLOAD_WRITER_DEBUG_HOLD_TIMED_OUT 4
+int dngPayloadWriterDebugWaitHoldResult(dngPayloadWriter_t * writer, unsigned wait_ms);
+
 #ifdef __cplusplus
 }
 #endif

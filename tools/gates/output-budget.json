@@ -11,7 +11,7 @@
     "artifact": null
   },
   "receipt": {
-    "path": "Z:/receipt/lookassist-rawdefaults.marxml",
+    "path": "tools/gates/receipts/lookassist-rawdefaults.marxml",
     "length": 529,
     "sha256": "A435B40F38062DE9F528B16EC8FCEABD3247EC07D65556C5C74A6733474AC81C"
   },
@@ -19,7 +19,7 @@
     {
       "id": "wb_locked",
       "disableLookAssist": true,
-      "playbackProcessing": "none",
+      "playbackProcessing": "subset",
       "qualityMode": "1",
       "expectedQualityMode": 1,
       "scaleFactor": "",

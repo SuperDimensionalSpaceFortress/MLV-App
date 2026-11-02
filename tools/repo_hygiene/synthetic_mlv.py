@@ -1,7 +1,9 @@
 """Synthetic MLV files with a REAL 52-byte MLVI file header (PLAYBACK-CLIP-LENGTH-ENFORCE-1).
 
-The clip-length gate (tools/profiling/gui-smoke-length-gate.ps1) reads nothing but that header, so a
-test needs exactly those 52 bytes -- never footage. ``mlv_file_hdr_t`` in src/mlv/mlv.h:
+The clip-length gate (tools/profiling/gui-smoke-length-gate.ps1) reads that header and walks the 16-byte
+block headers behind it (it counts VIDF blocks, as the app does), so a test needs the 52 bytes plus one
+tiny VIDF block per frame -- never footage. A header with no block behind it is a truncated clip the gate
+refuses (``write_header_only_mlv``). ``mlv_file_hdr_t`` in src/mlv/mlv.h:
 
     fileMagic[4] blockSize u32 versionString[8] fileGuid u64 fileNum u16 fileCount u16
     fileFlags u32 videoClass u16 audioClass u16 videoFrameCount u32 audioFrameCount u32
@@ -35,11 +37,12 @@ def mlvi_header(
     file_count: int = 1,
     guid: int = 0x0123456789ABCDEF,
     magic: bytes = b"MLVI",
+    block_size: int = HEADER_BYTES,
 ) -> bytes:
     return struct.pack(
         HEADER_STRUCT,
         magic,
-        HEADER_BYTES,
+        block_size,
         b"v2.0\x00\x00\x00\x00",
         guid,
         file_num,
@@ -54,8 +57,58 @@ def mlvi_header(
     )
 
 
-def write_synthetic_mlv(path: Path, frames: int, **header_kwargs) -> Path:
-    """Write a header-only clip (the gate reads the header and nothing else)."""
+def write_header_only_mlv(path: Path, frames: int, **header_kwargs) -> Path:
+    """A 52-byte MLVI header declaring ``frames`` and NO block behind it: a truncated clip, which the app refuses."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(mlvi_header(frames, **header_kwargs))
     return path
+
+
+def write_synthetic_mlv(path: Path, frames: int, **header_kwargs) -> Path:
+    """Write a walkable clip: a header declaring ``frames`` and exactly ``frames`` VIDF blocks behind it."""
+    return write_synthetic_mlv_with_blocks(path, frames, frames, **header_kwargs)
+
+
+BLOCK_HEADER_STRUCT = "<4sIQ"  # mlv_hdr_t: blockType[4] blockSize u32 timestamp u64 == 16 bytes
+BLOCK_HEADER_BYTES = struct.calcsize(BLOCK_HEADER_STRUCT)
+assert BLOCK_HEADER_BYTES == 16
+BLOCK_PAYLOAD_BYTES = 16
+
+
+def block(block_type: bytes, payload_bytes: int = BLOCK_PAYLOAD_BYTES, *, size: int | None = None) -> bytes:
+    """One block: a real 16-byte block header and a zero payload (``size`` overrides the declared blockSize)."""
+    declared = BLOCK_HEADER_BYTES + payload_bytes if size is None else size
+    return struct.pack(BLOCK_HEADER_STRUCT, block_type, declared, 0) + bytes(payload_bytes)
+
+
+def write_synthetic_mlv_with_blocks(path: Path, header_frames: int, vidf_blocks: int, *, extra: bytes = b"",
+                                    **header_kwargs) -> Path:
+    """A clip whose MLVI header declares ``header_frames`` but which really carries ``vidf_blocks`` VIDF blocks.
+
+    ``src/mlv/video_mlv.c`` getMlvFrames counts the VIDF blocks, never the header field, so a test that
+    wants the app's frame count must put real blocks behind the header. ``extra`` is appended verbatim.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = b"".join(block(b"VIDF") for _ in range(vidf_blocks))
+    path.write_bytes(mlvi_header(header_frames, **header_kwargs) + body + extra)
+    return path
+
+
+def mlv_bytes_with_random_vidf_payload(frames: int, total_bytes: int, **header_kwargs) -> bytes:
+    """``total_bytes`` of a walkable clip: the MLVI header, then ``frames`` VIDF blocks of random payload.
+
+    For a test about how often the BYTES are read, where the content must be incompressible and a fixed size
+    but the length gate must still count ``frames`` VIDF blocks (a random body after the header is not a
+    playable clip: the gate walks it and refuses it). The last block absorbs the division remainder.
+    """
+    import os
+
+    room = total_bytes - HEADER_BYTES
+    if frames < 1 or room < frames * BLOCK_HEADER_BYTES:
+        raise ValueError(f"{total_bytes} bytes cannot hold the header and {frames} VIDF blocks")
+    each = room // frames
+    sizes = [each] * (frames - 1) + [room - each * (frames - 1)]
+    body = b"".join(
+        struct.pack(BLOCK_HEADER_STRUCT, b"VIDF", size, 0) + os.urandom(size - BLOCK_HEADER_BYTES) for size in sizes
+    )
+    return mlvi_header(frames, **header_kwargs) + body

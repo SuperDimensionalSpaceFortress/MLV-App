@@ -16,6 +16,7 @@
 #include <Qt>
 #include <QDebug>
 #include <QShortcut>
+#include "PreviewPaintTiming.h"
 
 class GraphicsZoomView : public QGraphicsView
 {
@@ -35,6 +36,11 @@ public:
     // The label text the most recent viewport paint drew ("" when it drew none).
     QString lookLabelDrawnText(void) const { return m_lookLabelDrawnText; }
 
+    //Wall time of every preview paint (playback_smoke.gui_present_summary)
+    using PaintTiming = preview_paint_timing::Totals;
+    PaintTiming paintTiming(void) const;
+    void resetPaintTiming(void);
+
 public slots:
     void shortCutZoomIn(void);
     void shortCutZoomOut(void);
@@ -53,6 +59,7 @@ protected:
     void mousePressEvent(QMouseEvent *event);
     void mouseReleaseEvent(QMouseEvent *event);
     void wheelEvent(QWheelEvent *event);
+    void paintEvent(QPaintEvent *event) override;
     void setPipetteCursor();
     void drawForeground(QPainter *painter, const QRectF &rect) override;
     void scrollContentsBy(int dx, int dy) override;

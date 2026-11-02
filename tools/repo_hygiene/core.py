@@ -1557,6 +1557,45 @@ def apply_branch_delete(repo_root: Path, plan: Dict[str, Any], candidate: Dict[s
     }
 
 
+LIVE_GUARD_HELPER = Path(__file__).resolve().parents[1] / "coordination" / "Retire-LaneWorktree.ps1"
+
+
+def worktree_live_refusal(repo_root: Path, path: Path, *, runner: Any = subprocess.run) -> Optional[Dict[str, Any]]:
+    """LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: ask the ONE shared live-reference guard (Get-WorktreeLiveRefusal in
+    tools/coordination/Retire-LaneWorktree.ps1) whether anything live still references the worktree: a process command line,
+    cwd or script, or a live driver recorded by a pid file in a run dir under <repo>/.claude-state/fleet-runs. None = free;
+    otherwise the guard's typed refusal. Every unknown (no pwsh, a failed or unparseable answer) is a census-failed refusal."""
+    def failed(detail: str) -> Dict[str, Any]:
+        return {"reason": "census-failed", "detail": detail,
+                "line": f"REFUSED worktree-removal reason=census-failed path={path} detail={detail}"}
+
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        return failed("pwsh not found")
+    env = dict(os.environ, MLV_RETIRE_HELPER=str(LIVE_GUARD_HELPER), MLV_GUARD_PATH=str(path),
+               MLV_GUARD_RUNS=str(Path(repo_root) / ".claude-state" / "fleet-runs"))
+    script = ("$ErrorActionPreference='Stop'; . $env:MLV_RETIRE_HELPER; "
+              "$r = Get-WorktreeLiveRefusal -WorktreePath $env:MLV_GUARD_PATH -RunsRoot $env:MLV_GUARD_RUNS; "
+              "if ($null -eq $r) { 'FREE' } else { $r | ConvertTo-Json -Compress -Depth 4 }")
+    try:
+        proc = runner([pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+                      capture_output=True, text=True, timeout=300, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return failed(f"guard did not answer: {exc}")
+    if proc.returncode != 0:
+        return failed(f"guard exit {proc.returncode}: {(proc.stderr or '').strip()[-500:]}")
+    lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+    if lines and lines[-1].strip() == "FREE":
+        return None
+    try:
+        refusal = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        refusal = None
+    if not isinstance(refusal, dict) or not refusal.get("reason"):
+        return failed("guard answer unparseable")
+    return refusal
+
+
 def apply_worktree_remove(repo_root: Path, config: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
     path = Path(candidate["path"]).resolve()
     if under_load_bearing_root(repo_root, config, path):
@@ -1564,6 +1603,11 @@ def apply_worktree_remove(repo_root: Path, config: Dict[str, Any], candidate: Di
     status = parse_status(repo_root, path)
     if not status["clean"]:
         raise HygieneError("worktree became dirty before apply")
+    refusal = worktree_live_refusal(repo_root, path)
+    if refusal:
+        line = refusal.get("line") or f"REFUSED worktree-removal reason={refusal.get('reason')} path={path}"
+        print(line, file=sys.stderr)
+        raise HygieneError(f"worktree removal refused: {line}")
     result = run_git(repo_root, ["worktree", "remove", str(path)])
     commands = [command_record(result, mutates=True)]
     if result.returncode != 0:

@@ -312,6 +312,19 @@ inline Debayered16ReconDoneStamp debayered16ReconDoneStamp( mlvObject_t * video 
     return stamp;
 }
 
+/*! The stamp signalReconDoneFromWorker takes for one finished recon-queue entry.
+ *  PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r2 (sol r1 B2): only a slot
+ *  (index >= 0) is stamped. A paused warm (slot -1) has no slot to store a stamp in,
+ *  and has already released its lifetime guard (RenderFrameThread::m_warmRunning),
+ *  so a clip close that saw the pipeline idle may have freed the clip: it reads
+ *  nothing. `readStamp` is the clip read (debayered16ReconDoneStamp in the app). */
+template <typename ReadStamp>
+inline Debayered16ReconDoneStamp debayered16ReconDoneStampForEntry( int slotIndex, ReadStamp readStamp )
+{
+    if( slotIndex < 0 ) return Debayered16ReconDoneStamp();
+    return readStamp();
+}
+
 /*! The render's copy of a slot's provenance into the policy inputs. */
 inline void applyDebayered16ReconProvenance( const Debayered16ReconProvenance & provenance,
                                              Debayered16ReconReuseInputs & in )
