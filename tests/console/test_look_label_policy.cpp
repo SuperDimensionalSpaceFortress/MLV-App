@@ -383,7 +383,8 @@ TEST(LookLabelWiring, PolicyCallSitesPassTheWindowStateUnflipped)
         "look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );")));
     const QString overlayCall = QStringLiteral("look_label::fullscreenOverlayShown(");
     ASSERT_EQ(-1, mw.indexOf(overlayCall, mw.indexOf(overlayCall) + 1));
-    const QString initialText = QStringLiteral("m_pLookLabelStatus->setText( look_label::text( false, QString() ) );");
+    const QString initialText =
+        QStringLiteral("m_pLookLabelStatus->setText( look_label::text( /*lookAssistEnabled=*/false, QString() ) );");
     ASSERT_TRUE(mw.contains(initialText));
     const QString textCall = QStringLiteral("look_label::text(");
     ASSERT_EQ(-1, mw.indexOf(textCall, mw.indexOf(textCall) + 1));

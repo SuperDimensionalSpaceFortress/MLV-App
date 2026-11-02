@@ -12615,7 +12615,7 @@ void MainWindow::initGui( void )
     m_pLookLabelStatus = new QLabel( statusBar() );
     m_pLookLabelStatus->setObjectName( QStringLiteral( "lookLabelStatus" ) );
     m_pLookLabelStatus->setMinimumWidth( 120 );
-    m_pLookLabelStatus->setText( look_label::text( false, QString() ) );
+    m_pLookLabelStatus->setText( look_label::text( /*lookAssistEnabled=*/false, QString() ) );
     m_pLookLabelStatus->setToolTip( tr( "Current Look Assist look." ) );
     statusBar()->addWidget( m_pLookLabelStatus );
     m_lookLabelText = m_pLookLabelStatus->text();
