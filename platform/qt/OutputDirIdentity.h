@@ -12,10 +12,20 @@
 // only through a POSIX bind mount of an ancestor of the other directory is not detected as nested (proving that
 // would need the mount table, which this does not parse). Separators are stripped by the platform's own rule:
 // on POSIX a backslash is an ordinary filename character and is kept.
+//
+// r5 (sol r4 BLOCKER): a file id is unique only inside one volume, and a cloned NTFS volume keeps its serial and
+// every file index, so an id match alone refused two distinct directories. On Windows the id is now the
+// FileIdInfo pair (64-bit serial + 128-bit id, unique on ReFS too; the 32-bit serial + 64-bit index is the
+// fallback), and the final path is also read in the volume-GUID namespace. Local volumes are told apart by their
+// mount-manager GUID, so when both directories resolve there the GUID path alone decides Same (a volume has no
+// directory hard links, so a directory has one normalized path in it). Without both GUID paths (a network share,
+// a volume outside the mount manager, POSIX) an id match still answers Same and fails closed.
+// Known limit, POSIX: st_dev/st_ino are not unique on overlayfs without xino; that is a successor, not handled here.
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QString>
+#include <QStringList>
 
 #ifdef Q_OS_WIN
 #ifndef NOMINMAX
@@ -45,7 +55,13 @@ struct DirIdentity
     bool ok = false;
     unsigned long long volume = 0;   // Windows volume serial / POSIX st_dev
     unsigned long long index = 0;    // Windows file index / POSIX st_ino
+    bool hasWideId = false;          // Windows FileIdInfo was read: the pair below replaces volume/index
+    unsigned long long wideVolume = 0;
+    unsigned long long wideIdLow = 0;
+    unsigned long long wideIdHigh = 0;
     QString finalPath;   // resolved through every alias, no trailing separator
+    QString identityPath;   // Windows: the final path as \\?\Volume{GUID}\... (else the NT form); empty on POSIX
+    QString volumeName;     // Windows: the \\?\Volume{GUID} root of identityPath; empty unless the GUID form was read
     QString error;
 };
 
@@ -95,20 +111,71 @@ inline bool isInside(const QString &inner, const QString &outer, const PathRules
     return inner.size() > prefix.size() && inner.startsWith(prefix, rules.pathCase);
 }
 
+// Pure: "\\?\Volume{GUID}" when the path is in the volume-GUID namespace, else empty.
+inline QString volumeGuidRootOf(const QString &path)
+{
+    static const QString prefix = QStringLiteral("\\\\?\\Volume{");
+    if (!path.startsWith(prefix, Qt::CaseInsensitive))
+        return QString();
+    const int close = path.indexOf(QLatin1Char('}'), prefix.size());
+    if (close < 0 || (close + 1 < path.size() && path.at(close + 1) != QLatin1Char('\\')))
+        return QString();
+    return path.left(close + 1);
+}
+
+// Pure: the file ids are equal. The wide (FileIdInfo) pair is used only when both sides have it.
+inline bool sameFileId(const DirIdentity &a, const DirIdentity &b)
+{
+    if (a.hasWideId && b.hasWideId)
+        return a.wideVolume == b.wideVolume && a.wideIdLow == b.wideIdLow && a.wideIdHigh == b.wideIdHigh;
+    return a.volume == b.volume && a.index == b.index;
+}
+
 // Pure: the relation of two identities that were both obtained (ok).
 inline DirRelation relationOf(const DirIdentity &a, const DirIdentity &b, const PathRules &rules)
 {
-    const bool sameObject = a.volume == b.volume && a.index == b.index;
-    if (sameObject || a.finalPath.compare(b.finalPath, rules.pathCase) == 0)
+    const bool bothInGuidNamespace = !a.volumeName.isEmpty() && !b.volumeName.isEmpty();
+    const bool samePath = a.finalPath.compare(b.finalPath, rules.pathCase) == 0
+        || (!a.identityPath.isEmpty() && a.identityPath.compare(b.identityPath, rules.pathCase) == 0);
+    // An id match decides Same only where the volume cannot be told apart (see the header comment).
+    if (samePath || (!bothInGuidNamespace && sameFileId(a, b)))
         return DirRelation::Same;
-    if (isInside(a.finalPath, b.finalPath, rules))
+    if (isInside(a.finalPath, b.finalPath, rules)
+        || (bothInGuidNamespace && isInside(a.identityPath, b.identityPath, rules)))
         return DirRelation::FirstInsideSecond;
-    if (isInside(b.finalPath, a.finalPath, rules))
+    if (isInside(b.finalPath, a.finalPath, rules)
+        || (bothInGuidNamespace && isInside(b.identityPath, a.identityPath, rules)))
         return DirRelation::SecondInsideFirst;
     return DirRelation::Distinct;
 }
 
 #ifdef Q_OS_WIN
+// FILE_ID_INFO and FileIdInfo (= 18) are declared only for _WIN32_WINNT >= 0x0602, and the app builds for 0x0601,
+// so the documented layout is spelled here. Where the class is unsupported the call fails and the 64-bit index is used.
+struct WideFileIdInfo
+{
+    ULONGLONG VolumeSerialNumber;
+    BYTE FileId[16];
+};
+constexpr int kFileIdInfoClass = 18;
+
+// The final path of an open handle in one namespace; false (with the win32 error) when it cannot be read.
+inline bool finalPathOf(HANDLE handle, DWORD flags, QString *out, DWORD *error)
+{
+    std::vector<wchar_t> buffer(512);
+    DWORD length = GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()), flags);
+    if (length >= buffer.size()) {
+        buffer.resize(static_cast<size_t>(length) + 1);
+        length = GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()), flags);
+    }
+    *error = GetLastError();
+    if (length == 0 || length >= buffer.size())
+        return false;
+    *out = withoutTrailingSeparators(QString::fromWCharArray(buffer.data(), static_cast<int>(length)),
+                                     windowsPathRules());
+    return true;
+}
+
 inline DirIdentity identityOf(const QString &path)
 {
     DirIdentity id;
@@ -133,24 +200,31 @@ inline DirIdentity identityOf(const QString &path)
         CloseHandle(handle);
         return id;
     }
-    std::vector<wchar_t> buffer(512);
-    DWORD length = GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()),
-                                             FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (length >= buffer.size()) {
-        buffer.resize(static_cast<size_t>(length) + 1);
-        length = GetFinalPathNameByHandleW(handle, buffer.data(), static_cast<DWORD>(buffer.size()),
-                                           FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    WideFileIdInfo wide{};
+    if (GetFileInformationByHandleEx(handle, static_cast<FILE_INFO_BY_HANDLE_CLASS>(kFileIdInfoClass), &wide,
+                                     sizeof(wide))) {
+        id.hasWideId = true;
+        id.wideVolume = wide.VolumeSerialNumber;
+        for (int i = 0; i < 8; ++i) {
+            id.wideIdLow |= static_cast<unsigned long long>(wide.FileId[i]) << (8 * i);
+            id.wideIdHigh |= static_cast<unsigned long long>(wide.FileId[8 + i]) << (8 * i);
+        }
     }
-    const DWORD finalPathError = GetLastError();
-    CloseHandle(handle);
-    if (length == 0 || length >= buffer.size()) {
+    DWORD finalPathError = 0;
+    if (!finalPathOf(handle, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, &id.finalPath, &finalPathError)) {
+        CloseHandle(handle);
         id.error = QStringLiteral("final_path_failed win32=%1").arg(finalPathError);
         return id;
     }
+    // The GUID form names the volume uniquely; a network share or a volume outside the mount manager has none,
+    // and then the NT form is kept and volumeName stays empty (an id match then still answers Same).
+    if (finalPathOf(handle, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID, &id.identityPath, &finalPathError))
+        id.volumeName = volumeGuidRootOf(id.identityPath);
+    else if (!finalPathOf(handle, FILE_NAME_NORMALIZED | VOLUME_NAME_NT, &id.identityPath, &finalPathError))
+        id.identityPath.clear();
+    CloseHandle(handle);
     id.volume = info.dwVolumeSerialNumber;
     id.index = (static_cast<unsigned long long>(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
-    id.finalPath = withoutTrailingSeparators(QString::fromWCharArray(buffer.data(), static_cast<int>(length)),
-                                             windowsPathRules());
     id.ok = true;
     return id;
 }
@@ -188,6 +262,8 @@ inline DirComparison compareIdentities(const DirIdentity &a, const DirIdentity &
         return result;
     }
     result.detail = QStringLiteral("first_final=%1 second_final=%2").arg(a.finalPath, b.finalPath);
+    if (!a.identityPath.isEmpty() || !b.identityPath.isEmpty())
+        result.detail += QStringLiteral(" first_volume_path=%1 second_volume_path=%2").arg(a.identityPath, b.identityPath);
     result.relation = relationOf(a, b, rules);
     return result;
 }
@@ -198,6 +274,52 @@ inline DirComparison compareDirectories(const QString &first, const QString &sec
 {
     return detail::compareIdentities(detail::identityOf(first), detail::identityOf(second),
                                      detail::hostPathRules());
+}
+
+namespace detail {
+
+// Creates each missing directory of `path`, outermost first, and appends every one it created to `created`.
+inline bool createMissingDirectories(const QString &path, QStringList *created)
+{
+    QStringList missing;
+    QString cursor = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    while (!QFileInfo::exists(cursor)) {
+        missing.prepend(cursor);
+        const QString parent = QFileInfo(cursor).absolutePath();
+        if (parent == cursor)
+            break;
+        cursor = parent;
+    }
+    for (const QString &dir : missing) {
+        if (!QDir().mkdir(dir))
+            return false;
+        created->append(dir);
+    }
+    return QFileInfo(path).isDir();
+}
+
+// Removes what createMissingDirectories made, innermost first; rmdir leaves a directory that is no longer empty.
+inline void removeCreatedDirectories(const QStringList &created)
+{
+    for (auto it = created.crbegin(); it != created.crend(); ++it)
+        QDir().rmdir(*it);
+}
+
+} // namespace detail
+
+// r5 (opus key3 r4): identity needs both directories on disk, so this creates the missing ones, compares, and
+// removes every directory it created unless the answer is Distinct. A refused run leaves no new directory.
+inline DirComparison prepareSeparateDirectories(const QString &first, const QString &second)
+{
+    QStringList created;
+    DirComparison result;
+    if (!detail::createMissingDirectories(first, &created) || !detail::createMissingDirectories(second, &created))
+        result.detail = QStringLiteral("reason=create_failed");
+    else
+        result = compareDirectories(first, second);
+    if (result.relation != DirRelation::Distinct)
+        detail::removeCreatedDirectories(created);
+    return result;
 }
 
 } // namespace output_dir_identity

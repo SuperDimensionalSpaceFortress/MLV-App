@@ -1136,28 +1136,34 @@ TEST(ContactSheetSeekDirIdentity, DistinctSiblingDirectoriesAreAcceptedAndAMissi
     ASSERT_FALSE(missing.detail.isEmpty());
 }
 
-TEST(ContactSheetSeekDirIdentity, TheCliCreatesBothDirsThenRefusesEveryRelationButDistinctBeforeAnyCapture)
+// r5 (opus key3 r4): the CLI used to mkpath both directories before the identity refusal and before the seek-list
+// parse, so a refused run left new empty directories. The on-disk compare now runs after every other argument check
+// (the seek-list parse included) through prepareSeparateDirectories, which removes what it created when refused.
+TEST(ContactSheetSeekDirIdentity, TheCliComparesTheDirsOnDiskOnlyAfterEveryOtherArgumentCheck)
 {
     const QString mainSource = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
     ASSERT_TRUE(mainSource.contains(QStringLiteral("#include \"OutputDirIdentity.h\"")));
     const int stringCheckAt = mainSource.indexOf(QStringLiteral("SEEK_DIR_SAME_AS_CONTACT_SHEET_DIR\\n"));
-    const int compareAt = mainSource.indexOf(QStringLiteral("output_dir_identity::compareDirectories(options.contactSheetSeekDir, options.contactSheetDir)"));
     const int framesAt = mainSource.indexOf(QStringLiteral("if (parser.isSet(contactSheetSeekFramesOpt))"));
+    const int prepareAt = mainSource.indexOf(QStringLiteral("output_dir_identity::prepareSeparateDirectories(options.contactSheetSeekDir, options.contactSheetDir)"));
+    const int windowAt = mainSource.indexOf(QStringLiteral("MainWindow window(smokeArgc, smokeArgv);"));
     ASSERT_TRUE(stringCheckAt > 0);
-    ASSERT_TRUE(compareAt > stringCheckAt);
-    ASSERT_TRUE(framesAt > compareAt);
-    const QString identityBlock = mainSource.mid(stringCheckAt, framesAt - stringCheckAt);
-    const int mkpathAt = identityBlock.indexOf(QStringLiteral("QDir().mkpath(options.contactSheetSeekDir)"));
-    ASSERT_TRUE(mkpathAt > 0);
-    ASSERT_TRUE(identityBlock.indexOf(QStringLiteral("output_dir_identity::compareDirectories(")) > mkpathAt);
-    ASSERT_TRUE(identityBlock.contains(QStringLiteral("QDir().mkpath(options.contactSheetDir)")));
+    ASSERT_TRUE(framesAt > stringCheckAt);
+    ASSERT_TRUE(prepareAt > framesAt);
+    ASSERT_TRUE(windowAt > prepareAt);
+    // Nothing in the CLI creates a contact sheet directory on its own any more.
+    ASSERT_FALSE(mainSource.contains(QStringLiteral("QDir().mkpath(options.contactSheet")));
+    ASSERT_FALSE(mainSource.contains(QStringLiteral("output_dir_identity::compareDirectories(")));
+    const QString identityBlock = mainSource.mid(prepareAt, windowAt - prepareAt);
+    // The identity refusal is the last refusal before the run starts.
+    ASSERT_EQ(1, static_cast<int>(identityBlock.count(QStringLiteral("return "))));
     ASSERT_TRUE(identityBlock.contains(QStringLiteral("!= output_dir_identity::DirRelation::Distinct")));
     ASSERT_TRUE(identityBlock.contains(QStringLiteral("SEEK_DIR_SAME_IDENTITY_AS_CONTACT_SHEET_DIR")));
     ASSERT_TRUE(identityBlock.contains(QStringLiteral("SEEK_DIR_NESTED_WITH_CONTACT_SHEET_DIR")));
     ASSERT_TRUE(identityBlock.contains(QStringLiteral("SEEK_DIR_IDENTITY_UNKNOWN")));
     ASSERT_TRUE(identityBlock.contains(QStringLiteral("contact_sheet_dir=")));
     ASSERT_TRUE(identityBlock.contains(QStringLiteral("seek_dir=")));
-    ASSERT_TRUE(identityBlock.count(QStringLiteral("return 2;")) >= 2);
+    ASSERT_EQ(1, static_cast<int>(identityBlock.count(QStringLiteral("return 2;"))));
 }
 
 // r4 (Dot item 1 / adversary A1): trailing separators are stripped by the platform's own rule. On POSIX a
@@ -1266,6 +1272,171 @@ TEST(ContactSheetSeekDirIdentity, OneFilesystemObjectUnderTwoResolvedPathsIsTheS
     ASSERT_TRUE(posixBranch.contains(QStringLiteral("id.volume = static_cast<unsigned long long>(st.st_dev);")));
     ASSERT_TRUE(posixBranch.contains(QStringLiteral("id.index = static_cast<unsigned long long>(st.st_ino);")));
     ASSERT_TRUE(posixBranch.contains(QStringLiteral("withoutTrailingSeparators(canonical, posixPathRules())")));
+}
+
+namespace
+{
+
+// A Windows identity as identityOf builds it on a local volume: DOS final path plus the volume-GUID final path.
+output_dir_identity::detail::DirIdentity guidIdentity(unsigned long long volume, unsigned long long index,
+                                                      const QString & dosPath, const QString & guidPath)
+{
+    using namespace output_dir_identity::detail;
+    DirIdentity id = provenIdentity(volume, index, dosPath, windowsPathRules());
+    id.identityPath = withoutTrailingSeparators(guidPath, windowsPathRules());
+    id.volumeName = volumeGuidRootOf(id.identityPath);
+    return id;
+}
+
+} // namespace
+
+// r5 (sol r4 BLOCKER): two independently mounted clones of one NTFS volume share the volume serial and every 64-bit
+// file index, so serial+index alone answered Same for two different directories (exit 2,
+// SEEK_DIR_SAME_IDENTITY_AS_CONTACT_SHEET_DIR). Their volume GUIDs differ, so they are Distinct.
+TEST(ContactSheetSeekDirIdentity, DirectoriesOnClonedVolumesThatShareASerialAndAFileIndexAreDistinct)
+{
+    using namespace output_dir_identity::detail;
+    using output_dir_identity::DirRelation;
+    const PathRules windows = windowsPathRules();
+    const QString volumeA = QStringLiteral("\\\\?\\Volume{0f1e2d3c-0000-0000-0000-00000000000a}");
+    const QString volumeB = QStringLiteral("\\\\?\\Volume{0f1e2d3c-0000-0000-0000-00000000000b}");
+    DirIdentity seek = guidIdentity(0x1234ABCDu, 0x0005000000000123ull, QStringLiteral("E:\\captures\\out"),
+                                    volumeA + QStringLiteral("\\captures\\out"));
+    DirIdentity in = guidIdentity(0x1234ABCDu, 0x0005000000000123ull, QStringLiteral("F:\\captures\\out"),
+                                  volumeB + QStringLiteral("\\captures\\out"));
+    ASSERT_EQ(volumeA.toStdString(), seek.volumeName.toStdString());
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(compareIdentities(seek, in, windows).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(compareIdentities(in, seek, windows).relation));
+    // FileIdInfo does not help on NTFS (its 128-bit id is the 64-bit index, its serial is the clone's too).
+    for (DirIdentity * id : { &seek, &in }) {
+        id->hasWideId = true;
+        id->wideVolume = 0x99887766001234ABull;
+        id->wideIdLow = 0x0005000000000123ull;
+        id->wideIdHigh = 0;
+    }
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(compareIdentities(seek, in, windows).relation));
+
+    // Controls. One GUID final path is one directory, whatever the ids say (a junction resolves to the same path).
+    ASSERT_EQ(static_cast<int>(DirRelation::Same),
+              static_cast<int>(compareIdentities(guidIdentity(1, 10, QStringLiteral("C:\\alias"), volumeA + QStringLiteral("\\cs\\in")),
+                                                 guidIdentity(1, 11, QStringLiteral("C:\\cs\\in"), volumeA + QStringLiteral("\\CS\\in\\")),
+                                                 windows).relation));
+    // A share has no GUID path (\\localhost\C$\cs\in can be C:\cs\in), so an id match there still fails closed.
+    DirIdentity share = provenIdentity(0x1234ABCDu, 0x0005000000000123ull, QStringLiteral("\\\\localhost\\C$\\captures\\out"), windows);
+    share.identityPath = QStringLiteral("\\Device\\Mup\\localhost\\C$\\captures\\out");
+    ASSERT_EQ(static_cast<int>(DirRelation::Same), static_cast<int>(compareIdentities(share, in, windows).relation));
+    ASSERT_EQ(static_cast<int>(DirRelation::Same), static_cast<int>(compareIdentities(in, share, windows).relation));
+    // One volume, two paths: a 64-bit index that repeats (ReFS without FileIdInfo) is still two directories.
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct),
+              static_cast<int>(compareIdentities(guidIdentity(1, 10, QStringLiteral("C:\\cs\\a"), volumeA + QStringLiteral("\\cs\\a")),
+                                                 guidIdentity(1, 10, QStringLiteral("C:\\cs\\b"), volumeA + QStringLiteral("\\cs\\b")),
+                                                 windows).relation));
+    // Nesting is also read in the GUID namespace (a drive letter and a folder mount point of one volume).
+    ASSERT_EQ(static_cast<int>(DirRelation::FirstInsideSecond),
+              static_cast<int>(compareIdentities(guidIdentity(1, 12, QStringLiteral("E:\\in\\sub"), volumeA + QStringLiteral("\\in\\sub")),
+                                                 guidIdentity(1, 11, QStringLiteral("C:\\mnt\\a\\in"), volumeA + QStringLiteral("\\in")),
+                                                 windows).relation));
+}
+
+// r5: the wide FileIdInfo pair decides id equality when both sides have it (ReFS: the 64-bit index is not unique),
+// and the GUID root parser accepts only a real \\?\Volume{...} prefix.
+TEST(ContactSheetSeekDirIdentity, TheWideFileIdDecidesWhenBothSidesHaveItAndOnlyAGuidPrefixNamesAVolume)
+{
+    using namespace output_dir_identity::detail;
+    const PathRules windows = windowsPathRules();
+    DirIdentity a = provenIdentity(5, 77, QStringLiteral("\\\\srv\\share\\a"), windows);
+    DirIdentity b = provenIdentity(5, 77, QStringLiteral("\\\\srv\\share\\b"), windows);
+    ASSERT_TRUE(sameFileId(a, b));
+    a.hasWideId = b.hasWideId = true;
+    a.wideVolume = b.wideVolume = 5;
+    a.wideIdLow = b.wideIdLow = 77;
+    a.wideIdHigh = 1;
+    b.wideIdHigh = 2;
+    ASSERT_FALSE(sameFileId(a, b));
+    ASSERT_EQ(static_cast<int>(output_dir_identity::DirRelation::Distinct),
+              static_cast<int>(compareIdentities(a, b, windows).relation));
+    b.hasWideId = false;   // one side without FileIdInfo: the 64-bit pair is compared
+    ASSERT_TRUE(sameFileId(a, b));
+
+    ASSERT_EQ(std::string("\\\\?\\Volume{abc}"), volumeGuidRootOf(QStringLiteral("\\\\?\\Volume{abc}\\x\\y")).toStdString());
+    ASSERT_EQ(std::string("\\\\?\\volume{abc}"), volumeGuidRootOf(QStringLiteral("\\\\?\\volume{abc}")).toStdString());
+    ASSERT_TRUE(volumeGuidRootOf(QStringLiteral("\\\\?\\C:\\x")).isEmpty());
+    ASSERT_TRUE(volumeGuidRootOf(QStringLiteral("\\Device\\HarddiskVolume3\\x")).isEmpty());
+    ASSERT_TRUE(volumeGuidRootOf(QStringLiteral("\\\\?\\Volume{abc")).isEmpty());
+    ASSERT_TRUE(volumeGuidRootOf(QStringLiteral("\\\\?\\Volume{abc}x")).isEmpty());
+}
+
+#ifdef Q_OS_WIN
+// r5: on this host the real identityOf reads the GUID namespace and FileIdInfo, and the junction alias still
+// resolves to one GUID path (the r3 RED stays GREEN through the new rule).
+TEST(ContactSheetSeekDirIdentity, OnALocalVolumeTheIdentityCarriesTheGuidPathAndAJunctionSharesIt)
+{
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+    const QString in = root.filePath(QStringLiteral("in"));
+    const QString alias = root.filePath(QStringLiteral("alias"));
+    ASSERT_TRUE(QDir().mkpath(in));
+    ASSERT_TRUE(makeDirectoryAlias(alias, in));
+    using namespace output_dir_identity::detail;
+    const DirIdentity inId = identityOf(in);
+    const DirIdentity aliasId = identityOf(alias);
+    ASSERT_TRUE(inId.ok && aliasId.ok);
+    ASSERT_TRUE(inId.volumeName.startsWith(QStringLiteral("\\\\?\\Volume{"), Qt::CaseInsensitive));
+    ASSERT_TRUE(inId.hasWideId);
+    ASSERT_EQ(inId.identityPath.toStdString(), aliasId.identityPath.toStdString());
+    ASSERT_TRUE(inId.identityPath.endsWith(QStringLiteral("\\in"), Qt::CaseInsensitive));
+}
+#endif
+
+// r5 (opus key3 r4): a refused comparison removes every directory it created; an accepted one keeps both.
+TEST(ContactSheetSeekDirIdentity, ARefusedComparisonLeavesNoNewDirectoryBehind)
+{
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+    using output_dir_identity::DirRelation;
+    using output_dir_identity::prepareSeparateDirectories;
+    const auto entries = [&root]() {
+        return QDir(root.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).join(QLatin1Char(','));
+    };
+
+    // Both new, one nested in the other: refused, and neither "fresh" nor anything under it is left.
+    const output_dir_identity::DirComparison nested = prepareSeparateDirectories(root.filePath(QStringLiteral("fresh/seek/inner")),
+                                                            root.filePath(QStringLiteral("fresh/seek")));
+    ASSERT_EQ(static_cast<int>(DirRelation::FirstInsideSecond), static_cast<int>(nested.relation));
+    ASSERT_EQ(std::string(), entries().toStdString());
+
+    // An existing in-pass dir and a new seek dir under it: the new levels are removed, the existing dir is kept.
+    const QString in = root.filePath(QStringLiteral("in"));
+    ASSERT_TRUE(QDir().mkpath(in));
+    const output_dir_identity::DirComparison under = prepareSeparateDirectories(root.filePath(QStringLiteral("in/new/deeper")), in);
+    ASSERT_EQ(static_cast<int>(DirRelation::FirstInsideSecond), static_cast<int>(under.relation));
+    ASSERT_EQ(std::string("in"), entries().toStdString());
+    ASSERT_TRUE(QDir(in).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).isEmpty());
+
+    // A junction alias of the existing dir: Same, and nothing new is left.
+    const QString alias = root.filePath(QStringLiteral("alias"));
+    ASSERT_TRUE(makeDirectoryAlias(alias, in));
+    const output_dir_identity::DirComparison same = prepareSeparateDirectories(alias, in);
+    ASSERT_EQ(static_cast<int>(DirRelation::Same), static_cast<int>(same.relation));
+    ASSERT_EQ(std::string("alias,in"), entries().toStdString());
+    ASSERT_TRUE(QDir(in).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).isEmpty());
+
+    // Creation fails on the second path (its parent is a file): Unknown, and the first path's new dirs are removed.
+    QFile blocker(root.filePath(QStringLiteral("blocker")));
+    ASSERT_TRUE(blocker.open(QIODevice::WriteOnly));
+    blocker.close();
+    const output_dir_identity::DirComparison failed = prepareSeparateDirectories(root.filePath(QStringLiteral("made/seek")),
+                                                            root.filePath(QStringLiteral("blocker/in")));
+    ASSERT_EQ(static_cast<int>(DirRelation::Unknown), static_cast<int>(failed.relation));
+    ASSERT_TRUE(failed.detail.contains(QStringLiteral("reason=create_failed")));
+    ASSERT_EQ(std::string("alias,blocker,in"), entries().toStdString());
+
+    // Distinct new siblings are accepted and both exist afterwards.
+    const output_dir_identity::DirComparison distinct = prepareSeparateDirectories(root.filePath(QStringLiteral("out/seek")),
+                                                              root.filePath(QStringLiteral("out/in")));
+    ASSERT_EQ(static_cast<int>(DirRelation::Distinct), static_cast<int>(distinct.relation));
+    ASSERT_TRUE(QFileInfo(root.filePath(QStringLiteral("out/seek"))).isDir());
+    ASSERT_TRUE(QFileInfo(root.filePath(QStringLiteral("out/in"))).isDir());
 }
 
 TEST(ContactSheetSeekFrameListWiring, TheLogLineNamesTheListOnlyWhenItIsSetAndTheDoneLineIsUnchanged)
