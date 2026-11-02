@@ -22,10 +22,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:unreadable = @()
-function Invoke-GitBytes([string[]]$GitArgs) {
+$script:noCallbacks = @('-c', 'core.fsmonitor=false')  # core.fsmonitor is a command git runs while it reads the index; it must not rewrite the dirt being saved (sol r7 B1). Main adds one empty -c per configured clean/smudge/process filter (adversary r8 A1)
+function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false) {
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-        foreach ($a in (@('-C', $WorkDir, '-c', 'core.fsmonitor=false') + $GitArgs)) { $psi.ArgumentList.Add($a) }  # core.fsmonitor is a command git runs while it reads the index; it must not rewrite the dirt being saved (sol r7 B1)
+        foreach ($a in (@('-C', $WorkDir) + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
         foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS') { [void]$psi.Environment.Remove($k) }
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
@@ -39,7 +40,7 @@ function Invoke-GitBytes([string[]]$GitArgs) {
     } catch { return @{ Code = -1; Bytes = [byte[]]@(); Err = $_.Exception.Message } }
 }
 function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exactly one LF (never CRLF, also on Windows): strip that LF and nothing else (r5 ADV-A4: a worktree named 'repo ' is not the sibling 'repo'; r6 A1: a name ending in CR keeps its CR)
-    $s = [System.Text.Encoding]::UTF8.GetString($Bytes)
+    $s = [System.Text.UTF8Encoding]::new($false, $true).GetString($Bytes)  # strict: a lossy decode turns byte FF into U+FFFD and can name a different, valid sibling (adversary r8 A3)
     if ($s.EndsWith("`n")) { $s = $s.Substring(0, $s.Length - 1) }
     return $s
 }
@@ -105,9 +106,11 @@ function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
     $procId = $LanePid; $born = $null
     if ($ChildJson) {
-        $j = Get-Content -LiteralPath $ChildJson -Raw | ConvertFrom-Json
+        $j = Get-Content -LiteralPath $ChildJson -Raw | ConvertFrom-Json -NoEnumerate
+        if ($j -isnot [pscustomobject] -or ($j.pid -isnot [int] -and $j.pid -isnot [long])) { throw 'bad-child-json' }  # a root array, or a pid that is not a number, is no lane record (adversary r8 A2)
         $procId = [int]$j.pid
-        $v = if ($j.PSObject.Properties['createdUtc']) { $j.createdUtc } else { $null }
+        $c = $j.PSObject.Properties['createdUtc']
+        $v = $null; if ($c) { $v = $c.Value }  # a plain assignment, not an if-expression: that would unroll a one-item list into its item and pass it (adversary r8 A2)
         if ($v -is [datetime]) { $born = $v.ToUniversalTime() }
         elseif ($v -is [string] -and $v -match '^\d{4}-\d\d-\d\dT\d\d:\d\d') { $born = [datetime]::Parse($v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
         else { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001) or prose is no timestamp: without it a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
@@ -145,7 +148,14 @@ try {
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=none', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
-if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
+if ($top.Code -eq 0) {
+    try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
+    $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true  # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1)
+    $keys = @([System.Text.Encoding]::UTF8.GetString($f.Bytes) -split "`0" | Where-Object { $_ })
+    $names = @($keys | Where-Object { $_ -match '^filter\.[^=]+\.[^.=]+$' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf('.')) } | Select-Object -Unique)
+    if (($f.Code -ne 0 -and $f.Code -ne 1) -or @($keys | Where-Object { $_ -notmatch '^filter\.[^=]+\.[^.=]+$' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $($f.Err.Trim())"; exit 40 }
+    foreach ($k in $names) { $script:noCallbacks += @('-c', "$k.clean=", '-c', "$k.smudge=", '-c', "$k.process=", '-c', "$k.required=false") }
+}
 try {
     if ($script:onWin) {
         $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path

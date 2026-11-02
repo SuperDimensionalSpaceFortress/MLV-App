@@ -640,6 +640,59 @@ def test_child_json_without_a_created_utc_is_bad_arguments_and_saves_nothing(rep
     assert saved(repo) == []
 
 
+def test_a_configured_clean_filter_cannot_overwrite_the_dirt_being_saved(repo, tmp_path):  # r8 adversary A1: the same class as fsmonitor, a command git runs on every tracked file it diffs
+    (repo / ".gitattributes").write_text("a.txt filter=rewrite\n")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "attrs")
+    dirty(repo)
+    want, a_before, marker = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes(), tmp_path / "filter-ran"
+    git(repo, "config", "filter.rewrite.clean", f"printf X >> '{marker.as_posix()}'; printf REPLACED > '{(repo / 'a.txt').as_posix()}'; cat")  # no git call from the test after this line
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before  # old code: the clean filter ran and rewrote the tracked file
+    assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
+
+
+@pytest.mark.parametrize("child", [{"pid": 2147483647, "createdUtc": ["2000-01-01T00:00:00Z"]},
+                                   [{"pid": 2147483647, "createdUtc": "2000-01-01T00:00:00Z"}],
+                                   {"pid": [2147483647], "createdUtc": "2000-01-01T00:00:00Z"}])
+def test_child_json_of_the_wrong_shape_is_bad_arguments_and_saves_nothing(repo, tmp_path, child):  # r8 adversary A2: a one-item list or root array was unwrapped into a valid-looking record
+    dirty(repo)
+    (tmp_path / "child.json").write_text(json.dumps(child))
+    r = save(repo, "-ChildJson", str(tmp_path / "child.json"))
+    assert r.returncode == 30, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+def test_a_toplevel_path_that_is_not_utf8_is_refused_not_decoded_into_a_sibling():  # r8 adversary A3: byte FF decoded to U+FFFD, which names a different, valid directory
+    text = SCRIPT.read_text(encoding="utf-8")
+    m = re.search(r"^function Remove-GitTerminator.*?^}\n", text, re.MULTILINE | re.DOTALL)
+    assert m, "lane-dirty-save.ps1 has no Remove-GitTerminator"
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop'; " + m.group(0) + "$b = [Convert]::FromHexString('2f772f7774ff0a'); [Console]::Out.Write('[' + (Remove-GitTerminator $b) + ']')"], capture_output=True)
+    assert r.returncode != 0 and b"[" not in r.stdout, r.stdout + r.stderr  # old code: '[/w/wt�]'
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="NTFS names are UTF-16, so a path with a byte that is not UTF-8 exists only on POSIX; the decoder test above runs everywhere")
+def test_a_posix_worktree_with_a_non_utf8_name_is_refused_and_its_replacement_sibling_is_untouched(tmp_path):  # r8 adversary A3 end to end
+    root = os.fsencode(str(tmp_path))
+    real, sibling = root + b"/wt\xff", root + "/wt�".encode()
+    (tmp_path / "run").mkdir()
+    for p in (real, sibling):
+        os.mkdir(p)
+        subprocess.run(["git", "init", "-q", p], check=True)
+        for kv in (("user.email", "t@example.invalid"), ("user.name", "t")):
+            subprocess.run(["git", "-C", p, "config", *kv], check=True)
+        Path(os.fsdecode(p), "a.txt").write_text("base\n")
+        subprocess.run(["git", "-C", p, "add", "."], check=True)
+        subprocess.run(["git", "-C", p, "commit", "-q", "-m", "base"], check=True)
+    Path(os.fsdecode(sibling), "a.txt").write_text("SIBLING dirt\n")
+    Path(os.fsdecode(real), "a.txt").write_text("REAL dirt\n")
+    os.symlink(real, root + b"/selected")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(tmp_path / "selected"), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30 and "toplevel-not-utf8" in r.stdout, r.stdout + r.stderr
+    assert list((tmp_path / "run").iterdir()) == []
+
+
 def bind_mount(src, dst):
     for pre in ([], ["sudo", "-n"]):
         if subprocess.run([*pre, "mount", "--bind", str(src), str(dst)], capture_output=True).returncode == 0:
