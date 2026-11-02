@@ -1047,11 +1047,23 @@ if ($ImagePathsGiven.Count -gt 0) {
 #   image-path-reparse-ancestor: ... (<path>)                         r5: the resolved snapshot path has a reparse point in its ancestry
 #   image-digest-timeout: ...                                         r5: a digest read ran past the lane budget (TimeoutException -> timeout/124)
 #   image-path-noncanonical: ...                                      r7: the resolved path, once \\?\ is removed, would open a different object
-#   image-path-bad-character: ... '%', '^' or '&' ...                 r7 (sol B1): cmd.exe (the codex .cmd shim) would rewrite the -i argument
+#   image-path-bad-character: ... a cmd.exe metacharacter ...        r7 (sol B1) / r8 (ADV-A1): cmd.exe (the codex .cmd shim) would rewrite the -i argument
+#   image-args-too-long: ...                                          r8 (ADV-A2): the codex command line would exceed what cmd.exe accepts
 # r7 (sol B1): ProcessStartInfo quotes an argument only when it has a space or a quote, and the codex launcher is a .cmd shim that forwards
 # %*, so cmd.exe expands %VAR%, drops '^' and splits at '&' in the attached path. Measured on this host: C:\x\%OS%\f.png reached the child
 # as C:\x\Windows_NT\f.png and C:\x\a^b\f.png as C:\x\ab\f.png. The held snapshot would verify while codex read another file: refuse.
-$IMAGE_CMD_META_PATTERN = '[%^&]'
+# r8 (ADV-A1): the refused set is the CLASS cmd.exe can rewrite in an argument the shim forwards via %*, not a list of observed cases:
+#   %        expanded in the command-line and batch phases, quoted or not
+#   !        expanded (or, unpaired, deleted) by delayed expansion, quoted or not. Delayed expansion is on for every batch the host runs when
+#            HKCU or HKLM 'Software\Microsoft\Command Processor\DelayedExpansion' is 1 (no /V:ON is needed), so it is a property of the
+#            machine at launch time, not of this script: refuse it unconditionally. Measured: C:\x\!OS!\f.png -> C:\x\Windows_NT\f.png under /V:ON.
+#   ^ & | < > the escape and the command separators / redirections of an unquoted argument
+#   ( )      block delimiters; measured unchanged through today's npm shim, refused because a shim that forwards %* inside a block splits on ')'
+#   "        quote state: toggles whether every character after it is special
+# '|', '<', '>' and '"' cannot occur in a Windows file name, so for them this is defence in depth. Every other file-name-legal character
+# (space # $ ' + , - . ; = @ [ ] _ ` { } ~) was measured to reach the child unchanged; ',' is refused separately (codex splits on it).
+$IMAGE_CMD_META_PATTERN = '[%!^&|<>()"]'
+$IMAGE_CMD_META_TEXT = "a cmd.exe metacharacter (% ! ^ & | < > ( ) or a double quote; codex is launched through a .cmd shim, and cmd.exe rewrites them -- choose a run dir without them)"
 if (-not ('MlvImageSnap' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -1221,7 +1233,7 @@ function Copy-ImageSnapshot {
         }
         if ($null -ne $reparse) { throw [System.IO.IOException]::new("image-path-reparse-ancestor: the resolved image snapshot path has a reparse point in its ancestry ($reparse) ($finalPath)") }
         if ($finalPath.Contains(',')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ',' (codex splits an -i value on commas): $finalPath") }
-        if ($finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains '%', '^' or '&' (codex is launched through a .cmd shim, and cmd.exe rewrites them): $finalPath") }
+        if ($finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_META_TEXT}: $finalPath") }
         $ok = $true
     } finally {
         # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
@@ -1233,6 +1245,55 @@ function Copy-ImageSnapshot {
     return [pscustomobject]@{ sha256 = $copySha; bytes = $total; Hold = $hold; Path = $finalPath }
 }
 # END Copy-ImageSnapshot
+# BEGIN Assert-CodexCommandLineFits (VISUAL-JUDGE-TERRA-LANE-1 r8, adversary ADV-A2)
+# Every accepted -ImagePaths entry adds one `-i <path>` pair, and a codex launch through a .cmd/.bat shim is bounded by cmd.exe's 8191-character
+# line, so enough images made cmd.exe answer "The command line is too long." and nothing ran. The length is computed EXACTLY as .NET builds it from
+# ProcessStartInfo.ArgumentList ("<FileName>" then each argument, quoted and backslash-escaped only when it is empty or carries whitespace or a quote:
+# PasteArguments.AppendArgument), and refused, typed, before the child is started. The shim's own expanded line (`... "%_prog%" "%dp0%\...\codex.js" %*`)
+# is longer than the line .NET hands it, so a reserve of (FileName length + 512) is kept: measured on this host, an npm-shaped shim whose path is
+# 101 characters launched an outer line of 7996 characters and failed at 7997 (195 characters of shim overhead; the reserve there is 613).
+# A native executable is held to CreateProcess's 32767-character limit instead.
+$CMD_LINE_LIMIT_SHIM = 8191
+$CMD_LINE_LIMIT_NATIVE = 32766
+$CMD_SHIM_RESERVE = 512
+function Get-NativeCommandLineLength {
+    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @())
+    $n = $Exe.Length + 2
+    foreach ($a in @($Argv)) {
+        $s = [string]$a
+        $n++
+        # .NET's ContainsNoWhitespaceOrQuotes is char.IsWhiteSpace or '"'; the .NET regex class \s is the same set.
+        if ($s.Length -gt 0 -and $s -notmatch '[\s"]') { $n += $s.Length; continue }
+        $n += 2
+        $i = 0
+        while ($i -lt $s.Length) {
+            $c = $s[$i]; $i++
+            if ($c -eq [char]'\') {
+                $bs = 1
+                while ($i -lt $s.Length -and $s[$i] -eq [char]'\') { $i++; $bs++ }
+                if ($i -eq $s.Length) { $n += 2 * $bs }
+                elseif ($s[$i] -eq [char]'"') { $n += 2 * $bs + 2; $i++ }
+                else { $n += $bs }
+                continue
+            }
+            if ($c -eq [char]'"') { $n += 2; continue }
+            $n++
+        }
+    }
+    return $n
+}
+function Assert-CodexCommandLineFits {
+    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0)
+    $len = Get-NativeCommandLineLength -Exe $Exe -Argv $Argv
+    $ext = [System.IO.Path]::GetExtension($Exe).ToLowerInvariant()
+    $limit = if ($ext -eq '.cmd' -or $ext -eq '.bat') { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $CMD_SHIM_RESERVE) } else { $CMD_LINE_LIMIT_NATIVE }
+    if ($len -gt $limit) {
+        $kind = if ($ImageCount -gt 0) { 'image-args-too-long' } else { 'codex-args-too-long' }
+        throw "${kind}: the codex command line would be $len characters with $ImageCount image(s) attached; the limit through '$Exe' is $limit (attach fewer -ImagePaths entries or use a shorter -RunDir)"
+    }
+    return $len
+}
+# END Assert-CodexCommandLineFits
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -1897,7 +1958,7 @@ if ($cfg.engine -eq 'claude') {
         $imageSeq++
         $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
         if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
-        if ($snapshot -match $IMAGE_CMD_META_PATTERN) { throw "image-path-bad-character: the image snapshot path contains '%', '^' or '&' (codex is launched through a .cmd shim, and cmd.exe rewrites them): $snapshot" }
+        if ($snapshot -match $IMAGE_CMD_META_PATTERN) { throw "image-path-bad-character: the image snapshot path contains ${IMAGE_CMD_META_TEXT}: $snapshot" }
         $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)
         # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
         # r5 B1: that string is the RESOLVED path of the held object (Copy-ImageSnapshot's Path), not the name the copy went through.
@@ -1919,6 +1980,8 @@ if ($cfg.engine -eq 'claude') {
               '-o', $lastPath,
               '--skip-git-repo-check',
               '-')
+    # r8 (ADV-A2): refuse, typed, a command line cmd.exe would reject, before the child is started (see Assert-CodexCommandLineFits).
+    $null = Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount @($ImageAttachments).Count
     # '-' MEANS "READ THE PROMPT FROM STDIN", and it is not optional here.
     # Passing a multi-line prompt POSITIONALLY is silently TRUNCATED AT THE FIRST
     # NEWLINE, because the launcher is a .cmd batch wrapper and cmd.exe breaks the

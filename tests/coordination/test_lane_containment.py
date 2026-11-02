@@ -1278,10 +1278,17 @@ try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGH
         assert f"OUT [{expected}]" in r.stdout,(r.stdout,r.stderr)
 
 
-@pytest.mark.parametrize("dirname,expanded",[("%OS%","Windows_NT"),("a^b","ab"),("a&b",None)])
-def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded):
+@pytest.mark.parametrize("dirname,expanded,delayed",[
+    ("%OS%","Windows_NT",False),("a^b","ab",False),("a&b",None,False),
+    # r8 (ADV-A1): '!' is expanded by delayed expansion, which HKCU/HKLM Command Processor\DelayedExpansion=1 turns on for every batch file.
+    # The fixture shim enables it itself (setlocal enabledelayedexpansion) so the registry is never touched; '(' / ')' are refused as a class.
+    ("!OS!","Windows_NT",True),("a!b",None,True),("a(b",None,False),("a)b",None,False),
+])
+def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded,delayed):
     # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
     # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
+    if delayed:
+        fixture_tree["shim"].write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
     root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
     run_dir=root/dirname; run_dir.mkdir()
     if expanded:
@@ -1299,6 +1306,80 @@ def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(f
         assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
     assert r.returncode!=0 and "image-path-bad-character" in text,(r.returncode,text)
     assert not (root/"args.json").exists(), "a path cmd.exe would rewrite must never reach the codex launch"
+
+
+# r8 (ADV-A1): the refused set is the class cmd.exe can rewrite in a %*-forwarded argument. '|', '<', '>' and '"' cannot be in a Windows file
+# name, so they are proved on the extracted pattern; every file-name-legal character measured to survive the shim must still be accepted.
+_CMD_REFUSED = ['%','!','^','&','|','<','>','(',')','"']
+_CMD_SURVIVES = [' ','#','$',"'",'+','-','.',';','=','@','[',']','_','`','{','}','~']
+
+
+@pytest.mark.parametrize("ch",_CMD_REFUSED+_CMD_SURVIVES)
+def test_the_cmd_metacharacter_pattern_refuses_exactly_the_class_cmd_rewrites(tmp_path,ch):
+    r=_copy_harness(tmp_path,f"""
+$p = 'C:\\x\\a' + [string][char]{ord(ch)} + 'b\\terra-001.image-01.png'
+'MATCH ' + ($p -match $IMAGE_CMD_META_PATTERN)
+""")
+    assert ("MATCH True" if ch in _CMD_REFUSED else "MATCH False") in r.stdout,(ch,r.stdout,r.stderr)
+
+
+def _cmdline_harness(tmp_path, body):
+    """Runs the Assert-CodexCommandLineFits block (between its BEGIN/END markers) alone in a fresh pwsh."""
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Assert-CodexCommandLineFits"); b=text.index("# END Assert-CodexCommandLineFits")
+    harness=tmp_path/"cmdline-harness.ps1"
+    harness.write_text(text[a:b]+"\n$ErrorActionPreference = 'Stop'\n"+body,encoding="utf-8")
+    return subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=90)
+
+
+def test_the_command_line_length_is_exactly_what_dotnet_hands_createprocess(tmp_path):
+    # r8 (ADV-A2): the bound is only sound if the computed length equals the real one. A child started through ProcessStartInfo.ArgumentList
+    # reports its own GetCommandLineW() length; arguments cover empty, spaces, embedded quotes, trailing and quote-adjacent backslashes.
+    probe=tmp_path/"cmdlen.py"
+    probe.write_text("import ctypes\nf=ctypes.windll.kernel32.GetCommandLineW\nf.restype=ctypes.c_wchar_p\nprint('LEN',len(f()))\n",encoding="ascii")
+    r=_cmdline_harness(tmp_path,f"""
+$exe = '{sys.executable}'
+$argv = @('-I', '{probe}', 'exec', '', 'a b', 'q"uote', 'C:\\dir with space\\', 'C:\\x\\\\"y', 'tail\\\\', 'plain\\path', ([string][char]0x3000 + 'ideographic'))
+$psi = [Diagnostics.ProcessStartInfo]::new($exe); foreach ($a in $argv) {{ [void]$psi.ArgumentList.Add($a) }}
+$psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+$p = [Diagnostics.Process]::Start($psi); $o = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+$o.Trim()
+'CALC ' + (Get-NativeCommandLineLength -Exe $exe -Argv $argv)
+""")
+    real=re.search(r"LEN (\d+)",r.stdout); calc=re.search(r"CALC (\d+)",r.stdout)
+    assert real and calc,(r.stdout,r.stderr)
+    assert int(real.group(1))==int(calc.group(1)),(r.stdout,r.stderr)
+
+
+def test_the_codex_command_line_bound_refuses_one_character_past_the_shim_limit(tmp_path):
+    # r8 (ADV-A2) boundary: through 'C:\\x\\codex.cmd' (14 chars) the limit is 8191-(14+512)=7665. "<exe>" + ' exec' + ' ' + k x's = 22+k.
+    r=_cmdline_harness(tmp_path,"""
+$exe = 'C:\\x\\codex.cmd'
+foreach ($k in 7643, 7644) {
+  try { 'FITS ' + $k + ' ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * $k)) -ImageCount 3) }
+  catch { 'REFUSED ' + $k + ' ' + $_.Exception.Message }
+}
+try { 'FITS-NOIMG ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * 7644))) } catch { 'REFUSED-NOIMG ' + $_.Exception.Message }
+try { 'FITS-NATIVE ' + (Assert-CodexCommandLineFits -Exe 'C:\\x\\codex.exe' -Argv @('exec', ('x' * 7644)) -ImageCount 3) } catch { 'REFUSED-NATIVE ' + $_.Exception.Message }
+""")
+    out=r.stdout
+    assert "FITS 7643 7665" in out,(out,r.stderr)
+    assert "REFUSED 7644 image-args-too-long: the codex command line would be 7666 characters with 3 image(s)" in out,(out,r.stderr)
+    assert "REFUSED-NOIMG codex-args-too-long:" in out,(out,r.stderr)
+    assert "FITS-NATIVE 7666" in out,(out,r.stderr)
+
+
+def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):
+    # r8 (ADV-A2): every accepted -ImagePaths entry became one `-i <snapshot>` pair, and 120 of them pushed the command line past cmd.exe's
+    # 8191 characters: the shim answered "The command line is too long." and codex never ran. The launcher must refuse it typed instead.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths","|".join([str(png)]*120)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "image-args-too-long" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists(), "an over-long command line must be refused before the codex child starts"
 
 
 def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
