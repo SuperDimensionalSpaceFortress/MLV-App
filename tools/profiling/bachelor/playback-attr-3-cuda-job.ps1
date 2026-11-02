@@ -249,6 +249,10 @@ param(
     # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
     # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
     [switch]$ContactSheetPairedSeek,
+    # CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: explicit seek targets for the paired seek capture (the app's
+    # --contact-sheet-seek-frames): strictly ascending 0-based frames, exactly -ContactSheetFrames of them,
+    # each 0..999999999. Only with -ContactSheet -ContactSheetPairedSeek. Unset = the job is the text it was.
+    [int[]]$ContactSheetSeekFrames,
     # PLAYBACK-VISUAL-INSPECTION-1: the app's post-measurement window capture (--visual-capture-dir: after the measured Play's own
     # stop and its summary, ~3 s of untimed play is captured with PrintWindow, then the paused frame and its paused full-quality
     # re-render). Forwarded only when the staged binary's smoke help lists the option; PresentMon's window ends where the tail
@@ -5606,6 +5610,26 @@ exit 0
 # Generation-time refusals (typed CORE_PARTITION_*); with every argument unset this returns zeros and nothing else changes.
 $corePartitionArgs = Assert-CorePartitionArgs $BenchAffinityMask $PartitionLoadMask $PartitionLoadThreads ([bool]$CorePartitionTelemetry) $CorePartitionHelperMask
 
+# CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: generation-time refusals for the seek list (the app re-checks the same rules, exit 2).
+$hasContactSheetSeekFrames = $PSBoundParameters.ContainsKey('ContactSheetSeekFrames')
+if ($hasContactSheetSeekFrames) {
+    if (-not ($ContactSheet -and $ContactSheetPairedSeek)) {
+        throw 'CONTACT_SHEET_SEEK_FRAMES_INVALID -ContactSheetSeekFrames is only for a paired seek capture (-ContactSheet -ContactSheetPairedSeek)'
+    }
+    $seekFramesList = @($ContactSheetSeekFrames)
+    if ($seekFramesList.Count -ne $ContactSheetFrames) {
+        throw "CONTACT_SHEET_SEEK_FRAMES_INVALID -ContactSheetSeekFrames must hold exactly -ContactSheetFrames ($ContactSheetFrames) frames, not $($seekFramesList.Count)"
+    }
+    for ($seekFrameIndex = 0; $seekFrameIndex -lt $seekFramesList.Count; $seekFrameIndex++) {
+        $seekFrame = $seekFramesList[$seekFrameIndex]
+        if ($seekFrame -lt 0 -or $seekFrame -gt 999999999) {
+            throw "CONTACT_SHEET_SEEK_FRAMES_INVALID -ContactSheetSeekFrames item $seekFrameIndex must be 0..999999999"
+        }
+        if ($seekFrameIndex -gt 0 -and $seekFrame -le $seekFramesList[$seekFrameIndex - 1]) {
+            throw "CONTACT_SHEET_SEEK_FRAMES_INVALID -ContactSheetSeekFrames must be strictly ascending (item $seekFrameIndex)"
+        }
+    }
+}
 if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg) {
     throw 'DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG -PlaybackRenderLookaheadFrames is only for a -LookPaceLeg run (the lookahead A/B)'
 }
@@ -6262,6 +6286,20 @@ $displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -R
 # (like --windowed above), so every other job is the text it always was. The anchor must match exactly once, or the generator throws.
 if (-not [string]::IsNullOrEmpty($Scope) -and $Scope -cne 'none') {
     $text = Edit-DualVenueSmokeCommand $text ' -Scope none ' " -Scope $Scope " 'DUAL_VENUE_SCOPE_ANCHOR_MISSING' 'replace'
+}
+
+# CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: the paired-seek -AdditionalArgs line gains --contact-sheet-seek-frames, on the expanded text and
+# only when asked (like the scope swap above), so every other job is the text it always was. The list is baked from the validated [int]
+# values, never caller text. The anchor must match exactly once, or the generator throws.
+if ($hasContactSheetSeekFrames) {
+    $seekFramesAnchor = "'--contact-sheet-seek-dir', `$(ConvertTo-PsSingleQuoted `$contactSheetSeekDir))`""
+    $seekFramesAt = $text.IndexOf($seekFramesAnchor, [StringComparison]::Ordinal)
+    if ($seekFramesAt -lt 0 -or $text.IndexOf($seekFramesAnchor, $seekFramesAt + 1, [StringComparison]::Ordinal) -ge 0) {
+        throw 'DUAL_VENUE_SEEK_FRAMES_ANCHOR_MISSING the job template has no single paired-seek -AdditionalArgs site to add --contact-sheet-seek-frames to'
+    }
+    $seekFramesLiteral = (@($ContactSheetSeekFrames) | ForEach-Object { ([int]$_).ToString([Globalization.CultureInfo]::InvariantCulture) }) -join ','
+    $seekFramesNew = "'--contact-sheet-seek-dir', `$(ConvertTo-PsSingleQuoted `$contactSheetSeekDir), '--contact-sheet-seek-frames', '$seekFramesLiteral')`""
+    $text = $text.Substring(0, $seekFramesAt) + $seekFramesNew + $text.Substring($seekFramesAt + $seekFramesAnchor.Length)
 }
 
 # PLAYBACK-SCOPES-OPTION-1: the same env-list site gains the scope throttle interval, only when asked.
