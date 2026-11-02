@@ -15,7 +15,7 @@
 # a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
 # append to it (sol r20 B1 on #698), and removing a caller's disable is what exposed it. GIT_OPTIONAL_LOCKS=0 keeps git from refreshing the index.
-# NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir under the repo's .git (removed on exit) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
+# NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir in the OS temp directory, or the RunDir when temp is not provably outside the worktree (never under the worktree or a git dir beneath it; removed on exit) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
 # Every git call also gets --no-replace-objects: a refs/replace entry for HEAD would make the diffs read another commit's tree while the receipt names HEAD (adversary r9 A2). Path and name comparisons are ordinal, never by culture (U+00AD and case are ignored by culture compares).
 param(
     [Parameter(Mandatory)][string]$WorkDir,
@@ -86,20 +86,42 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     $alt = if ($objects.IndexOfAny([char[]]@("`n", "`r", '"', '\')) -ge 0 -or $objects.StartsWith('#', [System.StringComparison]::Ordinal)) { '"' + $objects.Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`r", '\r') + '"' } else { $objects }  # alternates is one path per LINE: a path holding an LF or a quote is written C-quoted (adversary r10 A3)
     [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'), "$alt`n", $enc)
     foreach ($pair in @(, @($attr, 'attributes')) + @(, @($excl, 'exclude'))) {  # attribute and ignore RULES are data; a filter attribute without a configured driver runs nothing
-        if ([System.IO.File]::Exists($pair[0])) { $dest = [System.IO.Path]::Combine($sg, 'info', $pair[1]); [System.IO.File]::Copy($pair[0], $dest); [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal) }
+        $dest = [System.IO.Path]::Combine($sg, 'info', $pair[1])
+        try { [System.IO.File]::Copy($pair[0], $dest) }
+        catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { continue }  # absent is the only silent case: File.Exists answers false for a file it may not look at, which dropped the rules and let the sealed git compare by other ones (adversary r11 A2). Any other failure ends in the typed private-git-dir refusal (40)
+        [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal)
     }
     $nullDev = if ($script:onWin) { 'NUL' } else { '/dev/null' }
     $script:seal = @{ Args = $script:noCallbacks; Env = @{ GIT_DIR = $sg; GIT_WORK_TREE = $WorkDir; GIT_INDEX_FILE = $index; GIT_CONFIG_NOSYSTEM = '1'; GIT_CONFIG_GLOBAL = $nullDev } }  # the REAL index file: copying it would reset its timestamp and hide racily-clean entries
 }
 $script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
+function Test-DirPresent([string]$Path) {  # $false ONLY when the directory is really gone. Directory.Exists answers false for one it may not look at (a parent it cannot search), which read as a clean removal and left the private directory unnamed (adversary r11 A2). Unknown is present
+    try { [void][System.IO.Directory]::GetFileSystemEntries($Path); return $true }
+    catch [System.IO.DirectoryNotFoundException] { return $false }
+    catch { return $true }
+}
+function Get-WarningLines([string[]]$Stderr) {  # what git said on stderr, minus its line-ending conversion notices (printed for a file git DID compare). Matched over the WHOLE text, not per line: a notice holds the raw file name, which may hold a line feed (adversary r11 A3). Anything else, or a notice in another language, stays a warning: unknown is never "complete"
+    $all = (@($Stderr) -join "`n").Replace("`r`n", "`n")
+    $notice = "(?:warning: )?in the working copy of '.+?', (?:LF|CRLF) will be replaced by (?:LF|CRLF) the next time Git touches it|(?:warning: )?(?:LF|CRLF) will be replaced by (?:LF|CRLF) in .+?\.\nThe file will have its original line endings in your working directory"
+    $rest = [regex]::Replace($all, $notice, '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    return @($rest -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
 function Test-Inside([string]$Parent, [string]$Child) {  # $true when $Child is $Parent or below it; ordinal, both already resolved to real paths
     $rel = [System.IO.Path]::GetRelativePath($Parent, $Child)
     return -not ([string]::Equals($rel, '..', [System.StringComparison]::Ordinal) -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($rel))
 }
-function Get-PrivateBase {  # where the saver's own temporary directory may live: the OS temp directory, unless that is inside the worktree (the lane's TEMP can be, on the hub VM it is), then the RunDir, which is already proven to be outside it. Real paths on both sides, so a link or an 8.3 spelling cannot hide the overlap
+function Get-ShareOf([string]$Path) {  # Windows: the \\server\share a final path lives on, '' for a drive path. A share can expose a local folder (\\localhost\C$) and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
+    if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return [System.IO.Path]::GetPathRoot($Path).ToLowerInvariant() }
+    return ''
+}
+function Get-PrivateBase {  # where the saver's own temporary directory may live: the OS temp directory, unless that is not provably outside the worktree (the lane's TEMP can be inside it, on the hub VM it is), then the RunDir, which is already proven to be. The temp directory gets the SAME proofs the RunDir got, not a name compare alone: a bind mount (POSIX) or a loopback share (Windows) aliases a worktree folder under an outside-looking name (adversary r11 A1)
     foreach ($cand in @([System.IO.Path]::GetTempPath(), $RunDir)) {
         try {
-            if ($script:onWin) { $f = Get-FinalDir $cand; $f.Handle.Dispose(); $real = $f.Path } else { $real = Resolve-RealPath $cand }
+            if ($script:onWin) {
+                $f = Get-FinalDir $cand; $f.Handle.Dispose(); $real = $f.Path
+                if (-not [string]::Equals((Get-ShareOf $real), (Get-ShareOf $realWork), [System.StringComparison]::Ordinal)) { continue }
+            }
+            else { $real = Resolve-RealPath $cand; if (-not [string]::Equals($cand, $RunDir, [System.StringComparison]::Ordinal)) { Assert-RunDirNotAlias $real $realWork } }  # throws when the temp directory is, or sits in, the worktree by identity, or when that cannot be proven: not used
             if (Test-Inside $realWork $real) { continue }
             if ($script:onWin -and $cand.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {  # git rejects a \\?\ GIT_DIR, so it gets the plain spelling, and only when Win32 would not re-read it as another directory (a component ending in a dot or a space is trimmed)
                 $cand = if ($cand.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { '\\' + $cand.Substring(8) } else { $cand.Substring(4) }
@@ -221,8 +243,7 @@ if ($top.Code -eq 0) {
 try {
     if ($script:onWin) {
         $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path
-        $shareOf = { param($p) if ($p.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { [System.IO.Path]::GetPathRoot($p).ToLowerInvariant() } else { '' } }
-        if (-not [string]::Equals((& $shareOf $RunDir), (& $shareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # a share can expose a local folder (\\localhost\C$), and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
+        if (-not [string]::Equals((Get-ShareOf $RunDir), (Get-ShareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # see Get-ShareOf (r7 fix-2 A2)
     }
     else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir; if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }
     $runInside = Test-Inside $realWork $RunDir
@@ -244,16 +265,15 @@ try {
 }
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
 finally {  # only the private dir this run made. A handle another process holds open (no delete sharing, Windows) can keep it: retried, then NAMED in the output and the receipt, never swallowed (adversary r10 A4)
-    for ($i = 0; $i -lt 5 -and $script:sealDir -and [System.IO.Directory]::Exists($script:sealDir); $i++) { try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { Start-Sleep -Milliseconds 200 } }
+    for ($i = 0; $i -lt 5 -and $script:sealDir -and (Test-DirPresent $script:sealDir); $i++) { try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { Start-Sleep -Milliseconds 200 } }
 }
-$left = if ($script:sealDir -and [System.IO.Directory]::Exists($script:sealDir)) { $script:sealDir } else { $null }
+$left = if ($script:sealDir -and (Test-DirPresent $script:sealDir)) { $script:sealDir } else { $null }
 $leftNote = if ($left) { " privateGitDirLeft=$left" } else { '' }
 $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
 if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())$leftNote"; exit 40 }
 $todo = 'patch', 'staged', 'untracked' | Where-Object { $git[$_].Bytes.Length -gt 0 }
 # r11 (sol r10 B2): exit 0 with words on stderr is not a complete collection (git walks past a directory it cannot open and says so only there). Line-ending conversion notices are the one exception: git printed them for a file it DID compare.
-$notice = '\A(?:warning: )?(?:in the working copy of .*, )?(?:LF|CRLF) will be replaced by (?:LF|CRLF)(?: in .*\.| the next time Git touches it)\z|\AThe file will have its original line endings in your working directory\z'
-$warnLines = @($script:gitStderr | ForEach-Object { $_ -split "`r?`n" } | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -cnotmatch $notice })
+$warnLines = Get-WarningLines $script:gitStderr
 $warnShown = @($warnLines | Select-Object -First 20 | ForEach-Object { if ($_.Length -gt 300) { $_.Substring(0, 300) + '...' } else { $_ } })
 if ($warnLines.Count -gt 20) { $warnShown += "... and $($warnLines.Count - 20) more" }
 if (-not $todo) {

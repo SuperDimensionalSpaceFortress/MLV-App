@@ -1281,3 +1281,126 @@ def test_the_saver_never_lists_its_own_temporary_files_and_a_repeat_save_is_byte
     assert [p for p in (wd / "admin").iterdir() if p.name.startswith("lane-dirty-save-")] == []
     if temp_inside_worktree:
         assert list((wd / "tmpdir").iterdir()) == []
+
+
+# ---- r11 adversary pass A1-A3 on f8baa750 ----
+def inventory_of(tmp_path):
+    return next((tmp_path / "run").glob("*.untracked.txt")).read_bytes()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="administrative shares are Windows")
+def test_a_temp_directory_reached_through_a_loopback_share_of_a_worktree_folder_is_not_used(repo, tmp_path):  # r11 adversary A1: the temp directory got a name compare only, so \\localhost\C$\...\wt\tmpdir looked like an outside directory
+    (repo / "tmpdir").mkdir()
+    (repo / "u.txt").write_text("u\n")
+    unc = "\\\\localhost\\" + str(repo / "tmpdir").replace(":", "$", 1)
+    if not os.path.isdir(unc):
+        pytest.skip("the administrative share of this drive is not reachable by this user")
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "TMP": unc, "TEMP": unc})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert b"lane-dirty-save-" not in inventory_of(tmp_path) and b"u.txt" in inventory_of(tmp_path)  # old code: the private git dir inside the worktree was listed
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a bind mount is a POSIX construct")
+def test_a_temp_directory_that_is_a_bind_mount_of_a_worktree_folder_is_not_used(repo, tmp_path):  # r11 adversary A1, POSIX form
+    inside, alias = repo / "tmpdir", tmp_path / "alias-temp"
+    inside.mkdir(); alias.mkdir()
+    pre = bind_mount(inside, alias)
+    if pre is None:
+        pytest.skip("cannot create a bind mount here (needs root or passwordless sudo)")
+    try:
+        (repo / "u.txt").write_text("u\n")
+        r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "TMPDIR": str(alias)})
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert b"lane-dirty-save-" not in inventory_of(tmp_path)
+    finally:
+        subprocess.run([*pre, "umount", str(alias)], capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32" or ROOT_IGNORES_DIR_MODES, reason="a directory this user may not search is a POSIX mode, and root ignores it")
+def test_a_rules_file_git_cannot_be_read_from_is_a_typed_refusal_not_a_silently_dropped_rule(tmp_path):  # r11 adversary A2: File.Exists answers false for an unreadable file, so its rules were dropped
+    base = tmp_path / "case"
+    base.mkdir()
+    wd, admin = base / "wt", base / "wt.git"
+    wd.mkdir()
+    subprocess.run(["git", "init", "-q", f"--separate-git-dir={admin}", str(wd)], check=True, capture_output=True)
+    for a in (["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "core.autocrlf", "true"]):
+        git(wd, *a)
+    (wd / "a.txt").write_bytes(b"one\n")
+    git(wd, "add", "a.txt")
+    git(wd, "-c", "core.autocrlf=false", "commit", "-q", "-m", "base")
+    (admin / "info").mkdir(exist_ok=True)
+    (admin / "info" / "attributes").write_text("a.txt -text\n")
+    (wd / "a.txt").write_bytes(b"one\r\n")
+    (base / "run").mkdir()
+    os.chmod(admin / "info", 0o000)
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(wd), "-RunDir", str(base / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    finally:
+        os.chmod(admin / "info", 0o755)
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout and list((base / "run").iterdir()) == [], r.stdout + r.stderr  # old code: 10 clean-tree
+
+
+@pytest.mark.skipif(sys.platform == "win32" or ROOT_IGNORES_DIR_MODES, reason="a parent this user may not search is a POSIX mode, and root ignores it")
+def test_a_private_git_dir_whose_parent_cannot_be_searched_is_named_not_called_removed(repo, tmp_path):  # r11 adversary A2 cleanup sibling: Directory.Exists is false for it, which read as a clean removal
+    base = tmp_path / "tmpbase"
+    base.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    anchor = "$git.patch = Invoke-GitBytes"
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, f"if ([System.IO.Path]::GetDirectoryName($script:sealDir) -ceq $env:LDS_BASE) {{ & chmod 000 $env:LDS_BASE }}; {anchor}"), encoding="utf-8")
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())],
+                           capture_output=True, text=True, env={**os.environ, "TMPDIR": str(base), "LDS_BASE": str(base)})
+    finally:
+        os.chmod(base, 0o755)
+    assert "privateGitDirLeft=" in r.stdout, r.stdout + r.stderr  # old code: nothing named, the directory was left behind
+    shutil.rmtree(base, ignore_errors=True)
+
+
+def run_ps_functions(names, expr, **env):
+    prog = ps_functions(*names) + f"[Console]::Out.Write({expr})"
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, **env})
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout.decode("utf-8")
+
+
+NOTICE_CRLF = "warning: CRLF will be replaced by LF in {name}.\nThe file will have its original line endings in your working directory\n"
+NOTICE_LF = "warning: in the working copy of '{name}', LF will be replaced by CRLF the next time Git touches it\n"
+DENIED = "warning: could not open directory 'hidden/': Permission denied\n"
+
+
+@pytest.mark.parametrize("stderr, want", [
+    (NOTICE_CRLF.format(name="a.txt"), []),
+    (NOTICE_LF.format(name="a.txt"), []),
+    (NOTICE_CRLF.format(name="a\nb.txt"), []),  # r11 adversary A3: the file name holds a line feed, so the notice spans three lines
+    (NOTICE_LF.format(name="a\nb.txt"), []),
+    (NOTICE_LF.format(name="a.txt") + DENIED + NOTICE_CRLF.format(name="a\nb.txt"), [DENIED.strip()]),
+    (DENIED, [DENIED.strip()]),
+    ("The file will have its original line endings in your working directory\n", ["The file will have its original line endings in your working directory"]),  # an orphan second line is not a notice
+    ("warning: LF will be replaced by CRLF in a.txt. but something else\n", ["warning: LF will be replaced by CRLF in a.txt. but something else"]),
+])
+def test_only_git_s_line_ending_notices_are_dropped_and_they_are_matched_over_the_whole_text(stderr, want):  # r11 adversary A3 (platform-independent: a file name with a line feed cannot exist on NTFS)
+    out = run_ps_functions(["Get-WarningLines"], "(ConvertTo-Json -Compress -InputObject @(Get-WarningLines @($env:LDS_ERR)))", LDS_ERR=stderr)
+    assert json.loads(out) == want
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="NTFS cannot hold a line feed in a file name")
+def test_a_tracked_name_with_a_line_feed_does_not_make_the_conversion_notice_a_warning(repo, tmp_path):  # r11 adversary A3 end to end
+    commit_lf(repo)
+    git(repo, "config", "core.autocrlf", "true")
+    odd = repo / "a\nb.txt"
+    odd.write_bytes(b"one\n")
+    git(repo, "add", "-A")
+    git(repo, "-c", "core.autocrlf=false", "commit", "-q", "-m", "odd")
+    odd.write_bytes(b"one\nextra\n")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0 and "collection" not in last_receipt(r), r.stdout + r.stderr  # old code: 60, the notice was split into two unmatched fragments
+
+
+def test_a_directory_is_reported_present_unless_it_is_really_gone(tmp_path):  # r11 adversary A2 guard (runs everywhere; the unsearchable-parent case is the POSIX test above)
+    here, gone = tmp_path / "here", tmp_path / "gone"
+    here.mkdir()
+    out = run_ps_functions(["Test-DirPresent"], "('' + (Test-DirPresent $env:LDS_A) + ',' + (Test-DirPresent $env:LDS_B))", LDS_A=str(here), LDS_B=str(gone))
+    assert out == "True,False"
