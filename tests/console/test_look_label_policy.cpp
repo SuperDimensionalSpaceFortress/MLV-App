@@ -428,6 +428,15 @@ TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
     ASSERT_TRUE(markAt > apply);
     ASSERT_TRUE(marked > markAt);
     ASSERT_TRUE(relabel > marked);
+    // r13 (adversary r12 A1 on 6d722d33): the fresh-capture branch (Reset Receipt: baseline invalid) is read the same way,
+    // also before the apply block.
+    const int capture = body.indexOf(QStringLiteral("captureLookAssistBaseline( receipt );"));
+    const int captureRead = body.indexOf(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );"), capture);
+    printf("[LL13] setSliders: capture=%d captureRead=%d\n", capture, captureRead);
+    ASSERT_TRUE(capture > restore);
+    ASSERT_TRUE(captureRead > capture);
+    ASSERT_TRUE(apply > captureRead);
+    ASSERT_EQ(2, body.count(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );")));
     // r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- setSliders never alters the outcome, which setReceipt saves as the
     // receipt's flavor ("classic" after a fallback must stay "classic").
     ASSERT_FALSE(body.contains(QStringLiteral("m_lookAssistFlavorOutcome.clear();")));

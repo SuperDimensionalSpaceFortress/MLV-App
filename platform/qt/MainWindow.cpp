@@ -16550,7 +16550,12 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
             baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );
         }
         else
+        {
+            // r13 (adversary r12 A1 on 6d722d33): Reset Receipt (defaults: enabled, baseline invalid) on an applied receipt
+            // captures the reset sliders as the baseline and, deduped below, nothing re-grades them either.
             captureLookAssistBaseline( receipt );
+            baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );
+        }
 
         if( !deferLookAssistUntilBaselineFrame
          && !m_lookAssistApplied.isApplied( receipt ) )
