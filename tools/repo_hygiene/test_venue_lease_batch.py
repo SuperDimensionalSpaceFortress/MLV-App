@@ -7111,12 +7111,20 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             "if ($a -lt 0 -or $e -lt 0) { throw 'the leg strip block was not found' }\n"
             "$e = $legText.IndexOf(\"`n\", $e)\n"
             "$block = $legText.Substring($a, $e - $a) + \"`n        }`n    }`n\"\n"
+            # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r12: the block may call a helper the LEG defines (Invoke-DvCollect wraps every copy). Carry each
+            # top-level leg function the block names, from the leg's own text, so the block runs as the leg runs it; and any error the block raises
+            # fails the test instead of printing a copy path for a copy that never happened (the r11 hosted red: PRIMARY=<path>, 0 PNGs written).
+            "$legAst = [System.Management.Automation.Language.Parser]::ParseInput($legText, [ref]$null, [ref]$null)\n"
+            "foreach ($fn in @($legAst.FindAll({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false))) {\n"
+            "    if ($block -match ('(?<![\\w-])' + [regex]::Escape($fn.Name) + '(?![\\w-])')) { . ([scriptblock]::Create($fn.Extent.Text)) } }\n"
             "function global:Read-DvVisualCaptures { param($Requested, $ArtifactsDir, $EvidenceDir, $LegId, $Header) "
             f"[pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null; verdict = 'OK'; reason = '' }} }}\n"
             f"$receipt = [ordered]@{{ visual = [pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null }} }}\n"
             "$spec = [pscustomobject]@{ legId = 'leg-r6' }; $Venue = 'bachelor'; $Backend = 'cuda'; $SourceCommit = '0123456789abcdef0123'; $runStamp = '20261031T000000Z'; $OfflineTestMode = $false\n"
             f"$SheetCopyDir = '{psq(sheet_copy_dir)}'; $ReceiptRoot = '{psq(receipt_root)}'; $evidenceDir = '{psq(evidence_dir)}'\n"
+            "$Error.Clear()\n"
             "$null = . ([scriptblock]::Create($block))\n"
+            "if ($Error.Count -gt 0) { throw ('the leg strip block raised: ' + [string]$Error[0]) }\n"
             "'PRIMARY=' + [string]$receipt.visual.stripCopyPath\n"
             "foreach ($k in @($receipt['selfHealVisual'].Keys)) { 'SELFHEAL ' + $k + '=' + [string]$receipt['selfHealVisual'][$k].stripCopyPath }\n"
         )
