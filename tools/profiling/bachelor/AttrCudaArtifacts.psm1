@@ -4141,7 +4141,15 @@ function Get-AttrCudaEligibilityLineForSession {
     )
 
     $idPattern = [regex]::Escape($MeasuredSessionId) + '(\s|$)'
-    $lines = $LogText -split "`r?`n"
+    # r3 (adversary A1 on ddceb595): record MARKERS are matched on the line's BODY, the text before its first ' (' -- the Qt
+    # location suffix CrashForensics::writeLogLine appends ( (<file>:<line>)) is written last and starts at or after it
+    # (DualVenueRunner's Get-DvLogRecordBody, the same rule) -- so a build path holding "playback_smoke.summary session=<id>"
+    # or "gpu_playback_recon.eligibility " can neither anchor the session, hide the real eligibility line in the tail, nor add
+    # one. The eligibility FIELDS are read from the whole line, first occurrence of a key winning: its free-text values
+    # (r16_reason, r16_renderer, cuda_backend_description; sanitizeLogValue keeps spaces) may hold ' (' before
+    # cuda_backend_available, and every key a later location suffix could spell is one the app already wrote earlier.
+    $rawLines = @($LogText -split "`r?`n")
+    $lines = @($rawLines | ForEach-Object { $open = $_.IndexOf(' (', [StringComparison]::Ordinal); if ($open -ge 0) { $_.Substring(0, $open) } else { $_ } })
     $startIndex = -1
     $summaryIndex = -1
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -4153,11 +4161,11 @@ function Get-AttrCudaEligibilityLineForSession {
     $tailRefused = $false
     $windowRefusing = 0
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        $line = $lines[$i]
-        if ($line -notmatch 'gpu_playback_recon\.eligibility ') { continue }
+        if ($lines[$i] -notmatch 'gpu_playback_recon\.eligibility ') { continue }
         $values = @{}
-        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?:"(?<quoted>[^"]*)"|(?<bare>[^\s]+))')) {
+        foreach ($match in [regex]::Matches($rawLines[$i], '(?<key>[A-Za-z0-9_]+)=(?:"(?<quoted>[^"]*)"|(?<bare>[^\s]+))')) {
             $key = $match.Groups['key'].Value
+            if ($values.ContainsKey($key)) { continue }
             if ($match.Groups['quoted'].Success) { $values[$key] = $match.Groups['quoted'].Value }
             else { $values[$key] = $match.Groups['bare'].Value }
         }

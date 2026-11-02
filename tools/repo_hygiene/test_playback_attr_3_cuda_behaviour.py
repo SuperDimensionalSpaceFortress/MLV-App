@@ -1045,6 +1045,75 @@ class MeasuredSessionEligibilityVerdictTests(_PwshCase):
         self.assertIn("# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name @(\n"
                       "    'Get-AttrCudaEligibilityLineForSession'\n", text)
 
+    def test_t7_a_qt_location_suffix_neither_anchors_hides_nor_rewrites_the_measured_line(self) -> None:
+        """r3 (adversary A1 on ddceb595): CrashForensics::writeLogLine appends ` (<file>:<line>)` after the message; a build
+        path holding record text must not be read as a record. Markers are matched on the body (before the first ` (`); the
+        eligibility fields are read from the whole line, first key wins, because its free-text values may hold ` (`."""
+        loc = " (C:/build/playback_smoke.summary session=7 x/platform/qt/MainWindow.cpp:100)"
+        # The adversary's exact shape: a spoofed summary BEFORE the session would make the real eligibility line "tail".
+        new, _old = self.verdicts([
+            self._ts() + "app.ready" + loc,
+            self.start(7),
+            self.elig(1, 1),
+            self.summary(7),
+        ], "7")
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertTrue(new["linePresent"])
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["exitCode"], 0)
+        self.assertEqual(new["tailLinesIgnored"], 0)
+        # A suffix spelling an admitting key cannot rewrite a refusing line; nor can one spelling the marker add a line.
+        self._second = 0
+        new, _old = self.verdicts([
+            self.start(7),
+            self.elig(1, 0, "paused") + " (C:/b r16_available=1 cuda_backend_available=1/x.cpp:5)",
+            self._ts() + "app.ready (C:/b gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=1/x.cpp:6)",
+            self.summary(7),
+        ], "7")
+        self.assertFalse(new["admitted"])
+        self.assertEqual(new["exitCode"], 15)
+        self.assertEqual(new["r16Reason"], "paused")
+        # A free-text value holding ` (` keeps every later field: the line still admits.
+        self._second = 0
+        new, _old = self.verdicts([
+            self.start(7), self.elig(1, 1, "ok (texture probe passed)") + " (C:/b/x.cpp:7)", self.summary(7),
+        ], "7")
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["r16Reason"], "ok (texture probe passed)")
+
+
+@requires_pwsh
+class MeasuredSessionScopeFieldsTests(_PwshCase):
+    """PLAYBACK-GPU-SCOPES-NO-VETO-1 r3 (adversary A2 on ddceb595): the job's read of scope_source / scope_tap_completed from
+    the measured session's playback_smoke.cpu_summary_ext line, run as the job runs it (the bracketed splice, verbatim), so a
+    build path in the Qt location suffix can supply neither the marker nor either field."""
+
+    def scope_fields(self, raw_log: str, session: str = "7") -> dict:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index("# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>\n# r2 (CoS #447): where the MEASURED session's scope updates")
+        end = text.index("# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<", start)
+        log = self.tmp / "run.log"
+        log.write_text(raw_log, encoding="utf-8")
+        proc = self.run_with_module(
+            f"$rawLog = [IO.File]::ReadAllText('{log}')\n$measuredSmokeSessionId = '{session}'\n"
+            + text[start:end]
+            + "\nWrite-Output ('OUT=' + (@{ s = $scopeSource; c = $scopeTapCompleted } | ConvertTo-Json -Compress))\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        line = next(x for x in proc.stdout.splitlines() if x.startswith("OUT="))
+        return json.loads(line[4:])
+
+    def test_the_fields_come_from_the_record_body_only(self) -> None:
+        ts = "[2026-11-02T09:00:04.000Z] [I] [0x1] "
+        spoof = (ts + "playback_smoke.cpu_summary_ext session=7 avg_processed8_setup_ms=0 "
+                 "(C:/build/x scope_source=gpu_tap scope_tap_completed=1 x/platform/qt/MainWindow.cpp:30090)\n")
+        self.assertEqual(self.scope_fields(spoof), {"s": None, "c": None})
+        marker_in_path = ts + "app.ready (C:/b playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap scope_tap_completed=9/x.cpp:1)\n"
+        self.assertEqual(self.scope_fields(marker_in_path), {"s": None, "c": None})
+        real = (ts + "playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap scope_tap_requests=4 scope_tap_completed=3 "
+                "scope_tap_w=256 (C:/b scope_source=cpu scope_tap_completed=0/x.cpp:2)\n")
+        self.assertEqual(self.scope_fields(real), {"s": "gpu_tap", "c": 3})
+        self.assertEqual(self.scope_fields(real, session="70"), {"s": None, "c": None})
+
 
 # --------------------------------------------------------------------------------------------
 # (e) an interrupted stage never publishes build.json

@@ -4277,9 +4277,13 @@ Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
 $scopeSource = $null
 $scopeTapCompleted = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
-    if ($candidateLine -match ('playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
-        $scopeSource = if ($candidateLine -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
-        $scopeTapCompleted = if ($candidateLine -match '\sscope_tap_completed=(?<v>\d+)') { [int64]$Matches['v'] } else { $null }
+    # r3 (adversary A2 on ddceb595): the record BODY only, the text before the first ' (' (the Qt location suffix starts there and a
+    # record body never holds ' ('), so a build path cannot supply the marker or either field.
+    $open = $candidateLine.IndexOf(' (', [StringComparison]::Ordinal)
+    $body = if ($open -ge 0) { $candidateLine.Substring(0, $open) } else { $candidateLine }
+    if ($body -match ('playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $scopeSource = if ($body -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
+        $scopeTapCompleted = if ($body -match '\sscope_tap_completed=(?<v>\d+)') { [int64]$Matches['v'] } else { $null }
     }
 }
 # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
