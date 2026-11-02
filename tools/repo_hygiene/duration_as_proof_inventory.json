@@ -262,6 +262,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackPrepInFlightGate.h",
+      "anchor": "std :: chrono :: milliseconds ( timeoutMs > 0 ? timeoutMs : 0 ) ,",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "drainLocked clamps its caller-supplied wait budget (a 2000 ms constant at every MainWindow drainPlaybackPrepInFlight call site) to zero before condition_variable::wait_for, so a negative argument cannot become an undefined wait. Whether the prep worker left its in-flight section is the gate's m_inFlight flag (the wait_for predicate and its return value), never this duration; on a timed-out drain playbackPrepBorrowFreeingMutationAllowed returns false and clip replacement aborts (r2, CoS B1).",
+      "lines": [
+        43
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackQualityPolicy.h",
       "anchor": "return frameMs > 0.0 ? 1000.0 / frameMs : 0.0 ;",
       "class": "division_guard",
@@ -489,6 +499,16 @@
       "justification": "export_profile_stage_set() clamps an externally-supplied stage duration to zero if negative before recording it into the optional export profiler; a defensive clamp, not a run-proof.",
       "lines": [
         544
+      ]
+    },
+    {
+      "path": "src/mlv/video_mlv.c",
+      "anchor": "const double max_slice_s = ( video -> processed8_prefetch_test_wait_slice_ms > 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "mlv_processed8_prefetch_wait_slice_locked() picks the fallback slice length for the processed8 test idle waiters: a test-set slice override (ms, a config seam; production leaves it 0) when non-zero, else the 50 ms default. A config select on a seam value, never a measured duration and never used to prove a stage ran (PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2).",
+      "lines": [
+        9507
       ]
     },
     {
@@ -2114,6 +2134,16 @@
       ]
     },
     {
+      "path": "platform/qt/GpuFieldTelemetry.cpp",
+      "anchor": "f . utcMs = fault . utcMs > 0.0 ? fault . utcMs : f . deliveredUtcMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1 recordFault: fault.utcMs is a wall-clock timestamp (the DLL note's igpu_cuda_error_t.utc_ms, Unix epoch ms), not a duration. A value > 0 is the DLL's own note time and is written as fault_utc_ms; 0 means no note time came with the fault (an older DLL, a validation failure, the fault-inject path), so the record falls back to the time the app recorded it. Selects which timestamp to write; never proof that any stage ran.",
+      "lines": [
+        537
+      ]
+    },
+    {
       "path": "tests/console/test_gpu_field_telemetry.cpp",
       "anchor": "\"    workerPool()->waitForDone(static_cast<int>(waitMs > 0 ? waitMs : 0));\" ,",
       "class": "not_run_proof_structural",
@@ -2181,6 +2211,77 @@
       "justification": "Pure-function unit test: a synthetic first present no slower than the later presents' median must attribute 0 ms to the route's one-time setup (clamped, never negative). Test-constructed input, no live clock; it checks the attribution math, not that any stage ran.",
       "lines": [
         82
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , split . firstPresentSplit ( ) . reconWallMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0 pure-function unit test ItIsResetWithTheSessionAndKeptUntilThen: a synthetic FirstPresentSplit (reconWallMs=3.0) noted on a StartupSplit must read back 0 after reset(). Test-constructed value, no live clock; it checks the reset, not that any stage ran.",
+      "lines": [
+        212
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , guiPickupMs ( 0.0 , 10.040 ) , 1 e - 9 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0 pure-function unit test GuiPickupIsRenderDoneToGuiPresentStart: an unknown (0) render-done stamp must yield 0 ms, not a huge gap from the clock origin. Synthetic stamps, no live clock; it pins the sentinel fallback, not that any stage ran.",
+      "lines": [
+        219
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , guiPickupMs ( 10.050 , 10.040 ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row 0 pure-function unit test GuiPickupIsRenderDoneToGuiPresentStart: out-of-order synthetic stamps (render done after the GUI present start) must clamp to 0 ms, never negative. No live clock; it checks the clamp, not that any stage ran.",
+      "lines": [
+        220
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , rf . otherMs ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0 pure-function unit test APartWithoutATimerIsNAAndOtherNeverGoesNegative: synthetic decode + llrawproc parts summing past a synthetic render_first must clamp other_ms to 0, never negative. Test-constructed values, no live clock; it checks the clamp, not that any stage ran.",
+      "lines": [
+        296
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_startup_split.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , split . renderFirstSplit ( ) . renderFirstMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row 0 pure-function unit test ItIsResetWithTheSession: a synthetic RenderFirstSplit (renderFirstMs=99.0) noted on a StartupSplit must read back 0 after reset(). Test-constructed value, no live clock; it checks the reset, not that any stage ran.",
+      "lines": [
+        317
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_recon_warm_run_policy.cpp",
+      "anchor": "ASSERT_TRUE ( playback_recon_warm_run :: kRepostDelayMs > 0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W pure-policy unit test: the warm's re-post delay constant is positive (a 0 ms re-post would spin the GUI event loop while real work is pending). A compile-time constant, no clock read; it pins the policy value, not that anything ran.",
+      "lines": [
+        123
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_gpu_playback_recon_preload.cpp",
+      "anchor": "ASSERT_TRUE ( loadMs >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: llrpGpuPlaybackReconPreloadBackend's load_ms out-param is written (the -1.0 sentinel is replaced) and never negative; a >= 0.0 check that cannot distinguish ran from not-ran. The run proof is the return value and llrpGpuExportBackendAttemptedForTesting() == 1 asserted beside it in both tests.",
+      "lines": [
+        35,
+        48
       ]
     },
     {
@@ -2291,6 +2392,138 @@
       "justification": "PLAYBACK-STARTUP-WAIT-PREWARM-1 r2 test: frameMs returns 0 for an unknown (0) fps instead of dividing by it.",
       "lines": [
         66
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackStartupSplit.h",
+      "anchor": "+ ( kickLeadMs < 0.0 ? QStringLiteral ( \"NA\" ) : QString :: number ( kickLeadMs , 'f' , 3 ) )",
+      "class": "display_or_format",
+      "clock": "other",
+      "justification": "PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 first_present_split formatter: kickLeadMs defaults to the -1 'not stamped' sentinel (no kick ran, or no AMaZE call was probed before the first present) and prints NA for it; MainWindow sets it from two std::chrono::steady_clock stamps (kick begin, frame 0's AMaZE call). Formatting only; nothing infers that a stage ran from it. (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1: the line no longer ends the expression; the reuse fields follow it.)",
+      "lines": [
+        217
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0 , doc . object ( ) . value ( QStringLiteral ( \"async_writer_debug_delay_ms\" ) ) . toInt ( - 1 ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PIPELINE-DNG-ASYNC-WRITER-QUEUE-FILL-FLAKE-1 r2 strict-parse test: async_writer_debug_delay_ms is the parsed MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS config value echoed into the profile, not a measured duration. The assert proves the malformed value '5garbage' parses as off (0) instead of a 5 ms delay; the -1 default makes a missing field fail. Run-proof for the frame is the ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter/finishDngPayloadWriter) pair above.",
+      "lines": [
+        4726
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t2 . gui_idle_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (GpuPresentTailWindow driven with injected nanosecond values, no clock): a fresh path-3 window carries nothing from the previous window, so its idle reads 0. Negative check, paired in the same block with ASSERT_EQ(0, t2.gui_idle_waits) and, for the positive side, window 1's ASSERT_EQ(2, t1.gui_idle_waits) with idle 12.0; the counters, not this value, are the proof of what the probe saw.",
+      "lines": [
+        787
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t2 . runner_sleep_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): the runner sleep counted between windows is not carried into the fresh window. Negative check, paired with ASSERT_EQ(0, t2.runner_sleeps) and window 1's ASSERT_EQ(1, t1.runner_sleeps) with 10.0 ms; the count is the proof a sleep was seen.",
+      "lines": [
+        789
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t2 . qt_paint_swap_max_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): the path-1 pair maximum resets with the window. Negative check, paired with ASSERT_EQ(0, t2.qt_paint_swaps) and window 1's ASSERT_EQ(2, t1.qt_paint_swaps) with max 5.0; the count is the proof a path-1 swap was seen.",
+      "lines": [
+        792
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , t . gui_idle_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): a setup during an open dispatcher block never charges the block's span as idle. Negative check, paired with ASSERT_FALSE(t.gui_idle_known) and ASSERT_EQ(0, t.gui_idle_waits); the known flag and the count carry the verdict, and the bucket assert (UNKNOWN) is what the product reads.",
+      "lines": [
+        816
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , next . gui_idle_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 lifecycle test (injected values, no clock): the late awake of a block the previous close dropped is not charged to the next window. Negative check, paired with ASSERT_EQ(0, next.gui_idle_waits) and ASSERT_TRUE(next.gui_idle_known); the count is the proof no wait was closed.",
+      "lines": [
+        828
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playback_slip :: presentSetupGuiBusyMs ( sampleFromTail ( 60.0 , over ) ) , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r3 (injected values, no clock): presentSetupGuiBusyMs clamps at 0 when a runner sleep timed on its own clock exceeds the window by 1 us. A range/clamp check on a computed value; it never says whether a stage ran (the runner sleep count is asserted in the neighbouring cases).",
+      "lines": [
+        885
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playback_slip :: presentSetupGuiBusyMs ( holdSample ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r4 ADV-A1 (injected values, no clock): a 250 ms window with a 100 ms dispatcher wait and fifteen 10 ms runner sleeps leaves no GUI busy time. Arithmetic on a computed value; it never says whether a stage ran (ASSERT_EQ(1, hold.gui_idle_waits) and ASSERT_EQ(15, hold.runner_sleeps) carry that, and the bucket assert is what the product reads).",
+      "lines": [
+        933
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , later . qt_paint_swap_max_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r4 G2 (injected values, no clock): a path-1 paint with no swap in window 1 never pairs with a swap in window 2, so window 2's pair maximum stays 0. Negative check, paired with ASSERT_EQ(0, later.qt_paint_swaps); the count is the proof no pair was taken.",
+      "lines": [
+        953
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_slip_histogram.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , dropped . qt_paint_swap_max_ms , 1 e - 12 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-PRESENT-TAIL-TIMING-1 r4 G2 (injected values, no clock): a session start/stop drops an unswapped stamp, so the later swap pairs with nothing and the pair maximum stays 0. Negative check, paired with ASSERT_EQ(0, dropped.qt_paint_swaps) and the positive paired case (1 pair, 3.0 ms) just above.",
+      "lines": [
+        973
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "const double llrawprocResidualSubstageMs = llrawprocMs > 0.0",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "LLRAWPROC-RESIDUAL-SUBTIMERS-1 (adversary r1 A1): drawFrame writes the llrawproc residual sub-stage fields only when this thread's own llrawproc wall (getMlvLastLlrawprocMilliseconds(), zeroed by every reconned-raw consumer) is non-zero, so a CPU frame the recon worker reconstructed keeps the worker's fields. A zero wall is the only 'this thread ran llrawproc' signal here, so it is honestly a run-proof. It is telemetry only (it chooses which run's sub-timers a field carries, never a pass/fail), and a real llrawproc wall spans several QPC reads, so a sub-resolution zero is implausible. Replace it with an llrp 'ran on this thread' flag in the successor.",
+      "status": "open",
+      "successor": "LLRAWPROC-TIMING-RECONNED-ROUTE-PRESERVE-1",
+      "lines": [
+        6260
+      ]
+    },
+    {
+      "path": "tests/console/test_llrawproc_residual_telemetry_wiring.cpp",
+      "anchor": "QStringLiteral ( \"const double llrawprocResidualSubstageMs = llrawprocMs > 0\\\\.0\\\\s*\\\\?\\\\s*\"",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Text of a regular expression in a source-text wiring test that pins the RenderFrameThread.cpp llrawprocResidualSubstageMs guard (row above); no duration is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        86
       ]
     }
   ]

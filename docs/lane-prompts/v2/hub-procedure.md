@@ -68,7 +68,7 @@ F. **Hook branch**: when a round changes a hook rule, a background agent (model 
    live hook denies that venue both ways — a worktree-rooted lane fails NA-10, a board-rooted author fails NA-7 because `C:\mlvtmp` is outside
    both roots — so the author works in a temporary worktree INSIDE the board root: `git -C "C:\!Layi Wkspc\MLV-App" worktree add
    "C:\!Layi Wkspc\MLV-App\.claude-state\worktrees\hook-amend-<ts>" <branch>`, never as a worktree-rooted lane (S116; that parent is already in
-   `tools/check-doc-size.py`'s EXEMPT list as an untracked full repo copy, so the author's checkout does not multiply the board's governed-doc
+   `tools/docs/doc-size-budget.config.json`'s `exempt` list (formerly `tools/check-doc-size.py`'s EXEMPT) as an untracked full repo copy, so the author's checkout does not multiply the board's governed-doc
    census — `hook-worktrees\` was not, and would — O154). Either way you
    re-run its suites yourself from a `git -C "C:\!Layi Wkspc\MLV-App" archive <sha> | tar -x` extraction in scratch (never in the author's
    working tree), then probe the hook with decision-only JSON on stdin. Record the sha and the results in the checkpoint in the same tool-call block.

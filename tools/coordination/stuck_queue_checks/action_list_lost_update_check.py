@@ -145,7 +145,12 @@ def one_trial(impl, workdir, n):
 
         return run
 
-    threads = [threading.Thread(target=guarded("beat_save", beat)), threading.Thread(target=guarded("arm", arm))]
+    # Daemon threads: a writer that never returns must not keep the interpreter alive at shutdown,
+    # or the CLI hangs instead of returning the exit 2 that HarnessError promises.
+    threads = [
+        threading.Thread(target=guarded("beat_save", beat), daemon=True),
+        threading.Thread(target=guarded("arm", arm), daemon=True),
+    ]
     for t in threads:
         t.start()
     for t in threads:
@@ -179,7 +184,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         impl = load_module(args.impl_module) if args.impl_module else {"naive": Naive, "locked": Locked}[args.impl]
-        with tempfile.TemporaryDirectory() as workdir:
+        # A hung writer may still hold a file open on Windows; a cleanup error must not replace the HarnessError text.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as workdir:
             lost = silent = 0
             for n in range(args.trials):
                 present, code = one_trial(impl, workdir, n)

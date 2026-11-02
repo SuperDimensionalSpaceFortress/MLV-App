@@ -56,6 +56,13 @@ typedef int (*pfn_run_post_wb_gl_texture)(igpu_amaze_debayer_backend *,
 typedef int (*pfn_last_timing)(igpu_amaze_debayer_backend *,
                                igpu_amaze_debayer_timing_t *);
 typedef int (*pfn_set_reduced_hnyquist)(igpu_amaze_debayer_backend *, int);
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 (--clock-kick) */
+typedef int (*pfn_run_post_wb_from_r16)(igpu_amaze_debayer_backend *, unsigned int, unsigned int,
+                                        int, int, int, double, double, double);
+typedef int (*pfn_arm_probe)(igpu_amaze_debayer_backend *, int);
+typedef int (*pfn_last_probe)(igpu_amaze_debayer_backend *, igpu_amaze_probe_t *);
+typedef int (*pfn_clock_kick_begin)(igpu_amaze_debayer_backend *, int);
+typedef int (*pfn_clock_kick_end)(igpu_amaze_debayer_backend *, igpu_clock_kick_report_t *);
 
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3 c1: a verbatim copy of
  * debayer_reduced_hnyquist121_rgb16 (src/debayer/debayer.c), which this MSVC
@@ -351,6 +358,271 @@ static std::vector<uint16_t> apply_wb_undo_reference(const uint16_t * rgb,
     var = (type)GetProcAddress(dll, name); \
     if (!var) { std::fprintf(stderr, "GetProcAddress failed for %s\n", name); return 4; }
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 --clock-kick: the Row K kick (begin / in-flight refusal / end with
+ * samples and a clock above 0, bounded by its deadline, stopped by a live run's drain) and the Row 0 probe (an armed
+ * live R16 -> RGBA16 run is valid with both clocks and a device time above 0; the next, unarmed run is not). */
+#ifndef GL_R16
+#define GL_R16 0x822A
+#endif
+
+static double kick_max_interval_mhz(const igpu_clock_kick_report_t & r)
+{
+    double best = 0.0;
+    for (int i = 1; i < r.samples; ++i)
+    {
+        if (r.sample_sm[i] != r.sample_sm[i - 1]) continue;   // clock64 is per SM
+        const double dns = (double)(r.sample_ns[i] - r.sample_ns[i - 1]);
+        const double dclk = (double)(r.sample_clk[i] - r.sample_clk[i - 1]);
+        if (dns > 0.0 && dclk * 1000.0 / dns > best) best = dclk * 1000.0 / dns;
+    }
+    return best;
+}
+
+static int collect_kick(pfn_clock_kick_end f_end, igpu_amaze_debayer_backend * backend, igpu_clock_kick_report_t * r)
+{
+    int rc = f_end(backend, r);
+    for (int tries = 0; rc == 1 && tries < 50; ++tries)
+    {
+        Sleep(10);
+        rc = f_end(backend, r);
+    }
+    return rc;
+}
+
+static int run_clock_kick_mode(HMODULE dll, igpu_amaze_debayer_backend * backend, const std::vector<float> & raw,
+                               int width, int height)
+{
+    pfn_arm_probe f_arm;
+    pfn_last_probe f_probe;
+    pfn_clock_kick_begin f_begin;
+    pfn_clock_kick_end f_end;
+    pfn_run_post_wb_from_r16 f_r16;
+    RESOLVE(f_arm, pfn_arm_probe, "igpu_amaze_debayer_arm_probe");
+    RESOLVE(f_probe, pfn_last_probe, "igpu_amaze_debayer_last_probe");
+    RESOLVE(f_begin, pfn_clock_kick_begin, "igpu_amaze_debayer_clock_kick_begin");
+    RESOLVE(f_end, pfn_clock_kick_end, "igpu_amaze_debayer_clock_kick_end");
+    RESOLVE(f_r16, pfn_run_post_wb_from_r16, "igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture");
+    bool pass = true;
+    auto check = [&pass](bool ok, const char * what)
+    {
+        std::printf("[amaze_dll_test] clock-kick %-58s %s\n", what, ok ? "ok" : "FAIL");
+        if (!ok) pass = false;
+    };
+
+    // bad arguments; nothing to collect yet
+    igpu_clock_kick_report_t r;
+    check(f_begin(backend, 0) == -1 && f_begin(backend, 2001) == -1 && f_begin(NULL, 100) == -1, "rejects bad max_ms");
+    check(f_end(backend, &r) == 2 && r.state == 2, "end with no kick is state 2");
+
+    // 1) ended by the host: samples, a clock above 0, at most one in flight
+    const int maxMs = 200;
+    const ULONGLONG t0 = GetTickCount64();
+    check(f_begin(backend, maxMs) == 0, "begin(200) launches");
+    check(f_begin(backend, maxMs) == 1, "a second begin is in flight");
+    Sleep(60);
+    int rc = collect_kick(f_end, backend, &r);
+    const ULONGLONG hostMs = GetTickCount64() - t0;
+    std::printf("[amaze_dll_test] clock-kick end rc=%d state=%d samples=%d stopped_by=%d ran_ms=%.3f max_mhz=%.1f host_ms=%llu\n",
+                rc, r.state, r.samples, r.stopped_by, r.ran_ms, kick_max_interval_mhz(r), (unsigned long long)hostMs);
+    check(rc == 0 && r.state == 0, "end collects");
+    check(r.samples >= 2, ">= 2 samples (periodic + closing)");
+    check(kick_max_interval_mhz(r) > 0.0, "SM MHz > 0");
+    check(r.stopped_by == 1, "stopped by end()");
+    check(r.ran_ms > 0.0 && r.ran_ms <= maxMs + 50.0, "ran_ms within max_ms + 50");
+
+    // 2) the deadline stops it on its own
+    check(f_begin(backend, 50) == 0, "begin(50) launches");
+    Sleep(200);
+    rc = collect_kick(f_end, backend, &r);
+    std::printf("[amaze_dll_test] clock-kick deadline rc=%d stopped_by=%d ran_ms=%.3f samples=%d\n",
+                rc, r.stopped_by, r.ran_ms, r.samples);
+    check(rc == 0 && r.stopped_by == 0, "stopped by its deadline");
+    check(r.ran_ms >= 49.0 && r.ran_ms <= 100.0, "deadline ran_ms in [49, 100]");
+
+    // 3) the probe on a live run, and a live run's drain stops a running kick
+    HiddenGlContext gl;
+    if (!create_hidden_gl_context(&gl)) return 5;
+    const size_t pixelCount = (size_t)width * (size_t)height;
+    std::vector<uint16_t> bayer(pixelCount);
+    for (size_t i = 0; i < pixelCount; ++i) bayer[i] = (uint16_t)(raw[i] > 65535.0f ? 65535.0f : raw[i]);
+    GLuint in = 0;
+    glGenTextures(1, &in);
+    glBindTexture(GL_TEXTURE_2D, in);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16, width, height, 0, GL_RED, GL_UNSIGNED_SHORT, bayer.data());
+    GLuint out = 0;
+    if (glGetError() != GL_NO_ERROR || !create_rgba16_texture(&out, width, height, "probe out"))
+    {
+        std::fprintf(stderr, "[amaze_dll_test] clock-kick: GL texture setup failed\n");
+        destroy_hidden_gl_context(&gl);
+        return 5;
+    }
+    igpu_amaze_probe_t probe;
+    std::memset(&probe, 0, sizeof(probe));
+    check(f_arm(backend, -1) == -1 && f_probe(NULL, &probe) == -1, "probe rejects bad arguments");
+    check(f_arm(backend, 1) == 0, "arm_probe(1)");
+    check(f_begin(backend, 400) == 0, "begin(400) before a live run");
+    rc = f_r16(backend, (unsigned int)in, (unsigned int)out, width, height, 2048, 1.0, 1.0, 1.0);
+    check(rc == 0, "armed live R16 run");
+    check(f_probe(backend, &probe) == 0, "last_probe");
+    std::printf("[amaze_dll_test] probe valid=%d mhz_before=%.1f mhz_after=%.1f device_ms=%.3f\n",
+                probe.valid, probe.sm_mhz_before, probe.sm_mhz_after, probe.device_ms);
+    check(probe.valid == 1 && probe.sm_mhz_before > 0.0 && probe.sm_mhz_after > 0.0 && probe.device_ms > 0.0,
+          "armed run: valid, both clocks and device_ms > 0");
+    rc = collect_kick(f_end, backend, &r);
+    std::printf("[amaze_dll_test] clock-kick after live run rc=%d stopped_by=%d ran_ms=%.3f\n", rc, r.stopped_by, r.ran_ms);
+    check(rc == 0 && r.stopped_by == 2, "the live run's drain stopped the kick");
+    rc = f_r16(backend, (unsigned int)in, (unsigned int)out, width, height, 2048, 1.0, 1.0, 1.0);
+    check(rc == 0 && f_probe(backend, &probe) == 0 && probe.valid == 0, "the next, unarmed run is not probed");
+    glDeleteTextures(1, &out);
+    glDeleteTextures(1, &in);
+    destroy_hidden_gl_context(&gl);
+    std::printf("\n[amaze_dll_test] RESULT: %s (clock kick + probe)\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 T3 --input-capture: the R1 capture / exact compare / release
+ * (capture then match on the same buffer gives 1; one changed pixel, other dims, a stale id, and after release give 0)
+ * and AMaZE determinism (the device Bayer16 -> RGBA16 run twice on the same input is bit-identical, both H-Nyquist
+ * settings). This MSVC harness links no CUDA runtime: device buffers come from the cudart DLL that ships beside the
+ * backend (cudart64_*.dll), loaded by name; the runtime API shares the process's primary context with the backend. */
+typedef int (*pfn_capture_input)(igpu_amaze_debayer_backend *, const uint16_t *, int, int, unsigned long long *);
+typedef int (*pfn_matches_capture)(igpu_amaze_debayer_backend *, const uint16_t *, int, int, unsigned long long, int *);
+typedef int (*pfn_release_capture)(igpu_amaze_debayer_backend *);
+typedef int (*pfn_run_post_wb_from_device)(igpu_amaze_debayer_backend *, const uint16_t *, unsigned int,
+                                           int, int, int, double, double, double);
+typedef int (*pfn_cuda_malloc)(void **, size_t);
+typedef int (*pfn_cuda_memcpy)(void *, const void *, size_t, int);
+typedef int (*pfn_cuda_free)(void *);
+
+static HMODULE load_cudart(const std::string & dllPath)
+{
+    std::string dir = dllPath;
+    const size_t slash = dir.find_last_of("\\/");
+    dir = slash == std::string::npos ? std::string() : dir.substr(0, slash + 1);
+    for (const char * name : {"cudart64_12.dll", "cudart64_13.dll", "cudart64_110.dll"})
+    {
+        HMODULE m = LoadLibraryA((dir + name).c_str());
+        if (!m) m = LoadLibraryA(name);
+        if (m) return m;
+    }
+    return NULL;
+}
+
+static int run_input_capture_mode(HMODULE dll, igpu_amaze_debayer_backend * backend, const std::string & dllPath,
+                                  const std::vector<float> & raw, int width, int height)
+{
+    pfn_capture_input f_capture;
+    pfn_matches_capture f_matches;
+    pfn_release_capture f_release;
+    pfn_run_post_wb_from_device f_device;
+    pfn_set_reduced_hnyquist f_hny;
+    RESOLVE(f_capture, pfn_capture_input, "igpu_amaze_debayer_capture_input_bayer16");
+    RESOLVE(f_matches, pfn_matches_capture, "igpu_amaze_debayer_input_bayer16_matches_capture");
+    RESOLVE(f_release, pfn_release_capture, "igpu_amaze_debayer_release_input_capture");
+    RESOLVE(f_device, pfn_run_post_wb_from_device, "igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16");
+    RESOLVE(f_hny, pfn_set_reduced_hnyquist, "igpu_amaze_debayer_set_reduced_hnyquist");
+    HMODULE cudart = load_cudart(dllPath);
+    if (!cudart)
+    {
+        std::fprintf(stderr, "[amaze_dll_test] input-capture: no cudart64_*.dll beside %s or on PATH\n", dllPath.c_str());
+        return 5;
+    }
+    pfn_cuda_malloc c_malloc = (pfn_cuda_malloc)GetProcAddress(cudart, "cudaMalloc");
+    pfn_cuda_memcpy c_memcpy = (pfn_cuda_memcpy)GetProcAddress(cudart, "cudaMemcpy");
+    pfn_cuda_free c_free = (pfn_cuda_free)GetProcAddress(cudart, "cudaFree");
+    if (!c_malloc || !c_memcpy || !c_free)
+    {
+        std::fprintf(stderr, "[amaze_dll_test] input-capture: cudart lacks cudaMalloc/cudaMemcpy/cudaFree\n");
+        return 5;
+    }
+    bool pass = true;
+    auto check = [&pass](bool ok, const char * what)
+    {
+        std::printf("[amaze_dll_test] input-capture %-62s %s\n", what, ok ? "ok" : "FAIL");
+        if (!ok) pass = false;
+    };
+    const size_t pixelCount = (size_t)width * (size_t)height;
+    const size_t bytes = pixelCount * sizeof(uint16_t);
+    std::vector<uint16_t> bayer(pixelCount);
+    for (size_t i = 0; i < pixelCount; ++i) bayer[i] = (uint16_t)(raw[i] > 65535.0f ? 65535.0f : raw[i]);
+    std::vector<uint16_t> changed = bayer;
+    changed[pixelCount / 2 + 3] = (uint16_t)(changed[pixelCount / 2 + 3] ^ 1u);   // one pixel, one LSB
+    void * dA = NULL;
+    void * dB = NULL;
+    const int cudaHostToDevice = 1;
+    if (c_malloc(&dA, bytes) != 0 || c_malloc(&dB, bytes) != 0
+        || c_memcpy(dA, bayer.data(), bytes, cudaHostToDevice) != 0
+        || c_memcpy(dB, changed.data(), bytes, cudaHostToDevice) != 0)
+    {
+        std::fprintf(stderr, "[amaze_dll_test] input-capture: device buffer setup failed\n");
+        return 5;
+    }
+    const uint16_t * a = (const uint16_t *)dA;
+    const uint16_t * b = (const uint16_t *)dB;
+
+    // capture / compare / release
+    unsigned long long id = 0;
+    int equal = -1;
+    check(f_capture(NULL, a, width, height, &id) == -1 && f_matches(backend, a, width, height, 1, NULL) == -1,
+          "rejects bad arguments");
+    check(f_matches(backend, a, width, height, 1, &equal) == 0 && equal == 0, "no capture yet: not equal");
+    check(f_capture(backend, a, width, height, &id) == 0 && id > 0, "capture issues an id > 0");
+    check(f_matches(backend, a, width, height, id, &equal) == 0 && equal == 1, "same buffer, same id: equal");
+    check(f_matches(backend, b, width, height, id, &equal) == 0 && equal == 0, "one pixel one LSB changed: not equal");
+    check(f_matches(backend, a, width, height - 2, id, &equal) == 0 && equal == 0, "other dims: not equal");
+    check(f_matches(backend, a, height, width, id, &equal) == 0 && equal == 0, "dims swapped: not equal");
+    check(f_matches(backend, a, width, height, id + 1, &equal) == 0 && equal == 0, "a stale or foreign id: not equal");
+    check(f_matches(backend, a, width, height, 0, &equal) == 0 && equal == 0, "id 0: not equal");
+    unsigned long long id2 = 0;
+    check(f_capture(backend, b, width, height, &id2) == 0 && id2 > id, "a second capture issues a newer id");
+    check(f_matches(backend, b, width, height, id, &equal) == 0 && equal == 0, "the first id is stale after it");
+    check(f_matches(backend, b, width, height, id2, &equal) == 0 && equal == 1, "the second capture matches its buffer");
+    check(f_matches(backend, a, width, height, id2, &equal) == 0 && equal == 0, "and not the other buffer");
+    check(f_release(backend) == 0 && f_release(NULL) == -1, "release");
+    check(f_matches(backend, b, width, height, id2, &equal) == 0 && equal == 0, "after release: not equal");
+    unsigned long long id3 = 0;
+    check(f_capture(backend, a, width, height, &id3) == 0 && id3 > id2, "a capture after release (buffer reused)");
+    check(f_matches(backend, a, width, height, id3, &equal) == 0 && equal == 1, "matches again");
+
+    // AMaZE determinism on the device Bayer16 route the warm and Play both use
+    HiddenGlContext gl;
+    if (!create_hidden_gl_context(&gl)) return 5;
+    GLuint out1 = 0;
+    GLuint out2 = 0;
+    if (!create_rgba16_texture(&out1, width, height, "determinism 1") || !create_rgba16_texture(&out2, width, height, "determinism 2"))
+    {
+        destroy_hidden_gl_context(&gl);
+        return 5;
+    }
+    std::vector<uint16_t> rgba1(pixelCount * 4u, 0u);
+    std::vector<uint16_t> rgba2(pixelCount * 4u, 0u);
+    for (int hny = 0; hny <= 1; ++hny)
+    {
+        check(f_hny(backend, hny) == 0, hny ? "reduced H-Nyquist on" : "reduced H-Nyquist off");
+        const int rc1 = f_device(backend, a, (unsigned int)out1, width, height, 2048, 2.0176366843033511, 1.0, 1.5503875968992249);
+        const int rc2 = f_device(backend, a, (unsigned int)out2, width, height, 2048, 2.0176366843033511, 1.0, 1.5503875968992249);
+        check(rc1 == 0 && rc2 == 0, "two device-Bayer16 AMaZE runs");
+        const bool read = read_rgba16_texture(out1, &rgba1, "determinism 1") && read_rgba16_texture(out2, &rgba2, "determinism 2");
+        size_t differing = 0;
+        for (size_t i = 0; read && i < rgba1.size(); ++i) if (rgba1[i] != rgba2[i]) ++differing;
+        std::printf("[amaze_dll_test] input-capture determinism hnyquist=%d differing_words=%zu fnv1=%016llx fnv2=%016llx\n",
+                    hny, differing, (unsigned long long)fnv1a64(rgba1.data(), rgba1.size() * 2u),
+                    (unsigned long long)fnv1a64(rgba2.data(), rgba2.size() * 2u));
+        check(read && differing == 0, "the same input gives bit-identical RGBA16");
+    }
+    (void)f_hny(backend, 0);
+    glDeleteTextures(1, &out2);
+    glDeleteTextures(1, &out1);
+    destroy_hidden_gl_context(&gl);
+    c_free(dB);
+    c_free(dA);
+    std::printf("\n[amaze_dll_test] RESULT: %s (input capture + determinism)\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char ** argv)
 {
     std::string dllPath = "igpu_amaze_debayer_cuda.dll";
@@ -365,12 +637,22 @@ int main(int argc, char ** argv)
     std::string inputU16Path;
     std::string dumpDir;
     int inputBlack = 0;
+    bool clockKick = false;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: run_clock_kick_mode
+    bool inputCapture = false;   // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 T3: run_input_capture_mode
 
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--gl-texture") == 0)
         {
             runGlTexture = true;
+        }
+        else if (std::strcmp(argv[i], "--input-capture") == 0)
+        {
+            inputCapture = true;
+        }
+        else if (std::strcmp(argv[i], "--clock-kick") == 0)
+        {
+            clockKick = true;
         }
         else if (std::strcmp(argv[i], "--reduced-hnyquist") == 0)
         {
@@ -472,6 +754,20 @@ int main(int argc, char ** argv)
             raw[i] = (float)(v > 0 ? v : 0);
         }
         std::printf("[amaze_dll_test] input u16  : %s black=%d\n", inputU16Path.c_str(), inputBlack);
+    }
+    if (clockKick)
+    {
+        const int kickRc = run_clock_kick_mode(dll, backend, raw, width, height);
+        f_destroy(backend);
+        FreeLibrary(dll);
+        return kickRc;
+    }
+    if (inputCapture)
+    {
+        const int captureRc = run_input_capture_mode(dll, backend, dllPath, raw, width, height);
+        f_destroy(backend);
+        FreeLibrary(dll);
+        return captureRc;
     }
     if (reducedHnyquist)
     {

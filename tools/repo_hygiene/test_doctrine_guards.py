@@ -59,6 +59,18 @@ NON-PROMISES:
   of any other type and a trap in another block are other scopes and are not counted, so two
   traps of the same specific type (trap [IOException] twice) are not flagged; traps inside a
   function or script block are not searched.
+- DG-HOOK-WALK-BOUND does not try to prove what a walk's root is. EVERY recursive directory walk in a
+  tracked hook script (every file under tools/hooks/ plus tools/session-checkpoint.py) fails unless
+  HOOK_WALK_ALLOW names its enclosing function: a hook's root can be reached through a variable, an
+  argument or an environment value, so "judge only a walk over fleet-runs or .claude-state" cannot be
+  decided statically. Python is read by AST: `.rglob(`, `os.walk(` (or a bare `walk(`), a
+  zero-argument `.walk()` (pathlib), and `glob(`/`iglob(` with `recursive=True` or a `**` anywhere
+  in a string argument. PowerShell is read as source with its comment tokens blanked (the tokenizer
+  decides what a comment is): `-Recurse` and its prefix abbreviations (`-Rec`, `-r`); the same text
+  inside a string or here-string IS flagged (over-flagged on purpose, fail closed). NOT seen: a
+  hand-written recursion (os.scandir in a loop, a recursive function), a `grep -r`/`find`/`git
+  ls-files` subprocess, a shell hook (.sh, .cmd), and a hook script that lives outside tools/hooks/
+  (user-scope hooks are never tracked; prove those by a receipt).
 
 If pwsh is not on PATH the AST guards SKIP with a reason; on a GitHub Actions
 runner (whose images carry pwsh) a missing pwsh FAILS instead.
@@ -542,6 +554,115 @@ def check_git_pathlist(root: Path, rel_paths: list[str]) -> list[Violation]:
     return quoted + scan_git_text_decode(root, rel_paths)
 
 
+# DG-HOOK-WALK-BOUND (bus TRAPS.md 2d8c6a1, "A per-turn hook that `rglob`s a run-archive tree saturates
+# the machine, and a scan-guard on agent tool calls cannot see it"; MLV fix PR #539 bounded
+# tools/session-checkpoint.py to depth 0 and 1). The fleet scan-guard is a PreToolUse hook, and a hook
+# script runs outside the tool boundary, so only a check on the tracked source can stop a recursive
+# walk coming back.
+HOOK_WALK_SCOPE_DIR = "tools/hooks/"
+HOOK_WALK_SCOPE_FILES = frozenset(("tools/session-checkpoint.py",))
+# Recursive walks that are allowed, by (tracked path, ENCLOSING FUNCTION NAME, why). The function name
+# is the stable key, never a line number. Each entry is checked for staleness against the live tree.
+HOOK_WALK_ALLOW: tuple[tuple[str, str, str], ...] = (
+    ("tools/hooks/mlv-never-authorized.py", "_archive_release_ok",
+     "archive-release path only (a Write that shrinks a file whose byte-identical copy must sit under "
+     ".claude-state/continuity/archive); a rare, small tree, not the per-turn fleet-runs archive"),
+)
+_PS_RECURSE = re.compile(r"(?<![\w-])-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?![\w-])", re.IGNORECASE)
+_WALK_GLOBS = frozenset(("glob", "iglob"))
+
+
+def is_hook_walk_scanned(rel: str) -> bool:
+    p = PurePosixPath(rel)
+    return (rel.startswith(HOOK_WALK_SCOPE_DIR) or rel in HOOK_WALK_SCOPE_FILES) \
+        and p.suffix.lower() in (".py", ".ps1", ".psm1")
+
+
+def _py_walk_shape(node: ast.Call) -> str | None:
+    """The recursive-walk shape a Python call spells, or None."""
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+    if name == "rglob" and isinstance(func, ast.Attribute):
+        return "rglob"
+    if name == "walk":
+        if isinstance(func, ast.Name):
+            return "walk"
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "os":
+            return "os.walk"
+        if isinstance(func, ast.Attribute) and not node.args and not node.keywords \
+                and not (isinstance(func.value, ast.Name) and func.value.id == "ast"):
+            return "Path.walk"
+    if name in _WALK_GLOBS:
+        recursive = any(k.arg == "recursive" and not (isinstance(k.value, ast.Constant) and k.value.value is False)
+                        for k in node.keywords)
+        doublestar = any(isinstance(c, ast.Constant) and isinstance(c.value, str) and "**" in c.value
+                         for arg in node.args for c in ast.walk(arg))
+        if recursive or doublestar:
+            return f"{name}(recursive/**)"
+    return None
+
+
+class _WalkFinder(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.stack: list[str] = []
+        self.found: list[tuple[int, str, str]] = []  # (line, shape, enclosing function or "")
+
+    def _scoped(self, node: ast.AST) -> None:
+        self.stack.append(node.name)  # type: ignore[attr-defined]
+        self.generic_visit(node)
+        self.stack.pop()
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _scoped  # noqa: N815
+
+    def visit_Call(self, node: ast.Call) -> None:
+        shape = _py_walk_shape(node)
+        if shape:
+            funcs = [s for s in self.stack]
+            self.found.append((node.lineno, shape, funcs[-1] if funcs else ""))
+        self.generic_visit(node)
+
+
+def scan_hook_walks(root: Path, rel_paths: list[str]) -> list[tuple[Violation, str]]:
+    """Every recursive directory walk in the given hook scripts, with its enclosing function ("" at
+    module level; always "" for PowerShell, which is matched by the line instead)."""
+    found: list[tuple[Violation, str]] = []
+    texts: dict[str, str] = {}
+    for rel in rel_paths:
+        try:
+            texts[rel] = (root / rel).read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            raise CouldNotCheck(f"{rel} is not readable text: {exc}") from exc
+    needs_tokens = [rel for rel, text in texts.items() if not rel.lower().endswith(".py") and "#" in text
+                    and any(_PS_RECURSE.search(line) for line in _ps_source_lines(text))]
+    comments = ast_scan(root, needs_tokens) if needs_tokens else {}
+    for rel in rel_paths:
+        text = texts[rel]
+        if rel.lower().endswith(".py"):
+            try:
+                tree = ast.parse(text)
+            except SyntaxError as exc:
+                raise CouldNotCheck(f"{rel} does not parse as Python: {exc}") from exc
+            finder = _WalkFinder()
+            finder.visit(tree)
+            for line, shape, func in finder.found:
+                found.append((Violation("DG-HOOK-WALK-BOUND", rel, line,
+                                        f"recursive walk ({shape}) in a hook script; bound it to a fixed "
+                                        f"depth (e.g. glob depth 0 and 1) or allowlist its function"), func))
+        else:
+            code = _ps_code_lines(rel, text, comments[rel]["comments"]) if rel in comments else _ps_source_lines(text)
+            for number, line in enumerate(code, 1):
+                if _PS_RECURSE.search(line):
+                    found.append((Violation("DG-HOOK-WALK-BOUND", rel, number,
+                                            "-Recurse in a hook script; bound the walk to a fixed depth "
+                                            "or allowlist the script"), ""))
+    return found
+
+
+def check_hook_walk_bound(root: Path, rel_paths: list[str]) -> list[Violation]:
+    return [v for v, func in scan_hook_walks(root, rel_paths)
+            if not any(v.path == path and func == allowed for path, allowed, _why in HOOK_WALK_ALLOW)]
+
+
 @dataclass(frozen=True)
 class Guard:
     id: str
@@ -565,6 +686,10 @@ REGISTRY: tuple[Guard, ...] = (
     Guard("DG-GIT-PATHLIST", "de09cae",
           "git quotes a non-ASCII path in its plain path-list output, so a path-prefix test on it misses the path",
           is_git_pathlist_scanned, check_git_pathlist, True),
+    Guard("DG-HOOK-WALK-BOUND", "2d8c6a1",
+          "a per-turn hook script that walks a growing run-archive tree recursively (rglob, os.walk, -Recurse) "
+          "saturates the machine, and the PreToolUse scan-guard never sees a hook's own process",
+          is_hook_walk_scanned, check_hook_walk_bound, True),
 )
 GUARDS = {g.id: g for g in REGISTRY}
 
@@ -753,6 +878,40 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             "j.ps1": "trap [RuntimeException] { 'unresolvable' }\ntrap { 'untyped' }\n",
         },
     },
+    "DG-HOOK-WALK-BOUND": {
+        "red": {
+            # The shape tools/session-checkpoint.py had before PR #539 (bus 2d8c6a1): line 4.
+            "tools/hooks/a.py": "from pathlib import Path\n\ndef newest_receipts(root):\n"
+                                "    fleet_runs = Path(root) / '.claude-state' / 'fleet-runs'\n"
+                                "    return sorted(fleet_runs.rglob('*-*.receipt.json'))\n",
+            "tools/hooks/b.py": "import os, glob\nfrom pathlib import Path\n"
+                                "def f(r):\n    for d, _n, _f in os.walk(r):\n        pass\n"
+                                "def g(r):\n    return glob.glob(r + '/**/*.json', recursive=True)\n"
+                                "def h(r):\n    return list(Path(r).glob('**/*.json'))\n"
+                                "def i(r):\n    return glob.iglob(f'{r}/**', recursive=True)\n"
+                                "def j(r):\n    return list(Path(r).walk())\n"
+                                "from os import walk\nk = walk('x')\n",
+            "tools/session-checkpoint.py": "import os\nTOP = [x for x in os.walk('.')]\n",
+            "tools/hooks/c.ps1": "$a = Get-ChildItem $root -Recurse -Filter *.json\n"
+                                 "$b = gci $root -Rec\n$c = ls $root -r:$true\n"
+                                 "# -Recurse in a comment is not code\n$d = gci $x -Recurse # real one\n",
+        },
+        "green": {
+            # The #539 fix: depth 0 and 1 only.
+            "tools/hooks/a.py": "from pathlib import Path\n\ndef newest_receipts(root):\n"
+                                "    fleet_runs = Path(root) / '.claude-state' / 'fleet-runs'\n"
+                                "    return sorted(list(fleet_runs.glob('*-*.receipt.json'))\n"
+                                "                  + list(fleet_runs.glob('*/*-*.receipt.json')))\n",
+            # A mention in a comment or string is not a call; an assignment to recursive=False is bounded;
+            # ast.walk is a tree walk, not a directory walk.
+            "tools/hooks/b.py": "import ast, glob\n# fleet_runs.rglob('x') would saturate the host\n"
+                                "DOC = 'os.walk and rglob are banned here'\n"
+                                "def f(r, src):\n    glob.glob(r + '/*.json', recursive=False)\n"
+                                "    return [n for n in ast.walk(ast.parse(src))]\n",
+            "tools/hooks/c.ps1": "# gci $root -Recurse is banned\n$a = Get-ChildItem $root -Filter *.json\n"
+                                 "$b = Get-Content $f -Raw -Receipt 1\n",
+        },
+    },
 }
 
 _LIVE: dict[str, tuple[list[Violation], float]] = {}
@@ -798,6 +957,12 @@ class RegistryTests(unittest.TestCase):
         self.assertFalse(is_git_pathlist_scanned("tools/repo_hygiene/test_brokered_closeout.py"))
         self.assertFalse(is_git_pathlist_scanned("tests/coordination/test_doctrine_outbox.py"))
         self.assertFalse(is_git_pathlist_scanned("tools/coordination/doctrine_outbox.md"))
+        self.assertTrue(is_hook_walk_scanned("tools/hooks/mlv-never-authorized.py"))
+        self.assertTrue(is_hook_walk_scanned("tools/hooks/x.ps1"))
+        self.assertTrue(is_hook_walk_scanned("tools/session-checkpoint.py"))
+        self.assertFalse(is_hook_walk_scanned("tools/other/session-checkpoint.py"))
+        self.assertFalse(is_hook_walk_scanned("tools/hooks/README.md"))
+        self.assertFalse(is_hook_walk_scanned("tools/coordination/x.py"))
 
     def test_untracked_files_are_not_checked(self) -> None:
         if shutil.which("git") is None:
@@ -889,6 +1054,30 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             self.assertNotEqual(rels, [path])
             self.assertEqual(len(check_git_pathlist(root, rels)), 1)
 
+    def test_hook_walk_bound_red_fails(self) -> None:
+        self._assert_red("DG-HOOK-WALK-BOUND", {
+            ("tools/hooks/a.py", 5),
+            ("tools/hooks/b.py", 4), ("tools/hooks/b.py", 7), ("tools/hooks/b.py", 9),
+            ("tools/hooks/b.py", 11), ("tools/hooks/b.py", 13), ("tools/hooks/b.py", 15),
+            ("tools/session-checkpoint.py", 2),
+            ("tools/hooks/c.ps1", 1), ("tools/hooks/c.ps1", 2), ("tools/hooks/c.ps1", 3), ("tools/hooks/c.ps1", 5)})
+
+    def test_hook_walk_bound_green_passes(self) -> None:
+        self._assert_green("DG-HOOK-WALK-BOUND")
+
+    def test_hook_walk_bound_allowlist_is_keyed_by_path_and_function(self) -> None:
+        path, func, _why = HOOK_WALK_ALLOW[0]
+        walk = f"import os\ndef {func}(a):\n    return [r for r, _d, _f in os.walk(a)]\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertEqual(check_hook_walk_bound(root, _write_tree(root, {path: walk})), [])
+            self.assertEqual(len(check_hook_walk_bound(root, _write_tree(root, {"tools/hooks/other.py": walk}))), 1)
+            renamed = walk.replace(func, func + "_2")
+            self.assertEqual(len(check_hook_walk_bound(root, _write_tree(root, {path: renamed}))), 1)
+            # A second walk at module level in the allowlisted file is not covered by the function entry.
+            both = walk + "TOP = list(os.walk('.'))\n"
+            self.assertEqual(len(check_hook_walk_bound(root, _write_tree(root, {path: both}))), 1)
+
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
                                           ("d.ps1", 3), ("e.ps1", 4), ("e.ps1", 8),
@@ -940,6 +1129,16 @@ class LiveTreeTests(_PwshMixin, unittest.TestCase):
 
     def test_live_tree_git_pathlist(self) -> None:
         self._assert_live_green("DG-GIT-PATHLIST")
+
+    def test_live_tree_hook_walk_bound(self) -> None:
+        self._assert_live_green("DG-HOOK-WALK-BOUND")
+
+    def test_hook_walk_allowlist_has_no_stale_entries(self) -> None:
+        rels = [p for p in tracked_files(REPO_ROOT) if is_hook_walk_scanned(p)]
+        raw = scan_hook_walks(REPO_ROOT, rels)
+        stale = [f"{path}: {func}" for path, func, _why in HOOK_WALK_ALLOW
+                 if not any(v.path == path and f == func for v, f in raw)]
+        self.assertEqual(stale, [], "allowlist entries that match no walk; remove them")
 
     def test_git_pathlist_allowlist_has_no_stale_entries(self) -> None:
         self.require(GUARDS["DG-GIT-PATHLIST"])

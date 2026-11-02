@@ -212,7 +212,7 @@ TEST(GuiSmokeDisplaySelectWiring, DisplayTargetLineCarriesThePreferredFieldsAppe
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     ASSERT_TRUE(smokeBody.contains(QStringLiteral(
         "gui_smoke.display_target screen=\\\"%1\\\" reason=%2 candidates=%3 fallback=%4 ")));
@@ -248,7 +248,7 @@ TEST(GuiSmokeDisplaySelectWiring, RunGuiPlaybackSmokePlacesBeforeForegroundAndFu
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int windowedFlagAt = smokeBody.indexOf(
@@ -311,7 +311,7 @@ TEST(GuiSmokeDisplaySelectWiring, GeometryGuardCapturesBeforeMoveAndRestoresOnDe
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // A stack-scoped RAII guard declared before the first geometry mutation, so every
@@ -336,7 +336,7 @@ TEST(GuiSmokeDisplaySelectWiring, WindowedModeSkipsTheFullscreenLossGateAndLeave
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     // The mid-loop-end fullscreen-loss gate does not apply to a windowed leg, which never
@@ -358,7 +358,7 @@ TEST(GuiSmokeDisplaySelectWiring, DisplayTargetAndWindowPlacementLinesAreLoggedF
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     ASSERT_TRUE(smokeBody.contains(QStringLiteral(

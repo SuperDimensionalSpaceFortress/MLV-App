@@ -79,6 +79,22 @@ bool MlvPipelineFixture::applyReceipt(QString * error_message)
     return true;
 }
 
+bool MlvPipelineFixture::resetProcessing(QString * error_message)
+{
+    if( !m_video || !m_processing )
+    {
+        if( error_message ) *error_message = QStringLiteral("Fixture is not open.");
+        return false;
+    }
+
+    processingObject_t * previous = m_processing;
+    m_processing = initProcessingObject();
+    setMlvProcessing( m_video, m_processing );
+    freeProcessingObject( previous );
+    resetSingleThreadedRuntime();
+    return true;
+}
+
 void MlvPipelineFixture::applyDebayerSelection()
 {
     switch( m_receipt.debayer() )

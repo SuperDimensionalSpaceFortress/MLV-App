@@ -80,6 +80,7 @@ static MLV_THREAD_LOCAL int g_llrawproc_last_pre_dualiso_fix_completed = 0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
+static MLV_THREAD_LOCAL llrpResidualSubstageTiming_t g_llrawproc_last_residual = {0};
 static double g_llrawproc_last_preview_histogram_ms = 0.0;
 static double g_llrawproc_last_preview_regression_ms = 0.0;
 static double g_llrawproc_last_preview_rowscale_ms = 0.0;
@@ -339,6 +340,10 @@ static MLV_THREAD_LOCAL llrpGpuPlaybackRetainedDeviceBayer16_t
  * reader are provably the same thread for the lifetime of one frame. */
 static MLV_THREAD_LOCAL llrpGpuPlaybackReconPreuploadStatus_t
     g_llrawproc_gpu_playback_last_preupload_status = {0};
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: the wall time run_backend() already measures for its set_clip / set_luts
+ * calls, kept for the calling thread (0 when the run needed neither). Read only by the paused warm run's log line. */
+static MLV_THREAD_LOCAL double g_llrawproc_gpu_last_set_clip_ms = 0.0;
+static MLV_THREAD_LOCAL double g_llrawproc_gpu_last_set_luts_ms = 0.0;
 
 static void llrawproc_gpu_export_reset_last_run_state(void)
 {
@@ -424,6 +429,74 @@ int llrpResetGpuPlaybackReconRunForTesting(void)
 {
     llrawproc_gpu_playback_reset_last_run_state();
     return 1;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: this thread's last-run playback recon state, moved aside for the paused
+ * warm run and put back after it (llrawproc.h). The owned input copy moves with it, so neither side frees the other's. */
+typedef struct
+{
+    int run_attempted;
+    int run_rc;
+    int used;
+    int state_valid;
+    int prepare_only;
+    dualiso_gpu_recon_state_t prepared_state;
+    uint16_t * input_bayer16;
+    size_t input_words;
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained_device_bayer16;
+    llrpGpuPlaybackReconPreuploadStatus_t preupload_status;
+} llrawprocGpuPlaybackLastRunSnapshot_t;
+
+void * llrpGpuPlaybackReconSaveLastRunState(void)
+{
+    llrawprocGpuPlaybackLastRunSnapshot_t * snapshot =
+        (llrawprocGpuPlaybackLastRunSnapshot_t *)calloc(1, sizeof(*snapshot));
+    if(!snapshot) return NULL;
+    snapshot->run_attempted = g_llrawproc_gpu_playback_last_run_attempted;
+    snapshot->run_rc = g_llrawproc_gpu_playback_last_run_rc;
+    snapshot->used = g_llrawproc_gpu_playback_last_used;
+    snapshot->state_valid = g_llrawproc_gpu_playback_last_state_valid;
+    snapshot->prepare_only = g_llrawproc_gpu_playback_last_prepare_only;
+    snapshot->prepared_state = g_llrawproc_gpu_playback_last_prepared_state;
+    snapshot->input_bayer16 = g_llrawproc_gpu_playback_last_input_bayer16;
+    snapshot->input_words = g_llrawproc_gpu_playback_last_input_words;
+    snapshot->retained_device_bayer16 = g_llrawproc_gpu_playback_last_retained_device_bayer16;
+    snapshot->preupload_status = g_llrawproc_gpu_playback_last_preupload_status;
+    /* the snapshot owns the input copy now; the reset below must not free it */
+    g_llrawproc_gpu_playback_last_input_bayer16 = NULL;
+    g_llrawproc_gpu_playback_last_input_words = 0;
+    llrawproc_gpu_playback_reset_last_run_state();
+    return snapshot;
+}
+
+void llrpGpuPlaybackReconRestoreLastRunState(void * snapshot_handle)
+{
+    llrawprocGpuPlaybackLastRunSnapshot_t * snapshot =
+        (llrawprocGpuPlaybackLastRunSnapshot_t *)snapshot_handle;
+    /* drop what the warm left (frees its owned input copy) */
+    llrawproc_gpu_playback_reset_last_run_state();
+    if(!snapshot) return;
+    g_llrawproc_gpu_playback_last_run_attempted = snapshot->run_attempted;
+    g_llrawproc_gpu_playback_last_run_rc = snapshot->run_rc;
+    g_llrawproc_gpu_playback_last_used = snapshot->used;
+    g_llrawproc_gpu_playback_last_state_valid = snapshot->state_valid;
+    g_llrawproc_gpu_playback_last_prepare_only = snapshot->prepare_only;
+    g_llrawproc_gpu_playback_last_prepared_state = snapshot->prepared_state;
+    g_llrawproc_gpu_playback_last_input_bayer16 = snapshot->input_bayer16;
+    g_llrawproc_gpu_playback_last_input_words = snapshot->input_words;
+    g_llrawproc_gpu_playback_last_retained_device_bayer16 = snapshot->retained_device_bayer16;
+    g_llrawproc_gpu_playback_last_preupload_status = snapshot->preupload_status;
+    free(snapshot);
+}
+
+double llrpGpuPlaybackReconLastSetClipMilliseconds(void)
+{
+    return g_llrawproc_gpu_last_set_clip_ms;
+}
+
+double llrpGpuPlaybackReconLastSetLutsMilliseconds(void)
+{
+    return g_llrawproc_gpu_last_set_luts_ms;
 }
 
 int llrpGpuExportLastRunAttemptedForTesting(void);
@@ -1074,7 +1147,13 @@ static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
 {
     llrawprocFakeGpuCudaErrorRing_t * r;
     igpu_cuda_error_t * e;
+    FILETIME now;
+    ULARGE_INTEGER ticks;
     if(code == 0 || channel < 0 || channel > 1) return;
+    /* As igpu_cuda_error_slot.h's note(): wall clock when noted, Unix epoch ms. */
+    GetSystemTimeAsFileTime(&now);
+    ticks.LowPart = now.dwLowDateTime;
+    ticks.HighPart = now.dwHighDateTime;
     r = &g_llrawproc_fake_gpu_backend_cuda_errors[channel];
     if(r->size == LLRAWPROC_FAKE_GPU_CUDA_ERROR_PENDING)
     {
@@ -1087,6 +1166,7 @@ static void llrawproc_fake_gpu_backend_note_cuda_error(int channel,
     e->code = code;
     snprintf(e->name, sizeof(e->name), "%s", name ? name : "");
     snprintf(e->site, sizeof(e->site), "%s", site ? site : "");
+    e->utc_ms = (double)(ticks.QuadPart - 116444736000000000ULL) / 10000.0;
     e->count = ++g_llrawproc_fake_gpu_backend_cuda_error_count;
     ++r->size;
     __atomic_store_n(&g_llrawproc_fake_gpu_backend_cuda_error_pending[channel], r->size, __ATOMIC_RELAXED);
@@ -1947,6 +2027,16 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
     return available;
 }
 
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: the playback runs pass prefer_playback_dll=1, so this loads
+ * the same DLL/backend name and the first run's llrawproc_gpu_export_backend_available(1) is a hit. */
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    const double start_s = mlv_stage_timing_now();
+    const int available = llrawproc_gpu_recon_backend_available_guarded(1);
+    if(load_ms) *load_ms = (mlv_stage_timing_now() - start_s) * 1000.0;
+    return available;
+}
+
 /* GPU-FIELD-TELEMETRY-1: one stage call's outcome, captured under the backend
  * mutex (or the preupload bypass claim) and handed to the sink after it is
  * released. */
@@ -2174,23 +2264,23 @@ static void llrawproc_gpu_stage_telemetry_emit(llrpGpuStageTelemetrySink_t sink,
     {
         const igpu_cuda_error_t * e = &ev->orphans.notes[i];
         sink("recon:uncaptured", 0, -1.0, e->code, e->name, e->site, "orphan",
-             i == 0 ? ev->orphans.dropped : 0);
+             i == 0 ? ev->orphans.dropped : 0, e->utc_ms);
     }
     if(emit_call)
     {
         if(ev->rc == 0)
         {
-            sink(ev->stage, 0, ev->ms, 0, NULL, NULL, NULL, 0);
+            sink(ev->stage, 0, ev->ms, 0, NULL, NULL, NULL, 0, 0.0);
         }
         else if(ev->noted.count == 0)
         {
-            sink(ev->stage, ev->rc, ev->ms, 0, NULL, NULL, "primary", ev->noted.dropped);
+            sink(ev->stage, ev->rc, ev->ms, 0, NULL, NULL, "primary", ev->noted.dropped, 0.0);
         }
         for(i = 0; ev->rc != 0 && i < ev->noted.count; ++i)
         {
             const igpu_cuda_error_t * e = &ev->noted.notes[i];
             sink(ev->stage, ev->rc, ev->ms, e->code, e->name, e->site,
-                 i == 0 ? "primary" : "secondary", i == 0 ? ev->noted.dropped : 0);
+                 i == 0 ? "primary" : "secondary", i == 0 ? ev->noted.dropped : 0, e->utc_ms);
         }
     }
     if(ev->orphans.notes)
@@ -2448,6 +2538,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(device_width_out) *device_width_out = 0;
     if(device_height_out) *device_height_out = 0;
     if(retained_out) memset(retained_out, 0, sizeof(*retained_out));
+    g_llrawproc_gpu_last_set_clip_ms = 0.0;
+    g_llrawproc_gpu_last_set_luts_ms = 0.0;
     /* GPU-DEVICE-LOSS-SELF-HEAL-1: after a device loss no CUDA call is made on
      * any thread; checked before any lock or backend access (the fast path),
      * and again once the backend mutex is held (r6). */
@@ -2559,6 +2651,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
+        g_llrawproc_gpu_last_set_clip_ms = set_clip_ms;
         set_clip_rc = rc;
         set_clip_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
@@ -2589,6 +2682,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         set_luts_start_s = mlv_stage_timing_now();
         rc = g->set_luts(g->backend, &luts);
         set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
+        g_llrawproc_gpu_last_set_luts_ms = set_luts_ms;
         set_luts_rc = rc;
         set_luts_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
@@ -3456,6 +3550,12 @@ static int llrawproc_gpu_recon_backend_available_guarded(int prefer_playback_dll
     return llrawproc_gpu_export_backend_available(prefer_playback_dll);
 }
 
+int llrpGpuPlaybackReconPreloadBackend(double * load_ms)
+{
+    if(load_ms) *load_ms = 0.0;
+    return 0;
+}
+
 int llrpResetGpuExportBackendForTesting(void);
 int llrpResetGpuExportBackendForTesting(void)
 {
@@ -4142,6 +4242,20 @@ static int llrawproc_runtime_state_equal(const llrawproc_runtime_state_t * lhs,
     return 1;
 }
 
+int llrpGetSharedRuntimeState(mlvObject_t * video, llrawproc_runtime_state_t * out)
+{
+    if (!video || !video->llrawproc || !out) return 0;
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    *out = llrawproc_capture_shared_runtime_state(video->llrawproc);
+    pthread_mutex_unlock(&video->llrawproc_mutex);
+    return 1;
+}
+
+int llrpSharedRuntimeStateEqual(const llrawproc_runtime_state_t * lhs, const llrawproc_runtime_state_t * rhs)
+{
+    return llrawproc_runtime_state_equal(lhs, rhs, 1);
+}
+
 static void llrawproc_worker_ensure_luts(llrawprocWorkerState_t * worker, int32_t black_level)
 {
     if (!worker) return;
@@ -4151,10 +4265,13 @@ static void llrawproc_worker_ensure_luts(llrawprocWorkerState_t * worker, int32_
         return;
     }
 
+    const double rebuild_start = mlv_stage_timing_now();
     free_luts(worker->raw2ev, worker->ev2raw);
     worker->raw2ev = get_raw2ev(black_level);
     worker->ev2raw = get_ev2raw(black_level);
     worker->prev_black_level = black_level;
+    g_llrawproc_last_residual.lut_rebuild_ms += (mlv_stage_timing_now() - rebuild_start) * 1000.0;
+    g_llrawproc_last_residual.lut_rebuilds++;
 }
 
 static llrawprocWorkerState_t * llrawproc_acquire_worker_state(mlvObject_t * video)
@@ -4606,6 +4723,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     g_llrawproc_last_pre_dualiso_fix_completed = 0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
+    memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6181,6 +6299,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
+    memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6268,6 +6387,8 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     uint32_t dark_frame_size_for_subtraction = 0;
     uint32_t dark_frame_black_level = 0;
 
+    const double make_14bit_start = mlv_stage_timing_now();
+    g_llrawproc_last_residual.setup_ms = (make_14bit_start - apply_start) * 1000.0;
     if (original_bits_per_pixel < 14)
     {
         if (!make_14bit(raw_image_buff, raw_image_size, &raw_info))
@@ -6276,12 +6397,15 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
             return 0;
         }
     }
+    g_llrawproc_last_residual.make_14bit_ms = (mlv_stage_timing_now() - make_14bit_start) * 1000.0;
 
     llrawproc_worker_reset_dng_bw_levels(worker, &raw_info);
     llrawproc_worker_ensure_luts(worker, raw_info.black_level);
 
     double shared_lock_start = mlv_stage_timing_now();
     pthread_mutex_lock(&video->llrawproc_mutex);
+    const double shared_lock_acquired = mlv_stage_timing_now();
+    g_llrawproc_last_residual.snapshot_lock_wait_ms = (shared_lock_acquired - shared_lock_start) * 1000.0;
     if (!shared->fix_raw)
     {
         pthread_mutex_unlock(&video->llrawproc_mutex);
@@ -6360,7 +6484,11 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
                                                 isolated_analysis);
 
     pthread_mutex_unlock(&video->llrawproc_mutex);
-    g_llrawproc_last_shared_lock_ms += (mlv_stage_timing_now() - shared_lock_start) * 1000.0;
+    {
+        const double shared_lock_end = mlv_stage_timing_now();
+        g_llrawproc_last_shared_lock_ms += (shared_lock_end - shared_lock_start) * 1000.0;
+        g_llrawproc_last_residual.snapshot_locked_ms = (shared_lock_end - shared_lock_acquired) * 1000.0;
+    }
 
     worker->diso_pattern = worker_diso_pattern;
     worker->diso_auto_correction = worker_diso_auto_correction;
@@ -6389,6 +6517,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
         uint16_t * dual_iso_failure_backup = NULL;
         if (restricted_lossless)
         {
+            const double failure_backup_start = mlv_stage_timing_now();
             dual_iso_failure_backup =
                 llrawproc_worker_capture_dual_iso_failure_backup(
                     worker,
@@ -6406,6 +6535,8 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
                 return 0;
             }
             const double dual_iso_start = mlv_stage_timing_now();
+            g_llrawproc_last_residual.failure_backup_ms =
+                (dual_iso_start - failure_backup_start) * 1000.0;
             int low_iso = MIN(diso1, diso2);
             int high_iso = MAX(diso1, diso2);
             if (!scale_restricted_range(&raw_info,
@@ -6577,9 +6708,12 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
     if (original_bits_per_pixel < 14 && dual_iso_mode != 1)
     {
+        const double undo_14bit_start = mlv_stage_timing_now();
         undo_14bit(raw_image_buff, raw_image_size, video->RAWI.raw_info.bits_per_pixel);
+        g_llrawproc_last_residual.make_14bit_ms += (mlv_stage_timing_now() - undo_14bit_start) * 1000.0;
     }
 
+    const double publish_start = mlv_stage_timing_now();
     {
         const llrawproc_runtime_state_t runtime_state = llrawproc_capture_worker_runtime_state(worker);
         llrawproc_note_output_levels(video, &runtime_state);
@@ -6608,7 +6742,11 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
     g_llrawproc_last_dual_iso_ms = dual_iso_ms;
     g_llrawproc_last_chroma_smooth_ms = chroma_smooth_ms;
-    g_llrawproc_last_total_ms = (mlv_stage_timing_now() - apply_start) * 1000.0;
+    {
+        const double apply_end = mlv_stage_timing_now();
+        g_llrawproc_last_residual.publish_ms = (apply_end - publish_start) * 1000.0;
+        g_llrawproc_last_total_ms = (apply_end - apply_start) * 1000.0;
+    }
 
     if (using_stack_worker)
     {
@@ -6702,6 +6840,7 @@ void llrpResetLastRunTimingForCurrentThread(void)
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
+    memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     llrawproc_reset_dual_iso_full20bit_timing();
     llrpResetLastPreDualIsoFixTelemetry();
 }
@@ -6714,6 +6853,12 @@ double llrpGetLastDualIsoMilliseconds(void)
 double llrpGetLastChromaSmoothMilliseconds(void)
 {
     return g_llrawproc_last_chroma_smooth_ms;
+}
+
+void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing)
+{
+    if (!timing) return;
+    *timing = g_llrawproc_last_residual;
 }
 
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing)

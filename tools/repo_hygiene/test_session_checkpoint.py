@@ -51,6 +51,14 @@ class SessionCheckpointTests(unittest.TestCase):
         self.assertEqual(str(prompt), result["prompt_path"])
         self.assertEqual(str(receipt), result["receipt"])
 
+    def test_scan_does_not_walk_below_run_dir_depth(self):
+        deep = self.fleet / "hub-tools/legspec-precheck/copy"
+        deep.mkdir(parents=True)
+        (deep / "luna-001.receipt.json").write_text(json.dumps(dict(
+            sessionId=SESSION, lane="luna", card="FIXTURE", exitCode=None,
+            promptPath=str(deep / "luna-001.prompt.txt"), workDir=str(self.repo))), encoding="utf-8")
+        self.assertIsNone(CHECKPOINT.scan_fleet_runs(self.repo, SESSION))
+
     def test_missing_empty_and_prefix_collision_session_are_not_owned(self):
         for owner in (None, "", "12345678-another-session"):
             with self.subTest(owner=owner):

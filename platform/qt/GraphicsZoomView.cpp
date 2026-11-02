@@ -193,6 +193,24 @@ void GraphicsZoomView::wheelEvent(QWheelEvent *event)
     }
 }
 
+//Viewport paint, timed for the playback smoke telemetry; the paint itself is unchanged
+void GraphicsZoomView::paintEvent(QPaintEvent *event)
+{
+    const preview_paint_timing::Scope timing;
+    QGraphicsView::paintEvent(event);
+}
+
+//The shared preview paint sink, which also counts the GL viewport's and GL window's paints
+GraphicsZoomView::PaintTiming GraphicsZoomView::paintTiming() const
+{
+    return preview_paint_timing::totals();
+}
+
+void GraphicsZoomView::resetPaintTiming()
+{
+    preview_paint_timing::reset();
+}
+
 //Show the wb picker icon as cursor
 void GraphicsZoomView::setPipetteCursor()
 {

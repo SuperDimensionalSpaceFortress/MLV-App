@@ -378,6 +378,7 @@ HEADERS += MainWindow.h \
            AutomationSettings.h \
            HubHostPlaybackGuard.h \
            PlaybackFrameRange.h \
+           OutputDirIdentity.h \
            PlaybackFpsMeterPolicy.h \
            Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
@@ -386,10 +387,18 @@ HEADERS += MainWindow.h \
            PlaybackAudioStartPolicy.h \
            PlaybackFirstPresentIdentity.h \
            PlaybackRoutePrewarmPolicy.h \
+           PlaybackRouteStagedSlotPolicy.h \
+           PlaybackReconWarmRunPolicy.h \
+           PlaybackReconWarmRun.h \
+           PlaybackGpuClockKickPolicy.h \
            PlaybackAudioGate.h \
            PlaybackEnvFlags.h \
+           LogLineField.h \
            PlaybackWorkerJoin.h \
+           PlaybackPrepInFlightGate.h \
+           ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
+           PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \
            PlaybackScopesDuringPlayback.h \
            DisplayDeviceMapping.h \
@@ -404,6 +413,7 @@ HEADERS += MainWindow.h \
            DualIsoPatternMapping.h \
            GpuDebayer.h \
            GpuPreviewProcessing.h \
+           GpuPresentTailWindow.h \
            PlaybackPrepCpuRoute.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
@@ -473,6 +483,8 @@ HEADERS += MainWindow.h \
            ReconWorker.h \
            ResizeLabel.h \
     GraphicsZoomView.h \
+    PreviewPaintTiming.h \
+    GuiPresentGapIdle.h \
     DarkStyle.h \
     JumpSlider.h \
     AudioPlayback.h \

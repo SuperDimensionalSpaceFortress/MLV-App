@@ -55,8 +55,12 @@ What it does
        itself prose-only, or an id that no longer matches any bullet (STALE: the bullet
        was reworded or deleted, so whoever did that must re-point or drop the mapping).
        Report-only otherwise: an unmapped bullet is counted and listed, never a failure.
-       The ratchet that would make a rising unmapped count fail is a later card
-       (RULE-COVERAGE-RATCHET-1).
+       The ratchet (RULE-COVERAGE-RATCHET-1) is the one exception, and it is opt-in:
+       `--baseline [PATH]` compares the census with the tracked, tighten-only baseline
+       (tools/docs/rule-coverage-baseline.json: behavioural_checked, unmapped_max) and
+       exits 1 when behavioural coverage fell or the unmapped count rose. The same
+       comparison runs as a hygiene test (tests/docs/test_rule_coverage_census.py), which
+       also fails when the baseline file itself loosens against the merge-base copy.
 
 Normalization (the id contract; changing it re-ids every bullet, so do not)
     Applied to the bullet text with its list marker removed and continuation lines joined:
@@ -72,7 +76,7 @@ Normalization (the id contract; changing it re-ids every bullet, so do not)
 
 Exit status:
   0  every mapping resolves (unmapped bullets are reported, not failed)
-  1  at least one mapping is stale, dangling or dishonest
+  1  at least one mapping is stale, dangling or dishonest, or --baseline found a regression
   2  a surface or the mapping file could not be read or parsed, or --map escapes the repo
 """
 
@@ -90,6 +94,8 @@ import unicodedata
 SCHEMA = "rule-coverage-census.v1"
 MAP_SCHEMA = "rule-coverage-map.v1"
 MAP_PATH = "tools/docs/rule-coverage-map.json"
+BASELINE_PATH = "tools/docs/rule-coverage-baseline.json"
+BASELINE_RULE = "tighten-only"
 GUARD_REGISTRY = "docs/never-authorized.json"
 CI_COLLECT_GUARD = "tools/repo_hygiene/test_ci_collects_every_test.py"
 CI_EXCEPTIONS_NAME = "LOCAL_ONLY_OR_UNCOLLECTED"
@@ -665,6 +671,66 @@ def census(repo_root: str, map_path: str | None = None):
     }, None
 
 
+def load_baseline(repo_root: str, baseline_path: str | None = None):
+    """Return (baseline dict, error). Unlike the map, a missing baseline is an error: the
+    gate must not pass because the file it reads is gone."""
+    path = os.path.abspath(baseline_path) if baseline_path \
+        else os.path.join(repo_root, BASELINE_PATH)
+    if not _inside(repo_root, path):
+        return None, ("baseline file %s resolves outside the repo root %s; a baseline must "
+                      "be tracked inside the repository" % (path, repo_root))
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return None, "cannot read baseline file %s: %s" % (path, exc)
+    return parse_baseline(data, path)
+
+
+def parse_baseline(data, where: str = "baseline"):
+    """Validate a decoded baseline. Returns (baseline dict, error)."""
+    if not isinstance(data, dict):
+        return None, "%s must be a JSON object" % where
+    for key in ("behavioural_checked", "unmapped_max"):
+        val = data.get(key)
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            return None, "%s: %r must be a non-negative integer" % (where, key)
+    if data.get("rule") != BASELINE_RULE:
+        return None, "%s: 'rule' must be %r" % (where, BASELINE_RULE)
+    return data, None
+
+
+def baseline_failures(res, baseline):
+    """[why] for every way the census is worse than the baseline; empty when it holds."""
+    out = []
+    if res["behavioural_mapped"] < baseline["behavioural_checked"]:
+        out.append("behavioural_checked %d is below the baseline %d (%d fewer rule bullets "
+                   "have a behavioural check; a check was removed, went stale or was "
+                   "relabelled prose-only)"
+                   % (res["behavioural_mapped"], baseline["behavioural_checked"],
+                      baseline["behavioural_checked"] - res["behavioural_mapped"]))
+    if res["unmapped"] > baseline["unmapped_max"]:
+        out.append("unmapped %d is above the baseline unmapped_max %d (%d more bullets "
+                   "carry neither a check nor a prose-only label; map the new rule to a "
+                   "check, or label it 'prose-only: <reason>' in %s)"
+                   % (res["unmapped"], baseline["unmapped_max"],
+                      res["unmapped"] - baseline["unmapped_max"], MAP_PATH))
+    return out
+
+
+def baseline_loosened(old, new):
+    """[why] for every way `new` is a weaker baseline than `old` (the tighten-only rule):
+    a lower behavioural_checked or a higher unmapped_max. Empty when new is as tight or tighter."""
+    out = []
+    if new["behavioural_checked"] < old["behavioural_checked"]:
+        out.append("behavioural_checked went DOWN %d -> %d (the baseline may only rise)"
+                   % (old["behavioural_checked"], new["behavioural_checked"]))
+    if new["unmapped_max"] > old["unmapped_max"]:
+        out.append("unmapped_max went UP %d -> %d (the baseline may only fall)"
+                   % (old["unmapped_max"], new["unmapped_max"]))
+    return out
+
+
 def _print_report(res, show_unmapped: bool):
     print("rule-coverage census -- %d bullets across %d surfaces"
           % (res["total"], len(res["per_file"])))
@@ -715,6 +781,10 @@ def main(argv=None):
     ap.add_argument("--repo-root", default=None)
     ap.add_argument("--map", default=None,
                     help="mapping file inside the repo root (default %s)" % MAP_PATH)
+    ap.add_argument("--baseline", nargs="?", const=BASELINE_PATH, default=None,
+                    help="also compare with the tighten-only baseline (default %s); exit 1 "
+                         "when behavioural coverage fell or the unmapped count rose"
+                         % BASELINE_PATH)
     ap.add_argument("--json", action="store_true", dest="as_json")
     ap.add_argument("--no-list", action="store_true",
                     help="omit the per-bullet unmapped list")
@@ -731,11 +801,31 @@ def main(argv=None):
     if err:
         sys.stderr.write("%s\n" % err)
         return 2
+    failures = []
+    if args.baseline is not None:
+        # The bare flag means the tracked default, resolved against the repo root (not the cwd).
+        baseline, berr = load_baseline(
+            repo_root, None if args.baseline == BASELINE_PATH else args.baseline)
+        if berr:
+            sys.stderr.write("%s\n" % berr)
+            return 2
+        failures = baseline_failures(res, baseline)
+        res["baseline"] = {"behavioural_checked": baseline["behavioural_checked"],
+                           "unmapped_max": baseline["unmapped_max"], "failures": failures}
     if args.as_json:
         print(json.dumps(res, indent=2))
     else:
         _print_report(res, show_unmapped=not args.no_list)
-    return 1 if res["errors"] else 0
+        if args.baseline is not None:
+            if failures:
+                print("BASELINE REGRESSION (%d) -- the ratchet only tightens:" % len(failures))
+                for why in failures:
+                    print("  %s" % why)
+            else:
+                print("PASS -- the census holds the baseline (behavioural_checked >= %d, "
+                      "unmapped <= %d)." % (baseline["behavioural_checked"],
+                                            baseline["unmapped_max"]))
+    return 1 if res["errors"] or failures else 0
 
 
 if __name__ == "__main__":

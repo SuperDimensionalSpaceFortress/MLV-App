@@ -61,8 +61,9 @@ TEST(GpuWindowSwapWiring, AutomaticSwapPathIsConnectedToTheRecorder)
 TEST(GpuWindowSwapWiring, ManualCaptureSwapPathAlsoCallsTheRecorder)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
-    // Real swap path 2: the explicit swapBuffers() in grabPresentedFramebufferIfActive,
-    // which runs outside Qt's own paint-event cycle so frameSwapped() never fires for it.
+    // Real swap path 2: the explicit swapBuffers() in swapOutsidePaintEventAndRecord (the one
+    // manual swap site; see ForcedCapturePaintReusesTheOneManualSwapSite below), which runs
+    // outside Qt's own paint-event cycle so frameSwapped() never fires for it.
     const int swapBuffersCalls = countOccurrences(source, QStringLiteral("glContext->swapBuffers(win)"));
     const int noteRealSwapCalls = countOccurrences(source, QStringLiteral("win->noteRealSwap()"));
     ASSERT_EQ(1, swapBuffersCalls);
@@ -229,6 +230,49 @@ TEST(GpuWindowSwapWiring, GuiTestsLinkTheOpenMpRuntimeTheSwapClockNeeds)
     // (hosted Windows GUI Pilot, #159 and #161).
     const QString pro = readRepoFile(QStringLiteral("tests/gui/gui_tests.pro"));
     ASSERT_TRUE(pro.contains(QStringLiteral("win32: LIBS += -llibgomp-1")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B1): the --visual-capture-dir forced
+// paint (paintPendingNowIfActive) and the --screenshot grab both paint outside Qt's paint-event
+// cycle. They share ONE manual swap site, so every frame they present is swapped once and the
+// swap recorder sees it; a second inline swapBuffers() is what reddened the pin above.
+
+TEST(GpuWindowSwapWiring, ForcedCapturePaintReusesTheOneManualSwapSite)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString call = QStringLiteral("swapOutsidePaintEventAndRecord(win, glContext);");
+
+    const QString helper = functionBody(source,
+        QStringLiteral("void GpuDisplayWindow::swapOutsidePaintEventAndRecord(GpuDisplayWindow *win, QOpenGLContext *glContext)"),
+        QStringLiteral("bool GpuDisplayWindow::grabPresentedFramebufferIfActive("));
+    ASSERT_FALSE(helper.isEmpty());
+    const int swapAt = helper.indexOf(QStringLiteral("glContext->swapBuffers(win);"));
+    const int noteAt = helper.indexOf(QStringLiteral("if ( swapTelemetryEnabled() ) win->noteRealSwap();"));
+    ASSERT_TRUE(swapAt >= 0);
+    ASSERT_TRUE(noteAt > swapAt);
+
+    // The grab: one paint, one swap through the shared site, and no inline swap.
+    const QString grab = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::grabPresentedFramebufferIfActive("),
+        QStringLiteral("bool GpuDisplayWindow::presentedSerialIfActive("));
+    ASSERT_FALSE(grab.isEmpty());
+    ASSERT_EQ(1, countOccurrences(grab, call));
+    ASSERT_EQ(0, countOccurrences(grab, QStringLiteral("swapBuffers(")));
+    ASSERT_TRUE(grab.indexOf(call) > grab.indexOf(QStringLiteral("win->paintGL();")));
+
+    // The forced capture paint: the same site, once, and only when a submitted frame is still
+    // unpainted -- a frame already painted is never painted or swapped a second time.
+    const QString forced = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::paintPendingNowIfActive(quint64 *presentedSerial)"),
+        QStringLiteral("void GpuDisplayWindow::initializeGL()"));
+    ASSERT_FALSE(forced.isEmpty());
+    ASSERT_EQ(1, countOccurrences(forced, call));
+    ASSERT_EQ(0, countOccurrences(forced, QStringLiteral("swapBuffers(")));
+    ASSERT_EQ(1, countOccurrences(forced, QStringLiteral("win->paintGL();")));
+    const int guardAt = forced.indexOf(QStringLiteral("if ( pending && glContext"));
+    ASSERT_TRUE(guardAt >= 0);
+    ASSERT_TRUE(forced.indexOf(QStringLiteral("win->paintGL();")) > guardAt);
+    ASSERT_TRUE(forced.indexOf(call) > forced.indexOf(QStringLiteral("win->paintGL();")));
 }
 
 // Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): superseded-before-paint wiring. See
@@ -715,4 +759,302 @@ TEST(GpuPresentSetupStall, SteadyStateBlurUploadTakesNoGlGetErrorButTheAllocatio
     ASSERT_TRUE(allocationUploadAt > drainAt);
     ASSERT_TRUE(checkAt > allocationUploadAt);
     ASSERT_TRUE(allocation.mid(checkAt).contains(QStringLiteral("return failClosed();")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2, CoS 6219217683): the --visual-capture-dir forced paint
+// (paintPendingNowIfActive above, or the viewport's repaint()) draws the frame the label names even when the
+// display's own deferred paint never lands, so a forced capture alone can never show a frozen display. Every forced
+// capture kind is therefore paired with an unforced "_unbound" twin, and only the "_unbound" kinds skip the paint.
+// 32626bd5 force-painted every play capture with no twin. The stop and paused twins are taken just before their forced
+// capture, with no event handled in between; the play twins are ordered by the r3 test below.
+TEST(VisualCaptureBinding, EveryForcedStopAndPausedCaptureIsPairedWithAnUnforcedCaptureTakenJustBeforeIt)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+
+    // Only the "_unbound" kinds skip the forced paint.
+    ASSERT_TRUE(block.contains(QStringLiteral("!kind.endsWith( QStringLiteral(\"_unbound\") )")));
+
+    const QString pairs[][2] = {
+        { QStringLiteral("grabVisual( QStringLiteral(\"stop_unbound\"), 0, false );"),
+          QStringLiteral("grabVisual( QStringLiteral(\"stop\"), 0, false );") },
+        { QStringLiteral("grabVisual( QStringLiteral(\"paused_unbound\"), 0, visualSettled );"),
+          QStringLiteral("grabVisual( QStringLiteral(\"paused\"), 0, visualSettled );") },
+    };
+    for (const auto & pair : pairs) {
+        ASSERT_EQ(1, countOccurrences(block, pair[0]));
+        ASSERT_EQ(1, countOccurrences(block, pair[1]));
+        const int unforcedAt = block.indexOf(pair[0]);
+        const int forcedAt = block.indexOf(pair[1]);
+        ASSERT_TRUE(unforcedAt >= 0 && forcedAt > unforcedAt);
+        ASSERT_FALSE(block.mid(unforcedAt, forcedAt - unforcedAt).contains(QStringLiteral("processEvents(")));
+    }
+    // No forced kind exists without its twin: three forced grabs, three unforced, nothing else.
+    ASSERT_EQ(6, countOccurrences(block, QStringLiteral("grabVisual( QStringLiteral(")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): r2 took unforced play k and then forced play k in each
+// slice. A forced paint stays on screen when the display's own deferred paint never lands, so unforced k+1 showed
+// forced k (trace initial,F0..F4): six moving pictures over a frozen display. Every forced play capture now comes
+// before the first unforced one, no forced capture falls between two unforced play captures or between the last of
+// them and stop_unbound, and every capture records how many forced paints preceded it (forced_paints_before) so the
+// runner judges only an interval no forced paint entered.
+TEST(VisualCaptureBinding, NoForcedPaintFallsInsideTheUnforcedPlayObservationInterval)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+
+    const QString forcedPlay = QStringLiteral("grabVisual( QStringLiteral(\"play\"), k, false );");
+    const QString unforcedPlay = QStringLiteral("grabVisual( QStringLiteral(\"play_unbound\"), k, false );");
+    const QString stopUnforced = QStringLiteral("grabVisual( QStringLiteral(\"stop_unbound\"), 0, false );");
+    ASSERT_EQ(1, countOccurrences(block, forcedPlay));
+    ASSERT_EQ(1, countOccurrences(block, unforcedPlay));
+    const int forcedAt = block.indexOf(forcedPlay);
+    const int unforcedAt = block.indexOf(unforcedPlay);
+    const int stopUnforcedAt = block.indexOf(stopUnforced);
+    ASSERT_TRUE(forcedAt >= 0 && unforcedAt > forcedAt && stopUnforcedAt > unforcedAt);
+    // The two play captures sit in two separate loops: the forced loop closes before the unforced one opens.
+    const QString forcedToUnforced = block.mid(forcedAt, unforcedAt - forcedAt);
+    ASSERT_EQ(1, countOccurrences(forcedToUnforced, QStringLiteral("for( int k = 0; k < visualPlayFrames; ++k )")));
+    // From the unforced play capture to stop_unbound: no other capture, only the pause.
+    const QString interval = block.mid(unforcedAt, stopUnforcedAt - unforcedAt);
+    ASSERT_EQ(1, countOccurrences(interval, QStringLiteral("grabVisual(")));
+    ASSERT_TRUE(interval.contains(QStringLiteral("ui->actionPlay->setChecked( false );")));
+
+    // The ordinal is read before this capture's own paint and advanced only by a forced capture; visual.json carries it.
+    const int lambdaAt = block.indexOf(QStringLiteral("auto grabVisual = [&]"));
+    const int lambdaEnd = block.indexOf(QStringLiteral("visualGrabs.append( grab );"), lambdaAt);
+    ASSERT_TRUE(lambdaAt >= 0 && lambdaEnd > lambdaAt);
+    const QString lambda = block.mid(lambdaAt, lambdaEnd - lambdaAt);
+    const int ordinalAt = lambda.indexOf(QStringLiteral("grab.forcedPaintsBefore = visualForcedPaints;"));
+    const int paintAt = lambda.indexOf(QStringLiteral("paintPresentedFrameForCapture("));
+    const int bumpAt = lambda.indexOf(QStringLiteral("if( forcePaint ) ++visualForcedPaints;"));
+    ASSERT_TRUE(ordinalAt >= 0 && paintAt > ordinalAt && bumpAt > paintAt);
+    ASSERT_EQ(1, countOccurrences(block, QStringLiteral("++visualForcedPaints")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "frameJson.insert( QStringLiteral(\"forced_paints_before\"), grab.forcedPaintsBefore );")));
+}
+
+TEST(VisualCaptureBinding, EveryCaptureNamesWhereItsPaintedSerialCameFrom)
+{
+    // Dot improvement on 60541263: on the pixmap route painted_serial == serial holds by construction, so the
+    // receipt says so (label_bound_basis) instead of passing it off as an independent paint-path record.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("frameJson.insert( QStringLiteral(\"label_bound_basis\"), grab.labelBoundBasis );")));
+    const int helperAt = source.indexOf(QStringLiteral("static bool paintPresentedFrameForCapture("));
+    ASSERT_TRUE(helperAt >= 0);
+    const QString helper = source.mid(helperAt, 2200);
+    const int windowAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"gl_window_paint\");"));
+    const int viewportAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"gl_viewport_paint\");"));
+    const int pixmapAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"pixmap_item_by_construction\");"));
+    ASSERT_TRUE(windowAt >= 0 && viewportAt > windowAt && pixmapAt > viewportAt);
+    // the pixmap-route basis is set only beside the item's own serial, never for a GL route
+    ASSERT_TRUE(helper.lastIndexOf(QStringLiteral("serial = pixmapItemSerial;"), pixmapAt) > viewportAt);
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 (T9): the tail markers around the path-3 paint/swap and at the next setup start are
+// CPU clock reads and POD stores only. A GL call there (an error drain, a finish, a fence) would itself move the stall
+// the markers bucket; an allocation would put a per-frame cost on the GUI thread.
+namespace
+{
+QString regionBetween(const QString & source, const QString & from, const QString & to)
+{
+    const int at = source.indexOf(from);
+    const int end = at < 0 ? -1 : source.indexOf(to, at);
+    if (at < 0 || end <= at) return QString();
+    return source.mid(at, end + to.size() - at);
+}
+
+void assertNoGlSyncAndNoAllocation(const QString & region)
+{
+    ASSERT_FALSE(region.isEmpty());
+    for (const char * call : { "glGetError", "glFinish", "glFlush", "glFenceSync", "glClientWaitSync", "glBeginQuery" })
+        ASSERT_EQ(0, countOccurrences(region, QString::fromLatin1(call)));
+    for (const char * token : { "new ", "QString", "QStringLiteral", "QByteArray", "push_back", "append(", "std::vector" })
+        ASSERT_EQ(0, countOccurrences(region, QString::fromLatin1(token)));
+}
+
+int glCallCount(const QString & region)
+{
+    return region.count(QRegularExpression(QStringLiteral("\\bgl[A-Z]\\w*\\s*\\(")));
+}
+} // namespace
+
+TEST(GpuPresentTailTiming, TailMarkersTakeNoGlCallAndNoAllocation)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString setupStamp = QStringLiteral("const qint64 tailSetupStartNs = m_tailClock.nsecsElapsed();");
+    const QString paintStamp = QStringLiteral("const double postPaintStartMs = elapsedMs();");
+    const QString swapStamp = QStringLiteral("const qint64 tailSwapReturnNs = m_tailClock.nsecsElapsed();");
+    const QString swapCall = QStringLiteral("glContext->swapBuffers(this);");
+    const QString swapCallMsLine = QStringLiteral("const double swapCallMs = elapsedMs() - swapCallStartMs;");
+    ASSERT_EQ(1, countOccurrences(body, setupStamp));
+    ASSERT_EQ(1, countOccurrences(body, paintStamp));
+    ASSERT_EQ(1, countOccurrences(body, swapStamp));
+
+    // r1: post_paint stamp -> swap-return stamp. Only paintGL() and the path-3 swap are GL-ish.
+    const QString r1 = regionBetween(body, paintStamp, swapStamp);
+    assertNoGlSyncAndNoAllocation(r1);
+    ASSERT_EQ(1, countOccurrences(r1, QStringLiteral("paintGL();")));
+    ASSERT_EQ(1, countOccurrences(r1, swapCall));
+    QString r1Rest = r1;
+    r1Rest.remove(QStringLiteral("paintGL();")).remove(swapCall);
+    ASSERT_EQ(0, r1Rest.count(QRegularExpression(QStringLiteral("gl\\w*\\s*\\("),
+                                                 QRegularExpression::CaseInsensitiveOption)));
+    // The swap-return stamp follows the swap with only the swapCallMs line between.
+    const int swapAt = r1.indexOf(swapCall);
+    const int stampAt = r1.indexOf(swapStamp);
+    ASSERT_TRUE(swapAt >= 0 && stampAt > swapAt);
+    ASSERT_EQ(swapCallMsLine.toStdString(),
+              r1.mid(swapAt + swapCall.size(), stampAt - swapAt - swapCall.size()).trimmed().toStdString());
+
+    // r2: the setup-start tail block, after setupStartMs and before ensurePreviewProcessingProgram().
+    const int setupStartAt = body.indexOf(QStringLiteral("const double setupStartMs = elapsedMs();"));
+    const int ensureAt = body.indexOf(QStringLiteral("ensurePreviewProcessingProgram();"), setupStartAt);
+    const int setupStampAt = body.indexOf(setupStamp);
+    ASSERT_TRUE(setupStartAt >= 0 && setupStampAt > setupStartAt && ensureAt > setupStampAt);
+    const QString r2 = body.mid(setupStampAt, ensureAt - setupStampAt);
+    // r3: the close lives in GpuPresentTailWindow::close (executed by test_playback_slip_histogram.cpp's lifecycle
+    // tests); this site only hands it the setup-start reading.
+    ASSERT_TRUE(r2.contains(QStringLiteral(
+        "m_tailWindow.close(tailSetupStartNs, m_tailIdleProbe, m_lastPresentTailTiming);")));
+    const QString windowHeader = readRepoFile(QStringLiteral("platform/qt/GpuPresentTailWindow.h"));
+    // Adversary A2: a block still open at setup start never reported its wake, so its span is not idle.
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral("tail.gui_idle_known = idleProbe && blockStartNs < 0;")));
+    // The path-3 swap opens the window with the swap-return reading, right after the stamp.
+    const QString r1Open = QStringLiteral(
+        "m_tailWindow.open(tailSwapReturnNs, swapCallStartMs - postPaintStartMs, swapCallMs);");
+    ASSERT_EQ(1, countOccurrences(body, r1Open));
+    ASSERT_TRUE(body.indexOf(r1Open) > body.indexOf(swapStamp));
+
+    // Adversary A2 sibling and ADV-A1: only the dispatcher whose awake follows the wait before any dispatch gets a probe;
+    // on every other one a wake's events run before the next awake, so the idle stays not known.
+    const int dispatcherGateAt = source.indexOf(QStringLiteral("if ( dispatcher && dispatcher->inherits(\"QEventDispatcherWin32\") )"));
+    ASSERT_TRUE(dispatcherGateAt >= 0);
+    ASSERT_TRUE(source.indexOf(QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")) > dispatcherGateAt);
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("&QAbstractEventDispatcher::awake")));
+
+    // Adversary A1: frameSwapped slots run in connection order, so the path-1 pair clock is read before the recorder
+    // can log; connected after it, a per-swap log line is timed as paint+swap.
+    const int pairSlotAt = source.indexOf(QStringLiteral("&GpuDisplayWindow::noteQtPaintSwap);"));
+    const int recorderSlotAt = source.indexOf(QStringLiteral("&GpuDisplayWindow::noteRealSwap);"));
+    ASSERT_TRUE(pairSlotAt >= 0 && recorderSlotAt > pairSlotAt);
+
+    // r3-r5: the path-1 paint stamp, its frameSwapped slot and the dispatcher idle lambdas.
+    const QString r3 = functionBody(source, QStringLiteral("void GpuDisplayWindow::paintUnderGL()"),
+                                    QStringLiteral("void GpuDisplayWindow::noteQtPaintSwap()"));
+    ASSERT_TRUE(r3.contains(QStringLiteral(
+        "if ( swapTelemetryEnabled() ) m_tailWindow.qtPaintStarted(m_tailClock.nsecsElapsed());")));
+    const QString r4 = functionBody(source, QStringLiteral("void GpuDisplayWindow::noteQtPaintSwap()"),
+                                    QStringLiteral("GpuDisplayWindow::~GpuDisplayWindow()"));
+    // r4 (G2): the stamp lives in the window struct (its open() drops it; executed by test_playback_slip_histogram.cpp),
+    // never in a GpuDisplayWindow member the path-3 open cannot reach, and the swap-telemetry session start and stop drop it.
+    ASSERT_TRUE(r4.contains(QStringLiteral("m_tailWindow.qtPaintSwapped(m_tailClock.nsecsElapsed());")));
+    ASSERT_EQ(0, countOccurrences(source, QStringLiteral("m_qtPaintStartNs")));
+    ASSERT_EQ(0, countOccurrences(readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.h")),
+                                  QStringLiteral("m_qtPaintStartNs")));
+    const QString drop = QStringLiteral("win->m_tailWindow.dropQtPaintStamp();");
+    const QString sessionStart = QStringLiteral("void GpuDisplayWindow::resetSwapTelemetry(quint64 sessionId)");
+    const QString sessionStop = QStringLiteral("GpuWindowSwapTelemetrySnapshot GpuDisplayWindow::swapTelemetrySnapshot()");
+    ASSERT_TRUE(functionBody(source, sessionStart, sessionStop).contains(drop));
+    ASSERT_TRUE(functionBody(source, sessionStop, QStringLiteral("void GpuDisplayWindow::noteRealSwap()")).contains(drop));
+    ASSERT_EQ(2, countOccurrences(source, drop));
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral("qint64 qtPaintStartNs = -1;")));
+    const QString r5 = regionBetween(source, QStringLiteral("&QAbstractEventDispatcher::aboutToBlock"),
+                                     QStringLiteral("m_tailIdleProbe = true;"));
+    ASSERT_TRUE(r5.contains(QStringLiteral("&QAbstractEventDispatcher::awake")));
+    for (const QString & region : { r2, r3, r4, r5 }) {
+        assertNoGlSyncAndNoAllocation(region);
+        ASSERT_EQ(0, glCallCount(region));
+    }
+
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral(
+        "static_assert(std::is_trivially_copyable<GpuPresentTailTiming>::value")));
+    ASSERT_TRUE(windowHeader.contains(QStringLiteral(
+        "static_assert(std::is_trivially_copyable<GpuPresentTailWindow>::value")));
+    const QString windowStruct = regionBetween(windowHeader, QStringLiteral("struct GpuPresentTailWindow"),
+                                               QStringLiteral("\n};"));
+    assertNoGlSyncAndNoAllocation(windowStruct);
+    ASSERT_EQ(0, glCallCount(windowStruct));
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 r3: the two call sites the executed lifecycle tests cannot reach. G1: every refusal
+// goes through fail(), which drops an open window before it returns, so a refused call is never inside the next
+// window. B1: every smoke-runner sleep reaches the active window's open tail window, timed around the sleep itself.
+TEST(GpuPresentTailTiming, RefusalsAbandonTheWindowAndRunnerSleepsReachIt)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString failLambda = regionBetween(body, QStringLiteral("auto fail = [&](const QString &why) -> bool"),
+                                             QStringLiteral("return false;"));
+    ASSERT_TRUE(failLambda.contains(QStringLiteral("m_tailWindow.abandon();")));
+    // Every refusal before the setup start uses fail(): no bare "return false;" between the lambda and the close.
+    const int lambdaEnd = body.indexOf(QStringLiteral("};"), body.indexOf(QStringLiteral("auto fail = [&]")));
+    const int closeAt = body.indexOf(QStringLiteral("m_tailWindow.close("));
+    ASSERT_TRUE(lambdaEnd > 0 && closeAt > lambdaEnd);
+    ASSERT_EQ(0, countOccurrences(body.mid(lambdaEnd, closeAt - lambdaEnd), QStringLiteral("return false;")));
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("m_tailWindow.abandon();")));
+
+    const QString note = functionBody(source,
+        QStringLiteral("void GpuDisplayWindow::noteSmokeRunnerSleepIfActive(qint64 sleptNs)"),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16TextureIfActive("));
+    ASSERT_TRUE(note.contains(QStringLiteral("if ( win ) win->m_tailWindow.runnerSlept(sleptNs);")));
+
+    const QString main = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int helperAt = main.indexOf(QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
+    ASSERT_TRUE(helperAt >= 0);
+    const int helperEnd = main.indexOf(QStringLiteral("\n}"), helperAt);
+    const QString helper = main.mid(helperAt, helperEnd - helperAt);
+    const int startAt = helper.indexOf(QStringLiteral("slept.start();"));
+    const int sleepAt = helper.indexOf(QStringLiteral("QThread::msleep( ms );"));
+    const int readAt = helper.indexOf(QStringLiteral("const qint64 sleptNs = slept.nsecsElapsed();"));
+    const int noteAt = helper.indexOf(QStringLiteral("GpuDisplayWindow::noteSmokeRunnerSleepIfActive( sleptNs );"));
+    ASSERT_TRUE(startAt >= 0 && sleepAt > startAt && readAt > sleepAt && noteAt > readAt);
+}
+
+// PLAYBACK-PRESENT-TAIL-TIMING-1 (W1): slip_summary appends the max-setup tail keys after present_setup_first_ms (the
+// existing keys keep their order), and no tail field rides the per-frame stageTimingTelemetry hash.
+TEST(GpuPresentTailTiming, SlipSummaryAppendsTheTailKeysAndNoTailFieldUsesStageTimingTelemetry)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int firstAt = source.indexOf(QStringLiteral("QStringLiteral(\"present_setup_first_ms=%1\")"));
+    ASSERT_TRUE(firstAt >= 0);
+    int previousAt = firstAt;
+    for (const char * key : { "present_setup_max_prev_paint_ms=", "present_setup_max_prev_swap_ms=",
+                              "present_setup_max_swap_return_to_setup_ms=", "present_setup_max_gui_busy_ms=",
+                              "present_setup_max_qt_paint_swaps=", "present_setup_max_qt_paint_swap_max_ms=",
+                              "present_setup_max_grab_swaps=", "present_setup_max_display=",
+                              "present_setup_max_bucket=" }) {
+        const QString needle = QStringLiteral("QStringLiteral(\"%1").arg(QLatin1String(key));
+        ASSERT_EQ(1, countOccurrences(source, needle));
+        const int at = source.indexOf(needle);
+        ASSERT_TRUE(at > previousAt);
+        previousAt = at;
+    }
+    ASSERT_TRUE(source.indexOf(QStringLiteral("qInfo().noquote() << fields.join( QLatin1Char(' ') );"), firstAt)
+                > previousAt);
+
+    const QRegularExpression insertKey(QStringLiteral(
+        "stageTimingTelemetry\\.insert\\(\\s*QStringLiteral\\(\"([^\"]*)\""));
+    const QRegularExpression tailToken(QStringLiteral(
+        "post_paint|post_swap|prev_paint|prev_swap|prev_post|swap_return|qt_paint|grab_swap|gui_idle|gui_busy|"
+        "setup_bucket|present_tail|tail_timing"));
+    int keys = 0;
+    for (auto it = insertKey.globalMatch(source); it.hasNext(); ++keys)
+        ASSERT_FALSE(tailToken.match(it.next().captured(1)).hasMatch());
+    ASSERT_TRUE(keys > 100);
 }

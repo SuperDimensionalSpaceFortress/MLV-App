@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -108,9 +109,25 @@ def ob(tmp_path, monkeypatch):
     return mod
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the project below took seven git processes to build and was rebuilt for
+# every test that asks for `repo`. It is now built once per pytest session by `_build_repo` (body unchanged) and
+# each test gets a private copy of that directory tree. The copy holds no remote, hence no absolute path.
+_REPO_TEMPLATE = {}
+
+
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, tmp_path_factory):
     """A fixture project on master: the tool at its configured path, the outbox README, one root commit."""
+    if "dir" not in _REPO_TEMPLATE:
+        template = tmp_path_factory.mktemp("hooks-repo-template")
+        _build_repo(template)
+        _REPO_TEMPLATE["dir"] = template
+    r = tmp_path / "project"
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "project", r)
+    return r
+
+
+def _build_repo(tmp_path):
     r = tmp_path / "project"
     r.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "master", str(r)], check=True, capture_output=True, text=True)
@@ -143,7 +160,18 @@ def run_pre_push(ob, repo: Path, monkeypatch, stdin_text: str) -> int:
 # ---------- the tool carries no project value ----------
 
 CANDIDATE_BUS_PATH = "tools/factory/doctrine_outbox.py"
-HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261016-doctrine-outbox-single-source-superset.md"
+# The steward is handed ONE live card for the merged tool, naming its digest: HANDOFF_CARD, the newest. Its `supersedes:`
+# field names the card it replaces (EARLIER_CARDS), whose digest is stale once the tool changes. A card already sent to the
+# bus is never edited to refresh that digest: a changed body is a new idempotency key, so it would publish twice
+# (OUTBOX-SENT-CARD-NEVER-EDITED-1; the guard is test_a_commit_that_edits_a_sent_item_is_refused_by_name_and_key). A tool
+# change adds the next superseding card instead. test_the_steward_handoff_card_supersedes_the_earlier_card derives the name
+# from that card's own heading. ROUTE_EXERCISE_CARD is the oldest, long since superseded; only its static route text is checked.
+HANDOFF_CARD = REPO_ROOT / "doctrine-outbox" / "20261023-doctrine-outbox-nlf-old-git-refuse-candidate.md"
+EARLIER_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-comment-history-candidate.md",)
+OLDER_SENT_CARDS = (REPO_ROOT / "doctrine-outbox" / "20261020-doctrine-outbox-markup-forms-candidate.md",
+                    REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-sent-item-guard-candidate.md",
+                    REPO_ROOT / "doctrine-outbox" / "20261022-doctrine-outbox-sent-ledger-read-candidate.md")
+ROUTE_EXERCISE_CARD = REPO_ROOT / "doctrine-outbox" / "20261017-doctrine-outbox-route-exercise-candidate.md"
 OUTBOX_README = REPO_ROOT / "doctrine-outbox" / "README.md"
 
 
@@ -164,17 +192,37 @@ def test_the_steward_handoff_card_names_the_candidate_digest():
     assert _bus_candidate()["sha256_lf"] in HANDOFF_CARD.read_text(encoding="utf-8")
 
 
+def test_the_steward_handoff_card_supersedes_the_earlier_card():
+    """Structural evidence, not a narrated history: the card's single `supersedes:` field names the card it replaces by
+    the `## ` id that card carries, so a card that drops out of that field (or is renamed) fails here."""
+    fields = [line for line in HANDOFF_CARD.read_text(encoding="utf-8").splitlines() if line.startswith("supersedes:")]
+    assert len(fields) == 1, fields
+    for earlier in EARLIER_CARDS:
+        ids = [line[3:].strip() for line in earlier.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
+        assert len(ids) == 1 and ids[0] in fields[0], (earlier.name, ids, fields[0])
+
+
+def test_only_the_live_handoff_card_carries_the_current_digest_and_the_sent_ones_are_not_chased():
+    """The earlier cards are SENT. Requiring them to quote today's digest is what forced #533 and #537 to edit them and
+    republish; they keep the digest they were sent with, and the superseding card carries the current one."""
+    current = _bus_candidate()["sha256_lf"]
+    assert current in HANDOFF_CARD.read_text(encoding="utf-8")
+    for sent in (ROUTE_EXERCISE_CARD, *OLDER_SENT_CARDS, *EARLIER_CARDS):
+        assert current not in sent.read_text(encoding="utf-8"), f"{sent.name} was edited to chase the digest"
+
+
 PIN_AWARE_FOLLOW_UP = "OUTBOX-PIN-AWARE-TOOL-AT-REF-1"
 
 
 def test_surfaces_keep_the_local_copy_and_name_the_pin_aware_follow_up():
-    """The installed hook runs `$REPO_ROOT/<tool_rel>` and debt/drain need `tool_rel` at the ref, so a
-    project that deletes its copy after pinning bricks its own pushes (CoS repro on a4480947). Every
+    """Without `tool_pin` the installed hook runs `$REPO_ROOT/<tool_rel>` and debt/drain need `tool_rel` at the
+    ref, so a project that deletes its copy after pinning bricks its own pushes (CoS repro on a4480947). Every
     surface that describes the route must say the copy stays until the pin-aware release, and name it."""
     assert _bus_candidate()["bus_path"] == CANDIDATE_BUS_PATH
     surfaces = {
         "config": (REPO_ROOT / "doctrine-outbox.config.json").read_text(encoding="utf-8"),
         "card": HANDOFF_CARD.read_text(encoding="utf-8"),
+        "route-exercise card": ROUTE_EXERCISE_CARD.read_text(encoding="utf-8"),
         "readme": OUTBOX_README.read_text(encoding="utf-8"),
         "tool docstring": ast.get_docstring(ast.parse(TOOL_SRC.read_text(encoding="utf-8"))) or "",
     }
@@ -293,7 +341,7 @@ def test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner(tmp_
     A scratch bus holds bus master's real tools/factory/pin-runner.py and this tool at the bus path the
     card names. A scratch consumer follows the card's own commands: adopt the runner, pin the tool with
     --reviewer/--reason, run it by pin with --config (install-hooks, then session-start), and then pushes
-    through the hook that run installed. The consumer KEEPS its local copy, as the card says: the hook and
+    through the hook that run installed. The consumer sets no `tool_pin`, so it KEEPS its local copy: the hook and
     the debt checks read it. Never writes into the real bus repository."""
     runner = _read_only_bus_runner()
     pin_cmd, run_cmd = _card_command("pin doctrine-outbox"), _card_command("run doctrine-outbox")
@@ -364,7 +412,148 @@ def test_the_steward_cards_route_runs_end_to_end_against_the_bus_pin_runner(tmp_
     git(consumer, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
     allowed = sh(["git", "push", "origin", "master"])
     assert allowed.returncode == 0, allowed.stderr
-    assert (consumer / "tools" / "coordination" / "doctrine_outbox.py").is_file()   # the copy the card says to keep
+    assert (consumer / "tools" / "coordination" / "doctrine_outbox.py").is_file()   # no tool_pin: the copy stays
+
+
+# ---------- OUTBOX-PIN-AWARE-TOOL-AT-REF-1: the hook and the ref check accept a pinned tool ----------
+
+PIN_NAME = "doctrine-outbox"
+# Named mutations (each turns the named tests red, then is reverted):
+#   P1  the hook always runs `$REPO_ROOT/<tool_rel>`           -> test_installed_hook_runs_the_pin_when_the_local_copy_is_gone
+#   P2  require_tool_at_ref always demands the file at tool_rel -> test_the_ref_check_accepts_a_pin_in_place_of_the_local_copy
+
+
+def _pinned_consumer(tmp_path: Path, tool_rel: str | None = "tools/coordination/doctrine_outbox.py") -> tuple[Path, dict[str, str], Path]:
+    """A consumer that runs the tool BY PIN and keeps NO copy of it. Its config names `tool_pin`; `tool_rel` is the
+    path of the copy it deleted (what a project's config says right after the deletion), or absent when None. A
+    scratch bus holds the bus runner and this tool at the bus path; the consumer adopts the runner and pins the
+    tool exactly as the steward card says. Returns (repo, env for git, config path)."""
+    runner = _read_only_bus_runner()
+    bus = tmp_path / "scratch-bus"
+    (bus / "tools" / "factory").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "master", str(bus)], check=True, capture_output=True, text=True)
+    (bus / RUNNER_BUS_PATH).write_bytes(runner)
+    (bus / CANDIDATE_BUS_PATH).write_bytes(TOOL_SRC.read_bytes().replace(b"\r\n", b"\n"))
+    git(bus, "add", "-A")
+    git(bus, "commit", "-m", "scratch bus: the runner plus the candidate")
+    bus_sha = git(bus, "rev-parse", "HEAD")
+
+    consumer = tmp_path / "pinned-consumer"
+    consumer.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "master", str(consumer)], check=True, capture_output=True, text=True)
+    config = {k: v for k, v in BUS_STYLE_CONFIG.items() if k != "tool_rel"}
+    config.update(project="consumer", tool_pin=PIN_NAME, state_dir=".state/outbox", finding_path_regexes=[r"^agents/[^/]+\.md$"])
+    if tool_rel is not None:
+        config["tool_rel"] = tool_rel
+    cfg_path = consumer / "doctrine-outbox.config.json"
+    commit(consumer, {"doctrine-outbox.config.json": json.dumps(config), f"{OUTBOX_DIR}/README.md": "# outbox\n"},
+           "init\n\nDoctrine-Export: none\n")
+    (consumer / "factory-pins").mkdir()
+    (consumer / "factory-pins" / "pin-runner.py").write_bytes(runner)
+    env = {**os.environ, "FACTORY_BUS_CLONE": str(bus), "FACTORY_PINS_CACHE": str(tmp_path / "blob-cache")}
+
+    def sh(argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(argv, cwd=consumer, capture_output=True, text=True, env=env)
+
+    adopt = sh([sys.executable, "factory-pins/pin-runner.py", "adopt-runner", "--commit", bus_sha])
+    assert adopt.returncode == 0, adopt.stderr
+    pin = sh([sys.executable, "factory-pins/pin-runner.py", "pin", PIN_NAME, "--commit", bus_sha, "--path", CANDIDATE_BUS_PATH,
+              "--reviewer", "pin-aware-fixture", "--reason", "fixture"])
+    assert pin.returncode == 0, pin.stderr
+    git(consumer, "add", "-A")
+    git(consumer, "commit", "-m", "pin the tool\n\nDoctrine-Export: none\n")
+    origin = tmp_path / "pinned-origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(origin)], check=True, capture_output=True, text=True)
+    git(consumer, "remote", "add", "origin", str(origin))
+    git(consumer, "push", "-q", "origin", "master")   # before the guard exists
+    return consumer, env, cfg_path
+
+
+def test_installed_hook_runs_the_pin_when_the_local_copy_is_gone(tmp_path):
+    """CoS repro on a4480947: a project that pins the shared outbox and deletes its copy bricked its own
+    pushes, because the hook ran `$REPO_ROOT/<tool_rel>`. With `tool_pin` in the config the hook runs the pin
+    through the vendored runner, with the config handed over, and guards a real push with no copy anywhere."""
+    consumer, env, cfg_path = _pinned_consumer(tmp_path)
+    ob = load_tool(cfg_path)
+    assert ob.TOOL_PIN == PIN_NAME and ob.TOOL_REL, "the config still names the deleted copy"
+    assert not [p for p in git(consumer, "ls-files").splitlines() if p.endswith("doctrine_outbox.py")], "the fixture must hold no copy"
+    assert ob.install_pre_push(consumer) == "installed"
+    hook = (consumer / ".git" / "hooks" / "pre-push").read_text(encoding="utf-8")
+    assert "factory-pins/pin-runner.py" in hook and f"run {PIN_NAME} --" in hook and "DOCTRINE_OUTBOX_CONFIG=" in hook
+    assert ob.TOOL_REL not in hook
+    assert ob.install_pre_push(consumer) == "present"   # idempotent for the pinned shape too
+
+    def push() -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(consumer), "push", "origin", "master"], capture_output=True, text=True, env=env)
+
+    commit(consumer, {"docs/notes.md": "prose\n"}, "docs only")
+    clean = push()
+    assert clean.returncode == 0, clean.stderr   # the pinned guard ran and said yes (a missing tool would exit non-zero)
+    commit(consumer, {"agents/new.md": "rule\n"}, "undeclared finding path")
+    refused = push()
+    assert refused.returncode != 0 and "PUSH REFUSED" in refused.stderr and "agents/new.md" in refused.stderr, refused.stderr
+    git(consumer, "commit", "--amend", "-m", "declared\n\nDoctrine-Export: none\n")
+    allowed = push()
+    assert allowed.returncode == 0, allowed.stderr
+
+
+@pytest.mark.parametrize("tool_rel", ["tools/coordination/doctrine_outbox.py", None], ids=["stale-tool_rel", "no-tool_rel"])
+def test_the_ref_check_accepts_a_pin_in_place_of_the_local_copy(tmp_path, capsys, tool_rel):
+    consumer, _env, cfg_path = _pinned_consumer(tmp_path, tool_rel)
+    ob = load_tool(cfg_path)
+    ob.require_tool_at_ref(consumer, "master")   # no tool_rel file at the ref, and no raise
+    assert ob.main(["--config", str(cfg_path), "--repo", str(consumer), "debt", "--ref", "master"]) == 0
+    assert "TOOL_ABSENT_AT_REF" not in capsys.readouterr().err
+
+
+def test_a_pinned_config_is_unknown_at_a_ref_without_the_pin(tmp_path):
+    """The pin must be AT the ref: a ref that predates the runner, or whose pins file names no such tool, reads as
+    TOOL_ABSENT_AT_REF (exit 2), never as 'no debt'."""
+    consumer, _env, cfg_path = _pinned_consumer(tmp_path)
+    ob = load_tool(cfg_path)
+    with pytest.raises(ob.Unknown, match="TOOL_ABSENT_AT_REF.*pin-runner.py"):
+        ob.require_tool_at_ref(consumer, "master~1")   # the init commit: config and README, no runner yet
+    pins_path = consumer / "factory-pins" / "factory-pins.json"
+    pins = json.loads(pins_path.read_text(encoding="utf-8"))
+    pins["tools"] = {"other-tool": pins["tools"][PIN_NAME]}
+    commit(consumer, {"factory-pins/factory-pins.json": json.dumps(pins)}, "re-pin something else\n\nDoctrine-Export: none\n")
+    with pytest.raises(ob.Unknown, match=f"TOOL_ABSENT_AT_REF.*no pin named {PIN_NAME}"):
+        ob.require_tool_at_ref(consumer, "master")
+
+
+def test_a_pin_does_not_excuse_a_missing_outbox_directory(tmp_path):
+    consumer, _env, cfg_path = _pinned_consumer(tmp_path)
+    ob = load_tool(cfg_path)
+    git(consumer, "rm", "-q", f"{OUTBOX_DIR}/README.md")
+    git(consumer, "commit", "-m", "drop the outbox\n\nDoctrine-Export: none\n")
+    with pytest.raises(ob.Unknown, match="TOOL_ABSENT_AT_REF"):
+        ob.require_tool_at_ref(consumer, "master")
+
+
+@pytest.mark.parametrize("override, offending", [
+    ({"tool_pin": "not a pin name"}, "tool_pin"),
+    ({"tool_pin": 7}, "tool_pin"),
+    ({"tool_pin": ""}, "tool_rel"),   # no pin and (below) no tool_rel: the tool has no location
+])
+def test_config_needs_tool_rel_or_a_valid_tool_pin(override, offending):
+    spec = importlib.util.spec_from_file_location("doctrine_outbox_pincfg", TOOL_SRC)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    no_rel = {k: v for k, v in BUS_STYLE_CONFIG.items() if k != "tool_rel"}
+    with pytest.raises(fresh.Refusal) as excinfo:
+        fresh.configure({**no_rel, **override})
+    assert excinfo.value.code == "CONFIG_INVALID" and offending in excinfo.value.detail
+    fresh.configure({**no_rel, "tool_pin": PIN_NAME})                       # a pin alone is a complete tool location
+    fresh.configure({**BUS_STYLE_CONFIG, "tool_pin": PIN_NAME})             # both: the pin wins, the copy is tolerated
+
+
+def test_a_config_without_tool_pin_installs_the_byte_identical_local_copy_hook(ob, repo):
+    """The default is unchanged: no `tool_pin` -> the guard runs `$REPO_ROOT/<tool_rel>` exactly as before."""
+    assert ob.TOOL_PIN == ""
+    assert ob.install_pre_push(repo) == "installed"
+    hook = (repo / ".git" / "hooks" / "pre-push").read_text(encoding="utf-8")
+    assert f'  "$OUTBOX_PY" "$REPO_ROOT/{TOOL_REL}" pre-push "$REPO_ROOT" "$@" < "$OUTBOX_STDIN" ||' in hook
+    assert "pin-runner" not in hook and "DOCTRINE_OUTBOX_CONFIG" not in hook
 
 
 def test_the_tool_names_no_project_host_or_state_directory():
@@ -1177,3 +1366,423 @@ def test_new_branch_push_with_no_guarded_base_judges_the_whole_history(tmp_path,
     line = f"refs/heads/release {local} refs/heads/release {ZEROS}\n"
     assert run_pre_push(mod, repo, monkeypatch, line) == 1
     assert "coordination/tools/old.py" in capsys.readouterr().err
+
+
+# ---------- a SENT item is never edited (OUTBOX-SENT-CARD-NEVER-EDITED-1) ----------
+# The idempotency key is sha256(source_commit, target, body). An item whose key the sent ledger already records and
+# whose body then changes gets a NEW key, so the next drain publishes it a second time (sent.jsonl rows 70/72, #533's
+# route-exercise card). The ledger is untracked and lives only on the board, so hosted CI has none: that case is the typed
+# skip `sent-ledger-absent`, never a quiet pass.
+
+SENT_ITEM = f"{OUTBOX_DIR}/20261016-the-fix.md"
+
+
+def _record_sent(ob, repo: Path, ledger: Path, item_rel: str = SENT_ITEM, text: str | None = None) -> str:
+    """Commit the item, then write the ledger row a drain would have written for it; returns that key."""
+    commit(repo, {item_rel: text or item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    item = ob.parse_item((repo / item_rel).read_text(encoding="utf-8"))
+    key = ob.idempotency_key(git(repo, "log", "--diff-filter=A", "--format=%H", "-n", "1", "--", item_rel),
+                             item["meta"]["target"], item["body"])
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(json.dumps({"key": key, "item": Path(item_rel).stem}) + "\n", encoding="utf-8")
+    return key
+
+
+def _check_commits(ob, repo: Path, base: str, ledger: Path | None) -> int:
+    extra = ["--ledger", str(ledger)] if ledger is not None else []
+    return ob.main(["check-commits", str(repo), f"{base}..HEAD", *extra])
+
+
+def test_a_commit_that_edits_a_sent_item_is_refused_by_name_and_key(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger)
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nWhat happened and a different fix.\n")},
+           "edit the sent card\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, ledger) == 1
+    assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in capsys.readouterr().err
+
+
+def test_pre_push_refuses_a_sent_item_edit_from_the_default_ledger(ob, repo, monkeypatch, capsys):
+    key = _record_sent(ob, repo, repo / ob.LEDGER_REL)
+    base = git(repo, "rev-parse", "HEAD")
+    head = commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited after it was sent.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert run_pre_push(ob, repo, monkeypatch, push_line(head, base)) == 1
+    assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in capsys.readouterr().err
+
+
+def test_a_new_item_that_names_the_sent_one_as_superseded_allows_the_edit(ob, repo, tmp_path):
+    ledger = tmp_path / "sent.jsonl"
+    _record_sent(ob, repo, ledger)
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(body=f"### The successor\nsupersedes: {SENT_ITEM} (its wording)\n")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nReworded.\n"), f"{OUTBOX_DIR}/20261022-the-successor.md": successor},
+           "supersede it\n\nDoctrine-Export: outbox\n")
+    assert _check_commits(ob, repo, base, ledger) == 0
+
+
+def test_a_new_item_that_does_not_name_the_sent_one_does_not_excuse_the_edit(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger)
+    base = git(repo, "rev-parse", "HEAD")
+    unrelated = item_text(body="### Unrelated\nsupersedes: 20260101-some-other-card.md\nA note that mentions the-fix in passing.\n")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nReworded.\n"), f"{OUTBOX_DIR}/20261022-unrelated.md": unrelated},
+           "edit with an unrelated card\n\nDoctrine-Export: outbox\n")
+    assert _check_commits(ob, repo, base, ledger) == 1
+    assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in capsys.readouterr().err
+
+
+def test_editing_an_unsent_item_is_allowed(ob, repo, tmp_path):
+    ledger = tmp_path / "sent.jsonl"
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    ledger.write_text(json.dumps({"key": "0123456789abcdef"}) + "\n", encoding="utf-8")   # a row for some other item
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nStill in the outbox, so still editable.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, ledger) == 0
+
+
+def test_an_edit_that_leaves_the_key_unchanged_is_allowed(ob, repo, tmp_path):
+    """The key covers source_commit, target and body; front matter beyond those does not move it, so nothing republishes."""
+    ledger = tmp_path / "sent.jsonl"
+    _record_sent(ob, repo, ledger)
+    base = git(repo, "rev-parse", "HEAD")
+    kept = item_text().replace("law4: attested\n", "law4: attested\nnote: front matter only\n")
+    commit(repo, {SENT_ITEM: kept}, "touch the front matter\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, ledger) == 0
+
+
+def test_no_sent_ledger_is_a_typed_skip_not_a_pass(ob, repo, tmp_path, capsys):
+    """Hosted CI has no ledger. The result must say it did not look, and must not say OK."""
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    missing = tmp_path / "no-such-ledger.jsonl"
+    for ledger in (None, missing):
+        assert _check_commits(ob, repo, base, ledger) == 0
+        out = capsys.readouterr().out
+        assert "sent-ledger-absent" in out and "SKIPPED" in out and "trailers only" in out, out
+        assert "check-commits OK" not in out, out
+
+
+def test_a_linked_worktree_finds_the_ledger_in_the_main_checkout(ob, repo, tmp_path, capsys):
+    """Lanes work in worktrees, where the untracked ledger is not; the default looks in the checkout that owns the git dir."""
+    key = _record_sent(ob, repo, repo / ob.LEDGER_REL)
+    lane = tmp_path / "lane"
+    git(repo, "worktree", "add", "-q", "-b", "lane", str(lane))
+    base = git(lane, "rev-parse", "HEAD")
+    commit(lane, {SENT_ITEM: item_text(body="### A finding\nEdited in a lane.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert not (lane / ob.LEDGER_REL).exists()
+    assert _check_commits(ob, lane, base, None) == 1
+    assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in capsys.readouterr().err
+
+
+# ---- the `supersedes:` exception names the sent item by a COMPLETE token (OUTBOX-SUPERSEDES-MATCH-EXACT-1) ----
+# A substring test let `example-10` and `example-1-followup` excuse an edit to `example-1`.
+
+SENT_CARD = f"{OUTBOX_DIR}/20261016-example-1.md"
+SENT_CARD_ID = "fixture/example-1"
+
+
+def _edit_sent_card_with_successor(ob, repo: Path, tmp_path: Path, supersedes_value: str) -> tuple[int, str, str]:
+    """Send the card `## fixture/example-1`, then edit it in a commit that also adds a card whose `supersedes:` line
+    says `supersedes_value`; returns (check-commits exit code, the sent key, the card's stem)."""
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger, SENT_CARD, item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent.\n"))
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(ob.CARDS_TARGET, f"## fixture/successor-9\nsupersedes: {supersedes_value}\nWhy.\n")
+    commit(repo, {SENT_CARD: item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent, reworded.\n"),
+                  f"{OUTBOX_DIR}/20261022-successor-9.md": successor},
+           "supersede it\n\nDoctrine-Export: outbox\n")
+    return _check_commits(ob, repo, base, ledger), key, "20261016-example-1"
+
+
+@pytest.mark.parametrize("value", [
+    "fixture/example-10",                          # card id that merely starts with the sent id
+    "fixture/example-1-followup",
+    "20261016-example-10",                         # file stem that merely starts with the sent stem
+    "20261016-example-1-followup",                 # a different file whose stem extends the sent one
+    "20261016-example-1-followup.md",
+    "coordination/doctrine-outbox/20261016-example-10.md",
+    "xfixture/example-1",                          # ends with the sent id
+    "pre-20261016-example-1",                      # ends with the sent stem
+])
+def test_a_supersedes_naming_a_longer_or_different_token_does_not_excuse_the_edit(ob, repo, tmp_path, capsys, value):
+    code, key, _stem = _edit_sent_card_with_successor(ob, repo, tmp_path, value)
+    assert code == 1
+    assert f"SENT_ITEM_EDITED {SENT_CARD} key={key}" in capsys.readouterr().err
+
+
+def test_a_supersedes_naming_the_key_plus_extra_characters_does_not_excuse_the_edit(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger, SENT_CARD, item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent.\n"))
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(ob.CARDS_TARGET, f"## fixture/successor-9\nsupersedes: {key}0\nWhy.\n")
+    commit(repo, {SENT_CARD: item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nReworded.\n"),
+                  f"{OUTBOX_DIR}/20261022-successor-9.md": successor}, "supersede it\n\nDoctrine-Export: outbox\n")
+    assert _check_commits(ob, repo, base, ledger) == 1
+    assert f"SENT_ITEM_EDITED {SENT_CARD} key={key}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("form", ["stem", "stem.md", "path", "card-id", "key", "wrapped-card-id", "list"])
+def test_a_supersedes_naming_the_sent_item_exactly_by_each_accepted_form_allows_the_edit(ob, repo, tmp_path, form):
+    """File stem, card id and key are the three accepted names; each may be wrapped in markup or sit in a list."""
+    ledger = tmp_path / "sent.jsonl"
+    key = _record_sent(ob, repo, ledger, SENT_CARD, item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nWhat was sent.\n"))
+    value = {"stem": "20261016-example-1", "stem.md": "20261016-example-1.md", "path": SENT_CARD,
+             "card-id": SENT_CARD_ID, "key": key, "wrapped-card-id": f"(`{SENT_CARD_ID}`, reworded)",
+             "list": f"20260101-other.md, {SENT_CARD_ID}; fixture/example-10"}[form]
+    base = git(repo, "rev-parse", "HEAD")
+    successor = item_text(ob.CARDS_TARGET, f"## fixture/successor-9\nsupersedes: {value}\nWhy.\n")
+    commit(repo, {SENT_CARD: item_text(ob.CARDS_TARGET, f"## {SENT_CARD_ID}\nReworded.\n"),
+                  f"{OUTBOX_DIR}/20261022-successor-9.md": successor}, "supersede it\n\nDoctrine-Export: outbox\n")
+    assert _check_commits(ob, repo, base, ledger) == 0
+
+
+def test_a_ledger_with_no_rows_is_a_typed_skip_not_a_pass(ob, repo, tmp_path, capsys):
+    """A ledger that exists but holds no row at all (empty, blank lines) cannot say what was sent: the check did not run."""
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    for n, content in enumerate(("", "\n\n")):
+        ledger = tmp_path / f"unreadable-{n}.jsonl"
+        ledger.write_text(content, encoding="utf-8")
+        assert _check_commits(ob, repo, base, ledger) == 0
+        out = capsys.readouterr().out
+        assert "sent-ledger-unreadable" in out and "SKIPPED" in out and "trailers only" in out, (content, out)
+        assert "check-commits OK" not in out, (content, out)
+
+
+# ---- the sent-ledger read fails CLOSED (OUTBOX-SENT-GUARD-LEDGER-READ-HARDENING-1) ----
+# A ledger the guard cannot open or decode, or one with rows it cannot use, must not let a range pass: the guard exists
+# to stop a republish, so "could not look" and "looked at part of it" are both UNKNOWN (exit 2), never a quiet pass.
+
+def _edited_sent_item_range(ob, repo: Path, ledger: Path) -> tuple[str, str]:
+    """Send SENT_ITEM (a good row lands in `ledger`), then edit it; returns (base sha, the sent key)."""
+    key = _record_sent(ob, repo, ledger)
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited after it was sent.\n")}, "edit\n\nDoctrine-Export: none\n")
+    return base, key
+
+
+def test_a_ledger_that_cannot_be_opened_fails_closed(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    ledger.mkdir()   # exists, is not a file: reading it raises OSError (PermissionError / IsADirectoryError)
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err and str(ledger) in cap.err, cap.err
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, cap.out
+
+
+def test_a_ledger_whose_read_raises_oserror_fails_closed(ob, repo, tmp_path, capsys, monkeypatch):
+    """A locked ledger: the file is there (is_file is true) but the read raises. No real lock, so nothing can hang."""
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    real_read_text = Path.read_text
+
+    def locked(self, *args, **kwargs):
+        if self == ledger:
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", locked)
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err and "being used by another process" in cap.err, cap.err
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, cap.out
+
+
+def test_a_ledger_with_invalid_utf8_fails_closed(ob, repo, tmp_path, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    with open(ledger, "ab") as fh:
+        fh.write(b'{"key": "\xff\xfe\xfa", "item": "latin-1 junk"}\n')
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err, cap.err
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, cap.out
+
+
+def test_pre_push_refuses_a_push_it_could_not_check_against_an_unreadable_default_ledger(ob, repo, monkeypatch, capsys):
+    """The pre-push hook already turns an Unknown into a refused push (exit 1), the same shape an unresolvable range gets."""
+    ledger = repo / ob.LEDGER_REL
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    ledger.write_bytes(ledger.read_bytes() + b"\xff\xfe\n")
+    head = git(repo, "rev-parse", "HEAD")
+    assert run_pre_push(ob, repo, monkeypatch, push_line(head, base)) == 1
+    err = capsys.readouterr().err
+    assert "PUSH REFUSED" in err and "sent-ledger-unreadable" in err, err
+
+
+@pytest.mark.parametrize("bad_line", [
+    "{not json",                                         # unparseable
+    json.dumps({"item": "no-key"}),                      # no key
+    json.dumps({"key": "", "item": "empty-key"}),        # empty key
+    json.dumps({"key": 42, "item": "int-key"}),          # non-string key
+    json.dumps({"key": None, "item": "null-key"}),
+    json.dumps({"key": "not-a-sixteen-hex-key"}),        # string, wrong shape (the writer emits 16 lowercase hex)
+    json.dumps({"key": "0123456789ABCDEF"}),             # uppercase hex is not what the writer emits
+    json.dumps({"key": "0123456789abcde"}),              # one short
+    json.dumps(["key"]),                                 # a row that is not an object
+])
+def test_a_ledger_with_a_malformed_row_beside_a_good_one_fails_closed_and_counts_it(ob, repo, tmp_path, capsys, bad_line):
+    """Not a quiet use of the good rows: the guard would run on a partial key set without saying so."""
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    with open(ledger, "a", encoding="utf-8", newline="\n") as fh:
+        fh.write(bad_line + "\n")
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-partial" in cap.err and "1 of 2" in cap.err, (bad_line, cap.err)
+    assert "check-commits OK" not in cap.out and "SKIPPED" not in cap.out, (bad_line, cap.out)
+
+
+def test_a_ledger_of_only_malformed_rows_fails_closed(ob, repo, tmp_path, capsys):
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nEdited.\n")}, "edit\n\nDoctrine-Export: none\n")
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_text('{not json\n{"item": "no-key"}\n["key"]\n', encoding="utf-8")
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "sent-ledger-partial" in cap.err and "3 of 3" in cap.err, cap.err
+
+
+def test_a_clean_ledger_with_blank_lines_still_judges_and_still_catches_the_edit(ob, repo, tmp_path, capsys):
+    """Blank lines are not rows: a clean ledger behaves as before, the edit is refused by name and key."""
+    ledger = tmp_path / "sent.jsonl"
+    base, key = _edited_sent_item_range(ob, repo, ledger)
+    ledger.write_text("\n" + ledger.read_text(encoding="utf-8") + "\n   \n", encoding="utf-8")
+    assert _check_commits(ob, repo, base, ledger) == 1
+    cap = capsys.readouterr()
+    assert f"SENT_ITEM_EDITED {SENT_ITEM} key={key}" in cap.err and "sent-ledger" not in cap.err, cap.err
+
+
+def test_a_clean_ledger_and_an_absent_ledger_behave_as_before(ob, repo, tmp_path, capsys):
+    """Pins both ends: a clean ledger lets an unsent-item edit pass with OK (no skip line); an absent ledger is the typed skip."""
+    clean = tmp_path / "sent.jsonl"
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    clean.write_text(json.dumps({"key": "0123456789abcdef"}) + "\n", encoding="utf-8")
+    base = git(repo, "rev-parse", "HEAD")
+    commit(repo, {SENT_ITEM: item_text(body="### A finding\nStill editable.\n")}, "edit\n\nDoctrine-Export: none\n")
+    assert _check_commits(ob, repo, base, clean) == 0
+    out = capsys.readouterr().out
+    assert "check-commits OK" in out and "SKIPPED" not in out, out
+    assert _check_commits(ob, repo, base, tmp_path / "no-such-ledger.jsonl") == 0
+    out = capsys.readouterr().out
+    assert "sent-ledger-absent" in out and "SKIPPED" in out and "check-commits OK" not in out, out
+
+
+# ---- every ledger reader shares the strict read (OUTBOX-SENT-GUARD-LEDGER-READ-HARDENING-1 r2) ----
+# r1 hardened only the guard's read. The drain's `read_ledger_keys` (drain, drain_kernel_filing, compute_debt) still let a
+# PermissionError / UnicodeDecodeError escape untyped, dropped a corrupt row without a word, and took any string as a key.
+# Discovery also read an inaccessible ledger as ABSENT, which skipped the guard.
+
+GOOD_KEY = "0123456789abcdef"
+
+
+def _ledger_with(tmp_path: Path, *lines: str) -> Path:
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+    return ledger
+
+
+def test_read_ledger_keys_returns_the_keys_of_a_clean_ledger_and_nothing_for_an_absent_one(ob, tmp_path):
+    ledger = _ledger_with(tmp_path, json.dumps({"key": GOOD_KEY}), "", json.dumps({"key": "fedcba9876543210", "item": "x"}))
+    assert ob.read_ledger_keys(ledger) == {GOOD_KEY, "fedcba9876543210"}
+    assert ob.read_ledger_keys(tmp_path / "no-such-ledger.jsonl") == set()
+    assert ob.read_ledger_keys(_ledger_with(tmp_path, "", "   ")) == set()   # blank lines are not rows
+
+
+def test_read_ledger_keys_on_a_locked_ledger_is_a_typed_unknown(ob, tmp_path, monkeypatch):
+    ledger = _ledger_with(tmp_path, json.dumps({"key": GOOD_KEY}))
+    real_read_text = Path.read_text
+
+    def locked(self, *args, **kwargs):
+        if self == ledger:
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", locked)
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.read_ledger_keys(ledger)
+    assert excinfo.value.code == "sent-ledger-unreadable" and "being used by another process" in excinfo.value.detail
+
+
+def test_read_ledger_keys_on_a_non_utf8_ledger_is_a_typed_unknown(ob, tmp_path):
+    ledger = _ledger_with(tmp_path, json.dumps({"key": GOOD_KEY}))
+    with open(ledger, "ab") as fh:
+        fh.write(b"\xff\n")
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.read_ledger_keys(ledger)
+    assert excinfo.value.code == "sent-ledger-unreadable"
+
+
+def test_read_ledger_keys_with_a_corrupt_row_beside_a_good_one_is_partial_and_counts_it(ob, tmp_path):
+    ledger = _ledger_with(tmp_path, json.dumps({"key": GOOD_KEY}), "{bad")
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.read_ledger_keys(ledger)
+    assert excinfo.value.code == "sent-ledger-partial" and "1 of 2" in excinfo.value.detail
+
+
+@pytest.mark.parametrize("bad_line", [
+    json.dumps({"key": ""}),                       # empty key
+    json.dumps({"key": 42}),                       # non-string key
+    json.dumps({"key": "not-a-sixteen-hex-key"}),  # string, wrong shape
+    json.dumps({"item": "no-key"}),
+    json.dumps(["key"]),
+])
+def test_read_ledger_keys_never_uses_a_malformed_key_as_a_key(ob, tmp_path, bad_line):
+    ledger = _ledger_with(tmp_path, bad_line)
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.read_ledger_keys(ledger)
+    assert excinfo.value.code == "sent-ledger-partial" and "1 of 1" in excinfo.value.detail
+
+
+def test_debt_on_an_unreadable_ledger_is_unknown_not_nothing_owed(ob, repo, tmp_path, capsys):
+    """compute_debt shares the read: a corrupt ledger is `debt: UNKNOWN` (exit 2), never a count taken on a partial key set."""
+    commit(repo, {SENT_ITEM: item_text()}, "file it\n\nDoctrine-Export: outbox\n")
+    ledger = _ledger_with(tmp_path, json.dumps({"key": GOOD_KEY}), "{bad")
+    assert ob.cmd_debt(repo, "HEAD", ledger) == 2
+    assert "UNKNOWN" in capsys.readouterr().out
+    assert ob.cmd_debt(repo, "HEAD", tmp_path / "no-such-ledger.jsonl") == 1   # ABSENT is unchanged: everything is owed
+
+
+class _StatDenied:
+    """Path.stat that raises PermissionError for one path, as an ACL-protected ledger does."""
+
+    def __init__(self, monkeypatch, target: Path):
+        real = Path.stat
+
+        def stat(path_self, *args, **kwargs):
+            if path_self == target:
+                raise PermissionError(13, "Access is denied")
+            return real(path_self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_a_ledger_whose_stat_is_denied_is_unreadable_not_absent_for_an_explicit_path(ob, repo, tmp_path, monkeypatch, capsys):
+    ledger = tmp_path / "sent.jsonl"
+    base, _key = _edited_sent_item_range(ob, repo, ledger)
+    _StatDenied(monkeypatch, ledger)
+    skips: list[str] = []
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.check_commits(repo, f"{base}..HEAD", [], ledger=ledger, skips=skips)
+    assert excinfo.value.code == "sent-ledger-unreadable" and "Access is denied" in excinfo.value.detail
+    assert skips == [], "an inaccessible ledger is UNKNOWN, never the `sent-ledger-absent` skip"
+    assert _check_commits(ob, repo, base, ledger) == 2
+    cap = capsys.readouterr()
+    assert "UNKNOWN" in cap.err and "sent-ledger-unreadable" in cap.err and "sent-ledger-absent" not in cap.out, (cap.out, cap.err)
+
+
+def test_a_ledger_whose_stat_is_denied_is_unreadable_not_absent_for_the_default_path(ob, repo, monkeypatch):
+    own = repo / ob.LEDGER_REL
+    base, _key = _edited_sent_item_range(ob, repo, own)
+    _StatDenied(monkeypatch, own)
+    skips: list[str] = []
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.check_commits(repo, f"{base}..HEAD", [], skips=skips)
+    assert excinfo.value.code == "sent-ledger-unreadable" and skips == []

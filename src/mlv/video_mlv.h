@@ -477,6 +477,7 @@ int getMlvLastProcessed8CacheHitScaleFactor(void);
 int getMlvLastProcessed8PrefetchHit(void);
 int getMlvProcessed8PrefetchEnabledForTesting(const mlvObject_t * video);
 int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video, uint32_t timeout_ms);
+void mlvSetProcessed8PrefetchPrepareFailuresForTesting(mlvObject_t * video, int count);
 void mlvSetProcessed8PrefetchPauseBeforeStoreForTesting(mlvObject_t * video, int enabled);
 int mlvWaitForProcessed8PrefetchPausedBeforeStoreForTesting(mlvObject_t * video,
                                                             uint32_t timeout_ms);
@@ -532,6 +533,10 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * MCRAW and CinemaDNG-folder sources (MLV containers only), an index out of range, a missing
  * index or file, a zero byte count, or a short read. Not for the playback path: it reads disk. */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
+ * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves
+ * no frame a later request could hit. Same return contract (0 = ok). */
+int getMlvRawFrameUint16Uncached(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
 int getMlvRawFrameProcessedUint16Direct(mlvObject_t * video,
                                         uint64_t frameIndex,
                                         uint16_t * outputFrame,

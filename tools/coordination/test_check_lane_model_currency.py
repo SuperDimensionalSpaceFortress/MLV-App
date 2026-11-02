@@ -313,6 +313,130 @@ class LoadAndCliTests(CurrencyFixture):
         self.assertIn("STALE-MODEL", result.stdout)
 
 
+REPO_ROOT = ROOT.parent.parent
+
+# The pre-MODEL-POSTURE-R19-ADOPT-1 shapes (fork/master 13d65263): Astra named as THE model of the
+# design-pass / arbiter row, and as the tie-breaker in the lane table comment.
+OLD_TIERING_ROW = (
+    "| judgement, cross-family | Codex Astra (`astra` tier row, `gpt-*-astra`) | high | one pre-implementation "
+    "design pass per substantive packet; one arbiter seat when consequential verdicts conflict | anything routine |"
+)
+NEW_TIERING_ROW = (
+    "| judgement, cross-family | Codex Sol tier (`sol` row). Astra (`astra` row) is an OPTIONAL diversity seat only "
+    "(bus R19.1: never a default, never a gate, never the only Codex seat a procedure waits for; a round that uses "
+    "it records `astra: diversity`) | high | one design pass; one arbiter seat | anything routine |"
+)
+OLD_LANES_COMMENT = (
+    "#   luna   -- breadth recon.\n"
+    "#   astra  -- tie-breaker / design arbiter on contested designs; never xhigh.\n"
+    "$LANES = @{\n"
+)
+NEW_LANES_COMMENT = (
+    "#   luna   -- breadth recon.\n"
+    "#   astra  -- optional diversity seat (bus R19.1): never a default, never a\n"
+    "#             gate, never the only Codex seat a procedure waits for; a round using it records\n"
+    "#             `astra: diversity`. Design-pass and arbiter duties go to the sol tier. Never xhigh.\n"
+    "$LANES = @{\n"
+)
+
+
+class AstraPostureTests(unittest.TestCase):
+    """MODEL-POSTURE-R19-ADOPT-1 (bus R19.1 clause 3): Astra is an occasional diversity seat, never a
+    default or a gate; a procedure that reserved a role for it re-points that role to the Sol tier."""
+
+    def test_the_old_astra_as_the_design_arbiter_row_is_refused(self):
+        problems = check.posture_violations(OLD_TIERING_ROW, NEW_LANES_COMMENT)
+        self.assertTrue(any("orchestration-tiering" in p for p in problems), problems)
+
+    def test_the_new_diversity_row_and_comment_pass(self):
+        self.assertEqual(check.posture_violations(NEW_TIERING_ROW, NEW_LANES_COMMENT), [])
+
+    def test_the_old_tie_breaker_comment_is_refused(self):
+        problems = check.posture_violations(NEW_TIERING_ROW, OLD_LANES_COMMENT)
+        self.assertTrue(any("Invoke-Lane" in p for p in problems), problems)
+
+    def test_a_row_that_makes_astra_a_gate_is_refused_even_with_a_diversity_word(self):
+        gate = NEW_TIERING_ROW.replace("never a gate", "a gate")
+        self.assertTrue(check.posture_violations(gate, NEW_LANES_COMMENT))
+
+    def test_a_row_that_names_astra_before_sol_is_refused(self):
+        swapped = NEW_TIERING_ROW.replace("Codex Sol tier (`sol` row). Astra (`astra` row)",
+                                          "Codex Astra (`astra` row). Sol tier (`sol` row)")
+        self.assertTrue(check.posture_violations(swapped, NEW_LANES_COMMENT))
+
+    def test_a_missing_astra_comment_block_is_refused_not_passed(self):
+        problems = check.posture_violations(NEW_TIERING_ROW, "$LANES = @{\n}\n")
+        self.assertTrue(any("Invoke-Lane" in p for p in problems), problems)
+
+    def test_prose_mentions_of_astra_outside_table_rows_are_not_judged(self):
+        prose = "astra joined Luna and Sol at high.\n" + NEW_TIERING_ROW
+        self.assertEqual(check.posture_violations(prose, NEW_LANES_COMMENT), [])
+
+    # KNOWN LIMITS (dot 718b5ce8 I1 on PR 675): the guard is a bounded text lint over marker substrings,
+    # their order and one comment block. These two tests pin what it does NOT catch; if a later change
+    # makes it catch them, flip the assertion rather than delete the test.
+    def test_known_limit_a_row_keeping_every_marker_but_adding_a_required_duty_still_passes(self):
+        contradictory = NEW_TIERING_ROW.replace(
+            "| anything routine |",
+            "| anything routine; Astra is required for every design pass and must sign off before merge |")
+        self.assertIn("required", contradictory)
+        self.assertIn("never a gate", contradictory)
+        self.assertEqual(check.posture_violations(contradictory, NEW_LANES_COMMENT), [])
+
+    def test_known_limit_a_duty_outside_the_checked_comment_block_still_passes(self):
+        elsewhere = NEW_LANES_COMMENT + (
+            "# Every packet must wait for the astra seat; astra is the required design arbiter.\n"
+            "#   astra  -- required design arbiter (a second, unchecked comment block).\n")
+        self.assertEqual(check.posture_violations(NEW_TIERING_ROW, elsewhere), [])
+
+    def test_known_limit_a_contradictory_duty_in_a_row_that_does_not_name_astra_is_not_seen(self):
+        other_row = "| design arbiter | the second Codex seat is required on every packet | high | x | y |"
+        self.assertEqual(check.posture_violations(NEW_TIERING_ROW + "\n" + other_row, NEW_LANES_COMMENT), [])
+
+    def test_the_lint_describes_itself_as_bounded_not_proof(self):
+        self.assertIn("BOUNDED TEXT LINT", check.__doc__)
+        self.assertIn("KNOWN LIMIT", check.__doc__)
+        self.assertIn("not proof", check.posture_violations.__doc__)
+        done = subprocess.run([sys.executable, str(SCRIPT), "--posture", "--repo-root", str(REPO_ROOT)],
+                              capture_output=True, text=True, timeout=30)
+        self.assertIn("bounded text lint", json.loads(done.stdout)["scope"])
+
+    def test_the_astra_role_label_is_marked_legacy_where_it_is_defined_and_emitted(self):
+        text = (REPO_ROOT / check.INVOKE_LANE_REL).read_text(encoding="utf-8-sig")
+        self.assertIn("role = 'tie-breaker-design-arbiter'", text)  # label unchanged; guardrail test pins it
+        self.assertEqual(text.count("LEGACY"), 2, "one note at the $LANES row, one at the receipt emit site")
+        self.assertEqual(text.count("NOT current routing authority"), 1)
+        self.assertEqual(text.count("must not take it as"), 1)
+
+    def test_the_committed_files_satisfy_the_posture(self):
+        problems, error = check.check_posture(str(REPO_ROOT))
+        self.assertIsNone(error)
+        self.assertEqual(problems, [])
+
+    def test_cli_posture_exit_zero_on_the_committed_files_and_one_on_a_violation(self):
+        done = subprocess.run([sys.executable, str(SCRIPT), "--posture", "--repo-root", str(REPO_ROOT)],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        root = Path(tempfile.mkdtemp(prefix="posture-root-"))
+        self.addCleanup(shutil.rmtree, str(root), True)
+        (root / "agents").mkdir()
+        (root / "tools" / "coordination").mkdir(parents=True)
+        (root / "agents" / "orchestration-tiering.md").write_text(OLD_TIERING_ROW + "\n", encoding="utf-8")
+        (root / "tools" / "coordination" / "Invoke-Lane.ps1").write_text(OLD_LANES_COMMENT, encoding="utf-8")
+        done = subprocess.run([sys.executable, str(SCRIPT), "--posture", "--repo-root", str(root)],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertFalse(json.loads(done.stdout)["ok"])
+
+    def test_cli_posture_exit_two_when_a_file_is_missing(self):
+        root = Path(tempfile.mkdtemp(prefix="posture-empty-"))
+        self.addCleanup(shutil.rmtree, str(root), True)
+        done = subprocess.run([sys.executable, str(SCRIPT), "--posture", "--repo-root", str(root)],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertTrue(json.loads(done.stdout)["error"].startswith("posture-file-unreadable:"))
+
+
 class DefaultRunsDirTests(unittest.TestCase):
     """default_runs_dir() must not depend on the caller's cwd: git prints a RELATIVE common dir
     from the main checkout, and abspath() of that resolved against the caller, not the script."""

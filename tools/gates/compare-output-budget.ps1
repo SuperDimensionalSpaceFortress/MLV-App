@@ -114,7 +114,10 @@ if ([string]::IsNullOrWhiteSpace($EvidencePath)) {
                         RequireLookAssist = $false
                     }
                     if ([string]$profile.playbackProcessing -eq 'receipt') {
-                        $runnerArgs.Receipt = [string]$spec.receipt.path
+                        # a repo-relative receipt (the tracked fixture) is resolved against the repo root, never the caller's cwd
+                        $receiptPath = [string]$spec.receipt.path
+                        if (-not [IO.Path]::IsPathRooted($receiptPath)) { $receiptPath = [IO.Path]::GetFullPath((Join-Path $root $receiptPath)) }
+                        $runnerArgs.Receipt = $receiptPath
                     }
                     & $runner @runnerArgs | Out-Null
                     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {

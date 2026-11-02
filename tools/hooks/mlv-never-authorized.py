@@ -820,6 +820,9 @@ NA10_GUARDED_TAILS = (
     ".claude/settings.local.json",
     "tools/hooks/mlv-never-authorized.py",
     "tools/gates/verify_consented_footage.py",
+    # NA10-WMI-GUARD-TAIL-1: the hidden-WMI-create guard is registered in .claude/settings.json
+    # beside this hook; a lane that rewrites it to `sys.exit(0)` turns that guard off.
+    "tools/hooks/wmi-create-hidden-guard.py",
 )
 
 # NA-11 (owner ruling 2026-09-09): Agent Bridge product SoT is layibabalola/agent-bridge.

@@ -160,3 +160,15 @@ TEST(VisualCaptureSourceDifferenceWiring, SourceHashesAreReadAfterPlayStopsAndAp
     // No second Play stop or start was added to the capture block.
     ASSERT_EQ(1, block.count(QStringLiteral("ui->actionPlay->setChecked(")));
 }
+
+// Master merge (2026-11-02): the capture block now takes forced "play" and unforced "play_unbound" captures, and the
+// runner judges the frozen check on the unforced ones when present -- so both kinds are hashed and carry a source_id.
+TEST(VisualCaptureSourceDifferenceWiring, BothPlayCaptureKindsCarryASourceId)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "return kind == QStringLiteral(\"play\") || kind == QStringLiteral(\"play_unbound\");")));
+    ASSERT_TRUE(source.contains(QStringLiteral("if( !isPlayCaptureKind( grab.kind ) ) continue;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("if( isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
+    ASSERT_FALSE(source.contains(QStringLiteral("if( grab.kind != QStringLiteral(\"play\") ) continue;")));
+}

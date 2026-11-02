@@ -44,12 +44,43 @@ class SelectReviewKeyBTests(unittest.TestCase):
         self.assertEqual((s["keyB"], s["producerLane"]), ("fable", "opus"))
         self.assertIn("no self-review", s["reason"])
 
-    def test_the_newest_producer_receipt_decides_by_start_time_not_by_directory_order(self):
+    def test_an_older_opus_round_forces_fable_and_producer_lane_is_still_the_newest_by_start_time(self):
+        # KEYB-SELECTOR-ANY-OPUS-ROUND-1: the newest receipt (sonnet) is NOT what decides key B any more;
+        # an opus round anywhere in the card forces fable. producerLane still names the newest by
+        # startedUtc, and the directory order is the reverse of the time order (sonnet's dir sorts first).
         self.receipt("CARD-1", "sonnet", "2026-10-12T12:00:00.0000000Z", run_name="lane-CARD-1-r1-a")
         self.receipt("CARD-1", "opus", "2026-10-12T09:00:00.0000000Z", run_name="lane-CARD-1-r2-z")
-        self.assertEqual(self.select()["keyB"], "opus")     # sonnet is newer, so opus is a fine key B
+        s = self.select()
+        self.assertEqual((s["keyB"], s["producerLane"], s["opusRounds"]), ("fable", "sonnet", 1))
+        self.assertIn("lane-CARD-1-r1-a", s["producerReceipt"])
+        self.assertIn("lane-CARD-1-r2-z", s["reason"])      # the reason names the opus receipt that forced fable
+        self.assertIn("no self-review", s["reason"])
         self.receipt("CARD-1", "opus", "2026-10-12T15:00:00.0000000Z", run_name="lane-CARD-1-r3-b")
-        self.assertEqual(self.select()["keyB"], "fable")    # opus is now the newest producer
+        s = self.select()
+        self.assertEqual((s["keyB"], s["producerLane"], s["opusRounds"]), ("fable", "opus", 2))  # opus is now the newest
+
+    def test_the_pr453_shape_opus_r2_opus_r2b_then_a_newer_sonnet_rebind_gets_fable(self):
+        self.receipt("CARD-1", "opus", "2026-10-15T20:00:00.0000000Z", run_name="lane-CARD-1-r2-20261015T2000Z")
+        self.receipt("CARD-1", "opus", "2026-10-15T23:00:00.0000000Z", run_name="lane-CARD-1-r2b-20261015T2300Z")
+        self.receipt("CARD-1", "sonnet", "2026-10-16T01:15:00.0000000Z", run_name="lane-CARD-1-r3-20261016T0115Z")
+        s = self.select()
+        self.assertEqual((s["keyB"], s["producerLane"], s["opusRounds"]), ("fable", "sonnet", 2))
+        self.assertIn("r2b", s["reason"])                   # the NEWEST opus receipt is the one named
+
+    def test_sonnet_only_rounds_keep_opus_as_key_b(self):
+        self.receipt("CARD-1", "sonnet", "2026-10-12T10:00:00.0000000Z", run_name="lane-CARD-1-r1")
+        self.receipt("CARD-1", "sonnet", "2026-10-12T11:00:00.0000000Z", run_name="lane-CARD-1-r2")
+        s = self.select()
+        self.assertEqual((s["keyB"], s["producerLane"], s["opusRounds"]), ("opus", "sonnet", 0))
+        self.assertEqual(s["reason"], "producer-receipt")
+        self.assertEqual(s["warnings"], [])
+
+    def test_an_opus_review_key_receipt_does_not_force_fable(self):
+        # a read-only opus key (allowEdits false) wrote nothing, so it is not a producer round
+        self.receipt("CARD-1", "sonnet", "2026-10-12T10:00:00.0000000Z")
+        self.receipt("CARD-1", "opus", "2026-10-12T11:00:00.0000000Z", allow_edits=False, run_name="review-pr9-opus-r1-CARD-1")
+        s = self.select()
+        self.assertEqual((s["keyB"], s["producerLane"], s["opusRounds"]), ("opus", "sonnet", 0))
 
     def test_review_key_receipts_never_name_the_producer(self):
         self.receipt("CARD-1", "sonnet", "2026-10-12T10:00:00.0000000Z")
@@ -97,6 +128,7 @@ class SelectReviewKeyBTests(unittest.TestCase):
         s = self.select("NO-SUCH-CARD", "-ProducerLane", "opus")
         self.assertEqual((s["keyB"], s["reason"].split(";")[0]), ("fable", "producer-given"))
         self.assertEqual(self.select("NO-SUCH-CARD", "-ProducerLane", "sonnet")["keyB"], "opus")
+        self.assertEqual(self.select("NO-SUCH-CARD", "-ProducerLane", "sonnet")["opusRounds"], 0)  # no receipt is read
 
     def test_an_unknown_producer_lane_or_runs_dir_is_a_usage_error(self):
         result = self.select("CARD-1", "-ProducerLane", "gpt", expect=2)

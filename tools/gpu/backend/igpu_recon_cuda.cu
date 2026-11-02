@@ -2430,6 +2430,11 @@ int igpu_recon_retain_last_device_output(igpu_recon_backend* b,
                   b->d_out,
                   bytes,
                   cudaMemcpyDeviceToDevice));
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-c: a device-to-device cudaMemcpy returns before the copy has
+     * run, on the default stream, and every reader of the retained pointer (the AMaZE streams, the warm reuse capture
+     * and compare) is cudaStreamNonBlocking, so none of them is ordered after it. The copy is host-complete before the
+     * pointer is handed out. */
+    CK(IGPU_LT_SYNC_CALL("retain:d2d_sync", cudaStreamSynchronize(0)));
     uint64_t next = b->next_retained_device_output_token++;
     if (next == 0) {
         next = b->next_retained_device_output_token++;

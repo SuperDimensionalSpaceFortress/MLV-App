@@ -18,6 +18,9 @@ public:
     bool openClipFile(const QString & clip_path, QString * error_message);
     bool loadReceipt(const QString & relative_path, QString * error_message);
     bool applyReceipt(QString * error_message);
+    /* Replaces the processing object with a fresh initProcessingObject() linked to
+     * the open clip; call applyReceipt again to restore the receipt's settings. */
+    bool resetProcessing(QString * error_message);
 
     std::vector<float> renderRawFrameFloat(uint64_t frame_index) const;
     std::vector<uint16_t> renderDebayeredFrame16(uint64_t frame_index) const;
