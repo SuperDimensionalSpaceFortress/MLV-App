@@ -7024,6 +7024,12 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in NATIVE_PACED_LEGS:   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s[24]$", path.name)
+                # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
+                self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
+                self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
