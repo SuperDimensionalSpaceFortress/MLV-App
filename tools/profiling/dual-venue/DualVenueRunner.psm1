@@ -2210,15 +2210,23 @@ function Get-DvPngImageProblem {
     if (-not ($script:PngBitDepths.ContainsKey($colour) -and $depth -in $script:PngBitDepths[$colour])) { return "its IHDR bit depth $depth with colour type $colour is not a PNG pixel format" }
     if ($Bytes[26] -ne 0 -or $Bytes[27] -ne 0 -or $Bytes[28] -gt 1) { return 'its IHDR compression, filter or interlace method is not one PNG defines' }
     $interlaced = ($Bytes[28] -eq 1)
-    $at = 8; $sawIdat = $false; $sawPlte = $false
+    $at = 8; $sawIdat = $false; $sawPlte = $false; $idatEnded = $false
     $idat = [IO.MemoryStream]::new()
     while ($true) {
         if ($at + 12 -gt $n) { return 'its chunks end without an IEND chunk, so it is truncated' }
         $length = & $u32 $at; $name = & $type ($at + 4)
         if ($name -cnotmatch '^[A-Za-z]{4}$') { return "the chunk at byte $at has no PNG chunk type" }
         if ($length -gt 0x7FFFFFFF -or $at + 12 + $length -gt $n) { return "its $name chunk at byte $at runs past the end of the file ($n bytes), so it is truncated" }
+        # r11 fix 1 (adversary r11 b4a4147f A1 and its class): the chunk sequence a decoder accepts. IHDR only first (a second, contradicting IHDR was
+        # ignored); no critical chunk (upper-case first letter) other than IHDR, PLTE, IDAT and IEND; at most one PLTE, and never after the image data;
+        # the IDAT chunks consecutive.
+        if ($name -ceq 'IHDR' -and $at -ne 8) { return "it has a second IHDR chunk at byte $at" }
+        if ($name -cmatch '^[A-Z]' -and $name -cnotin @('IHDR', 'PLTE', 'IDAT', 'IEND')) { return "its $name chunk at byte $at is a critical chunk PNG does not define" }
+        if ($name -ceq 'PLTE' -and ($sawPlte -or $sawIdat)) { return "its PLTE chunk at byte $at $(if ($sawPlte) { 'repeats' } else { 'comes after the image data' })" }
+        if ($name -cne 'IDAT' -and $sawIdat) { $idatEnded = $true }
         if ($name -ceq 'IDAT') {
             if ($colour -eq 3 -and -not $sawPlte) { return 'it is a palette image with no PLTE chunk before its image data' }
+            if ($idatEnded) { return "its IDAT chunk at byte $at is not consecutive with the earlier IDAT chunks" }
             $sawIdat = $true; $idat.Write($Bytes, $at + 8, [int]$length)
         }
         else {   # (IDAT bytes are covered by the zlib stream's own Adler-32 below; every other chunk is small, so its CRC-32 is checked here)
@@ -2235,6 +2243,11 @@ function Get-DvPngImageProblem {
     $bits = $depth * $script:PngChannels[$colour]
     $passes = $script:PngAdam7
     if (-not $interlaced) { $passes = @(, @(0, 0, 1, 1)) }   # (a direct assignment: a $(...) or if-expression would unroll the one pass into four numbers)
+    # r11 fix 1 (adversary r11 b4a4147f A3): the byte count IHDR implies, bounded in floating point BEFORE any [long] arithmetic. A 2^31-1 square 16-bit
+    # RGBA header implied ~3.7e19 bytes and threw an Int64 overflow out of this function (collection UNRESOLVED) instead of a refusal. No still this
+    # check reads is near 1 GiB inflated (an 8K 16-bit RGBA frame is ~265 MB), so a larger header is refused as no image this check reads.
+    $impliedBytes = [double]$height * (1.0 + [Math]::Ceiling([double]$width * [double]$bits / 8.0))
+    if ($impliedBytes -gt 1GB) { return "its IHDR says $width x $height at $bits bits per pixel, about $([Math]::Round($impliedBytes / 1GB, 1)) GiB of image data, larger than any still this check reads (1 GiB)" }
     $segments = [System.Collections.Generic.List[long[]]]::new()
     foreach ($p in $passes) {
         $pw = $(if ($width -gt $p[0]) { [Math]::Floor(($width - $p[0] + $p[2] - 1) / $p[2]) } else { 0 })
@@ -2242,31 +2255,51 @@ function Get-DvPngImageProblem {
         if ($pw -gt 0 -and $ph -gt 0) { $segments.Add([long[]]@([long]$ph, [long](1 + [Math]::Floor(($pw * $bits + 7) / 8)))) }
     }
     [long]$expected = 0; foreach ($s in $segments) { $expected += $s[0] * $s[1] }
-    $idat.Position = 0
+    # r11 fix 1 (adversary r11 b4a4147f A2): the IDAT data must be ONE complete zlib stream whose Adler-32 is checked. The inflater stops without an
+    # error when its input runs out, so a stream with no Adler-32 trailer, or whose deflate data never reaches a final block, inflated to the right byte
+    # count and passed. The inflater now reads the IDAT data followed by a 64-byte 0xFF tail. A deflate stream that never reaches its final block is fed
+    # the tail as more deflate data (0xFF codes literals, or a reserved block type), so it errors or inflates past the image's byte count. One that does
+    # end is followed by the 4 bytes ZLibStream (.NET 6+) checks as its Adler-32: the real trailer passes, while a missing one (the tail is read instead)
+    # or a misplaced one (whatever follows the deflate data is read instead) fails with InvalidDataException. The raw DeflateStream of .NET before 6
+    # checks no trailer, so there the last 4 bytes of the IDAT data must equal the Adler-32 of the inflated bytes, computed here.
+    $idatLength = $idat.Length
+    if ($idatLength -lt 6) { return "its IDAT data is $idatLength bytes, too short for a zlib stream (2-byte header, deflate data, 4-byte Adler-32)" }
+    $idatBytes = $idat.ToArray(); $idat.Dispose()
+    [long]$trailer = ([long]$idatBytes[$idatLength - 4] -shl 24) -bor ([long]$idatBytes[$idatLength - 3] -shl 16) -bor ([long]$idatBytes[$idatLength - 2] -shl 8) -bor [long]$idatBytes[$idatLength - 1]
+    $cmf = [int]$idatBytes[0]; $flg = [int]$idatBytes[1]
+    if (($cmf -band 0x0F) -ne 8 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header' }
+    $fed = [IO.MemoryStream]::new()
     $zType = 'System.IO.Compression.ZLibStream' -as [type]
-    if ($null -eq $zType) {   # (.NET before 6: check the 2-byte zlib header, then inflate the raw deflate data after it)
-        $cmf = $idat.ReadByte(); $flg = $idat.ReadByte()
-        if ($flg -lt 0 -or ($cmf -band 0x0F) -ne 8 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header' }
-    }
+    if ($null -ne $zType) { $fed.Write($idatBytes, 0, $idatLength) } else { $fed.Write($idatBytes, 2, $idatLength - 2) }   # (.NET before 6: raw deflate after the header)
+    $fed.Write([byte[]](@(0xFF) * 64), 0, 64)
+    $fed.Position = 0
     $z = $null
+    [long]$adlerA = 1; [long]$adlerB = 0
     try {
-        $z = $(if ($null -ne $zType) { $zType::new($idat, [IO.Compression.CompressionMode]::Decompress) } else { [IO.Compression.DeflateStream]::new($idat, [IO.Compression.CompressionMode]::Decompress) })
+        $z = $(if ($null -ne $zType) { $zType::new($fed, [IO.Compression.CompressionMode]::Decompress) } else { [IO.Compression.DeflateStream]::new($fed, [IO.Compression.CompressionMode]::Decompress) })
         $buf = [byte[]]::new(65536); [long]$total = 0
         $seg = 0; [long]$rowsLeft = $segments[0][0]; [long]$nextFilter = 0
         while (($got = $z.Read($buf, 0, $buf.Length)) -gt 0) {
-            if ($total + $got -gt $expected) { return "its IDAT data inflates to more than the $expected bytes a $width x $height image holds" }
+            if ($total + $got -gt $expected) { return "its IDAT data inflates to more than the $expected bytes a $width x $height image holds (or its deflate data never ends)" }
             while ($seg -lt $segments.Count -and $nextFilter -lt $total + $got) {
                 $f = $buf[$nextFilter - $total]
                 if ($f -gt 4) { return "a scanline of its image data has filter type $f (PNG defines 0 .. 4), so it is not image data" }
                 $nextFilter += $segments[$seg][1]; $rowsLeft--
                 if ($rowsLeft -eq 0) { $seg++; if ($seg -lt $segments.Count) { $rowsLeft = $segments[$seg][0] } }
             }
+            # (.NET before 6 only) Adler-32 of the inflated bytes, in blocks of at most 5552 (zlib's NMAX: the sums cannot overflow before the modulo)
+            if ($null -eq $zType) { for ($blk = 0; $blk -lt $got; $blk += 5552) {
+                $end = [Math]::Min($got, $blk + 5552)
+                for ($i = $blk; $i -lt $end; $i++) { $adlerA += $buf[$i]; $adlerB += $adlerA }
+                $adlerA %= 65521; $adlerB %= 65521
+            } }
             $total += $got
         }
     }
     catch { return "its IDAT data is not a valid zlib stream ($($_.Exception.GetType().Name))" }
-    finally { if ($null -ne $z) { $z.Dispose() }; $idat.Dispose() }
+    finally { if ($null -ne $z) { $z.Dispose() }; $fed.Dispose() }
     if ($total -ne $expected) { return "its IDAT data inflates to $total bytes but a $width x $height image needs $expected, so it is truncated" }
+    if ($null -eq $zType -and (($adlerB -shl 16) -bor $adlerA) -ne $trailer) { return 'its IDAT data does not end with the Adler-32 of its image data (a zlib stream with no, or a misplaced, trailer)' }
     $null
 }
 

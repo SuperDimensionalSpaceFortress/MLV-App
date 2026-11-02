@@ -1252,6 +1252,34 @@ NOT_A_PNG = (("zero-byte", b""),                                                
              ("ihdr-bad-crc", _GOOD[:29] + bytes(b ^ 0xFF for b in _GOOD[29:33]) + _GOOD[33:]),
              ("palette-without-plte", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"))),
              ("interlaced-with-flat-scanlines", png_of(5, 5, 8, 2, 1, zlib.compress(b"".join(b"\x00" + bytes(15) for _ in range(5))))))
+# r11 fix 1 (adversary r11 b4a4147f): A1 a second IHDR that contradicts the first (the 1x1 header was checked, Pillow reads it as truncated); A2 an IDAT
+# zlib stream with no Adler-32 trailer (Python zlib: incomplete); A3 (advisory) a 2^31-1 square 16-bit RGBA IHDR that threw an Int64 overflow instead of
+# being refused. All three verbatim. Siblings of the same class -- chunk sequences a PNG decoder refuses: an unknown critical chunk, a second PLTE, a PLTE
+# after the image data, IDAT chunks that are not consecutive, a zlib trailer that is present but not where the deflate data ends, and a deflate stream
+# that never ends (no final block). The unit check reads them all; collection and final validation call the same helper (Get-DvPairedSeekVerdict).
+ADVERSARY_R11_A1 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000d4948445200000002000000020802000000fdd49a730000000c49444154789c63606060000000040001f61738550000000049454e44ae426082")
+ADVERSARY_R11_A2 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000849444154789c636060600000dd36fd700000000049454e44ae426082")
+ADVERSARY_R11_A3 = bytes.fromhex("89504e470d0a1a0a0000000d494844527fffffff7fffffff10060000004459d7250000000c49444154789c63606060000000040001f61738550000000049454e44ae426082")
+_RGB_STREAM = zlib.compress(_RGB_ROWS)
+_RAW_DEFLATE = zlib.compressobj(6, zlib.DEFLATED, -15)
+_RGB_DEFLATE = _RAW_DEFLATE.compress(_RGB_ROWS) + _RAW_DEFLATE.flush()
+_RAW_NOFINAL = zlib.compressobj(6, zlib.DEFLATED, -15)
+_RGB_NOFINAL = _RAW_NOFINAL.compress(_RGB_ROWS) + _RAW_NOFINAL.flush(zlib.Z_SYNC_FLUSH)   # every row, but no final block: the stream never ends
+_ADLER = struct.pack(">I", zlib.adler32(_RGB_ROWS) & 0xFFFFFFFF)
+_IHDR_4X3 = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 3, 8, 2, 0, 0, 0))
+R11_NOT_A_PNG = (("second-ihdr-contradicts-first", ADVERSARY_R11_A1),
+                 ("idat-zlib-without-adler32", ADVERSARY_R11_A2),
+                 ("ihdr-2gib-square-rgba16", ADVERSARY_R11_A3),
+                 ("unknown-critical-chunk", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"ABCD", b"x"))),
+                 ("second-plte", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") * 2)),
+                 ("plte-after-idat", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + png_chunk(b"IDAT", _RGB_STREAM) + png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"IEND", b"")),
+                 ("idat-not-consecutive", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + png_chunk(b"IDAT", _RGB_STREAM[:6]) + png_chunk(b"tEXt", b"k\x00v")
+                  + png_chunk(b"IDAT", _RGB_STREAM[6:]) + png_chunk(b"IEND", b"")),
+                 ("idat-junk-before-adler32", png_of(4, 3, 8, 2, 0, b"\x78\x9c" + _RGB_DEFLATE + b"\x00\x00\x00\x00" + _ADLER)),
+                 ("idat-deflate-never-ends", png_of(4, 3, 8, 2, 0, b"\x78\x9c" + _RGB_NOFINAL + _ADLER)))
+# controls the r11 check must still accept: stored (level 0) deflate blocks, and a valid ancillary chunk between IHDR and IDAT
+R11_PNG_CONTROLS = (("ok-stored-blocks.png", png_of(4, 3, 8, 2, 0, zlib.compress(_RGB_ROWS, 0))),
+                    ("ok-ancillary-chunk.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tEXt", b"k\x00v"))))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -1285,7 +1313,8 @@ class PngImageCheckUnitTests(unittest.TestCase):
         cases = {**{f"bad-{n}.png": (b, False) for n, b in NOT_A_PNG}, "bad-depth.png": (bad_depth, False),
                  "ok-fixture.png": (_GOOD, True), "ok-grey.png": (grey, True), "ok-rgba16.png": (rgba16, True), "ok-interlaced.png": (laced, True),
                  "ok-interlaced-5x5.png": (laced5, True), "ok-palette.png": (palette, True), "ok-1bit.png": (onebit, True), "ok-split-idat.png": (split, True),
-                 "ok-1920x1080.png": (hd, True)}
+                 "ok-1920x1080.png": (hd, True),
+                 **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{n: (b, True) for n, b in R11_PNG_CONTROLS}}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
