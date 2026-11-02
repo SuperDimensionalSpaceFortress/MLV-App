@@ -504,7 +504,13 @@ function Initialize-BoundedCaptureIo {
     using System.Threading.Tasks;
     public static class BoundedCaptureIo {
         public static Task<string> ReadAllText(string path) { return Task.Run(() => File.ReadAllText(path)); }
-        public static Task Delete(string[] paths) { return Task.Run(() => { foreach (string p in paths) { try { File.Delete(p); } catch (Exception) { } } }); }
+        public static Task<string> Delete(string[] paths) {
+            return Task.Run(() => {
+                var left = new System.Collections.Generic.List<string>();
+                foreach (string p in paths) { try { File.Delete(p); } catch (Exception) { } if (File.Exists(p)) { left.Add(p); } }
+                return string.Join(", ", left);
+            });
+        }
     }
 '@
 }
@@ -543,7 +549,12 @@ function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBo
     try {
         $task = Get-CaptureTask $Start $Paths { [BoundedCaptureIo]::Delete($Paths) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
-        if ($task.Wait($left)) { return '' }
+        if ($task.Wait($left)) {
+            # The task reports the files a failed delete left behind (adversary r7 A3); a seam's plain Task has no Result and means none.
+            $present = if ($null -ne $task.PSObject.Properties['Result']) { [string]$task.Result } else { '' }
+            if ($present) { return "capture cleanup incomplete: still present: $present" }
+            return ''
+        }
         return "capture cleanup abandoned after $([Math]::Round($BoundMs / 1000, 3)) s: $($Paths -join ', ')"
     }
     catch { return "capture cleanup failed: $($_.Exception.Message): $($Paths -join ', ')" }

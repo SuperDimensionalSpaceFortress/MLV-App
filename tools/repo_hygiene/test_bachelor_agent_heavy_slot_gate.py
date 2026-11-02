@@ -78,11 +78,22 @@ def _remove_capture_dir(path: str) -> str:
     The removal runs in a daemon thread that is abandoned if it does not finish, so a stalled temp store (a hung share, a slow
     enumeration, a held handle) cannot hold the verdict back. The note names the step and the path left behind.
     """
-    remover = threading.Thread(target=lambda: shutil.rmtree(path, ignore_errors=True), name="rmtree-capture", daemon=True)
-    remover.start()
+    left: dict[str, bool] = {}
+
+    def remove() -> None:
+        shutil.rmtree(path, ignore_errors=True)
+        left["present"] = os.path.exists(path)  # ignore_errors hides a held or read-only file; the caller is told it stayed (adversary r7 A3)
+
+    remover = threading.Thread(target=remove, name="rmtree-capture", daemon=True)
+    try:
+        remover.start()
+    except Exception as exc:  # noqa: BLE001 - adversary r7 A1: a worker that cannot start must not replace the case-named verdict
+        return f"capture cleanup not started ({type(exc).__name__}: {exc}): {path}"
     remover.join(CAPTURE_CLEANUP_BOUND_SEC)
     if remover.is_alive():
         return f"capture cleanup abandoned after {CAPTURE_CLEANUP_BOUND_SEC:g} s: {path}"
+    if left.get("present"):
+        return f"capture cleanup incomplete: {path} was not fully removed"
     return ""
 
 
@@ -102,7 +113,13 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
             box["error"] = exc
 
     reader = threading.Thread(target=read, name=f"read-{path.name}", daemon=True)
-    reader.start()
+    try:
+        reader.start()
+    except Exception as exc:  # noqa: BLE001 - adversary r7 A1: "can't start new thread" must not replace the case-named verdict
+        note = f"<read failed: could not start the reader thread ({type(exc).__name__}: {exc})>"
+        if tolerate_oserror:
+            return note
+        raise
     reader.join(READ_BOUND_SEC)
     if reader.is_alive():
         note = f"<read timed out: {path.name} not readable within {READ_BOUND_SEC:g} s>"
@@ -1027,6 +1044,61 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertTrue(any("capture cleanup abandoned after 0.3 s" in str(w.message) and "clean-run-case" in str(w.message)
                             for w in recorded), [str(w.message) for w in recorded])
 
+    def _run_with_failing_thread_start(self, thread_name_prefix: str, *, timeout_expires: bool = True) -> BaseException:
+        proc = BoundedRunOutputReadFailureTests._TimedOutProc()
+        if not timeout_expires:
+            proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
+        real_start = threading.Thread.start
+
+        def start(thread: threading.Thread) -> None:
+            if thread.name.startswith(thread_name_prefix):
+                raise RuntimeError("can't start new thread")
+            real_start(thread)
+
+        popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
+        with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(threading.Thread, "start", start):
+            try:
+                run_bounded(["child"], 3, "thread-start-case")
+            except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                return exc
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_worker_thread_that_cannot_start_keeps_the_case_named_verdict(self) -> None:
+        # adversary r7 A1: Thread.start() raising RuntimeError("can't start new thread") (a thread or memory limit) escaped from the reader
+        # and from the cleanup and replaced the case-named verdict.
+        caught = self._run_with_failing_thread_start("read-")
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("thread-start-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("<read failed: could not start the reader thread (RuntimeError: can't start new thread)>", str(caught))
+        caught = self._run_with_failing_thread_start("rmtree-capture")
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("thread-start-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("capture cleanup not started (RuntimeError: can't start new thread): ", str(caught))
+
+    def test_a_reader_thread_that_cannot_start_without_a_timeout_surfaces_as_itself(self) -> None:
+        caught = self._run_with_failing_thread_start("read-", timeout_expires=False)
+        self.assertIsInstance(caught, RuntimeError, repr(caught))
+
+    def test_a_cleanup_that_leaves_the_capture_behind_is_reported_not_silent(self) -> None:
+        # adversary r7 A3: shutil.rmtree(ignore_errors=True) hides a held or read-only file, so the removal read as a success.
+        real_rmtree = shutil.rmtree
+        seen: list[str] = []
+
+        def leave_behind(path: str, *args: object, **kwargs: object) -> None:
+            seen.append(path)
+
+        proc = BoundedRunOutputReadFailureTests._TimedOutProc()
+        popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
+        try:
+            with mock.patch.object(subprocess, "Popen", side_effect=popen), mock.patch.object(shutil, "rmtree", leave_behind):
+                with self.assertRaises(AssertionError) as caught:
+                    run_bounded(["child"], 3, "left-behind-case")
+        finally:
+            for path in seen:
+                real_rmtree(path, ignore_errors=True)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(f"capture cleanup incomplete: {seen[0]} was not fully removed", str(caught.exception))
+
     def test_a_finished_cleanup_adds_no_note_to_the_verdict(self) -> None:
         caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
         self.assertNotIn("capture cleanup", str(caught))
@@ -1097,11 +1169,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "Write-Output ('STALLED|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
                   "$real = [IO.Path]::GetTempFileName()\n"
-                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n")
+                  "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n"
+                  # adversary r7 A3: a delete that fails (a read-only or held file) is reported, not read as a success.
+                  "$stuck = [IO.Path]::GetTempFileName(); [IO.File]::SetAttributes($stuck, [IO.FileAttributes]::ReadOnly)\n"
+                  "Write-Output ('STUCK|' + (Remove-CaptureFiles @($stuck)) + '|' + (Test-Path -LiteralPath $stuck))\n"
+                  "[IO.File]::SetAttributes($stuck, [IO.FileAttributes]::Normal); Remove-Item -LiteralPath $stuck -Force\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("STALLED|capture cleanup abandoned after 0.3 s: C:\\x\\a.txt, C:\\x\\b.txt|True", proc.stdout)
         self.assertIn("CLEAN|[]|False", proc.stdout)
+        self.assertRegex(proc.stdout, r"STUCK\|capture cleanup incomplete: still present: .+\.tmp\|True")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_the_suite_json_is_read_once_under_the_bound_and_every_stalled_step_fails_the_suite_by_name(self) -> None:
