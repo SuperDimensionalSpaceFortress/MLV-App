@@ -1525,6 +1525,18 @@ def test_a_file_name_with_a_line_feed_and_the_notice_tail_does_not_make_the_conv
     assert r.returncode == 0 and "collection" not in last_receipt(r), r.stdout + r.stderr
 
 
+@pytest.mark.parametrize("caller", [None, "true", "warn"])
+def test_the_private_git_dir_silences_line_ending_notices_at_the_source_whatever_the_caller_sets(repo, tmp_path, caller):  # r12 adversary pass 2 A1: a notice holds the raw file name, so text can imitate the next message; core.safecrlf only decides whether git SAYS something about a conversion, never the bytes it compares
+    if caller:
+        git(repo, "config", "core.safecrlf", caller)
+    (repo / "u.txt").write_text("u\n")
+    out = tmp_path / "private-config.txt"
+    r = save_with_hook(repo, tmp_path, f"Copy-Item -LiteralPath ([System.IO.Path]::Combine($script:sealDir, 'config')) -Destination '{out}'")
+    assert r.returncode == 0, r.stdout + r.stderr
+    cfg = out.read_text(encoding="latin-1")
+    assert re.search(r"^\s*safecrlf = false\s*$", cfg, re.MULTILINE) and not re.search(r"safecrlf = \"?(?:true|warn)", cfg), cfg  # old code: absent, or the caller's value
+
+
 @pytest.mark.skipif(not WIN, reason="git walks into a directory junction on Windows; on POSIX it lists a symlink as one file")
 def test_a_junction_made_straight_to_the_private_directory_cannot_put_the_savers_files_in_the_inventory(repo, tmp_path):  # r12 sol r11 B3: alias/HEAD, alias/config, alias/objects/info/alternates carry no GUID component
     (repo / "u.txt").write_text("u\n")
