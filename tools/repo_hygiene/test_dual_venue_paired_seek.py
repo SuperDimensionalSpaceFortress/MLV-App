@@ -1301,6 +1301,24 @@ R11_PNG_CONTROLS = (("ok-stored-blocks.png", png_of(4, 3, 8, 2, 0, zlib.compress
                                                      + png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 1)))),
                     ("ok-rgb-trns.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tRNS", bytes(6)))),
                     ("ok-palette-trns.png", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x80"))))
+# r12 (adversary r12 e68b3f74): A1 an IDAT chunk whose CRC-32 is wrong (one bit of the verbatim input's CRC flipped; Pillow: bad IDAT checksum) was
+# accepted, because only non-IDAT chunks had their CRC checked. Verbatim, plus the class: a bad CRC on the middle one of three split IDAT chunks, and on
+# the last one. A2 (advisory) an IEND chunk with data, its CRC correct. A3 (advisory, a control): hIST is valid after a suggested palette (PLTE) in an
+# RGB image; the check refused it as having no palette.
+ADVERSARY_R12_A1 = bytes.fromhex("89504E470D0A1A0A0000000D4948445200000001000000010802000000907753DE0000000C49444154789C63606060000000040001F71738550000000049454E44AE426082")
+_SPLIT_IDAT = (png_chunk(b"IDAT", _RGB_STREAM[:5]), png_chunk(b"IDAT", _RGB_STREAM[5:9]), png_chunk(b"IDAT", _RGB_STREAM[9:]))
+
+
+def _bad_crc(chunk: bytes) -> bytes:
+    return chunk[:-4] + bytes(b ^ 0x01 for b in chunk[-4:])
+
+
+R12_NOT_A_PNG = (("idat-bad-crc", ADVERSARY_R12_A1),
+                 ("split-idat-middle-bad-crc", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + _SPLIT_IDAT[0] + _bad_crc(_SPLIT_IDAT[1]) + _SPLIT_IDAT[2] + png_chunk(b"IEND", b"")),
+                 ("split-idat-last-bad-crc", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + _SPLIT_IDAT[0] + _SPLIT_IDAT[1] + _bad_crc(_SPLIT_IDAT[2]) + png_chunk(b"IEND", b"")),
+                 ("iend-with-data", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + png_chunk(b"IDAT", _RGB_STREAM) + png_chunk(b"IEND", b"\x00")))
+R12_PNG_CONTROLS = (("ok-rgb-plte-hist.png", png_of(1, 1, 8, 2, 0, zlib.compress(bytes(4)), extra=png_chunk(b"PLTE", b"\x00\x00\x00") + png_chunk(b"hIST", b"\x00\x01"))),
+                    ("ok-split-idat-r12.png", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + b"".join(_SPLIT_IDAT) + png_chunk(b"IEND", b"")))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -1336,7 +1354,8 @@ class PngImageCheckUnitTests(unittest.TestCase):
                  "ok-interlaced-5x5.png": (laced5, True), "ok-palette.png": (palette, True), "ok-1bit.png": (onebit, True), "ok-split-idat.png": (split, True),
                  "ok-1920x1080.png": (hd, True),
                  **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{f"bad-r11f2-{n}.png": (b, False) for n, b in R11_FIX2_NOT_A_PNG},
-                 **{n: (b, True) for n, b in R11_PNG_CONTROLS}}
+                 **{n: (b, True) for n, b in R11_PNG_CONTROLS},
+                 **{f"bad-r12-{n}.png": (b, False) for n, b in R12_NOT_A_PNG}, **{n: (b, True) for n, b in R12_PNG_CONTROLS}}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")

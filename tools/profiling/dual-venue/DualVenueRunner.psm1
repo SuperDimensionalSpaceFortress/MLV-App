@@ -2182,8 +2182,8 @@ function Get-DvLegSpecShapeRefusal {
 # was honoured whatever its bytes were: a zero-byte frame-00.png (sha256 e3b0c442...b855), a truncated file, a non-PNG renamed .png. A hash binds the
 # bytes to the listing; it says nothing about whether they are an image. This checks the PNG container and its image data with the .NET base library
 # only (no image-decoder dependency): the 8-byte signature; a first chunk IHDR of length 13 with width and height 1..2^31-1, a valid bit depth / colour
-# type pair, compression 0, filter 0 and interlace 0 or 1; every chunk length inside the file, every chunk type four ASCII letters and every non-IDAT
-# chunk's CRC-32; a PLTE before the image data of a palette image; at least one IDAT; an IEND that ends the chunk sequence (a file cut short has none);
+# type pair, compression 0, filter 0 and interlace 0 or 1; every chunk length inside the file, every chunk type four ASCII letters and every chunk's
+# CRC-32 (IDAT included since r12); a PLTE before the image data of a palette image; at least one IDAT; an IEND that ends the chunk sequence (a file cut short has none);
 # and -- r10 fix 1, adversary r10 77fc99fa A1: a well-formed container whose IDAT inflated to 0 bytes passed -- the concatenated IDAT data must be ONE
 # valid zlib stream (its Adler-32 checked by the inflater) that inflates to exactly the scanline bytes IHDR implies (Adam7 passes included), each
 # scanline led by a filter type 0..4. Returns $null for a decodable PNG, otherwise the reason. Get-DvPairedSeekVerdict calls it for every paused still
@@ -2193,8 +2193,32 @@ $script:PngMinBytes = 8 + 25 + 12 + 12   # signature + IHDR chunk (12 + 13) + an
 $script:PngBitDepths = @{ 0 = @(1, 2, 4, 8, 16); 2 = @(8, 16); 3 = @(1, 2, 4, 8); 4 = @(8, 16); 6 = @(8, 16) }   # colour type -> allowed bit depths
 $script:PngChannels = @{ 0 = 1; 2 = 3; 3 = 1; 4 = 2; 6 = 4 }                                                     # colour type -> samples per pixel
 $script:PngAdam7 = @(@(0, 0, 8, 8), @(4, 0, 8, 8), @(0, 4, 4, 8), @(2, 0, 4, 4), @(0, 2, 2, 4), @(1, 0, 2, 2), @(0, 1, 1, 2))   # xStart, yStart, xStep, yStep
-$script:PngCrcTable = [long[]]::new(256)
-for ($k = 0; $k -lt 256; $k++) { [long]$c = $k; for ($j = 0; $j -lt 8; $j++) { $c = $(if ($c -band 1) { 0xEDB88320L -bxor ($c -shr 1) } else { $c -shr 1 }) }; $script:PngCrcTable[$k] = $c }
+# r12 (adversary r12 e68b3f74 A1): EVERY chunk's CRC-32 is checked, IDAT included (an IDAT with a wrong CRC passed: only the zlib Adler-32 covered its
+# bytes, and Adler-32 does not cover the chunk's own CRC field). A PowerShell byte loop runs about 2 s per MB, too slow for a full-size still's IDAT, so
+# the CRC-32 (ISO 3309, the PNG polynomial) is a small C# type compiled once per process on first use (C# 5 syntax, so Windows PowerShell 5.1 builds it too).
+$script:PngCrc32TypeName = 'DvPngCrc32R12'
+$script:PngCrc32Source = @'
+public static class DvPngCrc32R12 {
+    private static readonly uint[] Table = MakeTable();
+    private static uint[] MakeTable() {
+        uint[] t = new uint[256];
+        for (uint k = 0; k < 256; k++) { uint c = k; for (int j = 0; j < 8; j++) { c = ((c & 1u) != 0u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); } t[k] = c; }
+        return t;
+    }
+    public static uint Compute(byte[] bytes, int offset, int count) {
+        uint c = 0xFFFFFFFFu;
+        int end = offset + count;
+        for (int i = offset; i < end; i++) { c = Table[(c ^ bytes[i]) & 0xFFu] ^ (c >> 8); }
+        return c ^ 0xFFFFFFFFu;
+    }
+}
+'@
+function Get-DvPngCrc32 {
+    param([byte[]]$Bytes, [int]$Offset, [int]$Count)
+    $t = $script:PngCrc32TypeName -as [type]
+    if ($null -eq $t) { Add-Type -TypeDefinition $script:PngCrc32Source -Language CSharp -ErrorAction Stop; $t = $script:PngCrc32TypeName -as [type] }
+    [long]$t::Compute($Bytes, $Offset, $Count)
+}
 # r11 fix 2: the PNG chunks whose length, place or count the image fixes (PNG 1.2 / ISO 15948 section 11.3). $null when the chunk keeps them, else why not.
 # Lengths by colour type (0 grey, 2 RGB, 3 palette, 4 grey+alpha, 6 RGBA); 'P' = the palette's entry count; absent = the chunk is not allowed there.
 $script:PngAncillaryLength = @{
@@ -2224,7 +2248,8 @@ function Get-DvPngAncillaryProblem {
         return $null
     }
     if ($Name -ceq 'hIST') {
-        if ($Colour -ne 3) { return "is not allowed without a palette (colour type $Colour)" }
+        # r12 A3 (advisory): hIST follows a PLTE of any colour type (a suggested palette of an RGB / RGBA image has one too), not only a palette image's
+        if (-not $SawPlte) { return "is not allowed without a palette (no PLTE before it, colour type $Colour)" }
         if ($Length -ne 2 * $PlteEntries) { return "is $Length bytes (2 per palette entry: $(2 * $PlteEntries))" }
         return $null
     }
@@ -2265,15 +2290,15 @@ function Get-DvPngImageProblem {
         if ($name -cmatch '^[A-Z]' -and $name -cnotin @('IHDR', 'PLTE', 'IDAT', 'IEND')) { return "its $name chunk at byte $at is a critical chunk PNG does not define" }
         if ($name -ceq 'PLTE' -and ($sawPlte -or $sawIdat)) { return "its PLTE chunk at byte $at $(if ($sawPlte) { 'repeats' } else { 'comes after the image data' })" }
         if ($name -cne 'IDAT' -and $sawIdat) { $idatEnded = $true }
+        # r12 A1: the CRC-32 of EVERY chunk (type + data), IDAT included. r12 A2 (advisory): IEND carries no data.
+        if ((Get-DvPngCrc32 -Bytes $Bytes -Offset ($at + 4) -Count (4 + [int]$length)) -ne (& $u32 ($at + 8 + [int]$length))) { return "its $name chunk at byte $at fails its CRC-32" }
+        if ($name -ceq 'IEND' -and $length -ne 0) { return "its IEND chunk at byte $at holds $length bytes (PNG fixes IEND at 0)" }
         if ($name -ceq 'IDAT') {
             if ($colour -eq 3 -and -not $sawPlte) { return 'it is a palette image with no PLTE chunk before its image data' }
             if ($idatEnded) { return "its IDAT chunk at byte $at is not consecutive with the earlier IDAT chunks" }
             $sawIdat = $true; $idat.Write($Bytes, $at + 8, [int]$length)
         }
-        else {   # (IDAT bytes are covered by the zlib stream's own Adler-32 below; every other chunk is small, so its CRC-32 is checked here)
-            [long]$crc = 0xFFFFFFFFL
-            for ($i = $at + 4; $i -lt $at + 8 + $length; $i++) { $crc = $script:PngCrcTable[($crc -bxor $Bytes[$i]) -band 0xFF] -bxor ($crc -shr 8) }
-            if (($crc -bxor 0xFFFFFFFFL) -ne (& $u32 ($at + 8 + [int]$length))) { return "its $name chunk at byte $at fails its CRC-32" }
+        else {
             # r11 fix 2 (adversary r11 5a79915c A1 and its class): a chunk PNG defines with a size, a place or a count fixed by the image is refused when
             # it breaks them (a decoder rejects it: a 1-byte tRNS on an RGB image, an empty gAMA, sRGB or pHYs passed). PLTE: 1..256 whole entries, at
             # most 2^depth for a palette image, none for a greyscale one. The others: their length for this colour type, before PLTE / IDAT where PNG
