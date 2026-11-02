@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace playback_frame_range {
 
@@ -100,6 +102,101 @@ inline int contactSheetTargetFrame( int i, int frameCount, int startFrame, int e
         : 0.0;
     return startFrame + static_cast<int>(
         std::lround( fraction * static_cast<double>( endFrame - startFrame ) ) );
+}
+
+// CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: --contact-sheet-seek-frames <list>, explicit seek-capture targets.
+// Accepts only ^[0-9]{1,9}(,[0-9]{1,9})*$ (no spaces, signs, empty items or trailing comma), strictly
+// ascending (so no repeats), 1..60 items and exactly expectedCount of them. On a refusal *out is left
+// empty and *errorToken names the first rule broken; on success *errorToken is cleared.
+inline bool parseContactSheetSeekFrameList( const std::string &text, int expectedCount,
+                                            std::vector<int> *out, std::string *errorToken )
+{
+    std::vector<int> frames;
+    const char *token = nullptr;
+    std::size_t at = 0;
+    while( token == nullptr )
+    {
+        std::size_t digits = 0;
+        long long value = 0;
+        while( at < text.size() && text[at] >= '0' && text[at] <= '9' )
+        {
+            value = value * 10 + ( text[at] - '0' );
+            ++at;
+            ++digits;
+            if( digits > 9 ) break;
+        }
+        if( digits < 1 || digits > 9 ) { token = "SEEK_FRAMES_SYNTAX"; break; }
+        frames.push_back( static_cast<int>( value ) );
+        if( at == text.size() ) break;
+        if( text[at] != ',' || at + 1 == text.size() ) { token = "SEEK_FRAMES_SYNTAX"; break; }
+        ++at;
+    }
+    if( token == nullptr )
+    {
+        for( std::size_t i = 1; i < frames.size(); ++i )
+        {
+            if( frames[i] <= frames[i - 1] ) { token = "SEEK_FRAMES_NOT_ASCENDING"; break; }
+        }
+    }
+    if( token == nullptr && frames.size() > 60 ) token = "SEEK_FRAMES_TOO_MANY";
+    if( token == nullptr && static_cast<long long>( frames.size() ) != static_cast<long long>( expectedCount ) )
+        token = "SEEK_FRAMES_COUNT_MISMATCH";
+    if( token != nullptr )
+    {
+        if( out ) out->clear();
+        if( errorToken ) *errorToken = token;
+        return false;
+    }
+    if( out ) *out = frames;
+    if( errorToken ) errorToken->clear();
+    return true;
+}
+
+// A seek still shows its requested frame only when the wait settled AND the presented request context on
+// record is valid AND names that very frame -- the observation, never the (possibly clamped) request.
+inline bool contactSheetSeekFrameHonoured( int requested, bool settled, bool presentedValid, int presented )
+{
+    return settled && presentedValid && presented == requested;
+}
+
+// Adversary A1: a list still's IMAGE must come from the surface that presented the frame, never from a
+// fall-through. r2: the tie is bound to the presentation serial OF THE SURFACE THE IMAGE WAS READ FROM, for
+// the request on record (requestSerial), never inferred from texture/recon flags (a widget that accepted a
+// frame but never painted it leaves both flags false while the hidden fallback pixmap still holds an older
+// frame). surfaceSerial is: the GL window readback's presented serial; the widget's paintedSerialFor read
+// after the grab (the grab runs paintGL); or the serial the fallback pixmap was last set for. With the GL
+// window active only its own readback can be certified. The plain viewport grab has no frame identity.
+// Returns "" when certified, otherwise a typed reason.
+inline const char *contactSheetSeekStillUntiedReason( bool glWindowActive, const std::string &source,
+                                                      bool surfaceSerialValid, uint64_t surfaceSerial,
+                                                      uint64_t requestSerial )
+{
+    const bool presenter = glWindowActive
+        ? source == "gl_window_framebuffer_readback"
+        : ( source == "app_internal_gl_viewport_grab" || source == "app_internal_presented_pixmap" );
+    if( !presenter ) return "SURFACE_NOT_PRESENTER";
+    if( requestSerial == 0 || !surfaceSerialValid || surfaceSerial == 0 ) return "SURFACE_SERIAL_UNKNOWN";
+    if( surfaceSerial != requestSerial ) return "SURFACE_SERIAL_STALE";
+    return "";
+}
+
+inline bool contactSheetSeekStillImageTied( bool glWindowActive, const std::string &source,
+                                            bool surfaceSerialValid, uint64_t surfaceSerial, uint64_t requestSerial )
+{
+    return contactSheetSeekStillUntiedReason( glWindowActive, source, surfaceSerialValid, surfaceSerial,
+                                              requestSerial )[0] == '\0';
+}
+
+// The first list frame a clip of frameCount frames cannot show (>= frameCount), or -1 when all fit. A clip
+// of fewer than two frames cannot be seeked at all (seekAndSettleLoadedClip refuses it), so then any frame
+// is out of range.
+inline int firstContactSheetSeekFrameOutOfRange( const std::vector<int> &frames, int frameCount )
+{
+    for( int frame : frames )
+    {
+        if( frameCount < 2 || frame >= frameCount ) return frame;
+    }
+    return -1;
 }
 
 // CONTACT-SHEET-PLAYBACK-PARITY-1: the in-pass contact sheet grabs the first frame PRESENTED by the

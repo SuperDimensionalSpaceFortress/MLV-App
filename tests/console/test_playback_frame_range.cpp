@@ -1406,3 +1406,146 @@ TEST( CpuPaceInformational, AdmissionUsesTheModeBudgetAndStillRefusesAnUnusableP
     ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( z.reason ) );
     ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0, 20.0, true, 0.5, PlayPaceMode::MeasuredInformational ).ok );
 }
+
+// CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: --contact-sheet-seek-frames <list>. The parser accepts only
+// ^[0-9]{1,9}(,[0-9]{1,9})*$, strictly ascending, 1..60 items, exactly --contact-sheet-frames of them.
+namespace {
+std::string seekListToken( const std::string &text, int expectedCount, std::vector<int> *frames = nullptr )
+{
+    std::vector<int> parsed{ 999 };
+    std::string token = "UNSET";
+    const bool ok = playback_frame_range::parseContactSheetSeekFrameList( text, expectedCount, &parsed, &token );
+    if( frames ) *frames = parsed;
+    if( ok ) return token.empty() ? std::string( "OK" ) : std::string( "OK_WITH_TOKEN:" ) + token;
+    return token;
+}
+}
+
+TEST( ContactSheetSeekFrameList, AStrictlyAscendingListOfTheDeclaredCountParsesInOrder )
+{
+    std::vector<int> frames;
+    ASSERT_EQ( std::string( "OK" ), seekListToken( "50,150,250,350,450,550", 6, &frames ) );
+    ASSERT_TRUE( frames == std::vector<int>( { 50, 150, 250, 350, 450, 550 } ) );
+    ASSERT_EQ( std::string( "OK" ), seekListToken( "0", 1, &frames ) );
+    ASSERT_TRUE( frames == std::vector<int>( { 0 } ) );
+    // Nine digits is the widest accepted item; leading zeros are digits and parse as the number.
+    ASSERT_EQ( std::string( "OK" ), seekListToken( "007,999999999", 2, &frames ) );
+    ASSERT_TRUE( frames == std::vector<int>( { 7, 999999999 } ) );
+}
+
+TEST( ContactSheetSeekFrameList, EveryMalformedSpellingIsRefusedAsSyntax )
+{
+    for( const char *text : { "", "50,,150", " 50", "-1", "+5", "1e3", "50,150,", "1234567890",
+                              ",50", "50 ,150", "50;150", "0x10", "5.0", "50,150\n" } )
+    {
+        ASSERT_EQ( std::string( "SEEK_FRAMES_SYNTAX" ), seekListToken( text, 1 ) );
+    }
+}
+
+TEST( ContactSheetSeekFrameList, ADescendingOrRepeatedFrameIsRefused )
+{
+    ASSERT_EQ( std::string( "SEEK_FRAMES_NOT_ASCENDING" ), seekListToken( "150,50", 2 ) );
+    ASSERT_EQ( std::string( "SEEK_FRAMES_NOT_ASCENDING" ), seekListToken( "50,50", 2 ) );
+    ASSERT_EQ( std::string( "SEEK_FRAMES_NOT_ASCENDING" ), seekListToken( "1,2,3,3,4,5", 6 ) );
+}
+
+TEST( ContactSheetSeekFrameList, MoreThanSixtyItemsOrAWrongCountIsRefused )
+{
+    std::string sixtyOne;
+    std::string sixty;
+    for( int i = 0; i < 61; ++i )
+    {
+        if( i > 0 ) sixtyOne += ",";
+        sixtyOne += std::to_string( i * 10 );
+        if( i < 60 )
+        {
+            if( i > 0 ) sixty += ",";
+            sixty += std::to_string( i * 10 );
+        }
+    }
+    ASSERT_EQ( std::string( "SEEK_FRAMES_TOO_MANY" ), seekListToken( sixtyOne, 61 ) );
+    ASSERT_EQ( std::string( "SEEK_FRAMES_TOO_MANY" ), seekListToken( sixtyOne, 60 ) );
+    ASSERT_EQ( std::string( "OK" ), seekListToken( sixty, 60 ) );
+    ASSERT_EQ( std::string( "SEEK_FRAMES_COUNT_MISMATCH" ), seekListToken( "50,150,250,350,450", 6 ) );
+    ASSERT_EQ( std::string( "SEEK_FRAMES_COUNT_MISMATCH" ), seekListToken( "50,150,250,350,450,550,650", 6 ) );
+}
+
+TEST( ContactSheetSeekFrameList, ARefusalLeavesNoPartialList )
+{
+    std::vector<int> frames;
+    ASSERT_EQ( std::string( "SEEK_FRAMES_NOT_ASCENDING" ), seekListToken( "50,150,100", 3, &frames ) );
+    ASSERT_TRUE( frames.empty() );
+}
+
+TEST( ContactSheetSeekFrameList, AStillIsHonouredOnlyWhenItSettledOnAValidPresentOfTheRequestedFrame )
+{
+    using playback_frame_range::contactSheetSeekFrameHonoured;
+    ASSERT_TRUE( contactSheetSeekFrameHonoured( 150, true, true, 150 ) );
+    ASSERT_FALSE( contactSheetSeekFrameHonoured( 150, false, true, 150 ) );   // never settled
+    ASSERT_FALSE( contactSheetSeekFrameHonoured( 150, true, false, 150 ) );   // no presented frame on record
+    ASSERT_FALSE( contactSheetSeekFrameHonoured( 150, true, true, 149 ) );    // a different frame is on screen
+    ASSERT_FALSE( contactSheetSeekFrameHonoured( 550, true, true, 549 ) );    // the clamp to the last frame
+}
+
+TEST( ContactSheetSeekFrameList, AListStillsImageMustComeFromTheSurfaceThatPresentedTheFrame )
+{
+    // Adversary A1 (r1 pass on 7e252640): a minimized GL window refuses its framebuffer readback and the
+    // capture fell through to an unrelated pixmap / hidden viewport that was then saved as frame_honoured=true.
+    // r2: every source is certified by ITS OWN surface's presentation serial for the request on record (the
+    // GL window readback serial, the widget's paintedSerialFor after the grab, the pixmap's own serial), never
+    // by texture/recon flags.
+    using playback_frame_range::contactSheetSeekStillImageTied;
+    // GL window: only its own framebuffer readback of THIS request's present counts.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( true, "gl_window_framebuffer_readback", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "app_internal_presented_pixmap", true, 41, 41 ) );    // r1 A1 input
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "app_internal_viewport_grab", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "app_internal_gl_viewport_grab", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "gl_window_framebuffer_readback", true, 40, 41 ) );  // an older present
+    ASSERT_FALSE( contactSheetSeekStillImageTied( true, "gl_window_framebuffer_readback", false, 41, 41 ) ); // no serial to prove it
+    // In-widget viewport: its grab counts only when the paint that grab ran drew THIS request's serial.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( false, "app_internal_gl_viewport_grab", true, 41, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_gl_viewport_grab", true, 40, 41 ) );
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_gl_viewport_grab", false, 0, 41 ) );
+    // CPU-presented pixmap: only when the pixmap was set FOR this request.
+    ASSERT_TRUE( contactSheetSeekStillImageTied( false, "app_internal_presented_pixmap", true, 41, 41 ) );
+    // The plain viewport fallback carries no frame identity: never certified.
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_viewport_grab", true, 41, 41 ) );
+    // No request on record: nothing can be proved.
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_presented_pixmap", true, 0, 0 ) );
+}
+
+TEST( ContactSheetSeekFrameList, AWidgetSubmittedFrameWithItsPaintWithheldNeverCertifiesTheOlderFallbackPixmap )
+{
+    // r2 (adversary A1 on ea772731, Dot 6553359245/6553493773): request 41 was accepted by the widget viewport
+    // (presentImage succeeded, so the pixmap was neither updated nor re-serialled), the widget never painted
+    // (minimized), so both texture flags read false and the chain grabbed the OLDER fallback pixmap (set for
+    // request 40). That still must be refused with a typed reason, never image_tied=true.
+    using playback_frame_range::contactSheetSeekStillImageTied;
+    using playback_frame_range::contactSheetSeekStillUntiedReason;
+    const uint64_t pixmapSerial = 40;   // m_graphicsItemPresentedSerial: the last frame the pixmap itself received
+    const uint64_t requestSerial = 41;  // m_lastPresentedRequestSerial: the requested frame, submitted to the widget
+    ASSERT_FALSE( contactSheetSeekStillImageTied( false, "app_internal_presented_pixmap", true, pixmapSerial, requestSerial ) );
+    ASSERT_EQ( std::string( "SURFACE_SERIAL_STALE" ),
+               contactSheetSeekStillUntiedReason( false, "app_internal_presented_pixmap", true, pixmapSerial, requestSerial ) );
+    // The other refusals are typed too; a certified still has no reason.
+    ASSERT_EQ( std::string( "SURFACE_SERIAL_UNKNOWN" ),
+               contactSheetSeekStillUntiedReason( false, "app_internal_gl_viewport_grab", false, 0, requestSerial ) );
+    ASSERT_EQ( std::string( "SURFACE_NOT_PRESENTER" ),
+               contactSheetSeekStillUntiedReason( false, "app_internal_viewport_grab", true, requestSerial, requestSerial ) );
+    ASSERT_EQ( std::string( "SURFACE_NOT_PRESENTER" ),
+               contactSheetSeekStillUntiedReason( true, "app_internal_presented_pixmap", true, requestSerial, requestSerial ) );
+    ASSERT_EQ( std::string(), contactSheetSeekStillUntiedReason( false, "app_internal_presented_pixmap", true, 41, 41 ) );
+}
+
+TEST( ContactSheetSeekFrameList, TheFirstFramePastTheClipIsNamedBeforeAnyPlay )
+{
+    using playback_frame_range::firstContactSheetSeekFrameOutOfRange;
+    ASSERT_EQ( -1, firstContactSheetSeekFrameOutOfRange( { 50, 150, 549 }, 550 ) );
+    ASSERT_EQ( -1, firstContactSheetSeekFrameOutOfRange( { 50, 150, 550 }, 551 ) );
+    ASSERT_EQ( 550, firstContactSheetSeekFrameOutOfRange( { 50, 150, 550 }, 550 ) );
+    ASSERT_EQ( 550, firstContactSheetSeekFrameOutOfRange( { 50, 550, 650 }, 550 ) );
+    // A clip of fewer than two frames cannot be seeked at all (seekAndSettleLoadedClip refuses it).
+    ASSERT_EQ( 0, firstContactSheetSeekFrameOutOfRange( { 0 }, 1 ) );
+    ASSERT_EQ( 3, firstContactSheetSeekFrameOutOfRange( { 3, 4 }, 0 ) );
+    ASSERT_EQ( -1, firstContactSheetSeekFrameOutOfRange( {}, 0 ) );
+}

@@ -357,6 +357,80 @@ class ContactSheetSwitchTests(unittest.TestCase):
         self.assertIn("-PubRoot (Join-Path $Pub 'paired-seek')", on_text)
         self._assert_valid_powershell(on_file)
 
+    # ---- CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: -ContactSheetSeekFrames forwards an explicit seek list ----
+
+    _SEEK_LIST = "50,150,250,350,450,550"
+
+    def test_the_seek_frame_list_is_forwarded_to_the_paired_seek_capture(self) -> None:
+        on_file = self._generate(
+            "seek-list-on.job.ps1", "-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "6",
+            "-ContactSheetSeekFrames", self._SEEK_LIST)
+        on_text = on_file.read_text(encoding="utf-8")
+        cmd = self._eval_cmd_for(on_text, enabled=True, frame_count=6, paired_seek=True)
+        seek_dir = str(self.tmp / "work-eval-True-6-True" / "contact-sheet-seek")
+        self.assertIn(
+            f"'--contact-sheet-seek-dir', '{seek_dir}', '--contact-sheet-seek-frames', '{self._SEEK_LIST}'", cmd)
+        self.assertEqual(cmd.count("--contact-sheet-seek-frames"), 1, cmd)
+        self._assert_valid_powershell(on_file)
+
+    def test_without_the_list_the_job_text_is_byte_identical_and_the_list_changes_one_line(self) -> None:
+        off_file = self._generate("seek-list-off.job.ps1", "-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "6")
+        on_file = self._generate(
+            "seek-list-on2.job.ps1", "-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "6",
+            "-ContactSheetSeekFrames", self._SEEK_LIST)
+        off_text = off_file.read_text(encoding="utf-8")
+        on_text = on_file.read_text(encoding="utf-8")
+        self.assertNotIn("contact-sheet-seek-frames", off_text)
+        off_lines = off_text.splitlines()
+        on_lines = on_text.splitlines()
+        self.assertEqual(len(off_lines), len(on_lines))
+        changed = [(a, b) for a, b in zip(off_lines, on_lines) if a != b]
+        # The only difference is the paired-seek -AdditionalArgs line, which gains the list (baked
+        # [int] literals, never caller text) just before its closing parenthesis.
+        self.assertEqual(len(changed), 1, changed[:3])
+        before, after = changed[0]
+        tail = "'--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))\""
+        self.assertTrue(before.endswith(tail), before)
+        self.assertEqual(
+            after,
+            before[: -len(")\"")] + f", '--contact-sheet-seek-frames', '{self._SEEK_LIST}')\"")
+
+    def _generate_refused(self, name: str, *extra_args: str) -> subprocess.CompletedProcess:
+        out_file = self.tmp / f"{name}.job.ps1"
+        script = self.tmp / f"generate-{name}.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
+            f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
+            f"-FixtureSha256 '{'b' * 64}' -OutFile '{out_file}' "
+            f"-RepoRoot '{self.repo}' {' '.join(extra_args)}\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(out_file.exists())
+        return proc
+
+    def test_a_bad_seek_frame_list_is_refused_with_a_typed_token(self) -> None:
+        cases = {
+            "no-paired-seek": ("-ContactSheet", "-ContactSheetFrames", "6", "-ContactSheetSeekFrames", self._SEEK_LIST),
+            "no-contact-sheet": ("-ContactSheetPairedSeek", "-ContactSheetSeekFrames", "50"),
+            "count-mismatch": ("-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "6",
+                               "-ContactSheetSeekFrames", "50,150,250,350,450"),
+            "not-ascending": ("-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "2",
+                              "-ContactSheetSeekFrames", "150,50"),
+            "repeated": ("-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "2",
+                         "-ContactSheetSeekFrames", "50,50"),
+            "negative": ("-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "2",
+                         "-ContactSheetSeekFrames", "-1,50"),
+            "too-large": ("-ContactSheet", "-ContactSheetPairedSeek", "-ContactSheetFrames", "2",
+                          "-ContactSheetSeekFrames", "50,1000000000"),
+        }
+        for name, args in cases.items():
+            with self.subTest(case=name):
+                proc = self._generate_refused(f"seek-list-{name}", *args)
+                self.assertIn("CONTACT_SHEET_SEEK_FRAMES_INVALID", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+
     def _extract_presentmon_helper_functions(self, text: str) -> str:
         """Start/Wait/Stop-PresentMonCapture -- the compose step's HARDENING fix (r1d) reuses
         Stop-PresentMonCapture's own already-tested Kill()+bounded-WaitForExit()+

@@ -1665,6 +1665,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #endif
 #include <windows.h>
 #endif
+#include "OutputDirIdentity.h"
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
 static uint8_t applyZebrasToImage( QImage *image, bool enableZebras );
@@ -9838,6 +9839,22 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    ? options.targetPresentedFrames / presentedTargetFps : 0.0, 'f', 3 ) << ")\n";
         return 14;
     }
+    // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: a --contact-sheet-seek-frames frame the clip cannot show would be
+    // clamped by the seek and reported as honoured, so it is refused here, before the measured Play (exit 14).
+    if( !options.contactSheetSeekFrames.isEmpty() )
+    {
+        const int seekListClipFrames = m_pMlvObject ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
+        const int seekListOutOfRange = playback_frame_range::firstContactSheetSeekFrameOutOfRange(
+            std::vector<int>( options.contactSheetSeekFrames.cbegin(), options.contactSheetSeekFrames.cend() ),
+            seekListClipFrames );
+        if( seekListOutOfRange >= 0 )
+        {
+            m_playbackSmokeFullscreenLossLatchArmed = false;
+            err << "[GUI-SMOKE] ERROR: SEEK_FRAME_OUT_OF_RANGE frame=" << seekListOutOfRange
+                << " frames=" << seekListClipFrames << "\n";
+            return 14;
+        }
+    }
     // PLAYBACK-STARTUP-WAIT-PREWARM-1 (opt-in, default off): the paused start frame as the window shows it, grabbed
     // untimed BEFORE the measured Play; the Play's first present is grabbed by noteContactSheetPresentedFrame().
     if( smokeFirstPresentCaptureRequested() && !options.contactSheetDir.isEmpty() )
@@ -10915,7 +10932,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     .arg( m_contactSheetPendingGrabs.size() ).arg( options.contactSheetFrames );
             }
             m_contactSheetPendingGrabs.clear();
-            // The paired seek capture renders the SAME frames the in-pass sheet shows.
+            // The paired seek capture renders the SAME frames the in-pass sheet shows, unless an explicit
+            // --contact-sheet-seek-frames list overrides them (below, in both modes).
             if( inPassDisplayFrames.size() == options.contactSheetFrames )
                 contactSheetTargetFrames = inPassDisplayFrames;
 
@@ -10926,6 +10944,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 m_playbackSmokePresentedFrames, static_cast<double>( contactSheetMeasuredElapsedMs ),
                 contactSheetGrabTotalMs );
         }
+        // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: the explicit list (validated in main.cpp: exactly
+        // --contact-sheet-frames ascending frames; range-checked before the measured Play) is the seek target.
+        if( !options.contactSheetSeekFrames.isEmpty() )
+            contactSheetTargetFrames = options.contactSheetSeekFrames;
 
         // CONTACT-SHEET-PLAYBACK-PARITY-1: seek capture (explicit, labelled alternative). Never plays.
         const QString seekSheetDir = options.contactSheetSeekMode ? options.contactSheetDir : options.contactSheetSeekDir;
@@ -10938,6 +10960,21 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     << seekSheetDir << "\n";
                 return 13;
             }
+            // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1 r5 (adversary pass 7 A1): the CLI check removes the directories it
+            // created, so the paired seek dir is proved separate again here, where both exist, before its first write.
+            if( !options.contactSheetSeekMode )
+            {
+                const output_dir_identity::DirComparison seekDirIdentity =
+                    output_dir_identity::compareDirectories( seekSheetDir, options.contactSheetDir );
+                if( seekDirIdentity.relation != output_dir_identity::DirRelation::Distinct )
+                {
+                    err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir is not a separate directory from "
+                           "--contact-sheet-dir at capture time: SEEK_DIR_NOT_SEPARATE_AT_CAPTURE seek_dir="
+                        << seekSheetDir << " contact_sheet_dir=" << options.contactSheetDir << " "
+                        << seekDirIdentity.detail << "\n";
+                    return 13;
+                }
+            }
             for( int i = 0; i < options.contactSheetFrames; ++i )
             {
                 const int targetFrame = contactSheetTargetFrames.at( i );
@@ -10945,6 +10982,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 int settledFrame = targetFrame;
                 const bool settled = seekAndSettleLoadedClip(
                     targetFrame, "gui-smoke-contact-sheet-seek", &settledFrame );
+                // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: with an explicit list, the still proves its frame by
+                // observation (the presented request context), never by the clamped request it was sent.
+                const int seekObservedFrame = m_lastPresentedRequestContextValid ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
+                const bool seekFrameHonoured = playback_frame_range::contactSheetSeekFrameHonoured(
+                    targetFrame, settled, m_lastPresentedRequestContextValid, seekObservedFrame );
 
                 QImage contactFrameImage;
                 QString contactFrameSource = QStringLiteral("app_internal_viewport_grab");
@@ -10952,8 +10994,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 quint64 contactFramePresentedSerial = 0;
                 bool contactFramePresentedSerialValid = false;
                 QString contactFrameRenderPath;
+                bool seekGlWindowActive = false;
+                quint64 seekSurfaceSerial = 0;
+                bool seekSurfaceSerialValid = false;
                 if( settled )
                 {
+                    seekGlWindowActive = GpuDisplayWindow::isActive();
                     const QJsonObject &seekTiming = m_lastPresentedStageTimingTelemetry;
                     const GpuPlaybackPipelineStatus seekPipelineStatus =
                         mainWindowGpuPlaybackPipelineStatus(
@@ -10996,6 +11042,24 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                         contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
                         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
                     }
+                    // r2 (A1): the presentation serial OF THE SURFACE THE IMAGE WAS READ FROM -- never inferred from
+                    // the texture flags. The widget's grab runs its paintGL, so paintedSerialFor names what that grab
+                    // drew; the fallback pixmap carries the serial it was last set for (a widget-accepted frame leaves
+                    // it on an older one).
+                    if( contactFrameSource == QStringLiteral("gl_window_framebuffer_readback") )
+                    {
+                        seekSurfaceSerialValid = contactFramePresentedSerialValid;
+                        seekSurfaceSerial = contactFramePresentedSerial;
+                    }
+                    else if( contactFrameSource == QStringLiteral("app_internal_gl_viewport_grab") )
+                    {
+                        seekSurfaceSerialValid = GpuDisplayViewport::paintedSerialFor( ui->graphicsView, &seekSurfaceSerial );
+                    }
+                    else if( contactFrameSource == QStringLiteral("app_internal_presented_pixmap") )
+                    {
+                        seekSurfaceSerial = static_cast<quint64>( m_graphicsItemPresentedSerial );
+                        seekSurfaceSerialValid = seekSurfaceSerial != 0;
+                    }
                 }
 
                 const QString frameBaseName =
@@ -11007,7 +11071,17 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 const QString jsonPath = contactSheetDirInfo.absoluteFilePath(
                     frameBaseName + QStringLiteral(".json") );
 
+                // Adversary A1: with the list, the image must come from the surface that presented the frame
+                // (no fall-through from a refused GL-window readback to an unrelated pixmap or viewport), and r2:
+                // that surface must prove by its own serial that it holds the request on record.
+                const QString seekStillUntiedReason = QString::fromLatin1(
+                    playback_frame_range::contactSheetSeekStillUntiedReason(
+                        seekGlWindowActive, contactFrameSource.toStdString(), seekSurfaceSerialValid,
+                        static_cast<uint64_t>( seekSurfaceSerial ),
+                        static_cast<uint64_t>( m_lastPresentedRequestSerial ) ) );
+                const bool seekStillImageTied = settled && seekStillUntiedReason.isEmpty();
                 bool frameOk = settled && !contactFrameImage.isNull()
+                    && ( options.contactSheetSeekFrames.isEmpty() || ( seekFrameHonoured && seekStillImageTied ) )
                     && contactFrameImage.save( pngPath, "PNG" );
 
                 const double elapsedMsForFrame = contactSheetFps > 0.0
@@ -11022,7 +11096,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 frameJson.insert( QStringLiteral("serial"), static_cast<double>(
                     contactFramePresentedSerialValid ? contactFramePresentedSerial
                                                       : m_lastPresentedRequestSerial ) );
-                frameJson.insert( QStringLiteral("display_frame"), settledFrame );
+                frameJson.insert( QStringLiteral("display_frame"), options.contactSheetSeekFrames.isEmpty() ? settledFrame : seekObservedFrame );
                 frameJson.insert( QStringLiteral("elapsed_ms"), elapsedMsForFrame );
                 frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
                 frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
@@ -11058,15 +11132,27 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     ui->horizontalSliderHighlights->value() );
                 frameJson.insert( QStringLiteral("settled"), settled );
                 frameJson.insert( QStringLiteral("saved"), frameOk );
+                if( !options.contactSheetSeekFrames.isEmpty() )
+                {
+                    frameJson.insert( QStringLiteral("requested_frame"), targetFrame );
+                    frameJson.insert( QStringLiteral("frame_honoured"), seekFrameHonoured );
+                    frameJson.insert( QStringLiteral("image_tied"), seekStillImageTied );
+                }
 
                 if( frameOk )
                 {
                     QFile sidecarFile( jsonPath );
                     if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
                     {
-                        sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
+                        // r2 (adversary A3): a frame counts as written only when the whole sidecar reached the disk.
+                        const QByteArray sidecarBytes = QJsonDocument( frameJson ).toJson( QJsonDocument::Indented );
+                        const bool sidecarWritten = sidecarFile.write( sidecarBytes ) == sidecarBytes.size()
+                            && sidecarFile.flush();
                         sidecarFile.close();
-                        ++contactSheetSeekFramesWritten;
+                        if( sidecarWritten && sidecarFile.error() == QFileDevice::NoError )
+                            ++contactSheetSeekFramesWritten;
+                        else
+                            frameOk = false;
                     }
                     else
                     {
@@ -11074,6 +11160,20 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     }
                 }
 
+                if( !options.contactSheetSeekFrames.isEmpty() && !seekFrameHonoured && contactSheetError.isEmpty() )
+                {
+                    contactSheetError = QStringLiteral(
+                        "seek frame %1 SEEK_FRAME_NOT_HONOURED requested=%2 shown=%3" )
+                        .arg( i ).arg( targetFrame ).arg( seekObservedFrame );
+                }
+                if( !options.contactSheetSeekFrames.isEmpty() && settled && !seekStillImageTied && contactSheetError.isEmpty() )
+                {
+                    contactSheetError = QStringLiteral(
+                        "seek frame %1 SEEK_FRAME_IMAGE_UNTIED source=%2 reason=%3 untied=%4 surface_serial=%5 request_serial=%6" )
+                        .arg( i ).arg( contactFrameSource ).arg( contactFrameReadbackReason ).arg( seekStillUntiedReason )
+                        .arg( seekSurfaceSerialValid ? QString::number( seekSurfaceSerial ) : QStringLiteral("none") )
+                        .arg( static_cast<qulonglong>( m_lastPresentedRequestSerial ) );
+                }
                 if( !frameOk && contactSheetError.isEmpty() )
                 {
                     contactSheetError = QStringLiteral(
@@ -11112,7 +11212,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( options.contactSheetSeekMode ? 0 : m_playbackSmokePresentedFrames )
                 .arg( contactSheetFpsMeasured, 0, 'f', 3 )
                 .arg( contactSheetFpsExcludingGrabs, 0, 'f', 3 )
-                .arg( options.contactSheetSeekMode ? 0 : contactSheetSeekFramesWritten ) );
+                .arg( options.contactSheetSeekMode ? 0 : contactSheetSeekFramesWritten )
+            + ( options.contactSheetSeekFrames.isEmpty() ? QString() : QStringLiteral(" seek_targets=list") ) );
 
         if( contactSheetFramesWritten != options.contactSheetFrames
          || ( !options.contactSheetSeekMode && !options.contactSheetSeekDir.isEmpty()
@@ -33545,6 +33646,9 @@ void MainWindow::drawFrameReady()
     task.displayPreviewCachingAllowed = displayPreviewCachingAllowed;
     task.playbackFastScaleActive = readyFrame.playbackFastScaleActive;
     task.gpuPresentationOptions = gpuPresentationOptions;
+    // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1 r2 (A1): every viewport route (texture/recon as well as the CPU image)
+    // carries this request's serial, so the widget's paintedSerialFor can prove which request a paint drew.
+    task.gpuPresentationOptions.presentationSerial = task.requestSerial;
     task.enqueueTime = mlv_stage_timing_now();
     task.preEnqueueMs =
         ( display_start > 0.0 && task.enqueueTime >= display_start )

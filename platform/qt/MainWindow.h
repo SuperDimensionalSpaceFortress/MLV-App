@@ -181,6 +181,7 @@ public:
         // paired seek capture of the same N targets here, after the measured Play has stopped
         // (it never plays; its sidecars record playback_path=false).
         QString contactSheetSeekDir;
+        QVector<int> contactSheetSeekFrames; // --contact-sheet-seek-frames: explicit seek targets; empty = off
         // --visual-capture-dir: opt-in, default empty (off: nothing runs and nothing is logged).
         // PLAYBACK-VISUAL-INSPECTION-1: AFTER the measured Play's own stop condition, its telemetry
         // session is closed (the playback_smoke summary is written first), Play keeps running UNTIMED

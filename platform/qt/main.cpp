@@ -21,6 +21,7 @@
 #include "../../src/batch/MlvTrim.h"
 #include "../../src/batch/EnvFlags.h"
 #include "debug/ForceSingleThread.h"
+#include "OutputDirIdentity.h"   // last: it pulls in <windows.h>
 
 #include <QByteArray>
 #include <QCommandLineParser>
@@ -1286,6 +1287,12 @@ static int runGuiPlaybackSmoke(QApplication &app)
         QStringLiteral("dir"));
     parser.addOption(contactSheetSeekDirOpt);
 
+    const QCommandLineOption contactSheetSeekFramesOpt(
+        QStringLiteral("contact-sheet-seek-frames"),
+        QStringLiteral("Comma-separated, strictly ascending 0-based display_frame indices (1-60, exactly --contact-sheet-frames of them) for the seek capture (--contact-sheet-seek-dir or --contact-sheet-seek-mode). Each still must show its requested frame or the run fails (exit 14). Never plays."),
+        QStringLiteral("list"));
+    parser.addOption(contactSheetSeekFramesOpt);
+
     const QCommandLineOption visualCaptureDirOpt(
         QStringLiteral("visual-capture-dir"),
         QStringLiteral("Optional directory for a post-measurement visual capture: after the measured Play has reached its own stop and its summary is written, Play continues UNTIMED for about 3 s while the window is captured (PrintWindow, PW_RENDERFULLCONTENT) 6 times, then once the instant Play is paused, then once more after the same frame is re-rendered by the paused full-quality path. Writes PNGs and visual.json. Never inside the measured interval."),
@@ -1706,6 +1713,70 @@ static int runGuiPlaybackSmoke(QApplication &app)
             return 2;
         }
         options.contactSheetSeekDir = QFileInfo(parser.value(contactSheetSeekDirOpt)).absoluteFilePath();
+        // r2 (adversary A2): the seek capture writes frame-NN.png/json too, so one directory would overwrite
+        // the in-pass sheet while both written counts still pass.
+#ifdef Q_OS_WIN
+        const Qt::CaseSensitivity seekDirCase = Qt::CaseInsensitive;
+#else
+        const Qt::CaseSensitivity seekDirCase = Qt::CaseSensitive;
+#endif
+        if (QDir::cleanPath(options.contactSheetSeekDir).compare(QDir::cleanPath(options.contactSheetDir), seekDirCase) == 0)
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir must differ from --contact-sheet-dir "
+                   "(the seek capture would overwrite the in-pass frames): SEEK_DIR_SAME_AS_CONTACT_SHEET_DIR\n";
+            return 2;
+        }
+    }
+    // CONTACT-SHEET-SEEK-FRAME-LIST-APP-1: explicit seek targets. Refused (exit 2) unless a seek capture
+    // is asked for and the list parses; the frames are checked against the clip before the measured Play.
+    if (parser.isSet(contactSheetSeekFramesOpt))
+    {
+        std::vector<int> seekFrames;
+        std::string errorToken;
+        if (options.contactSheetSeekDir.isEmpty() && !options.contactSheetSeekMode)
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-frames needs a seek capture "
+                   "(--contact-sheet-seek-dir or --contact-sheet-seek-mode): SEEK_FRAMES_NO_SEEK_CAPTURE\n";
+            return 2;
+        }
+        if (!playback_frame_range::parseContactSheetSeekFrameList(
+                parser.value(contactSheetSeekFramesOpt).toStdString(), contactSheetFrames, &seekFrames, &errorToken))
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-frames is invalid: "
+                << QString::fromStdString(errorToken) << "\n";
+            return 2;
+        }
+        for (const int frame : seekFrames)
+            options.contactSheetSeekFrames.append(frame);
+    }
+    // r3 (sol B1): a string is not an identity. A junction, symlink or subst alias of the in-pass directory
+    // passes the string check above, so the directories are compared on disk. Only proven distinct, non-nested
+    // directories go on; anything unprovable fails closed.
+    // r5 (opus key3 r4): this runs after every other argument check, and it removes each directory it created
+    // whatever the answer (the capture creates its own), so a refused run leaves no new directory behind.
+    if (!options.contactSheetSeekDir.isEmpty())
+    {
+        const output_dir_identity::DirComparison seekDirIdentity =
+            output_dir_identity::prepareSeparateDirectories(options.contactSheetSeekDir, options.contactSheetDir);
+        if (seekDirIdentity.relation != output_dir_identity::DirRelation::Distinct)
+        {
+            const char *seekDirToken =
+                seekDirIdentity.relation == output_dir_identity::DirRelation::Same
+                    ? "SEEK_DIR_SAME_IDENTITY_AS_CONTACT_SHEET_DIR"
+                    : ( seekDirIdentity.relation == output_dir_identity::DirRelation::Unknown
+                            ? "SEEK_DIR_IDENTITY_UNKNOWN"
+                            : "SEEK_DIR_NESTED_WITH_CONTACT_SHEET_DIR" );
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir must be a separate directory from "
+                   "--contact-sheet-dir on disk: " << seekDirToken
+                << " contact_sheet_dir=" << options.contactSheetDir
+                << " seek_dir=" << options.contactSheetSeekDir << " " << seekDirIdentity.detail << "\n";
+            return 2;
+        }
+        // r5 (adversary pass 7 A2): an accepted run still names a directory the check made but could not remove.
+        if (seekDirIdentity.detail.contains(QStringLiteral("cleanup_left=")))
+        {
+            err << "[GUI-SMOKE] WARN: SEEK_DIR_CHECK_CLEANUP_LEFT " << seekDirIdentity.detail << "\n";
+        }
     }
     options.visualCaptureDir = parser.value(visualCaptureDirOpt).isEmpty()
         ? QString()
