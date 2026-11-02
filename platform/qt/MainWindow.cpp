@@ -19558,7 +19558,9 @@ void MainWindow::onPlaybackDueWake( void )
     const double nowMs = mlv_stage_timing_now() * 1000.0;
     ++m_playbackDueWakeFired;
     m_playbackDueWakeLatenessMs.push_back( nowMs - m_playbackDueWakeDueAtMs );
-    m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    // adversary r1 pass 2 A1: the wake honours m_frameStillDrawing exactly as the poll tick does and never recomputes it from the
+    // render thread -- an idle renderer with a Ready frame whose notification is still queued would read as not busy, and the
+    // advance would request the next frame over it (every-frame mode, CPU latest-ready acquisition: a skipped frame)
     if( m_frameStillDrawing )
     {
         // the frameReady / drawFrameReady paths consume the pending advance when the render lands

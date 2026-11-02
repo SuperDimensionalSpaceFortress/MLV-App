@@ -1250,6 +1250,24 @@ TEST(PlaybackDueWakeWiring, ATailTickThatDidNotReachANewFrameStillArmsTheWake)
     ASSERT_TRUE(call > 0 && tail - call < 200);                // set right after the tail's own timerFrameEvent()
 }
 
+TEST(PlaybackDueWakeWiring, TheWakeHonoursTheStillDrawingFlagLikeThePollAndNeverRecomputesIt)
+{
+    // adversary r1 pass 2 A1 input: every-frame CPU playback, frame 10 requested (slider 10, stillDrawing true), the wake delivered
+    // at 1017 ms before frame 10's queued ready notification. Recomputing the flag from the idle renderer read "not busy", granted
+    // a frame and requested 11 over the unpresented 10. The poll tick keeps the flag, so the wake must too.
+    const QString source = mainWindowSource();
+    const int begin = source.indexOf(QStringLiteral("void MainWindow::onPlaybackDueWake( void )"));
+    const int end = source.indexOf(QStringLiteral("void MainWindow::cancelPlaybackDueWake( void )"));
+    ASSERT_TRUE(begin > 0 && end > begin);
+    const QString body = source.mid(begin, end - begin);
+    ASSERT_FALSE(body.contains(QStringLiteral("m_frameStillDrawing =")));
+    ASSERT_FALSE(body.contains(QStringLiteral("renderThreadBusyForPlaybackAdvance")));
+    const int gate = body.indexOf(QStringLiteral("if( m_frameStillDrawing )"));
+    const int advance = body.indexOf(QStringLiteral("timerFrameEvent( true );"));
+    ASSERT_TRUE(gate > 0 && advance > gate);            // the busy gate comes before the advance
+    ASSERT_TRUE(body.mid(gate, advance - gate).contains(QStringLiteral("m_playbackFrameAdvancePending = true;")));
+}
+
 TEST(PlaybackDueWakeWiring, TheSummaryReportsTheResolutionThePlayRanAt)
 {
     // adversary r1 A4: endPlay() drops the raised resolution before finishPlaybackSmokeTelemetry() prints the line, so the line
