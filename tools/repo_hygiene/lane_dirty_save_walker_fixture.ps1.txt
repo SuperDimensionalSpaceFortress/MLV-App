@@ -7,6 +7,7 @@
 # The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; createdUtc must be an ISO-8601 string, else exit 30; a process that started after it, at full precision, is a reused pid, so the lane is dead), never both.
 # The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree (links followed) is refused (exit 30): evidence written there would be listed as untracked dirt.
 # Paths are split on the platform's own separators only (a POSIX backslash is a filename character), and the RunDir that passes the containment test is the resolved path every artifact is then written through.
+# Windows resolves both directories through an open handle (GetFinalPathNameByHandle: links, junctions, subst drives, 8.3 and \\?\ spellings in any case) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX walks symlinks by name; a swap in that window is not closed there.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay).
 # Never stashes, resets, checks out, cleans or deletes. Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
@@ -42,20 +43,40 @@ function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exa
     if ($s.EndsWith("`n")) { $s = $s.Substring(0, $s.Length - 1) }
     return $s
 }
-function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # every link (symlink or junction) on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2)
+$script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
+function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # POSIX: every symlink on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2). Windows asks the kernel instead (Get-FinalDir)
     if ($Depth -gt 16) { throw 'too-many-links' }
-    $win = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
-    if ($win -and $Path.StartsWith('\\?\UNC\')) { $Path = '\\' + $Path.Substring(8) } elseif ($win -and ($Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\'))) { $Path = $Path.Substring(4) }  # the extended-length prefix is another spelling of the same place (r7 A1)
     $full = [System.IO.Path]::GetFullPath($Path); $root = [System.IO.Path]::GetPathRoot($full); $cur = $root
     foreach ($seg in $full.Substring($root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries)) {
-        if ($win -and $seg.Contains('~')) {  # an 8.3 short name is a third spelling: ask the parent for the long name
-            try { $hit = [System.IO.DirectoryInfo]::new($cur).GetFileSystemInfos($seg) | Select-Object -First 1; if ($hit) { $seg = $hit.Name } } catch { }
-        }
         $cur = [System.IO.Path]::Combine($cur, $seg)
         $di = [System.IO.DirectoryInfo]::new($cur)
         if ($di.LinkTarget) { $t = $di.ResolveLinkTarget($true); if ($t) { $cur = Resolve-RealPath $t.FullName ($Depth + 1) } }
     }
     return $cur
+}
+function Remove-ExtendedPrefix([string]$Path) {  # Windows: \\?\ and \\.\ (any case, either slash) spell the same place as the plain path; a form with no drive or UNC meaning is refused, never guessed (r7 A1)
+    if (-not $script:onWin) { return $Path }
+    $p = $Path.Replace('/', '\')
+    if ($p -notmatch '^\\\\[?.]\\') { return $Path }
+    if ($p -match '^\\\\[?.]\\UNC\\(?<rest>.+)$') { return '\\' + $Matches['rest'] }
+    if ($p -match '^\\\\[?.]\\(?<rest>[A-Za-z]:\\.*)$') { return $Matches['rest'] }
+    throw 'unsupported-extended-path'
+}
+function Get-FinalDir([string]$Path) {  # Windows: open the directory and read its true path back, so links, junctions, subst drives, 8.3 and \\?\ spellings are all resolved by the kernel (r7 A1, A2). The handle stays open (no share-delete), so the directory and its parents cannot be renamed or replaced before the artifacts are written (r7 A3)
+    if (-not ('LdsNative.Win' -as [type])) {
+        Add-Type -Namespace LdsNative -Name Win -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, System.IntPtr security, uint disposition, uint flags, System.IntPtr template);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle handle, System.Text.StringBuilder buffer, uint length, uint flags);
+'@
+    }
+    $h = [LdsNative.Win]::CreateFileW((Remove-ExtendedPrefix $Path), 0x81, 3, [System.IntPtr]::Zero, 3, 0x02000000, [System.IntPtr]::Zero)  # LIST_DIRECTORY+READ_ATTRIBUTES (an attributes-only open is exempt from sharing checks, so it would hold nothing); share read+write, not delete; OPEN_EXISTING; BACKUP_SEMANTICS (a directory)
+    if ($h.IsInvalid) { throw 'cannot-open-directory' }
+    $sb = [System.Text.StringBuilder]::new(32768)
+    $n = [LdsNative.Win]::GetFinalPathNameByHandleW($h, $sb, 32768, 0)
+    if ($n -eq 0 -or $n -ge 32768) { $h.Dispose(); throw 'cannot-resolve-directory' }
+    return @{ Path = (Remove-ExtendedPrefix $sb.ToString()); Handle = $h }
 }
 function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
@@ -105,7 +126,11 @@ try {
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=none', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
-try { $RunDir = Resolve-RealPath $RunDir; $rel = [System.IO.Path]::GetRelativePath((Resolve-RealPath $WorkDir), $RunDir) } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
+try {
+    if ($script:onWin) { $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path }
+    else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir }
+    $rel = [System.IO.Path]::GetRelativePath($realWork, $RunDir)
+} catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
 if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
 $headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()

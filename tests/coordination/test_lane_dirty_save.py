@@ -453,9 +453,69 @@ def test_the_resolver_and_the_writer_use_only_the_platforms_own_separators():  #
     assert m, "lane-dirty-save.ps1 has no Resolve-RealPath"
     body = m.group(0)
     assert "[char[]]@('\\', '/')" not in body and "DirectorySeparatorChar" in body and "AltDirectorySeparatorChar" in body  # old code: split on both characters on every platform
-    assert r"$win -and $Path.StartsWith('\\?\UNC\')" in body  # the extended-length prefix is a Windows spelling only
+    assert "Get-FinalDir $RunDir" in text and "Get-FinalDir $WorkDir" in text  # Windows resolves through an open directory handle, not by walking names
     assert "Resolve-Path" not in text and "Join-Path" not in text and "Test-Path" not in text  # PowerShell's path layer may re-spell a backslash; .NET only
-    assert re.search(r"\$RunDir = Resolve-RealPath \$RunDir; \$rel = ", text)  # the checked directory is the written one
+    assert "$RunDir = Resolve-RealPath $RunDir;" in text and "$RunDir = $script:held[0].Path;" in text  # the checked directory is the written one, on both platforms
+
+
+def ps_functions(*names):
+    text = SCRIPT.read_text(encoding="utf-8")
+    out = ""
+    for n in names:
+        m = re.search(rf"^function {n}\b.*?^}}\n", text, re.MULTILINE | re.DOTALL)
+        assert m, f"lane-dirty-save.ps1 has no {n}"  # old code: no such helper
+        out += m.group(0)
+    return out
+
+
+@pytest.mark.parametrize("raw, want", [
+    ("\\\\?\\C:\\a\\b", "C:\\a\\b"),
+    ("\\\\.\\C:\\a", "C:\\a"),
+    ("\\\\?\\UNC\\srv\\sh\\repo\\run", "\\\\srv\\sh\\repo\\run"),
+    ("\\\\?\\unc\\srv\\sh\\repo\\run", "\\\\srv\\sh\\repo\\run"),   # r7 A1: the UNC marker is case-insensitive
+    ("\\\\.\\UNC\\srv\\sh\\repo\\run", "\\\\srv\\sh\\repo\\run"),
+    ("//?/unc/srv/sh/repo/run", "\\\\srv\\sh\\repo\\run"),          # forward slashes spell the same prefix
+    ("C:\\plain\\x", "C:\\plain\\x"),
+    ("\\\\srv\\sh\\x", "\\\\srv\\sh\\x"),
+    ("\\\\?\\Volume{1234}\\x", None),                                # a form with no drive or UNC meaning is refused, not stripped to a local relative path
+    ("\\\\?\\GLOBALROOT\\Device\\x", None),
+    ("\\\\.\\PhysicalDrive0", None),
+    ("\\\\?\\C:", None),
+])
+def test_an_extended_length_prefix_is_removed_in_any_case_or_the_path_is_refused(raw, want):  # r7 A1
+    prog = "$script:onWin = $true; " + ps_functions("Remove-ExtendedPrefix") + "try { [Console]::Out.Write('[' + (Remove-ExtendedPrefix $env:LDS_P) + ']') } catch { [Console]::Out.Write('THROWN ' + $_.Exception.Message) }"
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, "LDS_P": raw})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.decode("utf-8") == ("THROWN unsupported-extended-path" if want is None else "[" + want + "]")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="subst drives are Windows")
+def test_a_run_dir_on_a_subst_drive_that_maps_into_the_worktree_is_bad_arguments(repo):  # r7 A2
+    letter = next((c for c in "YXWVUTSR" if not os.path.exists(f"{c}:\\")), None)
+    if letter is None:
+        pytest.skip("no free drive letter")
+    (repo / "run").mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    subprocess.run(["subst", f"{letter}:", str(repo)], check=True, capture_output=True)
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", f"{letter}:\\run", "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    finally:
+        subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True)
+    assert r.returncode == 30, r.stdout + r.stderr  # old code: exit 0, evidence written into the worktree through the mapping
+    assert "run-dir-inside-worktree" in r.stdout and list((repo / "run").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the open directory handle is the Windows remedy; POSIX re-resolves names only (see summary OPEN A3-posix)")
+def test_the_checked_run_dir_cannot_be_renamed_away_while_the_saver_holds_it(tmp_path):  # r7 A3
+    target = tmp_path / "run"
+    target.mkdir()
+    prog = ("$script:onWin = $true; " + ps_functions("Remove-ExtendedPrefix", "Get-FinalDir") +
+            "$h = Get-FinalDir $env:LDS_P; try { [System.IO.Directory]::Move($env:LDS_P, $env:LDS_P + '.moved'); $o = 'MOVED' } catch { $o = 'BLOCKED' }; "
+            "$h.Handle.Dispose(); [Console]::Out.Write($o + ' ' + $h.Path)")
+    r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, "LDS_P": str(target)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.decode("utf-8").split(" ", 1)[0] == "BLOCKED" and target.is_dir()  # old code: only a path string survived the check
+    assert not (tmp_path / "run.moved").exists()
 
 
 def test_a_changed_gitlink_is_saved_as_an_applicable_patch_even_when_diff_submodule_is_log(repo, tmp_path):  # r7 A2
@@ -537,7 +597,7 @@ def test_the_toplevel_path_is_never_trimmed():
 # ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
 FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
 # The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.
-LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType\s+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.File\]::\s*(?:Move|Replace)|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
+LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType[\s:]+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.File\]::\s*(?:Move|Replace)|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
 
 
 def walker_violations(text):
@@ -553,6 +613,6 @@ def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_c
 @pytest.mark.parametrize("mutant", ["NtSetInformationFile(h, out io, info, 24, 11);", "CreateHardLinkW(a, b, 0);", "New-Item -ItemType HardLink -Path $a -Value $b",
                                     "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)",
                                     "[IO.File]::Move($a, $b)", "[IO.File]::Replace($a, $b, $null)", "[IO.File]:: Move($a, $b)", "[IO.FileInfo]::new($a).MoveTo($b)",
-                                    "Move-Item -LiteralPath $a -Destination $b", 'New-Item -ItemType "HardLink" -Path $a -Value $b', "Rename-Item $a $b"])
+                                    "Move-Item -LiteralPath $a -Destination $b", 'New-Item -ItemType "HardLink" -Path $a -Value $b', "Rename-Item $a $b", "New-Item -ItemType:HardLink -Path $a -Value $b", "New-Item -ItemType: HardLink -Path $a -Value $b"])
 def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
     assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")
