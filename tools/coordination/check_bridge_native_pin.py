@@ -15,7 +15,15 @@ a class attribute, a default argument. At each such frame's `return` event it co
 the frame's own `native` local: the call took the fast path exactly when it returned the object the native
 lookup gave it. No line number is consulted, so the layout of the source (`if native is not None: return
 native` on one line or on two) cannot change the answer, and no module attribute is replaced, so no alias can
-route around the observation.
+route around the observation. Tracing is applied to threads that already exist too (3.12+; older Pythons say
+UNKNOWN if another thread is alive).
+
+A second signal needs no tracing at all: the forced native entry records every call it receives, from any
+thread. The forcing is a loader wrapper on core.win_process, so importlib.reload of it, or a purge and fresh
+import, re-forces it. Any call of the forced entry during the test means a lookup consulted the native entry
+unpinned: UNPINNED, even if the test swapped the trace function or ran the call on an untraced thread. Out of
+the model: a call made in a separate interpreter the test launches (it is not this process, so nothing here
+forces or sees it).
 
 Verdict (stdout, exactly one line; exit code):
   PINNED   (0)  the test ran and passed, was not skipped, an observed call looked a pid up and fell through to
@@ -61,22 +69,46 @@ def _child(agent_dir, nonce):
         print("RESULT %s %s" % (nonce, text))
         return VERDICT_CODE[text.split(" ")[0]]
 
+    import importlib.abc
+    import importlib.machinery
+
     sys.path.insert(0, agent_dir)
+    forced_calls = []    # every call of the forced native entry, from any thread, through any alias
 
     def forced(pid):
+        forced_calls.append(pid)
         return {"pid": pid, "parent_pid": 0, "name": "python.exe", "command_line": FORCED,
                 "executable_path": None, "creation_date": None}
 
     # Force the REAL implementation at its source BEFORE anything imports it: server, the wrapper, the
     # trampoline and the test module all bind it by `from core.win_process import native_process_entry`,
     # and a pin whose side_effect delegates to the real function (the host answers None for an idle pid)
-    # must reach the forced one, not a host-dependent answer. Forcing precedes the test module's import
-    # so a pin that module sets at import time still wins.
+    # must reach the forced one, not a host-dependent answer. The forcing is a loader wrapper, so it is
+    # re-applied by every (re)execution of core.win_process: importlib.reload(core.win_process), or a
+    # purge from sys.modules and a fresh import, cannot restore the host-dependent function.
+    class ForcingFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path, target=None):
+            if fullname != "core.win_process":
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+            if spec is None or not isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+                raise ImportError("cannot force core.win_process: unexpected loader")
+
+            class ForcingLoader(type(spec.loader)):
+                def exec_module(self, module):
+                    super().exec_module(module)
+                    module.native_process_entry = forced
+
+            spec.loader = ForcingLoader(spec.loader.name, spec.loader.path)
+            return spec
+
+    finder = ForcingFinder()
+    sys.meta_path.insert(0, finder)
     import core.win_process as win_process
-    win_process.native_process_entry = forced
     import server
 
-    server.native_process_entry = forced
+    if win_process.native_process_entry is not forced or server.native_process_entry is not forced:
+        return emit("UNKNOWN (could not force the native process entry)")
     import test_server_wrapper_phase2 as mod
 
     cls = getattr(mod, TEST_CLASS, None)
@@ -113,22 +145,31 @@ def _child(agent_dir, nonce):
         return local if (c is code or c == code) else None
 
     suite = unittest.defaultTestLoader.loadTestsFromName(TEST_CLASS + "." + TEST_NAME, mod)
+    # Threads that already exist (a pool started at import) are traced too (3.12+); where that is not
+    # available a second live thread cannot be observed, so the check says UNKNOWN rather than guess.
+    set_threads = getattr(threading, "settrace_all_threads", None)
+    if set_threads is None and threading.active_count() > 1:
+        return emit("UNKNOWN (a thread other than the main one is alive and cannot be traced on this Python)")
+    set_threads = set_threads or threading.settrace
     previous = sys.gettrace()
+    forced_calls.clear()
     sys.settrace(tracer)
-    threading.settrace(tracer)
+    set_threads(tracer)
     try:
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
-        disturbed = sys.gettrace() is not tracer
+        disturbed = sys.gettrace() is not tracer or finder not in sys.meta_path
     finally:
         sys.settrace(previous)
-        threading.settrace(None)
+        set_threads(None)
     if problems:
         return emit("UNKNOWN (tracer error: %s)" % problems[0])
-    if any(kind == "fast" for kind, _ in frames) or \
-            any(isinstance(e, dict) and e.get("command_line") == FORCED for _, e in frames):
-        return emit("UNPINNED (a call of the lookup in the test returned the native result)")
+    # Two independent signals that a lookup consulted the native entry unpinned: the traced frame returned
+    # the object the native lookup gave it, or the forced native entry itself was CALLED (this one needs no
+    # tracing, so a thread or a swapped trace function cannot hide it).
+    if forced_calls or any(kind == "fast" for kind, _ in frames):
+        return emit("UNPINNED (a lookup in the test consulted the native process entry)")
     if disturbed:
-        return emit("UNKNOWN (the test replaced the trace function; later calls were not observed)")
+        return emit("UNKNOWN (the test replaced the trace function or the forcing finder; later calls were not observed)")
     if result.skipped or result.expectedFailures or result.unexpectedSuccesses:
         return emit("UNKNOWN (the test was skipped or marked expected-failure; a skipped test is not retired)")
     if result.testsRun != 1 or not result.wasSuccessful():
