@@ -942,7 +942,7 @@ def test_a_toplevel_path_that_is_not_utf8_is_refused_not_decoded_into_a_sibling(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="NTFS names are UTF-16, so a path with a byte that is not UTF-8 exists only on POSIX; the decoder test above runs everywhere")
-def test_a_posix_worktree_with_a_non_utf8_name_is_refused_and_its_replacement_sibling_is_untouched(tmp_path):  # r8 adversary A3 end to end
+def test_a_posix_worktree_with_a_non_utf8_name_is_refused_and_its_replacement_sibling_is_untouched(tmp_path):  # r8 adversary A3 end to end (POSIX only; never run on the Windows hub VM, first run is ubuntu CI)
     root = os.fsencode(str(tmp_path))
     real, sibling = root + b"/wt\xff", root + "/wt�".encode()
     (tmp_path / "run").mkdir()
@@ -958,7 +958,7 @@ def test_a_posix_worktree_with_a_non_utf8_name_is_refused_and_its_replacement_si
     Path(os.fsdecode(real), "a.txt").write_text("REAL dirt\n")
     os.symlink(real, root + b"/selected")
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(tmp_path / "selected"), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
-    assert r.returncode == 30 and "toplevel-not-utf8" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 30 and "reason=link-in-path" in r.stdout, r.stdout + r.stderr  # r13 CHANGED MEANING (sol r12 F2; adversary r13 A3): the ASCII symlink `selected` was followed so git could print the non-UTF-8 top level (toplevel-not-utf8); a link in the WorkDir chain is refused first now. The strict decoder is still pinned by the unit test above, and no non-UTF-8 argument can reach it without a link (.NET decodes such an argv byte to U+FFFD, the sibling)
     assert list((tmp_path / "run").iterdir()) == []
 
 
