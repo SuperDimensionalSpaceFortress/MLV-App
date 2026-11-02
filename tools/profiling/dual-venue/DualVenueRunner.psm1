@@ -1985,6 +1985,45 @@ function Get-DvLegSpecShapeRefusal {
     $null
 }
 
+# --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r10: is a paired-comparison image a PNG at all? ONE check for both members of every pair ------------
+# (sol r9 key B1, r9 adversary successor ADV-A1 DualVenueRunner.psm1:2048) A paused still or an in-pass partner whose file hash-matches its listing
+# was honoured whatever its bytes were: a zero-byte frame-00.png (sha256 e3b0c442...b855), a truncated file, a non-PNG renamed .png. A hash binds the
+# bytes to the listing; it says nothing about whether they are an image. This walks the PNG container without decoding pixels (no decoder dependency):
+# the 8-byte signature; a first chunk IHDR of length 13 with width and height 1..2^31-1, a valid bit depth / colour type pair, compression 0, filter 0
+# and interlace 0 or 1; every chunk length inside the file and every chunk type four ASCII letters; at least one IDAT; and an IEND that ends the chunk
+# sequence (a file cut short has none). Returns $null for a well-formed PNG, otherwise the reason. Get-DvPairedSeekVerdict calls it for every paused
+# still and every in-pass partner image, so collection (Invoke-VenueLeg) and final validation (Test-DvReceiptValid) refuse the same files.
+$script:PngSignature = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+$script:PngMinBytes = 8 + 25 + 12 + 12   # signature + IHDR chunk (12 + 13) + an IDAT chunk header + IEND chunk
+$script:PngBitDepths = @{ 0 = @(1, 2, 4, 8, 16); 2 = @(8, 16); 3 = @(1, 2, 4, 8); 4 = @(8, 16); 6 = @(8, 16) }   # colour type -> allowed bit depths
+function Get-DvPngImageProblem {
+    param([AllowNull()][byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return 'it is empty (0 bytes)' }
+    $n = $Bytes.Length
+    for ($i = 0; $i -lt [Math]::Min(8, $n); $i++) { if ($Bytes[$i] -ne $script:PngSignature[$i]) { return "it does not start with the 8-byte PNG signature ($n bytes)" } }
+    if ($n -lt $script:PngMinBytes) { return "it is $n bytes, shorter than the smallest PNG ($($script:PngMinBytes) bytes: signature, IHDR, IDAT and IEND), so it is truncated" }
+    $u32 = { param([int]$at) ([long]$Bytes[$at] -shl 24) -bor ([long]$Bytes[$at + 1] -shl 16) -bor ([long]$Bytes[$at + 2] -shl 8) -bor [long]$Bytes[$at + 3] }
+    $type = { param([int]$at) [Text.Encoding]::ASCII.GetString($Bytes, $at, 4) }   # (a byte over 0x7F decodes to '?', which no chunk type matches)
+    if ((& $u32 8) -ne 13 -or (& $type 12) -cne 'IHDR') { return 'its first chunk is not a 13-byte IHDR' }
+    $width = & $u32 16; $height = & $u32 20
+    if ($width -lt 1 -or $width -gt 0x7FFFFFFF -or $height -lt 1 -or $height -gt 0x7FFFFFFF) { return "its IHDR says $width x $height (width and height must be 1 .. 2^31-1)" }
+    $depth = [int]$Bytes[24]; $colour = [int]$Bytes[25]
+    if (-not ($script:PngBitDepths.ContainsKey($colour) -and $depth -in $script:PngBitDepths[$colour])) { return "its IHDR bit depth $depth with colour type $colour is not a PNG pixel format" }
+    if ($Bytes[26] -ne 0 -or $Bytes[27] -ne 0 -or $Bytes[28] -gt 1) { return 'its IHDR compression, filter or interlace method is not one PNG defines' }
+    $at = 8; $sawIdat = $false
+    while ($true) {
+        if ($at + 12 -gt $n) { return 'its chunks end without an IEND chunk, so it is truncated' }
+        $length = & $u32 $at; $name = & $type ($at + 4)
+        if ($name -cnotmatch '^[A-Za-z]{4}$') { return "the chunk at byte $at has no PNG chunk type" }
+        if ($length -gt 0x7FFFFFFF -or $at + 12 + $length -gt $n) { return "its $name chunk at byte $at runs past the end of the file ($n bytes), so it is truncated" }
+        if ($name -ceq 'IDAT') { $sawIdat = $true }
+        if ($name -ceq 'IEND') { break }
+        $at += 12 + [int]$length
+    }
+    if (-not $sawIdat) { return 'it has no IDAT chunk, so it holds no image data' }
+    $null
+}
+
 # --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the paused stills of a look.pairedSeekFrames leg, ONE reader for the runner and the validator ---------
 # (adversary r5 A2 / A3, Dot 5c6bcd98, sol r5 key B1 / B2) Still i (frame-<ii>) counts only when (1) its png AND its sidecar are in the hash listing;
 # (2) EACH is read back now and its bytes hash to the listed sha256 -- a file missing, replaced or truncated after the listing is a mismatch naming it
@@ -2047,6 +2086,11 @@ function Get-DvPairedSeekVerdict {
                 if ($null -eq $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { $problem = "$stillName.$ext is missing after it was hash-listed$tail"; break }
                 [byte[]]$bytes = [IO.File]::ReadAllBytes($file)
                 if ((Get-DvSha256OfBytes $bytes) -cne $listedSha["$stillName.$ext"]) { $problem = "$stillName.$ext changed after it was hash-listed (its bytes no longer hash to the listed sha256)$tail"; break }
+                # r10 (sol r9 key B1, adversary successor ADV-A1): a hash-matching png is still no paused image unless it IS a PNG (Get-DvPngImageProblem)
+                if ($ext -eq 'png') {
+                    $imageProblem = Get-DvPngImageProblem $bytes
+                    if ($null -ne $imageProblem) { $problem = "$stillName.png is not a decodable PNG image: $imageProblem (a paired still is a paused image, not a file that merely hash-matches its listing)$tail"; break }
+                }
                 if ($ext -eq 'json') { $sidecarBytes = $bytes }
             }
         }
@@ -2080,6 +2124,10 @@ function Get-DvPairedSeekVerdict {
                     $problem = "$stillName's in-pass partner $stillName.json was not grabbed while playing (it says capture_mode $(& $show $partnerMode), playback_path $(& $show $partnerPath); an in-pass partner needs capture_mode ""in_pass"" and playback_path true), so its paused still is no playing-versus-paused comparison"
                 }
                 elseif (-not $inPassBytes.ContainsKey("$stillName.png")) { $problem = "$stillName's in-pass partner has no image: contact-sheet\raw\$stillName.png is not among the hash-verified in-pass files, so there is no playing frame to compare its paused still with" }
+                # r10 (sol r9 key B1): the partner's hash-verified bytes must be a PNG too -- both members of a pair are images, or neither is compared
+                elseif ($null -ne ($partnerImageProblem = Get-DvPngImageProblem ([byte[]]$inPassBytes["$stillName.png"]))) {
+                    $problem = "$stillName's in-pass partner image contact-sheet\raw\$stillName.png is not a decodable PNG image: $partnerImageProblem, so there is no playing frame to compare its paused still with"
+                }
                 elseif ($shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
             }
         }
@@ -3464,7 +3512,7 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
+    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,

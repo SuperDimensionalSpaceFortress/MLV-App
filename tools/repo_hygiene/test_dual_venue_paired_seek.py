@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 
 from tools.repo_hygiene.test_dual_venue_evidence import DV, STUB_GENERATOR, RunnerHarness, requires_windows_pwsh
@@ -22,10 +24,25 @@ from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import ATTRIBUTION_G
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
 PAIRED_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,[switch]$ContactSheetPairedSeek)")
+
+
+def png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def fixture_png(tag: bytes | str, width: int = 2, height: int = 2) -> bytes:
+    """r10 forced fixture (sol r9 key B1): a well-formed PNG -- signature, IHDR, IDAT, IEND -- tagged by a tEXt chunk so each still hashes apart. The
+    r6-r9 fixtures were the 8-byte signature plus a tag (no IHDR), the shape r10's image check now refuses, as it refuses a zero-byte png."""
+    tag = tag.encode("utf-8") if isinstance(tag, str) else tag
+    rows = b"".join(b"\x00" + bytes(3 * width) for _ in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + png_chunk(b"tEXt", b"fixture\x00" + tag)
+            + png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
+
+
 # r7: two COMPLETE paused stills (each png with its sidecar, as the app writes a seek capture). The r1-r6 fixture -- a sidecar with no display_frame
 # and a png with no sidecar -- is exactly the listless shape adversary r6 A1 showed passing; it is now a typed mismatch (PairedSeekListlessProvenanceTests).
-SEEK_FRAMES = {"frame-00.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":50}', "frame-00.png": b"\x89PNG\r\n\x1a\nseek-0",
-               "frame-01.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":150}', "frame-01.png": b"\x89PNG\r\n\x1a\nseek-1"}
+SEEK_FRAMES = {"frame-00.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":50}', "frame-00.png": fixture_png("seek-0"),
+               "frame-01.json": b'{"capture_mode":"seek","playback_path":false,"display_frame":150}', "frame-01.png": fixture_png("seek-1")}
 
 
 def write_in_pass_partners(artifacts: Path, count: int, frames: list[int] | None = None) -> None:
@@ -34,7 +51,7 @@ def write_in_pass_partners(artifacts: Path, count: int, frames: list[int] | None
     raw = artifacts / "artifacts" / "contact-sheet" / "raw"
     raw.mkdir(parents=True, exist_ok=True)
     for i in range(count):
-        (raw / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nraw-%d" % i)
+        (raw / f"frame-{i:02d}.png").write_bytes(fixture_png("raw-%d" % i))
         (raw / f"frame-{i:02d}.json").write_bytes(json.dumps({"capture_mode": "in_pass", "playback_path": True, "display_frame": frames[i] if frames else 50 + 100 * i}).encode("utf-8"))
 
 
@@ -232,7 +249,7 @@ class PairedSeekFrameListTests(RunnerHarness, unittest.TestCase):
         seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
         seek.mkdir(parents=True, exist_ok=True)
         for i, frame in enumerate(display_frames):
-            (seek / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-%d" % i)
+            (seek / f"frame-{i:02d}.png").write_bytes(fixture_png("seek-%d" % i))
             if frame is not None:
                 (seek / f"frame-{i:02d}.json").write_bytes(seek_sidecar(frame))
         # r8 fix 2 forced fixture (adversary r8 fix-1 A2): the in-pass partners of the requested frames [50, 150], which a listed-frame still must match too
@@ -509,7 +526,7 @@ class PairedStillsHarness(RunnerHarness):
         seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
         seek.mkdir(parents=True, exist_ok=True)
         for i, sidecar in enumerate(sidecars):
-            (seek / f"frame-{i:02d}.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-%d" % i)
+            (seek / f"frame-{i:02d}.png").write_bytes(fixture_png("seek-%d" % i))
             (seek / f"frame-{i:02d}.json").write_bytes(sidecar)
         write_in_pass_partners(self.artifacts, len(sidecars))
 
@@ -694,9 +711,9 @@ class PairedSeekListlessProvenanceTests(PairedStillsHarness, unittest.TestCase):
         self.write_artifacts(sheet=True, raw_frames=True)
         seek = self.artifacts / "artifacts" / "paired-seek" / "contact-sheet" / "raw"
         seek.mkdir(parents=True, exist_ok=True)
-        (seek / "frame-00.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-0")
+        (seek / "frame-00.png").write_bytes(fixture_png("seek-0"))
         (seek / "frame-00.json").write_bytes(provenance_sidecar(50))
-        (seek / "frame-01.png").write_bytes(b"\x89PNG\r\n\x1a\nseek-1")
+        (seek / "frame-01.png").write_bytes(fixture_png("seek-1"))
         proc, receipt, _ = self.run_leg("ultra-magnus", self.listless_spec("ll-no-sidecar"), extra=["-Backend", "cpu"])
         self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
         self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
@@ -899,7 +916,7 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
 
     def test_a1_every_hash_listed_file_is_one_of_the_committed_stills(self) -> None:
         # an extra playing still beside a complete set: a listed-frame leg (r7 never looked past frame-01) and the shipped listless leg
-        extra = {"frame-0{n}.png": b"\x89PNG\r\n\x1a\nextra", "frame-0{n}.json": provenance_sidecar(999, capture_mode="in_pass", playback_path=True)}
+        extra = {"frame-0{n}.png": fixture_png("extra"), "frame-0{n}.json": provenance_sidecar(999, capture_mode="in_pass", playback_path=True)}
         for case, spec, sidecars in (("listed", lambda: self.paired_spec("set-extra-listed"), [provenance_sidecar(50), provenance_sidecar(150)]),
                                      ("listless", lambda: self.shipped_spec("set-extra-listless"), [provenance_sidecar(f) for f in SIX_FRAMES])):
             with self.subTest(case=case):
@@ -920,7 +937,7 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
     def test_r8_a1_a_collected_still_the_listing_leaves_out_is_not_invisible(self) -> None:
         # adversary r8 A1: six paused stills plus a playing frame-06 on disk; the listing (and every claim) leaves frame-06 out
         drop = "        $seekFiles = @($seekFiles | Where-Object { $_.name -notlike 'frame-06*' })\n"
-        extra = {"frame-06.png": b"\x89PNG\r\n\x1a\nextra", "frame-06.json": provenance_sidecar(999, capture_mode="in_pass", playback_path=True)}
+        extra = {"frame-06.png": fixture_png("extra"), "frame-06.json": provenance_sidecar(999, capture_mode="in_pass", playback_path=True)}
         for final in (False, True):
             with self.subTest(final_validation=final):
                 self.fresh()
@@ -1188,6 +1205,119 @@ class PairedSeekInPassPartnerTests(PairedStillsHarness, unittest.TestCase):
                 if not final:
                     blamed = sorted({m[:8] for m in receipt["look"]["pairedSeek"]["frameMismatches"]})
                     self.assertEqual(blamed, ["frame-01", "frame-02"], "each defect is named, the intact stills are not blamed")
+
+
+# r10 (sol r9 key B1, r9 adversary successor ADV-A1, fable r9 hardening): files that hash-match their listing but are no PNG image. On ac26ee87 every one
+# of them, as a paused still OR as its in-pass partner, was honoured (framesHonoured=true, PASS) at collection and at final validation alike.
+_GOOD = fixture_png("good", width=4, height=3)
+NOT_A_PNG = (("zero-byte", b""),                                                     # sha256 e3b0c442...b855, sol r9's repro
+             ("four-byte-non-png", b"GIF8"),
+             ("truncated-no-iend", _GOOD[:-12]),                                     # cut before IEND
+             ("truncated-mid-chunk", _GOOD[:len(_GOOD) - 20]),                       # cut inside IDAT
+             ("wrong-signature", b"\x89PNX" + _GOOD[4:]),
+             ("zero-width-ihdr", fixture_png("w0", width=0, height=3)),
+             ("zero-height-ihdr", fixture_png("h0", width=4, height=0)),
+             ("renamed-jpeg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01" + bytes(96)),
+             ("no-idat", _GOOD[:8] + _GOOD[8:33] + png_chunk(b"IEND", b"")))
+PNG_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
+foreach ($p in @($args | Select-Object -Skip 1)) { $r = Get-DvPngImageProblem ([IO.File]::ReadAllBytes($p)); Write-Output ("ROW|" + (Split-Path -Leaf $p) + "|" + $(if ($null -eq $r) { 'OK' } else { $r })) }
+"""
+
+
+@requires_pwsh
+class PngImageCheckUnitTests(unittest.TestCase):
+    """r10: Get-DvPngImageProblem, the one image check both members of every pair go through. Each NOT_A_PNG shape is refused with a reason; well-formed
+    PNGs (the fixtures, a 1x1 grey, a 16-bit RGBA, an interlaced one) are accepted. (RED on ac26ee87: the function did not exist.)"""
+
+    def test_r10_b1_a_file_that_is_not_a_png_is_refused_and_a_png_is_accepted(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="png-shape-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        grey = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(b"\x00\x80")) + png_chunk(b"IEND", b"")
+        rgba16 = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 16, 6, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(bytes(9))) + png_chunk(b"IEND", b"")
+        laced = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 1)) + png_chunk(b"IDAT", zlib.compress(bytes(4))) + png_chunk(b"IEND", b"")
+        bad_depth = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 4, 2, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(bytes(4))) + png_chunk(b"IEND", b"")
+        cases = {**{f"bad-{n}.png": (b, False) for n, b in NOT_A_PNG}, "bad-depth.png": (bad_depth, False),
+                 "ok-fixture.png": (_GOOD, True), "ok-grey.png": (grey, True), "ok-rgba16.png": (rgba16, True), "ok-interlaced.png": (laced, True)}
+        for name, (data, _) in cases.items():
+            (root / name).write_bytes(data)
+        (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
+        import subprocess
+        from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import PWSH
+        proc = subprocess.run([PWSH, "-NoProfile", "-File", str(root / "probe.ps1"), str(DV)] + [str(root / n) for n in cases], capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {line.split("|")[1]: line.split("|", 2)[2] for line in proc.stdout.splitlines() if line.startswith("ROW|")}
+        for name, (_, ok) in cases.items():
+            with self.subTest(case=name):
+                self.assertIn(name, rows, proc.stdout + proc.stderr)
+                if ok:
+                    self.assertEqual(rows[name], "OK")
+                else:
+                    self.assertNotEqual(rows[name], "OK", f"{name} is no PNG image")
+
+
+SEEK_RAW = ("artifacts", "paired-seek", "contact-sheet", "raw")
+
+
+@requires_windows_pwsh
+class PairedSeekImageContentTests(PairedStillsHarness, unittest.TestCase):
+    """r10 (sol r9 key B1, r9 adversary successor ADV-A1 DualVenueRunner.psm1:2048): a paired comparison is two IMAGES of one frame. A paused still, or
+    its in-pass partner, whose file hash-matches its listing but is no decodable PNG (zero bytes, four bytes, truncated, wrong signature, a zero-size IHDR,
+    a JPEG renamed .png) is a typed mismatch naming the frame, framesHonoured=false and INVALID -- on a listed and a listless leg, at collection and at the
+    receipt writer's final validation. The complete pair of valid images is the control."""
+
+    def run_image_case(self, leg_id: str, member: str | None, data: bytes = b"", listed: bool = False, final: bool = False):
+        frames = [50, 150] if listed else SIX_FRAMES
+        if final:
+            leg_id += "-f"
+        runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR,
+                                              VERDICT_DONE_ANCHOR + claimed_block(frames, requested=frames if listed else None))])} if final else {}
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills([provenance_sidecar(f) for f in frames])
+        if member is not None:
+            folder = SEEK_RAW if member == "paused" else IN_PASS_RAW
+            self.artifacts.joinpath(*folder, "frame-00.png").write_bytes(data)
+        spec = self.paired_spec(leg_id, frames) if listed else PairedSeekCommittedStillSetTests.shipped_spec(self, leg_id)
+        proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"], **runner)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def assert_image_mismatch(self, receipt, member: str, final: bool) -> None:
+        where = "frame-00.png is not a decodable PNG" if member == "paused" else "in-pass partner image contact-sheet\\raw\\frame-00.png is not a decodable PNG"
+        PairedSeekCommittedStillSetTests.assert_not_a_pass(self, receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", where, final=final)
+        if not final:
+            info = receipt["look"]["pairedSeek"]
+            self.assertIs(info["framesHonoured"], False)
+            self.assertEqual(sorted({m[:8] for m in info["frameMismatches"]}), ["frame-00"], "only the frame with the bad image is blamed")
+
+    def test_r10_b1_a_zero_byte_or_four_byte_image_in_either_member_is_not_a_pass(self) -> None:
+        for shape, data in NOT_A_PNG[:2]:
+            for member in ("paused", "partner"):
+                for listed in (True, False):
+                    for final in (False, True):
+                        with self.subTest(shape=shape, member=member, listed=listed, final_validation=final):
+                            self.fresh()
+                            receipt = self.run_image_case(f"img-{shape[:4]}-{member[:4]}-{'l' if listed else 'n'}", member, data, listed=listed, final=final)
+                            self.assert_image_mismatch(receipt, member, final)
+
+    def test_r10_b1_every_other_non_png_shape_in_either_member_is_not_a_pass(self) -> None:
+        for shape, data in NOT_A_PNG[2:]:
+            for member in ("paused", "partner"):
+                with self.subTest(shape=shape, member=member):
+                    self.fresh()
+                    receipt = self.run_image_case(f"img-{shape}-{member[:4]}", member, data)
+                    self.assert_image_mismatch(receipt, member, final=False)
+
+    def test_r10_the_valid_image_pair_control_passes(self) -> None:
+        for listed in (True, False):
+            for final in (False, True):
+                with self.subTest(listed=listed, final_validation=final):
+                    self.fresh()
+                    receipt = self.run_image_case(f"img-control-{'l' if listed else 'n'}", None, listed=listed, final=final)
+                    self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                    self.assertIs(receipt["look"]["pairedSeek"]["framesHonoured"], True)
 
 
 if __name__ == "__main__":
