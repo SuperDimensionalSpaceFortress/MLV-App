@@ -5021,3 +5021,2059 @@ def test_fsmonitor_lexer_stays_in_sync_over_the_shipped_lane_script():
     flags, ended_in_code = fsmon_code_mask(code)
     assert ended_in_code, "the lexer ended inside a string: it lost sync with Invoke-Lane.ps1"
     assert not fsmon_lane_pin_violation(lane) and not fsmon_end_stop_violation(lane)
+
+
+# --- MERGE-GROUP-EXPORT-LANDED-RUN-SELECT-1: Select-MergeGroupJobsRun in Invoke-Workstream.ps1 --------
+# Owed on PR #732 (ACK 6544553789, Grok G1). On a merge-queue repo the newest completed merge_group run
+# can be an EJECTED queue entry whose headSha never landed on master. The hosted-evidence export used to
+# fetch the job graph of runs[0] (newest by createdAt) and call it "newest", so a reader could take a
+# non-landed run's jobs for master's CI. The selector is pure, so it is extracted by AST and run over
+# fixture rows; Invoke-Workstream itself is never executed (it reads the live queue and writes into real
+# .claude-state).
+
+MGRS_TIP = "a" * 40
+MGRS_OTHER = "b" * 40
+MGRS_EJECTED = "c" * 40
+MGRS_LABEL_LANDED = "landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)"
+
+
+def _mgrs_newer(n):
+    return "; %d newer completed run(s) not at the local tip" % n
+MGRS_LABEL_SUCCESS = "newest success; may be a non-landed queue entry"
+MGRS_LABEL_NEWEST = "newest by createdAt; may be a non-landed queue entry"
+
+
+def _mgrs_row(run_id, created, sha, conclusion):
+    return {"databaseId": run_id, "createdAt": created, "headSha": sha, "conclusion": conclusion, "displayTitle": "t"}
+
+
+def _mgrs_select(tmp_path, rows, tip, env=None):
+    """Run the real function over fixture rows; return {'id': databaseId, 'label': ...} or None."""
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    rows_file = tmp_path / "rows.json"
+    rows_file.write_text(json.dumps(rows), encoding="utf-8")
+    harness = tmp_path / "mgrs-harness.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n" + fn +
+        "\n$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip.replace("'", "''") + "'\n"
+        "if ($null -eq $pick) { 'NONE' } else { ([pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress) }\n",
+        encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True, env=env)
+    assert out.returncode == 0, out.stdout + out.stderr
+    text = out.stdout.strip()
+    return None if text == "NONE" else json.loads(text)
+
+
+def test_an_ejected_newest_merge_group_entry_loses_to_the_older_landed_run(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "failure"),   # newest, never landed
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),       # landed
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
+    ]
+    # r2 (adversary A2): the ejected newest FAILURE is a newer completed off-tip run too, so it is counted.
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}
+
+
+def test_a_newer_success_not_at_the_local_tip_puts_a_stale_ref_caveat_in_the_landed_label(tmp_path):
+    """adversary A1: the tip is read from the LOCAL fork/master, which can lag hosted master. A newer
+    successful run whose headSha is not the local tip may be the real landed run, so the label must
+    say the local ref may lag instead of asserting 'landed' flatly. An ejected newest FAILURE (the
+    ordinary case above) is counted as well since r2 (A2)."""
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "success"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "failure"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 200
+    assert picked["label"].startswith(MGRS_LABEL_LANDED), picked
+    assert picked["label"] == MGRS_LABEL_LANDED + _mgrs_newer(1), picked
+    assert "the local tip can lag hosted master" in picked["label"], picked
+
+
+def test_a_newer_off_tip_run_whose_conclusion_is_failure_still_puts_the_caveat_in_the_label(tmp_path):
+    """adversary A2 (r1 a211ccf4): a landed run that was RERUN and now reads failure sits at a newer
+    createdAt on a headSha that is not the local tip. The r1 caveat counted only conclusion == success, so
+    this gave no caveat. Every newer completed off-tip run counts."""
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 200
+    assert picked["label"].endswith(_mgrs_newer(1)), picked
+
+
+def test_two_newer_off_tip_runs_of_mixed_conclusions_are_both_counted(tmp_path):
+    rows = [
+        _mgrs_row(400, "2026-10-31T18:00:00Z", MGRS_EJECTED, "cancelled"),
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_EJECTED, "failure"),   # OLDER than the landed run: not counted
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _mgrs_newer(2)}
+
+
+def test_a_stale_local_tip_with_no_newer_run_in_the_sample_still_carries_the_lag_caveat(tmp_path):
+    """adversary A2 / Dot #734: the sample may simply not contain the run that landed after the local tip.
+    A missing newer run does not prove freshness, so the exact-match label names its source and the lag
+    caveat even when nothing newer is in the sample, and carries no newer-run count."""
+    rows = [
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked == {"id": 200, "label": MGRS_LABEL_LANDED}, picked
+    assert "local refs/remotes/fork/master tip" in picked["label"]
+    assert "the local tip can lag hosted master" in picked["label"]
+    assert "newer completed run" not in picked["label"]
+
+
+def test_the_newest_of_several_landed_merge_group_runs_is_taken(tmp_path):
+    rows = [
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_TIP, "success"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED}
+
+
+def test_no_landed_merge_group_run_falls_to_the_newest_success_with_the_hedged_label(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "failure"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "success"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_SUCCESS}
+
+
+def test_only_failed_merge_group_runs_fall_to_newest_by_created_at_with_the_hedged_label(tmp_path):
+    rows = [
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "failure"),
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "cancelled"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 300, "label": MGRS_LABEL_NEWEST}
+
+
+def test_an_unreadable_master_tip_skips_the_landed_rule(tmp_path):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_EJECTED, "failure"),
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    # tip unknown: the row that happens to carry the tip sha cannot be called landed; the success rule applies.
+    assert _mgrs_select(tmp_path, rows, "") == {"id": 200, "label": MGRS_LABEL_SUCCESS}
+
+
+def test_no_merge_group_rows_selects_nothing(tmp_path):
+    assert _mgrs_select(tmp_path, [], MGRS_TIP) is None
+
+
+def test_the_merge_group_export_uses_the_selector_and_names_its_label_not_a_fixed_newest():
+    """Source pin for the call site (the dispatcher is not executed under test): the old runs[0] choice and
+    the fixed 'newest by createdAt' row text must be gone, the master tip must be read locally, and a
+    failed tip read must never throw out of the export."""
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    assert "$runs[0]" not in text, "the export still takes the newest run by createdAt"
+    assert "Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha -TipReason $tipReason" in text
+    assert "newest by createdAt)" not in text, "the jobs row still hard-codes the label"
+    assert "$($pick.Label))" in text, "the jobs row does not carry the selector's label"
+    assert "Get-ForkMasterTip -RepoRoot $RepoRoot" in text   # r5 ADV-A1: exact-ref read, not a revision lookup
+    assert "show-ref --verify --hash refs/remotes/fork/master" in text
+    start = text.index("$pick = Select-MergeGroupJobsRun")
+    block = text[text.index("$tipSha = ''"):start]
+    assert "catch" in block and "gh " not in block and "gh api" not in block, "tip read must be local and non-throwing"
+    assert re.search(r"(?m)^\s*\} catch \{\s*\n\s*\$ghRows \+= .*\(job graph\)", text), "the export's own try/catch shape is gone"
+
+
+# --- r3 (sol B1 / adversary ADV-A1): "newer" is STRICTLY greater createdAt, never array position ----------
+# Rows that share the selected run's createdAt are not newer. Sorting ties and slicing by position used to
+# count every off-tip row that happened to sort ahead of the selected one.
+
+MGRS_TS = "2026-10-31T17:00:00Z"
+
+
+def test_equal_created_at_off_tip_rows_are_not_counted_as_newer_runs(tmp_path):
+    """sol's two-row repro: the off-tip row (id 2) sorts first but carries the SAME createdAt."""
+    rows = [
+        _mgrs_row(2, MGRS_TS, MGRS_OTHER, "success"),
+        _mgrs_row(1, MGRS_TS, MGRS_TIP, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 1, picked
+    assert "newer completed run" not in picked["label"], picked
+    assert picked == {"id": 1, "label": MGRS_LABEL_LANDED}, picked
+
+
+def test_a_seventeen_row_equal_timestamp_sample_counts_zero_newer_runs(tmp_path):
+    """sol's 17-row case: ids 17..1 all at one createdAt, all success, id 16 is at the tip, the rest off it."""
+    rows = [_mgrs_row(i, MGRS_TS, MGRS_TIP if i == 16 else MGRS_OTHER, "success") for i in range(17, 0, -1)]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 16, picked
+    assert "newer completed run" not in picked["label"], picked
+    assert picked["label"] == MGRS_LABEL_LANDED, picked
+
+
+def test_only_the_strictly_newer_off_tip_run_is_counted_among_equal_timestamp_rows(tmp_path):
+    rows = [
+        _mgrs_row(5, "2026-10-31T18:00:00Z", MGRS_EJECTED, "failure"),   # strictly newer, off tip: counted
+        _mgrs_row(4, MGRS_TS, MGRS_OTHER, "success"),                    # equal createdAt, off tip: not counted
+        _mgrs_row(3, MGRS_TS, MGRS_OTHER, "failure"),                    # equal createdAt, off tip: not counted
+        _mgrs_row(2, MGRS_TS, MGRS_TIP, "success"),                      # selected
+        _mgrs_row(1, "2026-10-31T16:00:00Z", MGRS_OTHER, "success"),     # older: not counted
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 2, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}
+
+
+def test_a_row_whose_created_at_does_not_parse_is_not_counted_as_newer(tmp_path):
+    rows = [
+        _mgrs_row(3, "not-a-timestamp", MGRS_OTHER, "success"),
+        _mgrs_row(2, MGRS_TS, MGRS_TIP, "success"),
+    ]
+    picked = _mgrs_select(tmp_path, rows, MGRS_TIP)
+    assert picked["id"] == 2, picked
+    assert "newer completed run" not in picked["label"], picked
+
+
+def test_the_newer_count_in_the_selector_has_no_positional_slice():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    start = text.index("function Select-MergeGroupJobsRun")
+    body = text[start:text.index("function Get-Prop", start)]
+    assert "IndexOf" not in body and "[0..(" not in body, "the newer count is positional again"
+
+
+# --- r2 (adversary A1): the master tip is read by FULL refname, never the bare "fork/master" ---------------
+# A same-named lightweight tag refs/tags/fork/master outranks refs/remotes/fork/master for the bare name, so
+# `git rev-parse fork/master` can return a tag target while the remote-tracking tip is somewhere else. The
+# expression is lifted out of each shipped script and run over a REAL throwaway repo.
+
+MGRS_TIP_READERS = (
+    (WORKSTREAM, 2),
+    (ROOT / "tools" / "coordination" / "Export-PrReviewEvidence.ps1", 1),
+)
+
+
+def _mgrs_tip_read_expressions(path):
+    text = path.read_text(encoding="utf-8")
+    return [m for m in re.findall(r"& git -C \$RepoRoot (?:rev-parse|show-ref) [^\r\n]*?\| Select-Object -First 1", text) if "fork/master" in m]
+
+
+def _mgrs_run_tip_expr(tmp_path, repo, expr):
+    harness = tmp_path / "mgrs-tip-harness.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n$RepoRoot='" + str(repo).replace("'", "''") + "'\n"
+        "$v = (" + expr + ")\nif ($null -eq $v) { '' } else { [string]$v }\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip()
+
+
+def test_the_fork_master_tip_read_ignores_a_same_named_tag(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    git(repo, "add", "f.txt")
+    git(repo, "commit", "-q", "-m", "one")
+    remote_tip = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("2", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "two")
+    tag_target = git(repo, "rev-parse", "HEAD")
+    assert remote_tip != tag_target
+    git(repo, "tag", "fork/master", tag_target)   # lightweight tag named like the remote-tracking branch
+    git(repo, "update-ref", "refs/remotes/fork/master", remote_tip)
+    for path, expected in MGRS_TIP_READERS:
+        exprs = _mgrs_tip_read_expressions(path)
+        assert len(exprs) == expected, (path.name, exprs)
+        for expr in exprs:
+            assert _mgrs_run_tip_expr(tmp_path, repo, expr) == remote_tip, (path.name, expr)
+    # with no remote-tracking ref at all the read must be EMPTY, never the tag target
+    git(repo, "update-ref", "-d", "refs/remotes/fork/master")
+    for path, _ in MGRS_TIP_READERS:
+        for expr in _mgrs_tip_read_expressions(path):
+            assert _mgrs_run_tip_expr(tmp_path, repo, expr) == "", (path.name, expr)
+
+
+def test_the_fork_master_tip_reads_use_the_full_refname_in_source():
+    for path, _ in MGRS_TIP_READERS:
+        text = path.read_text(encoding="utf-8")
+        assert "rev-parse fork/master" not in text, path.name
+        assert "show-ref --verify --hash refs/remotes/fork/master" in text, path.name   # r5 ADV-A1: exact ref
+        assert "refs/remotes/fork/master^{commit}" not in text, path.name
+    # r3 (G1): the merge-target and driver-ref sites and the currency guard default carry the full refname too
+    for label, ref in _g1_ref_sites():
+        assert ref == "refs/remotes/fork/master", (label, ref)
+    guard = (ROOT / "tools" / "coordination" / "assert-script-currency.ps1").read_text(encoding="utf-8")
+    assert "[string]$Ref = 'refs/remotes/fork/master'" in guard
+
+
+# --- r3 (Grok G1, hub ACK 6548301889): every consumer of the fork/master TIP gets the FULL refname --------
+# Same-named tag refs/tags/fork/master outranks refs/remotes/fork/master for the bare name, so a merge-base
+# --is-ancestor test or a `reset --hard` against the bare name follows the TAG. The ref string is lifted out of
+# each shipped script and then handed to real git in a throwaway repo.
+
+COORD = ROOT / "tools" / "coordination"
+RETIRE = COORD / "Retire-LaneWorktree.ps1"
+LOOP = COORD / "Invoke-WorkstreamLoop.ps1"
+FULL_FORK_MASTER = "refs/remotes/fork/master"
+
+
+def _g1_ref_sites():
+    """(label, ref string) for each consumer, read from source."""
+    ws = WORKSTREAM.read_text(encoding="utf-8")
+    ret = RETIRE.read_text(encoding="utf-8")
+    loop = LOOP.read_text(encoding="utf-8")
+    m_ws = re.search(r"Invoke-RetireLaneWorktree -WorkDir \$WorkDirToCheck -MergeTarget '([^']+)'", ws)
+    sweep = ret[ret.index("function Invoke-SweepMergedLaneWorktrees"):]
+    m_sw = re.search(r"\[string\]\$MergeTarget = '([^']+)'", sweep)
+    m_lp = re.search(r"(?m)^\$TargetRef\s*=\s*'([^']+)'", loop)
+    guard = (COORD / "Test-ProductRatioGuard.ps1").read_text(encoding="utf-8")
+    m_rg = re.search(r"\[string\]\$SourceRef = '([^']+)'", guard)
+    assert m_ws and m_sw and m_lp and m_rg, (bool(m_ws), bool(m_sw), bool(m_lp), bool(m_rg))
+    return [
+        ("Invoke-Workstream -MergeTarget", m_ws.group(1)),
+        ("Retire sweep default MergeTarget", m_sw.group(1)),
+        ("Invoke-WorkstreamLoop TargetRef", m_lp.group(1)),
+        ("Test-ProductRatioGuard SourceRef default", m_rg.group(1)),
+    ]
+
+
+def test_the_merge_target_and_driver_ref_sites_use_the_full_refname_in_source():
+    for label, ref in _g1_ref_sites():
+        assert ref == FULL_FORK_MASTER, (label, ref)
+    ws = WORKSTREAM.read_text(encoding="utf-8")
+    # the comment that promises "the ref baseSha was resolved from" is true again
+    comment_to_call = ws[ws.index("# MergeTarget is the ref baseSha was resolved from"):ws.index("$disp = Invoke-RetireLaneWorktree")]
+    assert "refs/remotes/fork/master" in comment_to_call
+
+
+def _g1_tag_collision_repo(tmp_path):
+    repo = tmp_path / "g1repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    git(repo, "add", "f.txt")
+    git(repo, "commit", "-q", "-m", "R")
+    remote_sha = git(repo, "rev-parse", "HEAD")
+    (repo / "f.txt").write_text("2", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "T")
+    tag_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "tag", "fork/master", tag_sha)                       # lightweight tag shadowing the bare name
+    git(repo, "update-ref", "refs/remotes/fork/master", remote_sha)
+    return repo, remote_sha, tag_sha
+
+
+def test_the_merge_target_and_driver_ref_follow_the_remote_tracking_ref_not_a_same_named_tag(tmp_path):
+    repo, remote_sha, tag_sha = _g1_tag_collision_repo(tmp_path)
+    # the throwaway repo really is ambiguous for the bare name (the fixture would pass vacuously otherwise)
+    bare = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "fork/master^{commit}"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    assert bare == tag_sha
+    for label, ref in _g1_ref_sites():
+        # Retire-LaneWorktree's gate: `merge-base --is-ancestor <head> <MergeTarget>`. The tag commit T is NOT
+        # an ancestor of the remote-tracking tip R (exit 1); followed through the tag it would read as merged (exit 0).
+        anc = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", tag_sha, ref],
+                             capture_output=True, text=True)
+        assert anc.returncode == 1, (label, ref, anc.returncode, anc.stderr)
+        # The loop driver's `worktree add --detach` / `reset --hard` target resolves to the remote-tracking commit.
+        res = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", ref + "^{commit}"],
+                             capture_output=True, text=True)
+        assert res.returncode == 0 and res.stdout.strip() == remote_sha, (label, ref, res.stdout, res.stderr)
+
+
+def test_the_loop_driver_reset_hard_follows_the_remote_tracking_ref_in_a_throwaway_worktree(tmp_path):
+    """`git worktree add --detach <path> <TargetRef>` then `reset --hard <TargetRef>` with the ref lifted from
+    Invoke-WorkstreamLoop.ps1, run only inside a temp repo (never the real board)."""
+    repo, remote_sha, tag_sha = _g1_tag_collision_repo(tmp_path)
+    ref = dict(_g1_ref_sites())["Invoke-WorkstreamLoop TargetRef"]
+    drv = tmp_path / "driver"
+    git(repo, "worktree", "add", "--detach", str(drv), ref)
+    assert git(drv, "rev-parse", "HEAD") == remote_sha
+    git(drv, "reset", "--hard", tag_sha, "--quiet")           # move it away from the target
+    assert git(drv, "rev-parse", "HEAD") == tag_sha
+    git(drv, "reset", "--hard", ref, "--quiet")
+    assert git(drv, "rev-parse", "HEAD") == remote_sha
+
+
+# --- r4 (Grok G3, hub ACK 6549076936): the product-ratio guard resolves the FULL refname by default ---------
+# Test-ProductRatioGuard.ps1 defaulted $SourceRef to the bare 'fork/master' and ran `git rev-parse --verify
+# "$SourceRef^{commit}"`; Invoke-Workstream calls it without -SourceRef, so a same-named tag
+# refs/tags/fork/master supplied the guard's sourceSha. The default is lifted from source and the real guard is run
+# over a throwaway repo with the tag collision.
+
+RATIO_GUARD = COORD / "Test-ProductRatioGuard.ps1"
+
+
+def test_the_ratio_guard_default_source_ref_is_the_full_refname_in_source():
+    text = RATIO_GUARD.read_text(encoding="utf-8")
+    m = re.search(r"\[string\]\$SourceRef = '([^']+)'", text)
+    assert m, "SourceRef default not found"
+    assert m.group(1) == FULL_FORK_MASTER, m.group(1)
+    # the resolve line still goes through the (now full-refname) parameter, never a re-spelled bare name
+    assert 'rev-parse --verify --quiet --end-of-options "$revision^{commit}"' in text   # r7: one resolve of the captured SHA (or of a revision expression), never the name twice
+
+
+def test_the_ratio_guard_resolves_the_remote_tracking_tip_not_a_same_named_tag(tmp_path):
+    repo, remote_sha, tag_sha = _g1_tag_collision_repo(tmp_path)
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(RATIO_GUARD),
+         "-RepoRoot", str(repo), "-AsOfEpoch", "1893456000"],
+        text=True, capture_output=True)
+    lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, (out.returncode, out.stdout, out.stderr)
+    doc = json.loads(lines[0])
+    assert doc["errorCode"] in ("", None) or doc["sourceSha"], doc
+    assert doc["sourceSha"] == remote_sha, (doc["sourceRef"], doc["sourceSha"], remote_sha, tag_sha)
+    assert doc["sourceRef"] == FULL_FORK_MASTER
+
+
+# --- r5 (hub ACK 6549274873; Dot 6b0ec449; ADV-A1 / ADV-A2) -----------------------------------------------
+# ADV-A1: `git rev-parse --verify refs/remotes/fork/master^{commit}` is a REVISION lookup. With the ref ABSENT, git's
+# dwim rules go on to try refs/tags/<name>, so a tag named refs/tags/refs/remotes/fork/master supplied a valid but
+# false tip. Every full-refname site now checks the EXACT ref (`show-ref --verify`) first.
+# ADV-A2: Select-MergeGroupJobsRun sorted createdAt as text; '...18:00:00+02:00' (16:00Z) sorted ahead of '...17:00:00Z'.
+
+R5_ABSENT_REF_TAG = "refs/tags/refs/remotes/fork/master"
+
+
+def _r5_tag_only_repo(tmp_path):
+    """A real repo with NO refs/remotes/fork/master and the tag refs/tags/refs/remotes/fork/master at commit T."""
+    repo = tmp_path / "r5repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("1", encoding="utf-8")
+    git(repo, "add", "f.txt")
+    git(repo, "commit", "-q", "-m", "T")
+    tag_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", R5_ABSENT_REF_TAG, tag_sha)
+    # the fixture is only meaningful if the OLD revision lookup really returns the tag's commit
+    old = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "refs/remotes/fork/master^{commit}"],
+                         capture_output=True, text=True)
+    assert old.stdout.strip() == tag_sha, (old.stdout, old.stderr)
+    assert subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet", "refs/remotes/fork/master"]).returncode != 0
+    return repo, tag_sha
+
+
+def test_r5_the_tip_reads_do_not_take_a_tag_named_like_the_absent_full_refname(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    for path, expected in MGRS_TIP_READERS:
+        exprs = _mgrs_tip_read_expressions(path)
+        assert len(exprs) == expected, (path.name, exprs)
+        for expr in exprs:
+            assert _mgrs_run_tip_expr(tmp_path, repo, expr) == "", (path.name, expr)
+
+
+def _r5_ps_str(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _r5_select_with_repo(tmp_path, repo, rows):
+    """Real Get-ForkMasterTip over a real repo feeding the real selector; rows are built in PowerShell with STRING createdAt."""
+    tip_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Get-ForkMasterTip")
+    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    lines = ["$ErrorActionPreference='Stop'", tip_fn, sel_fn, "$rows=@()"]
+    for r in rows:
+        lines.append("$rows += [pscustomobject]@{ databaseId=%d; createdAt=%s; headSha=%s; conclusion=%s }"
+                     % (r[0], _r5_ps_str(r[1]), _r5_ps_str(r[2]), _r5_ps_str(r[3])))
+    lines += [
+        "$tip = Get-ForkMasterTip -RepoRoot " + _r5_ps_str(repo),
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha $tip.Sha -TipReason $tip.Reason",
+        "[pscustomobject]@{ tip = $tip.Sha; id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress",
+    ]
+    harness = tmp_path / "r5-harness.ps1"
+    harness.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+R5_REASON = "tip-ref-missing: refs/remotes/fork/master"
+
+
+def test_r5_a_missing_tip_ref_reads_empty_and_the_label_names_the_typed_reason(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    rows = [
+        (3, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"),
+        (2, "2026-10-31T16:00:00Z", tag_sha, "failure"),   # would be 'landed' if the tag supplied the tip
+    ]
+    got = _r5_select_with_repo(tmp_path, repo, rows)
+    assert got["tip"] == "", got
+    assert got["id"] == 3, got                                   # falls through to choice (c)
+    assert got["label"] == MGRS_LABEL_NEWEST + "; " + R5_REASON, got
+    # choice (b) carries the reason too
+    rows[0] = (3, "2026-10-31T17:00:00Z", MGRS_OTHER, "success")
+    got = _r5_select_with_repo(tmp_path, repo, rows)
+    assert got["label"] == MGRS_LABEL_SUCCESS + "; " + R5_REASON, got
+
+
+def test_r5_a_present_tip_ref_reads_its_sha_and_carries_no_reason(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    git(repo, "update-ref", "refs/remotes/fork/master", tag_sha)
+    got = _r5_select_with_repo(tmp_path, repo, [(2, "2026-10-31T16:00:00Z", tag_sha, "success")])
+    assert got["tip"] == tag_sha and got["id"] == 2, got
+    assert got["label"] == MGRS_LABEL_LANDED, got
+
+
+def test_r5_the_ratio_guard_does_not_resolve_an_absent_full_refname_through_a_tag(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(RATIO_GUARD),
+         "-RepoRoot", str(repo), "-AsOfEpoch", "1893456000"],
+        text=True, capture_output=True)
+    lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, (out.returncode, out.stdout, out.stderr)
+    doc = json.loads(lines[0])
+    assert doc["sourceSha"] in ("", None), doc["sourceSha"]
+    assert doc["errorCode"] == "ERROR_REF_UNRESOLVED", doc["errorCode"]
+    assert doc["sourceRef"] == FULL_FORK_MASTER
+
+
+def test_r5_the_script_currency_guard_does_not_resolve_an_absent_full_refname_through_a_tag(tmp_path):
+    repo, tag_sha = _r5_tag_only_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'x'\n", encoding="utf-8")
+    git(repo, "add", "x.ps1")
+    git(repo, "commit", "-q", "-m", "x")
+    git(repo, "update-ref", R5_ABSENT_REF_TAG, git(repo, "rev-parse", "HEAD"))
+    guard = COORD / "assert-script-currency.ps1"
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(guard),
+         "-ScriptPath", str(script), "-PassThru"],
+        text=True, capture_output=True, env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""})
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "unknown" in out.stdout and "does not exist" in out.stdout, out.stdout
+
+
+def test_r5_the_loop_and_retire_sites_check_the_exact_ref_before_following_it():
+    loop = LOOP.read_text(encoding="utf-8")
+    # r6: the exact-ref check IS the read (show-ref --verify --hash), and the captured SHA is what the next call takes
+    assert loop.count("show-ref --verify --hash $TargetRef") == 2, "worktree add and reset --hard both need the exact-ref read"
+    assert loop.index("show-ref --verify --hash $TargetRef") < loop.index("worktree add --detach $DriverRoot $tipSha")
+    assert loop.rindex("show-ref --verify --hash $TargetRef") < loop.index("reset --hard $tipSha")
+    ret = RETIRE.read_text(encoding="utf-8")
+    guard = ret.index("show-ref --verify --hash $mergeBase")
+    assert guard < ret.index("merge-base --is-ancestor $d.head $mergeRev")
+    assert "merge target ref missing" in ret
+
+
+def _r5_select_strings(tmp_path, rows, tip=MGRS_TIP):
+    sel_fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    lines = ["$ErrorActionPreference='Stop'", sel_fn, "$rows=@()"]
+    for r in rows:
+        lines.append("$rows += [pscustomobject]@{ databaseId=%d; createdAt=%s; headSha=%s; conclusion=%s }"
+                     % (r[0], _r5_ps_str(r[1]), _r5_ps_str(r[2]), _r5_ps_str(r[3])))
+        lines.append("if ($rows[-1].createdAt -isnot [string]) { throw 'createdAt must stay a string' }")
+    lines += ["$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha " + _r5_ps_str(tip),
+              "[pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress"]
+    harness = tmp_path / "r5-strings.ps1"
+    harness.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_r5_created_at_is_sorted_as_a_parsed_utc_instant_not_as_text(tmp_path):
+    """Both runs are off-tip failures, so choice (c) decides. '18:00:00+02:00' is 16:00Z (OLDER); text order puts it first."""
+    rows = [
+        (1, "2026-10-31T18:00:00+02:00", MGRS_OTHER, "failure"),   # 16:00Z
+        (2, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"),        # 17:00Z, newer
+    ]
+    got = _r5_select_strings(tmp_path, rows)
+    assert got == {"id": 2, "label": MGRS_LABEL_NEWEST}, got
+    got = _r5_select_strings(tmp_path, list(reversed(rows)))
+    assert got["id"] == 2, got
+
+
+def test_r5_an_unparsable_created_at_sorts_last_and_is_never_picked_over_a_parsable_one(tmp_path):
+    rows = [
+        (9, "not-a-timestamp", MGRS_OTHER, "failure"),
+        (1, "2026-10-31T10:00:00Z", MGRS_OTHER, "failure"),
+    ]
+    assert _r5_select_strings(tmp_path, rows)["id"] == 1
+    assert _r5_select_strings(tmp_path, list(reversed(rows)))["id"] == 1
+
+
+def test_r5_the_selector_sort_uses_the_parsed_instant_in_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "Sort-Object -Property createdAt" not in body, "the sort is by createdAt text again"
+    assert "Sort-Object -Property @(" in body and "Descending = $true" in body   # r6: validity key, then the parsed instant
+
+
+# --- r6 (sol r5 on 4b07d561: B1 exact-ref TOCTOU, B2 offset-free createdAt, B3 invalid ties a valid minimum) --------
+# B1: `show-ref --verify` followed by a SEPARATE revision lookup of the same name is check-then-use. If the exact ref
+# disappears between the two calls, git's dwim rules resolve refs/tags/refs/remotes/fork/master instead. The fix reads
+# the SHA ONCE (`show-ref --verify --hash <full refname>`) and uses that captured SHA for every later step. The race is
+# reproduced deterministically: a `git` / `git.exe` FUNCTION in the harness wraps the real git and, right after the
+# first successful `show-ref --verify refs/remotes/fork/master`, deletes that ref (once). It is run in-process around the
+# real script / function, so the shipped code is what races.
+
+R6_REF = "refs/remotes/fork/master"
+R6_SHADOW_TAG = "refs/tags/refs/remotes/fork/master"
+R6_RACE_SHIM = r"""
+$global:R6RealGit = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source
+$global:R6RaceRepo = '__REPO__'
+$global:R6RaceFired = $false
+function Invoke-R6RaceGit {
+    $a = @($args)
+    $out = & $global:R6RealGit @a
+    $code = $LASTEXITCODE
+    if (-not $global:R6RaceFired -and $code -eq 0 -and ($a -contains 'show-ref') -and ($a -contains '--verify') -and ($a -contains 'refs/remotes/fork/master')) {
+        $global:R6RaceFired = $true
+        & $global:R6RealGit -C $global:R6RaceRepo update-ref -d refs/remotes/fork/master | Out-Null
+    }
+    $global:LASTEXITCODE = $code
+    $out
+}
+function git { Invoke-R6RaceGit @args }
+function git.exe { Invoke-R6RaceGit @args }
+"""
+
+
+def _r6_race_repo(tmp_path):
+    """Commit A holds x.ps1 = 'a' and is refs/remotes/fork/master; commit B (child of A, x.ps1 = 'b') is the shadow tag
+    refs/tags/refs/remotes/fork/master and also refs/remotes/other/x. Returns (repo, A, B)."""
+    repo = tmp_path / "r6race"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    (repo / "x.ps1").write_text("'a'\n", encoding="utf-8")
+    git(repo, "add", "x.ps1")
+    git(repo, "commit", "-q", "-m", "A")
+    sha_a = git(repo, "rev-parse", "HEAD")
+    (repo / "x.ps1").write_text("'b'\n", encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "B")
+    sha_b = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-ref", R6_REF, sha_a)
+    git(repo, "update-ref", R6_SHADOW_TAG, sha_b)
+    git(repo, "update-ref", "refs/remotes/other/x", sha_b)
+    return repo, sha_a, sha_b
+
+
+def _r6_shim(repo):
+    return R6_RACE_SHIM.replace("__REPO__", str(repo).replace("'", "''"))
+
+
+def _r6_run(tmp_path, repo, body, name="r6-race.ps1", env=None):
+    harness = tmp_path / name
+    harness.write_text("$ErrorActionPreference='Continue'\n" + _r6_shim(repo) + "\n" + body + "\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True,
+                         env=env)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout
+
+
+def _r6_last_json(stdout):
+    return json.loads([ln for ln in stdout.splitlines() if ln.strip()][-1])
+
+
+def test_r6_b1_the_race_fixture_really_flips_the_old_revision_lookup(tmp_path):
+    """The fixture is only meaningful if, once the exact ref is gone, a revision lookup lands on the shadow tag."""
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    git(repo, "update-ref", "-d", R6_REF)
+    old = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", R6_REF + "^{commit}"], capture_output=True, text=True)
+    assert old.stdout.strip() == sha_b, (old.stdout, old.stderr)
+
+
+def _r6_loop_sync(tmp_path, repo, driver_exists):
+    fn = _extract_ps_function(tmp_path, LOOP, "Sync-DriverWorktree")
+    driver = tmp_path / "r6driver"
+    if driver_exists:
+        git(repo, "worktree", "add", "--detach", str(driver), R6_REF)
+    body = (
+        "$RepoRoot='" + str(repo).replace("'", "''") + "'\n$DriverRoot='" + str(driver).replace("'", "''") + "'\n"
+        "$TargetRef='refs/remotes/fork/master'\n"
+        "function Invoke-GitFetchFork { [pscustomobject]@{ Ok = $true; ExitCode = 0; Attempts = 1 } }\n"
+        "function Disable-DriverFsmonitor { }\n" + fn + "\n"
+        "$r = Sync-DriverWorktree\n"
+        "$head = (& $global:R6RealGit -C $DriverRoot rev-parse HEAD)\n"
+        "[pscustomobject]@{ ret = [string]$r; head = [string]$head; fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    return _r6_last_json(_r6_run(tmp_path, repo, body, "r6-loop.ps1"))
+
+
+@pytest.mark.parametrize("driver_exists", [True, False], ids=["reset-hard-branch", "worktree-add-branch"])
+def test_r6_b1_the_loop_driver_uses_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path, driver_exists):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    got = _r6_loop_sync(tmp_path, repo, driver_exists)
+    assert got["fired"] is True, got
+    # captured A - never the shadow tag's commit B
+    assert got["head"] != sha_b, got
+    assert got["head"] == sha_a and got["ret"] == "", got
+
+
+def test_r6_b1_the_ratio_guard_reads_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    body = "& '" + str(RATIO_GUARD).replace("'", "''") + "' -RepoRoot '" + str(repo).replace("'", "''") + "' -AsOfEpoch 1893456000\n"
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r6-ratio.ps1"))
+    assert doc["sourceSha"] != sha_b, doc
+    assert doc["sourceSha"] == sha_a, doc
+
+
+def test_r6_b1_the_currency_guard_compares_against_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'a'\n", encoding="utf-8")        # the disk copy equals A's blob, NOT the shadow tag's
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("try { $res = & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -PassThru } catch { }\n"
+            "if ($null -eq $res) { [pscustomobject]@{ status = 'threw-stale' } | ConvertTo-Json -Compress } else { @($res)[0] | ConvertTo-Json -Compress }\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r6-currency.ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    assert doc["status"] == "current", doc
+
+
+def test_r6_b1_the_retire_merge_gate_uses_the_captured_sha_when_the_exact_ref_vanishes_after_the_check(tmp_path):
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    wt = tmp_path / "r6wt"
+    git(repo, "worktree", "add", "--detach", str(wt), sha_b)
+    body = (". '" + str(RETIRE).replace("'", "''") + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + str(wt).replace("'", "''") + "' -MergeTarget 'refs/remotes/fork/master' -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason; fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r6-retire.ps1"))
+    assert doc["fired"] is True, doc
+    # B is NOT an ancestor of A: judged against the captured A the worktree is unmerged and kept. Judged through the
+    # shadow tag (B is its own ancestor) it would read as merged.
+    assert doc["action"] == "kept" and doc["reason"].startswith("unmerged"), doc
+
+
+def test_r6_b1_no_site_resolves_the_exact_refname_again_after_reading_it_in_source():
+    """One captured SHA per site: show-ref --verify --hash, then the SHA - never `<refname>^{commit}` / `<refname>:path` / `$TargetRef`."""
+    loop = LOOP.read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $TargetRef" not in loop
+    assert loop.count("show-ref --verify --hash $TargetRef") == 2
+    assert "worktree add --detach $DriverRoot $TargetRef" not in loop and "reset --hard $TargetRef" not in loop
+    ratio = RATIO_GUARD.read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $SourceRef" not in ratio and 'rev-parse --verify "$SourceRef^{commit}"' not in ratio
+    assert "show-ref --verify --hash $refBase" in ratio
+    cur = (COORD / "assert-script-currency.ps1").read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $Ref" not in cur and 'rev-parse --verify --quiet "$Ref^{commit}"' not in cur
+    assert 'cat-file -e "${Ref}:${rel}"' not in cur and 'rev-parse "${Ref}:${rel}"' not in cur
+    assert "show-ref --verify --hash $refBase" in cur
+    ret = RETIRE.read_text(encoding="utf-8")
+    assert "show-ref --verify --quiet $MergeTarget" not in ret and "merge-base --is-ancestor $d.head $MergeTarget" not in ret
+    assert "show-ref --verify --hash $mergeBase" in ret
+
+
+# r8 (Grok G6/G4): the r6 B2 tests used to depend on the HOST zone (r7: TZ=America/Chicago off Windows, the Windows host zone
+# as-is) and SKIPPED on the hosted Windows runner (UTC, TZ ignored), so a B2 regression could not go RED in CI. The zone is
+# now INJECTED. The production selector text is extracted, and its single `$v.ToUniversalTime()` is replaced by a test-only
+# wrapper that converts an Unspecified-kind [datetime] as a host in the injected zone would ([TimeZoneInfo]::ConvertTimeToUtc
+# with a custom zone) and leaves every other Kind to the real ToUniversalTime. The source-pin test below proves the text
+# the wrapper substitutes is the shipped text. Production is GREEN (its Unspecified branch never reaches the wrapper);
+# the "pre-B2" variant is the SAME text with that branch removed, so it converts through the injected zone and goes RED.
+# G4: the zone/input pair must DISCRIMINATE. With a POSITIVE offset local 16:00 is still older than 17:00Z, so the pre-B2
+# ordering equals the UTC ordering and the test could pass on old code. A NEGATIVE offset (-05:00: 16:00 local = 21:00Z)
+# flips the order; every test asserts that flip on the pre-B2 variant BEFORE it asserts the production result.
+R8_ZONE_HOURS = -5
+R8_ZONE_FN = r"""
+$script:TestZone = [TimeZoneInfo]::CreateCustomTimeZone('Test-Zone', [TimeSpan]::FromHours(__HOURS__), 'Test-Zone', 'Test-Zone')
+function ConvertTo-UtcInTestZone($v) {
+    if ($v.Kind -eq [System.DateTimeKind]::Unspecified) { return [TimeZoneInfo]::ConvertTimeToUtc($v, $script:TestZone) }
+    return $v.ToUniversalTime()
+}
+"""
+R8_UNSPEC_BRANCH = re.compile(r"(?m)^[ \t]*if \(\$v\.Kind -eq \[System\.DateTimeKind\]::Unspecified\) \{ return \[datetime\]::SpecifyKind\(\$v, \[System\.DateTimeKind\]::Utc\) \}\r?\n")
+
+
+def _r8_selector(tmp_path, pre_b2, hours=R8_ZONE_HOURS):
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    # the seam text is pinned by test_r8_g6_the_zone_injection_wrapper_substitutes_the_shipped_text; the branch is deliberately
+    # NOT asserted here, so removing it from production fails these tests on BEHAVIOUR (the zone shift), not on a pin.
+    assert fn.count("$v.ToUniversalTime()") >= 1, "the production conversion text moved: re-pin the zone-injection wrapper"
+    if pre_b2:
+        fn = R8_UNSPEC_BRANCH.sub("", fn)
+    return R8_ZONE_FN.replace("__HOURS__", str(hours)) + fn.replace("$v.ToUniversalTime()", "(ConvertTo-UtcInTestZone $v)")
+
+
+def _r8_pick(tmp_path, selector, setup, name, tail="(Select-MergeGroupJobsRun -Runs $rows -MasterSha '').Run.databaseId\n"):
+    harness = tmp_path / name
+    harness.write_text("$ErrorActionPreference='Stop'\n" + selector + "\n" + setup + "\n" + tail, encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    return out.stdout.strip().splitlines()[-1]
+
+
+def _r8_json_rows_setup(tmp_path, rows):
+    rows_file = tmp_path / "r8-rows.json"
+    rows_file.write_text(json.dumps(rows), encoding="utf-8")
+    return "$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
+
+
+def _r8_require_discriminating(old_pick, utc_pick, hours=R8_ZONE_HOURS):
+    """G4: the pre-B2 (zone-interpreted) order and the UTC order must differ, else the pair proves nothing - a stated skip."""
+    if old_pick == utc_pick:
+        pytest.skip("injected zone %+d h does not discriminate: pre-B2 order == UTC order (id %s); use a negative offset" % (hours, old_pick))
+    assert old_pick == "1" and utc_pick == "2", (old_pick, utc_pick)
+
+
+# B2 / B3 --------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("day", ["2026-10-31", "2026-01-15", "2026-07-15"], ids=["oct", "jan", "jul"])
+def test_r6_b2_offset_free_created_at_orders_as_utc_through_the_production_conversion(tmp_path, day):
+    """ConvertFrom-Json (the production read, Invoke-Workstream.ps1) turns '2026-10-31T16:00:00' into an Unspecified
+    [datetime]; ToUniversalTime used to shift it by the HOST zone (injected -05:00: 16:00 -> 21:00Z, newer than 17:00Z)."""
+    rows = [_mgrs_row(1, day + "T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, day + "T17:00:00Z", MGRS_OTHER, "failure")]
+    for order in (rows, list(reversed(rows))):
+        setup = _r8_json_rows_setup(tmp_path, order)
+        old = _r8_pick(tmp_path, _r8_selector(tmp_path, True), setup, "r8-b2-old.ps1")
+        _r8_require_discriminating(old, "2")                       # the pair discriminates BEFORE the production result is judged
+        assert _r8_pick(tmp_path, _r8_selector(tmp_path, False), setup, "r8-b2-new.ps1") == "2", (day, order)
+
+
+def test_r6_b2_an_unspecified_kind_datetime_is_utc_and_never_local(tmp_path):
+    """Unit form: an Unspecified-kind [datetime] 16:00 is 16:00Z, so it is OLDER than 17:00Z in any host zone."""
+    setup = (
+        "$u = [datetime]::SpecifyKind([datetime]'2026-10-31T16:00:00', [DateTimeKind]::Unspecified)\n"
+        "$z = [datetime]::SpecifyKind([datetime]'2026-10-31T17:00:00', [DateTimeKind]::Utc)\n"
+        "$rows = @([pscustomobject]@{ databaseId = 1; createdAt = $u; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' },"
+        " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n")
+    old = _r8_pick(tmp_path, _r8_selector(tmp_path, True), setup, "r8-b2u-old.ps1")
+    _r8_require_discriminating(old, "2")
+    assert _r8_pick(tmp_path, _r8_selector(tmp_path, False), setup, "r8-b2u-new.ps1") == "2"
+
+
+@pytest.mark.parametrize("hours,discriminates", [(-5, True), (5, False), (0, False)], ids=["minus5", "plus5", "utc"])
+def test_r8_g4_only_a_negative_offset_separates_the_pre_b2_order_from_the_utc_order(tmp_path, hours, discriminates):
+    """Why the injected zone is -05:00: local 16:00 vs 17:00Z is only reordered by a zone WEST of UTC."""
+    setup = (
+        "$u = [datetime]::SpecifyKind([datetime]'2026-10-31T16:00:00', [DateTimeKind]::Unspecified)\n"
+        "$z = [datetime]::SpecifyKind([datetime]'2026-10-31T17:00:00', [DateTimeKind]::Utc)\n"
+        "$rows = @([pscustomobject]@{ databaseId = 1; createdAt = $u; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' },"
+        " [pscustomobject]@{ databaseId = 2; createdAt = $z; headSha = '" + MGRS_OTHER + "'; conclusion = 'failure' })\n")
+    old = _r8_pick(tmp_path, _r8_selector(tmp_path, True, hours), setup, "r8-g4-%d.ps1" % hours)
+    assert (old == "1") is discriminates, (hours, old)
+
+
+def test_r6_b2_the_production_read_expression_keeps_created_at_a_string_and_the_selector_orders_it_as_utc(tmp_path):
+    """Lift the shipped `$runs = ...` read line out of Invoke-Workstream.ps1 and run it over sol's exact input."""
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    m = re.search(r"(?m)^\s*(\$runs = if \(\(Get-Command ConvertFrom-Json\)[^\n]*)$", text)
+    assert m, "production read line not found"
+    raw = json.dumps([_mgrs_row(1, "2026-10-31T16:00:00", MGRS_OTHER, "failure"), _mgrs_row(2, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure")])
+    raw_line = "$runsRaw = '" + raw.replace("'", "''") + "'\n"
+    # the pre-B2 pair: the plain read (no -DateKind: offset-free text becomes an Unspecified [datetime]) + the pre-B2 selector
+    old = _r8_pick(tmp_path, _r8_selector(tmp_path, True), raw_line + "$runs = @($runsRaw | ConvertFrom-Json)\n", "r8-b2p-old.ps1",
+                   tail="(Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId\n")
+    _r8_require_discriminating(old, "2")
+    out = _r8_pick(
+        tmp_path, _r8_selector(tmp_path, False), raw_line + m.group(1) + "\n", "r8-b2p-new.ps1",
+        tail="$kinds = @($runs | ForEach-Object { $_.createdAt.GetType().Name }) -join ','\n"
+             "$hasDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')\n"
+             "[pscustomobject]@{ kinds = $kinds; hasDateKind = $hasDateKind; id = (Select-MergeGroupJobsRun -Runs $runs -MasterSha '').Run.databaseId } | ConvertTo-Json -Compress\n")
+    doc = json.loads(out)
+    assert doc["id"] == 2, doc
+    # r7 (Grok G5): the raw string survives the read only where -DateKind exists (pwsh 7.5+); production falls back to the
+    # default conversion on older hosts, where the selector's SpecifyKind/UTC pin keeps the order right (id == 2 above).
+    if doc["hasDateKind"]:
+        assert doc["kinds"] == "String,String", doc
+    else:
+        assert doc["kinds"] == "DateTime,DateTime", doc
+
+
+def test_r8_g6_the_zone_injection_wrapper_substitutes_the_shipped_text():
+    """Pins the seam the B2 tests evaluate: exactly one ToUniversalTime call and one Unspecified branch in the shipped selector."""
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert body.count("$v.ToUniversalTime()") == 1 and len(R8_UNSPEC_BRANCH.findall(body)) == 1
+
+
+def test_r6_b2_the_production_read_keeps_created_at_as_the_raw_string_where_the_host_can_and_the_helper_pins_utc():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    assert "ConvertFrom-Json -DateKind String" in text
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "SpecifyKind" in body and "Unspecified" in body
+
+
+R6_MIN_VARIANTS = ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00+00:00", "0001-01-01"]
+
+
+@pytest.mark.parametrize("minimum", R6_MIN_VARIANTS)
+def test_r6_b3_an_invalid_created_at_never_ties_a_valid_minimum_timestamp_in_choice_c(tmp_path, minimum):
+    rows = [(9, "bad", MGRS_OTHER, "failure"), (1, minimum, MGRS_OTHER, "failure")]
+    for order in (rows, list(reversed(rows))):
+        assert _r5_select_strings(tmp_path, order, "")["id"] == 1, (minimum, order)
+
+
+@pytest.mark.parametrize("minimum", R6_MIN_VARIANTS)
+def test_r6_b3_an_invalid_created_at_never_ties_a_valid_minimum_timestamp_in_choice_b_and_a(tmp_path, minimum):
+    ok = [(9, "bad", MGRS_OTHER, "success"), (1, minimum, MGRS_OTHER, "success")]
+    for order in (ok, list(reversed(ok))):
+        assert _r5_select_strings(tmp_path, order, "")["id"] == 1, ("b", minimum, order)
+    landed = [(9, "bad", MGRS_TIP, "failure"), (1, minimum, MGRS_TIP, "failure")]
+    for order in (landed, list(reversed(landed))):
+        assert _r5_select_strings(tmp_path, order, MGRS_TIP)["id"] == 1, ("a", minimum, order)
+
+
+def test_r6_b3_validity_is_a_sort_key_of_its_own_in_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "[datetime]::MinValue" not in body.replace("[datetimeoffset]::MinValue", ""), "the MinValue sentinel is back: it ties 'bad' with a valid 0001-01-01"
+
+
+# --- r7 (sol r6 on 3671119d: ADV-A1 revision EXPRESSIONS under refs/ were read as literal refnames) ---------------------
+# r6 sent every refs/* input to `show-ref --verify --hash`, which only knows exact refnames, so `refs/remotes/fork/master~1`
+# and `refs/remotes/fork/master^{commit}` became "does not exist" / unknown and the currency refusal was skipped. r7: a full
+# refname with no revision operator keeps the exact-ref read; anything else resolves ONCE through rev-parse to a commit SHA.
+R7_EXPRS = ["refs/remotes/fork/master~1", "refs/remotes/fork/master^{commit}"]
+
+
+def _r7_repo(tmp_path):
+    """A (x.ps1='a') <- B (x.ps1='b'); refs/remotes/fork/master = B. Returns (repo, A, B). ~1 names A, ^{commit} names B."""
+    repo, sha_a, sha_b = _r6_race_repo(tmp_path)
+    git(repo, "update-ref", R6_REF, sha_b)
+    return repo, sha_a, sha_b
+
+
+@pytest.mark.parametrize("expr", R7_EXPRS)
+def test_r7_a1_the_currency_guard_resolves_a_revision_expression_under_refs_and_compares_content(tmp_path, expr):
+    repo, sha_a, sha_b = _r7_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'b'\n", encoding="utf-8")          # the disk copy equals B's blob
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("try { $res = & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -Ref '" + expr + "' -PassThru } catch { }\n"
+            "if ($null -eq $res) { [pscustomobject]@{ status = 'threw-stale' } | ConvertTo-Json -Compress } else { @($res)[0] | ConvertTo-Json -Compress }\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r7-currency.ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    # ~1 is A ('a'): the disk copy differs, so the stale refusal must fire. ^{commit} is B: the disk copy matches.
+    assert doc["status"] == ("threw-stale" if expr.endswith("~1") else "current"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R7_EXPRS)
+def test_r7_a1_the_ratio_guard_resolves_a_revision_expression_under_refs(tmp_path, expr):
+    repo, sha_a, sha_b = _r7_repo(tmp_path)
+    body = ("& '" + str(RATIO_GUARD).replace("'", "''") + "' -RepoRoot '" + str(repo).replace("'", "''") + "' -SourceRef '" + expr + "' -AsOfEpoch 1893456000\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r7-ratio.ps1"))
+    assert doc["sourceSha"] == (sha_a if expr.endswith("~1") else sha_b), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R7_EXPRS)
+def test_r7_a1_the_retire_merge_gate_resolves_a_revision_expression_under_refs_before_the_ancestry_test(tmp_path, expr):
+    repo, sha_a, sha_b = _r7_repo(tmp_path)
+    wt = tmp_path / "r7wt"
+    # ~1 names A: a worktree at B is NOT an ancestor of A (unmerged). ^{commit} names B: a worktree at A IS an ancestor of B.
+    git(repo, "worktree", "add", "--detach", str(wt), sha_b if expr.endswith("~1") else sha_a)
+    body = (". '" + str(RETIRE).replace("'", "''") + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + str(wt).replace("'", "''") + "' -MergeTarget '" + expr + "' -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r7-retire.ps1"))
+    assert "merge target ref missing" not in doc["reason"] and "merge-base" not in doc["reason"], (expr, doc)
+    if expr.endswith("~1"):
+        assert doc["reason"].startswith("unmerged"), (expr, doc)
+    else:
+        assert not doc["reason"].startswith("unmerged"), (expr, doc)
+
+
+def test_r7_a1_every_site_keeps_the_exact_ref_read_for_a_plain_refname_and_resolves_anything_else_once_in_source():
+    for path, var in ((COORD / "assert-script-currency.ps1", "$refBase"), (RATIO_GUARD, "$refBase"), (RETIRE, "$mergeBase")):
+        text = path.read_text(encoding="utf-8")
+        assert "show-ref --verify --hash " + var in text, path
+        assert "rev-parse --verify --quiet --end-of-options" in text, path
+
+
+# --- r8 (sol r7 on c40c2d32: ADV-A1 a revision expression under refs/ resolved its BASE NAME through git's dwim lookup) --
+# r7 sent `refs/remotes/fork/master~1` / `...^{commit}` WHOLE to `rev-parse`. With the exact ref absent and a tag
+# refs/tags/refs/remotes/fork/master present, dwim resolved the base through the tag. r8: split at the FIRST revision
+# operator (~ ^ @{ :); a full-refname base is read ONCE with `show-ref --verify --hash` (missing = the site's typed
+# refusal) and only `<sha><suffix>^{commit}` is resolved. The exact ref is P <- A <- B chain: ref = A, shadow tag = B.
+R8_EXPRS = ["refs/remotes/fork/master~1", "refs/remotes/fork/master^{commit}"]
+
+
+def _r8_repo(tmp_path, ref_present):
+    """P (x.ps1='p') <- A (x.ps1='a') <- B (x.ps1='b'). refs/remotes/fork/master = A (absent unless ref_present); shadow
+    tag refs/tags/refs/remotes/fork/master = B; refs/remotes/other/x = B. Returns (repo, P, A, B). Through the ref: ~1 = P,
+    ^{commit} = A. Through the shadow tag: ~1 = A, ^{commit} = B - every answer differs."""
+    repo = tmp_path / "r8repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name in ("p", "a", "b"):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", name.upper())
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    sha_p, sha_a, sha_b = shas
+    if ref_present:
+        git(repo, "update-ref", R6_REF, sha_a)
+    git(repo, "update-ref", R6_SHADOW_TAG, sha_b)
+    git(repo, "update-ref", "refs/remotes/other/x", sha_b)
+    return repo, sha_p, sha_a, sha_b
+
+
+def _r8_currency(tmp_path, repo, expr, disk, name):
+    script = repo / "x.ps1"
+    script.write_text(disk, encoding="utf-8")
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("try { $res = & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -Ref '" + expr + "' -PassThru } catch { }\n"
+            "if ($null -eq $res) { [pscustomobject]@{ status = 'threw-stale' } | ConvertTo-Json -Compress } else { @($res)[0] | ConvertTo-Json -Compress }\n"
+            "[pscustomobject]@{ r8fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    return _r8_merge_fired(_r6_run(tmp_path, repo, body, name, env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+
+
+def _r8_merge_fired(stdout):
+    """The harness prints the site's JSON, then {r8fired}; merge them so a test can assert the race really fired."""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    doc = json.loads(lines[-2])
+    doc["fired"] = json.loads(lines[-1])["r8fired"]
+    return doc
+
+
+def _r8_ratio(tmp_path, repo, expr, name):
+    body = ("& '" + str(RATIO_GUARD).replace("'", "''") + "' -RepoRoot '" + str(repo).replace("'", "''") + "' -SourceRef '" + expr + "' -AsOfEpoch 1893456000\n"
+            "[pscustomobject]@{ r8fired = $global:R6RaceFired } | ConvertTo-Json -Compress\nexit 0\n")
+    return _r8_merge_fired(_r6_run(tmp_path, repo, body, name))
+
+
+def _r8_retire(tmp_path, repo, wt_sha, expr, name):
+    wt = tmp_path / ("wt-" + name)
+    git(repo, "worktree", "add", "--detach", str(wt), wt_sha)
+    body = (". '" + str(RETIRE).replace("'", "''") + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + str(wt).replace("'", "''") + "' -MergeTarget '" + expr + "' -ProcessSnapshot $snap\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason; fired = $global:R6RaceFired } | ConvertTo-Json -Compress\n")
+    return _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1"))
+
+
+def test_r8_g7_the_fixture_really_resolves_the_missing_base_through_the_shadow_tag(tmp_path):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    for expr, want in ((R8_EXPRS[0], sha_a), (R8_EXPRS[1], sha_b)):
+        got = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", "--end-of-options", expr + "^{commit}"],
+                             capture_output=True, text=True)
+        assert got.returncode == 0 and got.stdout.strip() == want, (expr, got.stdout, got.stderr)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS + ["refs/remotes/fork/master^{commit}^{commit}"])
+def test_r8_g7_the_currency_guard_refuses_an_absent_base_and_never_uses_the_shadow_tag(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    doc = _r8_currency(tmp_path, repo, expr, "'b'\n", "r8-cur-absent.ps1")      # disk == B: the shadow tag would read 'current'
+    assert doc["status"] == "unknown" and "does not exist" in doc["detail"], (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS + ["refs/remotes/fork/master^{commit}^{commit}"])
+def test_r8_g7_the_ratio_guard_refuses_an_absent_base_and_never_uses_the_shadow_tag(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    doc = _r8_ratio(tmp_path, repo, expr, "r8-ratio-absent.ps1")
+    assert doc["errorCode"] == "ERROR_REF_UNRESOLVED" and doc["sourceSha"] == "", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_retire_merge_gate_refuses_an_absent_base_and_never_uses_the_shadow_tag(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=False)
+    doc = _r8_retire(tmp_path, repo, sha_a if expr.endswith("~1") else sha_b, expr, "r8-ret-absent")
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target ref missing"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_currency_guard_uses_the_captured_sha_when_the_base_vanishes_after_the_read(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=True)
+    # captured A: ~1 is P ('p'), ^{commit} is A ('a'). The shadow tag would give A ('a') and B ('b').
+    disk = "'p'\n" if expr.endswith("~1") else "'a'\n"
+    doc = _r8_currency(tmp_path, repo, expr, disk, "r8-cur-race.ps1")
+    assert doc["fired"] is True, (expr, doc)
+    assert doc["status"] == "current", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_ratio_guard_uses_the_captured_sha_when_the_base_vanishes_after_the_read(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=True)
+    doc = _r8_ratio(tmp_path, repo, expr, "r8-ratio-race.ps1")
+    assert doc["fired"] is True, (expr, doc)
+    assert doc["sourceSha"] == (sha_p if expr.endswith("~1") else sha_a), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R8_EXPRS)
+def test_r8_g7_the_retire_merge_gate_uses_the_captured_sha_when_the_base_vanishes_after_the_read(tmp_path, expr):
+    repo, sha_p, sha_a, sha_b = _r8_repo(tmp_path, ref_present=True)
+    # captured A: ~1 = P, ^{commit} = A. A worktree at A is not an ancestor of P; one at B is not an ancestor of A.
+    # Through the shadow tag (~1 = A, ^{commit} = B) each would read as merged.
+    doc = _r8_retire(tmp_path, repo, sha_a if expr.endswith("~1") else sha_b, expr, "r8-ret-race")
+    assert doc["fired"] is True, (expr, doc)
+    assert doc["reason"].startswith("unmerged"), (expr, doc)
+
+
+def test_r8_g7_every_site_splits_at_the_first_revision_operator_and_reads_the_base_once_in_source():
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        text = path.read_text(encoding="utf-8")
+        assert "(?<base>.*?)(?<suffix>(?:[~^:]|@\\{).*)" in text, path
+        assert "show-ref --verify --hash $" in text, path
+        assert "rev-parse --verify --quiet --end-of-options" in text, path
+
+
+# --- r9 (sol r8 ADV-A1 / Grok G8 / Dot a71eec35: a reflog suffix cannot ride on a SHA) -----------------------------------
+# r8 rewrote `refs/remotes/fork/master@{1}` to `<sha>@{1}`, which git rejects, so every site read a VALID reflog expression
+# as unresolved - and the currency guard is fail-OPEN on `unknown`. No default caller uses reflog syntax, so r9 REFUSES an
+# expression whose base is a full refname and whose suffix contains `@{`, fail-CLOSED, with a typed site-specific refusal:
+#   assert-script-currency.ps1  status 'refused-reflog' (PassThru) and a THROW (like 'stale'); never 'unknown'
+#   Test-ProductRatioGuard.ps1  errorCode ERROR_REF_REFLOG_REFUSED, exit 3
+#   Retire-LaneWorktree.ps1     kept, reason 'cannot-determine: merge target uses a reflog selector (@{) ...'
+R9_REFLOG_EXPRS = ["refs/remotes/fork/master@{1}", "refs/remotes/fork/master@{1}^{commit}"]
+
+
+def _r9_repo(tmp_path):
+    """A (x.ps1='a') then B (x.ps1='b'); refs/remotes/fork/master was set to A, then to B: a TWO-ENTRY reflog, so git itself
+    resolves refs/remotes/fork/master@{1} to A. Returns (repo, A, B)."""
+    repo = tmp_path / "r9repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name in ("a", "b"):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", name.upper())
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    git(repo, "update-ref", "--create-reflog", "-m", "first", R6_REF, shas[0])
+    git(repo, "update-ref", "--create-reflog", "-m", "second", R6_REF, shas[1])
+    return repo, shas[0], shas[1]
+
+
+def test_r9_adv_a1_the_fixture_has_a_valid_two_entry_reflog(tmp_path):
+    """Only meaningful if git itself resolves the expression: @{1} is A, and <sha>@{1} (the r8 rewrite) is rejected."""
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", R6_REF + "@{1}^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == sha_a, (ok.stdout, ok.stderr)
+    bad = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", sha_b + "@{1}^{commit}"], capture_output=True, text=True)
+    assert bad.returncode != 0, bad.stdout
+
+
+@pytest.mark.parametrize("expr", R9_REFLOG_EXPRS)
+def test_r9_adv_a1_the_currency_guard_refuses_a_reflog_selector_fail_closed_with_its_own_status(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    script = repo / "x.ps1"
+    script.write_text("'zzz-stale'\n", encoding="utf-8")        # differs from every ref: only a refusal stops this copy
+    guard = COORD / "assert-script-currency.ps1"
+    body = ("$o = @(); $threw = $false\n"
+            "try { & '" + str(guard).replace("'", "''") + "' -ScriptPath '" + str(script).replace("'", "''") + "' -Ref '" + expr + "' -PassThru | ForEach-Object { $o += $_ } } catch { $threw = $true }\n"
+            "[pscustomobject]@{ status = $(if ($o.Count) { [string]$o[0].status } else { 'none' }); threw = $threw } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, "r9-currency.ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R9_REFLOG_EXPRS)
+def test_r9_adv_a1_the_ratio_guard_refuses_a_reflog_selector_with_its_own_error_code(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r8_ratio(tmp_path, repo, expr, "r9-ratio.ps1")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED" and doc["verdict"] == "ERROR" and doc["sourceSha"] == "", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R9_REFLOG_EXPRS)
+def test_r9_adv_a1_the_retire_merge_gate_refuses_a_reflog_selector_with_its_own_reason(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r8_retire(tmp_path, repo, sha_a, expr, "r9-ret")
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
+
+
+def test_r9_adv_a1_every_site_names_its_typed_reflog_refusal_in_source():
+    for path, token in ((COORD / "assert-script-currency.ps1", "refused-reflog"), (RATIO_GUARD, "ERROR_REF_REFLOG_REFUSED"),
+                        (RETIRE, "merge target uses a reflog selector")):
+        text = path.read_text(encoding="utf-8")
+        assert token in text, path
+        assert r"@\{" in text, path
+
+
+# --- r10 (sol r9 on feec4eda: ADV-A1 Unicode whitespace in a refname, ADV-A2 `@{` inside a ^{/regex} search) -------------
+# ADV-A1: the full-refname classifier used `\s`, which .NET makes Unicode-aware (NBSP, EM SPACE, ...). Git accepts such a
+# refname, so the classifier said "not a full refname", the exact-ref read and the r9 reflog refusal were skipped, and the
+# whole expression went to rev-parse - which honoured the reflog (fail-open in the currency guard). The class is now
+# ASCII-whitespace-only, so a base is classified the same with or without a non-ASCII space.
+# ADV-A2: r9 refused any `@{` in the suffix, which also refused a valid commit-message search `refs/x^{/foo@{1}}`. Only an
+# actual reflog selector (a `@{` outside a `^{/...}` search group) is refused now.
+R10_UNICODE_SPACES = ["0x00A0", "0x2003"]
+
+
+def _r10_name_ps(cp):
+    return "('refs/remotes/fork/topic' + [char]" + cp + " + 'x')"
+
+
+def _r10_unicode_repo(tmp_path, cp):
+    """A (x.ps1='a') then B (x.ps1='b'); a ref whose NAME holds a Unicode space was set to A, then B: a two-entry reflog."""
+    repo = tmp_path / "r10repo"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name in ("a", "b"):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", name.upper())
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    ref = "refs/remotes/fork/topic" + chr(int(cp, 16)) + "x"
+    git(repo, "update-ref", "--create-reflog", "-m", "first", ref, shas[0])
+    git(repo, "update-ref", "--create-reflog", "-m", "second", ref, shas[1])
+    return repo, shas[0], shas[1], ref
+
+
+def _r10_site(tmp_path, repo, site, expr_ps, name, disk="'a'\n", wt_sha=None):
+    """Run one of the three sites with a PowerShell expression for the ref; returns the site's result as a dict."""
+    q = lambda p: str(p).replace("'", "''")
+    if site == "currency":
+        script = repo / "x.ps1"
+        script.write_text(disk, encoding="utf-8")
+        body = ("$expr = " + expr_ps + "\n$o = @(); $threw = $false\n"
+                "try { & '" + q(COORD / "assert-script-currency.ps1") + "' -ScriptPath '" + q(script) + "' -Ref $expr -PassThru | ForEach-Object { $o += $_ } } catch { $threw = $true }\n"
+                "[pscustomobject]@{ status = $(if ($o.Count) { [string]$o[0].status } else { 'none' }); threw = $threw } | ConvertTo-Json -Compress\n")
+        return _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1", env={**os.environ, "MLV_ALLOW_STALE_TOOLS": ""}))
+    if site == "ratio":
+        body = ("$expr = " + expr_ps + "\n& '" + q(RATIO_GUARD) + "' -RepoRoot '" + q(repo) + "' -SourceRef $expr -AsOfEpoch 1893456000\n"
+                "[pscustomobject]@{ r8fired = $global:R6RaceFired } | ConvertTo-Json -Compress\nexit 0\n")
+        return _r8_merge_fired(_r6_run(tmp_path, repo, body, name + ".ps1"))
+    wt = tmp_path / ("wt-" + name)
+    git(repo, "worktree", "add", "--detach", str(wt), wt_sha)
+    body = ("$expr = " + expr_ps + "\n. '" + q(RETIRE) + "'\n"
+            "$snap = [pscustomobject]@{ Procs = @(); SelfPids = @($PID) }\n"
+            "$d = Invoke-RetireLaneWorktree -WorkDir '" + q(wt) + "' -MergeTarget $expr -ProcessSnapshot $snap -WhatIf\n"
+            "[pscustomobject]@{ action = [string]$d.action; reason = [string]$d.reason; workDir = [string]$d.workDir; head = [string]$d.head } | ConvertTo-Json -Compress\n")
+    doc = _r6_last_json(_r6_run(tmp_path, repo, body, name + ".ps1"))
+    doc["wt"] = str(wt)       # r15: the worktree this call was asked to retire, for the exact-target assertion
+    return doc
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_fixture_ref_with_a_unicode_space_has_a_valid_reflog_git_accepts(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", ref + "@{1}^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == sha_a, (cp, ok.stdout, ok.stderr)
+    assert subprocess.run(["git", "check-ref-format", ref]).returncode == 0, ref
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_currency_guard_refuses_a_reflog_on_a_unicode_space_refname_fail_closed(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    # disk == A's blob: the bypass reads the reflog entry A, reports 'current' and never throws.
+    doc = _r10_site(tmp_path, repo, "currency", "(" + _r10_name_ps(cp) + " + '@{1}')", "r10-cur-uni")
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (cp, doc)
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_ratio_guard_refuses_a_reflog_on_a_unicode_space_refname(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    doc = _r10_site(tmp_path, repo, "ratio", "(" + _r10_name_ps(cp) + " + '@{1}')", "r10-ratio-uni")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED" and doc["sourceSha"] == "", (cp, doc)
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_the_retire_merge_gate_refuses_a_reflog_on_a_unicode_space_refname(tmp_path, cp):
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    doc = _r10_site(tmp_path, repo, "retire", "(" + _r10_name_ps(cp) + " + '@{1}')", "r10-ret-uni", wt_sha=sha_a)
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (cp, doc)
+
+
+@pytest.mark.parametrize("cp", R10_UNICODE_SPACES)
+def test_r10_adv_a1_a_unicode_space_refname_gets_the_exact_ref_read_at_every_site(tmp_path, cp):
+    """The ref is ABSENT but a same-named shadow tag exists: the exact-ref read must refuse it, as for an ASCII name."""
+    repo, sha_a, sha_b, ref = _r10_unicode_repo(tmp_path, cp)
+    git(repo, "update-ref", "refs/tags/" + ref, sha_b)
+    git(repo, "update-ref", "refs/remotes/other/x", sha_b)       # keeps the retire gate past its 'unpushed' check (as in r8)
+    git(repo, "update-ref", "-d", ref)
+    expr = "(" + _r10_name_ps(cp) + " + '~1')"
+    cur = _r10_site(tmp_path, repo, "currency", expr, "r10-cur-uni-absent", disk="'a'\n")      # shadow tag ~1 = A would read 'current'
+    assert cur["status"] == "unknown", (cp, cur)
+    rat = _r10_site(tmp_path, repo, "ratio", expr, "r10-ratio-uni-absent")
+    assert rat["errorCode"] == "ERROR_REF_UNRESOLVED" and rat["sourceSha"] == "", (cp, rat)
+    ret = _r10_site(tmp_path, repo, "retire", expr, "r10-ret-uni-absent", wt_sha=sha_a)
+    assert ret["reason"].startswith("cannot-determine: merge target ref missing"), (cp, ret)
+
+
+R10_SEARCH_EXPR = R6_REF + "^{/foo@{1}}"
+
+
+def _r10_search_repo(tmp_path):
+    """A (message 'foo@ A', x.ps1='a') <- B (message 'B', x.ps1='b'); refs/remotes/fork/master = B. The commit-message
+    search `^{/foo@{1}}` (regex foo@ with an interval) names A and contains the characters `@{`. Returns (repo, A, B)."""
+    repo = tmp_path / "r10search"
+    repo.mkdir()
+    init_repo(repo)
+    git(repo, "config", "user.email", "t@example.invalid")
+    git(repo, "config", "user.name", "t")
+    shas = []
+    for name, msg in (("a", "foo@ A"), ("b", "B")):
+        (repo / "x.ps1").write_text("'%s'\n" % name, encoding="utf-8")
+        git(repo, "add", "x.ps1")
+        git(repo, "commit", "-q", "-m", msg)
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    git(repo, "update-ref", R6_REF, shas[1])
+    return repo, shas[0], shas[1]
+
+
+def test_r10_adv_a2_the_fixture_search_expression_is_a_valid_non_reflog_revision(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", R10_SEARCH_EXPR + "^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == sha_a, (ok.stdout, ok.stderr)
+
+
+def test_r10_adv_a2_the_currency_guard_resolves_a_search_expression_containing_at_brace(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "currency", "'" + R10_SEARCH_EXPR + "'", "r10-cur-search", disk="'a'\n")
+    assert doc["status"] == "current" and doc["threw"] is False, doc          # A's blob; a refusal would be 'refused-reflog'
+
+
+def test_r10_adv_a2_the_ratio_guard_resolves_a_search_expression_containing_at_brace(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + R10_SEARCH_EXPR + "'", "r10-ratio-search")
+    assert doc.get("errorCode") in (None, "") and doc["sourceSha"] == sha_a, doc
+
+
+def test_r10_adv_a2_the_retire_merge_gate_resolves_a_search_expression_containing_at_brace(tmp_path):
+    repo, sha_a, sha_b = _r10_search_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + R10_SEARCH_EXPR + "'", "r10-ret-search", wt_sha=sha_a)
+    assert "reflog selector" not in doc["reason"] and "merge target ref missing" not in doc["reason"] and "merge-base" not in doc["reason"], doc
+    assert not doc["reason"].startswith("unmerged"), doc                       # a worktree at A IS an ancestor of A
+
+
+R10_REAL_SELECTOR_BEHIND_A_SEARCH = ["refs/remotes/fork/master@{1}^{/foo}", "refs/remotes/fork/master@{1}^{/foo@{1}}"]
+
+
+@pytest.mark.parametrize("expr", R10_REAL_SELECTOR_BEHIND_A_SEARCH)
+def test_r10_adv_a2_an_actual_reflog_selector_is_still_refused_at_every_site_when_a_search_follows_it(tmp_path, expr):
+    # r14: the refusal now reads the exact ref (show-ref) before it probes, and the r6 shim deletes the ref after the first
+    # show-ref, so each site gets its own repo instead of sharing one that the first site has already emptied.
+    subs = []
+    for site in ("currency", "ratio", "retire"):
+        sub = tmp_path / site
+        sub.mkdir()
+        subs.append((sub,) + tuple(_r9_repo(sub)))
+    (sub, repo, sha_a, sha_b) = subs[0]
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", "r10-cur-real", disk="'a'\n")
+    assert cur["status"] == "refused-reflog" and cur["threw"] is True, (expr, cur)
+    (sub, repo, sha_a, sha_b) = subs[1]
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", "r10-ratio-real")
+    assert rat["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, rat)
+    (sub, repo, sha_a, sha_b) = subs[2]
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r10-ret-real", wt_sha=sha_a)
+    assert ret["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, ret)
+
+
+def test_r10_every_site_classifies_a_full_refname_by_ascii_whitespace_and_strips_search_groups_in_source():
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        text = path.read_text(encoding="utf-8")
+        assert r"[^?*\[\\\s]" not in text, (path, "the Unicode-aware \\s is back in the full-refname classifier")
+        assert r"[^?*\[\\ \t\n\v\f\r]" in text, path
+        assert r"\^\{/.*" not in text, (path, "r14: no regex strip of the ^{/...} search group may decide the reflog test (see test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix)")
+
+
+# --- r11 (Dot prior-key B3, old Sol r9 CR 6553630639): type the run rows BEFORE any comparison ---------------
+# `gh run list --json databaseId,conclusion,createdAt,headSha,displayTitle` (gh 2.97.0, captured live in the r11 run's
+# evidence\gh-run-list-merge-group.json: 50 rows) emits headSha / conclusion / createdAt / displayTitle as JSON STRINGS and
+# databaseId as an integer. The export is written to disk and read back with ConvertFrom-Json, so the selector sees whatever
+# the file holds; PowerShell's -eq coerces the RIGHT operand to the left operand's type, so `$true -eq 'success'` and
+# `$true -eq <any non-empty sha>` are both True and an array on the left FILTERS instead of comparing. A row of the wrong
+# shape is therefore excluded from every selection branch and counted in the label (never silently dropped).
+R11_MALFORMED_TEXT = "; %d malformed run row(s) ignored (headSha/conclusion not a string or databaseId not a positive integer)"
+
+# Two rows exactly as `gh run list` printed them (the head of evidence\gh-run-list-merge-group.json, 2026-11-01).
+R11_REAL_ROWS = [
+    {"conclusion": "success", "createdAt": "2026-11-01T04:26:11Z", "databaseId": 41273090820,
+     "displayTitle": "Tests", "headSha": "df039a92e8af57d57b3594d466c09cf2947d3bc7"},
+    {"conclusion": "success", "createdAt": "2026-10-31T17:43:10Z", "databaseId": 41225880883,
+     "displayTitle": "Tests", "headSha": "124de5190698a0b0ffd8ba488f5a9eddb37e3e36"},
+]
+
+
+def _r11_malformed(n):
+    return R11_MALFORMED_TEXT % n
+
+
+def _r11_without(row, key):
+    return {k: v for k, v in row.items() if k != key}
+
+
+def test_r11_real_gh_row_shapes_are_accepted_unchanged(tmp_path):
+    picked = _mgrs_select(tmp_path, R11_REAL_ROWS, "124de5190698a0b0ffd8ba488f5a9eddb37e3e36")
+    assert picked == {"id": 41225880883, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}, picked
+    assert "malformed" not in picked["label"]
+
+
+# every non-string shape a headSha can take after ConvertFrom-Json: Boolean, null, number, array, object
+R11_BAD_SHA = [
+    pytest.param(True, MGRS_TIP, id="bool"),
+    pytest.param(None, MGRS_TIP, id="null"),
+    pytest.param(1, MGRS_TIP, id="number"),   # r13: the good row's tip must itself be a 40-hex sha (was the unrealistic "1")
+    pytest.param([MGRS_TIP, "x"], MGRS_TIP, id="array"),
+    pytest.param({"sha": MGRS_TIP}, MGRS_TIP, id="object"),
+]
+
+
+@pytest.mark.parametrize("bad,tip", R11_BAD_SHA)
+def test_r11_a_non_string_head_sha_is_never_the_landed_run_and_is_counted_malformed(tmp_path, bad, tip):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", bad, "failure"),            # newest; wrong-typed headSha
+        _mgrs_row(200, "2026-10-31T16:00:00Z", tip, "success"),            # the genuinely landed run
+    ]
+    assert _mgrs_select(tmp_path, rows, tip) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r11_a_missing_head_sha_property_is_malformed(tmp_path):
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP, "failure"), "headSha"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+R11_BAD_CONCLUSION = [
+    pytest.param(True, id="bool"),
+    pytest.param(None, id="null"),
+    pytest.param(1, id="number"),
+    pytest.param(["success"], id="array"),
+    pytest.param({"c": "success"}, id="object"),
+]
+
+
+@pytest.mark.parametrize("bad", R11_BAD_CONCLUSION)
+def test_r11_a_non_string_conclusion_is_never_a_success_and_is_counted_malformed(tmp_path, bad):
+    rows = [
+        _mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, bad),           # newest; wrong-typed conclusion
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+        _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "cancelled"),
+    ]
+    # no landed run and no real success: the newest WELL-TYPED row by createdAt, never the wrong-typed one
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}
+
+
+def test_r11_a_missing_conclusion_property_is_malformed(tmp_path):
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success"), "conclusion"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "success")]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+R11_BAD_ID = [
+    pytest.param(True, id="bool"),
+    pytest.param(None, id="null"),
+    pytest.param("300", id="string"),
+    pytest.param([300], id="array"),
+    pytest.param(1.5, id="fraction"),
+    pytest.param(0, id="zero"),
+    pytest.param(-5, id="negative"),
+]
+
+
+@pytest.mark.parametrize("bad", R11_BAD_ID)
+def test_r11_a_database_id_that_is_not_a_positive_integer_is_never_selected(tmp_path, bad):
+    rows = [
+        _mgrs_row(bad, "2026-10-31T17:00:00Z", MGRS_TIP, "success"),       # newest and landed by sha, but its id cannot key a URL
+        _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success"),
+    ]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r11_every_label_branch_carries_the_malformed_count(tmp_path):
+    bad = _mgrs_row(300, "2026-10-31T17:00:00Z", True, True)
+    landed = _mgrs_select(tmp_path, [bad, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "failure")], MGRS_TIP)
+    success = _mgrs_select(tmp_path, [bad, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "success")], MGRS_TIP)
+    newest = _mgrs_select(tmp_path, [bad, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure")], MGRS_TIP)
+    assert landed == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}, landed
+    assert success == {"id": 200, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}, success
+    assert newest == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}, newest
+
+
+def test_r11_when_every_row_is_malformed_nothing_is_selected(tmp_path):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", True, True), _mgrs_row(200, "2026-10-31T16:00:00Z", None, ["success"])]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) is None
+
+
+def test_r11_a_row_that_is_not_an_object_is_malformed(tmp_path):
+    rows = ["not-a-row", 7, _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _mgrs_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(2)}
+
+
+def test_r11_the_export_reports_a_failed_row_when_runs_exist_but_none_is_usable():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    start = text.index("$pick = Select-MergeGroupJobsRun")
+    tail = text[start:start + 3000]
+    assert "elseif (@($runs).Count -gt 0)" in tail and "no usable run row" in tail, "an all-malformed export must surface a FAILED row"
+
+
+# --- r12 (r11 adversary A1 + A2, hub ruling 2026-11-01): StrictMode-safe property reads and an ORDINAL comparison -------------
+# A1: Invoke-Workstream.ps1 runs under `Set-StrictMode -Version Latest`, where `$row.headSha` on a row WITHOUT that property
+# (or on a string / number row) throws PropertyNotFoundException. The r11 harness did not enable strict mode, so its
+# missing-property tests passed while production's catch turned the throw into "(job graph) FAILED" instead of selecting the
+# usable rows. The harness below runs the extracted selector under StrictMode Latest exactly as production does.
+# A2: PowerShell's -eq AND -ceq both ignore an embedded NUL (measured on pwsh 7.6.9: "abc" -ceq ("abc" + [char]0) is True), so
+# `<tip>` + NUL matched the landed tip and `success` + NUL counted as a success. Only [string]::Equals(.., Ordinal) tells them
+# apart, and a value carrying any control character is refused as malformed in the first place.
+def _r12_select(tmp_path, rows, tip, strict=True):
+    """Like _mgrs_select, but the harness runs under Set-StrictMode -Version Latest (production's mode) unless strict=False."""
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Select-MergeGroupJobsRun")
+    rows_file = tmp_path / "rows-r12.json"
+    rows_file.write_text(json.dumps(rows), encoding="utf-8")
+    harness = tmp_path / "r12-harness.ps1"
+    harness.write_text(
+        ("Set-StrictMode -Version Latest\n" if strict else "") + "$ErrorActionPreference='Stop'\n" + fn +
+        "\n$rows=@(Get-Content -LiteralPath '" + str(rows_file).replace("'", "''") + "' -Raw | ConvertFrom-Json)\n"
+        "$pick = Select-MergeGroupJobsRun -Runs $rows -MasterSha '" + tip.replace("'", "''") + "'\n"
+        "if ($null -eq $pick) { 'NONE' } else { ([pscustomobject]@{ id = $pick.Run.databaseId; label = $pick.Label } | ConvertTo-Json -Compress) }\n",
+        encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    text = out.stdout.strip()
+    return None if text == "NONE" else json.loads(text)
+
+
+@pytest.mark.parametrize("missing", ["headSha", "conclusion", "databaseId"])
+def test_r12_a_row_missing_a_property_is_counted_malformed_under_strict_mode(tmp_path, missing):
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP, "success"), missing),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r12_non_object_rows_are_counted_malformed_under_strict_mode(tmp_path):
+    rows = ["not-a-row", 7, True, [1, 2], _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(4)}
+
+
+def test_r12_a_row_without_created_at_stays_usable_and_sorts_last_under_strict_mode(tmp_path):
+    # createdAt is only a sort key: a row lacking it is not malformed (same as before r12), it just ranks behind any row that has one.
+    rows = [_r11_without(_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "failure"), "createdAt"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST}
+
+
+@pytest.mark.parametrize("bad,tip", R11_BAD_SHA + [pytest.param(["a" * 40], "a" * 40, id="one-element-array")])
+def test_r12_every_r11_non_string_head_sha_shape_still_holds_under_strict_mode(tmp_path, bad, tip):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", bad, "failure"), _mgrs_row(200, "2026-10-31T16:00:00Z", tip, "success")]
+    assert _r12_select(tmp_path, rows, tip) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R11_BAD_CONCLUSION + [pytest.param(["success"], id="one-element-array-dup")])
+def test_r12_every_r11_non_string_conclusion_shape_still_holds_under_strict_mode(tmp_path, bad):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, bad), _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R11_BAD_ID)
+def test_r12_every_r11_bad_database_id_shape_still_holds_under_strict_mode(tmp_path, bad):
+    rows = [_mgrs_row(bad, "2026-10-31T17:00:00Z", MGRS_TIP, "success"), _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+def test_r12_the_real_gh_rows_select_the_same_under_strict_mode(tmp_path):
+    picked = _r12_select(tmp_path, R11_REAL_ROWS, "124de5190698a0b0ffd8ba488f5a9eddb37e3e36")
+    assert picked == {"id": 41225880883, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}, picked
+
+
+R12_CONTROL_SUFFIXES = [
+    pytest.param(chr(0), id="nul"),
+    pytest.param(chr(0) * 2, id="two-nuls"),
+    pytest.param(chr(10), id="lf"),
+    pytest.param(chr(9), id="tab"),
+    pytest.param(chr(31), id="us"),
+    pytest.param(chr(127), id="del"),
+]
+
+
+@pytest.mark.parametrize("suffix", R12_CONTROL_SUFFIXES)
+def test_r12_a_head_sha_with_a_control_character_is_never_the_landed_run(tmp_path, suffix):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP + suffix, "failure"),   # newest; the tip plus a control character
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]            # the genuinely landed run
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("suffix", R12_CONTROL_SUFFIXES)
+def test_r12_a_conclusion_with_a_control_character_is_never_a_success(tmp_path, suffix):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success" + suffix),  # newest; "success" plus a control character
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+            _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success")]           # the real success
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 100, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+def test_r12_a_nul_polluted_row_alone_selects_nothing(tmp_path):
+    # the only row is NUL-polluted in both fields: not landed, not a success, not selectable
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_TIP + chr(0), "success" + chr(0))]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) is None
+
+
+def test_r12_an_ordinal_comparison_is_pinned_in_the_selector_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "StringComparison]::Ordinal" in body, "headSha / conclusion must be compared ordinally ( -eq and -ceq both ignore an embedded NUL )"
+    assert "$_.headSha -eq" not in body and "$_.headSha -ne" not in body and "$_.conclusion -eq" not in body
+    assert "-ceq" not in body and "-cne" not in body, "-ceq still ignores an embedded NUL; use [string]::Equals(.., Ordinal)"
+
+
+# All 50 rows of `gh run list --workflow Tests --event merge_group --json databaseId,conclusion,createdAt,headSha,displayTitle`
+# (gh 2.97.0), captured live 2026-11-01 (r11 evidence gh-run-list-merge-group.json), as (databaseId, createdAt, headSha, conclusion).
+R13_REAL_GH_CAPTURE = [
+    (41273090820, "2026-11-01T04:26:11Z", "df039a92e8af57d57b3594d466c09cf2947d3bc7", "success"),
+    (41225880883, "2026-10-31T17:43:10Z", "124de5190698a0b0ffd8ba488f5a9eddb37e3e36", "success"),
+    (41218504235, "2026-10-31T16:11:57Z", "cdc186796424515a80e015f7d940a424e9af83e5", "success"),
+    (41192640007, "2026-10-31T10:24:41Z", "a95d2c5dfcdada8696e2e6b7ac111cfd0a0793b8", "success"),
+    (41191699415, "2026-10-31T10:11:01Z", "b45a065141eeea7395f2569457e8ff595bea7dbc", "success"),
+    (41190240329, "2026-10-31T09:49:22Z", "ea9f2a998337e255a12c7ba6d9031f4619b384d0", "success"),
+    (41187946375, "2026-10-31T09:15:23Z", "4ad66eb4123d1df9c36ca1480c164b606c390f47", "cancelled"),
+    (41176707205, "2026-10-31T06:27:53Z", "0930a3dd68959c46e520415288e1170248eab805", "success"),
+    (41172362927, "2026-10-31T05:22:48Z", "dd1cfc68627c4de41edb0ad5be42f40aaf81533d", "success"),
+    (41167580702, "2026-10-31T04:12:14Z", "c10339878ee9bab3a8724ded95e8430ffafcf90e", "failure"),
+    (41165941673, "2026-10-31T03:48:33Z", "928b89bc895014828fe2ca771296d0f70a54c0ca", "success"),
+    (41139627093, "2026-10-30T22:40:06Z", "1018a13e219c78835609d0e598ae52f2176923a3", "success"),
+    (41139162979, "2026-10-30T22:35:43Z", "08ec1afb9bc58b11e13312d79deff23c0976eba2", "success"),
+    (41108668798, "2026-10-30T18:38:43Z", "8f22c6d15713ec688ce5ae100b66c49ed678140e", "success"),
+    (41084135587, "2026-10-30T15:48:44Z", "524e1f2c1a66a1d09c838e25024b7eac82e7ee22", "success"),
+    (41079011074, "2026-10-30T15:15:26Z", "4313beb3572daf5b6b4ed109866db36e8d254cb2", "success"),
+    (41023754896, "2026-10-30T08:02:05Z", "dd99118ed65dca3292cad9a975d4fb304a997abc", "success"),
+    (41006983968, "2026-10-30T05:11:01Z", "01f0f6d6e9317af83aa7658b6ae229b10bf108ef", "success"),
+    (41003826294, "2026-10-30T04:36:22Z", "7f95a4841deefad6017b5ec040c8e4dd20adc1d8", "failure"),
+    (41003824879, "2026-10-30T04:36:21Z", "c548d7aeea5f4f4343be2454a6abba2deefd2e29", "failure"),
+    (41000650226, "2026-10-30T04:02:28Z", "412af7e65f001eb9144e5212c9c4c5d5692353f0", "failure"),
+    (40997478763, "2026-10-30T03:27:27Z", "d0d63782cb484488d865af09c2b60694886d94c8", "success"),
+    (40961846547, "2026-10-29T21:55:54Z", "49cdb6c01921eb8606bbd51ba3465334e9af5e44", "success"),
+    (40959445779, "2026-10-29T21:38:08Z", "5fef282af8479f43da7f955ec3e28bdab7faafdc", "success"),
+    (40958213988, "2026-10-29T21:29:24Z", "7719271d7b64b6af1a66c8b7c87dfbbeaffb85a3", "success"),
+    (40926624385, "2026-10-29T18:00:01Z", "8b7cb2f28112024fe6b20e67a83afcf7b2cb4b23", "success"),
+    (40925740088, "2026-10-29T17:54:17Z", "0cf275fd75ffa536dc3babd4176e7758fd42738e", "success"),
+    (40871917397, "2026-10-29T12:16:31Z", "a013c733e2fd9d099a76be84d85bd592c4d90c7f", "success"),
+    (40858861385, "2026-10-29T10:36:12Z", "cf598bd2b444b33b6ffb31f46746d2cc7456a696", "success"),
+    (40836854562, "2026-10-29T07:39:38Z", "6281b50fa65844932b34fd9df606349223a47fd9", "success"),
+    (40713497429, "2026-10-28T15:11:55Z", "293b0b818dd268d81bc5aa667b3ae7a021f02b24", "success"),
+    (40713494260, "2026-10-28T15:11:54Z", "55c1405d26663fa63eac6c8e91467d28482e24f5", "success"),
+    (40711418664, "2026-10-28T14:59:35Z", "daf11506e55c658b05158104699030c6320773fc", "failure"),
+    (40710577449, "2026-10-28T14:54:28Z", "8c0ce8d9361eb2af06f391c8a5f703786c871052", "cancelled"),
+    (40705077872, "2026-10-28T14:21:13Z", "27b81a47241905d2a0094c344ed11edd384d0314", "cancelled"),
+    (40616742646, "2026-10-28T01:43:31Z", "038ba3357e262bfc866f82c2e3c9ba4b04f790fc", "success"),
+    (40539446886, "2026-10-27T16:17:27Z", "685b91ad25e07b7b5e8ac46a558470db22021d19", "success"),
+    (40509624873, "2026-10-27T13:09:47Z", "5175855f46b946e3ab180d750171d7229c17e383", "success"),
+    (40509625455, "2026-10-27T13:09:47Z", "82a15395547db26c72f4dc31ae8d6734b54d2242", "success"),
+    (40497267505, "2026-10-27T11:35:17Z", "f32ea2a2e9928d1081cccb9d0b29304825f693ea", "success"),
+    (40458055327, "2026-10-27T05:55:16Z", "0154c55beae29baf06a2db717e675ac560d1cc98", "success"),
+    (40413026689, "2026-10-26T22:30:58Z", "01ef201681f6581f4c6cef53d6419f64c0339393", "success"),
+    (40399274068, "2026-10-26T20:50:58Z", "646b70ab1ddc19760f7ff6d311bc3c10ffc52b23", "success"),
+    (40341411397, "2026-10-26T14:38:00Z", "b59662cd12c2783d3718f7b4da2b17392cd9d51a", "success"),
+    (40303774121, "2026-10-26T09:58:51Z", "7eeef2013a016895b5bf205732b8f4b20d7f50a9", "success"),
+    (40300657207, "2026-10-26T09:34:52Z", "3cc5364bebc5a7ade0960543b2f622538aa1ff33", "success"),
+    (40253427805, "2026-10-26T01:16:36Z", "a235df4d4c47ab77056b0016f8c4a8443811a6a9", "success"),
+    (40249431889, "2026-10-26T00:27:13Z", "5e1b6887c01bcc3f12ab8eb1b13ceef9f203edf5", "success"),
+    (40243119527, "2026-10-25T23:04:54Z", "da8b230e2a08614c2a86eaa5d376ba66aa85cbac", "success"),
+    (40235952520, "2026-10-25T21:32:12Z", "dfbfd54e25e186687b80981b1f1269706ed56083", "success"),
+]
+
+
+# --- r13 (hub ACK 6560764371 / Dot 6561311995 + 6561775338; r12 adversary A1): a headSha SCHEMA and the C1 control range ---------
+# The hub promised a `^[0-9a-f]{40}$` headSha check at every selector branch. `gh run list --json headSha` emits a full lowercase
+# 40-hex commit id (all 50 rows of the live capture below), so a row whose headSha is anything else is malformed: it is excluded
+# from EVERY branch (landed filter, newer-off-tip count, success fallback, newest fallback) and counted in the malformed label.
+# Uppercase hex is deliberately malformed (gh never emits it). r12's control-character predicate omitted U+0080-U+009F, so
+# 'failure' + U+0085 was treated as well-formed and could be the newest-by-createdAt fallback.
+R13_BAD_SHAS = [
+    pytest.param("a" * 39, id="39-hex"),
+    pytest.param("a" * 41, id="41-hex"),
+    pytest.param("A" * 40, id="uppercase-hex"),
+    pytest.param("a" * 39 + "B", id="one-uppercase-char"),
+    pytest.param("a" * 40 + "\n", id="40-hex-plus-lf"),
+    pytest.param("a" * 40 + " ", id="40-hex-plus-space"),
+    pytest.param("a" * 40 + chr(0x85), id="40-hex-plus-c1-nel"),
+    pytest.param(chr(0x80) + "a" * 40, id="c1-prefix"),
+    pytest.param("g" * 40, id="40-non-hex"),
+    pytest.param("zzz", id="zzz"),
+    pytest.param("", id="empty"),
+    pytest.param(1234567890, id="number"),
+]
+
+
+@pytest.mark.parametrize("bad", R13_BAD_SHAS)
+def test_r13_a_head_sha_outside_the_schema_is_not_a_newer_off_tip_run(tmp_path, bad):
+    # landed branch: the bad row is NEWER than the landed run. Before r13 a non-hex headSha with no control character counted
+    # as "1 newer completed run(s) not at the local tip"; it is malformed instead and counted only in the malformed label.
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", bad, "failure"), _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_TIP, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_LANDED + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R13_BAD_SHAS)
+def test_r13_a_head_sha_outside_the_schema_is_never_the_success_fallback(tmp_path, bad):
+    # success fallback (no landed run): the bad row is the newest success; the real older success must win.
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", bad, "success"),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+            _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 100, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+@pytest.mark.parametrize("bad", R13_BAD_SHAS)
+def test_r13_a_head_sha_outside_the_schema_is_never_the_newest_fallback(tmp_path, bad):
+    # newest-by-createdAt fallback (no landed run, no success): the bad row is the newest; the well-formed one must win.
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", bad, "failure"), _mgrs_row(200, "2026-11-01T16:00:00Z", MGRS_OTHER, "failure")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 200, "label": MGRS_LABEL_NEWEST + _r11_malformed(1)}
+
+
+R13_C1_SUFFIXES = [
+    pytest.param(chr(0x80), id="u0080"),
+    pytest.param(chr(0x85), id="u0085-nel"),
+    pytest.param(chr(0x9F), id="u009f"),
+]
+
+
+@pytest.mark.parametrize("suffix", R13_C1_SUFFIXES)
+def test_r13_a_conclusion_with_a_c1_control_is_never_a_success(tmp_path, suffix):
+    rows = [_mgrs_row(300, "2026-10-31T17:00:00Z", MGRS_OTHER, "success" + suffix),
+            _mgrs_row(200, "2026-10-31T16:00:00Z", MGRS_OTHER, "failure"),
+            _mgrs_row(100, "2026-10-31T15:00:00Z", MGRS_OTHER, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) == {"id": 100, "label": MGRS_LABEL_SUCCESS + _r11_malformed(1)}
+
+
+def test_r13_fallback_selection_c1_conclusion_row_is_not_the_newest_fallback(tmp_path):
+    # Dot ask 6561775338 (literal inputs): MasterSha = 40 x 'a'; Row A 300 is newer with conclusion 'failure' + U+0085.
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", "b" * 40, "failure" + chr(0x85)),
+            _mgrs_row(200, "2026-11-01T16:00:00Z", "b" * 40, "failure")]
+    picked = _r12_select(tmp_path, rows, "a" * 40)
+    assert picked is not None and picked["id"] == 200, picked
+    assert "1 malformed run row(s) ignored" in picked["label"], picked
+
+
+def test_r13_fallback_selection_zzz_head_sha_row_is_not_the_newest_fallback(tmp_path):
+    # Same shape for headSha: Row A headSha 'zzz', conclusion 'failure', newer.
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", "zzz", "failure"),
+            _mgrs_row(200, "2026-11-01T16:00:00Z", "b" * 40, "failure")]
+    picked = _r12_select(tmp_path, rows, "a" * 40)
+    assert picked is not None and picked["id"] == 200, picked
+    assert "1 malformed run row(s) ignored" in picked["label"], picked
+
+
+def test_r13_an_all_bad_head_sha_export_selects_nothing(tmp_path):
+    rows = [_mgrs_row(300, "2026-11-01T17:00:00Z", "zzz", "success"), _mgrs_row(200, "2026-11-01T16:00:00Z", "A" * 40, "success")]
+    assert _r12_select(tmp_path, rows, MGRS_TIP) is None
+
+
+def _r13_real_rows():
+    return [_mgrs_row(i, c, s, k) for (i, c, s, k) in R13_REAL_GH_CAPTURE]
+
+
+def test_r13_control_the_real_50_row_gh_capture_is_all_usable_and_selects_as_before(tmp_path):
+    assert len(R13_REAL_GH_CAPTURE) == 50 and all(re.fullmatch(r"[0-9a-f]{40}", s) for (_, _, s, _) in R13_REAL_GH_CAPTURE)
+    landed = _r12_select(tmp_path, _r13_real_rows(), "124de5190698a0b0ffd8ba488f5a9eddb37e3e36")
+    assert landed == {"id": 41225880883, "label": MGRS_LABEL_LANDED + _mgrs_newer(1)}, landed
+    success = _r12_select(tmp_path, _r13_real_rows(), MGRS_TIP)    # no row is at this tip: newest success wins
+    assert success == {"id": 41273090820, "label": MGRS_LABEL_SUCCESS}, success
+    assert "malformed" not in landed["label"] and "malformed" not in success["label"]
+
+
+def test_r13_the_schema_and_the_c1_range_are_pinned_in_the_selector_source():
+    text = WORKSTREAM.read_text(encoding="utf-8")
+    body = text[text.index("function Select-MergeGroupJobsRun"):text.index("function Get-ForkMasterTip")]
+    assert "-cmatch '\\A[0-9a-f]{40}\\z'" in body, "headSha must be checked with the case-sensitive, end-anchored 40-hex schema"
+    assert "[\\x00-\\x1F\\x7F-\\x9F]" in body, "the control-character predicate must cover C0, DEL and C1"
+
+
+# --- r14 (sol r13 BLOCKER on 47a65674 + r13 adversary A1): a GREEDY `^{/.*}` strip hides an external reflog selector -----
+# r10 stripped `^{/regex}` commit-message-search groups with the greedy `\^\{/.*\}` before testing for `@{`. Greedy `.*` runs to
+# the LAST `}` in the suffix, so `refs/remotes/fork/master^{/search}^{}@{1}` lost its trailing `@{1}` (the `}` of `@{1}` is the
+# last brace) and the typed reflog refusal never fired at any of the three sites. A first r14 attempt made the strip NON-greedy
+# (`.*?`), which the r14 adversary (A1) showed wrongly REFUSED a valid search holding `{n}` before its `@{` (`^{/.*|a{1}foo@{1}}`:
+# the group's first `}` is the interval's). No regex over the suffix can tell `^{/a}^{}@{1}` (selector) from `^{/a{1}x@{1}}`
+# (search) by shape alone, and a second r14 attempt that let git decide (probe `<sha><suffix>^{commit}`) was refuted too: git itself
+# resolves `<sha>^{}@{1}` and `<sha>^{/.*}^{}@{1}` (adversary A1 on 55f93997), so git is no oracle for the typed-refusal contract.
+# The strip now follows the grammar: a search group is `^{/` + BRACE-BALANCED text + `}` (regex intervals `{n}` balance), matched
+# with the .NET balancing-group pattern `\^\{/(?:[^{}]|\{(?<d>)|\}(?<-d>))*(?(d)(?!))\}`. A `@{` left after stripping balanced
+# groups is an external selector and is refused fail-closed at all three sites; an unbalanced group is not stripped.
+R14_HIDDEN_SELECTORS = [
+    R6_REF + "^{/.*}^{}@{1}",            # adversary A1 (55f93997): the search MATCHES, the old fixtures' searches did not
+    R6_REF + "^{}@{1}",                  # the simplest suffix that git itself resolves on a SHA
+    R6_REF + "^{/B}^{}@{1}",
+    # r15: `^{/.*}~1@{1}`, `^{/a{b}@{1}`, `^{/a}^{/b}@{1}` and `^{/a}~1@{1}` moved to R15_SEARCH_TEXT_TAILS: git's own end-anchored parse
+    # reads each whole tail as ONE search (the last `^{` opens it and the final `}` closes it), so its `@{` is regex text, not a selector.
+    R6_REF + "^{/a{1}x}^{}@{1}",         # a search holding {n}, then an external selector
+    R6_REF + "^{/search}^{}@{1}",       # sol's catalogue input
+    R6_REF + "^{/search}^{}@{0}",
+    R6_REF + "^{/search}^{}@{2}",
+    R6_REF + "^{/foo@{1}}^{}@{1}",       # a legitimate search followed by a real selector
+]
+R14_PLAIN_REFLOG_CONTROLS = ["refs/remotes/fork/master@{1}", "refs/remotes/fork/master@{0}", "refs/remotes/fork/master@{1}~1"]
+
+
+@pytest.mark.parametrize("expr", R14_HIDDEN_SELECTORS + R14_PLAIN_REFLOG_CONTROLS)
+def test_r14_the_currency_guard_refuses_a_reflog_selector_a_greedy_search_strip_would_hide(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r14-cur", disk="'a'\n")
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R14_HIDDEN_SELECTORS + R14_PLAIN_REFLOG_CONTROLS)
+def test_r14_the_ratio_guard_refuses_a_reflog_selector_a_greedy_search_strip_would_hide(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r14-ratio")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R14_HIDDEN_SELECTORS + R14_PLAIN_REFLOG_CONTROLS)
+def test_r14_the_retire_merge_gate_refuses_a_reflog_selector_a_greedy_search_strip_would_hide(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r14-ret", wt_sha=sha_a)
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
+
+
+# The adversary's own input and two siblings: valid searches that hold `{n}` and/or `@{n}` and DO resolve in git. They must not be
+# refused by any site. Fixture (_r10_search_repo): A = 'foo@ A' (x.ps1='a'), B = 'B' (x.ps1='b'), refs/remotes/fork/master = B.
+R14_VALID_SEARCHES = [
+    (R6_REF + "^{/.*|a{1}foo@{1}}", "b"),     # adversary A1: `.*` matches the tip B
+    (R6_REF + "^{/(a{1}|foo)@{1}}", "a"),     # `{1}` before the `@{1}`: only A's message has 'foo@'
+    (R6_REF + "^{/foo@{1}}", "a"),            # the r10 control
+]
+
+
+@pytest.mark.parametrize("expr,disk", R14_VALID_SEARCHES)
+def test_r14_a_valid_search_holding_braces_resolves_in_git_and_is_not_refused_by_any_site(tmp_path, expr, disk):
+    def fresh(site):
+        # the r6 shim deletes the ref right after the first show-ref, so each site gets its own repo
+        sub = tmp_path / site
+        sub.mkdir()
+        return sub, _r10_search_repo(sub)
+
+    sub, (repo, sha_a, sha_b) = fresh("currency")
+    want = sha_a if disk == "a" else sha_b
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == want, (expr, ok.stdout, ok.stderr)
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", "r14-cur-valid", disk="'%s'\n" % disk)
+    assert cur["status"] == "current" and cur["threw"] is False, (expr, cur)
+    sub, (repo, sha_a, sha_b) = fresh("ratio")
+    want = sha_a if disk == "a" else sha_b
+    rat =_r10_site(sub, repo, "ratio", "'" + expr + "'", "r14-ratio-valid")
+    assert rat.get("errorCode") in (None, "") and rat["sourceSha"] == want, (expr, rat)
+    sub, (repo, sha_a, sha_b) = fresh("retire")
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r14-ret-valid", wt_sha=sha_a)
+    _r15_assert_retired_exactly(ret, sha_a, expr)
+
+
+def _r15_assert_retired_exactly(ret, sha_a, expr):
+    """r15 (hub ACK 6565386601): the valid-search retirement must name the EXACT retirement target and action, not only lack two refusal
+    reasons. The fixture worktree is detached at A (an ancestor of every target the valid searches resolve to) and the call is -WhatIf, so
+    the disposition is action=would-retire, reason=ok, workDir=<the worktree asked for>, head=A, and nothing is removed. (A real retire with
+    no -QuarantineRoot throws at Retire-LaneWorktree.ps1 `Join-Path $QuarantineRoot` after the rename probe - a base defect, recorded as
+    an advisory in the r15 summary - which is why the pre-r15 "no refusal reason" assertion passed over a call that never reached ok.)"""
+    assert ret["action"] == "would-retire" and ret["reason"] == "ok", (expr, ret)
+    assert ret["workDir"] == ret["wt"] and ret["head"] == sha_a, (expr, ret)
+    assert os.path.isdir(ret["wt"]), (expr, "-WhatIf must not remove the worktree", ret)
+
+
+def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
+    # The CLASS: a greedy or non-greedy `.*` strip of the `^{/...}` group cannot parse a brace-balanced search. No tools/ script keeps
+    # either. (r14c's brace-balanced pattern was refuted in turn by `[}]` - Dot B1 - and is gone too: r15 pins the shared peel helper.)
+    offenders = []
+    for path in sorted((COORD.parent).rglob("*")):
+        if path.suffix.lower() not in (".ps1", ".psm1", ".py", ".mjs") or path.name == "test_coordination_guardrails.py":
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if "\\^\\{/.*" in line:
+                offenders.append("%s:%d" % (path, n))
+    assert not offenders, offenders
+    balanced = "(?(d)(?!))"
+    for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
+        text = path.read_text(encoding="utf-8")
+        assert balanced not in text, (path, "r15: the brace-balanced regex strip is back; the reflog test must go through Get-RevisionSuffixAfterPeel")
+        assert text.count("function Get-RevisionSuffixAfterPeel") == 1 and len(re.findall(r"\(Get-RevisionSuffixAfterPeel \$\w+\)", text)) == 1, (path, "one definition and one call site")
+
+
+# --- r15 (Dot B1 on a49424fb, delivery 925f2ec1): follow git's OWN end-anchored grammar, not a guess at brace balance ------------------
+# `refs/remotes/fork/master^{/.*|[}]foo@{1}}` is a valid commit-message search (git resolves it). r14c's brace-balanced strip ended the
+# group at the literal `}` inside the character class `[}]`, left `]foo@{1}}`, and refused it as a reflog selector. Four strip designs
+# (greedy, non-greedy, git-probe, brace-balanced) were each refuted by a new shape because none followed git's grammar. r15 mirrors
+# object-name.c: get_oid_1 drops a trailing `~N` / `^N`; peel_onion takes the LAST `^{` as the opener and the final `}` as the closer, and
+# content starting with `/` is search text of ANY shape (`}` `[` `@{` included), while content that is empty or one of the object types is
+# a peel. Anything else stops the parse. A `@{` left over is an external selector (typed refusal). One helper, three identical copies.
+R15_VALID_SEARCHES = [
+    (R6_REF + "^{/.*|[}]foo@{1}}", "b"),          # Dot B1: `.*` matches the tip B
+    (R6_REF + "^{/[}]*foo@{1}}", "a"),            # `}` in a class, then `@{1}` as an interval: A's 'foo@'
+    (R6_REF + "^{/[^}]*foo@{1}}", "a"),           # negated class holding `}`
+    (R6_REF + "^{/(x|[}])*foo@{1}}", "a"),        # alternation + class
+    (R6_REF + "^{/[}]*foo@{1}}~0", "a"),          # a trailing ancestor step after the search
+    (R6_REF + "^{/[}]*foo@{1}}^{commit}", "a"),   # a trailing peel after the search
+]
+# Shapes the r14 tests listed as hidden selectors that git's grammar reads as ONE search (last `^{` .. final `}`): the `@{` is regex text.
+# git resolves none of them (invalid or non-matching pattern), so the sites must report the ref as unresolved - not as a reflog refusal.
+R15_SEARCH_TEXT_TAILS = [
+    R6_REF + "^{/.*}~1@{1}",
+    R6_REF + "^{/a{b}@{1}",
+    R6_REF + "^{/a}^{/b}@{1}",
+    R6_REF + "^{/a}~1@{1}",
+]
+# Real selectors (git consults the reflog, or the suffix cannot be stripped as a peel): all still refused at every site.
+R15_HIDDEN_SELECTORS = [
+    R6_REF + "^{/.*|[}]foo@{1}}^{}@{1}",     # Dot's valid search followed by a real selector
+    R6_REF + "^{/[}]*foo@{1}}^{commit}@{1}",
+    R6_REF + "^{commit}@{1}",
+    R6_REF + "^{tree}@{1}",
+    R6_REF + "^{/x}^{foo}@{1}",              # an unknown peel type stops the parse
+    R6_REF + "^{/x}~1^{}@{1}",
+    R6_REF + "@{1}^{/[}]foo}",               # a real selector BEFORE a search
+]
+
+
+def _r15_check_valid(tmp_path, expr, disk, tag):
+    def fresh(site):
+        sub = tmp_path / site
+        sub.mkdir()
+        return sub, _r10_search_repo(sub)
+
+    sub, (repo, sha_a, sha_b) = fresh("currency")
+    want = sha_a if disk == "a" else sha_b
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    assert ok.returncode == 0 and ok.stdout.strip() == want, (expr, ok.stdout, ok.stderr)
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", tag + "-cur", disk="'%s'\n" % disk)
+    assert cur["status"] == "current" and cur["threw"] is False, (expr, cur)
+    sub, (repo, sha_a, sha_b) = fresh("ratio")
+    want = sha_a if disk == "a" else sha_b       # each site's repo has its own commit ids
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", tag + "-ratio")
+    assert rat.get("errorCode") in (None, "") and rat["sourceSha"] == want, (expr, rat)
+    sub, (repo, sha_a, sha_b) = fresh("retire")
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", tag + "-ret", wt_sha=sha_a)
+    _r15_assert_retired_exactly(ret, sha_a, expr)
+
+
+@pytest.mark.parametrize("expr,disk", R15_VALID_SEARCHES)
+def test_r15_a_valid_search_with_a_brace_in_a_character_class_resolves_in_git_and_at_every_site(tmp_path, expr, disk):
+    _r15_check_valid(tmp_path, expr, disk, "r15-valid")
+
+
+@pytest.mark.parametrize("expr", R15_HIDDEN_SELECTORS)
+def test_r15_the_currency_guard_still_refuses_a_real_selector_after_a_bracketed_brace_search(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r15-cur", disk="'a'\n")
+    assert doc["status"] == "refused-reflog" and doc["threw"] is True, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_HIDDEN_SELECTORS)
+def test_r15_the_ratio_guard_still_refuses_a_real_selector_after_a_bracketed_brace_search(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r15-ratio")
+    assert doc["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_HIDDEN_SELECTORS)
+def test_r15_the_retire_merge_gate_still_refuses_a_real_selector_after_a_bracketed_brace_search(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r15-ret", wt_sha=sha_a)
+    assert doc["action"] == "kept" and doc["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_SEARCH_TEXT_TAILS)
+def test_r15_a_tail_git_reads_as_one_search_is_unresolved_not_a_reflog_refusal_at_every_site(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    probe = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    assert probe.returncode != 0 and probe.stdout.strip() == "", ("git itself must not resolve this tail", expr, probe.stdout)
+    sub = tmp_path / "currency"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    cur = _r10_site(sub, repo, "currency", "'" + expr + "'", "r15-tail-cur", disk="'a'\n")
+    assert cur["status"] == "unknown" and cur["threw"] is False, (expr, cur)
+    sub = tmp_path / "ratio"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", "r15-tail-ratio")
+    assert rat["errorCode"] == "ERROR_REF_UNRESOLVED" and rat["sourceSha"] == "", (expr, rat)
+    sub = tmp_path / "retire"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r15-tail-ret", wt_sha=sha_a)
+    assert ret["action"] == "kept" and ret["reason"].startswith("cannot-determine: merge target ref missing"), (expr, ret)
+
+
+# (suffix, left an `@{` => refused). Pure helper table, run through the real function text of each site.
+R15_PEEL_TABLE = [
+    ("@{1}", True), ("@{0}", True), ("@{-1}", True), ("@{u}", True), ("@{1}~1", True), ("~1@{1}", True),
+    ("^{}@{1}", True), ("^{/s}^{}@{1}", True), ("^{/.*}^{}@{1}", True), ("^{/.*|a{1}x}^{}@{1}", True),
+    ("^{/.*|[}]foo@{1}}^{}@{1}", True), ("^{commit}@{1}", True), ("^{tree}@{1}", True), ("^{/x}^{foo}@{1}", True),
+    ("^{/x}~1^{}@{1}", True), ("@{1}^{/foo}", True), ("^{commit}^{}@{1}", True), ("^{/a}@{1}^{}@{1}", True),
+    ("^{/.*|[}]foo@{1}}", False), ("^{/.*|a{1}foo@{1}}", False), ("^{/foo@{1}}", False), ("^{/[}]*foo@{1}}~0", False),
+    ("^{/[^}]*foo@{1}}^{commit}", False), ("^{commit}^{/foo@{1}}", False), ("^{tree}^{/x}", False), ("^{/a}~1@{1}", False),
+    ("^{/a}^{/b}@{1}", False), ("^{/a{b}@{1}", False), ("^{/.*}~1@{1}", False), ("^{/x|}@{1}}", False),
+    ("~1", False), ("^", False), ("^2", False), ("^{}", False), ("^{object}~3^{blob}", False), ("~", False), ("", False),
+    ("^{/a", False), ("^{", False), ("}", False), ("^{}}", False),
+]
+
+
+def _r15_peel_run(tmp_path, site_script, cases):
+    inp = tmp_path / "peel-in.json"
+    out = tmp_path / "peel-out.json"
+    inp.write_text(json.dumps(cases), encoding="utf-8")
+    harness = tmp_path / "peel-run.ps1"
+    harness.write_text(
+        "param($Script,$In,$Out)\n"
+        "$t = [System.IO.File]::ReadAllText($Script); $b = $t.IndexOf('# r15-PEEL-BEGIN'); $e = $t.IndexOf('# r15-PEEL-END')\n"
+        "if ($b -lt 0 -or $e -lt $b) { throw 'markers missing' }\n"
+        "Invoke-Expression $t.Substring($b, $e - $b)\n"
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+        "$r = foreach ($s in @(Get-Content -LiteralPath $In -Raw | ConvertFrom-Json)) { [bool]((Get-RevisionSuffixAfterPeel ([string]$s)) -match '@\\{') }\n"
+        "[System.IO.File]::WriteAllText($Out, (@{ refused = @($r); ms = $sw.ElapsedMilliseconds } | ConvertTo-Json -Compress))\n",
+        encoding="utf-8")
+    run = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness), "-Script", str(site_script), "-In", str(inp), "-Out", str(out)],
+                         text=True, capture_output=True)
+    assert run.returncode == 0, run.stdout + run.stderr
+    return json.loads(out.read_text(encoding="utf-8-sig"))
+
+
+@pytest.mark.parametrize("site", ["assert-script-currency.ps1", "Test-ProductRatioGuard.ps1", "Retire-LaneWorktree.ps1"])
+def test_r15_the_peel_helper_follows_gits_grammar_on_the_table_and_is_linear(tmp_path, site):
+    # The `^{}` x 5000 and `~1` x 5000 tails are 15000 / 10000 characters; a quadratic rescan would take minutes, linear takes milliseconds.
+    cases = [s for s, _ in R15_PEEL_TABLE] + ["^{}" * 5000, "~1" * 5000, "^{/a}" * 3000 + "@{1}", "^{}" * 5000 + "@{1}"]
+    want = [w for _, w in R15_PEEL_TABLE] + [False, False, False, True]
+    got = _r15_peel_run(tmp_path, COORD / site, cases)
+    bad = [(c[:60], w, g) for c, w, g in zip(cases, want, got["refused"]) if w != g]
+    assert not bad, (site, bad)
+    assert got["ms"] < 10000, (site, got["ms"])
+
+
+# --- r15 adversary A1 (cb45cce1; = the r14 pass-2 A2): the full-refname classifier is case-insensitive in PowerShell ------------------
+# `-match '^refs/...'` also matches `REFS/` and `Refs/`, which routed them into `show-ref --verify` - a case-sensitive literal-prefix
+# check - so a ref git resolves read as 'unknown' (currency, fail-OPEN), ERROR_REF_UNRESOLVED (ratio) or 'merge target ref missing'
+# (retire). The reflog refusal keeps the case-insensitive classifier (a `REFS/x@{1}` must still be refused); only the EXACT-ref read
+# (show-ref) is limited to a lowercase `refs/` base. A non-lowercase base goes down the r7 path: the whole input to rev-parse, once.
+R15_CASED_REFS = [("REFS/remotes/fork/master", "b"), ("Refs/remotes/fork/master", "b"), ("REFS/remotes/fork/master~1", "a"), ("rEfS/remotes/fork/master^{commit}", "b")]
+R15_CASED_REFLOG = ["REFS/remotes/fork/master@{1}", "Refs/remotes/fork/master@{0}", "REFS/remotes/fork/master^{}@{1}", "Refs/remotes/fork/master~1@{1}"]
+
+
+def _r15_cased_ref_resolves_in_git(repo, expr, want):
+    ok = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", expr + "^{commit}"], capture_output=True, text=True)
+    if ok.returncode != 0:
+        pytest.skip("this filesystem does not resolve a REFS/ spelling of a loose ref: " + expr)
+    assert ok.stdout.strip() == want, (expr, ok.stdout)
+
+
+@pytest.mark.parametrize("expr,tip", R15_CASED_REFS)
+def test_r15_a1_the_currency_guard_resolves_a_non_lowercase_refs_namespace_like_git(tmp_path, expr, tip):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    _r15_cased_ref_resolves_in_git(repo, expr, sha_b if tip == "b" else sha_a)
+    # disk = A's blob: tip B reads 'stale' (and throws), ~1 = A reads 'current'. 'unknown' is the fail-open bug.
+    doc = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r15-a1-cur", disk="'a'\n")
+    want = "stale" if tip == "b" else "current"
+    assert doc["status"] == want and doc["threw"] is (tip == "b"), (expr, doc)
+
+
+@pytest.mark.parametrize("expr,tip", R15_CASED_REFS)
+def test_r15_a1_the_ratio_guard_resolves_a_non_lowercase_refs_namespace_like_git(tmp_path, expr, tip):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    _r15_cased_ref_resolves_in_git(repo, expr, sha_b if tip == "b" else sha_a)
+    doc = _r10_site(tmp_path, repo, "ratio", "'" + expr + "'", "r15-a1-ratio")
+    assert doc.get("errorCode") in (None, "") and doc["sourceSha"] == (sha_b if tip == "b" else sha_a), (expr, doc)
+
+
+@pytest.mark.parametrize("expr,tip", R15_CASED_REFS)
+def test_r15_a1_the_retire_merge_gate_resolves_a_non_lowercase_refs_namespace_like_git(tmp_path, expr, tip):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    _r15_cased_ref_resolves_in_git(repo, expr, sha_b if tip == "b" else sha_a)
+    doc = _r10_site(tmp_path, repo, "retire", "'" + expr + "'", "r15-a1-ret", wt_sha=sha_a)    # A is an ancestor of B and of A
+    assert doc["action"] == "would-retire" and doc["reason"] == "ok" and doc["workDir"] == doc["wt"] and doc["head"] == sha_a, (expr, doc)
+
+
+@pytest.mark.parametrize("expr", R15_CASED_REFLOG)
+def test_r15_a1_a_non_lowercase_refs_namespace_is_still_refused_when_it_carries_a_reflog_selector(tmp_path, expr):
+    repo, sha_a, sha_b = _r9_repo(tmp_path)
+    cur = _r10_site(tmp_path, repo, "currency", "'" + expr + "'", "r15-a1-reflog-cur", disk="'a'\n")
+    assert cur["status"] == "refused-reflog" and cur["threw"] is True, (expr, cur)
+    sub = tmp_path / "ratio"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    rat = _r10_site(sub, repo, "ratio", "'" + expr + "'", "r15-a1-reflog-ratio")
+    assert rat["errorCode"] == "ERROR_REF_REFLOG_REFUSED", (expr, rat)
+    sub = tmp_path / "retire"; sub.mkdir()
+    repo, sha_a, sha_b = _r9_repo(sub)
+    ret = _r10_site(sub, repo, "retire", "'" + expr + "'", "r15-a1-reflog-ret", wt_sha=sha_a)
+    assert ret["action"] == "kept" and ret["reason"].startswith("cannot-determine: merge target uses a reflog selector"), (expr, ret)
+
+
+def test_r15_the_three_peel_helper_copies_are_identical():
+    def block(path):
+        text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        b = text.index("# r15-PEEL-BEGIN")
+        e = text.index("# r15-PEEL-END") + len("# r15-PEEL-END")
+        assert text.count("# r15-PEEL-BEGIN") == 1 and text.count("# r15-PEEL-END") == 1, path
+        return text[b:e]
+
+    blocks = [block(COORD / n) for n in ("assert-script-currency.ps1", "Test-ProductRatioGuard.ps1", "Retire-LaneWorktree.ps1")]
+    assert blocks[0] == blocks[1] == blocks[2], "the three Get-RevisionSuffixAfterPeel copies drifted apart"
+    assert "function Get-RevisionSuffixAfterPeel" in blocks[0]

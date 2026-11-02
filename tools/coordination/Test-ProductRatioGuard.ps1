@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = $(if ($env:MLV_BOARD_ROOT) { $env:MLV_BOARD_ROOT } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }),
-    [string]$SourceRef = 'fork/master',
+    [string]$SourceRef = 'refs/remotes/fork/master',   # full refname: a same-named tag refs/tags/fork/master would win the bare name in rev-parse
     [long]$AsOfEpoch = 0,
     [string]$ReservationsPath = '',
     [string]$LegacyDispatchPath = '',
@@ -55,6 +55,36 @@ function New-Decision {
         reasons = @($reasons)
     }
 }
+
+# r15-PEEL-BEGIN (identical copy in Test-ProductRatioGuard.ps1 and Retire-LaneWorktree.ps1; pinned by test_r15_the_three_peel_helper_copies_are_identical)
+function Get-RevisionSuffixAfterPeel([string]$Suffix) {
+    # r15 (Dot B1 on a49424fb): mirrors git's own end-anchored parse (object-name.c get_oid_1 + peel_onion, read at git master and
+    # checked against git 2.40 by differential fuzz) instead of guessing at brace balance. From the END of the revision suffix:
+    #  - a trailing `~N` / `^N` (digits optional) is an ancestor step: drop it (get_oid_1's has_suffix branch, tried before peel_onion);
+    #  - a trailing `}`: find the LAST `^{` (peel_onion's backwards scan); the text between it and the final `}` is the content.
+    #    Content starting with `/` is a commit-message search: ALL of it is regex text (any `}` `[` `@{` inside), so the whole tail is
+    #    dropped. Content that is empty or exactly commit / tree / blob / tag / object is a peel: dropped. Any other content (for
+    #    example `}@{1` from `^{}@{1}`) is not a peel git can strip, so the loop stops there.
+    # What is left is returned; a `@{` left in it is an external reflog selector and the caller refuses it. git's own check on a type
+    # is a prefix test (`commit}` then ignores the rest); this one is exact, so the odd shapes git ignores are refused (fail-closed).
+    $end = $Suffix.Length
+    while ($end -gt 0) {
+        if ($Suffix[$end - 1] -ceq '}') {
+            if ($end -lt 3) { break }
+            $open = $Suffix.LastIndexOf('^{', $end - 2, [System.StringComparison]::Ordinal)
+            if ($open -lt 0) { break }
+            $content = $Suffix.Substring($open + 2, $end - 3 - $open)
+            if ($content.StartsWith('/', [System.StringComparison]::Ordinal) -or $content -ceq '' -or $content -ceq 'commit' -or $content -ceq 'tree' -or $content -ceq 'blob' -or $content -ceq 'tag' -or $content -ceq 'object') { $end = $open; continue }
+            break
+        }
+        $i = $end
+        while ($i -gt 0 -and $Suffix[$i - 1] -ge [char]'0' -and $Suffix[$i - 1] -le [char]'9') { $i-- }
+        if ($i -gt 0 -and ($Suffix[$i - 1] -ceq '~' -or $Suffix[$i - 1] -ceq '^')) { $end = $i - 1; continue }
+        break
+    }
+    return $Suffix.Substring(0, $end)
+}
+# r15-PEEL-END
 
 function Invoke-GitLines {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -384,8 +414,38 @@ $windowStart = $AsOfEpoch - $WindowSeconds
 
 $sourceSha = ''
 try {
-    $resolved = @(& git -C $RepoRoot rev-parse --verify "$SourceRef^{commit}" 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $resolved.Count -ne 1 -or $resolved[0] -notmatch '^[0-9a-fA-F]{40}$') {
+    # A full refs/ name must exist EXACTLY: rev-parse is a revision lookup and, for a missing ref, goes on to try
+    # refs/tags/<name> and refs/heads/<name> (for example refs/tags/refs/remotes/fork/master).
+    # r6 (sol B1): the exact ref's SHA is read ONCE (show-ref --verify --hash) and only that SHA is peeled below, so a ref
+    # that vanishes after the check can never be re-resolved through a shadow tag.
+    $resolved = @()
+    $refExists = $true
+    # r8 (sol r7 ADV-A1): split the input at the FIRST revision operator (~ ^ @{ :). A base that is a full refname is read
+    # ONCE with show-ref --verify --hash (absent = ERROR_REF_UNRESOLVED, even when a shadow tag of that name exists) and only
+    # `<sha><suffix>^{commit}` is resolved. A base that is not a full refname keeps the r7 behaviour (rev-parse, once).
+    $revision = $SourceRef
+    $refSplit = [regex]::Match($SourceRef, '(?s)^(?<base>.*?)(?<suffix>(?:[~^:]|@\{).*)$')
+    $refBase = if ($refSplit.Success) { $refSplit.Groups['base'].Value } else { $SourceRef }
+    $refSuffix = if ($refSplit.Success) { $refSplit.Groups['suffix'].Value } else { '' }
+    # r10 (sol r9 ADV-A1): ASCII-whitespace-only class (`\s` is Unicode-aware in .NET; git accepts NBSP / EM SPACE in a refname).
+    if ($refBase -match '^refs/[^?*\[\\ \t\n\v\f\r]+$' -and $refBase -notmatch '\.\.|//|/$') {
+        # r9 (sol r8 ADV-A1 / Grok G8): `<sha>@{n}` is not a revision git accepts, so a reflog selector on a full refname is
+        # REFUSED with its own code (fail-closed, exit 3) instead of surfacing as a misleading ERROR_REF_UNRESOLVED.
+        # r10 (sol r9 ADV-A2): only an ACTUAL reflog selector (a `@{` outside a `^{/regex}` search group) is refused.
+        # r14/r15 (sol r13 BLOCKER, Dot B1): the suffix is parsed the way git parses it (Get-RevisionSuffixAfterPeel above); a `@{` left
+        # after the search groups and peels are dropped is an external selector and is refused, fail-closed.
+        if ((Get-RevisionSuffixAfterPeel $refSuffix) -match '@\{') { Write-ErrorResult 'ERROR_REF_REFLOG_REFUSED' }
+        # r15 (adversary A1 on cb45cce1): `-match` is case-insensitive, so `REFS/...` reached this point too; `show-ref --verify` is a
+        # case-sensitive literal-prefix check and rejects it (a ref git resolves read as unresolved). The reflog refusal above keeps the
+        # case-insensitive class; the exact-ref read is for a lowercase `refs/` base only, any other spelling goes whole to rev-parse below.
+        if ($refBase -cmatch '^refs/') {
+            $exactSha = [string](& git -C $RepoRoot show-ref --verify --hash $refBase 2>$null | Select-Object -First 1)
+            $refExists = ($exactSha -match '^[0-9a-f]{40}$')
+            if ($refExists) { $revision = "$exactSha$refSuffix" }
+        }
+    }
+    if ($refExists) { $resolved = @(& git -C $RepoRoot rev-parse --verify --quiet --end-of-options "$revision^{commit}" 2>$null) }
+    if (-not $refExists -or $LASTEXITCODE -ne 0 -or $resolved.Count -ne 1 -or $resolved[0] -notmatch '^[0-9a-fA-F]{40}$') {
         Write-ErrorResult 'ERROR_REF_UNRESOLVED'
     }
     $sourceSha = ([string]$resolved[0]).ToLowerInvariant()
