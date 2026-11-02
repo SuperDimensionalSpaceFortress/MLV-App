@@ -10,10 +10,11 @@
 # Windows resolves both directories through an open handle (GetFinalPathNameByHandle: links, junctions, subst drives, 8.3 and \\?\ spellings in any case) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX walks symlinks by name, then also refuses a RunDir (or ancestor) whose st_dev:st_ino is the worktree root or any directory inside it, so a bind mount cannot alias it; if that cannot be proven (no find/stat, unreadable tree) it exits 30. A swap between check and write is not closed on POSIX.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay).
-# Never stashes, resets, checks out, cleans or deletes. Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
+# Never stashes, resets, checks out, cleans or deletes (the one removal is its own private git dir, below). Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
 # a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
 # append to it (sol r20 B1 on #698), and removing a caller's disable is what exposed it. GIT_OPTIONAL_LOCKS=0 keeps git from refreshing the index.
+# NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir under the repo's .git (removed on exit) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
 # Every git call also gets --no-replace-objects: a refs/replace entry for HEAD would make the diffs read another commit's tree while the receipt names HEAD (adversary r9 A2). Path and name comparisons are ordinal, never by culture (U+00AD and case are ignored by culture compares).
 param(
     [Parameter(Mandatory)][string]$WorkDir,
@@ -23,13 +24,17 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:unreadable = @()
-$script:noCallbacks = @('-c', 'core.fsmonitor=false')  # core.fsmonitor is a command git runs while it reads the index; it must not rewrite the dirt being saved (sol r7 B1). Main adds one empty -c per configured clean/smudge/process filter (adversary r8 A1)
-function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false, [string]$Dir = $WorkDir) {
+$script:seal = $null; $script:sealDir = $null
+$script:noCallbacks = @('-c', 'core.fsmonitor=false')  # the few read-only calls made BEFORE the seal (toplevel, HEAD, paths, config list) run nothing, and core.fsmonitor is blanked anyway (sol r7 B1)
+function Invoke-GitBytes([string[]]$GitArgs) {
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-        foreach ($a in (@('-C', $Dir, '--no-replace-objects') + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
+        foreach ($a in (@('-C', $WorkDir, '--no-replace-objects') + $(if ($script:seal) { $script:seal.Args } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
-        foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR') { [void]$psi.Environment.Remove($k) }  # GIT_CONFIG makes only `git config` read another file, so the filter discovery would miss what the diff later runs (r8 A1); GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4)
+        foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_SYSTEM', 'GIT_ATTR_SOURCE', 'GIT_NAMESPACE') { [void]$psi.Environment.Remove($k) }  # GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4); the config-injecting variables would hand a callback to the sealed git (r10)
+        foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_CONFIG_KEY_*' -or $_ -like 'GIT_CONFIG_VALUE_*' })) { [void]$psi.Environment.Remove($k) }
+        if ($script:seal) { foreach ($k in $script:seal.Env.Keys) { $psi.Environment[$k] = $script:seal.Env[$k] } }
+        $psi.Environment['GIT_OPTIONAL_LOCKS'] = '0'
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
         foreach ($k in 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_PROXY_COMMAND', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'GIT_EXEC_PATH') { [void]$psi.Environment.Remove($k) }  # each names a program git may run; a diff over a partial clone's missing blob starts a promisor fetch that runs the ssh one, and exit 40 would be reported only after it rewrote a tracked file (adversary r9 A3)
         $psi.Environment['GIT_NO_LAZY_FETCH'] = '1'; $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'  # git 2.44+ then never lazy-fetches at all
@@ -45,6 +50,34 @@ function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exa
     $s = [System.Text.UTF8Encoding]::new($false, $true).GetString($Bytes)  # strict: a lossy decode turns byte FF into U+FFFD and can name a different, valid sibling (adversary r8 A3)
     if ($s.EndsWith("`n", [System.StringComparison]::Ordinal)) { $s = $s.Substring(0, $s.Length - 1) }
     return $s
+}
+function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call that reads the tree may be able to run a configured callback. Chasing filter NAMES (r8, r9) always missed one: a filter added after the search, or one inside a submodule below the depth cap. So every collecting call runs against a PRIVATE git dir whose config holds no program at all: system and global config are off, the repo's own config is not read (only an allowlist of plain comparison settings is copied as -c), and the objects, index and work tree are the real ones. A filter, textconv, fsmonitor, diff.external or hook defined anywhere then has nothing to be read from.
+    $q = Invoke-GitBytes @('rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-path', 'index', '--git-path', 'objects', '--git-path', 'info/attributes', '--git-path', 'info/exclude')
+    $c = Invoke-GitBytes @('config', '--null', '--list', '--local')
+    if ($q.Code -ne 0 -or $c.Code -ne 0) { throw "$($q.Err.Trim()) $($c.Err.Trim())".Trim() }
+    $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $p = $utf8.GetString($q.Bytes).Split("`n")
+    if ($p.Count -ne 6 -or $p[5] -ne '') { throw 'git-paths-unexpected' }
+    $gitDir, $index, $objects, $attr, $excl = $p[0..4]
+    $allow = 'core.filemode', 'core.symlinks', 'core.ignorecase', 'core.autocrlf', 'core.eol', 'core.safecrlf', 'core.precomposeunicode', 'core.trustctime', 'core.checkstat', 'core.protectntfs', 'core.protecthfs', 'core.longpaths', 'core.bigfilethreshold'  # how git compares and converts bytes; none names a program
+    $vals = [ordered]@{}; $sha256 = $false
+    foreach ($e in ([System.Text.Encoding]::Latin1.GetString($c.Bytes) -split "`0" | Where-Object { $_ })) {  # Latin-1: every byte decodes, and the keys wanted here are ASCII (any other entry, a non-UTF-8 filter name included, matches nothing and is never read as a name)
+        $i = $e.IndexOf("`n"); $k = if ($i -ge 0) { $e.Substring(0, $i) } else { $e }; $v = if ($i -ge 0) { $e.Substring($i + 1) } else { $null }
+        if ($k -ceq 'extensions.objectformat') { $sha256 = ($v -ceq 'sha256') }
+        elseif (($allow -ccontains $k) -and ($null -eq $v -or $v -cmatch '\A[A-Za-z0-9_.-]{0,32}\z')) { $vals[$k] = $v }  # last value wins; anything with other characters is left at git's default
+    }
+    $cargs = @(); foreach ($k in $vals.Keys) { $cargs += '-c'; $cargs += $(if ($null -eq $vals[$k]) { $k } else { "$k=$($vals[$k])" }) }
+    $sg = [System.IO.Path]::Combine($gitDir, 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg
+    foreach ($sub in 'objects/info', 'refs', 'info') { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine($sg, $sub)) }
+    $enc = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD'), "$HeadFull`n", $enc)
+    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'config'), $(if ($sha256) { "[core]`n`trepositoryformatversion = 1`n[extensions]`n`tobjectformat = sha256`n" } else { "[core]`n`trepositoryformatversion = 0`n" }), $enc)
+    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'), "$objects`n", $enc)
+    foreach ($pair in @(, @($attr, 'attributes')) + @(, @($excl, 'exclude'))) {  # attribute and ignore RULES are data; a filter attribute without a configured driver runs nothing
+        if ([System.IO.File]::Exists($pair[0])) { $dest = [System.IO.Path]::Combine($sg, 'info', $pair[1]); [System.IO.File]::Copy($pair[0], $dest); [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal) }
+    }
+    $nullDev = if ($script:onWin) { 'NUL' } else { '/dev/null' }
+    $script:seal = @{ Args = $script:noCallbacks + $cargs; Env = @{ GIT_DIR = $sg; GIT_WORK_TREE = $WorkDir; GIT_INDEX_FILE = $index; GIT_CONFIG_NOSYSTEM = '1'; GIT_CONFIG_GLOBAL = $nullDev } }  # the REAL index file: copying it would reset its timestamp and hide racily-clean entries
 }
 $script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
 function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # POSIX: every symlink on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2). Windows asks the kernel instead (Get-FinalDir)
@@ -150,27 +183,10 @@ try {
     if (-not [System.IO.Directory]::Exists($WorkDir) -or -not [System.IO.Directory]::Exists($RunDir)) { throw 'no-such-directory' }
     if (Test-LaneAlive) { Write-Output 'DIRTY_SAVE_REFUSED reason=lane-alive'; exit 20 }
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
-$flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=none', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
+$flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=dirty', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) {
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
-    # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1).
-    # The diff also scans every submodule through its OWN config, so the search covers each submodule worktree too (adversary r9 A1b); -c reaches those children.
-    $keys = @(); $cfgErr = $null; $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal); $queue = [System.Collections.Generic.Queue[object]]::new(); $queue.Enqueue(@($WorkDir, 0))
-    while ($queue.Count -gt 0 -and -not $cfgErr) {
-        $d, $lvl = $queue.Dequeue()
-        if (-not $visited.Add($d)) { continue }
-        $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true $d
-        $g = Invoke-GitBytes @('ls-files', '-s', '-z') $false $d  # gitlinks are mode 160000. Reads the index, so core.fsmonitor stays off (not Plain)
-        if (($f.Code -ne 0 -and $f.Code -ne 1) -or $g.Code -ne 0) { $cfgErr = "$($f.Err.Trim()) $($g.Err.Trim())".Trim(); break }
-        try { $keys += @([System.Text.UTF8Encoding]::new($false, $true).GetString($f.Bytes) -split "`0" | Where-Object { $_ }) } catch { $keys += 'not-utf8' }  # a name that is not UTF-8 cannot be handed to -c unchanged, and a lossy copy would blank a different driver (r8 A2): refused below
-        try { $links = @([System.Text.UTF8Encoding]::new($false, $true).GetString($g.Bytes) -split "`0" | Where-Object { $_.StartsWith('160000 ', [System.StringComparison]::Ordinal) } | ForEach-Object { $_.Substring($_.IndexOf("`t") + 1) }) } catch { $cfgErr = 'gitlink-paths-not-utf8'; break }
-        foreach ($l in $links) { $sub = [System.IO.Path]::GetFullPath($l, $d); if ($lvl -lt 8 -and [System.IO.Directory]::Exists($sub)) { $queue.Enqueue(@($sub, $lvl + 1)) } }
-    }
-    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)  # Select-Object -Unique compares by culture and ignoring case, so filter.a and filter.a<U+00AD> (or Rewrite and rewrite), two drivers to git, collapsed to one and the other kept running (adversary r9 A1)
-    $names = @($keys | Where-Object { $_ -match '\Afilter\.[^=]+\.[^.=]+\z' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf([char]'.')) } | Where-Object { $seen.Add($_) })
-    if ($cfgErr -or @($keys | Where-Object { $_ -notmatch '\Afilter\.[^=]+\.[^.=]+\z' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $cfgErr"; exit 40 }
-    foreach ($k in $names) { $script:noCallbacks += @('-c', "$k.clean=", '-c', "$k.smudge=", '-c', "$k.process=", '-c', "$k.required=false") }
 }
 try {
     if ($script:onWin) {
@@ -182,21 +198,29 @@ try {
     $rel = [System.IO.Path]::GetRelativePath($realWork, $RunDir)
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
 if ($top.Code -eq 0 -and -not ([string]::Equals($rel, '..', [System.StringComparison]::Ordinal) -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
-$headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
-$headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()
-if ($headR.Code -eq 0 -and $headFull -notmatch '\A[0-9a-f]{40,64}\z') { $headR = @{ Code = -1; Err = "unexpected HEAD '$headFull'" } }
-$git = [ordered]@{ head = $headR }
-if ($headR.Code -eq 0) {
-    $git.patch = Invoke-GitBytes (@('diff', $headFull) + $flags); $git.staged = Invoke-GitBytes (@('diff', '--cached', $headFull) + $flags)
-    $git.untracked = Invoke-GitBytes @('ls-files', '-z', '--others', '--exclude-standard')
+$git = [ordered]@{}; $subs = 0
+try {
+    $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
+    $headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()
+    if ($headR.Code -eq 0 -and $headFull -notmatch '\A[0-9a-f]{40,64}\z') { $headR = @{ Code = -1; Err = "unexpected HEAD '$headFull'" } }
+    $git.head = $headR
+    if ($headR.Code -eq 0) {
+        New-SealedGit $headFull
+        $git.index = Invoke-GitBytes @('ls-files', '-s', '-z')  # only to count gitlinks (mode 160000): their CONTENTS are not scanned (--ignore-submodules=dirty), so no submodule config is ever read
+        if ($git.index.Code -eq 0) { $subs = @([System.Text.Encoding]::Latin1.GetString($git.index.Bytes) -split "`0" | Where-Object { $_.StartsWith('160000 ', [System.StringComparison]::Ordinal) }).Count }
+        $git.patch = Invoke-GitBytes (@('diff', $headFull) + $flags); $git.staged = Invoke-GitBytes (@('diff', '--cached', $headFull) + $flags)
+        $git.untracked = Invoke-GitBytes @('ls-files', '-z', '--others', '--exclude-standard')
+    }
 }
+catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
+finally { if ($script:sealDir) { try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { } } }  # only the private dir this run made
 $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
 if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())"; exit 40 }
 $todo = 'patch', 'staged', 'untracked' | Where-Object { $git[$_].Bytes.Length -gt 0 }
 if (-not $todo) { Write-Output 'DIRTY_SAVE_NOTHING reason=clean-tree'; exit 10 }
 $head8 = $headFull.Substring(0, 8)
 $ext = @{ patch = 'patch'; staged = 'staged.patch'; untracked = 'untracked.txt' }
-$r = [ordered]@{ schema = 'lane-dirty-save/v1'; head = $headFull; untrackedFormat = 'nul-separated'; untrackedContents = 'not-saved' }
+$r = [ordered]@{ schema = 'lane-dirty-save/v1'; head = $headFull; untrackedFormat = 'nul-separated'; untrackedContents = 'not-saved'; submodules = "skipped $subs" }
 try {
     foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }
     if ($r.Contains('patch')) { $r.patchSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($git.patch.Bytes)).Replace('-', '').ToLowerInvariant() }

@@ -1,6 +1,6 @@
 """LANE-DIRTY-SAVE-CORE-1: tools/coordination/lane-dirty-save.ps1 keeps a dead lane's uncommitted work.
 Exit codes: 0 saved, 10 nothing to save, 20 lane alive (refused), 30 bad arguments, 40 git failed."""
-import datetime, json, os, re, shutil, subprocess, sys, time
+import datetime, json, os, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 import pytest
@@ -764,7 +764,7 @@ def test_a_run_dir_inside_the_worktree_under_a_dotdot_lookalike_name_is_bad_argu
     assert list(inner.iterdir()) == []
 
 
-def test_a_filter_whose_name_is_not_utf8_is_refused_not_blanked_under_a_lossy_copy_of_its_name(repo, tmp_path):  # second r8 pass A2: byte FF became U+FFFD, so the driver git really runs stayed on
+def test_a_filter_whose_name_is_not_utf8_never_runs_and_the_dirt_is_still_saved(repo, tmp_path):  # second r8 pass A2 (byte FF became U+FFFD, so the driver git really runs stayed on); r10: no filter name is read at all, so there is nothing to refuse
     (repo / ".gitattributes").write_bytes(b"a.txt filter=\xff\n")
     git(repo, "add", ".gitattributes")
     git(repo, "commit", "-q", "-m", "attrs")
@@ -773,8 +773,8 @@ def test_a_filter_whose_name_is_not_utf8_is_refused_not_blanked_under_a_lossy_co
     with open(repo / ".git" / "config", "ab") as f:  # no git call from the test after this
         f.write(b'[filter "\xff"]\n\tclean = printf X >> \'' + marker.as_posix().encode() + b"'; printf REPLACED > '" + (repo / "a.txt").as_posix().encode() + b"'; cat\n")
     r = save(repo, "-LanePid", str(dead_pid()))
-    assert r.returncode == 40 and "filter-config-unreadable" in r.stdout, r.stdout + r.stderr
-    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before and saved(repo) == []
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before and any(n.endswith(".patch") for n in saved(repo))
 
 
 def test_an_inherited_git_redirect_cannot_write_git_output_into_a_tracked_file(repo, tmp_path):  # second r8 pass A4: Git for Windows writes stdout into the file GIT_REDIRECT_STDOUT names
@@ -784,6 +784,128 @@ def test_an_inherited_git_redirect_cannot_write_git_output_into_a_tracked_file(r
     assert r.returncode == 0, r.stdout + r.stderr
     assert (repo / "a.txt").read_bytes() == a_before and (repo / "b.bin").read_bytes() == BINARY[::-1]
     assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
+
+
+# ---- r10: sol r9 B1 (a filter added after the search) and B2 (a submodule below the depth cap): no collecting git call can run a configured callback ----
+def rewriting_filter(marker, victim):
+    return f"printf X >> '{marker.as_posix()}'; printf REPLACED > '{victim.as_posix()}'; cat"
+
+
+def commit_attrs(repo, line):
+    (repo / ".gitattributes").write_text(line)
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "attrs")
+
+
+def newest_patch(tmp_path):
+    return next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes()
+
+
+def test_a_filter_added_between_the_saver_s_steps_cannot_overwrite_the_dirt_being_saved(repo, tmp_path):  # r10 sol r9 B1: the hook stands where the old filter search ended and the first diff began
+    commit_attrs(repo, "a.txt filter=late\n")
+    dirty(repo)
+    want, a_before, marker = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes(), tmp_path / "filter-ran"
+    anchor = "$git.patch = Invoke-GitBytes"
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1
+    cmd = rewriting_filter(marker, repo / "a.txt").replace("'", "''")
+    hooked = tmp_path / "hooked-saver.ps1"  # a copy: the fixture hook is another process editing the config while the saver runs
+    hooked.write_text(text.replace(anchor, f"& git -C $WorkDir config filter.late.clean '{cmd}'; {anchor}"), encoding="utf-8")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert git(repo, "config", "filter.late.clean")  # the hook did run, before the collecting calls
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before  # old code: the late filter was not in the override list, ran, and rewrote a.txt
+    assert newest_patch(tmp_path) == want
+
+
+def rmtree_force(path):  # git objects are read-only on Windows
+    def fix(fn, p, _err):
+        os.chmod(p, 0o700)
+        fn(p)
+    shutil.rmtree(path, **({"onexc": fix} if sys.version_info >= (3, 12) else {"onerror": fix}))
+
+
+def chain_of_submodules(tmp_path, depth):
+    """A repo that holds the next one down as submodule `s`, `depth` levels in all down to a leaf; returns the top one (the caller adds it to its own repo as `s`)."""
+    def mk(name):
+        d = tmp_path / "chain" / name
+        d.mkdir(parents=True)
+        for a in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "core.autocrlf", "false"]):
+            git(d, *a)
+        return d
+    add = ["-c", "protocol.file.allow=always", "submodule", "add", "-q"]
+    leaf = mk("r0")
+    (leaf / ".gitattributes").write_text("f.txt filter=deep\n")
+    (leaf / "f.txt").write_text("old\n")
+    git(leaf, "add", ".")
+    git(leaf, "commit", "-q", "-m", "leaf")
+    below = leaf
+    for i in range(1, depth):
+        mid = mk(f"r{i}")
+        subprocess.run(["git", "-C", str(mid), *add, str(below), "s"], capture_output=True, check=True)
+        git(mid, "commit", "-q", "-m", "mid")
+        below = mid
+    return below
+
+
+@pytest.mark.parametrize("depth", [8, 9])  # 8 was the old discovery cap (the boundary), 9 the first level it skipped
+def test_a_filter_configured_only_in_a_deeply_nested_submodule_cannot_overwrite_the_parents_dirt(depth):  # r10 sol r9 B2
+    base = Path(tempfile.mkdtemp(prefix="lds"))  # the system temp dir, not pytest's long one: nine nested .git/modules paths pass Windows' 260 characters in that
+    try:
+        top_sub = chain_of_submodules(base, depth)
+        repo = base / "wt"
+        init_repo(repo, b"one\r\ntwo\nthree\n")
+        (base / "run").mkdir()
+        subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(top_sub), "s"], capture_output=True, check=True)
+        git(repo, "commit", "-q", "-m", "gitlink")
+        subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive", "-q"], capture_output=True, check=True)
+        deepest = repo
+        for _ in range(depth):
+            deepest = deepest / "s"
+        marker = base / "filter-ran"
+        git(deepest, "config", "filter.deep.clean", rewriting_filter(marker, repo / "a.txt"))
+        dirty(repo)
+        time.sleep(1.1)
+        (deepest / "f.txt").write_text("new\n")  # same size as 'old\n', so git must read the content to know it changed, which runs the clean filter
+        a_before = (repo / "a.txt").read_bytes()
+        r = save(repo, "-LanePid", str(dead_pid()))
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before  # old code at depth 9: the cap skipped this config and --ignore-submodules=none still recursed into it
+        assert last_receipt(r)["submodules"] == "skipped 1"  # the submodule's contents are out of scope and the receipt says so
+    finally:
+        rmtree_force(base)
+
+
+@pytest.mark.parametrize("how", ["env-count", "global-file"])
+def test_a_filter_injected_through_the_environment_or_the_global_config_cannot_run(repo, tmp_path, how):  # r10 class: config can reach git from the environment and from files other than the repository's own
+    commit_attrs(repo, "a.txt filter=rewrite\n")
+    dirty(repo)
+    want, a_before, marker = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes(), tmp_path / "filter-ran"
+    cmd = rewriting_filter(marker, repo / "a.txt")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG")}
+    if how == "env-count":
+        env.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "filter.rewrite.clean", "GIT_CONFIG_VALUE_0": cmd})
+    else:
+        g = tmp_path / "global.gitconfig"
+        g.write_text(f'[filter "rewrite"]\n\tclean = {cmd}\n')
+        env["GIT_CONFIG_GLOBAL"] = str(g)
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before
+    assert newest_patch(tmp_path) == want
+
+
+def test_the_private_git_dir_is_removed_and_a_linked_worktree_is_saved_like_any_other(repo, tmp_path):  # r10: the seal finds the index and objects through --git-path, which differs for a linked worktree
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(linked))
+    (linked / "a.txt").write_bytes(b"one\r\nlinked dirt\n")
+    (linked / "new.txt").write_text("u\n")
+    want = git(linked, "diff", "HEAD", "--binary")
+    r = save(linked, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert newest_patch(tmp_path) == want and last_receipt(r)["submodules"] == "skipped 0"
+    for gd in (repo / ".git", repo / ".git" / "worktrees" / "linked"):
+        assert [p.name for p in gd.iterdir() if p.name.startswith("lane-dirty-save-")] == []
 
 
 @pytest.mark.parametrize("child", [{"pid": 2147483647, "createdUtc": ["2000-01-01T00:00:00Z"]},
