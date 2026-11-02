@@ -20,6 +20,7 @@ Usage: py -3 tools/coordination/check_bridge_native_pin.py [REF]        (REF def
 """
 import io
 import os
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -31,25 +32,39 @@ TEST_CLASS = "ServerWrapperPhase2Tests"
 TEST_NAME = "test_server_wrapper_process_entry_prefers_pwsh_for_cim"
 FORCED = "FORCED-LIVE-PID"
 CHILD_FLAG = "--child"
+VERDICT_CODE = {"PINNED": 0, "UNPINNED": 1, "UNKNOWN": 2}
 
 
-def _child(agent_dir):
+def _child(agent_dir, nonce):
     import unittest
 
+    def emit(text):
+        # The only line the parent believes: it carries the nonce. A bare "PINNED" printed by the test
+        # file, or a SystemExit before this line, is never a verdict.
+        print("RESULT %s %s" % (nonce, text))
+        return VERDICT_CODE[text.split(" ")[0]]
+
     sys.path.insert(0, agent_dir)
+
+    def forced(pid):
+        return {"pid": pid, "parent_pid": 0, "name": "python.exe", "command_line": FORCED,
+                "executable_path": None, "creation_date": None}
+
+    # Force the REAL implementation at its source BEFORE anything imports it: server, the wrapper, the
+    # trampoline and the test module all bind it by `from core.win_process import native_process_entry`,
+    # and a pin whose side_effect delegates to the real function (the host answers None for an idle pid)
+    # must reach the forced one, not a host-dependent answer. Forcing precedes the test module's import
+    # so a pin that module sets at import time still wins.
+    import core.win_process as win_process
+    win_process.native_process_entry = forced
     import server
 
-    # Force BEFORE the test module is imported, so a pin the module sets at import time still wins.
-    server.native_process_entry = lambda pid: {
-        "pid": pid, "parent_pid": 0, "name": "python.exe", "command_line": FORCED,
-        "executable_path": None, "creation_date": None,
-    }
+    server.native_process_entry = forced
     import test_server_wrapper_phase2 as mod
 
     cls = getattr(mod, TEST_CLASS, None)
     if cls is None or not callable(getattr(cls, TEST_NAME, None)):
-        print("UNKNOWN (the qualified test is absent; retired or renamed?)")
-        return 2
+        return emit("UNKNOWN (the qualified test is absent; retired or renamed?)")
     seen = []
     probes = []
     original = server._wrapper_process_entry
@@ -66,20 +81,15 @@ def _child(agent_dir):
     result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
     forced_seen = any(isinstance(e, dict) and e.get("command_line") == FORCED for e in seen + probes)
     if forced_seen:
-        print("UNPINNED (a lookup in the test was answered by the native fast path)")
-        return 1
+        return emit("UNPINNED (a lookup in the test was answered by the native fast path)")
     if result.skipped or result.expectedFailures or result.unexpectedSuccesses:
-        print("UNKNOWN (the test was skipped or marked expected-failure; a skipped test is not retired)")
-        return 2
+        return emit("UNKNOWN (the test was skipped or marked expected-failure; a skipped test is not retired)")
     if result.testsRun != 1 or not result.wasSuccessful():
-        print("UNKNOWN (the test did not pass for a reason other than the fast path: run=%d errors=%d failures=%d)"
-              % (result.testsRun, len(result.errors), len(result.failures)))
-        return 2
+        return emit("UNKNOWN (the test did not pass for a reason other than the fast path: run=%d errors=%d failures=%d)"
+                    % (result.testsRun, len(result.errors), len(result.failures)))
     if not seen or not all(isinstance(e, dict) for e in seen) or any(p is not None for p in probes):
-        print("UNKNOWN (the test passed but no pid lookup ran past a fast path that answers None; nothing was proven)")
-        return 2
-    print("PINNED")
-    return 0
+        return emit("UNKNOWN (the test passed but no pid lookup ran past a fast path that answers None; nothing was proven)")
+    return emit("PINNED")
 
 
 def _parent(ref, test_source):
@@ -99,11 +109,14 @@ def _parent(ref, test_source):
         if test_source:
             with open(test_source, "rb") as src, open(target, "wb") as dst:
                 dst.write(src.read())
-        proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), CHILD_FLAG, agent_dir],
+        nonce = secrets.token_hex(16)
+        proc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), CHILD_FLAG, agent_dir, nonce],
                               cwd=tmp, env=env, capture_output=True, text=True, timeout=300)
-        out = proc.stdout.strip().splitlines()
-        if out and out[-1].split(" ")[0] in ("PINNED", "UNPINNED", "UNKNOWN") and proc.returncode in (0, 1, 2):
-            print(out[-1])
+        prefix = "RESULT %s " % nonce
+        verdicts = [l[len(prefix):] for l in proc.stdout.splitlines() if l.startswith(prefix)]
+        if len(verdicts) == 1 and verdicts[0].split(" ")[0] in VERDICT_CODE \
+                and proc.returncode == VERDICT_CODE[verdicts[0].split(" ")[0]]:
+            print(verdicts[0])
             return proc.returncode
         tail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
         print("UNKNOWN (the check run itself failed, exit %d: %s)" % (proc.returncode, tail))
@@ -111,15 +124,15 @@ def _parent(ref, test_source):
 
 
 def main(argv):
-    if len(argv) == 3 and argv[1] == CHILD_FLAG:
-        return _child(argv[2])
-    args = argv[1:]
-    test_source = None
-    if "--test-source" in args:
-        i = args.index("--test-source")
-        test_source = args[i + 1]
-        del args[i:i + 2]
+    if len(argv) == 4 and argv[1] == CHILD_FLAG:
+        return _child(argv[2], argv[3])
     try:
+        args = argv[1:]
+        test_source = None
+        if "--test-source" in args:
+            i = args.index("--test-source")
+            test_source = args[i + 1]
+            args[i:i + 2] = []
         return _parent(args[0] if args else "fork/master", test_source)
     except Exception as e:  # noqa: BLE001 -- any failure to run the check is UNKNOWN, never a pass
         print("UNKNOWN (%s: %s)" % (type(e).__name__, str(e).splitlines()[0] if str(e) else ""))
