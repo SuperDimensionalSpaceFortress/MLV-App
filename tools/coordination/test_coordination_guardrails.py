@@ -6860,7 +6860,7 @@ def test_r14_no_site_decides_reflog_by_a_regex_over_the_suffix():
     for path in (COORD / "assert-script-currency.ps1", RATIO_GUARD, RETIRE):
         text = path.read_text(encoding="utf-8")
         assert balanced not in text, (path, "r15: the brace-balanced regex strip is back; the reflog test must go through Get-RevisionSuffixAfterPeel")
-        assert text.count("Get-RevisionSuffixAfterPeel") == 2, (path, "one definition and one call site")
+        assert text.count("function Get-RevisionSuffixAfterPeel") == 1 and text.count("(Get-RevisionSuffixAfterPeel ") == 1, (path, "one definition and one call site")
 
 
 # --- r15 (Dot B1 on a49424fb, delivery 925f2ec1): follow git's OWN end-anchored grammar, not a guess at brace balance ------------------
