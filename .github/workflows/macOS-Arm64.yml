@@ -12,7 +12,7 @@ concurrency:
 
 env:
   SOURCE_DIR:   ${{ github.workspace }}/platform
-  QTDIR:        /opt/homebrew/opt/qt@5/bin
+  QTDIR:        /opt/homebrew/opt/qt/bin
   ARTIFACT:     ${{ github.workspace }}/platform/build/MLV\ App.dmg
 
 jobs:
@@ -29,12 +29,15 @@ jobs:
     - name: Install llvm & Qt & OpenSSL
       uses: ConorMacBride/install-package@3e7ad059e07782ee54fa35f827df52aae0626f30 # v1.1.0
       with:
-        brew: llvm qt5 openssl
+        brew: llvm qt openssl
 
     - name: Verify macOS build toolchain
       run: |
         test -x "${{ env.QTDIR }}/qmake"
         "${{ env.QTDIR }}/qmake" -v
+        "${{ env.QTDIR }}/qmake" -query QT_VERSION
+        QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"
+        case "$QT_VERSION" in 6.*) ;; *) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac
         LLVM_CXX="$(brew --prefix llvm)/bin/clang++"
         test -x "$LLVM_CXX"
         "$LLVM_CXX" --version
@@ -62,7 +65,7 @@ jobs:
             ${{ env.QTDIR }}/qmake -r ${{ env.SOURCE_DIR }}/qt/MLVApp.pro MLVAPP_SKIP_LEGACY_PAYLOAD_EXTRACTION=1
             make -j8
             ls -al
-            PYTHONPATH="${{ github.workspace }}" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id ffmpeg-macos-x86_64 --archive-reference ffmpegOSX.zip --output-dir "MLV App.app/Contents/MacOS" --verify-installed
+            PYTHONPATH="${{ github.workspace }}" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id ffmpeg-macos-arm64 --archive-reference ffmpegOSXarm.zip --output-dir "MLV App.app/Contents/MacOS" --verify-installed
             PYTHONPATH="${{ github.workspace }}" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id raw2mlv-macos-arm64 --archive-reference raw2mlvMacOsArm.zip --output-dir "MLV App.app/Contents/MacOS" --verify-installed
             ${{ env.QTDIR }}/macdeployqt MLV\ App.app -dmg
 

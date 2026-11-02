@@ -28,7 +28,9 @@
 #   5. P6: the declared -Venue must agree with Get-AttrCudaMeasurementVenue on the host the probe ran
 #      on, and the host must be the venue table's expectedHost -> VENUE_HOST_MISMATCH;
 #   6. the staged build and smoke-runner closure must be the ones named (never a different build)
-#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7). (No registry snapshot is taken any more: master
+#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7), with -NotAfterBudgetSec, this call's own wait counted
+#      by the drop from the drop (Get-DvJobNotAfter; the probe's submit too), judged against the drop um-run reports and printed
+#      as DVE_NOT_AFTER (DVE_NOT_AFTER_DROP_LATE, a defect signal, if the drop's value did not cover it). (No registry snapshot is taken any more: master
 #      isolates an automation run's settings store; the receipt proves it from the run log.)
 #   7. read summary.json / evidence-manifest.json / artifact-index.json plus the launcher's result.json and the app's
 #      run log, copy metrics VERBATIM, RE-DERIVE the receipt oracle's verdict from the run log (source_advanced /
@@ -66,6 +68,9 @@ param(
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
     [switch]$HealthOnly,
+    # BACHELOR-LEASE-BATCH-LEGS-1: the batch token of Invoke-VenueLeaseBatch.ps1. The leg's job id then ends "-lb<token>", so the venue agent runs
+    # it on that batch's parked quiet lease instead of requesting one (ultra-magnus-agent.ps1, lease-batch block). Nothing else about the leg changes.
+    [Parameter(ParameterSetName = 'Leg')][ValidatePattern('^[0-9a-f]{12}$')][string]$LeaseBatch = '',
     [string]$Actor = '',
     # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
     # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
@@ -102,8 +107,10 @@ if ($OfflineTestMode) {
         throw 'DVE_OFFLINE_TEST_REFUSES_REAL_UMRUN offline test mode can never use um-run.ps1 (by path or content): it would submit a job'
     }
 }
-if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {
-    throw 'DVE_SHEET_COPY_MUST_STAY_LOCAL -SheetCopyDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
+# r4 A2: the helper RETURNS the normalised full path it certified and the value used from here on is THAT one (a relative value is resolved once, against the PowerShell location)
+if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
+    $SheetCopyDir = Test-DvLocalReceiptRoot -Path $SheetCopyDir
+    if (-not $SheetCopyDir) { throw 'DVE_SHEET_COPY_MUST_STAY_LOCAL -SheetCopyDir must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory; a sheet of owner footage is never committed, attached or published' }
 }
 
 # --- SET MODE, part 1 (DUAL-VENUE-DISPLAY-MATRIX-1): expand the leg set into its planned legs and print them. -PlanOnly stops here: nothing is generated, probed or submitted. ---
@@ -130,15 +137,19 @@ if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
     $mainRoot = if ($LASTEXITCODE -eq 0 -and $common) { Split-Path -Parent ([string]$common) } else { $RepoRoot }
     $ReceiptRoot = Join-Path $mainRoot '.claude-state\dual-venue\receipts'
 }
-if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $ReceiptRoot)) {
-    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be under a .claude-state directory: a receipt and its evidence name an owner clip''s run'
+$rrCert = $(if ($OfflineTestMode) { $ReceiptRoot } else { Test-DvLocalReceiptRoot -Path $ReceiptRoot })
+if (-not $rrCert) {
+    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: a receipt and its evidence name an owner clip''s run'
 }
+$ReceiptRoot = $rrCert
 # The hashed run evidence (summary, manifest, result, run log, um-run record) goes in a sibling of the receipts directory. It names an
 # owner clip's run too, so in production that directory must ALSO sit under .claude-state (a ReceiptRoot of `.claude-state` itself would not).
 $evidenceBase = Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence'
-if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $evidenceBase)) {
-    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be under a .claude-state directory: the run evidence names an owner clip''s run'
+$evCert = $(if ($OfflineTestMode) { $evidenceBase } else { Test-DvLocalReceiptRoot -Path $evidenceBase })
+if (-not $evCert) {
+    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be a LOCAL path (no UNC, device path, venue agentShare or network drive) under a .claude-state directory: the run evidence names an owner clip''s run'
 }
+$evidenceBase = $evCert
 if ([string]::IsNullOrWhiteSpace($Actor)) { $Actor = "dual-venue-runner@$($env:COMPUTERNAME)" }
 $runStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
 
@@ -302,15 +313,60 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
 function Submit-VenueJob([string]$ScriptPath, [string]$JobId, [int]$TimeoutSec, [int]$QueueSec, [int]$ClaimedExtraSec) {
     # um-run.ps1 is the ONLY writer to a venue share (NA-7). Its three outcomes: a receipt object,
     # RETRACTED, or UNRESOLVED -- a thrown UNRESOLVED/RETRACTED is data here, never an error.
-    try {
-        $out = @(& $UmRunScript -ScriptPath $ScriptPath -JobId $JobId -AgentShare $agentShare -TimeoutSec $TimeoutSec `
-            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec 6>$null)
+    # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's notAfterUtc is the end of this call's own wait (DualVenueRunner.psm1: no later reader needs the job
+    # run), and the admission wait it assumes (um-run's default) is passed by name.
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: um-run starts its waits only once the job file is on the share, after the bound was computed here. Its
+    # information stream (its host lines; collected here, still never shown) carries the 'submitted <id>' line it prints after the drop, so each submit also
+    # returns the bound judged against that measured drop (notAfter; the caller prints it as DVE_NOT_AFTER). Records are collected as they arrive, so a
+    # um-run that throws (UNRESOLVED / RETRACTED) after its drop still leaves the drop measured.
+    # r2 (hub ruling on sol's r1 blocker): the bound is passed DROP-RELATIVE, -NotAfterBudgetSec (the waits plus the slack, Get-DvJobNotAfter's budgetSec).
+    # r5 (Dot 180721e3 on r4) states what that guarantees: UmRunDrop.psm1 writes notAfterUtc = sampledUtc + budgetSec, sampledUtc being a clock read at most
+    # 15 s before the job's rename into view (r3/r4), and um-run.ps1 ends its queue and admission waits by sampledUtc + queue + admission, absolute
+    # deadlines, so however late the drop lands and however long its return takes after the job is visible, those waits end before notAfterUtc by at least
+    # the slack. The one step this does not measure is um-run's poll: each deadline is checked once per -PollSeconds, after that poll's own share reads.
+    # (The claimed wait starts once the job is launched, when notAfterUtc no longer applies.) The drop's own value comes back on um-run's 'job not-after:'
+    # line and is what the witness judges. Only those two information records are kept (um-run also logs a line per poll for hours of admission wait).
+    # r4 (Grok G1): the not-after arguments come from Get-DvUmRunNotAfterArgs, which fails closed (DVE_NOT_AFTER_BUDGET_MISSING, an ERROR outcome, nothing
+    # submitted) where a null budgetSec would have bound to [int] 0 and dropped the bound silently.
+    $records = [Collections.Generic.List[object]]::new()
+    $notAfter = $null
+    $submitted = try {
+        $notAfter = Get-DvJobNotAfter -TimeoutSec $TimeoutSec -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec
+        $notAfterArgs = Get-DvUmRunNotAfterArgs -NotAfter $notAfter
+        & $UmRunScript -ScriptPath $ScriptPath -JobId $JobId -AgentShare $agentShare -TimeoutSec $TimeoutSec `
+            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec -MaxAdmissionWaitSec $notAfter.maxAdmissionWaitSec @notAfterArgs 6>&1 |
+            ForEach-Object { if ($_ -isnot [System.Management.Automation.InformationRecord] -or [string]$_.MessageData -cmatch '^(submitted |job not-after: )') { $records.Add($_) } }
+        $out = @($records | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
-        [pscustomobject]@{ umOutcome = 'RECEIPT'; result = $r; message = $null }
+        [pscustomobject]@{ umOutcome = 'RECEIPT'; result = $r; message = $null; notAfter = $null }
     } catch {
         $m = [string]$_.Exception.Message
         $kind = if ($m -match '^RETRACTED:') { 'RETRACTED' } elseif ($m -match '^UNRESOLVED:') { 'UNRESOLVED' } else { 'ERROR' }
-        [pscustomobject]@{ umOutcome = $kind; result = $null; message = $m }
+        [pscustomobject]@{ umOutcome = $kind; result = $null; message = $m; notAfter = $null }
+    }
+    if ($null -ne $notAfter) {
+        # The witness never decides the leg's outcome: a judge that throws is recorded as unknown (covered null) with its error, never as a leg ERROR.
+        $submitted.notAfter = try {
+            $recs = $records.ToArray()
+            Test-DvNotAfterCoversDrop -NotAfter $notAfter -DropVisibleUtc (Get-DvUmRunDropVisibleUtc -Records $recs -JobId $JobId) `
+                -DropNotAfter (Get-DvUmRunDropNotAfter -Records $recs -JobId $JobId) -JobId $JobId
+        } catch {
+            [pscustomobject]@{ jobId = $JobId; covered = $null; why = "DVE_NOT_AFTER_JUDGE_ERROR $([string]$_.Exception.Message)" }
+        }
+    }
+    $submitted
+}
+
+function Write-NotAfterVerdict($Submitted) {
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: one DVE_NOT_AFTER=<json> line per submit (the drop's own notAfterUtc, the bound's anchor, the measured
+    # drop, covered true / false / null = unmeasured). r2: the bound is drop-relative, so covered is true by construction; DVE_NOT_AFTER_DROP_LATE is
+    # now a DEFECT signal (r6, Grok G7: the drop did not count the budget from the clock read it reports, which um-run counts its waits from): the agent may
+    # then refuse the job (notAfterExpired) while this client still waits, and that is named here, before the outcome, never left for a reader to guess.
+    $v = $Submitted.notAfter
+    if ($null -eq $v) { return }
+    Write-Output ('DVE_NOT_AFTER=' + ($v | ConvertTo-Json -Compress))
+    if ($v.covered -eq $false) {
+        Write-Output "DVE_NOT_AFTER_DROP_LATE job=$($v.jobId) dropDelaySec=$($v.dropDelaySec) toleranceSec=$($v.dropToleranceSec) shortBySec=$(-$v.marginSec) notAfterUtc=$($v.notAfterUtc)"
     }
 }
 
@@ -329,7 +385,7 @@ function Stop-Leg([string]$Outcome, [string]$Detail) {
 
 $workDirResolved = if ([string]::IsNullOrWhiteSpace($WorkDir)) { Join-Path ([IO.Path]::GetTempPath()) "dve-$runStamp-$([guid]::NewGuid().ToString('N').Substring(0,8))" } else { $WorkDir }
 New-Item -ItemType Directory -Force -Path $workDirResolved | Out-Null
-$jobStem = "dve-$($spec.legId)-$Venue-$Backend-$runStamp"
+$jobStem = "dve-$($spec.legId)-$Venue-$Backend-$runStamp$(if ($LeaseBatch) { "-lb$LeaseBatch" })"
 
 $terminal = $null
 $run = $null
@@ -361,11 +417,20 @@ try {
     }
     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a look leg's optional receipt (the GUI smoke applies it before playback). Its bytes are the blob COMMITTED at the admission
     # head (offline test mode: the repo's HEAD), never the working copy, and must hash to look.receiptSha256, which legSpecSha256 binds.
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: a capture-free pace leg (a speed leg forcing Look Assist) may name the same receipt in
+    # generatorArgs.lookReceipt / lookReceiptSha256, read the same way. Named anywhere else (a look leg, or a speed leg not forcing Look Assist) it is refused, never ignored.
     $lookReceiptPath = $null
-    if ($isLook) {
+    $paceReceiptLook = $null
+    if ($null -ne $spec.PSObject.Properties['generatorArgs'] -and ($spec.generatorArgs.PSObject.Properties['lookReceipt'] -or $spec.generatorArgs.PSObject.Properties['lookReceiptSha256'])) {
+        if ($isLook -or -not ($spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist)) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        $paceReceiptLook = [pscustomobject]@{ receipt = [string]$spec.generatorArgs.lookReceipt; receiptSha256 = [string]$spec.generatorArgs.lookReceiptSha256 }
+    }
+    if ($isLook -or $null -ne $paceReceiptLook) {
         $receiptCommit = if ($OfflineTestMode) { [string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null) } else { [string]$sources.headCommit }
-        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $spec.look
+        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $(if ($isLook) { $spec.look } else { $paceReceiptLook })
         if (-not $lookReceipt.ok) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        # (a pace leg that names the keys must name a receipt: empty or null values are refused, never read as "no receipt")
+        if ($null -ne $paceReceiptLook -and -not $lookReceipt.present) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
         if ($lookReceipt.present) {
             $lookReceiptPath = Join-Path $workDirResolved "$jobStem.look-receipt.marxml"
             [IO.File]::WriteAllBytes($lookReceiptPath, $lookReceipt.bytes)
@@ -396,6 +461,14 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
+        # BACHELOR-CORE-PARTITION-AB-1: the core-partition A/B (bench affinity, the MLV-owned E-core load, the telemetry helper), for any leg; the generator refuses a bad combination, typed.
+        if ($spec.generatorArgs.PSObject.Properties['benchAffinityMask']) { $gen['BenchAffinityMask'] = [string]$spec.generatorArgs.benchAffinityMask }
+        if ($spec.generatorArgs.PSObject.Properties['partitionLoadMask']) { $gen['PartitionLoadMask'] = [string]$spec.generatorArgs.partitionLoadMask }
+        if ($spec.generatorArgs.PSObject.Properties['partitionLoadThreads']) { $gen['PartitionLoadThreads'] = [int]$spec.generatorArgs.partitionLoadThreads }
+        if ($spec.generatorArgs.PSObject.Properties['corePartitionTelemetry'] -and [bool]$spec.generatorArgs.corePartitionTelemetry) { $gen['CorePartitionTelemetry'] = $true }
+        if ($spec.generatorArgs.PSObject.Properties['corePartitionHelperMask']) { $gen['CorePartitionHelperMask'] = [string]$spec.generatorArgs.corePartitionHelperMask }
+        # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: the app's playback worker-thread cap (the smoke runner's -Threads <n>), for any leg; judged below by the run's own worker count.
+        if ($spec.generatorArgs.PSObject.Properties['playbackMaxThreads']) { $gen['PlaybackMaxThreads'] = [int]$spec.generatorArgs.playbackMaxThreads }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
         # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the injected device loss, the safe-start clear, the shared settings store and the pre-launches of the self-heal proof, for any leg.
@@ -415,6 +488,10 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['warmOutputReuse'] -and [bool]$spec.generatorArgs.warmOutputReuse) { $gen['WarmOutputReuse'] = $true }
         # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
+        # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg. Only a JSON true arms it (a string "false" is not true).
+        if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
+        # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the #397 prep-conflated-move switch (ON arm), for any leg; judged below by the app's own prep_conflated_move_active readback.
+        if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] -and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
@@ -425,6 +502,8 @@ try {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
             if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }
             if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
+            # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the pace leg's committed look receipt (read and bound above).
+            if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
         }
     }
     # PLAYBACK-VISUAL-INSPECTION-1: the post-measurement window capture, for every speed leg that does not opt out.
@@ -441,7 +520,8 @@ try {
         # receipt, recorded as its TOKEN only (a message may echo a value). Anything untyped is a runner error.
         $first = ([string]$_.Exception.Message -split '\s+')[0]
         # ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING (CPU-LEG-SMOKE-CEILING-1): an input too large for a bounded leg at the measured read rate is a typed refusal, not a runner error.
-        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
+        # BACHELOR-CORE-PARTITION-AB-1: the generator's CORE_PARTITION_* mask / combination refusals are typed too (dot B3).
+        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE|CORE_PARTITION)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
         throw
     }
     $generated = $genOut[-1]
@@ -453,7 +533,12 @@ try {
     # --- 4. health probe (P5), bounded -------------------------------------------------------------
     $probeJob = Join-Path $workDirResolved "$jobStem-health.job.ps1"
     [IO.File]::WriteAllText($probeJob, (New-DvHealthProbeJobText -AgentRoot $agentRoot), [Text.UTF8Encoding]::new($false))
-    $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId "$jobStem-health" -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
+    # VENUE-LEG-PRINT-DVE-JOB-ID-1: the id this call submits under goes to stdout BEFORE the submit, so a chain that kills this client mid-wait still holds the remote job's identity
+    # (Get-VenueRemoteJobIds in VenueChain.psm1 reads `DVE_JOB_ID=<id>` lines). um-run's own output stays suppressed (Submit-VenueJob collects its information stream, never shows it).
+    $probeJobId = "$jobStem-health"
+    Write-Output "DVE_JOB_ID=$probeJobId"
+    $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId $probeJobId -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
+    Write-NotAfterVerdict $probeRun
     $receipt.evidence.umRunOutcome = $probeRun.umOutcome
     $probe = $null
     if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) { $probe = ConvertFrom-DvProbeStdout ([string]$probeRun.result.stdout) }
@@ -508,7 +593,9 @@ try {
 
     # --- 6. submit (the venue's settings are isolated by the app; the receipt proves it from the run log) -----
     $timeoutSec = [int]$generated.recommendedJobTimeoutSec + 120
+    Write-Output "DVE_JOB_ID=$jobStem"   # VENUE-LEG-PRINT-DVE-JOB-ID-1: before the submit, same id (see the health probe above)
     $run = Submit-VenueJob -ScriptPath $jobFile -JobId $jobStem -TimeoutSec $timeoutSec -QueueSec ([int]$spec.timeouts.queueWaitSec) -ClaimedExtraSec ([int]$spec.timeouts.extraClaimedWaitSec)
+    Write-NotAfterVerdict $run
     $receipt.evidence.umRunOutcome = $run.umOutcome
 } catch {
     $message = [string]$_.Exception.Message
@@ -713,7 +800,10 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
     $receipt.visual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $artifactsShare -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) `
         -Header "$($spec.legId)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
     $stripDir = $(if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $SheetCopyDir } else { Join-Path (Split-Path -Parent $ReceiptRoot) 'sheets' })
-    if ($receipt.visual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+    $stripCert = $(if ($OfflineTestMode) { $stripDir } else { Test-DvLocalReceiptRoot -Path $stripDir })
+    # r5 G6: the certified spelling replaces $stripDir HERE, before either branch (the primary strip and the self-heal loop below) builds a copy path from it
+    if ($stripCert) { $stripDir = $stripCert }
+    if ($receipt.visual.stripPath -and $stripCert) {
         New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
         $stripCopy = Join-Path $stripDir "strip-$($spec.legId)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
         Copy-Item -LiteralPath $receipt.visual.stripPath -Destination $stripCopy -Force
@@ -727,7 +817,7 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
         foreach ($preDir in @(Get-ChildItem -LiteralPath $selfHealLocal -Directory | Where-Object { $_.Name -cmatch '^pre-\d+$' } | Sort-Object { [int]$_.Name.Substring(4) })) {
             $preVisual = Read-DvVisualCaptures -Requested $true -ArtifactsDir $preDir.FullName -EvidenceDir (Join-Path $preDir.FullName 'inspected') -LegId "$($spec.legId)-$($preDir.Name)" `
                 -Header "$($spec.legId) $($preDir.Name)  $Venue  $Backend  $($SourceCommit.Substring(0, 12))"
-            if ($preVisual.stripPath -and ($OfflineTestMode -or (Test-DvUnderClaudeState -Path $stripDir))) {
+            if ($preVisual.stripPath -and $stripCert) {
                 New-Item -ItemType Directory -Force -Path $stripDir | Out-Null
                 $preStripCopy = Join-Path $stripDir "strip-$($spec.legId)-$($preDir.Name)-$Venue-$Backend-$($SourceCommit.Substring(0, 8))-$runStamp.png"
                 Copy-Item -LiteralPath $preVisual.stripPath -Destination $preStripCopy -Force
@@ -770,6 +860,32 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but UNPACED_NOT_HONOURED: $($unpacedVerdict.reason). A paced run is no throughput measurement"
     $outcome = 'INVALID'
 }
+# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1, FAIL CLOSED: a leg that asks for a worker-thread cap of n counts only when the measured session's own worker count and the
+# job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
+$workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary
+if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement under the cap this leg names"
+    $outcome = 'INVALID'
+}
+# PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, FAIL CLOSED: a leg that asks for the #397 prep-conflated-move switch counts only when the measured session's own
+# playback_smoke.prep_route record reports prep_conflated_move_active=1 (r2: a line of its own, never the start line's env-derived fields); a value in the
+# launcher's env block is a request, not engagement, and a binary that emits no such record is a typed INVALID, never a PASS or FAIL. A leg that does not ask
+# for it is unchanged.
+$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText
+if ($prepConflatedMoveVerdict.requested) { $receipt['prepConflatedMove'] = [ordered]@{ requested = $true; observed = $prepConflatedMoveVerdict.observed; verdict = $prepConflatedMoveVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $prepConflatedMoveVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason). A run whose prep-conflated-move state is not the one its leg names (ON when it asks, otherwise not on) is no measurement of that arm"
+    $outcome = 'INVALID'
+}
+# PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does
+# not show the app running with it on (gui_smoke.visual_state look_assist_enabled=1; 0 or missing blocks) measured another look: a typed INVALID, never a PASS or FAIL.
+$lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText
+if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ requested = $true; reported = $lookAssistVerdict.reported; verdict = $lookAssistVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but LOOK_ASSIST_NOT_HONOURED: $($lookAssistVerdict.reason). A leg that did not run the look it names is no measurement under it"
+    $outcome = 'INVALID'
+}
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
 # enough is not a product result either. A product FAIL the job reached AFTER its oracle passed (GPU_RECON_FRAMES_ZERO,
@@ -800,8 +916,10 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE')) {
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE')) {
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: an unbound paused-instant capture is surfaced the same way (counted; its difference judges nothing).
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5: so is a partial freeze over source frames known to differ (counted; the display's paint stopped part-way).
         $detail += "; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)"
     }
 }

@@ -1,6 +1,7 @@
 #include "../common/minitest.h"
 #include "../common/hash_helpers.h"
 #include "../common/test_artifacts.h"
+#include "../common/repo_paths.h"
 #include "../common/frame_compare.h"
 
 #include "mlv_pipeline_fixture.h"
@@ -1786,7 +1787,7 @@ TEST(GpuPreviewProcessing, ViewportRouteContractCheckerAcceptsOnlyTheMainPath)
 TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlightsBlur)
 {
     QString path = qEnvironmentVariable("MLVAPP_TEST_VIEWPORT_SOURCE"); /* red-first override */
-    if (path.isEmpty()) path = QStringLiteral("platform/qt/GpuDisplayViewport.cpp");
+    if (path.isEmpty()) path = repo_file_path(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
     QFile file(path);
     ASSERT_TRUE(file.open(QIODevice::ReadOnly));
     const std::string source = cpp_body_without_comments_and_strings(file.readAll().toStdString());
@@ -2013,7 +2014,7 @@ TEST(GpuPreviewProcessing, HostRouteAndTelemetryComeFromTheSingleEngineCallSite)
     int helperCalls = 0;
     for (const QString & path : sources)
     {
-        QFile file(path);
+        QFile file(repo_file_path(path));
         ASSERT_TRUE(file.open(QIODevice::ReadOnly));
         const std::string body = cpp_body_without_comments_and_strings(file.readAll().toStdString());
         const bool isHelper = path.endsWith("GpuPreviewHostRoute.h");
@@ -2044,7 +2045,7 @@ TEST(GpuPreviewProcessing, HostRouteAndTelemetryComeFromTheSingleEngineCallSite)
     ASSERT_EQ(1, helperCalls);   /* the one call site: RenderFrameThread::drawFrame */
 
     /* the telemetry keys read the engine's route (strings are blanked above) */
-    QFile raw(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    QFile raw(repo_file_path(QStringLiteral("platform/qt/RenderFrameThread.cpp")));
     ASSERT_TRUE(raw.open(QIODevice::ReadOnly));
     const QString text = QString::fromUtf8(raw.readAll());
     const int directAt = text.indexOf(QStringLiteral("QStringLiteral(\"gpu_preview_processing_cpu_route_direct8\")"));
@@ -4239,7 +4240,7 @@ TEST(GpuPreviewProcessing, PlaybackTextureRouteRefusalIsWiredIntoThePolicy)
      * policy state, the scale-one clamp sees the same refusal, the fallback reason
      * carries the typed token, and the viewport's RGB16 display-shader present is
      * skipped for a refused stage. */
-    QFile policyFile(QStringLiteral("platform/qt/MainWindowGpuPreviewPolicy.h"));
+    QFile policyFile(repo_file_path(QStringLiteral("platform/qt/MainWindowGpuPreviewPolicy.h")));
     ASSERT_TRUE(policyFile.open(QIODevice::ReadOnly));
     const QString policy = QString::fromUtf8(policyFile.readAll());
     auto functionBody = [&policy](const QString & signature) -> QString
@@ -4254,7 +4255,7 @@ TEST(GpuPreviewProcessing, PlaybackTextureRouteRefusalIsWiredIntoThePolicy)
     ASSERT_TRUE(functionBody(QStringLiteral("inline bool mainWindowAllowsGpuAmazeTexturePresentation("))
                     .contains(QStringLiteral("state.gpuPreviewProcessingDisplayShaderCompatible")));
 
-    QFile mainWindowFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    QFile mainWindowFile(repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp")));
     ASSERT_TRUE(mainWindowFile.open(QIODevice::ReadOnly));
     const QString mainWindow = QString::fromUtf8(mainWindowFile.readAll());
     ASSERT_TRUE(mainWindow.contains(QStringLiteral(

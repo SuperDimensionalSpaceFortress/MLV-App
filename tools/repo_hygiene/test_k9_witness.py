@@ -75,7 +75,9 @@ class Fixture:
         cfg = root / "empty.gitconfig"
         if not cfg.exists():
             cfg.write_text("")
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        # GIT_CEILING_DIRECTORIES is kept: a lane's TEMP sits inside its worktree under a ceiling, and without it
+        # the 'not-a-repo' dir below would resolve the lane's worktree (LANE-HOOK-DENY-RECURRENCE-1 T-03).
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k == "GIT_CEILING_DIRECTORIES"}
         env.update(
             GIT_CONFIG_GLOBAL=str(cfg), GIT_CONFIG_NOSYSTEM="1",
             HOME=str(root), USERPROFILE=str(root),

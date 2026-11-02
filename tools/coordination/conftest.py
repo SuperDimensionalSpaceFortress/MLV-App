@@ -21,7 +21,13 @@ from pathlib import Path
 
 import pytest
 
+import fast_git_path
+
 DOCTRINE_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "doctrine-offline"
+
+# CI-SHARD8-GUARDRAILS-COST-1: skip Git for Windows' two-process launcher for every git these tests run
+# (see fast_git_path.py for the measurement and the MLV_TEST_GIT_LAUNCHER=1 escape hatch).
+fast_git_path.install()
 
 
 @pytest.fixture(autouse=True)

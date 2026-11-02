@@ -329,6 +329,7 @@ def _majority_render_path(frames):
     return counts.most_common(1)[0][0]
 
 
+# scale_label must stay self-contained (builtins only, no module-level helpers): the mirror test execs this one function alone because the hosted runner has no numpy.
 def scale_label(scale):
     """The words a person reads for a playback scale FACTOR on the sheet header (SCALE-LABEL-CLARITY-1 r2): '1' -> 'Full res (1x)', '2' -> 'Half res (0.5x)',
     '4' -> 'Quarter res (0.25x)', other whole numbers -> 'Custom res (1/N)'. Mirrors PlaybackScaleLabel::resolutionLabel (platform/qt/PlaybackScaleLabel.h); text that is

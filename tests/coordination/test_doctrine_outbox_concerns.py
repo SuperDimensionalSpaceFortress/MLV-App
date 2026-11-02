@@ -8,8 +8,10 @@ purpose: the 2,900-line sibling suite takes more than ten minutes.
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -54,7 +56,36 @@ def item_text(body: str = ENTRY, target: str = CONCERNS, kind: str = "concern") 
     return f"---\ntarget: {target}\nkind: {kind}\nsource_commit: PENDING\nlaw4: attested\n---\n{body}"
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the bus and the source below took nine and six git processes to build and were
+# rebuilt for every test. Each distinct one is now built once per pytest session by the original builder
+# (`_build_bus` / `_build_source`, bodies unchanged) and each test gets a private copy of that directory tree; the
+# one absolute path a bus copy carries, the clone's `origin` url, is repointed at the copy's own bare repo.
+_FIXTURE_TEMPLATES: dict = {}
+_TEMPLATE_BASE: dict = {}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_template_base(tmp_path_factory):
+    _TEMPLATE_BASE["dir"] = tmp_path_factory.getbasetemp()
+
+
+def _fixture_template(key: tuple, build):
+    """Build `key`'s fixture once under a fresh directory in the session's base temp dir, then reuse it."""
+    if key not in _FIXTURE_TEMPLATES:
+        _FIXTURE_TEMPLATES[key] = build(Path(tempfile.mkdtemp(prefix="concerns-fixture-template-", dir=_TEMPLATE_BASE["dir"])))
+    return _FIXTURE_TEMPLATES[key]
+
+
 def init_bus(tmp_path: Path, readme: str) -> Path:
+    template_bare, template_clone = _fixture_template(("bus", readme), lambda root: _build_bus(root, readme))
+    bare, clone = tmp_path / "bus-origin.git", tmp_path / "bus-clone"
+    shutil.copytree(template_bare, bare)
+    shutil.copytree(template_clone, clone)
+    git(clone, "remote", "set-url", "origin", str(bare))
+    return clone
+
+
+def _build_bus(tmp_path: Path, readme: str):
     bare, clone = tmp_path / "bus-origin.git", tmp_path / "bus-clone"
     subprocess.run(["git", "init", "--bare", "-b", "master", str(bare)], check=True, capture_output=True, text=True)
     subprocess.run(["git", "clone", str(bare), str(clone)], check=True, capture_output=True, text=True)
@@ -63,10 +94,17 @@ def init_bus(tmp_path: Path, readme: str) -> Path:
     git(clone, "add", "cos-feedback")
     git(clone, "commit", "-m", "seed bus")
     git(clone, "push", "origin", "HEAD:refs/heads/master")
-    return clone
+    return bare, clone
 
 
 def init_source(tmp_path: Path) -> Path:
+    template = _fixture_template(("source",), lambda root: _build_source(root))
+    src = tmp_path / "source"
+    shutil.copytree(template, src)
+    return src
+
+
+def _build_source(tmp_path: Path) -> Path:
     src = tmp_path / "source"
     (src / "doctrine-outbox").mkdir(parents=True)
     (src / ob.TOOL_REL).parent.mkdir(parents=True)

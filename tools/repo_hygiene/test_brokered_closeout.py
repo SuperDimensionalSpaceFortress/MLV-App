@@ -1,4 +1,5 @@
 import atexit
+import contextlib
 import hashlib
 import json
 import os
@@ -214,6 +215,9 @@ def process_is_running(pid: int) -> bool:
 # See .claude-state/project-memory/windows-ci-5x-gap-root-cause-20260917.md.
 _TEMPLATE_CACHE: dict[tuple[str, bool], Path] = {}
 _TEMPLATE_ROOT: Path | None = None
+# Transient git lock files (maintenance.lock, gc.pid.lock, ...) can vanish
+# between listing and copying; skip *.lock only, never anything broader.
+_TRANSIENT_LOCK_IGNORE = shutil.ignore_patterns("*.lock")
 
 
 def _template_root() -> Path:
@@ -469,6 +473,18 @@ class BrokeredCloseoutTests(unittest.TestCase):
             config = deep_update(config, updates)
         (repo / "closeout.config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
+    @staticmethod
+    def _disable_background_maintenance(repo: Path) -> None:
+        """Stop git auto-gc/auto-maintenance from touching a template repo.
+
+        Set right after `git init`, before any commit/push that could start it:
+        a background run creates and deletes `.git/objects/maintenance.lock`
+        while `init_repo` copies the template.
+        """
+        git(repo, "config", "gc.auto", "0")
+        git(repo, "config", "maintenance.auto", "false")
+        git(repo, "config", "gc.autoDetach", "false")
+
     def _build_repo_template(
         self, destination: Path, *, remote: bool, config_updates: dict | None
     ) -> None:
@@ -476,6 +492,7 @@ class BrokeredCloseoutTests(unittest.TestCase):
         repo = destination / "repo"
         repo.mkdir(parents=True)
         git(repo, "init", "-b", "master")
+        self._disable_background_maintenance(repo)
         git(repo, "config", "user.email", "test@example.invalid")
         git(repo, "config", "user.name", "Test User")
         (repo / ".gitignore").write_text(".claude-state/\n", encoding="utf-8")
@@ -489,6 +506,7 @@ class BrokeredCloseoutTests(unittest.TestCase):
         if remote:
             bare = destination / "origin.git"
             git(destination, "init", "--bare", str(bare))
+            self._disable_background_maintenance(bare)
             git(repo, "remote", "add", "origin", str(bare))
             git(repo, "push", "-u", "origin", "master")
 
@@ -510,14 +528,77 @@ class BrokeredCloseoutTests(unittest.TestCase):
         self.repo_counter += 1
         repo = self.tempdir / ("repo" if self.repo_counter == 1 else f"repo-{self.repo_counter}")
         template = self._repo_template(remote=remote, config_updates=config_updates)
-        shutil.copytree(template / "repo", repo)
+        shutil.copytree(template / "repo", repo, ignore=_TRANSIENT_LOCK_IGNORE)
         if remote:
             bare = self.tempdir / f"origin-{self.repo_counter}.git"
-            shutil.copytree(template / "origin.git", bare)
+            shutil.copytree(template / "origin.git", bare, ignore=_TRANSIENT_LOCK_IGNORE)
             # The template's origin URL points into the template root; re-point
             # it at this test's own bare copy.
             git(repo, "remote", "set-url", "origin", str(bare))
         return repo
+
+    def test_template_copy_survives_lock_file_vanishing_mid_copy(self) -> None:
+        # CI-FLAKE-BROKERED-CLOSEOUT-TEMPLATE-MAINTENANCE-LOCK-1: git background
+        # maintenance can create and delete .git/objects/maintenance.lock while
+        # init_repo copies the cached template.  copytree lists the entry, the
+        # lock vanishes, and the copy raises FileNotFoundError (runs
+        # 38283430209 and 38617974918).  Reproduce the shape without timing:
+        # the lock is listed by scandir and then removed before it is copied.
+        shape = {"templateLockFixture": "vanish"}
+        self.init_repo(remote=True, config_updates=shape)
+        template = self._repo_template(remote=True, config_updates=shape)
+        planted = [
+            template / "repo" / ".git" / "objects" / "maintenance.lock",
+            template / "origin.git" / "gc.pid.lock",
+        ]
+        for lock in planted:
+            lock.write_text("transient\n", encoding="utf-8")
+        real_scandir = os.scandir
+        template_prefix = os.path.normcase(str(template))
+
+        def vanishing_scandir(path="."):
+            with real_scandir(path) as itr:
+                entries = list(itr)
+            if os.path.normcase(os.fspath(path)).startswith(template_prefix):
+                for entry in entries:
+                    if entry.name.endswith(".lock"):
+                        os.unlink(entry.path)
+            return contextlib.nullcontext(entries)
+
+        with mock.patch("os.scandir", vanishing_scandir):
+            repo = self.init_repo(remote=True, config_updates=shape)
+
+        self.assertTrue((repo / ".git" / "HEAD").is_file())
+        self.assertFalse((repo / ".git" / "objects" / "maintenance.lock").exists())
+
+    def test_template_copy_ignores_only_lock_files(self) -> None:
+        # Isolated template shape: this test adds untracked files to the cached
+        # template, which must not leak into other tests that share the default.
+        shape = {"templateLockFixture": "only-locks"}
+        self.init_repo(remote=True, config_updates=shape)
+        template = self._repo_template(remote=True, config_updates=shape)
+        (template / "repo" / ".git" / "objects" / "maintenance.lock").write_text("x\n", encoding="utf-8")
+        (template / "repo" / "keep.lockfile.txt").write_text("keep\n", encoding="utf-8")
+        (template / "repo" / "notes.txt").write_text("keep\n", encoding="utf-8")
+
+        repo = self.init_repo(remote=True, config_updates=shape)
+
+        self.assertFalse((repo / ".git" / "objects" / "maintenance.lock").exists())
+        self.assertTrue((repo / "keep.lockfile.txt").is_file())
+        self.assertTrue((repo / "notes.txt").is_file())
+        self.assertTrue((repo / "README.md").is_file())
+
+    def test_template_repos_disable_background_maintenance(self) -> None:
+        self.init_repo(remote=True)
+        template = self._repo_template(remote=True, config_updates=None)
+        for gitdir_cwd in (template / "repo", template / "origin.git"):
+            for key, expected in (
+                ("gc.auto", "0"),
+                ("maintenance.auto", "false"),
+                ("gc.autoDetach", "false"),
+            ):
+                value = git(gitdir_cwd, "config", "--local", "--get", key).stdout.strip()
+                self.assertEqual(value, expected, f"{gitdir_cwd.name} {key}")
 
     def make_feature(self, repo: Path, work_block_id: str, *, filename: str = "work.txt") -> dict:
         git(repo, "checkout", "-b", "codex/test-work")

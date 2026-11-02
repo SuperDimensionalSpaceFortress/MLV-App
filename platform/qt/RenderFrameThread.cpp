@@ -14,6 +14,7 @@
 #include "PlaybackFrameRange.h"
 #include "GpuPreviewHostRoute.h"
 #include "PlaybackQualityPolicy.h"
+#include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
@@ -311,6 +312,44 @@ void insertDualIsoWarmupInstrumentationTelemetry(
                    dualIsoFull20.phase_implied_pattern );
 }
 
+/* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the llrawproc steps outside the seven stage
+ * timers, emitted beside them; returns their sum so llrawproc_other_ms is the
+ * residual of the finer set. Every field is disjoint (llrawproc.h). The bundle
+ * also carries the wall, the seven-timer sum and the residual of the SAME run
+ * (llrawproc_residual_*), so a reader never pairs one thread's sub-timers with
+ * another thread's total (adversary r1 pass 2 A1). */
+double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target,
+                                                 double llrawprocTotalMs,
+                                                 double llrawprocStageTimersMs )
+{
+    llrpResidualSubstageTiming_t residual = {};
+    llrpGetLastResidualSubstageTiming( &residual );
+    const double substageMs = residual.setup_ms
+        + residual.make_14bit_ms
+        + residual.lut_rebuild_ms
+        + residual.snapshot_lock_wait_ms
+        + residual.snapshot_locked_ms
+        + residual.failure_backup_ms
+        + residual.publish_ms;
+    target.insert( QStringLiteral("llrawproc_setup_ms"), residual.setup_ms );
+    target.insert( QStringLiteral("llrawproc_make_14bit_ms"), residual.make_14bit_ms );
+    target.insert( QStringLiteral("llrawproc_lut_rebuild_ms"), residual.lut_rebuild_ms );
+    target.insert( QStringLiteral("llrawproc_lut_rebuilds"), residual.lut_rebuilds );
+    target.insert( QStringLiteral("llrawproc_snapshot_lock_wait_ms"),
+                   residual.snapshot_lock_wait_ms );
+    target.insert( QStringLiteral("llrawproc_snapshot_locked_ms"),
+                   residual.snapshot_locked_ms );
+    target.insert( QStringLiteral("llrawproc_failure_backup_ms"),
+                   residual.failure_backup_ms );
+    target.insert( QStringLiteral("llrawproc_publish_ms"), residual.publish_ms );
+    target.insert( QStringLiteral("llrawproc_residual_total_ms"), llrawprocTotalMs );
+    target.insert( QStringLiteral("llrawproc_residual_stage_timers_ms"),
+                   llrawprocStageTimersMs );
+    target.insert( QStringLiteral("llrawproc_residual_other_ms"),
+                   qMax( 0.0, llrawprocTotalMs - llrawprocStageTimersMs - substageMs ) );
+    return substageMs;
+}
+
 void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
 {
     const double llrawprocTotalMs = llrpGetLastTotalMilliseconds();
@@ -321,7 +360,7 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
     const double llrawprocPatternNoiseMs = llrpGetLastPatternNoiseMilliseconds();
     const double llrawprocDualIsoMs = llrpGetLastDualIsoMilliseconds();
     const double llrawprocChromaSmoothMs = llrpGetLastChromaSmoothMilliseconds();
-    const double llrawprocKnownMs =
+    const double llrawprocStageTimersMs =
         llrawprocDarkFrameMs
         + llrawprocVerticalStripesMs
         + llrawprocFocusPixelsMs
@@ -329,6 +368,11 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
         + llrawprocPatternNoiseMs
         + llrawprocDualIsoMs
         + llrawprocChromaSmoothMs;
+    const double llrawprocKnownMs =
+        llrawprocStageTimersMs
+        + insertLlrawprocResidualSubstageTelemetry( target,
+                                                    llrawprocTotalMs,
+                                                    llrawprocStageTimersMs );
     dualiso_full20bit_timing_t dualIsoFull20 = {};
     llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
 
@@ -1545,13 +1589,16 @@ int RenderFrameThread::cancelPlaybackPresentationRequests( uint64_t presentation
     for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
     {
         FrameSlot &slot = m_frameSlots[i];
-        if( !slot.presentationContext.playbackActive
-         || slot.presentationContext.presentationGeneration != presentationGeneration )
-        {
-            continue;
-        }
         const SlotState state = slot.state.load( std::memory_order_acquire );
-        if( state != SlotState::Ready && state != SlotState::Presenting )
+        const PlaybackSlotHold hold =
+            state == SlotState::Ready ? PlaybackSlotHold::Ready
+          : state == SlotState::Presenting ? PlaybackSlotHold::Presenting
+          : PlaybackSlotHold::Other;
+        // A Presenting slot stays pinned: its borrower releases it by serial.
+        if( !playbackCancelReleasesSlot( hold,
+                                         slot.presentationContext.playbackActive,
+                                         slot.presentationContext.presentationGeneration,
+                                         presentationGeneration ) )
         {
             continue;
         }
@@ -1671,6 +1718,7 @@ bool RenderFrameThread::acquireReadySlotLocked( ReadyFrame *frame,
     if( frame )
     {
         frame->rawImage8 = slot.rawImage8.empty() ? nullptr : slot.rawImage8.data();
+        frame->rawImage8Bytes = slot.rawImage8.size();
         frame->rawImage16 = slot.rawImage16.empty() ? nullptr : slot.rawImage16.data();
         frame->rawImage16Words = slot.rawImage16.size();
         frame->playbackScaledImage8 =
@@ -3972,6 +4020,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * CPU render entries, all called from the render dispatch below), so this
      * cannot clear a legitimate "ran" from the same frame. */
     llrpResetLastPreDualIsoFixTelemetry();
+    /* PROCESSED8-MS-TELEMETRY-STUCK-1: the processing timers (g_processing_last_*)
+     * are thread-local and only rewritten when this thread runs processing. A frame
+     * that never does (OutputDebayered16, GPU texture no-readback) would otherwise
+     * report the previous processed render's timings. Nothing earlier in this
+     * function runs processing. */
+    processingResetLastTimingTelemetry();
     if( preserveGpuPlaybackReconTextureSnapshot )
     {
         slot.gpuPlaybackReconTextureNoReadbackCandidate = true;
@@ -4959,6 +5013,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
             r16AmazeTextureAvailability.rendererDescription );
     }
 
+    /* PROCESSED8-MS-TELEMETRY-STUCK-1: whether this draw ran the processed8 /
+     * processed16 stage; the g_mlv_last_processed8_* / processed16_* getters are
+     * thread-local and stale otherwise. */
+    bool renderThreadProcessed8StageRan = false;
+    bool renderThreadProcessed16StageRan = false;
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
         slot.usedGpuAmazeDebayer = true;
@@ -4987,6 +5046,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if ( outputMode == OutputProcessed16 && !slot.rawImage16.empty() )
     {
+        renderThreadProcessed16StageRan = true;
         getMlvProcessedFrame16Scaled( m_pMlvObject,
                                       frameNumber,
                                       slot.rawImage16.data(),
@@ -5385,6 +5445,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if( !slot.rawImage8.empty() )
     {
+        // Every path below reaches one getMlvProcessedFrame8* entry.
+        renderThreadProcessed8StageRan = true;
         bool renderedFromPhase3Raw = false;
         bool renderedFromReducedRecon = false;
         bool renderedFromGpuTextureNoReadbackStatePath = false;
@@ -6185,7 +6247,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
     dualiso_full20bit_timing_t dualIsoFull20 = {};
     llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
     const double llrawprocChromaSmoothMs = llrpGetLastChromaSmoothMilliseconds();
-    const double llrawprocKnownMs =
+    /* LLRAWPROC-RESIDUAL-SUBTIMERS-1 (adversary A1): a render that consumed another
+     * thread's recon ran no llrawproc here (every reconned-raw consumer zeroes
+     * getMlvLastLlrawprocMilliseconds, not all of them this thread's llrp record), so
+     * the recon worker's residual fields stay on the slot instead of an empty or
+     * stale record from this thread. */
+    const double llrawprocStageTimersMs =
         llrawprocDarkFrameMs +
         llrawprocVerticalStripesMs +
         llrawprocFocusPixelsMs +
@@ -6193,6 +6260,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
         llrawprocPatternNoiseMs +
         llrawprocDualIsoMs +
         llrawprocChromaSmoothMs;
+    const double llrawprocResidualSubstageMs = llrawprocMs > 0.0
+        ? insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry,
+                                                    llrawprocMs,
+                                                    llrawprocStageTimersMs )
+        : 0.0;
+    const double llrawprocKnownMs = llrawprocStageTimersMs + llrawprocResidualSubstageMs;
     const double llrawprocOtherMs = qMax( 0.0, llrawprocMs - llrawprocKnownMs );
     const double dualIsoPreviewTotalMs =
         slot.dualIsoPreviewHistogramMs +
@@ -6941,6 +7014,28 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       processed8CacheHitScale );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_prefetch_hit"),
                                       processed8PrefetchHit );
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: a stage this draw did not run reports 0.0 plus
+    // a false *_stage_measured flag, never the previous processed render's carryover
+    // (every getMlvProcessedFrame8* entry resets and rewrites the processed16 timers too).
+    const bool processed8StageMeasured = renderThreadProcessed8StageRan;
+    const bool processed16StageMeasured =
+        renderThreadProcessed8StageRan || renderThreadProcessed16StageRan;
+    slot.stageTimingTelemetry.insert( QStringLiteral("processed8_stage_measured"),
+                                      processed8StageMeasured );
+    slot.stageTimingTelemetry.insert( QStringLiteral("processed16_stage_measured"),
+                                      processed16StageMeasured );
+    if( !processed8StageMeasured )
+    {
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed8_total_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed8_cache_store_ms"), 0.0 );
+    }
+    if( !processed16StageMeasured )
+    {
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_total_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_for_8bit_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_to_8bit_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_cache_store_ms"), 0.0 );
+    }
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
         // The no-readback GPU AMaZE texture path does not run the CPU debayer, so the

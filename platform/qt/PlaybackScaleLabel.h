@@ -52,6 +52,20 @@ public:
                     .arg( scaleFactor );
         }
     }
+
+    /*! \brief Toolbar playback-quality indicator text (SCALE-LABEL-INDICATOR-PIN-1):
+     *  requested == active -> shortLabel(requested); otherwise "<requested>-><active>"
+     *  with both sides in shortLabel words. Callers pass active == requested when the
+     *  active scale is unknown or belongs to a different request. */
+    static QString indicatorText( int requestedScale, int activeScale )
+    {
+        if( requestedScale == activeScale )
+        {
+            return shortLabel( requestedScale );
+        }
+        return QCoreApplication::translate( "PlaybackScaleLabel", "%1->%2" )
+            .arg( shortLabel( requestedScale ), shortLabel( activeScale ) );
+    }
 };
 
 #endif // PLAYBACKSCALELABEL_H

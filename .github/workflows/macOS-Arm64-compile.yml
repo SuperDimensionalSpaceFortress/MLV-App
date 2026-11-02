@@ -1,0 +1,68 @@
+name: macOS Arm64 Compile Canary
+
+# Compile-only canary (MAC-LINUX-BUILD-RESTORE-1; OWNER RULING 2026-10-25T00:44:41Z).
+# qmake + make only: no packaged release or vendored payload is produced (qmake
+# still builds an .app bundle in the build tree), so no vendored payload is
+# verified, extracted or shipped here. The release path stays in macOS-Arm64.yml.
+# Qt: this canary and macOS-Arm64.yml both moved from Qt 5 (qt@5) to Qt 6 (brew
+# `qt`); the toolchain step fails unless `qmake -query QT_VERSION` starts with 6.
+# Not a required context.
+#
+# The narrow trigger below (workflow_dispatch, plus pull_request only when this
+# file changes) is intentional (owner ruling): fold the canary into tests.yml after
+# a week green. Widening the path filter (platform/qt/**, src/**, *.pro) is a
+# separate follow-up card, not part of this change.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/macOS-Arm64-compile.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_DIR:   ${{ github.workspace }}/platform
+  QTDIR:        /opt/homebrew/opt/qt/bin
+
+jobs:
+  compile:
+
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+    - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      with:
+        persist-credentials: false
+
+    - name: Install llvm & Qt & OpenSSL
+      uses: ConorMacBride/install-package@3e7ad059e07782ee54fa35f827df52aae0626f30 # v1.1.0
+      with:
+        brew: llvm qt openssl
+
+    - name: Verify macOS build toolchain
+      run: |
+        test -x "${{ env.QTDIR }}/qmake"
+        "${{ env.QTDIR }}/qmake" -v
+        "${{ env.QTDIR }}/qmake" -query QT_VERSION
+        QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"
+        case "$QT_VERSION" in 6.*) ;; *) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac
+        LLVM_CXX="$(brew --prefix llvm)/bin/clang++"
+        test -x "$LLVM_CXX"
+        "$LLVM_CXX" --version
+
+    - name: Create build directory
+      run:  mkdir ${{ env.SOURCE_DIR }}/build
+
+    - name: Compile
+      working-directory: ${{ env.SOURCE_DIR }}/build
+      run:  |
+            ${{ env.QTDIR }}/qmake -r ${{ env.SOURCE_DIR }}/qt/MLVApp.pro MLVAPP_SKIP_LEGACY_PAYLOAD_EXTRACTION=1
+            make -j8
+            ls -al

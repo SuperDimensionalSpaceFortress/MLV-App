@@ -23,6 +23,9 @@ Exit codes: 0 = every task that ran passed, or no row matched ("none mapped");
             2 = could not decide (bad worktree, unresolvable base, git failure, invalid manifest, a matched
                 row naming a suite file that does not exist) -- UNKNOWN, never a pass.
 
+``--check-evidence`` prints the resolved line beside each declared floor's ``line`` hint and runs nothing else
+(exit 1 only for an unresolvable citation; a drifted hint is advice).
+
 Read-only on the worktree: git calls only read, and every child runs with PYTHONDONTWRITEBYTECODE=1 and
 ``-p no:cacheprovider``. ``--list`` prints the plan without running anything.
 """
@@ -114,7 +117,7 @@ def validate_manifest(data: object) -> list[str]:
             if not runtimes:
                 problems.append(f"{label}: a declared floor needs at least one runtime")
             if not isinstance(evidence, list) or not evidence:
-                problems.append(f"{label}: a declared floor needs evidence (file, line, contains)")
+                problems.append(f"{label}: a declared floor needs evidence (file, contains; optional within, line hint)")
         elif floor == "undeclared":
             if runtimes:
                 problems.append(f"{label}: an undeclared floor must not list runtimes (nothing is invented)")
@@ -123,9 +126,10 @@ def validate_manifest(data: object) -> list[str]:
         if isinstance(evidence, list):
             for item in evidence:
                 if not (isinstance(item, dict) and isinstance(item.get("file"), str)
-                        and isinstance(item.get("line"), int) and isinstance(item.get("contains"), str)
-                        and item["contains"]):
-                    problems.append(f"{label}: each evidence item needs file, line, contains")
+                        and isinstance(item.get("contains"), str) and item["contains"]
+                        and isinstance(item.get("line", 1), int) and not isinstance(item.get("line"), bool)
+                        and isinstance(item.get("within", "x"), str) and item.get("within", "x")):
+                    problems.append(f"{label}: each evidence item needs file, contains; line (int hint) and within (string) are optional")
         mins = row.get("min_versions", {})
         if not isinstance(mins, dict) or any(k not in runtimes or not _version_tuple(str(v)) for k, v in mins.items()):
             problems.append(f"{label}: min_versions keys must be declared runtimes with numeric versions")
@@ -158,21 +162,122 @@ def load_manifest(path: Path) -> dict:
     return data
 
 
-def check_evidence(manifest: dict, root: Path) -> list[str]:
-    """Each declared floor must cite a real line of a real file that contains the quoted text."""
-    problems: list[str] = []
+def _indent(text: str) -> int:
+    return len(text) - len(text.lstrip())
+
+
+def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | None]:
+    """Resolve one evidence item by its text anchor: (1-based line, None) or (None, problem).
+
+    ``contains`` must match exactly one line of the scope. The scope is the whole file, or with ``within`` the
+    block that opens at the one line holding that literal and runs over the lines indented deeper than it
+    (a function, a YAML job). ``line`` is only a hint: an edit above the cited text never turns it red.
+
+    The scope ends at the first non-blank line indented no deeper than the ``within`` line, so it ends EARLY at a
+    comment at the same indent, a column-zero line (a here-string body), or an opening brace on the line after the
+    ``within`` line. An early end never lets ``contains`` resolve to a line other than the one it names in the
+    shorter scope, and it can only turn a citation red (``matches 0 lines``), with one qualification:
+
+    * An early end at a COMMENT is seen through. The comment line itself says nothing about where the block ends,
+      so a second match past it (up to the next non-comment line indented no deeper) makes the citation red
+      (``matches 2 lines ... past an early scope end``) rather than letting it resolve to the first match.
+    * An early end at a column-zero code line or a brace is NOT seen through: a here-string body cannot be told
+      from the next top-level declaration, so a second match beyond it is invisible and the citation resolves to
+      the first one. Cite a ``contains`` that is unique in the whole block, or a ``within`` anchor that closes
+      before such a line.
+    """
+    scope = range(len(lines))
+    wide = scope
+    where = "the file"
+    anchor = item.get("within")
+    if anchor:
+        opens = [i for i, text in enumerate(lines) if anchor in text]
+        if len(opens) != 1:
+            return None, f"'within' anchor {anchor!r} matches {len(opens)} lines (need exactly 1)"
+        start = opens[0]
+        scope = range(start, _scope_end(lines, start, see_through_comments=False))
+        wide = range(start, _scope_end(lines, start, see_through_comments=True))
+        where = f"the block under {anchor!r}"
+    hits = [i for i in scope if item["contains"] in lines[i]]
+    if len(hits) == 1:
+        beyond = [i for i in wide if i not in scope and item["contains"] in lines[i]]
+        if beyond:
+            return None, (f"{item['contains']!r} matches {len(hits) + len(beyond)} lines of {where}, "
+                          f"{len(beyond)} of them past an early scope end at line {scope.stop + 1} (need exactly 1)")
+        return hits[0] + 1, None
+    return None, f"{item['contains']!r} matches {len(hits)} lines of {where} (need exactly 1)"
+
+
+def _is_comment(text: str) -> bool:
+    return text.lstrip().startswith(("#", "//"))
+
+
+def _scope_end(lines: list[str], start: int, see_through_comments: bool) -> int:
+    """Index one past the ``within`` block that opens at ``start``: the first non-blank line indented no deeper than
+    it. With ``see_through_comments`` a comment line never ends the block (it only marks where a narrow scope ends
+    early); the first code line indented no deeper still does."""
+    end = start + 1
+    while end < len(lines):
+        text = lines[end]
+        if text.strip() and _indent(text) <= _indent(lines[start]) and not (see_through_comments and _is_comment(text)):
+            break
+        end += 1
+    return end
+
+
+def citation_snapshot(manifest: dict, root: Path) -> list[tuple]:
+    """Resolve every citation ONCE: [(row id, evidence item, resolved 1-based line or None, problem or None)].
+
+    Each cited file is read once per snapshot, so every citation to it resolves against the same text. The report and
+    the verdict are both derived from one snapshot, so a cited file edited while the check runs can never leave them
+    disagreeing."""
+    snapshot = []
+    texts: dict[Path, list[str]] = {}
     for row in manifest["rows"]:
         for item in row.get("evidence", []):
             target = Path(root) / item["file"]
             if not target.is_file():
-                problems.append(f"{row['id']}: evidence file missing: {item['file']}")
+                snapshot.append((row["id"], item, None, f"evidence file missing: {item['file']}"))
                 continue
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-            if not 1 <= item["line"] <= len(lines):
-                problems.append(f"{row['id']}: {item['file']} has no line {item['line']}")
-            elif item["contains"] not in lines[item["line"] - 1]:
-                problems.append(f"{row['id']}: {item['file']}:{item['line']} does not contain {item['contains']!r}")
-    return problems
+            key = target.resolve()
+            if key not in texts:
+                texts[key] = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = texts[key]
+            resolved, problem = resolve_evidence(item, lines)
+            snapshot.append((row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)))
+    return snapshot
+
+
+def snapshot_problems(snapshot: list[tuple]) -> list[str]:
+    return [f"{row_id}: {problem}" for row_id, _, _, problem in snapshot if problem]
+
+
+def check_evidence(manifest: dict, root: Path) -> list[str]:
+    """Each declared floor must cite, by a unique text anchor, a real file that contains the quoted text."""
+    return snapshot_problems(citation_snapshot(manifest, root))
+
+
+def evidence_report(manifest: dict, root: Path) -> list[str]:
+    """One line per citation: the resolved line beside its ``line`` hint. Drift is advice, never a failure; only an
+    UNRESOLVED citation (the problems ``check_evidence`` returns) is one."""
+    return snapshot_report(citation_snapshot(manifest, root))
+
+
+def snapshot_report(snapshot: list[tuple]) -> list[str]:
+    report = []
+    for row_id, item, resolved, problem in snapshot:
+        if problem:
+            report.append(f"{row_id}: UNRESOLVED {problem}")
+            continue
+        hint = item.get("line")
+        if hint is None:
+            note = "no hint"
+        elif hint == resolved:
+            note = f"hint {hint} (in sync)"
+        else:
+            note = f"hint {hint} (drifted by {abs(hint - resolved)})"
+        report.append(f"{row_id}: {item['file']}: resolved line {resolved}, {note}")
+    return report
 
 
 # --- runtimes -----------------------------------------------------------------------------------------------
@@ -435,6 +540,8 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
     parser.add_argument("--list", action="store_true", help="print the plan and run nothing")
     parser.add_argument("--strict-absent", action="store_true", help="a declared runtime that is absent exits 1")
     parser.add_argument("--include-slow", action="store_true", help="also run suites the manifest marks slow (over about a minute)")
+    parser.add_argument("--check-evidence", action="store_true",
+                        help="print the resolved line beside each evidence hint and run nothing else; exit 1 only on an UNRESOLVED citation")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     # Absolute once, before planning and spawning: every child runs with cwd=<worktree>, so a relative value kept
@@ -452,6 +559,16 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
 
     try:
         manifest = load_manifest(Path(args.manifest) if args.manifest else worktree / DEFAULT_MANIFEST)
+        if args.check_evidence:
+            snapshot = citation_snapshot(manifest, worktree)
+            report = snapshot_report(snapshot)
+            result["evidence"] = report
+            if not args.json:
+                print("\n".join(report))
+            bad = len(snapshot_problems(snapshot))
+            if bad:
+                return emit(1, "FAIL", f"{bad} of {len(report)} citation(s) unresolved")
+            return emit(0, "PASS", f"{len(report)} citation(s) resolved")
         merge_base, changed = changed_files(worktree, args.base)
         result.update(mergeBase=merge_base, changed=changed)
         matched = match_rows(manifest, changed)

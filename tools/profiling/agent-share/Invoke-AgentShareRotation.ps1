@@ -25,7 +25,11 @@ Rules:
   seen by any re-check; it also leaves nothing to protect. Any difference skips the WHOLE job
   (stats.changedSinceScan); if it is detected after some members already moved, the run stops (exit 3,
   step=changed), the remaining members stay live, and a "stopped" manifest row names the partial job with its
-  moved and remaining members. The residual window is the milliseconds between that probe and the rename.
+  moved and remaining members. A residual window remains between that probe and the rename, and it is NOT
+  bounded here: the SMB manifest "intent" append, a possible month-folder mkdir and the rename itself all run
+  after the probe, each over the share with no time limit, so a claim that lands inside that window does not
+  stop that member's rename; the next probe sees it and stops the rest of the job (rotation does not coordinate
+  with the producers; it re-checks, it does not lock them out).
 - -Apply holds an exclusive lock (<share>\archive\rotation-manifests\rotation.lock, opened CreateNew and removed
   on close) so two -Apply runs never work the same share at once; a second run refuses with ROTATION_LOCKED.
 - Moves are same-share renames (no data copy). In -Apply mode each move is bracketed in

@@ -38,7 +38,7 @@ if (-not (Test-Path $key)) { throw "VM private key not found: $key" }
 $sshArgs = @(
     '-i', $key,
     '-o', 'StrictHostKeyChecking=accept-new',
-    '-o', "UserKnownHostsFile=$kh",
+    '-o', ('UserKnownHostsFile="' + $kh + '"'),   # quoted: ssh splits this option's value on whitespace
     '-o', "ConnectTimeout=$ConnectTimeout",
     '-o', 'BatchMode=yes',
     '-o', 'ServerAliveInterval=15',   # MUT:alive-interval

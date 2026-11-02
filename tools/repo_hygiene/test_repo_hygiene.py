@@ -186,6 +186,15 @@ def workflow_job_timeouts(workflow_text: str) -> dict[str, int | None]:
     return timeouts
 
 
+def merge_group_trigger_problem(trigger_section: str) -> str | None:
+    """Why the workflow's trigger block is not the merge-group run on every master commit, or None."""
+    if "  merge_group:\n    types: [checks_requested]\n" not in trigger_section:
+        return "merge_group: types: [checks_requested] is missing"
+    if re.search(r"(?m)^  merge_group:\n(?:    .*\n)*?    branches(?:-ignore)?:", trigger_section):
+        return "merge_group carries a branches filter, so a master queue commit may not run"
+    return None
+
+
 class RepoHygieneTests(unittest.TestCase):
     def test_job_timeout_pin_rejects_an_absent_or_unbounded_deadline(self) -> None:
         def workflow(job_header: str) -> str:
@@ -923,7 +932,7 @@ class RepoHygieneTests(unittest.TestCase):
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 8)
+        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 9)
         self.assertEqual(bridge_workflow.count('python-version-file: ".python-version"'), 1)
         # The moved job retains the same locked dependency policy; count both
         # reviewed workflow surfaces so relocation cannot weaken its checks.
@@ -942,7 +951,7 @@ class RepoHygieneTests(unittest.TestCase):
             for line in workflow.splitlines()
             if "-m pip install " in line
         ]
-        self.assertEqual(len(install_lines), 17)
+        self.assertEqual(len(install_lines), 19)
         for line in install_lines:
             for required_flag in (
                 "--disable-pip-version-check",
@@ -954,7 +963,7 @@ class RepoHygieneTests(unittest.TestCase):
                 self.assertIn(required_flag, line, f"unsafe Python install command: {line}")
             lock_path = line.rsplit(" -r ", 1)[1].strip()
             self.assertIn(lock_path, allowed_locks, f"unapproved Python lock: {lock_path}")
-        self.assertEqual(workflow.count("python -m pip check"), 8)
+        self.assertEqual(workflow.count("python -m pip check"), 9)
 
         observed_locks: dict[str, dict[str, str]] = {}
         for relative_path, roots in PYTHON_LOCK_ROOTS.items():
@@ -1033,6 +1042,14 @@ class RepoHygieneTests(unittest.TestCase):
         ):
             self.assertIn(required_policy, lock_policy)
 
+    def test_merge_group_trigger_pin_rejects_a_branches_filter(self) -> None:
+        # sol r2 H1: a merge_group branches filter that excludes master used to pass the substring pin.
+        ok = "  merge_group:\n    types: [checks_requested]\n"
+        self.assertIsNone(merge_group_trigger_problem(ok))
+        for extra in ("    branches: [adversary-never-target]\n", "    branches-ignore: [master]\n"):
+            self.assertIsNotNone(merge_group_trigger_problem(ok + extra), extra)
+        self.assertIsNotNone(merge_group_trigger_problem("  pull_request:\n"))
+
     def test_ci_workflow_hardening_is_fail_closed_and_coordination_aware(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
@@ -1048,7 +1065,8 @@ class RepoHygieneTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("  pull_request:\n", trigger_section)
-        self.assertIn("  push:\n    branches:\n      - master\n", trigger_section)
+        # Master integration is the merge-group run on the exact master sha (CI-PUSH-MASTER-DEDUP-1).
+        self.assertIsNone(merge_group_trigger_problem(trigger_section))
         self.assertNotRegex(
             trigger_section,
             r"(?m)^\s+paths(?:-ignore)?:",
@@ -1062,6 +1080,7 @@ class RepoHygieneTests(unittest.TestCase):
             "repo-hygiene-python-windows-shard": 50,
             "repo-hygiene-python-windows-containment": 45,
             "repo-hygiene-python-windows-coordination-heavy": 45,
+            "repo-hygiene-python-windows-unittest-heavy": 50,
             "repo-hygiene-python-windows": 5,
             "windows-product-oracles-part": 60,
             "windows-product-oracles": 5,
@@ -1076,7 +1095,7 @@ class RepoHygieneTests(unittest.TestCase):
         expected_remote_uses = [
             ("actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "v5"),
             ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1", "v6"),
-        ] * 8 + [
+        ] * 9 + [
             ("actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "v7"),
         ] * 3
         uses_entries = []
@@ -1115,7 +1134,7 @@ class RepoHygieneTests(unittest.TestCase):
             r"\s+persist-credentials: false\s*$",
             workflow,
         )
-        self.assertEqual(len(checkout_blocks), 8)
+        self.assertEqual(len(checkout_blocks), 9)
 
         aqt_steps = re.findall(
             r"(?ms)^      - name: Install Qt 6\.10\.2 \+ MinGW 13\.1\r?\n"
@@ -1290,7 +1309,8 @@ class RepoHygieneTests(unittest.TestCase):
                     # The lane containment job gates the same required check as the shards.
                     self.assertIn(
                         f"    needs: [{shard_id}, repo-hygiene-python-windows-containment, "
-                        "repo-hygiene-python-windows-coordination-heavy]",
+                        "repo-hygiene-python-windows-coordination-heavy, "
+                        "repo-hygiene-python-windows-unittest-heavy]",
                         aggregator,
                     )
                     self.assertIn("needs.repo-hygiene-python-windows-containment.result", aggregator)
@@ -1298,6 +1318,9 @@ class RepoHygieneTests(unittest.TestCase):
                     # So does the heavy coordination job.
                     self.assertIn("needs.repo-hygiene-python-windows-coordination-heavy.result", aggregator)
                     self.assertIn('test "$HEAVY_RESULT" = "success"', aggregator)
+                    # And the unittest heavy job (CI-WINDOWS-UNITTEST-SHARD-8-1).
+                    self.assertIn("needs.repo-hygiene-python-windows-unittest-heavy.result", aggregator)
+                    self.assertIn('test "$UNITTEST_HEAVY_RESULT" = "success"', aggregator)
                 else:
                     self.assertIn(f"    needs: {shard_id}", aggregator)
                 self.assertIn(f"needs.{shard_id}.result", aggregator)
@@ -1462,6 +1485,9 @@ class RepoHygieneTests(unittest.TestCase):
             "tests\\docs",
         ):
             self.assertIn(path, tokens)
+        # STUCK-QUEUE-HANG-AND-CI-REVERT-1 r4: the stuck-queue suite stays collected in this step
+        # (hosted CI); the r2 assertNotIn that pinned its removal is reversed.
+        # No local-only exemption exists for it in test_ci_collects_every_test.py.
 
     def test_product_oracles_are_split_into_parts_behind_the_required_name(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
@@ -2025,10 +2051,10 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_remote_inventory = Counter(
             {
-                ("actions/checkout", "v5"): 13,
-                ("actions/setup-python", "v6"): 13,
+                ("actions/checkout", "v5"): 15,
+                ("actions/setup-python", "v6"): 14,
                 ("actions/upload-artifact", "v7"): 13,
-                ("ConorMacBride/install-package", "v1"): 2,
+                ("ConorMacBride/install-package", "v1"): 3,
             }
         )
         observed_remote_inventory: Counter[tuple[str, str]] = Counter()
@@ -4099,6 +4125,65 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertNotIn("orphan_quarantine", candidate["allowed_actions"])
         self.assertTrue(candidate["evidence"]["is_reparse_point"])
         self.assertTrue(candidate["evidence"]["inventory"]["refused_reparse_point"])
+
+    # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: apply_worktree_remove asks the shared live-reference guard (Get-WorktreeLiveRefusal in
+    # tools/coordination/Retire-LaneWorktree.ps1) right before `git worktree remove`. The guard's process table is faked here.
+    def test_worktree_live_refusal_is_none_when_the_guard_answers_free(self) -> None:
+        from .core import worktree_live_refusal
+
+        calls = []
+
+        def runner(args, **kw):
+            calls.append((args, kw))
+            return subprocess.CompletedProcess(args, 0, stdout="FREE\n", stderr="")
+
+        self.assertIsNone(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner))
+        self.assertEqual(calls[0][1]["env"]["MLV_GUARD_PATH"], str(Path("C:/mlvtmp/lane-X-1")))
+        self.assertEqual(calls[0][1]["env"]["MLV_GUARD_RUNS"], str(Path("C:/r") / ".claude-state" / "fleet-runs"))
+
+    def test_worktree_live_refusal_returns_the_typed_refusal(self) -> None:
+        from .core import worktree_live_refusal
+
+        refusal = {"reason": "live-driver", "processId": 43484, "via": "rundir-pid:venue-cpu17v9-ab.pid",
+                   "matchedPath": "C:\\run", "line": "REFUSED worktree-removal reason=live-driver pid=43484"}
+
+        def runner(args, **kw):
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(refusal) + "\n", stderr="")
+
+        self.assertEqual(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner), refusal)
+
+    def test_worktree_live_refusal_fails_closed_on_every_unknown(self) -> None:
+        from .core import worktree_live_refusal
+
+        def nonzero(args, **kw):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom")
+
+        def garbage(args, **kw):
+            return subprocess.CompletedProcess(args, 0, stdout="not json\n", stderr="")
+
+        def timeout(args, **kw):
+            raise subprocess.TimeoutExpired(args, 1)
+
+        for runner in (nonzero, garbage, timeout):
+            r = worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner)
+            self.assertEqual(r["reason"], "census-failed", runner.__name__)
+        with patch("tools.repo_hygiene.core.shutil.which", return_value=None):
+            self.assertEqual(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"))["reason"], "census-failed")
+
+    def test_apply_worktree_remove_refuses_a_live_reference_and_never_runs_git_remove(self) -> None:
+        from .core import apply_worktree_remove
+
+        repo = self.init_repo()
+        wt = repo.parent / f"{repo.name}-lane-X-1"
+        git(repo, "worktree", "add", "--detach", str(wt))
+        self.addCleanup(lambda: subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], capture_output=True))
+        refusal = {"reason": "live-driver", "line": "REFUSED worktree-removal reason=live-driver pid=43484"}
+        with patch("tools.repo_hygiene.core.worktree_live_refusal", return_value=refusal) as guard:
+            with self.assertRaises(HygieneError) as ctx:
+                apply_worktree_remove(repo, load_config(repo), {"path": str(wt)})
+        guard.assert_called_once()
+        self.assertIn("reason=live-driver", str(ctx.exception))
+        self.assertTrue(wt.exists(), "a refused worktree must not be removed")
 
 
 if __name__ == "__main__":

@@ -39,11 +39,24 @@ $keys = @{
     'J.provenance.json' = 'J'; 'J.out.txt' = 'J'; 'J.err.txt' = 'J'
     # sol r2 hardening: the agent's heavy-slot holder logs belong to J (ultra-magnus-agent.ps1 "$id.heavy-slot.out.txt")
     'J.heavy-slot.out.txt' = 'J'; 'J.heavy-slot.err.txt' = 'J'; 'J.x.heavy-slot.out.txt' = 'J.x'
+    # AGENT-SHARE-HEAVY-SLOT-LOG-LOOKUP-1 I1: the REAL producer name. Start-HeavySlotHolder builds
+    # $id = "$JobId.<guid 'N' first 12 hex>" and writes "$id.heavy-slot.out.txt" / ".err.txt", so the nonce sits between the
+    # job id and the suffix. A lookup by the job id must return them; the nonce is not part of the job id.
+    'J.0123456789ab.heavy-slot.out.txt' = 'J'; 'J.0123456789ab.heavy-slot.err.txt' = 'J'
+    'wbdet-20260903-141643.9f8e7d6c5b4a.heavy-slot.out.txt' = 'wbdet-20260903-141643'
+    'J.x.0123456789ab.heavy-slot.out.txt' = 'J.x'
+    # a job id that itself ends in .heavy-slot, or in 12 hex chars, keeps its whole id because the producer appends a nonce
+    'J.heavy-slot.0123456789ab.heavy-slot.out.txt' = 'J.heavy-slot'
+    'J.fedcba987654.0123456789ab.heavy-slot.err.txt' = 'J.fedcba987654'
+    # a segment of the wrong length is part of the id (legacy rule); the case-variant is checked below (hashtable keys are case-insensitive)
+    'J.0123456789a.heavy-slot.out.txt' = 'J.0123456789a'; 'J.0123456789abc.heavy-slot.out.txt' = 'J.0123456789abc'
     # Dot 85c1267 reserved-token shapes
     'J.started.job.ps1' = 'J.started'; 'J.started.started.json' = 'J.started'; 'J.started.started.json.tmp' = 'J.started'; 'J.started.meta.json' = 'J.started'
 }
 foreach ($n in $keys.Keys) { Check ((Get-AgentShareJobKey -Name $n) -ceq $keys[$n]) "job key '$n' -> '$($keys[$n])' (got '$(Get-AgentShareJobKey -Name $n)')" }
 Check (-not (Test-AgentShareJobEntry -Name 'J.artifacts.result.json' -JobId 'J')) 'exact lookup: J.artifacts.result.json is not job J'
+Check ((Get-AgentShareJobKey -Name 'J.0123456789AB.heavy-slot.out.txt') -ceq 'J.0123456789AB') 'an uppercase 12-hex segment is not the producer nonce (guid N is lowercase): it stays in the id'
+Check (Test-AgentShareJobEntry -Name 'J.0123456789ab.heavy-slot.out.txt' -JobId 'j') 'I1: exact lookup j (case-insensitive) matches the holder log of J'
 
 try {
     # --- base scenario
@@ -100,6 +113,19 @@ try {
     Check ($arch.Count -eq 2) "-IncludeArchive finds the archived job (got $($arch.Count))"
     $null = pwsh -NoProfile -File $recent -AgentShare (Join-Path $root 'nope') -Directory outbox -JobId J -AsJson 2>&1
     Check ($LASTEXITCODE -ne 0) 'unreachable root is an error, not an empty answer'
+
+    # --- AGENT-SHARE-HEAVY-SLOT-LOG-LOOKUP-1 I1: -Directory logs -JobId J returns J's holder logs (real producer names)
+    New-Entry 'logs\J.out.txt' 1; New-Entry 'logs\J.err.txt' 1
+    New-Entry 'logs\J.0123456789ab.heavy-slot.out.txt' 1; New-Entry 'logs\J.0123456789ab.heavy-slot.err.txt' 1
+    New-Entry 'logs\J.fedcba987654.heavy-slot.out.txt' 1                  # a second holder of J (a re-queued gate wait)
+    New-Entry 'logs\J.other.0123456789ab.heavy-slot.out.txt' 1            # job J.other, never J
+    New-Entry 'logs\J.heavy-slot.0123456789ab.heavy-slot.out.txt' 1       # job J.heavy-slot, never J
+    New-Entry 'logs\Jx.0123456789ab.heavy-slot.out.txt' 1
+    $lg = @(pwsh -NoProfile -File $recent -AgentShare $root -Directory logs -JobId J -AsJson | Out-String | ConvertFrom-Json)
+    Check ($lg.Count -eq 5 -and ($lg.name -contains 'J.0123456789ab.heavy-slot.out.txt') -and ($lg.name -contains 'J.0123456789ab.heavy-slot.err.txt') -and ($lg.name -contains 'J.fedcba987654.heavy-slot.out.txt')) "I1: -Directory logs -JobId J returns J's own and both holder logs (got $($lg.name -join ','))"
+    Check (-not ($lg.name -contains 'J.other.0123456789ab.heavy-slot.out.txt') -and -not ($lg.name -contains 'J.heavy-slot.0123456789ab.heavy-slot.out.txt') -and -not ($lg.name -contains 'Jx.0123456789ab.heavy-slot.out.txt')) 'I1: -JobId J does not return the holder logs of J.other, J.heavy-slot or Jx'
+    $lgHs = @(pwsh -NoProfile -File $recent -AgentShare $root -Directory logs -JobId J.heavy-slot -AsJson | Out-String | ConvertFrom-Json)
+    Check ($lgHs.Count -eq 1 -and $lgHs[0].name -eq 'J.heavy-slot.0123456789ab.heavy-slot.out.txt') "I1: -JobId J.heavy-slot returns only its own holder log (got $($lgHs.name -join ','))"
     Remove-Root
 
     # --- failed move: the run stops, names the partial job, and the manifest accounts for it

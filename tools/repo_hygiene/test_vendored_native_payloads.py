@@ -245,22 +245,84 @@ class VendoredNativePayloadTests(unittest.TestCase):
         )
         self.assertEqual(schema["properties"]["authority"]["const"]["automatic_launch_gate"], "CLOSED")
 
-    def test_manifest_keeps_unknown_raw2mlv_provenance_and_arm64_ffmpeg_debt_explicit(self) -> None:
+    def test_manifest_keeps_unknown_raw2mlv_provenance_and_pins_arm64_ffmpeg_consumer(self) -> None:
         raw_records = [record for record in self.manifest["payloads"] if record["id"].startswith("raw2mlv-")]
         self.assertEqual(len(raw_records), 5)
         self.assertTrue(all(record["provenance"]["status"] == "unknown" for record in raw_records))
         self.assertTrue(all(record["provenance"]["license"] == "unknown" for record in raw_records))
-        mac_ffmpeg = next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
-        arm_consumer = next(row for row in mac_ffmpeg["consumers"] if row["target"] == "macos-arm64")
-        self.assertEqual(arm_consumer["status"], "active-release-workflow-architecture-mismatch")
-        self.assertEqual(mac_ffmpeg["selected_members"][0]["binary"]["machine"], "x86_64")
+        intel_ffmpeg = next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
+        self.assertEqual(intel_ffmpeg["selected_members"][0]["binary"]["machine"], "x86_64")
+        self.assertNotIn("macos-arm64", {row["target"] for row in intel_ffmpeg["consumers"]})
+        arm_ffmpeg = next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-arm64")
+        self.assertEqual(arm_ffmpeg["path"], "platform/qt/FFmpeg/ffmpegOSXarm.zip")
+        self.assertEqual(arm_ffmpeg["selected_members"][0]["binary"], {"format": "macho", "machine": "arm64"})
+        arm_consumer = next(row for row in arm_ffmpeg["consumers"] if row["target"] == "macos-arm64")
+        self.assertEqual(arm_consumer["status"], "active-release-workflow")
+        self.assertEqual(arm_consumer["path"], ".github/workflows/macOS-Arm64.yml")
+        self.assertEqual(arm_consumer["reference_marker"], "ffmpegOSXarm.zip")
+        self.assertIn("--payload-id ffmpeg-macos-arm64", arm_consumer["operation_marker"])
 
-    def test_arm64_release_target_rejects_committed_x86_64_ffmpeg_before_packaging(self) -> None:
-        with self.assertRaisesRegex(
-            PayloadIntegrityError,
-            "release target macos-arm64 rejects payload ffmpeg-macos-x86_64",
+    @staticmethod
+    def _stale_arm64_consumer_blockers(manifest: dict) -> list[str]:
+        # A blocker naming the x86_64 archive as the macOS Arm64 release consumer is only
+        # true while the arm64 consumer row points at an x86_64 payload.
+        arm_consumer_machines = {
+            member["binary"]["machine"]
+            for record in manifest["payloads"]
+            for consumer in record["consumers"]
+            if consumer["target"] == "macos-arm64" and record["id"].startswith("ffmpeg-")
+            for member in record["selected_members"]
+        }
+        if arm_consumer_machines != {"arm64"}:
+            return []
+        return [
+            blocker
+            for blocker in manifest["redistribution_readiness"]["blockers"]
+            if re.search(r"(?i)arm64.*(?:x86_64|ffmpegOSX\.zip)|(?:x86_64|ffmpegOSX\.zip).*arm64", blocker)
+        ]
+
+    def test_redistribution_blockers_do_not_name_x86_64_ffmpeg_as_arm64_release_consumer(self) -> None:
+        # r6 G1: r5 moved the Arm64 release to ffmpeg-macos-arm64, so the old blocker
+        # "The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload." is false.
+        self.assertEqual(self._stale_arm64_consumer_blockers(self.manifest), [])
+        reintroduced = copy.deepcopy(self.manifest)
+        reintroduced["redistribution_readiness"]["blockers"].append(
+            "The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload."
+        )
+        self.assertEqual(
+            self._stale_arm64_consumer_blockers(reintroduced),
+            ["The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload."],
+        )
+
+    def test_real_manifest_swapback_of_arm64_consumer_to_x86_64_is_rejected_for_architecture(self) -> None:
+        # VENDORED-ARM64-SWAPBACK-NEGATIVE-1: workflow AND manifest both moved back to the
+        # x86_64 archive with status active-release-workflow. The payload-id sets then agree,
+        # so the only thing left to reject it is the architecture policy (the workflow side
+        # of the swap is modelled by _workflow_payload_ids returning the swapped set).
+        swapped = copy.deepcopy(self.manifest)
+        arm = next(record for record in swapped["payloads"] if record["id"] == "ffmpeg-macos-arm64")
+        intel = next(record for record in swapped["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
+        moved = next(row for row in arm["consumers"] if row["target"] == "macos-arm64")
+        arm["consumers"] = [row for row in arm["consumers"] if row is not moved]
+        moved["status"] = "active-release-workflow"
+        intel["consumers"].append(moved)
+        with mock.patch(
+            "tools.repo_hygiene.vendored_native_payloads._workflow_payload_ids",
+            return_value={"ffmpeg-macos-x86_64", "raw2mlv-macos-arm64"},
         ):
-            validate(ROOT, required_target="macos-arm64")
+            with self.assertRaisesRegex(PayloadIntegrityError, "required architecture arm64.*'x86_64'"):
+                _validate_release_target_compatibility(self.root, swapped, "macos-arm64")
+
+    def test_arm64_release_target_admits_arm64_ffmpeg_and_rejects_x86_64_ffmpeg(self) -> None:
+        arm = validate(ROOT, required_target="macos-arm64")
+        admitted_arm = arm["target_compatibility"]
+        self.assertEqual(admitted_arm["status"], "pass")
+        self.assertEqual(admitted_arm["target"], "macos-arm64")
+        self.assertEqual(
+            {row["payload_id"] for row in admitted_arm["members"]},
+            {"ffmpeg-macos-arm64", "raw2mlv-macos-arm64"},
+        )
+        self.assertEqual({row["machine"] for row in admitted_arm["members"]}, {"arm64"})
 
         intel = validate(ROOT, required_target="macos-x86_64")
         admitted = intel["target_compatibility"]
@@ -271,8 +333,23 @@ class VendoredNativePayloadTests(unittest.TestCase):
             {"ffmpeg-macos-x86_64", "raw2mlv-macos-x86_64"},
         )
 
+        # Re-declaring the x86_64 archive as an arm64 release consumer must still be rejected.
+        regressed = copy.deepcopy(self.manifest)
+        regressed_intel = next(
+            record for record in regressed["payloads"] if record["id"] == "ffmpeg-macos-x86_64"
+        )
+        regressed_intel["consumers"].append(
+            {
+                "target": "macos-arm64",
+                "path": ".github/workflows/macOS-Arm64.yml",
+                "status": "active-release-workflow",
+            }
+        )
+        with self.assertRaisesRegex(PayloadIntegrityError, "extraction/consumer payload mismatch"):
+            _validate_release_target_compatibility(ROOT, regressed, "macos-arm64")
+
         relabeled = copy.deepcopy(
-            next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
+            next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-arm64")
         )
         arm_consumer = next(
             consumer for consumer in relabeled["consumers"] if consumer["target"] == "macos-arm64"
@@ -288,7 +365,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
 
         omitted = copy.deepcopy(self.manifest)
         omitted_ffmpeg = next(
-            record for record in omitted["payloads"] if record["id"] == "ffmpeg-macos-x86_64"
+            record for record in omitted["payloads"] if record["id"] == "ffmpeg-macos-arm64"
         )
         omitted_ffmpeg["consumers"] = [
             consumer for consumer in omitted_ffmpeg["consumers"] if consumer["target"] != "macos-arm64"
@@ -1722,6 +1799,15 @@ class VendoredNativePayloadTests(unittest.TestCase):
             "Verify vendored native payload integrity",
             "Build",
         )
+        qt_major_guard = (
+            'case "$QT_VERSION" in 6.*) ;; '
+            '*) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac'
+        )
+        qt_major_probe_lines = (
+            '"${{ env.QTDIR }}/qmake" -query QT_VERSION',
+            'QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"',
+            qt_major_guard,
+        )
         expected_verify_lines = (
             'test -x "${{ env.QTDIR }}/qmake"',
             '"${{ env.QTDIR }}/qmake" -v',
@@ -1729,6 +1815,14 @@ class VendoredNativePayloadTests(unittest.TestCase):
             'test -x "$LLVM_CXX"',
             '"$LLVM_CXX" --version',
         )
+        # Intel stays on Qt 5 and has no major guard; the Arm64 release (Qt 6) carries the
+        # same guard as the compile-only canary (r6, hub ACK 6393835298 item 2).
+        expected_verify_lines_by_workflow = {
+            '.github/workflows/macOS-Intel.yml': expected_verify_lines,
+            '.github/workflows/macOS-Arm64.yml': expected_verify_lines[:2]
+            + qt_major_probe_lines
+            + expected_verify_lines[2:],
+        }
         permissive_shell = re.compile(
             r"(?im)(?:\|\|\s*(?:true|:)(?:\s|$)|(?:;|&&)\s*true(?:\s|$)|"
             r"^\s*set\s+\+(?:e|o\s+errexit)\b)"
@@ -1763,7 +1857,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
                     break
             return tuple(commands)
 
-        def assert_fail_closed_policy(text: str) -> None:
+        def assert_fail_closed_policy(text: str, brew_line: str, verify_lines: tuple[str, ...]) -> None:
             self.assertNotRegex(text, r"(?im)^\s*continue-on-error\s*:")
             steps = named_step_blocks(text)
             names = [name for name, _ in steps]
@@ -1775,18 +1869,21 @@ class VendoredNativePayloadTests(unittest.TestCase):
             blocks = dict(steps)
             install_block = blocks[expected_order[0]]
             verify_block = blocks[expected_order[1]]
-            self.assertIn("brew: llvm qt5 openssl", install_block)
+            self.assertIn(brew_line, install_block)
             self.assertNotRegex(install_block, permissive_shell)
             self.assertNotRegex(verify_block, permissive_shell)
-            self.assertEqual(normalized_run_lines(verify_block), expected_verify_lines)
+            self.assertEqual(normalized_run_lines(verify_block), verify_lines)
 
-        for relative in (
-            ".github/workflows/macOS-Intel.yml",
-            ".github/workflows/macOS-Arm64.yml",
-        ):
+        # Intel stays on Qt 5 (qt@5); the Arm64 release workflow moved to Qt 6 (brew `qt`).
+        expected_brew_lines = {
+            ".github/workflows/macOS-Intel.yml": "brew: llvm qt5 openssl",
+            ".github/workflows/macOS-Arm64.yml": "brew: llvm qt openssl",
+        }
+        for relative, brew_line in expected_brew_lines.items():
             with self.subTest(workflow=relative):
                 text = (ROOT / relative).read_text(encoding="utf-8")
-                assert_fail_closed_policy(text)
+                verify_lines = expected_verify_lines_by_workflow[relative]
+                assert_fail_closed_policy(text, brew_line, verify_lines)
 
                 falsifiers = (
                     (
@@ -1818,10 +1915,82 @@ class VendoredNativePayloadTests(unittest.TestCase):
                         ),
                     ),
                 )
+                if relative.endswith('macOS-Arm64.yml'):
+                    falsifiers += (
+                        ('qt major guard removed', text.replace(qt_major_guard, 'true', 1)),
+                        ('qt major guard accepts any version', text.replace('in 6.*)', 'in *)', 1)),
+                        ('qt major guard accepts qt 5', text.replace('in 6.*)', 'in 5.*|6.*)', 1)),
+                        ('qt major guard cannot fail', text.replace('exit 1 ;;', 'exit 0 ;;', 1)),
+                    )
                 for label, falsified in falsifiers:
                     with self.subTest(workflow=relative, falsifier=label):
+                        self.assertNotEqual(falsified, text)
                         with self.assertRaises(AssertionError):
-                            assert_fail_closed_policy(falsified)
+                            assert_fail_closed_policy(falsified, brew_line, verify_lines)
+
+        # The compile-only canary has no payload steps, so it gets its own policy: fail
+        # closed (no continue-on-error, no masked failures anywhere in its run bodies) and
+        # the toolchain step must FAIL unless `qmake -query QT_VERSION` starts with `6.`
+        # (brew `qt` floats, so the major version is asserted, not assumed).
+        canary_relative = ".github/workflows/macOS-Arm64-compile.yml"
+        canary_order = (
+            "Install llvm & Qt & OpenSSL",
+            "Verify macOS build toolchain",
+            "Create build directory",
+            "Compile",
+        )
+        canary_verify_lines = (
+            'test -x "${{ env.QTDIR }}/qmake"',
+            '"${{ env.QTDIR }}/qmake" -v',
+            '"${{ env.QTDIR }}/qmake" -query QT_VERSION',
+            'QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"',
+            qt_major_guard,
+            'LLVM_CXX="$(brew --prefix llvm)/bin/clang++"',
+            'test -x "$LLVM_CXX"',
+            '"$LLVM_CXX" --version',
+        )
+
+        def assert_canary_policy(text: str) -> None:
+            self.assertNotRegex(text, r"(?im)^\s*continue-on-error\s*:")
+            self.assertNotRegex(text, permissive_shell)
+            steps = named_step_blocks(text)
+            self.assertEqual([name for name, _ in steps], list(canary_order))
+            blocks = dict(steps)
+            self.assertIn("brew: llvm qt openssl", blocks[canary_order[0]])
+            self.assertEqual(normalized_run_lines(blocks[canary_order[1]]), canary_verify_lines)
+
+        with self.subTest(workflow=canary_relative):
+            canary_text = (ROOT / canary_relative).read_text(encoding="utf-8")
+            assert_canary_policy(canary_text)
+
+            canary_falsifiers = (
+                (
+                    "compile continue-on-error",
+                    canary_text.replace(
+                        "    - name: Compile\n",
+                        "    - name: Compile\n      continue-on-error: true\n",
+                        1,
+                    ),
+                ),
+                ("make masks failure", canary_text.replace("make -j8", "make -j8 || true", 1)),
+                (
+                    "errexit disabled",
+                    canary_text.replace(
+                        '        test -x "${{ env.QTDIR }}/qmake"',
+                        '        set +e\n        test -x "${{ env.QTDIR }}/qmake"',
+                        1,
+                    ),
+                ),
+                ("qt major guard removed", canary_text.replace(qt_major_guard, "true", 1)),
+                ("qt major guard accepts any version", canary_text.replace("in 6.*)", "in *)", 1)),
+                ("qt major guard accepts qt 5", canary_text.replace("in 6.*)", "in 5.*|6.*)", 1)),
+                ("qt major guard cannot fail", canary_text.replace("exit 1 ;;", "exit 0 ;;", 1)),
+            )
+            for label, falsified in canary_falsifiers:
+                with self.subTest(workflow=canary_relative, falsifier=label):
+                    self.assertNotEqual(falsified, canary_text)
+                    with self.assertRaises(AssertionError):
+                        assert_canary_policy(falsified)
 
 
 if __name__ == "__main__":

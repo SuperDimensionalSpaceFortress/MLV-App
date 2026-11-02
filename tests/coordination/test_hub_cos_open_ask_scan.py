@@ -194,6 +194,47 @@ class TestProfileSeam(ScanCase):
                 r = subprocess.run([*PWSH, '-Command', script], text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT, cwd=str(self.tmp))
                 self.assertEqual(r.stdout.strip(), 'HubProfileUnreadableException', r.stdout + r.stderr)
 
+    def module_outcome(self, name, text):
+        """Run Get-HubProfile on a profile file holding `text`; return 'TypeName|Message' of the throw, or 'LOADED|<project>'."""
+        profile = self.tmp / name
+        profile.write_text(text, encoding='utf-8')
+        script = (
+            f"Import-Module '{HUB / 'HubProfile.psm1'}' -Force; "
+            f"try {{ $p = Get-HubProfile -Path '{profile}'; 'LOADED|' + $p.project }} "
+            "catch { $_.Exception.GetType().Name + '|' + $_.Exception.Message }"
+        )
+        r = subprocess.run([*PWSH, '-Command', script], text=True, capture_output=True, timeout=SUBPROCESS_TIMEOUT, cwd=str(self.tmp))
+        return r.stdout.strip()
+
+    def test_g9_array_root_is_unreadable_never_unwrapped(self):
+        # HUB-PROFILE-ROOT-SHAPE-NOENUMERATE-1: ConvertFrom-Json without -NoEnumerate unwrapped a one-element array into its
+        # element, so [ {valid profile} ] loaded and [{}] raised missing-key instead of unreadable.
+        valid = json.dumps(EXPECTED_PROFILE)
+        for label, text in (('singleton-valid', f'[{valid}]'), ('singleton-empty-object', '[{}]'), ('empty-array', '[]'),
+                            ('two-valid', f'[{valid},{valid}]'), ('nested-singleton', f'[[{valid}]]')):
+            with self.subTest(root=label):
+                out = self.module_outcome(f'array-{label}.json', text)
+                self.assertTrue(out.startswith('HubProfileUnreadableException|hub-profile-unreadable: '), out)
+                self.assertNotIn('hub-profile-missing-key', out)
+
+    def test_g9_scanner_reports_a_singleton_array_profile_as_unreadable(self):
+        profile = self.tmp / 'singleton-array.json'
+        profile.write_text(f'[{json.dumps(EXPECTED_PROFILE)}]', encoding='utf-8')
+        code, out, err = self.scan('-FixtureDir', str(self.fixture_dir()), '-ProfilePath', str(profile), '-OutFile', '')
+        self.assertEqual(code, 20, out + err)
+        self.assertIn(f'UNKNOWN pr=- reason=hub-profile-unreadable path={profile}', out.splitlines())
+
+    def test_g10_single_object_profile_still_loads(self):
+        self.assertEqual(self.module_outcome('object-root.json', json.dumps(EXPECTED_PROFILE)), 'LOADED|mlv-app')
+
+    def test_g10_missing_key_still_raises_missing_key(self):
+        data = dict(EXPECTED_PROFILE)
+        data.pop('ownerLogin')
+        self.assertEqual(self.module_outcome('missing-key.json', json.dumps(data)),
+                         'HubProfileMissingKeyException|hub-profile-missing-key: ownerLogin')
+        self.assertEqual(self.module_outcome('empty-object.json', '{}'),
+                         'HubProfileMissingKeyException|hub-profile-missing-key: schema')
+
 
 @unittest.skipUnless(os.name == 'nt', 'the fake gh is a .cmd')
 class TestStateListGhExeSeam(ScanCase):

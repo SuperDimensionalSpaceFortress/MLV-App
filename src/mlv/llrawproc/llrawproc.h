@@ -359,6 +359,10 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
  * "recon:uncaptured", rc 0, role "orphan", with its own site, never as the new
  * call's. dropped (r5) is the number of notes the channel's queue dropped
  * since the previous drain, carried by the first record of that drain.
+ * noted_utc_ms (GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1) is the note's own
+ * igpu_cuda_error_t.utc_ms, the wall clock when the DLL noted the code: an
+ * orphan can be drained a call, a view close or an app exit later. 0 when
+ * there is no note (a success, or a failure with no code noted).
  * A failed async preupload (llrpGpuPlaybackReconPreuploadFrame) is reported as
  * "recon:preupload" on the preupload's own thread, failure only; its "no free
  * slot" back-pressure return is not reported unless a CUDA code was noted.
@@ -367,7 +371,7 @@ void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
 typedef void (*llrpGpuStageTelemetrySink_t)(const char * stage, int rc, double ms,
                                             int cuda_code, const char * cuda_name,
                                             const char * site, const char * role,
-                                            unsigned long long dropped);
+                                            unsigned long long dropped, double noted_utc_ms);
 void llrpSetGpuStageTelemetrySink(llrpGpuStageTelemetrySink_t sink);
 llrpGpuStageTelemetrySink_t llrpGetGpuStageTelemetrySinkForTesting(void);
 /* GPU-DEVICE-LOSS-SELF-HEAL-1: one process-wide flag, set by
@@ -529,6 +533,26 @@ void llrpResetLastPreDualIsoFixTelemetry(void);
 void llrpResetLastRunTimingForCurrentThread(void);
 double llrpGetLastDualIsoMilliseconds(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
+/* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the steps inside the llrawproc wall that the
+ * seven stage timers above (dark frame .. chroma smooth) do not cover, timed
+ * with the same clock on the same thread-local last-run convention. Every
+ * field is disjoint from those seven and from the others here, so the playback
+ * llrawproc_other_ms is the wall minus all of them. The scaled (with_dims)
+ * entry sets every field; the full-resolution entry sets the LUT fields only.
+ * lut_rebuild_ms / lut_rebuilds count the raw2ev/ev2raw rebuilds in
+ * llrawproc_worker_ensure_luts on either entry (a cache hit costs nothing). */
+typedef struct
+{
+    double setup_ms;               /* entry to make_14bit: extents, worker acquire, raw_info */
+    double make_14bit_ms;          /* make_14bit, plus undo_14bit on the success path */
+    double lut_rebuild_ms;         /* raw2ev/ev2raw rebuilds in ensure_luts */
+    int lut_rebuilds;
+    double snapshot_lock_wait_ms;  /* pthread_mutex_lock of the shared-state snapshot */
+    double snapshot_locked_ms;     /* held: df_init, dark-frame copy sync, snapshot */
+    double failure_backup_ms;      /* dual-ISO failure backup copy (LJ92 restricted) */
+    double publish_ms;             /* runtime-state capture, publish lock or restore */
+} llrpResidualSubstageTiming_t;
+void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void);
 double llrpGetLastDualIsoPreviewRegressionMilliseconds(void);
