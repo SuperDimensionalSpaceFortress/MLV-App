@@ -68,12 +68,16 @@ inline QString appliedText( bool lookAssistEnabled, const QString &appliedFlavor
  *  landed on it -- analysis disabled (MLVAPP_NO_LOOK_ASSIST) or skipped, a clip whose analysis has not landed yet, or a
  *  flavor change, which clears the outcome and restores the baseline -- the baseline sliders are what is on screen, so
  *  the label says "Look: Baseline", never the selected flavor. `selectedFlavorName` is not read here: the selector's
- *  value is the receipt's and the telemetry's fallback (LookAssistFlavorOutcome::receiptValue), not what the screen shows. */
+ *  value is the receipt's and the telemetry's fallback (LookAssistFlavorOutcome::receiptValue), not what the screen shows.
+ *  r10 (sol + fable + key3 r9 on 2b748fa3): a receipt whose baseline setSliders put back (outcome.showsBaseline) reads
+ *  "Look: Baseline" until an analysis lands on it -- the landing itself forgets the mark, so a later landing (async after a
+ *  paste, or a safety fallback) is named, and the mark never depends on the de-dupe marker. */
 inline QString shownText( bool lookAssistEnabled, const lookassist::LookAssistFlavorOutcome &outcome,
                           const void *receipt, const QString &selectedFlavorName )
 {
     Q_UNUSED( selectedFlavorName );
     if( !lookAssistEnabled ) return text( false, QString() );
+    if( outcome.showsBaseline( receipt ) ) return QStringLiteral( "Look: Baseline" );
     const lookassist::LookAssistFlavorOutcome onScreen = outcome.shown();
     if( onScreen.fellBack( receipt ) ) return appliedText( true, QString(), true );
     // Empty unless an analysis landed on this receipt and applied a flavor.

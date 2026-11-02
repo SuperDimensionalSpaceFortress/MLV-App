@@ -827,7 +827,12 @@ private:
  * byte-identical to a Classic receipt); an applied grade names the flavor applied; a clip with no recorded outcome
  * (Look Assist off, or the analysis is pending) keeps the selector's value, which is the clip's setting.
  * shown(): the outcome ON SCREEN, which the look label reads -- while an analysis is pending, the one that last landed
- * (the previous look stays on screen until this one lands); otherwise this outcome. */
+ * (the previous look stays on screen until this one lands); otherwise this outcome.
+ * baselineRestored() / showsBaseline(): LABEL ONLY (LOOK-FULLSCREEN-PARITY-1 r10, sol + fable + key3 r9 on 2b748fa3).
+ *   The GUI put `receipt`'s ungraded baseline sliders back on screen, so until an analysis LANDS on it the label reads
+ *   "Look: Baseline". The mark is kept here, keyed by the same receipt identity as the outcome, so it changes in the
+ *   same step as the outcome: landed() and clear() forget it; begin() keeps it (the baseline is still what is on screen
+ *   while the re-grade runs). receiptValue() and fellBack() never read it: setReceipt saves those (r12). */
 class LookAssistFlavorOutcome
 {
 public:
@@ -838,14 +843,17 @@ public:
         m_receipt = nullptr; m_applied.clear(); m_fellBack = false;
         m_pending = true;
     }
-    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; m_pending = false; }
+    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; m_pending = false; m_baselineShownReceipt = nullptr; }
     void landed( const void *receipt, const QString &flavorName, bool safetyFallback )
     {
         m_receipt = receipt;
         m_fellBack = safetyFallback;
         m_applied = safetyFallback ? QString() : flavorName;
         m_pending = false;
+        m_baselineShownReceipt = nullptr;   // r10: the landing is what is on screen now, not the restored baseline
     }
+    void baselineRestored( const void *receipt ) { m_baselineShownReceipt = receipt; }
+    bool showsBaseline( const void *receipt ) const { return receipt != nullptr && receipt == m_baselineShownReceipt; }
     LookAssistFlavorOutcome shown() const
     {
         if( !m_pending ) return *this;
@@ -873,6 +881,7 @@ private:
     const void *m_shownReceipt = nullptr;   // what last landed, kept for shown() while pending
     QString m_shownApplied;
     bool m_shownFellBack = false;
+    const void *m_baselineShownReceipt = nullptr;   // r10: baseline put back on this receipt, nothing landed since (label only)
 };
 
 /* flavor defaults to Classic, so every caller that does not pass one is master's. The scene verdict is the

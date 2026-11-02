@@ -407,58 +407,173 @@ TEST(LookLabelWiring, TheLabelNeverTouchesTheGrade)
     ASSERT_FALSE(update.contains(QStringLiteral("previewProcessing")));
 }
 
-// r11 (adversary r10 A1 on 0b840efd): a paste onto the active row (or any setSliders of a receipt already marked applied)
-// puts the baseline back and no analysis re-grades it (the apply and the frame-ready step both dedup). The landed outcome
-// is cleared there, for the active row's receipt only, so the label reads "Look: Baseline", not the flavor that landed.
+// r11 (adversary r10 A1 on 0b840efd): a paste onto the active row (or any setSliders of the active receipt) puts the
+// baseline back, so the label reads "Look: Baseline", not the flavor that landed before -- until an analysis lands.
+// r10 (sol + fable + key3 r9 on 2b748fa3): the mark used to be a MainWindow member (m_lookLabelBaselineReceipt) set only
+// when the de-dupe marker named the receipt and cleared only at begin(), so it outlived the event that made it true. It
+// is now the outcome's own (LookAssistFlavorOutcome::baselineRestored), keyed by the outcome's receipt identity, and
+// landed() forgets it in the same step it records the outcome -- one place for all five landing sites.
 TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
 {
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(mw, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"));
     ASSERT_FALSE(body.isEmpty());
-    const int restore = body.indexOf(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );"));
-    ASSERT_TRUE(body.lastIndexOf(QStringLiteral("restoreLookAssistBaseline( receipt );"), restore) >= 0);
-    const int apply = body.indexOf(QStringLiteral("&& !m_lookAssistApplied.isApplied( receipt ) )"));
-    const int markAt = body.indexOf(QStringLiteral("if( baselineRestoredUngraded && receipt == activeReceiptAtLoad )"));
-    const int marked = body.indexOf(QStringLiteral("m_lookLabelBaselineReceipt = receipt;"), markAt);
-    const int relabel = body.indexOf(QStringLiteral("updateLookLabel();"), marked);
-    printf("[LL11] setSliders: restore=%d apply=%d markAt=%d marked=%d relabel=%d\n", restore, apply, markAt, marked, relabel);
-    // read BEFORE the apply block marks a fresh grade applied, so a grade applied here is never marked as the baseline
-    ASSERT_TRUE(restore >= 0);
-    ASSERT_TRUE(apply > restore);
-    ASSERT_TRUE(markAt > apply);
-    ASSERT_TRUE(marked > markAt);
-    ASSERT_TRUE(relabel > marked);
-    // r13 (adversary r12 A1 on 6d722d33): the fresh-capture branch (Reset Receipt: baseline invalid) is read the same way,
-    // also before the apply block.
+    const int restore = body.indexOf(QStringLiteral("restoreLookAssistBaseline( receipt );"));
+    // r13 (adversary r12 A1 on 6d722d33): the fresh-capture branch (Reset Receipt: baseline invalid) is marked the same way.
     const int capture = body.indexOf(QStringLiteral("captureLookAssistBaseline( receipt );"));
-    const int captureRead = body.indexOf(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );"), capture);
-    printf("[LL13] setSliders: capture=%d captureRead=%d\n", capture, captureRead);
+    const int markRead = body.indexOf(QStringLiteral("baselineRestoredUngraded = receipt == activeReceiptAtLoad;"));
+    const int marked = body.indexOf(QStringLiteral("if( baselineRestoredUngraded ) m_lookAssistFlavorOutcome.baselineRestored( receipt );"));
+    const int apply = body.indexOf(QStringLiteral("&& !m_lookAssistApplied.isApplied( receipt ) )"));
+    const int relabelAt = body.indexOf(QStringLiteral("if( baselineRestoredUngraded )\n"));
+    const int relabel = body.indexOf(QStringLiteral("updateLookLabel();"), relabelAt);
+    printf("[LL10] setSliders: restore=%d capture=%d markRead=%d marked=%d apply=%d relabelAt=%d relabel=%d\n",
+           restore, capture, markRead, marked, apply, relabelAt, relabel);
+    ASSERT_TRUE(restore >= 0);
     ASSERT_TRUE(capture > restore);
-    ASSERT_TRUE(captureRead > capture);
-    ASSERT_TRUE(apply > captureRead);
-    ASSERT_EQ(2, body.count(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied( receipt );")));
-    // r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- setSliders never alters the outcome, which setReceipt saves as the
-    // receipt's flavor ("classic" after a fallback must stay "classic").
+    ASSERT_TRUE(markRead > capture);    // after both branches: restored OR captured
+    ASSERT_TRUE(marked > markRead);
+    ASSERT_TRUE(apply > marked);        // marked BEFORE the apply block, so a grade applied there lands and is named
+    ASSERT_TRUE(relabelAt > apply);
+    ASSERT_TRUE(relabel > relabelAt);
+    ASSERT_EQ(1, body.count(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored(")));
+    // key3 r9 B1: the mark never reads the de-dupe marker (it may name another clip whose analysis skipped before begin()).
+    ASSERT_FALSE(body.contains(QStringLiteral("baselineRestoredUngraded = m_lookAssistApplied.isApplied(")));
+    // r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- setSliders never alters the reported outcome, which setReceipt
+    // saves as the receipt's flavor ("classic" after a fallback must stay "classic").
     ASSERT_FALSE(body.contains(QStringLiteral("m_lookAssistFlavorOutcome.clear();")));
-    // The label reads the marked receipt as one nothing landed on, and the next analysis's begin() forgets the mark.
+    ASSERT_EQ(1, mw.count(QStringLiteral("m_lookAssistFlavorOutcome.baselineRestored(")));
+    // Pin count update (was ASSERT_EQ(2, count("m_lookLabelBaselineReceipt = "))): the member and both of its writes (the
+    // setSliders mark and the begin() reset) are gone; the mark lives in the outcome, so no landing site can forget it.
+    ASSERT_EQ(0, mw.count(QStringLiteral("m_lookLabelBaselineReceipt")));
+    ASSERT_EQ(0, readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).count(QStringLiteral("m_lookLabelBaselineReceipt")));
+    // updateLookLabel passes the active receipt through; shownText reads the mark.
     const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
-    ASSERT_TRUE(update.contains(QStringLiteral("static_cast<const void *>( ACTIVE_RECEIPT ) != m_lookLabelBaselineReceipt")));
-    const int begin = mw.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.begin();"));
-    ASSERT_TRUE(begin >= 0);
-    ASSERT_TRUE(mw.indexOf(QStringLiteral("m_lookLabelBaselineReceipt = nullptr;"), begin) > begin);
-    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelBaselineReceipt = ")));
-    // The policy: a landed flavor is named for its receipt; read through no receipt it is the baseline; the receipt value
-    // (what setReceipt saves) is unchanged by the label's choice.
+    ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? ACTIVE_RECEIPT : nullptr;")));
+    const QString policy = readRepoFile(QStringLiteral("platform/qt/LookLabelPolicy.h"));
+    ASSERT_TRUE(functionBody(policy, QStringLiteral("inline QString shownText("))
+                    .contains(QStringLiteral("if( outcome.showsBaseline( receipt ) ) return QStringLiteral( \"Look: Baseline\" );")));
+    // The policy: the mark reads Baseline for its receipt only, and the receipt value (what setReceipt saves) is unchanged.
     lookassist::LookAssistFlavorOutcome outcome;
-    int receipt = 0;
+    int receipt = 0, other = 0;
     const QString cinematic = QStringLiteral("cinematic");
     outcome.landed(&receipt, cinematic, true);
+    outcome.baselineRestored(&receipt);
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, &receipt, cinematic).toStdString());
     ASSERT_EQ(std::string("classic"), outcome.receiptValue(&receipt, cinematic).toStdString());
-    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, nullptr, cinematic).toStdString());
-    ASSERT_EQ(std::string("classic"), outcome.receiptValue(&receipt, cinematic).toStdString());
+    ASSERT_TRUE(outcome.fellBack(&receipt));
     outcome.landed(&receipt, cinematic, false);
-    ASSERT_EQ(std::string("Look: Cinematic"), look_label::shownText(true, outcome, &receipt, cinematic).toStdString());
-    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, nullptr, cinematic).toStdString());
+    outcome.baselineRestored(&receipt);
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, &receipt, cinematic).toStdString());
+    ASSERT_EQ(std::string("cinematic"), outcome.receiptValue(&receipt, cinematic).toStdString());
+    ASSERT_FALSE(outcome.showsBaseline(&other));
+    ASSERT_FALSE(outcome.showsBaseline(nullptr));
+    ASSERT_EQ(std::string("Look: Off"), look_label::shownText(false, outcome, &receipt, cinematic).toStdString());
+}
+
+// r10 (a) -- catalogue L-05, sol + fable r9 on 2b748fa3. MLVAPP_LOOK_ASSIST_ASYNC=1: the analysis on R is dispatched
+// (begin()), a paste or Reset Receipt onto R restores its baseline (setSliders marks R), then the queued result lands
+// applied. RED on 2b748fa3: the mark was cleared only at begin(), which ran BEFORE the paste, so the landing kept
+// "Look: Baseline" over the applied Cinematic grade.
+TEST(LookLabelPolicy, R10AMarkThenAsyncLandingNamesTheLandedFlavor)
+{
+    int r = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    const auto shown = [&]() { return look_label::shownText(true, outcome, &r, cinematic).toStdString(); };
+    outcome.begin();                 // async dispatch on R (applyLookAssistToReceipt -> begin(); worker detached)
+    ASSERT_EQ(std::string("Look: Baseline"), shown());
+    outcome.baselineRestored(&r);    // paste / Reset Receipt onto R while the worker is in flight
+    ASSERT_EQ(std::string("Look: Baseline"), shown());
+    outcome.landed(&r, cinematic, false);   // the queued result applies Cinematic and lands (MainWindow.cpp async applied)
+    ASSERT_EQ(std::string("Look: Cinematic"), shown());
+    ASSERT_FALSE(outcome.showsBaseline(&r));
+    // The sync route the same: the mark, then a landing in the same call.
+    lookassist::LookAssistFlavorOutcome sync;
+    sync.landed(&r, cinematic, false);
+    sync.baselineRestored(&r);
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, sync, &r, cinematic).toStdString());
+    sync.begin();                    // a re-grade starts: the baseline is still on screen until it lands (key3 H1)
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, sync, &r, cinematic).toStdString());
+    sync.landed(&r, cinematic, false);
+    ASSERT_EQ(std::string("Look: Cinematic"), look_label::shownText(true, sync, &r, cinematic).toStdString());
+}
+
+// r10 (b) -- catalogue L-05 sibling: the async safety-fallback landings (fail-closed and post-measure) after the same
+// paste keep their suffix. RED on 2b748fa3: the surviving mark read the fallback as "Look: Baseline".
+TEST(LookLabelPolicy, R10BFallbackLandingAfterAMarkKeepsItsSuffix)
+{
+    int r = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.begin();
+    outcome.baselineRestored(&r);
+    outcome.landed(&r, cinematic, true);
+    ASSERT_EQ(std::string("Look: Baseline (fallback)"), look_label::shownText(true, outcome, &r, cinematic).toStdString());
+    ASSERT_EQ(std::string("classic"), outcome.receiptValue(&r, cinematic).toStdString());
+    // clear() (Look Assist off / flavor change) forgets the mark too.
+    outcome.baselineRestored(&r);
+    outcome.clear();
+    ASSERT_FALSE(outcome.showsBaseline(&r));
+}
+
+// r10 (c) -- catalogue L-06, key3 r9 B1 on 2b748fa3 (shipped default SYNC route). A lands Cinematic; Y's apply skips
+// before begin() (empty_stats: black / lens-cap clip) but Y is marked applied, so the de-dupe marker moves to Y while
+// the outcome stays on A. setSliders(A) restores A's baseline. RED on 2b748fa3: the mark was set only when
+// isApplied(A) -- false here -- so the label read "Look: Cinematic" over A's ungraded baseline.
+TEST(LookLabelPolicy, R10CSkippedAnalysisOnAnotherClipNeverLeavesAFlavorOverARestoredBaseline)
+{
+    int a = 0, y = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    lookassist::LookAssistAppliedMarker applied;
+    const auto shownFor = [&](const void *receipt) { return look_label::shownText(true, outcome, receipt, cinematic).toStdString(); };
+
+    outcome.landed(&a, cinematic, false);   // open A: its frame-ready analysis lands
+    applied.markApplied(&a);
+    ASSERT_EQ(std::string("Look: Cinematic"), shownFor(&a));
+    outcome.baselineRestored(&y);           // select Y: setSliders(Y) restores Y's baseline
+    applied.markApplied(&y);                // Y's apply skipped before begin() (no outcome change), Y still marked applied
+    ASSERT_EQ(std::string("Look: Baseline"), shownFor(&y));
+    // Back to A: the de-dupe marker no longer names A -- the old rule (mark iff isApplied) would not mark, and the label
+    // would read the stale landing:
+    ASSERT_FALSE(applied.isApplied(&a));
+    ASSERT_EQ(std::string("Look: Cinematic"), shownFor(&a));   // what 2b748fa3 showed over the restored baseline
+    outcome.baselineRestored(&a);           // the r10 rule: setSliders(A) restores A's baseline -> marked, whatever the marker says
+    ASSERT_EQ(std::string("Look: Baseline"), shownFor(&a));
+    ASSERT_TRUE(shownFor(&a).find("Cinematic") == std::string::npos);
+    // A's deferred re-grade (not deduped: the marker names Y) lands: named again.
+    outcome.begin();
+    ASSERT_EQ(std::string("Look: Baseline"), shownFor(&a));
+    outcome.landed(&a, cinematic, false);
+    ASSERT_EQ(std::string("Look: Cinematic"), shownFor(&a));
+}
+
+// r10: every landing goes through LookAssistFlavorOutcome::landed, which forgets the mark in the same step -- pinned in
+// the header so a landing cannot record an outcome and leave the mark (the r9 class).
+TEST(LookLabelWiring, R10EveryLandingForgetsTheBaselineMarkInTheSameStep)
+{
+    const QString fullHeader = readRepoFile(QStringLiteral("src/batch/LookAssistAnalysis.h"));
+    // Only the outcome class (LookAssistAppliedMarker above it has its own clear()).
+    const int classAt = fullHeader.indexOf(QStringLiteral("class LookAssistFlavorOutcome\n"));
+    ASSERT_TRUE(classAt >= 0);
+    const QString header = fullHeader.mid(classAt, fullHeader.indexOf(QStringLiteral("\n};"), classAt) - classAt);
+    const QString landed = functionBody(header, QStringLiteral("    void landed( const void *receipt, const QString &flavorName, bool safetyFallback )"));
+    // functionBody stops at a column-0 brace; the method's own closing brace is indented, so bound it explicitly.
+    const QString landedBody = landed.left(landed.indexOf(QStringLiteral("\n    }")));
+    ASSERT_TRUE(landedBody.contains(QStringLiteral("m_receipt = receipt;")));
+    ASSERT_TRUE(landedBody.contains(QStringLiteral("m_baselineShownReceipt = nullptr;")));
+    const int clearAt = header.indexOf(QStringLiteral("    void clear() {"));
+    ASSERT_TRUE(clearAt >= 0);
+    ASSERT_TRUE(header.mid(clearAt, header.indexOf(QLatin1Char('\n'), clearAt) - clearAt)
+                    .contains(QStringLiteral("m_baselineShownReceipt = nullptr;")));
+    const int beginAt = header.indexOf(QStringLiteral("    void begin()"));
+    ASSERT_TRUE(beginAt >= 0);
+    const QString beginBody = header.mid(beginAt, header.indexOf(QStringLiteral("\n    }"), beginAt) - beginAt);
+    ASSERT_FALSE(beginBody.contains(QStringLiteral("m_baselineShownReceipt")));   // begin() keeps it: baseline still on screen
+    // Five landing sites in the window, each through landed() (L04 pin counts them); none writes the mark itself.
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_EQ(5, mw.count(QStringLiteral("m_lookAssistFlavorOutcome.landed(")));
+    ASSERT_EQ(0, mw.count(QStringLiteral("m_baselineShownReceipt")));
 }
 
 // POLICY-CALLSITE-BOOL-MUTATION-SMOKE-1 (master-merge round, 2026-11-02): the bool arguments the window passes to the
