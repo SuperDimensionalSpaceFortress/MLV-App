@@ -192,6 +192,10 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
 # CUDA-HEADROOM-1, Look Assist forced Cinematic, visual strips on): the paced picture evidence for the NO_PUBLISH LUT-keep change.
 NATIVE_PACED_LEGS = tuple(f"legs/m16-1457-native-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_PACED_LEGS)
+# HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1: the per-present trace twins of the paced M16-1457 native s2/s4 legs, keyed to the leg each one twins.
+# Each differs from its twin only in its legId (native- -> native-trace-) and generatorArgs.presentTrace true (still paced, LIGHT, Look Assist Cinematic).
+NATIVE_TRACE_LEGS = {rel.replace("/m16-1457-native-", "/m16-1457-native-trace-"): rel for rel in NATIVE_PACED_LEGS}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -6887,6 +6891,24 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_native_trace_legs_are_their_paced_twins_with_the_trace_on(self) -> None:
+        """HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1: a native trace leg differs from its paced native twin only in its legId and
+        generatorArgs.presentTrace true, so the trace legs measure the same paced shape (no unpaced, no swapInterval, LIGHT)."""
+        self.assertEqual(sorted(NATIVE_TRACE_LEGS.values()), sorted(NATIVE_PACED_LEGS))
+        for rel, twin_rel in NATIVE_TRACE_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("presentTrace", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"].replace("m16-1457-native-", "m16-1457-native-trace-"), rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            for key in ("unpaced", "swapInterval"):
+                self.assertNotIn(key, arm["generatorArgs"], rel)
+            self.assertEqual(arm["generatorArgs"]["telemetryArm"], "LIGHT", rel)
+            self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
+            self.assertEqual(list(arm["generatorArgs"]), list(twin["generatorArgs"]), rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
         """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
         self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["firstPresentCapture"]["type"], "boolean")
@@ -7024,9 +7046,11 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
-            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in NATIVE_PACED_LEGS:   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
                 # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
