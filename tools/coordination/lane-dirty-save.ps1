@@ -14,6 +14,7 @@
 # a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
 # append to it (sol r20 B1 on #698), and removing a caller's disable is what exposed it. GIT_OPTIONAL_LOCKS=0 keeps git from refreshing the index.
+# Every git call also gets --no-replace-objects: a refs/replace entry for HEAD would make the diffs read another commit's tree while the receipt names HEAD (adversary r9 A2). Path and name comparisons are ordinal, never by culture (U+00AD and case are ignored by culture compares).
 param(
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][string]$RunDir,
@@ -26,7 +27,7 @@ $script:noCallbacks = @('-c', 'core.fsmonitor=false')  # core.fsmonitor is a com
 function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false) {
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-        foreach ($a in (@('-C', $WorkDir) + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
+        foreach ($a in (@('-C', $WorkDir, '--no-replace-objects') + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
         foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR') { [void]$psi.Environment.Remove($k) }  # GIT_CONFIG makes only `git config` read another file, so the filter discovery would miss what the diff later runs (r8 A1); GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4)
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
@@ -41,7 +42,7 @@ function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false) {
 }
 function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exactly one LF (never CRLF, also on Windows): strip that LF and nothing else (r5 ADV-A4: a worktree named 'repo ' is not the sibling 'repo'; r6 A1: a name ending in CR keeps its CR)
     $s = [System.Text.UTF8Encoding]::new($false, $true).GetString($Bytes)  # strict: a lossy decode turns byte FF into U+FFFD and can name a different, valid sibling (adversary r8 A3)
-    if ($s.EndsWith("`n")) { $s = $s.Substring(0, $s.Length - 1) }
+    if ($s.EndsWith("`n", [System.StringComparison]::Ordinal)) { $s = $s.Substring(0, $s.Length - 1) }
     return $s
 }
 $script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
@@ -154,7 +155,8 @@ if ($top.Code -eq 0) {
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
     $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true  # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1)
     try { $keys = @([System.Text.UTF8Encoding]::new($false, $true).GetString($f.Bytes) -split "`0" | Where-Object { $_ }) } catch { $keys = @('not-utf8') }  # a name that is not UTF-8 cannot be handed to -c unchanged, and a lossy copy would blank a different driver (r8 A2): refused below
-    $names = @($keys | Where-Object { $_ -match '\Afilter\.[^=]+\.[^.=]+\z' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf('.')) } | Select-Object -Unique)
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)  # Select-Object -Unique compares by culture and ignoring case, so filter.a and filter.a<U+00AD> (or Rewrite and rewrite), two drivers to git, collapsed to one and the other kept running (adversary r9 A1)
+    $names = @($keys | Where-Object { $_ -match '\Afilter\.[^=]+\.[^.=]+\z' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf([char]'.')) } | Where-Object { $seen.Add($_) })
     if (($f.Code -ne 0 -and $f.Code -ne 1) -or @($keys | Where-Object { $_ -notmatch '\Afilter\.[^=]+\.[^.=]+\z' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $($f.Err.Trim())"; exit 40 }
     foreach ($k in $names) { $script:noCallbacks += @('-c', "$k.clean=", '-c', "$k.smudge=", '-c', "$k.process=", '-c', "$k.required=false") }
 }
@@ -162,12 +164,12 @@ try {
     if ($script:onWin) {
         $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path
         $shareOf = { param($p) if ($p.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { [System.IO.Path]::GetPathRoot($p).ToLowerInvariant() } else { '' } }
-        if ((& $shareOf $RunDir) -ne (& $shareOf $realWork)) { throw 'run-dir-namespace-unprovable' }  # a share can expose a local folder (\\localhost\C$), and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
+        if (-not [string]::Equals((& $shareOf $RunDir), (& $shareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # a share can expose a local folder (\\localhost\C$), and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
     }
     else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir; if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }
     $rel = [System.IO.Path]::GetRelativePath($realWork, $RunDir)
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
-if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
+if ($top.Code -eq 0 -and -not ([string]::Equals($rel, '..', [System.StringComparison]::Ordinal) -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
 $headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()
 if ($headR.Code -eq 0 -and $headFull -notmatch '\A[0-9a-f]{40,64}\z') { $headR = @{ Code = -1; Err = "unexpected HEAD '$headFull'" } }

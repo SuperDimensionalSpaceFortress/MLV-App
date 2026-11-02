@@ -680,6 +680,52 @@ def test_a_configured_clean_filter_cannot_overwrite_the_dirt_being_saved(repo, t
     assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
 
 
+@pytest.mark.parametrize("benign,hostile", [("a", "a­"), ("rewrite", "Rewrite")])  # git treats these as two drivers; a culture-sensitive unique collapsed the first pair (the case pair is a guard: it already passed)
+def test_two_filter_drivers_whose_names_differ_only_by_an_ignorable_char_or_case_are_both_blanked(repo, tmp_path, benign, hostile):  # r9 adversary A1: Select-Object -Unique kept one name, the other driver still rewrote a.txt
+    (repo / ".gitattributes").write_text(f"a.txt filter={hostile}\n", encoding="utf-8")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "attrs")
+    dirty(repo)
+    want, a_before, marker = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes(), tmp_path / "filter-ran"
+    git(repo, "config", f"filter.{benign}.clean", "cat")  # first, so a unique-by-culture keeps this name
+    git(repo, "config", f"filter.{hostile}.clean", f"printf X >> '{marker.as_posix()}'; printf REPLACED > '{(repo / 'a.txt').as_posix()}'; cat")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before
+    assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
+
+
+def test_a_replace_ref_for_head_cannot_change_the_tree_the_patch_is_taken_from(repo, tmp_path):  # r9 adversary A2: with git replace F R, both diffs read R's tree while the receipt names F
+    first = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "checkout", "-q", "-b", "alt")
+    (repo / "a.txt").write_bytes(b"two\n")
+    git(repo, "commit", "-q", "-am", "r")
+    replacement = git(repo, "rev-parse", "HEAD").decode().strip()
+    git(repo, "checkout", "-q", first)
+    git(repo, "replace", first, replacement)
+    (repo / "a.txt").write_bytes(b"one\r\ntwo\nthree\nfour\n")
+    want = subprocess.run(["git", "-C", str(repo), "--no-replace-objects", "diff", first, "--binary"], capture_output=True, check=True).stdout
+    assert want
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    names = saved(repo)
+    assert not any(".staged." in n for n in names), names  # the index is F's: nothing is staged, but a replaced F made it look different
+    assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch")).read_bytes() == want
+
+
+@pytest.mark.parametrize("name", ["­..", "..­"])  # culture compares ignore U+00AD, so these read as '..' and a RunDir inside the worktree looked outside it
+def test_a_run_dir_inside_the_worktree_under_a_dotdot_lookalike_name_is_bad_arguments(repo, name):  # r9 adversary A1 class: ordinal path comparisons
+    inner = repo / name / "run"
+    try:
+        inner.mkdir(parents=True)
+    except OSError:
+        pytest.skip("this file system cannot hold a directory with that name")  # Windows refuses a leading U+00AD before '..'
+    dirty(repo)
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(inner), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30 and "run-dir-inside-worktree" in r.stdout, r.stdout + r.stderr
+    assert list(inner.iterdir()) == []
+
+
 def test_a_filter_whose_name_is_not_utf8_is_refused_not_blanked_under_a_lossy_copy_of_its_name(repo, tmp_path):  # second r8 pass A2: byte FF became U+FFFD, so the driver git really runs stayed on
     (repo / ".gitattributes").write_bytes(b"a.txt filter=\xff\n")
     git(repo, "add", ".gitattributes")
