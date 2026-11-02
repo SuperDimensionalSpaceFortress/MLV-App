@@ -205,14 +205,14 @@ def test_a_pid_reused_two_seconds_after_created_utc_is_dead(repo, tmp_path):  # 
         sleeper.kill()
 
 
-def test_relative_paths_resolve_where_powershell_is_not_where_dotnet_is(repo, tmp_path):  # adversary A6
+def test_relative_paths_are_refused_not_resolved_against_either_current_directory(repo, tmp_path):  # adversary A6; r13 CHANGED MEANING (sol r12 F1): this asserted that a relative path resolved where PowerShell is and not where .NET is; no path is resolved against a current directory any more, so it is refused (exit 30 reason=not-fully-qualified) and nothing is saved
     other = tmp_path / "elsewhere"
     other.mkdir()
     cmd = f"Set-Location '{tmp_path}'; [Environment]::CurrentDirectory = '{other}'; & '{SCRIPT}' -WorkDir wt -RunDir run -LanePid {dead_pid()}; exit $LASTEXITCODE"
     dirty(repo)
     r = subprocess.run([PWSH, "-NoProfile", "-Command", cmd], capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert saved(repo) != []
+    assert r.returncode == 30 and "reason=not-fully-qualified" in r.stdout, r.stdout + r.stderr  # r12 saver: 0
+    assert saved(repo) == []
 
 
 def test_a_missing_git_is_exit_40_not_a_powershell_throw(repo, tmp_path):  # adversary A7; dot B2: an empty PATH dir, no Windows-only SystemRoot
@@ -391,7 +391,7 @@ def link_dir(link, target):
 
 
 @pytest.mark.parametrize("via_ancestor", [False, True])
-def test_a_run_dir_that_reaches_the_worktree_through_a_link_is_bad_arguments(repo, tmp_path, via_ancestor):  # r6 A2
+def test_a_run_dir_that_reaches_the_worktree_through_a_link_is_bad_arguments(repo, tmp_path, via_ancestor):  # r6 A2. r13 CHANGED MEANING (sol r12 F2): the link used to be resolved and the RunDir judged inside the worktree; no link is resolved now, any link in the chain is refused first (reason=link-in-path)
     (repo / "run").mkdir()
     (repo / "a.txt").write_bytes(b"changed\n")
     alias = tmp_path / "alias"
@@ -399,7 +399,7 @@ def test_a_run_dir_that_reaches_the_worktree_through_a_link_is_bad_arguments(rep
     run_dir = alias / "run" if via_ancestor else alias
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(run_dir), "-LanePid", str(dead_pid())], capture_output=True, text=True)
     assert r.returncode == 30, r.stdout + r.stderr
-    assert "run-dir-inside-worktree" in r.stdout and list((repo / "run").iterdir()) == []
+    assert "reason=link-in-path" in r.stdout and list((repo / "run").iterdir()) == []  # r12 saver: reason=run-dir-inside-worktree
 
 
 def short_name(path):
@@ -425,7 +425,7 @@ def test_a_run_dir_spelled_extended_or_8dot3_inside_the_worktree_is_bad_argument
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="a backslash is a path separator on Windows, so a directory name containing one cannot exist there; the source-pin test below covers Windows")
-def test_a_posix_run_dir_symlink_whose_name_holds_a_backslash_is_judged_by_the_link_not_a_decoy(repo, tmp_path):  # r7 dot B1 on #722 (comment 6565339764)
+def test_a_posix_run_dir_symlink_whose_name_holds_a_backslash_is_refused_as_a_link_not_judged_by_a_decoy(repo, tmp_path):  # r7 dot B1 on #722 (comment 6565339764). r13 CHANGED MEANING: the link was resolved and judged inside the worktree (run-dir-inside-worktree); any link is refused now (link-in-path). Never run on the Windows hub VM (skipped): first run is ubuntu CI
     (repo / "run").mkdir()
     (repo / "a.txt").write_bytes(b"changed\n")
     (tmp_path / "out" / "alias").mkdir(parents=True)  # the decoy the old resolver walked after splitting 'out\alias' on the backslash
@@ -433,7 +433,7 @@ def test_a_posix_run_dir_symlink_whose_name_holds_a_backslash_is_judged_by_the_l
     os.symlink(repo / "run", spelled, target_is_directory=True)
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", spelled, "-LanePid", str(dead_pid())], capture_output=True, text=True)
     assert r.returncode == 30, r.stdout + r.stderr  # old code: exit 0, evidence written through the link into the worktree
-    assert "run-dir-inside-worktree" in r.stdout
+    assert "reason=link-in-path" in r.stdout  # r12 saver: run-dir-inside-worktree
     assert list((repo / "run").iterdir()) == [] and list((tmp_path / "out" / "alias").iterdir()) == []
 
 
@@ -447,15 +447,18 @@ def test_a_posix_run_dir_with_a_literal_backslash_name_receives_the_artifacts_wh
     assert sorted(p.name for p in real.iterdir()) and not (tmp_path / "out").exists()
 
 
-def test_the_resolver_and_the_writer_use_only_the_platforms_own_separators():  # r7 dot B1 source pin, runs on every platform
+def test_the_resolver_and_the_writer_use_only_the_platforms_own_separators():  # r7 dot B1 source pin, runs on every platform. r13 CHANGED MEANING (sol r12 F2): the resolver (Resolve-RealPath, which followed links) is deleted; the same separator rule is pinned on its replacement, the link-free chain walk
     text = SCRIPT.read_text(encoding="utf-8")
-    m = re.search(r"^function Resolve-RealPath.*?^}\n", text, re.MULTILINE | re.DOTALL)
-    assert m, "lane-dirty-save.ps1 has no Resolve-RealPath"
+    code = "\n".join(re.sub(r"\s#\s.*$", "", ln) for ln in text.splitlines() if not ln.lstrip().startswith("#"))  # comments may name the deleted resolver; code may not
+    assert "Resolve-RealPath" not in code, "no code path may resolve a link any more"
+    assert not re.search(r"ResolveLinkTarget", code)  # the link resolution itself is gone; LinkTarget is only READ (to refuse)
+    m = re.search(r"^function Assert-LinkFree.*?^}\n", text, re.MULTILINE | re.DOTALL)
+    assert m, "lane-dirty-save.ps1 has no Assert-LinkFree"
     body = m.group(0)
     assert "[char[]]@('\\', '/')" not in body and "DirectorySeparatorChar" in body and "AltDirectorySeparatorChar" in body  # old code: split on both characters on every platform
     assert "Get-FinalDir $RunDir" in text and "Get-FinalDir $WorkDir" in text  # Windows resolves through an open directory handle, not by walking names
     assert "Resolve-Path" not in text and "Join-Path" not in text and "Test-Path" not in text  # PowerShell's path layer may re-spell a backslash; .NET only
-    assert "$RunDir = Resolve-RealPath $RunDir;" in text and "$RunDir = $script:held[0].Path;" in text  # the checked directory is the written one, on both platforms
+    assert "Assert-LinkFree $raw" in text and "$RunDir = $script:held[0].Path;" in text  # every argument is walked for links before any read; the checked directory is the written one, on both platforms
 
 
 def ps_functions(*names):
@@ -640,7 +643,7 @@ def test_child_json_without_a_created_utc_is_bad_arguments_and_saves_nothing(rep
     assert saved(repo) == []
 
 
-def test_a_relative_child_json_is_read_where_powershell_is_not_where_dotnet_is(repo, tmp_path):  # r9 sol r8b B1: ReadAllText follows .NET's directory, where another lane's record (dead pid) may sit while the intended lane is alive
+def test_a_relative_child_json_is_refused_and_neither_directorys_record_is_read(repo, tmp_path):  # r9 sol r8b B1: ReadAllText follows .NET's directory, where another lane's record (dead pid) may sit while the intended lane is alive. r13 CHANGED MEANING (sol r12 F1): the record used to be read from PowerShell's directory (exit 20 for the live lane); a relative -ChildJson is now refused outright, so neither the intended record nor the decoy can be picked by a current directory
     jobs, other = tmp_path / "jobs", tmp_path / "elsewhere"
     jobs.mkdir(); other.mkdir()
     (jobs / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)).isoformat()}))  # the intended lane: alive (a stamp later than its start)
@@ -648,7 +651,7 @@ def test_a_relative_child_json_is_read_where_powershell_is_not_where_dotnet_is(r
     dirty(repo)
     cmd = f"Set-Location '{jobs}'; [Environment]::CurrentDirectory = '{other}'; & '{SCRIPT}' -WorkDir '{repo}' -RunDir '{repo.parent / 'run'}' -ChildJson child.json; exit $LASTEXITCODE"
     r = subprocess.run([PWSH, "-NoProfile", "-Command", cmd], capture_output=True, text=True)
-    assert r.returncode == 20 and "lane-alive" in r.stdout, r.stdout + r.stderr  # old code: read the decoy, exit 0
+    assert r.returncode == 30 and "reason=not-fully-qualified" in r.stdout, r.stdout + r.stderr  # r12 saver: 20 (the record of the live lane); r8 saver: read the decoy, exit 0
     assert saved(repo) == []
 
 
@@ -801,14 +804,14 @@ def newest_patch(tmp_path):
     return next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes()
 
 
-def save_with_hook(wd, tmp_path, hook):
+def save_with_hook(wd, tmp_path, hook, env=None):
     """Run a COPY of the saver with `hook` (PowerShell) run just before its first collecting diff, standing in for another process acting between the saver's steps."""
     anchor = "$git.patch = Invoke-GitBytes"
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.count(anchor) == 1
     hooked = tmp_path / "hooked-saver.ps1"
     hooked.write_text(text.replace(anchor, f"{hook}; {anchor}"), encoding="utf-8")
-    return subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(wd), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    return subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(wd), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env=env)
 
 
 def test_a_filter_added_between_the_saver_s_steps_cannot_overwrite_the_dirt_being_saved(repo, tmp_path):  # r10 sol r9 B1: the hook stands where the old filter search ended and the first diff began
@@ -1584,3 +1587,139 @@ def test_no_name_in_the_saver_is_compared_by_culture():  # r12 sol r11 B4 sweep 
         assert "StringComparison" in m.group(1) or "[char]" in m.group(1), m.group(0)  # a bare string argument is a culture compare
     assert not re.search(r"\.IndexOf\(\s*[\"']", code)  # a string IndexOf is a culture search; use the char overload
     assert not re.search(r"\s-i?eq\s+['\"][A-Za-z_.]", code)  # an equality operator against a quoted name
+
+
+# ---- r13: sol r12 F1-F3 on ec99ed20. The class "the saver computes a path's physical identity and the computation can be fooled" ends by REFUSING: only fully qualified arguments, no link anywhere in a chain, and an identity probe that fails is unknown, never "unrelated" ----
+def child_record(tmp_path):
+    child = tmp_path / "child.json"
+    child.write_text(json.dumps({"pid": dead_pid(), "createdUtc": "2000-01-01T00:00:00Z"}))
+    return child
+
+
+def run_saver(work, run, child=None, cwd=None, env=None):
+    args = [PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(work), "-RunDir", str(run)]
+    args += ["-ChildJson", str(child)] if child is not None else ["-LanePid", str(dead_pid())]
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd, env=env)
+
+
+@pytest.mark.parametrize("which", ["child-json", "work-dir", "run-dir"])
+@pytest.mark.parametrize("form", ["relative", "root-relative", "drive-relative", "drive-relative-parent"])
+def test_a_path_that_is_not_fully_qualified_is_bad_arguments_and_nothing_is_saved(repo, tmp_path, which, form):  # r13 sol r12 F1: `C:..\wt` has no `..` segment (its first segment is `C:..`), yet GetFullPath resolved it against the drive's current directory and collection went on (r12 saver: exit 0)
+    if form != "relative" and not WIN:
+        pytest.skip("root-relative and drive-relative are Windows path forms; on POSIX they are plain relative names, covered by form=relative")
+    dirty(repo)
+    (tmp_path / "sub").mkdir()
+    child = child_record(tmp_path)
+    real = {"work-dir": repo, "run-dir": tmp_path / "run", "child-json": child}[which]
+    drive = os.path.splitdrive(str(real))[0]
+    spelled, cwd = {
+        "relative": (real.name, tmp_path),
+        "root-relative": (str(real)[len(drive):], tmp_path),
+        "drive-relative": (drive + real.name, tmp_path),
+        "drive-relative-parent": (drive + "..\\" + real.name, tmp_path / "sub"),
+    }[form]
+    given = {"work-dir": str(repo), "run-dir": str(tmp_path / "run"), "child-json": str(child)}
+    given[which] = spelled
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", given["work-dir"], "-RunDir", given["run-dir"], "-ChildJson", given["child-json"]], capture_output=True, text=True, cwd=cwd)
+    assert r.returncode == 30 and "reason=not-fully-qualified" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+    ok = run_saver(repo, tmp_path / "run", child)
+    assert ok.returncode == 0, ok.stdout + ok.stderr  # the fully qualified spelling of the same three paths still works
+
+
+@pytest.mark.parametrize("which", ["work-dir", "run-dir", "child-json"])
+def test_a_link_in_any_argument_chain_is_refused_not_resolved(repo, tmp_path, which):  # r13 sol r12 F2 (Windows junction / POSIX symlink): the old saver resolved the link and went on (Windows: Get-FinalDir, POSIX: ResolveLinkTarget); no link is resolved now
+    dirty(repo)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    child = jobs / "child.json"
+    child.write_text(json.dumps({"pid": dead_pid(), "createdUtc": "2000-01-01T00:00:00Z"}))
+    link = tmp_path / "link"
+    target = {"work-dir": repo, "run-dir": tmp_path / "run", "child-json": jobs}[which]
+    link_dir(link, target)
+    work, run, cj = repo, tmp_path / "run", child
+    if which == "work-dir":
+        work = link
+    elif which == "run-dir":
+        run = link
+    else:
+        cj = link / "child.json"
+    r = run_saver(work, run, cj)
+    assert r.returncode == 30 and "reason=link-in-path" in r.stdout, r.stdout + r.stderr  # r12 saver: 0
+    assert list((tmp_path / "run").iterdir()) == []
+
+
+@pytest.mark.skipif(WIN, reason="a symlink whose TARGET holds a parent segment needs a POSIX symlink (Windows junction targets are absolute and normalised at creation); the chain-walk unit below feeds the same shape through a stubbed attribute reader on every platform")
+def test_a_symlink_target_holding_a_parent_segment_cannot_move_the_artifacts_to_an_outside_decoy(repo, tmp_path):  # r13 sol r12 F2 end to end (POSIX; never run on the Windows hub VM, first run is ubuntu CI): hop -> wt/sub, runlink -> hop/../evidence. The OS selects wt/evidence, ResolveLinkTarget().FullName gave the outside decoy
+    dirty(repo)
+    (repo / "sub").mkdir()
+    (repo / "evidence").mkdir()
+    decoy = tmp_path / "evidence"
+    decoy.mkdir()
+    hop, runlink = tmp_path / "hop", tmp_path / "runlink"
+    os.symlink(repo / "sub", hop, target_is_directory=True)
+    os.symlink(str(hop) + "/../evidence", runlink, target_is_directory=True)
+    r = run_saver(repo, runlink)
+    assert r.returncode == 30 and "reason=link-in-path" in r.stdout, r.stdout + r.stderr  # r12 saver: 0, the artifacts were written through the decoy
+    assert list(decoy.iterdir()) == [] and list((repo / "evidence").iterdir()) == []
+
+
+def test_the_private_base_is_never_reached_through_a_link_and_the_run_dir_is_used_instead(repo, tmp_path):  # r13 sol r12 F2 private-base sibling: TEMP/TMPDIR through a link was accepted when its final target was outside the worktree (and a link target holding `..` could put the private dir INSIDE it)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    link = tmp_path / "templink"
+    link_dir(link, elsewhere)
+    (repo / "u.txt").write_text("u\n")
+    rec = tmp_path / "seal-dir.txt"
+    env = {**os.environ, "TMP": str(link), "TEMP": str(link), "TMPDIR": str(link)}
+    r = save_with_hook(repo, tmp_path, f"Set-Content -LiteralPath '{rec}' -Value $script:sealDir -NoNewline", env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    parent = Path(rec.read_text()).parent
+    assert os.path.normcase(os.path.realpath(parent)) == os.path.normcase(os.path.realpath(tmp_path / "run")), parent  # r12 saver: the link
+    assert list(elsewhere.iterdir()) == []
+
+
+CHAIN_STUB = "{ param($c) if ($c.EndsWith('runlink')) { [System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint } elseif ($c.EndsWith('boom')) { throw 'denied' } else { [System.IO.FileAttributes]::Directory } }"
+
+
+@pytest.mark.parametrize("leaf, want", [("plain", "ok"), ("runlink", "link-in-path"), ("boom", "path-unreadable")])
+def test_the_chain_walk_refuses_a_link_or_an_unreadable_component_read_through_a_stubbed_attribute_reader(tmp_path, leaf, want):  # r13 sol r12 F2 on every platform: the POSIX layout `runlink -> hop/../evidence` cannot be built on Windows, so the attribute reader is stubbed (a link is a ReparsePoint attribute; an unreadable component throws)
+    p = str(tmp_path / "case" / "hop" / leaf / "evidence")
+    expr = "$(try { Assert-LinkFree $env:LDS_P " + CHAIN_STUB + "; 'ok' } catch { $_.Exception.Message })"
+    out = run_ps_functions(["Assert-LinkFree", "ConvertTo-NativePath"], expr, pre="$script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq [char]92; ", LDS_P=p)
+    assert out == want
+
+
+def test_a_directory_that_is_read_and_is_not_a_link_is_false_and_one_that_cannot_be_read_is_unknown(tmp_path):  # r13 sol r12 F3: the probe has THREE states; the catch used to answer false
+    (tmp_path / "sub").mkdir()
+    probe = "('' + (Test-ResolvesInto $env:LDS_W 'sub' 'P') + ',' + $(if ($null -eq (Test-ResolvesInto $env:LDS_W 'gone' 'P')) { 'unknown' } else { 'known' }))"
+    assert run_ps_functions(["Test-ResolvesInto"], probe, LDS_W=str(tmp_path)) == "False,unknown"  # r12 saver: False,known
+
+
+def test_names_below_a_directory_whose_alias_probe_cannot_be_read_are_kept_and_the_failure_is_named():  # r13 sol r12 F3: unknown is neither "unrelated" nor silent
+    pre = ("$script:onWin = $true; $script:probeWarnings = @(); function Get-FinalDir { @{ Path = 'P'; Handle = [System.IO.MemoryStream]::new() } }; "
+           "function Test-ResolvesInto { param($w, $d, $p) if ($d -eq 'bad') { $null } elseif ($d -eq 'alias') { $true } else { $false } }; ")
+    raw = b"alias/HEAD\0bad/x\0bad/y\0ok/z\0"
+    expr = "(([System.Text.Encoding]::Latin1.GetString((Remove-AliasedNames ([System.Convert]::FromHexString($env:LDS_RAW)) 'W' 'P')) -replace \"`0\", ',') + '|' + ($script:probeWarnings -join ';'))"
+    out = run_ps_functions(["Remove-AliasedNames"], expr, pre=pre, LDS_RAW=raw.hex().upper())
+    assert out == "bad/x,bad/y,ok/z,|alias-inspection-failed dir=bad"  # one warning per directory, not per name
+
+
+FAIL_ALIAS_PROBE = "$script:origFinal = ${function:Get-FinalDir}; function Get-FinalDir([string]$Path) { if ($Path.EndsWith('\\alias', [System.StringComparison]::Ordinal)) { throw 'cannot-open-directory' }; & $script:origFinal $Path }"  # the injection seam: only the alias directory's identity read fails, as a peer holding an incompatible handle would make it
+
+
+@pytest.mark.skipif(not WIN, reason="git walks into a directory junction on Windows; on POSIX it lists a symlink as one file")
+def test_an_alias_whose_identity_cannot_be_read_makes_the_collection_incomplete_not_complete(repo, tmp_path):  # r13 sol r12 F3 end to end: alias/HEAD, alias/config, alias/objects/info/alternates survived clean-up in a complete receipt with exit 0
+    (repo / "u.txt").write_text("u\n")
+    hook = JUNCTION_HOOK.format(target="$($script:sealDir)") + "; " + FAIL_ALIAS_PROBE
+    r = save_with_hook(repo, tmp_path, hook)
+    assert r.returncode == 60, r.stdout + r.stderr  # r12 saver: 0
+    receipt = last_receipt(r)
+    assert receipt["collection"] == "incomplete" and any("alias-inspection-failed dir=alias" in w for w in receipt["warnings"]), receipt
+    assert b"u.txt" in inventory_of(tmp_path)
+
+
+def test_no_identity_or_ownership_probe_in_the_saver_answers_false_from_a_bare_catch():  # r13 sol r12 F3 sweep pin: a failed read is unknown. The remaining catches that return a boolean are Test-DirPresent (unknown = present: the leftover is named) and the typed-exception arm that says a directory is really gone
+    code = "\n".join(re.sub(r"\s#\s.*$", "", ln) for ln in SCRIPT.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+    assert not re.search(r"catch\s*\{\s*return\s+\$false\s*\}", code)
+    assert "Remove-AliasedNames" in code and "probeWarnings" in code

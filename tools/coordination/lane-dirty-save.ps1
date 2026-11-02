@@ -5,10 +5,16 @@
 #   .receipt.json = one JSON line naming the files of THIS save, also printed; it says untrackedFormat=nul-separated and untrackedContents=not-saved
 # Untracked file CONTENTS are NOT preserved by this saver (names only); copying them is LANE-DIRTY-SAVE-INVENTORY-ROWS-1 / LANE-DIRTY-SAVE-WORKSTREAM-WIRE-1 scope.
 # The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; createdUtc is required and must be an ISO-8601 string, else exit 30 before any write; a process that started after it, at full precision, is a reused pid, so the lane is dead), never both.
-# The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree (links followed) is refused (exit 30): evidence written there would be listed as untracked dirt.
-# A -WorkDir, -RunDir or -ChildJson holding a `..` segment is refused with exit 30 reason=dotdot-path before any read (r12, sol r11 B1): path normalisation removes `link/..` before the OS follows the link, so the path judged would not be the path opened. Link-then-parent is not emulated.
+# The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree is refused (exit 30; r13: no link is ever followed, so "inside" is judged on a link-free path or by the kernel's own answer): evidence written there would be listed as untracked dirt.
+# r13 (sol r12 F1-F3) ends the class "the saver computes a path's physical identity and the computation can be fooled" by REFUSING instead of computing. Exit 30 reasons, all before any read or write:
+#   dotdot-path           a -WorkDir, -RunDir or -ChildJson holding a `..` segment (r12, sol r11 B1): normalisation removes `link/..` before the OS follows the link
+#   not-fully-qualified   an argument that is not a fully qualified path ([System.IO.Path]::IsPathFullyQualified on the raw text): a relative path, a root-relative `\x` and a drive-relative `C:x` / `C:..\x` all depend on a current directory the saver cannot name (r13, sol r12 F1)
+#   link-in-path          any component of -WorkDir, -RunDir, -ChildJson (the file itself included), the git top level or the private base is a symbolic link, junction or other reparse point (r13, sol r12 F2): no link is ever resolved or followed to decide identity
+#   path-unreadable       the attributes of a component cannot be read: unknown is a refusal, never a pass
+# An unreadable private-base candidate (the OS temp directory) is skipped and the RunDir is used instead; with none left the run ends in exit 40 (private-git-dir: no-private-dir-outside-worktree).
+# An alias probe that cannot be read is not "unrelated" (r13, sol r12 F3): the names below that directory stay in the list, the warning "alias-inspection-failed dir=..." is added, and the run is collection=incomplete (exit 60).
 # Paths are split on the platform's own separators only (a POSIX backslash is a filename character), and the RunDir that passes the containment test is the resolved path every artifact is then written through.
-# Windows resolves both directories through an open handle (GetFinalPathNameByHandle: links, junctions, subst drives, 8.3 and \\?\ spellings in any case) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX walks symlinks by name, then also refuses a RunDir (or ancestor) whose st_dev:st_ino is the worktree root or any directory inside it, so a bind mount cannot alias it; if that cannot be proven (no find/stat, unreadable tree) it exits 30. A swap between check and write is not closed on POSIX.
+# Windows, with no link in either chain, reads both directories back through an open handle (GetFinalPathNameByHandle: subst drives, 8.3 and \\?\ spellings in any case, loopback shares) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX, with no symlink in either chain, then also refuses a RunDir (or ancestor) whose st_dev:st_ino is the worktree root or any directory inside it, so a bind mount cannot alias it; if that cannot be proven (no find/stat, unreadable tree) it exits 30. A swap between check and write is not closed on POSIX.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay), 60 INCOMPLETE: git exited 0 but said something on stderr (an unreadable directory, a config it could not read), so the collection may be missing evidence. 60 is never "clean": with nothing to save it prints DIRTY_SAVE_INCOMPLETE and the warning text; with something saved the receipt carries collection=incomplete and warnings, and what was readable is still written.
 # Only git's line-ending conversion notices ("LF will be replaced by CRLF ...", printed for a file git DID compare) are not warnings, and only as WHOLE lines of git's known shape (r12, sol r11 B2). The private git dir also sets core.safecrlf=false (never the caller's value), so git prints no such notice in the first place (r12, adversary pass 2 A1). Everything else on stderr is (r11, sol r10 B2).
@@ -29,6 +35,7 @@ $ErrorActionPreference = 'Stop'
 $script:unreadable = @()
 $script:gitStderr = @()  # stderr of every git call that exited 0: a warning there is a collection that may be incomplete (r11 sol r10 B2)
 $script:seal = $null; $script:sealDir = $null
+$script:probeWarnings = @()  # identity probes that could not be read (r13 sol r12 F3): each is a warning, so the collection is incomplete
 $script:noCallbacks = @('-c', 'core.fsmonitor=false')  # the few read-only calls made BEFORE the seal (toplevel, HEAD, paths, config list) run nothing, and core.fsmonitor is blanked anyway (sol r7 B1)
 function Invoke-GitBytes([string[]]$GitArgs, [switch]$KeepConfigEnv) {  # -KeepConfigEnv: the ONE call that reads the caller's effective config as data keeps the config-injecting environment (r11 sol r10 B1); every other call has it stripped
     try {
@@ -108,25 +115,29 @@ function Remove-OwnNames([byte[]]$Bytes, [string]$Own) {  # the saver never list
     if (-not $keep) { return , [byte[]]@() }
     return , [System.Text.Encoding]::Latin1.GetBytes(($keep -join "`0") + "`0")
 }
-function Test-ResolvesInto([string]$Work, [string]$RelDir, [string]$Priv) {  # Windows: $true when the directory $RelDir (a git path below $Work) is a link whose final target is $Priv or below it. Identity, not spelling: both sides are read back by the kernel (Get-FinalDir), so 8.3 names, other casing and nested links cannot hide an alias. Anything that cannot be examined is $false: a name is kept, never dropped, on a guess
+function Test-ResolvesInto([string]$Work, [string]$RelDir, [string]$Priv) {  # Windows: $true when the directory $RelDir (a git path below $Work) is a link whose final target is $Priv or below it, $false when it is read and is not. Identity, not spelling: both sides are read back by the kernel (Get-FinalDir), so 8.3 names, other casing and nested links cannot hide an alias. THREE states (r13 sol r12 F3): anything that cannot be examined is $null (unknown), never $false: the caller keeps the name AND reports the collection as incomplete
     try {
         $abs = [System.IO.Path]::Combine($Work, [System.Text.Encoding]::UTF8.GetString([System.Text.Encoding]::Latin1.GetBytes($RelDir)).Replace('/', '\'))
         if (-not ([System.IO.File]::GetAttributes($abs) -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
         $f = Get-FinalDir $abs; $f.Handle.Dispose()
         return (Test-Inside $Priv $f.Path)
-    } catch { return $false }
+    } catch { return $null }
 }
-function Remove-AliasedNames([byte[]]$Bytes, [string]$Work, [string]$Private) {  # r12 (sol r11 B3): the saver never observes itself, by IDENTITY. A junction made straight to the private directory has no GUID in its name, so git lists alias/HEAD, alias/config ... and the clean-up then deletes the files those names stand for. Every name below a directory link that resolves into the private directory is the saver's own file and is dropped. A link listed as a file itself (a Windows symbolic link, which git does not walk) survives clean-up and stays in the list. POSIX git does not walk symlinks, so there is nothing to resolve there. An unresolvable private directory throws (typed exit 40), never a quiet pass
+function Remove-AliasedNames([byte[]]$Bytes, [string]$Work, [string]$Private) {  # r12 (sol r11 B3): the saver never observes itself, by IDENTITY. A junction made straight to the private directory has no GUID in its name, so git lists alias/HEAD, alias/config ... and the clean-up then deletes the files those names stand for. Every name below a directory link that resolves into the private directory is the saver's own file and is dropped. A link listed as a file itself (a Windows symbolic link, which git does not walk) survives clean-up and stays in the list. POSIX git does not walk symlinks, so there is nothing to resolve there. An unresolvable private directory throws (typed exit 40), never a quiet pass. A directory whose probe cannot be read (r13 sol r12 F3) is UNKNOWN: its names stay in the list and one "alias-inspection-failed" warning per directory is added to $script:probeWarnings, which makes the run collection=incomplete (exit 60)
     if (-not $script:onWin -or -not $Private -or $Bytes.Length -eq 0) { return , $Bytes }
     $f = Get-FinalDir $Private; $f.Handle.Dispose(); $priv = $f.Path  # the handle is released at once: it would block the clean-up delete
-    $into = [System.Collections.Generic.Dictionary[string, bool]]::new([System.StringComparer]::Ordinal)
+    $into = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)  # 1 resolves into the private directory, 0 does not, -1 unknown
     $keep = [System.Collections.Generic.List[string]]::new()
     foreach ($name in ([System.Text.Encoding]::Latin1.GetString($Bytes) -split "`0" | Where-Object { $_ })) {
         $hit = $false; $at = -1
         while (-not $hit -and ($at = $name.IndexOf([char]47, $at + 1)) -ge 0) {
             $dir = $name.Substring(0, $at)
-            if (-not $into.ContainsKey($dir)) { $into[$dir] = Test-ResolvesInto $Work $dir $priv }
-            $hit = $into[$dir]
+            if (-not $into.ContainsKey($dir)) {
+                $state = Test-ResolvesInto $Work $dir $priv
+                $into[$dir] = if ($null -eq $state) { -1 } elseif ($state) { 1 } else { 0 }
+                if ($into[$dir] -lt 0) { $script:probeWarnings += 'alias-inspection-failed dir=' + [regex]::Replace($dir.Length -gt 200 ? $dir.Substring(0, 200) : $dir, '[\x00-\x1f\x7f]', '?') }
+            }
+            $hit = $into[$dir] -gt 0
         }
         if (-not $hit) { $keep.Add($name) }
     }
@@ -158,11 +169,13 @@ function Get-ShareOf([string]$Path) {  # Windows: the \\server\share a final pat
 function Get-PrivateBase {  # where the saver's own temporary directory may live: the OS temp directory, unless that is not provably outside the worktree (the lane's TEMP can be inside it, on the hub VM it is), then the RunDir, which is already proven to be. The temp directory gets the SAME proofs the RunDir got, not a name compare alone: a bind mount (POSIX) or a loopback share (Windows) aliases a worktree folder under an outside-looking name (adversary r11 A1)
     foreach ($cand in @([System.IO.Path]::GetTempPath(), $RunDir)) {
         try {
+            if (-not [System.IO.Path]::IsPathFullyQualified($cand) -or (Test-HasDotDot $cand)) { continue }  # r13 (sol r12 F1, F2): the base is an OS-supplied path (TMPDIR may be relative on POSIX, or hold a link whose target holds `..`): it is used only when fully qualified and link-free, else the next candidate (the RunDir, already proven) is
+            Assert-LinkFree $cand  # throws on a link or an unreadable component: this candidate is skipped
             if ($script:onWin) {
                 $f = Get-FinalDir $cand; $f.Handle.Dispose(); $real = $f.Path
                 if (-not [string]::Equals((Get-ShareOf $real), (Get-ShareOf $realWork), [System.StringComparison]::Ordinal)) { continue }
             }
-            else { $real = Resolve-RealPath $cand; if (-not [string]::Equals($cand, $RunDir, [System.StringComparison]::Ordinal)) { Assert-RunDirNotAlias $real $realWork } }  # throws when the temp directory is, or sits in, the worktree by identity, or when that cannot be proven: not used
+            else { $real = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($cand)); if (-not [string]::Equals($cand, $RunDir, [System.StringComparison]::Ordinal)) { Assert-RunDirNotAlias $real $realWork } }  # throws when the temp directory is, or sits in, the worktree by identity, or when that cannot be proven: not used
             if (Test-Inside $realWork $real) { continue }
             if ($script:onWin -and $cand.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {  # git rejects a \\?\ GIT_DIR, so it gets the plain spelling, and only when Win32 would not re-read it as another directory (a component ending in a dot or a space is trimmed)
                 $cand = if ($cand.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { '\\' + $cand.Substring(8) } else { $cand.Substring(4) }
@@ -173,15 +186,16 @@ function Get-PrivateBase {  # where the saver's own temporary directory may live
     }
     throw 'no-private-dir-outside-worktree'
 }
-function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # POSIX: every symlink on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2). Windows asks the kernel instead (Get-FinalDir)
-    if ($Depth -gt 16) { throw 'too-many-links' }
-    $full = [System.IO.Path]::GetFullPath($Path); $root = [System.IO.Path]::GetPathRoot($full); $cur = $root
-    foreach ($seg in $full.Substring($root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+function Assert-LinkFree([string]$Path, [scriptblock]$ReadAttr = $null) {  # r13 (sol r12 F2): NO LINK IS RESOLVED, so none can be resolved wrongly. Resolve-RealPath used to follow each symlink with ResolveLinkTarget().FullName, which removes a `..` held in the link's TARGET before the OS follows the link (`runlink -> hop/../evidence` with `hop -> wt/sub`: the OS opens wt/evidence, the saver judged evidence). Now every component below the root of a fully qualified path is read (attributes and link target, never followed) and ANY reparse point, symbolic link or junction ends in a refusal (exit 30 reason=link-in-path); a component whose attributes cannot be read ends in reason=path-unreadable. Paths this function is given have no `..` segment (Test-HasDotDot ran first), so their text is their identity once no component is a link. Windows reads the same \\?\ spelling Get-FinalDir will open. $ReadAttr is a test seam: a scriptblock that takes a component path and returns its FileAttributes (or throws)
+    $p = ConvertTo-NativePath $Path; $root = [System.IO.Path]::GetPathRoot($p); $cur = $root
+    foreach ($seg in $p.Substring($root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries)) {
         $cur = [System.IO.Path]::Combine($cur, $seg)
-        $di = [System.IO.DirectoryInfo]::new($cur)
-        if ($di.LinkTarget) { $t = $di.ResolveLinkTarget($true); if ($t) { $cur = Resolve-RealPath $t.FullName ($Depth + 1) } }
+        try {
+            if ($ReadAttr) { $attr = & $ReadAttr $cur; $target = $null }
+            else { $attr = [System.IO.File]::GetAttributes($cur); $target = [System.IO.DirectoryInfo]::new($cur).LinkTarget }
+        } catch { throw 'path-unreadable' }
+        if (($attr -band [System.IO.FileAttributes]::ReparsePoint) -or $null -ne $target) { throw 'link-in-path' }
     }
-    return $cur
 }
 function Invoke-Capture([string]$Exe, [string[]]$CmdArgs) {  # one child's stdout lines; $null when it cannot start or exits non-zero (unknown is never "clear")
     try {
@@ -271,10 +285,11 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) { 
 }
 try {
     foreach ($raw in $WorkDir, $RunDir, $ChildJson) { if ($raw -and (Test-HasDotDot $raw)) { throw 'dotdot-path' } }  # before any normalisation or read (r12 sol r11 B1); exit 30 with a reason of its own
-    $here = (Get-Location).ProviderPath  # PowerShell's location, not .NET's (adversary A6)
-    $WorkDir = [System.IO.Path]::GetFullPath($WorkDir, $here); $RunDir = [System.IO.Path]::GetFullPath($RunDir, $here)  # .NET only: PowerShell's path layer may re-spell a POSIX backslash as '/' (dot B1 on #722)
-    if ($ChildJson) { $ChildJson = [System.IO.Path]::GetFullPath($ChildJson, $here) }  # every path the saver reads is resolved against PowerShell's location before any read: a relative record must never be opened through .NET's current directory, where another lane's record may sit (sol r8b B1)
+    foreach ($raw in $WorkDir, $RunDir, $ChildJson) { if ($raw -and -not [System.IO.Path]::IsPathFullyQualified($raw)) { throw 'not-fully-qualified' } }  # r13 (sol r12 F1): on the RAW text, before any normalisation or read. `C:..\wt` has no `..` segment (its first segment is `C:..`) yet GetFullPath resolves it against the drive's current directory; a relative or root-relative path names whatever the current directory is. The old relative-path support (resolved against PowerShell's location) is gone with it: nothing is resolved against a current directory any more
+    $WorkDir = [System.IO.Path]::GetFullPath($WorkDir); $RunDir = [System.IO.Path]::GetFullPath($RunDir)  # .NET only: PowerShell's path layer may re-spell a POSIX backslash as '/' (dot B1 on #722). Fully qualified and without `..`, so this only folds `.` segments and repeated separators
+    if ($ChildJson) { $ChildJson = [System.IO.Path]::GetFullPath($ChildJson) }
     if (-not [System.IO.Directory]::Exists($WorkDir) -or -not [System.IO.Directory]::Exists($RunDir)) { throw 'no-such-directory' }
+    foreach ($raw in $WorkDir, $RunDir, $ChildJson) { if ($raw) { Assert-LinkFree $raw } }  # r13 (sol r12 F2): before the record is read and before any write; the child record's own file name is checked too (a symlinked child.json is another file)
     if (Test-LaneAlive) { Write-Output 'DIRTY_SAVE_REFUSED reason=lane-alive'; exit 20 }
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=dirty', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
@@ -283,11 +298,12 @@ if ($top.Code -eq 0) {
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
 }
 try {
+    if ($top.Code -eq 0) { if (Test-HasDotDot $WorkDir) { throw 'dotdot-path' }; Assert-LinkFree $WorkDir }  # r13: the top level is what git printed (forward slashes on Windows); it is judged like the argument was, not trusted
     if ($script:onWin) {
         $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path
         if (-not [string]::Equals((Get-ShareOf $RunDir), (Get-ShareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # see Get-ShareOf (r7 fix-2 A2)
     }
-    else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir; if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }
+    else { $RunDir = [System.IO.Path]::TrimEndingDirectorySeparator($RunDir); $realWork = [System.IO.Path]::TrimEndingDirectorySeparator($WorkDir); if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }  # no link is in either chain (Assert-LinkFree), so the text is the real path
     $runInside = Test-Inside $realWork $RunDir
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
 if ($top.Code -eq 0 -and $runInside) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
@@ -316,7 +332,7 @@ $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
 if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())$leftNote"; exit 40 }
 $todo = 'patch', 'staged', 'untracked' | Where-Object { $git[$_].Bytes.Length -gt 0 }
 # r11 (sol r10 B2): exit 0 with words on stderr is not a complete collection (git walks past a directory it cannot open and says so only there). Line-ending conversion notices are the one exception: git printed them for a file it DID compare.
-$warnLines = Get-WarningLines $script:gitStderr
+$warnLines = @(Get-WarningLines $script:gitStderr) + @($script:probeWarnings)  # r13 (sol r12 F3): an identity probe that could not be read is a warning too
 $warnShown = @($warnLines | Select-Object -First 20 | ForEach-Object { if ($_.Length -gt 300) { $_.Substring(0, 300) + '...' } else { $_ } })
 if ($warnLines.Count -gt 20) { $warnShown += "... and $($warnLines.Count - 20) more" }
 if (-not $todo) {
