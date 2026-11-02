@@ -489,14 +489,22 @@ function ConvertTo-CommandLineArg([string]$Value) {
     # before a quote (and before the closing quote) are doubled, or a RepoRoot ending in "\" escapes its closing quote (adversary r4 A1).
     '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
+# The largest bound Invoke-BoundedSuite accepts: the same range the public -QuietLeaseBoundSec / -StageExemptBoundSec carry.
+$SuiteBoundMaxSec = 3600
 function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
+    # sol r5 B1: the bound is checked, and converted to milliseconds, BEFORE any file or child exists. A direct call with 2147484 (or
+    # 0, or a negative) used to launch the suite and only then fail in WaitForExit, leaving the child running with no named verdict.
+    if ($TimeoutSec -lt 1 -or $TimeoutSec -gt $SuiteBoundMaxSec) { throw "FAIL: $Name ($Script) bound $TimeoutSec s is outside 1..$SuiteBoundMaxSec s; no child was started" }
+    $waitMs = [int]($TimeoutSec * 1000)
     $outF = [IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
     try {
         $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { ConvertTo-CommandLineArg $_ }
         $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $suiteArgs -NoNewWindow -PassThru -RedirectStandardOutput $outF -RedirectStandardError $errF
         $null = $p.Handle   # keeps ExitCode readable after the exit
         $clock = [Diagnostics.Stopwatch]::StartNew()   # monotonic: a local-time subtraction goes negative across a DST fall-back
-        $finished = $p.WaitForExit($TimeoutSec * 1000)
+        # Any failure of the wait itself is treated as a hung suite: the tree is killed below and the failure names the suite.
+        $finished = $false; $waitNote = ''
+        try { $finished = $p.WaitForExit($waitMs) } catch { $waitNote = " (the wait itself failed: $($_.Exception.Message))" }
         $killNote = 'its process tree was killed'
         if (-not $finished) {
             # The kill itself is bounded (sol adversary A2): a hung taskkill.exe must not hold the suite-named failure back.
@@ -509,7 +517,7 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
             try { $p.Kill() } catch { }
         }
         $text = ((Get-Content -LiteralPath $outF -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $errF -ErrorAction SilentlyContinue)) -join ' | '
-        Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text"
+        Assert-True $finished "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text"
         # A finished suite's JSON is the result: a read error here must surface, not aggregate as an empty result.
         $json = (Get-Content -LiteralPath $outF -ErrorAction Stop) -join "`n"
         return [pscustomobject]@{ ExitCode = $p.ExitCode; Json = $json; Text = $text }

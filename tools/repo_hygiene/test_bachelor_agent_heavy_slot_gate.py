@@ -19,6 +19,7 @@ Windows-only test below runs that script's pure-function cases (-UnitOnly, no he
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -46,6 +47,9 @@ TASKKILL_REAP_SEC = 5  # a taskkill that outlived its bound is killed and gets t
 ROOT_REAP_SEC = 30  # the root process gets this long to be reaped after its kill
 CLEANUP_BOUND_SEC = TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC + ROOT_REAP_SEC
 CLEANUP_MARGIN_SEC = 10  # scheduling slack on a loaded runner, on top of the bounds
+# The largest timeout run_bounded accepts (sol r5 B1). Callers pass 720 s at most; this leaves a wide margin and stays far below
+# threading.TIMEOUT_MAX, above which the Windows wait raises OverflowError after the child is already launched.
+MAX_RUN_BOUNDED_TIMEOUT_SEC = 3600
 
 
 def max_run_bounded_sec(timeout: float) -> float:
@@ -120,10 +124,17 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
     that way until the job cap cancelled it. So the output goes to files (nothing waits for pipe EOF) and a timeout kills
     the whole tree, then fails naming the case and the elapsed time.
     """
+    # sol r5 B1: refuse an unusable bound BEFORE any child exists. inf, nan, 1e308 or a non-positive value would otherwise be accepted,
+    # the child launched, and the wait would raise OverflowError / ValueError past the TimeoutExpired handler.
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout)
+            or not 0 < timeout <= MAX_RUN_BOUNDED_TIMEOUT_SEC):
+        raise ValueError(f"{case}: run_bounded timeout must be a finite number in (0, {MAX_RUN_BOUNDED_TIMEOUT_SEC}] s, "
+                         f"got {timeout!r}; no child was started")
     tmp = tempfile.mkdtemp(prefix="heavy-slot-gate-")
     out_path, err_path = Path(tmp) / "stdout.txt", Path(tmp) / "stderr.txt"
     started = time.monotonic()
-    timed_out = False
+    failed = False
+    verdict = ""
     kill_note = ""
     try:
         with open(out_path, "wb") as out, open(err_path, "wb") as err:
@@ -131,17 +142,26 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                timed_out = True
+                failed = True
+                verdict = f"exceeded its {timeout:g} s wall-clock bound"
                 kill_note = _kill_tree(proc)
+            except BaseException as exc:
+                # sol r5 B1: any other failure of the wait (OverflowError, ValueError, OSError, an interrupt) happens with the child
+                # already running. The tree is killed first; an interrupt is then re-raised, anything else keeps the case-named verdict.
+                kill_note = _kill_tree(proc)
+                if not isinstance(exc, Exception):
+                    raise
+                failed = True
+                verdict = f"could not be waited on ({exc!r})"
         elapsed = time.monotonic() - started
-        # After a timeout the case-named verdict below is the failure, so a read error (a Windows sharing violation on a file the
-        # killed tree still holds) is recorded in the text instead of replacing it. Without a timeout the read error surfaces.
-        stdout = _read_captured(out_path, tolerate_oserror=timed_out)
-        stderr = _read_captured(err_path, tolerate_oserror=timed_out)
+        # After a failed wait the case-named verdict below is the failure, so a read error (a Windows sharing violation on a file the
+        # killed tree still holds) is recorded in the text instead of replacing it. Without a failed wait the read error surfaces.
+        stdout = _read_captured(out_path, tolerate_oserror=failed)
+        stderr = _read_captured(err_path, tolerate_oserror=failed)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    if timed_out:
-        raise AssertionError(f"{case} exceeded its {timeout:g} s wall-clock bound (ran {elapsed:.0f} s) and {kill_note}.\n"
+    if failed:
+        raise AssertionError(f"{case} {verdict} (ran {elapsed:.0f} s) and {kill_note}.\n"
                              f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}")
     return proc.returncode, stdout, stderr
 
@@ -509,6 +529,32 @@ class BoundedRunTests(unittest.TestCase):
             ctypes.windll.kernel32.LocalFree(argv)
         self.assertEqual(parsed, values, command_line)
 
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_the_fifo_suite_helper_refuses_an_out_of_range_bound_before_launching_a_child(self) -> None:
+        # sol r5 B1 (PowerShell half): the public -QuietLeaseBoundSec / -StageExemptBoundSec are ValidateRange'd, but a direct call to the
+        # internal Invoke-BoundedSuite with 2147484 launched the suite and then failed converting to milliseconds. Start-Process is shadowed
+        # by a counting stub, so the assertion is that the launcher was never reached for the bad bounds and was reached for a good one.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        start = fifo.index("function ConvertTo-CommandLineArg")
+        end_marker = fifo.index("function Invoke-BoundedSuite")
+        body = fifo[start:fifo.index("\n}\n", end_marker) + 3]
+        self.assertIn("$SuiteBoundMaxSec = 3600", body)
+        bounds = (2147484, 3601, 0, -1)
+        script = ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'; $script:launched = 0\n"
+                  "function Start-Process { $script:launched++; throw 'LAUNCH-ATTEMPTED' }\n" + body + "\n"
+                  "foreach ($t in " + ",".join(str(b) for b in bounds) + ",1) { try { Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' $t } "
+                  "catch { Write-Output ('RESULT|' + $t + '|' + $_.Exception.Message + '|' + $script:launched) } }\n")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = [line.split("|", 3) for line in proc.stdout.splitlines() if line.startswith("RESULT|")]
+        self.assertEqual([r[1] for r in rows], [str(b) for b in bounds] + ["1"], proc.stdout)
+        for _, bound, message, launched in rows[:-1]:
+            self.assertIn("case-x", message, bound)
+            self.assertIn(f"bound {bound} s is outside 1..3600 s; no child was started", message, bound)
+            self.assertEqual(launched, "0", f"bound {bound}: a child was launched")
+        _, bound, message, launched = rows[-1]
+        self.assertEqual((message, launched), ("LAUNCH-ATTEMPTED", "1"), "a valid bound must reach the launch")
+
     def test_a_finished_run_returns_its_code_and_both_streams(self) -> None:
         rc, out, err = run_bounded([sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err'); sys.exit(3)"], 60, "finished-case")
         self.assertEqual((rc, out.strip(), err), (3, "out", "err"))
@@ -662,6 +708,83 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
         for name in ("stdout.txt", "stderr.txt"):
             caught = self._run_failing_read(name, timeout_expires=False)
             self.assertIsInstance(caught, PermissionError, f"{name}: {caught!r}")
+
+
+class BoundedRunInputRangeTests(unittest.TestCase):
+    """sol r5 B1 (INV-9): an accepted timeout must never bypass the cleanup after the child is launched.
+
+    The unusable bounds (1e308, inf, nan) made the Windows wait raise OverflowError / ValueError after the launch, past the
+    TimeoutExpired handler, so the child survived and no case-named verdict was produced. Everything is in memory: Popen is a mock.
+    """
+
+    class _Proc:
+        pid = 4242
+        returncode = 0
+
+        def __init__(self, wait_error: BaseException | None = None) -> None:
+            self.wait_error = wait_error
+            self.wait_timeouts: list[float | None] = []
+            self.kills = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_timeouts.append(timeout)
+            if self.wait_error is not None and len(self.wait_timeouts) == 1:
+                raise self.wait_error
+            return 0
+
+        def kill(self) -> None:
+            self.kills += 1
+
+    UNUSABLE = (1e308, float("inf"), float("-inf"), float("nan"), 0, 0.0, -1, -0.5, MAX_RUN_BOUNDED_TIMEOUT_SEC + 1, True, None, "5")
+
+    def test_an_unusable_timeout_is_refused_before_any_child_is_launched(self) -> None:
+        for timeout in self.UNUSABLE:
+            with self.subTest(timeout=timeout), mock.patch.object(subprocess, "Popen") as popen, \
+                    mock.patch.object(tempfile, "mkdtemp") as mkdtemp:
+                with self.assertRaises(ValueError) as caught:
+                    run_bounded(["child"], timeout, "range-case")  # type: ignore[arg-type]
+                popen.assert_not_called()
+                mkdtemp.assert_not_called()
+                self.assertIn("range-case", str(caught.exception))
+                self.assertIn(repr(timeout), str(caught.exception))
+                self.assertIn("no child was started", str(caught.exception))
+
+    def test_the_largest_accepted_timeout_is_far_below_the_wait_overflow_limit(self) -> None:
+        import threading
+        self.assertLess(MAX_RUN_BOUNDED_TIMEOUT_SEC, threading.TIMEOUT_MAX)
+        self.assertGreaterEqual(MAX_RUN_BOUNDED_TIMEOUT_SEC, UNIT_RUN_TIMEOUT_SEC)
+
+    def test_a_usable_timeout_at_either_edge_runs_the_child(self) -> None:
+        for timeout in (0.001, 1, UNIT_RUN_TIMEOUT_SEC, MAX_RUN_BOUNDED_TIMEOUT_SEC):
+            proc = self._Proc()
+            with self.subTest(timeout=timeout), mock.patch.object(subprocess, "Popen", return_value=proc):
+                self.assertEqual(run_bounded(["child"], timeout, "edge-case"), (0, "", ""))
+                self.assertEqual(proc.wait_timeouts, [timeout])
+
+    def test_a_wait_that_raises_after_the_launch_still_kills_the_tree_and_names_the_case(self) -> None:
+        for label, exc in (("overflow", OverflowError("timeout is too large")), ("value", ValueError("Invalid value NaN (not a number)")),
+                           ("oserror", OSError(6, "invalid handle"))):
+            proc = self._Proc(wait_error=exc)
+            taskkill = BoundedRunOutputReadFailureTests._FakeTaskkill(0)
+            popen = BoundedRunOutputReadFailureTests._popen_for(proc, taskkill)
+            with self.subTest(label=label), mock.patch.object(subprocess, "Popen", side_effect=popen):
+                with self.assertRaises(AssertionError) as caught:
+                    run_bounded(["child"], 3, "wait-fail-case")
+                self.assertEqual(taskkill.wait_timeouts, [TASKKILL_BOUND_SEC], label)  # the bounded taskkill ran
+                self.assertGreaterEqual(proc.kills, 1, label)  # and so did the root kill
+                self.assertIn("wait-fail-case could not be waited on", str(caught.exception), label)
+                self.assertIn(repr(exc), str(caught.exception), label)
+                self.assertIn("and its process tree was killed.", str(caught.exception), label)
+
+    def test_an_interrupt_during_the_wait_kills_the_tree_and_is_not_swallowed(self) -> None:
+        proc = self._Proc(wait_error=KeyboardInterrupt())
+        taskkill = BoundedRunOutputReadFailureTests._FakeTaskkill(0)
+        popen = BoundedRunOutputReadFailureTests._popen_for(proc, taskkill)
+        with mock.patch.object(subprocess, "Popen", side_effect=popen):
+            with self.assertRaises(KeyboardInterrupt):
+                run_bounded(["child"], 3, "interrupt-case")
+        self.assertEqual(taskkill.wait_timeouts, [TASKKILL_BOUND_SEC])
+        self.assertGreaterEqual(proc.kills, 1)
 
 
 class BoundedCleanupTests(unittest.TestCase):
