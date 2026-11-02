@@ -188,6 +188,10 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
                             for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
+# HFR-NATIVE-M16-1457-RECON-LUT-KEEP-1 r2: the paced M16-1457 native s2/s4 legs (the #420 s1 native shape with legId and scaleFactor changed, card
+# CUDA-HEADROOM-1, Look Assist forced Cinematic, visual strips on): the paced picture evidence for the NO_PUBLISH LUT-keep change.
+NATIVE_PACED_LEGS = tuple(f"legs/m16-1457-native-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_PACED_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
