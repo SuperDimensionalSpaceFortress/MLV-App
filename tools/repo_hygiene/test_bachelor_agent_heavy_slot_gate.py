@@ -219,6 +219,25 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertGreater(UNIT_RUN_TIMEOUT_SEC, worst_case,
                            f"the outer guard ({UNIT_RUN_TIMEOUT_SEC} s) must outlast unit cases + both sub-suite bounds + both bounded kills ({worst_case} s)")
 
+    def test_the_suite_bounds_are_range_checked_before_any_child_is_launched(self) -> None:
+        # adversary r4 pass 3 A1: -QuietLeaseBoundSec -1 or 2147484 bound as a legal [int], then WaitForExit threw after the child
+        # was launched, skipping the kill block. The range is refused at parameter binding, before any child exists.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        for name in ("QuietLeaseBoundSec", "StageExemptBoundSec"):
+            self.assertRegex(fifo, r"\[ValidateRange\(1, 3600\)\]\s*\[int\]\$" + name + r" = \d+", name)
+
+    def test_a_completed_suite_must_hand_back_its_json_and_its_elapsed_time_is_monotonic(self) -> None:
+        # adversary r4 pass 3 A2 / A3: a captured-output read error was swallowed (SilentlyContinue), so a passing suite could aggregate
+        # as quietLease:null; and the timeout diagnostic subtracted local wall-clock times, which go negative across a DST fall-back.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        body = fifo[fifo.index("function Invoke-BoundedSuite"):]
+        body = body[:body.index("\n}\n")]
+        self.assertIn("$json = (Get-Content -LiteralPath $outF -ErrorAction Stop) -join \"`n\"", body)
+        self.assertIn("[Diagnostics.Stopwatch]::StartNew()", body)
+        self.assertNotIn("Get-Date", body)
+        for name in ("lease", "stage"):
+            self.assertIn(f"Assert-True ($null -ne ${name}.Json -and ${name}.Json.Trim().Length -gt 0)", fifo, name)
+
     def test_light_probes_stay_exempt_and_deploy_gate_string_matches(self) -> None:
         self.assertIn("[string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$'", self.text)
         m = re.search(r'^\$script:GateVersion = "([^"]+)"', self.text, re.M)
@@ -410,6 +429,16 @@ class BoundedRunTests(unittest.TestCase):
             run_bounded([sys.executable, "-c", self.HUNG_TREE], 3, "stub-hang-case")
         self.assertLess(time.monotonic() - started, 30)
         self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught.exception))
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_an_out_of_range_suite_bound_is_refused_at_binding_without_launching_a_child(self) -> None:
+        for flag, value in (("-QuietLeaseBoundSec", "-1"), ("-QuietLeaseBoundSec", "2147484"),
+                            ("-StageExemptBoundSec", "-1"), ("-StageExemptBoundSec", "2147484")):
+            rc, stdout, stderr = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly", flag, value],
+                                             90, f"fifo binding {flag} {value}")
+            self.assertNotEqual(rc, 0, f"{flag} {value}: {stdout}")
+            self.assertIn(flag.lstrip("-"), stdout + stderr, f"{flag} {value}")
+            self.assertNotIn('"status"', stdout, f"{flag} {value}: the suite must not have run")
 
     @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
     def test_the_fifo_suite_hands_a_trailing_backslash_root_to_its_children_intact(self) -> None:
