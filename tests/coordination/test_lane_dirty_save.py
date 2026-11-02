@@ -640,22 +640,46 @@ def test_child_json_without_a_created_utc_is_bad_arguments_and_saves_nothing(rep
     assert saved(repo) == []
 
 
-def test_a_configured_clean_filter_cannot_overwrite_the_dirt_being_saved(repo, tmp_path):  # r8 adversary A1: the same class as fsmonitor, a command git runs on every tracked file it diffs
+@pytest.mark.parametrize("caller_env", [{}, {"GIT_CONFIG": os.devnull}])  # GIT_CONFIG redirects only `git config`, so a discovery run through it saw no filter (second r8 pass A1)
+def test_a_configured_clean_filter_cannot_overwrite_the_dirt_being_saved(repo, tmp_path, caller_env):  # r8 adversary A1: the same class as fsmonitor, a command git runs on every tracked file it diffs
     (repo / ".gitattributes").write_text("a.txt filter=rewrite\n")
     git(repo, "add", ".gitattributes")
     git(repo, "commit", "-q", "-m", "attrs")
     dirty(repo)
     want, a_before, marker = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes(), tmp_path / "filter-ran"
     git(repo, "config", "filter.rewrite.clean", f"printf X >> '{marker.as_posix()}'; printf REPLACED > '{(repo / 'a.txt').as_posix()}'; cat")  # no git call from the test after this line
-    r = save(repo, "-LanePid", str(dead_pid()))
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, **caller_env})
     assert r.returncode == 0, r.stdout + r.stderr
     assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before  # old code: the clean filter ran and rewrote the tracked file
     assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
 
 
+def test_a_filter_whose_name_is_not_utf8_is_refused_not_blanked_under_a_lossy_copy_of_its_name(repo, tmp_path):  # second r8 pass A2: byte FF became U+FFFD, so the driver git really runs stayed on
+    (repo / ".gitattributes").write_bytes(b"a.txt filter=\xff\n")
+    git(repo, "add", ".gitattributes")
+    git(repo, "commit", "-q", "-m", "attrs")
+    dirty(repo)
+    a_before, marker = (repo / "a.txt").read_bytes(), tmp_path / "filter-ran"
+    with open(repo / ".git" / "config", "ab") as f:  # no git call from the test after this
+        f.write(b'[filter "\xff"]\n\tclean = printf X >> \'' + marker.as_posix().encode() + b"'; printf REPLACED > '" + (repo / "a.txt").as_posix().encode() + b"'; cat\n")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 40 and "filter-config-unreadable" in r.stdout, r.stdout + r.stderr
+    assert not marker.exists() and (repo / "a.txt").read_bytes() == a_before and saved(repo) == []
+
+
+def test_an_inherited_git_redirect_cannot_write_git_output_into_a_tracked_file(repo, tmp_path):  # second r8 pass A4: Git for Windows writes stdout into the file GIT_REDIRECT_STDOUT names
+    dirty(repo)
+    want, a_before = git(repo, "diff", "HEAD", "--binary"), (repo / "a.txt").read_bytes()
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "GIT_REDIRECT_STDOUT": str(repo / "a.txt"), "GIT_REDIRECT_STDERR": str(repo / "b.bin")})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (repo / "a.txt").read_bytes() == a_before and (repo / "b.bin").read_bytes() == BINARY[::-1]
+    assert next(p for p in (tmp_path / "run").iterdir() if p.name.endswith(".patch") and ".staged." not in p.name).read_bytes() == want
+
+
 @pytest.mark.parametrize("child", [{"pid": 2147483647, "createdUtc": ["2000-01-01T00:00:00Z"]},
                                    [{"pid": 2147483647, "createdUtc": "2000-01-01T00:00:00Z"}],
-                                   {"pid": [2147483647], "createdUtc": "2000-01-01T00:00:00Z"}])
+                                   {"pid": [2147483647], "createdUtc": "2000-01-01T00:00:00Z"},
+                                   {"pid": os.getpid(), "createdUtc": "/Date(0)/"}])  # second r8 pass A3: PowerShell's JSON reader turns this into 1970 and the live lane then looks reused
 def test_child_json_of_the_wrong_shape_is_bad_arguments_and_saves_nothing(repo, tmp_path, child):  # r8 adversary A2: a one-item list or root array was unwrapped into a valid-looking record
     dirty(repo)
     (tmp_path / "child.json").write_text(json.dumps(child))
@@ -734,7 +758,7 @@ def test_the_toplevel_path_is_never_trimmed():
 # ---- r5 B7: the walker fixture (subject-ledger.md:8547-8548: "walker fixture and its unit test" belong to CORE) ----
 FIXTURE = SCRIPT.parents[2] / "tools" / "repo_hygiene" / "lane_dirty_save_walker_fixture.ps1.txt"
 # The walker is a census over the saver's raw text for any call that can make a hard link or a native rename (OWNER-FOOTAGE-NO-HARDLINK-1): the saver may write only through CREATE_NEW streams.
-LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-ItemType[\s:]+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.(?:File|Directory)\]::\s*(?:Move|Replace)|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
+LINK_CAPABLE = re.compile(r"\b(?:Nt|Zw)SetInformationFile|SetFileInformationByHandle|CreateHardLink|-(?:Item)?Type[\s:]+[\"']?HardLink|\bmklink\b|fsutil\s+hardlink|\bln\s+(?!-s)|\[(?:System\.)?IO\.(?:File|Directory)\]::\s*[\"']?(?:Move|Replace)|\bcmd(?:\.exe)?\s+/c\s+(?:move|ren(?:ame)?)\b|\.MoveTo\(|\bMove-Item\b|\bRename-Item\b", re.IGNORECASE)  # r6 A5/r7 A3: [IO.File] is [System.IO.File]; whitespace after ::, MoveTo, Move-Item, Rename-Item, a quoted HardLink
 
 
 def walker_violations(text):
@@ -751,6 +775,6 @@ def test_the_walker_fixture_is_the_saver_byte_for_byte_and_the_walker_reads_it_c
                                     "cmd /c mklink /H a b", "fsutil hardlink create a b", "[System.IO.File]::Move($a, $b)", "SetFileInformationByHandle(h, 11, p, 8)",
                                     "[IO.File]::Move($a, $b)", "[IO.File]::Replace($a, $b, $null)", "[IO.File]:: Move($a, $b)", "[IO.FileInfo]::new($a).MoveTo($b)",
                                     "Move-Item -LiteralPath $a -Destination $b", 'New-Item -ItemType "HardLink" -Path $a -Value $b', "Rename-Item $a $b", "New-Item -ItemType:HardLink -Path $a -Value $b", "New-Item -ItemType: HardLink -Path $a -Value $b",
-                                    "[IO.Directory]::Move($a, $b)", "[System.IO.Directory]::Move($a, $b)"])  # r8 sol hardening: directory moves
+                                    "[IO.Directory]::Move($a, $b)", "[System.IO.Directory]::Move($a, $b)", "[IO.File]::'Move'($a,$b)", "New-Item -Type HardLink -Path $a -Value $b", "cmd /c move a b"])  # r8 sol hardening: directory moves
 def test_the_walker_goes_red_on_every_link_capable_spelling_cut_from_the_fixture(mutant):
     assert walker_violations(FIXTURE.read_text(encoding="utf-8") + "\n" + mutant + "\n")

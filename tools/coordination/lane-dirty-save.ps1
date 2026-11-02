@@ -28,7 +28,7 @@ function Invoke-GitBytes([string[]]$GitArgs, [bool]$Plain = $false) {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
         foreach ($a in (@('-C', $WorkDir) + $(if ($Plain) { @() } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
-        foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS') { [void]$psi.Environment.Remove($k) }
+        foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR') { [void]$psi.Environment.Remove($k) }  # GIT_CONFIG makes only `git config` read another file, so the filter discovery would miss what the diff later runs (r8 A1); GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4)
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
         $psi.Environment['GIT_OPTIONAL_LOCKS'] = '0'
         $p = [System.Diagnostics.Process]::Start($psi)
@@ -106,14 +106,12 @@ function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
     $procId = $LanePid; $born = $null
     if ($ChildJson) {
-        $j = Get-Content -LiteralPath $ChildJson -Raw | ConvertFrom-Json -NoEnumerate
-        if ($j -isnot [pscustomobject] -or ($j.pid -isnot [int] -and $j.pid -isnot [long])) { throw 'bad-child-json' }  # a root array, or a pid that is not a number, is no lane record (adversary r8 A2)
-        $procId = [int]$j.pid
-        $c = $j.PSObject.Properties['createdUtc']
-        $v = $null; if ($c) { $v = $c.Value }  # a plain assignment, not an if-expression: that would unroll a one-item list into its item and pass it (adversary r8 A2)
-        if ($v -is [datetime]) { $born = $v.ToUniversalTime() }
-        elseif ($v -is [string] -and $v -match '^\d{4}-\d\d-\d\dT\d\d:\d\d') { $born = [datetime]::Parse($v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
-        else { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001) or prose is no timestamp: without it a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
+        # System.Text.Json, not ConvertFrom-Json: PowerShell turns '/Date(0)/' into a DateTime, unwraps one-item lists and casts arrays to int, so every shape check was passed by something that is no ISO string (adversary r8 A2, A3)
+        $root = [System.Text.Json.JsonDocument]::Parse([System.IO.File]::ReadAllText($ChildJson)).RootElement
+        $pe = [System.Text.Json.JsonElement]::new(); $ce = [System.Text.Json.JsonElement]::new()
+        if ($root.ValueKind -ne 'Object' -or -not $root.TryGetProperty('pid', [ref]$pe) -or $pe.ValueKind -ne 'Number' -or -not $pe.TryGetInt32([ref]$procId)) { throw 'bad-child-json' }
+        if (-not $root.TryGetProperty('createdUtc', [ref]$ce) -or $ce.ValueKind -ne 'String' -or $ce.GetString() -notmatch '^\d{4}-\d\d-\d\dT\d\d:\d\d') { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001), prose or '/Date(0)/' is no timestamp: without one a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
+        $born = [datetime]::Parse($ce.GetString(), [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
     }
     if ($procId -le 0) { throw 'no-lane-pid' }
     $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
@@ -151,7 +149,7 @@ $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) {
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
     $f = Invoke-GitBytes @('config', '--null', '--name-only', '--get-regexp', '^filter\.') $true  # exit 1 = none configured. A clean/smudge/process filter is a command git runs on each tracked file it diffs: switch each configured one off (adversary r8 A1)
-    $keys = @([System.Text.Encoding]::UTF8.GetString($f.Bytes) -split "`0" | Where-Object { $_ })
+    try { $keys = @([System.Text.UTF8Encoding]::new($false, $true).GetString($f.Bytes) -split "`0" | Where-Object { $_ }) } catch { $keys = @('not-utf8') }  # a name that is not UTF-8 cannot be handed to -c unchanged, and a lossy copy would blank a different driver (r8 A2): refused below
     $names = @($keys | Where-Object { $_ -match '^filter\.[^=]+\.[^.=]+$' } | ForEach-Object { $_.Substring(0, $_.LastIndexOf('.')) } | Select-Object -Unique)
     if (($f.Code -ne 0 -and $f.Code -ne 1) -or @($keys | Where-Object { $_ -notmatch '^filter\.[^=]+\.[^.=]+$' }).Count) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=filter-config-unreadable $($f.Err.Trim())"; exit 40 }
     foreach ($k in $names) { $script:noCallbacks += @('-c', "$k.clean=", '-c', "$k.smudge=", '-c', "$k.process=", '-c', "$k.required=false") }
