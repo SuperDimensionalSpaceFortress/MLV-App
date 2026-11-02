@@ -4125,7 +4125,12 @@ int llrpLastOutputLevelsForCurrentThread(const mlvObject_t * video, int * bit_de
     return 1;
 }
 
-static void llrawproc_restore_worker_runtime_state(
+/* HFR-NATIVE-M16-1457-RECON-LUT-KEEP-1: the runtime levels only. The worker's
+ * raw2ev/ev2raw LUTs are left alone: they are a pure function of the black level
+ * they were built for (get_raw2ev/get_ev2raw read nothing else but the
+ * compile-time EV_RESOLUTION), which prev_black_level records and
+ * llrawproc_worker_ensure_luts compares, and no step writes into them. */
+static void llrawproc_restore_worker_runtime_levels(
     llrawprocWorkerState_t * worker,
     const llrawproc_runtime_state_t * state)
 {
@@ -4138,6 +4143,16 @@ static void llrawproc_restore_worker_runtime_state(
     worker->dng_bit_depth = state->dng_bit_depth;
     worker->dng_black_level = state->dng_black_level;
     worker->dng_white_level = state->dng_white_level;
+}
+
+/* The failure-path restore: the levels, and the LUTs invalidated. */
+static void llrawproc_restore_worker_runtime_state(
+    llrawprocWorkerState_t * worker,
+    const llrawproc_runtime_state_t * state)
+{
+    if (!worker || !state) return;
+
+    llrawproc_restore_worker_runtime_levels(worker, state);
     worker->prev_black_level = -1;
 }
 
@@ -6735,8 +6750,10 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
         {
             /* Estimates made on reduced data never reach the shared object
              * that exports and paused frames read; the next call reseeds
-             * this worker from the shared state. */
-            llrawproc_restore_worker_runtime_state(worker, &worker->seeded_runtime_state);
+             * this worker from the shared state. A successful run's LUTs
+             * stay valid (keyed on the black level), so they are kept
+             * rather than rebuilt on the next frame. */
+            llrawproc_restore_worker_runtime_levels(worker, &worker->seeded_runtime_state);
         }
     }
 
