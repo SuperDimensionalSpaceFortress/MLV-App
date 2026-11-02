@@ -30607,6 +30607,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     }
     selectDebayerAlgorithm();
     applyEffectiveDualIsoPlaybackSettings();
+    // CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: the last frame Play presented may be a reduced
+    // dual-ISO recon; re-render the stopped frame now that requests carry playbackActive=false.
+    if( !checked ) requestFrameRefresh( false, "play-stop-full-recon" );
     // PLAYBACK-SCOPES-OPTION-1: Hide skipped scope work while playing, so redraw the stopped frame
     // for its scope (the policy admits the scope again now that Play is off).
     if( !checked

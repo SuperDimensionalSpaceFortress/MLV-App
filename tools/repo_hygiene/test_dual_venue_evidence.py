@@ -151,6 +151,8 @@ HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip
 PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
                                                                                               # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: A and B1 at a worker-thread cap of 12
                                                                                               "a12", "b1-12-pcore"))
+# CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the quality-1 Look Assist cells of the inline reduced recon A/B and its D4 matrix.
+Q1_CPU_LOOK_LEGS = tuple(f"legs/m16-1243-q1-cpu-look-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
@@ -158,7 +160,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
                 *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
-                *IDENTITY_LEGS, *MISSDUMP_LEGS)
+                *IDENTITY_LEGS, *MISSDUMP_LEGS, *Q1_CPU_LOOK_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -188,6 +190,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
                             for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: the quality-1 look cells with look.pairedSeek true (the same frames captured paused after the Play), keyed to
+# the cell each one copies (legId, card and look.pairedSeek are the only differences).
+Q1_CPU_LOOK_PAIRED_LEGS = {f"legs/m16-1243-q1-cpu-look-paired-{mode}-s{scale}.json": f"legs/m16-1243-q1-cpu-look-{mode}-s{scale}.json"
+                           for mode in ("fullscreen", "windowed") for scale in (2, 4)}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *Q1_CPU_LOOK_PAIRED_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -1016,6 +1023,35 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -PlaybackProcessing is the default job, byte for byte")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
+
+    def test_quality_mode_reaches_the_job_env_and_absent_changes_nothing(self) -> None:
+        """CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: -QualityMode hq changes exactly the job's pinned quality env line, so a cpu leg runs the default mode (Phase 3 Disabled);
+        an absent or empty argument emits the default job byte for byte; a cuda job refuses it (the CUDA texture route needs Phase 3)."""
+        base = ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4"]
+        default = self.generate(GENERATOR, "qm-default.job.ps1", base)
+        hq = self.generate(GENERATOR, "qm-hq.job.ps1", [*base, "-QualityMode", "hq"])
+        self.assertEqual(self.parse_errors(hq), 0)
+        text = hq.read_text(encoding="utf-8")
+        self.assertEqual(text.count("'MLVAPP_PLAYBACK_QUALITY_MODE=hq',"), 1)
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq"), 0)
+        self.assertEqual(text.replace("MLVAPP_PLAYBACK_QUALITY_MODE=hq", "MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq"), default.read_text(encoding="utf-8"))
+        explicit_empty = self.generate(GENERATOR, "qm-empty.job.ps1", [*base, "-QualityMode", ""])
+        self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -QualityMode is the default job, byte for byte")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["qualityMode"]["enum"], ["hq"])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['qualityMode']) { $gen['QualityMode'] = [string]$spec.generatorArgs.qualityMode }", runner)
+        for name in ("fullscreen-s4", "windowed-s4", "fullscreen-s2", "windowed-s2"):
+            spec = json.loads((DV / "legs" / f"m16-1243-q1-cpu-look-{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual(spec["backends"], ["cpu"])
+            self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq")
+            self.assertNotIn("playbackProcessing", spec["generatorArgs"], "receipt routes Processed8, not the route under test")
+
+    def test_quality_mode_is_refused_on_a_cuda_job(self) -> None:
+        """CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: a typed refusal, never a job that silently runs the CUDA route without Phase 3."""
+        result = run_pwsh(self.generator_command(GENERATOR, self.tmp / "qm-cuda.job.ps1", ["-QualityMode", "hq"]))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DUAL_VENUE_QUALITY_MODE_CPU_ONLY", result.stdout + result.stderr)
 
     def test_disable_look_assist_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
         """UPSTREAM-CPU-BASELINE-1: -DisableLookAssist adds exactly '-DisableLookAssist' to the smoke runner's command (it passes --no-look-assist and fails
@@ -7029,6 +7065,15 @@ class LegSpecSchemaTests(unittest.TestCase):
                 # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
                 self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1":   # the quality-1 Look Assist legs, named by display and scale
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
+            elif spec["card"] == "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1":   # the paired-seek copies of the quality-1 Look Assist legs
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-paired-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
+                self.assertIs(spec["look"]["pairedSeek"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -7224,6 +7269,10 @@ class LegSpecSchemaTests(unittest.TestCase):
 NO_PACE_TWIN_BY_DESIGN = {
     **{f"m16-1243-display-{mode}-s{scale}-vsync1": "swapInterval 1 A/B arm; no merged PR cites an absolute figure from it, so a swapInterval 1 pace twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
+    **{f"m16-1243-q1-cpu-look-{mode}-s{scale}": "quality-1 A/B arm of the inline reduced recon: its figures compare the arms of one leg, and no capture-free pace leg runs at quality mode 1"
+       for mode in ("fullscreen", "windowed") for scale in (2, 4)},
+    **{f"m16-1243-q1-cpu-look-paired-{mode}-s{scale}": "paired-seek copy of a quality-1 look cell: playing vs paused frames of one leg, and no capture-free pace leg runs at quality mode 1"
+       for mode in ("fullscreen", "windowed") for scale in (2, 4)},
     "m16-1243-look": "Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-scale2": "Classic flavor-parity contact-sheet leg at scale 2; pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-film": "Film flavor-parity contact-sheet leg; no merged PR cites an absolute figure from it",

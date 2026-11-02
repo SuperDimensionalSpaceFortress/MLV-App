@@ -29,19 +29,36 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #define HONOUR_SCALE_TEST_SETENV(name, value) _putenv_s((name), (value))
 #define HONOUR_SCALE_TEST_UNSETENV(name) _putenv_s((name), "")
 #else
+#include <signal.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #define HONOUR_SCALE_TEST_SETENV(name, value) setenv((name), (value), 1)
 #define HONOUR_SCALE_TEST_UNSETENV(name) unsetenv((name))
 #endif
+
+extern "C" {
+#include "../../src/debayer/debayer.h"
+int debayerBasicU16ReinitDispatchForTesting(void);
+}
 
 namespace {
 
@@ -447,7 +464,620 @@ std::vector<std::vector<uint16_t>> playProduction(int scale, int frames, const c
     return out;
 }
 
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3 (ADV-A1): the calling thread's last decode and
+// llrawproc records, every one the reduced debayer's reset clears
+// (mlv_reset_last_raw_stage_telemetry, llrpResetLastRunTimingForCurrentThread). drawFrame
+// reads these getters after the debayer and exports them.
+struct ThreadRecords
+{
+    std::vector<std::pair<const char *, double>> values;
+    dualiso_full20bit_timing_t full20 = {};
+
+    static ThreadRecords capture()
+    {
+        ThreadRecords r;
+#define THREAD_RECORD(getter) r.values.emplace_back(#getter, static_cast<double>(getter()))
+        THREAD_RECORD(getMlvLastRawUint16Milliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DiskReadMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DecompressMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DecompressPrepareMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16DecompressExecuteMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6SplitActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6SplitRequested);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericSplitActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericSplitRequested);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathMeasurementRequested);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathMeasurementActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathEligible);
+        THREAD_RECORD(getMlvLastRawUint16Lj92ScanComponentCount);
+        THREAD_RECORD(getMlvLastRawUint16Lj92WriteLength);
+        THREAD_RECORD(getMlvLastRawUint16Lj92ExpectedWriteLength);
+        THREAD_RECORD(getMlvLastRawUint16Lj92SkipLength);
+        THREAD_RECORD(getMlvLastRawUint16Lj92LinearizeActive);
+        THREAD_RECORD(getMlvLastRawUint16Lj92ComponentCount);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Predictor);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6TotalMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6BitstreamMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred6PredictorMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericTotalMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericBitstreamMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92GenericPredictorMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathTotalMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathBitstreamMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16Lj92Pred1FastPathPredictorMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16UnpackMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16CopyMilliseconds);
+        THREAD_RECORD(getMlvLastRawUint16PrefetchHit);
+        THREAD_RECORD(getMlvLastRawUint16Source);
+        THREAD_RECORD(getMlvLastRawUint16FrameLj92Milliseconds);
+        THREAD_RECORD(getMlvLastRawUint16InflightWaitMilliseconds);
+        THREAD_RECORD(llrpGetLastSharedLockMilliseconds);
+        THREAD_RECORD(llrpGetLastDualIsoRefineLockMilliseconds);
+        THREAD_RECORD(llrpGetLastPublishLockMilliseconds);
+        THREAD_RECORD(llrpGetLastTotalMilliseconds);
+        THREAD_RECORD(llrpGetLastDarkFrameMilliseconds);
+        THREAD_RECORD(llrpGetLastVerticalStripesMilliseconds);
+        THREAD_RECORD(llrpGetLastFocusPixelsMilliseconds);
+        THREAD_RECORD(llrpGetLastBadPixelsMilliseconds);
+        THREAD_RECORD(llrpGetLastPatternNoiseMilliseconds);
+        THREAD_RECORD(llrpGetLastDualIsoMilliseconds);
+        THREAD_RECORD(llrpGetLastChromaSmoothMilliseconds);
+        THREAD_RECORD(llrpGetLastPreDualIsoFixMilliseconds);
+        THREAD_RECORD(llrpGetLastPreDualIsoFixCompleted);
+#undef THREAD_RECORD
+        llrpGetLastDualIsoFull20bitTiming(&r.full20);
+        return r;
+    }
+
+    double value(const char * name) const
+    {
+        for (const auto & v : values)
+            if (std::strcmp(v.first, name) == 0) return v.second;
+        return -12345.0;
+    }
+
+    // Records that differ from `recorded`, each printed; the full20 struct counts as one.
+    int mismatches(const ThreadRecords & recorded, const char * label) const
+    {
+        int n = 0;
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            if (values[i].second != recorded.values[i].second)
+            {
+                std::printf("[debayered16-inline-records] %s: %s recorded=%.6f exported=%.6f\n", label,
+                            values[i].first, recorded.values[i].second, values[i].second);
+                ++n;
+            }
+        }
+        // Up to the last member: struct copies need not carry tail padding.
+        if (std::memcmp(&full20, &recorded.full20, offsetof(dualiso_full20bit_timing_t, valid) + sizeof(int)) != 0)
+        {
+            std::printf("[debayered16-inline-records] %s: dual_iso_full20 recorded path_kind=%d input=%dx%d "
+                        "exported path_kind=%d input=%dx%d\n",
+                        label, static_cast<int>(recorded.full20.path_kind), recorded.full20.input_width,
+                        recorded.full20.input_height, static_cast<int>(full20.path_kind), full20.input_width,
+                        full20.input_height);
+            ++n;
+        }
+        return n;
+    }
+};
+
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: what drawFrame does for one OutputDebayered16 frame
+// with Phase 3 Disabled: no recon worker ran, so the slot arrives unreconned. The render
+// admits the frame, reconstructs it inline and dispatches as for a worker slot.
+struct InlineStep
+{
+    bool wanted = false;
+    Debayered16InlineReducedRecon recon;
+    Debayered16HonourScaleRefusal admission = Debayered16HonourScaleRefusal::NotPlaying;
+    Debayered16ReconRefusal outcome = Debayered16ReconRefusal::NotReconned;
+    Debayered16RenderedDims dims;
+    uint64_t renderLlrawprocRuns = 0;
+    double llrawprocMsAfterDebayer = -1.0;
+    // r3: the thread's records right after the recon, and after the render's debayer.
+    ThreadRecords recordedAtRecon;
+    ThreadRecords afterDebayer;
+};
+
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: `playing` is the request's
+// PresentationContext::playbackActive (ui->actionPlay->isChecked()), read by the admission,
+// the inline decision and the reuse policy. renderPlaying >= 0 overrides the reuse's copy
+// alone: a slot reconned while playing, rendered by a request that is not.
+InlineStep inlineStep(MlvPipelineFixture & fixture, uint64_t frame, int scale, ProductionSlot & slot,
+                      Debayered16ReconReuseCounters * counters, bool admittedByRequest = true, bool playing = true,
+                      int renderPlaying = -1)
+{
+    const size_t n = fullPixels(fixture);
+    InlineStep step;
+    Debayered16HonourScaleInputs in;
+    in.playbackActive = playing;
+    in.cpuPreviewRoute = true;
+    in.amazeDebayer = doesMlvAlwaysUseAmaze(fixture.video()) != 0;
+    in.requestedScale = scale;
+    in.prepFactor = (scale == 2 || scale == 4) ? scale : 1;
+    step.admission = debayered16HonourScaleRefusal(in);
+    const bool admitted = admittedByRequest && step.admission == Debayered16HonourScaleRefusal::None;
+    if (slot.rawImage16.size() < n * 3u) slot.rawImage16.resize(n * 3u);
+
+    Debayered16InlineReducedReconInputs decide;
+    decide.phase3Disabled = true;
+    decide.honourScaleAdmitted = admitted;
+    decide.playbackActive = playing;
+    decide.scale = scale;
+    decide.frameCacheMayServe = mlvRawDebayerCacheMayServeFrame(fixture.video(), frame) != 0;
+    step.wanted = debayered16InlineReducedReconWanted(decide);
+    if (step.wanted)
+    {
+        slot.reducedReconScale = 1;
+        slot.reducedReconWidth = 0;
+        slot.reducedReconHeight = 0;
+        step.recon = debayered16RunInlineReducedRecon(fixture.video(), static_cast<uint32_t>(frame), scale, kCpuCores,
+                                                      slot.rawImage16.data(), slot.rawImage16.size(),
+                                                      slot.reducedReconBayer);
+        if (step.recon.reconstructed)
+        {
+            slot.reducedReconScale = step.recon.scale;
+            slot.reducedReconWidth = step.recon.reducedWidth;
+            slot.reducedReconHeight = step.recon.reducedHeight;
+        }
+    }
+
+    Debayered16ReconReuseInputs reuse;
+    reuse.playbackActive = renderPlaying < 0 ? playing : renderPlaying != 0;
+    reuse.reducedReconScale = slot.reducedReconScale;
+    reuse.honourScaleAdmitted = admitted && slot.reducedReconScale == scale;
+    if (slot.reducedReconScale > 1)
+    {
+        reuse.reducedReconBayer = slot.reducedReconBayer.data();
+        reuse.reducedReconWidth = slot.reducedReconWidth;
+        reuse.reducedReconHeight = slot.reducedReconHeight;
+    }
+    reuse.reconBufferComplete = slot.rawImage16.size() >= n * 3u;
+    if (step.recon.reconstructed) applyDebayered16InlineReducedRecon(step.recon, static_cast<uint32_t>(frame), 11, reuse);
+    llrpResetDebugRunCount();
+    step.recordedAtRecon = ThreadRecords::capture();
+    step.outcome = renderDebayered16FromSlot(fixture.video(), static_cast<uint32_t>(frame), reuse, slot.rawImage16.data(),
+                                             n, slot.scratch, counters, nullptr, nullptr, &step.dims);
+    step.renderLlrawprocRuns = llrpGetDebugRunCount();
+    step.llrawprocMsAfterDebayer = llrpGetLastTotalMilliseconds();
+    step.afterDebayer = ThreadRecords::capture();
+    return step;
+}
+
+void printInlineStep(const char * label, int frame, int scale, const InlineStep & s)
+{
+    std::printf("[debayered16-inline] %s frame %d x%d: wanted=%d reconstructed=%d decoded=%d admission=%s outcome=%s "
+                "dims=%dx%d scale=%d render_llrawproc_runs=%llu recon_llrawproc_ms=%.3f after_debayer_ms=%.3f "
+                "fallback='%s'\n",
+                label, frame, scale, s.wanted ? 1 : 0, s.recon.reconstructed ? 1 : 0, s.recon.decoded ? 1 : 0,
+                debayered16HonourScaleRefusalName(s.admission), debayered16ReconRefusalName(s.outcome), s.dims.width,
+                s.dims.height, s.dims.reducedScale, static_cast<unsigned long long>(s.renderLlrawprocRuns),
+                s.recon.llrawprocMs, s.llrawprocMsAfterDebayer, s.recon.fallbackReason);
+}
+
+std::vector<uint16_t> presentedWords(const ProductionSlot & slot, const Debayered16RenderedDims & dims)
+{
+    const size_t words = static_cast<size_t>(dims.width) * static_cast<size_t>(dims.height) * 3u;
+    return std::vector<uint16_t>(slot.rawImage16.begin(), slot.rawImage16.begin() + static_cast<std::ptrdiff_t>(words));
+}
+
+// Histogram exposure matching not yet settled at full resolution: the plan refuses.
+void unsettleExposureMatch(MlvPipelineFixture & fixture)
+{
+    fixture.video()->llrawproc->diso_auto_correction = -2;
+    fixture.video()->llrawproc->diso_ev_correction = 1;
+    fixture.video()->llrawproc->diso_black_delta = -1;
+}
+
+// Today's frame from a fresh object with the same settings.
+std::vector<uint16_t> todaysFrame(uint64_t frame, bool unsettled)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    if (unsettled) unsettleExposureMatch(fixture);
+    return fixture.renderDebayeredFrame16(frame);
+}
+
 } // namespace
+
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the decision, one case per false branch.
+TEST(Debayered16ReconReuse, HonourScaleInlineWantedNamesEveryFalseBranch)
+{
+    EnvGuard guard;
+    const auto wanted = []() {
+        Debayered16InlineReducedReconInputs in;
+        in.phase3Disabled = true;
+        in.honourScaleAdmitted = true;
+        in.playbackActive = true;
+        in.scale = 4;
+        in.frameCacheMayServe = false;
+        return in;
+    };
+    ASSERT_TRUE(debayered16InlineReducedReconWanted(wanted()));
+    Debayered16InlineReducedReconInputs in = wanted();
+    in.scale = 2;
+    ASSERT_TRUE(debayered16InlineReducedReconWanted(in));
+
+    in = wanted();
+    in.slotReconned = true;
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(in));
+    in = wanted();
+    in.phase3Disabled = false;
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(in));
+    in = wanted();
+    in.honourScaleAdmitted = false;
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(in));
+    in = wanted();
+    in.playbackActive = false;
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(in));
+    for (const int scale : { 0, 1, 3, 8 })
+    {
+        in = wanted();
+        in.scale = scale;
+        ASSERT_FALSE(debayered16InlineReducedReconWanted(in));
+    }
+    in = wanted();
+    in.frameCacheMayServe = true;
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(in));
+    // Default-constructed inputs refuse: every field fails closed.
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(Debayered16InlineReducedReconInputs()));
+    // The reuse kill switch would refuse the slot anyway: no recon is spent on it.
+    HONOUR_SCALE_TEST_SETENV(MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE_ENV, "1");
+    ASSERT_FALSE(debayered16InlineReducedReconWanted(wanted()));
+}
+
+// With no worker slot an admitted x2/x4 frame is reconstructed inline and consumed.
+TEST(Debayered16ReconReuse, HonourScaleInlineReconConsumedWithNoWorkerSlot)
+{
+    EnvGuard guard;
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        ProductionSlot slot;
+        Debayered16ReconReuseCounters counters;
+        for (int f = 0; f < 2; ++f)
+        {
+            const InlineStep s = inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, &counters);
+            printInlineStep("no worker slot", f, scale, s);
+            ASSERT_TRUE(s.admission == Debayered16HonourScaleRefusal::None);
+            ASSERT_TRUE(s.wanted);
+            ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, s.dims.reducedScale);
+            ASSERT_EQ(fixture.width() / scale, s.dims.width);
+            ASSERT_EQ(fixture.height() / scale, s.dims.height);
+            ASSERT_EQ(static_cast<uint64_t>(0), s.renderLlrawprocRuns);
+        }
+        ASSERT_EQ(static_cast<uint64_t>(2), counters.consumed());
+        ASSERT_EQ(static_cast<uint64_t>(0), counters.ownRecon());
+    }
+}
+
+// The inline route presents the worker route's frame, word for word.
+TEST(Debayered16ReconReuse, HonourScaleInlineBytesEqualTheWorkerRoute)
+{
+    EnvGuard guard;
+    const int frames = 4;
+    for (const int scale : { 2, 4 })
+    {
+        const std::vector<std::vector<uint16_t>> workerRoute = playProduction(scale, frames, nullptr, nullptr);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        ProductionSlot slot;
+        for (int f = 0; f < frames; ++f)
+        {
+            const InlineStep s = inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr);
+            printInlineStep("worker parity", f, scale, s);
+            ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+            const std::vector<uint16_t> got = presentedWords(slot, s.dims);
+            ASSERT_EQ(workerRoute[static_cast<size_t>(f)].size(), got.size());
+            ASSERT_EQ(0, std::memcmp(workerRoute[static_cast<size_t>(f)].data(), got.data(),
+                                     got.size() * sizeof(uint16_t)));
+        }
+    }
+}
+
+// Every refusal leaves today's frame, byte for byte, and a plan refusal costs no decode.
+TEST(Debayered16ReconReuse, HonourScaleInlineRefusalsRenderTodaysBytes)
+{
+    EnvGuard guard;
+    const uint64_t frame = 1;
+    const std::vector<uint16_t> today = todaysFrame(frame, false);
+    const std::vector<uint16_t> todayUnsettled = todaysFrame(frame, true);
+    const auto expectFrame = [&](const char * label, const std::vector<uint16_t> & expected, const InlineStep & s,
+                                 const ProductionSlot & slot, int scale) {
+        printInlineStep(label, static_cast<int>(frame), scale, s);
+        ASSERT_TRUE(s.outcome != Debayered16ReconRefusal::None);
+        ASSERT_EQ(1, s.dims.reducedScale);
+        const std::vector<uint16_t> got = presentedWords(slot, s.dims);
+        ASSERT_EQ(expected.size(), got.size());
+        ASSERT_EQ(0, std::memcmp(expected.data(), got.data(), got.size() * sizeof(uint16_t)));
+    };
+    for (const int scale : { 2, 4 })
+    {
+        {
+            setHonourScaleSwitch("0");
+            MlvPipelineFixture fixture;
+            ASSERT_TRUE(openLargeHq(fixture));
+            ProductionSlot slot;
+            const InlineStep s = inlineStep(fixture, frame, scale, slot, nullptr);
+            setHonourScaleSwitch(nullptr);
+            ASSERT_TRUE(s.admission == Debayered16HonourScaleRefusal::KillSwitch);
+            ASSERT_FALSE(s.wanted);
+            expectFrame("kill switch", today, s, slot, scale);
+        }
+        {
+            MlvPipelineFixture fixture;
+            ASSERT_TRUE(openLargeHq(fixture));
+            ProductionSlot slot;
+            const InlineStep s = inlineStep(fixture, frame, scale, slot, nullptr, false);
+            ASSERT_FALSE(s.wanted);
+            expectFrame("not admitted", today, s, slot, scale);
+        }
+        {
+            HONOUR_SCALE_TEST_SETENV("MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON", "1");
+            MlvPipelineFixture fixture;
+            ASSERT_TRUE(openLargeHq(fixture));
+            ProductionSlot slot;
+            const InlineStep s = inlineStep(fixture, frame, scale, slot, nullptr);
+            HONOUR_SCALE_TEST_UNSETENV("MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON");
+            ASSERT_TRUE(s.wanted);
+            ASSERT_FALSE(s.recon.reconstructed);
+            ASSERT_FALSE(s.recon.decoded);
+            ASSERT_TRUE(std::strlen(s.recon.fallbackReason) > 0);
+            expectFrame("refused plan", today, s, slot, scale);
+        }
+        {
+            MlvPipelineFixture fixture;
+            ASSERT_TRUE(openLargeHq(fixture));
+            unsettleExposureMatch(fixture);
+            ProductionSlot slot;
+            const InlineStep s = inlineStep(fixture, frame, scale, slot, nullptr);
+            ASSERT_TRUE(s.wanted);
+            ASSERT_FALSE(s.recon.reconstructed);
+            ASSERT_FALSE(s.recon.decoded);
+            ASSERT_EQ(std::string("dual-ISO exposure match not settled at full resolution yet"),
+                      std::string(s.recon.fallbackReason));
+            expectFrame("unsettled exposure match", todayUnsettled, s, slot, scale);
+        }
+    }
+}
+
+// Export after reduced playback in one process equals a fresh object's export: the inline
+// recon publishes nothing the export reads.
+TEST(Debayered16ReconReuse, HonourScaleInlinePlaybackLeavesExportUntouched)
+{
+    EnvGuard guard;
+    const uint64_t frame = 1;
+    MlvPipelineFixture played;
+    ASSERT_TRUE(openLargeHq(played));
+    ProductionSlot slot;
+    for (const int scale : { 2, 4 })
+    {
+        for (int f = 0; f < 2; ++f)
+        {
+            const InlineStep s = inlineStep(played, static_cast<uint64_t>(f), scale, slot, nullptr);
+            ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, s.dims.reducedScale);
+        }
+    }
+    const std::vector<uint16_t> playedPaused = played.renderDebayeredFrame16(frame);
+    const std::vector<uint16_t> playedExport16 = played.renderFrame16(frame);
+    const std::vector<uint8_t> playedExport8 = played.renderFrame8(frame);
+
+    MlvPipelineFixture fresh;
+    ASSERT_TRUE(openLargeHq(fresh));
+    ASSERT_TRUE(playedPaused == fresh.renderDebayeredFrame16(frame));
+    ASSERT_TRUE(playedExport16 == fresh.renderFrame16(frame));
+    ASSERT_TRUE(playedExport8 == fresh.renderFrame8(frame));
+}
+
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 T-S1 (HUB RULING CPU-DUALISO-REDUCED-RECON-S4-DECISION-1):
+// the reduced recon runs only while playing. A request built with Play unchecked (pause, seek,
+// scrub, single-step, open) renders today's full recon at s2 and s4, word for word. Positive
+// control on the SAME fixture and slot: a playing frame is reduced, and the still of that frame
+// rendered right after it (the pause transition) is full again.
+TEST(Debayered16ReconReuse, HonourScaleStillFrameRunsTheFullRecon)
+{
+    EnvGuard guard;
+    const int frames = 2;
+    std::vector<std::vector<uint16_t>> today;
+    for (int f = 0; f < frames; ++f) today.push_back(todaysFrame(static_cast<uint64_t>(f), false));
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        ProductionSlot slot;
+        const auto expectFull = [&](const char * label, int f, const InlineStep & s) {
+            printInlineStep(label, f, scale, s);
+            ASSERT_TRUE(s.admission == Debayered16HonourScaleRefusal::NotPlaying);
+            ASSERT_FALSE(s.wanted);
+            ASSERT_FALSE(s.recon.reconstructed);
+            ASSERT_EQ(1, s.dims.reducedScale);
+            ASSERT_EQ(fixture.width(), s.dims.width);
+            ASSERT_EQ(fixture.height(), s.dims.height);
+            const std::vector<uint16_t> got = presentedWords(slot, s.dims);
+            const std::vector<uint16_t> & expected = today[static_cast<size_t>(f)];
+            ASSERT_EQ(expected.size(), got.size());
+            ASSERT_EQ(0, std::memcmp(expected.data(), got.data(), got.size() * sizeof(uint16_t)));
+        };
+        for (int f = 0; f < frames; ++f)
+            expectFull("still", f, inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr, true, false));
+        for (int f = 0; f < frames; ++f)
+        {
+            const InlineStep played = inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr);
+            printInlineStep("playing", f, scale, played);
+            ASSERT_TRUE(played.admission == Debayered16HonourScaleRefusal::None);
+            ASSERT_TRUE(played.wanted);
+            ASSERT_TRUE(played.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, played.dims.reducedScale);
+            ASSERT_EQ(fixture.width() / scale, played.dims.width);
+            expectFull("paused after playing", f,
+                       inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr, true, false));
+        }
+    }
+}
+
+// T-S2: a slot that holds an admitted reduced recon, rendered by a request with Play unchecked,
+// is refused NotPlaying and renders today's full frame (it is never consumed).
+TEST(Debayered16ReconReuse, HonourScaleReducedSlotRenderedNotPlayingIsTheFullRecon)
+{
+    EnvGuard guard;
+    const uint64_t frame = 1;
+    const std::vector<uint16_t> today = todaysFrame(frame, false);
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        ProductionSlot slot;
+        Debayered16ReconReuseCounters counters;
+        const InlineStep s = inlineStep(fixture, frame, scale, slot, &counters, true, true, 0);
+        printInlineStep("reduced slot, render not playing", static_cast<int>(frame), scale, s);
+        ASSERT_TRUE(s.wanted);
+        ASSERT_TRUE(s.recon.reconstructed);
+        ASSERT_EQ(scale, slot.reducedReconScale);
+        ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::NotPlaying);
+        ASSERT_EQ(1, s.dims.reducedScale);
+        ASSERT_EQ(fixture.width(), s.dims.width);
+        ASSERT_EQ(fixture.height(), s.dims.height);
+        ASSERT_EQ(static_cast<uint64_t>(0), counters.consumed());
+        const std::vector<uint16_t> got = presentedWords(slot, s.dims);
+        ASSERT_EQ(today.size(), got.size());
+        ASSERT_EQ(0, std::memcmp(today.data(), got.data(), got.size() * sizeof(uint16_t)));
+    }
+}
+
+// T-E2: the export call (getMlvProcessedFrame16 / 8) after an s4 reduced playing frame equals the
+// same call on a fresh object, with the exposure match settled, unsettled before the play (the
+// plan refuses), and unsettled after it (llrawproc publishes shared dual-ISO match state; lesson
+// warm-run-writes-shared-dualiso-match).
+TEST(Debayered16ReconReuse, HonourScaleExportAfterAReducedPlayingFrameEqualsAFreshExport)
+{
+    EnvGuard guard;
+    const uint64_t frame = 1;
+    const int scale = 4;
+    enum class Match { Settled, UnsettledBeforePlay, UnsettledAfterPlay };
+    for (const Match match : { Match::Settled, Match::UnsettledBeforePlay, Match::UnsettledAfterPlay })
+    {
+        MlvPipelineFixture played;
+        ASSERT_TRUE(openLargeHq(played));
+        if (match == Match::UnsettledBeforePlay) unsettleExposureMatch(played);
+        ProductionSlot slot;
+        const InlineStep s = inlineStep(played, frame, scale, slot, nullptr);
+        printInlineStep(match == Match::Settled ? "export, settled"
+                        : match == Match::UnsettledBeforePlay ? "export, unsettled before play"
+                                                              : "export, unsettled after play",
+                        static_cast<int>(frame), scale, s);
+        ASSERT_TRUE(s.wanted);
+        if (match == Match::UnsettledBeforePlay)
+        {
+            ASSERT_FALSE(s.recon.reconstructed);
+        }
+        else
+        {
+            ASSERT_TRUE(s.recon.reconstructed);
+            ASSERT_EQ(scale, s.dims.reducedScale);
+        }
+        if (match == Match::UnsettledAfterPlay) unsettleExposureMatch(played);
+        const std::vector<uint16_t> playedExport16 = played.renderFrame16(frame);
+        const std::vector<uint8_t> playedExport8 = played.renderFrame8(frame);
+
+        MlvPipelineFixture fresh;
+        ASSERT_TRUE(openLargeHq(fresh));
+        if (match != Match::Settled) unsettleExposureMatch(fresh);
+        const std::vector<uint16_t> freshExport16 = fresh.renderFrame16(frame);
+        const std::vector<uint8_t> freshExport8 = fresh.renderFrame8(frame);
+        ASSERT_EQ(freshExport16.size(), playedExport16.size());
+        ASSERT_TRUE(playedExport16 == freshExport16);
+        ASSERT_TRUE(playedExport8 == freshExport8);
+    }
+}
+
+// The reduced debayer clears the thread's llrawproc timing, so the recon's own is captured
+// first: a head frame reporting 0.0 is a telemetry bug, not a win. r3: the thread's record
+// survives the debayer too (ADV-A1).
+TEST(Debayered16ReconReuse, HonourScaleInlineReconTimingSurvivesTheReducedDebayer)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    ProductionSlot slot;
+    const InlineStep s = inlineStep(fixture, 1, 4, slot, nullptr);
+    printInlineStep("timing", 1, 4, s);
+    ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+    ASSERT_TRUE(s.recon.decoded);
+    ASSERT_TRUE(s.recon.llrawprocMs > 0.0);
+    ASSERT_TRUE(s.llrawprocMsAfterDebayer == s.recon.llrawprocMs);
+}
+
+// CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3 (ADV-A1): after an inline reduced recon is consumed,
+// every decode, LJ92, llrawproc and dual_iso_full20 record drawFrame exports still holds the
+// value the recon recorded, not the reduced debayer's reset (LJ92 component count 0,
+// predictor -1, zero stage times). Every frame and scale runs before the one assert.
+TEST(Debayered16ReconReuse, HonourScaleInlineDecodeRecordsSurviveTheReducedDebayer)
+{
+    EnvGuard guard;
+    int mismatches = 0;
+    int legs = 0;
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        fixture.video()->llrawproc->focus_pixels = 1;
+        ProductionSlot slot;
+        for (int f = 0; f < 2; ++f)
+        {
+            const InlineStep s = inlineStep(fixture, static_cast<uint64_t>(f), scale, slot, nullptr);
+            printInlineStep("decode records", f, scale, s);
+            ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+            ASSERT_EQ(scale, s.dims.reducedScale);
+            const ThreadRecords & at = s.recordedAtRecon;
+            std::printf("[debayered16-inline-records] x%d frame %d recorded: raw_uint16_ms=%.3f source=%.0f "
+                        "lj92_components=%.0f lj92_predictor=%.0f llrawproc_total_ms=%.3f dual_iso_ms=%.3f "
+                        "full20_path_kind=%d pre_dualiso_fix_completed=%.0f\n",
+                        scale, f, at.value("getMlvLastRawUint16Milliseconds"), at.value("getMlvLastRawUint16Source"),
+                        at.value("getMlvLastRawUint16Lj92ComponentCount"),
+                        at.value("getMlvLastRawUint16Lj92Predictor"), at.value("llrpGetLastTotalMilliseconds"),
+                        at.value("llrpGetLastDualIsoMilliseconds"), static_cast<int>(at.full20.path_kind),
+                        at.value("llrpGetLastPreDualIsoFixCompleted"));
+            // Not vacuous: the recon left records the reset would clear.
+            ASSERT_TRUE(at.value("getMlvLastRawUint16Milliseconds") > 0.0);
+            ASSERT_TRUE(at.value("llrpGetLastTotalMilliseconds") > 0.0);
+            ASSERT_TRUE(at.value("llrpGetLastPreDualIsoFixCompleted") != 0.0);
+            char label[48];
+            std::snprintf(label, sizeof(label), "x%d frame %d", scale, f);
+            mismatches += s.afterDebayer.mismatches(at, label);
+            ++legs;
+        }
+    }
+    std::printf("[debayered16-inline-records] legs=%d mismatched records=%d\n", legs, mismatches);
+    ASSERT_EQ(4, legs);
+    ASSERT_EQ(0, mismatches);
+}
+
+// Adversary A1: the full-resolution fix pass's telemetry is cleared the same way, so a frame
+// with a completed pass must carry it out of the recon or it publishes zero dimensions.
+TEST(Debayered16ReconReuse, HonourScaleInlineFullResFixTelemetrySurvivesTheReducedDebayer)
+{
+    EnvGuard guard;
+    for (const int scale : { 2, 4 })
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openLargeHq(fixture));
+        fixture.video()->llrawproc->focus_pixels = 1;
+        ProductionSlot slot;
+        const InlineStep s = inlineStep(fixture, 1, scale, slot, nullptr);
+        printInlineStep("full-res fixes", 1, scale, s);
+        ASSERT_TRUE(s.outcome == Debayered16ReconRefusal::None);
+        ASSERT_TRUE(s.recon.fullResFixesMs > 0.0);
+        ASSERT_TRUE(s.recon.preDualIsoFixCompleted);
+        ASSERT_TRUE(s.recon.preDualIsoFixMs > 0.0);
+        // r3 (ADV-A1): the thread's own record survives the reduced debayer as well.
+        ASSERT_TRUE(llrpGetLastPreDualIsoFixCompleted() != 0);
+    }
+}
 
 // (a) The look gate at x2 and x4 over 8 frames of the large fixture (16 frames available).
 TEST(Debayered16ReconReuse, HonourScaleReducedReconLookWithinGateOfTodaysPrepReducedFrame)
@@ -731,6 +1361,111 @@ TEST(Debayered16ReconReuse, HonourScaleCoreEntryRefusalsAndRowFill)
     }
 }
 
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 adversary A2: the reduced entry reset this thread's
+// debayer kernel time and then ran its debayer without recording it, so every reduced frame
+// published debayer_kernel_ms = 0. The clock may tick coarsely, so a call may legitimately read
+// 0 ms; the entry must record a nonzero time on some call within 64 (it never did before).
+TEST(Debayered16ReconReuse, HonourScaleReducedEntryRecordsItsDebayerKernelTime)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    WorkerState worker;
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        std::vector<uint16_t> reduced;
+        ASSERT_TRUE(reducedRecon(fixture, 1, scale, worker, &plan, &reduced));
+        const size_t outWords = static_cast<size_t>(fixture.width() / scale) * static_cast<size_t>(fixture.height() / scale) * 3u;
+        std::vector<uint16_t> out(outWords);
+        const int hq = llrpHQDualIso(fixture.video()) ? 1 : 0;
+        int calls = 0;
+        double kernelMs = 0.0;
+        while (calls < 64 && kernelMs <= 0.0)
+        {
+            std::vector<uint16_t> bayer(reduced); // the entry shifts its input in place
+            int w = -1, h = -1;
+            ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(fixture.video(), 1, bayer.data(), plan.reducedWidth,
+                                                                         plan.reducedHeight, scale, out.data(), hq, &w, &h));
+            ++calls;
+            kernelMs = getMlvLastDebayerKernelMilliseconds();
+        }
+        std::printf("[debayered16-honour-scale] reduced entry x%d: debayer_kernel_ms=%.4f after %d call(s)\n", scale, kernelMs,
+                    calls);
+        ASSERT_TRUE(kernelMs > 0.0);
+    }
+}
+
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r2 (Grok G1): the four debayer stage times are this
+// thread's last-run records. The full-resolution entries reset them; the scaled frame entries
+// (getMlvProcessedFrame16Scaled, getMlvProcessedFrame8Scaled, ...) did not, so a mid- or
+// quarter-scale frame rendered after a full-resolution AMaZE+CA frame on the same thread
+// reported that frame's wb-prepare, CA and wb-undo times (and, on a downsample route, its
+// kernel time) as its own. Each scaled frame must report only stages it ran: the three
+// non-kernel stages are 0 (no scaled route runs them) and the kernel time is not the full frame's.
+TEST(Debayered16ReconReuse, HonourScaleScaledFrameDoesNotInheritFullResDebayerStageTimes)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    WorkerState worker;
+    const char * const routes[] = { "processed16 x2", "processed8 x4" };
+    for (int route = 0; route < 2; ++route)
+    {
+        // A full-resolution AMaZE frame with CA on: the route that measures all four stages.
+        setMlvAlwaysUseAmaze(fixture.video());
+        fixture.video()->ca_red = 1.0f;
+        double wbPrepareMs = 0.0, caMs = 0.0, kernelMs = 0.0, wbUndoMs = 0.0;
+        for (uint64_t frame = 0; frame < 8 && (wbPrepareMs + caMs + wbUndoMs <= 0.0 || kernelMs <= 0.0); ++frame)
+        {
+            std::vector<uint16_t> rgb16;
+            ASSERT_TRUE(controlDebayered16(fixture, frame, worker, &rgb16));
+            wbPrepareMs = getMlvLastDebayerWbPrepareMilliseconds();
+            caMs = getMlvLastDebayerCaMilliseconds();
+            kernelMs = getMlvLastDebayerKernelMilliseconds();
+            wbUndoMs = getMlvLastDebayerWbUndoMilliseconds();
+        }
+        std::printf("[debayered16-honour-scale] full-res AMaZE+CA: wb_prepare=%.4f ca=%.4f kernel=%.4f wb_undo=%.4f\n",
+                    wbPrepareMs, caMs, kernelMs, wbUndoMs);
+        ASSERT_TRUE(wbPrepareMs + caMs + wbUndoMs > 0.0);
+        ASSERT_TRUE(kernelMs > 0.0);
+
+        // Then a scaled frame on the same thread, on the playback debayer.
+        setMlvDontAlwaysUseAmaze(fixture.video());
+        resetMlvCachedFrame(fixture.video());
+        const int scale = route == 0 ? 2 : 4;
+        const size_t scaledWords = static_cast<size_t>(fixture.width() / scale) * static_cast<size_t>(fixture.height() / scale) * 3u;
+        // The fixture sizes its output up front and a failed scaled render zeroes it, so the
+        // render's success is proved by its fill (adversary r2 A1), not by the size.
+        size_t nonzero = 0;
+        if (route == 0)
+        {
+            const std::vector<uint16_t> out16 = fixture.renderFrame16Scaled(2, kCpuCores, scale);
+            ASSERT_EQ(scaledWords, out16.size());
+            nonzero = static_cast<size_t>(std::count_if(out16.begin(), out16.end(), [](uint16_t v) { return v != 0; }));
+        }
+        else
+        {
+            const std::vector<uint8_t> out8 = fixture.renderFrame8Scaled(3, kCpuCores, scale);
+            ASSERT_EQ(scaledWords, out8.size());
+            nonzero = static_cast<size_t>(std::count_if(out8.begin(), out8.end(), [](uint8_t v) { return v != 0; }));
+        }
+        ASSERT_TRUE(nonzero > scaledWords / 2);
+        const double scaledWbPrepareMs = getMlvLastDebayerWbPrepareMilliseconds();
+        const double scaledCaMs = getMlvLastDebayerCaMilliseconds();
+        const double scaledKernelMs = getMlvLastDebayerKernelMilliseconds();
+        const double scaledWbUndoMs = getMlvLastDebayerWbUndoMilliseconds();
+        std::printf("[debayered16-honour-scale] %s after full-res: wb_prepare=%.4f ca=%.4f kernel=%.4f wb_undo=%.4f "
+                    "phase4b_path=%d\n",
+                    routes[route], scaledWbPrepareMs, scaledCaMs, scaledKernelMs, scaledWbUndoMs, mlv_phase4bv2_last_path_taken());
+        ASSERT_TRUE(scaledWbPrepareMs == 0.0);
+        ASSERT_TRUE(scaledCaMs == 0.0);
+        ASSERT_TRUE(scaledWbUndoMs == 0.0);
+        ASSERT_TRUE(scaledKernelMs != kernelMs);
+        fixture.video()->ca_red = 0.0f;
+    }
+}
+
 // The prep's reduced-source config: only a SourceAlreadyReduced decision at x2/x4 whose
 // source is exactly the clip divided by that scale; otherwise nothing is built.
 TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyReducedSource)
@@ -766,4 +1501,198 @@ TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyRe
     ASSERT_EQ(4, d.factor);
     ASSERT_FALSE(playbackPrepReducedSourceConfig(workspace, config, 1, d, 1808, 2268, 1808, 2268, &reduced));
     ASSERT_FALSE(playbackPrepReducedSourceConfig(workspace, config, 1, d, 1808, 2268, 1808, 2268, nullptr));
+}
+
+// r2 B1 (Dot 4fcd6bc7, adversary A2): the policy admits odd reduced widths (4004x2268 at x4 is
+// 1001x564) and allocates exactly reducedWidth*reducedHeight words. The bilinear kernels read
+// the x+2 column, which at an odd width is past the row and, on the final row pair, one word
+// past the frame. The frame below ends exactly at a no-access page; a read of that page is
+// recorded by the fault handler, which then opens the page read-only so the kernel finishes.
+namespace {
+
+struct GuardPage
+{
+    char *lo = nullptr;
+    char *hi = nullptr;
+    long hits = 0;
+    const char *firstFault = nullptr;
+};
+
+GuardPage g_guardPage;
+
+#ifdef _WIN32
+LONG CALLBACK guardPageHandler(EXCEPTION_POINTERS *info)
+{
+    const EXCEPTION_RECORD *rec = info->ExceptionRecord;
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const char *addr = reinterpret_cast<const char *>(rec->ExceptionInformation[1]);
+    if (addr < g_guardPage.lo || addr >= g_guardPage.hi)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (g_guardPage.hits++ == 0)
+        g_guardPage.firstFault = addr;
+    DWORD old = 0;
+    VirtualProtect(g_guardPage.lo, static_cast<SIZE_T>(g_guardPage.hi - g_guardPage.lo), PAGE_READONLY, &old);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+#else
+struct sigaction g_guardPagePrevious;
+
+void guardPageHandler(int sig, siginfo_t *info, void *)
+{
+    const char *addr = static_cast<const char *>(info->si_addr);
+    if (addr < g_guardPage.lo || addr >= g_guardPage.hi)
+    {
+        sigaction(sig, &g_guardPagePrevious, nullptr);
+        return;
+    }
+    if (g_guardPage.hits++ == 0)
+        g_guardPage.firstFault = addr;
+    mprotect(g_guardPage.lo, static_cast<size_t>(g_guardPage.hi - g_guardPage.lo), PROT_READ);
+}
+#endif
+
+// A frame of `bytes` bytes ending exactly at a no-access page; run() reports the guard reads.
+class GuardedFrame
+{
+public:
+    explicit GuardedFrame(size_t bytes) : m_bytes(bytes)
+    {
+#ifdef _WIN32
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        m_page = si.dwPageSize;
+#else
+        m_page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+        const size_t dataPages = (bytes + m_page - 1) / m_page;
+        m_mapBytes = (dataPages + 1) * m_page;
+#ifdef _WIN32
+        m_base = static_cast<char *>(VirtualAlloc(nullptr, m_mapBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+#else
+        void *p = mmap(nullptr, m_mapBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        m_base = p == MAP_FAILED ? nullptr : static_cast<char *>(p);
+#endif
+        m_guard = m_base ? m_base + dataPages * m_page : nullptr;
+    }
+    ~GuardedFrame()
+    {
+        if (!m_base)
+            return;
+#ifdef _WIN32
+        VirtualFree(m_base, 0, MEM_RELEASE);
+#else
+        munmap(m_base, m_mapBytes);
+#endif
+    }
+    bool ok() const { return m_base != nullptr; }
+    void *data() const { return m_guard - m_bytes; }
+
+    // Arms the guard, runs fn, disarms; returns the number of faulting reads of the guard page
+    // and the first one's offset past the frame's end in *firstOffset.
+    template <typename Fn> long run(Fn fn, long *firstOffset)
+    {
+        g_guardPage.lo = m_guard;
+        g_guardPage.hi = m_guard + m_page;
+        g_guardPage.hits = 0;
+        g_guardPage.firstFault = nullptr;
+#ifdef _WIN32
+        DWORD old = 0;
+        VirtualProtect(m_guard, m_page, PAGE_NOACCESS, &old);
+        void *handler = AddVectoredExceptionHandler(1, guardPageHandler);
+        fn();
+        RemoveVectoredExceptionHandler(handler);
+        VirtualProtect(m_guard, m_page, PAGE_READWRITE, &old);
+#else
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = guardPageHandler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &g_guardPagePrevious);
+        mprotect(m_guard, m_page, PROT_NONE);
+        fn();
+        mprotect(m_guard, m_page, PROT_READ | PROT_WRITE);
+        sigaction(SIGSEGV, &g_guardPagePrevious, nullptr);
+#endif
+        *firstOffset = g_guardPage.firstFault ? static_cast<long>(g_guardPage.firstFault - m_guard) : -1;
+        return g_guardPage.hits;
+    }
+
+private:
+    size_t m_bytes = 0;
+    size_t m_page = 0;
+    size_t m_mapBytes = 0;
+    char *m_base = nullptr;
+    char *m_guard = nullptr;
+};
+
+bool hostRunsDebayerAvx2()
+{
+#if defined(__GNUC__) && !defined(__clang__) && (defined(__x86_64__) || defined(__i386__))
+    // The kernel's own kill switch latches scalar whatever the host supports.
+    const char *kill = std::getenv("MLVAPP_DISABLE_AVX2");
+    if (kill && kill[0] != '\0' && std::strcmp(kill, "0") != 0)
+        return false;
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#else
+    return false;
+#endif
+}
+
+} // namespace
+
+TEST(Debayered16ReconReuse, ReducedDebayerOddWidthReadsStayInsideTheBayerFrame)
+{
+    EnvGuard guard;
+    struct Case { int width; int height; };
+    // 1001x564 is the admitted x4 geometry of a 4004x2268 clip (the AVX2 path's scalar tail
+    // reaches x=999); 127x20 ends in a short tail; 17x10 is below the AVX2 width floor.
+    const Case cases[] = { { 1001, 564 }, { 127, 20 }, { 17, 10 } };
+    const bool avx2Host = hostRunsDebayerAvx2();
+    int avx2Runs = 0;
+    // Every leg runs before the one assert, so a RED names each dispatch that overreads.
+    long guardReads = 0;
+    for (const Case &c : cases)
+    {
+        const size_t pixels = static_cast<size_t>(c.width) * static_cast<size_t>(c.height);
+        std::vector<uint16_t> out(pixels * 3u, 0);
+        for (const bool scalar : { true, false })
+        {
+            if (!scalar && !avx2Host)
+                continue;
+            HONOUR_SCALE_TEST_SETENV("MLVAPP_DISABLE_AVX2_DEBAYER", scalar ? "1" : "");
+            const int avx2 = debayerBasicU16ReinitDispatchForTesting();
+            ASSERT_EQ(scalar ? 0 : 1, avx2);
+            if (!scalar && c.width >= 18)
+                ++avx2Runs;
+            GuardedFrame frame(pixels * sizeof(uint16_t));
+            ASSERT_TRUE(frame.ok());
+            uint16_t *bayer = static_cast<uint16_t *>(frame.data());
+            for (size_t i = 0; i < pixels; ++i)
+                bayer[i] = static_cast<uint16_t>((i * 37u + 1u) & 0x3FFFu);
+            long offset = -1;
+            const long hits = frame.run([&] { debayerBasicU16(out.data(), bayer, c.width, c.height, 1, 0); }, &offset);
+            std::printf("[debayered16-honour-scale] debayerBasicU16 %s %dx%d: guard reads=%ld first offset=%ld\n",
+                        scalar ? "scalar" : "avx2", c.width, c.height, hits, offset);
+            guardReads += hits;
+        }
+        // The float sibling (debayerBasic) indexes the same 4x4 neighbourhood.
+        GuardedFrame frame(pixels * sizeof(float));
+        ASSERT_TRUE(frame.ok());
+        float *bayer = static_cast<float *>(frame.data());
+        for (size_t i = 0; i < pixels; ++i)
+            bayer[i] = static_cast<float>((i * 37u + 1u) & 0x3FFFu);
+        long offset = -1;
+        const long hits = frame.run([&] { debayerBasic(out.data(), bayer, c.width, c.height, 1); }, &offset);
+        std::printf("[debayered16-honour-scale] debayerBasic %dx%d: guard reads=%ld first offset=%ld\n", c.width,
+                    c.height, hits, offset);
+        guardReads += hits;
+    }
+    HONOUR_SCALE_TEST_UNSETENV("MLVAPP_DISABLE_AVX2_DEBAYER");
+    debayerBasicU16ReinitDispatchForTesting();
+    std::printf("[debayered16-honour-scale] odd-width guard: avx2 host=%d avx2 runs=%d\n", avx2Host ? 1 : 0, avx2Runs);
+    ASSERT_EQ(avx2Host ? 2 : 0, avx2Runs);
+    ASSERT_EQ(0L, guardReads);
 }

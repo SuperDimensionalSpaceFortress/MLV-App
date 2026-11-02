@@ -152,43 +152,52 @@ static uint64_t file_get_pos(FILE *stream)
 #define MLV_THREAD_LOCAL __thread
 #endif
 
+/* Every record mlv_reset_last_raw_stage_telemetry clears, with the value it is
+ * cleared to. CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the save/restore pair
+ * (mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread) copies the same list,
+ * so a record added here is covered by both. */
+#define MLV_LAST_RAW_STAGE_TELEMETRY(X) \
+    X(double, g_mlv_last_raw_uint16_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_disk_read_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_decompress_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_decompress_prepare_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_decompress_execute_ms, 0.0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred6_split_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred6_split_requested, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_generic_split_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_generic_split_requested, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_scan_component_count, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_write_length, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_expected_write_length, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_skip_length, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_linearize_active, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_component_count, 0) \
+    X(int, g_mlv_last_raw_uint16_lj92_predictor, -1) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred6_total_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred6_predictor_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_generic_total_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_generic_bitstream_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_generic_predictor_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_unpack_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_copy_ms, 0.0) \
+    X(int, g_mlv_last_raw_uint16_prefetch_hit, 0) \
+    X(int, g_mlv_last_raw_uint16_source, MLV_RAW_UINT16_SOURCE_NONE) \
+    X(double, g_mlv_last_raw_uint16_frame_lj92_ms, 0.0) \
+    X(double, g_mlv_last_raw_uint16_inflight_wait_ms, 0.0)
+
 static void mlv_reset_last_raw_stage_telemetry(void)
 {
-    g_mlv_last_raw_uint16_ms = 0.0;
-    g_mlv_last_raw_uint16_disk_read_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_prepare_ms = 0.0;
-    g_mlv_last_raw_uint16_decompress_execute_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred6_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_active = 0;
-    g_mlv_last_raw_uint16_lj92_generic_split_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_requested = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_measurement_active = 0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_eligible = 0;
-    g_mlv_last_raw_uint16_lj92_scan_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_expected_write_length = 0;
-    g_mlv_last_raw_uint16_lj92_skip_length = 0;
-    g_mlv_last_raw_uint16_lj92_linearize_active = 0;
-    g_mlv_last_raw_uint16_lj92_component_count = 0;
-    g_mlv_last_raw_uint16_lj92_predictor = -1;
-    g_mlv_last_raw_uint16_lj92_pred6_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred6_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_generic_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_total_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_bitstream_ms = 0.0;
-    g_mlv_last_raw_uint16_lj92_pred1_fast_path_predictor_ms = 0.0;
-    g_mlv_last_raw_uint16_unpack_ms = 0.0;
-    g_mlv_last_raw_uint16_copy_ms = 0.0;
-    g_mlv_last_raw_uint16_prefetch_hit = 0;
-    g_mlv_last_raw_uint16_source = MLV_RAW_UINT16_SOURCE_NONE;
-    g_mlv_last_raw_uint16_frame_lj92_ms = 0.0;
-    g_mlv_last_raw_uint16_inflight_wait_ms = 0.0;
+#define MLV_RESET_LAST_RAW_STAGE_RECORD(type, name, cleared) name = (cleared);
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_RESET_LAST_RAW_STAGE_RECORD)
+#undef MLV_RESET_LAST_RAW_STAGE_RECORD
 }
 
 static int mlv_env_value_is_truthy(const char * value)
@@ -4339,6 +4348,9 @@ int get_mlv_raw_frame_debayered_isolated_analysis_scaled(mlvObject_t * video,
         return 0;
     }
 
+    /* r2 (Grok G1): this route downsamples without a debayer; clear the four debayer stages. */
+    resetMlvLastDebayerStageMilliseconds();
+
     const int full_w = (int)getMlvWidth(video);
     const int full_h = (int)getMlvHeight(video);
     const int normalized_scale = mlv_effective_playback_scale_factor(video, scaleFactor);
@@ -5089,7 +5101,7 @@ static int mlv_render_scaled_rgb16_v3_full_xy(mlvObject_t * video,
      * and mid_h <= out_h, so this fills rows 0..mid_h-1 of the output.) */
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
     const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
 
     /* Step 5: replicate the last valid row into rows mid_h..out_h-1 of the
@@ -5207,7 +5219,7 @@ static int mlv_render_scaled_rgb16_x2_full_xy_core(mlvObject_t * video,
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
     const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
 
     const size_t row_words = (size_t)out_w * 3u;
@@ -5385,7 +5397,7 @@ static int mlv_render_scaled_rgb16_x2_quarter_preview_core(mlvObject_t * video,
         /* Reduced-processing mode: debayer + pad straight into the caller's
          * buffer at quarter layout; the caller upscales after processing. */
         const double debayer_start = mlv_stage_timing_now();
-        debayerBasicU16(outputFrame, q_bayer, q_w, q_h, threads, bit_shift);
+        debayerBasicU16RecordingKernelMilliseconds(outputFrame, q_bayer, q_w, q_h, threads, bit_shift);
         const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
         const size_t q_row_words_direct = (size_t)q_w * 3u;
         if (q_h > 0)
@@ -5409,7 +5421,7 @@ static int mlv_render_scaled_rgb16_x2_quarter_preview_core(mlvObject_t * video,
     uint16_t * q_rgb = mlv_ensure_thread_rgb_u16_buffer(q_rgb_words);
     if (!q_rgb) return 0;
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(q_rgb, q_bayer, q_w, q_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(q_rgb, q_bayer, q_w, q_h, threads, bit_shift);
     const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
 
     /* Pad the cropped rows (q_h .. q_out_h) from the last valid row, matching v3. */
@@ -5550,7 +5562,7 @@ static int mlv_render_scaled_rgb16_x1_half_preview_core(mlvObject_t * video,
          * at mid layout; no upscale here (the caller upscales after
          * processing). */
         const double debayer_start = mlv_stage_timing_now();
-        debayerBasicU16(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
+        debayerBasicU16RecordingKernelMilliseconds(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
         const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
         g_mlv_last_debayered_frame_ms = downsample_ms + debayer_ms;
         mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
@@ -5564,7 +5576,7 @@ static int mlv_render_scaled_rgb16_x1_half_preview_core(mlvObject_t * video,
     uint16_t * mid_rgb = mlv_ensure_thread_rgb_u16_buffer(mid_rgb_words);
     if (!mid_rgb) return 0;
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(mid_rgb, mid_bayer, mid_w, mid_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(mid_rgb, mid_bayer, mid_w, mid_h, threads, bit_shift);
     const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
 
     const double upscale_start = mlv_stage_timing_now();
@@ -5926,7 +5938,7 @@ static int mlv_render_scaled_rgb16_v2(mlvObject_t * video,
     /* Step 4: debayer narrowed bayer → RGB16 at (mid_w, mid_h). */
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(mid_rgb, mid_bayer, mid_w, mid_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(mid_rgb, mid_bayer, mid_w, mid_h, threads, bit_shift);
 
     /* Step 5: RGB Y-only 4x downsample → final (out_w, out_h). */
     int actual_out_w = 0, actual_out_h = 0;
@@ -6002,7 +6014,7 @@ static int mlv_render_scaled_rgb16_v3_full_xy_from_raw(mlvObject_t * video,
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
     const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
 
     const size_t row_words = (size_t)out_w * 3u;
@@ -6115,7 +6127,7 @@ static int mlv_render_scaled_rgb16_v4_x8_full_xy_core(mlvObject_t * video,
 
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
     const double debayer_start = mlv_stage_timing_now();
-    debayerBasicU16(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(outputFrame, mid_bayer, mid_w, mid_h, threads, bit_shift);
     const double debayer_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
 
     const size_t row_words = (size_t)out_w * 3u;
@@ -6388,7 +6400,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
                             g_mlv_last_llrawproc_ms = llrawproc_ms;
                             const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
                             const double debayer_start = mlv_stage_timing_now();
-                            debayerBasicU16(mid_rgb, mid_bayer, mid_w, mid_h, threads, bit_shift);
+                            debayerBasicU16RecordingKernelMilliseconds(mid_rgb, mid_bayer, mid_w, mid_h, threads, bit_shift);
                             int actual_out_w = 0, actual_out_h = 0;
                             int rc2 = pl_downsample_rgb_to_rgb_4x_y_only(mid_rgb, mid_w, mid_h,
                                                                           outputFrame, &actual_out_w, &actual_out_h, threads);
@@ -6704,6 +6716,33 @@ void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error)
     g_mlv_debayered16_reduced_bit_shift_error_for_testing = error;
 }
 
+/* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: one saved copy per thread of every
+ * decode record the reconned debayers clear (MLV_LAST_RAW_STAGE_TELEMETRY) and of
+ * llrawproc's last-run records (llrpSaveLastRunTimingForCurrentThread). */
+typedef struct
+{
+#define MLV_SAVED_LAST_RAW_STAGE_RECORD(type, name, cleared) type name;
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_SAVED_LAST_RAW_STAGE_RECORD)
+#undef MLV_SAVED_LAST_RAW_STAGE_RECORD
+} mlv_saved_last_raw_stage_telemetry_t;
+static MLV_STAGE_THREAD_LOCAL mlv_saved_last_raw_stage_telemetry_t g_mlv_saved_last_raw_stage_telemetry;
+
+void mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread(void)
+{
+#define MLV_SAVE_LAST_RAW_STAGE_RECORD(type, name, cleared) g_mlv_saved_last_raw_stage_telemetry.name = name;
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_SAVE_LAST_RAW_STAGE_RECORD)
+#undef MLV_SAVE_LAST_RAW_STAGE_RECORD
+    llrpSaveLastRunTimingForCurrentThread();
+}
+
+void mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread(void)
+{
+#define MLV_RESTORE_LAST_RAW_STAGE_RECORD(type, name, cleared) name = g_mlv_saved_last_raw_stage_telemetry.name;
+    MLV_LAST_RAW_STAGE_TELEMETRY(MLV_RESTORE_LAST_RAW_STAGE_RECORD)
+#undef MLV_RESTORE_LAST_RAW_STAGE_RECORD
+    llrpRestoreLastRunTimingForCurrentThread();
+}
+
 int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     uint64_t frameIndex,
                                                     const uint16_t * reducedReconnedRaw,
@@ -6740,7 +6779,7 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                         + g_mlv_debayered16_reduced_bit_shift_error_for_testing;
     /* debayerBasicU16 applies a nonzero bit shift to its input in place; the
      * caller's reduced Bayer is not read again after this frame. */
-    debayerBasicU16(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
+    debayerBasicU16RecordingKernelMilliseconds(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
                     getMlvCpuCores(video), bit_shift);
     /* Rows the kernel's block crop dropped repeat the last reconstructed row,
      * as getMlvProcessedFrame8ScaledFromReducedReconnedRaw16 does. */
@@ -7460,7 +7499,7 @@ static int mlv_render_processed_frame8_direct_with_processing_from_reconned_raw(
          * producer, so avoid the full CPU AMaZE fallback that otherwise
          * dominates the path; the displayed pixels still come from the CUDA
          * AMaZE/device-Bayer presenter. */
-        debayerBasicU16(unprocessed_frame, reconnedRawFrame, full_w, full_h,
+        debayerBasicU16RecordingKernelMilliseconds(unprocessed_frame, reconnedRawFrame, full_w, full_h,
                         threads, bit_shift);
     }
     else if (eff_scale == 4)
@@ -7536,6 +7575,8 @@ static void getMlvProcessedFrame16_with_scale(mlvObject_t * video,
     mlv_reset_last_raw_stage_telemetry();
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    /* r2 (Grok G1): the scaled routes below set only the kernel time; clear all four stages. */
+    resetMlvLastDebayerStageMilliseconds();
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_cache_store_ms = 0.0;
@@ -7934,6 +7975,7 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
     mlv_reset_last_raw_stage_telemetry();
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8334,6 +8376,7 @@ int getMlvProcessedFrame8ScaledFromRaw16(mlvObject_t * video,
     g_mlv_last_raw_uint16_ms = 0.0;
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8440,6 +8483,7 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_raw_uint16_ms = 0.0;
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8904,6 +8948,7 @@ int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
     g_mlv_last_raw_uint16_ms = 0.0;
     g_mlv_last_llrawproc_ms = 0.0;
     g_mlv_last_debayered_frame_ms = 0.0;
+    resetMlvLastDebayerStageMilliseconds(); /* r2 (Grok G1) */
     g_mlv_last_processing_ms = 0.0;
     g_mlv_last_processed16_total_ms = 0.0;
     g_mlv_last_processed16_for_8bit_ms = 0.0;
@@ -8944,7 +8989,7 @@ int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
 
     const double debayer_start = mlv_stage_timing_now();
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
-    debayerBasicU16(rgb, reducedReconnedRaw, reducedWidth, reducedHeight, threads, bit_shift);
+    debayerBasicU16RecordingKernelMilliseconds(rgb, reducedReconnedRaw, reducedWidth, reducedHeight, threads, bit_shift);
     /* Rows the kernel's block crop dropped repeat the last reconstructed row,
      * as in the v3 core. */
     const size_t row_words = (size_t)out_w * 3u;

@@ -531,6 +531,10 @@ double llrpGetLastPreDualIsoFixMilliseconds(void);
 int llrpGetLastPreDualIsoFixCompleted(void);
 void llrpResetLastPreDualIsoFixTelemetry(void);
 void llrpResetLastRunTimingForCurrentThread(void);
+/* Save / restore every record llrpResetLastRunTimingForCurrentThread clears
+ * (one saved copy per thread). */
+void llrpSaveLastRunTimingForCurrentThread(void);
+void llrpRestoreLastRunTimingForCurrentThread(void);
 double llrpGetLastDualIsoMilliseconds(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);

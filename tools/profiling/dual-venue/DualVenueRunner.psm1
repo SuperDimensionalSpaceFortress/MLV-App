@@ -1933,6 +1933,167 @@ function Read-DvContactFrames {
     & $done
 }
 
+# --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the leg-spec SHAPE refusals, ONE predicate for the leg and the lease batch's preflight --------------
+# (adversary r5 A1) Invoke-VenueLeg refuses these before its terminal try; the batch preflight (Get-LegSpecRefusal) calls this same function, so a spec the
+# leg would refuse is refused before a lease opens, never after it (LEG_FAILED, no receipt). A control container the runner reads members of must be ONE
+# JSON object when present (r5, sol r4 B1: an array reads through member enumeration but has no PSObject property, so its controls were dropped), and
+# look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg. Returns the refusal text, or $null.
+$script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
+function Get-DvLegSpecShapeRefusal {
+    param($Spec)
+    if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
+    foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria') {
+        $present = $Spec.PSObject.Properties[$container]
+        if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
+            $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
+            return "$container must be a single JSON object (it is $shape)"
+        }
+    }
+    # r9 (adversary r8 cc8061a2 A1, Dot pr-721, hub ACK 6564543250): legType is ONE string of the schema's enum, compared case-sensitively as the validator
+    # compares it. [string] of the array ["look","speed"] is 'look speed', so that spec with no look passed this predicate, the batch opened its lease, and the
+    # leg's -eq against the array was truthy and indexed the absent look before any receipt. An array, object, number, null, empty or other-case value is
+    # refused here, for the leg and every batch preflight alike. An ABSENT legType stays a speed leg, as the runner has always read it.
+    $legTypeProp = $Spec.PSObject.Properties['legType']
+    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
+        return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
+    }
+    $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
+    # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
+    # "Cannot index into a null array" after the batch had opened its lease).
+    if ($isLookLeg -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }
+    $look = Get-DvProp $Spec 'look'
+    # r9 fix 1 (adversary r9 a0936637 A2): a look leg's look.contactSheetFrames is a whole number from 1 to 60 -- the schema's range and the generator's
+    # ValidateRange(1,60) -- refused here, before a lease opens. 61 (with a 61-frame list) and 0 (with []) passed this predicate and the generator refused
+    # them after the lease; 1.4 was generated as [int] 1 and then refused as no whole number after collection; 6.0 likewise. (A JSON number with a
+    # fraction parses to a double, never an int or long.)
+    if ($isLookLeg -and $null -ne $look) {
+        $countValue = Get-DvProp $look 'contactSheetFrames'
+        if (-not (($countValue -is [int] -or $countValue -is [long]) -and $countValue -ge 1 -and $countValue -le 60)) {
+            return "look.contactSheetFrames must be a whole number from 1 to 60 (it is $(if ($null -eq $look.PSObject.Properties['contactSheetFrames']) { 'absent' } else { ConvertTo-Json -InputObject $countValue -Compress -Depth 3 }))"
+        }
+    }
+    if (-not $isLookLeg -or $null -eq $look -or $null -eq $look.PSObject.Properties['pairedSeekFrames']) { return $null }
+    $listed = $look.pairedSeekFrames
+    $items = @($listed)
+    $bad = $(if ($listed -isnot [array]) { 'is not an array' }
+        elseif (-not ($look.PSObject.Properties['pairedSeek'] -and $look.pairedSeek -is [bool] -and $look.pairedSeek)) { 'needs look.pairedSeek true' }
+        elseif (@($items | Where-Object { -not ($_ -is [int] -or $_ -is [long]) -or $_ -lt 0 }).Count -gt 0) { 'must hold non-negative integers' }
+        elseif (@($items | Sort-Object -Unique).Count -ne $items.Count) { 'must not repeat a frame' }
+        elseif ($items.Count -ne [int]$look.contactSheetFrames) { "names $($items.Count) frame(s) but look.contactSheetFrames is $($look.contactSheetFrames)" }
+        else { $null })
+    if ($null -ne $bad) { return "look.pairedSeekFrames $bad" }
+    $null
+}
+
+# --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the paused stills of a look.pairedSeekFrames leg, ONE reader for the runner and the validator ---------
+# (adversary r5 A2 / A3, Dot 5c6bcd98, sol r5 key B1 / B2) Still i (frame-<ii>) counts only when (1) its png AND its sidecar are in the hash listing;
+# (2) EACH is read back now and its bytes hash to the listed sha256 -- a file missing, replaced or truncated after the listing is a mismatch naming it
+# (r5 took the png's presence from the listing alone); (3) the sidecar, parsed from those same bytes, says the still was captured PAUSED through the full
+# reconstruction path, as the app writes a seek capture (capture_mode "seek", playback_path false; a field that is missing or of another type is a
+# mismatch); and (4) its display_frame is the requested frame. The runner records this at collection; Test-DvReceiptValid re-derives it with this function.
+# r7 (adversary r6 A1, Dot 6558329764, sol r6 key B1): it runs for EVERY look.pairedSeek leg. With no RequestedFrames (a leg that names no
+# look.pairedSeekFrames -- all four shipped paired legs) the stills are the ones the listing holds (each png/json stem), (1)-(3) bind each of them, a
+# png or a sidecar without its partner is a mismatch naming the absent file, and a leg that collected no still at all is not honoured; only (4) is skipped.
+# r8 (adversary r7 A2 / A1 / A3, Dot on #721 16:25:15Z): the stills a leg must hold come from the COMMITTED spec, never from what was collected or what a
+# receipt claims. -StillCount is the committed look.contactSheetFrames: the stills are frame-00 .. frame-<StillCount-1> (the app's own numbering, which
+# -RequestedFrames, when listed, also follows), so one valid still no longer satisfies a six-frame leg. Every expected still must be present and paused;
+# every hash-listed file must belong to one of them (an extra still -- a playing one included -- is a mismatch naming it, never ignored); a StillCount
+# that is not a positive integer, or a frame list of another length, is a mismatch. A sidecar whose top level is not ONE JSON object (a one-element
+# array, which ConvertFrom-Json would unwrap) is no sidecar.
+# r8 fix iteration 1 (adversary r8 A1 / A2): every entry ON DISK in -SeekDir must be a plain file the listing names (an extra still a receipt leaves out of
+# its listing is a mismatch, not invisible); and with no frame list, still i must show the display_frame of its IN-PASS partner frame-<ii>.json
+# (-InPassFiles: the hash-verified contact-sheet\raw files, Read-DvContactFrames' .files) -- the app seeks to exactly those frames (MainWindow.cpp
+# contactSheetTargetFrames = inPassDisplayFrames), so a paused still of another frame is no same-frame comparison.
+function Get-DvPairedSeekVerdict {
+    param([string]$SeekDir, $Files, [long[]]$RequestedFrames, $StillCount, $InPassFiles)
+    $listedSha = @{}
+    foreach ($f in @($Files)) { if ($null -ne $f) { $listedSha[[string](Get-DvProp $f 'name')] = [string](Get-DvProp $f 'sha256') } }
+    $reported = [System.Collections.Generic.List[object]]::new()
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    $show = { param($v) $(if ($null -eq $v) { 'absent' } else { ConvertTo-Json -InputObject $v -Compress }) }
+    # r9 (adversary r8 cc8061a2 A2 / A3): the in-pass partner sidecar is read whole -- its display_frame AND its provenance -- not only the frame number
+    $readSidecar = { param([byte[]]$b) $o = $null
+        try { $o = ([Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $o = $null }
+        $(if ($o -is [System.Management.Automation.PSCustomObject]) { $o } else { $null }) }
+    $inPassBytes = @{}
+    foreach ($f in @($InPassFiles)) { if ($null -ne $f) { $inPassBytes[[string](Get-DvProp $f 'name')] = (Get-DvProp $f 'bytes') } }
+    if (-not [string]::IsNullOrEmpty($SeekDir) -and (Test-Path -LiteralPath $SeekDir -PathType Container)) {
+        foreach ($actual in @(Get-ChildItem -LiteralPath $SeekDir -Force | Sort-Object Name)) {
+            $isReparse = (($actual.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($actual.PSIsContainer -or $isReparse -or -not $listedSha.ContainsKey($actual.Name)) { $mismatches.Add("'$($actual.Name)' is in paired-seek\contact-sheet\raw but the paired-still listing does not name it as a plain file (every collected still is listed and checked)") }
+        }
+    }
+    $frameList = $null -ne $RequestedFrames
+    $count = $(if (($StillCount -is [int] -or $StillCount -is [long]) -and $StillCount -ge 1 -and $StillCount -le 999) { [int]$StillCount } else { 0 })
+    if ($count -eq 0) { $mismatches.Add("the committed look.contactSheetFrames ($(& $show $StillCount)) is not a positive whole number, so the paired stills this leg must hold are unknown") }
+    elseif ($frameList -and $RequestedFrames.Count -ne $count) { $mismatches.Add("look.pairedSeekFrames names $($RequestedFrames.Count) frame(s) but the committed look.contactSheetFrames is $count") }
+    $expectedCount = $(if ($frameList) { $RequestedFrames.Count } else { $count })
+    # (@(...) around the whole loop: $(...) would unroll a one-still list into a bare string, and [0] of a string is its first character)
+    [string[]]$stills = @(for ($i = 0; $i -lt $expectedCount; $i++) { 'frame-{0:D2}' -f $i })
+    if (-not $frameList -and $listedSha.Count -eq 0) { $mismatches.Add('no paused still was collected (look.pairedSeek asks for paused stills, each a png with its sidecar)') }
+    for ($i = 0; $i -lt $stills.Count; $i++) {
+        $stillName = $stills[$i]
+        $requested = $(if ($frameList) { $RequestedFrames[$i] } else { $null })
+        $tail = $(if ($frameList) { ", requested $requested" } else { '' })
+        $shown = $null; $problem = $null; $sidecarBytes = $null
+        if (-not ($listedSha.ContainsKey("$stillName.json") -and $listedSha.ContainsKey("$stillName.png"))) {
+            $problem = $(if ($frameList) { "$stillName reported no display_frame$tail" }
+                elseif (-not ($listedSha.ContainsKey("$stillName.json") -or $listedSha.ContainsKey("$stillName.png"))) { "$stillName was not collected (the committed spec asks for $expectedCount paired stills, frame-00 .. $($stills[-1]), each a png with its sidecar)" }
+                else { "$stillName.$(if ($listedSha.ContainsKey("$stillName.png")) { 'json' } else { 'png' }) is not hash-listed (a paired still needs its png and its sidecar)" })
+        }
+        else {
+            foreach ($ext in 'png', 'json') {
+                $file = $(if ([string]::IsNullOrEmpty($SeekDir)) { $null } else { Join-Path $SeekDir "$stillName.$ext" })
+                if ($null -eq $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { $problem = "$stillName.$ext is missing after it was hash-listed$tail"; break }
+                [byte[]]$bytes = [IO.File]::ReadAllBytes($file)
+                if ((Get-DvSha256OfBytes $bytes) -cne $listedSha["$stillName.$ext"]) { $problem = "$stillName.$ext changed after it was hash-listed (its bytes no longer hash to the listed sha256)$tail"; break }
+                if ($ext -eq 'json') { $sidecarBytes = $bytes }
+            }
+        }
+        if ($null -eq $problem) {
+            $parsed = $null
+            # (-NoEnumerate keeps a top-level array an array, so a one-element array sidecar is refused below instead of read as its element)
+            try { $parsed = ([Text.Encoding]::UTF8.GetString($sidecarBytes).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $parsed = $null }
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { $parsed = $null }
+            $value = Get-DvProp $parsed 'display_frame'
+            # r9 fix 2 (adversary r9 7240a133 A1): a display_frame is a frame NUMBER, so a negative one identifies no frame -- -1 on a still and on its in-pass
+            # partner used to compare equal and stay honoured. Both readers accept only a non-negative integer (the frame list's own domain).
+            if (($value -is [int] -or $value -is [long]) -and $value -ge 0) { $shown = [long]$value }
+            $mode = Get-DvProp $parsed 'capture_mode'; $playbackPath = Get-DvProp $parsed 'playback_path'
+            if ($null -eq $shown) { $problem = "$stillName reported no display_frame (its sidecar $stillName.json is not a JSON object carrying a non-negative integer display_frame)$tail" }
+            elseif (-not ($mode -is [string] -and $mode -ceq 'seek' -and $playbackPath -is [bool] -and -not $playbackPath)) {
+                $problem = "$stillName was not captured paused through the full reconstruction path (its sidecar $stillName.json says capture_mode $(& $show $mode), playback_path $(& $show $playbackPath); a paired still needs capture_mode ""seek"" and playback_path false)$tail"
+            }
+            elseif ($frameList -and $shown -ne $requested) { $problem = "$stillName reported display_frame $shown$tail" }
+            # fix 2 (adversary r8 fix-1 A2): the in-pass partner binds a listed-frame leg too -- the list adds the requested frame, it never removes the pairing
+            # r9 (adversary r8 cc8061a2 A2 / A3, Dot pr-721 21:52:55Z, hub ACK 6564543250): the partner must be a frame the measured pass PRESENTED -- its
+            # sidecar says capture_mode "in_pass" and playback_path Boolean true, exactly as the app writes an in-pass grab (MainWindow.cpp in-pass sidecar
+            # writer; not the string "true", not 1) -- and its own image contact-sheet\raw\<still>.png must be among the hash-verified in-pass files. cc8061a2
+            # read only the partner's display_frame, so paused-versus-paused pairs, and six partner sidecars beside a single png, stayed honoured.
+            else {
+                $partnerSide = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readSidecar ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
+                $partnerValue = Get-DvProp $partnerSide 'display_frame'
+                $partner = $(if (($partnerValue -is [int] -or $partnerValue -is [long]) -and $partnerValue -ge 0) { [long]$partnerValue } else { $null })
+                $partnerMode = Get-DvProp $partnerSide 'capture_mode'; $partnerPath = Get-DvProp $partnerSide 'playback_path'
+                if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying a non-negative integer display_frame), so its paused still cannot be shown to be the same frame" }
+                elseif (-not ($partnerMode -is [string] -and $partnerMode -ceq 'in_pass' -and $partnerPath -is [bool] -and $partnerPath)) {
+                    $problem = "$stillName's in-pass partner $stillName.json was not grabbed while playing (it says capture_mode $(& $show $partnerMode), playback_path $(& $show $partnerPath); an in-pass partner needs capture_mode ""in_pass"" and playback_path true), so its paused still is no playing-versus-paused comparison"
+                }
+                elseif (-not $inPassBytes.ContainsKey("$stillName.png")) { $problem = "$stillName's in-pass partner has no image: contact-sheet\raw\$stillName.png is not among the hash-verified in-pass files, so there is no playing frame to compare its paused still with" }
+                elseif ($shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
+            }
+        }
+        $reported.Add($shown)
+        if ($null -ne $problem) { $mismatches.Add($problem) }
+    }
+    $expectedNames = @{}
+    foreach ($s in $stills) { $expectedNames["$s.png"] = $true; $expectedNames["$s.json"] = $true }
+    foreach ($name in @($listedSha.Keys | Sort-Object)) {
+        if (-not $expectedNames.ContainsKey($name)) { $mismatches.Add("'$name' is hash-listed among the paired stills but is not one of the $expectedCount the committed spec asks for (frame-00 .. frame-$('{0:D2}' -f [Math]::Max(0, $expectedCount - 1)) png and json); every listed still is checked, none is ignored") }
+    }
+    [pscustomobject]@{ reportedFrames = $reported.ToArray(); framesHonoured = ($mismatches.Count -eq 0); frameMismatches = $mismatches.ToArray() }
+}
+
 # --- PLAYBACK-VISUAL-INSPECTION-1: the window captures every speed leg keeps --------------------------------------------------------------
 # The app (--visual-capture-dir) captures the WINDOW with PrintWindow AFTER the measured session has closed: 6 frames across ~3 s of untimed
 # play, the frame on screen the instant Play is paused ('stop'), and that frame re-rendered by the paused full-quality path ('paused'). The
@@ -2412,7 +2573,9 @@ function Test-DvReceiptValid {
     A receipt written in offline test mode is never evidence (OFFLINE_TEST_RECEIPT) unless -AllowOfflineTestMode, which only the
     writer's own offline test path and the test harness pass; that mode still re-derives the evidence but has no committed consent to read.
     #>
-    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode)
+    # -OfflineLegSpecBytes (r8): offline test mode only -- the leg spec bytes the runner ran, so a paired-seek block is checked against a spec contract there
+    # too (bound to subject.legSpecSha256); production ignores it and reads the committed spec.
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
     $incomplete = [System.Collections.Generic.List[string]]::new()
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
@@ -2538,6 +2701,68 @@ function Test-DvReceiptValid {
     $ev = Read-DvEvidenceSet -Receipt $Receipt -EvidenceDir $EvidenceDir
     foreach ($m in $ev.incomplete) { $incomplete.Add($m) }
     foreach ($m in $ev.invalid) { $invalid.Add($m) }
+    # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6 (adversary r5 A2, Dot 5c6bcd98, sol r5 key B1): the look.pairedSeek block is RE-DERIVED from its files.
+    # Every file it lists must still be in <evidence>\paired-seek\contact-sheet\raw with its listed bytes, and a look.pairedSeekFrames verdict must be what
+    # Get-DvPairedSeekVerdict -- the runner's own reader -- derives from them now, so a paired still deleted or replaced after collection cannot leave a
+    # PASS/FAIL. (Production: the requested frames are the committed spec's, and a committed paired leg whose receipt has no block is incomplete.)
+    $pairedSeek = Get-DvProp (Get-DvProp $Receipt 'look') 'pairedSeek'
+    # r8 (adversary r7 A1 / A2, Dot on #721 16:25:15Z): the paired-still CONTRACT -- how many stills, and which frames when listed -- is read from the
+    # committed leg spec only, never from the receipt (r7 took receipt requestedFrames when the spec listed none, so a receipt naming one frame narrowed
+    # validation to frame-00). Production: the spec committed at admission.headCommit. Offline test mode: the spec bytes the runner ran
+    # (-OfflineLegSpecBytes), bound to subject.legSpecSha256. No contract and a paired block = a typed mismatch, never a fallback to the receipt.
+    $contractSpec = $(if ($production) { $spec } else { $null })
+    $offlineSpecRefused = $null
+    if (-not $production -and $AllowOfflineTestMode -and $null -ne $OfflineLegSpecBytes) {
+        if ((Get-DvLegSpecSha256 $OfflineLegSpecBytes) -cne [string](Get-DvProp $subject 'legSpecSha256')) { $offlineSpecRefused = 'the leg spec the runner ran does not hash to subject.legSpecSha256' }
+        else { try { $contractSpec = [Text.Encoding]::UTF8.GetString($OfflineLegSpecBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json -ErrorAction Stop } catch { $offlineSpecRefused = 'the leg spec the runner ran does not parse' } }
+    }
+    $specLook = Get-DvProp $contractSpec 'look'
+    $specFrames = Get-DvProp $specLook 'pairedSeekFrames'
+    # r9 fix 1 (adversary r9 a0936637 A1): the spec asks for paired stills exactly when the RUNNER asks the generator for them (Invoke-VenueLeg: a look leg,
+    # look.pairedSeek Boolean true). This used `-eq $true`, which a speed leg carrying look.pairedSeek true and a look leg whose pairedSeek is the string
+    # "true" both satisfy; the runner asks neither, so an otherwise good run ended INVALID (RECEIPT_FIELD_ABSENT). A paired block on a receipt whose spec
+    # asks for none is no runner's record either.
+    $specLegType = Get-DvProp $contractSpec 'legType'
+    $specPairedSeek = Get-DvProp $specLook 'pairedSeek'
+    $specAsksPaired = ($specLegType -is [string] -and $specLegType -ceq 'look' -and $specPairedSeek -is [bool] -and $specPairedSeek)
+    if ($null -eq $pairedSeek) {
+        if ($specAsksPaired) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the committed leg spec asks for look.pairedSeek but the receipt carries no look.pairedSeek block') }
+    } elseif ($null -eq $specLook) {
+        $invalid.Add("PAIRED_SEEK_NOT_FROM_EVIDENCE: the receipt carries a look.pairedSeek block but no committed leg spec look names the paired stills it must hold$(if ($offlineSpecRefused) { " ($offlineSpecRefused)" })")
+    } elseif (-not $specAsksPaired) {
+        $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: the receipt carries a look.pairedSeek block but the committed leg spec asks for no paired stills (a look leg with look.pairedSeek true)')
+    } elseif (-not [string]::IsNullOrWhiteSpace($ev.dir) -and (Test-Path -LiteralPath $ev.dir -PathType Container)) {
+        $seekDir = Join-Path $ev.dir 'paired-seek\contact-sheet\raw'
+        $listedSeek = Get-DvProp $pairedSeek 'files'   # (assigned, then @()-wrapped: see Read-DvContactFrames)
+        $seekEntries = @(@($listedSeek) | Where-Object { $null -ne $_ })
+        if ((ConvertTo-DvInt64 (Get-DvProp $pairedSeek 'count')) -ne $seekEntries.Count) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.count is not the number of files it lists') }
+        foreach ($entry in $seekEntries) {
+            $name = [string](Get-DvProp $entry 'name'); $sha = [string](Get-DvProp $entry 'sha256')
+            if ($name -cnotmatch '^[^\\/:*?"<>|]+$' -or $name -cin @('.', '..') -or $sha -cnotmatch '^[0-9a-f]{64}$') { $invalid.Add('PAIRED_SEEK_UNLISTED: a look.pairedSeek entry is not a plain file name with a 64-hex sha256'); continue }
+            $file = Join-Path $seekDir $name
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $invalid.Add("PAIRED_SEEK_FILE_ABSENT: look.pairedSeek lists '$name' but paired-seek\contact-sheet\raw does not hold it"); continue }
+            if ((Get-DvSha256OfBytes ([IO.File]::ReadAllBytes($file))) -cne $sha) { $invalid.Add("PAIRED_SEEK_HASH_MISMATCH: '$name' does not hash to the sha256 look.pairedSeek lists") }
+        }
+        $requestedSeek = Get-DvProp $pairedSeek 'requestedFrames'
+        if ($null -ne $specFrames -and -not (Test-DvJsonEquivalent $requestedSeek $specFrames)) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.requestedFrames is not the committed leg spec''s look.pairedSeekFrames') }
+        elseif ($null -eq $specFrames -and $null -ne $requestedSeek) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.requestedFrames is present but the committed leg spec names no look.pairedSeekFrames (a receipt cannot narrow or add to the committed stills)') }
+        # r7 (adversary r6 A1, Dot 6558329764): the verdict is re-derived for EVERY paired block. r8 (adversary r7 A1 / A2): over the committed spec's
+        # stills only -- look.contactSheetFrames of them, at look.pairedSeekFrames when listed -- so every expected still and every listed file is checked.
+        # (fix iteration 1, adversary r8 A2: the in-pass partners are the hash-verified contact-sheet\raw frames, read the way every reader reads them)
+        $inPass = Read-DvContactFrames -Receipt $Receipt -EvidenceDir $ev.dir
+        $verdictArgs = @{ SeekDir = $seekDir; Files = $seekEntries; StillCount = (Get-DvProp $specLook 'contactSheetFrames'); InPassFiles = @($inPass.files) }
+        $framesUsable = $true
+        if ($null -ne $specFrames) {
+            try { $verdictArgs['RequestedFrames'] = [long[]]@($specFrames) } catch { $framesUsable = $false; $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: the committed look.pairedSeekFrames is not a list of frame numbers') }
+        }
+        if ($framesUsable) {
+            $seekVerdict = Get-DvPairedSeekVerdict @verdictArgs
+            foreach ($f in 'reportedFrames', 'framesHonoured', 'frameMismatches') {
+                if (-not (Test-DvJsonEquivalent (Get-DvProp $pairedSeek $f) $seekVerdict.$f)) { $invalid.Add("PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.$f is not what the paired stills re-derive") }
+            }
+            if (-not $seekVerdict.framesHonoured) { $invalid.Add("PAIRED_SEEK_FRAMES_NOT_HONOURED: $($seekVerdict.frameMismatches -join '; ')") }
+        }
+    }
     if ($ev.complete) {
         $derived = Get-DvPlaybackEvidence -Summary $ev.summary -EvidenceManifest $ev.manifest -ResultJson $ev.result -LogText $ev.logText -LogSha256 $ev.logSha -ExpectedClipId $clipId
         $stored = Get-DvProp $Receipt 'playback'
@@ -3206,12 +3431,21 @@ function Write-DvReceipt {
     the file with CreateNew -- an existing receipt is NEVER overwritten (append-only; a repeat receiptId throws).
     Returns the path written.
     #>
-    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode)
+    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode, [byte[]]$LegSpecBytes = $null)
     if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
     if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
         # The writer never records a signal without its proof, whatever the caller believed: the SAME evidence-bearing validator a
         # reader calls re-derives the admission from the committed blobs and the run from the hashed evidence files.
-        $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B4): the validator RE-READS the hashed evidence. A throw there (a file held with FileShare.None
+        # after collection, one that vanished or turned unreadable) is an evidence-validation failure, never a receipt-destination write failure: it is
+        # re-thrown tagged DVE_EVIDENCE_VALIDATION_IO|<path>|<reason> (the path the .NET message quotes), and the runner writes the leg as a typed UNRESOLVED.
+        # (r8: -LegSpecBytes, the spec the runner ran, is the paired-still contract in offline test mode only; production reads the committed spec)
+        try { $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode -OfflineLegSpecBytes $(if ($OfflineTestMode) { $LegSpecBytes } else { $null }) }
+        catch {
+            $reason = ([string]$_.Exception.Message) -replace '\s+', ' '
+            $where = $(if ($reason -match "'((?:[A-Za-z]:\\|\\\\)[^']+)'") { $Matches[1] } else { '(validator)' })
+            throw [System.Management.Automation.RuntimeException]::new("DVE_EVIDENCE_VALIDATION_IO|$where|$reason")
+        }
         # A production receipt that re-derives is ADVISORY (valid=false, VENUE_ANCHOR_ABSENT): it is written as the local diagnostic record, stamped as such,
         # and no reader treats it as a PASS. Anything that does not re-derive (INVALID / INCOMPLETE) is refused outright.
         if (-not ($validity.valid -or $validity.status -ceq 'ADVISORY')) { throw "DVE_RECEIPT_INVALID a $($Receipt['outcome']) receipt that does not re-derive from committed consent and hashed run evidence is refused ($($validity.status)): $($validity.reasons -join '; ')" }
@@ -3230,7 +3464,7 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
+    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
