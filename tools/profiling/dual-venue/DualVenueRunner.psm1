@@ -2195,6 +2195,46 @@ $script:PngChannels = @{ 0 = 1; 2 = 3; 3 = 1; 4 = 2; 6 = 4 }                    
 $script:PngAdam7 = @(@(0, 0, 8, 8), @(4, 0, 8, 8), @(0, 4, 4, 8), @(2, 0, 4, 4), @(0, 2, 2, 4), @(1, 0, 2, 2), @(0, 1, 1, 2))   # xStart, yStart, xStep, yStep
 $script:PngCrcTable = [long[]]::new(256)
 for ($k = 0; $k -lt 256; $k++) { [long]$c = $k; for ($j = 0; $j -lt 8; $j++) { $c = $(if ($c -band 1) { 0xEDB88320L -bxor ($c -shr 1) } else { $c -shr 1 }) }; $script:PngCrcTable[$k] = $c }
+# r11 fix 2: the PNG chunks whose length, place or count the image fixes (PNG 1.2 / ISO 15948 section 11.3). $null when the chunk keeps them, else why not.
+# Lengths by colour type (0 grey, 2 RGB, 3 palette, 4 grey+alpha, 6 RGBA); 'P' = the palette's entry count; absent = the chunk is not allowed there.
+$script:PngAncillaryLength = @{
+    gAMA = @{ 0 = 4; 2 = 4; 3 = 4; 4 = 4; 6 = 4 }; cHRM = @{ 0 = 32; 2 = 32; 3 = 32; 4 = 32; 6 = 32 }; sRGB = @{ 0 = 1; 2 = 1; 3 = 1; 4 = 1; 6 = 1 }
+    pHYs = @{ 0 = 9; 2 = 9; 3 = 9; 4 = 9; 6 = 9 }; tIME = @{ 0 = 7; 2 = 7; 3 = 7; 4 = 7; 6 = 7 }
+    sBIT = @{ 0 = 1; 2 = 3; 3 = 3; 4 = 2; 6 = 4 }; bKGD = @{ 0 = 2; 2 = 6; 3 = 1; 4 = 2; 6 = 6 }; tRNS = @{ 0 = 2; 2 = 6 }   # (tRNS of a palette image: below)
+}
+$script:PngBeforePlte = @('gAMA', 'cHRM', 'sRGB', 'iCCP', 'sBIT')
+$script:PngAfterPlte = @('tRNS', 'bKGD', 'hIST')   # (after PLTE when there is one)
+$script:PngBeforeIdat = @('gAMA', 'cHRM', 'sRGB', 'iCCP', 'sBIT', 'tRNS', 'bKGD', 'hIST', 'pHYs', 'sPLT')
+function Get-DvPngAncillaryProblem {
+    param([string]$Name, [int]$Length, [int]$Colour, [int]$Depth, [bool]$SawPlte, [bool]$SawIdat, [int]$PlteEntries, [System.Collections.Generic.HashSet[string]]$Seen)
+    if ($Name -ceq 'PLTE') {
+        if ($Colour -eq 0 -or $Colour -eq 4) { return "is not allowed in a greyscale image (colour type $Colour)" }
+        if ($Length -lt 3 -or $Length -gt 768 -or ($Length % 3) -ne 0) { return "is $Length bytes (a palette is 1 .. 256 three-byte entries)" }
+        if ($Colour -eq 3 -and ($Length / 3) -gt [Math]::Pow(2, $Depth)) { return "has $($Length / 3) entries, more than a $Depth-bit palette image indexes" }
+        return $null
+    }
+    if ($Name -cnotin @($script:PngBeforeIdat + 'tIME')) { return $null }   # (text, private and other chunks: variable length, no place PNG fixes)
+    if ($Name -cne 'sPLT' -and $Seen.Contains($Name)) { return 'repeats (PNG allows one)' }
+    if ($Name -cin $script:PngBeforePlte -and $SawPlte) { return 'comes after PLTE (PNG requires it before)' }
+    if ($Name -cin $script:PngAfterPlte -and $Colour -eq 3 -and -not $SawPlte) { return 'comes before PLTE (PNG requires it after)' }
+    if ($SawIdat -and $Name -cin $script:PngBeforeIdat) { return 'comes after the image data (PNG requires it before IDAT)' }
+    if (($Name -ceq 'iCCP' -and $Seen.Contains('sRGB')) -or ($Name -ceq 'sRGB' -and $Seen.Contains('iCCP'))) { return 'sits beside an sRGB / iCCP chunk (PNG allows one of the two)' }
+    if ($Name -ceq 'tRNS' -and $Colour -eq 3) {
+        if ($Length -lt 1 -or $Length -gt $PlteEntries) { return "is $Length bytes (a palette image's tRNS holds 1 .. $PlteEntries entries, one per palette entry)" }
+        return $null
+    }
+    if ($Name -ceq 'hIST') {
+        if ($Colour -ne 3) { return "is not allowed without a palette (colour type $Colour)" }
+        if ($Length -ne 2 * $PlteEntries) { return "is $Length bytes (2 per palette entry: $(2 * $PlteEntries))" }
+        return $null
+    }
+    if ($script:PngAncillaryLength.ContainsKey($Name)) {
+        $want = $script:PngAncillaryLength[$Name]
+        if (-not $want.ContainsKey($Colour)) { return "is not allowed in an image of colour type $Colour" }
+        if ($Length -ne $want[$Colour]) { return "is $Length bytes (PNG fixes it at $($want[$Colour]) for colour type $Colour)" }
+    }
+    $null
+}
 function Get-DvPngImageProblem {
     param([AllowNull()][byte[]]$Bytes)
     if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return 'it is empty (0 bytes)' }
@@ -2210,7 +2250,8 @@ function Get-DvPngImageProblem {
     if (-not ($script:PngBitDepths.ContainsKey($colour) -and $depth -in $script:PngBitDepths[$colour])) { return "its IHDR bit depth $depth with colour type $colour is not a PNG pixel format" }
     if ($Bytes[26] -ne 0 -or $Bytes[27] -ne 0 -or $Bytes[28] -gt 1) { return 'its IHDR compression, filter or interlace method is not one PNG defines' }
     $interlaced = ($Bytes[28] -eq 1)
-    $at = 8; $sawIdat = $false; $sawPlte = $false; $idatEnded = $false
+    $at = 8; $sawIdat = $false; $sawPlte = $false; $idatEnded = $false; $plteEntries = 0
+    $seenChunks = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $idat = [IO.MemoryStream]::new()
     while ($true) {
         if ($at + 12 -gt $n) { return 'its chunks end without an IEND chunk, so it is truncated' }
@@ -2233,6 +2274,14 @@ function Get-DvPngImageProblem {
             [long]$crc = 0xFFFFFFFFL
             for ($i = $at + 4; $i -lt $at + 8 + $length; $i++) { $crc = $script:PngCrcTable[($crc -bxor $Bytes[$i]) -band 0xFF] -bxor ($crc -shr 8) }
             if (($crc -bxor 0xFFFFFFFFL) -ne (& $u32 ($at + 8 + [int]$length))) { return "its $name chunk at byte $at fails its CRC-32" }
+            # r11 fix 2 (adversary r11 5a79915c A1 and its class): a chunk PNG defines with a size, a place or a count fixed by the image is refused when
+            # it breaks them (a decoder rejects it: a 1-byte tRNS on an RGB image, an empty gAMA, sRGB or pHYs passed). PLTE: 1..256 whole entries, at
+            # most 2^depth for a palette image, none for a greyscale one. The others: their length for this colour type, before PLTE / IDAT where PNG
+            # requires it, and not repeated.
+            $problem = Get-DvPngAncillaryProblem -Name $name -Length ([int]$length) -Colour $colour -Depth $depth -SawPlte $sawPlte -SawIdat $sawIdat -PlteEntries $plteEntries -Seen $seenChunks
+            if ($null -ne $problem) { return "its $name chunk at byte $at $problem" }
+            if ($name -ceq 'PLTE') { $plteEntries = [int]($length / 3) }
+            [void]$seenChunks.Add($name)
         }
         if ($name -ceq 'PLTE') { $sawPlte = $true }
         if ($name -ceq 'IEND') { break }

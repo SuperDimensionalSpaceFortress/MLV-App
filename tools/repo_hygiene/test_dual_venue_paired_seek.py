@@ -1277,9 +1277,30 @@ R11_NOT_A_PNG = (("second-ihdr-contradicts-first", ADVERSARY_R11_A1),
                   + png_chunk(b"IDAT", _RGB_STREAM[6:]) + png_chunk(b"IEND", b"")),
                  ("idat-junk-before-adler32", png_of(4, 3, 8, 2, 0, b"\x78\x9c" + _RGB_DEFLATE + b"\x00\x00\x00\x00" + _ADLER)),
                  ("idat-deflate-never-ends", png_of(4, 3, 8, 2, 0, b"\x78\x9c" + _RGB_NOFINAL + _ADLER)))
-# controls the r11 check must still accept: stored (level 0) deflate blocks, and a valid ancillary chunk between IHDR and IDAT
+# r11 fix 2 (adversary r11 5a79915c A1): an ancillary chunk whose size, place or count the image fixes, broken (Pillow refuses each). Verbatim: a 1-byte
+# tRNS on an RGB image. Siblings the pass named (grey tRNS of 1 byte, empty gAMA, empty sRGB, empty pHYs) and more of the class (gAMA after PLTE, pHYs
+# after IDAT, tRNS on an RGBA image, a repeated gAMA, a PLTE in a greyscale image, a palette tRNS longer than the palette).
+ADVERSARY_R11_FIX2_A1 = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000174524e530040e6d8660000000c49444154789c63606060000000040001f61738550000000049454e44ae426082")
+_GREY_1X1 = zlib.compress(b"\x00\x80")
+R11_FIX2_NOT_A_PNG = (("rgb-trns-one-byte", ADVERSARY_R11_FIX2_A1),
+                      ("grey-trns-one-byte", png_of(1, 1, 8, 0, 0, _GREY_1X1, extra=png_chunk(b"tRNS", b"\x00"))),
+                      ("empty-gama", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"gAMA", b""))),
+                      ("empty-srgb", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"sRGB", b""))),
+                      ("empty-phys", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"pHYs", b""))),
+                      ("gama-after-plte", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"gAMA", struct.pack(">I", 45455)))),
+                      ("phys-after-idat", b"\x89PNG\r\n\x1a\n" + _IHDR_4X3 + png_chunk(b"IDAT", _RGB_STREAM) + png_chunk(b"pHYs", bytes(9)) + png_chunk(b"IEND", b"")),
+                      ("rgba-trns", png_of(1, 1, 8, 6, 0, zlib.compress(bytes(5)), extra=png_chunk(b"tRNS", bytes(6)))),
+                      ("gama-repeated", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"gAMA", struct.pack(">I", 45455)) * 2)),
+                      ("grey-with-plte", png_of(1, 1, 8, 0, 0, _GREY_1X1, extra=png_chunk(b"PLTE", b"\x10\x20\x30"))),
+                      ("palette-trns-longer-than-palette", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x00\x00"))))
+# controls the r11 check must still accept: stored (level 0) deflate blocks, a valid ancillary chunk between IHDR and IDAT, and the fixed-size chunks a
+# Qt-written PNG carries (gAMA, sRGB, pHYs) plus an RGB tRNS and a palette tRNS at their sizes
 R11_PNG_CONTROLS = (("ok-stored-blocks.png", png_of(4, 3, 8, 2, 0, zlib.compress(_RGB_ROWS, 0))),
-                    ("ok-ancillary-chunk.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tEXt", b"k\x00v"))))
+                    ("ok-ancillary-chunk.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tEXt", b"k\x00v"))),
+                    ("ok-gama-srgb-phys.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"sRGB", b"\x00") + png_chunk(b"gAMA", struct.pack(">I", 45455))
+                                                     + png_chunk(b"pHYs", struct.pack(">IIB", 3780, 3780, 1)))),
+                    ("ok-rgb-trns.png", png_of(4, 3, 8, 2, 0, _RGB_STREAM, extra=png_chunk(b"tRNS", bytes(6)))),
+                    ("ok-palette-trns.png", png_of(1, 1, 8, 3, 0, zlib.compress(b"\x00\x00"), extra=png_chunk(b"PLTE", b"\x10\x20\x30") + png_chunk(b"tRNS", b"\x80"))))
 PNG_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
@@ -1314,7 +1335,8 @@ class PngImageCheckUnitTests(unittest.TestCase):
                  "ok-fixture.png": (_GOOD, True), "ok-grey.png": (grey, True), "ok-rgba16.png": (rgba16, True), "ok-interlaced.png": (laced, True),
                  "ok-interlaced-5x5.png": (laced5, True), "ok-palette.png": (palette, True), "ok-1bit.png": (onebit, True), "ok-split-idat.png": (split, True),
                  "ok-1920x1080.png": (hd, True),
-                 **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{n: (b, True) for n, b in R11_PNG_CONTROLS}}
+                 **{f"bad-r11-{n}.png": (b, False) for n, b in R11_NOT_A_PNG}, **{f"bad-r11f2-{n}.png": (b, False) for n, b in R11_FIX2_NOT_A_PNG},
+                 **{n: (b, True) for n, b in R11_PNG_CONTROLS}}
         for name, (data, _) in cases.items():
             (root / name).write_bytes(data)
         (root / "probe.ps1").write_text(PNG_PROBE, encoding="utf-8")
