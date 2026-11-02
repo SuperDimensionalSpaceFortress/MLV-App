@@ -207,6 +207,126 @@ $Terminal = @(
 # same class of defect this fix exists to remove, just aimed at a different card.
 $Schedulable = @('queued', 'dispatched', 'in-review', 'waiting-evidence', 'dispatched-untracked-target')
 
+# MERGE-GROUP-EXPORT-LANDED-RUN-SELECT-1 (owed on #732, ACK 6544553789, Grok G1): which merge_group run
+# supplies the job graph. On a merge-queue repo the newest COMPLETED merge_group run can be an EJECTED
+# queue entry whose headSha never landed on master; labelling its jobs "newest" lets a reader take them
+# for master's CI. Preference: (a) newest run whose headSha IS the master tip; (b) newest success;
+# (c) newest by createdAt. (a) always says its tip is the local ref and can lag; (b) and (c) say in their
+# label that the run may not be a landed one.
+# Pure: no I/O. $MasterSha is '' when the tip could not be read, which skips (a).
+function Select-MergeGroupJobsRun {
+    param([object[]]$Runs, [string]$MasterSha = '', [string]$TipReason = '')
+    # createdAt as a parsed UTC instant. A string is parsed with the invariant culture and an offset-free string is UTC.
+    # r6 (sol B2): a [datetime] of Kind Unspecified is what ConvertFrom-Json makes of an OFFSET-FREE string; ToUniversalTime
+    # would treat it as LOCAL and shift it by the host zone, so it is pinned to UTC instead. Local and Utc kinds are
+    # converted as before. $null when the value does not parse.
+    $toUtc = {
+        param($v)
+        if ($v -is [datetime]) {
+            if ($v.Kind -eq [System.DateTimeKind]::Unspecified) { return [datetime]::SpecifyKind($v, [System.DateTimeKind]::Utc) }
+            return $v.ToUniversalTime()
+        }
+        $o = [datetimeoffset]::MinValue
+        if ([datetimeoffset]::TryParse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$o)) { return $o.UtcDateTime }
+        return $null
+    }
+    # ADV-A2 (r5): sort by the parsed UTC instant, NEVER by the createdAt text: '2026-10-31T18:00:00+02:00'
+    # (16:00Z) sorts after '2026-10-31T17:00:00Z' as a string but is the OLDER run.
+    # r6 (sol B3): VALIDITY is a sort key of its own, ahead of the instant. A MinValue sentinel for "does not parse" tied a
+    # row whose text is garbage with a genuinely valid '0001-01-01T00:00:00Z'. With validity first, every selection branch
+    # (all three are taken from $sorted) puts a valid row ahead of any invalid one, whatever its instant.
+    # r11 (Dot prior-key B3): TYPE every row BEFORE any comparison. `gh run list --json` (gh 2.97.0, captured live) emits
+    # headSha, conclusion and createdAt as JSON strings and databaseId as an integer, but the export is read back from disk, and
+    # PowerShell's -eq coerces the RIGHT operand to the LEFT operand's type: `$true -eq 'success'` and `$true -eq <any sha>` are
+    # True, and an array on the left filters instead of comparing. A row whose headSha or conclusion is not a [string], or whose
+    # databaseId is not a positive integer (it keys the jobs URL), is excluded from EVERY selection branch (fail closed) and is
+    # counted in the label so a reader sees it was ignored. A row that is not an object has none of the properties, so it is
+    # malformed too. A null row is not a row and is not counted.
+    # r12 (r11 adversary A1): this file runs under `Set-StrictMode -Version Latest`, where `$row.headSha` on a row WITHOUT that
+    # property (or on a string / number row) THROWS PropertyNotFoundException, and production's catch would then report
+    # "(job graph) FAILED" instead of selecting the usable rows. Every read goes through PSObject.Properties[name], which yields
+    # $null for an absent property on any value, so such a row is counted malformed and the usable rows stay selectable.
+    # The value is returned wrapped (the unary comma) because a scriptblock call unrolls a one-element array into its element, which
+    # would turn a headSha / conclusion / databaseId of ["x"] into the string "x" and defeat the type check below.
+    $get = { param($o, $n) $p = $o.PSObject.Properties[$n]; if ($null -eq $p) { $null } else { , $p.Value } }
+    # r12 (r11 adversary A2): PowerShell's string -eq AND its case-sensitive form both ignore an embedded NUL character, so a
+    # headSha of <tip>+NUL equalled the tip and a conclusion of 'success'+NUL counted as a success. Identity is decided by an
+    # ORDINAL String.Equals, and a headSha or conclusion that carries any control character (NUL included) is refused as malformed.
+    $same = { param([string]$a, [string]$b) [string]::Equals($a, $b, [System.StringComparison]::Ordinal) }
+    # r13 (r12 adversary A1): the refused range is C0, DEL AND C1 (U+0080-U+009F). U+0085 (NEL) is a C1 control that r12's
+    # [\x00-\x1F\x7F] left well-formed, so 'failure' + U+0085 could be the newest-by-createdAt fallback with no malformed count.
+    $clean = { param($v) ($v -is [string]) -and ($v -notmatch '[\x00-\x1F\x7F-\x9F]') }
+    # r13 (hub ACK 6560764371, Dot 6561311995): a headSha is a full 40-hex commit id. `gh run list --json headSha` emits it lowercase
+    # (all 50 rows of the live capture), so UPPERCASE hex is malformed by design. -cmatch makes the class case-sensitive (-match is
+    # not), and \A ... \z (not ^ ... $) refuses a trailing newline, which `$` would accept. A headSha outside this schema is
+    # excluded from EVERY branch below (landed filter, newer-off-tip count, success fallback, newest fallback).
+    $isSha = { param($v) ($v -is [string]) -and ($v -cmatch '\A[0-9a-f]{40}\z') }
+    $present = @($Runs | Where-Object { $null -ne $_ })
+    $wellTyped = @($present | Where-Object {
+        $id = & $get $_ 'databaseId'
+        (& $isSha (& $get $_ 'headSha')) -and (& $clean (& $get $_ 'conclusion')) -and
+        (($id -is [int]) -or ($id -is [long])) -and ($id -gt 0)
+    })
+    $badRows = $present.Count - $wellTyped.Count
+    $bad = if ($badRows -gt 0) { "; $badRows malformed run row(s) ignored (headSha/conclusion not a string or databaseId not a positive integer)" } else { '' }
+    $sorted = @($wellTyped | Sort-Object -Property @(
+        @{ Expression = { if ($null -eq (& $toUtc (& $get $_ 'createdAt'))) { 0 } else { 1 } }; Descending = $true },
+        @{ Expression = { $t = & $toUtc (& $get $_ 'createdAt'); if ($null -eq $t) { [datetime]::new(0) } else { $t } }; Descending = $true }
+    ))
+    if ($sorted.Count -eq 0) { return $null }
+    if ($MasterSha) {
+        $landed = @($sorted | Where-Object { & $same (& $get $_ 'headSha') $MasterSha })
+        if ($landed.Count -gt 0) {
+            # The tip is the LOCAL refs/remotes/fork/master and can lag hosted master, so the label ALWAYS names
+            # its source and carries that caveat: a missing newer success proves nothing about freshness. Every
+            # newer COMPLETED run (the export is completed-only) whose headSha is not the tip is counted, whatever
+            # its current conclusion - a landed run with a failed rerun is still a newer off-tip run.
+            # "Newer" means createdAt STRICTLY GREATER than the selected run's, compared as parsed UTC instants:
+            # never by array position (rows sharing a createdAt sort in arbitrary order) and never by string
+            # order. A row whose createdAt does not parse cannot be shown newer, so it is not counted; when the
+            # selected run's own createdAt does not parse nothing can be shown newer either.
+            $label = 'landed (headSha = local refs/remotes/fork/master tip; the local tip can lag hosted master)'
+            $selAt = & $toUtc (& $get $landed[0] 'createdAt')
+            $newerOff = @()
+            if ($null -ne $selAt) {
+                $newerOff = @($sorted | Where-Object {
+                    $t = & $toUtc (& $get $_ 'createdAt')
+                    (-not (& $same (& $get $_ 'headSha') $MasterSha)) -and $null -ne $t -and $t -gt $selAt
+                })
+            }
+            if ($newerOff.Count -gt 0) {
+                $label += "; $($newerOff.Count) newer completed run(s) not at the local tip"
+            }
+            return [pscustomobject]@{ Run = $landed[0]; Label = $label + $bad }
+        }
+    }
+    # ADV-A1 (r5): when the tip could not be read, the label names the typed reason ($TipReason, for example
+    # 'tip-ref-missing: refs/remotes/fork/master') so a reader sees WHY the landed rule was skipped.
+    $why = if ($TipReason) { "; $TipReason" } else { '' }
+    $ok = @($sorted | Where-Object { & $same (& $get $_ 'conclusion') 'success' })
+    if ($ok.Count -gt 0) {
+        return [pscustomobject]@{ Run = $ok[0]; Label = "newest success; may be a non-landed queue entry$why$bad" }
+    }
+    return [pscustomobject]@{ Run = $sorted[0]; Label = "newest by createdAt; may be a non-landed queue entry$why$bad" }
+}
+
+# ADV-A1 (r5): read the local master tip by the EXACT ref, not by a revision lookup. `rev-parse --verify` on
+# the full refname plus a commit peel is a revision lookup: when that ref is ABSENT git's dwim rules go on to try
+# refs/tags/refs/remotes/fork/master, refs/heads/refs/remotes/fork/master and similar names, so a ref with one
+# of those names supplies a valid but false tip. `show-ref --verify --hash` accepts only the exact ref and
+# exits non-zero when it is missing. A missing or unreadable ref returns Sha '' and the typed Reason that
+# Select-MergeGroupJobsRun puts in its label; the selector then falls through to its success / createdAt choices.
+function Get-ForkMasterTip {
+    param([string]$RepoRoot)
+    $ref = 'refs/remotes/fork/master'
+    $sha = ''
+    try {
+        $sha = [string](& git -C $RepoRoot show-ref --verify --hash refs/remotes/fork/master 2>$null | Select-Object -First 1)
+    } catch { $sha = '' }
+    if ($sha -notmatch '^[0-9a-f]{40}$') { return [pscustomobject]@{ Sha = ''; Reason = "tip-ref-missing: $ref" } }
+    return [pscustomobject]@{ Sha = $sha; Reason = '' }
+}
+
 function Get-Prop($obj, [string]$name) {
     if ($null -eq $obj) { return $null }
     $p = $obj.PSObject.Properties[$name]
@@ -851,15 +971,29 @@ if ($needsHostedEvidence) {
             }
         }
 
-        # The job graph is a SECOND call keyed on the first one's newest row, so it can only be made
-        # after the run list lands. Skipped without complaint when that export failed.
+        # The job graph is a SECOND call keyed on the run Select-MergeGroupJobsRun picks from the first
+        # one's rows in this order: master-tip match, then newest success, then newest by createdAt; so it can only be
+        # made after the run list lands. Skipped without complaint when that export failed.
         $runsFile = Join-Path $ghDir 'runs-tests-merge-group-completed.json'
         if (Test-Path -LiteralPath $runsFile) {
             try {
-                $runs = @(Get-Content -LiteralPath $runsFile -Raw | ConvertFrom-Json |
-                          Sort-Object -Property createdAt -Descending)
-                if ($runs.Count -gt 0) {
-                    $newest  = $runs[0].databaseId
+                # r6 (sol B2): keep createdAt as the raw string where the host can (pwsh 7.5+ -DateKind String); the selector
+                # also pins an Unspecified-kind [datetime] to UTC for older hosts.
+                $runsRaw = Get-Content -LiteralPath $runsFile -Raw
+                $runs = if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { @($runsRaw | ConvertFrom-Json -DateKind String) } else { @($runsRaw | ConvertFrom-Json) }
+                # Master tip is read LOCALLY (never the network) by FULL refname: a same-named tag
+                # refs/tags/fork/master would win the bare name fork/master. An unreadable tip falls through
+                # to the success / createdAt choices inside Select-MergeGroupJobsRun.
+                $tipSha = ''
+                $tipReason = 'tip-ref-missing: refs/remotes/fork/master'
+                try {
+                    $tip = Get-ForkMasterTip -RepoRoot $RepoRoot
+                    $tipSha = [string]$tip.Sha
+                    $tipReason = [string]$tip.Reason
+                } catch { $tipSha = '' }
+                $pick = Select-MergeGroupJobsRun -Runs $runs -MasterSha $tipSha -TipReason $tipReason
+                if ($null -ne $pick) {
+                    $newest  = $pick.Run.databaseId
                     $jobsOut = Join-Path $ghDir "jobs-latest-$newest.json"
                     $jobsErr = "$jobsOut.err.txt"
                     & gh api "repos/$ghRepo/actions/runs/$newest/jobs" 1>$jobsOut 2>$jobsErr
@@ -867,11 +1001,14 @@ if ($needsHostedEvidence) {
                     $jlen  = if (Test-Path -LiteralPath $jobsOut) { (Get-Item -LiteralPath $jobsOut).Length } else { 0 }
                     if ($jcode -eq 0 -and $jlen -gt 0) {
                         Remove-Item -LiteralPath $jobsErr -ErrorAction SilentlyContinue
-                        $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "$jlen bytes (run $newest, newest by createdAt)" }
+                        $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "$jlen bytes (run $newest, $($pick.Label))" }
                     } else {
                         Remove-Item -LiteralPath $jobsOut -ErrorAction SilentlyContinue
                         $ghRows += [pscustomobject]@{ Name = "jobs-latest-$newest.json"; Result = "FAILED - gh exit $jcode" }
                     }
+                } elseif (@($runs).Count -gt 0) {
+                    # r11: rows were exported but none passed the selector's type check, so no job graph is fetched and the reader is told why.
+                    $ghRows += [pscustomobject]@{ Name = '(job graph)'; Result = 'FAILED - no usable run row (headSha/conclusion must be strings and databaseId a positive integer)' }
                 }
             } catch {
                 $ghRows += [pscustomobject]@{ Name = '(job graph)'; Result = "FAILED - $($_.Exception.Message)" }
@@ -1162,7 +1299,7 @@ $fence
 
     $laneWorkDir = Join-Path 'C:\mlvtmp' "lane-$cardId-$stamp"
 
-    $baseSha = (& git -C $RepoRoot rev-parse fork/master 2>$null | Select-Object -First 1)
+    $baseSha = (& git -C $RepoRoot show-ref --verify --hash refs/remotes/fork/master 2>$null | Select-Object -First 1)   # exact ref: a missing ref must not fall through to refs/tags/refs/remotes/fork/master
     if (-not $baseSha -or $baseSha -notmatch '^[0-9a-f]{40}$') {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not resolve fork/master to a full sha at $RepoRoot"
         Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-base-sha' -ExitCode 3
@@ -1374,8 +1511,10 @@ $fence
         # discarded. The previous `worktree remove --force` after a porcelain-only check
         # also deleted git-ignored evidence and never looked for unpushed commits.
         # MergeTarget is the ref baseSha was resolved from: local master can lag fork/master,
-        # which would wrongly keep a worktree whose HEAD is still exactly baseSha.
-        $disp = Invoke-RetireLaneWorktree -WorkDir $WorkDirToCheck -MergeTarget 'fork/master' `
+        # which would wrongly keep a worktree whose HEAD is still exactly baseSha. It is the FULL refname
+        # refs/remotes/fork/master: a same-named tag refs/tags/fork/master would win the bare name in
+        # `merge-base --is-ancestor`, so a tag could make an unmerged HEAD read as merged.
+        $disp = Invoke-RetireLaneWorktree -WorkDir $WorkDirToCheck -MergeTarget 'refs/remotes/fork/master' `
             -QuarantineRoot (Join-Path $RepoRoot ('.claude-state\disk-hygiene\quarantine\lane-exit\' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')))
         $script:LastWorktreeDisposition = $disp
         if ($disp.action -eq 'retired') { return $true }

@@ -103,7 +103,7 @@ $prBefore = Get-PrView -GhExe $GhExe -Repo $Repo -PrNumber $PrNumber
 $requiredBefore = @(Get-RequiredContexts -GhExe $GhExe -Repo $Repo)
 
 $headSha = [string]$prBefore.headRefOid
-$baseSha = (& git -C $RepoRoot rev-parse fork/master 2>$null | Select-Object -First 1)
+$baseSha = (& git -C $RepoRoot show-ref --verify --hash refs/remotes/fork/master 2>$null | Select-Object -First 1)   # exact ref: a missing ref must not fall through to refs/tags/refs/remotes/fork/master
 # EACH VALUE VALIDATED AS A FULL 40-HEX SHA BEFORE THE COMMIT-EXISTENCE CHECK (sol round-1
 # review, MAJOR 2). The previous form skipped cat-file entirely for a falsy value ("if ($sha)"),
 # so an empty or short sha silently passed with no objects ever verified - the exact case a
