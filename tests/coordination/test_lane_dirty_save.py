@@ -1383,6 +1383,9 @@ NAME_WITH_TAIL = "x', LF will be replaced by CRLF the next time Git touches it" 
     ("warning: LF will be replaced by CRLF in a.txt. but something else\n", ["warning: LF will be replaced by CRLF in a.txt. but something else"]),
     (NOTICE_LF.format(name=NAME_WITH_TAIL), []),  # r12 sol r11 B2: the name holds the notice's own tail text; the old lazy match ended inside it and left a fragment
     (NOTICE_LF.format(name=NAME_WITH_TAIL) + DENIED + NOTICE_LF.format(name=NAME_WITH_TAIL), [DENIED.strip()]),  # a warning between two such notices is neither swallowed nor hidden
+    (NOTICE_LF.format(name=NAME_WITH_TAIL + "\nb.txt"), []),  # r12 adversary A1: a name holding a line feed AND the tail text; the tail closes a line in the middle of the name
+    (NOTICE_CRLF.format(name="a.\nThe file will have its original line endings in your working directory\nb.txt"), []),  # the same for the two-line form
+    (NOTICE_LF.format(name=NAME_WITH_TAIL + "\nb.txt") + DENIED + NOTICE_LF.format(name=NAME_WITH_TAIL + "\nc.txt"), [DENIED.strip()]),  # a warning between two of them is still the only warning
     (NOTICE_CRLF.format(name="x. a.txt"), []),
     ("warning: x', LF will be replaced by CRLF the next time Git touches it\n", ["warning: x', LF will be replaced by CRLF the next time Git touches it"]),  # the tail alone is no notice
     ("warning: in the working copy of 'a', LF will be replaced by CRLF the next time Git touches it extra\n", ["warning: in the working copy of 'a', LF will be replaced by CRLF the next time Git touches it extra"]),  # a notice ends at its line end
@@ -1507,6 +1510,19 @@ def test_a_file_name_that_holds_the_notice_tail_does_not_make_the_conversion_not
     odd.write_bytes(b"one\nextra\n")
     r = save(repo, "-LanePid", str(dead_pid()))
     assert r.returncode == 0 and "collection" not in last_receipt(r), r.stdout + r.stderr  # old code: 60, a fragment of the name was counted as a warning
+
+
+@pytest.mark.skipif(WIN, reason="NTFS cannot hold a line feed in a file name; the parser cases above carry the Windows evidence")
+def test_a_file_name_with_a_line_feed_and_the_notice_tail_does_not_make_the_conversion_notice_a_warning(repo, tmp_path):  # r12 adversary A1 end to end (POSIX; never run on the Windows hub VM, first run is ubuntu CI)
+    commit_lf(repo)
+    git(repo, "config", "core.autocrlf", "true")
+    odd = repo / (NAME_WITH_TAIL + "\nb.txt")
+    odd.write_bytes(b"one\n")
+    git(repo, "add", "-A")
+    git(repo, "-c", "core.autocrlf=false", "commit", "-q", "-m", "odd")
+    odd.write_bytes(b"one\nextra\n")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0 and "collection" not in last_receipt(r), r.stdout + r.stderr
 
 
 @pytest.mark.skipif(not WIN, reason="git walks into a directory junction on Windows; on POSIX it lists a symlink as one file")
