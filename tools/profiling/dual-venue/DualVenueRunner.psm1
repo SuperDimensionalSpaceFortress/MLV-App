@@ -2056,9 +2056,11 @@ function Get-DvPairedSeekVerdict {
             try { $parsed = ([Text.Encoding]::UTF8.GetString($sidecarBytes).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $parsed = $null }
             if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { $parsed = $null }
             $value = Get-DvProp $parsed 'display_frame'
-            if ($value -is [int] -or $value -is [long]) { $shown = [long]$value }
+            # r9 fix 2 (adversary r9 7240a133 A1): a display_frame is a frame NUMBER, so a negative one identifies no frame -- -1 on a still and on its in-pass
+            # partner used to compare equal and stay honoured. Both readers accept only a non-negative integer (the frame list's own domain).
+            if (($value -is [int] -or $value -is [long]) -and $value -ge 0) { $shown = [long]$value }
             $mode = Get-DvProp $parsed 'capture_mode'; $playbackPath = Get-DvProp $parsed 'playback_path'
-            if ($null -eq $shown) { $problem = "$stillName reported no display_frame (its sidecar $stillName.json is not a JSON object carrying an integer display_frame)$tail" }
+            if ($null -eq $shown) { $problem = "$stillName reported no display_frame (its sidecar $stillName.json is not a JSON object carrying a non-negative integer display_frame)$tail" }
             elseif (-not ($mode -is [string] -and $mode -ceq 'seek' -and $playbackPath -is [bool] -and -not $playbackPath)) {
                 $problem = "$stillName was not captured paused through the full reconstruction path (its sidecar $stillName.json says capture_mode $(& $show $mode), playback_path $(& $show $playbackPath); a paired still needs capture_mode ""seek"" and playback_path false)$tail"
             }
@@ -2071,9 +2073,9 @@ function Get-DvPairedSeekVerdict {
             else {
                 $partnerSide = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readSidecar ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
                 $partnerValue = Get-DvProp $partnerSide 'display_frame'
-                $partner = $(if ($partnerValue -is [int] -or $partnerValue -is [long]) { [long]$partnerValue } else { $null })
+                $partner = $(if (($partnerValue -is [int] -or $partnerValue -is [long]) -and $partnerValue -ge 0) { [long]$partnerValue } else { $null })
                 $partnerMode = Get-DvProp $partnerSide 'capture_mode'; $partnerPath = Get-DvProp $partnerSide 'playback_path'
-                if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying an integer display_frame), so its paused still cannot be shown to be the same frame" }
+                if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying a non-negative integer display_frame), so its paused still cannot be shown to be the same frame" }
                 elseif (-not ($partnerMode -is [string] -and $partnerMode -ceq 'in_pass' -and $partnerPath -is [bool] -and $partnerPath)) {
                     $problem = "$stillName's in-pass partner $stillName.json was not grabbed while playing (it says capture_mode $(& $show $partnerMode), playback_path $(& $show $partnerPath); an in-pass partner needs capture_mode ""in_pass"" and playback_path true), so its paused still is no playing-versus-paused comparison"
                 }

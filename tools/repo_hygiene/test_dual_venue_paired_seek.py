@@ -1162,6 +1162,22 @@ class PairedSeekInPassPartnerTests(PairedStillsHarness, unittest.TestCase):
                 receipt = self.run_partner_case("partner-pngs", drop_pngs=(1, 2, 3, 4, 5), final=final)
                 self.assert_invalid(receipt, "frame-01", "frame-05", "contact-sheet\\raw\\frame-01.png", final=final)
 
+    def test_r9_fix2_a1_a_negative_display_frame_identifies_no_presented_frame(self) -> None:
+        # adversary r9 7240a133 A1: frame-00's paused still AND its in-pass partner both say display_frame -1; every hash and provenance is valid
+        stills = [-1] + SIX_FRAMES[1:]
+        for final in (False, True):
+            with self.subTest(final_validation=final):
+                self.fresh()
+                runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claimed_block(stills))])} if final else {}
+                self.write_artifacts(sheet=True, raw_frames=True)
+                self.write_seek_stills([provenance_sidecar(f) for f in stills])
+                (self.artifacts.joinpath(*IN_PASS_RAW) / "frame-00.json").write_bytes(
+                    json.dumps({"capture_mode": "in_pass", "playback_path": True, "display_frame": -1}).encode("utf-8"))
+                spec = PairedSeekCommittedStillSetTests.shipped_spec(self, "partner-negative" + ("-f" if final else ""))
+                proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"], **runner)
+                self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+                self.assert_invalid(receipt, "frame-00", "non-negative", final=final)
+
     def test_r9_combined_a_missing_partner_png_and_a_seek_partner_in_one_receipt_is_not_a_pass(self) -> None:
         for final in (False, True):
             with self.subTest(final_validation=final):
