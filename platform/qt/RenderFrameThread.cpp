@@ -312,6 +312,44 @@ void insertDualIsoWarmupInstrumentationTelemetry(
                    dualIsoFull20.phase_implied_pattern );
 }
 
+/* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the llrawproc steps outside the seven stage
+ * timers, emitted beside them; returns their sum so llrawproc_other_ms is the
+ * residual of the finer set. Every field is disjoint (llrawproc.h). The bundle
+ * also carries the wall, the seven-timer sum and the residual of the SAME run
+ * (llrawproc_residual_*), so a reader never pairs one thread's sub-timers with
+ * another thread's total (adversary r1 pass 2 A1). */
+double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target,
+                                                 double llrawprocTotalMs,
+                                                 double llrawprocStageTimersMs )
+{
+    llrpResidualSubstageTiming_t residual = {};
+    llrpGetLastResidualSubstageTiming( &residual );
+    const double substageMs = residual.setup_ms
+        + residual.make_14bit_ms
+        + residual.lut_rebuild_ms
+        + residual.snapshot_lock_wait_ms
+        + residual.snapshot_locked_ms
+        + residual.failure_backup_ms
+        + residual.publish_ms;
+    target.insert( QStringLiteral("llrawproc_setup_ms"), residual.setup_ms );
+    target.insert( QStringLiteral("llrawproc_make_14bit_ms"), residual.make_14bit_ms );
+    target.insert( QStringLiteral("llrawproc_lut_rebuild_ms"), residual.lut_rebuild_ms );
+    target.insert( QStringLiteral("llrawproc_lut_rebuilds"), residual.lut_rebuilds );
+    target.insert( QStringLiteral("llrawproc_snapshot_lock_wait_ms"),
+                   residual.snapshot_lock_wait_ms );
+    target.insert( QStringLiteral("llrawproc_snapshot_locked_ms"),
+                   residual.snapshot_locked_ms );
+    target.insert( QStringLiteral("llrawproc_failure_backup_ms"),
+                   residual.failure_backup_ms );
+    target.insert( QStringLiteral("llrawproc_publish_ms"), residual.publish_ms );
+    target.insert( QStringLiteral("llrawproc_residual_total_ms"), llrawprocTotalMs );
+    target.insert( QStringLiteral("llrawproc_residual_stage_timers_ms"),
+                   llrawprocStageTimersMs );
+    target.insert( QStringLiteral("llrawproc_residual_other_ms"),
+                   qMax( 0.0, llrawprocTotalMs - llrawprocStageTimersMs - substageMs ) );
+    return substageMs;
+}
+
 void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
 {
     const double llrawprocTotalMs = llrpGetLastTotalMilliseconds();
@@ -322,7 +360,7 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
     const double llrawprocPatternNoiseMs = llrpGetLastPatternNoiseMilliseconds();
     const double llrawprocDualIsoMs = llrpGetLastDualIsoMilliseconds();
     const double llrawprocChromaSmoothMs = llrpGetLastChromaSmoothMilliseconds();
-    const double llrawprocKnownMs =
+    const double llrawprocStageTimersMs =
         llrawprocDarkFrameMs
         + llrawprocVerticalStripesMs
         + llrawprocFocusPixelsMs
@@ -330,6 +368,11 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
         + llrawprocPatternNoiseMs
         + llrawprocDualIsoMs
         + llrawprocChromaSmoothMs;
+    const double llrawprocKnownMs =
+        llrawprocStageTimersMs
+        + insertLlrawprocResidualSubstageTelemetry( target,
+                                                    llrawprocTotalMs,
+                                                    llrawprocStageTimersMs );
     dualiso_full20bit_timing_t dualIsoFull20 = {};
     llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
 
@@ -6201,7 +6244,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
     dualiso_full20bit_timing_t dualIsoFull20 = {};
     llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
     const double llrawprocChromaSmoothMs = llrpGetLastChromaSmoothMilliseconds();
-    const double llrawprocKnownMs =
+    /* LLRAWPROC-RESIDUAL-SUBTIMERS-1 (adversary A1): a render that consumed another
+     * thread's recon ran no llrawproc here (every reconned-raw consumer zeroes
+     * getMlvLastLlrawprocMilliseconds, not all of them this thread's llrp record), so
+     * the recon worker's residual fields stay on the slot instead of an empty or
+     * stale record from this thread. */
+    const double llrawprocStageTimersMs =
         llrawprocDarkFrameMs +
         llrawprocVerticalStripesMs +
         llrawprocFocusPixelsMs +
@@ -6209,6 +6257,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
         llrawprocPatternNoiseMs +
         llrawprocDualIsoMs +
         llrawprocChromaSmoothMs;
+    const double llrawprocResidualSubstageMs = llrawprocMs > 0.0
+        ? insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry,
+                                                    llrawprocMs,
+                                                    llrawprocStageTimersMs )
+        : 0.0;
+    const double llrawprocKnownMs = llrawprocStageTimersMs + llrawprocResidualSubstageMs;
     const double llrawprocOtherMs = qMax( 0.0, llrawprocMs - llrawprocKnownMs );
     const double dualIsoPreviewTotalMs =
         slot.dualIsoPreviewHistogramMs +
