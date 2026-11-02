@@ -98,11 +98,11 @@ private:
  *  700 -> 0 jumps back by 700, under its 711. The tracker then counted the wrap as a backward jump and lost
  *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
  *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
- *  wrap_count. An engine wrap belongs to the NEXT presented transition only: a presentation that goes
- *  backward while an engine wrap noted since the previous presentation is pending IS the wrap. EVERY
- *  presentation consumes the pending wraps, the first one of the measured Play included (r16 re-pass A1
- *  on c9b4ca5e: a wrap before the first presentation stayed pending, and a later backward seek took it and
- *  was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
+ *  wrap_count. An engine wrap belongs to ONE presented transition only: a presentation that goes backward
+ *  while a wrap is pending for it IS the wrap. The first presentation of a frame whose request stamp is
+ *  above the consumed count consumes the pending wraps, whether it goes backward or not, the first one of
+ *  the measured Play included (r16 re-pass A1 on c9b4ca5e: a wrap before the first presentation stayed
+ *  pending, and a later backward seek took it and was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
  *  a cut range narrower than its 8-frame tolerance, cut 1..8, it calls any backward seek a wrap, and the
  *  seek 5 -> 4 was credited 7 frames).
  *  r17 (adversary A1 on 6451a8d9): engineWraps is the count stamped when the presented frame was REQUESTED
