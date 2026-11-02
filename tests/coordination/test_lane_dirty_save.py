@@ -1399,6 +1399,33 @@ def test_a_tracked_name_with_a_line_feed_does_not_make_the_conversion_notice_a_w
     assert r.returncode == 0 and "collection" not in last_receipt(r), r.stdout + r.stderr  # old code: 60, the notice was split into two unmatched fragments
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="git walks into a junction on Windows; on POSIX it lists a symlink as one file")
+def test_a_junction_inside_the_worktree_to_the_temp_directory_cannot_make_the_saver_list_itself(repo, tmp_path):  # r11 adversary pass 2 A1 (and A2: any alias that appears after the placement check): where the private dir is cannot be proven unreachable, so what git lists is also filtered
+    outside = tmp_path / "outside-temp"
+    outside.mkdir()
+    link_dir(repo / "jtemp", outside)
+    (repo / "u.txt").write_text("u\n")
+    env = {**os.environ, "TMP": str(outside), "TEMP": str(outside)}
+    first = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert b"lane-dirty-save-" not in inventory_of(tmp_path) and b"u.txt" in inventory_of(tmp_path)  # old code: jtemp/lane-dirty-save-<guid>/HEAD ... were listed
+    before = saved(repo)
+    second = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert second.returncode == 0 and second.stdout == first.stdout and saved(repo) == before  # old code: a new GUID, so a new artifact set
+
+
+@pytest.mark.parametrize("raw, own, want", [
+    (b"a.txt\0lane-dirty-save-0f\0lane-dirty-save-0f/HEAD\0x/lane-dirty-save-0f/objects/info/alternates\0y/lane-dirty-save-0f\0u.txt\0", "lane-dirty-save-0f", b"a.txt\0u.txt\0"),
+    (b"lane-dirty-save-0f/HEAD\0", "lane-dirty-save-0f", b""),
+    (b"lane-dirty-save-0fx/HEAD\0lane-dirty-save-0\0xlane-dirty-save-0f/a\0", "lane-dirty-save-0f", b"lane-dirty-save-0fx/HEAD\0lane-dirty-save-0\0xlane-dirty-save-0f/a\0"),  # only a whole path component is the saver's own
+    (b"caf\xc3\xa9\0u\xffv\0", "lane-dirty-save-0f", b"caf\xc3\xa9\0u\xffv\0"),  # names that are not ASCII (or not UTF-8) pass through byte for byte
+    (b"", "lane-dirty-save-0f", b""),
+])
+def test_the_savers_own_directory_is_removed_from_the_untracked_names_by_whole_path_component(raw, own, want):  # r11 adversary pass 2 A1/A2
+    out = run_ps_functions(["Remove-OwnNames"], "([System.BitConverter]::ToString((Remove-OwnNames ([System.Convert]::FromHexString($env:LDS_RAW)) $env:LDS_OWN)))", LDS_RAW=raw.hex().upper(), LDS_OWN=own)
+    assert out == "-".join(f"{b:02X}" for b in want)
+
+
 def test_a_directory_is_reported_present_unless_it_is_really_gone(tmp_path):  # r11 adversary A2 guard (runs everywhere; the unsearchable-parent case is the POSIX test above)
     here, gone = tmp_path / "here", tmp_path / "gone"
     here.mkdir()

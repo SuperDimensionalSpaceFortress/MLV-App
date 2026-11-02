@@ -100,6 +100,12 @@ function Test-DirPresent([string]$Path) {  # $false ONLY when the directory is r
     catch [System.IO.DirectoryNotFoundException] { return $false }
     catch { return $true }
 }
+function Remove-OwnNames([byte[]]$Bytes, [string]$Own) {  # the saver never lists itself: its private directory is named by a random GUID, so any NUL-separated name holding that whole path component is the saver's own file, however git reached it (an inward junction to the temp directory, a directory swapped for a link after the placement check; adversary r11 pass 2 A1, A2). Where the directory is cannot be proven unreachable; what git lists can be filtered
+    if (-not $Own -or $Bytes.Length -eq 0) { return , $Bytes }
+    $keep = @([System.Text.Encoding]::Latin1.GetString($Bytes) -split "`0" | Where-Object { $_ -and -not ($_ -ceq $Own -or $_.StartsWith($Own + '/', [System.StringComparison]::Ordinal) -or $_.EndsWith('/' + $Own, [System.StringComparison]::Ordinal) -or $_.Contains('/' + $Own + '/')) })
+    if (-not $keep) { return , [byte[]]@() }
+    return , [System.Text.Encoding]::Latin1.GetBytes(($keep -join "`0") + "`0")
+}
 function Get-WarningLines([string[]]$Stderr) {  # what git said on stderr, minus its line-ending conversion notices (printed for a file git DID compare). Matched over the WHOLE text, not per line: a notice holds the raw file name, which may hold a line feed (adversary r11 A3). Anything else, or a notice in another language, stays a warning: unknown is never "complete"
     $all = (@($Stderr) -join "`n").Replace("`r`n", "`n")
     $notice = "(?:warning: )?in the working copy of '.+?', (?:LF|CRLF) will be replaced by (?:LF|CRLF) the next time Git touches it|(?:warning: )?(?:LF|CRLF) will be replaced by (?:LF|CRLF) in .+?\.\nThe file will have its original line endings in your working directory"
@@ -261,6 +267,7 @@ try {
         if ($git.index.Code -eq 0) { $subs = @([System.Text.Encoding]::Latin1.GetString($git.index.Bytes) -split "`0" | Where-Object { $_.StartsWith('160000 ', [System.StringComparison]::Ordinal) }).Count }
         $git.patch = Invoke-GitBytes (@('diff', $headFull) + $flags); $git.staged = Invoke-GitBytes (@('diff', '--cached', $headFull) + $flags)
         $git.untracked = Invoke-GitBytes @('ls-files', '-z', '--others', '--exclude-standard')
+        if ($git.untracked.Code -eq 0) { $git.untracked.Bytes = Remove-OwnNames $git.untracked.Bytes ([System.IO.Path]::GetFileName($script:sealDir)) }
     }
 }
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
