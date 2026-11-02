@@ -1074,7 +1074,7 @@ def test_a_private_git_dir_that_cannot_be_removed_is_named_not_swallowed(repo, t
     r = save_with_hook(repo, tmp_path, "$script:hold = [System.IO.File]::Open([System.IO.Path]::Combine($script:sealDir, 'config'), 'Open', 'Read', 'ReadWrite')")
     assert r.returncode == 0, r.stdout + r.stderr  # the patch is saved all the same
     left = last_receipt(r)["privateGitDirLeft"]
-    assert Path(left).parent == repo / ".git" and Path(left).name.startswith("lane-dirty-save-")
+    assert Path(left).name.startswith("lane-dirty-save-") and repo.resolve() not in Path(left).resolve().parents  # r11 sol r10 B3: never inside the worktree or a git dir under it (the old assertion pinned it to .git)
     assert newest_patch(tmp_path) == git(repo, "diff", "HEAD", "--binary")
 
 
@@ -1129,3 +1129,155 @@ def test_a_leftover_private_git_dir_is_named_even_when_the_artifacts_cannot_be_w
     finally:
         allow_writes(tmp_path / "run")
     assert r.returncode == 50 and "DIRTY_SAVE_WRITE_FAILED" in r.stdout and "privateGitDirLeft=" in r.stdout, r.stdout + r.stderr
+
+
+# ---- r11: sol r10 B1-B3 on 16152f01 (three classes: comparison config = the caller's effective config; a warning is not completeness; the saver never observes itself) ----
+def clean_git_env(tmp_path, **extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG")}
+    env.update({"GIT_CONFIG_GLOBAL": str(tmp_path / "absent.gitconfig")})
+    env.update(extra)
+    return env
+
+
+def commit_lf(repo, text=b"one\n"):
+    git(repo, "config", "--unset", "core.autocrlf")
+    (repo / "a.txt").write_bytes(text)
+    git(repo, "-c", "core.autocrlf=false", "commit", "-q", "-am", "lf")
+
+
+@pytest.mark.parametrize("how", ["env-count", "env-parameters", "system-file"])
+def test_comparison_settings_the_caller_injects_decide_what_is_dirt_exactly_as_they_do_for_git(repo, tmp_path, how):  # r11 sol r10 B1: the injection was stripped before the effective config was read
+    commit_lf(repo)
+    (repo / "a.txt").write_bytes(b"one\r\n")
+    if how == "env-count":
+        git(repo, "config", "core.autocrlf", "true")  # the repository says true, the caller's environment says false
+        env = clean_git_env(tmp_path, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.autocrlf", GIT_CONFIG_VALUE_0="false")
+    elif how == "env-parameters":
+        git(repo, "config", "core.autocrlf", "true")
+        env = clean_git_env(tmp_path, GIT_CONFIG_PARAMETERS="'core.autocrlf'='false'")
+    else:
+        system = tmp_path / "system.gitconfig"
+        system.write_text("[core]\n\tautocrlf = false\n")
+        env = clean_git_env(tmp_path, GIT_CONFIG_SYSTEM=str(system))
+    want = git_env(repo, env, "diff", "HEAD", "--binary")
+    assert want  # git itself sees the CRLF bytes as a change
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 0, r.stdout + r.stderr  # old code: 10 clean-tree (the injection was removed, the repository's true normalised the difference away)
+    assert newest_patch(tmp_path) == want
+
+
+def test_an_excludes_file_the_caller_injects_decides_which_untracked_names_are_listed(repo, tmp_path):  # r11 sol r10 B1 sibling: core.excludesFile through GIT_CONFIG_COUNT
+    hide, show = tmp_path / "hide-u", tmp_path / "no-ignores"
+    hide.write_text("u.txt\n")
+    show.write_text("")
+    git(repo, "config", "core.excludesFile", hide.as_posix())
+    (repo / "u.txt").write_text("u\n")
+    env = clean_git_env(tmp_path, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.excludesFile", GIT_CONFIG_VALUE_0=show.as_posix())
+    want = git_env(repo, env, "ls-files", "-z", "--others", "--exclude-standard")
+    assert want == b"u.txt\0"
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 0, r.stdout + r.stderr  # old code: 10, the repository's ignore file hid u.txt
+    assert next((tmp_path / "run").glob("*.untracked.txt")).read_bytes() == want
+
+
+def test_an_injection_git_cannot_read_is_a_typed_refusal_before_anything_is_collected(repo, tmp_path):  # r11 hub ruling B1: a setting that cannot be carried is refused, never collected under different settings
+    (repo / "a.txt").write_bytes(b"changed\n")
+    env = clean_git_env(tmp_path, GIT_CONFIG_COUNT="not-a-number")
+    r = save(repo, "-LanePid", str(dead_pid()), env=env)
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout and saved(repo) == [], r.stdout + r.stderr  # old code: stripped the variable and saved with exit 0
+
+
+def deny_listing(path):
+    if sys.platform == "win32":
+        subprocess.run(["icacls", str(path), "/deny", "*S-1-1-0:(RD)"], check=True, capture_output=True)
+    else:
+        os.chmod(path, 0o000)
+
+
+def allow_listing(path):
+    if sys.platform == "win32":
+        subprocess.run(["icacls", str(path), "/remove:d", "*S-1-1-0"], check=True, capture_output=True)
+    else:
+        os.chmod(path, 0o755)
+
+
+ROOT_IGNORES_DIR_MODES = sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+@pytest.mark.skipif(ROOT_IGNORES_DIR_MODES, reason="root ignores directory permissions")
+def test_an_unreadable_directory_is_an_incomplete_collection_never_a_clean_tree(repo, tmp_path):  # r11 sol r10 B2 (ACL fixture: icacls deny list on Windows, chmod 000 on POSIX)
+    (repo / "hidden").mkdir()
+    (repo / "hidden" / "draft.txt").write_text("d\n")
+    deny_listing(repo / "hidden")
+    try:
+        r = save(repo, "-LanePid", str(dead_pid()))
+    finally:
+        allow_listing(repo / "hidden")
+    assert r.returncode == 60, r.stdout + r.stderr  # old code: 10 DIRTY_SAVE_NOTHING reason=clean-tree
+    assert "DIRTY_SAVE_NOTHING" not in r.stdout and "DIRTY_SAVE_INCOMPLETE" in r.stdout and "hidden" in r.stdout, r.stdout
+    assert saved(repo) == []
+
+
+@pytest.mark.skipif(ROOT_IGNORES_DIR_MODES, reason="root ignores directory permissions")
+def test_visible_dirt_does_not_turn_an_incomplete_collection_into_unqualified_success(repo, tmp_path):  # r11 sol r10 B2: the warning rides in the receipt and the exit code
+    (repo / "hidden").mkdir()
+    (repo / "hidden" / "draft.txt").write_text("d\n")
+    (repo / "a.txt").write_bytes(b"changed\n")
+    (repo / "u.txt").write_text("u\n")
+    deny_listing(repo / "hidden")
+    try:
+        r = save(repo, "-LanePid", str(dead_pid()))
+    finally:
+        allow_listing(repo / "hidden")
+    assert r.returncode == 60, r.stdout + r.stderr  # old code: 0 with a receipt that says nothing was missed
+    rec = last_receipt(r)
+    assert rec["collection"] == "incomplete" and any("hidden" in w for w in rec["warnings"]), rec
+    assert next((tmp_path / "run").glob("*.patch")).read_bytes() == git(repo, "diff", "HEAD", "--binary")  # what was readable is still saved
+    assert (tmp_path / "run" / f"dirty-save-{head8(repo)}.untracked.txt").read_bytes() == b"u.txt\0"
+    assert json.loads(next((tmp_path / "run").glob("*.receipt.json")).read_text()) == rec  # the persisted receipt carries it too
+
+
+def test_a_line_ending_conversion_notice_is_not_an_incomplete_collection(repo, tmp_path):  # r11 B2 guard (green on the old code): git diff prints 'LF will be replaced by CRLF' with exit 0 for a file it did compare
+    commit_lf(repo)
+    git(repo, "config", "core.autocrlf", "true")
+    (repo / "a.txt").write_bytes(b"one\nextra\n")
+    r = save(repo, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "collection" not in last_receipt(r)
+
+
+def separate_git_dir_repo(tmp_path):
+    base = tmp_path / "sep"
+    base.mkdir()
+    wd, admin = base / "wt", base / "wt" / "admin"
+    wd.mkdir()
+    subprocess.run(["git", "init", "-q", f"--separate-git-dir={admin}", str(wd)], check=True, capture_output=True)
+    for a in (["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "core.autocrlf", "false"]):
+        git(wd, *a)
+    (wd / "a.txt").write_bytes(b"one\n")
+    git(wd, "add", "a.txt")
+    git(wd, "commit", "-q", "-m", "base")
+    (wd / "u.txt").write_text("u\n")
+    (base / "run").mkdir()
+    return wd, base / "run"
+
+
+@pytest.mark.parametrize("temp_inside_worktree", [False, True])
+def test_the_saver_never_lists_its_own_temporary_files_and_a_repeat_save_is_byte_identical(tmp_path, temp_inside_worktree):  # r11 sol r10 B3: a separate git dir inside the worktree held the private git dir
+    wd, run = separate_git_dir_repo(tmp_path)
+    env = dict(os.environ)
+    if temp_inside_worktree:  # the lane's own TEMP can sit in the worktree (it does on the hub VM): the saver must then use the RunDir, not it
+        (wd / "tmpdir").mkdir()
+        env.update({"TMP": str(wd / "tmpdir"), "TEMP": str(wd / "tmpdir"), "TMPDIR": str(wd / "tmpdir")})
+    args = [PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(wd), "-RunDir", str(run), "-LanePid", str(dead_pid())]
+    first = subprocess.run(args, capture_output=True, text=True, env=env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    names_before = sorted(p.name for p in run.iterdir())
+    second = subprocess.run(args, capture_output=True, text=True, env=env)
+    assert second.returncode == 0 and second.stdout == first.stdout, second.stdout + second.stderr  # old code: a new GUID in the inventory, so new artifacts
+    assert sorted(p.name for p in run.iterdir()) == names_before
+    inventory = next(run.glob("*.untracked.txt")).read_bytes()
+    assert b"lane-dirty-save-" not in inventory and b"u.txt" in inventory  # old code: the private git dir's HEAD, config and alternates were named
+    assert [p for p in (wd / "admin").iterdir() if p.name.startswith("lane-dirty-save-")] == []
+    if temp_inside_worktree:
+        assert list((wd / "tmpdir").iterdir()) == []

@@ -9,7 +9,8 @@
 # Paths are split on the platform's own separators only (a POSIX backslash is a filename character), and the RunDir that passes the containment test is the resolved path every artifact is then written through.
 # Windows resolves both directories through an open handle (GetFinalPathNameByHandle: links, junctions, subst drives, 8.3 and \\?\ spellings in any case) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX walks symlinks by name, then also refuses a RunDir (or ancestor) whose st_dev:st_ino is the worktree root or any directory inside it, so a bind mount cannot alias it; if that cannot be proven (no find/stat, unreadable tree) it exits 30. A swap between check and write is not closed on POSIX.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
-# Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay).
+# Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay), 60 INCOMPLETE: git exited 0 but said something on stderr (an unreadable directory, a config it could not read), so the collection may be missing evidence. 60 is never "clean": with nothing to save it prints DIRTY_SAVE_INCOMPLETE and the warning text; with something saved the receipt carries collection=incomplete and warnings, and what was readable is still written.
+# Only git's line-ending conversion notices ("LF will be replaced by CRLF ...", printed for a file git DID compare) are not warnings. Everything else on stderr is (r11, sol r10 B2).
 # Never stashes, resets, checks out, cleans or deletes (the one removal is its own private git dir, below). Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
 # a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
@@ -24,15 +25,19 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:unreadable = @()
+$script:gitStderr = @()  # stderr of every git call that exited 0: a warning there is a collection that may be incomplete (r11 sol r10 B2)
 $script:seal = $null; $script:sealDir = $null
 $script:noCallbacks = @('-c', 'core.fsmonitor=false')  # the few read-only calls made BEFORE the seal (toplevel, HEAD, paths, config list) run nothing, and core.fsmonitor is blanked anyway (sol r7 B1)
-function Invoke-GitBytes([string[]]$GitArgs) {
+function Invoke-GitBytes([string[]]$GitArgs, [switch]$KeepConfigEnv) {  # -KeepConfigEnv: the ONE call that reads the caller's effective config as data keeps the config-injecting environment (r11 sol r10 B1); every other call has it stripped
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
         foreach ($a in (@('-C', $WorkDir, '--no-replace-objects') + $(if ($script:seal) { $script:seal.Args } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
-        foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_SYSTEM', 'GIT_ATTR_SOURCE', 'GIT_NAMESPACE') { [void]$psi.Environment.Remove($k) }  # GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4); the config-injecting variables would hand a callback to the sealed git (r10)
-        foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_CONFIG_KEY_*' -or $_ -like 'GIT_CONFIG_VALUE_*' })) { [void]$psi.Environment.Remove($k) }
+        foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_ATTR_SOURCE', 'GIT_NAMESPACE') { [void]$psi.Environment.Remove($k) }  # GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4)
+        if (-not $KeepConfigEnv) {  # the config-injecting variables would hand a callback to the sealed git (r10). The effective-config read keeps them, so a core.autocrlf, core.eol or core.excludesFile the caller injects reaches the private config like any other (r11 sol r10 B1); the allowlist, not this stripping, is what keeps a callback out
+            foreach ($k in 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_SYSTEM') { [void]$psi.Environment.Remove($k) }
+            foreach ($k in @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_CONFIG_KEY_*' -or $_ -like 'GIT_CONFIG_VALUE_*' })) { [void]$psi.Environment.Remove($k) }
+        }
         if ($script:seal) { foreach ($k in $script:seal.Env.Keys) { $psi.Environment[$k] = $script:seal.Env[$k] } }
         $psi.Environment['GIT_OPTIONAL_LOCKS'] = '0'
         foreach ($k in (@('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF') + @($psi.Environment.Keys | Where-Object { $_ -like 'GIT_TRACE*' }))) { $psi.Environment[$k] = '0' }
@@ -43,6 +48,7 @@ function Invoke-GitBytes([string[]]$GitArgs) {
         $ms = [System.IO.MemoryStream]::new()
         $p.StandardOutput.BaseStream.CopyTo($ms)
         $p.WaitForExit()
+        if ($p.ExitCode -eq 0 -and $err.Result.Trim()) { $script:gitStderr += $err.Result }
         return @{ Code = $p.ExitCode; Bytes = $ms.ToArray(); Err = $err.Result }
     } catch { return @{ Code = -1; Bytes = [byte[]]@(); Err = $_.Exception.Message } }
 }
@@ -59,7 +65,7 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
         $paths += Remove-GitTerminator $q.Bytes
     }
     $gitDir, $index, $objects, $attr, $excl = $paths
-    $c = Invoke-GitBytes @('config', '--null', '--list')  # the EFFECTIVE config (system, global, includes, local, worktree), read as data: what git itself would compare and convert by (adversary r10 A1)
+    $c = Invoke-GitBytes @('config', '--null', '--list') -KeepConfigEnv  # the EFFECTIVE config (system, global, includes, local, worktree, AND the caller's GIT_CONFIG_COUNT/KEY/VALUE, GIT_CONFIG_PARAMETERS and GIT_CONFIG_SYSTEM), read as data: what git itself would compare and convert by (adversary r10 A1; sol r10 B1). It runs nothing. Git that cannot parse the injection exits non-zero here, which is a typed refusal (40) before anything is collected, never a collection under other settings
     if ($c.Code -ne 0) { throw $c.Err.Trim() }
     $allow = 'core.filemode', 'core.symlinks', 'core.ignorecase', 'core.autocrlf', 'core.eol', 'core.safecrlf', 'core.precomposeunicode', 'core.trustctime', 'core.checkstat', 'core.protectntfs', 'core.protecthfs', 'core.longpaths', 'core.bigfilethreshold', 'core.quotepath'  # how git compares and converts bytes; none names a program
     $allow += 'core.excludesfile', 'core.attributesfile'  # a path to a list of RULES (data): kept, so the sealed git reads the same ignore and attribute files; unset, git's own default applies identically (adversary r10 A2)
@@ -72,8 +78,8 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     $cfg = "[core]`n`trepositoryformatversion = $(if ($sha256) { 1 } else { 0 })`n"
     foreach ($k in $vals.Keys) { $cfg += "`t" + $k.Substring(5) + $(if ($null -eq $vals[$k]) { '' } else { ' = "' + $vals[$k].Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`t", '\t').Replace("`b", '\b') + '"' }) + "`n" }
     if ($sha256) { $cfg += "[extensions]`n`tobjectformat = sha256`n" }
-    $sg = [System.IO.Path]::Combine($gitDir, 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg
-    foreach ($sub in 'objects/info', 'refs', 'info') { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine($sg, $sub)) }
+    $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
+    foreach ($sub in @('objects', 'info'), @('refs'), @('info')) { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine([string[]](@($sg) + $sub))) }  # one segment per argument: a \\?\ path (the RunDir fall-back) does not translate a slash
     $enc = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD'), "$HeadFull`n", $enc)
     [System.IO.File]::WriteAllBytes([System.IO.Path]::Combine($sg, 'config'), [System.Text.Encoding]::Latin1.GetBytes($cfg))
@@ -86,6 +92,24 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     $script:seal = @{ Args = $script:noCallbacks; Env = @{ GIT_DIR = $sg; GIT_WORK_TREE = $WorkDir; GIT_INDEX_FILE = $index; GIT_CONFIG_NOSYSTEM = '1'; GIT_CONFIG_GLOBAL = $nullDev } }  # the REAL index file: copying it would reset its timestamp and hide racily-clean entries
 }
 $script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
+function Test-Inside([string]$Parent, [string]$Child) {  # $true when $Child is $Parent or below it; ordinal, both already resolved to real paths
+    $rel = [System.IO.Path]::GetRelativePath($Parent, $Child)
+    return -not ([string]::Equals($rel, '..', [System.StringComparison]::Ordinal) -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($rel))
+}
+function Get-PrivateBase {  # where the saver's own temporary directory may live: the OS temp directory, unless that is inside the worktree (the lane's TEMP can be, on the hub VM it is), then the RunDir, which is already proven to be outside it. Real paths on both sides, so a link or an 8.3 spelling cannot hide the overlap
+    foreach ($cand in @([System.IO.Path]::GetTempPath(), $RunDir)) {
+        try {
+            if ($script:onWin) { $f = Get-FinalDir $cand; $f.Handle.Dispose(); $real = $f.Path } else { $real = Resolve-RealPath $cand }
+            if (Test-Inside $realWork $real) { continue }
+            if ($script:onWin -and $cand.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {  # git rejects a \\?\ GIT_DIR, so it gets the plain spelling, and only when Win32 would not re-read it as another directory (a component ending in a dot or a space is trimmed)
+                $cand = if ($cand.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { '\\' + $cand.Substring(8) } else { $cand.Substring(4) }
+                if (@($cand.Split('\') | Where-Object { $_ -and ($_.EndsWith('.') -or $_.EndsWith(' ')) }).Count) { continue }
+            }
+            return $cand
+        } catch { continue }
+    }
+    throw 'no-private-dir-outside-worktree'
+}
 function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # POSIX: every symlink on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2). Windows asks the kernel instead (Get-FinalDir)
     if ($Depth -gt 16) { throw 'too-many-links' }
     $full = [System.IO.Path]::GetFullPath($Path); $root = [System.IO.Path]::GetPathRoot($full); $cur = $root
@@ -201,9 +225,9 @@ try {
         if (-not [string]::Equals((& $shareOf $RunDir), (& $shareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # a share can expose a local folder (\\localhost\C$), and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
     }
     else { $RunDir = Resolve-RealPath $RunDir; $realWork = Resolve-RealPath $WorkDir; if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }
-    $rel = [System.IO.Path]::GetRelativePath($realWork, $RunDir)
+    $runInside = Test-Inside $realWork $RunDir
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
-if ($top.Code -eq 0 -and -not ([string]::Equals($rel, '..', [System.StringComparison]::Ordinal) -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
+if ($top.Code -eq 0 -and $runInside) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $git = [ordered]@{}; $subs = 0
 try {
     $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
@@ -227,11 +251,20 @@ $leftNote = if ($left) { " privateGitDirLeft=$left" } else { '' }
 $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
 if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())$leftNote"; exit 40 }
 $todo = 'patch', 'staged', 'untracked' | Where-Object { $git[$_].Bytes.Length -gt 0 }
-if (-not $todo) { Write-Output "DIRTY_SAVE_NOTHING reason=clean-tree$leftNote"; exit 10 }
+# r11 (sol r10 B2): exit 0 with words on stderr is not a complete collection (git walks past a directory it cannot open and says so only there). Line-ending conversion notices are the one exception: git printed them for a file it DID compare.
+$notice = '\A(?:warning: )?(?:in the working copy of .*, )?(?:LF|CRLF) will be replaced by (?:LF|CRLF)(?: in .*\.| the next time Git touches it)\z|\AThe file will have its original line endings in your working directory\z'
+$warnLines = @($script:gitStderr | ForEach-Object { $_ -split "`r?`n" } | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -cnotmatch $notice })
+$warnShown = @($warnLines | Select-Object -First 20 | ForEach-Object { if ($_.Length -gt 300) { $_.Substring(0, 300) + '...' } else { $_ } })
+if ($warnLines.Count -gt 20) { $warnShown += "... and $($warnLines.Count - 20) more" }
+if (-not $todo) {
+    if ($warnLines) { Write-Output "DIRTY_SAVE_INCOMPLETE reason=git-warning count=$($warnLines.Count) warnings=$($warnShown -join ' | ')$leftNote"; exit 60 }
+    Write-Output "DIRTY_SAVE_NOTHING reason=clean-tree$leftNote"; exit 10
+}
 $head8 = $headFull.Substring(0, 8)
 $ext = @{ patch = 'patch'; staged = 'staged.patch'; untracked = 'untracked.txt' }
 $r = [ordered]@{ schema = 'lane-dirty-save/v1'; head = $headFull; untrackedFormat = 'nul-separated'; untrackedContents = 'not-saved'; submodules = "skipped $subs" }
 if ($left) { $r.privateGitDirLeft = $left }
+if ($warnLines) { $r.collection = 'incomplete'; $r.warnings = @($warnShown) }
 try {
     foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }
     if ($r.Contains('patch')) { $r.patchSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($git.patch.Bytes)).Replace('-', '').ToLowerInvariant() }
@@ -239,4 +272,4 @@ try {
     [void](Save-Bytes 'receipt.json' $null $make)
 } catch { Write-Output "DIRTY_SAVE_WRITE_FAILED reason=$($_.Exception.Message)$leftNote"; exit 50 }  # r6 A4: a read-only or full RunDir ends in a documented status; artifacts already written stay
 Write-Output ([System.Text.UTF8Encoding]::new($false).GetString($script:written).TrimEnd("`n"))
-exit 0
+exit $(if ($warnLines) { 60 } else { 0 })
