@@ -424,6 +424,40 @@ def test_a_run_dir_spelled_extended_or_8dot3_inside_the_worktree_is_bad_argument
     assert list(inside.iterdir()) == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a backslash is a path separator on Windows, so a directory name containing one cannot exist there; the source-pin test below covers Windows")
+def test_a_posix_run_dir_symlink_whose_name_holds_a_backslash_is_judged_by_the_link_not_a_decoy(repo, tmp_path):  # r7 dot B1 on #722 (comment 6565339764)
+    (repo / "run").mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    (tmp_path / "out" / "alias").mkdir(parents=True)  # the decoy the old resolver walked after splitting 'out\alias' on the backslash
+    spelled = str(tmp_path / "out\\alias")  # ONE file name: a symlink to the real run dir inside the worktree
+    os.symlink(repo / "run", spelled, target_is_directory=True)
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", spelled, "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30, r.stdout + r.stderr  # old code: exit 0, evidence written through the link into the worktree
+    assert "run-dir-inside-worktree" in r.stdout
+    assert list((repo / "run").iterdir()) == [] and list((tmp_path / "out" / "alias").iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a backslash is a path separator on Windows, so a directory name containing one cannot exist there")
+def test_a_posix_run_dir_with_a_literal_backslash_name_receives_the_artifacts_where_it_really_is(repo, tmp_path):  # r7 dot B1 class: the written directory is the checked one
+    (repo / "a.txt").write_bytes(b"changed\n")
+    real = tmp_path / "out\\run"
+    real.mkdir()
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(repo), "-RunDir", str(real), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sorted(p.name for p in real.iterdir()) and not (tmp_path / "out").exists()
+
+
+def test_the_resolver_and_the_writer_use_only_the_platforms_own_separators():  # r7 dot B1 source pin, runs on every platform
+    text = SCRIPT.read_text(encoding="utf-8")
+    m = re.search(r"^function Resolve-RealPath.*?^}\n", text, re.MULTILINE | re.DOTALL)
+    assert m, "lane-dirty-save.ps1 has no Resolve-RealPath"
+    body = m.group(0)
+    assert "[char[]]@('\\', '/')" not in body and "DirectorySeparatorChar" in body and "AltDirectorySeparatorChar" in body  # old code: split on both characters on every platform
+    assert r"$win -and $Path.StartsWith('\\?\UNC\')" in body  # the extended-length prefix is a Windows spelling only
+    assert "Resolve-Path" not in text and "Join-Path" not in text and "Test-Path" not in text  # PowerShell's path layer may re-spell a backslash; .NET only
+    assert re.search(r"\$RunDir = Resolve-RealPath \$RunDir; \$rel = ", text)  # the checked directory is the written one
+
+
 def test_a_changed_gitlink_is_saved_as_an_applicable_patch_even_when_diff_submodule_is_log(repo, tmp_path):  # r7 A2
     sha_a, sha_b = "a" * 40, "b" * 40
     git(repo, "update-index", "--add", "--cacheinfo", f"160000,{sha_a},sub")

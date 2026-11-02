@@ -6,6 +6,7 @@
 # Untracked file CONTENTS are NOT preserved by this saver (names only); copying them is LANE-DIRTY-SAVE-INVENTORY-ROWS-1 / LANE-DIRTY-SAVE-WORKSTREAM-WIRE-1 scope.
 # The lane is named by -LanePid or by -ChildJson ({pid, createdUtc}; createdUtc must be an ISO-8601 string, else exit 30; a process that started after it, at full precision, is a reused pid, so the lane is dead), never both.
 # The whole worktree is collected: a -WorkDir below the top level is lifted to `git rev-parse --show-toplevel` and every diff gets --no-relative. A -RunDir inside that worktree (links followed) is refused (exit 30): evidence written there would be listed as untracked dirt.
+# Paths are split on the platform's own separators only (a POSIX backslash is a filename character), and the RunDir that passes the containment test is the resolved path every artifact is then written through.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay).
 # Never stashes, resets, checks out, cleans or deletes. Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
@@ -43,10 +44,11 @@ function Remove-GitTerminator([byte[]]$Bytes) {  # git ends a path line with exa
 }
 function Resolve-RealPath([string]$Path, [int]$Depth = 0) {  # every link (symlink or junction) on the way is followed, so the inside-worktree test sees where bytes would land (r6 A2)
     if ($Depth -gt 16) { throw 'too-many-links' }
-    if ($Path.StartsWith('\\?\UNC\')) { $Path = '\\' + $Path.Substring(8) } elseif ($Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\')) { $Path = $Path.Substring(4) }  # the extended-length prefix is another spelling of the same place (r7 A1)
+    $win = [System.IO.Path]::DirectorySeparatorChar -eq '\'  # a backslash separates path parts on Windows only; on POSIX it is a literal filename character (dot B1 on #722)
+    if ($win -and $Path.StartsWith('\\?\UNC\')) { $Path = '\\' + $Path.Substring(8) } elseif ($win -and ($Path.StartsWith('\\?\') -or $Path.StartsWith('\\.\'))) { $Path = $Path.Substring(4) }  # the extended-length prefix is another spelling of the same place (r7 A1)
     $full = [System.IO.Path]::GetFullPath($Path); $root = [System.IO.Path]::GetPathRoot($full); $cur = $root
-    foreach ($seg in $full.Substring($root.Length).Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)) {
-        if ([System.IO.Path]::DirectorySeparatorChar -eq '\' -and $seg.Contains('~')) {  # an 8.3 short name is a third spelling: ask the parent for the long name
+    foreach ($seg in $full.Substring($root.Length).Split([char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar), [System.StringSplitOptions]::RemoveEmptyEntries)) {
+        if ($win -and $seg.Contains('~')) {  # an 8.3 short name is a third spelling: ask the parent for the long name
             try { $hit = [System.IO.DirectoryInfo]::new($cur).GetFileSystemInfos($seg) | Select-Object -First 1; if ($hit) { $seg = $hit.Name } } catch { }
         }
         $cur = [System.IO.Path]::Combine($cur, $seg)
@@ -79,11 +81,11 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) { 
         if ($Make) { $Bytes = [byte[]](& $Make) }
         $script:written = $Bytes
         $name = if ($n -eq 1) { "dirty-save-$head8.$Ext" } else { "dirty-save-$head8.$n.$Ext" }
-        $f = Join-Path $RunDir $name
+        $f = [System.IO.Path]::Combine($RunDir, $name)
         try { $fs = [System.IO.File]::Open($f, 'CreateNew', 'Write', 'None') }
         catch [System.IO.IOException], [System.UnauthorizedAccessException] {  # a directory at the name raises UnauthorizedAccess (sol r4 B3)
-            if (-not (Test-Path -LiteralPath $f)) { throw }
-            if (Test-Path -LiteralPath $f -PathType Container) { continue }
+            if (-not ([System.IO.File]::Exists($f) -or [System.IO.Directory]::Exists($f))) { throw }
+            if ([System.IO.Directory]::Exists($f)) { continue }
             $same = $null
             for ($i = 0; $i -lt 5 -and $null -eq $same; $i++) { try { $same = [System.Linq.Enumerable]::SequenceEqual([byte[]][System.IO.File]::ReadAllBytes($f), $Bytes) } catch { Start-Sleep -Milliseconds 200 } }
             if ($same) { return $name }
@@ -95,14 +97,15 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) { 
     }
 }
 try {
-    $WorkDir = (Resolve-Path -LiteralPath $WorkDir).ProviderPath; $RunDir = (Resolve-Path -LiteralPath $RunDir).ProviderPath
-    if (-not (Test-Path -LiteralPath $WorkDir -PathType Container) -or -not (Test-Path -LiteralPath $RunDir -PathType Container)) { throw 'no-such-directory' }
+    $here = (Get-Location).ProviderPath  # PowerShell's location, not .NET's (adversary A6)
+    $WorkDir = [System.IO.Path]::GetFullPath($WorkDir, $here); $RunDir = [System.IO.Path]::GetFullPath($RunDir, $here)  # .NET only: PowerShell's path layer may re-spell a POSIX backslash as '/' (dot B1 on #722)
+    if (-not [System.IO.Directory]::Exists($WorkDir) -or -not [System.IO.Directory]::Exists($RunDir)) { throw 'no-such-directory' }
     if (Test-LaneAlive) { Write-Output 'DIRTY_SAVE_REFUSED reason=lane-alive'; exit 20 }
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=none', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
 if ($top.Code -eq 0) { $WorkDir = Remove-GitTerminator $top.Bytes }
-try { $rel = [System.IO.Path]::GetRelativePath((Resolve-RealPath $WorkDir), (Resolve-RealPath $RunDir)) } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
+try { $RunDir = Resolve-RealPath $RunDir; $rel = [System.IO.Path]::GetRelativePath((Resolve-RealPath $WorkDir), $RunDir) } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
 if ($top.Code -eq 0 -and -not ($rel -eq '..' -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar) -or [System.IO.Path]::IsPathRooted($rel))) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $headR = if ($top.Code -eq 0) { Invoke-GitBytes @('rev-parse', 'HEAD') } else { $top }
 $headFull = [System.Text.Encoding]::ASCII.GetString($headR.Bytes).Trim()
