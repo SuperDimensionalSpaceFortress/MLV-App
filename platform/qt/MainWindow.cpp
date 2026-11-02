@@ -6914,6 +6914,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_playbackStartupSplit.noteRequest( ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0 );
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
+    requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;   // r17 adversary A1: see presentationIsLoopWrap
     requestContext.sceneWidth = sceneWidth;
     requestContext.sceneHeight = sceneHeight;
     requestContext.devicePixelRatioMilli = devicePixelRatioMilli;
@@ -26161,7 +26162,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
     // (presentationIsLoopWrap): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold,
     // and over a cut range narrower than its tolerance the inference calls any backward seek a wrap.
-    const bool sourceAdvanceWrap = presentationIsLoopWrap( m_playbackWrapRecorder.engineWraps,
+    // r17 (adversary A1 on 6451a8d9): the count is the one stamped when THIS frame was requested. The draw's
+    // early/tail advance (timerFrameEvent) runs before this call and can wrap the engine to the cut-in first, so
+    // the live count would hand the wrap to the in-flight forward frame (718 -> 719) and make 719 -> 0 backward.
+    const bool sourceAdvanceWrap = presentationIsLoopWrap( requestContext.engineWrapsAtRequest,
                                                            m_playbackSmokeTrackerEngineWraps,
                                                            m_playbackSmokePresentedFrames > 0,
                                                            m_playbackSmokeLastPresentedFrame,

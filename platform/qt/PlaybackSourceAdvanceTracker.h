@@ -104,14 +104,20 @@ private:
  *  on c9b4ca5e: a wrap before the first presentation stayed pending, and a later backward seek took it and
  *  was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
  *  a cut range narrower than its 8-frame tolerance, cut 1..8, it calls any backward seek a wrap, and the
- *  seek 5 -> 4 was credited 7 frames). consumedEngineWraps is the caller's running count; it is set to the
- *  engine's count at every presentation and when the measured Play starts.
+ *  seek 5 -> 4 was credited 7 frames).
+ *  r17 (adversary A1 on 6451a8d9): engineWraps is the count stamped when the presented frame was REQUESTED
+ *  (RenderFrameThread::ReadyFrame::PresentationContext::engineWrapsAtRequest), never the live count. The draw
+ *  runs its early/tail advance before noting the presentation, so with the live count an in-flight frame
+ *  requested before the wrap (719 after 718) took the wrap and the real wrap 719 -> 0 counted backward. A wrap
+ *  therefore belongs to the first presentation of a frame requested after it. consumedEngineWraps is the
+ *  caller's running count. It is set to the live count when the measured Play starts and only ever rises, so
+ *  an older request presented late (a stamp below it) never re-opens a consumed wrap.
  *  \param havePrevious a frame was presented before this one in the measured Play */
 inline bool presentationIsLoopWrap( int engineWraps, int &consumedEngineWraps,
                                     bool havePrevious, int lastFrame, int frame )
 {
     const bool engineWrapPending = engineWraps > consumedEngineWraps;
-    consumedEngineWraps = engineWraps;
+    if( engineWrapPending ) consumedEngineWraps = engineWraps;
     return havePrevious && engineWrapPending && frame < lastFrame;
 }
 

@@ -100,10 +100,13 @@ struct PresentDriver
     int presented = 0;
     int last = -1;
     void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; last = -1; }
-    void present(double t, int frame, bool loop, int cutIn0, int cutOut0)
+    // r17 (adversary A1 on 6451a8d9): MainWindow passes the count stamped when the frame was REQUESTED
+    // (PresentationContext::engineWrapsAtRequest). stampAtRequest < 0 = requested after every wrap so far.
+    void present(double t, int frame, bool loop, int cutIn0, int cutOut0, int stampAtRequest = -1)
     {
         (void)loop;   // the inference (Loop, the jump size) no longer decides the tracker's wrap (re-pass A2)
-        const bool wrap = presentationIsLoopWrap(engineWraps, consumed, presented > 0, last, frame);
+        const int stamp = stampAtRequest < 0 ? engineWraps : stampAtRequest;
+        const bool wrap = presentationIsLoopWrap(stamp, consumed, presented > 0, last, frame);
         tracker.notePresented(t, frame, wrap, cutIn0, cutOut0);
         last = frame;
         ++presented;
@@ -185,4 +188,54 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     s.present(0.1, 300, false, 0, 719);
     ASSERT_EQ(0u, s.tracker.wraps());
     ASSERT_EQ(1u, s.tracker.backwardJumps());
+}
+
+// r17 (adversary A1 on 6451a8d9): Loop on, drop-frame off, cut 1..720 (0..719), presentations 718, 719, 0 at 1.000,
+// 1.045 and 1.090 s. Frame 719 was requested before the wrap, but the draw that presents it runs its early/tail
+// advance first (MainWindow::finishPresentedFrame / drawFrameReady -> timerFrameEvent -> playbackHandling), and that
+// advance wraps the engine to 0 before notePlaybackSmokePresentedFrame reads the count. With the live count, 719 took
+// the wrap and 719 -> 0 was a backward jump: advanced 1, wraps 0, backward 1, 11.111 fps. With the request's stamp,
+// the wrap belongs to frame 0, the first frame requested after it: advanced 2, wraps 1, backward 0, 22.222 fps.
+TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1AFrameRequestedBeforeTheWrapNeverTakesIt)
+{
+    PresentDriver d;
+    d.engineWraps = 2;                       // earlier Plays' wraps
+    d.startMeasuredPlay();
+    d.present(1.000, 718, true, 0, 719);
+    const int stamp719 = d.engineWraps;      // 719 is requested before the wrap ...
+    ++d.engineWraps;                         // ... and the draw that presents it wraps the engine first
+    d.present(1.045, 719, true, 0, 719, stamp719);
+    d.present(1.090, 0, true, 0, 719);       // requested after the wrap
+    ASSERT_EQ(2, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(0u, d.tracker.backwardJumps());
+    ASSERT_NEAR(2.0 / 0.090, d.tracker.sourceFps(), 1e-9);
+    // two in-flight frames (a lookahead request) ahead of the wrap: still only the post-wrap frame takes it
+    PresentDriver e;
+    e.startMeasuredPlay();
+    e.present(1.000, 717, true, 0, 719);
+    const int before = e.engineWraps;
+    ++e.engineWraps;
+    e.present(1.040, 718, true, 0, 719, before);
+    e.present(1.080, 719, true, 0, 719, before);
+    e.present(1.120, 0, true, 0, 719);
+    e.present(1.160, 1, true, 0, 719);
+    ASSERT_EQ(4, static_cast<int>(e.tracker.advancedFrames()));
+    ASSERT_EQ(1u, e.tracker.wraps());
+    ASSERT_EQ(0u, e.tracker.backwardJumps());
+    // the stamped wrap is still taken once: a later backward seek (requested after it) is a backward jump
+    e.present(1.200, 0, true, 0, 719);
+    ASSERT_EQ(1u, e.tracker.wraps());
+    ASSERT_EQ(1u, e.tracker.backwardJumps());
+    // the consumed count only rises: a frame requested before the measured Play (a stamp below the count at its
+    // start) never re-opens the earlier Plays' wraps for the next presentation, so the seek after it is not a wrap
+    // (6451a8d9's helper lowered the count to 2 and credited the seek 400 -> 300 as a wrap of 620 frames)
+    PresentDriver late;
+    late.engineWraps = 3;
+    late.startMeasuredPlay();
+    late.present(0.000, 400, true, 0, 719, 2);
+    late.present(0.040, 300, true, 0, 719);
+    ASSERT_EQ(0u, late.tracker.wraps());
+    ASSERT_EQ(1u, late.tracker.backwardJumps());
+    ASSERT_EQ(0, static_cast<int>(late.tracker.advancedFrames()));
 }
