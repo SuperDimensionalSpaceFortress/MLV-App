@@ -28553,10 +28553,11 @@ void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
 // frame to the recon worker. Never touches actionPlay, programmaticPlay(), the play ledger or Loop.
 void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
 {
-    m_playbackReconWarmRepostArmed = false;
     // one warm per clip, re-run only after a recon-state change re-arms it (rearmPlaybackReconWarmAfterStateChange; a
-    // later raw-level change leaves set_clip to Play, correctly)
-    if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject || m_playbackReconWarmRan ) return;
+    // later raw-level change leaves set_clip to Play, correctly). WARM-RUN-CHROMA-SMOOTH-PARITY-1 r4 (adversary r3 A2 on
+    // c8ee6197): one warm in flight at a time -- while the gate holds one, its done re-posts (onPlaybackReconWarmDone).
+    if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject
+     || m_playbackReconWarmStateGate.inFlight || m_playbackReconWarmRan ) return;
     playback_recon_warm_run::Decision decision = playback_recon_warm_run::decide(
         !mlvappPlaybackReconWarmRunDisabled() && !mlvappPlaybackRoutePrewarmDisabled(),
         ui->actionPlay->isChecked(),
@@ -28598,8 +28599,16 @@ void MainWindow::schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reaso
     if( m_playbackReconWarmRepostArmed
      || !playback_recon_warm_run::repostAfterSkip( reason, m_playbackReconWarmPosts ) ) return;
     m_playbackReconWarmRepostArmed = true;
+    // r4 (adversary r3 A2 on c8ee6197): the timer owns the armed flag only while it is the current one. A clip change
+    // (armPlaybackRoutePrewarm) bumps the sequence, so an older clip's timer neither clears this clip's flag nor posts.
+    const quint64 repostSeq = ++m_playbackReconWarmRepostSeq;
     QTimer::singleShot( playback_recon_warm_run::kRepostDelayMs, this,
-                        [this, clipGeneration]() { postPlaybackReconWarm( clipGeneration ); } );
+                        [this, clipGeneration, repostSeq]()
+                        {
+                            if( repostSeq != m_playbackReconWarmRepostSeq ) return;
+                            m_playbackReconWarmRepostArmed = false;
+                            postPlaybackReconWarm( clipGeneration );
+                        } );
 }
 
 // Row W, GUI half: AMaZE from the warm's retained output into #473's staged slot (only for this clip, while paused),
@@ -28679,6 +28688,7 @@ void MainWindow::armPlaybackRoutePrewarm()
     m_playbackReconWarmPrewarmRan = false;
     m_playbackReconWarmPosts = 0;
     m_playbackReconWarmRepostArmed = false;
+    ++m_playbackReconWarmRepostSeq;   // r4: a re-post timer of the old clip is now stale
     m_playbackReconWarmRan = false;
     m_playbackReconWarmStateGate.reset();   // WARM-RUN-CHROMA-SMOOTH-PARITY-1: the old clip's queued warm was dropped
     m_playbackRoutePrewarmArmed = !mlvappPlaybackRoutePrewarmDisabled();
@@ -28696,7 +28706,8 @@ void MainWindow::rearmPlaybackReconWarmAfterStateChange( const char *why )
     const bool postNow = m_playbackReconWarmStateGate.stateChanged();
     if( !m_playbackReconWarmPrewarmRan || ui->actionPlay->isChecked() ) return;
     m_playbackReconWarmRan = false;
-    m_playbackReconWarmPosts = 0;
+    // r4 (adversary r3 A1 on c8ee6197): the post budget is per CLIP (kMaxPosts) and is not reset here, so alternating
+    // the setting cannot post warms without end; one change costs one post.
     qInfo().noquote() << QStringLiteral( "playback_recon_warm_rearm why=" ) + QString::fromLatin1( why )
                              + QStringLiteral( " in_flight=" ) + QString::number( postNow ? 0 : 1 )
                              + QStringLiteral( " generation=" ) + QString::number( m_playbackReconWarmStateGate.generation );

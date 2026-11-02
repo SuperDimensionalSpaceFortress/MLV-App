@@ -1328,3 +1328,46 @@ TEST(PlaybackWarmReconDeterminismWiring, AChromaSmoothChangeReArmsThePausedWarm)
     ASSERT_TRUE(thread.contains(QStringLiteral("    entry.warmStateGeneration = stateGeneration;\n")));
     ASSERT_TRUE(thread.contains(QStringLiteral("    done.stateGeneration = entry.warmStateGeneration;\n")));
 }
+
+// WARM-RUN-CHROMA-SMOOTH-PARITY-1 r4 (adversary r3 on c8ee6197). A1: the re-arm does not reset the per-clip post budget,
+// so alternating the setting cannot post warms without end. A2: only the CURRENT re-post timer clears the armed flag and
+// posts (a clip change makes an older clip's timer stale), and no warm is posted while the gate holds one in flight.
+TEST(PlaybackWarmReconDeterminismWiring, TheReArmKeepsThePostBudgetAndOneWarmIsInFlight)
+{
+    const QString main = sourceFile("platform/qt/MainWindow.cpp");
+    const QString rearmBody = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::rearmPlaybackReconWarmAfterStateChange( const char *why )"),
+                                                        QStringLiteral("\n}\n")));
+    ASSERT_FALSE(rearmBody.isEmpty());
+    ASSERT_FALSE(rearmBody.contains(QStringLiteral("m_playbackReconWarmPosts")));
+    // the budget is reset only per clip
+    const QString arm = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"),
+                                                  QStringLiteral("\n}\n")));
+    ASSERT_TRUE(arm.contains(QStringLiteral("m_playbackReconWarmPosts = 0;")));
+    ASSERT_TRUE(arm.contains(QStringLiteral("++m_playbackReconWarmRepostSeq;")));
+    ASSERT_EQ(1, main.count(QStringLiteral("m_playbackReconWarmPosts = 0;")));
+
+    const QString post = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )"),
+                                                   QStringLiteral("\n}\n")));
+    ASSERT_FALSE(post.isEmpty());
+    const int guard = post.indexOf(QStringLiteral("|| m_playbackReconWarmStateGate.inFlight || m_playbackReconWarmRan ) return;"));
+    const int decideAt = post.indexOf(QStringLiteral("playback_recon_warm_run::decide("));
+    ASSERT_TRUE(guard >= 0);
+    ASSERT_TRUE(decideAt > guard);
+    // a direct post (the prewarm's) never clears a pending timer's flag
+    ASSERT_FALSE(post.contains(QStringLiteral("m_playbackReconWarmRepostArmed = false;")));
+
+    const QString schedule = codeLinesOnly(bodyBetween(main, QStringLiteral("void MainWindow::schedulePlaybackReconWarmRepost("),
+                                                       QStringLiteral("\n}\n")));
+    ASSERT_FALSE(schedule.isEmpty());
+    const int seq = schedule.indexOf(QStringLiteral("const quint64 repostSeq = ++m_playbackReconWarmRepostSeq;"));
+    const int stale = schedule.indexOf(QStringLiteral("if( repostSeq != m_playbackReconWarmRepostSeq ) return;"));
+    const int clear = schedule.indexOf(QStringLiteral("m_playbackReconWarmRepostArmed = false;"));
+    const int repost = schedule.indexOf(QStringLiteral("postPlaybackReconWarm( clipGeneration );"));
+    printf("[WCS4] schedule: seq=%d stale=%d clear=%d repost=%d\n", seq, stale, clear, repost);
+    ASSERT_TRUE(seq >= 0);
+    ASSERT_TRUE(stale > seq);
+    ASSERT_TRUE(clear > stale);
+    ASSERT_TRUE(repost > clear);
+    // every flag clear outside the timer is a per-clip reset
+    ASSERT_EQ(2, main.count(QStringLiteral("m_playbackReconWarmRepostArmed = false;")));
+}

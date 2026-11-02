@@ -1770,6 +1770,7 @@ private:
     int m_playbackReconWarmScale = 1;             // the Play-time scale the prewarm sized for
     int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
     bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
+    quint64 m_playbackReconWarmRepostSeq = 0;     // the pending re-post timer's sequence (an older one is stale)
     bool m_playbackReconWarmRan = false;          // first_present_split warm_run
     // WARM-RUN-CHROMA-SMOOTH-PARITY-1: a recon setting the warm reads at run time (chroma smooth) changed while paused:
     // a warm of the older state is not staged, and the warm runs again at the new one.
