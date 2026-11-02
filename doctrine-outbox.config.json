@@ -1,0 +1,26 @@
+{
+  "schema": "doctrine-outbox-config.v1",
+  "_comment": "MLV-App's values for the fleet doctrine outbox. Data only: tools/coordination/doctrine_outbox.py is the config-driven shared file offered as the candidate for the bus's tools/factory/doctrine_outbox.py (adoption is pending the bus steward, see the handoff card in doctrine-outbox/). Once the bus holds it, each project pins a reviewed bus SHA in factory-pins/factory-pins.json and runs it through factory-pins/pin-runner.py with --config, and, once its config sets `tool_pin`, the installed hook and the ref check use the pin (release OUTBOX-PIN-AWARE-TOOL-AT-REF-1); without `tool_pin` they read tool_rel, so this repo KEEPS its local copy and sets no `tool_pin` until the bus holds the file. It is never edited here for a project value. The tool finds this file at the repo root (or via --config / $DOCTRINE_OUTBOX_CONFIG).",
+  "project": "mlv-app",
+  "outbox_dir": "doctrine-outbox",
+  "tool_rel": "tools/coordination/doctrine_outbox.py",
+  "default_ref": "refs/remotes/fork/master",
+  "state_dir": ".claude-state/doctrine-outbox",
+  "subject_ledger_rel": ".claude-state/kernel/subject-ledger.md",
+  "finding_path_prefixes": ["tools/coordination/", "agents/", ".claude/"],
+  "finding_path_files": ["CLAUDE.md"],
+  "subject_ledger_env": "MLV_OUTBOX_LEDGER",
+  "watermark_env": "MLV_OUTBOX_WATERMARK",
+  "law4_extra": [
+    { "name": "board private state dir", "pattern": "\\.claude-state\\b", "ignorecase": true },
+    { "name": "subject ledger", "pattern": "subject-ledger", "ignorecase": true },
+    { "name": "fleet run receipts", "pattern": "fleet-runs", "ignorecase": true },
+    { "name": "hub write-ahead log", "pattern": "HUB_RUN_WAL", "ignorecase": true },
+    { "name": "dual-lane ledger", "pattern": "dual-lane", "ignorecase": true },
+    { "name": "GPU host name", "pattern": "ultra[\\s_-]?magnus", "ignorecase": true }
+  ],
+  "bus_candidate": {
+    "bus_path": "tools/factory/doctrine_outbox.py",
+    "sha256_lf": "4e29138114f4f6a04484605d11fcd3502f639eada1f6a84599b4a1f518411fa5"
+  }
+}

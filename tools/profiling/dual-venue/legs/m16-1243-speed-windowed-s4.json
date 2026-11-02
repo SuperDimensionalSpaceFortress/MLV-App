@@ -1,0 +1,27 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-speed-windowed-s4",
+  "card": "PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1",
+  "legType": "speed",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
+  "backends": ["cuda", "cpu"],
+  "scaleFactor": 4,
+  "displayMode": "windowed",
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }
+      ],
+      "cpu": []
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }
+      ],
+      "cpu": []
+    }
+  }
+}

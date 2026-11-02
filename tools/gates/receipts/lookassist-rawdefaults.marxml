@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<receipt version="4" mlvapp="1.16">
+    <lookAssistEnabled>0</lookAssistEnabled>
+    <lookAssistBaselineValid>0</lookAssistBaselineValid>
+    <lookAssistBaselineRawBlack>-1</lookAssistBaselineRawBlack>
+    <lookAssistBaselineRawWhite>-1</lookAssistBaselineRawWhite>
+    <rawBlack>-1</rawBlack>
+    <rawWhite>-1</rawWhite>
+    <stretchFactorX>1</stretchFactorX>
+    <stretchFactorY>-1</stretchFactorY>
+    <cutIn>1</cutIn>
+    <cutOut>2147483647</cutOut>
+    <debayer>2</debayer>
+</receipt>

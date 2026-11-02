@@ -477,21 +477,29 @@ def compose(args):
 
 # ---- Three-side mode (LOOK-ASSIST-FILM-FLAVOR-1): Classic | Cinematic | Film ----
 # Reached only when the --film-* arguments are given; without them the tool above is byte-for-byte the two-side tool.
+# --third-flavor vision50d (LOOK-ASSIST-KODAK-VISION-50D-1) makes the third side Kodak Vision3 50D; the default, film, is byte-for-byte the Film trio.
 
 TRIO_SHEET_NAME = "sheet-classic-cinematic-film.png"
 SCHEMA_METRICS_TRIO = "mlv-app/look-flavor-diff-metrics/v2"
 FILM_GRADE_ID = "film-v3"
 TRIO_SIDES = ("classic", "cinematic", "film")
+# LOOK-ASSIST-KODAK-VISION-50D-1: the third side is a grade flavor, Film by default or Kodak Vision3 50D (--third-flavor). The JSON keys stay "film"
+# (the grade side) either way; only the check, the labels and a top-level "thirdFlavor" (written only when it is not film) follow the flavor.
+GRADE_IDS = {"film": FILM_GRADE_ID, "vision50d": "vision50d-v1"}
+THIRD_SIDE_NAMES = {"film": "Film", "vision50d": "Kodak Vision3 50D"}          # the side, in refusals and the table's column
+THIRD_SHEET_LABELS = {"film": "Film grade", "vision50d": "Kodak Vision3 50D"}   # the sheet's header and row labels (the GUI's)
 
 
-def film_live(film_sliders, film_reported):
-    """(live, reasons). The Film side must report `film` AND carry presetGrade FILM_GRADE_ID (its colour grade was laid)."""
+def film_live(film_sliders, film_reported, third_flavor="film"):
+    """(live, reasons). The grade side must report the third flavor (`film` by default) AND carry that flavor's presetGrade (GRADE_IDS: its
+    colour grade was laid)."""
     reasons = []
-    if film_reported != "film":
-        reasons.append(f"the Film side reported lookFlavorReported={film_reported!r}, not 'film' (the app fell back)")
+    side, grade_id = THIRD_SIDE_NAMES[third_flavor], GRADE_IDS[third_flavor]
+    if film_reported != third_flavor:
+        reasons.append(f"the {side} side reported lookFlavorReported={film_reported!r}, not {third_flavor!r} (the app fell back)")
     grade = film_sliders.get("presetGrade") or "none"
-    if grade != FILM_GRADE_ID:
-        reasons.append(f"the Film side's presetGrade={grade!r}, not {FILM_GRADE_ID!r} (no colour grade was laid)")
+    if grade != grade_id:
+        reasons.append(f"the {side} side's presetGrade={grade!r}, not {grade_id!r} (no colour grade was laid)")
     return (not reasons), reasons
 
 
@@ -535,7 +543,8 @@ def compose_trio(args):
     sliders = {s: load_sliders(getattr(args, f"{s}_sliders"), s.capitalize()) for s in TRIO_SIDES}
     reported = {s: getattr(args, f"{s}_flavor_reported") for s in TRIO_SIDES}
     live, reasons = flavor_live(sliders["classic"], sliders["cinematic"], reported["classic"], reported["cinematic"])
-    flive, freasons = film_live(sliders["film"], reported["film"])
+    third = args.third_flavor
+    flive, freasons = film_live(sliders["film"], reported["film"], third)
     if not (live and flive):
         raise Refusal(EXIT_FLAVOR_INERT, "FLAVOR_INERT " + "; ".join(reasons + freasons))
 
@@ -617,7 +626,7 @@ def compose_trio(args):
     sheet = Image.new("RGB", (SHEET_WIDTH, HEADER_HEIGHT + len(panels) * (ROW_LABEL_HEIGHT + tile_h)), (8, 8, 8))
     draw = ImageDraw.Draw(sheet)
     header = [
-        f"clip={args.clip_id}  venue={args.venue}  build={args.build_sha}  LEFT=Classic  MIDDLE=Cinematic  RIGHT=Film grade",
+        f"clip={args.clip_id}  venue={args.venue}  build={args.build_sha}  LEFT=Classic  MIDDLE=Cinematic  RIGHT={THIRD_SHEET_LABELS[third]}",
         f"flavors reported: classic={reported['classic']}  cinematic={reported['cinematic']}  film={reported['film']}  "
         f"presetGrade: classic={sliders['classic'].get('presetGrade') or 'none'}  cinematic={sliders['cinematic'].get('presetGrade') or 'none'}  "
         f"film={sliders['film'].get('presetGrade') or 'none'}",
@@ -658,6 +667,7 @@ def compose_trio(args):
     means["dSGapFilmMinusCinematic"] = means["dS"]["film"] - means["dS"]["cinematic"]
     doc = {
         "schema": SCHEMA_METRICS_TRIO,
+        **({"thirdFlavor": third} if third != "film" else {}),
         "clipId": args.clip_id, "venue": args.venue, "buildSha12": args.build_sha,
         "receiptIds": {s: getattr(args, f"{s}_receipt_id") for s in TRIO_SIDES},
         "lookFlavorReported": reported,
@@ -681,7 +691,7 @@ def compose_trio(args):
     write_new(out / "table.md", render_trio_table(doc).encode("utf-8"))
     for index in indices:
         label = next(t["label"] for t in tiles if t["index"] == index)
-        ImageDraw.Draw(row_images[index]).text((10, 10), f"CLASSIC | CINEMATIC | FILM GRADE   {label}", fill=(255, 255, 255), font=font)
+        ImageDraw.Draw(row_images[index]).text((10, 10), f"CLASSIC | CINEMATIC | {THIRD_SHEET_LABELS[third].upper()}   {label}", fill=(255, 255, 255), font=font)
         write_new(out / f"row-{index:02d}.png", png_bytes(row_images[index]))
         write_new(out / f"heat-film-vs-classic-{index:02d}.png", png_bytes(heat_images[index]["classic"]))
         write_new(out / f"heat-film-vs-cinematic-{index:02d}.png", png_bytes(heat_images[index]["cinematic"]))
@@ -693,7 +703,8 @@ def compose_trio(args):
 
 
 def render_trio_table(doc):
-    lines = ["### Look Assist sliders (flavor-owned fields marked *)", "", "| field | Classic | Cinematic | Film |", "|---|---|---|---|"]
+    third = THIRD_SIDE_NAMES[doc.get("thirdFlavor", "film")]
+    lines = ["### Look Assist sliders (flavor-owned fields marked *)", "", f"| field | Classic | Cinematic | {third} |", "|---|---|---|---|"]
     for k in SLIDER_FIELDS:
         vals = [doc["sliders"][s].get(k) for s in TRIO_SIDES]
         lines.append(f"| {k}{' *' if k in FLAVOR_OWNED_FIELDS else ''} | " + " | ".join(_num(v) for v in vals) + " |")
@@ -1192,6 +1203,8 @@ def main(argv=None):
     p.add_argument("--film-sliders", type=Path, default=None)
     p.add_argument("--film-flavor-reported", default=None)
     p.add_argument("--film-receipt-id", default="")
+    # LOOK-ASSIST-KODAK-VISION-50D-1: which grade flavor the third side is (its report and presetGrade are checked against it).
+    p.add_argument("--third-flavor", choices=sorted(GRADE_IDS), default="film")
     p.add_argument("--clip-id", default="")
     p.add_argument("--venue", default="")
     p.add_argument("--build-sha", default="")

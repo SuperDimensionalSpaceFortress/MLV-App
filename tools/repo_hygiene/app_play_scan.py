@@ -12,8 +12,8 @@ exact text is compared with a pinned string. Adding an exemption therefore means
 
 ENFORCE-3 (sol r2 hardening, owner rule 2026-10-01 "20 s means 20 s of source frames"): the scan now also pins
 
-* the COMPLETE request expression of every ``programmaticPlay(`` call (not a prefix: ``kMinPlayWindowSeconds / 20.0``
-  or ``kMinPlayWindowSeconds - 19`` no longer pass),
+* the COMPLETE request expression of every ``programmaticPlay(`` call (not a prefix: ``playGateMinPlayWindowSeconds() / 20.0``
+  or ``playGateMinPlayWindowSeconds() - 19`` no longer pass),
 * EVERY automation stop site by enclosing function and count -- a raw ``actionPlay->setChecked( false )``,
   ``on_actionPlay_triggered( false )`` or ``programmaticStop(`` inserted anywhere (``playbackClock.restart()`` or
   not) changes a pinned count and is reported,
@@ -46,8 +46,8 @@ HEADER_SOURCE = "platform/qt/MainWindow.h"
 # not just its first token -- fails the scan.
 REVIEWED_PROGRAMMATIC_PLAY_SITES = {
     "autoplay": (1, "autoplaySeconds"),                                          # MLVAPP_AUTOPLAY_* hook (normal GUI)
-    "profile-look-assist-settle": (1, "playback_frame_range::kMinPlayWindowSeconds"),
-    "profile-exercise-play-action": (1, "playback_frame_range::kMinPlayWindowSeconds"),
+    "profile-look-assist-settle": (1, "playGateMinPlayWindowSeconds()"),      # HFR-10S-1: the clip's own floor
+    "profile-exercise-play-action": (1, "playGateMinPlayWindowSeconds()"),
     "gui-smoke-measured": (1, "playback_frame_range::smokePlayRequestSeconds( options.durationMs, "
                               "options.targetPresentedFrames, presentedTargetFps )"),
 }
@@ -129,14 +129,14 @@ PINNED_STOP_STATEMENTS = {
         "playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue; "
         "while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
-        "QThread::msleep( 10 ); } programmaticStop( \"profile-look-assist-settle\" ); "
+        "sleepGuiThreadForSmokeRunner( 10 ); } programmaticStop( \"profile-look-assist-settle\" ); "
         "if( autoSettleState != playback_frame_range::PlayStopState::Reached )",
         "&& !m_lastLookAssistDiagnosticsValid && playback_frame_range::lookAssistSettleNeedsOwnPlay( "
         "m_programmaticPlayLedger.admitted ) ) {",
         "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
         "while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
-        "QThread::msleep( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",
+        "sleepGuiThreadForSmokeRunner( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",
         "isolateAutomationPacing( \"profile-entry\" );",
         # r2 (sol BLOCKER): the profile JSON echoes the launcher's per-run nonce (see finishPlaybackSmokeTelemetry below).
         "metadata.insert( QStringLiteral(\"run_nonce\"), automationRunNonce() );",
@@ -161,9 +161,19 @@ PINNED_STOP_STATEMENTS = {
     "MainWindow::checkPlayableWindow": (
         "return playback_frame_range::evaluatePlayableWindow( ui->horizontalSliderPosition->value(), "
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
-        "playback_frame_range::kMinPlayWindowSeconds, !f3CutRangeRepairDisabledByEnvironment(), "
+        "playback_frame_range::minPlayWindowSeconds( fps ), !f3CutRangeRepairDisabledByEnvironment(), "
         "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
         "const double enginePaceFps = getFramerate();",
+        "const double fps = playGateNativeFps();",
+    ),
+    # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the settle / play-action requests and the smoke's clip-aware
+    # floors read the floor through these two helpers; their bodies are the ONE derivation (minPlayWindowSeconds of the loaded
+    # clip's NATIVE fps, 0 -- the 20 s floor -- without a clip). A constant or another fps source here fails the scan.
+    "MainWindow::playGateNativeFps": (
+        "return ( m_fileLoaded && m_pMlvObject ) ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;",
+    ),
+    "MainWindow::playGateMinPlayWindowSeconds": (
+        "return playback_frame_range::minPlayWindowSeconds( playGateNativeFps() );",
     ),
     "MainWindow::programmaticPlay": (
         "m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter(); "

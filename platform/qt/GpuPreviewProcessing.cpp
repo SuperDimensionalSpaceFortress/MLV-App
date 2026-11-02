@@ -2,6 +2,7 @@
 
 #include "../../src/processing/raw_processing.h"
 #include "../../src/debug/StageTiming.h"
+#include "../../src/batch/WorkerThreadCount.h"
 
 #include <QElapsedTimer>
 #include <QGuiApplication>
@@ -4319,12 +4320,511 @@ static double cpuReferenceSpanMs(const QElapsedTimer & clock, qint64 startNs)
     return static_cast<double>(clock.nsecsElapsed() - startNs) / 1000000.0;
 }
 
-void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig & configIn,
-                                                const uint16_t * inputRgb16,
-                                                uint16_t * outputRgb16,
-                                                int width,
-                                                int height,
-                                                GpuPreviewProcessingCpuSpans * spans)
+const char * gpuPreviewProcessingPointwiseFastKillSwitchName(void)
+{
+    return "MLVAPP_DISABLE_PREP_POINTWISE_FAST";
+}
+
+const char * gpuPreviewProcessingPointwiseFastRefusal(const GpuPreviewProcessingConfig & config)
+{
+    if ( mlvappEnvFlagEnabled(gpuPreviewProcessingPointwiseFastKillSwitchName()) ) return "kill_switch";
+    if ( !config.enabled ) return "config_disabled";
+    if ( config.applyVignette ) return "vignette";
+    if ( config.applyGradient || config.applyGradientContrast ) return "gradient";
+    /* AgX is admitted (CPU-LOOKASSIST-AGX-FASTPATH-1): both matrices are per
+     * pixel, and pointwiseFastPixel runs the reference's blocks verbatim. The
+     * gradient layer's own AgX copy stays in the reference loop with gradient. */
+    if ( config.applyHueVs ) return "hue_vs";
+    if ( config.applyLut ) return "lut";
+    if ( config.gammaLut.size() < static_cast<int>(65536u * sizeof(uint16_t)) ) return "gamma_lut_missing";
+    /* The toning cast (uint16_t)(value * gain) is only defined while the product
+     * stays in [0, 65535]; the composite table must not depend on how an
+     * out-of-range conversion happens to compile. processingSetToning keeps
+     * every gain in [0, 1]. */
+    if ( config.applyToning )
+    {
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const float gain = config.toningGain[channel];
+            if ( !(gain >= 0.0f && gain <= 1.0f) ) return "toning_gain_range";
+        }
+    }
+    return "";
+}
+
+namespace
+{
+
+/* CPU-LOOKASSIST-PLAYBACK-COST-1: the per-frame tables of the fast path. Each
+ * entry is computed by the same helper calls the reference pixel makes
+ * (sampleLut, levelIndexFromNormalized, matrixRawValue), so a table read is
+ * that value, not an approximation of it. Contents are rebuilt every frame;
+ * only the allocations persist (per calling thread). */
+struct PointwiseFastTables
+{
+    std::vector<int32_t> diagonal;   /* 3 x 65536: input sample -> unclamped diagonal-matrix value */
+    std::vector<int32_t> matrix;     /* 3 x 65536: level -> matrixRawValue, only without the raw LUTs */
+    std::vector<uint16_t> tail;      /* 3 x 65536: gamma-space value -> toning + creative curves */
+};
+
+/* code[k] == static_cast<float>(k) / 65535.0f, the reference's
+ * std::floor(clamp16(scaled)) / 65535.0f for the integral k it floors to. */
+const float * pointwiseFastCodeTable()
+{
+    static const std::vector<float> table = [] {
+        std::vector<float> values(65536u);
+        for (int k = 0; k < 65536; ++k) values[static_cast<size_t>(k)] = static_cast<float>(k) / 65535.0f;
+        return values;
+    }();
+    return table.data();
+}
+
+/* Everything the admitted stages read, as raw pointers and plain values. */
+struct PointwiseFastView
+{
+    const int32_t * diagonal[3];
+    const int32_t * matrixRaw[3];
+    const uint16_t * blur;          /* null: the S/H factor is 1 */
+    int blurPixels;
+    const float * shCurve;          /* null: factor 1 */
+    const float * contrastCurve;    /* null: factor 1 */
+    const uint16_t * gamma;
+    const uint16_t * tail[3];       /* null: no toning and no creative curves */
+    const float * code;
+    bool shadowsHighlights;
+    bool shIndexMask;
+    bool inLoopContrast;
+    bool highlightRecon;
+    bool highlightReconDualIso;
+    bool cameraMatrix;
+    bool gamutCompression;
+    bool vibrance;
+    bool saturation;
+    bool agx;
+    int highestGreen;
+    int highestGreenDiso;
+    float vibranceValue;
+    float saturationValue;
+    float properWbMatrix[9];
+    float rgbToY[3];
+    float agxForward[9];
+    float agxInverse[9];
+};
+
+/* Writable table pointers for the fill pass (never the thread_local itself:
+ * the fill runs on every thread of the team). */
+struct PointwiseFastFill
+{
+    int32_t * diagonal;
+    int32_t * matrix;     /* null: the raw LUTs are used directly */
+    uint16_t * tail;      /* null: no tail table */
+};
+
+void pointwiseFastPrepare(const GpuPreviewProcessingConfig & config,
+                          PointwiseFastTables & tables,
+                          PointwiseFastView * view,
+                          PointwiseFastFill * fill)
+{
+    tables.diagonal.resize(3u * 65536u);
+    fill->diagonal = tables.diagonal.data();
+    const QByteArray * raw[3] = { &config.matrixLutRawR, &config.matrixLutRawG, &config.matrixLutRawB };
+    bool rawComplete = true;
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        if ( raw[channel]->size() < kMatrixLutBytes ) rawComplete = false;
+    }
+    if ( rawComplete )
+    {
+        fill->matrix = nullptr;
+        for (int channel = 0; channel < 3; ++channel)
+            view->matrixRaw[channel] = reinterpret_cast<const int32_t *>(raw[channel]->constData());
+    }
+    else
+    {
+        tables.matrix.resize(3u * 65536u);
+        fill->matrix = tables.matrix.data();
+        for (int channel = 0; channel < 3; ++channel)
+            view->matrixRaw[channel] = fill->matrix + static_cast<size_t>(channel) * 65536u;
+    }
+    const bool tail = config.applyToning || config.applyCreativeCurves;
+    if ( tail )
+    {
+        tables.tail.resize(3u * 65536u);
+        fill->tail = tables.tail.data();
+    }
+    else
+    {
+        fill->tail = nullptr;
+    }
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        view->diagonal[channel] = fill->diagonal + static_cast<size_t>(channel) * 65536u;
+        view->tail[channel] = tail ? fill->tail + static_cast<size_t>(channel) * 65536u : nullptr;
+    }
+
+    view->shadowsHighlights = config.applyShadowsHighlights;
+    view->shIndexMask = config.shadowsHighlightsCurveIndexMask;
+    view->blur = nullptr;
+    view->blurPixels = 0;
+    if ( config.applyShadowsHighlights && config.shadowsHighlightsFrameStateReady )
+    {
+        /* sampleShadowsHighlightsFactor's size test, per pixel: pixelIndex <
+         * size / 6. */
+        view->blurPixels = config.shadowsHighlightsBlur.size() / static_cast<int>(3u * sizeof(uint16_t));
+        if ( view->blurPixels > 0 )
+            view->blur = reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData());
+    }
+    view->shCurve = config.shadowsHighlightsCurve.size() >= static_cast<int>(kInLoopContrastSamples * sizeof(float))
+        ? reinterpret_cast<const float *>(config.shadowsHighlightsCurve.constData()) : nullptr;
+    view->inLoopContrast = config.applyInLoopContrast;
+    view->contrastCurve = config.inLoopContrastCurve.size() >= static_cast<int>(kInLoopContrastSamples * sizeof(float))
+        ? reinterpret_cast<const float *>(config.inLoopContrastCurve.constData()) : nullptr;
+    view->gamma = lutValues(config.gammaLut);
+    view->code = pointwiseFastCodeTable();
+    view->highlightRecon = config.applyHighlightReconstruction;
+    view->highlightReconDualIso = config.highlightReconDualIso;
+    view->highestGreen = config.highestGreen;
+    view->highestGreenDiso = config.highestGreenDiso;
+    view->cameraMatrix = config.useCameraMatrix;
+    view->gamutCompression = config.applyGamutCompression;
+    view->vibrance = config.applyVibrance;
+    view->vibranceValue = config.vibrance;
+    view->saturation = config.applySaturation;
+    view->saturationValue = config.saturation;
+    std::memcpy(view->properWbMatrix, config.properWbMatrix, sizeof(view->properWbMatrix));
+    std::memcpy(view->rgbToY, config.rgbToY, sizeof(view->rgbToY));
+    view->agx = config.applyAgx;
+    std::memcpy(view->agxForward, config.agxForward, sizeof(view->agxForward));
+    std::memcpy(view->agxInverse, config.agxInverse, sizeof(view->agxInverse));
+}
+
+/* Entry `index` of every table, from the same calls applyPreviewProcessingPixel makes. */
+inline void pointwiseFastFillEntry(const GpuPreviewProcessingConfig & config,
+                                   const PointwiseFastFill & fill,
+                                   int index)
+{
+    const float color = sampleLut(config.levelsLut, index / 65535.0f) / 65535.0f;
+    const int level = levelIndexFromNormalized(color);
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const size_t slot = static_cast<size_t>(channel) * 65536u + static_cast<size_t>(index);
+        fill.diagonal[slot] = matrixRawValue(config, channel, level);
+        if ( fill.matrix ) fill.matrix[slot] = matrixRawValue(config, channel, index);
+        if ( fill.tail )
+        {
+            uint16_t value = static_cast<uint16_t>(index);
+            if ( config.applyToning )
+            {
+                value = static_cast<uint16_t>(static_cast<float>(value) * config.toningGain[channel]);
+            }
+            if ( config.applyCreativeCurves )
+            {
+                value = sampleLut(config.contrastCurveLut, value / 65535.0f);
+                value = sampleLut(config.gradationLutY, value / 65535.0f);
+                const QByteArray & perChannelGradation =
+                    (channel == 0) ? config.gradationLutR
+                  : (channel == 1) ? config.gradationLutG
+                                   : config.gradationLutB;
+                value = sampleLut(perChannelGradation, value / 65535.0f);
+            }
+            fill.tail[slot] = value;
+        }
+    }
+}
+
+/* applyPreviewProcessingPixel for the admitted stages, reading the view. Every
+ * arithmetic step is the reference's, in the reference's order; only the table
+ * lookups changed form. kLookAssist fixes the M16-1243 Look Assist stage set
+ * (S/H, in-loop contrast, camera matrix + gamut, vibrance; no highlight
+ * reconstruction, no saturation) at compile time. */
+template <bool kLookAssist>
+inline void pointwiseFastPixel(const PointwiseFastView & v,
+                               const uint16_t * inputPixel,
+                               uint16_t * outputPixel,
+                               int pixelIndex)
+{
+    const bool shadowsHighlights = kLookAssist || v.shadowsHighlights;
+    const bool inLoopContrast = kLookAssist || v.inLoopContrast;
+    const bool highlightRecon = !kLookAssist && v.highlightRecon;
+    const bool cameraMatrix = kLookAssist || v.cameraMatrix;
+    const bool gamutCompression = kLookAssist || v.gamutCompression;
+    const bool vibrance = kLookAssist || v.vibrance;
+    const bool saturation = !kLookAssist && v.saturation;
+
+    const int32_t diagonal[3] = { v.diagonal[0][inputPixel[0]],
+                                  v.diagonal[1][inputPixel[1]],
+                                  v.diagonal[2][inputPixel[2]] };
+    double expoCorrection = 1.0;
+    if ( shadowsHighlights )
+    {
+        float factor = 1.0f;
+        if ( v.blur && pixelIndex < v.blurPixels )
+        {
+            const uint16_t * blur = v.blur + static_cast<size_t>(pixelIndex) * 3u;
+            int bval = 0;
+            if ( v.shIndexMask )
+            {
+                bval = blur[0];
+            }
+            else
+            {
+                const int32_t blurR = v.matrixRaw[0][blur[0]];
+                const int32_t blurG = v.matrixRaw[1][blur[1]];
+                const int32_t blurB = v.matrixRaw[2][blur[2]];
+                bval = ((blurR << 2) + (blurG * 11) + blurB) >> 4;
+            }
+            if ( v.shCurve )
+                factor = v.shCurve[std::max(0, std::min(kInLoopContrastSamples - 1, bval))];
+        }
+        expoCorrection *= factor;
+    }
+    if ( inLoopContrast )
+    {
+        const int cval = ((diagonal[0] << 2) + (diagonal[1] * 11) + diagonal[2]) >> 4;
+        const float factor = v.contrastCurve
+            ? v.contrastCurve[std::max(0, std::min(kInLoopContrastSamples - 1, cval))] : 1.0f;
+        expoCorrection *= factor;
+    }
+
+    float matrixApplied[3];
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const float scaled = static_cast<float>(
+            static_cast<double>(static_cast<float>(diagonal[channel])) * expoCorrection);
+        /* clamp16 returns a value in [0, 65535] (NaN included: it yields
+         * 65535), where the int cast's truncation IS std::floor. */
+        matrixApplied[channel] = v.code[static_cast<int>(clamp16(scaled))];
+    }
+
+    if ( highlightRecon )
+    {
+        const float reconMatrixGreen =
+            std::max(0, std::min(diagonal[1], 65535)) / 65535.0f;
+        const float p0 = std::floor(clamp16(matrixApplied[0] * 65535.0f + 0.5f));
+        const float p1 = std::floor(clamp16(matrixApplied[1] * 65535.0f + 0.5f));
+        const float p2 = std::floor(clamp16(matrixApplied[2] * 65535.0f + 0.5f));
+        const float tmp1 = std::floor(clamp16(reconMatrixGreen * 65535.0f + 0.5f));
+        bool replace = false;
+        if ( v.highlightReconDualIso )
+        {
+            const float lo = clamp16(static_cast<float>(v.highestGreenDiso) - 5000.0f);
+            const float hi = clamp16(static_cast<float>(v.highestGreenDiso) + 5000.0f);
+            if ( tmp1 >= lo && tmp1 <= hi && p1 < 1.1f * p0 && p1 < p2 )
+            {
+                replace = true;
+            }
+        }
+        else if ( tmp1 == static_cast<float>(v.highestGreen) )
+        {
+            replace = true;
+        }
+        if ( replace )
+        {
+            matrixApplied[1] = std::floor((p0 + p2) / 2.0f) / 65535.0f;
+        }
+    }
+
+    if ( cameraMatrix )
+    {
+        const float * wb = v.properWbMatrix;
+        float wbApplied[3];
+        wbApplied[0] = wb[0] * matrixApplied[0] + wb[1] * matrixApplied[1] + wb[2] * matrixApplied[2];
+        wbApplied[1] = wb[3] * matrixApplied[0] + wb[4] * matrixApplied[1] + wb[5] * matrixApplied[2];
+        wbApplied[2] = wb[6] * matrixApplied[0] + wb[7] * matrixApplied[1] + wb[8] * matrixApplied[2];
+        if ( gamutCompression )
+        {
+            applyPreviewGamutCompression(wbApplied, v.rgbToY);
+        }
+        std::memcpy(matrixApplied, wbApplied, sizeof(matrixApplied));
+    }
+
+    if ( v.agx )
+    {
+        /* AgX forward, the reference's block verbatim (double accumulation in
+         * the same term order, float coeffs, clamp+truncate, renormalize). */
+        double av[3];
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            av[channel] = static_cast<double>(matrixApplied[channel]) * 65535.0;
+            if ( av[channel] < 0.0 ) av[channel] = 0.0;
+        }
+        const double a[3] = {
+            av[0] * v.agxForward[0] + av[1] * v.agxForward[1] + av[2] * v.agxForward[2],
+            av[0] * v.agxForward[3] + av[1] * v.agxForward[4] + av[2] * v.agxForward[5],
+            av[0] * v.agxForward[6] + av[1] * v.agxForward[7] + av[2] * v.agxForward[8] };
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const double clamped = a[channel] < 0.0 ? 0.0 : (a[channel] > 65535.0 ? 65535.0 : a[channel]);
+            matrixApplied[channel] = static_cast<float>(static_cast<uint16_t>(clamped)) / 65535.0f;
+        }
+    }
+
+    uint16_t gammaOut[3];
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        const float gammaInput = clamp01(matrixApplied[channel]);
+        gammaOut[channel] = v.gamma[std::max(0, std::min(65535,
+            static_cast<int>(gammaInput * 65535.0f + 0.5f)))];
+    }
+
+    if ( vibrance )
+    {
+        const int32_t Y1 = ((static_cast<int32_t>(gammaOut[0]) << 2)
+                          + (static_cast<int32_t>(gammaOut[1]) * 11)
+                          + static_cast<int32_t>(gammaOut[2])) >> 4;
+        int32_t pix0[3];
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            /* The int cast truncates toward zero like std::trunc; the product
+             * is within +-65535 * vibrance, well inside int32. */
+            pix0[channel] = static_cast<int32_t>(
+                (static_cast<float>(gammaOut[channel]) - static_cast<float>(Y1)) * v.vibranceValue) + Y1;
+        }
+        if ( v.vibranceValue > 1.0f )
+        {
+            const int biggest = std::max(std::max(int(gammaOut[0]), int(gammaOut[1])), int(gammaOut[2]));
+            const int smallest = std::min(std::min(int(gammaOut[0]), int(gammaOut[1])), int(gammaOut[2]));
+            float sat = (biggest > 0)
+                ? (static_cast<float>(biggest) - static_cast<float>(smallest)) / static_cast<float>(biggest)
+                : 0.0f;
+            sat = 2.0f * sat / (sat * sat + 1.0f);
+            if ( sat > 1.0f ) sat = 1.0f;
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                const float blended = static_cast<float>(gammaOut[channel]) * sat
+                                    + static_cast<float>(pix0[channel]) * (1.0f - sat);
+                const int32_t b = static_cast<int32_t>(blended);
+                gammaOut[channel] = static_cast<uint16_t>(b < 0 ? 0 : (b > 65535 ? 65535 : b));
+            }
+        }
+        else
+        {
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                gammaOut[channel] = static_cast<uint16_t>(
+                    pix0[channel] < 0 ? 0 : (pix0[channel] > 65535 ? 65535 : pix0[channel]));
+            }
+        }
+    }
+
+    if ( saturation )
+    {
+        const int32_t Y1 = ((static_cast<int32_t>(gammaOut[0]) << 2)
+                          + (static_cast<int32_t>(gammaOut[1]) * 11)
+                          + static_cast<int32_t>(gammaOut[2])) >> 4;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const int32_t saturated = static_cast<int32_t>(
+                (static_cast<float>(gammaOut[channel]) - static_cast<float>(Y1)) * v.saturationValue) + Y1;
+            gammaOut[channel] = static_cast<uint16_t>(
+                saturated < 0 ? 0 : (saturated > 65535 ? 65535 : saturated));
+        }
+    }
+
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        outputPixel[channel] = v.tail[channel] ? v.tail[channel][gammaOut[channel]] : gammaOut[channel];
+    }
+
+    if ( v.agx )
+    {
+        /* AgX inverse on the tail's uint16 output, the reference's block verbatim. */
+        const double f0 = static_cast<double>(outputPixel[0]);
+        const double f1 = static_cast<double>(outputPixel[1]);
+        const double f2 = static_cast<double>(outputPixel[2]);
+        const double iv[3] = {
+            f0 * v.agxInverse[0] + f1 * v.agxInverse[1] + f2 * v.agxInverse[2],
+            f0 * v.agxInverse[3] + f1 * v.agxInverse[4] + f2 * v.agxInverse[5],
+            f0 * v.agxInverse[6] + f1 * v.agxInverse[7] + f2 * v.agxInverse[8] };
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const double clamped = iv[channel] < 0.0 ? 0.0 : (iv[channel] > 65535.0 ? 65535.0 : iv[channel]);
+            outputPixel[channel] = static_cast<uint16_t>(clamped);
+        }
+    }
+}
+
+/* One frame through the fast path on an explicit team of
+ * mlvappEffectivePlaybackWorkerThreadCount() threads: the table fill, then the
+ * pixels (independent writes, so the team size cannot change a byte). Out8
+ * stores the developed value >> 8. Returns the team size read inside the region. */
+template <bool kOut8>
+int pointwiseFastRun(const GpuPreviewProcessingConfig & config,
+                     const uint16_t * inputRgb16,
+                     uint16_t * output16,
+                     uint8_t * output8,
+                     int pixelCount)
+{
+    static thread_local PointwiseFastTables tables;
+    PointwiseFastView view;
+    PointwiseFastFill fill;
+    pointwiseFastPrepare(config, tables, &view, &fill);
+    const bool lookAssist = view.shadowsHighlights && view.inLoopContrast && view.cameraMatrix
+                         && view.gamutCompression && view.vibrance
+                         && !view.highlightRecon && !view.saturation;
+    const int requested = std::max(1, mlvappEffectivePlaybackWorkerThreadCount());
+    int team = 1;
+    #pragma omp parallel num_threads(requested) if(pixelCount >= 2048)
+    {
+        if ( omp_get_thread_num() == 0 ) team = omp_get_num_threads();
+        #pragma omp for schedule(static)
+        for (int index = 0; index < 65536; ++index)
+        {
+            pointwiseFastFillEntry(config, fill, index);
+        }
+        if ( lookAssist )
+        {
+            #pragma omp for schedule(static)
+            for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+            {
+                uint16_t developed[3];
+                pointwiseFastPixel<true>(view, inputRgb16 + pixelIndex * 3, developed, pixelIndex);
+                if ( kOut8 )
+                {
+                    uint8_t * out = output8 + pixelIndex * 3;
+                    out[0] = static_cast<uint8_t>( developed[0] >> 8 );
+                    out[1] = static_cast<uint8_t>( developed[1] >> 8 );
+                    out[2] = static_cast<uint8_t>( developed[2] >> 8 );
+                }
+                else
+                {
+                    std::memcpy(output16 + pixelIndex * 3, developed, sizeof(developed));
+                }
+            }
+        }
+        else
+        {
+            #pragma omp for schedule(static)
+            for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+            {
+                uint16_t developed[3];
+                pointwiseFastPixel<false>(view, inputRgb16 + pixelIndex * 3, developed, pixelIndex);
+                if ( kOut8 )
+                {
+                    uint8_t * out = output8 + pixelIndex * 3;
+                    out[0] = static_cast<uint8_t>( developed[0] >> 8 );
+                    out[1] = static_cast<uint8_t>( developed[1] >> 8 );
+                    out[2] = static_cast<uint8_t>( developed[2] >> 8 );
+                }
+                else
+                {
+                    std::memcpy(output16 + pixelIndex * 3, developed, sizeof(developed));
+                }
+            }
+        }
+    }
+    return team;
+}
+
+/* gpuPreviewProcessingApplyCpuReferenceTimed's body; allowFast is false only
+ * for gpuPreviewProcessingApplyCpuReference, the parity oracle. */
+void applyCpuReferenceTimedImpl(const GpuPreviewProcessingConfig & configIn,
+                                const uint16_t * inputRgb16,
+                                uint16_t * outputRgb16,
+                                int width,
+                                int height,
+                                GpuPreviewProcessingCpuSpans * spans,
+                                bool allowFast)
 {
     QElapsedTimer clock;
     clock.start();
@@ -4355,14 +4855,33 @@ void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig
     }
 
     qint64 spanStartNs = clock.nsecsElapsed();
-    #pragma omp parallel for if(pixelCount >= 2048)
-    for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+    const char * refusal = allowFast ? gpuPreviewProcessingPointwiseFastRefusal(config) : "reference_oracle";
+    int team = 0;
+    if ( refusal[0] == '\0' )
     {
-        const uint16_t * inputPixel = inputRgb16 + pixelIndex * 3;
-        uint16_t * outputPixel = outputRgb16 + pixelIndex * 3;
-        applyPreviewProcessingPixel(config, inputPixel, outputPixel, pixelIndex);
+        team = pointwiseFastRun<false>(config, inputRgb16, outputRgb16, nullptr, pixelCount);
     }
-    if ( spans ) spans->pointwiseMs = cpuReferenceSpanMs(clock, spanStartNs);
+    else
+    {
+        #pragma omp parallel if(pixelCount >= 2048)
+        {
+            if ( omp_get_thread_num() == 0 ) team = omp_get_num_threads();
+            #pragma omp for
+            for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+            {
+                const uint16_t * inputPixel = inputRgb16 + pixelIndex * 3;
+                uint16_t * outputPixel = outputRgb16 + pixelIndex * 3;
+                applyPreviewProcessingPixel(config, inputPixel, outputPixel, pixelIndex);
+            }
+        }
+    }
+    if ( spans )
+    {
+        spans->pointwiseMs = cpuReferenceSpanMs(clock, spanStartNs);
+        spans->pointwiseFast = refusal[0] == '\0';
+        spans->pointwiseOmpThreads = team;
+        spans->pointwiseFastRefusal = refusal;
+    }
 
     /* Spatial post-passes on the developed image (raw_processing.c:1816+). Chroma
      * separation/blur runs in YCbCr space; sharpen is a 5-tap cross. They are
@@ -4388,14 +4907,25 @@ void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig
     }
 }
 
+} // namespace
+
+void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig & configIn,
+                                                const uint16_t * inputRgb16,
+                                                uint16_t * outputRgb16,
+                                                int width,
+                                                int height,
+                                                GpuPreviewProcessingCpuSpans * spans)
+{
+    applyCpuReferenceTimedImpl(configIn, inputRgb16, outputRgb16, width, height, spans, true);
+}
+
 void gpuPreviewProcessingApplyCpuReference(const GpuPreviewProcessingConfig & configIn,
                                            const uint16_t * inputRgb16,
                                            uint16_t * outputRgb16,
                                            int width,
                                            int height)
 {
-    gpuPreviewProcessingApplyCpuReferenceTimed(configIn, inputRgb16, outputRgb16,
-                                               width, height, nullptr);
+    applyCpuReferenceTimedImpl(configIn, inputRgb16, outputRgb16, width, height, nullptr, false);
 }
 
 void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig & configIn,
@@ -4449,17 +4979,36 @@ void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig &
     /* No spatial post-pass reads the 16-bit result, so each pixel is developed
      * into registers and truncated straight to 8 bits: the same (v >> 8) the
      * 16-to-8 conversion applies to the same 16-bit value. */
-    #pragma omp parallel for if(pixelCount >= 2048)
-    for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+    const char * refusal = gpuPreviewProcessingPointwiseFastRefusal(config);
+    int team = 0;
+    if ( refusal[0] == '\0' )
     {
-        uint16_t developed[3];
-        applyPreviewProcessingPixel(config, inputRgb16 + pixelIndex * 3, developed, pixelIndex);
-        uint8_t * out = outputRgb8 + pixelIndex * 3;
-        out[0] = static_cast<uint8_t>( developed[0] >> 8 );
-        out[1] = static_cast<uint8_t>( developed[1] >> 8 );
-        out[2] = static_cast<uint8_t>( developed[2] >> 8 );
+        team = pointwiseFastRun<true>(config, inputRgb16, nullptr, outputRgb8, pixelCount);
     }
-    if ( spans ) spans->pointwiseMs = cpuReferenceSpanMs(clock, pointwiseStartNs);
+    else
+    {
+        #pragma omp parallel if(pixelCount >= 2048)
+        {
+            if ( omp_get_thread_num() == 0 ) team = omp_get_num_threads();
+            #pragma omp for
+            for (int pixelIndex = 0; pixelIndex < pixelCount; ++pixelIndex)
+            {
+                uint16_t developed[3];
+                applyPreviewProcessingPixel(config, inputRgb16 + pixelIndex * 3, developed, pixelIndex);
+                uint8_t * out = outputRgb8 + pixelIndex * 3;
+                out[0] = static_cast<uint8_t>( developed[0] >> 8 );
+                out[1] = static_cast<uint8_t>( developed[1] >> 8 );
+                out[2] = static_cast<uint8_t>( developed[2] >> 8 );
+            }
+        }
+    }
+    if ( spans )
+    {
+        spans->pointwiseMs = cpuReferenceSpanMs(clock, pointwiseStartNs);
+        spans->pointwiseFast = refusal[0] == '\0';
+        spans->pointwiseOmpThreads = team;
+        spans->pointwiseFastRefusal = refusal;
+    }
 }
 
 static bool applyChromaPostPassGpu(uint16_t * img, int width, int height, int radius,

@@ -89,6 +89,12 @@ LOCAL_ONLY_OR_UNCOLLECTED: dict[str, str] = {
         "follow-up CI-COLLECT-COORDINATION-TOOLS: tests.yml names only "
         "tools/coordination/test_coordination_guardrails.py and test_demote_factory_bridge.py"
     ),
+    "tools/coordination/test_render_roadmap.py": (
+        "UNCOLLECTED at ROADMAP-REFRESH-FROM-CARD-QUEUE-1 r1, same gap as test_resolve_codex_tier.py, "
+        "follow-up CI-COLLECT-COORDINATION-TOOLS: tests.yml names only "
+        "tools/coordination/test_coordination_guardrails.py and test_demote_factory_bridge.py; "
+        "it needs only the stdlib and its tracked testdata/ fixture, so it can join that step as-is"
+    ),
     "tools/profiling/test_frame_colour_spatial_metrics.py": (
         "UNCOLLECTED at acc811f8, follow-up CI-COLLECT-PROFILING-NUMPY-PILLOW: factory-bridge.yml "
         "passes it to --ignore because numpy and Pillow are pinned in no hash-locked requirements file"
@@ -97,6 +103,10 @@ LOCAL_ONLY_OR_UNCOLLECTED: dict[str, str] = {
         "UNCOLLECTED at acc811f8, follow-up CI-COLLECT-PROFILING-NUMPY-PILLOW: factory-bridge.yml "
         "passes it to --ignore; it imports numpy and Pillow, pinned in no hash-locked requirements file"
     ),
+    # STUCK-QUEUE-HANG-AND-CI-REVERT-1 r4: test_stuck_queue_checks.py is collected by the
+    # Windows guardrails step of tests.yml again (the 2026-10-25 owner ruling moved .github
+    # changes to factory adjudication), so it needs no exemption here and must not get one.
+    # A hosted collector is required for it by the guard below like for any other test file.
 }
 
 _PYTEST_OPTIONS_WITH_VALUE = frozenset(

@@ -1,0 +1,1965 @@
+{
+ "schema": "safety-lint-parity-corpus.v1",
+ "comment": "Deny corpus for safety_lint_parity.py. Static rows are kept only when fork/master's lint DENIED them when this file was built (build recipe: the card's run dir). Add rows; never delete one without a reason.",
+ "macros": {
+  "hook": {
+   "<RUN>": "C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "<FILE>": "C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt"
+  },
+  "playback": {}
+ },
+ "rows": [
+  {
+   "id": "b455-literal-01",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_equals_delimiter_is_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-02",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /c rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_equals_delimiter_is_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-03",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /c del= C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_equals_delimiter_is_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-06",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /s /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-07",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /s /c rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-08",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /s /c del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-09",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /d /s /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-10",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /s /k rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-12",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /v:on /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-13",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd /D /S /C rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_exe_leading_switches_before_c_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-14",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd //c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-15",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd //c rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-16",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd //c del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-17",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /s/c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-18",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /s/c rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-19",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /s/c del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-20",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd //s //c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-21",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd/c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-22",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /d/s/k rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_double_slash_and_compact_switches_are_still_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-23",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /cecho cleanup '&' rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_cmd_or_comspec_mention_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-24",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /cecho cleanup '&' rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_cmd_or_comspec_mention_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-25",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /cecho cleanup '&' del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_cmd_or_comspec_mention_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-26",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "cmd.exe /d /cecho x '&' rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_cmd_or_comspec_mention_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-27",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "%ComSpec% /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_cmd_or_comspec_mention_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-28",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "& $env:ComSpec /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_cmd_or_comspec_mention_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-29",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"import subprocess; subprocess.run('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1', shell=True)\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_implicit_cmd_launchers_select_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-30",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"import os; os.system('echo x & rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_implicit_cmd_launchers_select_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-31",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "node -e \"require('child_process').execSync('echo x & del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_implicit_cmd_launchers_select_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-32",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Start-Process -FilePath $env:SystemRoot\\System32\\x.exe -ArgumentList 'echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_implicit_cmd_launchers_select_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-33",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1'}",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_implicit_cmd_launchers_select_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-34",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "schtasks /create /tn t /tr \"echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1\" /sc once /st 00:00",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_implicit_cmd_launchers_select_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-35",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"from os import system; system('echo cleanup & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-36",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"from os import system; system('echo cleanup & rmdir= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-37",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"from os import system; system('echo cleanup & del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-38",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "py -3 -c \"__import__('os').system('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-39",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "C:\\Python314\\python.exe -c \"import os as o; getattr(o, 'sys' + 'tem')('echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-41",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "perl -e \"system('echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-42",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "ruby -e \"system('echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-43",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "php -r \"system('echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1');\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-44",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "pwsh -NoProfile -Command \"[Diagnostics.Process]::Start('c'+'md', '/c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-45",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "powershell -c \"& ('c'+'md') /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_any_interpreter_import_or_system_call_selects_the_strict_reading (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-47",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Rscript -e \"shell('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-48",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Rscript -e \"shell('echo x & del= /q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-49",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "julia -e 'run(`$(\"c\"*\"md\") /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1`)'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-50",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "wsl.exe -e sh -c 'c''md.exe /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-51",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "anylauncher 'echo & rd=/s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-52",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "anylauncher 'echo & rmdir=/q C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_cmd_delete_shape_selects_the_strict_reading_whatever_the_launcher (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-54",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rd /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_real_delete_verbs_still_read_as_deletes (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-56",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "del C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_real_delete_verbs_still_read_as_deletes (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-59",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Remove-Item -Recurse C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2AssignmentIsNotADeleteTests.test_real_delete_verbs_still_read_as_deletes (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-01",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rd=/q/s C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-02",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rmdir=/s/q C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-03",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "del=/f/q C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-04",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rd=,/s C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-05",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rd=;/s C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-06",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rd==/s C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-07",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "rd=\t/s C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-61",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Rscript -e \"shell('echo x & rd=\\t/s C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-literal-62",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "Rscript -e \"shell('echo x & del=C:/review/board/.claude-state/fleet-runs/lane-A-r1/x.txt')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (literal row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-08",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "anylauncher \"echo & rd=C:/review/board/.claude-state/fleet-runs/lane-A-r1\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-09",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "anylauncher 'echo | rmdir=C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2CmdDelimiterShapeR9Tests.test_every_cmd_delimiter_and_glued_switch_reads_as_a_delete (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-12",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"from os import system; system('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2ImplicitLauncherEndToEndDenyTests.test_each_implicit_launcher_delete_is_denied_end_to_end (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-13",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "python -c \"import subprocess; subprocess.run('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1', shell=True)\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2ImplicitLauncherEndToEndDenyTests.test_each_implicit_launcher_delete_is_denied_end_to_end (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-14",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "node -e \"require('child_process').execSync('echo x & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2ImplicitLauncherEndToEndDenyTests.test_each_implicit_launcher_delete_is_denied_end_to_end (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-15",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "perl -e \"system('echo & rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1')\"",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2ImplicitLauncherEndToEndDenyTests.test_each_implicit_launcher_delete_is_denied_end_to_end (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-16",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "wsl.exe -e sh -c 'c''md.exe /c rd= /s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2ImplicitLauncherEndToEndDenyTests.test_each_implicit_launcher_delete_is_denied_end_to_end (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b455-fstring-17",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "command": "anylauncher 'echo & rd=/s /q C:/review/board/.claude-state/fleet-runs/lane-A-r1'",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2ImplicitLauncherEndToEndDenyTests.test_each_implicit_launcher_delete_is_denied_end_to_end (f-string row; r8/r9 rd=P shape family)"
+  },
+  {
+   "id": "b465-rule4-001",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-002",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor, tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-003",
+   "lint": "playback",
+   "text": "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu; then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-004",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-005",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain, tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-006",
+   "lint": "playback",
+   "text": "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu; then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-007",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-008",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor, tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-009",
+   "lint": "playback",
+   "text": "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cuda; then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-010",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-011",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain, tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-012",
+   "lint": "playback",
+   "text": "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cuda; then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-013",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-014",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor, pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-015",
+   "lint": "playback",
+   "text": "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu; then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-016",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-017",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain, pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-018",
+   "lint": "playback",
+   "text": "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu; then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-019",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-020",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor, pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-021",
+   "lint": "playback",
+   "text": "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda; then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-022",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-023",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain, pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-024",
+   "lint": "playback",
+   "text": "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda; then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-025",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-026",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor, & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-027",
+   "lint": "playback",
+   "text": "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu; then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-028",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-029",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain, & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-030",
+   "lint": "playback",
+   "text": "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu; then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-031",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-032",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor, & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-033",
+   "lint": "playback",
+   "text": "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda; then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-034",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-035",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain, & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-036",
+   "lint": "playback",
+   "text": "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda; then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-037",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat --gui-smoke-playback on Bachelor. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-038",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat --gui-smoke-playback on Bachelor, MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-039",
+   "lint": "playback",
+   "text": "Run MLVApp.exe take01.dat --gui-smoke-playback; then run MLVApp.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-040",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat --gui-smoke-playback through the venue chain. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-041",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat --gui-smoke-playback through the venue chain, MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-042",
+   "lint": "playback",
+   "text": "Run MLVApp.exe take01.dat --gui-smoke-playback; then run MLVApp.exe take01.dat --gui-smoke-playback through the venue chain.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-043",
+   "lint": "playback",
+   "text": "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_SECOND_LAUNCHER_GUARDS"
+  },
+  {
+   "id": "b465-rule4-044",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 on Bachelor. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-045",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 on Bachelor. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-046",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 on Bachelor. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-047",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 on Bachelor. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-048",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 on Bachelor. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-049",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 on Bachelor. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-050",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 through the venue chain. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-051",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 through the venue chain. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-052",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 through the venue chain. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-053",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 through the venue chain. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-054",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 through the venue chain. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-055",
+   "lint": "playback",
+   "text": "pwsh -File build.ps1 through the venue chain. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-056",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat on Bachelor. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-057",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat on Bachelor. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-058",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat on Bachelor. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-059",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat on Bachelor. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-060",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat on Bachelor. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-061",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat on Bachelor. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-062",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat through the venue chain. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-063",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat through the venue chain. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-064",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat through the venue chain. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-065",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat through the venue chain. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-066",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat through the venue chain. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-067",
+   "lint": "playback",
+   "text": "MLVApp.exe take01.dat through the venue chain. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-068",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 on Bachelor. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-069",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 on Bachelor. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-070",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 on Bachelor. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-071",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 on Bachelor. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-072",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 on Bachelor. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-073",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 on Bachelor. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-074",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 through the venue chain. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-075",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 through the venue chain. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-076",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 through the venue chain. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-077",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 through the venue chain. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-078",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 through the venue chain. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-079",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File build.ps1 through the venue chain. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-080",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat on Bachelor. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-081",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat on Bachelor. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-082",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat on Bachelor. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-083",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat on Bachelor. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-084",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat on Bachelor. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-085",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat on Bachelor. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-086",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat through the venue chain. Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-087",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat through the venue chain. Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-088",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat through the venue chain. Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-089",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat through the venue chain. Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-090",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat through the venue chain. Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-091",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat through the venue chain. Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-092",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-093",
+   "lint": "playback",
+   "text": "Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-094",
+   "lint": "playback",
+   "text": "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-095",
+   "lint": "playback",
+   "text": "The venue job calls tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-096",
+   "lint": "playback",
+   "text": "Then run tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-097",
+   "lint": "playback",
+   "text": "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-098",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-099",
+   "lint": "playback",
+   "text": "Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-100",
+   "lint": "playback",
+   "text": "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-101",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-102",
+   "lint": "playback",
+   "text": "Then run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-103",
+   "lint": "playback",
+   "text": "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-104",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-105",
+   "lint": "playback",
+   "text": "Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-106",
+   "lint": "playback",
+   "text": "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-107",
+   "lint": "playback",
+   "text": "The venue job calls & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-108",
+   "lint": "playback",
+   "text": "Then run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-109",
+   "lint": "playback",
+   "text": "Run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-110",
+   "lint": "playback",
+   "text": "The venue job calls MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-111",
+   "lint": "playback",
+   "text": "Then run MLVApp.exe take01.dat --gui-smoke-playback.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-112",
+   "lint": "playback",
+   "text": "Run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-113",
+   "lint": "playback",
+   "text": "The venue job calls run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-114",
+   "lint": "playback",
+   "text": "Then run run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-115",
+   "lint": "playback",
+   "text": "Run run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-116",
+   "lint": "playback",
+   "text": "The venue job calls run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-117",
+   "lint": "playback",
+   "text": "Then run run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-118",
+   "lint": "playback",
+   "text": "Run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-119",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-120",
+   "lint": "playback",
+   "text": "Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-121",
+   "lint": "playback",
+   "text": "Run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-122",
+   "lint": "playback",
+   "text": "The venue job calls pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-123",
+   "lint": "playback",
+   "text": "Then run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R2_GUARDS"
+  },
+  {
+   "id": "b465-rule4-138",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --log C:\\MLVApp\\out.txt --gui-smoke-playback",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-139",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --out C:\\pwsh\\x.txt --gui-smoke-playback",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-140",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --log C:\\MLVAppRelease\\out.txt --gui-smoke-playback",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-141",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --out C:\\powershell\\x.txt --gui-smoke-playback",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-142",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --log D:\\MLVApp.exe.d\\log.txt --gui-smoke-playback",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-143",
+   "lint": "playback",
+   "text": "Run pwsh -NoProfile -WorkingDirectory C:\\MLVApp\\w -File tools/profiling/run-release-gui-smoke.ps1",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-144",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.dat and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-145",
+   "lint": "playback",
+   "text": "Run MLVApp.exe take01.dat and run MLVApp.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-146",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.dat; run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-147",
+   "lint": "playback",
+   "text": "Open MLVApp.exe D:\\clips\\a.mlv, then run MLVApp.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-149",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --clip D:\\clips\\a.mlv --gui-smoke-playback",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "b465-rule4-150",
+   "lint": "playback",
+   "text": "Run pwsh -NoProfile -WorkingDirectory C:\\pwsh\\w -File tools/profiling/run-release-gui-smoke.ps1",
+   "why": "NA2-RULE4-PER-LAUNCHER-SCOPE-1 (#465) branch tools/repo_hygiene/test_hub_vm_no_local_playback.py, RULE4_R4_REFUSE"
+  },
+  {
+   "id": "authored-spaced-clip-01",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --clip \"D:\\clips\\my take\\a.mlv\" --gui-smoke-playback",
+   "why": "authored by SAFETY-LINT-MASTER-PARITY-DIFF-1: the #465 branch carries no quoted clip path containing a space (only `--clip D:\\clips\\a.mlv`), so this card adds the shape"
+  },
+  {
+   "id": "authored-spaced-clip-02",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --clip 'D:\\clips\\my take\\a.mlv' --gui-smoke-playback",
+   "why": "authored by SAFETY-LINT-MASTER-PARITY-DIFF-1: the #465 branch carries no quoted clip path containing a space (only `--clip D:\\clips\\a.mlv`), so this card adds the shape"
+  },
+  {
+   "id": "authored-spaced-clip-06",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe --clip=\"D:\\clips\\my take\\a.mlv\" --gui-smoke-playback",
+   "why": "authored by SAFETY-LINT-MASTER-PARITY-DIFF-1: the #465 branch carries no quoted clip path containing a space (only `--clip D:\\clips\\a.mlv`), so this card adds the shape"
+  },
+  {
+   "id": "b465-b5-01",
+   "lint": "playback",
+   "text": "Run C:\\Program Files\\MLVApp\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 1 (unquoted path with a space): a first launch the r8 lint's lead did not read; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-02",
+   "lint": "playback",
+   "text": "Run Layi's MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 2 (a word with an apostrophe): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-03",
+   "lint": "playback",
+   "text": "Run the x64-release MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 3 (a hyphenated word): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-04",
+   "lint": "playback",
+   "text": "Run pwsh-free MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 3 (a hyphenated word): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-05",
+   "lint": "playback",
+   "text": "Run, as before, MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 4 (punctuation in the lead): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-06",
+   "lint": "playback",
+   "text": "Run again: MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 4 (punctuation in the lead): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-07",
+   "lint": "playback",
+   "text": "Run: .\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (no verb right before the app): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-08",
+   "lint": "playback",
+   "text": "Then MLVApp.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (no verb right before the app): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-09",
+   "lint": "playback",
+   "text": "First ~/bin/MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (no verb right before the app): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-10",
+   "lint": "playback",
+   "text": "First build\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (verbless opener, relative path): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-11",
+   "lint": "playback",
+   "text": "Then $env:BIN\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (verbless opener, $env: path): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-12",
+   "lint": "playback",
+   "text": "First %BIN%\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4), family 5 (verbless opener, %VAR% path): master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-13",
+   "lint": "playback",
+   "text": "Execute Layi's MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Execute) over family 2; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-14",
+   "lint": "playback",
+   "text": "Re-run the x64-release MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Re-run) over family 3; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-15",
+   "lint": "playback",
+   "text": "Launch C:\\Program Files\\MLVApp\\MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Launch) over family 1; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-16",
+   "lint": "playback",
+   "text": "Kick off pwsh-free MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Kick off) over family 3; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b5-17",
+   "lint": "playback",
+   "text": "Play Layi's MLVAppRelease.exe take01.mlv and run C:\\build\\MLVAppRelease.exe take01.dat --gui-smoke-playback on Bachelor.",
+   "why": "CoS review of #465 r8 B5 (comment 6230178238, pwsh 7.4): the verb axis (Play) over family 2; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-01",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; add --gui-smoke-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a semicolon between the app launch and its playback mode hides the launch; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-02",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; use --gui-smoke-playback here.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a semicolon between the app launch and its playback mode hides the launch; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-03",
+   "lint": "playback",
+   "text": "Start MLVApp.exe take01.mlv; pass --profile-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a semicolon between the app launch and its playback mode hides the launch; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-04",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv;add --gui-smoke-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): the semicolon with no space after it; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-05",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv ; --profile-playback",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): the spaced semicolon before a bare mode flag; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-06",
+   "lint": "playback",
+   "text": "Run C:\\build\\MLVAppRelease.exe take01.mlv --verbose; then add --gui-smoke-playback.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a later clause (`; then add`) carries the mode flag; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-07",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; add --gui-smoke-playback; run the venue chain on Bachelor.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): the mode flag in a middle clause, a venue clause after it; master refuses it. Lint test data, never executed"
+  },
+  {
+   "id": "b465-b6-08",
+   "lint": "playback",
+   "text": "Run MLVAppRelease.exe take01.mlv; do not pass --gui-smoke-playback here, run it on Bachelor.",
+   "why": "CoS review of #465 r9 B6 (comment 6230713095, pwsh 7.4): a negated mode flag in a later clause; master refuses it. Lint test data, never executed"
+  }
+ ],
+ "groups": [
+  {
+   "id": "defeater-glued-switch",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "SAFETY-LINT-DEFEATER-CORPUS-1 hook family GLUED SWITCHES (switches glued to the verb, to each other or to the path; PowerShell colon-bound parameters), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 4 (Recurrence 2). Every row fork/master 530d70e9 DENIED when measured (r3 run dir measure-candidates.json)",
+   "commands": [
+    "cmd /c rd/s/q <RUN>",
+    "cmd /c rd /s/q <RUN>",
+    "cmd /c rd/q/s <RUN>",
+    "cmd /c rmdir/s/q <RUN>",
+    "cmd /c del/f/q <FILE>",
+    "cmd /c del/q <FILE>",
+    "rd/s/q <RUN>",
+    "rmdir/s/q <RUN>",
+    "del/f/s/q <FILE>",
+    "rm -rf <RUN>",
+    "rm -fr <RUN>",
+    "rm -Rf <RUN>",
+    "rm -rfv <RUN>",
+    "rm -r -f <RUN>",
+    "rm --recursive --force <RUN>",
+    "rm -rf<RUN>",
+    "Remove-Item -Recurse -Force <RUN>",
+    "Remove-Item -r -fo <RUN>",
+    "Remove-Item -Path:<RUN> -Recurse",
+    "Remove-Item -LiteralPath:<RUN> -Recurse",
+    "Remove-Item -Recurse:$true <RUN>",
+    "cmd /c/s/q rd/s/q <RUN>",
+    "cmd.exe /c rd /s/q <RUN>"
+   ]
+  },
+  {
+   "id": "defeater-delimiter",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "SAFETY-LINT-DEFEATER-CORPUS-1 hook family DELIMITERS ( ; , = & | around the verb and between its arguments, cmd blocks, PowerShell statement and subexpression openers), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 4 (Recurrences 2 and 3). Every row fork/master 530d70e9 DENIED when measured; the master-ALLOWED variants (`,rd` `=rd` `@rd` `{rm`) are gap-card candidates in the PR body, not rows",
+   "commands": [
+    "cmd /c (rd /s /q <RUN>)",
+    "cmd /c ( rd /s /q <RUN> )",
+    "cmd /c ;rd /s /q <RUN>",
+    "cmd /c echo x&rd /s /q <RUN>",
+    "cmd /c echo x&&rd /s /q <RUN>",
+    "cmd /c echo x||rd /s /q <RUN>",
+    "cmd /c echo x|rd /s /q <RUN>",
+    "cmd /c \"if exist <RUN> (rd /s /q <RUN>)\"",
+    "cmd /c rd,/s,/q,<RUN>",
+    "cmd /c rd;/s;/q;<RUN>",
+    "cmd /c rd=/s=/q=<RUN>",
+    "cmd /c rd,/s /q <RUN>",
+    "cmd /c rd;/s /q <RUN>",
+    "cmd /c rd /s /q,<RUN>",
+    "cmd /c rd /s /q;<RUN>",
+    "cmd /c rd /s /q=<RUN>",
+    "echo ok;Remove-Item -Recurse <RUN>",
+    "Remove-Item -Recurse <RUN>;echo ok",
+    "(Remove-Item -Recurse <RUN>)",
+    "$null=Remove-Item -Recurse <RUN>",
+    "echo ok|rm -rf <RUN>",
+    "echo ok&&rm -rf <RUN>",
+    "true;rm -rf <RUN>",
+    "(rm -rf <RUN>)",
+    "$(rm -rf <RUN>)",
+    "x=1 rm -rf <RUN>"
+   ]
+  },
+  {
+   "id": "defeater-quoting",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "SAFETY-LINT-DEFEATER-CORPUS-1 hook family QUOTING (single, double and partial quotes around the protected path, a quoted cmdlet name after the call operator), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 1 (the exempting token inside a quotation). Every row fork/master 530d70e9 DENIED when measured; quoted, caret-escaped and empty-quote-spliced VERBS and spliced protected paths are master-ALLOWED and are gap-card candidates in the PR body, not rows",
+   "commands": [
+    "rd /s /q \"<RUN>\"",
+    "rd /s /q '<RUN>'",
+    "rm -rf \"<RUN>\"",
+    "rm -rf '<RUN>'",
+    "Remove-Item -Recurse \"<RUN>\"",
+    "Remove-Item -Recurse '<RUN>'",
+    "Remove-Item -Recurse -LiteralPath \"<RUN>\"",
+    "& 'Remove-Item' -Recurse <RUN>",
+    "& \"Remove-Item\" -Recurse <RUN>",
+    "Re`move-Item -Recurse <RUN>",
+    "rd /s /q C:/review/board/.claude-state/fleet-runs/\"lane-A-r1\"",
+    "rd /s /q C:/review/board/.claude-state/fleet-runs/lane-A\"\"-r1",
+    "rd /s /q 'C:/review/board/.claude-state/fleet-runs/'lane-A-r1",
+    "rm -rf C:/review/board/.claude-state/fleet-runs/'lane-A-r1'"
+   ]
+  },
+  {
+   "id": "defeater-argument-position",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "SAFETY-LINT-DEFEATER-CORPUS-1 hook family ARGUMENT POSITION (switches before, after and around the path; the protected path first, last or in the middle of several operands; comma lists and pipelines), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 1 (a second forbidden marker after the exempting phrase). Every row fork/master 530d70e9 DENIED when measured",
+   "commands": [
+    "rd <RUN> /s /q",
+    "rd /s <RUN> /q",
+    "cmd /c rd <RUN> /s /q",
+    "cmd /c rd /q <RUN> /s",
+    "del <FILE> /f /q",
+    "del /q <FILE> /f",
+    "rm <RUN> -rf",
+    "rm -r <RUN> -f",
+    "rm -- <RUN>",
+    "rm -rf -- <RUN>",
+    "Remove-Item <RUN> -Recurse -Force",
+    "Remove-Item -Force <RUN> -Recurse",
+    "Remove-Item -Recurse -Force -LiteralPath <RUN>",
+    "Remove-Item -LiteralPath <RUN> -Recurse",
+    "Remove-Item -Recurse -Path <RUN> -Force",
+    "rm -rf C:/review/worktree/scratch <RUN>",
+    "rm -rf <RUN> C:/review/worktree/scratch",
+    "rm -rf C:/review/worktree/a <RUN> C:/review/worktree/b",
+    "rd /s /q C:/review/worktree/scratch <RUN>",
+    "Remove-Item -Recurse C:/review/worktree/scratch,<RUN>",
+    "Remove-Item -Recurse C:/review/worktree/scratch, <RUN>",
+    "Remove-Item -Recurse -Path @('C:/review/worktree/scratch','<RUN>')",
+    "Get-ChildItem <RUN> | Remove-Item -Recurse",
+    "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue <RUN>"
+   ]
+  },
+  {
+   "id": "defeater-extensionless",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "why": "SAFETY-LINT-DEFEATER-CORPUS-1 hook family EXTENSION-LESS AND FULL PATHS (cmd vs cmd.exe, pwsh vs pwsh.exe, upper case, System32 and Program Files paths, module-qualified cmdlet, wsl, rm.exe), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 4 (generic run-anything wrappers). Every row fork/master 530d70e9 DENIED when measured; full-path rm (/usr/bin/rm, msys rm.exe), bash/sh -c with a quoted script, the ri alias and erase are master-ALLOWED and are gap-card candidates in the PR body, not rows",
+   "commands": [
+    "cmd /c rd /s /q <RUN>",
+    "cmd.exe /c rd /s /q <RUN>",
+    "CMD /C RD /S /Q <RUN>",
+    "CMD.EXE /C RMDIR /S /Q <RUN>",
+    "C:\\Windows\\System32\\cmd.exe /c rd /s /q <RUN>",
+    "C:\\Windows\\System32\\cmd /c rd /s /q <RUN>",
+    "C:/Windows/System32/cmd.exe /c rd /s /q <RUN>",
+    "%SystemRoot%\\System32\\cmd.exe /c rd /s /q <RUN>",
+    "pwsh -NoProfile -Command \"Remove-Item -Recurse <RUN>\"",
+    "pwsh.exe -NoProfile -Command \"Remove-Item -Recurse <RUN>\"",
+    "powershell -c \"Remove-Item -Recurse <RUN>\"",
+    "powershell.exe -c \"Remove-Item -Recurse <RUN>\"",
+    "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"Remove-Item -Recurse <RUN>\"",
+    "& \"C:\\Program Files\\PowerShell\\7\\pwsh\" -Command \"Remove-Item -Recurse <RUN>\"",
+    "rm.exe -rf <RUN>",
+    "RM -RF <RUN>",
+    "wsl rm -rf <RUN>",
+    "Microsoft.PowerShell.Management\\Remove-Item -Recurse <RUN>",
+    "del -Recurse <RUN>",
+    "rmdir -Recurse <RUN>"
+   ]
+  },
+  {
+   "id": "defeater-pb-glued-switch",
+   "lint": "playback",
+   "why": "PLAYBACK-LINT-DEFEATER-CORPUS-1 playback family GLUED SWITCHES (=, : and glued values on the clip option, the mode flag and the script parameter; a switch glued to the next switch or to -File), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 5 (the token's own argument gap). Every row fork/master f2d6d69d DENIED when measured (lane run dir lane-PLAYBACK-LINT-DEFEATER-CORPUS-1-r1-20261023T0545Z, measure.py); the master-ALLOWED variants are gap-card candidates in the PR body, not rows. Lint test data, never executed",
+   "texts": [
+    "Run MLVApp.exe --clip=tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVAppRelease.exe --clip=tests/fixtures/clips/tiny_dual_iso.mlv --profile-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback=1.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback=true.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --profile-playback=on.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --verbose--gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback--verbose.",
+    "Run MLVApp.exe --clip:tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe /clip:tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe -clip=tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --log=C:/MLVApp/out.txt --gui-smoke-playback.",
+    "Run MLVAppRelease.exe --out=C:/pwsh/x.txt --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback --seconds=5.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Backend:cpu.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Backend:cuda.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Backend=cpu.",
+    "Run pwsh -File:tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend:cpu.",
+    "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend:cpu.",
+    "Run pwsh -NoProfile-File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend:cuda.",
+    "Run pwsh -NoProfile -File tools/profiling/run-release-gui-smoke.ps1 -Backend:cpu -Clip:tests/fixtures/clips/tiny_dual_iso.mlv."
+   ]
+  },
+  {
+   "id": "defeater-pb-delimiter",
+   "lint": "playback",
+   "why": "PLAYBACK-LINT-DEFEATER-CORPUS-1 playback family DELIMITERS (( ; , = [ { $( & before the app token, the pwsh launcher and the script path), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 4 (Recurrences 2 and 3: every command-start position) and clause 5 (the lead side of the token). Every row fork/master f2d6d69d DENIED when measured (lane run dir lane-PLAYBACK-LINT-DEFEATER-CORPUS-1-r1-20261023T0545Z, measure.py); the master-ALLOWED variants are gap-card candidates in the PR body, not rows. Lint test data, never executed",
+   "texts": [
+    "Run (MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback).",
+    "Run ;MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run ,MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run =MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run x=MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run (MLVAppRelease.exe --clip tests/fixtures/clips/tiny_dual_iso.mlv --profile-playback).",
+    "Run $(MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback).",
+    "Run {MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback}.",
+    "Run [MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback].",
+    "Run MLVApp.exe (tests/fixtures/clips/tiny_dual_iso.mlv) --gui-smoke-playback.",
+    "Run &MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run (pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu).",
+    "Run ;pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run ,pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run =pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run x=pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run (tools/profiling/run-release-gui-smoke.ps1 -Backend cpu).",
+    "Run ;tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run ,tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run =tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run (& ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu).",
+    "Run $(pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda).",
+    "Run {tools/profiling/run-release-gui-smoke.ps1 -Backend cpu}.",
+    "Run [tools/profiling/run-release-gui-smoke.ps1 -Backend cpu]."
+   ]
+  },
+  {
+   "id": "defeater-pb-quoting",
+   "lint": "playback",
+   "why": "PLAYBACK-LINT-DEFEATER-CORPUS-1 playback family QUOTING (single, double and backtick quotes around the app token, the pwsh launcher, the script path, the clip and the mode flag; markdown code spans), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 1 (the token inside a quotation). Every row fork/master f2d6d69d DENIED when measured (lane run dir lane-PLAYBACK-LINT-DEFEATER-CORPUS-1-r1-20261023T0545Z, measure.py); the master-ALLOWED variants are gap-card candidates in the PR body, not rows. Lint test data, never executed",
+   "texts": [
+    "Run \"MLVApp.exe\" tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run 'MLVApp.exe' tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run `MLVApp.exe` tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run & \"MLVApp.exe\" tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run & 'C:/build/MLVAppRelease.exe' tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run \"C:/build/MLVAppRelease.exe\" --clip tests/fixtures/clips/tiny_dual_iso.mlv --profile-playback.",
+    "Run MLVApp.exe \"tests/fixtures/clips/tiny_dual_iso.mlv\" --gui-smoke-playback.",
+    "Run MLVApp.exe 'tests/fixtures/clips/tiny_dual_iso.mlv' --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv \"--gui-smoke-playback\".",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv '--gui-smoke-playback'.",
+    "Run \"pwsh\" -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run 'pwsh' -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run p^wsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pw\"\"sh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -File \"tools/profiling/run-release-gui-smoke.ps1\" -Backend cpu.",
+    "Run pwsh -File 'tools/profiling/run-release-gui-smoke.ps1' -Backend cpu.",
+    "Run & 'tools/profiling/run-release-gui-smoke.ps1' -Backend cpu.",
+    "Run & \"./tools/profiling/run-release-gui-smoke.ps1\" -Backend cpu.",
+    "Run \"tools/profiling/run-release-gui-smoke.ps1\" -Backend cpu.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Backend \"cpu\".",
+    "Run `pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu`.",
+    "Run `MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback`.",
+    "Run `tools/profiling/run-release-gui-smoke.ps1` -Backend cpu."
+   ]
+  },
+  {
+   "id": "defeater-pb-argument-position",
+   "lint": "playback",
+   "why": "PLAYBACK-LINT-DEFEATER-CORPUS-1 playback family ARGUMENT POSITION (the mode flag before, after and between the clip and other options; up to the 12-argument gap; pwsh switches reordered and lengthened; script parameters reordered or absent), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 5 (both sides of the token). Every row fork/master f2d6d69d DENIED when measured (lane run dir lane-PLAYBACK-LINT-DEFEATER-CORPUS-1-r1-20261023T0545Z, measure.py); the master-ALLOWED variants are gap-card candidates in the PR body, not rows. Lint test data, never executed",
+   "texts": [
+    "Run MLVApp.exe --gui-smoke-playback tests/fixtures/clips/tiny_dual_iso.mlv.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe --verbose tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback --seconds 5.",
+    "Run MLVApp.exe --gui-smoke-playback --clip tests/fixtures/clips/tiny_dual_iso.mlv.",
+    "Run MLVApp.exe --clip tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe --log C:/MLVApp/out.txt --clip tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe --profile-playback tests/fixtures/clips/tiny_dual_iso.mlv.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --profile-playback --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --a 1 --b 2 --c 3 --d 4 --e 5 --f 6 --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --a 1 --b 2 --c 3 --d 4 --e 5 --f 6 --g --gui-smoke-playback.",
+    "Run MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --a 1 --b 2 --c 3 --d 4 --e 5 --f 6 --g 7 --h 8 --gui-smoke-playback.",
+    "Run MLVApp.exe --gui-smoke-playback --a 1 --b 2 --c 3 --d 4 --e 5 --f 6 --g 7 tests/fixtures/clips/tiny_dual_iso.mlv.",
+    "Run --gui-smoke-playback with MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu -Clip tests/fixtures/clips/tiny_dual_iso.mlv.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Clip tests/fixtures/clips/tiny_dual_iso.mlv -Backend cpu.",
+    "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Clip tests/fixtures/clips/tiny_dual_iso.mlv -Backend cuda.",
+    "Run pwsh -NoProfile -File tools/profiling/run-release-gui-smoke.ps1.",
+    "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1.",
+    "Run pwsh -NonInteractive -NoProfile -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu -NoProfile.",
+    "Run pwsh -ExecutionPolicy Bypass -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -WorkingDirectory C:/work/a/b/c/d -NoLogo -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run tools/profiling/run-release-gui-smoke.ps1 -Backend cpu tests/fixtures/clips/tiny_dual_iso.mlv."
+   ]
+  },
+  {
+   "id": "defeater-pb-extensionless",
+   "lint": "playback",
+   "why": "PLAYBACK-LINT-DEFEATER-CORPUS-1 playback family EXTENSION-LESS AND FULL PATHS (case, absolute, relative, home, $env: and %VAR% paths to the app; pwsh.exe, powershell, powershell.exe and a Program Files pwsh; backslash and absolute script paths), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 4 (generic run-anything wrappers) and clause 5 (decide from the token). Every row fork/master f2d6d69d DENIED when measured (lane run dir lane-PLAYBACK-LINT-DEFEATER-CORPUS-1-r1-20261023T0545Z, measure.py); the master-ALLOWED variants are gap-card candidates in the PR body, not rows. Lint test data, never executed",
+   "texts": [
+    "Run mlvapp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVAPP.EXE tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run MLVApp.EXE tests/fixtures/clips/tiny_dual_iso.mlv --GUI-SMOKE-PLAYBACK.",
+    "Run C:/build/MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run C:\\build\\MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run ./MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run .\\MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run build/release/MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run \"C:\\Program Files\\MLVApp\\MLVAppRelease.exe\" tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run C:\\Program Files\\MLVApp\\MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run ~/bin/MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run $env:BIN\\MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run %BIN%\\MLVAppRelease.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run pwsh.exe -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run powershell -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run powershell.exe -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run PWSH -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run C:\\Program Files\\PowerShell\\7\\pwsh.exe -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run \"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run tools\\profiling\\run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run C:/work/MLV-App/tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run TOOLS/PROFILING/RUN-RELEASE-GUI-SMOKE.PS1 -Backend cpu."
+   ]
+  },
+  {
+   "id": "defeater-pb-shell-indirection",
+   "lint": "playback",
+   "why": "PLAYBACK-LINT-DEFEATER-CORPUS-1 playback family SHELL INDIRECTION, only the forms an existing playback row already shows (pwsh -File with its switches, the & call operator; no cmd /c, pwsh -Command or Start-Process row exists, so none is added), ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 clause 4 (wrappers). Every row fork/master f2d6d69d DENIED when measured (lane run dir lane-PLAYBACK-LINT-DEFEATER-CORPUS-1-r1-20261023T0545Z, measure.py); the master-ALLOWED variants are gap-card candidates in the PR body, not rows. Lint test data, never executed",
+   "texts": [
+    "Run & pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run & pwsh -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+    "Run pwsh -NoProfile -WorkingDirectory C:/work -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -NoProfile -WorkingDirectory C:/work -File tools/profiling/run-release-gui-smoke.ps1.",
+    "Run pwsh -NoLogo -NoProfile -NonInteractive -File tools/profiling/run-release-gui-smoke.ps1 -Backend cuda.",
+    "Run & ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu -NoProfile.",
+    "Run & .\\tools\\profiling\\run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run & tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run & ../tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run . ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run &./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run &  ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run & MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run & ./MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run & C:/build/MLVAppRelease.exe --clip tests/fixtures/clips/tiny_dual_iso.mlv --profile-playback.",
+    "Run pwsh -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu, which launches MLVApp.exe tests/fixtures/clips/tiny_dual_iso.mlv --gui-smoke-playback.",
+    "Run pwsh -NoProfile -NonInteractive -File ./tools/profiling/run-release-gui-smoke.ps1 -Backend cpu.",
+    "Run pwsh -File .\\tools\\profiling\\run-release-gui-smoke.ps1 -Backend cuda.",
+    "Run & pwsh -File tools/profiling/run-release-gui-smoke.ps1.",
+    "Run & pwsh.exe -NoProfile -File tools/profiling/run-release-gui-smoke.ps1 -Backend cpu."
+   ]
+  }
+ ],
+ "generators": [
+  {
+   "id": "b455-sweep",
+   "lint": "hook",
+   "tool_name": "PowerShell",
+   "cwd": "C:/review/worktree",
+   "board_root": "C:/review/board",
+   "verbs": [
+    "rd",
+    "rmdir",
+    "del",
+    "erase"
+   ],
+   "tails": [
+    " /s /q {t}",
+    "/s/q {t}",
+    "/q/s {t}",
+    ",/s {t}",
+    ";/s {t}",
+    "=/s {t}",
+    "\\t/s {t}",
+    "\t/s {t}",
+    "{t}"
+   ],
+   "wrappers": [
+    "cmd /c {x}",
+    "Rscript -e \"shell('echo x & {x}')\"",
+    "anylauncher \"echo & {x}\"",
+    "python -c \"import os; os.system('echo & {x}')\"",
+    "node -e \"require('child_process').execSync('echo & {x}')\""
+   ],
+   "target": "C:/review/board/.claude-state/fleet-runs/lane-A-r1",
+   "why": "HOOK-NA2-REDIRECT-FALSE-POSITIVE-1 (#455) branch tools/repo_hygiene/test_mlv_never_authorized.py, Na2MasterParitySweepTests._rows: 4 verbs x 9 tails x 5 launcher wrappers (r9 master-parity sweep)"
+  }
+ ]
+}

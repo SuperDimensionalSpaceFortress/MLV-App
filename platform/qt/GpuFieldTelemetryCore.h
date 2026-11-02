@@ -251,7 +251,8 @@ struct Fault
     int cudaCode = 0;
     std::string cudaName;
     std::string site;
-    double utcMs = 0.0;
+    double utcMs = 0.0;             /* when noted (the DLL's utc_ms when it gave one) */
+    double deliveredUtcMs = 0.0;    /* when the app recorded it (a drain can be late) */
     std::string role = "primary";  /* r5: primary | secondary | orphan */
     unsigned long long dropped = 0; /* r5: DLL queue drops reported with this record */
 };
@@ -367,6 +368,7 @@ inline std::string formatFault(const std::string & sessionId, const std::string 
         + ",\"cuda_name\":" + quoted(f.cudaName)
         + ",\"site\":" + quoted(f.site)
         + ",\"fault_utc_ms\":" + number(f.utcMs)
+        + ",\"fault_delivered_utc_ms\":" + number(f.deliveredUtcMs)
         + ",\"device_loss\":" + (isDeviceLossCode(f.cudaCode) ? "true" : "false")
         + ",\"role\":" + quoted(f.role)
         + ",\"dropped\":" + number(f.dropped) + "}";

@@ -132,6 +132,17 @@ def test_refuses_the_lanes_own_workdir(world):
     assert (work / "keep.txt").exists() and sub.exists()
 
 
+def test_refuses_the_default_in_worktree_lane_scratch_leaf(world):
+    # LANE-HOOK-DENY-RECURRENCE-1 r4: the default TEMP is <WorkDir>\.claude-state\ls\<8-hex>, inside the lane's own
+    # WorkDir, so a lane that registers it (or its parent) in scratch-paths.txt is refused as 'workdir' and nothing is removed.
+    work = make_repo(world["bulk"] / "lane-work")
+    leaf = work / ".claude-state" / "ls" / "0a1b2c3d"; leaf.mkdir(parents=True); (leaf / "t.txt").write_text("x")
+    d = call_helper(world, [leaf, leaf.parent], work=work)
+    assert [e["reason"] for e in d["entries"]] == ["workdir", "workdir"]
+    assert all(e["action"] == "refused" for e in d["entries"])
+    assert (leaf / "t.txt").exists()
+
+
 def test_refuses_a_git_worktree_and_a_dir_that_contains_one(world):
     wt = world["bulk"] / "lane-other-wt"
     git("worktree", "add", "-q", "--detach", str(wt), cwd=world["work"])

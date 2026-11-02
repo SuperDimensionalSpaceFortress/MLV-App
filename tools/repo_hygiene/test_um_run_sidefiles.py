@@ -11,15 +11,18 @@ The placement code is exercised two ways:
 
 from __future__ import annotations
 
+import ast
 import re
 import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # hub: pwsh colours its error view with ANSI escapes whenever the parent environment advertises a colour
@@ -41,6 +44,81 @@ requires_git = unittest.skipIf(GIT is None, "git is not on PATH")
 
 def _q(path: Path | str) -> str:
     return "'" + str(path).replace("'", "''") + "'"
+
+
+CLAIM_WAIT_PASS = "PASS"
+CLAIM_WAIT_FAIL = "FAIL"
+CLAIM_WAIT_INCONCLUSIVE = "INCONCLUSIVE"
+
+
+def judge_claim_wait(claim_lo: float, claim_hi: float, verdict_time: float, timeout_sec: float,
+                     slack: float = 0.5) -> str:
+    """Judge the claimed wait from three epoch-second stamps, with no process involved.
+
+    UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1: pure so the verdict table is covered deterministically
+    (UmRunClaimWaitOracleTests) instead of by whatever the scheduler does to a live client.
+
+    FAIL: the verdict came before even the earliest possible claim (claim_lo) plus the budget: a
+    correct client cannot do that. PASS: the verdict is also a full budget after the LATEST possible
+    claim (claim_hi), so the wait was served whatever happened inside the claim window. Between the
+    two the stamps cannot say where the time went: a client that stalled ~8 s inside the window
+    (before or after assigning claimedAt) and a healthy one look alike, so the outcome is
+    INCONCLUSIVE, never a FAIL and never a PASS. The window is microseconds on a healthy host, so
+    this almost never triggers; it only stops a stalled run from vouching for a wrong anchor."""
+    if verdict_time - claim_lo < timeout_sec - slack:
+        return CLAIM_WAIT_FAIL
+    if verdict_time - claim_hi < timeout_sec - slack:
+        return CLAIM_WAIT_INCONCLUSIVE
+    return CLAIM_WAIT_PASS
+
+
+def skip_if_claim_wait_inconclusive(test: unittest.TestCase, claim_lo: float, claim_hi: float,
+                                    verdict_time: float, timeout_sec: float, timing_facts: str) -> None:
+    """The live wait test's last step, extracted so a committed test can drive it without a UM client
+    (UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1): an INCONCLUSIVE verdict skips, anything else returns."""
+    if judge_claim_wait(claim_lo, claim_hi, verdict_time, timeout_sec) == CLAIM_WAIT_INCONCLUSIVE:
+        test.skipTest(
+            "INCONCLUSIVE: the claim window (claim_lo -> claim_hi) was wide enough that a stall "
+            "inside it cannot be told from an hour-back client; every other check passed "
+            f"[{timing_facts}]")
+
+
+_SEAM_CALL_ARGS = ["self", "claim_lo", "claim_hi", "verdict_time", "timeout_sec", "timing_facts"]
+_SEAM_CALL_METHOD = "test_a_clock_skewed_claim_marker_observed_at_the_queue_deadline_does_not_shrink_the_clients_patience"
+
+
+def seam_call_position_problem(source: str, class_name: str, method_name: str | None = None) -> str | None:
+    """UMRUN-SEAM-CALL-POSITION-PIN-1: None when `class_name` in `source` calls
+    skip_if_claim_wait_inconclusive exactly once, as the FINAL top-level statement of a method body
+    and with the live test's own arguments; otherwise a sentence saying what is wrong. The seam only
+    skips after every other check has run, so a call placed earlier would skip past the UNRESOLVED /
+    started-marker asserts below it. Takes source text so a test can feed it a mutated copy. When
+    `method_name` is given, the call must also sit in the method of that name.
+
+    Final-statement placement is a positional contract only: it does not prove the call is reached at
+    run time (an early return, a raised skip or an exception above it still bypasses it). The
+    earlier checks in the live test must pass before execution reaches the call."""
+    classes = [node for node in ast.walk(ast.parse(source))
+               if isinstance(node, ast.ClassDef) and node.name == class_name]
+    if len(classes) != 1:
+        return f"expected exactly one class {class_name}, found {len(classes)}"
+    calls = [(member, node) for member in classes[0].body for node in ast.walk(member)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "skip_if_claim_wait_inconclusive"]
+    if len(calls) != 1:
+        return f"expected exactly one seam call in {class_name}, found {len(calls)}"
+    method, call = calls[0]
+    if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return "the seam call is not inside a method body"
+    if method_name is not None and method.name != method_name:
+        return f"the seam call is in {method.name}, not in the expected method {method_name}"
+    if [ast.unparse(arg) for arg in call.args] != _SEAM_CALL_ARGS or call.keywords:
+        return f"{method.name} calls the seam with unexpected arguments: {ast.unparse(call)}"
+    final = method.body[-1]
+    if not (isinstance(final, ast.Expr) and final.value is call):
+        return (f"{method.name}: the seam call (line {call.lineno}) is not the final top-level "
+                f"statement of the method body (that is line {final.lineno})")
+    return None
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -79,13 +157,137 @@ class _Share(unittest.TestCase):
             line += f" job={job_id}"
         (self.share / "heartbeat.txt").write_text(line, encoding="utf-8")
 
+    # ---- following the client's own poll loop instead of the wall clock -----------------------
+    # UMRUN-E2E-TIMING-FLAKES-1: a test that choreographs a child pwsh with time.sleep() races the
+    # child's start-up (module import + the drop can take several seconds on a hosted runner, so a
+    # marker written at "t=1s" and removed at "t=2s" can come and go before the client ever polls
+    # -- the client then never saw a claim and RETRACTs) and, when the test also rewrites a file the
+    # client reads, races that read (a truncate-then-write torn heartbeat reads as state=?). The
+    # client already exposes -TestHookAtLoopTop, run at the top of every wait-loop iteration; the
+    # hook below logs "<poll number> <epoch ms>" there, so a test advances on what the client has
+    # DONE (it has polled N times) and never on how long it has been. This tick hook changes nothing
+    # in um-run.ps1 or UmRunDrop.psm1 (production never passes it); the separate claim hook below
+    # is a gated seam of its own (UMRUN-SIBLING-1122-WAIT-LOCUS-1).
+    def start_ticked(self, *um_run_args: str, hold_first_poll_until: Path | None = None,
+                     queue_deadline_hook: str | None = None,
+                     tick_action: tuple[int, str] | None = None,
+                     claim_hook: str | None = None) -> subprocess.Popen:
+        """Start um-run.ps1 for JobId demo with the tick hook; failures print `THREW <message>` and exit 1.
+
+        hold_first_poll_until: the client blocks (at most 120 s) at the top of its FIRST poll until this
+        path exists, so a test can guarantee a claim marker is in place before the client makes any
+        queue-deadline decision, whatever the scheduler does to the test process in between.
+
+        queue_deadline_hook: a PowerShell scriptblock literal (`{ ... }`) passed as -TestHookAtQueueDeadline,
+        run inside the client at exactly the queue-deadline recheck.
+
+        tick_action: (poll number, PowerShell statements). The statements run inside the client, right
+        after it logs that poll, so a side effect lands at a point in the client's own poll sequence
+        and not at whatever moment the test process happens to get scheduled.
+
+        claim_hook: a PowerShell scriptblock literal (`{ ... }`) passed as
+        -TestHookAroundQueueDeadlineClaim; the client calls it with no arguments twice, immediately
+        before and immediately after the queue-deadline recheck sets `$claimedAt`, so a test can
+        stamp, from its own clock, a lower and an upper bound on the instant the claimed wait begins
+        (never the client's `$claimedAt` value, which a broken client would get wrong).
+
+        On any throw the client's wrapper also stamps the instant of its own verdict (verdict_at()),
+        so a test can judge WHEN the client decided without depending on when the parent noticed."""
+        self.ticks_path = self.tmp / "client-ticks.log"
+        self.verdict_path = self.tmp / "client-verdict-at.log"
+        hold = _q(hold_first_poll_until) if hold_first_poll_until is not None else "''"
+        queue_hook_arg = " -TestHookAtQueueDeadline $queueHook" if queue_deadline_hook is not None else ""
+        claim_hook_arg = " -TestHookAroundQueueDeadlineClaim $claimHook" if claim_hook is not None else ""
+        action_poll, action_body = tick_action if tick_action is not None else (0, "")
+        wrapper = self.tmp / "run-ticked.ps1"
+        wrapper.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$queueHook = {queue_deadline_hook if queue_deadline_hook is not None else '$null'}\n"
+            f"$claimHook = {claim_hook if claim_hook is not None else '$null'}\n"
+            f"$tickLog = {_q(self.ticks_path)}\n"
+            f"$tickHold = {hold}\n"
+            "$tickHook = {\n"
+            "  $tickN = 1 + @(Get-Content -LiteralPath $tickLog -ErrorAction SilentlyContinue).Count\n"
+            "  if ($tickN -eq 1 -and $tickHold) {\n"
+            "    $tickUntil = [DateTime]::UtcNow.AddSeconds(120)\n"
+            "    while (-not (Test-Path -LiteralPath $tickHold) -and [DateTime]::UtcNow -lt $tickUntil) { Start-Sleep -Milliseconds 20 }\n"
+            "  }\n"
+            "  $tickLine = '{0} {1}' -f $tickN, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n"
+            "  $tickWritten = $false; $tickError = ''\n"
+            "  for ($tickTry = 0; $tickTry -lt 40; $tickTry++) {\n"
+            "    try { Add-Content -LiteralPath $tickLog -Value $tickLine -Encoding ascii -ErrorAction Stop; $tickWritten = $true; break }\n"
+            "    catch { $tickError = $_.Exception.Message; Start-Sleep -Milliseconds 25 }\n"
+            "  }\n"
+            # um-run's loop catch rewraps a hook throw as UNRESOLVED naming only the exception type,
+            # so the path and the last error also go to stderr, where the waiting test reports them.
+            "  if (-not $tickWritten) {\n"
+            "    $tickFail = \"TICK_LOG_WRITE_EXHAUSTED: 40 tries to append poll $tickN to $tickLog all failed; last error: $tickError\"\n"
+            "    [Console]::Error.WriteLine($tickFail)\n"
+            "    throw $tickFail\n"
+            "  }\n"
+            f"  if ($tickN -eq {action_poll}) {{ {action_body} }}\n"
+            "}\n"
+            "try {\n"
+            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
+            f"-PollSeconds 1 -JobId 'demo' {' '.join(um_run_args)} -TestHookAtLoopTop $tickHook{queue_hook_arg}{claim_hook_arg}\n"
+            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
+            "} catch {\n"
+            f"  Set-Content -LiteralPath {_q(self.verdict_path)} -Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ascii\n"
+            "  Write-Output ('THREW ' + $_.Exception.Message); exit 1\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def ticks(self) -> list[tuple[int, float]]:
+        """(poll number, epoch seconds) for every poll the client has started so far."""
+        try:
+            text = self.ticks_path.read_text(encoding="ascii")
+        except OSError:
+            return []
+        polls = []
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():   # a torn last line is skipped
+                polls.append((int(parts[0]), int(parts[1]) / 1000.0))
+        return polls
+
+    def verdict_at(self) -> float:
+        """Epoch seconds at which the client's wrapper caught the client's throw (its verdict)."""
+        return int(self.verdict_path.read_text(encoding="ascii").strip()) / 1000.0
+
+    def wait_for_polls(self, proc: subprocess.Popen, count: int, *, within: float = 120.0) -> None:
+        """Block until the client has started `count` polls. `within` is a hang guard, not a budget."""
+        deadline = time.monotonic() + within
+        while time.monotonic() < deadline:
+            if len(self.ticks()) >= count:
+                return
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                output = _ANSI_ESCAPE.sub("", (stdout or "") + (stderr or "")).strip()
+                self.fail(f"um-run exited before it started poll {count}: {output[-2000:]}")
+            time.sleep(0.05)
+        self.fail(f"um-run never started poll {count} within {within}s (saw {len(self.ticks())})")
+
+    def wait_until_the_client_has_read(self, proc: subprocess.Popen) -> None:
+        """Return once the client has fully run one poll that began after this call.
+
+        Poll N+1 starts after the caller's last write, so it reads that write; poll N+2 starting
+        proves poll N+1 ran to its end. (Poll N, already running when the caller wrote, may or may
+        not have seen it -- it is never relied on.)"""
+        self.wait_for_polls(proc, len(self.ticks()) + 2)
+
     def drop(self, copier: str, *, side: list[Path] | None = None, job_id: str = "demo",
              module: Path | None = None, repo_root: Path | None = None,
              job_timeout_sec: int | None = None,
              before_job_visible: str | None = None,
-             after_meta_tmp_written: str | None = None) -> subprocess.CompletedProcess:
+             after_meta_tmp_written: str | None = None,
+             not_after_utc: str | None = None) -> subprocess.CompletedProcess:
         sides = ",".join(_q(p) for p in (side if side is not None else [self.side]))
         timeout_arg = "" if job_timeout_sec is None else f" -JobTimeoutSec {job_timeout_sec}"
+        if not_after_utc is not None:
+            timeout_arg += f" -NotAfterUtc {_q(not_after_utc)}"
         script = self.tmp / "drop.ps1"
         repo_root_arg = f" -RepoRoot {_q(repo_root)}" if repo_root is not None else ""
         preamble = (
@@ -133,6 +335,16 @@ RACING_JOB = ("{ param($s, $d) Copy-Item -LiteralPath $s -Destination $d; "
 # rollback proof that actually exercises metadata-then-job-rename-fails.
 JOB_COPY_FAILS = ("{ param($s, $d) if ($d -like '*.job.tmp') { throw 'INJECTED_JOB_COPY_FAILURE' }; "
                    "Copy-Item -LiteralPath $s -Destination $d }")
+
+
+def _future_not_after(hours: float = 2.0) -> datetime:
+    """A whole-second UTC instant `hours` from now, for -NotAfterUtc."""
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(microsecond=0)
+
+
+def _round_trip_utc(instant: datetime) -> str:
+    """.NET's DateTime 'o' form of a whole-second UTC instant, as the module writes notAfterUtc."""
+    return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
 
 class UmRunDropModuleTests(_Share):
@@ -230,6 +442,51 @@ class UmRunDropModuleTests(_Share):
         self.assertIn("THREW UMRUN_JOB_TIMEOUT_INVALID", proc.stdout, proc.stdout + proc.stderr)
         self.assertFalse(self.log.exists(), "no copy may happen before the budget is validated")
         self.assertEqual(self.names(), [])
+
+    # ---- agent-side absolute deadline (LEASE-REQUEST-CHILD-NOT-AFTER-1) -----------------------
+    # inbox\<id>.meta.json notAfterUtc: past it, the Bachelor agent never takes a quiet lease for the
+    # job and never runs it. Optional; absent leaves the metadata exactly as it was.
+
+    def test_not_after_is_written_as_a_round_trip_utc_string(self) -> None:
+        instant = _future_not_after()
+        expected = _round_trip_utc(instant)
+        for given in (instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      instant.astimezone(timezone(timedelta(hours=2))).isoformat()):
+            with self.subTest(given=given):
+                for leftover in self.inbox.iterdir():
+                    leftover.unlink()
+                proc = self.drop(OBSERVING, side=[], not_after_utc=given)
+                self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"job not-after: demo.meta.json notAfterUtc={expected}", proc.stdout, proc.stdout)
+                meta = json.loads((self.inbox / "demo.meta.json").read_text(encoding="ascii"))
+                self.assertEqual(meta["notAfterUtc"], expected, "the same instant, normalised to 'o' form in Z")
+
+    def test_no_not_after_leaves_the_metadata_without_the_key(self) -> None:
+        # Passes on a module without -NotAfterUtc too, by design: it pins that the field's absence
+        # leaves the claim's bytes exactly as they were.
+        proc = self.drop(OBSERVING, side=[], job_timeout_sec=600)
+        self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("job not-after:", proc.stdout)
+        raw = (self.inbox / "demo.meta.json").read_text(encoding="ascii")
+        meta = json.loads(raw)
+        self.assertNotIn("notAfterUtc", meta)
+        self.assertEqual(raw, json.dumps({"jobId": "demo", "nonce": meta["nonce"], "timeoutSec": 600}, separators=(",", ":")))
+
+    def test_an_invalid_not_after_is_refused_before_anything_is_placed(self) -> None:
+        offsetless = _future_not_after().strftime("%Y-%m-%dT%H:%M:%S")
+        for bad, reason in (("not-a-date", "does not parse"),
+                            (offsetless, "no Z or +hh:mm offset"),
+                            ("2020-01-01T00:00:00Z", "not later than now")):
+            with self.subTest(not_after=bad):
+                for leftover in self.inbox.iterdir():
+                    leftover.unlink()
+                if self.log.exists():
+                    self.log.unlink()
+                proc = self.drop(OBSERVING, not_after_utc=bad)   # self.side is a real side-file by default
+                self.assertIn(f"THREW UMRUN_NOT_AFTER_INVALID '{bad}'", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(reason, proc.stdout, proc.stdout)
+                self.assertFalse(self.log.exists(), "no copy may happen before notAfterUtc is validated")
+                self.assertEqual(self.names(), [], "a refused notAfterUtc must leave neither metadata nor a job")
 
     def test_a_failed_job_copy_removes_the_metadata_so_a_retry_with_the_same_job_id_succeeds(self) -> None:
         # fable/sol major 1: metadata was placed and never rolled back when the job's OWN copy then
@@ -735,6 +992,27 @@ class UmRunEndToEndTests(_Share):
         self.assertIn("UMRUN_TIMEOUT_SEC_INVALID", proc.stdout + proc.stderr)
         self.assertEqual(self.names(), [], "a rejected -TimeoutSec must submit nothing at all")
 
+    def test_a_tick_log_that_cannot_be_written_fails_naming_the_path_and_the_last_error(self) -> None:
+        # CoS on #460: the tick hook's write retry (40 tries, catch -> sleep) used to end silently
+        # when every try failed, so a test waiting on polls saw no poll and no reason. A directory
+        # at the tick log's path makes every Add-Content fail; the client must stop at its first
+        # poll and the waiting test must fail with the path and the last error.
+        ticks_path = self.tmp / "client-ticks.log"
+        ticks_path.mkdir()
+        proc = self.start_ticked("-TimeoutSec", "1", "-MaxQueueWaitSec", "1")
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                self.wait_for_polls(proc, 1)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+        message = str(caught.exception)
+        self.assertIn(f"TICK_LOG_WRITE_EXHAUSTED: 40 tries to append poll 1 to {ticks_path} all failed",
+                      message, message)
+        self.assertIn("last error:", message, message)
+        self.assertIn("THREW UNRESOLVED:", message, message)
+
     def test_the_callers_timeout_reaches_the_agent_as_the_jobs_own_budget(self) -> None:
         # The bug this closes: -TimeoutSec bounded only the client poll, so the agent ran every job
         # on its 1800 s default and killed a placement the caller had given an hour.
@@ -758,6 +1036,31 @@ class UmRunEndToEndTests(_Share):
         finally:
             proc.kill()
             proc.communicate()
+
+    def test_the_callers_not_after_reaches_the_agents_metadata(self) -> None:
+        # LEASE-REQUEST-CHILD-NOT-AFTER-1: um-run forwards -NotAfterUtc and never derives one itself.
+        instant = _future_not_after()
+        proc = subprocess.Popen(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
+             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
+             "-TimeoutSec", "3600", "-PollSeconds", "1", "-JobId", "demo",
+             "-NotAfterUtc", instant.strftime("%Y-%m-%dT%H:%M:%SZ")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            meta_path = self.inbox / "demo.meta.json"
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not meta_path.exists() and proc.poll() is None:
+                time.sleep(0.2)
+            exists = meta_path.exists()
+            meta = json.loads(meta_path.read_text(encoding="ascii")) if exists else {}
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            stdout, stderr = proc.communicate()
+        output = _ANSI_ESCAPE.sub("", (stdout or "") + (stderr or ""))[-2000:]
+        self.assertTrue(exists, f"the drop must write the job's notAfterUtc: {output}")
+        self.assertEqual(meta["notAfterUtc"], _round_trip_utc(instant), output)
+        self.assertEqual(meta["timeoutSec"], 3600)
 
     def test_retracted_message_discloses_the_agents_own_stale_enumeration_window(self) -> None:
         # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 12 (sol BLOCKER / fable MINOR, item 1): RETRACTED
@@ -857,24 +1160,37 @@ class UmRunEndToEndTests(_Share):
         # natural stale-liveness throw is fast and intentional, not an accidental ~30s coincidence
         # with the default) and heartbeat.txt is never refreshed after setUp, so it goes stale
         # almost immediately once the client starts actually checking it (past budget).
+        #
+        # UMRUN-E2E-TIMING-FLAKES-1: this used to run -TimeoutSec 2 on wall-clock sleeps (marker at
+        # t=1s, removed at t=2s). On a hosted runner the child pwsh could reach its first poll only
+        # AFTER the marker had come and gone (merge_group run 38675787436: "agent heartbeat is 2s
+        # old" at start-up, then RETRACTED after the 10 s queue ceiling), and even when it saw the
+        # marker the old assertions could not tell a marker-anchored deadline from the correct one --
+        # with the marker present a client waits either way, and after it is removed both throw.
+        # Now (1) the test advances on the client's own polls (start_ticked), so the marker is
+        # always observed before it is removed; (2) the heartbeat's mtime is set an hour old, so it
+        # is stale by construction rather than by elapsed time; and (3) -TimeoutSec 8 makes the claim
+        # measurable: a client whose deadline starts at its own observation cannot reach the liveness
+        # verdict before observation + 8 s, while one anchored to the marker's hour-old startedUtc
+        # (the bug) throws at its first poll after the marker is gone, 1-2 s after the marker was
+        # written. The assertion is on the time of the client's LAST poll against the time the marker
+        # was written -- a delay (a stall, a slow runner) can only move that later, so a correct
+        # client cannot fail it, and the bug is caught unless something stalls it for 4+ s.
+        timeout_sec = 8
         running_dir = self.share / "running"
         marker_path = running_dir / "demo.started.json"
-        proc = subprocess.Popen(
-            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
-             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
-             "-TimeoutSec", "2", "-PollSeconds", "1", "-MaxQueueWaitSec", "10",
-             "-MaxHeartbeatAgeSec", "2", "-JobId", "demo"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stale_at = time.time() - 3600
+        os.utime(self.share / "heartbeat.txt", (stale_at, stale_at))
+        proc = self.start_ticked("-TimeoutSec", str(timeout_sec), "-MaxQueueWaitSec", "300",
+                                 "-MaxHeartbeatAgeSec", "2")
         try:
-            time.sleep(1.0)
+            self.wait_for_polls(proc, 1)   # the client has dropped the job and is polling
             running_dir.mkdir(parents=True, exist_ok=True)
             skewed = time.gmtime(time.time() - 3600)
             marker = {"jobId": "demo", "startedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", skewed)}
+            marker_written_at = time.time()
             marker_path.write_text(json.dumps(marker), encoding="ascii")
-            # One more poll cycle: under a marker-anchored deadline the client would already have
-            # thrown (or misjudged liveness) on the very first check after observing this marker.
-            time.sleep(1.0)
-            self.assertIsNone(proc.poll(), "a stale agent-clock stamp must not shrink the client's own patience")
+            self.wait_until_the_client_has_read(proc)   # it has now observed the marker
             # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11 (item 3): the started marker's own
             # presence is now an independent proof the agent may still own this job (the deployed
             # agent's silent kill/drain/publish window) -- removing it here simulates that window
@@ -882,11 +1198,17 @@ class UmRunEndToEndTests(_Share):
             # was published) so the stale-heartbeat diagnosis below can actually fire, the same way
             # a real agent's own marker removal would let it fire in production.
             marker_path.unlink()
-            stdout, stderr = proc.communicate(timeout=15)
+            stdout, stderr = proc.communicate(timeout=timeout_sec + 90)
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate()
+        last_poll_at = self.ticks()[-1][1]
+        self.assertGreaterEqual(
+            last_poll_at - marker_written_at, timeout_sec - 2,
+            "a stale agent-clock stamp must not shrink the client's own patience: it reached the "
+            f"liveness verdict {last_poll_at - marker_written_at:.1f}s after the marker was written, "
+            f"before its own {timeout_sec}s budget (counted from observing the marker) could elapse")
         # Whitespace-flattened, with "|" removed: PowerShell's own default uncaught-exception
         # formatting word-wraps a long message at a fixed console width, prefixing each
         # continuation line with a literal "| " margin -- both would otherwise split a long
@@ -957,29 +1279,37 @@ class UmRunEndToEndTests(_Share):
         # explicitly names a different job: that is liveness-lost for THIS job specifically, and
         # must be diagnosed as such (not silently trusted, and not the generic "no heartbeat" or
         # plain staleness wording).
+        #
+        # UMRUN-E2E-TIMING-FLAKES-1: this used to hold the marker for a wall-clock 1 s..3 s window
+        # with -MaxQueueWaitSec 5; a child pwsh that reached its first poll after the marker was
+        # removed never saw a claim and RETRACTED at the 5 s queue ceiling (PR #427 r4, run
+        # 38568661635). Now the test advances on the client's own polls (start_ticked): the marker is
+        # removed only once the client has observed it. The heartbeat is written once, naming another
+        # job, with -MaxHeartbeatAgeSec 3600 so it is fresh by age for the whole test whatever the
+        # runner does -- the ONLY thing that can make it non-fresh is the job mismatch this test
+        # pins (a broken mismatch check would treat it as fresh and wait, and the test would time out).
         running_dir = self.share / "running"
         marker_path = running_dir / "demo.started.json"
-        proc = subprocess.Popen(
-            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
-             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
-             "-TimeoutSec", "1", "-PollSeconds", "1", "-MaxQueueWaitSec", "5", "-JobId", "demo"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = self.start_ticked("-TimeoutSec", "1", "-MaxQueueWaitSec", "300", "-MaxHeartbeatAgeSec", "3600")
         try:
-            time.sleep(1.0)
+            self.wait_for_polls(proc, 1)   # the client has dropped the job and is polling
             running_dir.mkdir(parents=True, exist_ok=True)
             marker = {"jobId": "demo", "startedUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             marker_path.write_text(json.dumps(marker), encoding="ascii")
-            # Fresh, but for a DIFFERENT job -- keep it refreshed so the mismatch is definitely
-            # observed at least once.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
-                self.touch_heartbeat(job_id="someone-elses-job")
-                time.sleep(0.4)
+            # Fresh, but for a DIFFERENT job.
+            self.touch_heartbeat(job_id="someone-elses-job")
+            self.wait_until_the_client_has_read(proc)   # it has now observed the claim
             # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11 (item 3): a job-mismatch alone is not
             # enough to end the wait any more -- the started marker must ALSO be gone (simulating
             # Complete-StartedMarker having already run for whatever job the agent is now on).
             marker_path.unlink()
-            stdout, stderr = proc.communicate(timeout=15)
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                self.fail("the client never stopped: a heartbeat naming a DIFFERENT job, with the started "
+                          "marker gone, was treated as proof of liveness for this job")
         finally:
             if proc.poll() is None:
                 proc.kill()
@@ -1134,56 +1464,170 @@ class UmRunEndToEndTests(_Share):
         # second assignment were ever changed to read the marker's own stale startedUtc instead of
         # the client's own Get-Date, execDeadline would already be ~3600s in the past the instant it
         # is computed, and the very next loop iteration would throw almost immediately -- long
-        # before this client's real budget (2s + >= 20s grace) could possibly be exhausted.
+        # before this client's real budget (-TimeoutSec 8 here) could possibly be exhausted.
+        #
+        # UMRUN-SIBLING-1122-VACUOUS-1: that test was VACUOUS. It checked only that the process was
+        # still alive 2 s after the marker appeared and then delivered a receipt -- but with the
+        # default 30 s heartbeat freshness and a heartbeat written at setUp, a client whose deadline
+        # was (wrongly) anchored an hour in the past ALSO stays alive: the marker is present, so the
+        # "may still own the job" rule keeps it waiting, and the receipt lands first. Breaking the
+        # queue-deadline `$claimedAt = ...` site left it green. It now uses the same shape as the
+        # skew test above (UMRUN-E2E-TIMING-FLAKES-1): (1) the heartbeat's mtime is an hour old, so
+        # liveness is lost by construction; (2) the marker is removed INSIDE the client, at the top
+        # of its second poll (tick_action; the claim is set before that poll begins), so the first
+        # budget check that finds the budget spent also finds no marker and throws -- and no
+        # parent-side delay can move that removal; and (3) -TimeoutSec 8 makes the budget
+        # measurable. A client whose claim starts at its own observation cannot reach that verdict
+        # before observation + 8 s; one anchored to the hour-old startedUtc throws on poll 2 itself.
+        #
+        # What is judged is the client's DECISION, not a poll: the instant the client's own wrapper
+        # caught the throw (verdict_at), measured from the instant the hook placed the marker (which
+        # is before the client's claimedAt, so the bound only errs toward the client). A scheduler
+        # pause between a poll's start and its verdict can therefore only move the verdict later --
+        # a correct client cannot fail on it (UMRUN-SIBLING-1122-VACUOUS-1 r2, sol BLOCKER). The
+        # poll count is deliberately NOT a discriminator (r3, sol r2 BLOCKER): a correct client
+        # whose poll 2 is delayed past the budget also decides after two polls.
+        timeout_sec = 8
         running_dir = self.share / "running"
-        wrapper = self.tmp / "run-with-hook-skewed.ps1"
+        marker_path = running_dir / "demo.started.json"
+        claim_stamp_path = self.tmp / "marker-placed-at.log"
+        stale_at = time.time() - 3600
+        os.utime(self.share / "heartbeat.txt", (stale_at, stale_at))
         hook = (
             "{ "
             f"New-Item -ItemType Directory -Force -Path {_q(running_dir)} | Out-Null; "
             "$marker = @{ jobId = 'demo'; startedUtc = (Get-Date).AddHours(-1).ToUniversalTime().ToString('o') } "
             "| ConvertTo-Json -Compress; "
-            f"Set-Content -LiteralPath {_q(running_dir / 'demo.started.json')} -Value $marker "
-            "-Encoding ascii -NoNewline "
+            f"Set-Content -LiteralPath {_q(marker_path)} -Value $marker "
+            "-Encoding ascii -NoNewline; "
+            f"Set-Content -LiteralPath {_q(claim_stamp_path)} "
+            "-Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ascii "
             "}"
         )
-        wrapper.write_text(
-            "$ErrorActionPreference = 'Stop'\n"
-            f"$hook = {hook}\n"
-            "try {\n"
-            f"  $r = & {_q(UM_RUN)} -ScriptPath {_q(self.job)} -AgentShare {_q(self.share)} "
-            "-TimeoutSec 3 -PollSeconds 1 -MaxQueueWaitSec 0 -JobId 'demo' "
-            "-TestHookAtQueueDeadline $hook\n"
-            "  Write-Output ('E2E_RESULT=OK EXIT=' + $r.exitCode)\n"
-            "} catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
-            encoding="utf-8",
+        # UMRUN-SIBLING-1122-WAIT-LOCUS-1 r3: the claim instant is BRACKETED by the client calling
+        # -TestHookAroundQueueDeadlineClaim immediately before it sets $claimedAt (first line:
+        # claim_lo) and again immediately after (last line: claim_hi). The hook reads the real
+        # clock (same PowerShell UtcNow as the other stamps) and is NOT handed $claimedAt: a client
+        # whose claim is anchored wrongly (an hour back) would otherwise vouch for its own claim.
+        # The in-wait bound below is anchored to claim_lo, which is never later than the true claim,
+        # so a scheduler pause between the claim and the hook's later sample (claim_hi) cannot make
+        # a correct client look early; and not to poll 2, which comes later still.
+        claim_at_path = self.tmp / "claim-at.log"
+        claim_hook = (
+            "{ "
+            f"Add-Content -LiteralPath {_q(claim_at_path)} "
+            "-Value ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) -Encoding ascii "
+            "}"
         )
-        proc = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(wrapper)],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # The started marker's presence keeps a client waiting past its budget; it is removed (in the
+        # client, on poll 2) so the stale-heartbeat verdict can fire (see the skew test above).
+        remove_marker = f"Remove-Item -LiteralPath {_q(marker_path)} -Force"
+        proc = self.start_ticked("-TimeoutSec", str(timeout_sec), "-MaxQueueWaitSec", "0",
+                                 "-MaxHeartbeatAgeSec", "2", queue_deadline_hook=hook,
+                                 tick_action=(2, remove_marker), claim_hook=claim_hook)
         try:
-            marker_path = running_dir / "demo.started.json"
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline and not marker_path.exists():
-                time.sleep(0.1)
-            self.assertTrue(marker_path.exists(), "the hook never wrote the skewed claim marker")
-            # A client that (wrongly) anchored claimedAt to the marker's own hour-old startedUtc
-            # would already be past its execDeadline on the very next poll -- well under 2s away.
-            # Still alive at 2s proves this run's patience came from the client's OWN observation.
-            time.sleep(2.0)
-            self.assertIsNone(
-                proc.poll(),
-                "a stale agent-clock stamp observed at the queue deadline must not shrink the "
-                "client's own patience",
-            )
-            result = {"jobId": "demo", "exitCode": 0, "stdout": "late but real", "stderr": "",
-                      "timeoutSec": 3, "timedOut": False}
-            tmp = self.outbox / "demo.result.tmp"
-            tmp.write_text(json.dumps(result), encoding="ascii")
-            tmp.replace(self.outbox / "demo.result.json")
-            stdout, stderr = proc.communicate(timeout=30)
+            stdout, stderr = proc.communicate(timeout=timeout_sec + 90)
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.communicate()
+        self.assertTrue(self.verdict_path.exists(),
+                        "the client returned instead of throwing UNRESOLVED, so it left no verdict "
+                        "stamp to judge")
+        marker_placed_at = int(claim_stamp_path.read_text(encoding="ascii").strip()) / 1000.0
+        decided_after = self.verdict_at() - marker_placed_at
+        # The anchor is judged by TIME ALONE: a correct client sets claimedAt after the hook stamped
+        # marker_placed_at and throws only once Now >= claimedAt + timeout_sec, so its verdict is
+        # >= timeout_sec after the stamp whatever the scheduler does and however many polls it got
+        # (the 0.5 s of slack covers the stamps' millisecond truncation and a system-clock
+        # adjustment between the two samples; the interval between the hook's stamp and the
+        # client's own claim can only make decided_after LONGER and no process start happens in it,
+        # so it needs no slack; both the stamp and the verdict come from PowerShell
+        # DateTimeOffset.UtcNow, so it is not a PowerShell/Python clock difference). The hour-back client
+        # decides on poll 2, about a second after the stamp. No poll-count bound is asserted: one
+        # would reject a correct client whose polls were delayed (UMRUN-SIBLING-1122-VACUOUS-1 r3,
+        # sol r2 BLOCKER); only the floor of two polls is, since the marker is removed on the second.
+        # The raw timing facts go to the log on the pass path too, so a scheduler-stalled false PASS
+        # (verdict >= 7.5 s after the stamp on a client that should decide in ~1 s) or a near-miss
+        # is visible in a hosted CI log (sol r3, Dot f936802c).
+        #
+        # UMRUN-SIBLING-1122-WAIT-LOCUS-1: elapsed wall time alone does not say WHERE the wait
+        # happened, so the facts also record the wait locus. The client enters its claimed wait at
+        # the instant it sets $claimedAt, which lies between the two stamps the claim hook takes
+        # (claim_lo before it, claim_hi after it; the hook samples the clock itself and is given
+        # nothing by the client) and leaves it at the throw its wrapper stamps as verdict_at; all
+        # stamps are the same PowerShell clock. pre_wait is the time before that entry (the hook
+        # stamp to claim_lo: no waiting by the client, only scheduling), in_wait the time inside it
+        # measured from claim_lo (so it can only over-state the wait, toward the client),
+        # claim_gap the claim_lo -> claim_hi spread (scheduling between the two samples, recorded,
+        # not judged), lo_to_first_poll the claim_lo -> poll-2 gap (the first poll after the claim; it
+        # includes the claim window itself and so the time before the claim, a scheduling delay
+        # a correct client may have, recorded and not judged on its own),
+        # tail the time from the last poll to the verdict, max_tick_gap the longest pause between
+        # two polls (a stall inside the wait shows as a gap far above the 1 s poll interval). A
+        # stall in pre_wait pushes decided_after over the bound for a client that decided at once;
+        # in_wait is judged below.
+        all_ticks = self.ticks()
+        verdict_time = self.verdict_at()
+        tick2_at = next((at for number, at in all_ticks if number == 2), None)
+        claim_stamps = ([int(line.strip()) / 1000.0
+                         for line in claim_at_path.read_text(encoding="ascii").splitlines()
+                         if line.strip()] if claim_at_path.exists() else [])
+        claim_lo = claim_stamps[0] if len(claim_stamps) >= 2 else None
+        claim_hi = claim_stamps[-1] if len(claim_stamps) >= 2 else None
+        locus_facts = f" wait_locus=unknown(claim stamps={len(claim_stamps)}, need 2)"
+        if claim_lo is not None:
+            wait_ticks = [at for number, at in all_ticks if number >= 2]
+            gaps = [later - earlier for earlier, later in zip(wait_ticks, wait_ticks[1:])]
+            lo_to_first_poll = f"{tick2_at - claim_lo:.3f}s" if tick2_at is not None else "none"
+            locus_facts = (
+                f" claim_lo={claim_lo:.3f} claim_hi={claim_hi:.3f} claim_gap={claim_hi - claim_lo:.3f}s"
+                f" pre_wait={claim_lo - marker_placed_at:.3f}s"
+                f" in_wait={verdict_time - claim_lo:.3f}s lo_to_first_poll={lo_to_first_poll}"
+                f" tail={verdict_time - (wait_ticks[-1] if wait_ticks else claim_lo):.3f}s"
+                f" polls_in_wait={len(wait_ticks)} max_tick_gap={max(gaps, default=0.0):.3f}s")
+        timing_facts = (
+            f"decided_after={decided_after:.3f}s marker_placed_at={marker_placed_at:.3f} "
+            f"verdict_at={verdict_time:.3f} tick2_at="
+            + (f"{tick2_at:.3f}" if tick2_at is not None else "none")
+            + f" timeout_sec={timeout_sec}" + locus_facts)
+        print(f"UMRUN-1122-TIMING {timing_facts}", file=sys.stderr)
+        self.assertGreaterEqual(
+            decided_after, timeout_sec - 0.5,
+            "a stale agent-clock stamp observed at the queue deadline must not shrink the client's "
+            f"own patience: it reached the liveness verdict {decided_after:.1f}s "
+            f"after the marker was placed, before its own {timeout_sec}s budget (counted from "
+            f"observing the marker) could elapse [{timing_facts}]")
+        self.assertGreaterEqual(
+            len(self.ticks()), 2,
+            "the client never reached its second poll, the one on which the marker is removed")
+        # The waited interval must lie INSIDE the wait region: the time the client spent between
+        # entering its claimed wait and its verdict has to cover the budget by itself, so a stall
+        # before the wait (pre_wait) cannot carry decided_after over the bound above for a client
+        # that decided at once. The wait is measured from claim_lo, the stamp taken immediately
+        # BEFORE the client sets $claimedAt, never from poll 2 and never from the later claim_hi
+        # sample: a correct client throws once Now >= claimedAt + timeout_sec, and claimedAt >=
+        # claim_lo, so verdict - claim_lo can only be LONGER than the wait the client really did;
+        # a scheduling delay between the claim and either poll 2 (lo_to_first_poll) or the hook's later
+        # sample (claim_gap) cannot fail a correct client (r2 sol r1 BLOCKER; r3 sol r2 BLOCKER).
+        # A stall that precedes claim_lo is still caught. Same 0.5 s slack as above (stamp
+        # truncation and system-clock adjustment only); the bound is not looser than the one above.
+        #
+        # UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1: that bound cannot see a stall INSIDE the claim
+        # window (claim_lo to the assignment), where an hour-back client pausing ~8 s still decides
+        # >= timeout_sec - 0.5 after claim_lo. So a pass that rests on time inside the window is not
+        # reported as a pass: judge_claim_wait() returns INCONCLUSIVE when the verdict is not also a
+        # full budget after claim_hi, and the test skips at the very end (after every other check
+        # below has run) rather than vouching for a client it could not tell from a broken one.
+        # The FAIL branch above is unchanged and no wall-clock ceiling is added; claim_gap stays a
+        # diagnostic. The verdict table is covered by UmRunClaimWaitOracleTests.
+        self.assertIsNotNone(claim_lo, f"no claim bracket, so the wait locus is unknown [{timing_facts}]")
+        self.assertGreaterEqual(
+            verdict_time - claim_lo, timeout_sec - 0.5,
+            f"the client's verdict came {verdict_time - claim_lo:.1f}s after the instant just before "
+            f"it entered its claimed wait (claim_lo), inside its own {timeout_sec}s budget: the {decided_after:.1f}s "
+            "measured from the marker stamp was spent before the wait began (scheduler or hook time), "
+            f"not waiting [{timing_facts}]")
         # Whitespace-flattened, with "|" removed: PowerShell's own default uncaught-exception
         # formatting word-wraps a long message at a fixed console width, prefixing each
         # continuation line with a literal "| " margin -- both would otherwise split a long
@@ -1191,8 +1635,11 @@ class UmRunEndToEndTests(_Share):
         # length rather than content. None of this file's own asserted text ever contains "|".
         combined = " ".join(_ANSI_ESCAPE.sub("", (stdout or "") + (stderr or "")).replace("|", " ").split())
         self.assertNotIn("was never claimed", combined, combined)
-        self.assertNotIn("THREW", combined, combined)
-        self.assertIn("E2E_RESULT=OK EXIT=0", combined, combined)
+        self.assertNotIn("RETRACTED", combined, combined)
+        self.assertIn("UNRESOLVED:", combined, combined)
+        self.assertIn("stopped proving liveness", combined, combined)
+        self.assertIn("its own started marker is gone too", combined, combined)
+        skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)
 
     # ---- round 11 (sol BLOCKER, item 2): RETRACT at the queue deadline instead of leaving the job
     # ---- in the inbox for the agent to claim after this client has already given up ------------
@@ -1714,15 +2161,24 @@ class UmRunAdmissionWaitTests(_Share):
     def test_the_admission_ceiling_stops_unresolved_and_never_withdraws_the_job(self) -> None:
         # Slots-full and unknown-feed holds are uncapped in the agent; -MaxAdmissionWaitSec bounds them
         # here. The outcome is UNRESOLVED (the agent still holds the job), never RETRACTED.
-        proc = self.start("-TimeoutSec", "60", "-MaxQueueWaitSec", "1", "-MaxAdmissionWaitSec", "3")
+        #
+        # UMRUN-E2E-TIMING-FLAKES-1: this used to rewrite heartbeat.txt every 0.4 s from the test
+        # while the client read it. write_text truncates before it writes, so a read in between is
+        # empty and the ceiling message says "last gate state=?" (PR #425 r5, run 38528323174). The
+        # ceiling does not need a live heartbeat at all -- only the gate state it carries -- so it is
+        # written ONCE, before the marker, and nothing writes it while the client runs. The first
+        # poll is also held until the marker exists: with -MaxQueueWaitSec 1 the old test relied on
+        # the test process writing the marker within a second of the drop, whatever the scheduler did.
+        proc = self.start_ticked("-TimeoutSec", "60", "-MaxQueueWaitSec", "1", "-MaxAdmissionWaitSec", "3",
+                                 hold_first_poll_until=self.share / "running" / "demo.started.json")
         try:
             self.wait_for_drop(proc)
+            self.gate_heartbeat("slots-full", 0)
             self.write_marker(self.admission_marker())
-            self.hold(proc, 20.0, state="slots-full")
         except BaseException:
             proc.kill()
             raise
-        combined = self.finish(proc)
+        combined = self.finish(proc, timeout=120)
         self.assertNotEqual(proc.returncode, 0, combined)
         self.assertIn("UNRESOLVED:", combined, combined)
         self.assertIn("held unlaunched in the agent's heavy-slot admission gate", combined, combined)
@@ -1876,6 +2332,229 @@ class UmRunDeadlineTypeTests(unittest.TestCase):
                 f"a wait-loop deadline root assignment constructs {type_name}, not DateTimeOffset "
                 f"-- reintroducing the Kind-ambiguity a prior round had to remove: {result}",
             )
+
+
+class UmRunClaimWaitOracleTests(unittest.TestCase):
+    """UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1 (Dot e3cb59d2 on #531 50a17a9c, hub ACK 6294165342).
+
+    The client sets `$claimedAt` at an instant the test cannot see, only bracket: claim_lo is stamped
+    just before it, claim_hi just after. An hour-back client that stalls ~8 s inside that window
+    reaches its poll-2 verdict ~8 s after claim_lo, so `verdict - claim_lo` alone cannot tell it from a
+    healthy client. These cases drive the verdict table with synthetic stamps (T = 8 s budget), so
+    the claim does not depend on what a live scheduler happens to do, and none of them adds a
+    wall-clock ceiling: a stamp pattern that cannot separate the two is INCONCLUSIVE, never FAIL."""
+
+    T = 8
+
+    def judge(self, claim_lo: float, claim_hi: float, verdict_time: float) -> str:
+        return judge_claim_wait(claim_lo, claim_hi, verdict_time, self.T)
+
+    def test_a_healthy_client_with_a_tight_claim_bracket_passes(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.005, 8.2), CLAIM_WAIT_PASS)
+
+    def test_an_hour_back_client_that_decides_at_once_fails(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.005, 1.1), CLAIM_WAIT_FAIL)
+
+    def test_an_hour_back_client_stalled_inside_the_claim_window_is_not_reported_as_a_pass(self) -> None:
+        # Dot's masking case: claim_lo stamped, the client stalls 8 s, assigns an hour-back claimedAt,
+        # claim_hi is stamped ~8 s after claim_lo, poll 2 decides ~1 s later. verdict - claim_lo
+        # = 9.0 s clears the bound, yet no wait happened inside the claimed wait.
+        self.assertEqual(self.judge(0.0, 8.0, 9.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_healthy_client_stalled_after_assigning_claimed_at_is_inconclusive_not_failed(self) -> None:
+        # The same stamps an hour-back client produces: claimedAt assigned at once, then an 8 s stall
+        # before claim_hi. It decides at claimedAt + T, ~8.1 s after claim_lo. Stamps alone cannot
+        # separate it from the case above, so neither may be judged either way.
+        self.assertEqual(self.judge(0.0, 8.0, 8.1), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_healthy_client_stalled_before_assigning_claimed_at_passes(self) -> None:
+        # Stall inside the window, THEN a correct assignment: the budget is spent after claim_hi.
+        self.assertEqual(self.judge(0.0, 8.0, 16.1), CLAIM_WAIT_PASS)
+
+    def test_the_conclusive_bound_uses_the_same_half_second_slack_as_the_other_bounds(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.4, 8.0), CLAIM_WAIT_PASS)
+        self.assertEqual(self.judge(0.0, 0.6, 8.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_verdict_inside_the_budget_fails_whatever_the_bracket_width(self) -> None:
+        self.assertEqual(self.judge(0.0, 8.0, 7.0), CLAIM_WAIT_FAIL)
+        self.assertEqual(self.judge(0.0, 0.005, 7.0), CLAIM_WAIT_FAIL)
+
+    # UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1 (Dot 89837a67 on #555 6a8c3b35, items 1+2): the cases
+    # above sit NEAR the two T-minus-slack boundaries; these sit EXACTLY on them and one step either
+    # side, to pin the two strict `<` comparisons in judge_claim_wait(). T = 8 and slack = 0.5, so
+    # both boundaries are 7.5. Every stamp below (0.0, 0.5, 7.5, 8.0, 7.5 -/+ 1/64) is a dyadic
+    # rational, exact in binary floating point, so each "exactly on the boundary" subtraction really
+    # is equal to 7.5 rather than off by a rounding error.
+    _STEP = 1 / 64
+
+    def test_a_verdict_exactly_t_minus_slack_after_claim_lo_is_not_failed(self) -> None:
+        # verdict - claim_lo == 7.5 == T - slack: strict `<` is False, so not FAIL. claim_hi == claim_lo
+        # keeps the second comparison at 7.5 < 7.5, also False, so the outcome is PASS.
+        self.assertEqual(self.judge(0.0, 0.0, 7.5), CLAIM_WAIT_PASS)
+
+    def test_a_verdict_one_step_short_of_t_minus_slack_after_claim_lo_fails(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.0, 7.5 - self._STEP), CLAIM_WAIT_FAIL)
+
+    def test_a_verdict_exactly_t_minus_slack_after_claim_hi_is_conclusive_not_inconclusive(self) -> None:
+        # verdict - claim_hi == 7.5 == T - slack: strict `<` is False, so not INCONCLUSIVE. The first
+        # comparison is 8.0 - 0.0 = 8.0 >= 7.5, so it does not fail either: PASS.
+        self.assertEqual(self.judge(0.0, 0.5, 8.0), CLAIM_WAIT_PASS)
+
+    def test_a_verdict_one_step_short_of_t_minus_slack_after_claim_hi_is_inconclusive(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.5 + self._STEP, 8.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_both_boundaries_hold_when_they_coincide_at_a_shared_stamp_offset(self) -> None:
+        # claim_lo == claim_hi == 1.0 and verdict 8.5: both differences are exactly 7.5.
+        self.assertEqual(self.judge(1.0, 1.0, 8.5), CLAIM_WAIT_PASS)
+
+    def test_the_slack_is_subtracted_from_the_budget_not_ignored(self) -> None:
+        # With no slack the first bound would be 8.0 and a verdict at 7.5 would FAIL; the half
+        # second is what makes it a PASS. Passing slack=0.0 explicitly shows the contrast.
+        self.assertEqual(judge_claim_wait(0.0, 0.0, 7.5, self.T), CLAIM_WAIT_PASS)
+        self.assertEqual(judge_claim_wait(0.0, 0.0, 7.5, self.T, slack=0.0), CLAIM_WAIT_FAIL)
+
+
+class UmRunClaimWaitSkipWiringTests(unittest.TestCase):
+    """UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1 (Dot 89837a67 on #555, item 2): an INCONCLUSIVE
+    claim-window verdict must reach skipTest in the live wait test, which had only been exercised in
+    review. skip_if_claim_wait_inconclusive() is the seam the live test now calls as its last step."""
+
+    T = 8
+    FACTS = "decided_after=9.000s timeout_sec=8"
+
+    @staticmethod
+    def _run(claim_lo: float, claim_hi: float, verdict_time: float) -> unittest.TestResult:
+        class _Probe(unittest.TestCase):
+            def runTest(self) -> None:
+                skip_if_claim_wait_inconclusive(
+                    self, claim_lo, claim_hi, verdict_time, UmRunClaimWaitSkipWiringTests.T,
+                    UmRunClaimWaitSkipWiringTests.FACTS)
+
+        result = unittest.TestResult()
+        _Probe().run(result)
+        return result
+
+    def test_an_inconclusive_stamp_pattern_is_recorded_as_a_skip_with_the_inconclusive_reason(self) -> None:
+        # Dot's masking case: judge_claim_wait() rules (0.0, 8.0, 9.0) INCONCLUSIVE.
+        self.assertEqual(judge_claim_wait(0.0, 8.0, 9.0, self.T), CLAIM_WAIT_INCONCLUSIVE)
+        result = self._run(0.0, 8.0, 9.0)
+        self.assertEqual(len(result.skipped), 1, result.skipped)
+        self.assertEqual((result.errors, result.failures), ([], []))
+        reason = result.skipped[0][1]
+        self.assertTrue(reason.startswith("INCONCLUSIVE:"), reason)
+        self.assertTrue(reason.endswith(f"[{self.FACTS}]"), reason)
+
+    def test_a_pass_stamp_pattern_does_not_skip(self) -> None:
+        self.assertEqual(judge_claim_wait(0.0, 0.005, 8.2, self.T), CLAIM_WAIT_PASS)
+        result = self._run(0.0, 0.005, 8.2)
+        self.assertEqual((result.skipped, result.errors, result.failures), ([], [], []))
+        self.assertEqual(result.testsRun, 1)
+
+    def test_a_fail_stamp_pattern_does_not_skip(self) -> None:
+        # The FAIL branch is asserted by the live test's own assertGreaterEqual before this step; the
+        # seam must not turn it into a skip either.
+        self.assertEqual(judge_claim_wait(0.0, 0.005, 1.1, self.T), CLAIM_WAIT_FAIL)
+        result = self._run(0.0, 0.005, 1.1)
+        self.assertEqual((result.skipped, result.errors, result.failures), ([], [], []))
+
+    def test_the_live_wait_test_ends_by_calling_the_seam(self) -> None:
+        import inspect
+        source = inspect.getsource(UmRunEndToEndTests)
+        calls = source.count(
+            "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)")
+        self.assertEqual(calls, 1, "the live wait test no longer routes its INCONCLUSIVE verdict through the seam")
+
+    # UMRUN-SEAM-CALL-POSITION-PIN-1 (opus r1 on #592): the count above is blind to WHERE the call
+    # sits; these pin it as the live wait test's final top-level statement.
+    _SEAM_CALL = "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)"
+    _SYNTH = (
+        "class Live:\n"
+        "    def test_it(self):\n"
+        "{body}"
+        "\n"
+    )
+
+    @classmethod
+    def _synth(cls, *body: str) -> str:
+        return cls._SYNTH.format(body="".join(f"        {line}\n" for line in body))
+
+    @classmethod
+    def _real_source(cls) -> str:
+        return Path(__file__).read_text(encoding="utf-8")
+
+    @classmethod
+    def _real_source_with_call_moved_above(cls, marker: str) -> str:
+        """The file's own source with the live wait test's seam call moved to just above the first
+        line in that test containing `marker`."""
+        source = cls._real_source()
+        lines = source.splitlines()
+        live = next(node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.ClassDef) and node.name == "UmRunEndToEndTests")
+        method = next(m for m in live.body if isinstance(m, ast.FunctionDef) and m.end_lineno is not None
+                      and lines[m.end_lineno - 1].strip() == cls._SEAM_CALL)
+        call_idx = method.end_lineno - 1
+        target_idx = next(i for i in range(method.lineno - 1, call_idx) if marker in lines[i])
+        lines.insert(target_idx, lines.pop(call_idx))
+        return "\n".join(lines) + "\n"
+
+    def test_the_live_wait_tests_final_statement_is_the_seam_call(self) -> None:
+        self.assertIsNone(seam_call_position_problem(
+            self._real_source(), "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD))
+
+    # UMRUN-SIBLING-1122-SLACK-COMMENT-SAME-CLOCK-1 (Dot c91c2dda on #597, H1): bind the method name.
+    def test_the_seam_call_moved_into_a_differently_named_method_is_rejected_when_the_name_is_bound(self) -> None:
+        source = self._synth(self._SEAM_CALL).replace("def test_it(", "def test_other(")
+        problem = seam_call_position_problem(source, "Live", method_name="test_it")
+        self.assertIsNotNone(problem)
+        self.assertIn("test_other", problem)
+        self.assertIn("test_it", problem)
+
+    def test_the_seam_call_in_the_renamed_real_live_wait_test_is_rejected_when_the_name_is_bound(self) -> None:
+        mutated = self._real_source().replace(f"def {_SEAM_CALL_METHOD}(", "def test_renamed_live_wait(", 1)
+        self.assertNotEqual(mutated, self._real_source())
+        problem = seam_call_position_problem(mutated, "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD)
+        self.assertIsNotNone(problem)
+        self.assertIn("test_renamed_live_wait", problem)
+        self.assertIn(_SEAM_CALL_METHOD, problem)
+
+    def test_a_seam_call_in_the_bound_method_name_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth(self._SEAM_CALL), "Live", method_name="test_it"))
+
+    def test_the_seam_call_moved_above_the_unresolved_assert_is_rejected_though_the_count_still_passes(self) -> None:
+        for marker in ('self.assertIn("UNRESOLVED:"', 'self.assertIn("its own started marker is gone too"'):
+            with self.subTest(marker=marker):
+                mutated = self._real_source_with_call_moved_above(marker)
+                class_node = next(node for node in ast.parse(mutated).body
+                                  if isinstance(node, ast.ClassDef) and node.name == "UmRunEndToEndTests")
+                # The mutation is one the old count-only pin cannot see ...
+                self.assertEqual(ast.get_source_segment(mutated, class_node).count(self._SEAM_CALL), 1)
+                # ... and the position pin rejects it.
+                problem = seam_call_position_problem(mutated, "UmRunEndToEndTests")
+                self.assertIsNotNone(problem)
+                self.assertIn("not the final top-level statement", problem)
+
+    def test_a_seam_call_followed_by_any_further_statement_is_rejected(self) -> None:
+        source = self._synth(self._SEAM_CALL, "self.assertTrue(True)")
+        self.assertIn("not the final", seam_call_position_problem(source, "Live") or "")
+
+    def test_a_seam_call_nested_in_a_branch_or_assigned_is_not_the_final_statement(self) -> None:
+        for body in (("if claim_lo:", "    " + self._SEAM_CALL),
+                     (f"outcome = {self._SEAM_CALL}",),
+                     (f"return {self._SEAM_CALL}",)):
+            with self.subTest(body=body):
+                self.assertIsNotNone(seam_call_position_problem(self._synth(*body), "Live"))
+
+    def test_a_missing_or_duplicated_seam_call_is_rejected(self) -> None:
+        self.assertIn("found 0", seam_call_position_problem(self._synth("pass"), "Live") or "")
+        self.assertIn("found 2", seam_call_position_problem(
+            self._synth(self._SEAM_CALL, self._SEAM_CALL), "Live") or "")
+
+    def test_a_seam_call_with_different_arguments_is_rejected(self) -> None:
+        source = self._synth("skip_if_claim_wait_inconclusive(self, claim_hi, claim_lo, verdict_time, timeout_sec, timing_facts)")
+        self.assertIn("unexpected arguments", seam_call_position_problem(source, "Live") or "")
+
+    def test_a_final_seam_call_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth("self.assertTrue(True)", self._SEAM_CALL), "Live"))
 
 
 def _git(args: list[str], cwd: Path) -> None:

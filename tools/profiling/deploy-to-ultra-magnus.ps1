@@ -59,9 +59,12 @@ $head = (& git -C $repo rev-parse HEAD 2>$null)
 if ($head) { $head = $head.Trim() }
 
 function Rc($src, $dst, $extra) {
+    # The OS robocopy by full path: the Resource Kit copy can sit first on PATH and rejects /BYTES, ignores /MAXAGE.
+    $robocopyExe = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+    if (-not (Test-Path -LiteralPath $robocopyExe -PathType Leaf)) { throw "robocopy not found at $robocopyExe" }
     $rcArgs = @($src, $dst) + $extra + $listOnly + @("/NFL","/NDL","/NJH","/NP","/R:1","/W:1")
     Write-Host ("robocopy {0} -> {1} {2}" -f $src, $dst, ($extra -join " "))
-    & robocopy.exe @rcArgs | Out-Null
+    & $robocopyExe @rcArgs | Out-Null
     # robocopy exit codes < 8 are success
     if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE): $src -> $dst" }
 }

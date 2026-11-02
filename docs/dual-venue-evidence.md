@@ -274,17 +274,81 @@ other-named session lose all of its events (15-17k "ETW events were lost" per 12
 longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
 (checked before the listing and again right after it); otherwise it records that it did not run. "A PresentMon process" is every `PresentMon*` process except one POSITIVELY
-identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` (Bachelor) is recognised because its pid is the `ProcessId` of a
-registered Windows service (`Win32_Service`), and a process with a readable path that is neither the pinned image/path nor a capture image is excluded too. The pinned capture executable
-(image name equal to the pinned one, case-insensitive, or the pinned cache path), a foreign capture image, and any process whose path cannot be read and that is no registered service
-are live (the sweep is skipped, with the reason recorded in `orphanSweep.livePresentMonProcesses`: name, pid, `pathReadable`, reason). Excluded processes are recorded in
-`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`; never a path). A process list or a service lookup that cannot be read stops the sweep with
+identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` is recognised on a host where it is a registered Windows service, because its pid is the `ProcessId` of that
+service (`Win32_Service`); on Bachelor it is no registered service and is recognised by the Intel parent identity below. Every other candidate process (r3 below: not only a
+`PresentMon*` name) is live: the pinned capture executable (image name equal to the pinned one, case-insensitive, or the pinned
+cache path), a foreign capture image, a process whose path cannot be read, and (since BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r2) a readable-path process that is no capture image -- a
+readable path is no identity, because a second harness under the same agent account has one. The reasons are recorded in `orphanSweep.livePresentMonProcesses` (name, pid, `pathReadable`,
+reason, `nonCaptureIdentity`, `parentName`, `parentPid`, `identityError`). Excluded processes are recorded in
+`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`, `nonCaptureIdentity = registered_service`; never a path). A process list or a service lookup that cannot be read stops the sweep with
 `error`. A job-issued `Kill()` is followed by the terminate of the job's own named
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
 
-The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
+*The harness's own sessions are swept even beside a positively identified non-capture PresentMon (BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1).* On Bachelor the `PresentMonService` is
+no registered service: it is a child of `IntelGraphicsSoftware.Service.exe`, and the agent cannot read its path. So it stayed live and skipped the whole sweep on every leg. On
+2026-10-27 at 20:06:20Z a lease demotion tree-killed a cpu leg mid-capture, leaving `MLVAttr3-...-150416` running, and every later capture on the host wrote no CSV (16 of 16
+cuda legs, `PRESENTMON_UNAVAILABLE`). A live process is left out of the `MLVAttr3-*` blockers only on POSITIVE identity (r2; a name test is not enough: a second harness may run the
+permitted `-PresentMonName PresentMon-custom.exe`, which no capture-image pattern matches). The identity is `nonCaptureIdentity = intel_graphics_presentmonservice`: image name exactly
+`PresentMonService` AND, per `Win32_Process`, a parent named exactly `IntelGraphicsSoftware.Service.exe` that started no later than the child. A parent read that fails, finds no row or
+no `CreationDate`, or names another parent leaves the process a blocker (`identityError` says why). So when every live process is positively identified, the sweep runs in
+`orphanSweep.scope = harness_sessions`: it terminates the `MLVAttr3-*` orphans, leaves the default `PresentMon` session (recorded in `orphanSweep.deferred`), and stops on a re-check
+(the same blocker helper before every terminate and every `logman stop`) for any process without that identity. With no candidate process alive (r3: not only a `PresentMon*` name) the scope is `all`, as before.
+`newlyListed` is what the full initial listing lacked, so a deferred session is never reported as new.
+r3: the processes examined are no longer only `PresentMon*`, because `-PresentMonName` accepts any `<name>.exe` (a live `capture.exe` beside the Intel child was invisible, and
+the sweep stopped its `MLVAttr3-*` session). Every process is enumerated, and one is a candidate when ANY of these holds: a `PresentMon*` name, the configured `-PresentMonName`, the
+pinned cache path, the pinned SHA-256 (read best-effort), or a command line (`Win32_Process.CommandLine`) naming an `MLVAttr3-` session or a `--session_name`/`-session_name`
+argument (reason `capture_session_command_line`). The sweeping job itself is never a candidate. One snapshot serves the scope choice and every re-check. If the command-line query fails,
+the sweep fails closed: `skippedReason = capture_owner_command_lines_unreadable` at the scope choice, and an `error` with that prefix on a re-check. Command lines that read empty are
+counted in `orphanSweep.unreadableCommandLineCount`.
+r4: a process with no readable command line, under a name, path and hash no route matches, is an UNIDENTIFIED possible owner, whether its path reads or not. Before r4 it was
+dropped without a record, so beside the Intel child the sweep could stop that capture's live `MLVAttr3-*` session. Only positive non-ownership evidence clears it, and the one kind is a
+registered service's pid (one `Win32_Service` query per snapshot). The session is recorded but is no evidence: another harness may run its job, and so its capture, in session 0. In scope
+`harness_sessions` any unidentified owner left stops the sweep: `skippedReason = capture_owner_unidentified` at the scope choice and after the listing, `abortedReason` with that value
+before a terminate or a `logman stop`. `orphanSweep.unidentifiedCaptureOwnerIds` names the pids, `unidentifiedCaptureOwners` gives name, pid and session, and
+`unidentifiedNonOwnership` holds the job's session, how many processes were held and how many a service registration cleared. Scope `all` is unchanged. A non-elevated agent cannot
+read the command line of system processes (csrss, winlogon, dwm, fontdrvhost and most of session 0), and most are no registered service, so beside the Intel child the sweep now
+refuses on such a host. The r4 run summary has the measurement.
+r5: a process is its pid AND its creation instant, never its pid and name. A `capture.exe` that exits and a later `capture.exe` under the same pid share both, so a command line counts
+for an enumerated process only when the row's `CreationDate` equals that process's own `StartTime` (both as UTC, to the microsecond). One instant read before and after the enumeration
+means one process held the pid throughout. An unreadable or different instant leaves the command line unread, so the process is held as above. The path is read between two
+`StartTime` reads and is dropped when they differ. The Intel child's own `Win32_Process` row must carry that process's name and instant too (`identityError =
+process_creation_instant_unbound`). `unidentifiedCaptureOwners` records `startedUtc`. A display-report
+failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, `newlyListed`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE`
+detail, and a sweep record that cannot be read names `recordUnreadable=` there instead of being dropped. A dictionary report whose keys differ only by case keeps every entry.
+
+**Report helper contract (r11).** It covers `Add-AttrCudaPresentMonEventsLostDetailToReport` and `Add-AttrCudaPresentMonOrphanSweepDetailToReport`, and replaces the r10
+sentence ("none dropped", which a containment dedupe broke). Both helpers carry the same block for it in `AttrCudaArtifacts.psm1`.
+- **Nothing to add.** With no detail to write (no sweep record, a clean sweep, no events record, no loss) the helper returns the report it was given.
+- **pscustomobject.** This is the job's own shape (`Get-AttrCudaPresentMonDisplayReport`), and r11 does not change it. It comes back as a pscustomobject copy with only `reason`
+  different. A reason that already carries the helper's token (`PRESENTMON_EVENTS_LOST`; the `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:` prefix or bracket) does not get it again.
+- **Dictionary.** It comes back as a NEW canonical report and is never returned by reference with the detail added. The input is never mutated.
+  - *Reason-like key.* This is a string key that equals `reason` under OrdinalIgnoreCase, or that the report's own public `Comparer` calls equal to `reason`. That second test
+    catches `rea<U+00AD>son` under a culture comparer. Some reports have no readable comparer (Hashtable, OrderedDictionary). If such a report's own lookup holds a `reason` that
+    no OrdinalIgnoreCase key explains, the one string key holding the text that lookup returns is reason-like.
+    A report whose key type is not string and that shows no public `Comparer` (`ReadOnlyDictionary[int,object]`, `ImmutableDictionary[int,object]`) cannot be asked for `reason`
+    (r13: the lookup binds to the key type and throws). With no string key among its keys it holds no `reason`, and it takes the canonical route like any other dictionary. A report
+    that has string keys and still cannot answer the lookup fails closed (below).
+  - *Fold.* All reason-like entries become one key, `reason`, at the place of the first one. Its text is their non-empty texts in enumeration order, joined by a space. A text
+    that is ordinally EQUAL to an earlier one is left out; containment never removes a text. Then ` [<detail>]` is appended once. It is skipped only if the folded text already
+    carries exactly this detail: it equals the detail, begins with `<detail> [`, or contains `[<detail>]`. No early return skips the write.
+  - *Other keys.* Each one is copied with its value. A non-string key is copied under its string form. The copy goes into an `[ordered]` table (OrdinalIgnoreCase on pwsh 7). It
+    is returned as a pscustomobject when every key can be a member name (the r3 shape), and as that table otherwise (for example when there is an empty key).
+  - *Collision rule (deterministic, no value dropped).* Two keys can collide in that table: case variants such as `status`/`Status`, `U+03A3`/`U+03C2`, or a string form equal
+    to another key, such as `1` and `'1'`. The report is then an exact-key `OrderedDictionary` that keeps every original key and value in order. The reason-like keys are still
+    folded into `reason`, so `.reason` reads the folded text. A second call keeps the same shape.
+  - *Fail closed.* In three cases the input comes back unchanged and the detail is not added: a held reason that no rule can tie to one key (r8: a report with no readable
+    comparer whose text two keys hold), a report with string keys whose `reason` lookup throws (r13), and an exact-key copy that its keys cannot build.
+- **Not promised.**
+  - `.Reason` or `.REASON` on an exact-key copy (only `reason` is spelled there).
+  - Lookalike matching for a dictionary whose comparer is not readable, apart from the one-holder rule above.
+  - The pscustomobject token rule is not exact-equality: it is the job path, left as it was.
+  - Windows PowerShell 5.1's culture-insensitive `[ordered]`: more keys collide there and take the exact-key rule.
+  - Comparers that throw: the report is then read as one without a readable comparer (OrdinalIgnoreCase plus the one-holder rule).
+
+The sweep is built not to stop a live capture or a session it did not list as an orphan (round 2; the r4 and r5 ownership refusals above hold the sweep when a capture owner cannot be
+identified, which is not a proof that none exists): it acts only on the names listed before its second liveness check -- a name a
 later listing shows (another job's capture starting meanwhile) is recorded as `newlyListed` and left alone -- and it re-checks that no PresentMon process exists immediately
 before **each** terminate and **each** `logman stop`; the first process that appears ends the sweep (`abortedReason` / `abortedBefore`, with `remaining` still derived from a
 final listing). A failing `logman query -ets` is asked for once more (`listAttempts`), a failed middle listing is a recorded verification failure, and every `logman` call runs
@@ -306,7 +370,7 @@ The job composes a one-backend sheet; `New-VenueSheetPair.ps1` then pairs the tw
 into one `cuda | cpu` sheet, by frame index. Each receipt's `look` block carries the sheet's sha256 and
 path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because receipts are never edited.
 
-* `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
+* `lookFlavor` (`classic` default | `cinematic` | `film` | `vision50d`) is in the leg spec and the receipt subject and is passed
   to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. The app reads it (LOOK-ASSIST-FLAVORS-1,
   [docs/look-assist-flavors.md](look-assist-flavors.md)) and reports the flavor it applied on
   `gui_smoke.visual_state` (`look_assist_flavor`). The job copies that report into its summary as
@@ -386,7 +450,7 @@ the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-
 * **The standard leg set** is `legsets/display-matrix.json`: the owner clip M16-1243, Look Assist Cinematic, `{fullscreen, windowed}` x `{scale 1 = full, 2 = half, 4 = quarter}` x `{cuda, cpu}` = **12 cells**.
   Each cell is an ordinary committed leg spec (`legs/m16-1243-display-<mode>-s<scale>.json`, six specs, each listing both backends); the set only names them. Why a set file and not one matrix spec the
   runner expands: a receipt is bound to a committed spec by its sha256 (`Find-DvCommittedLegSpec`), so a cell that is not a committed spec could never validate. The CUDA texture route honours scales 2 and 4
-  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at 1 reads `2->1` or `4->1` and ends `SCALE_NOT_HONOURED`.
+  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at full resolution reads `Half res (0.5x)->Full res (1x)` or `Quarter res (0.25x)->Full res (1x)` in the summary table (receipt fields stay the numbers `2`/`4` and `1`) and ends `SCALE_NOT_HONOURED`.
   Roles are declared in `venues.json` (`DUAL-VENUE-DISPLAY-MATRIX-1`: Bachelor acceptance, Ultra-Magnus supplementary).
 * **Run it** (one entry point, the same script; `-LegSet` and `-LegSpec` are different parameter sets):
 
@@ -456,6 +520,42 @@ append-only (created with `CreateNew`; a repeat is refused, never overwritten). 
 the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt` / `smoke-stdout.txt`) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
 `.claude-state` too (the run log and result name an owner clip's run; they stay local like the receipt).
 
+### Staging a commit on a venue (tracked: `Invoke-VenueStageNightly.ps1`)
+
+`tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1` is the tracked staging path (UM-REGULAR-BASELINE-STAGE-1). It runs the four steps
+above in order: the DLL pair on Ultra-Magnus (harvested when its single-use JobId already built the sha), the assemble on the board host under
+build-guard, the stage job, and the smoke-runner stage job. It stages at most one commit per night (default: the local `fork/master` ref, no fetch)
+and is ready for one scheduled call (UM-REGULAR-BASELINE-SCHEDULE-1: fetch fork, this driver, then `Invoke-VenueBaseline.ps1` on exit 0).
+
+```powershell
+pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
+```
+
+- The cache is the truth, read by name. A sha whose `<agentShare>\cache\playback-attr-3-cuda-<sha12>-build.json`, three artifacts and smoke-runner
+  dir are already there is `STAGE_SKIP_ALREADY` and is never re-assembled. A re-assemble makes a new manifest (`assembledAtUtc`), so a spent default
+  stage JobId whose cache does not hold the assembled manifest is re-staged under `-JobIdSuffix n<yyyyMMddHHmm>` (#508). Every `STAGE_OK` is
+  re-hashed by name, and a mismatch is `STAGE_VERIFY_MISMATCH`.
+- The receipt row (`<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, schema `mlv-app/venue-stage-nightly/v1`) records
+  `buildManifestSha256` as that by-name hash. It is the exact file `Invoke-VenueBaseline.ps1` and `Invoke-VenueLeg.ps1` hash.
+- The night is reserved before it is spent. Before the first staging step, the driver appends a `STAGE_RESERVED` row (venue, `nightKey`,
+  `sourceCommit`, a new `reservationId`). It flushes the row and reads it back. Every later row of that call carries the same `reservationId`.
+- The once-per-night check counts `STAGE_OK` rows and reservations. A reservation holds its night for its sha whether its call ended
+  `STAGE_OK`, failed, or never wrote its closing row (the call was killed, or its row was lost). For another sha that night:
+  - `NIGHT_ALREADY_BUILT` (exit 0) when the holder ended `STAGE_OK`;
+  - `NIGHT_RESERVED` (exit 52) otherwise. The hub then inspects the venue cache.
+
+  The same sha resumes, and its row lists, under `reconciled`, every incomplete reservation it took over.
+- Receipt I/O fails closed with `RECEIPT_IO_FAILED` (exit 51), never `STAGE_OK`/0, in three cases:
+  - a receipt that cannot be read for the night check;
+  - a reservation that cannot be persisted (nothing is staged);
+  - a closing row that cannot be appended. The result json names the `unpersistedOutcome`, and the persisted reservation still holds the night.
+- One driver per venue. The lock is the named mutex `Global\MLV-VenueStageNightly-<venue>`, with no caller-selected path in it. With the real
+  venue share, the only receipt accepted is the canonical `<main checkout>\.claude-state\dual-venue\stage-nightly.jsonl`, and any other
+  `-ReceiptFile` is `USAGE`. So the night cap has one ledger.
+- It refuses over a live venue claim or ticket (`AGENT_BUSY`). It honours the shared board disk floor and commit ceiling
+  (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
+  `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.
+
 ## How to read the evidence
 
 * **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
@@ -470,7 +570,7 @@ the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt`
 * **`INVALID` is not a failure of the product**: the run could not show >= 20 s of distinct source frames (or
   the proof is absent). It carries no signal; the card stays open. Fix the venue or the clip and re-run.
 * **Every speed leg keeps window captures** (PLAYBACK-VISUAL-INSPECTION-1): the receipt's `visual` block, the frames under
-  `visual/` in the evidence and one strip per leg; a `FROZEN_DISPLAY` leg is `INVALID`. Open the strip before approving a playback
+  `visual/` in the evidence and one strip per leg; a `FROZEN_DISPLAY` leg (one picture over source frames known to differ) is `INVALID`; `FROZEN_DISPLAY_SUSPECTED` and `VISUAL_ASSESSMENT_UNAVAILABLE` are counted and surfaced. Open the strip before approving a playback
   PR. Design, gate and opt-out: [dual-venue-visual-capture.md](dual-venue-visual-capture.md).
 
 ## Outcome mapping (job `RESULT=` token -> receipt outcome)

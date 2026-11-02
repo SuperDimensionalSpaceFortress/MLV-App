@@ -33,12 +33,16 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackPrepInFlightGate.h"
 #include "PlaybackPresentTrace.h"
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
 #include "PlaybackStartupSplit.h"
+#include "PlaybackGpuClockKickPolicy.h"
 #include "PlaybackFirstPresentIdentity.h"
 #include "PlaybackRoutePrewarmPolicy.h"
+#include "PlaybackReconWarmRunPolicy.h"
+#include "GuiPresentGapIdle.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -177,6 +181,7 @@ public:
         // paired seek capture of the same N targets here, after the measured Play has stopped
         // (it never plays; its sidecars record playback_path=false).
         QString contactSheetSeekDir;
+        QVector<int> contactSheetSeekFrames; // --contact-sheet-seek-frames: explicit seek targets; empty = off
         // --visual-capture-dir: opt-in, default empty (off: nothing runs and nothing is logged).
         // PLAYBACK-VISUAL-INSPECTION-1: AFTER the measured Play's own stop condition, its telemetry
         // session is closed (the playback_smoke summary is written first), Play keeps running UNTIMED
@@ -205,7 +210,8 @@ public:
         bool exerciseClipLifecycleStress = false;
         QString stressSwitchInputPath;
         // ENFORCE-2 round 2: the switch stops Play on the first clip, so it may not happen before the
-        // 20 s play floor (playback_frame_range::kMinPlayWindowMs); runGuiPlaybackSmoke refuses less.
+        // clip's play floor (playback_frame_range::minPlayWindowMs: 20 s, 10 s for an HFR clip); runGuiPlaybackSmoke
+        // refuses less.
         int stressSwitchAtMs = 20000;
         int stressSeekFrame = 8;
         // UM-DISPLAY-SELECT-AND-LOG-1: when true, the smoke session is placed and maximized
@@ -732,6 +738,7 @@ private:
                 scopeSourceImage = sourceImage;
                 scopeSourceImageSize = sourceImageSize;
                 readyFrame.rawImage8 = sourceImage;
+                readyFrame.rawImage8Bytes = sourceImageSize;
             }
             if( !ownedSourceImage16.empty() )
             {
@@ -885,6 +892,24 @@ private:
     bool m_audioExportEnabled;
     bool m_hdrExport;
     bool m_exportAbortPressed;
+    // r3: an export job whose open a busy prep task refused is retried, not dropped.
+    bool m_exportRetryHeadJob = false;
+    int m_exportOpenAbortRetries = 0;
+    // r3: true while the sliders describe no receipt (a prep-refused open left them); setReceipt is a no-op.
+    // r4: setSliders applies nothing either; only a successful open (markClipOpenSucceeded) re-attaches them.
+    bool m_slidersDetachedFromReceipt = false;
+    // r4 (adversary A4): bumped by every successful clip open; a deferred reopen scheduled under an older value
+    // is a no-op, and so is one that fires while an export holds a clip (GUI block to final reopen).
+    unsigned long long m_clipOpenGeneration = 0;
+    // r5 (Dot 29eac4d5 A1): the file the last successful open loaded; receiptOwnedByLoadedClip compares it with
+    // the active row. A refused direct receipt write is logged once per clip-open generation.
+    QString m_loadedClipFileName;
+    unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
+    bool m_exportInProgress = false;
+    // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
+    unsigned long long m_exportBatchGeneration = 0;
+    // r4: set while a deferred reopen runs, so a refusal inside it is not retried again.
+    bool m_inClipReopenRetry = false;
     bool m_zoomTo100Center;
     bool m_zoomModeChanged;
     bool m_playbackStopped;
@@ -1169,6 +1194,10 @@ private:
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
+    // PLAYBACK-PRESENT-TAIL-TIMING-1: the GpuDisplayWindow recon present tail of the frame presentPlaybackPreparedFrame
+    // is presenting (reset at its entry); notePlaybackSmokePresentedFrame reads it for that same frame.
+    GpuPresentTailTiming m_lastPresentTailTiming;
+    bool m_lastPresentTailTimingKnown = false;
     // PLAYBACK-STARTUP-WAIT-PREWARM-1: where the Play -> first-present wait goes (playback_smoke.startup_split);
     // fed only while m_playbackSmokeActive, reset at every smoke session start.
     playback_startup_split::StartupSplit m_playbackStartupSplit;
@@ -1215,6 +1244,10 @@ private:
     };
     QElapsedTimer m_contactSheetCaptureClock;
     QVector<qint64> m_contactSheetCaptureTargetMs;
+    // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2: an unpaced measured Play keys its targets to source frames consumed
+    // (contactSheetInPassTargetDue), so a run that outpaces the wall-clock centres still takes them before it stops.
+    QVector<qint64> m_contactSheetCaptureTargetSourceFrames;
+    bool m_contactSheetCaptureUnpaced = false;
     QVector<ContactSheetPendingGrab> m_contactSheetPendingGrabs;
     int m_contactSheetCaptureNextTargetIndex = 0;
     int m_contactSheetCaptureStartFrame = 0;
@@ -1274,6 +1307,10 @@ private:
     double m_playbackSmokePresentPacingSumMs = 0.0;
     double m_playbackSmokeLlrawprocSumMs = 0.0;
     double m_playbackSmokeProcessed8SumMs = 0.0;
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: presented frames whose render ran the
+    // processed8 / processed16 stage; the divisors of the processed8/16 averages.
+    int m_playbackSmokeProcessed8MeasuredFrames = 0;
+    int m_playbackSmokeProcessed16MeasuredFrames = 0;
     double m_playbackSmokeProcessed8CacheStoreSumMs = 0.0;
     double m_playbackSmokeRawUint16SumMs = 0.0;
     double m_playbackSmokeRawUint16DecompressSumMs = 0.0;
@@ -1473,8 +1510,44 @@ private:
         QString downscaleBranchLast;
         QMap<QString, quint64> refusalCounts;
         QMap<QString, quint64> downscaleBranchCounts;
+        // CPU-LOOKASSIST-PLAYBACK-COST-1: the pointwise fast path (empty refusal = it ran).
+        quint64 pointwiseFastFrames = 0;
+        double pointwiseOmpThreadsSum = 0.0;
+        int pointwiseOmpThreadsLast = 0;
+        QString pointwiseFastRefusalLast;
+        QMap<QString, quint64> pointwiseFastRefusalCounts;
+        // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI-thread prep-present regions
+        // (playback_prep_region_*_ms), CPU-route frames only.
+        double regionSetupMs = 0.0;
+        double regionImageMs = 0.0;
+        double regionPresentMs = 0.0;
+        double regionFinishMs = 0.0;
+        double regionTotalMs = 0.0;
+        double regionUnattributedMs = 0.0;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
+    // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread wall time from one prep present's exit to
+    // the next prep result's entry, less the event loop's blocked (idle) time in between, and less
+    // the preview viewport paint inside it for "other busy" (playback_smoke.gui_present_summary).
+    struct GuiPresentGapTotals
+    {
+        quint64 gaps = 0;
+        double gapSumMs = 0.0;
+        double gapMaxMs = 0.0;
+        double idleSumMs = 0.0;
+        double runnerSleepSumMs = 0.0;
+        double busySumMs = 0.0;
+        double busyMaxMs = 0.0;
+        double otherBusySumMs = 0.0;
+        double otherBusyMaxMs = 0.0;
+    };
+    GuiPresentGapTotals m_guiPresentGaps;
+    QElapsedTimer m_guiPresentGapClock;
+    qint64 m_guiPresentGapStartNs = -1;
+    gui_present_gap::IdleWaits m_guiPresentGapIdle;
+    qint64 m_guiPresentGapRunnerSleepNs = 0;
+    double m_guiPresentGapPaintStartMs = 0.0;
+    bool m_guiPresentIdleProbeConnected = false;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -1568,6 +1641,8 @@ private:
     bool m_headlessPlaybackProfileActive = false;
     uint64_t m_nextRenderRequestSerial = 1;
     uint64_t m_lastPresentedRequestSerial = 0;
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the requestSerial whose pixmap m_pGraphicsItem holds (0: none / a placeholder).
+    uint64_t m_graphicsItemPresentedSerial = 0;
     GpuPreviewProcessingBackendRequest m_gpuPreviewProcessingBackendRequest =
         GpuPreviewProcessingBackendRequest::Auto;
     GpuBilinearDebayerBackendRequest m_gpuBilinearDebayerBackendRequest =
@@ -1611,6 +1686,7 @@ private:
     bool m_playbackPrepPendingValid = false;
     PlaybackPrepTask m_playbackPrepPending;
     std::deque<PlaybackPrepResult> m_playbackPrepResults;
+    PlaybackPrepInFlightGate m_playbackPrepInFlight;
     std::atomic<uint64_t> m_playbackPrepStaleDropCount{0};
     std::atomic<uint64_t> m_playbackPrepGenerationDropCount{0};
     std::atomic<uint64_t> m_playbackPrepReplacedBeforeComputeCount{0};
@@ -1694,6 +1770,30 @@ private:
     void runPlaybackRoutePrewarm( quint64 clipGeneration );
     bool m_playbackRoutePrewarmArmed = false;
     quint64 m_playbackRoutePrewarmClipGeneration = 0;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: this clip's prewarm loaded the recon backend (first_present_split)
+    bool m_playbackReconBackendPreloaded = false;
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (PlaybackReconWarmRunPolicy.h): after the prewarm, ONE paused recon
+    // warm run per clip on the recon worker; a skip for real work pending is re-posted kRepostDelayMs later.
+    void postPlaybackReconWarm( quint64 clipGeneration );
+    void onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done );
+    void schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason reason, quint64 clipGeneration );
+    bool m_playbackReconWarmPrewarmRan = false;   // this clip's route prewarm decided Run
+    int m_playbackReconWarmScale = 1;             // the Play-time scale the prewarm sized for
+    int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
+    bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
+    bool m_playbackReconWarmRan = false;          // first_present_split warm_run
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h): at Play, before the play-start
+    // frame request, one bounded GPU clock kick on the loaded AMaZE backend; ended (and logged) at the first present,
+    // Play stop, a clip change, a device loss, the next Play or its deadline. Also arms Row 0's session probe.
+    void beginPlaybackGpuClockKick();
+    void endPlaybackGpuClockKick( const char *site );
+    bool m_playbackGpuClockKickActive = false;
+    playback_gpu_clock_kick::Decision m_playbackGpuClockKickDecision;   // this Play's (first_present_split)
+    double m_playbackGpuClockKickBeginSteadyMs = 0.0;
+    quint64 m_playbackGpuClockKickSerial = 0;     // cancels a stale deadline timer
+    quint64 m_playbackGpuClockKickSession = 0;
+    QString m_playbackGpuClockKickEndedAt;         // the first site that asked for the end (ended_at)
+    int m_playbackGpuClockKickPendingRetries = 0;  // collects that found the feeder still draining
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with
@@ -1731,12 +1831,20 @@ private:
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
-    void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
+    PlaybackPrepDrainOutcome drainPlaybackPrepInFlight( const char *reason, int timeoutMs );
+    // Returns playbackPrepBorrowFreeingMutationAllowed for its drain: a caller that
+    // then frees memory a prep task borrows must abort on false.
+    bool waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
+    bool playbackPrepQuiescentBeforeClipReplacement( const char *reason );
     struct PlaybackPrepThreadState;
     PlaybackPrepResult buildPlaybackPrepResult( const PlaybackPrepTask &task,
                                                 PlaybackPrepThreadState *threadState = nullptr );
     void playbackPrepThreadLoop( void );
     void presentPlaybackPreparedFrame( const PlaybackPrepResult &result );
+    void openGuiPresentGap( void );
+    void closeGuiPresentGap( void );
+    void endGuiPresentIdleWait( void );
+    void sleepGuiThreadForSmokeRunner( unsigned long ms );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,
                                const PresentationRequestContext &requestContext,
@@ -1760,7 +1868,7 @@ private:
     QString playbackDebayerLabel( void ) const;
     QString selectedPlaybackProcessingLabel( void ) const;
     QString playbackProcessingLabel( void ) const;
-    void importNewMlv(QString fileName);
+    bool importNewMlv(QString fileName);
     int openMlvForPreview(QString fileName);
     int openMlv(QString fileName);
     void playbackHandling( int timeDiff );
@@ -1773,7 +1881,7 @@ private:
     void startExportCdng( QString fileName );
     void startExportMlv( QString fileName );
     void startExportAVFoundation( QString fileName );
-    void addFileToSession( QString fileName );
+    ClipInformation *addFileToSession( QString fileName );
     int askToSaveCurrentSession( void );
     void openSession(QString fileNameSession );
     void saveSession( QString fileName );
@@ -1783,7 +1891,7 @@ private:
     void initPlaybackPreviewModeFromSettings( void );
     void initPlaybackPreviewResolutionFromSettings( void );
     void drainLookAssistWorkers( const char *reason );
-    void freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
+    bool freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
     void initPlaybackScaleFactorFromSettings( void );
     void seedPlaybackQualityActiveStateForCurrentContext( void );
     void resetPlaybackQualityAutoRunState( void );
@@ -1844,7 +1952,13 @@ private:
     void replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings *receiptSource , bool paste);
     void resetReceiptWithDefault( ReceiptSettings *receipt );
     int showFileInEditor(int row);
-    void addClipToExportQueue( int row, QString fileName );
+    void markClipOpenSucceeded( void );
+    bool loadedClipIsRow( int row ) const;
+    bool receiptOwnedByLoadedClip( const char *site );
+    void retryClipReopenAfterPrepAbort( int row );
+    void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );
+    void resetExportOpenAbortRetries( void );
+    bool addClipToExportQueue( int row, QString fileName );
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );
@@ -1894,6 +2008,10 @@ private:
     // exercise modes, GUI-smoke measured Play) goes through programmaticPlay(); user input handlers
     // (on_actionPlay_triggered, the Loop menu) are never gated. See PlaybackFrameRange.h.
     playback_frame_range::PlayableWindowVerdict checkPlayableWindow( const char *site, double requestedSeconds );
+    // PLAYBACK-CLIP-LENGTH-HFR-10S-1: the loaded clip's NATIVE fps (0 when no clip: the 20 s floor) and the play floor
+    // derived from it (playback_frame_range::minPlayWindowSeconds).
+    double playGateNativeFps() const;
+    double playGateMinPlayWindowSeconds() const;
     bool programmaticPlay( const char *site, double requestedSeconds );
     void programmaticStop( const char *site );
     void forceLoopOffForAutomation( const char *site );

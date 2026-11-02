@@ -43,18 +43,20 @@ PLAN = [
     ("## Exit Code Reference", "batch-cli-spec.md"),
     ("## CLI Usage (Target)", "batch-cli-spec.md"),
     ("## .NET Orchestrator Integration (Later \u2014 Not Claude Code's Job)", "batch-cli-spec.md"),
+    # Demoted 2026-10-17: the hook it describes is no longer wired and the in-tree bridge is suspended.
+    ("## Agent Bridge \u2014 Session Startup (Hook-Driven)", "agent-bridge-session-startup.md"),
 ]
 
 CHILD_TITLES = {
     "session-closeout.md": "Agent Bridge - Session Closeout (detail)",
     "batch-cli-spec.md": "Batch CLI Implementation Spec (detail)",
+    "agent-bridge-session-startup.md": "Agent Bridge - Session Startup (detail)",
 }
 
 # Kept in the parent because they are read on every session start.
 RETAIN = [
     "## Purpose",
     "## Memory Policy (project-level content, machine-level pointers)",
-    "## Agent Bridge \u2014 Session Startup (Hook-Driven)",
     "## Behavioral Rules for Claude Code",
 ]
 

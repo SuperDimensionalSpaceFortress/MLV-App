@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Guard: doc splits must not drop substrings that closeout asserts.
 
-This is the companion to `tools/check-doc-size.py`. That script measures SIZE.
+This is the companion to the pinned check-doc-size (`tools/docs/run_doc_size.py`). That tool measures SIZE.
 This one measures the thing that makes shrinking a doc dangerous *in this repo*.
 
 Why it exists

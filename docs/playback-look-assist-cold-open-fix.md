@@ -10,6 +10,11 @@ diff is in git once committed, and durable one-line lessons are in the agent mem
 frame immediately). One accepted caveat remains: a brief one-frame pink flash on open — see
 "Cold frame-0 pink (separate bug)" below.
 
+**Reading `x1` / `x2` / `x4` / `x8` in this log:** these are the playback scale *factors* the
+investigation recorded at the time, kept verbatim in the iteration notes and tables. They mean
+resolution divided by that factor: x1 = Full res (1x), x2 = Half res (0.5x), x4 = Quarter res
+(0.25x), x8 = Custom res (1/8). The app now shows those words instead of "x2".
+
 **Commits on this branch (newest first):**
 - checkpoint 2 — Decouple the (single) analysis from the first-frame paint: the clip paints its first
   frame immediately on open instead of holding black. Trace: analysis delayed ~50ms after the frame,
@@ -24,8 +29,8 @@ frame is the COLD dual-ISO render — recon + focus/bad-pixel maps not yet settl
 Look Assist night preset's **+187 exposure boost** amplifies into a brief magenta/pink band. It
 clears the instant the clip advances (frame 1+ are clean); it is a **one-frame flash**.
 
-Key facts for whoever fixes it: it appears at **all scales including x1**, so it is NOT the committed
-scaled-seed fix's territory (that only covers the x4/x8 downsample paths, video_mlv.c:3464/4023/4133).
+Key facts for whoever fixes it: it appears at **all playback resolutions including Full res (1x)**, so it is NOT the committed
+scaled-seed fix's territory (that only covers the Quarter res / Custom res (1/8) downsample paths, video_mlv.c:3464/4023/4133).
 look-assist OFF = clean (the artifact is dark/hidden without the boost). Ruled out: WB (auto-WB was
 rejected as extreme-color-cast), and slider settings (skipping the baseline restore did not help and
 made it worse). The fix is in the full-res + scaled cold dual-ISO recon / map-init path (fragile;
@@ -131,7 +136,7 @@ x4 renders ~22 fps (mean 46ms) but is hit by the stuck-frame bug above.
 ## 1. The bug
 
 Opening a heavy Dual-ISO clip (e.g. `M16-1327.MLV`) and pressing play froze the picture for several
-seconds with a black viewport and "no new frames", on every playback scale (x1/x2/x4/x8). The user
+seconds with a black viewport and "no new frames", at every playback resolution (Full / Half / Quarter / 1/8 res). The user
 remembered older behaviour as "~7 fps, dropped frames, never frozen" and asked, exhaustively, *when*
 this regressed.
 

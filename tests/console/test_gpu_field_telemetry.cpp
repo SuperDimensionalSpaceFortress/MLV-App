@@ -279,8 +279,11 @@ int noteSites(const QString & source)
 // 38 = 6 macro notes (the four map notes and gl_rgba16:register moved into evaluated entries, +
 // gl_rgba16_post_wb:free) + 32 evaluated entries (+20: map-failure unregisters, mapped_array, frees,
 // catch-path cleanups).
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: AMaZE 49 = 17 macro notes (+11: the Row 0 probe's host_alloc,
+// device_pointer, sm_clock, event_create, elapsed, event_start, event_join; the Row K kick's stream, host_alloc,
+// launch, submit) + the same 32 evaluated entries.
 constexpr int kReconNotes = 27;
-constexpr int kAmazeNotes = 38;
+constexpr int kAmazeNotes = 49;
 
 QStringList failureCensus(const QString & recon, const QString & amaze)
 {
@@ -570,6 +573,7 @@ TEST(GpuFieldTelemetry, LinesCarryTheFieldsAndNoPrivateData)
     f.cudaName = "cudaErrorLaunchTimeout";
     f.site = core::sanitize("IGPU_LT_SYNC_CALL(\"run:ev_after_dl\", cudaEventSynchronize(b->ev_after_dl)) /x\\y", 95);
     f.utcMs = 1791774588083.125;
+    f.deliveredUtcMs = 1791774590000.5;
     core::SystemLogResult sys;
     sys.status = "ok";
     sys.nvlddmkm153.count = 1;
@@ -618,6 +622,9 @@ TEST(GpuFieldTelemetry, LinesCarryTheFieldsAndNoPrivateData)
     ASSERT_EQ(std::string("cudaErrorLaunchTimeout"), fault.value(QStringLiteral("cuda_name")).toString().toStdString());
     ASSERT_TRUE(fault.value(QStringLiteral("site")).toString().startsWith(QStringLiteral("IGPU_LT_SYNC_CALL('run:ev_after_dl'")));
     ASSERT_TRUE(fault.value(QStringLiteral("device_loss")).toBool());
+    // GPU-FIELD-TELEMETRY-FAULT-UTC-STAMP-1: when noted, and when the app recorded it.
+    ASSERT_NEAR(1791774588083.125, fault.value(QStringLiteral("fault_utc_ms")).toDouble(), 1e-3);
+    ASSERT_NEAR(1791774590000.5, fault.value(QStringLiteral("fault_delivered_utc_ms")).toDouble(), 1e-3);
     const QJsonObject sysLine = parseLine(lines[4]);
     ASSERT_EQ(std::string("ok"), sysLine.value(QStringLiteral("status")).toString().toStdString());
     ASSERT_EQ(1, sysLine.value(QStringLiteral("nvlddmkm_153")).toObject().value(QStringLiteral("count")).toInt());
@@ -718,7 +725,9 @@ TEST(GpuFieldTelemetry, CudaFailureBranchesNoteTheCodeAndAddNoSync)
                               "{(int)unmapRc, \"gl_rgba16_post_wb:unmap\"},",
                               "{(int)rc, \"gl_rgba16_direct:copy_to_array\"},"})
         ASSERT_TRUE(amaze.contains(QString::fromLatin1(note)));
-    ASSERT_EQ(38, noteSites(amaze)); // r8: exact (r7 22)
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: + 11 macro notes (probe:* x7, clock_kick:* x4), each in its
+    // rc != cudaSuccess branch
+    ASSERT_EQ(49, noteSites(amaze)); // exact (r8 38, r7 22)
     ASSERT_EQ(27, noteSites(recon)); // r8: exact (r7 17)
     // r3: the exact counts and the brace-scope check (FailureCensusIsExactAndBraceScoped).
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
@@ -948,15 +957,15 @@ TEST(GpuFieldTelemetry, FailureCensusIsExactAndBraceScoped)
     ASSERT_EQ(kReconNotes, noteSites(recon));
     ASSERT_EQ(kAmazeNotes, noteSites(amaze));
     ASSERT_EQ(24, (int)recon.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // r8: + 3 evaluated entries
-    ASSERT_EQ(6, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));   // r8: + 32 evaluated entries
+    ASSERT_EQ(17, (int)amaze.count(QStringLiteral("IGPU_CUDA_ERROR_NOTE(")));  // + 32 evaluated entries (r8 6; FIRST-AMAZE-AT-PLAY-1 +11)
     ASSERT_EQ(std::string(), failureCensus(recon, amaze).join(QStringLiteral("; ")).toStdString());
 
     // Mutation 1 (sol's replay): drop the preupload:submit note -> recon count 26.
     const QString noSubmit = replacedOnce(recon, QStringLiteral("        IGPU_CUDA_ERROR_NOTE(e, \"preupload:submit\");\n"), QString());
     ASSERT_EQ(std::string("recon notes 26 != 27"), failureCensus(noSubmit, amaze).join(QStringLiteral("; ")).toStdString());
-    // Mutation 2: drop one AMaZE note -> 37 (r8: the register note; the map note is an evaluated entry).
+    // Mutation 2: drop one AMaZE note -> one short (r8: the register note; the map note is an evaluated entry).
     const QString noMap = replacedOnce(amaze, QStringLiteral("            IGPU_CUDA_ERROR_NOTE(rc, \"gl_r16_in:register\");\n"), QString());
-    ASSERT_EQ(std::string("amaze notes 37 != 38"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
+    ASSERT_EQ(std::string("amaze notes 48 != 49"), failureCensus(recon, noMap).join(QStringLiteral("; ")).toStdString());
     // Mutation 3 (fable's repro): the note moved after an early-return failure check, into the
     // success path. Same count; the old 4-line context check accepted it.
     const QString earlyReturn = replacedOnce(recon,
@@ -1418,9 +1427,14 @@ QStringList r6WiringCensus(const QString & def, const QString & amaze, const QSt
          "resolve drain");
     need(debayer.contains(QStringLiteral("runtime->library.resolve(\"igpu_amaze_debayer_cuda_error_pending_word\")")),
          "resolve pending word");
-    // Each of the 4 runs is entered, under the telemetry gate, before its backend call.
-    const QString enter = QStringLiteral("if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&");
-    need(debayer.count(enter) == 4, "4 AMaZE entries");
+    // Each of the 4 runs is entered, under the telemetry gate, before its backend call (GPU-DEVICE-LOSS-SELF-HEAL-1
+    // r6: through the one step that also reads the suppression flag again after the entry).
+    const QString enter = QStringLiteral("if ( !enterAmazeRunUnlessCudaSuppressed(&");
+    need(debayer.count(enter) == 4
+             && debayer.count(QStringLiteral(", GpuFieldTelemetry::enabled()) )")) == 4
+             && bodyFrom(debayer, QStringLiteral("bool enterAmazeRunUnlessCudaSuppressed("))
+                    .contains(QStringLiteral("    if ( telemetry ) enterAmazeStageTelemetry(runtime);\n")),
+         "4 AMaZE entries");
     const char * calls[] = {"const int rc = runtime.run(backend,", "const int rc = runtime.runPostWbGlTexture(backend,",
                             "live.runtime.runPostWbGlTextureFromR16GlTexture(",
                             "live.runtime.runPostWbGlTextureFromDeviceBayer16("};
@@ -1498,8 +1512,8 @@ TEST(GpuFieldTelemetry, AmazeDrainsEveryCodeAndLeftoversAreDrainedAtTeardown)
     ASSERT_EQ(std::string("failure drains every code; no last-note rule on the r6 path"),
               r6WiringCensus(def, amaze, lastOnly, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());
     const QString noEntry = replacedOnce(debayer,
-        QStringLiteral("    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);\n    const int rc =\n"
-                       "        live.runtime.runPostWbGlTextureFromR16GlTexture("),
+        QStringLiteral("    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());\n"
+                       "    const int rc =\n        live.runtime.runPostWbGlTextureFromR16GlTexture("),
         QStringLiteral("    const int rc =\n        live.runtime.runPostWbGlTextureFromR16GlTexture("));
     ASSERT_EQ(std::string("4 AMaZE entries; an entry right before each AMaZE run"),
               r6WiringCensus(def, amaze, noEntry, llrawproc, telemetry).join(QStringLiteral("; ")).toStdString());

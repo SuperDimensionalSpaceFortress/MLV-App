@@ -8,7 +8,9 @@
 #include "GpuDisplayViewport.h"
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
+#include "LogLineField.h"
 #include "PlaybackSwapInterval.h"
+#include "PreviewPaintTiming.h"
 
 #include <algorithm>
 #include <cmath>
@@ -384,6 +386,8 @@ GpuDisplayViewport::GpuDisplayViewport(QWidget *parent)
     , m_program(nullptr)
     , m_texture(nullptr)
     , m_gpuReconSourceTexture(nullptr)
+    , m_paintedSerial(0)
+    , m_paintedSerialValid(false)
 {
     QSurfaceFormat requestedFormat = format();
     requestedFormat.setSwapInterval(playbackSwapInterval());
@@ -410,13 +414,14 @@ GpuDisplayViewport::GpuDisplayViewport(QWidget *parent)
         setAttribute(Qt::WA_AlwaysStackOnTop, true);
     if ( abSwapSet || viewportAbAlphaEnabled() || viewportAbStackTopEnabled()
          || viewportAbNativeWindow() || viewportAbPrimeEnabled() || viewportAbFlushMode() != 0 )
+        // PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2: raw env text never reaches a log line (LogLineField.h).
         qInfo().nospace() << "viewport_ab present probe active: swap="
-            << qgetenv("MLVAPP_VIEWPORT_AB_SWAP").constData()
+            << log_line_field::fieldValue(qEnvironmentVariable("MLVAPP_VIEWPORT_AB_SWAP")).toUtf8().constData()
             << " alpha=" << (viewportAbAlphaEnabled() ? 1 : 0)
             << " stacktop=" << (viewportAbStackTopEnabled() ? 1 : 0)
             << " native=" << (viewportAbNativeWindow() ? 1 : 0)
             << " prime=" << (viewportAbPrimeEnabled() ? 1 : 0)
-            << " flush=" << qgetenv("MLVAPP_VIEWPORT_AB_FLUSH").constData();
+            << " flush=" << log_line_field::fieldValue(qEnvironmentVariable("MLVAPP_VIEWPORT_AB_FLUSH")).toUtf8().constData();
 }
 
 GpuDisplayViewport::~GpuDisplayViewport()
@@ -463,6 +468,8 @@ bool GpuDisplayViewport::eventFilter(QObject *watched, QEvent *event)
     {
         // Invoke Qt's paint-event path, which binds the widget FBO, calls paintGL,
         // and schedules composition. Calling paintGL directly skips that setup.
+        // Consumed here, so GraphicsZoomView::paintEvent never sees it: time it here.
+        const preview_paint_timing::Scope paintTiming;
         QOpenGLWidget::event(event);
         return true;
     }
@@ -552,6 +559,14 @@ GpuDisplayViewport::ScopeTapCounters GpuDisplayViewport::scopeTapCountersFor(con
 {
     const GpuDisplayViewport *viewport = from(view);
     return viewport ? viewport->m_scopeTap.counters() : ScopeTapCounters();
+}
+
+bool GpuDisplayViewport::paintedSerialFor(const QGraphicsView *view, quint64 *serial)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    const bool valid = viewport && viewport->m_paintedSerialValid;
+    if ( serial ) *serial = valid ? viewport->m_paintedSerial : 0;
+    return valid;
 }
 
 GpuDisplayViewport::SamplingMode GpuDisplayViewport::samplingModeFor(const QGraphicsView *view)
@@ -1067,6 +1082,10 @@ void GpuDisplayViewport::initializeGL()
 
 void GpuDisplayViewport::paintGL()
 {
+    // grab()/grabFramebuffer() call paintGL with no Paint event: time it here too (counted once).
+    const preview_paint_timing::Scope paintTiming;
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: set again below only when this paint draws a frame.
+    m_paintedSerialValid = false;
     const QColor clearColor = m_view
         ? m_view->backgroundBrush().color()
         : palette().color(QPalette::Window);
@@ -1180,6 +1199,8 @@ void GpuDisplayViewport::paintGL()
     gpuPreviewProcessingReleaseDisplayTextures(m_lutSet, previewProcessingReady);
     m_program->release();
     m_texturePresentationActive = true;
+    m_paintedSerial = m_presentationOptions.presentationSerial;
+    m_paintedSerialValid = m_paintedSerial != 0;
 
     // PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope's read-back of the picture just drawn. Every drawn
     // picture records whether its rectangle can be read back (zoomed past fit it cannot: the scope then stays

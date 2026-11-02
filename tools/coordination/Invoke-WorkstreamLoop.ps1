@@ -90,7 +90,7 @@ $TaskName   = 'MLV-WorkstreamLoop'
 # is a LOAD-BEARING worktree, not sweep debris: it is recreated on demand and its
 # absence is a CANNOT-DETERMINE, never a silent no-op.
 $DriverRoot   = 'C:\mlvtmp\ws-driver'
-$TargetRef    = 'fork/master'
+$TargetRef    = 'refs/remotes/fork/master'   # full refname: a same-named tag would win the bare name in worktree add / reset --hard
 $Dispatcher   = Join-Path $DriverRoot 'tools\coordination\Invoke-Workstream.ps1'
 
 function Get-ReservationBudget {
@@ -218,21 +218,40 @@ function Invoke-GitFetchFork {
     return [pscustomobject]@{ Ok = $false; Attempts = $Attempts; ExitCode = $last }
 }
 
+# HOST-FSMONITOR-DAEMON-LEAK-1 (a): the tool-owned driver worktree inherits the board's core.fsmonitor=true like every other worktree, and the
+# `reset --hard` below would start a daemon in it. Fail-soft: the helper lives in lane-fsmonitor.ps1, which a pinned sibling directory may not carry.
+function Disable-DriverFsmonitor {
+    try {
+        if (-not (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
+        $null = Disable-LaneWorktreeFsmonitor -WorkDir $DriverRoot
+        # r2: the driver worktree persists between cycles, so a daemon from before this fix may already be running in it.
+        $null = Stop-LaneWorktreeFsmonitor -WorkDir $DriverRoot
+    } catch { }
+}
+
 function Sync-DriverWorktree {
     # Returns $null on success, or a CANNOT-DETERMINE reason string.
     try {
         if (-not (Test-Path -LiteralPath (Join-Path $DriverRoot '.git'))) {
             if (Test-Path -LiteralPath $DriverRoot) { Remove-Item -LiteralPath $DriverRoot -Recurse -Force }
             Invoke-GitFetchFork | Out-Null
-            & git -C $RepoRoot -c core.longpaths=true worktree add --detach $DriverRoot $TargetRef 2>&1 | Out-Null
+            # r6 (sol B1): read the exact ref's SHA ONCE and use only that SHA below. A check followed by a second lookup of
+            # the NAME is check-then-use: if the ref vanished in between, git would resolve refs/tags/refs/remotes/fork/master.
+            $tipSha = [string](& git -C $RepoRoot show-ref --verify --hash $TargetRef 2>$null | Select-Object -First 1)
+            if ($tipSha -notmatch '^[0-9a-f]{40}$') { return "target ref $TargetRef does not exist" }
+            & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add --detach $DriverRoot $tipSha 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) { return "could not create driver worktree at $DriverRoot" }
+            Disable-DriverFsmonitor
             return $null
         }
+        Disable-DriverFsmonitor
         $fetch = Invoke-GitFetchFork
         if (-not $fetch.Ok) { return "git fetch fork failed (exit $($fetch.ExitCode)) after $($fetch.Attempts) attempts; driver worktree may be stale" }
         # Hard reset is safe here and ONLY here: this worktree is tool-owned, is
         # never edited by hand, and holds nothing anyone can lose.
-        & git -C $DriverRoot reset --hard $TargetRef --quiet 2>&1 | Out-Null
+        $tipSha = [string](& git -C $RepoRoot show-ref --verify --hash $TargetRef 2>$null | Select-Object -First 1)   # captured once, see the worktree-add site above
+        if ($tipSha -notmatch '^[0-9a-f]{40}$') { return "target ref $TargetRef does not exist" }
+        & git -C $DriverRoot reset --hard $tipSha --quiet 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { return "could not reset driver worktree to $TargetRef" }
         return $null
     } catch {

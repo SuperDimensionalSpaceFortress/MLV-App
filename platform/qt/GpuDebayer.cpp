@@ -22,8 +22,11 @@
 #include "../../tools/gpu/igpu_amaze_debayer.h"
 #include "../../tools/gpu/igpu_cuda_error.h"
 #include "GpuFieldTelemetry.h"
+#include "PlaybackGpuClockKickPolicy.h"
+#include "../../src/mlv/llrawproc/llrawproc.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 
 #ifdef Q_OS_WIN
@@ -44,6 +47,13 @@ constexpr GLfloat kQuadVertices[16] = {
     -1.0f, -1.0f, 0.0f, 0.0f,
      1.0f, -1.0f, 1.0f, 0.0f,
 };
+
+/* GPU-DEVICE-LOSS-SELF-HEAL-1: every CUDA AMaZE entry fails with this before
+ * any runtime or backend call while llrpGpuCudaSuppressed() is set. */
+QString cudaSuppressedReason()
+{
+    return QStringLiteral("CUDA suppressed after a GPU device loss");
+}
 
 bool envFlagEnabled(const QByteArray & value)
 {
@@ -338,6 +348,19 @@ typedef int (*GpuAmazeSetReducedHnyquistFn)(igpu_amaze_debayer_backend *, int);
 typedef int (*GpuAmazeLastTimingFn)(igpu_amaze_debayer_backend *,
                                     igpu_amaze_debayer_timing_t *);
 typedef int (*GpuAmazeLastCudaErrorFn)(igpu_cuda_error_t *);
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Rows 0 and K (optional symbols)
+typedef int (*GpuAmazeArmProbeFn)(igpu_amaze_debayer_backend *, int);
+typedef int (*GpuAmazeLastProbeFn)(igpu_amaze_debayer_backend *, igpu_amaze_probe_t *);
+typedef int (*GpuAmazeClockKickBeginFn)(igpu_amaze_debayer_backend *, int);
+typedef int (*GpuAmazeClockKickEndFn)(igpu_amaze_debayer_backend *, igpu_clock_kick_report_t *);
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1 (optional symbols)
+typedef int (*GpuAmazeCaptureInputBayer16Fn)(igpu_amaze_debayer_backend *, const uint16_t *, int, int, unsigned long long *);
+typedef int (*GpuAmazeInputBayer16MatchesCaptureFn)(igpu_amaze_debayer_backend *, const uint16_t *, int, int,
+                                                     unsigned long long, int *);
+typedef int (*GpuAmazeReleaseInputCaptureFn)(igpu_amaze_debayer_backend *);
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag (optional symbol)
+typedef int (*GpuAmazeDownloadBayer16Fn)(igpu_amaze_debayer_backend *, const uint16_t *, unsigned long long, uint16_t *,
+                                         int, int);
 
 struct GpuAmazeDebayerRuntime
 {
@@ -356,6 +379,19 @@ struct GpuAmazeDebayerRuntime
     /* GPU-FIELD-TELEMETRY-1: optional; older DLLs omit them (r6: drain and the
      * pending words; r4: last only). */
     GpuAmazeCudaErrorSource cudaErrors;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1: optional (live runtime only); older DLLs omit them, and the
+     * probe fields then print NA and the kick skips. */
+    GpuAmazeArmProbeFn armProbe = nullptr;
+    GpuAmazeLastProbeFn lastProbe = nullptr;
+    GpuAmazeClockKickBeginFn clockKickBegin = nullptr;
+    GpuAmazeClockKickEndFn clockKickEnd = nullptr;
+    /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: optional (live runtime only); older DLLs omit
+     * them, and the warm output is then never reused (reason symbol_missing). */
+    GpuAmazeCaptureInputBayer16Fn captureInputBayer16 = nullptr;
+    GpuAmazeInputBayer16MatchesCaptureFn inputBayer16MatchesCapture = nullptr;
+    GpuAmazeReleaseInputCaptureFn releaseInputCapture = nullptr;
+    /* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: optional; without it the miss dump writes no words. */
+    GpuAmazeDownloadBayer16Fn downloadBayer16 = nullptr;
 };
 
 typedef int (*GpuAmazeDrainCudaErrorsFn)(int, igpu_cuda_error_t *, int, unsigned long long *);
@@ -551,6 +587,17 @@ void enterAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime)
     gpuAmazeCudaErrorsEmitOrphans(runtime->cudaErrors, 1, g_amazeStageTelemetrySink.load(std::memory_order_relaxed));
 }
 
+/* GPU-DEVICE-LOSS-SELF-HEAL-1 r6 (CoS #437, guard under the serializing lock):
+ * the last step before every AMaZE backend run. The entry above can hand an
+ * orphan device-loss code to the breaker on this thread, which suppresses CUDA,
+ * and a loss on another thread can land while this caller waited on live.mutex:
+ * the flag is read again after both. false = the run must not submit. */
+bool enterAmazeRunUnlessCudaSuppressed(GpuAmazeDebayerRuntime * runtime, bool telemetry)
+{
+    if ( telemetry ) enterAmazeStageTelemetry(runtime);
+    return !llrpGpuCudaSuppressed();
+}
+
 /* GPU-FIELD-TELEMETRY-1: one stage record per AMaZE run wrapper call. Success
  * reads the backend's own per-frame timing (no CUDA call); failure (r6) emits
  * every code the call noted (gpuAmazeCudaErrorsEmitFailure). Call sites guard
@@ -568,7 +615,7 @@ void noteAmazeStageTelemetry(GpuAmazeDebayerRuntime * runtime,
         igpu_amaze_debayer_timing_t backendTiming;
         if ( runtime->lastTiming && runtime->lastTiming(backend, &backendTiming) == 0 )
         {
-            sink(stage, 0, backendTiming.total_ms, 0, nullptr, nullptr, nullptr, 0);
+            sink(stage, 0, backendTiming.total_ms, 0, nullptr, nullptr, nullptr, 0, 0.0);
         }
         return;
     }
@@ -603,6 +650,14 @@ struct GpuAmazeDebayerLiveTextureRuntime
             return available;
         }
 
+        /* r6: create('cuda') below is a CUDA call, so the flag is read again
+         * under the lock; a suppressed session leaves the runtime unattempted. */
+        if ( llrpGpuCudaSuppressed() )
+        {
+            if ( outReason ) *outReason = cudaSuppressedReason();
+            return false;
+        }
+
         attempted = true;
         QString loadReason;
         if ( !loadAmazeDebayerRuntime(&runtime, &loadReason) )
@@ -632,6 +687,27 @@ struct GpuAmazeDebayerLiveTextureRuntime
         runtime.setReducedHnyquist =
             reinterpret_cast<GpuAmazeSetReducedHnyquistFn>(
                 runtime.library.resolve("igpu_amaze_debayer_set_reduced_hnyquist"));
+        /* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Rows 0 and K: optional; a missing symbol prints NA (probe)
+         * or skips (kick), never fails a present. */
+        runtime.armProbe =
+            reinterpret_cast<GpuAmazeArmProbeFn>(runtime.library.resolve("igpu_amaze_debayer_arm_probe"));
+        runtime.lastProbe =
+            reinterpret_cast<GpuAmazeLastProbeFn>(runtime.library.resolve("igpu_amaze_debayer_last_probe"));
+        runtime.clockKickBegin =
+            reinterpret_cast<GpuAmazeClockKickBeginFn>(runtime.library.resolve("igpu_amaze_debayer_clock_kick_begin"));
+        runtime.clockKickEnd =
+            reinterpret_cast<GpuAmazeClockKickEndFn>(runtime.library.resolve("igpu_amaze_debayer_clock_kick_end"));
+        /* PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1: optional; a missing symbol means no reuse,
+         * never a failed present. */
+        runtime.captureInputBayer16 = reinterpret_cast<GpuAmazeCaptureInputBayer16Fn>(
+            runtime.library.resolve("igpu_amaze_debayer_capture_input_bayer16"));
+        runtime.inputBayer16MatchesCapture = reinterpret_cast<GpuAmazeInputBayer16MatchesCaptureFn>(
+            runtime.library.resolve("igpu_amaze_debayer_input_bayer16_matches_capture"));
+        runtime.releaseInputCapture = reinterpret_cast<GpuAmazeReleaseInputCaptureFn>(
+            runtime.library.resolve("igpu_amaze_debayer_release_input_capture"));
+        // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: optional (the opt-in miss dump only)
+        runtime.downloadBayer16 = reinterpret_cast<GpuAmazeDownloadBayer16Fn>(
+            runtime.library.resolve("igpu_amaze_debayer_download_bayer16"));
 
         backend = runtime.create("cuda");
         if ( !backend )
@@ -692,6 +768,73 @@ bool setLiveReducedHnyquist(GpuAmazeDebayerLiveTextureRuntime & live,
 }
 }
 
+namespace
+{
+/* PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0: the armed-run counts (arming never needs the DLL) and the Play
+ * session's record. All under live.mutex. A session (Play) arm outranks a paused one; a paused arm ends a session. */
+int g_probeArmCalls = 0;
+int g_probeSessionCallsLeft = 0;
+GpuAmazeProbeSessionRecord g_probeSessionRecord;
+
+struct LiveProbeArm
+{
+    bool armed = false;     // this run consumed an armed count
+    bool session = false;   // ... a Play session's
+};
+
+/* Caller holds live.mutex, right before a live run's backend call. The backend is armed for exactly this run (or
+ * disarmed), so a run that returns before its probe step never leaves a stale arm behind. */
+LiveProbeArm takeLiveProbeArm(GpuAmazeDebayerLiveTextureRuntime & live)
+{
+    LiveProbeArm arm;
+    if ( g_probeSessionCallsLeft > 0 )
+    {
+        --g_probeSessionCallsLeft;
+        arm.armed = arm.session = true;
+    }
+    else if ( g_probeArmCalls > 0 )
+    {
+        --g_probeArmCalls;
+        arm.armed = true;
+    }
+    if ( live.runtime.armProbe && live.runtime.lastProbe ) live.runtime.armProbe(live.backend, arm.armed ? 1 : 0);
+    return arm;
+}
+
+/* Caller holds live.mutex, right after a successful armed run: its probe into *timing and the session record. */
+void noteLiveProbeAfterRun(GpuAmazeDebayerLiveTextureRuntime & live,
+                           const LiveProbeArm & arm,
+                           double runStartSteadyMs,
+                           GpuAmazeDebayerBackendTiming * timing)
+{
+    if ( !arm.armed ) return;
+    igpu_amaze_probe_t probe;
+    std::memset(&probe, 0, sizeof(probe));
+    const bool probeAvailable = live.runtime.lastProbe != nullptr;
+    if ( probeAvailable && live.runtime.lastProbe(live.backend, &probe) != 0 ) probe.valid = 0;
+    if ( timing )
+    {
+        timing->probeAvailable = probeAvailable;
+        timing->probeValid = probe.valid != 0;
+        timing->smMhzBefore = probe.sm_mhz_before;
+        timing->smMhzAfter = probe.sm_mhz_after;
+        timing->deviceMs = probe.device_ms;
+    }
+    if ( !arm.session || g_probeSessionRecord.calls >= GpuAmazeProbeSessionRecord::kMaxCalls ) return;
+    igpu_amaze_debayer_timing_t backendTiming;
+    std::memset(&backendTiming, 0, sizeof(backendTiming));
+    if ( live.runtime.lastTiming ) live.runtime.lastTiming(live.backend, &backendTiming);
+    const int i = g_probeSessionRecord.calls++;
+    g_probeSessionRecord.probeAvailable = probeAvailable;
+    g_probeSessionRecord.kernelMs[i] = backendTiming.kernel_ms;
+    g_probeSessionRecord.deviceMs[i] = probe.device_ms;
+    g_probeSessionRecord.smMhzBefore[i] = probe.sm_mhz_before;
+    g_probeSessionRecord.smMhzAfter[i] = probe.sm_mhz_after;
+    g_probeSessionRecord.valid[i] = probe.valid != 0;
+    g_probeSessionRecord.startSteadyMs[i] = runStartSteadyMs;
+}
+} // namespace
+
 QString gpuAmazeDebayerReducedHnyquistMissingReason(void)
 {
     return QStringLiteral("AMaZE DLL lacks the reduced H-Nyquist filter");
@@ -699,6 +842,7 @@ QString gpuAmazeDebayerReducedHnyquistMissingReason(void)
 
 bool gpuAmazeDebayerReducedHnyquistAvailable(void)
 {
+    if ( llrpGpuCudaSuppressed() ) return false;
     GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
     if ( !live.ensure() ) return false;
     QMutexLocker locker(&live.mutex);
@@ -888,6 +1032,11 @@ bool gpuBilinearDebayerApplyGpuOffscreen(const float * inputRawFrame,
 GpuAmazeDebayerBackendAvailability gpuAmazeDebayerProbeBackend(void)
 {
     GpuAmazeDebayerBackendAvailability availability;
+    if ( llrpGpuCudaSuppressed() )
+    {
+        availability.reason = cudaSuppressedReason();
+        return availability;
+    }
 
     GpuAmazeDebayerRuntime runtime;
     if ( !loadAmazeDebayerRuntime(&runtime, &availability.reason) )
@@ -940,6 +1089,7 @@ bool gpuAmazeDebayerApplyGpuOffscreen(const float * inputRawFrame,
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !inputRawFrame || !outputRgb16 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE debayer input/output buffers are invalid"));
@@ -969,7 +1119,11 @@ bool gpuAmazeDebayerApplyGpuOffscreen(const float * inputRawFrame,
         return fail(mismatch);
     }
 
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&runtime);
+    if ( !enterAmazeRunUnlessCudaSuppressed(&runtime, GpuFieldTelemetry::enabled()) )
+    {
+        runtime.destroy(backend);
+        return fail(cudaSuppressedReason());
+    }
     const int rc = runtime.run(backend, inputRawFrame, outputRgb16, width, height);
     if ( GpuFieldTelemetry::enabled() ) noteAmazeStageTelemetry(&runtime, backend, "amaze:offscreen", rc);
     if ( rc != 0 )
@@ -1012,6 +1166,7 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !inputRawFrame || glTexture == 0 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE texture-present input or GL texture is invalid"));
@@ -1052,7 +1207,11 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
         return fail(mismatch);
     }
 
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&runtime);
+    if ( !enterAmazeRunUnlessCudaSuppressed(&runtime, GpuFieldTelemetry::enabled()) )
+    {
+        runtime.destroy(backend);
+        return fail(cudaSuppressedReason());
+    }
     const int rc = runtime.runPostWbGlTexture(backend,
                                              inputRawFrame,
                                              glTexture,
@@ -1082,6 +1241,11 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
 GpuAmazeDebayerBackendAvailability gpuAmazeDebayerProbeR16TextureBackend(void)
 {
     GpuAmazeDebayerBackendAvailability availability;
+    if ( llrpGpuCudaSuppressed() )
+    {
+        availability.reason = cudaSuppressedReason();
+        return availability;
+    }
     QString reason;
     GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
     if ( !live.ensure(&reason) )
@@ -1136,6 +1300,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( inputR16GlTexture == 0 || outputRgba16GlTexture == 0 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE R16 texture-present input/output GL texture is invalid"));
@@ -1155,12 +1320,17 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
     }
 
     QMutexLocker locker(&live.mutex);
+    /* r6: read again under the lock: a caller queued here through a loss must not reach CUDA. */
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     QString hnyquistReason;
     if ( !setLiveReducedHnyquist(live, reducedHnyquist, &hnyquistReason) )
     {
         return fail(hnyquistReason);
     }
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 (host-only, no CUDA call): this run's probe arm and start stamp
+    const LiveProbeArm probeArm = takeLiveProbeArm(live);
+    const double runStartSteadyMs = gpuAmazeDebayerSteadyNowMs();
+    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
     const int rc =
         live.runtime.runPostWbGlTextureFromR16GlTexture(
             live.backend,
@@ -1184,6 +1354,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
 
     if ( rendererDescription ) *rendererDescription = live.rendererDescription;
     copyAmazeTiming(&live.runtime, live.backend, timing);
+    noteLiveProbeAfterRun(live, probeArm, runStartSteadyMs, timing);
     if ( reason ) reason->clear();
     return true;
 }
@@ -1208,6 +1379,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
         return false;
     };
 
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !deviceBayer16 || outputRgba16GlTexture == 0 || width <= 32 || height <= 32 )
     {
         return fail(QStringLiteral("GPU AMaZE direct device texture-present input/output is invalid"));
@@ -1227,6 +1399,8 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
     }
 
     QMutexLocker locker(&live.mutex);
+    /* r6: read again under the lock: a caller queued here through a loss must not reach CUDA. */
+    if ( llrpGpuCudaSuppressed() ) return fail(cudaSuppressedReason());
     if ( !live.runtime.runPostWbGlTextureFromDeviceBayer16 )
     {
         return fail(QStringLiteral("GPU AMaZE direct device texture-present symbol is unavailable"));
@@ -1237,7 +1411,10 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
         return fail(hnyquistReason);
     }
 
-    if ( GpuFieldTelemetry::enabled() ) enterAmazeStageTelemetry(&live.runtime);
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0 (host-only, no CUDA call): this run's probe arm and start stamp
+    const LiveProbeArm probeArm = takeLiveProbeArm(live);
+    const double runStartSteadyMs = gpuAmazeDebayerSteadyNowMs();
+    if ( !enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled()) ) return fail(cudaSuppressedReason());
     const int rc =
         live.runtime.runPostWbGlTextureFromDeviceBayer16(
             live.backend,
@@ -1261,6 +1438,7 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
 
     if ( rendererDescription ) *rendererDescription = live.rendererDescription;
     copyAmazeTiming(&live.runtime, live.backend, timing);
+    noteLiveProbeAfterRun(live, probeArm, runStartSteadyMs, timing);
     if ( reason ) reason->clear();
     return true;
 }
@@ -1275,6 +1453,13 @@ bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
                                            QString * rendererDescription,
                                            GpuAmazeDebayerBackendTiming * timing)
 {
+    if ( llrpGpuCudaSuppressed() )
+    {
+        if ( reason ) *reason = cudaSuppressedReason();
+        if ( rendererDescription ) rendererDescription->clear();
+        if ( timing ) *timing = GpuAmazeDebayerBackendTiming();
+        return false;
+    }
     if ( !validWbMultipliers(wbMultipliers) )
     {
         if ( reason ) *reason = QStringLiteral("GPU AMaZE post-WB fallback WB multipliers are invalid");
@@ -1316,7 +1501,7 @@ int gpuAmazeCudaErrorsEmitOrphans(const GpuAmazeCudaErrorSource & source, int ch
         for ( int i = 0; i < n; ++i, ++emitted )
         {
             sink("amaze:uncaptured", 0, -1.0, notes[i].code, notes[i].name, notes[i].site, "orphan",
-                 i == 0 ? dropped : 0);
+                 i == 0 ? dropped : 0, notes[i].utc_ms);
         }
     }
     return emitted;
@@ -1340,11 +1525,11 @@ int gpuAmazeCudaErrorsEmitFailure(const GpuAmazeCudaErrorSource & source, const 
         {
             error.name[sizeof(error.name) - 1] = '\0';
             error.site[sizeof(error.site) - 1] = '\0';
-            sink(stage, rc, -1.0, error.code, error.name, error.site, "primary", 0);
+            sink(stage, rc, -1.0, error.code, error.name, error.site, "primary", 0, error.utc_ms);
         }
         else
         {
-            sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", 0);
+            sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", 0, 0.0);
         }
         return 1;
     }
@@ -1353,13 +1538,13 @@ int gpuAmazeCudaErrorsEmitFailure(const GpuAmazeCudaErrorSource & source, const 
     const int n = drainAmazeCudaErrors(source, IGPU_CUDA_ERROR_CHANNEL_RENDER, notes, &dropped);
     if ( n == 0 )
     {
-        sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", dropped);
+        sink(stage, rc, -1.0, 0, nullptr, nullptr, "primary", dropped, 0.0);
         return 1;
     }
     for ( int i = 0; i < n; ++i )
     {
         sink(stage, rc, -1.0, notes[i].code, notes[i].name, notes[i].site,
-             i == 0 ? "primary" : "secondary", i == 0 ? dropped : 0);
+             i == 0 ? "primary" : "secondary", i == 0 ? dropped : 0, notes[i].utc_ms);
     }
     return n;
 }
@@ -1410,4 +1595,185 @@ int gpuAmazeDebayerDrainCudaErrorsAtTeardown(int waitMs)
 void gpuAmazeDebayerSetCudaErrorSourceForTesting(const GpuAmazeCudaErrorSource * source)
 {
     g_amazeCudaErrorSourceForTesting.store(source);
+}
+
+bool gpuAmazeDebayerEnterRunForTesting(const GpuAmazeCudaErrorSource & source)
+{
+    GpuAmazeDebayerRuntime runtime;
+    runtime.cudaErrors = source;
+    return enterAmazeRunUnlessCudaSuppressed(&runtime, true);
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row 0
+double gpuAmazeDebayerSteadyNowMs(void)
+{
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration<double, std::milli>(now).count();
+}
+
+void gpuAmazeDebayerArmProbe(int calls)
+{
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    g_probeArmCalls = calls > 0 ? calls : 0;
+    g_probeSessionCallsLeft = 0;   // a paused arm ends any Play session's arm
+}
+
+void gpuAmazeDebayerBeginProbeSession(void)
+{
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    g_probeSessionRecord = GpuAmazeProbeSessionRecord();
+    g_probeSessionCallsLeft = GpuAmazeProbeSessionRecord::kMaxCalls;
+    g_probeArmCalls = 0;
+}
+
+GpuAmazeProbeSessionRecord gpuAmazeDebayerProbeSessionRecord(void)
+{
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    return g_probeSessionRecord;
+}
+
+// Row K
+bool gpuAmazeDebayerLiveBackendLoaded(void)
+{
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    return live.attempted && live.available && live.backend != nullptr;
+}
+
+bool gpuAmazeDebayerClockKickBegin(int maxMs, QString * why, double * beginSteadyMs)
+{
+    if ( beginSteadyMs ) *beginSteadyMs = 0.0;
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): the kick only uses a backend the route prewarm (or a present) already loaded
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("backend_not_loaded");
+    if ( !live.runtime.clockKickBegin || !live.runtime.clockKickEnd ) return fail("symbol_missing");
+    // like every AMaZE run: read the device-loss flag again under the lock, after any orphan code was emitted (the
+    // kick is not one of the four AMaZE runs the r6 wiring census counts)
+    const bool mayLaunch = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayLaunch ) return fail("cuda_suppressed");
+    const double startMs = gpuAmazeDebayerSteadyNowMs();
+    const int rc = live.runtime.clockKickBegin(live.backend, maxMs);
+    if ( rc == 1 ) return fail("in_flight");
+    if ( rc != 0 ) return fail("begin_failed");
+    if ( beginSteadyMs ) *beginSteadyMs = startMs;
+    if ( why ) why->clear();
+    return true;
+}
+
+GpuAmazeClockKickReport gpuAmazeDebayerClockKickEnd(void)
+{
+    GpuAmazeClockKickReport report;
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.backend || !live.runtime.clockKickEnd ) return report;
+    igpu_clock_kick_report_t raw;
+    std::memset(&raw, 0, sizeof(raw));
+    if ( live.runtime.clockKickEnd(live.backend, &raw) < 0 ) return report;
+    report.state = raw.state;
+    report.stoppedBy = raw.stopped_by;
+    report.ranMs = raw.ran_ms;
+    if ( raw.state != 0 ) return report;
+    const int n = raw.samples < 0 ? 0 : ( raw.samples > IGPU_CLOCK_KICK_MAX_SAMPLES ? IGPU_CLOCK_KICK_MAX_SAMPLES : raw.samples );
+    std::vector<unsigned long long> ns(raw.sample_ns, raw.sample_ns + n);
+    std::vector<long long> clk(raw.sample_clk, raw.sample_clk + n);
+    std::vector<unsigned int> sm(raw.sample_sm, raw.sample_sm + n);   // clock64 is per SM: cross-SM intervals are unknown
+    report.sampleMs = playback_gpu_clock_kick::sampleMs(ns);
+    report.intervalMhz = playback_gpu_clock_kick::intervalMhz(ns, clk, sm);
+    return report;
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1 R1
+bool gpuAmazeDebayerCaptureInputBayer16(const uint16_t * deviceBayer16, int width, int height,
+                                        quint64 * captureId, QString * why)
+{
+    if ( captureId ) *captureId = 0;
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): the warm that captures already ran AMaZE on the loaded backend
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("backend_not_loaded");
+    if ( !live.runtime.captureInputBayer16 || !live.runtime.inputBayer16MatchesCapture || !live.runtime.releaseInputCapture )
+        return fail("symbol_missing");
+    // like the kick: the device-loss flag read again under the lock (not one of the four AMaZE runs the census counts)
+    const bool mayCapture = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayCapture ) return fail("cuda_suppressed");
+    unsigned long long id = 0;
+    if ( live.runtime.captureInputBayer16(live.backend, deviceBayer16, width, height, &id) != 0 || id == 0 )
+        return fail("failed");
+    if ( captureId ) *captureId = id;
+    if ( why ) why->clear();
+    return true;
+}
+
+bool gpuAmazeDebayerInputBayer16MatchesCapture(const uint16_t * deviceBayer16, int width, int height,
+                                               quint64 captureId, bool * equal, QString * why)
+{
+    if ( equal ) *equal = false;
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): a capture exists only on a backend that is already loaded
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("capture_missing");
+    if ( !live.runtime.inputBayer16MatchesCapture ) return fail("symbol_missing");
+    const bool mayCompare = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayCompare ) return fail("cuda_suppressed");
+    int same = 0;
+    if ( live.runtime.inputBayer16MatchesCapture(live.backend, deviceBayer16, width, height,
+                                                 static_cast<unsigned long long>(captureId), &same) != 0 )
+        return fail("compare_failed");
+    if ( equal ) *equal = same == 1;
+    if ( why ) why->clear();
+    return true;
+}
+
+void gpuAmazeDebayerReleaseInputCapture(void)
+{
+    // never gated: the backend's release makes no CUDA call (safe after a device loss)
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( live.backend && live.runtime.releaseInputCapture ) live.runtime.releaseInputCapture(live.backend);
+}
+
+// PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag
+bool gpuAmazeDebayerDownloadBayer16ForDiagnostics(const uint16_t * deviceBayer16, quint64 captureId, uint16_t * host,
+                                                  int width, int height, QString * why)
+{
+    auto fail = [&](const char * reason) -> bool
+    {
+        if ( why ) *why = QString::fromLatin1(reason);
+        return false;
+    };
+    if ( llrpGpuCudaSuppressed() ) return fail("cuda_suppressed");
+    // never live.ensure(): a capture and a device input exist only on a backend that is already loaded
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    QMutexLocker locker(&live.mutex);
+    if ( !live.attempted || !live.available || !live.backend ) return fail("backend_not_loaded");
+    if ( !live.runtime.downloadBayer16 ) return fail("symbol_missing");
+    const bool mayDownload = enterAmazeRunUnlessCudaSuppressed(&live.runtime, GpuFieldTelemetry::enabled());
+    if ( !mayDownload ) return fail("cuda_suppressed");
+    if ( live.runtime.downloadBayer16(live.backend, deviceBayer16, static_cast<unsigned long long>(captureId), host,
+                                      width, height) != 0 )
+        return fail("failed");
+    if ( why ) why->clear();
+    return true;
 }

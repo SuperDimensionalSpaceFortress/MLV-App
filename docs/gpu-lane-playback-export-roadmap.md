@@ -910,6 +910,19 @@ real throughput win; async writer promotion still needs a representative
 writer-heavy workload or scheduler result that beats the serial payload boundary
 without DNG mismatches.
 
+`MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS=<bound>` is the
+ordering companion (PIPELINE-DNG-ASYNC-WRITER-QUEUE-FILL-FLAKE-1). It has the
+same opt-in as the delay: the export profiler must be on and a profile file
+set. On the writer thread's first dequeue only, after the debug delay, the
+writer holds until the queue is full or finish is called, for at most `<bound>`
+ms. A hold that runs out while the producer is still running prints
+`[dng] async writer debug hold timed out ...` and makes
+`finishDngPayloadWriter` fail. Both values must be plain decimal digits: a
+sign, whitespace or trailing characters (`1garbage`) turn the hook off. The
+pipeline regressions wait on the test-only `dngPayloadWriterDebugWaitHoldResult`
+acknowledgement, not on a sleep, so the queue-fill result no longer depends on
+host speed.
+
 Batch CDNG codec selector:
 `MLVApp --batch` still defaults to uncompressed CDNG, but `--cdng-codec
 lossless` now selects the existing lossless-JPEG DNG path and `--cdng-codec

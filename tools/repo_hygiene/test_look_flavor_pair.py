@@ -299,8 +299,9 @@ def graded(arr):
 
 class FlavorTrioHarness(FlavorDiffHarness):
     def run_trio(self, tiles: dict, *, film_sliders=FILM, film_reported="film", out_dir: Path | None = None, tool: Path = TOOL,
-                 frames: dict | None = None):
-        """tiles: {"classic": {i: arr}, "cinematic": {...}, "film": {...}}; frames: {side: {i: display_frame or OMIT}}."""
+                 frames: dict | None = None, third_flavor: str | None = None):
+        """tiles: {"classic": {i: arr}, "cinematic": {...}, "film": {...}}; frames: {side: {i: display_frame or OMIT}}; third_flavor: --third-flavor
+        (None passes nothing: the Film trio's argv exactly)."""
         self.runs += 1
         run = self.tmp / f"trio{self.runs}"
         stage = run / ".claude-state" / "stage"
@@ -313,7 +314,77 @@ class FlavorTrioHarness(FlavorDiffHarness):
                      f"--{side}-flavor-reported", reported, f"--{side}-receipt-id", f"r-{side}"]
         out = out_dir if out_dir is not None else run / ".claude-state" / "trio"
         args += ["--clip-id", "M16-1243", "--venue", "bachelor", "--build-sha", "0123456789ab", "--out-dir", str(out)]
+        if third_flavor is not None:
+            args += ["--third-flavor", third_flavor]
         return subprocess.run(args, capture_output=True, text=True, timeout=300), out
+
+
+# LOOK-ASSIST-KODAK-VISION-50D-1: the third side as Kodak Vision3 50D (--third-flavor vision50d).
+VISION50D = dict(CINEMATIC, presetGrade="vision50d-v1")
+
+
+class FlavorTrioVision50dRefusalTests(FlavorTrioHarness):
+    def test_a_vision50d_side_without_its_grade_or_its_name_is_refused_as_inert(self) -> None:
+        cases = ((dict(VISION50D, presetGrade="none"), "vision50d"), (dict(VISION50D, presetGrade="skipped_user_curve"), "vision50d"),
+                 (dict(VISION50D, presetGrade="film-v3"), "vision50d"), ({k: v for k, v in VISION50D.items() if k != "presetGrade"}, "vision50d"),
+                 (VISION50D, "film"), (VISION50D, "cinematic"), (VISION50D, "none"), (FILM, "film"))
+        for sliders, reported in cases:
+            with self.subTest(grade=sliders.get("presetGrade"), reported=reported):
+                proc, out = self.run_trio({s: {0: None} for s in ("classic", "cinematic", "film")}, film_sliders=sliders, film_reported=reported,
+                                          third_flavor="vision50d")
+                self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("FLAVOR_INERT"), proc.stderr)
+                self.assertIn("Kodak Vision3 50D side", proc.stderr)
+                self.assertEqual(self.pngs(out), [])
+
+    def test_a_vision50d_side_is_inert_under_the_default_film_check(self) -> None:
+        # Without --third-flavor the third side must be Film: a live Kodak Vision3 50D side is refused, exactly as before this card.
+        proc, out = self.run_trio({s: {0: None} for s in ("classic", "cinematic", "film")}, film_sliders=VISION50D, film_reported="vision50d")
+        self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+        self.assertIn("the Film side reported lookFlavorReported='vision50d', not 'film'", proc.stderr)
+        self.assertIn("the Film side's presetGrade='vision50d-v1', not 'film-v3'", proc.stderr)
+        self.assertEqual(self.pngs(out), [])
+
+    def test_an_unknown_third_flavor_is_a_usage_error(self) -> None:
+        proc, _ = self.run_trio({s: {0: None} for s in ("classic", "cinematic", "film")}, third_flavor="vision")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+
+
+@requires_imaging
+class FlavorTrioVision50dComposeTests(FlavorTrioHarness):
+    def test_third_flavor_is_recorded_only_for_vision50d_and_the_labels_follow_it(self) -> None:
+        tiles = {"classic": {0: tile(80), 1: tile(81)}, "cinematic": {0: tile(82), 1: tile(83)}}
+        tiles["film"] = {i: graded(a) for i, a in tiles["cinematic"].items()}
+        proc, out = self.run_trio(tiles, film_sliders=VISION50D, film_reported="vision50d", third_flavor="vision50d")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["thirdFlavor"], "vision50d")
+        self.assertEqual(list(m)[:2], ["schema", "thirdFlavor"])
+        self.assertIs(m["filmLive"], True)
+        self.assertEqual(m["presetGrade"], {"classic": "none", "cinematic": "none", "film": "vision50d-v1"})
+        self.assertEqual(m["lookFlavorReported"], {"classic": "classic", "cinematic": "cinematic", "film": "vision50d"})
+        table = (out / "table.md").read_text(encoding="utf-8")
+        self.assertIn("| field | Classic | Cinematic | Kodak Vision3 50D |", table)
+        self.assertIn("| presetGrade | none | none | vision50d-v1 |", table)
+        self.assertTrue((out / "sheet-classic-cinematic-film.png").exists())
+        # The same tiles as a Film trio (the default): no thirdFlavor key, Film's column, and the metrics otherwise the same numbers.
+        proc, fout = self.run_trio(tiles)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        f = json.loads((fout / "metrics.json").read_text(encoding="utf-8"))
+        self.assertNotIn("thirdFlavor", f)
+        self.assertIn("| field | Classic | Cinematic | Film |", (fout / "table.md").read_text(encoding="utf-8"))
+        self.assertEqual(f["means"], m["means"])
+        self.assertEqual([t["MAD"] for t in f["tiles"]], [t["MAD"] for t in m["tiles"]])
+
+    def test_an_explicit_third_flavor_film_is_byte_identical_to_the_default(self) -> None:
+        tiles = {"classic": {0: tile(84)}, "cinematic": {0: tile(85)}}
+        tiles["film"] = {0: graded(tiles["cinematic"][0])}
+        runs = []
+        for third in (None, "film"):
+            proc, out = self.run_trio(tiles, third_flavor=third)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            runs.append((proc.stdout.replace(str(out), "<OUT>"), FlavorDiffComposeTests.tree_hashes(out)))
+        self.assertEqual(runs[0], runs[1])
 
 
 class FlavorTrioRefusalTests(FlavorTrioHarness):
@@ -1166,15 +1237,45 @@ class FlavorPairDriverTests(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in out.iterdir()), [name])
 
     # LOOK-ASSIST-FILM-FLAVOR-1: -FilmReceipt makes it a trio; the same equality checks hold across all three.
-    def trio(self, classic, cinematic, film, out: Path | None = None):
+    def trio(self, classic, cinematic, film, out: Path | None = None, third_flavor: str | None = None):
         paths = []
         for name, doc in (("classic", classic), ("cinematic", cinematic), ("film", film)):
             p = self.tmp / f"{name}.receipt.json"
             p.write_text(json.dumps(doc), encoding="utf-8")
             paths.append(p)
+        extra = ["-ThirdFlavor", third_flavor] if third_flavor is not None else []
         return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "New-VenueFlavorPair.ps1"),
-                               "-ClassicReceipt", str(paths[0]), "-CinematicReceipt", str(paths[1]), "-FilmReceipt", str(paths[2]),
+                               "-ClassicReceipt", str(paths[0]), "-CinematicReceipt", str(paths[1]), "-FilmReceipt", str(paths[2]), *extra,
                                "-OutDir", str(out or self.tmp / ".claude-state" / "trio")], capture_output=True, text=True, timeout=300)
+
+    # LOOK-ASSIST-KODAK-VISION-50D-1: -ThirdFlavor names the third receipt's flavor (default film).
+    def test_third_flavor_vision50d_takes_only_a_vision50d_third_receipt(self) -> None:
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("film"), third_flavor="vision50d")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_FLAVORS_WRONG the third receipt must be the vision50d flavor (got 'film')", proc.stdout + proc.stderr)
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("vision50d"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_FLAVORS_WRONG the third receipt must be the film flavor (got 'vision50d')", proc.stdout + proc.stderr)
+        # Past the flavor check, a vision50d trio meets the same equality checks as a Film trio.
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("vision50d", manifest="b" * 64),
+                         third_flavor="vision50d")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_SUBJECT_DIFFERS the film receipt differs in subject.buildManifestSha256", proc.stdout + proc.stderr)
+
+    def test_third_flavor_without_a_third_receipt_or_misspelt_is_refused(self) -> None:
+        paths = []
+        for name in ("classic", "cinematic"):
+            p = self.tmp / f"{name}.receipt.json"
+            p.write_text(json.dumps(synthetic_receipt(name)), encoding="utf-8")
+            paths.append(p)
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "New-VenueFlavorPair.ps1"),
+                               "-ClassicReceipt", str(paths[0]), "-CinematicReceipt", str(paths[1]), "-ThirdFlavor", "vision50d",
+                               "-OutDir", str(self.tmp / ".claude-state" / "pair")], capture_output=True, text=True, timeout=300)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_THIRD_FLAVOR_NEEDS_TRIO", proc.stdout + proc.stderr)
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("vision50d"), third_flavor="Vision 50D")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("PAIR_RECORD", proc.stdout + proc.stderr)
 
     def test_a_third_receipt_that_is_not_film_is_refused(self) -> None:
         proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("cinematic"))

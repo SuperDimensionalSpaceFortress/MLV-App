@@ -14,14 +14,40 @@ Enforced by two scripts, deliberately separate:
 
 | Script | Checks | Comparable across fleet |
 |---|---|---|
-| [`tools/check-doc-size.py`](../tools/check-doc-size.py) | byte budgets by role | yes - ported machinery, only CONFIG is repo-specific |
+| [`tools/docs/run_doc_size.py`](../tools/docs/run_doc_size.py) -> the bus `check-doc-size` **run by pin** (`factory-pins/factory-pins.json`), budgets in [`tools/docs/doc-size-budget.config.json`](../tools/docs/doc-size-budget.config.json) | byte budgets by role | yes - one implementation, the pinned bus bytes; only the config is repo-specific |
+| `tools/check-doc-size.py` (**retiring** - see "Pinned runs") | the same budgets, old project copy | no - its only remaining caller is the `Stop` hook below |
 | [`tools/docs/check_pinned_tokens.py`](../tools/docs/check_pinned_tokens.py) | splits do not drop closeout-asserted substrings | no - this hazard is specific to this repo |
 
 Re-derive every number below rather than trusting the snapshot:
 
 ```bash
-py -3 tools/check-doc-size.py --warn-only --all
+py -3 tools/docs/run_doc_size.py --warn-only --all
 ```
+
+### Pinned runs (CHECK-DOC-SIZE-SINGLE-SOURCE-1)
+
+`run_doc_size.py` runs `python -X utf8 -I factory-pins/pin-runner.py run check-doc-size -- --config
+tools/docs/doc-size-budget.config.json --repo <repo> ...`, so the bytes that execute are the bus blob
+recorded in `factory-pins/factory-pins.json` (a bus push changes nothing that runs). It adds one thing the
+pinned tool lacks, `--trace FILE`, the one-line run record the `Stop` hook relies on. What to know:
+
+- **Scan = `worktree`**, not git-tracked. `.claude-state` is git-ignored and is most of the markdown mass, so
+  a tracked-only scan would report compliance while the hottest files sat outside it (the `hub` tier below
+  keeps its coverage). It also never decodes `git ls-files`, so a non-ASCII file name stays checked; the
+  bus tool's git-tracked mode loses such names (bus card `airmypc/factory-check-doc-size-drops-non-ascii-paths`).
+  `.codex-state/`, `CLAUDE_CODE_PROMPTS.md` and the two `.pytest_cache` trees outside `.claude-state` are git-ignored
+  files the old tool never governed, so they are exempted to keep the findings identical.
+- **A host without the bus clone.** `factory-pins.json` `bus_clone` lists one absolute path (this box's). The
+  runner reads the pinned blob from a local blob cache first (`$FACTORY_PINS_CACHE`, default
+  `%LOCALAPPDATA%/factory-pins/blobs`), so a pin that has run once on a host keeps running with no clone. A
+  host that has neither exits **3 UNAVAILABLE** and runs nothing: set `FACTORY_BUS_CLONE` to a clone. Hosted CI
+  has neither, which is why no CI step calls this tool.
+- **Cache repair (bus defect, not edited here).** `pin-runner.py` rejects corrupt cache bytes but never
+  repairs a same-size corruption, so a run after bus loss can fail offline (exit 3, never wrong bytes). Cure:
+  delete `<cache>/<blob id>` and run once with the bus present. Reported to the bus owner in
+  `doctrine-outbox/20261018-pin-runner-cache-never-repairs-same-size-corruption.md`.
+- **Guard:** `tests/coordination/test_check_doc_size_by_pin.py` (pass and breach cases through the runner,
+  non-ASCII names, scratch bus, no inherited `GIT_DIR`).
 
 ```bash
 py -3 tools/docs/check_pinned_tokens.py
@@ -70,7 +96,7 @@ Every markdown file is an **INDEX** (pointers + procedures) or a **LEAF**
 ## 2. Budgets by role, in bytes
 
 Cost is proportional to how often a file is **read**, not to where it sits. Roles
-are assigned by glob in the CONFIG block of `tools/check-doc-size.py`.
+are assigned by glob in `tools/docs/doc-size-budget.config.json`.
 
 | Role | Meaning | Soft | Hard |
 |---|---|---:|---:|
@@ -201,7 +227,7 @@ owning lane runs its D1 rung and an independent-lane byte-verify has run.
 
 ### Exempt, with reasons
 
-Listed in `EXEMPT` in `tools/check-doc-size.py`, each with its reason inline. An
+Listed under `exempt` in `tools/docs/doc-size-budget.config.json`, each with its reason. An
 exemption without a stated reason is indistinguishable from an oversight.
 
 | Pattern | Reason |
@@ -226,7 +252,7 @@ across all repos sharing the sentinel and land in the same work block.
 
 | Mechanism | Status |
 |---|---|
-| `Stop` hook -> `tools/check-doc-size.py --warn-only --trace` | **wired and OBSERVED FIRING** 2026-07-27T21:59:43Z; always exits 0 |
+| `Stop` hook -> `tools/check-doc-size.py --warn-only --trace` (still the old copy: moving it to `tools/docs/run_doc_size.py` is an edit of `.claude/settings.json`, which CHECK-DOC-SIZE-SINGLE-SOURCE-1 r1 could not make - successor card) | **wired and OBSERVED FIRING** 2026-07-27T21:59:43Z; always exits 0 |
 | `PostToolUse` hook -> `check_pinned_tokens.py --hook` | **wired and OBSERVED FIRING**; fails open on any input |
 | Closeout audit harness gate | **deliberately not wired** |
 | Pre-commit gate | **not touched** |

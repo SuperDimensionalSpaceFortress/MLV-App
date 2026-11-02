@@ -24,7 +24,7 @@
     EVIDENCE IS VALID ONLY WHEN THE LAUNCHER SAYS SO (PLAYBACK-CLIP-LENGTH-ENFORCE-4).
     Every sample is the product of an evidence Play started through the TRACKED launcher
     capture-reference-frame.ps1, which exits 0 only when the app's own receipt proves its engine consumed >= 20 s of
-    source footage (exit 43 = INVALID, 4 = the app failed). This script reads that exit code for EVERY run:
+    source footage (exit 43 = INVALID, 45 / 46 / 47 = the app failed, 4 = it never started). This script reads that exit code for EVERY run:
     a run that exited non-zero, or that wrote no capture.err.txt, is an INVALID run -- its traces never enter the
     distribution, it is counted in invalidRuns, and the script exits 43. A build that is missing is a failure too. The
     published JSON carries verdict OK / INVALID so nothing downstream can mistake a partial set for a measurement.

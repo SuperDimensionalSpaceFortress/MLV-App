@@ -1,0 +1,21 @@
+{
+  "schema": "mlv-app/card-queue/v1",
+  "generated_utc": "2026-10-23T12:00:00Z",
+  "ledger": "fixture",
+  "unclassified": [],
+  "aliases": {},
+  "rows": [
+    {"card": "OPEN-A-P2", "kind": "product", "priority": 2, "state": "queued", "source_ledger_stamp": "2026-10-20T08:00:00Z", "source_ledger_line": 1, "order_chain": null, "notes": "", "evidence": ""},
+    {"card": "OPEN-B-P1-LATE", "kind": "product", "priority": 1, "state": "declared", "source_ledger_stamp": "2026-10-22T08:00:00Z", "source_ledger_line": 2, "order_chain": {"chain": "ORDER-20261022T080000Z", "index": 2, "predecessor": "OPEN-C-P1-TIE"}, "notes": "", "evidence": ""},
+    {"card": "OPEN-C-P1-TIE", "kind": "product", "priority": 1, "state": "pr-open", "source_ledger_stamp": "2026-10-18T08:00:00Z", "source_ledger_line": 3, "order_chain": {"chain": "ORDER-20261022T080000Z", "index": 1, "predecessor": null}, "notes": "", "evidence": ""},
+    {"card": "OPEN-D-P1-TIE", "kind": "playback", "priority": 1, "state": "running", "source_ledger_stamp": "2026-10-18T08:00:00Z", "source_ledger_line": 4, "order_chain": null, "notes": "", "evidence": ""},
+    {"card": "PARKED-E", "kind": "product", "priority": 1, "state": "parked", "source_ledger_stamp": "2026-10-19T08:00:00Z", "source_ledger_line": 5, "order_chain": null, "notes": "waiting on the owner clip. This note is deliberately much longer than one hundred and forty characters so the renderer has to cut it short and keep the line readable", "evidence": ""},
+    {"card": "PARKED-NOTELESS", "kind": "product", "priority": 3, "state": "parked", "source_ledger_stamp": "2026-10-01T08:00:00Z", "source_ledger_line": 6, "order_chain": null, "notes": "", "evidence": ""},
+    {"card": "MERGED-F-DECLARED", "kind": "product", "priority": 1, "state": "merged", "source_ledger_stamp": "2026-10-15T08:00:00Z", "source_ledger_line": 7, "order_chain": null, "notes": "", "evidence": "declared@2026-10-21T09:00:00Z run-dir:x pr#1:MERGED"},
+    {"card": "MERGED-G-NEWEST-STAMP", "kind": "product", "priority": 1, "state": "merged", "source_ledger_stamp": "2026-10-23T01:00:00Z", "source_ledger_line": 8, "order_chain": null, "notes": "", "evidence": "run-dir:y pr#2:MERGED"},
+    {"card": "MERGED-H-PINNED", "kind": "playback", "priority": 1, "state": "merged", "source_ledger_stamp": "2026-10-10T08:00:00Z", "source_ledger_line": 9, "order_chain": null, "notes": "", "evidence": "", "pinned_utc": "2026-10-22T07:00:00Z"},
+    {"card": "MERGED-I-OLD", "kind": "product", "priority": 1, "state": "merged", "source_ledger_stamp": "2026-10-01T08:00:00Z", "source_ledger_line": 10, "order_chain": null, "notes": "", "evidence": "declared@2026-10-02T08:00:00Z"},
+    {"card": "TOOLING-J-OPEN", "kind": "hub-tooling", "priority": 1, "state": "queued", "source_ledger_stamp": "2026-10-22T08:00:00Z", "source_ledger_line": 11, "order_chain": null, "notes": "", "evidence": ""},
+    {"card": "PLAYBACK-NAMED-UNCLASSIFIED-K", "kind": "unclassified", "priority": 1, "state": "queued", "source_ledger_stamp": "2026-10-22T08:00:00Z", "source_ledger_line": 12, "order_chain": null, "notes": "", "evidence": ""}
+  ]
+}

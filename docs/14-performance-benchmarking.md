@@ -570,8 +570,9 @@ plugin:
 - Playback preview mode is a separate quality/performance policy from scale:
   - `Sharp / Smooth Preview` is the default quality-first policy.
   - `Aggressive Performance Preview` opts into faster preview contracts, such
-    as x4 HQ mean23 early reconstruction where gates allow and Dual ISO raw
-    decode-ahead overlap for compatible reduced x4/x8 previews.
+    as Quarter res (0.25x) HQ mean23 early reconstruction where gates allow and
+    Dual ISO raw decode-ahead overlap for compatible Quarter res / Custom res
+    (1/8) previews.
   - For scripted profiles, use `MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW=1` or
     `MLVAPP_PLAYBACK_PREVIEW_MODE=aggressive_performance`. Use `0` or
     `sharp_smooth` for the default behavior.
@@ -595,7 +596,7 @@ headroom sharpening is reported without an active validated no-readback latch,
 when headroom capability is true but validated capability is false, or when
 validated and demoted capability are both true in the same summary. The headroom
 capability is shape-scoped: Dual ISO `GPU Tex NR` telemetry does not arm
-non-Dual-ISO `HQ x2` promotion; that promotion requires a non-Dual-ISO
+non-Dual-ISO HQ Half res (0.5x) promotion; that promotion requires a non-Dual-ISO
 no-readback observation in the current Auto run.
 Default GUI smokes require at least two presented frames, distinct first/last
 presented frame ids, and a bounded skipped/unpresented ratio. Timeline movement
@@ -635,6 +636,11 @@ the following families of keys.
 
 ### Playback scale and per-stage resolution
 
+The telemetry keys and `MLVAPP_PLAYBACK_SCALE_FACTOR` keep the numeric factor
+(1, 2, 4, 8). In the app, reports and docs the factor reads as a resolution:
+1 = Full res (1x), 2 = Half res (0.5x), 4 = Quarter res (0.25x),
+8 = Custom res (1/8). A factor of 2 is half resolution, not double size.
+
 - `render_thread_playback_scale_factor_request`
 - `render_thread_playback_scale_factor_effective`
 - `render_thread_playback_scale_factor_clamped`
@@ -653,7 +659,7 @@ Per-stage resolution telemetry uses the prefix
 `pixel_retention_ratio`, and `preview_resolution` fields. Current stages are:
 
 - `raw_decode` — raw Bayer decode/unpack resolution; currently full source
-  resolution for x1/x2/x4/x8 when the stage runs.
+  resolution at every playback resolution (factor 1/2/4/8) when the stage runs.
 - `bayer_reduction_input` and `bayer_reduction_output` — the early
   Bayer-domain preview-reduction contract for Phase 4B paths 2, 3, and 8.
 - `llrawproc` — active LLRawProc/Dual ISO resolution. This is the field that
