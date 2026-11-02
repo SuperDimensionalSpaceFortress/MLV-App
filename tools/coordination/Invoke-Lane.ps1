@@ -1253,6 +1253,13 @@ function Copy-ImageSnapshot {
 # is longer than the line .NET hands it, so a reserve of (FileName length + 512) is kept: measured on this host, an npm-shaped shim whose path is
 # 101 characters launched an outer line of 7996 characters and failed at 7997 (195 characters of shim overhead; the reserve there is 613).
 # A native executable is held to CreateProcess's 32767-character limit instead.
+# r8 iteration 2 (adversary A1 on 7ba1883b): the computed length is the length BEFORE cmd.exe expands it. Through a shim, %NAME% in ANY argument
+# (-ModelOverride, -C, -o, an MCP name ...) is replaced by the variable's value, quoted or not, and with :~ / :a=b modifiers its length is not
+# knowable from the argument, so `-ModelOverride '%PAD%'` measured 332 characters before expansion and 8419 after: the guard accepted, cmd.exe refused.
+# Through a shim an argument carrying '%' is therefore refused (codex-arg-cmd-expansion), and so is one carrying '!' whenever delayed expansion
+# can be on (Test-CmdDelayedExpansion). '!' is NOT refused unconditionally here: every run dir under C:\!Layi Wkspc puts one in `-o`, and with
+# delayed expansion off cmd.exe passes it through unchanged (measured, probe-cmd-meta.txt). Every other cmd.exe rewrite only removes characters
+# ('^') or splits the line ('&', '|', '<', '>'), so it cannot make the line longer than counted.
 $CMD_LINE_LIMIT_SHIM = 8191
 $CMD_LINE_LIMIT_NATIVE = 32766
 $CMD_SHIM_RESERVE = 512
@@ -1282,11 +1289,36 @@ function Get-NativeCommandLineLength {
     }
     return $n
 }
+function Test-CmdDelayedExpansion {
+    # cmd.exe /? : delayed expansion is on for every invocation when HKCU or HKLM 'Software\Microsoft\Command Processor' DelayedExpansion is 1
+    # (HKCU wins over HKLM; this check is ON when EITHER is non-zero, which only ever refuses more), and a shim can turn it on itself. An
+    # unreadable shim counts as ON (fail closed).
+    param([Parameter(Mandatory = $true)][string]$Shim)
+    foreach ($hive in 'HKCU:', 'HKLM:') {
+        try {
+            $v = (Get-ItemProperty -LiteralPath "$hive\Software\Microsoft\Command Processor" -Name DelayedExpansion -ErrorAction Stop).DelayedExpansion
+            if ($null -ne $v -and [int64]$v -ne 0) { return $true }
+        } catch { }
+    }
+    try { $text = [System.IO.File]::ReadAllText($Shim) } catch { return $true }
+    return ($text -match '(?i)enabledelayedexpansion|/v:on')
+}
 function Assert-CodexCommandLineFits {
-    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0)
+    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0, [object]$DelayedExpansion = $null)
     $len = Get-NativeCommandLineLength -Exe $Exe -Argv $Argv
     $ext = [System.IO.Path]::GetExtension($Exe).ToLowerInvariant()
-    $limit = if ($ext -eq '.cmd' -or $ext -eq '.bat') { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $CMD_SHIM_RESERVE) } else { $CMD_LINE_LIMIT_NATIVE }
+    $isShim = ($ext -eq '.cmd' -or $ext -eq '.bat')
+    if ($isShim) {
+        $bad = @($Argv | Where-Object { ([string]$_).Contains('%') })
+        if ($bad.Count -eq 0) {
+            if ($null -eq $DelayedExpansion) { $DelayedExpansion = Test-CmdDelayedExpansion -Shim $Exe }
+            if ([bool]$DelayedExpansion) { $bad = @($Argv | Where-Object { ([string]$_).Contains('!') }) }
+        }
+        if ($bad.Count -gt 0) {
+            throw "codex-arg-cmd-expansion: the codex argument '$($bad[0])' carries a character cmd.exe expands ('%', or '!' with delayed expansion on) in '$Exe', so neither the argument codex would receive nor the command-line length is knowable; refused before launch"
+        }
+    }
+    $limit = if ($isShim) { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $CMD_SHIM_RESERVE) } else { $CMD_LINE_LIMIT_NATIVE }
     if ($len -gt $limit) {
         $kind = if ($ImageCount -gt 0) { 'image-args-too-long' } else { 'codex-args-too-long' }
         throw "${kind}: the codex command line would be $len characters with $ImageCount image(s) attached; the limit through '$Exe' is $limit (attach fewer -ImagePaths entries or use a shorter -RunDir)"

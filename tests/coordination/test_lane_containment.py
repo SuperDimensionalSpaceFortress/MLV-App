@@ -1369,6 +1369,66 @@ try { 'FITS-NATIVE ' + (Assert-CodexCommandLineFits -Exe 'C:\\x\\codex.exe' -Arg
     assert "FITS-NATIVE 7666" in out,(out,r.stderr)
 
 
+def test_the_codex_command_line_bound_refuses_an_argument_cmd_would_expand(tmp_path):
+    # r8 iteration 2 (adversary A1 on 7ba1883b): the length was counted BEFORE cmd.exe expanded %NAME% (and, with delayed expansion, !NAME!),
+    # so `-ModelOverride '%PAD%'` measured 332 characters and became 8419. Through a shim such an argument is refused; a native exe is not.
+    r=_cmdline_harness(tmp_path,"""
+$shim = 'C:\\x\\codex.cmd'
+function Try-Fits($label, $exe, $argv, $delayed) {
+  try { $label + ' FITS ' + (Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount 1 -DelayedExpansion $delayed) } catch { $label + ' REFUSED ' + $_.Exception.Message }
+}
+Try-Fits 'pct' $shim @('exec', '-m', '%MLV_ADV_PAD%') $false
+Try-Fits 'pct-delayed' $shim @('exec', '-o', 'C:\\run\\a%b\\terra-001.last.txt') $true
+Try-Fits 'bang-delayed' $shim @('exec', '-o', 'C:\\!Layi Wkspc\\run\\terra-001.last.txt') $true
+Try-Fits 'bang-plain' $shim @('exec', '-o', 'C:\\!Layi Wkspc\\run\\terra-001.last.txt') $false
+Try-Fits 'native' 'C:\\x\\codex.exe' @('exec', '-m', '%MLV_ADV_PAD%') $true
+""")
+    out=r.stdout
+    assert "pct REFUSED codex-arg-cmd-expansion: the codex argument '%MLV_ADV_PAD%'" in out,(out,r.stderr)
+    assert "pct-delayed REFUSED codex-arg-cmd-expansion:" in out,(out,r.stderr)
+    assert "bang-delayed REFUSED codex-arg-cmd-expansion:" in out,(out,r.stderr)
+    assert "bang-plain FITS " in out,(out,r.stderr)
+    assert "native FITS " in out,(out,r.stderr)
+
+
+def test_delayed_expansion_is_detected_from_the_shim_itself(tmp_path):
+    on=tmp_path/"on.cmd"; on.write_text('@echo off\r\nsetlocal EnableDelayedExpansion\r\n"x.exe" %*\r\n',encoding="ascii")
+    plain=tmp_path/"plain.cmd"; plain.write_text('@echo off\r\n"x.exe" %*\r\n',encoding="ascii")
+    r=_cmdline_harness(tmp_path,f"""
+'ON ' + (Test-CmdDelayedExpansion -Shim '{on}')
+'PLAIN ' + (Test-CmdDelayedExpansion -Shim '{plain}')
+'MISSING ' + (Test-CmdDelayedExpansion -Shim '{tmp_path / "absent.cmd"}')
+""")
+    assert "ON True" in r.stdout and "MISSING True" in r.stdout,(r.stdout,r.stderr)
+    assert re.search(r"PLAIN (True|False)",r.stdout),(r.stdout,r.stderr)
+
+
+def test_a_model_override_cmd_would_expand_past_the_limit_is_refused_before_the_codex_child_starts(fixture_tree):
+    # r8 iteration 2 (adversary A1 on 7ba1883b), the adversary's own input: an 8100-character variable named in -ModelOverride.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_ADV_PAD"]="x"*8100
+    r=run_lane(cmd+["-ModelOverride","%MLV_ADV_PAD%","-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-arg-cmd-expansion" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists(), "an argument cmd.exe would expand must be refused before the codex child starts"
+
+
+def test_a_run_dir_with_a_bang_is_refused_for_every_codex_argument_when_the_shim_runs_delayed_expansion(fixture_tree):
+    # r8 iteration 2, sibling class (-o <RunDir>\...last.txt): no image at all, a RunDir 'run!x' and a shim with delayed expansion on.
+    fixture_tree["shim"].write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; run_dir=root/"run!x"; run_dir.mkdir()
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd,env)
+    text=_failure_text(r,run_dir/"terra-001.receipt.json")
+    assert r.returncode!=0 and "codex-arg-cmd-expansion" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
 def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):
     # r8 (ADV-A2): every accepted -ImagePaths entry became one `-i <snapshot>` pair, and 120 of them pushed the command line past cmd.exe's
     # 8191 characters: the shim answered "The command line is too long." and codex never ran. The launcher must refuse it typed instead.
