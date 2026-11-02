@@ -312,6 +312,33 @@ void insertDualIsoWarmupInstrumentationTelemetry(
                    dualIsoFull20.phase_implied_pattern );
 }
 
+/* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the llrawproc steps outside the seven stage
+ * timers, emitted beside them; returns their sum so llrawproc_other_ms is the
+ * residual of the finer set. Every field is disjoint (llrawproc.h). */
+double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target )
+{
+    llrpResidualSubstageTiming_t residual = {};
+    llrpGetLastResidualSubstageTiming( &residual );
+    target.insert( QStringLiteral("llrawproc_setup_ms"), residual.setup_ms );
+    target.insert( QStringLiteral("llrawproc_make_14bit_ms"), residual.make_14bit_ms );
+    target.insert( QStringLiteral("llrawproc_lut_rebuild_ms"), residual.lut_rebuild_ms );
+    target.insert( QStringLiteral("llrawproc_lut_rebuilds"), residual.lut_rebuilds );
+    target.insert( QStringLiteral("llrawproc_snapshot_lock_wait_ms"),
+                   residual.snapshot_lock_wait_ms );
+    target.insert( QStringLiteral("llrawproc_snapshot_locked_ms"),
+                   residual.snapshot_locked_ms );
+    target.insert( QStringLiteral("llrawproc_failure_backup_ms"),
+                   residual.failure_backup_ms );
+    target.insert( QStringLiteral("llrawproc_publish_ms"), residual.publish_ms );
+    return residual.setup_ms
+        + residual.make_14bit_ms
+        + residual.lut_rebuild_ms
+        + residual.snapshot_lock_wait_ms
+        + residual.snapshot_locked_ms
+        + residual.failure_backup_ms
+        + residual.publish_ms;
+}
+
 void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
 {
     const double llrawprocTotalMs = llrpGetLastTotalMilliseconds();
@@ -329,7 +356,8 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
         + llrawprocBadPixelsMs
         + llrawprocPatternNoiseMs
         + llrawprocDualIsoMs
-        + llrawprocChromaSmoothMs;
+        + llrawprocChromaSmoothMs
+        + insertLlrawprocResidualSubstageTelemetry( target );
     dualiso_full20bit_timing_t dualIsoFull20 = {};
     llrpGetLastDualIsoFull20bitTiming( &dualIsoFull20 );
 
@@ -6208,7 +6236,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
         llrawprocBadPixelsMs +
         llrawprocPatternNoiseMs +
         llrawprocDualIsoMs +
-        llrawprocChromaSmoothMs;
+        llrawprocChromaSmoothMs +
+        insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry );
     const double llrawprocOtherMs = qMax( 0.0, llrawprocMs - llrawprocKnownMs );
     const double dualIsoPreviewTotalMs =
         slot.dualIsoPreviewHistogramMs +

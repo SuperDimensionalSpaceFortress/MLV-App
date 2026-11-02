@@ -80,6 +80,7 @@ static MLV_THREAD_LOCAL int g_llrawproc_last_pre_dualiso_fix_completed = 0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
+static MLV_THREAD_LOCAL llrpResidualSubstageTiming_t g_llrawproc_last_residual = {0};
 static double g_llrawproc_last_preview_histogram_ms = 0.0;
 static double g_llrawproc_last_preview_regression_ms = 0.0;
 static double g_llrawproc_last_preview_rowscale_ms = 0.0;
@@ -4264,10 +4265,13 @@ static void llrawproc_worker_ensure_luts(llrawprocWorkerState_t * worker, int32_
         return;
     }
 
+    const double rebuild_start = mlv_stage_timing_now();
     free_luts(worker->raw2ev, worker->ev2raw);
     worker->raw2ev = get_raw2ev(black_level);
     worker->ev2raw = get_ev2raw(black_level);
     worker->prev_black_level = black_level;
+    g_llrawproc_last_residual.lut_rebuild_ms += (mlv_stage_timing_now() - rebuild_start) * 1000.0;
+    g_llrawproc_last_residual.lut_rebuilds++;
 }
 
 static llrawprocWorkerState_t * llrawproc_acquire_worker_state(mlvObject_t * video)
@@ -4719,6 +4723,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     g_llrawproc_last_pre_dualiso_fix_completed = 0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
+    memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6294,6 +6299,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
+    memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6381,6 +6387,8 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     uint32_t dark_frame_size_for_subtraction = 0;
     uint32_t dark_frame_black_level = 0;
 
+    const double make_14bit_start = mlv_stage_timing_now();
+    g_llrawproc_last_residual.setup_ms = (make_14bit_start - apply_start) * 1000.0;
     if (original_bits_per_pixel < 14)
     {
         if (!make_14bit(raw_image_buff, raw_image_size, &raw_info))
@@ -6389,12 +6397,15 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
             return 0;
         }
     }
+    g_llrawproc_last_residual.make_14bit_ms = (mlv_stage_timing_now() - make_14bit_start) * 1000.0;
 
     llrawproc_worker_reset_dng_bw_levels(worker, &raw_info);
     llrawproc_worker_ensure_luts(worker, raw_info.black_level);
 
     double shared_lock_start = mlv_stage_timing_now();
     pthread_mutex_lock(&video->llrawproc_mutex);
+    const double shared_lock_acquired = mlv_stage_timing_now();
+    g_llrawproc_last_residual.snapshot_lock_wait_ms = (shared_lock_acquired - shared_lock_start) * 1000.0;
     if (!shared->fix_raw)
     {
         pthread_mutex_unlock(&video->llrawproc_mutex);
@@ -6473,7 +6484,11 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
                                                 isolated_analysis);
 
     pthread_mutex_unlock(&video->llrawproc_mutex);
-    g_llrawproc_last_shared_lock_ms += (mlv_stage_timing_now() - shared_lock_start) * 1000.0;
+    {
+        const double shared_lock_end = mlv_stage_timing_now();
+        g_llrawproc_last_shared_lock_ms += (shared_lock_end - shared_lock_start) * 1000.0;
+        g_llrawproc_last_residual.snapshot_locked_ms = (shared_lock_end - shared_lock_acquired) * 1000.0;
+    }
 
     worker->diso_pattern = worker_diso_pattern;
     worker->diso_auto_correction = worker_diso_auto_correction;
@@ -6502,6 +6517,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
         uint16_t * dual_iso_failure_backup = NULL;
         if (restricted_lossless)
         {
+            const double failure_backup_start = mlv_stage_timing_now();
             dual_iso_failure_backup =
                 llrawproc_worker_capture_dual_iso_failure_backup(
                     worker,
@@ -6519,6 +6535,8 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
                 return 0;
             }
             const double dual_iso_start = mlv_stage_timing_now();
+            g_llrawproc_last_residual.failure_backup_ms =
+                (dual_iso_start - failure_backup_start) * 1000.0;
             int low_iso = MIN(diso1, diso2);
             int high_iso = MAX(diso1, diso2);
             if (!scale_restricted_range(&raw_info,
@@ -6690,9 +6708,12 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
     if (original_bits_per_pixel < 14 && dual_iso_mode != 1)
     {
+        const double undo_14bit_start = mlv_stage_timing_now();
         undo_14bit(raw_image_buff, raw_image_size, video->RAWI.raw_info.bits_per_pixel);
+        g_llrawproc_last_residual.make_14bit_ms += (mlv_stage_timing_now() - undo_14bit_start) * 1000.0;
     }
 
+    const double publish_start = mlv_stage_timing_now();
     {
         const llrawproc_runtime_state_t runtime_state = llrawproc_capture_worker_runtime_state(worker);
         llrawproc_note_output_levels(video, &runtime_state);
@@ -6721,7 +6742,11 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
 
     g_llrawproc_last_dual_iso_ms = dual_iso_ms;
     g_llrawproc_last_chroma_smooth_ms = chroma_smooth_ms;
-    g_llrawproc_last_total_ms = (mlv_stage_timing_now() - apply_start) * 1000.0;
+    {
+        const double apply_end = mlv_stage_timing_now();
+        g_llrawproc_last_residual.publish_ms = (apply_end - publish_start) * 1000.0;
+        g_llrawproc_last_total_ms = (apply_end - apply_start) * 1000.0;
+    }
 
     if (using_stack_worker)
     {
@@ -6815,6 +6840,7 @@ void llrpResetLastRunTimingForCurrentThread(void)
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
+    memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
     llrawproc_reset_dual_iso_full20bit_timing();
     llrpResetLastPreDualIsoFixTelemetry();
 }
@@ -6827,6 +6853,12 @@ double llrpGetLastDualIsoMilliseconds(void)
 double llrpGetLastChromaSmoothMilliseconds(void)
 {
     return g_llrawproc_last_chroma_smooth_ms;
+}
+
+void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing)
+{
+    if (!timing) return;
+    *timing = g_llrawproc_last_residual;
 }
 
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing)
