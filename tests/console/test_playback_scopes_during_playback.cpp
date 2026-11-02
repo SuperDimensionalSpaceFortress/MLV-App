@@ -718,3 +718,27 @@ TEST(PlaybackScopeTapWiring, ARefusedReadBackAllocationIsNotCachedAsCapacity)
     ASSERT_TRUE(recorded > skip);
     ASSERT_EQ(1, tap.count(QStringLiteral("slot.capacityBytes = bytes;")));
 }
+
+// r6 (adversary r5 A1/A3 on 9570ccf8): poll publishes only a read-back NEWER than the last published one (an older slot
+// signalling late never moves the scope backward), and only once glUnmapBuffer confirms the store was intact while mapped
+// (GL_FALSE: corrupt; nothing published, nothing counted completed). The conversion goes to a local buffer first.
+TEST(PlaybackScopeTapWiring, OnlyANewerIntactReadBackIsPublished)
+{
+    const QString tap = readRepoFile(QStringLiteral("platform/qt/GpuScopeTap.cpp"));
+    const int newer = tap.indexOf(QStringLiteral("&& slot.serial > m_resultSerial )"));
+    const int convert = tap.indexOf(QStringLiteral("slot.width, slot.height, &converted);"), newer);
+    const int unmap = tap.indexOf(QStringLiteral("const bool unmapped = mapped && gl->glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_TRUE;"), convert);
+    const int gate = tap.indexOf(QStringLiteral("if ( unmapped )"), unmap);
+    const int publish = tap.indexOf(QStringLiteral("m_result.swap(converted);"), gate);
+    const int serial = tap.indexOf(QStringLiteral("m_resultSerial = slot.serial;"), publish);
+    const int completed = tap.indexOf(QStringLiteral("++m_counters.completed;"), serial);
+    ASSERT_TRUE(newer >= 0);
+    ASSERT_TRUE(convert > newer);
+    ASSERT_TRUE(unmap > convert);
+    ASSERT_TRUE(gate > unmap);
+    ASSERT_TRUE(publish > gate);
+    ASSERT_TRUE(serial > publish);
+    ASSERT_TRUE(completed > serial);
+    // the shared result is never written by the conversion itself
+    ASSERT_FALSE(tap.contains(QStringLiteral("slot.width, slot.height, &m_result);")));
+}

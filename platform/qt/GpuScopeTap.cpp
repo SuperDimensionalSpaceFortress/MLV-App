@@ -194,17 +194,26 @@ void GpuScopeTap::poll(QOpenGLContext *context)
         const GLenum state = gl->glClientWaitSync(slot.fence, 0, 0);
         if ( state == GL_TIMEOUT_EXPIRED ) continue;
         // A read-back issued before the last invalidate() (stop, seek, clip or mode change) is freed unread.
-        if ( ( state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED ) && slot.generation == m_generation )
+        // r6 (adversary r5 A1 on 9570ccf8): only a read-back NEWER than the last one published is published -- the older
+        // slot can signal after the newer one was taken (a TIMEOUT on one poll, ALREADY_SIGNALED on the next), and it must
+        // not move the scope backward. Serials only grow (never reset), so this holds across invalidate() too.
+        if ( ( state == GL_ALREADY_SIGNALED || state == GL_CONDITION_SATISFIED ) && slot.generation == m_generation
+          && slot.serial > m_resultSerial )
         {
             QElapsedTimer mapClock;
             mapClock.start();
             const int bytes = slot.width * slot.height * 4;
             gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
             const void *mapped = gl->glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT);
+            std::vector<uint8_t> converted;
             if ( mapped )
+                playbackScopeTapRgbaBottomUpToRgb8(static_cast<const uint8_t *>(mapped), slot.width, slot.height, &converted);
+            // r6 (adversary r5 A3): GL_FALSE from glUnmapBuffer means the store was corrupted while mapped, so what was read
+            // is not the picture: nothing is published or counted completed.
+            const bool unmapped = mapped && gl->glUnmapBuffer(GL_PIXEL_PACK_BUFFER) == GL_TRUE;
+            if ( unmapped )
             {
-                playbackScopeTapRgbaBottomUpToRgb8(static_cast<const uint8_t *>(mapped), slot.width, slot.height, &m_result);
-                gl->glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                m_result.swap(converted);
                 m_resultWidth = slot.width;
                 m_resultHeight = slot.height;
                 m_resultSerial = slot.serial;
