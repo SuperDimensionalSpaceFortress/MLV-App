@@ -18,6 +18,7 @@ Windows-only test below runs that script's pure-function cases (-UnitOnly, no he
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -60,6 +61,7 @@ MAX_RUN_BOUNDED_TIMEOUT_SEC = 3600
 READ_BOUND_SEC = 10
 MAX_READ_SEC = 2 * READ_BOUND_SEC
 CAPTURE_CLEANUP_BOUND_SEC = 10
+CAPTURE_CLOSE_BOUND_SEC = 10  # closing the two capture files (adversary r8 A1): a close that stalls or fails is named, never awaited
 
 
 def max_wait_and_kill_sec(timeout: float) -> float:
@@ -69,7 +71,33 @@ def max_wait_and_kill_sec(timeout: float) -> float:
 
 def max_run_bounded_sec(timeout: float) -> float:
     """The longest run_bounded(timeout=...) may take before it must have raised: every allowance the helper makes, added up once."""
-    return max_wait_and_kill_sec(timeout) + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
+    return max_wait_and_kill_sec(timeout) + CAPTURE_CLOSE_BOUND_SEC + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
+
+
+def _close_captures(files: list) -> str:
+    """Close the capture files under CAPTURE_CLOSE_BOUND_SEC (adversary r8 A1); return '' or a note naming what went wrong.
+
+    A `with open(...)` closed them synchronously: an OSError from the close replaced the case-named verdict and a stalled close held it
+    back with no bound. The close runs on a daemon thread that is abandoned if it overruns; a failed close is recorded, never raised.
+    """
+    problems: list[str] = []
+
+    def close() -> None:
+        for handle in files:
+            try:
+                handle.close()
+            except Exception as exc:  # noqa: BLE001 - recorded in the note below
+                problems.append(f"{type(exc).__name__}: {exc}")
+
+    try:
+        closer = threading.Thread(target=close, name="close-capture", daemon=True)
+        closer.start()
+    except Exception as exc:  # noqa: BLE001 - a worker that cannot start must not replace the case-named verdict
+        return f"capture close not started ({type(exc).__name__}: {exc})"
+    closer.join(CAPTURE_CLOSE_BOUND_SEC)
+    if closer.is_alive():
+        return f"capture close abandoned after {CAPTURE_CLOSE_BOUND_SEC:g} s"
+    return f"capture close failed: {'; '.join(problems)}" if problems else ""
 
 
 def _remove_capture_dir(path: str) -> str:
@@ -84,8 +112,8 @@ def _remove_capture_dir(path: str) -> str:
         shutil.rmtree(path, ignore_errors=True)
         left["present"] = os.path.exists(path)  # ignore_errors hides a held or read-only file; the caller is told it stayed (adversary r7 A3)
 
-    remover = threading.Thread(target=remove, name="rmtree-capture", daemon=True)
     try:
+        remover = threading.Thread(target=remove, name="rmtree-capture", daemon=True)
         remover.start()
     except Exception as exc:  # noqa: BLE001 - adversary r7 A1: a worker that cannot start must not replace the case-named verdict
         return f"capture cleanup not started ({type(exc).__name__}: {exc}): {path}"
@@ -112,8 +140,8 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
         except BaseException as exc:  # noqa: BLE001 - handed to the caller's thread below
             box["error"] = exc
 
-    reader = threading.Thread(target=read, name=f"read-{path.name}", daemon=True)
     try:
+        reader = threading.Thread(target=read, name=f"read-{path.name}", daemon=True)
         reader.start()
     except Exception as exc:  # noqa: BLE001 - adversary r7 A1: "can't start new thread" must not replace the case-named verdict
         note = f"<read failed: could not start the reader thread ({type(exc).__name__}: {exc})>"
@@ -209,8 +237,16 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
     verdict = ""
     kill_note = ""
     cleanup_note = ""
+    close_note = ""
+    captures: list = []
     try:
-        with open(out_path, "wb") as out, open(err_path, "wb") as err:
+        try:
+            # adversary r8 A1: not `with open(...)`: the implicit close at the end of the block was synchronous and unbounded, and an
+            # OSError from it replaced the case-named verdict. _close_captures closes them under CAPTURE_CLOSE_BOUND_SEC and names a failure.
+            out = open(out_path, "wb")
+            captures.append(out)
+            err = open(err_path, "wb")
+            captures.append(err)
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
             try:
                 proc.wait(timeout=timeout)
@@ -226,6 +262,8 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
                     raise
                 failed = True
                 verdict = f"could not be waited on ({exc!r})"
+        finally:
+            close_note = _close_captures(captures)
         elapsed = time.monotonic() - started
         # After a failed wait the case-named verdict below is the failure, so a read error (a Windows sharing violation on a file the
         # killed tree still holds) is recorded in the text instead of replacing it. Without a failed wait the read error surfaces.
@@ -233,10 +271,13 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
         stderr = _read_captured(err_path, tolerate_oserror=failed)
     finally:
         cleanup_note = _remove_capture_dir(tmp)
+    notes = "".join(f"\n{note}" for note in (close_note, cleanup_note) if note)
     if failed:
         raise AssertionError(f"{case} {verdict} (ran {elapsed:.0f} s) and {kill_note}.\n"
-                             f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}"
-                             + (f"\n{cleanup_note}" if cleanup_note else ""))
+                             f"stdout tail: {stdout[-1500:]!r}\nstderr tail: {stderr[-1500:]!r}" + notes)
+    if close_note:
+        # No failed wait, so the captured output may be incomplete: that is the failure, named by case (it used to surface as a bare OSError).
+        raise AssertionError(f"{case}: {close_note}" + (f"\n{cleanup_note}" if cleanup_note else ""))
     if cleanup_note:
         warnings.warn(f"{case}: {cleanup_note}", RuntimeWarning, stacklevel=2)
     return proc.returncode, stdout, stderr
@@ -1099,6 +1140,108 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertIn(f"capture cleanup incomplete: {seen[0]} was not fully removed", str(caught.exception))
 
+    def _run_with_capture_close(self, on_close, *, timeout_expires: bool = True, close_bound: float | None = None) -> BaseException:
+        """run_bounded with in-memory Popen fakes where closing a capture file calls on_close() after really closing it."""
+        proc = BoundedRunOutputReadFailureTests._TimedOutProc()
+        if not timeout_expires:
+            proc.wait = lambda timeout=None: 0  # type: ignore[method-assign]
+        real_open = open
+
+        class CaptureFile:
+            def __init__(self, handle: object) -> None:
+                self.handle = handle
+
+            def fileno(self) -> int:
+                return self.handle.fileno()  # type: ignore[attr-defined]
+
+            def close(self) -> None:
+                self.handle.close()  # type: ignore[attr-defined]
+                on_close()
+
+            def __enter__(self) -> "CaptureFile":
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                self.close()
+
+        def fake_open(path: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+            return CaptureFile(real_open(path, mode, *args, **kwargs))
+
+        popen = BoundedRunOutputReadFailureTests._popen_for(proc, BoundedRunOutputReadFailureTests._FakeTaskkill(0))
+        patches = [mock.patch.object(subprocess, "Popen", side_effect=popen),
+                   mock.patch.object(sys.modules[__name__], "open", fake_open, create=True)]
+        if close_bound is not None:
+            patches.append(mock.patch.object(sys.modules[__name__], "CAPTURE_CLOSE_BOUND_SEC", close_bound))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            try:
+                run_bounded(["child"], 3, "close-case")
+            except BaseException as exc:  # noqa: BLE001 - the verdict type is the assertion
+                return exc
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_capture_file_whose_close_fails_keeps_the_case_named_verdict(self) -> None:
+        # adversary r8 A1: `with open(...)` closed the captures synchronously, so an OSError from the close replaced the case-named
+        # AssertionError with a bare OSError.
+        def failing_close() -> None:
+            raise OSError(5, "capture close failed")
+
+        caught = self._run_with_capture_close(failing_close)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("capture close failed: OSError: [Errno 5] capture close failed", str(caught))
+
+    def test_a_capture_close_that_stalls_is_abandoned_inside_its_bound_and_named(self) -> None:
+        # adversary r8 A1 (slow variant): two synchronous closes of 300 s each held the verdict 603 s past a 128 s ceiling.
+        release = threading.Event()
+        started = time.monotonic()
+        try:
+            caught = self._run_with_capture_close(lambda: release.wait(60), close_bound=0.3)
+        finally:
+            release.set()
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("capture close abandoned after 0.3 s", str(caught))
+
+    def test_a_capture_close_that_cannot_start_keeps_the_case_named_verdict(self) -> None:
+        real_start = threading.Thread.start
+
+        def start(thread: threading.Thread) -> None:
+            if thread.name == "close-capture":
+                raise RuntimeError("can't start new thread")
+            real_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", start):
+            caught = self._run_with_capture_close(lambda: None)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertIn("capture close not started (RuntimeError: can't start new thread)", str(caught))
+
+    def test_a_capture_close_failure_without_a_timeout_is_a_named_failure_not_a_pass(self) -> None:
+        def failing_close() -> None:
+            raise OSError(5, "capture close failed")
+
+        caught = self._run_with_capture_close(failing_close, timeout_expires=False)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("close-case", str(caught))
+        self.assertIn("capture close failed: OSError: [Errno 5] capture close failed", str(caught))
+
+    def test_a_thread_constructor_that_fails_keeps_the_case_named_verdict(self) -> None:
+        # adversary r8 A2: threading.Thread(...) itself (MemoryError) ran before the protected start() call, so it escaped.
+        real_init = threading.Thread.__init__
+
+        def init(thread: threading.Thread, *args: object, **kwargs: object) -> None:
+            if str(kwargs.get("name", "")).startswith(("read-", "rmtree-capture", "close-capture")):
+                raise MemoryError("thread constructor allocation failed")
+            real_init(thread, *args, **kwargs)
+
+        with mock.patch.object(threading.Thread, "__init__", init):
+            caught = self._run_with_capture_close(lambda: None)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
+
     def test_a_finished_cleanup_adds_no_note_to_the_verdict(self) -> None:
         caught = BoundedRunOutputReadFailureTests()._run_failing_cleanup(taskkill=0)
         self.assertNotIn("capture cleanup", str(caught))
@@ -1307,7 +1450,9 @@ class BoundedCleanupTests(unittest.TestCase):
         self.assertEqual(CLEANUP_BOUND_SEC, TASKKILL_BOUND_SEC + TASKKILL_REAP_SEC + ROOT_REAP_SEC)
         self.assertEqual(max_wait_and_kill_sec(3), 3 + CLEANUP_BOUND_SEC)
         # sol r6 B3: the ceiling is every allowance, added in one place. Adding an allowance without adding it here is a red test.
-        self.assertEqual(max_run_bounded_sec(3), 3 + CLEANUP_BOUND_SEC + 2 * READ_BOUND_SEC + CAPTURE_CLEANUP_BOUND_SEC)
+        # adversary r8 A1: the capture close is one more bounded allowance.
+        self.assertEqual(max_run_bounded_sec(3),
+                         3 + CLEANUP_BOUND_SEC + CAPTURE_CLOSE_BOUND_SEC + 2 * READ_BOUND_SEC + CAPTURE_CLEANUP_BOUND_SEC)
 
     def test_a_run_that_uses_every_allowance_stays_inside_the_ceiling(self) -> None:
         # sol r6 B3: wait 3 + taskkill wait 60 + taskkill reap 5 + root reap 30 + stdout read 10 + stderr read 10 = 118 s is permitted by
