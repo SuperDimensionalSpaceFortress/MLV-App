@@ -1499,7 +1499,9 @@ TEST(ContactSheetSeekDirIdentity, ADirectoryThatCannotBeRemovedIsReported)
     const QString released = QDir::cleanPath(root.filePath(QStringLiteral("free")));
     ASSERT_TRUE(QDir().mkdir(held));
     ASSERT_TRUE(QDir().mkdir(released));
-    const HANDLE handle = CreateFileW(QDir::toNativeSeparators(held).toStdWString().c_str(), FILE_READ_ATTRIBUTES,
+    // FILE_READ_ATTRIBUTES alone takes no part in share-mode checks, so the holder lists the directory.
+    const HANDLE handle = CreateFileW(QDir::toNativeSeparators(held).toStdWString().c_str(),
+                                      FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
                                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                       FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     ASSERT_TRUE(handle != INVALID_HANDLE_VALUE);
