@@ -71,7 +71,7 @@ QString functionBody(const QString & source, const QString & signature)
     return QString();
 }
 
-const QString kRenderInsert = QStringLiteral("insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry )");
+const QString kRenderInsert = QStringLiteral("insertLlrawprocResidualSubstageTelemetry( slot.stageTimingTelemetry,");
 
 } // namespace
 
@@ -84,7 +84,7 @@ TEST(LlrawprocResidualTelemetryWiring, RenderThreadInsertOnlyWhenThisThreadRanLl
     // reconned-raw consumer), and the false arm subtracts nothing.
     const QRegularExpression guarded(
         QStringLiteral("const double llrawprocResidualSubstageMs = llrawprocMs > 0\\.0\\s*\\?\\s*"
-                       "insertLlrawprocResidualSubstageTelemetry\\( slot\\.stageTimingTelemetry \\)\\s*:\\s*0\\.0;"));
+                       "insertLlrawprocResidualSubstageTelemetry\\( slot\\.stageTimingTelemetry,\\s*llrawprocMs,\\s*llrawprocStageTimersMs \\)\\s*:\\s*0\\.0;"));
     const QRegularExpressionMatch match = guarded.match(body);
     ASSERT_TRUE(match.hasMatch());
     ASSERT_TRUE(match.capturedStart() < insertAt && insertAt < match.capturedEnd());
@@ -102,9 +102,11 @@ TEST(LlrawprocResidualTelemetryWiring, ReconWorkerInsertIsUnconditionalAndInItsR
 {
     const QString body = functionBody(renderFrameThreadSource(),
                                       QStringLiteral("void insertLlrawprocReconTimingTelemetry( QJsonObject &target )"));
-    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("+ insertLlrawprocResidualSubstageTelemetry( target );")));
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("+ insertLlrawprocResidualSubstageTelemetry( target,")));
+    // The bundle is told the wall and seven-timer sum of the run it describes.
+    ASSERT_TRUE(QRegularExpression(QStringLiteral("insertLlrawprocResidualSubstageTelemetry\\( target,\\s*llrawprocTotalMs,\\s*llrawprocStageTimersMs \\)")).match(body).hasMatch());
     const int knownAt = body.indexOf(QStringLiteral("const double llrawprocKnownMs ="));
-    const int insertAt = body.indexOf(QStringLiteral("insertLlrawprocResidualSubstageTelemetry( target )"));
+    const int insertAt = body.indexOf(QStringLiteral("insertLlrawprocResidualSubstageTelemetry( target,"));
     const int otherAt = body.indexOf(QStringLiteral("QStringLiteral(\"llrawproc_other_ms\")"));
     ASSERT_TRUE(knownAt >= 0 && knownAt < insertAt && insertAt < otherAt);
 }
@@ -112,7 +114,7 @@ TEST(LlrawprocResidualTelemetryWiring, ReconWorkerInsertIsUnconditionalAndInItsR
 TEST(LlrawprocResidualTelemetryWiring, EveryResidualFieldCarriesThePreservedPrefix)
 {
     const QString body = functionBody(renderFrameThreadSource(),
-                                      QStringLiteral("double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target )"));
+                                      QStringLiteral("double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target,"));
     const QRegularExpression key(QStringLiteral("QStringLiteral\\(\"([a-z0-9_]+)\"\\)"));
     int keys = 0;
     for (QRegularExpressionMatchIterator it = key.globalMatch(body); it.hasNext();) {
@@ -120,8 +122,28 @@ TEST(LlrawprocResidualTelemetryWiring, EveryResidualFieldCarriesThePreservedPref
         ASSERT_TRUE(name.startsWith(QStringLiteral("llrawproc_")));
         ++keys;
     }
-    ASSERT_EQ(8, keys);
+    ASSERT_EQ(11, keys);
     // The CUDA texture route keeps the worker's values only through this prefix.
     ASSERT_TRUE(renderFrameThreadSource().contains(
         QStringLiteral("return key.startsWith( QStringLiteral(\"llrawproc_\") )")));
+}
+
+TEST(LlrawprocResidualTelemetryWiring, SmokeLineReportsOneRunNotTheGenericTotals)
+{
+    // Adversary r1 pass 2 A1: on a reconned CPU frame the render thread rewrites the generic llrawproc_total_ms /
+    // llrawproc_other_ms with its own zero while the guard keeps the worker's sub-timers, so the line must read the
+    // bundle (one run's total, seven-timer sum and residual), never the generic keys.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int lineAt = source.indexOf(QStringLiteral("\"playback_smoke.llrawproc_residual session=%1"));
+    ASSERT_TRUE(lineAt >= 0);
+    const int endAt = source.indexOf(QStringLiteral("qInfo()"), lineAt);
+    ASSERT_TRUE(endAt > lineAt);
+    const QString block = source.mid(lineAt, endAt - lineAt);
+    for (const char * key : {"llrawproc_residual_total_ms", "llrawproc_residual_other_ms",
+                             "llrawproc_residual_stage_timers_ms", "llrawproc_setup_ms", "llrawproc_make_14bit_ms",
+                             "llrawproc_lut_rebuild_ms", "llrawproc_lut_rebuilds", "llrawproc_snapshot_lock_wait_ms",
+                             "llrawproc_snapshot_locked_ms", "llrawproc_failure_backup_ms", "llrawproc_publish_ms"})
+        ASSERT_TRUE(block.contains(QStringLiteral("\"%1\"").arg(QLatin1String(key))));
+    ASSERT_FALSE(block.contains(QStringLiteral("\"llrawproc_total_ms\"")));
+    ASSERT_FALSE(block.contains(QStringLiteral("\"llrawproc_other_ms\"")));
 }
