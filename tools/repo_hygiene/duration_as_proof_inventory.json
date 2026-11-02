@@ -2503,6 +2503,28 @@
       "lines": [
         973
       ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "const double llrawprocResidualSubstageMs = llrawprocMs > 0.0",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "LLRAWPROC-RESIDUAL-SUBTIMERS-1 (adversary r1 A1): drawFrame writes the llrawproc residual sub-stage fields only when this thread's own llrawproc wall (getMlvLastLlrawprocMilliseconds(), zeroed by every reconned-raw consumer) is non-zero, so a CPU frame the recon worker reconstructed keeps the worker's fields. A zero wall is the only 'this thread ran llrawproc' signal here, so it is honestly a run-proof. It is telemetry only (it chooses which run's sub-timers a field carries, never a pass/fail), and a real llrawproc wall spans several QPC reads, so a sub-resolution zero is implausible. Replace it with an llrp 'ran on this thread' flag in the successor.",
+      "status": "open",
+      "successor": "LLRAWPROC-TIMING-RECONNED-ROUTE-PRESERVE-1",
+      "lines": [
+        6260
+      ]
+    },
+    {
+      "path": "tests/console/test_llrawproc_residual_telemetry_wiring.cpp",
+      "anchor": "QStringLiteral ( \"const double llrawprocResidualSubstageMs = llrawprocMs > 0\\\\.0\\\\s*\\\\?\\\\s*\"",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Text of a regular expression in a source-text wiring test that pins the RenderFrameThread.cpp llrawprocResidualSubstageMs guard (row above); no duration is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        86
+      ]
     }
   ]
 }

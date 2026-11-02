@@ -27855,6 +27855,35 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                         timing, "phase3_recon_lut_snapshot_atomic_generation" ) ) )
                     .arg( static_cast<qulonglong>( telemetryDoubleValue(
                         timing, "phase3_recon_lut_snapshot_request_generation" ) ) );
+            // LLRAWPROC-RESIDUAL-SUBTIMERS-1: the llrawproc steps outside the seven stage
+            // timers (RenderFrameThread insertLlrawprocResidualSubstageTelemetry). Every value
+            // is from ONE llrawproc run (the llrawproc_residual_* bundle): total_ms =
+            // stage_timers_ms + the sub-timers + other_ms. A line of its own, so no parsed line moves.
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_smoke.llrawproc_residual session=%1 index=%2 serial=%3 "
+                   "llrawproc_total_ms=%4 setup_ms=%5 make_14bit_ms=%6 "
+                   "lut_rebuild_ms=%7 lut_rebuilds=%8 snapshot_lock_wait_ms=%9 "
+                   "snapshot_locked_ms=%10 failure_backup_ms=%11 publish_ms=%12 "
+                   "other_ms=%13 stage_timers_ms=%14" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokePresentedFrames )
+                   .arg( static_cast<qulonglong>( readyFrame.requestSerial ) )
+                   .arg( telemetryDoubleValue( timing, "llrawproc_residual_total_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue( timing, "llrawproc_setup_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue( timing, "llrawproc_make_14bit_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue( timing, "llrawproc_lut_rebuild_ms" ), 0, 'f', 3 )
+                   .arg( telemetryIntValue( timing, "llrawproc_lut_rebuilds" ) )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_snapshot_lock_wait_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_snapshot_locked_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_failure_backup_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue( timing, "llrawproc_publish_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue( timing, "llrawproc_residual_other_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_residual_stage_timers_ms" ), 0, 'f', 3 );
             qInfo().noquote()
                 << QStringLiteral(
                        "playback_smoke.early_yield session=%1 index=%2 serial=%3 "

@@ -66,6 +66,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_fullscreen_ui_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
     $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_llrawproc_residual_telemetry_wiring.cpp \
     $$REPO_ROOT/tests/console/test_debayered16_recon_provenance_wiring.cpp \
     $$REPO_ROOT/tests/console/test_debayered16_honour_scale_wiring.cpp \
     $$REPO_ROOT/tests/console/test_contact_sheet_capture_wiring.cpp \
