@@ -281,6 +281,14 @@ $script:RunDirTieExt = @('.ps1', '.psm1', '.json', '.jsonl', '.txt', '.md', '.ar
 $script:RunDirTieBulkExt = @('.txt', '.jsonl')
 $script:RunDirTieMaxFiles = 200
 $script:RunDirTieMaxBytes = 1048576
+# RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: a pid in a run-dir record is a REUSE candidate until it is bound to the recorded process. Windows reuses
+# pids, so a dead lane's child.json / receipt can name a pid that now runs tailscaled.exe, OfficeClickToRun.exe, remoting_host.exe or git.exe
+# (fleet doctrine RECEIPTS.md:5103 "procStart defeats PID reuse"; TRAPS.md:11541 "a liveness pid is reused"). Find-RunDirDriverHolders ties a
+# recorded pid to a run dir only when Test-RecordedPidBound says the live process can be the recorded one: the image is a lane driver/host image
+# (RunDirDriverImagePattern) AND its creation time fits the record (RunDirPidCreatedSlackSec). A creation time that cannot be read falls back to
+# the image test alone; a record or process that cannot be read at all keeps the existing fail-closed paths.
+$script:RunDirDriverImagePattern = '(?i)^(pwsh|pwsh-preview|powershell|claude|codex|node|cmd|python|pythonw|py)(\.exe)?$'
+$script:RunDirPidCreatedSlackSec = 5
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -640,6 +648,45 @@ function Get-PidsFromRecordText([string]$Text) {
 }
 $script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
 $script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
+$script:CreatedUtcJsonRx = [regex]::new('"createdUtc"\s*:\s*"([^"]+)"', 'Compiled')
+
+function Get-RecordedCreatedUtc([string]$Text, [int]$PidCount) {
+    # The process creation time a record states for its pid (opus-001.child.json: {"pid":N,"createdUtc":"..."}), UTC, or $null. Used only when the
+    # record names exactly one pid, so the time cannot belong to another one; any other shape, or text that does not parse, is $null (no claim).
+    if ($PidCount -ne 1 -or [string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $m = $script:CreatedUtcJsonRx.Match($Text)
+    if (-not $m.Success) { return $null }
+    $t = [datetime]::MinValue
+    $ok = [datetime]::TryParse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$t)
+    if ($ok) { return $t }
+    return $null
+}
+
+function Test-RecordedPidBound {
+    # Can the LIVE process $Proc be the process a run-dir record named? {Bound; Why}. The pid alone is not evidence: Windows reuses pids.
+    #   image     the live image must be a lane driver / host image (RunDirDriverImagePattern); tailscaled.exe, git.exe ... are not.
+    #   created   when the process creation time is readable: it must equal the record's createdUtc (within RunDirPidCreatedSlackSec) when the
+    #             record states one, else it must not be later than the record file's last write (+ slack): a record is written after the
+    #             process it names starts, so a process that started after it is a different one that got the pid.
+    #   unreadable creation time (null / absent): the image test decides alone (fail toward live for a lane image, never for a foreign one).
+    param([object]$Proc, [object]$Record)
+    $name = [string]$Proc.Name
+    if ($name -notmatch $script:RunDirDriverImagePattern) { return [pscustomobject]@{ Bound = $false; Why = "image-not-a-lane-driver:$name" } }
+    $cdp = $Proc.PSObject.Properties['CreationDate']
+    if (-not $cdp -or $cdp.Value -isnot [datetime]) { return [pscustomobject]@{ Bound = $true; Why = 'creation-time-unreadable:image-only' } }
+    $created = ([datetime]$cdp.Value).ToUniversalTime()
+    $slack = [double]$script:RunDirPidCreatedSlackSec
+    $rc = $Record.PSObject.Properties['RecordedCreatedUtc']
+    if ($rc -and $rc.Value -is [datetime]) {
+        if ([math]::Abs(($created - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds) -le $slack) { return [pscustomobject]@{ Bound = $true; Why = 'created-matches-record' } }
+        return [pscustomobject]@{ Bound = $false; Why = "created-differs-from-record:$($created.ToString('o')) vs $(([datetime]$rc.Value).ToUniversalTime().ToString('o'))" }
+    }
+    $at = $Record.PSObject.Properties['RecordedAtUtc']
+    if ($at -and $at.Value -is [datetime]) {
+        if (($created - ([datetime]$at.Value).ToUniversalTime()).TotalSeconds -gt $slack) { return [pscustomobject]@{ Bound = $false; Why = "started-after-record:$($created.ToString('o')) > $(([datetime]$at.Value).ToUniversalTime().ToString('o'))" } }
+    }
+    return [pscustomobject]@{ Bound = $true; Why = 'created-fits-record' }
+}
 
 function Read-SharedText {
     # r3 (PR #654 key3 r2 B1): read a file another process may hold open for WRITING. [IO.File]::ReadAllText asks for FileShare.Read, so it
@@ -699,7 +746,11 @@ function Get-RunDirPidIndex {
                     if ($why) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = 0; Error = "$($f.FullName) $why" }) }
                     continue
                 }
-                foreach ($id in (Get-PidsFromRecordText $text)) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null }) }
+                # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: each row also carries when the record was written (RecordedAtUtc) and, when it states one for
+                # its only pid, the recorded process creation time (RecordedCreatedUtc), so Find-RunDirDriverHolders can bind the pid to its process.
+                $recIds = Get-PidsFromRecordText $text
+                $recCreated = Get-RecordedCreatedUtc -Text $text -PidCount @($recIds).Count
+                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $f.LastWriteTimeUtc; RecordedCreatedUtc = $recCreated }) }
             }
         }
     }
@@ -767,7 +818,9 @@ function Find-RunDirDriverHolders {
         $matched = $null; $enc = ''
         try {
             if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
-            elseif ((-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: the run-dir tie below needs the live pid to BE the recorded process (image + creation time);
+            # a reused pid (tailscaled.exe, git.exe ... with an unreadable command line) is not a driver of this run dir.
+            elseif ((Test-RecordedPidBound -Proc $p -Record $rec).Bound -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
                 $matched = $rec.RunDir
                 if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }

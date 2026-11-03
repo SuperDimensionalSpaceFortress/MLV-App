@@ -2752,6 +2752,107 @@ def test_gate_refused_line_carries_reason_live_driver_or_live_process(repo):
     assert re.search(r"REFUSED worktree-removal reason=live-process path=.* pid=999992 .*via=cmdline", err), err
 
 
+# --- RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: a recorded pid is a live driver only while it is still the RECORDED process ---
+# 2026-11-01 (lane-NONBUILDING-WAITER-SKIPS-BUILD-ADMISSION-LOCK-1-r1 invoke.err.txt): dead lanes' worktrees were never retired because pids read
+# from stale child.json / receipt files in old run dirs had been REUSED by tailscaled.exe, OfficeClickToRun.exe, remoting_host.exe and git.exe.
+# A run-dir record is written after the process it names starts, so a live pid whose image is not a lane driver, or whose creation time does not
+# fit the record, is a different process that got the pid. Fleet doctrine RECEIPTS.md:5103 (procStart defeats PID reuse), TRAPS.md:11541.
+
+def _utc_expr(epoch):
+    return f"[datetime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc).AddSeconds({int(epoch)})"
+
+
+def _fake_proc_created(pid, cmdline, name, epoch):
+    """A fake snapshot row WITH a creation time (epoch seconds, UTC), as Win32_Process rows carry."""
+    cl = str(cmdline).replace("'", "''")
+    return f"[pscustomobject]@{{ ProcessId = {pid}; Name = '{name}'; CommandLine = '{cl}'; CreationDate = {_utc_expr(epoch)} }}"
+
+
+def _stamp_run_dir(rd, epoch):
+    """Pin every record in the run dir to a known write time (the record's 'written' moment)."""
+    for f in rd.iterdir():
+        os.utime(f, (epoch, epoch))
+
+
+@pytest.mark.parametrize("image", ["tailscaled.exe", "OfficeClickToRun.exe", "remoting_host.exe", "git.exe"])
+@pytest.mark.parametrize("cmdline_shape", ["unreadable", "names-run-dir"])
+def test_reused_pid_running_a_foreign_image_is_not_a_live_driver(tmp_path, image, cmdline_shape):
+    """The 2026-11-01 shape: the recorded pid now runs an unrelated image (unreadable command line, or one that merely names the run dir)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r1", 999971, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    cmdline = "" if cmdline_shape == "unreadable" else f"{image} --state {rd}"
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999971, cmdline, image)), runs)
+    assert r is None, (r, err)
+
+
+def test_reused_pid_that_started_after_its_record_was_written_is_not_a_live_driver(tmp_path):
+    """Even a pwsh.exe: a process created AFTER the record was written cannot be the process the record named."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r2", 999972, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    for cmdline in ("", _driver_cmdline(rd)):
+        r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, cmdline, "pwsh.exe", written + 600)), runs)
+        assert r is None, (cmdline, r, err)
+
+
+def test_a_driver_that_started_before_its_record_was_written_is_still_a_live_driver(tmp_path):
+    """No regression: the genuine detached driver (process older than its pid file) still refuses, unreadable command line included."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r3", 999973, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    for cmdline in (_driver_cmdline(rd), ""):
+        r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, cmdline, "pwsh.exe", written - 600)), runs)
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999973, (cmdline, r)
+
+
+def test_a_record_that_states_createdutc_binds_the_pid_to_exactly_that_process(tmp_path):
+    """child.json carries createdUtc: a different creation time is a reused pid even when it predates the record file's write time."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r4", 999974, workdir=wt, pid_file="opus-001.child.json", child_json=True)   # ONE record for the pid (a second, createdUtc-less .pid record would legitimately tie it by write time)
+    created = time.time() - 7200
+    (rd / "opus-001.child.json").write_text(json.dumps({
+        "schema": "mlv-lane-child/v1", "pid": 999974,
+        "createdUtc": datetime.datetime.fromtimestamp(created, datetime.timezone.utc).isoformat()}), encoding="utf-8")
+    _stamp_run_dir(rd, time.time() - 60)   # written long after, so the write-time rule alone would call a 1 h old process "the same"
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 1)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["via"].startswith("rundir-pid:"), r
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_a_creation_time_that_cannot_be_read_falls_back_to_the_image_check(tmp_path):
+    """No CreationDate on the row: a lane image is still treated as the driver (fail toward live), a foreign image is not."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    _driver_run_dir(runs, "lane-X-1-r5", 999975, workdir=wt)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999975, "", "pwsh.exe")), runs)
+    assert r is not None and r["reason"] == "live-driver", r
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999975, "", "tailscaled.exe")), runs)
+    assert r is None, (r, err)
+
+
+def test_gate_retires_a_worktree_whose_only_recorded_driver_pid_was_reused(repo):
+    """End to end through the gate: a dead lane's worktree is would-retire while its recorded pid runs an unrelated image."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-REUSE-1")
+    runs = tmp / "fleet-runs"
+    _driver_run_dir(runs, "lane-REUSE-1-r1", 999976, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999976, "", "OfficeClickToRun.exe")), runs)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), (d, err)
+    assert "REFUSED" not in err, err
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo
