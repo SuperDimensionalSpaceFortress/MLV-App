@@ -1822,6 +1822,14 @@ def test_case_sensitive_siblings_wt_and_WT_are_different_directories_when_their_
     assert out == "False,True,False,True,True,False"  # r13 saver: the call fails (no -ReadId); its string compare read wt and WT as one directory
 
 
+@pytest.mark.parametrize("depth", [4095, 4096, 4097, 6000])
+def test_a_child_nested_deeper_than_any_fixed_chain_length_is_still_found_inside_its_parent(depth):  # r14 adversary pass 1 A1 (fb5bb80d): the parent-chain walk was capped at 4096 components, so a RunDir 4096+ levels below the worktree lost the worktree root from its chain and read as OUTSIDE (the saver then wrote inside the worktree). Stubbed identity reader: the identity of a path is the path
+    expr = ("$($base = [System.IO.Path]::Combine($env:LDS_ROOT, 'wt'); $child = $base + (([string][System.IO.Path]::DirectorySeparatorChar + 'a') * [int]$env:LDS_DEPTH); $each = { param($p) $p }; "
+            "(@((Test-Inside $base $child $each), (Test-Inside $child $base $each)) -join ','))")
+    out = run_ps_functions(IDENTITY_FUNCS, expr, pre=ONWIN, LDS_ROOT=str(Path(tempfile.gettempdir())), LDS_DEPTH=str(depth))
+    assert out == "True,False"  # fb5bb80d: depths 4095 true, 4096 and 4097 false
+
+
 def test_an_identity_that_cannot_be_read_is_a_refusal_not_a_pass():  # r14 B3: unknown is never "outside"
     expr = "$(try { Test-Inside 'P' 'Q' { param($p) throw 'denied' } } catch { $_.Exception.Message })"
     out = run_ps_functions(IDENTITY_FUNCS, expr, pre=ONWIN)
@@ -1866,3 +1874,30 @@ def test_a_case_sensitive_sibling_run_dir_is_outside_the_worktree_end_to_end(tmp
     r = run_saver(wt, run)
     assert r.returncode == 0, r.stdout + r.stderr  # r13 saver: 30 run-dir-inside-worktree
     assert any(p.name.endswith(".patch") for p in run.iterdir())
+
+
+@pytest.mark.skipif(not WIN, reason="a directory handle that blocks a rename is Windows; POSIX relies on the end-of-run identity re-check")
+def test_the_captured_git_dir_cannot_be_renamed_away_and_replaced_while_the_saver_runs(repo, tmp_path):  # r14 adversary pass 1 A2 (fb5bb80d): the pin was a path string, so a peer could move .git away and put another repository's git dir at the same path between the capture and the first read; every later read then used the other repository (clean-tree/10 for A's dirt). The hook plays the peer right before the first diff
+    marker = tmp_path / "rename-result.txt"
+    hook = (f"try {{ [System.IO.Directory]::Move([System.IO.Path]::Combine($WorkDir.Replace('/', '\\'), '.git'), [System.IO.Path]::Combine($WorkDir.Replace('/', '\\'), '.git.old')); $o = 'MOVED' }} catch {{ $o = 'BLOCKED' }}; "
+            f"Set-Content -LiteralPath '{marker}' -Value $o -NoNewline")
+    (repo / "u.txt").write_text("u\n")
+    r = save_with_hook(repo, tmp_path, hook)
+    outcome = marker.read_text()
+    if outcome == "MOVED":
+        (repo / ".git.old").rename(repo / ".git")  # leave the fixture usable
+    assert outcome == "BLOCKED", r.stdout + r.stderr  # fb5bb80d: MOVED, nothing held the git dir
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_repository_whose_identity_changed_during_the_run_is_a_refusal_not_a_clean_tree():  # r14 adversary pass 1 A2 on every platform: the git dir and the work tree are read again at the end and must still be the ones captured at the start (the swap that a handle cannot block on POSIX is detected, never reported as clean)
+    expr = ("$($same = { param($p) 'id:' + $p }; $moved = { param($p) if ($p -eq 'G') { 'id:other' } else { 'id:' + $p } }; "
+            "$t = { param($sb) try { Assert-RepoUnchanged 'G' 'W' @('id:G', 'id:W') $sb; 'ok' } catch { $_.Exception.Message } }; "
+            "(@((& $t $same), (& $t $moved)) -join ','))")
+    out = run_ps_functions(["Assert-RepoUnchanged", "Get-DirIdList", "Get-DirId", "Get-DirIds", "Invoke-Capture"], expr, pre=ONWIN)
+    assert out == "ok,repository-changed"
+
+
+def test_the_repository_identity_is_held_and_rechecked_in_the_saver_source():  # r14 A2 source pin
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "$script:heldGit = Get-FinalDir $gitDir" in text and "Assert-RepoUnchanged $gitDir $WorkDir $script:repoIds" in text and "reason=repository-changed" in text
