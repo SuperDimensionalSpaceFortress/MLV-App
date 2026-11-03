@@ -4153,11 +4153,14 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
  * own output makes both directions exact: equal pictures give equal identities, and different pictures differ
  * (up to an FNV-1a 64 collision). `payload` is the caller's buffer and liblj92 writes into it (parseHuff zeroes each
  * DHT class/id byte), exactly as it does when it decodes the frame for display. */
-static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length,
+/* r5 (adversary r5 pass 2 A2 on 787b70cc): `capacity` is the zero-filled allocation behind `payload`; liblj92's bit
+ * reader runs by sample count and can read past `length`, so the decode is refused unless the buffer is at least the
+ * display decode's (getMlvRawFrameUint16Direct: max(frame_size, packed picture) + 4, mlvRawFrameInputCapacity). */
+static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length, size_t capacity,
                                          int expectedWidth, int expectedHeight, int expectedBitdepth,
                                          uint64_t * hashOut)
 {
-    if (!payload || !hashOut || length < 4 || length > (size_t)INT_MAX) return 1;
+    if (!payload || !hashOut || length < 4 || length > (size_t)INT_MAX || capacity < length) return 1;
     lj92 decoder;
     int width = 0, height = 0, bitdepth = 0, components = 0;
     if (lj92_open(&decoder, payload, (int)length, &width, &height, &bitdepth, &components) != LJ92_ERROR_NONE)
@@ -4171,6 +4174,14 @@ static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length,
     if (ok && expectedWidth > 0)
         ok = bitdepth == expectedBitdepth
             && samples == (size_t)expectedWidth * (size_t)expectedHeight;
+    if (ok)
+    {
+        /* the display decode's buffer floor (A2): max(length, packed picture) + 4 */
+        ok = bitdepth > 0 && bitdepth <= 16 && samples <= (SIZE_MAX - 7u) / (size_t)bitdepth;
+        const size_t packed = ok ? (samples * (size_t)bitdepth + 7u) / 8u : 0;
+        const size_t floorBytes = (packed > length ? packed : length);
+        ok = ok && floorBytes <= SIZE_MAX - 4u && capacity >= floorBytes + 4u;
+    }
     uint16_t * picture = ok ? (uint16_t *)calloc(samples, sizeof(uint16_t)) : NULL;
     if (!picture)
     {
@@ -4185,11 +4196,9 @@ static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length,
         free(picture);
         return 1;
     }
+    /* The samples only (r5 pass 2 A1): the display reads them in RAWI's geometry whatever width, height and component
+     * count the LJ92 header declares, so two payloads that decode the same sample sequence are the same picture. */
     uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
-    const uint8_t shape[9] = { (uint8_t)(width >> 24), (uint8_t)(width >> 16), (uint8_t)(width >> 8), (uint8_t)width,
-                               (uint8_t)(height >> 24), (uint8_t)(height >> 16), (uint8_t)(height >> 8), (uint8_t)height,
-                               (uint8_t)components };
-    hash = mlv_source_hash_fnv1a64(hash, shape, sizeof shape);
     for (size_t i = 0; i < samples; ++i)
     {
         const uint8_t sample[2] = { (uint8_t)(picture[i] & 0xFFu), (uint8_t)(picture[i] >> 8) };
@@ -4200,15 +4209,31 @@ static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length,
     return 0;
 }
 
-/* The const entry point decodes a private copy (with the 4 zeroed look-ahead bytes the display decode's buffer
- * also has), so the caller's payload is never written. No expected size: the picture lj92_open reports is hashed. */
+/* The const entry point decodes a private, display-sized, zero-filled copy, so the caller's payload is never written.
+ * No expected size: the picture lj92_open reports is hashed. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut)
 {
-    if (!data || !hashOut || length < 4 || length > (size_t)INT_MAX) return 1;
-    uint8_t * copy = (uint8_t *)calloc(length + 4u, 1);
+    if (!data || !hashOut || length < 4 || length > (size_t)INT_MAX - 4) return 1;
+    /* r5 pass 2 A2: no RAWI here, so a throwaway lj92_open on a probe copy learns the picture size first; the decode
+     * copy is then sized like the display decode's buffer (max(length, packed picture) + 4, zero-filled). */
+    uint8_t * probe = (uint8_t *)calloc(length + 4u, 1);
+    if (!probe) return 1;
+    memcpy(probe, data, length);
+    lj92 decoder;
+    int width = 0, height = 0, bitdepth = 0, components = 0;
+    const int opened = lj92_open(&decoder, probe, (int)length, &width, &height, &bitdepth, &components);
+    if (opened == LJ92_ERROR_NONE) lj92_close(decoder);
+    free(probe);
+    if (opened != LJ92_ERROR_NONE || width <= 0 || height <= 0 || components <= 0 || bitdepth <= 0 || bitdepth > 16
+        || (size_t)width > SIZE_MAX / (size_t)height
+        || (size_t)width * (size_t)height > SIZE_MAX / (size_t)components / 16u)
+        return 1;
+    const size_t packed = ((size_t)width * (size_t)height * (size_t)components * (size_t)bitdepth + 7u) / 8u;
+    const size_t capacity = (packed > length ? packed : length) + 4u;
+    uint8_t * copy = (uint8_t *)calloc(capacity, 1);
     if (!copy) return 1;
     memcpy(copy, data, length);
-    const int status = mlv_lj92_decoded_picture_hash(copy, length, 0, 0, 0, hashOut);
+    const int status = mlv_lj92_decoded_picture_hash(copy, length, capacity, 0, 0, 0, hashOut);
     free(copy);
     return status;
 }
@@ -4231,6 +4256,7 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
         || !video->main_file_mutex) return 1;
 
     size_t byte_count = 0;
+    size_t lj92_capacity = 0;
     if ((video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
         || (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_JPEG2K))
     {
@@ -4245,6 +4271,7 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
             || (size_t)entry->frame_size > raw_frame_capacity - 4u)
             return 1;
         byte_count = (size_t)entry->frame_size;
+        lj92_capacity = raw_frame_capacity;
     }
     else
     {
@@ -4263,7 +4290,7 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
         /* r5 (adversary r5 A1 on e57fd03e): the whole payload, decoded as the display decodes it, and the
          * decoded picture hashed (mlv_lj92_decoded_picture_hash). The buffer is the display decode's shape:
          * frame_size bytes plus 4 look-ahead bytes (zeroed here, so the identity is deterministic). */
-        uint8_t * payload = (uint8_t *)calloc(byte_count + 4u, 1);
+        uint8_t * payload = (uint8_t *)calloc(lj92_capacity, 1); /* pass 2 A2: the display decode's raw_frame size */
         if (!payload) return 1;
         pthread_mutex_lock(video->main_file_mutex + chunk);
         /* r5: a failed seek is no identity (the read after it would hash whatever the stream was positioned on). */
@@ -4273,7 +4300,7 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
         /* payload is this function's own buffer: liblj92 may write into it, as it writes into raw_frame. The
          * expected size and bit depth are the display decode's (RAWI), so a frame it refuses has no identity. */
         const int lj92Failed = seekFailed || got != byte_count
-            || mlv_lj92_decoded_picture_hash(payload, byte_count, video->RAWI.xRes, video->RAWI.yRes,
+            || mlv_lj92_decoded_picture_hash(payload, byte_count, lj92_capacity, video->RAWI.xRes, video->RAWI.yRes,
                                              video->RAWI.raw_info.bits_per_pixel, hashOut) != 0;
         free(payload);
         return lj92Failed ? 1 : 0;

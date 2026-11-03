@@ -55,9 +55,13 @@ std::vector<uint8_t> withSegmentAfterSoi(const std::vector<uint8_t> & payload, c
 // Decodes a COPY: liblj92's parseHuff writes into the buffer it parses.
 bool decodeLj92(std::vector<uint8_t> payload, std::vector<uint16_t> * picture)
 {
+    // r5 (adversary r5 pass 2 A2): liblj92's bit reader runs by sample count and can read past the payload, so the copy
+    // carries zeroed slack (more than any 64x64 test picture's packed size), as the display decode's buffer does.
+    const int length = static_cast<int>(payload.size());
+    payload.resize(payload.size() + 4 + 2 * 65536, 0);
     lj92 decoder;
     int width = 0, height = 0, bitdepth = 0, components = 0;
-    if (lj92_open(&decoder, payload.data(), static_cast<int>(payload.size()),
+    if (lj92_open(&decoder, payload.data(), length,
                   &width, &height, &bitdepth, &components) != LJ92_ERROR_NONE)
         return false;
     picture->assign(static_cast<size_t>(width) * height * components, 0);
@@ -454,6 +458,35 @@ TEST(VisualCaptureSourceHash, Lj92TheDhtClassIdIsReadAsZeroWhereverTheWalkLandsO
             ASSERT_EQ(0, status);
         }
     }
+}
+
+// r5 (adversary r5 pass 2 A1 on 787b70cc, verbatim input): a 64x64 and a 128x32 SOF3 over one scan decode the same
+// sample sequence, which the display reads in RAWI's geometry either way, so the identity hashes the samples, not the
+// LJ92 header's shape.
+TEST(VisualCaptureSourceHash, Lj92TheHeadersShapeIsNotPartOfTheIdentity)
+{
+    auto build = [&](const std::vector<uint8_t> & sof)
+    {
+        return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x01, 0x01 }, zeros(14), { 0x00, 0x0D }, sof, kSos,
+                       zeros(256), { 0xA0 }, zeros(256), { 0x03 }, { 0xFF, 0xD9 } });
+    };
+    const std::vector<uint8_t> square = build(kSof3);
+    const std::vector<uint8_t> wide = build({ 0xFF, 0xC3, 0x00, 0x0B, 0x0E, 0x00, 0x20, 0x00, 0x80, 0x01, 0x01, 0x11, 0x00 });
+    ASSERT_EQ(static_cast<size_t>(564), square.size());
+    ASSERT_EQ(2, expectIdentityFollowsPicture(square, wide));
+}
+
+// r5 (adversary r5 pass 2 A2 on 787b70cc, verbatim input): a 114-byte payload whose scan runs out of entropy bytes long
+// before its 4096 samples. The decode copy is sized like the display decode's buffer (max(length, packed) + 4, zeroed),
+// so the bit reader's run past the payload stays inside it; the identity still follows the decoded picture.
+TEST(VisualCaptureSourceHash, Lj92AShortScanDecodesInsideTheDisplaySizedCopy)
+{
+    const std::vector<uint8_t> shortScan = bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(15), { 0x00, 0x00 },
+                                                   kSof3, kSos, zeros(64), { 0xFF, 0xD9 } });
+    ASSERT_EQ(static_cast<size_t>(114), shortScan.size());
+    std::vector<uint8_t> padded = shortScan;
+    padded.push_back(0x00); // one more zero byte the decoder may read as entropy: the same picture or not, per liblj92
+    expectIdentityFollowsPicture(shortScan, padded);
 }
 
 TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)
