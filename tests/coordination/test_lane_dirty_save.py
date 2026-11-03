@@ -2472,7 +2472,7 @@ def _convert_hook(directory_expr, target, marker):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
-def test_the_run_dir_converted_in_place_into_a_junction_never_has_an_artifact_written_through_it(repo, tmp_path):  # r17 adversary pass 2 A1 (4a7cb9e4): the held RunDir stops a rename, not FSCTL_SET_REPARSE_POINT on the same empty directory; the patch and receipt were then created inside the worktree and the run ended 0. Every held directory is proved at its path again right before each write
+def test_the_run_dir_converted_in_place_into_a_junction_never_has_an_artifact_written_through_it(repo, tmp_path):  # r17 adversary pass 2 A1 (4a7cb9e4): the held RunDir stops a rename, not FSCTL_SET_REPARSE_POINT on the same empty directory; the patch and receipt were then created inside the worktree and the run ended 0. Every held directory is proved at its path again right before each artifact write (r18: checked before and after; a name-based check/use window remains, so this is a narrowing, not an atomic guarantee)
     victim, marker = repo / "victim", tmp_path / "convert-result.txt"
     victim.mkdir()
     (repo / "a.txt").write_bytes(b"changed\n")
@@ -2495,3 +2495,99 @@ def test_a_private_subdirectory_converted_in_place_into_a_junction_never_has_a_f
     assert marker.read_text() == "CONVERTED", "the test premise did not happen: " + r.stdout + r.stderr
     assert list(victim.iterdir()) == [], r.stdout + r.stderr  # 4a7cb9e4: alternates created in the worktree
     assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
+
+
+# ---- r18 sol r17 B1 + Dot I1 (30c85957): a directory is created, or its metadata written, by NAME; the held ancestor chain is proved again BEFORE the name is used ----
+def _hooked_after(tmp_path, pairs):
+    """Like _hooked, but each snippet runs right AFTER its anchor (the peer acts after the statement that computed the name and before the next one)."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    for anchor, code in pairs:
+        assert text.count(anchor) == 1, anchor
+        text = text.replace(anchor, anchor + " " + code)
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text, encoding="utf-8")
+    return hooked
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
+def test_a_held_private_subdirectory_converted_in_place_before_the_next_create_has_nothing_created_below_it(repo, tmp_path):  # r18 sol r17 B1 (30c85957 :112): the loop made the next subdirectory with CreateDirectory BEFORE it proved the held parent again. `objects` (held, proved, still empty) is converted into a junction to a worktree folder; CreateDirectory(objects\info) then made `victim\info` and only the later handle proof refused, leaving the directory inside the worktree
+    base, marker = tmp_path / "tempbase", tmp_path / "convert-result.txt"
+    base.mkdir()
+    victim = repo / "victim"
+    victim.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    code = "if ($sub.Count -eq 2) { " + _convert_hook("[System.IO.Path]::Combine($sg, 'objects')", victim, marker) + "}; "
+    hooked = _hooked_after(tmp_path, [("$sd = [System.IO.Path]::Combine([string[]](@($sg) + $sub));", code)])
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    assert marker.read_text() == "CONVERTED", "the test premise did not happen: " + r.stdout + r.stderr
+    assert list(victim.iterdir()) == [], r.stdout + r.stderr  # 30c85957: victim\info created in the worktree
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
+def test_a_held_private_base_converted_in_place_before_the_private_directory_is_created_has_nothing_created_below_it(repo, tmp_path):  # r18 sol r17 B1 sibling (30c85957 :107): the same create-before-revalidate order for the private directory itself. The held private base is converted into a junction to a worktree folder right before CreateDirectory($sg)
+    base, marker = tmp_path / "tempbase", tmp_path / "convert-result.txt"
+    base.mkdir()
+    victim = repo / "victim"
+    victim.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    code = _convert_hook("[System.IO.Path]::GetDirectoryName($sg)", victim, marker)
+    hooked = _hooked_after(tmp_path, [("$script:sealDir = $sg", ";" + code)])
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    assert marker.read_text() == "CONVERTED", "the test premise did not happen: " + r.stdout + r.stderr
+    assert list(victim.iterdir()) == [], r.stdout + r.stderr  # 30c85957: victim\lane-dirty-save-<guid> created in the worktree
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
+    assert saved(repo) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
+def test_the_copied_rule_files_attributes_are_not_written_through_a_parent_converted_after_the_copy(repo, tmp_path):  # r18 Dot I1 (:125, 30c85957): SetAttributes(dest, Normal) ran by name after the checked copy with no further check. The private copy is removed and its (now empty) held parent `info` converted into a junction to a worktree folder; the attribute write then cleared the READ-ONLY flag of victim\attributes
+    import stat
+    base, marker = tmp_path / "tempbase", tmp_path / "convert-result.txt"
+    base.mkdir()
+    victim = repo / "victim"
+    victim.mkdir()
+    outside = victim / "attributes"
+    outside.write_bytes(b"outside\n")
+    os.chmod(outside, stat.S_IREAD)
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_bytes(b"*.bin -text\n")
+    (repo / "a.txt").write_bytes(b"changed\n")
+    code = "if ($pair[1] -eq 'attributes') { Remove-Item -LiteralPath $dest -Force; " + _convert_hook("[System.IO.Path]::Combine($sg, 'info')", victim, marker) + "}; "
+    hooked = _hooked_after(tmp_path, [("catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { continue }", "\n        " + code)])
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    try:
+        assert marker.read_text() == "CONVERTED", "the test premise did not happen: " + r.stdout + r.stderr
+        assert os.stat(outside).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY, r.stdout + r.stderr  # 30c85957: the flag was cleared outside the private root
+        assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
+    finally:
+        os.chmod(outside, stat.S_IWRITE)
+
+
+def test_with_rule_files_present_and_nobody_interfering_the_dirt_is_still_saved(repo, tmp_path):  # r18 control: the pre-checks refuse only a moved directory; the ordinary run (attributes and exclude present, read-only source) still saves and exits 0
+    import stat
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    for n in ("attributes", "exclude"):
+        f = repo / ".git" / "info" / n
+        f.write_bytes(b"*.bin -text\n" if n == "attributes" else b"ignored.txt\n")
+        os.chmod(f, stat.S_IREAD)
+    try:
+        (repo / "a.txt").write_bytes(b"changed\n")
+        r = save(repo, "-LanePid", str(dead_pid()))
+        assert r.returncode == 0, r.stdout + r.stderr
+        head8 = git(repo, "rev-parse", "HEAD").decode().strip()[:8]
+        assert (tmp_path / "run" / f"dirty-save-{head8}.patch").read_bytes() == git(repo, "diff", "HEAD", "--binary")
+    finally:
+        for n in ("attributes", "exclude"):
+            os.chmod(repo / ".git" / "info" / n, stat.S_IWRITE)
+
+
+def test_every_directory_create_and_by_name_metadata_write_is_preceded_by_a_hold_check_in_the_saver_source():  # r18 sol r17 B1 + Dot I1 class pin: the held chain (private base, private root, every subdirectory) is proved right before each CreateDirectory and the attribute write; the claim is "checked before and after", never "atomic"
+    text = SCRIPT.read_text(encoding="utf-8")
+    code = "\n".join(l.split("  #")[0] for l in text.splitlines() if not l.lstrip().startswith("#"))
+    for create in re.finditer(r"\[System\.IO\.Directory\]::CreateDirectory\(", code):
+        assert "Assert-HoldsIntact" in code[max(0, create.start() - 160):create.start()], code[max(0, create.start() - 160):create.start() + 60]
+    at = code.index("[System.IO.File]::SetAttributes($dest")
+    assert "Assert-HoldsIntact" in code[max(0, at - 220):at]
+    assert "every write is atomic" not in text.lower() and "every write is checked" not in text.lower()
