@@ -33,10 +33,11 @@ after every callback the test registered, and after threading's shutdown joined 
 ends the child with os._exit and the matching exit code.
 
 Verdict (stdout, exactly one line; exit code):
-  PINNED   (0)  the test ran and passed, was not skipped, an observed call looked a pid up and fell through to
-                the fallback at least once, no call at any time consulted the native entry, no thread other
-                than the main one is still alive at exit, no exception was ignored at shutdown, and every
-                observed fallback returned a real entry: the test's own pin took effect.
+  PINNED   (0)  the test ran and passed, was not skipped, a call made WHILE THE TEST RAN (not at import or
+                construction) looked a pid up and fell through to the fallback at least once, no call at any
+                time consulted the native entry, no thread other than the main one (threading or raw _thread)
+                is still alive at exit, no exception was ignored at shutdown, and every observed fallback
+                returned a real entry: the test's own pin took effect.
   UNPINNED (1)  some call, at any time, returned the native result, or the forced entry was called.
   UNKNOWN  (2)  anything else: git/import/timeout error, Python older than 3.12, the test absent, skipped, failed
                 for another reason, the observer removed by the test, a thread still running at exit, a
@@ -72,6 +73,7 @@ NATIVE_LOCAL = "native"
 FORCED = "FORCED-LIVE-PID"
 FORCE_HOOK = "_BRIDGE_NATIVE_PIN_FORCED"
 TOOL_ID = 4
+SETTLE_SECONDS = 0.2
 CHILD_FLAG = "--child"
 VERDICT_CODE = {"PINNED": 0, "UNPINNED": 1, "UNKNOWN": 2}
 # A child that raised from a test-registered atexit callback leaves one of these on stderr (3.12/3.13 and older).
@@ -125,7 +127,12 @@ def _child(agent_dir, st):
     # by its name and its `native` local; afterwards by equality, which an importlib.reload keeps.
     state = {"code": None}
     missing = object()
-    frames = st["frames"] = []    # one (kind, returned) per observed frame of the lookup, decided as the frame exits
+    # One (kind, returned, phase) per observed frame of the lookup, decided as the frame exits. The phase is
+    # "load" (import, construction), "run" (inside unittest's run of the one test) or "done" (afterwards:
+    # finalization, test-created threads). Only a "run" lookup proves the test's own pin took effect; a module-level
+    # pinned lookup cannot vouch for a method that was shadowed by an empty one.
+    phase = st["phase"] = ["load"]
+    frames = st["frames"] = []
     problems = st["problems"] = []
 
     def is_target(code_obj):
@@ -143,13 +150,13 @@ def _child(agent_dir, st):
             if frame.f_code is not code_obj:
                 problems.append("monitored frame not found")
             elif native is missing:
-                frames.append(("nolookup", returned))    # exited before the native lookup (e.g. not win32)
+                frames.append(("nolookup", returned, phase[0]))    # exited before the native lookup (e.g. not win32)
             elif native is None:
-                frames.append(("lookup", returned))      # the native lookup answered None: the fallback ran
+                frames.append(("lookup", returned, phase[0]))      # the native lookup answered None: the fallback ran
             elif returned is native:
-                frames.append(("fast", returned))        # returned exactly what the native lookup gave it
+                frames.append(("fast", returned, phase[0]))        # returned exactly what the native lookup gave it
             else:
-                frames.append(("odd", returned))
+                frames.append(("odd", returned, phase[0]))
         except BaseException as e:  # noqa: BLE001 -- an unreadable frame must not read as a pass
             problems.append("%s: %s" % (type(e).__name__, e))
         return True
@@ -199,7 +206,11 @@ def _child(agent_dir, st):
         return
     # Construction (the TestCase instance is built here) is observed and counted too; nothing is ever cleared.
     suite = unittest.defaultTestLoader.loadTestsFromName(TEST_MODULE + "." + TEST_CLASS + "." + TEST_NAME)
-    st["result"] = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+    phase[0] = "run"
+    try:
+        st["result"] = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+    finally:
+        phase[0] = "done"
 
 
 def _verdict(st):
@@ -209,16 +220,27 @@ def _verdict(st):
     result = st.get("result")
     mon, name, events = st["monitor"]
     frames = st["frames"]
+    # Liveness is read BEFORE the facts below: a thread seen dead here cannot add a call afterwards, and one seen
+    # alive keeps the verdict off PINNED whatever it does next. `_thread._count()` also counts threads started
+    # with _thread.start_new_thread, which threading.enumerate() cannot see.
+    import _thread
+    import threading
+    import time
+    # A raw thread started in the test's last statement may not have been scheduled yet, and is not counted until it
+    # runs: give pending threads a moment to start (this releases the GIL). Best effort, not a proof: a thread the
+    # host does not schedule within the pause is outside what this check can see.
+    time.sleep(SETTLE_SECONDS)
+    alive =[t.name for t in threading.enumerate() if t is not threading.main_thread() and t.is_alive()]
+    running = _thread._count()
     if st["problems"]:
         return "UNKNOWN (observer error: %s)" % st["problems"][0]
-    # Facts first: a forced call or a fast-path return at ANY time (import, construction, run, a test-created
-    # thread or atexit callback) is UNPINNED, whatever else is true.
-    if st["forced_calls"] or any(kind == "fast" for kind, _ in frames):
+    # Facts: a forced call or a fast-path return at ANY time (import, construction, run, a test-created thread or
+    # atexit callback) is UNPINNED, whatever else is true.
+    if st["forced_calls"] or any(kind == "fast" for kind, _, _ in frames):
         return "UNPINNED (a lookup in the test consulted the native process entry)"
-    import threading
-    alive = [t.name for t in threading.enumerate() if t is not threading.main_thread() and t.is_alive()]
-    if alive:
-        return "UNKNOWN (a thread is still running at process exit: %s; a later lookup could not be seen)" % ", ".join(alive[:3])
+    if alive or running:
+        return "UNKNOWN (a thread is still running at process exit: %s; a later lookup could not be seen)" % (
+            ", ".join(alive[:3]) or "%d raw thread(s)" % running)
     if st["unraisable"] or sys.unraisablehook is not st["hook"]:
         return "UNKNOWN (an exception was ignored at shutdown, or the hook was replaced: %s)" % (
             st["unraisable"][0] if st["unraisable"] else "sys.unraisablehook replaced")
@@ -232,11 +254,13 @@ def _verdict(st):
         why = (result.errors + result.failures or [("", "")])[0][1].strip().splitlines()[-1:] or [""]
         return ("UNKNOWN (the test did not pass for a reason other than the fast path: run=%d errors=%d failures=%d: %s)"
                 % (result.testsRun, len(result.errors), len(result.failures), why[0][:200]))
-    if any(kind == "odd" for kind, _ in frames):
+    if any(kind == "odd" for kind, _, _ in frames):
         return "UNKNOWN (a call returned something other than the native result or the fallback's)"
-    lookups = [e for kind, e in frames if kind == "lookup"]
-    if not lookups or not all(isinstance(e, dict) for e in lookups):
-        return "UNKNOWN (the test passed but no observed lookup returned a real entry; nothing was proven)"
+    lookups = [(e, ph) for kind, e, ph in frames if kind == "lookup"]
+    if not all(isinstance(e, dict) for e, _ in lookups):
+        return "UNKNOWN (a pinned lookup did not return a real entry; nothing was proven)"
+    if not any(ph == "run" for _, ph in lookups):
+        return "UNKNOWN (no pinned lookup happened while the test ran; an import-time or construction-time lookup proves nothing about the test)"
     return "PINNED"
 
 
