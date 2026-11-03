@@ -49,6 +49,14 @@ per-run nonce that is handed to the child on stdin, not argv, so an accidental `
 SystemExit in the test file is never taken for a verdict. Out of the model: a test engineered to forge this
 protocol by introspection, to tamper with sys.monitoring tool id 4, or to launch a separate interpreter (which
 nothing here forces or sees) -- it could do anything else the interpreter allows, too.
+The same holds for a test that replaces this checker's own mechanics: its streams, the result object's methods or
+lists, or unittest internals. Bounded, not exhaustive: the verdict line goes out with os.write on a descriptor
+duplicated before any ref code runs, nothing is flushed after it, the result is read once as plain data (exact
+list/int types) and never called, every fact is re-read as the last step, and the checker reports UNKNOWN where it can
+see the tampering (the result's fields replaced, unittest.TestCase._callTestMethod replaced while the test loaded or
+no longer the wrapper installed here). A method that delegates the pinned lookup to a thread, which the method itself
+starts or releases and the process does not outlive, is the method's own pin. Tampering that leaves no such trace is
+out of model.
 
 Usage: py -3 tools/coordination/check_bridge_native_pin.py [REF]        (REF defaults to fork/master)
        --test-source PATH / --server-source PATH replace the extracted test file / server.py (fixtures only).
@@ -90,14 +98,27 @@ FORCING_STUB = (
 def _child(agent_dir, st):
     """Arm everything, run the one test, and leave the verdict to _child_main's atexit callback (registered
     before any of the ref's code is imported). An early out sets st["early"] and returns."""
+    import _thread
     import builtins
     import importlib
+    import threading
+    import time
     import unittest
 
     mon = getattr(sys, "monitoring", None)
     if mon is None:
         st["early"] = "UNKNOWN (needs Python 3.12+ for sys.monitoring; running %d.%d)" % sys.version_info[:2]
         return
+
+    # Everything the verdict will use is captured HERE, before any of the ref's code runs, so a test that rebinds
+    # time.sleep, _thread._count, sys.monitoring.get_tool or the like cannot make the verdict run its code.
+    st["threading"] = threading
+    st["sleep"] = time.sleep
+    st["thread_count"] = _thread._count
+    st["mon_get_tool"], st["mon_get_events"] = mon.get_tool, mon.get_events
+    st["tamper"] = []
+    test_case = st["TestCase"] = unittest.TestCase
+    genuine_call = test_case.__dict__["_callTestMethod"]    # the raw function, read without any descriptor
 
     root = os.path.dirname(os.path.dirname(agent_dir))
     forced_calls = st["forced_calls"] = []    # every call of the forced native entry, any thread, any alias; NEVER cleared
@@ -123,7 +144,6 @@ def _child(agent_dir, st):
     st["hook"] = hook
 
     # An exception that kills a thread goes through threading.excepthook, not the unraisable hook: recorded the same way.
-    import threading
     thread_errors = st["thread_errors"] = []
     previous_thread_hook = threading.excepthook
 
@@ -229,7 +249,12 @@ def _child(agent_dir, st):
         return
     # Construction (the TestCase instance is built here) is observed and counted too; nothing is ever cleared.
     suite = unittest.defaultTestLoader.loadTestsFromName(TEST_MODULE + "." + TEST_CLASS + "." + TEST_NAME)
-    original_call = unittest.TestCase._callTestMethod
+    # Tamper check: the phase boundary below is a patchable class attribute. If loading the test module already
+    # replaced it, the "method" phase would be the test's own dispatcher, so the verdict is UNKNOWN. The same check
+    # runs again at the end (the wrapper installed here must still be the one in place).
+    original_call = test_case.__dict__["_callTestMethod"]
+    if original_call is not genuine_call:
+        st["tamper"].append("unittest.TestCase._callTestMethod was replaced while the test module loaded")
 
     def call_test_method(self, method):
         before = phase[0]
@@ -239,58 +264,90 @@ def _child(agent_dir, st):
         finally:
             phase[0] = before
 
-    unittest.TestCase._callTestMethod = call_test_method
+    st["wrapper"] = call_test_method
+    test_case._callTestMethod = call_test_method
     phase[0] = "run"
+    result = None
     try:
-        st["result"] = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
     finally:
         phase[0] = "done"
+    # The result is read ONCE, here, as plain data (exact list/int/str types only, so nothing the test replaced on it
+    # can run). The verdict later uses only this snapshot and never calls into the result.
+    try:
+        st["outcome"] = _snapshot(result)
+    except TypeError as e:
+        st["tamper"].append(str(e))
+
+
+def _snapshot(result):
+    def plain(name, kind):
+        value = getattr(result, name)
+        if type(value) is not kind:
+            raise TypeError("the test replaced result.%s (%s)" % (name, type(value).__name__))
+        return value
+
+    errors, failures = plain("errors", list), plain("failures", list)
+    why = ""
+    for entry in errors + failures:
+        if type(entry) is tuple and len(entry) == 2 and type(entry[1]) is str:
+            why = (entry[1].strip().splitlines() or [""])[-1][:200]
+        break
+    return {"run": plain("testsRun", int), "errors": len(errors), "failures": len(failures), "why": why,
+            "skipped": len(plain("skipped", list)), "expected_failures": len(plain("expectedFailures", list)),
+            "unexpected_successes": len(plain("unexpectedSuccesses", list))}
 
 
 def _verdict(st):
     """The verdict text, computed at the last moment the child process allows (an atexit callback run last)."""
     if st.get("early"):
         return st["early"]
-    result = st.get("result")
-    mon, name, events = st["monitor"]
+    # The only step that lets other threads run. A raw thread started in the test's last statement may not have been
+    # scheduled yet, and is not counted until it runs: give pending threads a moment to start (this releases the GIL).
+    # Best effort, not a proof: a thread the host does not schedule within the pause is outside what this can see.
+    # `_thread._count()` also counts threads started with _thread.start_new_thread, and is read without touching any
+    # Thread object (a test's Thread subclass cannot run code here).
+    st["sleep"](SETTLE_SECONDS)
+    running = st["thread_count"]()
+    return _decide(st, running)
+
+
+def _decide(st, running):
+    """Pure decision over data this checker owns. It calls nothing the test could have replaced, and it reads every
+    fact (forced calls, observed frames, hooks, liveness) HERE, after every other inspection, as the last step."""
+    threading = st["threading"]
     frames = st["frames"]
-    # Liveness is read BEFORE the facts below: a thread seen dead here cannot add a call afterwards, and one seen
-    # alive keeps the verdict off PINNED whatever it does next. `_thread._count()` also counts threads started
-    # with _thread.start_new_thread, which threading.enumerate() cannot see.
-    import _thread
-    import threading
-    import time
-    # A raw thread started in the test's last statement may not have been scheduled yet, and is not counted until it
-    # runs: give pending threads a moment to start (this releases the GIL). Best effort, not a proof: a thread the
-    # host does not schedule within the pause is outside what this check can see.
-    time.sleep(SETTLE_SECONDS)
-    alive =[t.name for t in threading.enumerate() if t is not threading.main_thread() and t.is_alive()]
-    running = _thread._count()
     if st["problems"]:
         return "UNKNOWN (observer error: %s)" % st["problems"][0]
-    # Facts: a forced call or a fast-path return at ANY time (import, construction, run, a test-created thread or
+    # A forced call or a fast-path return at ANY time (import, construction, run, a test-created thread or
     # atexit callback) is UNPINNED, whatever else is true.
     if st["forced_calls"] or any(kind == "fast" for kind, _, _ in frames):
         return "UNPINNED (a lookup in the test consulted the native process entry)"
-    if alive or running:
-        return "UNKNOWN (a thread is still running at process exit: %s; a later lookup could not be seen)" % (
-            ", ".join(alive[:3]) or "%d raw thread(s)" % running)
+    if running:
+        return "UNKNOWN (a thread is still running at process exit: %d thread(s); a later lookup could not be seen)" % running
     if st["unraisable"] or sys.unraisablehook is not st["hook"]:
         return "UNKNOWN (an exception was ignored at shutdown, or the hook was replaced: %s)" % (
             st["unraisable"][0] if st["unraisable"] else "sys.unraisablehook replaced")
     if st["thread_errors"] or threading.excepthook is not st["thread_hook"]:
         return "UNKNOWN (a thread died with an exception, or threading.excepthook was replaced: %s)" % (
             st["thread_errors"][0] if st["thread_errors"] else "threading.excepthook replaced")
-    if mon.get_tool(TOOL_ID) != name or mon.get_events(TOOL_ID) != events:
+    mon, name, events = st["monitor"]
+    if st["mon_get_tool"](TOOL_ID) != name or st["mon_get_events"](TOOL_ID) != events:
         return "UNKNOWN (the test replaced the observer; later calls were not observed)"
-    if result is None:
+    # Tamper check: what this checker installed or captured is still what it was. A test that rewrites unittest's
+    # internals is out of the model; it is reported as UNKNOWN where it can be seen.
+    if st["tamper"]:
+        return "UNKNOWN (tampering with the checker's own mechanics: %s)" % st["tamper"][0]
+    if st["TestCase"].__dict__.get("_callTestMethod") is not st["wrapper"]:
+        return "UNKNOWN (tampering with the checker's own mechanics: unittest.TestCase._callTestMethod is no longer the wrapper installed here)"
+    out = st.get("outcome")
+    if out is None:
         return "UNKNOWN (the test did not run to completion)"
-    if result.skipped or result.expectedFailures or result.unexpectedSuccesses:
+    if out["skipped"] or out["expected_failures"] or out["unexpected_successes"]:
         return "UNKNOWN (the test was skipped or marked expected-failure; a skipped test is not retired)"
-    if result.testsRun != 1 or not result.wasSuccessful():
-        why = (result.errors + result.failures or [("", "")])[0][1].strip().splitlines()[-1:] or [""]
+    if out["run"] != 1 or out["errors"] or out["failures"]:
         return ("UNKNOWN (the test did not pass for a reason other than the fast path: run=%d errors=%d failures=%d: %s)"
-                % (result.testsRun, len(result.errors), len(result.failures), why[0][:200]))
+                % (out["run"], out["errors"], out["failures"], out["why"]))
     if any(kind == "odd" for kind, _, _ in frames):
         return "UNKNOWN (a call returned something other than the native result or the fallback's)"
     lookups = [(e, ph) for kind, e, ph in frames if kind == "lookup"]
@@ -304,6 +361,15 @@ def _verdict(st):
 def _child_main(agent_dir):
     nonce = sys.stdin.readline().strip()
     st = {}
+    # Captured ONCE, before any of the ref's code runs: a private duplicate of the original stdout descriptor and the
+    # os primitives that write to it and end the process. Nothing the test rebinds (sys.stdout, sys.__stdout__,
+    # os.write, even fd 1) can reach the verdict line.
+    out_fd = os.dup(1)
+    os_write, os_exit = os.write, os._exit
+
+    def emit(data):
+        while data:
+            data = data[os_write(out_fd, data):]
 
     def finish():
         # Registered with atexit before any of the ref's code runs, so atexit (LIFO) calls it after every callback
@@ -311,8 +377,8 @@ def _child_main(agent_dir):
         # line the parent believes (it carries the nonce) and ends the process with the matching exit code, so
         # nothing the interpreter does afterwards can change either.
         # Streams the TEST may have replaced are flushed BEFORE the verdict is computed: whatever their flush does
-        # (a native lookup, an exception) is then seen by the verdict. After it, nothing the test controls is run:
-        # only the interpreter's original streams are touched.
+        # (a native lookup, an exception) is then seen by the verdict. After the verdict nothing the test controls
+        # runs and nothing is flushed: the line goes out with os.write on the private descriptor, then os._exit.
         for stream in (sys.stdout, sys.stderr):
             try:
                 if stream is not None:
@@ -324,20 +390,11 @@ def _child_main(agent_dir):
             text = _verdict(st)
         except BaseException as e:  # noqa: BLE001
             text = "UNKNOWN (%s computing the verdict: %s)" % (type(e).__name__, e)
+        code = VERDICT_CODE[text.split(" ")[0]]
         try:
-            mon, _, _ = st["monitor"]
-            mon.set_events(TOOL_ID, 0)
-            mon.free_tool_id(TOOL_ID)
-        except BaseException:  # noqa: BLE001 -- the verdict is already decided
-            pass
-        out = sys.__stdout__ or sys.stdout
-        out.write("\nRESULT %s %s\n" % (nonce, text))    # leading newline: a test's unterminated print cannot hide it
-        out.flush()
-        try:
-            (sys.__stderr__ or sys.stderr).flush()
-        except BaseException:  # noqa: BLE001
-            pass
-        os._exit(VERDICT_CODE[text.split(" ")[0]])
+            emit(("\nRESULT %s %s\n" % (nonce, text)).encode("utf-8", "replace"))    # leading newline: a test's unterminated print cannot hide it
+        finally:
+            os_exit(code)
 
     atexit.register(finish)
     try:
