@@ -411,6 +411,26 @@ $r['r3B3'] = @{ cpu = $b3c.status; gpu = $b3g.status; scalar = (Get-UtilSampleSc
 $b3okcpu = ConvertFrom-UtilSampleCpuCsv "utc,cpuTotalPct,appPid,appCpuCores`n2026-11-02T14:00:01.0000000Z,10,1234,1`n2026-11-02T14:00:02.0000000Z,20,1234,2`n2026-11-02T14:00:03.0000000Z,30,1234,3`n"
 $b3ok = Get-UtilSampleCpuSummary $b3okcpu $b3run $b3win $b3stop
 $r['r3B3Steady'] = @{ cpu = $b3ok.status; inWindow = $b3ok.rowsInWindow }
+# r4 adversary b544cdb8 A1: a PATH entry on an absent drive is skipped (Join-Path throws there), so System32\nvidia-smi.exe is still found
+$a1Drive = @('Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q') | Where-Object { -not (Test-Path -LiteralPath "$($_):\") } | Select-Object -First 1
+$a1Root = Join-Path $t 'a1root'
+[void](New-Item -ItemType Directory -Force -Path (Join-Path $a1Root 'System32'))
+Set-Content -LiteralPath (Join-Path $a1Root 'System32\nvidia-smi.exe') -Value 'x'
+$a1OldPath = $env:PATH; $a1OldRoot = $env:SystemRoot; $a1OldPf = $env:ProgramFiles
+try {
+    $env:PATH = "$($a1Drive):\removed-toolchain\bin;" + (Join-Path $t 'empty-bin'); $env:SystemRoot = $a1Root; $env:ProgramFiles = Join-Path $t 'no-pf'
+    $a1Found = Resolve-UtilSampleNvidiaSmi
+    $env:PATH = Join-Path $t 'empty-bin'; $env:SystemRoot = Join-Path $t 'no-root'
+    $a1None = Resolve-UtilSampleNvidiaSmi
+} finally { $env:PATH = $a1OldPath; $env:SystemRoot = $a1OldRoot; $env:ProgramFiles = $a1OldPf }
+$r['r4A1'] = @{ drive = [string]$a1Drive; found = [string]$a1Found; expected = (Join-Path $a1Root 'System32\nvidia-smi.exe'); none = [string]$a1None }
+# r4 adversary b544cdb8 A2: one stalled counter read must not be followed by a burst of catch-up rows (each weighted as a whole interval by the summary)
+$script:a2n = 0
+$a2 = Invoke-UtilSampleCpuLoop (Join-Path $t 'a2.csv') (Join-Path $t 'a2.stop') 'no-such-process-name-xyz' 200 2500 { $script:a2n++; if ($script:a2n -eq 2) { Start-Sleep -Milliseconds 1200 }; 5 } 0 0 0 0
+$a2stamps = @([IO.File]::ReadAllLines((Join-Path $t 'a2.csv')) | Select-Object -Skip 1 | ForEach-Object { [DateTime]::Parse(($_ -split ',')[0], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) })
+$a2min = 1e9
+for ($i = 1; $i -lt $a2stamps.Count; $i++) { $a2min = [math]::Min($a2min, ($a2stamps[$i] - $a2stamps[$i - 1]).TotalMilliseconds) }
+$r['r4A2'] = @{ rows = $a2stamps.Count; minGapMs = [math]::Round($a2min); endedBy = $a2.endedBy }
 Write-Output (J $r)
 """
 
@@ -535,6 +555,17 @@ class UtilSamplePureHelperTests(unittest.TestCase):
     def test_r3_b3_out_of_order_sample_stamps_are_an_unverified_clock_not_ok(self) -> None:
         self.assertEqual(self.r["r3B3"], {"cpu": "unavailable(sample-clock-unverified)", "gpu": "unavailable(sample-clock-unverified)", "scalar": "unavailable"})
         self.assertEqual(self.r["r3B3Steady"], {"cpu": "ok", "inWindow": 2}, "a steady clock still maps (rows 02 and 03 are whole intervals in the window)")
+
+    def test_r4_a1_a_path_entry_on_an_absent_drive_does_not_hide_system32_nvidia_smi(self) -> None:
+        a1 = self.r["r4A1"]
+        self.assertTrue(a1["drive"], "no absent drive letter on this host to build the probe")
+        self.assertEqual(a1["found"], a1["expected"], "an unreachable PATH entry ended the search before System32")
+        self.assertEqual(a1["none"], "", "no nvidia-smi anywhere is the empty string")
+
+    def test_r4_a2_a_stalled_read_is_not_followed_by_a_burst_of_catch_up_rows(self) -> None:
+        a2 = self.r["r4A2"]
+        self.assertGreaterEqual(a2["rows"], 3, a2)
+        self.assertGreaterEqual(a2["minGapMs"], 100, f"rows landed back to back after the stall (interval 200 ms): {a2}")
 
     def test_a6_a_throwing_kill_is_retried_and_a_running_side_is_not_stopped(self) -> None:
         self.assertEqual(self.r["stopKillRetry"], {"stopped": True, "killed": True, "kills": 2, "early": False})

@@ -6700,9 +6700,15 @@ $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $cor
 function Resolve-UtilSampleNvidiaSmi {
     try {
         # PATH walked by hand (a Get-Command result would make the whole job file a session-carrier tree to the attr3 spliced-body scan).
-        $onPath = @(([string]$env:PATH -split ';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { Join-Path $_.Trim('"') 'nvidia-smi.exe' })
-        foreach ($p in @($onPath + (Join-Path ([string]$env:SystemRoot) 'System32\nvidia-smi.exe') + (Join-Path ([string]$env:ProgramFiles) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))) {
-            if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+        # adversary b544cdb8 A1: one directory at a time, each in its own try, so a PATH entry on an absent drive (Join-Path throws there under
+        # ErrorActionPreference=Stop) is skipped instead of ending the whole search with '' while System32 holds the executable.
+        $dirs = @(([string]$env:PATH -split ';')) + @((Join-Path ([string]$env:SystemRoot) 'System32')) + @((Join-Path ([string]$env:ProgramFiles) 'NVIDIA Corporation\NVSMI'))
+        foreach ($d in $dirs) {
+            try {
+                if ([string]::IsNullOrWhiteSpace($d)) { continue }
+                $p = [IO.Path]::Combine($d.Trim().Trim('"'), 'nvidia-smi.exe')
+                if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+            } catch { }
         }
     } catch { }
     ''
@@ -6821,10 +6827,13 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
                 if (-not $ppSame) { $res.endedBy = 'parent-gone'; break }
             }
             if ($w.Elapsed.TotalMilliseconds -lt $next) { Start-Sleep -Milliseconds 50; continue }
+            # adversary b544cdb8 A2: after a stall (a paused VM, a starved scheduler) the next tick is the next boundary AFTER now, never the overdue
+            # one plus one interval, which would emit a burst of near-zero-width rows that the summary then weights as whole intervals.
             $next += $IntervalMs
             $total = ''
             try { $total = ([double](& $ReadTotal)).ToString('0.###', $inv) } catch { $res.counterErrors++ }
             $cur = & $snap; $nowMs = $w.Elapsed.TotalMilliseconds
+            if ($next -le $nowMs) { $next = $nowMs + $IntervalMs }
             $sec = 0.0; $both = 0
             foreach ($k in @($cur.Keys)) { if ($prev.ContainsKey($k)) { $sec += [math]::Max(0.0, $cur[$k][1] - $prev[$k][1]); $both++ } }
             $pids = (@($cur.Values | ForEach-Object { [int]$_[0] } | Sort-Object) -join ';')
