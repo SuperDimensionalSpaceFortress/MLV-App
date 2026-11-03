@@ -475,7 +475,12 @@ private:
             if (drop)
             {
                 const cudaError_t destroyed = cudaEventDestroy(drop);
-                if (destroyed != cudaSuccess) own = destroyed;
+                if (destroyed != cudaSuccess)
+                {
+                    /* adversary r3 pass 5 A2: a failed call ends the tries, a destroy included */
+                    own = destroyed;
+                    break;
+                }
             }
         }
         drop_own_error_locked(own);
@@ -495,7 +500,9 @@ private:
      * holds exactly that code; the last error is per host thread, so only this thread's calls
      * reach it. If the clear itself observes another code (an asynchronous fault surfacing at that
      * instant), the recorder cannot put it back, so it logs it as an error record
-     * (kind=recorder stage=clear), never silently. */
+     * (kind=recorder stage=clear), past the error-line cap, never silently. Such a fault is a
+     * kernel-execution error, which leaves the context unusable: every later runtime call of the
+     * backend returns it again. */
     void drop_own_error_locked(cudaError_t own)
     {
         if (own == cudaSuccess || !igpu_lt_recorder_clearable((int)own)) return;
@@ -555,20 +562,14 @@ private:
     }
 
     /* Error branches and teardown: the handles are destroyed, never just dropped. Returns the
-     * code of the last destroy that failed (cudaSuccess when none did). */
+     * code of the destroy that failed (cudaSuccess when none did). Adversary r3 pass 5 A2: once a
+     * destroy fails, the other is not attempted over that pending error (its handle is given up;
+     * a failing destroy means a faulted context). */
     cudaError_t destroy_events_locked(Pending & p)
     {
         cudaError_t failed = cudaSuccess;
-        if (p.start)
-        {
-            const cudaError_t e = cudaEventDestroy(p.start);
-            if (e != cudaSuccess) failed = e;
-        }
-        if (p.stop)
-        {
-            const cudaError_t e = cudaEventDestroy(p.stop);
-            if (e != cudaSuccess) failed = e;
-        }
+        if (p.start) failed = cudaEventDestroy(p.start);
+        if (p.stop && failed == cudaSuccess) failed = cudaEventDestroy(p.stop);
         p.start = p.stop = nullptr;
         return failed;
     }
@@ -578,8 +579,9 @@ private:
         std::memset(rec, 0, sizeof(*rec));
         const Context & c = context();
         rec->dll = IGPU_LT_DLL_NAME;
-        rec->kind = kind;
-        rec->stage = stage ? stage : "?"; /* adversary r3 pass 4 A3: never a null C string downstream */
+        /* adversary r3 pass 4 A3 / pass 5 A4: never a null C string downstream */
+        rec->kind = kind ? kind : "?";
+        rec->stage = stage ? stage : "?";
         rec->seq = ++seq_;
         rec->utc_ms = utc_ms();
         rec->width = c.width;
@@ -598,7 +600,10 @@ private:
         IgpuLtStats & s = stats_[key];
         igpu_lt_stats_add(&s, rec, min_ms_);
         if (!igpu_lt_should_log_record(rec, min_ms_, first)) return;
-        if (rec.err != 0)
+        /* Adversary r3 pass 5 A1: the record of an error the recorder's clear consumed is never
+         * suppressed by the error-line cap (it is the only trace of that error). */
+        const bool always = std::strcmp(rec.kind, "recorder") == 0;
+        if (rec.err != 0 && !always)
         {
             error_lines_ += 1;
             if (error_lines_ > kMaxErrorLines) return;

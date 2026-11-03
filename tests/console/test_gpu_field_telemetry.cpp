@@ -758,14 +758,15 @@ TEST(GpuFieldTelemetry, CudaFailureBranchesNoteTheCodeAndAddNoSync)
 
 TEST(GpuFieldTelemetry, LaunchTimingRecorderIsUntouched)
 {
-    // CUDA-LT-TIMING-HARDENING-1 owns igpu_launch_timing.cuh: byte-identical (line endings
-    // normalised) to base 6be0df82ae5406dc4f33e02d6e1f80af7e084670.
+    // CUDA-LT-TIMING-HARDENING-1 owned igpu_launch_timing.cuh (base 6be0df82, sha256 b5e89abf...).
+    // CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1 (device-clock stamps) changes it; this pin follows that
+    // card's head, byte-identical with line endings normalised (a forced companion).
     const QString path = repo_file_path(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
     QFile file(path);
     ASSERT_TRUE(file.open(QIODevice::ReadOnly));
     QByteArray bytes = file.readAll();
     bytes.replace("\r", "");
-    ASSERT_EQ(std::string("b5e89abf94802e68893ef21462b50c378289fe2c2260ad329e9b0a7ddf316291"),
+    ASSERT_EQ(std::string("623bede5af93bc72d99a721bbd9d07b1bd645186cc67419556180bf86240f10c"),
               QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().toStdString());
 }
 

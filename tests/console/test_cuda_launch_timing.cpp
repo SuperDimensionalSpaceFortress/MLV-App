@@ -342,7 +342,8 @@ TEST(CudaLaunchTiming, AnchorTryPinsEachWallReadToTheMonotonicClock)
     // The same gap before the first wall read is caught by that read's own pin.
     ASSERT_EQ(0, igpu_lt_anchor_try_bracket(4000.0, u, 5000.0, 5000.125, u + 0.125, 5000.125, &bracket));
     // A pin just past the tolerance is unusable even when the two intervals agree.
-    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(5000.0, u, 5000.0, 5000.125, u + 0.125,
+    // (ASSERT_FALSE: a return code, not a duration compared to zero; duration_as_proof_scan.)
+    ASSERT_FALSE(igpu_lt_anchor_try_bracket(5000.0, u, 5000.0, 5000.125, u + 0.125,
                                             5000.125 + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS, &bracket));
     ASSERT_NEAR(-1.0, bracket, 0.0);
     // Pins inside the tolerance: usable, and the bracket covers the longest monotonic time between the
@@ -491,6 +492,29 @@ TEST(CudaLaunchTiming, RecorderOnlyCudaFailuresDoNotStayPendingForTheBackend)
     ASSERT_FALSE(header.mid(def, end - def).contains(QStringLiteral("return")));
 }
 
+TEST(CudaLaunchTiming, AFailedRecorderDestroyEndsTheAnchorTriesAndThePair)
+{
+    // Adversary r3 pass 5 A2, its input: timer on; try 0 succeeds; try 1 succeeds and its
+    // cudaEventDestroy returns an asynchronous backend error (719), which stays pending. The tries
+    // went on to try 2's cudaEventCreate over that error. A failed destroy now ends the tries, and in
+    // an event pair a failed destroy is not followed by the other destroy. The runtime probe runs the
+    // input (scenario 12, red-pass5.txt).
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "                const cudaError_t destroyed = cudaEventDestroy(drop);\n                if (destroyed != cudaSuccess)\n"
+        "                {\n                    /* adversary r3 pass 5 A2: a failed call ends the tries, a destroy included */\n"
+        "                    own = destroyed;\n                    break;\n                }")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        if (p.start) failed = cudaEventDestroy(p.start);\n"
+        "        if (p.stop && failed == cudaSuccess) failed = cudaEventDestroy(p.stop);\n")));
+    // Every failure inside the anchor tries ends them (create, record/wait, destroy: three exits).
+    const int def = header.indexOf(QStringLiteral("    void establish_anchor_locked()"));
+    const int end = header.indexOf(QStringLiteral("        drop_own_error_locked(own);\n    }"), def);
+    ASSERT_TRUE(end > def);
+    const QString body = header.mid(def, end - def);
+    ASSERT_EQ(3, (int)body.count(QStringLiteral("break;")));
+}
+
 TEST(CudaLaunchTiming, RecorderClearsOnlyItsOwnErrorCode)
 {
     // Adversary r3 pass 4 A1, its input: timer on; the anchor's calls all succeed, and just before
@@ -510,8 +534,13 @@ TEST(CudaLaunchTiming, RecorderClearsOnlyItsOwnErrorCode)
         "        if (cudaPeekAtLastError() != own) return;\n"
         "        const cudaError_t got = cudaGetLastError();\n"
         "        if (got == own || got == cudaSuccess) return;\n")));
-    // Advisory r3 pass 4 A3: a null stage never reaches the line or the stats key as a C string.
-    ASSERT_TRUE(header.contains(QStringLiteral("        rec->stage = stage ? stage : \"?\";")));
+    // Advisory r3 pass 4 A3 / pass 5 A4: a null stage or kind never reaches the line or the stats
+    // key as a C string.
+    ASSERT_TRUE(header.contains(QStringLiteral("        rec->kind = kind ? kind : \"?\";\n        rec->stage = stage ? stage : \"?\";")));
+    // Adversary r3 pass 5 A1: the record of a consumed error is never suppressed by the error cap.
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        const bool always = std::strcmp(rec.kind, \"recorder\") == 0;\n        if (rec.err != 0 && !always)\n")));
+    ASSERT_TRUE(header.contains(QStringLiteral("        fill_locked(&rec, \"recorder\", \"clear\");")));
     // The recorder's one clearing call is that one.
     ASSERT_EQ(1, (int)header.count(QStringLiteral("cudaGetLastError();")));
     ASSERT_FALSE(header.contains(QStringLiteral("drop_own_error(")));
@@ -561,7 +590,7 @@ TEST(CudaLaunchTiming, NoDeviceStampPastTheFloatPrecisionAge)
     ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588000.0, 16777216.5, &out));
     ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588001.0, 16777215.5, &out));
     ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588000.0, -0.5, &out));
-    ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588000.0, IGPU_LT_ANCHOR_MAX_AGE_MS, &out));
+    ASSERT_FALSE(igpu_lt_dev_stamp(1791774588000.0, IGPU_LT_ANCHOR_MAX_AGE_MS, &out));
     ASSERT_NEAR(-1.0, out, 0.0);
     ASSERT_EQ(1, igpu_lt_dev_stamp(1791774588000.0, 1234.5, &out));
     ASSERT_NEAR(1791774589234.5, out, 1e-6);
