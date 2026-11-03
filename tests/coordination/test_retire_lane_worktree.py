@@ -3502,6 +3502,20 @@ def test_r7_a4_an_escaped_pid_key_with_a_stamp_for_another_process_is_still_reus
     assert r is None, (r, err)
 
 
+@pytest.mark.parametrize("pair", ["childPid:childCreatedUtc", "ownerPid:ownerCreatedUtc", "runnerPid:runnerCreatedUtc"])
+@pytest.mark.parametrize("value", ["999972.0", '"999972 "'], ids=["float-shape", "padded-string"])
+def test_r7_pass8_a1_one_pid_converter_serves_the_members_and_the_containment_stamps(tmp_path, pair, value):
+    """r7 pass-8 A1: member discovery accepted 999972.0 / "999972 " as a pid while the containment stamp pairing used a stricter converter, so the
+    genuine stamp was dropped and the stale root stamp marked the live driver reused. ONE converter (ConvertTo-RecordedPid) serves both."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    pid_key, stamp_key = pair.split(":")
+    _write_record(rd, "new.receipt.json", '{"pid":999972,"createdUtc":"%s","containment":{"%s":%s,"%s":"%s"}}' % (_STALE, pid_key, value, stamp_key, _iso(created)), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
 def test_r7_unparsable_json_in_a_run_dir_that_names_the_worktree_is_never_free(tmp_path):
     """r7 (a): text that looks like JSON but does not parse is ambiguous (it may name any pid, e.g. through an escaped key). It fails toward live
     through the unreadable-record path: a live pid that could be tied through the run dir refuses the worktree. Plain text with no JSON punctuation

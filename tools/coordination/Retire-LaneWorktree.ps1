@@ -647,18 +647,6 @@ $script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)
 $script:PidLeadRx = [regex]::new('^(\d{1,7})\b', 'Compiled')
 $script:PidMemberKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')
 
-function ConvertTo-MemberPid([System.Text.Json.JsonElement]$El) {
-    # A pid-valued member's value as an int (0 = no pid). The strict reader first (a JSON integer, or an integer string), then the leading
-    # digits of the number's or string's text (the shape the earlier regex accepted: "5000 ", 5000.0): a superset, so no member that was a pid is lost.
-    $n = ConvertTo-RecordedPid $El
-    if ($n -gt 0) { return $n }
-    $s = $null
-    if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) { $s = $El.GetRawText() }
-    elseif ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $s = $El.GetString() }
-    if ($s) { $m = $script:PidLeadRx.Match($s); if ($m.Success) { return [int]$m.Groups[1].Value } }
-    return 0
-}
-
 function Get-RecordPidMembers([string]$Text) {
     # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r7 (adversary pass 7 A3, A4; folds RETIRE-WORKTREE-PID-JSON-PARSE-1): THE ONE reader of the pids a
     # run-dir record names. The pid rows (Get-RunDirPidIndex) and the root-stamp "exactly one pid" count (Get-RecordedCreatedUtcMap) both read ONLY
@@ -697,7 +685,7 @@ function Get-RecordPidMembers([string]$Text) {
             if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
                 foreach ($prop in $el.EnumerateObject()) {
                     if (Test-OrdinalMember $prop.Name $script:PidMemberKeys) {
-                        $n = ConvertTo-MemberPid $prop.Value
+                        $n = ConvertTo-RecordedPid $prop.Value
                         $members.Add([pscustomobject]@{ Pid = $n; Root = [bool]$item[1] })
                         if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) }
                     }
@@ -726,10 +714,16 @@ function ConvertTo-RecordedUtc([object]$Value) {
 }
 
 function ConvertTo-RecordedPid([System.Text.Json.JsonElement]$El) {
-    # A pid field's value as an int: a JSON integer or an integer string (the pid extractor accepts both); anything else 0 (no pid).
+    # A pid field's value as an int: a JSON integer or an integer string, else the LEADING DIGITS of the number's or string's text (the shape the
+    # earlier regex accepted: 5000.0, "5000 "); anything else 0 (no pid). r7 (pass-8 A1): this is the ONE converter for every pid-valued member, both
+    # the pid rows / root count (Get-RecordPidMembers) and the containment pid/stamp pairing, so a value accepted as a pid for one is the same pid for the other.
     $n = 0
     if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and $El.TryGetInt32([ref]$n)) { return $n }
     if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and [int]::TryParse($El.GetString(), [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n }
+    $s = $null
+    if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) { $s = $El.GetRawText() }
+    elseif ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $s = $El.GetString() }
+    if ($s) { $m = $script:PidLeadRx.Match($s); if ($m.Success) { return [int]$m.Groups[1].Value } }
     return 0
 }
 
