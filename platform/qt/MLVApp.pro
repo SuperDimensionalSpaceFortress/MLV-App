@@ -385,6 +385,7 @@ HEADERS += MainWindow.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
            PlaybackDueWake.h \
+           PlaybackDueWakeSamples.h \
            PlaybackStartupSplit.h \
            PlaybackAudioStartPolicy.h \
            PlaybackFirstPresentIdentity.h \

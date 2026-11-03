@@ -12,14 +12,20 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/PlaybackDueWake.h"
+#include "../../platform/qt/PlaybackDueWakeSamples.h"
 
 #include <QCoreApplication>
+#include <QRegularExpression>
 #include <QEventLoop>
 #include <QFile>
 #include <QString>
 #include <QTextStream>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -366,16 +372,16 @@ TEST(PlaybackDueWakeA1, EveryFrameAHeldWakeLeavesNoPendingAdvanceForTheEmptyFram
     ASSERT_FALSE( pendingAfterWake );
     // ... so frame 10's frameReady at 1017 ms (empty path: renderer idle) does not advance
     const bool drawingAtEmptyFrameReady = false;
-    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, pendingAfterWake, drawingAtEmptyFrameReady, false, presented, slider ) );
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, pendingAfterWake, drawingAtEmptyFrameReady, false, presented, slider ) );
     // and the class: whoever left the flag (a poll tick that found the renderer busy before 1010 ms, a busy wake), the empty
     // and lookahead-drop paths never advance over the unpresented 9 in every-frame mode; 9's present takes the flag
-    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, drawingAtEmptyFrameReady, false, presented, slider ) );
-    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, false, false, 9, slider ) );     // once 9's present ended
-    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, false, true, presented, slider ) );   // drop-frame: unchanged
-    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, false, false, -1, slider ) );    // nothing presented this Play
-    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, true, true, 9, slider ) );      // busy never takes it
-    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( false, true, false, true, 9, slider ) );    // not playing
-    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, false, false, true, 9, slider ) );    // nothing pending
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, true, drawingAtEmptyFrameReady, false, presented, slider ) );
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, true, false, false, 9, slider ) );     // once 9's present ended
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, true, false, true, presented, slider ) );   // drop-frame: unchanged
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, true, false, false, -1, slider ) );    // nothing presented this Play
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, true, true, true, 9, slider ) );      // busy never takes it
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, false, true, false, true, 9, slider ) );    // not playing
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, false, false, true, 9, slider ) );    // nothing pending
 
     // the wiring, in MainWindow.cpp
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
@@ -392,7 +398,7 @@ TEST(PlaybackDueWakeA1, EveryFrameAHeldWakeLeavesNoPendingAdvanceForTheEmptyFram
     const int emptyAdvance = source.indexOf( QStringLiteral( "\"drawFrameReady.empty_advance\"" ), empty );
     ASSERT_TRUE( empty > 0 && emptyAdvance > empty );
     const QString emptyPath = source.mid( empty, emptyAdvance - empty );
-    ASSERT_TRUE( emptyPath.contains( QStringLiteral( "if( playbackPendingAdvanceMayBeTaken( ui->actionPlay->isChecked(), m_playbackFrameAdvancePending," ) ) );
+    ASSERT_TRUE( emptyPath.contains( QStringLiteral( "if( playbackPendingAdvanceMayBeTaken( mlvappPlaybackDueWakeEnabled(), ui->actionPlay->isChecked()," ) ) );
     ASSERT_TRUE( emptyPath.contains( QStringLiteral( "m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )" ) ) );
     ASSERT_FALSE( emptyPath.contains( QStringLiteral( "&& m_playbackFrameAdvancePending )" ) ) );
     // the lookahead-drop advance (its deferred lambda) is gated the same way, after it re-reads the renderer
@@ -401,7 +407,7 @@ TEST(PlaybackDueWakeA1, EveryFrameAHeldWakeLeavesNoPendingAdvanceForTheEmptyFram
     ASSERT_TRUE( drop > 0 && dropAdvance > drop );
     const QString dropPath = source.mid( drop, dropAdvance - drop );
     const int reread = dropPath.indexOf( QStringLiteral( "renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );" ) );
-    const int dropGate = dropPath.indexOf( QStringLiteral( "if( !playbackPendingAdvanceMayBeTaken( ui->actionPlay->isChecked(), m_playbackFrameAdvancePending," ) );
+    const int dropGate = dropPath.indexOf( QStringLiteral( "if( !playbackPendingAdvanceMayBeTaken( mlvappPlaybackDueWakeEnabled(), ui->actionPlay->isChecked()," ) );
     const int dropTimer = dropPath.indexOf( QStringLiteral( "timerFrameEvent();" ) );
     ASSERT_TRUE( reread > 0 && dropGate > reread && dropTimer > dropGate );
     // no other site takes the pending flag outside the poll tick (timerFrameEvent) and these two
@@ -420,8 +426,8 @@ TEST(PlaybackDueWakeNative, TheMessageCarriesItsPostTimeAndTheLatenessIsSplitAtT
     ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
         "\" post_stamped=%1 due_to_post_p50_ms=%2 due_to_post_p95_ms=%3 \"" ) ) );
     ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "\"post_to_receive_p50_ms=%4 post_to_receive_p95_ms=%5\"" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakeDueToPostMs.push_back( postMs - m_playbackDueWakeDueAtMs );" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostToReceiveMs.push_back( nowMs - postMs );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakeDueToPostMs.add( postMs - m_playbackDueWakeDueAtMs );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostToReceiveMs.add( nowMs - postMs );" ) ) );
 #ifdef Q_OS_WIN
     LARGE_INTEGER frequency;
     ASSERT_TRUE( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 );
@@ -475,4 +481,152 @@ TEST(PlaybackDueWakeA1, TheGateReadsTheFrameWhosePresentEndedNotTheOneAcceptedFo
     const int finish = source.lastIndexOf( QStringLiteral( "    finishPresentedFrame( display_frame," ), set );
     ASSERT_TRUE( present > 0 && finish > present && set > finish && armed > set && armed - set < 400 );
     ASSERT_EQ( 1, source.count( QStringLiteral( "m_playbackDueWakePresentedFrame = -1;" ) ) );   // reset with the counters at Play
+}
+
+namespace
+{
+// the r3 summary line's percentile over its unbounded std::vector (MainWindow.cpp at 9ca4c36b), kept as the reference
+double unboundedPercentile( std::vector<double> values, double p )
+{
+    if( values.empty() ) return 0.0;
+    const size_t index = static_cast<size_t>( std::floor( p * static_cast<double>( values.size() - 1 ) + 0.5 ) );
+    std::nth_element( values.begin(), values.begin() + static_cast<std::ptrdiff_t>( index ), values.end() );
+    return values[index];
+}
+
+// deterministic wake-lateness-shaped samples in [lo, hi)
+struct LatenessSource
+{
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    double next( double lo, double hi )
+    {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        const double unit = static_cast<double>( state >> 11 ) / 9007199254740992.0;
+        return lo + unit * ( hi - lo );
+    }
+};
+}
+
+TEST(PlaybackDueWakeSamplesB1, ALongLoopingPlayKeepsTheSampleStorageBounded)
+{
+    // Dot B1 (CoS 6609540072 on 21fc60dd): every due wake appended a double, and every native delivery two more, for the whole
+    // Play with no bound (about 4.9 MiB/h at 60 wakes/s); clear() at the next Play start kept the capacity. Every ordinary Play
+    // is a playback_smoke session, so the bound must be in the storage. 1e6 wakes = 4.6 h of looping Play at 60 fps.
+    PlaybackDueWakeSamples samples;
+    std::vector<double> unbounded;   // the r3 collector
+    LatenessSource source;
+    for( int i = 0; i < 1000000; ++i )
+    {
+        const double lateness = source.next( -0.5, 16.0 );
+        samples.add( lateness );
+        unbounded.push_back( lateness );
+        if( i % 4096 == 0 ) ASSERT_TRUE( samples.storageBytes() <= PlaybackDueWakeSamples::maxStorageBytes() );
+    }
+    ASSERT_TRUE( samples.storageBytes() <= PlaybackDueWakeSamples::maxStorageBytes() );
+    ASSERT_TRUE( PlaybackDueWakeSamples::maxStorageBytes() <= 256u * 1024u );
+    ASSERT_EQ( static_cast<std::size_t>( 1000000 ), samples.size() );
+    ASSERT_FALSE( samples.exact() );
+    // past the exact store the percentiles stay within half a bin of the unbounded vector's
+    ASSERT_NEAR( unboundedPercentile( unbounded, 0.50 ), samples.percentile( 0.50 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_NEAR( unboundedPercentile( unbounded, 0.95 ), samples.percentile( 0.95 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    // the r3 vector held 7.6 MiB or more for the same Play, and kept it after clear()
+    ASSERT_TRUE( unbounded.capacity() * sizeof( double ) > 30u * PlaybackDueWakeSamples::maxStorageBytes() );
+    unbounded.clear();
+    ASSERT_TRUE( unbounded.capacity() * sizeof( double ) > 30u * PlaybackDueWakeSamples::maxStorageBytes() );
+    // the Play-start reset releases the storage, and the next (measured) Play is exact again
+    samples.reset();
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), samples.storageBytes() );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), samples.size() );
+    ASSERT_TRUE( samples.exact() );
+    for( int i = 0; i < 1000; ++i ) samples.add( source.next( 0.0, 4.0 ) );
+    ASSERT_TRUE( samples.exact() );
+    ASSERT_TRUE( samples.storageBytes() <= PlaybackDueWakeSamples::kExactCapacity * sizeof( double ) );
+}
+
+TEST(PlaybackDueWakeSamplesB1, MeasuredPlayPercentilesAreTheUnboundedCollectorsOnAKnownSampleSet)
+{
+    const double ps[] = { 0.0, 0.05, 0.50, 0.95, 1.0 };
+    ASSERT_EQ( 0.0, PlaybackDueWakeSamples().percentile( 0.50 ) );   // no samples: 0.000, as before
+    // up to the exact capacity (a measured Play is seconds long): identical, bit for bit
+    const std::size_t sizes[] = { 1, 2, 7, 1000, 9999, PlaybackDueWakeSamples::kExactCapacity };
+    LatenessSource source;
+    for( const std::size_t n : sizes )
+    {
+        PlaybackDueWakeSamples samples;
+        std::vector<double> reference;
+        for( std::size_t i = 0; i < n; ++i )
+        {
+            const double v = source.next( -3.0, 25.0 );
+            samples.add( v );
+            reference.push_back( v );
+        }
+        ASSERT_TRUE( samples.exact() );
+        for( const double p : ps ) ASSERT_EQ( unboundedPercentile( reference, p ), samples.percentile( p ) );
+    }
+    // a known set: 0..99 ms in reverse
+    PlaybackDueWakeSamples known;
+    std::vector<double> knownReference;
+    for( int i = 99; i >= 0; --i ) { known.add( i ); knownReference.push_back( i ); }
+    ASSERT_EQ( 50.0, known.percentile( 0.50 ) );   // floor( 0.5 * 99 + 0.5 ) = 50
+    ASSERT_EQ( 94.0, known.percentile( 0.95 ) );   // floor( 0.95 * 99 + 0.5 ) = 94
+    ASSERT_EQ( unboundedPercentile( knownReference, 0.95 ), known.percentile( 0.95 ) );
+    // past the exact capacity: the same rank, within half a bin, inside the histogram range
+    PlaybackDueWakeSamples binned;
+    std::vector<double> binnedReference;
+    for( int i = 0; i < 200000; ++i )
+    {
+        const double v = source.next( -19.0, 79.0 );
+        binned.add( v );
+        binnedReference.push_back( v );
+    }
+    ASSERT_FALSE( binned.exact() );
+    for( const double p : ps )
+        ASSERT_NEAR( unboundedPercentile( binnedReference, p ), binned.percentile( p ),
+                     PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+}
+
+TEST(PlaybackDueWakeSamplesB1, MainWindowKeepsNoUnboundedDueWakeSampleVector)
+{
+    // RED on 9ca4c36b: MainWindow.h declared three std::vector<double> sample members, onPlaybackDueWake push_back'ed into
+    // them, and resetPlaybackDueWakeCounters clear()ed them (capacity kept)
+    const QString header = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.h" ) );
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_FALSE( header.isEmpty() );
+    ASSERT_FALSE( source.isEmpty() );
+    ASSERT_FALSE( header.contains( QRegularExpression( QStringLiteral( "std::vector<double>[ ]+m_playbackDueWake" ) ) ) );
+    ASSERT_EQ( 3, header.count( QRegularExpression( QStringLiteral( "PlaybackDueWakeSamples[ ]+m_playbackDueWake[A-Za-z]+Ms;" ) ) ) );
+    ASSERT_FALSE( source.contains( QRegularExpression( QStringLiteral( "m_playbackDueWake[A-Za-z]*Ms[.](push_back|emplace_back|clear)[(]" ) ) ) );
+    const QString reset = functionBody( source, QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
+                                        QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ) );
+    ASSERT_FALSE( reset.isEmpty() );
+    ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWakeLatenessMs.reset();" ) ) );
+    ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWakeDueToPostMs.reset();" ) ) );
+    ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWakePostToReceiveMs.reset();" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "m_playbackDueWakeLatenessMs.add( nowMs - m_playbackDueWakeDueAtMs );" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "QStringLiteral( \" samples_binned=%1\" )" ) ) );
+}
+
+TEST(PlaybackDueWakeI1, WithTheWakeOffThePendingAdvanceGateIsTheBaseCondition)
+{
+    // Dot I1: MLVAPP_PLAYBACK_DUE_WAKE=0 stopped the arming but kept the every-frame "only past the presented frame" gate on the
+    // empty-frameReady and lookahead-drop advances, so wake-off was not the base build. Off, the gate is the base condition:
+    // playing && pending && !drawing (MainWindow.cpp at 03b9ea28, both sites).
+    const long long presentedFrames[] = { -1, 8, 9 };
+    int differs = 0;
+    for( int bits = 0; bits < 16; ++bits )
+    {
+        const bool play = ( bits & 1 ) != 0, pending = ( bits & 2 ) != 0, drawing = ( bits & 4 ) != 0, dropFrame = ( bits & 8 ) != 0;
+        for( const long long presented : presentedFrames )
+        {
+            const bool base = play && pending && !drawing;
+            ASSERT_EQ( base, playbackPendingAdvanceMayBeTaken( false, play, pending, drawing, dropFrame, presented, 9 ) );
+            if( base != playbackPendingAdvanceMayBeTaken( true, play, pending, drawing, dropFrame, presented, 9 ) ) ++differs;
+        }
+    }
+    ASSERT_TRUE( differs > 0 );   // on, the every-frame hold (presented 8, slider 9) still applies
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( false, true, true, false, false, 8, 9 ) );   // the held shape, wake off
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, true, false, false, 8, 9 ) );   // the held shape, wake on
+    // both MainWindow sites pass the kill switch
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 2, source.count( QStringLiteral( "playbackPendingAdvanceMayBeTaken( mlvappPlaybackDueWakeEnabled(), ui->actionPlay->isChecked()," ) ) );
 }

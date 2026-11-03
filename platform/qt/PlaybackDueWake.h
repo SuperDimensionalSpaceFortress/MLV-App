@@ -126,11 +126,15 @@ inline bool playbackDueWakeOutcomeLeavesPendingAdvance( PlaybackDueWakeOutcome o
 /*! r3 (adversary pass 6 A1, siblings): a pending advance taken OUTSIDE the poll tick and the present's own tail advance
  *  (the empty-frameReady path and the lookahead-drop path) obeys the same rule as the wake. In every-frame mode it may
  *  advance only past the frame whose present ended; otherwise the pending flag stays set for the present's tail advance
- *  (or the next poll tick) to take. Whoever set the flag (the poll tick or a busy wake), the rule is the same. */
-inline bool playbackPendingAdvanceMayBeTaken( bool playChecked, bool pendingAdvance, bool frameStillDrawing,
-                                              bool dropFrameMode, long long lastPresentedFrame, int position )
+ *  (or the next poll tick) to take. Whoever set the flag (the poll tick or a busy wake), the rule is the same.
+ *  r4 (Dot I1): with the due wake off (MLVAPP_PLAYBACK_DUE_WAKE=0, \a dueWakeEnabled false) this is the base build's
+ *  condition exactly (playing, pending, renderer not busy), so the wake-off arm is baseline-equivalent. */
+inline bool playbackPendingAdvanceMayBeTaken( bool dueWakeEnabled, bool playChecked, bool pendingAdvance,
+                                              bool frameStillDrawing, bool dropFrameMode, long long lastPresentedFrame,
+                                              int position )
 {
     if( !playChecked || !pendingAdvance ) return false;
+    if( !dueWakeEnabled ) return !frameStillDrawing;
     return playbackDueWakeMayAdvance( frameStillDrawing, dropFrameMode, lastPresentedFrame, position );
 }
 

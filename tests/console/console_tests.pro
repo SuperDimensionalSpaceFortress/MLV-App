@@ -145,6 +145,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
     $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
     $$REPO_ROOT/platform/qt/PlaybackDueWake.h \
+    $$REPO_ROOT/platform/qt/PlaybackDueWakeSamples.h \
     $$REPO_ROOT/platform/qt/PlaybackPresentTrace.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \
