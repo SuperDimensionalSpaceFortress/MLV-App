@@ -39,6 +39,7 @@ param(
     [string]$ChildJson = ''
 )
 $ErrorActionPreference = 'Stop'
+$script:holds = [System.Collections.Generic.List[object]]::new()  # r17 (adversary pass 2 A1): every directory the saver holds open (RunDir, private root, private subdirectories) with the path it was proved at. A held handle stops a rename or delete, NOT an in-place conversion of an empty directory into a junction (FSCTL_SET_REPARSE_POINT on the same directory object), so each hold is proved again right before a write
 $script:gitStderr = @()  # stderr of every git call that exited 0: a warning there is a collection that may be incomplete (r11 sol r10 B2)
 $script:seal = $null; $script:sealDir = $null; $script:sealId = $null; $script:heldSeal = $null
 $script:probeWarnings = @()  # identity probes that could not be read (r13 sol r12 F3): each is a warning, so the collection is incomplete
@@ -104,12 +105,12 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     if ($sha256) { $cfg += "[extensions]`n`tobjectformat = sha256`n" }
     $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
     [void][System.IO.Directory]::CreateDirectory($sg)  # r16 (adversary pass 1 A1): the directory is made, then HELD and proved to be at its own name BEFORE anything is written into it. Windows: opened without share-delete, so it cannot be moved away and replaced by a junction into the worktree, and its kernel final path must equal its own long path (a name that already resolves elsewhere is refused before a byte is written). POSIX cannot hold it: every private file is CREATE_NEW (an existing file is never truncated) and the directory is proved link-free and outside the worktree once written
-    if ($script:onWin) { $script:heldSeal = Get-FinalDir $sg; Assert-HandleAtPath $script:heldSeal.Handle $sg }
+    if ($script:onWin) { $script:heldSeal = Get-FinalDir $sg; Assert-HandleAtPath $script:heldSeal.Handle $sg; $script:holds.Add(@{ Handle = $script:heldSeal.Handle; Path = $sg }) }
     $script:sealId = $null; try { $script:sealId = Get-DirId $sg } catch { }  # r16 (adversary A2): the identity of the directory this run made; the leftover is reported verified only while the name still holds it
     $script:heldSub = [System.Collections.Generic.List[object]]::new()  # r17 (adversary A2): each subdirectory is created PARENT FIRST, then held and proved at its own path exactly like the root. Only the root was held before, so `objects` could be moved away and a junction to a worktree folder put at its name before objects/info/alternates was created
     foreach ($sub in @('objects'), @('objects', 'info'), @('refs'), @('info')) {  # one segment per argument: a \\?\ path (the RunDir fall-back) does not translate a slash
         $sd = [System.IO.Path]::Combine([string[]](@($sg) + $sub)); [void][System.IO.Directory]::CreateDirectory($sd)
-        if ($script:onWin) { $hd = Get-FinalDir $sd; $script:heldSub.Add($hd.Handle); Assert-HandleAtPath $hd.Handle $sd }
+        if ($script:onWin) { $hd = Get-FinalDir $sd; $script:heldSub.Add($hd.Handle); Assert-HandleAtPath $hd.Handle $sd; $script:holds.Add(@{ Handle = $hd.Handle; Path = $sd }) }
         else { Assert-LinkFree $sd }  # POSIX cannot hold a directory: the new subdirectory is proved link-free once made (the documented limit, a swap after this proof, stays)
     }
     $enc = [System.Text.UTF8Encoding]::new($false)
@@ -119,7 +120,7 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     Write-NewFile ([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates')) $enc.GetBytes("$alt`n")
     foreach ($pair in @(, @($attr, 'attributes')) + @(, @($excl, 'exclude'))) {  # attribute and ignore RULES are data; a filter attribute without a configured driver runs nothing
         $dest = [System.IO.Path]::Combine($sg, 'info', $pair[1])
-        try { [System.IO.File]::Copy($pair[0], $dest) }
+        try { Assert-HoldsIntact; [System.IO.File]::Copy($pair[0], $dest) }
         catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { continue }  # absent is the only silent case: File.Exists answers false for a file it may not look at, which dropped the rules and let the sealed git compare by other ones (adversary r11 A2). Any other failure ends in the typed private-git-dir refusal (40)
         [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal)
     }
@@ -342,7 +343,12 @@ function Assert-HandleAtPath($Handle, [string]$Path) {  # r16 (adversary A1, A3)
     } finally { $want.Dispose() }
     if (-not [string]::Equals((ConvertTo-PlainPath $fin.ToString()), (ConvertTo-PlainPath $req.ToString()), [System.StringComparison]::Ordinal)) { throw 'opened-through-a-link' }
 }
+function Assert-HoldsIntact {  # r17 (adversary pass 2 A1): Windows. Every held directory is still at the path it was proved at: the open handle's kernel path equals the kernel path of the name opened NOW (Ordinal). A directory converted in place into a junction keeps its handle's path but sends the NAME elsewhere, so the two now differ and the write is refused. What stays open is only the instant between this proof and the create (see the header: a write by name cannot be made atomic with a check)
+    if (-not $script:onWin) { return }
+    foreach ($h in $script:holds) { Assert-HandleAtPath $h.Handle $h.Path }
+}
 function Write-NewFile([string]$Path, [byte[]]$Bytes) {  # r16 (adversary A1): a private file is only ever CREATED; one that already exists (a worktree file reached through a swapped link included) is an error, never truncated
+    Assert-HoldsIntact
     $fs = [System.IO.File]::Open($Path, 'CreateNew', 'Write', 'None')
     try { $fs.Write($Bytes, 0, $Bytes.Length) } finally { $fs.Dispose() }
 }
@@ -374,6 +380,7 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes) {  # r16 (sol r15 B2, hub ruli
         $script:written = $Bytes
         $name = if ($n -eq 1) { "dirty-save-$head8.$Ext" } else { "dirty-save-$head8.$n.$Ext" }
         $f = [System.IO.Path]::Combine($RunDir, $name)
+        Assert-HoldsIntact
         try { $fs = [System.IO.File]::Open($f, 'CreateNew', 'Write', 'None') }
         catch [System.IO.IOException], [System.UnauthorizedAccessException] {  # a directory at the name raises UnauthorizedAccess (sol r4 B3)
             if (-not ([System.IO.File]::Exists($f) -or [System.IO.Directory]::Exists($f))) { throw }  # nothing is at the name: a real write failure (read-only or full RunDir), not a collision
@@ -411,7 +418,7 @@ if ($top.Code -eq 0) {
 try {
     if ($top.Code -eq 0) { if (Test-HasDotDot $WorkDir) { throw 'dotdot-path' }; Assert-LinkFree $WorkDir; Assert-SameRepo $startDir $gitDir; $script:pin = @(('--git-dir=' + $gitDir), ('--work-tree=' + $WorkDir)); if ($script:onWin) { $script:heldGit = Get-FinalDir $gitDir } }  # the captured git dir is held open (no share-delete) like the RunDir and work tree: it cannot be renamed away and replaced for the rest of the run  # r13: the top level is what git printed (forward slashes on Windows); it is judged like the argument was, not trusted. r14: and it must be the SAME repository by identity; from here every git call is handed the captured git dir and work tree
     if ($script:onWin) {
-        $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path
+        $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path; $script:holds.Add(@{ Handle = $script:held[0].Handle; Path = $RunDir })
         if (-not [string]::Equals((Get-ShareOf $RunDir), (Get-ShareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # see Get-ShareOf (r7 fix-2 A2)
     }
     else { $RunDir = [System.IO.Path]::TrimEndingDirectorySeparator($RunDir); $realWork = [System.IO.Path]::TrimEndingDirectorySeparator($WorkDir); if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }  # no link is in either chain (Assert-LinkFree), so the text is the real path

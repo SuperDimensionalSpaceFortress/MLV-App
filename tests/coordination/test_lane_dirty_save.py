@@ -1911,7 +1911,7 @@ def test_the_private_base_cannot_be_replaced_by_a_junction_into_the_worktree_bet
     base = tmp_path / "tempbase"
     base.mkdir()
     marker = tmp_path / "rename-result.txt"
-    anchor = "foreach ($sub in @('objects', 'info'), @('refs'), @('info')) {"
+    anchor = "$script:heldSub = [System.Collections.Generic.List[object]]::new()"  # r17 (adversary A2): the subdirectory loop now starts with this line; the hook still runs right before any subdirectory exists
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.count(anchor) == 1
     hook = (f"try {{ $b = [System.IO.Path]::GetDirectoryName($sg); [System.IO.Directory]::Move($b, $b + '.saved'); $o = 'MOVED' }} catch {{ $o = 'BLOCKED' }}; Set-Content -LiteralPath '{marker}' -Value $o -NoNewline; ")
@@ -2456,3 +2456,42 @@ def test_a_private_subdirectory_swapped_for_a_junction_into_the_worktree_never_h
     assert list((repo / "victim" / "info").iterdir()) == [], r.stdout + r.stderr  # c5015bc5: alternates written into the worktree
     assert marker.read_text() == "BLOCKED", r.stdout + r.stderr
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+# ---- r17 adversary pass 2 on 4a7cb9e4 (A1) ----
+CONVERT_IN_PLACE = ("Add-Type -Namespace RpConv -Name Win -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"kernel32.dll\", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string n, uint a, uint s, System.IntPtr sec, uint d, uint f, System.IntPtr t); "
+                    "[System.Runtime.InteropServices.DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool DeviceIoControl(Microsoft.Win32.SafeHandles.SafeFileHandle h, uint code, byte[] inb, uint inl, System.IntPtr outb, uint outl, out uint ret, System.IntPtr ov);'; "
+                    "$convDir = @@DIR@@; $sub = [System.Text.Encoding]::Unicode.GetBytes('\\??\\@@TARGET@@'); $buf = New-Object byte[] (20 + $sub.Length); "
+                    "[BitConverter]::GetBytes([uint32]2684354563).CopyTo($buf, 0); [BitConverter]::GetBytes([uint16](12 + $sub.Length)).CopyTo($buf, 4); [BitConverter]::GetBytes([uint16]$sub.Length).CopyTo($buf, 10); [BitConverter]::GetBytes([uint16]($sub.Length + 2)).CopyTo($buf, 12); $sub.CopyTo($buf, 16); "
+                    "$ch = [RpConv.Win]::CreateFileW($convDir, 0x40000000, 3, [System.IntPtr]::Zero, 3, 0x02200000, [System.IntPtr]::Zero); $ret = [uint32]0; "
+                    "$ok = (-not $ch.IsInvalid) -and [RpConv.Win]::DeviceIoControl($ch, 0x000900A4, $buf, [uint32]$buf.Length, [System.IntPtr]::Zero, 0, [ref]$ret, [System.IntPtr]::Zero); if (-not $ch.IsInvalid) { $ch.Dispose() }; Set-Content -LiteralPath '@@MARKER@@' -Value $(if ($ok) { 'CONVERTED' } else { 'REFUSED' }) -NoNewline; ")
+
+
+def _convert_hook(directory_expr, target, marker):
+    return CONVERT_IN_PLACE.replace("@@DIR@@", directory_expr).replace("@@TARGET@@", str(target)).replace("@@MARKER@@", str(marker))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
+def test_the_run_dir_converted_in_place_into_a_junction_never_has_an_artifact_written_through_it(repo, tmp_path):  # r17 adversary pass 2 A1 (4a7cb9e4): the held RunDir stops a rename, not FSCTL_SET_REPARSE_POINT on the same empty directory; the patch and receipt were then created inside the worktree and the run ended 0. Every held directory is proved at its path again right before each write
+    victim, marker = repo / "victim", tmp_path / "convert-result.txt"
+    victim.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    hooked = _hooked(tmp_path, [("foreach ($k in $todo) { $r[$k] = Save-Bytes", _convert_hook("$RunDir", victim, marker))])
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert marker.read_text() == "CONVERTED", "the test premise (an in-place conversion of the held run dir) did not happen: " + r.stdout + r.stderr
+    assert list(victim.iterdir()) == [], r.stdout + r.stderr  # 4a7cb9e4: dirty-save-<head8>.patch and the receipt in the worktree
+    assert r.returncode == 50 and "DIRTY_SAVE_WRITE_FAILED" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows reparse points")
+def test_a_private_subdirectory_converted_in_place_into_a_junction_never_has_a_file_written_through_it(repo, tmp_path):  # r17 adversary pass 2 A1 sibling (private objects/info): same conversion, after the creation proof and before the alternates write
+    base, marker = tmp_path / "tempbase", tmp_path / "convert-result.txt"
+    base.mkdir()
+    victim = repo / "victim"
+    victim.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    hooked = _hooked(tmp_path, [("Write-NewFile ([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'))", _convert_hook("[System.IO.Path]::Combine($sg, 'objects', 'info')", victim, marker))])
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    assert marker.read_text() == "CONVERTED", "the test premise did not happen: " + r.stdout + r.stderr
+    assert list(victim.iterdir()) == [], r.stdout + r.stderr  # 4a7cb9e4: alternates created in the worktree
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
