@@ -1358,7 +1358,7 @@ def test_a_private_git_dir_whose_parent_cannot_be_searched_is_named_not_called_r
                            capture_output=True, text=True, env={**os.environ, "TMPDIR": str(base), "LDS_BASE": str(base)})
     finally:
         os.chmod(base, 0o755)
-    assert "privateGitDirLeft=" in r.stdout, r.stdout + r.stderr  # old code: nothing named, the directory was left behind
+    assert "privateGitDirLeft" in r.stdout, r.stdout + r.stderr  # old code: nothing named, the directory was left behind
     shutil.rmtree(base, ignore_errors=True)
 
 
@@ -2022,7 +2022,8 @@ def test_a_child_record_whose_folder_is_swapped_for_a_link_after_the_check_is_ne
     decoy.mkdir()
     (a / "a.txt").write_bytes(b"DIRT\n")
     old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).isoformat()
-    (records / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": old}))  # the live lane
+    live = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)).isoformat()  # r15 adversary A4 (5d62d133): a createdUtc earlier than the process start reads as PID reuse (dead); later or equal is the live lane
+    (records / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": live}))  # the live lane
     (decoy / "child.json").write_text(json.dumps({"pid": dead_pid(), "createdUtc": old}))  # a dead one
     anchor = "if (Test-LaneAlive) {"
     text = SCRIPT.read_text(encoding="utf-8")
@@ -2057,3 +2058,72 @@ def test_a_linked_worktrees_common_dir_pointer_rewritten_and_restored_during_the
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(linked), "-RunDir", str(run), "-LanePid", str(dead_pid())], capture_output=True, text=True)
     assert r.returncode == 30 and "reason=repository-changed" in r.stdout, r.stdout + r.stderr  # 79641666: DIRTY_SAVE_NOTHING reason=clean-tree, exit 10
     assert list(run.iterdir()) == []
+
+
+# ---- r15 adversary pass 2 on 5d62d133 (A1-A3) ----
+def _hooked(tmp_path, pairs):
+    text = SCRIPT.read_text(encoding="utf-8")
+    for anchor, code in pairs:
+        assert text.count(anchor) == 1, anchor
+        text = text.replace(anchor, code + anchor)
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text, encoding="utf-8")
+    return hooked
+
+
+def test_the_clean_up_never_deletes_a_directory_that_took_the_private_directorys_name(repo, tmp_path):  # r15 adversary pass 2 A1 (5d62d133): the private directory was deleted by NAME; a peer that renamed it away and moved another folder to its name had that folder deleted, while the real private directory stayed unreported. The hook plays the peer right before the clean-up
+    base, victim = tmp_path / "tempbase", tmp_path / "victim"
+    base.mkdir()
+    victim.mkdir()
+    (victim / "precious.txt").write_text("KEEP\n")
+    (repo / "a.txt").write_bytes(b"changed\n")
+    hook = f"[System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir); "
+    hooked = _hooked(tmp_path, [("for ($i = 0; $i -lt 5 -and $script:sealDir", hook)])
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base)})
+    kept = list(base.glob("lane-dirty-save-*/precious.txt"))
+    assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 5d62d133: the other folder was deleted
+    assert "privateGitDirLeft" in r.stdout, r.stdout  # and the remainder is named, not silently reported as clean
+
+
+def test_an_existing_artifact_name_that_is_a_link_into_the_worktree_is_not_reused_as_the_same_bytes(tmp_path):  # r15 adversary pass 2 A2 (5d62d133): a file symlink at dirty-save-<head8>.untracked.txt pointing at the worktree's own untracked file made the saver read through it, find equal bytes and report exit 0 naming evidence that lives INSIDE the worktree
+    a, run = tmp_path / "wtA", tmp_path / "run"
+    init_repo(a, b"BASE\n")
+    run.mkdir()
+    (a / "u.txt").write_bytes(b"x")
+    head8 = git(a, "rev-parse", "HEAD").decode().strip()[:8]
+    # the saver writes the NUL-separated name list; a link at that name to a file with exactly those bytes is what the old code called "already saved"
+    (a / "names.txt").write_bytes(b"u.txt\0")
+    try:
+        os.symlink(a / "names.txt", run / f"dirty-save-{head8}.untracked.txt")
+    except (OSError, NotImplementedError):
+        pytest.skip("this host cannot create a file symlink")
+    r = save(a, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    receipt = last_receipt(r)
+    assert receipt["untracked"] != f"dirty-save-{head8}.untracked.txt", r.stdout  # 5d62d133: the link was reused
+    assert not (run / receipt["untracked"]).is_symlink() and (run / receipt["untracked"]).read_bytes() == b"names.txt\0u.txt\0"
+
+
+def test_a_child_record_that_was_a_decoy_when_opened_and_is_the_original_again_at_the_second_proof_is_refused(tmp_path):  # r15 adversary pass 2 A3 (5d62d133): the link in place at the open and removed before the second link-free proof left the saver validating the restored NAME while it read the held decoy handle (dead decoy -> the live lane's work saved). The record read from the handle must equal what the name holds
+    a, run, records, decoy = tmp_path / "wtA", tmp_path / "run", tmp_path / "records", tmp_path / "decoy"
+    init_repo(a, b"BASE\n")
+    for d in (run, records, decoy):
+        d.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).isoformat()
+    live = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)).isoformat()
+    (records / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": live}))
+    (decoy / "child.json").write_text(json.dumps({"pid": dead_pid(), "createdUtc": old}))
+    kind = "Junction" if sys.platform == "win32" else "SymbolicLink"
+    swap = f"[System.IO.Directory]::Move('{records}', '{records}.saved'); [void](New-Item -ItemType {kind} -Path '{records}' -Target '{decoy}'); "
+    restore = f"[System.IO.Directory]::Delete('{records}'); [System.IO.Directory]::Move('{records}.saved', '{records}'); "
+    hooked = _hooked(tmp_path, [("if (Test-LaneAlive) {", swap), ("try { Assert-LinkFree $ChildJson; $cjson", restore)])
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-ChildJson", str(records / "child.json")], capture_output=True, text=True)
+    assert r.returncode in (20, 30), r.stdout + r.stderr  # 5d62d133: exit 0
+    assert list(run.iterdir()) == []
+
+
+def test_a_link_at_an_artifact_name_is_skipped_not_compared_in_the_saver_source():  # r15 adversary pass 2 A2 source pin (the symlink end-to-end test skips on a host that cannot create one)
+    text = SCRIPT.read_text(encoding="utf-8")
+    body = text[text.index("function Save-Bytes"):text.index("\ntry {\n    foreach ($v in 'GIT_DIR'")]
+    assert body.index("FileAttributes]::ReparsePoint") < body.index("SequenceEqual")

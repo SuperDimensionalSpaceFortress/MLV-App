@@ -31,7 +31,7 @@
 # append to it (sol r20 B1 on #698), and removing a caller's disable is what exposed it. GIT_OPTIONAL_LOCKS=0 keeps git from refreshing the index.
 # NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir in the OS temp directory, or the RunDir when temp is not provably outside the worktree (never under the worktree or a git dir beneath it; removed on exit) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
 # Every git call also gets --no-replace-objects: a refs/replace entry for HEAD would make the diffs read another commit's tree while the receipt names HEAD (adversary r9 A2). Path and name comparisons are ordinal, never by culture (U+00AD and case are ignored by culture compares).
-# r15 (sol r14 B1; adversary pass on 79641666 A1, A3, A4): the repository identity (git dir, work tree, and for a linked worktree the bytes of its `commondir` file) is re-read before and after EVERY git call; the private base is returned by its real path, never a re-mappable drive alias; the -ChildJson record is opened first and proved link-free again with the file held. OPEN, carried to r16: adversary A2 (a git dir replaced by another repository BEFORE the first identity read is indistinguishable from that repository having been selected; no re-read can tell) and any other repository metadata file a peer may rewrite and restore mid-run (alternates, packed-refs): the threat model excludes a peer with write access to the repository's own metadata during the run.
+# r15 (sol r14 B1; adversary pass on 79641666 A1, A3, A4): the repository identity (git dir, work tree, and for a linked worktree the bytes of its `commondir` file) is re-read before and after EVERY git call; the private base is returned by its real path, never a re-mappable drive alias; the -ChildJson record is opened first, proved link-free again with the file held, and must equal what its name then holds; the private directory is deleted only while its name still holds the directory this run made (else it is named as left over); an existing artifact name that is a link is skipped, never compared. OPEN, carried to r16: adversary A2 (a git dir replaced by another repository BEFORE the first identity read is indistinguishable from that repository having been selected; no re-read can tell) and any other repository metadata file a peer may rewrite and restore mid-run (alternates, packed-refs): the threat model excludes a peer with write access to the repository's own metadata during the run.
 param(
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][string]$RunDir,
@@ -103,8 +103,9 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     $cfg = "[core]`n`trepositoryformatversion = $(if ($sha256) { 1 } else { 0 })`n`tsafecrlf = false`n"  # r12 (adversary pass 2 A1): core.safecrlf only decides whether git SAYS something about a line-ending conversion (or dies on an irreversible one); it never changes the bytes compared. Forced off, git prints no conversion notice at all, so no stderr text has to be told apart from a file name that imitates one (a name may hold a line feed and any message text). Not copied from the caller for that reason
     foreach ($k in $vals.Keys) { $cfg += "`t" + $k.Substring(5) + $(if ($null -eq $vals[$k]) { '' } else { ' = "' + $vals[$k].Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`t", '\t').Replace("`b", '\b') + '"' }) + "`n" }
     if ($sha256) { $cfg += "[extensions]`n`tobjectformat = sha256`n" }
-    $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
+    $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg; $script:sealId = $null  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
     foreach ($sub in @('objects', 'info'), @('refs'), @('info')) { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine([string[]](@($sg) + $sub))) }  # one segment per argument: a \\?\ path (the RunDir fall-back) does not translate a slash
+    $script:sealId = Get-DirId $sg  # r15 (adversary pass 2 A1): the identity of the directory this run made; the clean-up deletes by NAME, so it first proves the name still holds this directory
     $enc = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD'), "$HeadFull`n", $enc)
     [System.IO.File]::WriteAllBytes([System.IO.Path]::Combine($sg, 'config'), [System.Text.Encoding]::Latin1.GetBytes($cfg))
@@ -317,6 +318,7 @@ function Test-LaneAlive {
         # System.Text.Json, not ConvertFrom-Json: PowerShell turns '/Date(0)/' into a DateTime, unwraps one-item lists and casts arrays to int, so every shape check was passed by something that is no ISO string (adversary r8 A2, A3)
         $cfs = [System.IO.File]::Open($ChildJson, 'Open', 'Read', 'Read')  # r15 (adversary A4): opened FIRST, then proved link-free again with the file held, then read from that handle: a folder swapped for a link after the first check (line "foreach ($raw in") cannot make the saver read another file by the same name
         try { Assert-LinkFree $ChildJson; $cjson = [System.IO.StreamReader]::new($cfs).ReadToEnd() } finally { $cfs.Dispose() }
+        if (-not [string]::Equals([System.IO.File]::ReadAllText($ChildJson), $cjson, [System.StringComparison]::Ordinal)) { throw 'child-record-changed' }  # r15 (adversary pass 2 A3): a link that was in place when the file was opened and removed before the second proof left the saver holding the decoy; the name now holds another file, so the two reads disagree and the run is refused
         $root = [System.Text.Json.JsonDocument]::Parse($cjson).RootElement
         $pe = [System.Text.Json.JsonElement]::new(); $ce = [System.Text.Json.JsonElement]::new()
         if ($root.ValueKind -ne 'Object' -or -not $root.TryGetProperty('pid', [ref]$pe) -or $pe.ValueKind -ne 'Number' -or -not $pe.TryGetInt32([ref]$procId)) { throw 'bad-child-json' }
@@ -341,6 +343,7 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) { 
         catch [System.IO.IOException], [System.UnauthorizedAccessException] {  # a directory at the name raises UnauthorizedAccess (sol r4 B3)
             if (-not ([System.IO.File]::Exists($f) -or [System.IO.Directory]::Exists($f))) { throw }
             if ([System.IO.Directory]::Exists($f)) { continue }
+            if ([System.IO.File]::GetAttributes($f) -band [System.IO.FileAttributes]::ReparsePoint) { continue }  # r15 (adversary pass 2 A2): a link at the name could point into the worktree; reading through it and calling the bytes equal would report evidence that does not live in the RunDir. A link is another file: the next suffix is used
             $same = $null
             for ($i = 0; $i -lt 5 -and $null -eq $same; $i++) { try { $same = [System.Linq.Enumerable]::SequenceEqual([byte[]][System.IO.File]::ReadAllBytes($f), $Bytes) } catch { Start-Sleep -Milliseconds 200 } }
             if ($same) { return $name }
@@ -403,7 +406,11 @@ try {
 }
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
 finally {  # only the private dir this run made. A handle another process holds open (no delete sharing, Windows) can keep it: retried, then NAMED in the output and the receipt, never swallowed (adversary r10 A4)
-    for ($i = 0; $i -lt 5 -and $script:sealDir -and (Test-DirPresent $script:sealDir); $i++) { try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { Start-Sleep -Milliseconds 200 } }
+    for ($i = 0; $i -lt 5 -and $script:sealDir -and (Test-DirPresent $script:sealDir); $i++) {
+        $mine = $false; try { $mine = (-not $script:sealId) -or [string]::Equals((Get-DirId $script:sealDir), $script:sealId, [System.StringComparison]::Ordinal) } catch { }
+        if (-not $mine) { break }  # another directory now holds the name (or its identity cannot be read): never deleted, and named below as left over
+        try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { Start-Sleep -Milliseconds 200 }
+    }
 }
 $left = if ($script:sealDir -and (Test-DirPresent $script:sealDir)) { $script:sealDir } else { $null }
 $leftNote = if ($left) { " privateGitDirLeft=$left" } else { '' }
