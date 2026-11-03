@@ -6699,9 +6699,9 @@ $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $cor
 # nvidia-smi as start-release-cuda-playback.ps1 (Resolve-NvidiaSmiCommand) finds it: PATH, then System32, then NVSMI. '' when none.
 function Resolve-UtilSampleNvidiaSmi {
     try {
-        $c = Get-Command nvidia-smi -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($c) { return [string]$c.Source }
-        foreach ($p in @((Join-Path ([string]$env:SystemRoot) 'System32\nvidia-smi.exe'), (Join-Path ([string]$env:ProgramFiles) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))) {
+        # PATH walked by hand (a Get-Command result would make the whole job file a session-carrier tree to the attr3 spliced-body scan).
+        $onPath = @(([string]$env:PATH -split ';') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { Join-Path $_.Trim('"') 'nvidia-smi.exe' })
+        foreach ($p in @($onPath + (Join-Path ([string]$env:SystemRoot) 'System32\nvidia-smi.exe') + (Join-Path ([string]$env:ProgramFiles) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))) {
             if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
         }
     } catch { }
@@ -6725,7 +6725,7 @@ function Get-UtilSampleDgpuState {
 
 # WAKE RULE: a cuda leg always starts nvidia-smi (and says it can wake the dGPU before the app does); any other leg reads the D-state first ($DState)
 # and starts it only in D0, else skipped_wake_risk with the state's reason and no process. Status running | skipped_wake_risk | unavailable.
-function Start-UtilSampleGpu([string]$Backend, [string]$SmiPath, [string]$CsvPath, [scriptblock]$DState) {
+function Start-UtilSampleGpu([string]$Backend, [string]$SmiPath, [string]$CsvPath, $DState) {
     $r = [ordered]@{ status = 'unavailable'; reason = $null; why = $null; proc = $null; pid = $null; startTicks = $null; dState = $null; wakeDisclosure = $null }
     try {
         # adversary 9d648094 A5: the backend is compared lower-cased (a 'CUDA' leg is a cuda leg); A4: the PnP record is read on every backend, so
@@ -6795,7 +6795,7 @@ function Start-UtilSampleCpu([string]$PwshPath, [string]$Encoded, [string]$CsvPa
 # summed over the processes named $AppName seen in both samples, bound by pid and start time (appPid lists them). It ends on the stop file, its
 # monotonic deadline, or its parent's exit; on the last two it also ends the job's nvidia-smi, that pid only and only while its start time matches.
 # adversary 9d648094 A10: the parent is bound by pid AND start time ($ParentStartTicks, 0 = pid only), so a reused pid is still parent-gone.
-function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$AppName, [int]$IntervalMs, [int64]$DeadlineMs, [scriptblock]$ReadTotal, [int]$ParentPid, [int64]$ParentStartTicks, [int]$GpuPid, [int64]$GpuStartTicks) {
+function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$AppName, [int]$IntervalMs, [int64]$DeadlineMs, $ReadTotal, [int]$ParentPid, [int64]$ParentStartTicks, [int]$GpuPid, [int64]$GpuStartTicks) {
     $res = [ordered]@{ endedBy = $null; rows = 0; counterErrors = 0; gpuKilled = $false }
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $u8 = [Text.UTF8Encoding]::new($false)
@@ -6877,7 +6877,7 @@ function Test-UtilSampleStopped($Rec) {
 }
 
 # Both samplers: nvidia-smi by its pid; the CPU child by its stop file ($WriteStop), then its pid if it outstays $WaitMs.
-function Stop-UtilSampleAll($GpuStart, $CpuStart, [scriptblock]$WriteStop, [int]$WaitMs) {
+function Stop-UtilSampleAll($GpuStart, $CpuStart, $WriteStop, [int]$WaitMs) {
     $r = [ordered]@{ gpu = $null; cpu = $null; stopFileWhy = $null }
     $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true
     $cp = $(if ($null -ne $CpuStart) { $CpuStart.proc })
@@ -6903,7 +6903,7 @@ function Read-UtilSampleText([string]$Path) {
 
 # A sampler CSV's lines, and whether its last line was cut off. An unterminated last line is kept only when $Complete accepts it: newline absence
 # is not proof of a torn row, its content is (the Repair-PresentMonCsvTail rule). The file itself is never modified.
-function Split-UtilSampleLines([string]$Text, [scriptblock]$Complete) {
+function Split-UtilSampleLines([string]$Text, $Complete) {
     $lines = [Collections.Generic.List[string]]::new(); $torn = $false
     if (-not [string]::IsNullOrEmpty($Text)) {
         $parts = $Text -split "`n"

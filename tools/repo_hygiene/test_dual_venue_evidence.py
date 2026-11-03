@@ -182,6 +182,10 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
 # per-frame playback_smoke.frame rows (telemetryArm HEAVY): the cpu-reduced pace twin at fullscreen s4 with the frame log kept.
 CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
+# CUDA-HEADROOM-UTIL-SAMPLER-1: the one unpaced Cinematic Look-Assist-ON windowed s1 leg (the owner shape, D4b) that arms generatorArgs.utilSample, so it
+# is a real unpaced swap-interval-0 leg and carries presentTearingExpectedReason like the headroom and partition legs.
+UTIL_SAMPLE_LEGS = ("legs/m16-1243-utilsample-unpaced-windowed-s1.json",)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *UTIL_SAMPLE_LEGS)
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B (generatorArgs.prepConflatedMove true -> MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1),
 # one per capture-free pace cell the CPU route runs at s2 and s4 (a speed leg, so the post-play visual strips are on by default), keyed to the cell it twins. The
 # OFF arm is the twinned cell itself (env unset).
@@ -6967,12 +6971,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -7051,6 +7055,12 @@ class LegSpecSchemaTests(unittest.TestCase):
                 # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
                 self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertEqual(spec["legId"], "m16-1243-utilsample-unpaced-windowed-s1", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+                self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
