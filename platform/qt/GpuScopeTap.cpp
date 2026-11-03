@@ -217,12 +217,10 @@ void GpuScopeTap::issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &so
             m_fboWidth = 0;
             m_fboHeight = 0;
             ++m_counters.skipped;
+            // r5b (adversary r5 A1 on c8393c8f): a raised setup error is counted whichever branch disables the tap.
+            if ( setupError != GL_NO_ERROR ) ++m_counters.glErrors;
             if ( incomplete ) noteGlFailure("fbo_incomplete", true);
-            else
-            {
-                ++m_counters.glErrors;
-                noteGlFailure("fbo_setup", false);
-            }
+            else noteGlFailure("fbo_setup", false);
             return;
         }
         m_fboWidth = tapSize.width();
@@ -286,6 +284,7 @@ void GpuScopeTap::issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &so
     if ( !slot.fence )
     {
         ++m_counters.skipped;
+        ++m_counters.glErrors;   // r5b (adversary r5 A1 sibling :286): glFenceSync returns null only on a GL error
         noteGlFailure("fence", false);
         return;
     }

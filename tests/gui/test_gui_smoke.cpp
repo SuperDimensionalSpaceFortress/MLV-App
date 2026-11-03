@@ -1801,6 +1801,15 @@ void GuiSmokeTest::gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedF
     QCOMPARE(int(gl.blitDrawTargets.size()), 1);
     QVERIFY(gl.blitDrawTargets[0] != 0);
     QCOMPARE(tap.counters().completed, quint64(1));
+
+    // r5b (adversary r5 A1 on c8393c8f): a setup error that comes with an incomplete status is still counted in glErrors.
+    GpuScopeTap refused("widget");
+    FakeScopeTapGl refusedGl;
+    refusedGl.renderbufferError = GL_OUT_OF_MEMORY;
+    refusedGl.framebufferStatus = GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+    QVERIFY(!fakeScopeTapRound(refused, refusedGl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(!refused.usable());
+    QCOMPARE(refused.counters().glErrors, quint64(1));
 }
 
 // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: GpuScopeTap's no-GL state, shared by the viewport and GpuDisplayWindow.
