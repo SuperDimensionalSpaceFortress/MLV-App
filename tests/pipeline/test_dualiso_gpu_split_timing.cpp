@@ -1,0 +1,179 @@
+// CUDA-RECON-DUALISO-TIMER-SPLIT-1: the per-run split of the dual_iso timer on the CUDA route
+// (llrawproc.h llrpDualIsoGpuSplitTiming_t), through the real llrawproc_gpu_recon_run_backend on the
+// in-process fake backend. (a) one run is one backend call whose run wall splits into the backend's own
+// GPU span (the fake reports total_ms 3.0) plus sync; (b) a run queued on the backend mutex (held here, as
+// the render thread's present or another run would hold it) reports that wait as mutex_wait_ms; (c) the
+// thread's reset zeroes the record; (d) a run refused before the lock leaves the record untouched.
+#include "../common/minitest.h"
+#include "../../src/mlv/llrawproc/llrawproc.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <thread>
+#include <vector>
+
+extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
+extern "C" int llrpResetGpuExportBackendForTesting(void);
+extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
+extern "C" long llrpGpuReconBackendLockArrivalsForTesting(void);
+
+namespace
+{
+
+llrpGpuPlaybackReconState_t splitValidatedState(uint64_t frameId, int width, int height)
+{
+    static int dummy_int_lut[1] = { 0 };
+    static double dummy_double_lut[1] = { 0.0 };
+    llrpGpuPlaybackReconState_t state = {};
+    state.valid = 1;
+    state.width = width;
+    state.height = height;
+    state.white_level = 65535;
+    state.white_darkened = 65535;
+    state.interp_method = 1;
+    state.use_alias_map = 1;
+    state.use_fullres = 1;
+    state.raw2ev = dummy_int_lut;
+    state.ev2raw = dummy_int_lut;
+    state.mix_curve = dummy_double_lut;
+    state.fullres_curve = dummy_double_lut;
+    state.frame_id = frameId;
+    return state;
+}
+
+int splitRunOnce(uint64_t frameId, int * rcOut, int width = 4)
+{
+    const int height = 4;
+    const llrpGpuPlaybackReconState_t state = splitValidatedState(frameId, width, height);
+    std::vector<uint16_t> input(size_t(width) * size_t(height), 100);
+    std::vector<uint16_t> output(input.size());
+    llrpGpuPlaybackReconTiming_t timing = {};
+    return llrpGpuPlaybackReconRunCpu16Probe(&state, input.data(), input.size() * sizeof(uint16_t),
+                                             output.data(), rcOut, &timing);
+}
+
+struct FakeBackendScope
+{
+    FakeBackendScope() { llrpInstallFakeGpuPlaybackReconBackendForTesting(1); }
+    ~FakeBackendScope()
+    {
+        llrpInstallFakeGpuPlaybackReconBackendForTesting(0);
+        llrpResetGpuExportBackendForTesting();
+    }
+};
+
+llrpDualIsoGpuSplitTiming_t lastSplit()
+{
+    llrpDualIsoGpuSplitTiming_t split = {};
+    llrpGetLastDualIsoGpuSplitTiming(&split);
+    return split;
+}
+
+} // namespace
+
+TEST(DualIsoGpuSplitTiming, OneRunIsOneBackendCallAndItsWallSplitsIntoGpuSpanPlusSync)
+{
+    FakeBackendScope scope;
+    llrpResetLastRunTimingForCurrentThread();
+    int rc = -99;
+    ASSERT_NE(0, splitRunOnce(1, &rc));
+    ASSERT_EQ(0, rc);
+    const llrpDualIsoGpuSplitTiming_t s = lastSplit();
+    ASSERT_EQ(1, s.backend_calls);
+    ASSERT_TRUE(s.mutex_wait_ms >= 0.0);
+    ASSERT_TRUE(s.configure_ms >= 0.0);
+    ASSERT_TRUE(s.post_run_ms >= 0.0);
+    ASSERT_TRUE(s.run_wall_ms >= 0.0);
+    // The GPU span is the backend's own timing (the fake reports 3.0 ms); sync is the wall beyond it, floored.
+    ASSERT_EQ(3.0, s.run_gpu_ms);
+    const double expectedSync = s.run_wall_ms > 3.0 ? s.run_wall_ms - 3.0 : 0.0;
+    ASSERT_TRUE(s.sync_ms >= expectedSync - 1e-9 && s.sync_ms <= expectedSync + 1e-9);
+    // prepare / preupload belong to the texture route's caller, not run_backend.
+    ASSERT_EQ(0.0, s.prepare_ms);
+    ASSERT_EQ(0.0, s.preupload_ms);
+
+    // A second run on the same thread without a reset accumulates (two backend calls, two GPU spans).
+    ASSERT_NE(0, splitRunOnce(2, &rc));
+    const llrpDualIsoGpuSplitTiming_t two = lastSplit();
+    ASSERT_EQ(2, two.backend_calls);
+    ASSERT_EQ(6.0, two.run_gpu_ms);
+    ASSERT_TRUE(two.run_wall_ms >= s.run_wall_ms);
+}
+
+TEST(DualIsoGpuSplitTiming, AWaitOnTheBackendMutexIsReportedAsMutexWait)
+{
+    FakeBackendScope scope;
+    const int holdMs = 60;
+    std::atomic<bool> done{false};
+    int rc = -99;
+    int used = -1;
+    llrpDualIsoGpuSplitTiming_t queuedSplit = {};
+    const long arrivalsBefore = llrpGpuReconBackendLockArrivalsForTesting();
+    llrpHoldGpuReconBackendMutexForTesting(1);
+    std::thread queued([&]() {
+        llrpResetLastRunTimingForCurrentThread();
+        used = splitRunOnce(3, &rc);
+        queuedSplit = lastSplit(); // thread-local: read on the thread that ran
+        done.store(true);
+    });
+    // Pre-lock rendezvous (as test_gpu_device_loss_selfheal.cpp): the run counts its arrival just before it
+    // starts the wait timer and takes the mutex held here. Bounded: a run that never arrives fails below.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore && !done.load()
+           && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool arrived = llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore + 1 && !done.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+    llrpHoldGpuReconBackendMutexForTesting(0);
+    queued.join();
+    ASSERT_TRUE(arrived);
+    ASSERT_NE(0, used);
+    ASSERT_EQ(0, rc);
+    ASSERT_EQ(1, queuedSplit.backend_calls);
+    // At least most of the hold (the run may be descheduled between its arrival and its timer start), and the
+    // wait is not booked as run, configure or post-run time.
+    ASSERT_TRUE(queuedSplit.mutex_wait_ms >= holdMs / 2.0);
+    ASSERT_TRUE(queuedSplit.run_wall_ms < queuedSplit.mutex_wait_ms);
+    ASSERT_TRUE(queuedSplit.configure_ms < queuedSplit.mutex_wait_ms);
+    ASSERT_TRUE(queuedSplit.post_run_ms < queuedSplit.mutex_wait_ms);
+    // This thread ran no backend call, so its own record shows none.
+    llrpResetLastRunTimingForCurrentThread();
+    ASSERT_EQ(0, lastSplit().backend_calls);
+}
+
+TEST(DualIsoGpuSplitTiming, TheThreadResetZeroesTheRecord)
+{
+    FakeBackendScope scope;
+    llrpResetLastRunTimingForCurrentThread();
+    int rc = -99;
+    ASSERT_NE(0, splitRunOnce(4, &rc));
+    ASSERT_EQ(1, lastSplit().backend_calls);
+    llrpResetLastRunTimingForCurrentThread();
+    const llrpDualIsoGpuSplitTiming_t s = lastSplit();
+    ASSERT_EQ(0, s.backend_calls);
+    ASSERT_EQ(0.0, s.mutex_wait_ms);
+    ASSERT_EQ(0.0, s.configure_ms);
+    ASSERT_EQ(0.0, s.run_wall_ms);
+    ASSERT_EQ(0.0, s.run_gpu_ms);
+    ASSERT_EQ(0.0, s.sync_ms);
+    ASSERT_EQ(0.0, s.post_run_ms);
+}
+
+TEST(DualIsoGpuSplitTiming, ARunRefusedBeforeTheLockLeavesTheRecordUntouched)
+{
+    FakeBackendScope scope;
+    llrpResetLastRunTimingForCurrentThread();
+    int rc = -99;
+    // An input size that does not match width x height is refused before the backend mutex.
+    const llrpGpuPlaybackReconState_t state = splitValidatedState(5, 4, 4);
+    std::vector<uint16_t> input(8, 100);
+    std::vector<uint16_t> output(input.size());
+    llrpGpuPlaybackReconTiming_t timing = {};
+    ASSERT_EQ(0, llrpGpuPlaybackReconRunCpu16Probe(&state, input.data(), input.size() * sizeof(uint16_t),
+                                                   output.data(), &rc, &timing));
+    const llrpDualIsoGpuSplitTiming_t s = lastSplit();
+    ASSERT_EQ(0, s.backend_calls);
+    ASSERT_EQ(0.0, s.mutex_wait_ms);
+    ASSERT_EQ(0.0, s.run_wall_ms);
+}

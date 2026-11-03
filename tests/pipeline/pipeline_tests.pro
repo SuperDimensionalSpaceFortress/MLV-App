@@ -135,7 +135,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_prep_pointwise_fast.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_playback_recon_preload.cpp \
-    $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp
+    $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp \
+    $$REPO_ROOT/tests/pipeline/test_dualiso_gpu_split_timing.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \

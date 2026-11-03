@@ -81,6 +81,8 @@ static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
 static MLV_THREAD_LOCAL llrpResidualSubstageTiming_t g_llrawproc_last_residual = {0};
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside the dual_iso timer (llrawproc.h). */
+static MLV_THREAD_LOCAL llrpDualIsoGpuSplitTiming_t g_llrawproc_last_dual_iso_gpu_split = {0};
 static double g_llrawproc_last_preview_histogram_ms = 0.0;
 static double g_llrawproc_last_preview_regression_ms = 0.0;
 static double g_llrawproc_last_preview_rowscale_ms = 0.0;
@@ -2530,6 +2532,10 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int telemetry_event_count = 0;
     int run_called = 0;
     int run_rc = 0;
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1 (llrpDualIsoGpuSplitTiming_t). */
+    double split_lock_acquired_s = 0.0;
+    double split_run_start_s = 0.0;
+    double split_run_end_s = 0.0;
     if(rc_out) *rc_out = -1;
     if(allocated_bytes_out) *allocated_bytes_out = 0;
     if(allocated_bytes_valid_out) *allocated_bytes_valid_out = 0;
@@ -2587,6 +2593,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     frame.apply_dither = state->apply_dither;
 
     InterlockedIncrement(&g_llrawproc_gpu_recon_lock_arrivals);
+    const double split_lock_start_s = mlv_stage_timing_now();
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
     /* r6 (CoS #437, guard under the serializing lock): a caller that passed the
      * check above and then waited here through a loss must not reach CUDA. */
@@ -2596,6 +2603,12 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
         return 0;
     }
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: the wait for the backend mutex (the
+     * suppression read above is a single volatile flag load). */
+    split_lock_acquired_s = mlv_stage_timing_now();
+    g_llrawproc_last_dual_iso_gpu_split.mutex_wait_ms +=
+        (split_lock_acquired_s - split_lock_start_s) * 1000.0;
+    g_llrawproc_last_dual_iso_gpu_split.backend_calls++;
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -2723,6 +2736,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
          && g->last_preupload_status)
         {
             used_run_preuploaded = 1;
+            split_run_start_s = mlv_stage_timing_now();
             rc = g->run_preuploaded(g->backend,
                                     frame_token,
                                     &frame,
@@ -2733,6 +2747,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         }
         else
         {
+            split_run_start_s = mlv_stage_timing_now();
             rc = g->run(g->backend,
                         &frame,
                         gpu_input,
@@ -2740,6 +2755,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                         gpu_output,
                         gl_texture_id);
         }
+        split_run_end_s = mlv_stage_timing_now();
         InterlockedExchange(&g_llrawproc_gpu_recon_run_active, 0);
         run_called = 1;
         run_rc = rc;
@@ -2888,6 +2904,30 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         llrawproc_gpu_stage_telemetry_capture(g, run_event,
                                               "recon:run",
                                               IGPU_CUDA_ERROR_CHANNEL_RENDER, run_rc, run_ms);
+    }
+    {
+        /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: held time before and after the run.
+         * The GPU span is the backend's own event total for a successful run;
+         * without it the run's wall stays unsplit (run_gpu_ms and sync_ms 0).
+         * Taken before the device-loss scan, whose cost is not counted. */
+        llrpDualIsoGpuSplitTiming_t * split = &g_llrawproc_last_dual_iso_gpu_split;
+        const double split_held_end_s = mlv_stage_timing_now();
+        if(run_called)
+        {
+            const double run_wall_ms = (split_run_end_s - split_run_start_s) * 1000.0;
+            split->configure_ms += (split_run_start_s - split_lock_acquired_s) * 1000.0;
+            split->run_wall_ms += run_wall_ms;
+            split->post_run_ms += (split_held_end_s - split_run_end_s) * 1000.0;
+            if(run_rc == 0 && timing_out && timing_out->available)
+            {
+                split->run_gpu_ms += timing_out->total_ms;
+                split->sync_ms += MAX(0.0, run_wall_ms - timing_out->total_ms);
+            }
+        }
+        else
+        {
+            split->configure_ms += (split_held_end_s - split_lock_acquired_s) * 1000.0;
+        }
     }
     llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -4739,6 +4779,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
+    memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6225,7 +6266,8 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
      * scale here left the 4-row ISO mesh in flat areas on the first venue leg. */
     const int playback_hint = processingPlaybackPreviewModeEnabled() ? 1 : 0;
     memset(&gpu_playback_state, 0, sizeof(gpu_playback_state));
-    if (!diso_prepare_gpu_recon_state(raw_info,
+    const double prepare_start = mlv_stage_timing_now();
+    const int prepared = diso_prepare_gpu_recon_state(raw_info,
                                       raw_image_buff,
                                       dark_frame_mode,
                                       diso1,
@@ -6241,7 +6283,11 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
                                       playback_hint,
                                       llrawproc_threads,
                                       &worker->diso_full20bit_scratch,
-                                      &gpu_playback_state))
+                                      &gpu_playback_state);
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside the caller's dual_iso timer. */
+    g_llrawproc_last_dual_iso_gpu_split.prepare_ms +=
+        (mlv_stage_timing_now() - prepare_start) * 1000.0;
+    if (!prepared)
     {
         return 0;
     }
@@ -6253,7 +6299,10 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
         return 0;
     }
 
+    const double preupload_start = mlv_stage_timing_now();
     (void)llrpGpuPlaybackReconPreuploadFrame(frame_index, raw_image_buff, raw_image_size);
+    g_llrawproc_last_dual_iso_gpu_split.preupload_ms +=
+        (mlv_stage_timing_now() - preupload_start) * 1000.0;
     memset(&public_gpu_playback_state, 0, sizeof(public_gpu_playback_state));
     memset(&retained_device, 0, sizeof(retained_device));
     memset(&retained_timing, 0, sizeof(retained_timing));
@@ -6315,6 +6364,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
+    memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6858,6 +6908,7 @@ void llrpResetLastRunTimingForCurrentThread(void)
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
+    memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
     llrpResetLastPreDualIsoFixTelemetry();
 }
@@ -6876,6 +6927,12 @@ void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing)
 {
     if (!timing) return;
     *timing = g_llrawproc_last_residual;
+}
+
+void llrpGetLastDualIsoGpuSplitTiming(llrpDualIsoGpuSplitTiming_t * timing)
+{
+    if (!timing) return;
+    *timing = g_llrawproc_last_dual_iso_gpu_split;
 }
 
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing)
