@@ -147,7 +147,8 @@ def test_a_second_save_with_different_dirt_never_overwrites_the_first(repo, tmp_
     second = len(saved(repo))
     assert second > len(first)
     assert save(repo, "-LanePid", pid).returncode == 0
-    assert len(saved(repo)) == second  # the same dirt twice adds nothing
+    assert len(saved(repo)) > second  # r16 CHANGED MEANING (sol r15 B2): this asserted "the same dirt twice adds nothing" (an existing file with the same bytes was reused). An existing artifact is never opened now, so the same dirt twice adds a fresh suffixed set and every earlier file stays untouched
+    assert all((tmp_path / "run" / n).read_bytes() == b for n, b in first.items())
 
 
 @pytest.mark.parametrize("caller_disable", [None, "0"])
@@ -284,7 +285,7 @@ def test_a_directory_at_an_artifact_name_advances_the_suffix_and_the_receipt_is_
     assert any(n.endswith(".receipt.json") for n in saved(repo))
 
 
-def test_an_unreadable_existing_artifact_is_never_called_different(repo, tmp_path):  # sol r4 B4
+def test_an_unreadable_existing_artifact_is_never_called_different(repo, tmp_path):  # sol r4 B4; r16 CHANGED MEANING (sol r15 B2): the comparison is gone, so a locked existing artifact is simply skipped without being opened, and the receipt has no comparison field
     (repo / "a.txt").write_bytes(b"changed\n")
     pid = str(dead_pid())
     first = last_receipt(save(repo, "-LanePid", pid))
@@ -301,7 +302,7 @@ def test_an_unreadable_existing_artifact_is_never_called_different(repo, tmp_pat
         r = save(repo, "-LanePid", pid)
         assert r.returncode == 0, r.stdout + r.stderr
         second = last_receipt(r)
-        assert second["comparisonUnreadable"] == [first["patch"]]  # it says the comparison was unreadable instead of claiming the bytes differ
+        assert "comparisonUnreadable" not in second  # nothing was compared, so nothing can be reported unreadable
         assert second["patch"] != first["patch"]  # the dirt is still saved (suffixed) rather than lost behind a lock
     finally:
         holder.kill()
@@ -573,7 +574,7 @@ def test_diff_ignore_submodules_config_cannot_hide_a_changed_gitlink(repo, tmp_p
     assert r.returncode == 0, r.stdout + r.stderr  # exit 10 would mean "nothing to save"
 
 
-def test_a_receipt_whose_own_earlier_name_was_unreadable_says_so(repo, tmp_path):  # r6 A3: the receipt used to snapshot comparisonUnreadable before its own save
+def test_a_receipt_whose_own_earlier_name_was_unreadable_says_so(repo, tmp_path):  # r6 A3: the receipt used to snapshot comparisonUnreadable before its own save; r16 CHANGED MEANING (sol r15 B2): no comparison, so a locked earlier receipt is skipped unopened and the persisted receipt equals the printed one
     (repo / "a.txt").write_bytes(b"changed\n")
     pid = str(dead_pid())
     assert save(repo, "-LanePid", pid).returncode == 0
@@ -592,7 +593,7 @@ def test_a_receipt_whose_own_earlier_name_was_unreadable_says_so(repo, tmp_path)
         r = save(repo, "-LanePid", pid)
         assert r.returncode == 0, r.stdout + r.stderr
         persisted = (tmp_path / "run" / f"dirty-save-{h8}.2.receipt.json").read_text(encoding="utf-8")
-        assert json.loads(persisted)["comparisonUnreadable"] == [first_receipt]
+        assert "comparisonUnreadable" not in json.loads(persisted)
         assert persisted.strip() == r.stdout.strip()  # printed == persisted
     finally:
         holder.kill()
@@ -1277,8 +1278,10 @@ def test_the_saver_never_lists_its_own_temporary_files_and_a_repeat_save_is_byte
     assert first.returncode == 0, first.stdout + first.stderr
     names_before = sorted(p.name for p in run.iterdir())
     second = subprocess.run(args, capture_output=True, text=True, env=env)
-    assert second.returncode == 0 and second.stdout == first.stdout, second.stdout + second.stderr  # old code: a new GUID in the inventory, so new artifacts
-    assert sorted(p.name for p in run.iterdir()) == names_before
+    assert second.returncode == 0, second.stdout + second.stderr
+    f1, f2 = json.loads(first.stdout.strip().splitlines()[-1]), json.loads(second.stdout.strip().splitlines()[-1])
+    assert (run / f1["untracked"]).read_bytes() == (run / f2["untracked"]).read_bytes()  # r16 CHANGED MEANING (sol r15 B2): this asserted identical stdout and an unchanged directory listing (the first run's files were reused). A repeat save writes a fresh set and every earlier name is still there; what must stay equal is the inventory itself (old code: a new GUID in it, so different bytes)
+    assert set(names_before) <= {p.name for p in run.iterdir()} and f2["untracked"] != f1["untracked"]
     inventory = next(run.glob("*.untracked.txt")).read_bytes()
     assert b"lane-dirty-save-" not in inventory and b"u.txt" in inventory  # old code: the private git dir's HEAD, config and alternates were named
     assert [p for p in (wd / "admin").iterdir() if p.name.startswith("lane-dirty-save-")] == []
@@ -1424,7 +1427,7 @@ def test_a_junction_inside_the_worktree_to_the_temp_directory_cannot_make_the_sa
     assert b"lane-dirty-save-" not in inventory_of(tmp_path) and b"u.txt" in inventory_of(tmp_path)  # old code: jtemp/lane-dirty-save-<guid>/HEAD ... were listed
     before = saved(repo)
     second = save(repo, "-LanePid", str(dead_pid()), env=env)
-    assert second.returncode == 0 and second.stdout == first.stdout and saved(repo) == before  # old code: a new GUID, so a new artifact set
+    assert second.returncode == 0 and set(before) <= set(saved(repo)), second.stdout + second.stderr  # r16 CHANGED MEANING (sol r15 B1, B2): this asserted identical stdout and an unchanged artifact set (reuse). The first run's private directory is now LEFT in the temp directory the junction reaches, so the second run may list it as the first run's leftover; what must hold is that the first run's own files are untouched and the second run saves
 
 
 @pytest.mark.parametrize("raw, want", [
@@ -1996,7 +1999,7 @@ def test_the_private_directory_is_cleaned_up_by_its_real_path_not_by_a_drive_ali
     outside.mkdir()
     victim.mkdir()
     (repo / "a.txt").write_bytes(b"changed\n")
-    anchor = "for ($i = 0; $i -lt 5 -and $script:sealDir"
+    anchor = "$left = if ($script:sealDir"  # r16: the clean-up loop that stood here is gone (sol r15 B1); the hook now plays the peer at the same moment, right before the leftover is looked for
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.count(anchor) == 1
     hook = (f"$g = [System.IO.Path]::GetFileName($script:sealDir); $d = [System.IO.Path]::Combine('{victim}', $g); [void][System.IO.Directory]::CreateDirectory($d); [System.IO.File]::WriteAllText([System.IO.Path]::Combine($d, 'precious.txt'), \"KEEP`n\"); "
@@ -2011,7 +2014,8 @@ def test_the_private_directory_is_cleaned_up_by_its_real_path_not_by_a_drive_ali
     kept = list(victim.glob("*/precious.txt"))
     assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 79641666: the other folder's directory was deleted
     assert r.returncode == 0, r.stdout + r.stderr
-    assert list(outside.iterdir()) == [], "the saver's own private directory is removed from where it was made"
+    assert len(list(outside.glob("lane-dirty-save-*"))) == 1, "r16 CHANGED MEANING (sol r15 B1): the private directory is no longer removed; it is left where it was made (the real path, not the re-mapped drive) and named"
+    assert "privateGitDirLeft" in r.stdout, r.stdout
 
 
 def test_a_child_record_whose_folder_is_swapped_for_a_link_after_the_check_is_never_read_through_it(tmp_path):  # r15 adversary A4 (79641666): the record's path was proved link-free and then read by NAME; a peer that renamed its folder and put a link to a decoy folder in its place made the saver read a dead decoy, judge the live lane dead and save. The record is opened first and the path is proved link-free again with the file open
@@ -2078,7 +2082,7 @@ def test_the_clean_up_never_deletes_a_directory_that_took_the_private_directorys
     (victim / "precious.txt").write_text("KEEP\n")
     (repo / "a.txt").write_bytes(b"changed\n")
     hook = f"[System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir); "
-    hooked = _hooked(tmp_path, [("for ($i = 0; $i -lt 5 -and $script:sealDir", hook)])
+    hooked = _hooked(tmp_path, [("$left = if ($script:sealDir", hook)])  # r16: the clean-up loop that stood here is gone (sol r15 B1)
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base)})
     kept = list(base.glob("lane-dirty-save-*/precious.txt"))
     assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 5d62d133: the other folder was deleted
@@ -2123,7 +2127,111 @@ def test_a_child_record_that_was_a_decoy_when_opened_and_is_the_original_again_a
     assert list(run.iterdir()) == []
 
 
-def test_a_link_at_an_artifact_name_is_skipped_not_compared_in_the_saver_source():  # r15 adversary pass 2 A2 source pin (the symlink end-to-end test skips on a host that cannot create one)
+def test_a_link_at_an_artifact_name_is_skipped_not_compared_in_the_saver_source():  # r15 adversary pass 2 A2 source pin; r16 PREMISE CHANGED (sol r15 B2, hub ruling b): it asserted "the link check comes before the comparison"; there is no comparison any more, so the pin is that the artifact writer never opens or reads an existing file at all
     text = SCRIPT.read_text(encoding="utf-8")
     body = text[text.index("function Save-Bytes"):text.index("\ntry {\n    foreach ($v in 'GIT_DIR'")]
-    assert body.index("FileAttributes]::ReparsePoint") < body.index("SequenceEqual")
+    for token in ("ReadAllBytes", "SequenceEqual", "ReadAllText", "OpenRead", "'Open'", "GetAttributes", "comparisonUnreadable", "unreadable"):
+        assert token not in body, token
+    assert body.count("'CreateNew'") == 1
+
+
+# ---- r16 (sol r15 B1, B2 on 8a11b142): the race CLASS is removed, not one more step guarded ----
+OLD_DELETE_ANCHOR = "try { [System.IO.Directory]::Delete($script:sealDir, $true)"  # 8a11b142: the statement that removed the private directory after an identity read
+CLEANUP_ANCHORS = (OLD_DELETE_ANCHOR, "$left = if ($script:sealDir")  # the same moment in the old and in the new saver: right where the clean-up used to act
+
+
+def _cleanup_hook(tmp_path, hook):
+    text = SCRIPT.read_text(encoding="utf-8")
+    anchor = next(a for a in CLEANUP_ANCHORS if text.count(a) == 1)
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, hook + anchor), encoding="utf-8")
+    return hooked
+
+
+def _run_hooked(hooked, repo, tmp_path, base):
+    return subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base), "TMPDIR": str(base)})
+
+
+SWAP_AWAY = "[System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir); "
+
+
+def test_a_directory_that_replaced_the_private_one_after_the_ownership_check_is_never_deleted(repo, tmp_path):  # r16 sol r15 B1: Get-DirId closed its handle and Directory.Delete then acted on the NAME, so a folder moved to the name in between was deleted recursively. The saver now deletes nothing at all: no check can be followed by a delete
+    base, victim = tmp_path / "tempbase", tmp_path / "victim"
+    base.mkdir()
+    victim.mkdir()
+    (victim / "precious.txt").write_text("KEEP\n")
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = _run_hooked(_cleanup_hook(tmp_path, SWAP_AWAY.format(victim=victim)), repo, tmp_path, base)
+    kept = list(base.glob("lane-dirty-save-*/precious.txt"))
+    assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 8a11b142: the other folder was deleted
+    assert r.returncode == 0 and "privateGitDirLeft" in r.stdout, r.stdout + r.stderr
+
+
+def test_a_failed_identity_capture_never_permits_a_deletion(repo, tmp_path):  # r16 sol r15 B1 (sealId=null): the clean-up treated "no identity captured" as "it is mine" and deleted whatever held the name. Fail closed: with or without an identity, nothing is deleted
+    base, victim = tmp_path / "tempbase", tmp_path / "victim"
+    base.mkdir()
+    victim.mkdir()
+    (victim / "precious.txt").write_text("KEEP\n")
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = _run_hooked(_cleanup_hook(tmp_path, "$script:sealId = $null; " + SWAP_AWAY.format(victim=victim)), repo, tmp_path, base)
+    kept = list(base.glob("lane-dirty-save-*/precious.txt"))
+    assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 8a11b142: deleted without any proof
+    assert r.returncode == 0 and "privateGitDirLeft" in r.stdout, r.stdout + r.stderr
+
+
+def test_the_private_directory_is_left_in_place_and_named(repo, tmp_path):  # r16 hub ruling (a): leave it, name it
+    base = tmp_path / "tempbase"
+    base.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = save(repo, "-LanePid", str(dead_pid()), env={**os.environ, "TMP": str(base), "TEMP": str(base), "TMPDIR": str(base)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    left = Path(last_receipt(r)["privateGitDirLeft"])
+    assert left.is_dir() and left.parent.resolve() == base.resolve() and (left / "HEAD").is_file()
+
+
+def test_the_saver_source_has_no_delete_of_any_kind():  # r16 sol r15 B1 class pin: every delete/remove site is gone (comments say "removed"/"left", never the call)
+    text = SCRIPT.read_text(encoding="utf-8")
+    for token in ("]::Delete(", "Remove-Item", "-Recurse", "rmdir", "DeleteFile", "RemoveDirectory", ".Delete("):
+        assert token not in text, token
+
+
+def test_an_existing_artifact_with_the_very_same_bytes_is_not_reused_a_fresh_file_is_created(tmp_path):  # r16 sol r15 B2: the saver opened an existing artifact (File.ReadAllBytes) and, on equal bytes, named it in the receipt. Reading by name follows whatever the name became since the attribute check. Now an existing name is never opened: CreateNew to a fresh suffixed name
+    a, run = tmp_path / "wtA", tmp_path / "run"
+    init_repo(a, b"BASE\n")
+    run.mkdir()
+    (a / "u.txt").write_bytes(b"x")
+    h8 = git(a, "rev-parse", "HEAD").decode().strip()[:8]
+    names = run / f"dirty-save-{h8}.untracked.txt"
+    names.write_bytes(b"u.txt\0")  # exactly the bytes the saver is about to write
+    r = save(a, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0, r.stdout + r.stderr
+    receipt = last_receipt(r)
+    assert receipt["untracked"] == f"dirty-save-{h8}.2.untracked.txt", r.stdout  # 8a11b142: the existing name
+    assert (run / receipt["untracked"]).read_bytes() == b"u.txt\0" and names.read_bytes() == b"u.txt\0"
+
+
+def test_a_name_that_became_a_link_between_the_attribute_check_and_the_read_is_never_followed(tmp_path):  # r16 sol r15 B2 replay: an ordinary file at the artifact name turned into a symlink to a worktree file holding the same bytes after the attribute check; the read followed it and the receipt named evidence that lives INSIDE the worktree
+    a, run = tmp_path / "wtA", tmp_path / "run"
+    init_repo(a, b"BASE\n")
+    run.mkdir()
+    (a / "u.txt").write_bytes(b"x")
+    (a / "names.txt").write_bytes(b"names.txt\0u.txt\0")
+    h8 = git(a, "rev-parse", "HEAD").decode().strip()[:8]
+    name = run / f"dirty-save-{h8}.untracked.txt"
+    name.write_bytes(b"ordinary")
+    probe = tmp_path / "probe-link"
+    try:
+        os.symlink(a / "names.txt", probe)
+    except (OSError, NotImplementedError):
+        pytest.skip("this host cannot create a file symlink")
+    probe.unlink()
+    text = SCRIPT.read_text(encoding="utf-8")
+    swap = f"[System.IO.File]::Delete('{name}'); [void](New-Item -ItemType SymbolicLink -Path '{name}' -Target '{a / 'names.txt'}'); "
+    anchor = "$same = $null"  # 8a11b142: after the ReparsePoint attribute check, before the read; absent in the new saver, where there is no read to race
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, swap + anchor) if text.count(anchor) == 1 else text, encoding="utf-8")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    receipt = last_receipt(r)
+    assert receipt["untracked"] != name.name, r.stdout  # 8a11b142: the swapped-in link was reused
+    assert not (run / receipt["untracked"]).is_symlink() and (run / receipt["untracked"]).read_bytes() == b"names.txt\0u.txt\0"

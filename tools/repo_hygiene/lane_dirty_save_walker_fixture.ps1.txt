@@ -16,7 +16,7 @@
 # Paths are split on the platform's own separators only (a POSIX backslash is a filename character), and the RunDir that passes the containment test is the resolved path every artifact is then written through.
 # Windows, with no link in either chain, reads both directories back through an open handle (GetFinalPathNameByHandle: subst drives, 8.3 and \\?\ spellings in any case, loopback shares) and keeps the handle open, so the checked RunDir cannot be renamed or replaced before the write. POSIX, with no symlink in either chain, then also refuses a RunDir (or ancestor) whose st_dev:st_ino is the worktree root or any directory inside it, so a bind mount cannot alias it; if that cannot be proven (no find/stat, unreadable tree) it exits 30. A swap between check and write is not closed on POSIX. The same limit holds for the repository and the private base: Windows holds the captured git dir and the accepted private base open for the whole run; POSIX re-reads the git dir and work tree identities before and after EVERY git call and once more after collection (r15, sol r14 B1 = adversary r14 pass 2 A1: a git dir swapped away and RESTORED during the run is seen at the call it affected and ends in repository-changed, never in clean-tree). The one window no re-read can see is a swap that begins and ends inside a single git process's lifetime.
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
-# Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay), 60 INCOMPLETE: git exited 0 but said something on stderr (an unreadable directory, a config it could not read), so the collection may be missing evidence. 60 is never "clean": with nothing to save it prints DIRTY_SAVE_INCOMPLETE and the warning text; with something saved the receipt carries collection=incomplete and warnings, and what was readable is still written.
+# Exit: 0 saved (a run never reuses an earlier run's file, even one with the same bytes: r16), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay), 60 INCOMPLETE: git exited 0 but said something on stderr (an unreadable directory, a config it could not read), so the collection may be missing evidence. 60 is never "clean": with nothing to save it prints DIRTY_SAVE_INCOMPLETE and the warning text; with something saved the receipt carries collection=incomplete and warnings, and what was readable is still written.
 # Only git's line-ending conversion notices ("LF will be replaced by CRLF ...", printed for a file git DID compare) are not warnings, and only as WHOLE lines of git's known shape (r12, sol r11 B2). The private git dir also sets core.safecrlf=false (never the caller's value), so git prints no such notice in the first place (r12, adversary pass 2 A1). Everything else on stderr is (r11, sol r10 B2).
 # r14 (sol r13 B1-B3) keeps the same rule: decide by PROVEN IDENTITY or refuse, never by a name or a string.
 #   worktree-redirect     (exit 30, before any collection, B1) the selected repository is not provably ONE repository: GIT_DIR, GIT_WORK_TREE or GIT_COMMON_DIR is set in the caller's environment; core.worktree is set at any scope (stored config, -c, GIT_CONFIG_*, includes: `git config --list` is the judge) so the work tree is another directory than the one git was started in; or git, asked again from the lifted top level, does not name the same work tree and git dir (by file identity). The git dir and work tree are then captured ONCE and handed to every later git call as --git-dir/--work-tree, so no call rediscovers a repository. A submodule checkout (core.worktree is set in it) is refused by this rule.
@@ -25,13 +25,12 @@
 #   B2: the saver's private directory and every artifact are proven OUTSIDE the worktree by identity (the private base is skipped, else exit 40, when it is not; a RunDir inside is exit 30), so no saver-owned path can be listed and no name is dropped by its spelling: an unrelated file under a directory that merely carries the private directory's name stays in the list. A directory reached through a link (a Windows junction from inside the worktree) is resolved by the kernel and its names are dropped only when it IS the private directory or below it.
 #   B3: "inside" and "the same directory" are decided by file identity (volume serial + file index on Windows, st_dev:st_ino on POSIX) along the parent chain, never by comparing path strings: Path.GetRelativePath compares case-insensitively on Windows, so distinct case-sensitive siblings `wt` and `WT` read as one. An identity that cannot be read is exit 30 (run-dir-identity-unprovable), never a pass.
 # The untracked names exclude names below a directory link that resolves into the private directory, by identity (r12, sol r11 B3; r14 B2). Every name comparison is ordinal, never by culture (r12, sol r11 B4).
-# Never stashes, resets, checks out, cleans or deletes (the one removal is its own private git dir, below). Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
-# a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
+# Never stashes, resets, checks out, cleans or deletes ANYTHING (r16, sol r15 B1: not even its own private git dir; that is left in place and named as privateGitDirLeft). Each file is created CREATE_NEW; a name that is taken (by any file, directory or link, with any bytes, the same ones included) is skipped for the next suffix (.2, .3 ...) and is never opened or read (r16, sol r15 B2: no existing artifact is ever compared or reused).
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
 # append to it (sol r20 B1 on #698), and removing a caller's disable is what exposed it. GIT_OPTIONAL_LOCKS=0 keeps git from refreshing the index.
-# NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir in the OS temp directory, or the RunDir when temp is not provably outside the worktree (never under the worktree or a git dir beneath it; removed on exit) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
+# NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir in the OS temp directory, or the RunDir when temp is not provably outside the worktree (never under the worktree or a git dir beneath it; left in place and named on exit, r16) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
 # Every git call also gets --no-replace-objects: a refs/replace entry for HEAD would make the diffs read another commit's tree while the receipt names HEAD (adversary r9 A2). Path and name comparisons are ordinal, never by culture (U+00AD and case are ignored by culture compares).
-# r15 (sol r14 B1; adversary pass on 79641666 A1, A3, A4): the repository identity (git dir, work tree, and for a linked worktree the bytes of its `commondir` file) is re-read before and after EVERY git call; the private base is returned by its real path, never a re-mappable drive alias; the -ChildJson record is opened first, proved link-free again with the file held, and must equal what its name then holds; the private directory is deleted only while its name still holds the directory this run made (else it is named as left over); an existing artifact name that is a link is skipped, never compared. OPEN, carried to r16: adversary A2 (a git dir replaced by another repository BEFORE the first identity read is indistinguishable from that repository having been selected; no re-read can tell) and any other repository metadata file a peer may rewrite and restore mid-run (alternates, packed-refs): the threat model excludes a peer with write access to the repository's own metadata during the run.
+# r15 (sol r14 B1; adversary pass on 79641666 A1, A3, A4): the repository identity (git dir, work tree, and for a linked worktree the bytes of its `commondir` file) is re-read before and after EVERY git call; the private base is returned by its real path, never a re-mappable drive alias; the -ChildJson record is opened first, proved link-free again with the file held, and must equal what its name then holds; the private directory was deleted only while its name still held the directory this run made; an existing artifact name that is a link was skipped, never compared. r16 (sol r15 B1, B2) REMOVES both classes: nothing is deleted, an existing artifact is never read. OPEN, carried past r16: adversary A2 (a git dir replaced by another repository BEFORE the first identity read is indistinguishable from that repository having been selected; no re-read can tell) and any other repository metadata file a peer may rewrite and restore mid-run (alternates, packed-refs): the threat model excludes a peer with write access to the repository's own metadata during the run.
 param(
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][string]$RunDir,
@@ -39,7 +38,6 @@ param(
     [string]$ChildJson = ''
 )
 $ErrorActionPreference = 'Stop'
-$script:unreadable = @()
 $script:gitStderr = @()  # stderr of every git call that exited 0: a warning there is a collection that may be incomplete (r11 sol r10 B2)
 $script:seal = $null; $script:sealDir = $null
 $script:probeWarnings = @()  # identity probes that could not be read (r13 sol r12 F3): each is a warning, so the collection is incomplete
@@ -103,9 +101,8 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     $cfg = "[core]`n`trepositoryformatversion = $(if ($sha256) { 1 } else { 0 })`n`tsafecrlf = false`n"  # r12 (adversary pass 2 A1): core.safecrlf only decides whether git SAYS something about a line-ending conversion (or dies on an irreversible one); it never changes the bytes compared. Forced off, git prints no conversion notice at all, so no stderr text has to be told apart from a file name that imitates one (a name may hold a line feed and any message text). Not copied from the caller for that reason
     foreach ($k in $vals.Keys) { $cfg += "`t" + $k.Substring(5) + $(if ($null -eq $vals[$k]) { '' } else { ' = "' + $vals[$k].Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`t", '\t').Replace("`b", '\b') + '"' }) + "`n" }
     if ($sha256) { $cfg += "[extensions]`n`tobjectformat = sha256`n" }
-    $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg; $script:sealId = $null  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
+    $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
     foreach ($sub in @('objects', 'info'), @('refs'), @('info')) { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine([string[]](@($sg) + $sub))) }  # one segment per argument: a \\?\ path (the RunDir fall-back) does not translate a slash
-    $script:sealId = Get-DirId $sg  # r15 (adversary pass 2 A1): the identity of the directory this run made; the clean-up deletes by NAME, so it first proves the name still holds this directory
     $enc = [System.Text.UTF8Encoding]::new($false)
     [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD'), "$HeadFull`n", $enc)
     [System.IO.File]::WriteAllBytes([System.IO.Path]::Combine($sg, 'config'), [System.Text.Encoding]::Latin1.GetBytes($cfg))
@@ -333,21 +330,14 @@ function Test-LaneAlive {
     if (-not $proc) { return $false }
     return -not ($born -and $proc.StartTime.ToUniversalTime() -gt $born)  # Invoke-Lane writes StartTime itself, so equal is the lane and anything later is a reuse
 }
-function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) {  # $Make rebuilds the bytes for every attempt, so the receipt lists names found unreadable by its OWN earlier attempts (r6 A3)
+function Save-Bytes([string]$Ext, [byte[]]$Bytes) {  # r16 (sol r15 B2, hub ruling b): an artifact is only ever CREATED. Every name is tried with CreateNew; a name that is taken (a file, a directory, a link, anything) is skipped for the next suffix and is never opened, read or compared, so a link swapped in at a name cannot be followed and its bytes cannot be reported as evidence that lives outside the worktree. The receipt names the file this run wrote
     for ($n = 1; ; $n++) {
-        if ($Make) { $Bytes = [byte[]](& $Make) }
         $script:written = $Bytes
         $name = if ($n -eq 1) { "dirty-save-$head8.$Ext" } else { "dirty-save-$head8.$n.$Ext" }
         $f = [System.IO.Path]::Combine($RunDir, $name)
         try { $fs = [System.IO.File]::Open($f, 'CreateNew', 'Write', 'None') }
         catch [System.IO.IOException], [System.UnauthorizedAccessException] {  # a directory at the name raises UnauthorizedAccess (sol r4 B3)
-            if (-not ([System.IO.File]::Exists($f) -or [System.IO.Directory]::Exists($f))) { throw }
-            if ([System.IO.Directory]::Exists($f)) { continue }
-            if ([System.IO.File]::GetAttributes($f) -band [System.IO.FileAttributes]::ReparsePoint) { continue }  # r15 (adversary pass 2 A2): a link at the name could point into the worktree; reading through it and calling the bytes equal would report evidence that does not live in the RunDir. A link is another file: the next suffix is used
-            $same = $null
-            for ($i = 0; $i -lt 5 -and $null -eq $same; $i++) { try { $same = [System.Linq.Enumerable]::SequenceEqual([byte[]][System.IO.File]::ReadAllBytes($f), $Bytes) } catch { Start-Sleep -Milliseconds 200 } }
-            if ($same) { return $name }
-            if ($null -eq $same) { $script:unreadable += $name }  # unknown is not "different" (sol r4 B4): the new bytes are still saved, and the receipt says the comparison failed
+            if (-not ([System.IO.File]::Exists($f) -or [System.IO.Directory]::Exists($f))) { throw }  # nothing is at the name: a real write failure (read-only or full RunDir), not a collision
             continue
         }
         try { $fs.Write($Bytes, 0, $Bytes.Length) } finally { $fs.Dispose() }
@@ -405,13 +395,7 @@ try {
     }
 }
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
-finally {  # only the private dir this run made. A handle another process holds open (no delete sharing, Windows) can keep it: retried, then NAMED in the output and the receipt, never swallowed (adversary r10 A4)
-    for ($i = 0; $i -lt 5 -and $script:sealDir -and (Test-DirPresent $script:sealDir); $i++) {
-        $mine = $false; try { $mine = (-not $script:sealId) -or [string]::Equals((Get-DirId $script:sealDir), $script:sealId, [System.StringComparison]::Ordinal) } catch { }
-        if (-not $mine) { break }  # another directory now holds the name (or its identity cannot be read): never deleted, and named below as left over
-        try { [System.IO.Directory]::Delete($script:sealDir, $true) } catch { Start-Sleep -Milliseconds 200 }
-    }
-}
+# r16 (sol r15 B1, hub ruling a): the saver removes NOTHING. A removal by name that follows an ownership check can act on a directory that replaced the checked one (no check is atomic with it), and a failed identity capture made it worse (it removed with no proof at all). The private directory is left where this run made it, and is NAMED in the output and the receipt as privateGitDirLeft, never swallowed (adversary r10 A4).
 $left = if ($script:sealDir -and (Test-DirPresent $script:sealDir)) { $script:sealDir } else { $null }
 $leftNote = if ($left) { " privateGitDirLeft=$left" } else { '' }
 if ($script:repoChanged) { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($script:repoChanged)$leftNote"; exit 30 }  # r15 (sol r14 B1): a collection that could have read another repository is never a clean tree (10), a git failure (40) or a save: it fails closed, typed, and writes nothing
@@ -435,8 +419,7 @@ if ($warnLines) { $r.collection = 'incomplete'; $r.warnings = @($warnShown) }
 try {
     foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }
     if ($r.Contains('patch')) { $r.patchSha256 = [System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::HashData($git.patch.Bytes)).Replace('-', '').ToLowerInvariant() }
-    $make = { $r.comparisonUnreadable = @($script:unreadable); [System.Text.UTF8Encoding]::new($false).GetBytes(($r | ConvertTo-Json -Compress) + "`n") }
-    [void](Save-Bytes 'receipt.json' $null $make)
+    [void](Save-Bytes 'receipt.json' ([System.Text.UTF8Encoding]::new($false).GetBytes(($r | ConvertTo-Json -Compress) + "`n")))
 } catch { Write-Output "DIRTY_SAVE_WRITE_FAILED reason=$($_.Exception.Message)$leftNote"; exit 50 }  # r6 A4: a read-only or full RunDir ends in a documented status; artifacts already written stay
 Write-Output ([System.Text.UTF8Encoding]::new($false).GetString($script:written).TrimEnd("`n"))
 exit $(if ($warnLines) { 60 } else { 0 })
