@@ -85,13 +85,16 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   first (or none: an r2 build); `stopUnboundObserverClean`: whether `stop-unbound.png` also follows them with no forced paint;
 * `repeatedPlayFrames`: judged unforced captures that show the same picture as the one before them while the app's label
   advanced (`null` over source frames the app records as identical); `repeatedPlayFramesNote` says so in words, and is set
-  whatever note `reason` already holds (`reason` keeps the first note).
+  whatever note `reason` already holds (`reason` keeps the first note). Each repeat is judged by its own pair's `source_id`s:
+  a pair whose ids are equal is the source repeating its picture and is no repeat; a pair with a missing or malformed id is
+  counted but proves nothing;
+* `repeatedPlayFramesSourceDiffer`: the repeats whose own pair's source ids differ, the only ones that can make `PARTIAL_FREEZE`.
 
 | verdict | when | counted |
 |---|---|---|
 | `FROZEN_DISPLAY` | the play frames show ONE picture while the app presented more than one frame across them AND the source frames are known to differ (`sourceDifference` `known-differ`) | **no**: the receipt is `INVALID` |
 | `FROZEN_DISPLAY_SUSPECTED` | the same one picture, but nothing records whether the source frames differ (`sourceDifference` `unknown`): a static clip shows one picture legitimately | yes, and the detail says so |
-| `PARTIAL_FREEZE` | more than one picture, but `repeatedPlayFrames` is 2 or more AND the source frames are known to differ: the display's own paint stopped landing for part of the tail. One repeat is `OK`; over an `unknown` source the repeats stay a note (`repeatedPlayFramesNote`) on an `OK` block | yes, and the detail says so; a self-heal pre-launch with it is `INVALID` |
+| `PARTIAL_FREEZE` | more than one picture, but `repeatedPlayFramesSourceDiffer` is 2 or more AND the source frames are known to differ: the display's own paint stopped landing for part of the tail. One repeat is `OK`; over an `unknown` source the repeats stay a note (`repeatedPlayFramesNote`) on an `OK` block | yes, and the detail says so; a self-heal pre-launch with it is `INVALID` |
 | `VISUAL_ASSESSMENT_UNAVAILABLE` | play frames have no usable viewport rectangle in `visual.json` (absent, empty or outside the image) AND fewer than two play frames with one remain: the whole window, with its timecode and chrome, is never judged in its place. With two or more usable frames those are judged as above (a known-differ leg with one frame lacking a rectangle is still `FROZEN_DISPLAY`) | yes, and the detail says so |
 | `CAPTURE_UNBOUND` | a capture the divergence compares is not shown bound to its label: on a binding build (either side carries `label_bound`), the stop OR the paused capture's `label_bound` is false or missing; the stop-vs-paused difference then compares two moments | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |

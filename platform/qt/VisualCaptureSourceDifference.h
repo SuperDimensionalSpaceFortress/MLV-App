@@ -13,6 +13,7 @@
  * >= 2 distinct display frames. A repeated display index is a stuck playback clock, not
  * evidence of a static clip. Without that evidence the field is removed, never null or empty. */
 
+#include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QSet>
@@ -79,6 +80,109 @@ inline bool isPlayCaptureKind( const QString &kind )
 inline QString sourceIdHex( quint64 hash )
 {
     return QStringLiteral("%1").arg( hash, 16, 16, QLatin1Char('0') ).toLower();
+}
+
+/* r7 (adversary r6 pass 3 A2): WHICH clip a capture was taken from. The capture path pumps events (the
+ * tail's waits, the post-stop drain, the paused settle), and a QFileOpenEvent handled there replaces the
+ * open clip before the deferred source hashing runs, so hashing "the open clip at display_frame" would
+ * attach the NEW clip's identities to the OLD clip's pictures. A clip is named by the clip-lifecycle
+ * generation (ClipLifecycleBarrier: bumped by every free of the open clip) plus the open object's
+ * address; both must match. */
+struct ClipToken
+{
+    quint64 generation = 0;
+    const void *object = nullptr;
+};
+
+inline bool sameClip( const ClipToken &a, const ClipToken &b )
+{
+    return a.generation == b.generation && a.object == b.object;
+}
+
+template <class Barrier, class Object>
+inline ClipToken clipToken( const Barrier &barrier, Object *const &openClip )
+{
+    ClipToken token;
+    token.generation = static_cast<quint64>( barrier.generation() );
+    token.object = static_cast<const void *>( openClip );
+    return token;
+}
+
+/* One saved capture as the source binding sees it. */
+struct CaptureClip
+{
+    QString kind;
+    int displayFrame = -1;
+    ClipToken clip;   // the clip open when the capture was taken
+};
+
+/* Per capture (same order as the input): whether it has a source id, and the id. playIdentities holds
+ * the play captures only, in order, for decide(). */
+struct BoundSourceIds
+{
+    QVector<bool> valid;
+    QVector<quint64> hash;
+    QVector<PlayIdentity> playIdentities;
+    int clipChangedCaptures = 0;   // play captures refused because their clip is not the capture's clip
+};
+
+/* Attach a source identity to each play capture ONLY from the clip the capture run started on, while
+ * that clip is still open: a capture taken from another clip, or one hashed after the open clip changed,
+ * gets NO id (fail closed: source_difference becomes unknown), never another clip's. The open clip is
+ * re-read before AND after each hash (hashFrame must not pump events, but a hash finished across a clip
+ * change is discarded rather than trusted). hashFrame( int displayFrame, quint64 *hash, bool *ok ) reads
+ * the currently open clip; a frame is hashed once. */
+template <class Barrier, class Object, class HashFrame>
+inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const ClipToken &captureClip,
+                                     const Barrier &barrier, Object *const &openClip, HashFrame hashFrame )
+{
+    BoundSourceIds out;
+    QHash<int, quint64> known;
+    QSet<int> failed;
+    for( const CaptureClip &capture : captures )
+    {
+        bool valid = false;
+        quint64 hash = 0;
+        if( isPlayCaptureKind( capture.kind ) )
+        {
+            const bool fromCaptureClip = sameClip( capture.clip, captureClip );
+            if( !fromCaptureClip ) ++out.clipChangedCaptures;
+            if( fromCaptureClip && capture.displayFrame >= 0 && !failed.contains( capture.displayFrame )
+             && sameClip( clipToken( barrier, openClip ), captureClip ) )
+            {
+                if( !known.contains( capture.displayFrame ) )
+                {
+                    quint64 frameHash = 0;
+                    bool ok = false;
+                    hashFrame( capture.displayFrame, &frameHash, &ok );
+                    if( !sameClip( clipToken( barrier, openClip ), captureClip ) )
+                        ++out.clipChangedCaptures;   // hashed across a clip change: not this capture's clip
+                    else if( ok )
+                        known.insert( capture.displayFrame, frameHash );
+                    else
+                        failed.insert( capture.displayFrame );
+                }
+                const auto at = known.constFind( capture.displayFrame );
+                if( at != known.constEnd() && sameClip( clipToken( barrier, openClip ), captureClip ) )
+                {
+                    valid = true;
+                    hash = at.value();
+                }
+            }
+            else if( fromCaptureClip && capture.displayFrame >= 0 && !sameClip( clipToken( barrier, openClip ), captureClip ) )
+            {
+                ++out.clipChangedCaptures;   // the open clip is no longer the capture's clip
+            }
+            PlayIdentity identity;
+            identity.displayFrame = capture.displayFrame;
+            identity.valid = valid;
+            identity.hash = hash;
+            out.playIdentities.append( identity );
+        }
+        out.valid.append( valid );
+        out.hash.append( hash );
+    }
+    return out;
 }
 
 } // namespace visual_capture_source_difference

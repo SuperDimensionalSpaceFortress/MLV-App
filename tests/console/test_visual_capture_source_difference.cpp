@@ -13,6 +13,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/VisualCaptureSourceDifference.h"
+#include "../../platform/qt/ClipLifecycleBarrier.h"
 
 #include <QFile>
 #include <QJsonObject>
@@ -187,4 +188,177 @@ TEST(VisualCaptureSourceDifferenceWiring, BothPlayCaptureKindsCarryASourceId)
     ASSERT_TRUE(source.contains(QStringLiteral(
         "if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
     ASSERT_FALSE(source.contains(QStringLiteral("if( grab.kind != QStringLiteral(\"play\") ) continue;")));
+}
+
+// r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the
+// old MainWindow.cpp:10698, the paused settle) and a QFileOpenEvent handled there replaces m_pMlvObject before the deferred
+// source hashing. 3663c8a3 then hashed "the open clip at display_frame", so clip B's ids were attached to clip A's captures:
+// static clip A read "differ" and the runner said FROZEN_DISPLAY, counted=false, for a healthy display. The ids are now bound
+// to the clip each capture was taken from (generation of the clip-lifecycle barrier + the open object), fail closed.
+namespace
+{
+
+struct FakeClip { int name = 0; };
+
+// The json's input: a static 1000-frame clip A (every payload the same picture) and a second clip B of the same geometry
+// whose frame i is a different picture per frame (encodeLj92(2048 + i, 12288)); six unforced play captures labelled 600..638.
+const int kA2Labels[6] = { 600, 608, 615, 623, 630, 638 };
+const quint64 kStaticAHash = 0xa0a0a0a0a0a0a0a0ull;
+quint64 clipBHash(int frame) { return 0xb000000000000000ull + static_cast<quint64>(2048 + frame); }
+
+struct ClipHarness
+{
+    ClipLifecycleBarrier barrier;
+    FakeClip a{ 1 };
+    FakeClip b{ 2 };
+    FakeClip *open = &a;
+    int hashCalls = 0;
+    int openBDuringHashCall = -1;   // when >= 0: the hash call with this ordinal opens B first (a clip change while hashing)
+
+    // what MainWindow does on a FileOpen: free the open clip behind the barrier, then open the new one
+    void openB()
+    {
+        barrier.beginMutation();
+        open = &b;
+        barrier.reopen();
+    }
+    vcsd::ClipToken now() const { return vcsd::clipToken(barrier, open); }
+    vcsd::BoundSourceIds bind(const QVector<vcsd::CaptureClip> & captures, const vcsd::ClipToken & captureClip)
+    {
+        return vcsd::bindSourceIds(captures, captureClip, barrier, open,
+            [this](int displayFrame, quint64 * hash, bool * ok) {
+                if (hashCalls++ == openBDuringHashCall) openB();
+                *ok = true;
+                *hash = open == &a ? kStaticAHash : clipBHash(displayFrame);
+            });
+    }
+};
+
+vcsd::CaptureClip playCapture(int displayFrame, const vcsd::ClipToken & clip)
+{
+    vcsd::CaptureClip capture;
+    capture.kind = QStringLiteral("play_unbound");
+    capture.displayFrame = displayFrame;
+    capture.clip = clip;
+    return capture;
+}
+
+void assertNoSourceId(const vcsd::BoundSourceIds & bound)
+{
+    for (bool valid : bound.valid) ASSERT_FALSE(valid);
+    ASSERT_TRUE(vcsd::decide(bound.playIdentities) == vcsd::Verdict::Unknown);
+    QJsonObject visualJson;
+    vcsd::apply(visualJson, vcsd::decide(bound.playIdentities));
+    ASSERT_FALSE(visualJson.contains(QStringLiteral("source_difference")));
+}
+
+} // namespace
+
+TEST(VisualCaptureSourceDifference, AFileOpenBeforeTheDeferredHashLendsNoSourceIdOfTheNewClip)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    for (int label : kA2Labels) captures.append(playCapture(label, clips.now()));
+    // control: with A still open the static clip reads identical (the frozen gate is waived on the app's word, correctly)
+    ASSERT_TRUE(vcsd::decide(clips.bind(captures, captureClip).playIdentities) == vcsd::Verdict::Identical);
+    // the processEvents after Play stops delivers a QFileOpenEvent for clip B before the hashing
+    clips.openB();
+    ASSERT_FALSE(vcsd::sameClip(clips.now(), captureClip));
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    ASSERT_EQ(6, bound.valid.size());
+    ASSERT_EQ(6, bound.playIdentities.size());
+    assertNoSourceId(bound);   // 3663c8a3: six of B's ids on A's pictures, "differ"
+    ASSERT_TRUE(bound.clipChangedCaptures > 0);
+}
+
+TEST(VisualCaptureSourceDifference, AFileOpenBetweenTwoCapturesLendsNoSourceIdToEither)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    for (int k = 0; k < 6; ++k) {
+        if (k == 3) clips.openB();   // a tail wait between play captures 2 and 3 handles the FileOpen
+        captures.append(playCapture(kA2Labels[k], clips.now()));
+    }
+    assertNoSourceId(clips.bind(captures, captureClip));
+}
+
+TEST(VisualCaptureSourceDifference, AClipChangeWhileHashingDiscardsThatHashAndEveryLaterOne)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    for (int label : kA2Labels) captures.append(playCapture(label, clips.now()));
+    clips.openBDuringHashCall = 2;
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    ASSERT_TRUE(bound.valid.at(0));
+    ASSERT_TRUE(bound.valid.at(1));
+    ASSERT_EQ(kStaticAHash, bound.hash.at(0));
+    ASSERT_EQ(kStaticAHash, bound.hash.at(1));
+    for (int k = 2; k < 6; ++k) ASSERT_FALSE(bound.valid.at(k));
+    ASSERT_TRUE(vcsd::decide(bound.playIdentities) == vcsd::Verdict::Unknown);
+}
+
+TEST(VisualCaptureSourceDifference, AClipThatStaysOpenKeepsEveryIdentityAndOnlyPlayKindsAreHashed)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    captures.append(playCapture(10, clips.now()));
+    vcsd::CaptureClip stop = playCapture(11, clips.now());
+    stop.kind = QStringLiteral("stop");
+    captures.append(stop);
+    captures.append(playCapture(10, clips.now()));
+    captures.append(playCapture(12, clips.now()));
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    ASSERT_EQ(4, bound.valid.size());
+    ASSERT_EQ(3, bound.playIdentities.size());
+    ASSERT_TRUE(bound.valid.at(0));
+    ASSERT_FALSE(bound.valid.at(1));   // not a play kind: no source_id
+    ASSERT_TRUE(bound.valid.at(2));
+    ASSERT_TRUE(bound.valid.at(3));
+    ASSERT_EQ(2, clips.hashCalls);     // one hash per distinct display frame
+    ASSERT_EQ(0, bound.clipChangedCaptures);
+}
+
+TEST(VisualCaptureSourceDifferenceWiring, TheCaptureRunBindsItsSourceIdsToTheClipItStartedOn)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString block = sliceBetween(source,
+        QStringLiteral("PLAYBACK-VISUAL-INSPECTION-1 (--visual-capture-dir"),
+        QStringLiteral("gui_smoke.visual_capture\")"));
+    ASSERT_FALSE(block.isEmpty());
+    const QString lf = QString(block).replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    const int startAt = lf.indexOf(QStringLiteral(
+        "const visual_capture_source_difference::ClipToken visualCaptureClip =\n"
+        "            visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );"));
+    ASSERT_TRUE(startAt >= 0);
+    // named before ANY event is pumped on the capture path
+    ASSERT_TRUE(lf.indexOf(QStringLiteral("processEvents(")) > startAt);
+    ASSERT_TRUE(lf.indexOf(QStringLiteral("finishPlaybackSmokeTelemetry( \"visual-capture\" );")) > startAt);
+    // every capture records its own clip
+    const int grabAt = lf.indexOf(QStringLiteral("auto grabVisual = [&]"));
+    const int grabEnd = lf.indexOf(QStringLiteral("visualGrabs.append( grab );"), grabAt);
+    ASSERT_TRUE(grabAt >= 0 && grabEnd > grabAt);
+    ASSERT_TRUE(lf.mid(grabAt, grabEnd - grabAt).contains(QStringLiteral(
+        "grab.clip = visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );")));
+    // the ONE source read goes through the clip binding; no second read can attach another clip's identity
+    ASSERT_EQ(1, lf.count(QStringLiteral("getMlvFrameSourceHash64(")));
+    const int bindAt = lf.indexOf(QStringLiteral("visual_capture_source_difference::bindSourceIds("));
+    ASSERT_TRUE(bindAt >= 0);
+    ASSERT_TRUE(lf.indexOf(QStringLiteral("getMlvFrameSourceHash64(")) > bindAt);
+    ASSERT_TRUE(lf.mid(bindAt, 200).contains(QStringLiteral("visualCaptureClips, visualCaptureClip, m_clipLifecycleBarrier, m_pMlvObject,")));
+    // the source_id written comes from that binding, not from a per-frame lookup on the open clip
+    ASSERT_TRUE(lf.contains(QStringLiteral("visual_capture_source_difference::sourceIdHex( visualSourceIds.hash.at( playAt ) )")));
+    ASSERT_TRUE(lf.contains(QStringLiteral("visual_capture_source_difference::decide( visualSourceIds.playIdentities );")));
+    // the paused settle is never sought in, or credited to, a clip opened since
+    const int settleAt = lf.indexOf(QStringLiteral("seekAndSettleLoadedClip( visualStopFrame"));
+    const int settleFrom = lf.lastIndexOf(QStringLiteral("const bool visualSettled"), settleAt);
+    ASSERT_TRUE(settleAt >= 0 && settleFrom >= 0);
+    const QString settleGuard = lf.mid(settleFrom, settleAt - settleFrom);
+    ASSERT_TRUE(settleGuard.contains(QStringLiteral("sameClip( visualGrabs.last().clip, visualCaptureClip )")));
+    ASSERT_TRUE(settleGuard.contains(QStringLiteral("clipToken( m_clipLifecycleBarrier, m_pMlvObject ), visualCaptureClip )")));
+    ASSERT_TRUE(lf.contains(QStringLiteral(
+        "grab.settled && visual_capture_source_difference::sameClip( grab.clip, visualCaptureClip ) );")));
 }

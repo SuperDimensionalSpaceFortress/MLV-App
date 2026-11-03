@@ -8988,6 +8988,57 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(out, expected)
 
+    @requires_windows_imaging
+    def test_a_repeat_is_judged_by_its_own_pairs_source_ids(self) -> None:
+        """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r7 (adversary r6 pass 3 A1 on 3663c8a3, the json's input verbatim): six saved play_unbound records,
+        display frames 0..5, forced_paints_before=6, 64x64 viewports, source ids [aa,bb,bb,bb,bb,bb], pictures [X,Y,Y,Y,Y,Y] (X: grey left half 32 /
+        right half 224; Y: 96 / 224), no top-level source_difference. The set-wide source is known-differ (aa vs bb), but each of the four repeated
+        pictures sits on a pair whose OWN ids are equal: the source repeated its picture, the display did not stop. 3663c8a3 counted four repeats and
+        said PARTIAL_FREEZE. A repeat is now judged by its own pair: equal ids are no repeat, differing ids are a display repeat, a missing id is an
+        UNKNOWN pair (counted in repeatedPlayFrames, never toward PARTIAL_FREEZE)."""
+        a, b, c, d_, e = (f"{n:016x}" for n in (0xaa, 0xbb, 0xcc, 0xdd, 0xee))
+        # ids, pictures (left-half grey levels), verdict, repeatedPlayFrames, repeats over pairs whose own ids differ, note text
+        rows = (
+            ((a, b, b, b, b, b), (32, 96, 96, 96, 96, 96), "OK", 0, 0, None),                                     # the json's input
+            ((a, b, b, c, d_, d_), (32, 96, 96, 96, 96, 96), "PARTIAL_FREEZE", 2, 2, "the display's own paint stopped"),   # bb|bb and dd|dd are the source's own
+            ((a, b, c, d_, e, f"{0xff:016x}"), (32, 96, 96, 96, 160, 160), "PARTIAL_FREEZE", 3, 3, "the display's own paint stopped"),
+            ((a, b, None, c, d_, e), (32, 96, 96, 96, 160, 200), "OK", 2, 0, "not a proven cause"),             # both repeats touch the frame with no id
+        )
+        for ids, levels, verdict, repeats, differ_repeats, note in rows:
+            with self.subTest(ids=ids, levels=levels), tempfile.TemporaryDirectory(prefix="vis-r7-pair-") as d:
+                share = Path(d) / "artifacts" / "visual"
+                share.mkdir(parents=True)
+                draw = ["Add-Type -AssemblyName System.Drawing"]
+                frames = []
+                for k, (sid, left) in enumerate(zip(ids, levels)):
+                    png = share / f"play-unbound-{k}.png"
+                    draw.append(f"$b = [System.Drawing.Bitmap]::new(64, 64); $g = [System.Drawing.Graphics]::FromImage($b); "
+                                f"$g.Clear([System.Drawing.Color]::FromArgb(224, 224, 224)); "
+                                f"$g.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb({left}, {left}, {left})), 0, 0, 32, 64); "
+                                f"$g.Dispose(); $b.Save('{png}', [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()")
+                    entry = {"kind": "play_unbound", "index": k, "file": png.name, "display_frame": k, "serial": 900 + k, "play_active": True,
+                             "tail_elapsed_ms": 1625 + 250 * k, "capture_ms": 40.0, "viewport": {"x": 0, "y": 0, "w": 64, "h": 64}, "saved": True,
+                             "reason": "", "forced_paints_before": 6}
+                    if sid is not None:
+                        entry["source_id"] = sid
+                    frames.append(entry)
+                proc = run_pwsh(["-Command", "\n".join(draw)])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                (share / "visual.json").write_text(json.dumps({"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)",
+                                                              "tail_ms": 3000, "frames": frames, "frames_written": 6, "error": ""}), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{Path(d) / 'artifacts'}' -EvidenceDir '{Path(d) / 'evidence'}' "
+                                          "-LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["flatPlayFrames"]), ("play_unbound", 6, 0), out["reason"])
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True), out["reason"])
+                self.assertEqual((out["repeatedPlayFrames"], out["repeatedPlayFramesSourceDiffer"]), (repeats, differ_repeats), out["reason"])
+                if note is None:
+                    self.assertIsNone(out["repeatedPlayFramesNote"], out["reason"])
+                else:
+                    self.assertIn(note, out["repeatedPlayFramesNote"])
+                    if verdict == "PARTIAL_FREEZE":
+                        self.assertIn(f"{differ_repeats} of the 6 judged play frames repeat the picture before them", out["reason"])
+
     def test_missing_or_invalid_frame_evidence_is_unknown_never_identical_and_never_a_throw(self) -> None:
         """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key on 27da457e): equal ids over display frames -0.4 and 1 read known-identical
         ([int]-0.4 is 0); a $null frame between two good ones was filtered away and the rest read known-identical; a display frame of

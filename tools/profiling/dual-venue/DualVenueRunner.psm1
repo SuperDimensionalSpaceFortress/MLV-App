@@ -2415,6 +2415,8 @@ function Read-DvVisualCaptures {
     them while the app's label advanced (a display whose paint stopped part-way when the source frames are known to differ, a possible one when
     nothing records them; $null over source frames the app records as identical). r5: repeatedPlayFramesNote carries the repeat note whatever
     reason was set first (reason keeps its first-wins rule), and two or more repeats over known-differ source frames are PARTIAL_FREEZE.
+    r7 (adversary r6 pass 3 A1): each repeat is judged by its own pair's source ids; repeatedPlayFramesSourceDiffer counts those whose ids differ,
+    and only it reaches the gate's -RepeatedPlayFrames. A pair with equal ids is not a repeat; one with a missing id is counted, never decisive.
     Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
     #>
     param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
@@ -2429,7 +2431,7 @@ function Read-DvVisualCaptures {
         labelBound = $null; stopUnboundVsPausedMeanAbsDiff = $null; stopUnboundVsStopMeanAbsDiff = $null
         pausedLabelBound = $null; labelBoundBasis = $null; pausedLabelBoundBasis = $null; pausedUnboundVsPausedMeanAbsDiff = $null
         frozenJudgedOn = 'play'; forcedPlayDistinctContentHashes = $null
-        observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesNote = $null
+        observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesSourceDiffer = $null; repeatedPlayFramesNote = $null
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
@@ -2445,7 +2447,7 @@ function Read-DvVisualCaptures {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
-            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
         # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
         # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
@@ -2590,15 +2592,28 @@ function Read-DvVisualCaptures {
     if ($judgeKind -ceq 'play_unbound' -and $block.sourceDifference -cne 'known-identical') {
         # a display whose own paint stopped part-way: a judged unforced picture equal to the one before it while the app's label advanced
         $ordered = @($play | Sort-Object index)
+        # r7 (adversary r6 pass 3 A1): each repeat is judged by ITS OWN pair's source ids (Get-DvVisualSourceDifference over the two frames), never by
+        # the set-wide result: ids [aa,bb,bb,bb,bb,bb] under pictures [X,Y,Y,Y,Y,Y] are four repeats of the source's own picture, not a stopped paint.
+        # A pair whose ids are equal is no repeat; a pair whose ids differ is a display repeat (repeatedPlayFramesSourceDiffer, the only count that can
+        # make PARTIAL_FREEZE); a pair with a missing or malformed id is UNKNOWN: it stays in repeatedPlayFrames and its note, never in the verdict.
+        $sourceDifferRepeats = 0
         $block.repeatedPlayFrames = @(for ($i = 1; $i -lt $ordered.Count; $i++) {
             $a = $ordered[$i - 1]; $b = $ordered[$i]
             $aFrame = Get-DvFrameNumber $a.displayFrame; $bFrame = Get-DvFrameNumber $b.displayFrame   # r5: no frame number, no advance (never a throw)
-            if ($b.contentHash -ceq $a.contentHash -and $null -ne $aFrame -and $null -ne $bFrame -and $bFrame -ne $aFrame) { $b.index }
+            if ($b.contentHash -ceq $a.contentHash -and $null -ne $aFrame -and $null -ne $bFrame -and $bFrame -ne $aFrame) {
+                $pairSource = Get-DvVisualSourceDifference -Frames @($a, $b)
+                if ($pairSource -cne 'known-identical') {
+                    if ($pairSource -ceq 'known-differ') { $sourceDifferRepeats++ }
+                    $b.index
+                }
+            }
         }).Count
+        $block.repeatedPlayFramesSourceDiffer = $sourceDifferRepeats
         if ($block.repeatedPlayFrames -gt 0 -and $block.distinctContentHashes -gt 1) {
-            # the cause is named only over source frames known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
+            # the cause is named only when every repeat's own pair is known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
             $repeatNote = "$($block.repeatedPlayFrames) of the $($play.Count) unforced play captures repeat the picture before them while the app's label advanced: " + $(
-                if ($block.sourceDifference -ceq 'known-differ') { "the display's own paint stopped landing for part of the tail" }
+                if ($block.sourceDifference -ceq 'known-differ' -and $sourceDifferRepeats -eq $block.repeatedPlayFrames) { "the display's own paint stopped landing for part of the tail" }
+                elseif ($sourceDifferRepeats -gt 0) { "$sourceDifferRepeats of them over pairs whose own source ids differ, but a judged frame has no usable source id, so this is a possible partial freeze or repeated source pictures, not a proven cause" }
                 else { "nothing records whether the source frames differ, so this is a possible partial freeze or repeated source pictures, not a proven cause" })
             $block.repeatedPlayFramesNote = $repeatNote   # its own field: an earlier note in reason never hides it (r5, Grok G4)
             if (-not $block.reason) { $block.reason = $repeatNote }
@@ -2629,7 +2644,7 @@ function Read-DvVisualCaptures {
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
-            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer)
         $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
