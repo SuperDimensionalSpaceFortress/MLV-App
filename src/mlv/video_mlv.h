@@ -536,7 +536,8 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * (mlvLj92FrameSourceHash64), so two frames that decode alike are never known to differ. */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
 /* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: FNV-1a 64 over the fields
- * liblj92 reads -- the last DHT's length, code counts and values; the last SOF3's precision, height,
+ * liblj92 reads -- the last DHT's 16 code counts and first sum(counts) values (the default parser does not
+ * advance past a DHT, so the marker walk goes through its bytes); the last SOF3's precision, height,
  * width and component count; the SOS component count and predictor -- then every byte from the end
  * of the SOS header to the end of the payload (never stopped at an EOI: liblj92 steps over one inside
  * the entropy data, so "identical" is never false). Markers are walked as lj92.c walks them, so
