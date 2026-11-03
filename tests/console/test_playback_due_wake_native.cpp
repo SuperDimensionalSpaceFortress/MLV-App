@@ -299,13 +299,120 @@ TEST(PlaybackDueWakeA1, EveryFrameModeAdvancesOnlyPastAPresentedFrame)
     const QString wake = functionBody( source, QStringLiteral( "void MainWindow::onPlaybackDueWake( void )" ),
                                        QStringLiteral( "void MainWindow::cancelPlaybackDueWake( void )" ) );
     ASSERT_FALSE( wake.isEmpty() );
-    const int gate = wake.indexOf( QStringLiteral( "if( !playbackDueWakeMayAdvance( m_frameStillDrawing, ui->actionDropFrameMode->isChecked()," ) );
+    const int gate = wake.indexOf( QStringLiteral( "playbackDueWakeOutcome( m_frameStillDrawing, ui->actionDropFrameMode->isChecked()," ) );
     const int advance = wake.indexOf( QStringLiteral( "timerFrameEvent( true );" ) );
     ASSERT_TRUE( gate > 0 && advance > gate );
     const QString held = wake.mid( gate, advance - gate );
-    ASSERT_TRUE( held.contains( QStringLiteral( "m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )" ) ) );
-    ASSERT_TRUE( held.contains( QStringLiteral( "m_playbackFrameAdvancePending = true;" ) ) );
+    ASSERT_TRUE( held.contains( QStringLiteral( "m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() );" ) ) );
     ASSERT_TRUE( held.contains( QStringLiteral( "++m_playbackDueWakeUnpresentedDeferred;" ) ) );
+    // r2 adversary pass 6 A1: the hold leaves no pending advance (see EveryFrameAHeldWakeLeavesNoPendingAdvance...)
+    ASSERT_TRUE( playbackDueWakeOutcome( false, false, presented, slider ) == PlaybackDueWakeOutcome::HoldUnpresented );
+    ASSERT_TRUE( playbackDueWakeOutcome( false, false, 10, slider ) == PlaybackDueWakeOutcome::Advance );
+    ASSERT_TRUE( playbackDueWakeOutcome( false, true, presented, slider ) == PlaybackDueWakeOutcome::Advance );
+}
+
+TEST(PlaybackDueWakeA1, EveryFrameAHeldWakeLeavesNoPendingAdvanceForTheEmptyFrameReadyPath)
+{
+    // r2 adversary pass 6 A1 input: Play, every-frame mode (dropFrame=false), 60 fps, cut 1..100, scale 1, admitted CUDA texture
+    // route with a supported readback fallback, lookahead 2. Frame 8's present ends at 1001 ms (the tail requested 9 at 1000 ms).
+    // Frame 9 / serial 109 is acquired and queued for background preparation at 1010 ms and its worker is descheduled until
+    // 1020 ms. The due wake at 1016.917 ms sees drawing=false, slider=9, presented=8: it is held. Lookahead frame 10 / serial
+    // 110 emits frameReady at 1017 ms, which takes drawFrameReady's empty path (no ready frame for target 9; the renderer idle).
+    // On bb06bf2b the held wake set m_playbackFrameAdvancePending, the empty path took it without the gate, advanced 9 -> 10,
+    // and preparation 110 replaced 109: frame 9 never presented.
+    const long long presented = 8;
+    const int slider = 9;
+    const bool drawingAtWake = false;
+    const PlaybackDueWakeOutcome atWake = playbackDueWakeOutcome( drawingAtWake, false, presented, slider );
+    ASSERT_TRUE( atWake == PlaybackDueWakeOutcome::HoldUnpresented );
+    // the held wake leaves no pending advance ...
+    const bool pendingAfterWake = playbackDueWakeOutcomeLeavesPendingAdvance( atWake );
+    ASSERT_FALSE( pendingAfterWake );
+    // ... so frame 10's frameReady at 1017 ms (empty path: renderer idle) does not advance
+    const bool drawingAtEmptyFrameReady = false;
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, pendingAfterWake, drawingAtEmptyFrameReady, false, presented, slider ) );
+    // and the class: whoever left the flag (a poll tick that found the renderer busy before 1010 ms, a busy wake), the empty
+    // and lookahead-drop paths never advance over the unpresented 9 in every-frame mode; 9's present takes the flag
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, drawingAtEmptyFrameReady, false, presented, slider ) );
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, false, false, 9, slider ) );     // once 9's present ended
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, false, true, presented, slider ) );   // drop-frame: unchanged
+    ASSERT_TRUE( playbackPendingAdvanceMayBeTaken( true, true, false, false, -1, slider ) );    // nothing presented this Play
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, true, true, true, 9, slider ) );      // busy never takes it
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( false, true, false, true, 9, slider ) );    // not playing
+    ASSERT_FALSE( playbackPendingAdvanceMayBeTaken( true, false, false, true, 9, slider ) );    // nothing pending
+
+    // the wiring, in MainWindow.cpp
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_FALSE( source.isEmpty() );
+    const QString wake = functionBody( source, QStringLiteral( "void MainWindow::onPlaybackDueWake( void )" ),
+                                       QStringLiteral( "void MainWindow::cancelPlaybackDueWake( void )" ) );
+    ASSERT_FALSE( wake.isEmpty() );
+    // the wake sets the flag in exactly one place, and only for a busy renderer
+    ASSERT_EQ( 1, wake.count( QStringLiteral( "m_playbackFrameAdvancePending = true;" ) ) );
+    ASSERT_EQ( 1, wake.count( QStringLiteral(
+        "if( playbackDueWakeOutcomeLeavesPendingAdvance( outcome ) ) m_playbackFrameAdvancePending = true;" ) ) );
+    // the empty-frameReady advance (drawFrameReady, no ready frame) is gated
+    const int empty = source.indexOf( QStringLiteral( "QStringLiteral(\"draw_frame_ready.empty\")" ) );
+    const int emptyAdvance = source.indexOf( QStringLiteral( "\"drawFrameReady.empty_advance\"" ), empty );
+    ASSERT_TRUE( empty > 0 && emptyAdvance > empty );
+    const QString emptyPath = source.mid( empty, emptyAdvance - empty );
+    ASSERT_TRUE( emptyPath.contains( QStringLiteral( "if( playbackPendingAdvanceMayBeTaken( ui->actionPlay->isChecked(), m_playbackFrameAdvancePending," ) ) );
+    ASSERT_TRUE( emptyPath.contains( QStringLiteral( "m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )" ) ) );
+    ASSERT_FALSE( emptyPath.contains( QStringLiteral( "&& m_playbackFrameAdvancePending )" ) ) );
+    // the lookahead-drop advance (its deferred lambda) is gated the same way, after it re-reads the renderer
+    const int drop = source.indexOf( QStringLiteral( "QTimer::singleShot( 0, this, [this, display_frame]()" ) );
+    const int dropAdvance = source.indexOf( QStringLiteral( "\"drawFrameReady.lookahead_drop_advance\"" ), drop );
+    ASSERT_TRUE( drop > 0 && dropAdvance > drop );
+    const QString dropPath = source.mid( drop, dropAdvance - drop );
+    const int reread = dropPath.indexOf( QStringLiteral( "renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );" ) );
+    const int dropGate = dropPath.indexOf( QStringLiteral( "if( !playbackPendingAdvanceMayBeTaken( ui->actionPlay->isChecked(), m_playbackFrameAdvancePending," ) );
+    const int dropTimer = dropPath.indexOf( QStringLiteral( "timerFrameEvent();" ) );
+    ASSERT_TRUE( reread > 0 && dropGate > reread && dropTimer > dropGate );
+    // no other site takes the pending flag outside the poll tick (timerFrameEvent) and these two
+    ASSERT_EQ( 2, source.count( QStringLiteral( "playbackPendingAdvanceMayBeTaken(" ) ) );
+}
+
+TEST(PlaybackDueWakeNative, TheMessageCarriesItsPostTimeAndTheLatenessIsSplitAtThePost)
+{
+    // r3: the wake's lateness is split into due-to-post and post-to-receive, so the fullscreen gap can be read as delivery
+    // (the timer / wait thread) or GUI-thread occupancy (successor HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1)
+    const quint64 packed = playbackDueWakePackWParam( 0xFFFFFFF0u, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) );
+    ASSERT_EQ( 0xFFFFFFF0u, playbackDueWakeWParamGeneration( packed ) );
+    ASSERT_EQ( static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ), playbackDueWakeWParamTag( packed ) );
+    ASSERT_EQ( 0u, playbackDueWakeWParamTag( 7u ) );   // a bare generation carries no tag
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "\" post_stamped=%1 due_to_post_p50_ms=%2 due_to_post_p95_ms=%3 \"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "\"post_to_receive_p50_ms=%4 post_to_receive_p95_ms=%5\"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakeDueToPostMs.push_back( postMs - m_playbackDueWakeDueAtMs );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostToReceiveMs.push_back( nowMs - postMs );" ) ) );
+#ifdef Q_OS_WIN
+    LARGE_INTEGER frequency;
+    ASSERT_TRUE( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 );
+    const auto qpcMs = [&frequency]() -> double
+    {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter( &now );
+        return static_cast<double>( now.QuadPart ) * 1000.0 / static_cast<double>( frequency.QuadPart );
+    };
+    double postMs = -2.0;
+    double receivedMs = -2.0;
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() { postMs = self->lastDeliveryPostMs(); receivedMs = qpcMs(); } );
+    self = &wake;
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    const double armedMs = qpcMs();
+    wake.arm( 1.0 );
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    ASSERT_TRUE( postMs >= armedMs );            // posted after the arm, on the same QPC clock
+    ASSERT_TRUE( receivedMs >= postMs );         // received after the post
+    ASSERT_TRUE( postMs - armedMs < 1000.0 );
+    ASSERT_TRUE( wake.lastDeliveryPostMs() < 0.0 );   // only meaningful inside the fire callback
+    // the notifier path carries no post time
+    PlaybackDueWake notifierWake( nullptr, []() {}, false );
+    ASSERT_TRUE( notifierWake.delivery() == PlaybackDueWake::Delivery::Notifier );
+    ASSERT_TRUE( notifierWake.lastDeliveryPostMs() < 0.0 );
+#endif
 }
 
 TEST(PlaybackDueWakeA1, TheGateReadsTheFrameWhosePresentEndedNotTheOneAcceptedForPreparation)

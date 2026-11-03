@@ -55,10 +55,15 @@ struct PlaybackDueWake::Impl
     {
         if( gate.accept( gate.generation(), clock.nsecsElapsed() ) && onFire ) onFire();
     }
-    // the native-message path: the message names its generation
-    void deliverGeneration( quint32 generation )
+    // r3: the post time of the delivery firing now (ms on the QPC clock), < 0 when the delivery carries none
+    double firingPostMs = -1.0;
+    // the native-message path: the message names its generation (and, r3, its post time)
+    void deliverGeneration( quint32 generation, double postMs = -1.0 )
     {
-        if( gate.accept( generation, clock.nsecsElapsed() ) && onFire ) onFire();
+        if( !gate.accept( generation, clock.nsecsElapsed() ) || !onFire ) return;
+        firingPostMs = postMs;
+        onFire();
+        firingPostMs = -1.0;
     }
 };
 
@@ -100,6 +105,9 @@ bool registerDueWakeWindowClass()
     return registered;
 }
 
+// r3: the tag and the generation share wParam, and the post QPC fills lParam (64-bit Windows only; Qt 6 has no other)
+static_assert( sizeof( WPARAM ) >= 8 && sizeof( LPARAM ) >= 8, "the due-wake message packs 64-bit wParam / lParam" );
+
 struct WaitThreadArgs
 {
     HANDLE stopEvent;
@@ -118,9 +126,14 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
     {
         const DWORD result = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
         if( result != WAIT_OBJECT_0 + 1 ) break;   // stop, or a wait failure
+        // r3: stamp the post time, so the GUI thread can split due-to-post from post-to-receive
+        LARGE_INTEGER postQpc;
+        if( !QueryPerformanceCounter( &postQpc ) ) postQpc.QuadPart = 0;
         PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
-                      static_cast<WPARAM>( args.postGeneration->load( std::memory_order_acquire ) ),
-                      static_cast<LPARAM>( PlaybackDueWake::kNativeWakeTag ) );
+                      static_cast<WPARAM>( playbackDueWakePackWParam(
+                          args.postGeneration->load( std::memory_order_acquire ),
+                          static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
+                      static_cast<LPARAM>( postQpc.QuadPart ) );
     }
     return 0;
 }
@@ -321,9 +334,15 @@ bool PlaybackDueWake::handleNativeMessage( const void *msg )
     if( !msg ) return false;
     const MSG *m = static_cast<const MSG *>( msg );
     if( m->message != kNativeWakeMessage || !d->window || m->hwnd != d->window ) return false;
-    if( static_cast<quintptr>( m->lParam ) != kNativeWakeTag ) return false;
+    const quint64 wParam = static_cast<quint64>( m->wParam );
+    if( playbackDueWakeWParamTag( wParam ) != static_cast<quint32>( kNativeWakeTag ) ) return false;
+    // r3: the post time in the message, on the same QPC clock as mlv_stage_timing_now()
+    double postMs = -1.0;
+    LARGE_INTEGER frequency;
+    if( m->lParam > 0 && QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 )
+        postMs = static_cast<double>( m->lParam ) * 1000.0 / static_cast<double>( frequency.QuadPart );
     // a stale generation (cancelled, re-armed or stopped since it was posted) is consumed and does nothing
-    d->deliverGeneration( static_cast<quint32>( m->wParam ) );
+    d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), postMs );
     return true;
 #else
     Q_UNUSED( msg );
@@ -349,6 +368,11 @@ bool PlaybackDueWake::waitThreadRunning() const
 #else
     return false;
 #endif
+}
+
+double PlaybackDueWake::lastDeliveryPostMs() const
+{
+    return d->firingPostMs;
 }
 
 PlaybackDueWake::Delivery PlaybackDueWake::delivery() const

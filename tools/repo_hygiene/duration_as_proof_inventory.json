@@ -2555,6 +2555,36 @@
       "lines": [
         1244
       ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( postMs >= 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3 onPlaybackDueWake: postMs is a TIMESTAMP (the QPC post time the wait thread stamped in the native message, PlaybackDueWake::lastDeliveryPostMs), not a duration; a negative value is the 'this delivery carried no post time' sentinel (notifier / qtimer path). The check filters that sentinel before the due-to-post / post-to-receive samples are recorded. Telemetry only; it never proves a stage ran.",
+      "lines": [
+        19598
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( wake . lastDeliveryPostMs ( ) < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3: lastDeliveryPostMs() is a timestamp getter whose negative value is the 'no delivery firing now' sentinel; the assert checks the sentinel outside the fire callback. The delivery itself is proven by pumpDueWakeMessages returning 1 and the callback's captured post/receive times.",
+      "lines": [
+        410
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( notifierWake . lastDeliveryPostMs ( ) < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3: the notifier fallback carries no post time, so its timestamp getter reads the negative sentinel; a structural check of the fallback's contract, no duration compared.",
+      "lines": [
+        414
+      ]
     }
   ]
 }

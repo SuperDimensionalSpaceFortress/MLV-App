@@ -97,10 +97,52 @@ inline bool playbackDueWakeMayAdvance( bool frameStillDrawing, bool dropFrameMod
     return lastPresentedFrame < 0 || lastPresentedFrame == static_cast<long long>( position );
 }
 
+/*! r3 (adversary pass 6 A1): what a due wake does. A busy renderer defers the advance to the frameReady / drawFrameReady
+ *  paths (the pending advance). An every-frame wake held because the slider's frame has not presented yet does NOT leave
+ *  a pending advance: the empty-frameReady and lookahead-drop paths would consume it while that frame's preparation is
+ *  still queued, and advance over it. The present that ends re-arms the wake, and its tail advance moves on. */
+enum class PlaybackDueWakeOutcome { Advance, DeferBusy, HoldUnpresented };
+
+inline PlaybackDueWakeOutcome playbackDueWakeOutcome( bool frameStillDrawing, bool dropFrameMode,
+                                                      long long lastPresentedFrame, int position )
+{
+    if( frameStillDrawing ) return PlaybackDueWakeOutcome::DeferBusy;
+    if( !playbackDueWakeMayAdvance( false, dropFrameMode, lastPresentedFrame, position ) )
+        return PlaybackDueWakeOutcome::HoldUnpresented;
+    return PlaybackDueWakeOutcome::Advance;
+}
+
+inline bool playbackDueWakeOutcomeLeavesPendingAdvance( PlaybackDueWakeOutcome outcome )
+{
+    return outcome == PlaybackDueWakeOutcome::DeferBusy;
+}
+
+/*! r3 (adversary pass 6 A1, siblings): a pending advance taken OUTSIDE the poll tick and the present's own tail advance
+ *  (the empty-frameReady path and the lookahead-drop path) obeys the same rule as the wake. In every-frame mode it may
+ *  advance only past the frame whose present ended; otherwise the pending flag stays set for the present's tail advance
+ *  (or the next poll tick) to take. Whoever set the flag (the poll tick or a busy wake), the rule is the same. */
+inline bool playbackPendingAdvanceMayBeTaken( bool playChecked, bool pendingAdvance, bool frameStillDrawing,
+                                              bool dropFrameMode, long long lastPresentedFrame, int position )
+{
+    if( !playChecked || !pendingAdvance ) return false;
+    return playbackDueWakeMayAdvance( frameStillDrawing, dropFrameMode, lastPresentedFrame, position );
+}
+
+/*! r3: the native message carries its post time. wParam = kNativeWakeTag in the high 32 bits and the generation in the
+ *  low 32 bits; lParam = the QueryPerformanceCounter value read just before PostMessage. The GUI thread then splits the
+ *  wake's lateness into due-to-post (the timer and the wait thread) and post-to-receive (the GUI thread's queue). */
+inline quint64 playbackDueWakePackWParam( quint32 generation, quint32 tag )
+{
+    return ( static_cast<quint64>( tag ) << 32 ) | static_cast<quint64>( generation );
+}
+inline quint32 playbackDueWakeWParamGeneration( quint64 wParam ) { return static_cast<quint32>( wParam & 0xFFFFFFFFull ); }
+inline quint32 playbackDueWakeWParamTag( quint64 wParam ) { return static_cast<quint32>( wParam >> 32 ); }
+
 class PlaybackDueWake
 {
 public:
-    /*! The message the wait thread posts: WM_APP (0x8000) + 0x1457. wParam is the generation, lParam kNativeWakeTag. */
+    /*! The message the wait thread posts: WM_APP (0x8000) + 0x1457. wParam is kNativeWakeTag (high 32 bits) and the
+     *  generation (low 32 bits); lParam is the post time in QueryPerformanceCounter ticks (r3). */
     static constexpr unsigned kNativeWakeMessage = 0x8000u + 0x1457u;
     static constexpr quintptr kNativeWakeTag = 0x4D4C5644u;   // 'MLVD'
 
@@ -142,6 +184,10 @@ public:
     /*! The message-only window the wait thread posts to (0 when not on the native-message path). */
     quintptr nativeWindow() const;
     bool waitThreadRunning() const;
+    /*! r3: when the delivery that is firing now was posted, in ms on the QueryPerformanceCounter clock (the base of
+     *  mlv_stage_timing_now() * 1000 on Windows). Valid inside the fire callback of a native-message delivery; < 0 on
+     *  the notifier / qtimer paths, which carry no post time. */
+    double lastDeliveryPostMs() const;
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
     void stop();
 

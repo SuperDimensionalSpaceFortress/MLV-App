@@ -19592,24 +19592,32 @@ void MainWindow::onPlaybackDueWake( void )
     const double nowMs = mlv_stage_timing_now() * 1000.0;
     ++m_playbackDueWakeFired;
     m_playbackDueWakeLatenessMs.push_back( nowMs - m_playbackDueWakeDueAtMs );
+    // r3: split the lateness at the post (native-message deliveries carry their post time): due-to-post is the timer and the
+    // wait thread, post-to-receive is the GUI thread's queue (delivery vs GUI-thread occupancy)
+    const double postMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostMs() : -1.0;
+    if( postMs >= 0.0 )
+    {
+        m_playbackDueWakeDueToPostMs.push_back( postMs - m_playbackDueWakeDueAtMs );
+        m_playbackDueWakePostToReceiveMs.push_back( nowMs - postMs );
+    }
     // adversary r1 pass 2 A1: the wake honours m_frameStillDrawing exactly as the poll tick does and never recomputes it from the
     // render thread -- an idle renderer with a Ready frame whose notification is still queued would read as not busy, and the
-    // advance would request the next frame over it (every-frame mode, CPU latest-ready acquisition: a skipped frame)
-    if( m_frameStillDrawing )
+    // advance would request the next frame over it (every-frame mode, CPU latest-ready acquisition: a skipped frame).
+    // adversary r1 pass 3 A1: every-frame mode advances only past the frame on screen (the frame whose present ENDED).
+    // r2 adversary pass 6 A1: a wake held for an unpresented frame leaves NO pending advance. The empty-frameReady and
+    // lookahead-drop paths took that flag while the frame's preparation was still queued and advanced over it; the present
+    // that ends re-arms the wake (presentPlaybackPreparedFrame) and its tail advance moves on.
+    const PlaybackDueWakeOutcome outcome =
+        playbackDueWakeOutcome( m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() );
+    if( outcome != PlaybackDueWakeOutcome::Advance )
     {
-        // the frameReady / drawFrameReady paths consume the pending advance when the render lands
-        m_playbackFrameAdvancePending = true;
-        ++m_playbackDueWakeBusyDeferred;
-        return;
-    }
-    // adversary r1 pass 3 A1: every-frame mode advances only past the frame on screen. A Ready frame whose frameReady is
-    // not sent yet does not read as busy above, so without this the wake requested N+1 over the unpresented N and
-    // latest-ready acquisition skipped N; drawFrameReady presents N and its advance consumes the pending flag.
-    if( !playbackDueWakeMayAdvance( m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
-                                    m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )
-    {
-        m_playbackFrameAdvancePending = true;
-        ++m_playbackDueWakeUnpresentedDeferred;
+        // only a busy renderer leaves the advance pending for the frameReady / drawFrameReady paths
+        if( playbackDueWakeOutcomeLeavesPendingAdvance( outcome ) ) m_playbackFrameAdvancePending = true;
+        if( outcome == PlaybackDueWakeOutcome::DeferBusy )
+            ++m_playbackDueWakeBusyDeferred;
+        else
+            ++m_playbackDueWakeUnpresentedDeferred;
         return;
     }
     const int positionBefore = ui->horizontalSliderPosition->value();
@@ -19658,21 +19666,30 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeDelivery = QStringLiteral( "none" );
     m_playbackDueWakeMechanismSeen = false;
     m_playbackDueWakeLatenessMs.clear();
+    m_playbackDueWakeDueToPostMs.clear();
+    m_playbackDueWakePostToReceiveMs.clear();
 }
 
 // One line per measured Play, logged after the timed window has closed (finishPlaybackSmokeTelemetry).
 QString MainWindow::playbackDueWakeSummaryLine( void ) const
 {
-    std::vector<double> late = m_playbackDueWakeLatenessMs;
-    const auto percentile = [&late]( double p ) -> double
+    const auto percentile = []( std::vector<double> values, double p ) -> double
     {
-        if( late.empty() ) return 0.0;
-        const size_t index = static_cast<size_t>( std::floor( p * static_cast<double>( late.size() - 1 ) + 0.5 ) );
-        std::nth_element( late.begin(), late.begin() + static_cast<std::ptrdiff_t>( index ), late.end() );
-        return late[index];
+        if( values.empty() ) return 0.0;
+        const size_t index = static_cast<size_t>( std::floor( p * static_cast<double>( values.size() - 1 ) + 0.5 ) );
+        std::nth_element( values.begin(), values.begin() + static_cast<std::ptrdiff_t>( index ), values.end() );
+        return values[index];
     };
-    const double p50 = percentile( 0.50 );
-    const double p95 = percentile( 0.95 );
+    const double p50 = percentile( m_playbackDueWakeLatenessMs, 0.50 );
+    const double p95 = percentile( m_playbackDueWakeLatenessMs, 0.95 );
+    // r3: the lateness split at the post (post_stamped = how many fired wakes carried a post time; the rest are 0.000)
+    const QString split = QStringLiteral( " post_stamped=%1 due_to_post_p50_ms=%2 due_to_post_p95_ms=%3 "
+                                          "post_to_receive_p50_ms=%4 post_to_receive_p95_ms=%5" )
+        .arg( static_cast<qulonglong>( m_playbackDueWakePostToReceiveMs.size() ) )
+        .arg( percentile( m_playbackDueWakeDueToPostMs, 0.50 ), 0, 'f', 3 )
+        .arg( percentile( m_playbackDueWakeDueToPostMs, 0.95 ), 0, 'f', 3 )
+        .arg( percentile( m_playbackDueWakePostToReceiveMs, 0.50 ), 0, 'f', 3 )
+        .arg( percentile( m_playbackDueWakePostToReceiveMs, 0.95 ), 0, 'f', 3 );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
                            "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )
         .arg( m_playbackDueWakeArmed )
@@ -19685,7 +19702,7 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( m_playbackDueWakeHiRes ? 1 : 0 )
         .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 )
         .arg( m_playbackDueWakeDelivery.isEmpty() ? QStringLiteral( "none" ) : m_playbackDueWakeDelivery )
-        .arg( m_playbackDueWakeUnpresentedDeferred );
+        .arg( m_playbackDueWakeUnpresentedDeferred ) + split;
 }
 
 //Paint the Audio Track Wave to GUI
@@ -33309,9 +33326,12 @@ void MainWindow::drawFrameReady()
                     .arg( ui->horizontalSliderPosition->value() ),
                 true );
         }
-        if( !m_frameStillDrawing
-         && ui->actionPlay->isChecked()
-         && m_playbackFrameAdvancePending )
+        // r2 adversary pass 6 A1 (sibling): in every-frame mode the pending advance is taken here only past the frame whose
+        // present ENDED. A lookahead frame's frameReady while the slider's frame is still queued for preparation advanced
+        // over it (9 -> 10, preparation 110 replaced 109); the flag stays for that present's tail advance.
+        if( playbackPendingAdvanceMayBeTaken( ui->actionPlay->isChecked(), m_playbackFrameAdvancePending,
+                                              m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                              m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )
         {
             m_skipImmediateTimecodeLabel = true;
             const double advance_start = mlv_stage_timing_now();
@@ -33404,7 +33424,12 @@ void MainWindow::drawFrameReady()
                     }
                     m_frameStillDrawing =
                         renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
-                    if( m_frameStillDrawing ) return;
+                    // r2 adversary pass 6 A1 (sibling): the same every-frame rule as the empty-frameReady advance
+                    if( !playbackPendingAdvanceMayBeTaken( ui->actionPlay->isChecked(), m_playbackFrameAdvancePending,
+                                                           m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                                           m_playbackDueWakePresentedFrame,
+                                                           ui->horizontalSliderPosition->value() ) )
+                        return;
 
                     m_skipImmediateTimecodeLabel = true;
                     const double advance_start = mlv_stage_timing_now();

@@ -13,6 +13,7 @@
 
 #include "../../platform/qt/PlaybackFrameRange.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
+#include "../../platform/qt/PlaybackDueWake.h"
 
 #include <QFile>
 #include <QRegularExpression>
@@ -1262,10 +1263,15 @@ TEST(PlaybackDueWakeWiring, TheWakeHonoursTheStillDrawingFlagLikeThePollAndNever
     const QString body = source.mid(begin, end - begin);
     ASSERT_FALSE(body.contains(QStringLiteral("m_frameStillDrawing =")));
     ASSERT_FALSE(body.contains(QStringLiteral("renderThreadBusyForPlaybackAdvance")));
-    const int gate = body.indexOf(QStringLiteral("if( m_frameStillDrawing )"));
+    // r3: the busy gate is the first branch of playbackDueWakeOutcome, fed the poll tick's own flag; busy leaves the advance pending
+    const int gate = body.indexOf(QStringLiteral("playbackDueWakeOutcome( m_frameStillDrawing,"));
     const int advance = body.indexOf(QStringLiteral("timerFrameEvent( true );"));
     ASSERT_TRUE(gate > 0 && advance > gate);            // the busy gate comes before the advance
-    ASSERT_TRUE(body.mid(gate, advance - gate).contains(QStringLiteral("m_playbackFrameAdvancePending = true;")));
+    ASSERT_TRUE(body.mid(gate, advance - gate).contains(
+        QStringLiteral("if( playbackDueWakeOutcomeLeavesPendingAdvance( outcome ) ) m_playbackFrameAdvancePending = true;")));
+    ASSERT_TRUE(playbackDueWakeOutcome(true, false, 10, 10) == PlaybackDueWakeOutcome::DeferBusy);
+    ASSERT_TRUE(playbackDueWakeOutcome(true, true, 10, 11) == PlaybackDueWakeOutcome::DeferBusy);
+    ASSERT_TRUE(playbackDueWakeOutcomeLeavesPendingAdvance(PlaybackDueWakeOutcome::DeferBusy));
 }
 
 TEST(PlaybackDueWakeWiring, TheSummaryReportsTheResolutionThePlayRanAt)

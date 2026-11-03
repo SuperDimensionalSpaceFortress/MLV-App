@@ -1204,6 +1204,8 @@ private:
     QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
     bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism
     std::vector<double> m_playbackDueWakeLatenessMs;
+    std::vector<double> m_playbackDueWakeDueToPostMs;       // r3: post time - due time (native-message deliveries)
+    std::vector<double> m_playbackDueWakePostToReceiveMs;   // r3: GUI-thread receive time - post time
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
