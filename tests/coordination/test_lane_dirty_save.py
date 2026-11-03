@@ -2317,6 +2317,7 @@ public static class Win {
   [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandle", SetLastError = true)] static extern bool RealInfo(SafeFileHandle handle, [Out] byte[] buffer);
   [DllImport("kernel32.dll", EntryPoint = "GetLongPathNameW", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint RealLong(string shortPath, StringBuilder buffer, uint length);
   public static string FlipFrom = null, FlipTo = null, FlagOpenContaining = null;
+  public static bool FlipAll = false;
   static IntPtr flagged = IntPtr.Zero;
   public static void Flag(SafeFileHandle h) { flagged = h.DangerousGetHandle(); }
   public static SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template) {
@@ -2326,7 +2327,7 @@ public static class Win {
   }
   public static uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder b, uint len, uint fl) {
     uint r = RealFinal(h, b, len, fl);
-    if (r != 0 && r < len && flagged != IntPtr.Zero && FlipFrom != null && h.DangerousGetHandle() == flagged) { string s = b.ToString().Replace(FlipFrom, FlipTo); b.Clear(); b.Append(s); }
+    if (r != 0 && r < len && FlipFrom != null && (FlipAll || (flagged != IntPtr.Zero && h.DangerousGetHandle() == flagged))) { string s = b.ToString().Replace(FlipFrom, FlipTo); b.Clear(); b.Append(s); }
     return r;
   }
   public static bool GetFileInformationByHandleEx(SafeFileHandle h, int c, byte[] buf, uint len) { return RealEx(h, c, buf, len); }
@@ -2339,9 +2340,9 @@ public static class Win {
 HANDLE_FUNCS = ["Assert-HandleAtPath", "ConvertTo-PlainPath", "ConvertTo-NativePath", "Initialize-LdsNative"]
 
 
-def _handle_at_path(opened, requested, flip=None):
+def _handle_at_path(opened, requested, flip=None, everywhere=False):
     """Open `opened` with a plain stream, optionally flag its handle so the double reports a case-swapped final path, then ask Assert-HandleAtPath whether that handle is at `requested`."""
-    pre = "$script:onWin = $true; " + CASE_DOUBLE + ("[LdsNative.Win]::FlipFrom = $env:LDS_FROM; [LdsNative.Win]::FlipTo = $env:LDS_TO; " if flip else "")
+    pre = "$script:onWin = $true; " + CASE_DOUBLE + ("[LdsNative.Win]::FlipFrom = $env:LDS_FROM; [LdsNative.Win]::FlipTo = $env:LDS_TO; " if flip else "") + ("[LdsNative.Win]::FlipAll = $true; " if everywhere else "")
     expr = ("$(try { $fs = [System.IO.File]::Open($env:LDS_OPEN, 'Open', 'Read', 'Read'); " + ("[LdsNative.Win]::Flag($fs.SafeFileHandle); " if flip else "") +
             "Assert-HandleAtPath $fs.SafeFileHandle $env:LDS_REQ; 'ok' } catch { $_.Exception.Message })")
     return run_ps_functions(HANDLE_FUNCS, expr, pre=pre, LDS_OPEN=str(opened), LDS_REQ=str(requested), LDS_FROM=(flip or ("", ""))[0], LDS_TO=(flip or ("", ""))[1])
@@ -2421,3 +2422,37 @@ def test_a_repository_with_no_commit_ends_in_exit_40_and_writes_nothing(tmp_path
     assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
     assert list(run.iterdir()) == []
     assert "unborn HEAD" in SCRIPT.read_text(encoding="utf-8").split("param(", 1)[0]  # stated in the header
+
+
+# ---- r17 adversary pass 1 on c5015bc5 (A1, A2) ----
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_link_left_in_place_through_both_opens_is_refused_by_the_name_compare_which_is_case_sensitive_below_the_root(record_file):  # r17 adversary A1 (c5015bc5): with the link still in place when the requested path is opened, BOTH handles resolve to the decoy `RECORDS`, so the handle compare agrees; the name proof still folded case and accepted. `everywhere` plays the link that stays: every handle reports the case-swapped path
+    assert _handle_at_path(record_file, record_file, flip=("records", "RECORDS"), everywhere=True) == "opened-through-a-link"  # c5015bc5: ok
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_private_directory_reached_through_a_link_that_stays_in_place_is_refused_before_a_byte_is_written(repo, tmp_path):  # r17 adversary A1 sibling (private directory): same persistence, at the creation proof
+    base = tmp_path / "tempbase"
+    base.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    flip = CASE_DOUBLE + "[LdsNative.Win]::FlipAll = $true; [LdsNative.Win]::FlipFrom = 'lane-dirty-save-'; [LdsNative.Win]::FlipTo = 'LANE-DIRTY-SAVE-'; "
+    hooked = _hooked(tmp_path, [("$ErrorActionPreference = 'Stop'", flip)])
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout and "opened-through-a-link" in r.stdout, r.stdout + r.stderr  # c5015bc5: exit 0
+    assert saved(repo) == []
+    assert [p.name for d in base.glob("lane-dirty-save-*") for p in d.iterdir()] == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows holds the directories open; POSIX keeps the documented limit")
+def test_a_private_subdirectory_swapped_for_a_junction_into_the_worktree_never_has_a_file_written_through_it(repo, tmp_path):  # r17 adversary A2 (c5015bc5): only the private ROOT was held, so `objects` could be moved away and a junction to a worktree folder put at its name before objects/info/alternates was created: the file landed in the worktree and was listed as dirt. Every private subdirectory is created, held and proved at its own path now, so the move is refused
+    base, marker = tmp_path / "tempbase", tmp_path / "swap-result.txt"
+    base.mkdir()
+    (repo / "victim" / "info").mkdir(parents=True)
+    swap = (f"try {{ [System.IO.Directory]::Move([System.IO.Path]::Combine($sg, 'objects'), [System.IO.Path]::Combine($sg, 'objects.owned')); [void](New-Item -ItemType Junction -Path ([System.IO.Path]::Combine($sg, 'objects')) -Target '{repo / 'victim'}'); $o = 'SWAPPED' }} catch {{ $o = 'BLOCKED' }}; "
+            f"Set-Content -LiteralPath '{marker}' -Value $o -NoNewline; ")
+    hooked = _hooked(tmp_path, [("Write-NewFile ([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'))", swap)])
+    (repo / "a.txt").write_bytes(b"changed\n")
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    assert list((repo / "victim" / "info").iterdir()) == [], r.stdout + r.stderr  # c5015bc5: alternates written into the worktree
+    assert marker.read_text() == "BLOCKED", r.stdout + r.stderr
+    assert r.returncode == 0, r.stdout + r.stderr
