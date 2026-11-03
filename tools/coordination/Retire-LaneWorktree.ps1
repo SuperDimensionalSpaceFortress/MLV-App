@@ -726,13 +726,14 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
             if (-not $claims.ContainsKey($rp)) { $claims[$rp] = New-Object 'System.Collections.Generic.List[datetime]' }
             $claims[$rp].Add($rootStamp)
         }
-        # r5 (adversary A2, 2nd pass): several claims for ONE pid in one record (root + containment, or child / owner / runner naming the same pid)
-        # stand only when they AGREE within RunDirPidCreatedSlackSec. A disagreement is ambiguous and states nothing for that pid (the write-time
-        # rule decides): the last claim must never silently replace a matching one, nor a root claim be dropped because containment filled the map.
+        # r5 (adversary A2, 2nd pass; A1, 3rd pass): several claims for ONE pid in one record (root + containment, or child / owner / runner naming
+        # the same pid) stand only when they are the SAME instant. Any difference is ambiguous and states nothing for that pid (the write-time rule
+        # decides): the last claim must never silently replace a matching one, a root claim must not be dropped because containment filled the
+        # map, and no representative may be picked from a set that spans more than the slack (a within-slack-of-the-first test lets it span twice).
         foreach ($k in @($claims.Keys)) {
             $l = $claims[$k]
             $agree = $true
-            foreach ($t in $l) { if ([math]::Abs(($t - $l[0]).TotalSeconds) -gt [double]$script:RunDirPidCreatedSlackSec) { $agree = $false } }
+            foreach ($t in $l) { if ($t.Ticks -ne $l[0].Ticks) { $agree = $false } }
             if ($agree) { $map[[int]$k] = $l[0] }
         }
     } catch { return @{} } finally { $doc.Dispose() }
@@ -913,6 +914,19 @@ function Find-RunDirDriverHolders {
     # Precedence per (run dir, pid) (adversary A1): one run dir's records describe one process lineage, so within it an exact creation-time MATCH
     # proves the process is the recorded one; else an exact MISMATCH proves reuse (a later write time cannot overrule it); else the weaker
     # write-time rule decides. Another run dir that once held the same pid NUMBER is a different lineage and never suppresses this one.
+    # r5 (adversary A3, 3rd pass): a stamped record that was written AFTER the snapshot was taken (or whose write time is unknown) cannot be
+    # contradicted by the snapshot's row for its pid: that row may be the previous holder of the pid number, which has since exited. Its stamp
+    # "mismatch" then proves nothing, so the record is read as a match (a lane image still holds, fail toward live) and never as reuse.
+    $snapAt = $null
+    $snapProp = $Snapshot.PSObject.Properties['CapturedUtc']
+    if ($snapProp -and $snapProp.Value -is [datetime]) { $snapAt = ([datetime]$snapProp.Value).ToUniversalTime() }
+    $staleVsSnapshot = {
+        param($rec)
+        if ($null -eq $snapAt) { return $false }
+        $atv = $rec.PSObject.Properties['RecordedAtUtc']
+        $newer = (-not $atv) -or ($atv.Value -isnot [datetime]) -or (([datetime]$atv.Value).ToUniversalTime() -gt $snapAt)
+        return ($newer -and [bool](Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec))
+    }
     $exactMatch = @{}; $reused = @{}
     foreach ($rec in $index) {
         if ($rec.Error -or -not $byPid.ContainsKey($rec.Pid)) { continue }
@@ -923,15 +937,15 @@ function Find-RunDirDriverHolders {
             # lane's terminal receipt) AFTER the live process started proves that process is the recorded one: the launcher wrote a pid it saw
             # alive, and the process created before that write has held the pid ever since. Such a record outranks an older lineage's stamp in the
             # same run dir. A receipt's write time is the lane's END, so it is not that proof (sol r1 B1 keeps its mismatch-wins rule against it).
-            $at = $rec.PSObject.Properties['RecordedAtUtc']
-            if ($at -and $at.Value -is [datetime] -and -not $rec.File.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and
+            # A record with NO readable write time (the post-read stat failed) is read the same way: fail toward live (adversary A2, 3rd pass).
+            if (-not $rec.File.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and
                 $byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) {
                 $b = Test-RecordedPidBound -Proc $byPid[$rec.Pid] -Record $rec
                 if ($b.Bound -and $b.Why -eq 'created-fits-record') { $exactMatch[$k] = $true }
             }
             continue
         }
-        if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) { $reused[$k] = $true }
+        if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) { if (& $staleVsSnapshot $rec) { $exactMatch[$k] = $true } else { $reused[$k] = $true } }
         elseif ($byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) { $exactMatch[$k] = $true }
     }
     foreach ($k in @($exactMatch.Keys)) { $reused.Remove($k) }
@@ -945,7 +959,7 @@ function Find-RunDirDriverHolders {
             if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
             # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: the run-dir tie below needs the live pid to BE the recorded process (image + creation time);
             # a reused pid (tailscaled.exe, git.exe ... with an unreadable command line) is not a driver of this run dir.
-            elseif (-not $reused.ContainsKey("$($rec.RunDir)|$($rec.Pid)") -and (Test-RecordedPidBound -Proc $p -Record $rec).Bound -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            elseif (-not $reused.ContainsKey("$($rec.RunDir)|$($rec.Pid)") -and (((& $staleVsSnapshot $rec) -and ([string]$p.Name -match $script:RunDirDriverImagePattern)) -or (Test-RecordedPidBound -Proc $p -Record $rec).Bound) -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
                 $matched = $rec.RunDir
                 if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }

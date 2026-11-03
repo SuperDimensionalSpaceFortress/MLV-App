@@ -3241,6 +3241,74 @@ def test_r5b_a3_a_record_that_vanishes_after_the_read_makes_no_write_time_claim(
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
 
 
+# Adversary pass r5 on 042ee981 (A1 slack-boundary claims, A2 unavailable write time vs an old lineage's stamp, A3 snapshot older than the record). Iteration 2.
+
+@pytest.mark.parametrize("offsets", [(0, -5, 5), (0, 4, -4), (0, 5, 5.5)], ids=["child-owner-runner-spread-10s", "spread-8s", "spread-5.5s"])
+def test_r5c_a1_claims_for_one_pid_that_do_not_all_agree_exactly_are_ambiguous(tmp_path, offsets):
+    """r5 A1 (3rd pass): each claim within the slack of the FIRST still let the set span twice the slack and the first claim won; a process 6 s
+    from it read as reused. Claims for one pid in one record stand only when they are the SAME instant; any difference states nothing for the pid."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    base = int(now - 6 * 3600)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    c, o, r_ = (_iso(base + d) if float(d).is_integer() else (_iso(base + d).replace("Z", ".500Z")) for d in offsets)
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","ownerPid":999972,"ownerCreatedUtc":"%s","runnerPid":999972,"runnerCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), c, o, r_), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", base + 6)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("leaf,text", [("venue-driver.pid", "999972\n"), ("new.child.json", '{"schema":"mlv-lane-child/v1","pid":999972}')], ids=["pid-file", "unstamped-child-json"])
+def test_r5c_a2_a_new_record_with_no_write_time_still_outranks_an_old_lineages_stamp(tmp_path, leaf, text):
+    """r5 A2 (3rd pass): the post-read stat is unavailable (file gone), so the record states no write time; that must fail toward live and not let
+    the same run dir's OLD child record (a different creation time for this pid) suppress the newly read pid."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "old.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(created - 86400)}, created - 86400 + 5)
+    _write_record(rd, leaf, "999900\n" if leaf.endswith(".pid") else '{"pid":999900}', created - 600)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq '{leaf}') {{ $t = '{text.strip()}'; [IO.File]::Delete($Path); return $t }}; "
+            "return [IO.File]::ReadAllText($Path) };")
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def _fake_snapshot_at(age_sec, *procs):
+    return f"[pscustomobject]@{{ Procs = @({', '.join(procs)}); SelfPids = @($PID); CapturedUtc = [DateTime]::UtcNow.AddSeconds(-{age_sec}) }}"
+
+
+def test_r5c_a3_a_snapshot_older_than_the_record_cannot_prove_the_recorded_process_was_reused(tmp_path):
+    """r5 A3 (3rd pass): the snapshot holds the OLD process that had pid 999972; the genuine driver took the pid afterwards and published
+    new.child.json (its own exact createdUtc) after the snapshot. The old row's creation time differs from the stamp only because the snapshot is
+    stale, so the record is not proof of reuse: the lane-image pid still holds the worktree. A snapshot taken AFTER the record still proves reuse."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    new_created = now - 300
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(new_created)}, now - 200)
+    old_row = _fake_proc_created(999972, "", "pwsh.exe", now - 86400)
+    r, err = _live_refusal(wt, _fake_snapshot_at(3600, old_row), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, old_row), runs)    # fresh snapshot: the old process really holds the pid now
+    assert r is None, (r, err)
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo
