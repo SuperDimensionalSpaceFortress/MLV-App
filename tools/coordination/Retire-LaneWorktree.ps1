@@ -281,17 +281,20 @@ $script:RunDirTieExt = @('.ps1', '.psm1', '.json', '.jsonl', '.txt', '.md', '.ar
 $script:RunDirTieBulkExt = @('.txt', '.jsonl')
 $script:RunDirTieMaxFiles = 200
 $script:RunDirTieMaxBytes = 1048576
-# RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: a pid in a run-dir record is a REUSE candidate until it is bound to the recorded process. Windows reuses
-# pids, so a dead lane's child.json / receipt can name a pid that now runs tailscaled.exe, OfficeClickToRun.exe, remoting_host.exe or git.exe
-# (fleet doctrine RECEIPTS.md:5103 "procStart defeats PID reuse"; TRAPS.md:11541 "a liveness pid is reused"). Find-RunDirDriverHolders ties a
-# recorded pid to a run dir only when Test-RecordedPidBound says the live process can be the recorded one: the image is a lane driver/host image
-# (RunDirDriverImagePattern) AND its creation time fits the record (RunDirPidCreatedSlackSec). A creation time that cannot be read falls back to
-# the image test alone; a record or process that cannot be read at all keeps the existing fail-closed paths.
-$script:RunDirDriverImagePattern = '(?i)^(pwsh|pwsh-preview|powershell|claude|codex|node|cmd|python|pythonw|py)(\.exe)?$'
+# RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: Windows reuses pids, so a dead lane's child.json / receipt can name a pid that now runs tailscaled.exe,
+# OfficeClickToRun.exe, remoting_host.exe or git.exe (fleet doctrine RECEIPTS.md:5103 "procStart defeats PID reuse"; TRAPS.md:11541).
+# r8 FAIL-CLOSED IDENTITY (HUB-TICK 20261103T1435Z step E; r1-r7 patched wall-clock and snapshot-age heuristics through nine adversary passes and each
+# pass found a new clock or stale-row boundary). The rule in Find-RunDirDriverHolders is now:
+#   A live pid named by a record in a run dir tied to the worktree is a HOLDER unless reuse is POSITIVELY PROVEN, and the ONLY proof is: the record
+#   carries a kernel process-creation stamp (createdUtc, containment.<x>CreatedUtc) AND the pid's CURRENT creation time, read by a per-pid query at
+#   decision time (Get-LivePidIdentity), differs from it by more than RunDirPidCreatedSlackSec.
+#   - No wall-clock or snapshot-age comparison (record write time, snapshot capture time) is part of the decision, so a clock step, forward or
+#     backward, can never free a worktree.
+#   - A command line or image (the snapshot row may be the PREVIOUS holder of the pid) only ever ADDS a holder; it never rejects a record.
+#   - A pid absent from the snapshot but running now is judged by the same rule; a pid not running now is judged from its snapshot row, if any.
+#   - An UNSTAMPED record + a live pid = HOLDER, always; an unreadable current creation time proves nothing.
+#   False refusals are accepted on purpose: retirement is hygiene, and the next sweep asks again once the driver (or the pid's new owner) exits.
 $script:RunDirPidCreatedSlackSec = 5
-# r4 (adversary A3): a record WITHOUT a stamp is bound by its write time alone, and the wall clock can step backwards between a process starting and
-# its pid file being published; a process that started up to this many seconds after the file's mtime is still read as the recorded one (fail toward live).
-$script:RunDirRecordClockSkewSec = 120
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -815,9 +818,9 @@ function Get-RecordedCreatedUtcMap([string]$Text, [object]$Members = $null) {
 }
 
 function Test-RecordedCreatedMismatch {
-    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1): does a record state an EXACT creation time for this pid that the live process does not
-    # have (beyond RunDirPidCreatedSlackSec)? Such a mismatch from any one record proves the pid was reused, and no weaker same-pid evidence from
-    # another record (a later write time) can overrule it. $false when the process creation time is unreadable or the record states none.
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: does a record state an EXACT creation time for this pid that $Proc (r8: the pid's CURRENT identity,
+    # from Get-LivePidIdentity) does not have (beyond RunDirPidCreatedSlackSec)? r8: the ONLY proof of reuse, and it proves it for THIS record only.
+    # $false when the creation time is unreadable or the record states none (an unstamped record is never proof).
     param([object]$Proc, [object]$Record)
     $cdp = $Proc.PSObject.Properties['CreationDate']
     if (-not $cdp -or $cdp.Value -isnot [datetime]) { return $false }
@@ -826,30 +829,35 @@ function Test-RecordedCreatedMismatch {
     return ([math]::Abs((([datetime]$cdp.Value).ToUniversalTime() - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds) -gt [double]$script:RunDirPidCreatedSlackSec)
 }
 
-function Test-RecordedPidBound {
-    # Can the LIVE process $Proc be the process a run-dir record named? {Bound; Why}. The pid alone is not evidence: Windows reuses pids.
-    #   image     the live image must be a lane driver / host image (RunDirDriverImagePattern); tailscaled.exe, git.exe ... are not.
-    #   created   when the process creation time is readable: it must equal the record's createdUtc (within RunDirPidCreatedSlackSec) when the
-    #             record states one, else it must not be later than the record file's last write (+ slack): a record is written after the
-    #             process it names starts, so a process that started after it is a different one that got the pid.
-    #   unreadable creation time (null / absent): the image test decides alone (fail toward live for a lane image, never for a foreign one).
-    param([object]$Proc, [object]$Record)
-    $name = [string]$Proc.Name
-    if ($name -notmatch $script:RunDirDriverImagePattern) { return [pscustomobject]@{ Bound = $false; Why = "image-not-a-lane-driver:$name" } }
-    $cdp = $Proc.PSObject.Properties['CreationDate']
-    if (-not $cdp -or $cdp.Value -isnot [datetime]) { return [pscustomobject]@{ Bound = $true; Why = 'creation-time-unreadable:image-only' } }
-    $created = ([datetime]$cdp.Value).ToUniversalTime()
-    $slack = [double]$script:RunDirPidCreatedSlackSec
-    $rc = $Record.PSObject.Properties['RecordedCreatedUtc']
-    if ($rc -and $rc.Value -is [datetime]) {
-        if ([math]::Abs(($created - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds) -le $slack) { return [pscustomobject]@{ Bound = $true; Why = 'created-matches-record' } }
-        return [pscustomobject]@{ Bound = $false; Why = "created-differs-from-record:$($created.ToString('o')) vs $(([datetime]$rc.Value).ToUniversalTime().ToString('o'))" }
+function Get-LivePidIdentity {
+    # r8 (ruling d): the pid's identity NOW, by a per-pid query at decision time, never the enumeration snapshot alone. $null = no process has this
+    # pid now. Otherwise {Name; CreationDate}: CreationDate is the kernel creation time (UTC) or $null when it cannot be read (an unreadable time
+    # proves nothing, so the caller holds). Process.StartTime first (GetProcessTimes); when this caller may not open the process, Win32_Process by pid
+    # (CreationDate is readable for every process). A query that fails for any other reason is "running, creation unknown" (fail toward holder).
+    # A seam: a test redefines it to play a process that runs now.
+    param([int]$ProcessId)
+    $p = $null
+    try { $p = [System.Diagnostics.Process]::GetProcessById($ProcessId) }
+    catch {
+        $e = $_.Exception
+        while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+        if ($e -is [ArgumentException]) { return $null }   # "Process with an Id of N is not running."
+        return [pscustomobject]@{ Name = ''; CreationDate = $null }
     }
-    $at = $Record.PSObject.Properties['RecordedAtUtc']
-    if ($at -and $at.Value -is [datetime]) {
-        if (($created - ([datetime]$at.Value).ToUniversalTime()).TotalSeconds -gt [double]$script:RunDirRecordClockSkewSec) { return [pscustomobject]@{ Bound = $false; Why = "started-after-record:$($created.ToString('o')) > $(([datetime]$at.Value).ToUniversalTime().ToString('o'))" } }
-    }
-    return [pscustomobject]@{ Bound = $true; Why = 'created-fits-record' }
+    try {
+        $name = ''
+        try { $name = [string]$p.ProcessName; if ($name -and -not [IO.Path]::HasExtension($name)) { $name += '.exe' } } catch { }
+        $created = $null
+        try { $created = $p.StartTime.ToUniversalTime() } catch { $created = $null }
+        if ($null -eq $created) {
+            try {
+                $c = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -Property ProcessId, Name, CreationDate -ErrorAction Stop | Select-Object -First 1
+                if ($c -and $c.CreationDate -is [datetime]) { $created = ([datetime]$c.CreationDate).ToUniversalTime() }
+                if ($c -and -not $name) { $name = [string]$c.Name }
+            } catch { }
+        }
+        return [pscustomobject]@{ Name = $name; CreationDate = $created }
+    } finally { $p.Dispose() }
 }
 
 function Read-SharedText {
@@ -912,12 +920,9 @@ function Get-RunDirPidIndex {
                     continue
                 }
                 # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: each row also carries when the record was written (RecordedAtUtc) and, when it states one for
-                # its only pid, the recorded process creation time (RecordedCreatedUtc), so Find-RunDirDriverHolders can bind the pid to its process.
-                # r5 (adversary A2): $f carries the mtime cached at ENUMERATION, but the text was read just now; a producer that replaced the file in
-                # between would pair its new pid text with the old mtime, and a genuine new driver would read as started-after-record. Re-stat AFTER
-                # the read and take the later of the two: a later write time can only make the started-after rejection more lenient (toward live).
-                # r5 (adversary A3, 2nd pass): when that re-stat is unavailable (the file is gone, or the stat throws) the cached value describes an
-                # earlier version than the text just read, so NO write time is stated ($null: Test-RecordedPidBound makes no started-after claim).
+                # its only pid, the recorded process creation time (RecordedCreatedUtc), so Find-RunDirDriverHolders can prove reuse of the pid.
+                # r8: RecordedAtUtc is DIAGNOSTIC ONLY (a wall-clock reading); no holder decision reads it. It is the later of the enumerated and the
+                # post-read mtime, or $null when the post-read stat is unavailable (the cached value would describe an earlier version of the text).
                 $recordedAt = $null
                 try { $f.Refresh(); if ($f.Exists) { $recordedAt = $f.LastWriteTimeUtc; if ($cachedAt -gt $recordedAt) { $recordedAt = $cachedAt } } } catch { $recordedAt = $null }
                 # r7: ONE reader (Get-RecordPidMembers) for the pid rows and the stamp map's pid count. A record that does not parse is ambiguous:
@@ -966,15 +971,21 @@ function Test-RunDirNamesPath {
 }
 
 function Find-RunDirDriverHolders {
-    # A live process recorded by a pid record in a run dir under -RunsRoot whose command line names the worktree, or names THAT run dir
-    # while the run dir names the worktree. A recorded live pid whose command line cannot be read holds it when its run dir names the
-    # worktree (unknown is never free). Rows {ProcessId; Name; Via = 'rundir-pid:<file>'; MatchedPath}. Throws when the run dirs cannot be listed.
+    # A live process recorded by a pid record in a run dir under -RunsRoot that names the worktree, or whose run dir names the worktree.
+    # Rows {ProcessId; Name; Via = 'rundir-pid:<file>'; MatchedPath}. Throws when the run dirs cannot be listed.
     # r2 (PR #654 sol r1 blocker): also THROWS, with the file and the error class, when the answer is unknown and no definite holder was found:
-    # a run dir whose tie cannot be settled (Test-RunDirNamesPath), or a pid record that exists but cannot be read. Such a record may name ANY
-    # pid, so it is read as naming every live non-self pid: it refuses exactly when one of them would hold the worktree through that run dir.
+    # a run dir whose tie cannot be settled (Test-RunDirNamesPath), or a pid record that exists but cannot be read.
+    # r8 FAIL-CLOSED IDENTITY (HUB-TICK 20261103T1435Z step E; see RunDirPidCreatedSlackSec at the top). Per record, independently of every other record:
+    #   1. identity = Get-LivePidIdentity (the pid NOW, per-pid query at decision time). Not running now: the snapshot row, if any (that process has
+    #      exited since the scan, or the table is a caller's fixture). Neither: not live, no holder.
+    #   2. HOLDER when the snapshot row's command line (raw or decoded -EncodedCommand) names the worktree: command-line evidence only ADDS.
+    #   3. else HOLDER when the record's run dir names the worktree, UNLESS the record carries a creation stamp and the identity's creation time is
+    #      readable and differs from it (Test-RecordedCreatedMismatch): the only proof of reuse, and it rejects only the record that states it.
+    # No record write time, snapshot capture time, image or non-matching command line takes part, so a clock step or a stale row (the pid's previous
+    # holder) can never free a worktree. False refusals are accepted: the next sweep asks again (ruling f).
     param([string]$WorktreePath, [object]$Snapshot, [string]$RunsRoot)
     # LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1 B2: each command line is read with its -EncodedCommand arguments decoded (Get-EncodedCommandText), so a
-    # driver started as `pwsh -EncodedCommand <base64>` that names its run dir only inside the base64 still ties to it; such a row is via ...+cmdline-encoded.
+    # driver started as `pwsh -EncodedCommand <base64>` that names its run dir only inside the base64 is labelled via ...+cmdline-encoded.
     $rows = New-Object System.Collections.Generic.List[object]
     if (-not $RunsRoot) { return $rows.ToArray() }
     $wd = $WorktreePath.TrimEnd('\')
@@ -987,112 +998,62 @@ function Find-RunDirDriverHolders {
     $fail = $null
     $unreadable = New-Object System.Collections.Generic.List[object]
     $index = @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)
-    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1): a creation-time mismatch stated by ANY record for a pid proves the pid was reused; it is
-    # settled once per pid here, so a weaker match from another record (a later write time) cannot bind it, whichever record comes first.
-    # Precedence per (run dir, pid) (adversary A1): one run dir's records describe one process lineage, so within it an exact creation-time MATCH
-    # proves the process is the recorded one; else an exact MISMATCH proves reuse (a later write time cannot overrule it); else the weaker
-    # write-time rule decides. Another run dir that once held the same pid NUMBER is a different lineage and never suppresses this one.
-    # r5 (adversary A3, 3rd pass): a stamped record that was written AFTER the snapshot was taken (or whose write time is unknown) cannot be
-    # contradicted by the snapshot's row for its pid: that row may be the previous holder of the pid number, which has since exited. Its stamp
-    # "mismatch" then proves nothing, so the record is read as a match (a lane image still holds, fail toward live) and never as reuse.
-    $snapAt = $null
-    $snapProp = $Snapshot.PSObject.Properties['CapturedUtc']
-    if ($snapProp -and $snapProp.Value -is [datetime]) { $snapAt = ([datetime]$snapProp.Value).ToUniversalTime() }
-    # r6 (adversary A3, A4; 6th pass): $recNewer = the snapshot cannot be shown to be at least as new as the record. That is when the record was written
-    # after the capture, or its write time is unknown (the post-read stat failed), whether or not the snapshot states a capture time: with no write
-    # time on either side the row may be the pid's previous holder, so it is not evidence. (A known write time with NO capture time cannot be
-    # compared, and stays "not newer": hand-built snapshots without a time keep the earlier rules.) $staleVsSnapshot = newer AND the stamp differs:
-    # the "mismatch" is then only the old holder's row, so it is never proof of reuse. Both only ever move a verdict toward LIVE.
-    $recNewer = {
-        param($rec)
-        $atv = $rec.PSObject.Properties['RecordedAtUtc']
-        $unknownAt = (-not $atv) -or ($atv.Value -isnot [datetime])
-        if ($unknownAt) { return $true }
-        if ($null -eq $snapAt) { return $false }
-        return (([datetime]$atv.Value).ToUniversalTime() -gt $snapAt)
-    }
-    $staleVsSnapshot = {
-        param($rec)
-        return ((& $recNewer $rec) -and [bool](Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec))
-    }
-    $exactMatch = @{}; $reused = @{}; $reusedBy = @{}; $reusedAt = @{}
-    foreach ($rec in $index) {
-        if ($rec.Error -or -not $byPid.ContainsKey($rec.Pid)) { continue }
-        $rc = $rec.PSObject.Properties['RecordedCreatedUtc']
-        $k = "$($rec.RunDir)|$($rec.Pid)"
-        if (-not $rc -or $rc.Value -isnot [datetime]) {
-            # r5 (adversary A1, 2nd pass): a record that states NO creation time but was written by the launcher (a pid file or child record, not a
-            # lane's terminal receipt) AFTER the live process started proves that process is the recorded one: the launcher wrote a pid it saw
-            # alive, and the process created before that write has held the pid ever since. Such a record outranks an older lineage's stamp in the
-            # same run dir. A receipt's write time is the lane's END, so it is not that proof (sol r1 B1 keeps its mismatch-wins rule against it).
-            # A record with NO readable write time (the post-read stat failed) is read the same way: fail toward live (adversary A2, 3rd pass).
-            if (-not $rec.File.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and
-                $byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) {
-                $b = Test-RecordedPidBound -Proc $byPid[$rec.Pid] -Record $rec
-                if ($b.Bound -and $b.Why -eq 'created-fits-record') { $exactMatch[$k] = $true }
-            }
-            continue
+    # One identity query per pid and one tie answer per run dir in this call (a tie that cannot be settled is cached as its error and thrown again).
+    $identity = @{}
+    $identityOf = {
+        param([int]$P)
+        if ($identity.ContainsKey($P)) { return $identity[$P] }
+        $id = $null
+        $f = Get-LivePidIdentity -ProcessId $P
+        if ($null -ne $f) {
+            $fc = $f.PSObject.Properties['CreationDate']
+            $nm = [string]$f.Name
+            if (-not $nm -and $byPid.ContainsKey($P)) { $nm = [string]$byPid[$P].Name }
+            $id = [pscustomobject]@{ Name = $nm; CreationDate = $(if ($fc -and $fc.Value -is [datetime]) { ([datetime]$fc.Value).ToUniversalTime() } else { $null }) }
+        } elseif ($byPid.ContainsKey($P)) {
+            $rc = $byPid[$P].PSObject.Properties['CreationDate']
+            $id = [pscustomobject]@{ Name = [string]$byPid[$P].Name; CreationDate = $(if ($rc -and $rc.Value -is [datetime]) { ([datetime]$rc.Value).ToUniversalTime() } else { $null }) }
         }
-        if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) {
-            if (& $staleVsSnapshot $rec) { $exactMatch[$k] = $true }
-            else {
-                $reused[$k] = $true
-                $reusedBy["$k|$($rec.File)"] = $true
-                $mt = ([datetime]$rec.RecordedAtUtc).ToUniversalTime().Ticks   # known: an unknown write time is "newer", never a mismatch that rejects
-                if (-not $reusedAt.ContainsKey($k) -or $mt -gt $reusedAt[$k]) { $reusedAt[$k] = $mt }
-            }
-        }
-        elseif ($byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) { $exactMatch[$k] = $true }
+        $identity[$P] = $id
+        return $id
     }
-    foreach ($k in @($exactMatch.Keys)) { $reused.Remove($k) }
-    # r7 (adversary pass 7 A2): a reuse mark belongs to the record that stated it and to OLDER records of the same (run dir, pid): it proves that an
-    # older lineage's process is not the live one. It must not reject a NEWER launcher-written record (a pid file or child record), which is judged on
-    # its own evidence: when the snapshot is older than that record, the snapshot's row (and its foreign image) is the previous holder of the pid.
-    # Rejected by the mark: the marking record itself, any receipt (its write time is the lane's END, r4 B1 keeps its mismatch-wins rule), and a record
-    # whose write time is known and STRICTLY older than the newest marking record. A record whose write time is unknown, or equal to the mark's,
-    # cannot be ordered against it: it is judged on its own evidence (fail toward live). Only ever moves a verdict toward live.
-    $rejectedAsReused = {
-        param($rec)
-        $k = "$($rec.RunDir)|$($rec.Pid)"
-        if (-not $reused.ContainsKey($k)) { return $false }
-        if ($reusedBy.ContainsKey("$k|$($rec.File)") -or $rec.File.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase)) { return $true }
-        $atv = $rec.PSObject.Properties['RecordedAtUtc']
-        if (-not $atv -or $atv.Value -isnot [datetime]) { return $false }
-        return (([datetime]$atv.Value).ToUniversalTime().Ticks -lt $reusedAt[$k])
+    $ties = @{}
+    $tiedOf = {
+        param([string]$RunDir)
+        if (-not $ties.ContainsKey($RunDir)) {
+            try { $ties[$RunDir] = [pscustomobject]@{ Tied = [bool](Test-RunDirNamesPath -RunDir $RunDir -Path $wd); Error = $null } }
+            catch { $ties[$RunDir] = [pscustomobject]@{ Tied = $false; Error = $_.Exception.Message } }
+        }
+        if ($ties[$RunDir].Error) { throw $ties[$RunDir].Error }
+        return $ties[$RunDir].Tied
     }
     foreach ($rec in $index) {
         if ($rec.Error) { $unreadable.Add($rec); continue }
-        if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
-        $p = $byPid[$rec.Pid]
-        $cl = [string]$p.CommandLine
+        $P = [int]$rec.Pid
+        if ($seen.ContainsKey($P) -or $self -contains $P) { continue }
+        $id = & $identityOf $P
+        if ($null -eq $id) { continue }
+        $row = if ($byPid.ContainsKey($P)) { $byPid[$P] } else { $null }
+        $cl = if ($row) { [string]$row.CommandLine } else { '' }
+        $dt = if ($row) { [string](& $text $row) } else { '' }
         $matched = $null; $enc = ''
         try {
-            if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
-            # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: the run-dir tie below needs the live pid to BE the recorded process (image + creation time);
-            # a reused pid (tailscaled.exe, git.exe ... with an unreadable command line) is not a driver of this run dir.
-            elseif (-not (& $rejectedAsReused $rec) -and ((& $recNewer $rec) -or (Test-RecordedPidBound -Proc $p -Record $rec).Bound) -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            if ((Test-PathNamed -Text $cl -Path $wd) -or (Test-PathNamed -Text $dt -Path $wd)) { $matched = $wd }
+            elseif (-not (Test-RecordedCreatedMismatch -Proc $id -Record $rec) -and (& $tiedOf $rec.RunDir)) {
                 $matched = $rec.RunDir
-                if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
+                if (-not (Test-PathNamed -Text $cl -Path $rec.RunDir) -and (Test-PathNamed -Text $dt -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }
-        } catch { if (-not $fail) { $fail = "$($_.Exception.Message) (live pid $($rec.Pid) recorded by $($rec.File))" }; continue }
+        } catch { if (-not $fail) { $fail = "$($_.Exception.Message) (live pid $P recorded by $($rec.File))" }; continue }
         if (-not $matched) { continue }
-        $seen[$rec.Pid] = $true
-        $rows.Add([pscustomobject]@{ ProcessId = [int]$rec.Pid; Name = [string]$p.Name; Via = "rundir-pid:$($rec.File)$enc"; MatchedPath = $matched })
+        $seen[$P] = $true
+        $rows.Add([pscustomobject]@{ ProcessId = $P; Name = [string]$id.Name; Via = "rundir-pid:$($rec.File)$enc"; MatchedPath = $matched })
     }
     if ($rows.Count) { return $rows.ToArray() }   # a definite holder outranks an unknown: both refuse, this one names the pid
     if ($fail) { throw $fail }
+    # A record that exists but cannot be read (or parsed) may name ANY pid, including one the snapshot does not list (r8 ruling d). r8 (ruling c): no
+    # command line can clear it, so it refuses whenever its run dir names the worktree (an unsettled tie throws too: fails closed).
     foreach ($rec in $unreadable) {
-        $tied = $null   # does the record's run dir name the worktree; asked once, and only when a live pid could be tied through it
-        foreach ($p in @($Snapshot.Procs)) {
-            if ($self -contains [int]$p.ProcessId) { continue }
-            $cl = [string]$p.CommandLine + "`n" + (& $text $p)
-            $hit = Test-PathNamed -Text $cl -Path $wd
-            if (-not $hit -and (-not $cl.Trim() -or (Test-PathNamed -Text $cl -Path $rec.RunDir))) {
-                if ($null -eq $tied) { $tied = [bool](Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd) }   # throws when unknown: fails closed too
-                $hit = $tied
-            }
-            if ($hit) { throw "rundir-record-unreadable path=$($rec.Error)" }
-        }
+        if (& $tiedOf $rec.RunDir) { throw "rundir-record-unreadable path=$($rec.Error)" }
     }
     return $rows.ToArray()
 }

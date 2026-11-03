@@ -2777,18 +2777,22 @@ def _stamp_run_dir(rd, epoch):
 @pytest.mark.parametrize("image", ["tailscaled.exe", "OfficeClickToRun.exe", "remoting_host.exe", "git.exe"])
 @pytest.mark.parametrize("cmdline_shape", ["unreadable", "names-run-dir"])
 def test_reused_pid_running_a_foreign_image_is_not_a_live_driver(tmp_path, image, cmdline_shape):
-    """The 2026-11-01 shape: the recorded pid now runs an unrelated image (unreadable command line, or one that merely names the run dir)."""
+    """The 2026-11-01 shape: the recorded pid now runs an unrelated image (unreadable command line, or one that merely names the run dir).
+    SUPERSEDED r8 (ruling c, f): the child record carries no creation stamp, and an image never rejects a record, so the live pid HOLDS. Was: free.
+    The stamped form of this shape (the lane launcher's own child.json) is still free: test_r8_gate_retires_a_worktree_whose_stamped_driver_pid_was_reused."""
     wt = tmp_path / "lane-X-1"
     wt.mkdir()
     runs = tmp_path / "fleet-runs"
     rd = _driver_run_dir(runs, "lane-X-1-r1", 999971, workdir=wt, pid_file="opus-001.child.json", child_json=True)
     cmdline = "" if cmdline_shape == "unreadable" else f"{image} --state {rd}"
     r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999971, cmdline, image)), runs)
-    assert r is None, (r, err)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999971, (r, err)
 
 
 def test_reused_pid_that_started_after_its_record_was_written_is_not_a_live_driver(tmp_path):
-    """Even a pwsh.exe: a process created AFTER the record was written cannot be the process the record named."""
+    """Even a pwsh.exe: a process created AFTER the record was written cannot be the process the record named.
+    SUPERSEDED r8 (ruling b, f): 'created after the record's write time' is a wall-clock comparison (Dot B1: a clock rollback makes a genuine driver
+    look started-after), and the pid file is unstamped, so the live pid HOLDS. Was: free."""
     wt = tmp_path / "lane-X-1"
     wt.mkdir()
     runs = tmp_path / "fleet-runs"
@@ -2797,7 +2801,7 @@ def test_reused_pid_that_started_after_its_record_was_written_is_not_a_live_driv
     _stamp_run_dir(rd, written)
     for cmdline in ("", _driver_cmdline(rd)):
         r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, cmdline, "pwsh.exe", written + 600)), runs)
-        assert r is None, (cmdline, r, err)
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (cmdline, r, err)
 
 
 def test_a_driver_that_started_before_its_record_was_written_is_still_a_live_driver(tmp_path):
@@ -2831,7 +2835,8 @@ def test_a_record_that_states_createdutc_binds_the_pid_to_exactly_that_process(t
 
 
 def test_a_creation_time_that_cannot_be_read_falls_back_to_the_image_check(tmp_path):
-    """No CreationDate on the row: a lane image is still treated as the driver (fail toward live), a foreign image is not."""
+    """No CreationDate on the row: a lane image is still treated as the driver (fail toward live), a foreign image is not.
+    SUPERSEDED r8 (ruling c, f), second half: an image never rejects a record, and the pid file is unstamped, so tailscaled.exe HOLDS too. Was: free."""
     wt = tmp_path / "lane-X-1"
     wt.mkdir()
     runs = tmp_path / "fleet-runs"
@@ -2839,16 +2844,33 @@ def test_a_creation_time_that_cannot_be_read_falls_back_to_the_image_check(tmp_p
     r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999975, "", "pwsh.exe")), runs)
     assert r is not None and r["reason"] == "live-driver", r
     r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999975, "", "tailscaled.exe")), runs)
-    assert r is None, (r, err)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999975, (r, err)
 
 
 def test_gate_retires_a_worktree_whose_only_recorded_driver_pid_was_reused(repo):
-    """End to end through the gate: a dead lane's worktree is would-retire while its recorded pid runs an unrelated image."""
+    """End to end through the gate: a dead lane's worktree is would-retire while its recorded pid runs an unrelated image.
+    SUPERSEDED r8 (ruling c, f): the child record is UNSTAMPED, so the live pid holds whatever its image: kept. Was: would-retire. The stamped
+    form still retires: test_r8_gate_retires_a_worktree_whose_stamped_driver_pid_was_reused."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "lane-REUSE-1")
     runs = tmp / "fleet-runs"
     _driver_run_dir(runs, "lane-REUSE-1-r1", 999976, workdir=wt, pid_file="opus-001.child.json", child_json=True)
     d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999976, "", "OfficeClickToRun.exe")), runs)
+    assert d["action"] == "kept" and "999976" in d["reason"], (d, err)
+    assert "REFUSED worktree-removal reason=live-driver" in err or "rundir-pid:" in d["reason"], (d, err)
+
+
+def test_r8_gate_retires_a_worktree_whose_stamped_driver_pid_was_reused(repo):
+    """r8 (a), genuine-reuse control end to end: the lane launcher's stamped child.json names pid 999976; the pid now runs OfficeClickToRun.exe, whose
+    CURRENT creation time (per-pid query) differs from the stamp: would-retire, no REFUSED line."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-REUSE-2")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-REUSE-2-r1", 999976, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    now = time.time()
+    (rd / "opus-001.child.json").write_text(json.dumps({"schema": "mlv-lane-child/v1", "pid": 999976, "createdUtc": _iso(now - 7200)}), encoding="utf-8")
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999976, "", "OfficeClickToRun.exe")), runs,
+                       prelude=_r8_live(999976, "OfficeClickToRun.exe", now - 600))
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), (d, err)
     assert "REFUSED" not in err, err
 
@@ -2890,7 +2912,12 @@ def test_b1_exact_mismatch_from_one_record_is_not_overridden_by_a_weaker_record(
     _write_record(rd, "z-last.receipt.json" if child_first else "a-first.receipt.json",
                   {"state": "complete", "exitCode": 0, "workDir": str(wt), "containment": containment}, receipt_mtime)
     r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", replacement)), runs)
-    assert r is None, (r, err)
+    if receipt_states_created:
+        assert r is None, (r, err)
+    else:
+        # SUPERSEDED r8 (ruling f, g): the receipt names the pid WITHOUT a stamp, and another record's stamp proves nothing about it (a reuse proof
+        # rejects only the record that states it). Unstamped record + live pid = HOLDER. Was: free.
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
 
 
 def test_b1_native_receipt_childcreatedutc_is_an_exact_stamp(tmp_path):
@@ -3303,7 +3330,9 @@ def test_r5c_a3_a_snapshot_older_than_the_record_cannot_prove_the_recorded_proce
     _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
     _write_record(rd, "new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(new_created)}, now - 200)
     old_row = _fake_proc_created(999972, "", "pwsh.exe", now - 86400)
-    r, err = _live_refusal(wt, _fake_snapshot_at(3600, old_row), runs)
+    # r8 premise: "the genuine driver took the pid afterwards" (it runs NOW) is stated through the per-pid query, which r8 reads at decision time
+    # instead of inferring it from the snapshot's age (ruling b, d). Assertion unchanged.
+    r, err = _live_refusal(wt, _fake_snapshot_at(3600, old_row), runs, prelude=_r8_live(999972, "pwsh.exe", new_created))
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
     r, err = _live_refusal(wt, _fake_snapshot_at(0, old_row), runs)    # fresh snapshot: the old process really holds the pid now
     assert r is None, (r, err)
@@ -3401,7 +3430,8 @@ def test_r6_a3_a_stamped_record_with_no_write_time_and_no_snapshot_time_is_not_p
             f"if ((Split-Path -Leaf $Path) -eq 'new.child.json') {{ $t = '{text}'; [IO.File]::Delete($Path); return $t }}; "
             "return [IO.File]::ReadAllText($Path) };")
     old_row = _fake_proc_created(999972, "", "pwsh.exe", now - 86400)
-    r, err = _live_refusal(wt, _fake_snapshot(old_row), runs, prelude=seam)
+    # r8 premise: the row may be the previous holder and the recorded driver runs NOW; stated through the per-pid query (ruling b, d). Assertion unchanged.
+    r, err = _live_refusal(wt, _fake_snapshot(old_row), runs, prelude=seam + _r8_live(999972, "pwsh.exe", created))
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
 
 
@@ -3418,10 +3448,15 @@ def test_r6_a4_a_snapshot_older_than_the_record_cannot_reject_the_driver_by_the_
         doc["createdUtc"] = _iso(now - 60)
     _write_record(rd, "new.child.json", doc, now - 30)
     row = _fake_proc_created(999972, "", image, now - 3600)
-    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs)
+    # r8 premise: the genuine pwsh driver runs NOW (per-pid query, ruling b, d). Assertion unchanged.
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 60))
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
     r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs)
-    assert r is None, (r, err)
+    if stamped:
+        assert r is None, (r, err)
+    else:
+        # SUPERSEDED r8 (ruling c, f): an image never rejects a record, and this one is unstamped: the live pid HOLDS. Was: free.
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
 
 
 # Adversary pass 7 on fb5c5b1e (A2 an old record's reuse mark rejects a newer record, A3 an escaped second pid outside the parser's walk, A4 escaped pid
@@ -3456,13 +3491,14 @@ def test_r7_a2_an_older_records_reused_mark_cannot_reject_a_newer_records_driver
 
 
 def test_r7_a2_a_snapshot_taken_after_the_newer_record_still_rejects_the_foreign_image(tmp_path):
-    """Guard: the snapshot is newer than every record, so its git.exe row IS the current holder of the pid: free."""
+    """Guard: the snapshot is newer than every record, so its git.exe row IS the current holder of the pid: free.
+    SUPERSEDED r8 (ruling c, f): z-new.child.json is unstamped and an image never rejects a record: the live pid HOLDS. Was: free."""
     now = time.time()
     wt, runs, rd = _r6_run_dir(tmp_path, now)
     _r7_old_stamped_marker(rd, now)
     _write_record(rd, "z-new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972}, now - 30)
     r, err = _live_refusal(wt, _fake_snapshot_at(0, _fake_proc_created(999972, "", "git.exe", now - 3600)), runs)
-    assert r is None, (r, err)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
 
 
 @pytest.mark.parametrize("extra", [
@@ -3542,6 +3578,119 @@ def test_r7_one_reader_feeds_the_pid_rows_and_the_root_stamp_count():
     for fn in ("Get-RunDirPidIndex", "Get-RecordedCreatedUtcMap"):
         m = re.search(r"function " + fn + r".*?\n}\n", text, re.S)
         assert m and "Get-RecordPidMembers" in m.group(0), fn
+
+
+# --- r8 (HUB-TICK 20261103T1435Z step E, FAIL-CLOSED IDENTITY): adversary pass 9 on 14825b15 (A1 :1073, A2 :1012, advisory A3 :1065) and Dot B1
+# (cos-feedback pr-744 2026-11-03T14:28:00Z, :294 / :848-850). A live pid named by a record in a run dir tied to the worktree is a HOLDER unless the
+# record's kernel creation stamp differs from the pid's CURRENT creation time, read at decision time (Get-LivePidIdentity, a per-pid query). No
+# wall-clock or snapshot-age comparison, no previous holder's command line or image, can free it. The seam below plays the per-pid query: the pid is
+# running NOW as $name, created at $epoch (None = creation time unreadable).
+
+def _r8_live(pid, name, epoch):
+    created = _utc_expr(epoch) if epoch is not None else "$null"
+    return ("function Get-LivePidIdentity { param([int]$ProcessId) "
+            f"if ($ProcessId -eq {pid}) {{ return [pscustomobject]@{{ Name = '{name}'; CreationDate = {created} }} }}; return $null }};")
+
+
+def test_r8_a1_a_record_published_after_capture_is_not_rejected_by_the_previous_holders_command_line(tmp_path):
+    """r8 A1 (pass 9, :1073): the snapshot row for pid 999972 is the PREVIOUS holder (git.exe -C C:\\other status, created an hour ago). The genuine
+    driver took the pid after capture and published new.child.json with its own stamp; it is running now. A stale non-empty command line that does
+    not name the run dir must not reject the run-dir tie: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 60)}, now - 30)
+    row = _fake_proc_created(999972, "git.exe -C C:\\other status", "git.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 60))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("cmdline", ["", "pwsh.exe -NoProfile"], ids=["empty-cmdline", "foreign-cmdline"])
+def test_r8_a2_a_backward_clock_step_cannot_turn_a_stale_row_into_a_reuse_proof(tmp_path, cmdline):
+    """r8 A2 (pass 9, :1012): capture at T; the old pid-999972 row (created T-1h) is read; the clock steps back 60 s; the genuine replacement starts at
+    T-59.8 s by the stepped clock and publishes new.child.json (mtime T-59.7 s, BEFORE the capture by wall clock). The record therefore reads as older
+    than the snapshot, and the stale row's creation 'mismatch' used to become a reuse mark. The driver is running now with the stamped creation: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    start = now - 59.8
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat()}, now - 59.7)
+    row = _fake_proc_created(999972, cmdline, "pwsh.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs, prelude=_r8_live(999972, "pwsh.exe", start))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("shape", ["unreadable-cmdline", "names-only-the-run-dir"])
+def test_r8_dot_b1_an_unstamped_driver_after_a_clock_rollback_is_still_a_live_driver(tmp_path, shape):
+    """Dot B1 (:294, :848-850): a genuine UNSTAMPED driver starts at 12:00; the clock rolls back to 11:57; its pid file is written (mtime 11:57). A
+    current snapshot then lists it, created 12:00. started-after-record (180 s > the 120 s skew) made it Bound=false and the refusal was lost.
+    Unstamped record + live pid = HOLDER, always (ruling f)."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    started = now - 600                       # 12:00
+    _write_record(rd, "venue-driver.pid", "999972\n", started - 180)   # written at 11:57 by the rolled-back clock
+    cl = "" if shape == "unreadable-cmdline" else _driver_cmdline(rd)
+    row = _fake_proc_created(999972, cl, "pwsh.exe", started)
+    for prelude in ("", _r8_live(999972, "pwsh.exe", started)):
+        r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs, prelude=prelude)
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (prelude, r, err)
+
+
+def test_r8_a3_a_pid_absent_from_the_snapshot_but_running_now_is_a_live_driver(tmp_path):
+    """r8 A3 (advisory, :1065, in scope by ruling d): the snapshot (captured before the driver started) has no row for pid 999972; the driver is running
+    now and published its stamped record. Liveness comes from the per-pid query at decision time: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 60)}, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120), runs, prelude=_r8_live(999972, "pwsh.exe", now - 60))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120), runs)             # control: not in the snapshot and not running now holds nothing
+    assert r is None, (r, err)
+
+
+def test_r8_an_unreadable_current_creation_time_never_proves_reuse_from_a_stale_row(tmp_path):
+    """r8 (a): the pid is running now but its creation time cannot be read; the snapshot row (the previous holder, older than the record by wall clock)
+    differs from the stamp. Only the CURRENT creation time can prove reuse, so the stale row proves nothing: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 7200)}, now - 7000)
+    row = _fake_proc_created(999972, "", "git.exe", now - 86400)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs, prelude=_r8_live(999972, "git.exe", None))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r8_reuse_is_proven_only_by_the_current_creation_time(tmp_path):
+    """r8 (a), the genuine-reuse control at decision time: the stamped driver exited after the snapshot (whose row still matches the stamp) and the pid
+    now runs another process. The CURRENT creation time differs from the stamp: reuse is proven, free. The same record with the current process
+    matching the stamp is held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    stamp = now - 7200
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(stamp)}, now - 7000)
+    row = _fake_proc_created(999972, "", "pwsh.exe", stamp)
+    r, err = _live_refusal(wt, _fake_snapshot_at(60, row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 30))
+    assert r is None, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(60, row), runs, prelude=_r8_live(999972, "pwsh.exe", stamp))
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+
+
+def test_r8_an_unreadable_record_is_not_cleared_by_a_live_pids_foreign_command_line(tmp_path):
+    """r8 (c), sibling :1090: a record that cannot be parsed may name any pid. The only live pid's command line names neither the worktree nor the run
+    dir (git.exe -C C:\\other status), which used to clear the record. Command-line evidence only ADDS a holder: refused while the run dir is tied."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"p\\u0069d":999972,"createdUtc":', now - 30)
+    row = _fake_proc_created(999972, "git.exe -C C:\\other status", "git.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+    assert r is not None and r["reason"] == "rundir-census-failed" and "unparsable" in r["detail"], (r, err)
+
+
+def test_r8_no_wall_clock_heuristic_remains_in_the_driver_decision():
+    """r8 (b), structural: the started-after-record rule, its clock skew and the record-newer-than-snapshot comparisons are gone; the decision reads the
+    pid's identity through the per-pid query."""
+    text = Path(HELPER).read_text(encoding="utf-8")
+    for gone in ("RunDirRecordClockSkewSec", "started-after-record", "function Test-RecordedPidBound", "$recNewer", "$staleVsSnapshot", "$rejectedAsReused"):
+        assert gone not in text, gone
+    body = re.search(r"function Find-RunDirDriverHolders.*?\n}\n", text, re.S)
+    assert body and "Get-LivePidIdentity" in body.group(0) and "CapturedUtc" not in body.group(0) and "RecordedAtUtc" not in body.group(0)
 
 
 def test_gate_census_failures_write_a_typed_refused_line(repo):
