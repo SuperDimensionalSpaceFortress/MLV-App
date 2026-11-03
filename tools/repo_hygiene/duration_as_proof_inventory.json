@@ -2525,6 +2525,36 @@
       "lines": [
         86
       ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( ! ( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 armPlaybackDueWake: dueMs is a FUTURE wait computed by NativePaceGuard::msUntilCredit (how long until the pace credit covers the next frame), not a measured duration. A non-positive wait means the credit already covers the frame; with the tail advance having reached a new frame (the completed-flag m_playbackTailAdvanceMovedFrame) nothing is left to wake for, so the wake is not armed. A scheduling decision; it never proves a stage ran.",
+      "lines": [
+        19552
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( ! ( dueMs > 0.0 ) ) dueMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 PlaybackDueWake::arm: clamps a requested FUTURE wait (negative or NaN) to 'fire now' before it is converted to a waitable-timer due time. Input sanitising of a timer argument, not a measured duration and never a run-proof.",
+      "lines": [
+        264
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_native_pace_guard.cpp",
+      "anchor": "ASSERT_EQ ( 1 , source . count ( QStringLiteral ( \"if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;\" ) ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Source-text wiring test (adversary r1 A1 of HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1) that counts the armPlaybackDueWake line pinned in the MainWindow.cpp row above; no duration is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        1244
+      ]
     }
   ]
 }

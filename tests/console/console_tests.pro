@@ -78,6 +78,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
+    $$REPO_ROOT/tests/console/test_playback_due_wake_native.cpp \
+    $$REPO_ROOT/platform/qt/PlaybackDueWake.cpp \
     $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
     $$REPO_ROOT/tests/console/test_playback_startup_split.cpp \
     $$REPO_ROOT/tests/console/test_playback_audio_start_policy.cpp \
@@ -141,6 +143,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
     $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
+    $$REPO_ROOT/platform/qt/PlaybackDueWake.h \
     $$REPO_ROOT/platform/qt/PlaybackPresentTrace.h \
     $$REPO_ROOT/platform/qt/PlaybackSwapInterval.h \
     $$REPO_ROOT/platform/qt/PlaybackScopesDuringPlayback.h \

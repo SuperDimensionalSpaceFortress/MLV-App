@@ -1199,6 +1199,8 @@ private:
     int m_playbackDueWakeAdvanced = 0;
     int m_playbackDueWakeRearmed = 0;
     int m_playbackDueWakeBusyDeferred = 0;
+    int m_playbackDueWakeUnpresentedDeferred = 0;       // r2 A1: every-frame wake held until the requested frame presented
+    const char *m_playbackDueWakeDelivery = "none";     // r2: native-msg | notifier | qtimer (summary line)
     std::vector<double> m_playbackDueWakeLatenessMs;
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the

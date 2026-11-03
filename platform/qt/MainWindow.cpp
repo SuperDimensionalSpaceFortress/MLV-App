@@ -2683,6 +2683,9 @@ MainWindow::~MainWindow()
 {
     killTimer( m_timerId );
     killTimer( m_timerCacheId );
+    // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: join the due wake's wait thread and drop its window and native
+    // filter first, while every object its callback touches is still alive
+    m_playbackDueWake.reset();
     flushPhase3PlaybackTime( true );
 
     //Stop playback-prep worker before tearing down render state it may reference.
@@ -19505,12 +19508,19 @@ double MainWindow::playbackPaceGuardFps( void )
 // advances, as before). Default on.
 static bool mlvappPlaybackDueWakeEnabled()
 {
-    static const bool enabled = []() {
-        bool ok = false;
-        const int env = qEnvironmentVariableIntValue( "MLVAPP_PLAYBACK_DUE_WAKE", &ok );
-        return !( ok && env == 0 );
-    }();
+    // read once: PlaybackDueWake::enabledByEnvironment() is the parse (pinned by the console tests)
+    static const bool enabled = PlaybackDueWake::enabledByEnvironment();
     return enabled;
+}
+
+// HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r2: MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY=notifier keeps r1's QWinEventNotifier
+// delivery (an isolation arm); anything else uses the native-message wait thread, with the notifier as its fallback.
+static bool mlvappPlaybackDueWakePreferNativeMessage()
+{
+    static const bool preferNative =
+        qEnvironmentVariable( "MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY" ).trimmed().compare( QStringLiteral( "notifier" ),
+                                                                                         Qt::CaseInsensitive ) != 0;
+    return preferNative;
 }
 
 // The wake lands this long after the credit covers the frame, so the guard's grant at the wake is never a hair short.
@@ -19542,9 +19552,11 @@ void MainWindow::armPlaybackDueWake( void )
     if( !( dueMs > 0.0 ) && m_playbackTailAdvanceMovedFrame ) return;
     if( !m_playbackDueWake )
     {
-        m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); } ) );
+        m_playbackDueWake.reset( new PlaybackDueWake( this, [this]() { onPlaybackDueWake(); },
+                                                      mlvappPlaybackDueWakePreferNativeMessage() ) );
         m_playbackDueWake->beginPlay();   // created inside a Play: on_actionPlay_toggled could not begin it
     }
+    m_playbackDueWakeDelivery = PlaybackDueWake::deliveryName( m_playbackDueWake->delivery() );
     m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
     m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
     ++m_playbackDueWakeArmed;
@@ -19566,6 +19578,16 @@ void MainWindow::onPlaybackDueWake( void )
         // the frameReady / drawFrameReady paths consume the pending advance when the render lands
         m_playbackFrameAdvancePending = true;
         ++m_playbackDueWakeBusyDeferred;
+        return;
+    }
+    // adversary r1 pass 3 A1: every-frame mode advances only past the frame on screen. A Ready frame whose frameReady is
+    // not sent yet does not read as busy above, so without this the wake requested N+1 over the unpresented N and
+    // latest-ready acquisition skipped N; drawFrameReady presents N and its advance consumes the pending flag.
+    if( !playbackDueWakeMayAdvance( m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
+                                    m_lastPresentedPlaybackFrame, ui->horizontalSliderPosition->value() ) )
+    {
+        m_playbackFrameAdvancePending = true;
+        ++m_playbackDueWakeUnpresentedDeferred;
         return;
     }
     const int positionBefore = ui->horizontalSliderPosition->value();
@@ -19607,7 +19629,9 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeAdvanced = 0;
     m_playbackDueWakeRearmed = 0;
     m_playbackDueWakeBusyDeferred = 0;
+    m_playbackDueWakeUnpresentedDeferred = 0;
     m_playbackDueWakeHiRes = false;
+    m_playbackDueWakeDelivery = "none";
     m_playbackDueWakeLatenessMs.clear();
 }
 
@@ -19625,7 +19649,7 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
     const double p50 = percentile( 0.50 );
     const double p95 = percentile( 0.95 );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
-                           "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9" )
+                           "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )
         .arg( m_playbackDueWakeArmed )
         .arg( m_playbackDueWakeFired )
         .arg( m_playbackDueWakeAdvanced )
@@ -19634,7 +19658,9 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( p50, 0, 'f', 3 )
         .arg( p95, 0, 'f', 3 )
         .arg( m_playbackDueWakeHiRes ? 1 : 0 )
-        .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 );
+        .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 )
+        .arg( QString::fromLatin1( m_playbackDueWakeDelivery ) )
+        .arg( m_playbackDueWakeUnpresentedDeferred );
 }
 
 //Paint the Audio Track Wave to GUI
