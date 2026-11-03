@@ -590,3 +590,211 @@ TEST(CpuDualIsoPreviewScale, ReducedIsoNotchScratchFailureFallsBackToFullRes)
     ASSERT_TRUE(reducedPathTaken(fixture, 1, 4, nullptr, nullptr));
     ASSERT_EQ(notchFrames + 1, mlvDualIsoReducedIsoNotchFrames());
 }
+
+// HFR-NATIVE-M16-1457-RECON-LUT-KEEP-1: the NO_PUBLISH tail of the scaled llrawproc
+// subset restores the worker's runtime levels when its reduced-data estimate differs
+// from the shared seed. Its raw2ev/ev2raw LUTs depend only on the black level they
+// were built for, so that restore keeps them: the next call on the same worker with an
+// unchanged black level rebuilds nothing (on 381d2133 it rebuilt both tables, ~16 ms on
+// the M16-1457 recon worker), keeps the same tables, and produces the same bytes as a
+// worker forced to rebuild (the pre-card behaviour). A changed black level still
+// rebuilds. The shared seed below (auto -2, ev 1, black delta -1) makes the subset
+// estimate, so the restore really runs; the publish arm proves the estimate differs.
+namespace {
+
+const size_t kLutKeepEvResolution = 65536u;  // EV_RESOLUTION (pixelproc.c)
+
+struct LutKeepCall
+{
+    int rc = 0;
+    int lutRebuilds = -1;
+    std::vector<uint16_t> out;
+};
+
+void seedUnsettledExposureMatch(MlvPipelineFixture & fixture, std::vector<uint16_t> & raw)
+{
+    llrpEnsureDualIsoPatternSeeded(fixture.video(), raw.data(), fixture.width(), fixture.height());
+    fixture.video()->llrawproc->diso_auto_correction = -2;
+    fixture.video()->llrawproc->diso_ev_correction = 1;
+    fixture.video()->llrawproc->diso_black_delta = -1;
+}
+
+LutKeepCall scaledSubsetCall(MlvPipelineFixture & fixture, const std::vector<uint16_t> & raw,
+                             llrawprocWorkerState_t * worker, int flags)
+{
+    LutKeepCall call;
+    const int fullW = fixture.width();
+    const int sourceH = (fixture.height() / 16) * 16;
+    call.out.assign(static_cast<size_t>(fullW / 4) * static_cast<size_t>(sourceH / 4), 0);
+    int w = 0, h = 0;
+    if (pl_downsample_bayer_to_bayer_4x(raw.data(), fullW, sourceH, call.out.data(), &w, &h, 1) != 0)
+        return call;
+    call.rc = applyLLRawProcObjectWorker_with_dims(fixture.video(), call.out.data(),
+                                                   call.out.size() * sizeof(uint16_t), w, h, worker, flags);
+    llrpResidualSubstageTiming_t residual;
+    llrpGetLastResidualSubstageTiming(&residual);
+    call.lutRebuilds = residual.lut_rebuilds;
+    return call;
+}
+
+// raw2ev is EV_RESOLUTION entries; ev2raw points 10 * EV_RESOLUTION into a
+// 24 * EV_RESOLUTION allocation (pixelproc.c get_ev2raw).
+bool lutsEqual(const llrawprocWorkerState_t & a, const llrawprocWorkerState_t & b)
+{
+    if (!a.raw2ev || !a.ev2raw || !b.raw2ev || !b.ev2raw) return false;
+    const ptrdiff_t ev2rawBase = 10 * static_cast<ptrdiff_t>(kLutKeepEvResolution);
+    return std::memcmp(a.raw2ev, b.raw2ev, kLutKeepEvResolution * sizeof(int)) == 0
+        && std::memcmp(a.ev2raw - ev2rawBase, b.ev2raw - ev2rawBase,
+                       24u * kLutKeepEvResolution * sizeof(int)) == 0;
+}
+
+} // namespace
+
+TEST(CpuDualIsoPreviewScale, NoPublishRestoreKeepsValidLuts)
+{
+    KillSwitchGuard guard;
+    const int noPublish = LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED | LLRP_WITH_DIMS_NO_PUBLISH;
+
+    // Publish arm: the same call without NO_PUBLISH publishes a different estimate,
+    // so with NO_PUBLISH the runtime state differs from the seed and is restored.
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openHqFixture(fixture, false));
+        std::vector<uint16_t> raw = decodeRaw(fixture, 0);
+        ASSERT_FALSE(raw.empty());
+        seedUnsettledExposureMatch(fixture, raw);
+        WorkerState worker;
+        ASSERT_EQ(1, scaledSubsetCall(fixture, raw, &worker.state, LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED).rc);
+        const SharedDualIsoState s = sharedState(fixture);
+        ASSERT_TRUE(s.evCorrection != 1.0 || s.blackDelta != -1);
+    }
+
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openHqFixture(fixture, false));
+    std::vector<uint16_t> raw = decodeRaw(fixture, 0);
+    ASSERT_FALSE(raw.empty());
+    seedUnsettledExposureMatch(fixture, raw);
+    const int32_t black = static_cast<int32_t>(fixture.video()->RAWI.raw_info.black_level);
+
+    WorkerState kept;
+    const LutKeepCall first = scaledSubsetCall(fixture, raw, &kept.state, noPublish);
+    ASSERT_EQ(1, first.rc);
+    ASSERT_EQ(1, first.lutRebuilds);                 // a fresh worker builds its tables once
+    ASSERT_EQ(1.0, kept.state.diso_ev_correction);   // restored to the seed
+    ASSERT_EQ(-1, kept.state.diso_black_delta);
+    ASSERT_EQ(black, kept.state.prev_black_level);   // 381d2133: -1 (tables discarded)
+    const int * const raw2ev = kept.state.raw2ev;
+    const int * const ev2raw = kept.state.ev2raw;
+
+    // The pre-card behaviour, emulated: the restore discarded the tables.
+    WorkerState rebuilt;
+    ASSERT_EQ(1, scaledSubsetCall(fixture, raw, &rebuilt.state, noPublish).rc);
+    rebuilt.state.prev_black_level = -1;
+
+    const LutKeepCall second = scaledSubsetCall(fixture, raw, &kept.state, noPublish);
+    ASSERT_EQ(1, second.rc);
+    ASSERT_EQ(0, second.lutRebuilds);                // 381d2133: 1
+    ASSERT_TRUE(kept.state.raw2ev == raw2ev);
+    ASSERT_TRUE(kept.state.ev2raw == ev2raw);
+
+    const LutKeepCall secondRebuilt = scaledSubsetCall(fixture, raw, &rebuilt.state, noPublish);
+    ASSERT_EQ(1, secondRebuilt.rc);
+    ASSERT_EQ(1, secondRebuilt.lutRebuilds);
+    ASSERT_TRUE(lutsEqual(kept.state, rebuilt.state)); // kept tables == freshly built ones
+    ASSERT_TRUE(second.out == secondRebuilt.out);       // byte-identical output
+    ASSERT_TRUE(second.out == first.out);
+}
+
+TEST(CpuDualIsoPreviewScale, NoPublishRestoreStillRebuildsLutsOnBlackLevelChange)
+{
+    KillSwitchGuard guard;
+    const int noPublish = LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED | LLRP_WITH_DIMS_NO_PUBLISH;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openHqFixture(fixture, false));
+    std::vector<uint16_t> raw = decodeRaw(fixture, 0);
+    ASSERT_FALSE(raw.empty());
+    seedUnsettledExposureMatch(fixture, raw);
+    const int black = fixture.video()->RAWI.raw_info.black_level;
+
+    WorkerState worker;
+    ASSERT_EQ(1, scaledSubsetCall(fixture, raw, &worker.state, noPublish).rc);
+    ASSERT_EQ(black, worker.state.prev_black_level);
+    const LutKeepCall same = scaledSubsetCall(fixture, raw, &worker.state, noPublish);
+    ASSERT_EQ(0, same.lutRebuilds);
+
+    const int changedBlack = black + 16;
+    fixture.video()->RAWI.raw_info.black_level = changedBlack;
+    const LutKeepCall changed = scaledSubsetCall(fixture, raw, &worker.state, noPublish);
+    WorkerState fresh;
+    const LutKeepCall freshCall = scaledSubsetCall(fixture, raw, &fresh.state, noPublish);
+    fixture.video()->RAWI.raw_info.black_level = black;
+    ASSERT_TRUE(changed.lutRebuilds >= 1);
+    ASSERT_EQ(freshCall.lutRebuilds, changed.lutRebuilds);
+    ASSERT_EQ(freshCall.rc, changed.rc);
+    ASSERT_EQ(fresh.state.prev_black_level, worker.state.prev_black_level);
+    ASSERT_TRUE(worker.state.prev_black_level == changedBlack || worker.state.prev_black_level == -1);
+    if (worker.state.prev_black_level == changedBlack)
+    {
+        ASSERT_TRUE(lutsEqual(worker.state, fresh.state));
+    }
+    ASSERT_TRUE(changed.out == freshCall.out);
+}
+
+// Parity on the real routes: s1 (full-res worker recon) and s2/s4
+// (mlvDualIsoPreviewScaleReconRun), frames 0,1,0,1 on one persistent worker, against
+// the same sequence with the tables discarded before every call (381d2133's restore).
+// Byte-identical, no tolerance.
+TEST(CpuDualIsoPreviewScale, LutKeepIsByteIdenticalAtScale1And2And4)
+{
+    KillSwitchGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openHqFixture(fixture, false));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const uint64_t frames[] = { 0u, 1u, 0u, 1u };
+
+    {
+        WorkerState kept;
+        WorkerState rebuilt;
+        for (const uint64_t frame : frames)
+        {
+            std::vector<uint16_t> a = decodeRaw(fixture, frame);
+            std::vector<uint16_t> b = a;
+            ASSERT_FALSE(a.empty());
+            applyLLRawProcObjectWorker(fixture.video(), a.data(), a.size() * sizeof(uint16_t), &kept.state, 0);
+            rebuilt.state.prev_black_level = -1;
+            applyLLRawProcObjectWorker(fixture.video(), b.data(), b.size() * sizeof(uint16_t), &rebuilt.state, 0);
+            ASSERT_TRUE(a == b);
+        }
+    }
+
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        ASSERT_TRUE(mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan) && plan.scale == scale);
+        WorkerState kept;
+        WorkerState rebuilt;
+        int keptRebuildsAfterFirst = 0;
+        bool firstCall = true;
+        for (const uint64_t frame : frames)
+        {
+            std::vector<uint16_t> raw = decodeRaw(fixture, frame);
+            ASSERT_FALSE(raw.empty());
+            std::vector<uint16_t> raw2 = raw;
+            const size_t n = static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight);
+            std::vector<uint16_t> a(n), b(n);
+            ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), a.data(),
+                                                        &kept.state, 1, nullptr, nullptr));
+            llrpResidualSubstageTiming_t residual;
+            llrpGetLastResidualSubstageTiming(&residual);
+            if (!firstCall) keptRebuildsAfterFirst += residual.lut_rebuilds;
+            firstCall = false;
+            rebuilt.state.prev_black_level = -1;
+            ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw2.data(), b.data(),
+                                                        &rebuilt.state, 1, nullptr, nullptr));
+            ASSERT_TRUE(a == b);
+        }
+        std::printf("[cpu-dualiso-preview-scale] lut-keep x%d: rebuilds after the first call %d\n",
+                    scale, keptRebuildsAfterFirst);
+        ASSERT_EQ(0, keptRebuildsAfterFirst);
+    }
+}

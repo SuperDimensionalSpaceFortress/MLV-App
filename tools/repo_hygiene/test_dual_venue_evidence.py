@@ -144,7 +144,8 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 # CUDA-HEADROOM-1: the unpaced throughput legs (both clips, the D4 cells) and the stage-attribution legs (HEAVY telemetry + CUDA launch timing).
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
-                 "legs/m16-1457-headroom-stage-fullscreen-s1.json")
+                 # CUDA-HEADROOM-HFR-1 r2: the M16-1457 stage leg at s2/s4 (the s1 spec with only legId and scaleFactor changed).
+                 *(f"legs/m16-1457-headroom-stage-fullscreen-s{scale}.json" for scale in (1, 2, 4)))
 # BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
 # (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
 PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
@@ -187,6 +188,14 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
                             for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
+# HFR-NATIVE-M16-1457-RECON-LUT-KEEP-1 r2: the paced M16-1457 native s2/s4 legs (the #420 s1 native shape with legId and scaleFactor changed, card
+# CUDA-HEADROOM-1, Look Assist forced Cinematic, visual strips on): the paced picture evidence for the NO_PUBLISH LUT-keep change.
+NATIVE_PACED_LEGS = tuple(f"legs/m16-1457-native-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_PACED_LEGS)
+# HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1: the per-present trace twins of the paced M16-1457 native s2/s4 legs, keyed to the leg each one twins.
+# Each differs from its twin only in its legId (native- -> native-trace-) and generatorArgs.presentTrace true (still paced, LIGHT, Look Assist Cinematic).
+NATIVE_TRACE_LEGS = {rel.replace("/m16-1457-native-", "/m16-1457-native-trace-"): rel for rel in NATIVE_PACED_LEGS}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -2872,7 +2881,7 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
         self.assertTrue((local / "sheet-unit-leg-ultra-magnus-cpu-classic.png").exists())
 
     def test_mutation_without_the_sheet_copy_guard_an_owner_sheet_is_copied_anywhere(self) -> None:
-        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {", "if ($false) {")])
+        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "    $SheetCopyDir = Test-DvLocalReceiptRoot -Path $SheetCopyDir", "    $null = Test-DvLocalReceiptRoot -Path $SheetCopyDir")])
         self.write_artifacts(sheet=True)
         published = self.tmp / "published"
         self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-SheetCopyDir", str(published), "-Backend", "cpu"], dv=mutated)
@@ -6882,6 +6891,24 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
             self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
 
+    def test_the_native_trace_legs_are_their_paced_twins_with_the_trace_on(self) -> None:
+        """HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1: a native trace leg differs from its paced native twin only in its legId and
+        generatorArgs.presentTrace true, so the trace legs measure the same paced shape (no unpaced, no swapInterval, LIGHT)."""
+        self.assertEqual(sorted(NATIVE_TRACE_LEGS.values()), sorted(NATIVE_PACED_LEGS))
+        for rel, twin_rel in NATIVE_TRACE_LEGS.items():
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+            self.assertNotIn("presentTrace", twin["generatorArgs"], twin_rel)
+            self.assertEqual(arm["legId"], twin["legId"].replace("m16-1457-native-", "m16-1457-native-trace-"), rel)
+            self.assertEqual(arm["legId"], Path(rel).stem, rel)
+            for key in ("unpaced", "swapInterval"):
+                self.assertNotIn(key, arm["generatorArgs"], rel)
+            self.assertEqual(arm["generatorArgs"]["telemetryArm"], "LIGHT", rel)
+            self.assertIs(arm["generatorArgs"].pop("presentTrace"), True, rel)
+            self.assertEqual(list(arm["generatorArgs"]), list(twin["generatorArgs"]), rel)
+            self.assertEqual(dict(arm, legId=twin["legId"]), twin, rel)
+
     def test_the_identity_legs_are_their_twins_with_the_capture_on(self) -> None:
         """PLAYBACK-STARTUP-WAIT-PREWARM-1: an identity leg differs from its twin only in its legId and generatorArgs.firstPresentCapture true."""
         self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["firstPresentCapture"]["type"], "boolean")
@@ -7019,6 +7046,14 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["backends"], ["cpu"], path.name)
                 self.assertEqual(spec["generatorArgs"]["playbackProcessing"], "receipt", path.name)
+            elif spec["card"] == "CUDA-HEADROOM-1" and "legs/" + path.name in (*NATIVE_PACED_LEGS, *NATIVE_TRACE_LEGS):   # the PACED M16-1457 native s2/s4 legs (r2 of the LUT-keep card)
+                # and their per-present trace twins (HFR-NATIVE-M16-1457-PRESENT-TRACE-LEGS-1, NATIVE_TRACE_LEGS; presentTrace only on a -trace- leg)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(trace-)?(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"].get("presentTrace", False), "-trace-" in spec["legId"], path.name)
+                # paced: no unpaced switch and no swap-interval override (the app's own pacing), so the leg measures the shipping shape
+                self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
+                self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
