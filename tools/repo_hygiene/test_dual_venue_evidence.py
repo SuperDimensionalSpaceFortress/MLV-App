@@ -8988,6 +8988,43 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(out, expected)
 
+    def test_missing_or_invalid_frame_evidence_is_unknown_never_identical_and_never_a_throw(self) -> None:
+        """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key on 27da457e): equal ids over display frames -0.4 and 1 read known-identical
+        ([int]-0.4 is 0); a $null frame between two good ones was filtered away and the rest read known-identical; a display frame of
+        2147483648 or an object threw. Each is unknown now: a frame without evidence is unknown evidence, never a static clip."""
+        a = "00000000000000aa"
+        good0 = f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 0 }}"
+        good1 = f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 1 }}"
+        rows = ((f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = -0.4 }}, {good1}", "fractional below zero"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 1.5 }}, {good0}", "fractional"),
+                (f"{good0}, $null, {good1}", "a null frame"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 2147483648 }}, {good0}", "past Int32"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = [long]-3 }}, {good0}", "negative long"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = @{{ value = 1 }} }}, {good0}", "an object"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = '1' }}, {good0}", "a string"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = $true }}, {good0}", "a boolean"))
+        for items, why in rows:
+            with self.subTest(why=why):
+                proc, out = run_pwsh_json(f"ConvertTo-Json -Compress -InputObject (Get-DvVisualSourceDifference -Frames @({items}))")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out, "unknown", why)
+        # a JSON integer as ConvertFrom-Json gives it ([long]) is still a frame number
+        proc, out = run_pwsh_json("ConvertTo-Json -Compress -InputObject (Get-DvVisualSourceDifference -Frames @(('[{\"sourceId\":\"00000000000000aa\",\"displayFrame\":0},"
+                                  "{\"sourceId\":\"00000000000000aa\",\"displayFrame\":1}]' | ConvertFrom-Json)))")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out, "known-identical")
+
+    def test_the_frame_number_reader_takes_only_whole_numbers_in_range_and_never_throws(self) -> None:
+        """r5 class sweep: Get-DvFrameNumber is what the appDistinctDisplayFrames count and the repeated-play-frame walk read the same display
+        frames through (Read-DvVisualCaptures), so an overflowing or object display frame no longer throws there either."""
+        rows = (("0", 0), ("[long]7", 7), ("2147483647", 2147483647), ("2147483648", None), ("-1", None), ("-0.4", None), ("1.5", None),
+                ("1.0", None), ("'3'", None), ("$null", None), ("@{ value = 1 }", None), ("$true", None))
+        for expr, expected in rows:
+            with self.subTest(expr=expr):
+                proc, out = run_pwsh_json(f"ConvertTo-Json -Compress -InputObject @{{ v = (Get-DvFrameNumber ({expr})) }}")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["v"], expected)
+
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:
             proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{d}' -EvidenceDir '{d}' -LegId 'unit-leg' | ConvertTo-Json -Depth 8 -Compress")

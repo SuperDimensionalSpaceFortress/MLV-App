@@ -2295,6 +2295,21 @@ function Get-DvVisualVerdict {
     [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $waivedReason }
 }
 
+function Get-DvFrameNumber {
+    <#
+    .SYNOPSIS
+    A display frame number as the app writes it (a JSON integer, 0..Int32.MaxValue) -> [int]; anything else -> $null (pure, never throws).
+    PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key): [int] on -0.4 is 0 and on 1.5 is 2, on 2147483648 or an object it throws; none is a frame.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $integral = $Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte] -or
+                $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64] -or $Value -is [System.Numerics.BigInteger]
+    if (-not $integral) { return $null }
+    if ($Value -lt 0 -or $Value -gt [int]::MaxValue) { return $null }
+    [int]$Value
+}
+
 function Get-DvVisualSourceDifference {
     <#
     .SYNOPSIS
@@ -2306,15 +2321,19 @@ function Get-DvVisualSourceDifference {
     over, so the two numbers the frozen gate compares come from ONE population.
     #>
     param([object[]]$Frames = @())
-    $judged = @($Frames | Where-Object { $null -ne $_ })
+    # PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key on 27da457e): missing or invalid evidence is unknown, never known-identical and never a
+    # throw. A $null frame is a judged frame with no evidence (it is not filtered away), and a display frame that is not a whole number in
+    # 0..Int32.MaxValue (-0.4, 1.5, 2147483648, an object) is no display frame (Get-DvFrameNumber).
+    $judged = @($Frames)
     if ($judged.Count -lt 2) { return 'unknown' }
     $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $displayFrames = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($f in $judged) {
-        $id = Get-DvProp $f 'sourceId'; $displayFrame = Get-DvProp $f 'displayFrame'
+        if ($null -eq $f) { return 'unknown' }
+        $id = Get-DvProp $f 'sourceId'; $displayFrame = Get-DvFrameNumber (Get-DvProp $f 'displayFrame')
         if (-not ($id -is [string] -and $id -cmatch '^[0-9a-f]{16}\z')) { return 'unknown' }   # \z: a trailing newline is not the app's form either
-        if ($null -eq $displayFrame -or [int]$displayFrame -lt 0) { return 'unknown' }
-        [void]$ids.Add($id); [void]$displayFrames.Add([int]$displayFrame)
+        if ($null -eq $displayFrame) { return 'unknown' }
+        [void]$ids.Add($id); [void]$displayFrames.Add($displayFrame)
     }
     if ($displayFrames.Count -lt 2) { return 'unknown' }
     if ($ids.Count -gt 1) { return 'known-differ' }
@@ -2561,7 +2580,8 @@ function Read-DvVisualCaptures {
         $crossCheckNote = "the app's $appWord (over every play capture) is not the $($block.sourceDifference) the $($play.Count) judged frames' source ids show; the judged frames decide"
     }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
-    $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
+    # r5 (sol r3 key class sweep): the same display frames reach here; a value that is not a frame number (Get-DvFrameNumber) is not counted, never a throw
+    $block.appDistinctDisplayFrames = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
     if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
@@ -2572,7 +2592,8 @@ function Read-DvVisualCaptures {
         $ordered = @($play | Sort-Object index)
         $block.repeatedPlayFrames = @(for ($i = 1; $i -lt $ordered.Count; $i++) {
             $a = $ordered[$i - 1]; $b = $ordered[$i]
-            if ($b.contentHash -ceq $a.contentHash -and $null -ne $a.displayFrame -and $null -ne $b.displayFrame -and [int]$b.displayFrame -ne [int]$a.displayFrame) { $b.index }
+            $aFrame = Get-DvFrameNumber $a.displayFrame; $bFrame = Get-DvFrameNumber $b.displayFrame   # r5: no frame number, no advance (never a throw)
+            if ($b.contentHash -ceq $a.contentHash -and $null -ne $aFrame -and $null -ne $bFrame -and $bFrame -ne $aFrame) { $b.index }
         }).Count
         if ($block.repeatedPlayFrames -gt 0 -and $block.distinctContentHashes -gt 1) {
             # the cause is named only over source frames known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
@@ -3466,7 +3487,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, Get-DvVisualSourceDifference, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,

@@ -531,7 +531,8 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * size otherwise), read under main_file_mutex[chunk] without decoding. Returns 0 and sets
  * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs,
  * MCRAW and CinemaDNG-folder sources (MLV containers only), an index out of range, a missing
- * index or file, a zero byte count, or a short read. Not for the playback path: it reads disk.
+ * index or file, a zero byte count, an encoded frame_size the decoder refuses (mlvRawFrameInputCapacity, r5),
+ * a failed seek (r5), or a short read. Not for the playback path: it reads disk.
  * r6 (adversary A1 on a9ae667a): for LJ92 it hashes only the bytes the decoder reads
  * (mlvLj92FrameSourceHash64), so two frames that decode alike are never known to differ. */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
@@ -544,7 +545,10 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
  * COM/APPn and every other skipped segment, header bytes the decoder ignores (component ids,
  * selectors) and filler between markers are not hashed. Returns 0 and sets *hashOut, or nonzero
  * (no identity) for NULL inputs, a payload under 4 bytes, no SOI, EOI before the scan, no DHT or
- * SOF3 before it, a predictor over 7, or a segment length the decoder would refuse. */
+ * SOF3 before it, a predictor over 7, or a segment length the decoder would refuse.
+ * r5 (opus r3 B1): the walk runs over a private COPY on which each DHT's class/id byte is set to 0 as liblj92's
+ * parseHuff sets it in the buffer it parses, so a later marker, segment length or scan header read that lands on that
+ * byte reads 0, as the decoder does. The caller's payload is never written. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
  * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves

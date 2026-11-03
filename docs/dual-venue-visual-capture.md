@@ -110,8 +110,9 @@ another read `differ` in the app's record, but the judged frames are a static cl
 `known-identical` source frames is a static clip, not frozen (`OK`, with the reason "one picture; the app records the source frames as
 identical: a static clip", so a wrong `identical` from a future build shows in the receipt). `playFrames` counts the judged play
 frames (those with a viewport); `savedPlayFrames` the play PNGs saved; `captured` is true when any was saved. The app side is
-tracked as `PLAYBACK-SOURCE-FRAME-IDENTITY-1`. No app build writes the field yet, so until one does a single picture reads
-`FROZEN_DISPLAY_SUSPECTED`. A self-heal pre-launch still needs `OK`, so either new verdict there makes the leg `INVALID`.
+tracked as `PLAYBACK-SOURCE-FRAME-IDENTITY-1`; a build that carries it writes `source_id` per capture and `source_difference`
+(next section). A build without it writes neither, and there a single picture reads `FROZEN_DISPLAY_SUSPECTED`. Missing or invalid
+frame evidence (a frame with no id, a display frame that is not a whole number from 0 to 2147483647) is `unknown`, never `known-identical`. A self-heal pre-launch still needs `OK`, so either new verdict there makes the leg `INVALID`.
 
 The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg: 6.0. The
 known-good Bachelor leg (M16-1243 windowed-s2, CPU, build `adf6185a`, receipt `a5d3ffbe`) measured 1.099 on its worst channel;

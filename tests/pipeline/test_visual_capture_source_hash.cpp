@@ -299,6 +299,107 @@ TEST(VisualCaptureSourceHash, Lj92AnOverSubscribedTablesUnreadSymbolIsNotHashed)
     ASSERT_TRUE(lj92Hash(second_symbol(0x0D), &status) != lj92Hash(second_symbol(0x0E), &status));
 }
 
+namespace
+{
+// r5 (opus r3 key B1 on 27da457e): SOI, SOF3, then a DHT marker whose length field (offset q = 17) starts with
+// `atDhtLength`, zero-padded to 66000 bytes so the decoder's hufflen check (q + 0xFFxx < length) passes.
+// liblj92's parseHuff zeroes the class/id byte (q + 2) in the buffer and does not advance, so the next marker
+// search starts at q: an FF there makes the DHT length field a marker, and the byte after it is read as 0.
+std::vector<uint8_t> classIdPayload(const std::vector<uint8_t> & atDhtLength)
+{
+    std::vector<uint8_t> out = bytes({ { 0xFF, 0xD8 }, kSof3, { 0xFF, 0xC4 }, atDhtLength });
+    out.resize(66000, 0);
+    return out;
+}
+
+// The key's repro: FF DA on the DHT length field. Entropy at q + 34 (scanstart q + 2 plus BEH(0, 0x20)).
+std::vector<uint8_t> sosOnDhtLength(uint8_t classId, bool flip)
+{
+    std::vector<uint8_t> v = bytes({ { 0xFF, 0xDA, classId, 0x20, 0x01, 0x00, 0x00, 0x01 }, zeros(11), { 0x00, 0x01 },
+                                     zeros(13), zeros(512) });
+    if (flip) v[100] = 0x80;
+    return classIdPayload(v);
+}
+
+// FF C3 on the DHT length field: an SOF3 of length BEH(0, 0x0B) at q + 2; SOS at q + 21, entropy at q + 31.
+std::vector<uint8_t> sofOnDhtLength(uint8_t classId, bool flip)
+{
+    std::vector<uint8_t> v = bytes({ { 0xFF, 0xC3, classId, 0x0B, 0x0E, 0x00, 0x40, 0x00, 0x40, 0x01 }, zeros(9),
+                                     { 0x00, 0x01 }, kSos, zeros(512) });
+    if (flip) v[100] = 0x80;
+    return classIdPayload(v);
+}
+
+// FF FE on the DHT length field: a COM of length BEH(0, 0x11) at q + 2; SOS at q + 21, entropy at q + 31.
+std::vector<uint8_t> comOnDhtLength(uint8_t classId, bool flip)
+{
+    std::vector<uint8_t> v = bytes({ { 0xFF, 0xFE, classId, 0x11 }, zeros(15), { 0x00, 0x01 }, kSos, zeros(512) });
+    if (flip) v[100] = 0x80;
+    return classIdPayload(v);
+}
+
+// FF C4 on the DHT length field: a second DHT at q + 2 (length BEH(0, 0xDA), its own class/id at q + 4 zeroed too);
+// its values at q + 21; SOS at q + 23, entropy at q + 33. A class/id of FF is NOT a marker to the decoder (it reads 0).
+std::vector<uint8_t> dhtOnDhtLength(uint8_t classId, bool flip)
+{
+    std::vector<uint8_t> v = bytes({ { 0xFF, 0xC4, classId, 0xDA, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 }, kSos,
+                                     zeros(512) });
+    if (flip) v[100] = 0x80;
+    return classIdPayload(v);
+}
+} // namespace
+
+// r5 B1, the key's repro verbatim: the decoder's entropy starts at q + 34; the old walk read the ORIGINAL class/id (01)
+// as the SOS length's high byte and started 256 bytes later, so A and B -- different pictures -- hashed equal.
+TEST(VisualCaptureSourceHash, Lj92AScanWhoseLengthIsTheZeroedClassIdStartsWhereTheDecoderStarts)
+{
+    const std::vector<uint8_t> a = sosOnDhtLength(0x01, false);
+    const std::vector<uint8_t> b = sosOnDhtLength(0x01, true);
+    std::vector<uint16_t> aPicture;
+    std::vector<uint16_t> bPicture;
+    ASSERT_TRUE(decodeLj92(a, &aPicture));
+    ASSERT_TRUE(decodeLj92(b, &bPicture));
+    ASSERT_TRUE(aPicture != bPicture); // the decoder reads byte q + 100...
+    int status = -1;
+    const uint64_t aHash = lj92Hash(a, &status);
+    ASSERT_EQ(0, status);
+    const uint64_t bHash = lj92Hash(b, &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(aHash != bHash); // ...so "identical" would waive FROZEN_DISPLAY over two different pictures
+    // The const entry point walks a copy: the caller's payload is not written.
+    ASSERT_TRUE(a == sosOnDhtLength(0x01, false));
+}
+
+// r5 B1 class sweep: FF DA / FF C3 / FF FE / FF C4 on the DHT length field. The decoder reads the class/id byte as 0
+// whatever it was, so every class/id gives the class/id-0 picture and identity; a byte the decoder reads still counts.
+TEST(VisualCaptureSourceHash, Lj92TheDhtClassIdIsReadAsZeroWhereverTheWalkLandsOnIt)
+{
+    using Build = std::vector<uint8_t> (*)(uint8_t, bool);
+    const Build builds[] = { sosOnDhtLength, sofOnDhtLength, comOnDhtLength, dhtOnDhtLength };
+    for (const Build build : builds)
+    {
+        std::vector<uint16_t> zeroPicture;
+        ASSERT_TRUE(decodeLj92(build(0x00, false), &zeroPicture));
+        int status = -1;
+        const uint64_t zeroHash = lj92Hash(build(0x00, false), &status);
+        ASSERT_EQ(0, status);
+        for (const uint8_t classId : std::initializer_list<uint8_t>{ 0x01, 0x02, 0x7F, 0xFF })
+        {
+            std::vector<uint16_t> picture;
+            ASSERT_TRUE(decodeLj92(build(classId, false), &picture));
+            ASSERT_TRUE(picture == zeroPicture);
+            ASSERT_TRUE(lj92Hash(build(classId, false), &status) == zeroHash);
+            ASSERT_EQ(0, status);
+
+            std::vector<uint16_t> flipped;
+            ASSERT_TRUE(decodeLj92(build(classId, true), &flipped));
+            ASSERT_TRUE(flipped != zeroPicture);
+            ASSERT_TRUE(lj92Hash(build(classId, true), &status) != zeroHash);
+            ASSERT_EQ(0, status);
+        }
+    }
+}
+
 TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)
 {
     const std::vector<uint8_t> plain = encodeLj92(2048, 12288);
