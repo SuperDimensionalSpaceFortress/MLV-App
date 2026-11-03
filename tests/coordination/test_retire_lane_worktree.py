@@ -3070,6 +3070,92 @@ def test_b2_nested_stamp_copies_are_ignored_and_unparsable_text_makes_no_claim(t
     assert r is not None and r["reason"] == "live-driver", (r, err)
 
 
+# Adversary pass r4 on d70bca44 (A1 duplicated keys, A2 mtime cached before the text it describes). r5.
+
+_STALE = "2026-11-02T09:00:00Z"   # an identity the genuine driver does not have
+
+
+@pytest.mark.parametrize("doc", [
+    '{"pid":999974,"pid":null,"createdUtc":"%s","state":"complete","workDir":%s}',                                                    # dup root pid (A1)
+    '{"childPid":999974,"childPid":null,"createdUtc":"%s","state":"complete","workDir":%s}',                                          # dup root childPid
+    '{"pid":999974,"createdUtc":"%s","createdUtc":null,"state":"complete","workDir":%s}',                                             # dup root stamp, stale first
+    '{"pid":999974,"createdUtc":null,"createdUtc":"%s","state":"complete","workDir":%s}',                                             # dup root stamp, stale last
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s"},"containment":{},"state":"complete","workDir":%s}',                    # dup containment (A1 sibling)
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s"},"containment":null,"state":"complete","workDir":%s}',                  # dup containment, null last
+    '{"containment":null,"containment":{"childPid":999974,"childCreatedUtc":"%s"},"state":"complete","workDir":%s}',                  # dup containment, null first
+    '{"containment":{"childPid":999974,"childPid":null,"childCreatedUtc":"%s"},"state":"complete","workDir":%s}',                     # dup inner pid
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","childCreatedUtc":null},"state":"complete","workDir":%s}',              # dup inner stamp
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","ownerPid":1234,"ownerPid":5678},"state":"complete","workDir":%s}',    # dup of ANOTHER pair's key poisons the record
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","runnerCreatedUtc":"x","runnerCreatedUtc":"y"},"state":"complete","workDir":%s}',
+], ids=["dup-root-pid", "dup-root-childPid", "dup-root-stamp-stale-first", "dup-root-stamp-stale-last", "dup-containment-empty-last",
+        "dup-containment-null-last", "dup-containment-null-first", "dup-inner-pid", "dup-inner-stamp", "dup-other-pair-pid", "dup-other-pair-stamp"])
+def test_r5_a1_a_duplicated_identity_key_makes_no_identity_claim(tmp_path, doc):
+    """r5 A1: a key that appears twice at the root or inside containment (pid, stamp or the containment object itself) is ambiguous at every
+    level: the record states no identity, so the genuine driver (created at a time the stale stamp does not name) still refuses."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", doc % (_STALE, json.dumps(str(wt))), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+def test_r5_a1_a_non_identity_duplicate_key_does_not_poison_a_good_stamp(tmp_path):
+    """Class guard: only identity keys are ambiguous when duplicated; a duplicated unrelated key leaves a single stamp binding its pid."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", '{"note":"a","note":"b","state":"complete","workDir":%s,"containment":{"childPid":999974,"childCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), _iso(created)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r5_a2_a_record_replaced_between_enumeration_and_read_is_judged_by_its_new_write_time(tmp_path):
+    """r5 A2: the index caches each file's mtime at enumeration but reads its text later. A producer that replaces venue-driver.pid in between
+    (new pid text, new mtime) must not have the NEW pid judged by the OLD mtime: the genuine new driver, started just before the replacement,
+    would read as started-after-record and the guard would say FREE. The seam below performs that replacement at read time."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 3600                     # the genuine driver starts here ...
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "venue-driver.pid", "999900\n", created - 600)   # ... the file enumerated is an OLD record (mtime 10 min before it)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            "if ((Split-Path -Leaf $Path) -eq 'venue-driver.pid') { [IO.File]::WriteAllText($Path, \"999974`n\"); "
+            "[IO.File]::SetLastWriteTimeUtc($Path, [DateTime]::UtcNow.AddSeconds(-30)) }; "
+            "return [IO.File]::ReadAllText($Path) };")
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+def test_r5_a2_an_unchanged_record_is_still_judged_by_its_write_time(tmp_path):
+    """Guard: re-statting after the read must not loosen the started-after rule for a file nobody touched."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-CURRENT-r1", 999974, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", written + 600)), runs)
+    assert r is None, (r, err)
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo

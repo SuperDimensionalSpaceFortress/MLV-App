@@ -687,12 +687,17 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
         if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $map }
         $rootStamp = $null
         $rootPids = New-Object System.Collections.Generic.List[int]   # pids carried by ROOT-level fields: the only pids the root createdUtc can belong to (adversary A2)
-        # Property names compare ORDINALLY (a differently-cased key is another key, never the recognised one); a key that appears twice in one
-        # object is ambiguous and states nothing (adversary A4).
-        $rootDup = $false
+        # Property names compare ORDINALLY (a differently-cased key is another key, never the recognised one). r5 (adversary A1): a key that
+        # appears twice in one object is ambiguous, and an IDENTITY key (pid / childPid / driverPid / runnerPid / ownerPid, createdUtc, containment
+        # at the root; the three pid/stamp pairs inside containment) that appears twice makes the WHOLE record state no identity: the map is empty
+        # and the caller falls back to the image + record-write-time test exactly as for unparsable text. A duplicate must never leave one copy
+        # standing as the claim (a parser keeps the last, a reader the first): a stale stamp would then mark the genuine driver reused.
+        $rootIdKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid', 'createdUtc', 'containment')
         $seenRoot = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
         foreach ($prop in $root.EnumerateObject()) {
-            if (-not $seenRoot.Add($prop.Name) -and $prop.Name -ceq 'createdUtc') { $rootDup = $true }
+            if (-not $seenRoot.Add($prop.Name) -and $rootIdKeys -ccontains $prop.Name) { return @{} }
+        }
+        foreach ($prop in $root.EnumerateObject()) {
             if ($prop.Name -ceq 'createdUtc') { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
             elseif ($prop.Name -cin @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')) {
                 $rn = ConvertTo-RecordedPid $prop.Value
@@ -700,10 +705,13 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
             }
             elseif ($prop.Name -ceq 'containment' -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
                 $f = New-Object 'System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]' ([StringComparer]::Ordinal)
-                $dup = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
-                foreach ($c in $prop.Value.EnumerateObject()) { if ($f.ContainsKey($c.Name)) { [void]$dup.Add($c.Name) }; $f[$c.Name] = $c.Value }
+                $innerIdKeys = @('childPid', 'childCreatedUtc', 'ownerPid', 'ownerCreatedUtc', 'runnerPid', 'runnerCreatedUtc')
+                foreach ($c in $prop.Value.EnumerateObject()) {
+                    if ($f.ContainsKey($c.Name) -and $innerIdKeys -ccontains $c.Name) { return @{} }
+                    $f[$c.Name] = $c.Value
+                }
                 foreach ($pair in @(@('childPid', 'childCreatedUtc'), @('ownerPid', 'ownerCreatedUtc'), @('runnerPid', 'runnerCreatedUtc'))) {
-                    if (-not $f.ContainsKey($pair[0]) -or -not $f.ContainsKey($pair[1]) -or $dup.Contains($pair[0]) -or $dup.Contains($pair[1])) { continue }
+                    if (-not $f.ContainsKey($pair[0]) -or -not $f.ContainsKey($pair[1])) { continue }
                     $se = $f[$pair[1]]
                     $pn = ConvertTo-RecordedPid $f[$pair[0]]
                     if ($pn -le 4 -or $se.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { continue }
@@ -712,7 +720,7 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
                 }
             }
         }
-        if (-not $rootDup -and $null -ne $rootStamp -and @($PidList).Count -eq 1 -and $rootPids.Contains([int]$PidList[0]) -and -not $map.ContainsKey([int]$PidList[0])) { $map[[int]$PidList[0]] = $rootStamp }
+        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and $rootPids.Contains([int]$PidList[0]) -and -not $map.ContainsKey([int]$PidList[0])) { $map[[int]$PidList[0]] = $rootStamp }
     } catch { return @{} } finally { $doc.Dispose() }
     return $map
 }
@@ -815,9 +823,15 @@ function Get-RunDirPidIndex {
                 }
                 # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: each row also carries when the record was written (RecordedAtUtc) and, when it states one for
                 # its only pid, the recorded process creation time (RecordedCreatedUtc), so Find-RunDirDriverHolders can bind the pid to its process.
+                # r5 (adversary A2): $f carries the mtime cached at ENUMERATION, but the text was read just now; a producer that replaced the file in
+                # between would pair its new pid text with the old mtime, and a genuine new driver would read as started-after-record. Re-stat AFTER
+                # the read and take the later of the two: a later write time can only make the started-after rejection more lenient (toward live).
+                # A file that vanished since the read keeps the cached value.
+                $recordedAt = $f.LastWriteTimeUtc
+                try { $f.Refresh(); if ($f.Exists -and $f.LastWriteTimeUtc -gt $recordedAt) { $recordedAt = $f.LastWriteTimeUtc } } catch { }
                 $recIds = Get-PidsFromRecordText $text
                 $recCreated = Get-RecordedCreatedUtcMap -Text $text -PidList $recIds
-                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $f.LastWriteTimeUtc; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }) }) }
+                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $recordedAt; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }) }) }
             }
         }
     }
