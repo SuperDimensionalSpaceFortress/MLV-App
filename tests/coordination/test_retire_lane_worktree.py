@@ -3424,6 +3424,112 @@ def test_r6_a4_a_snapshot_older_than_the_record_cannot_reject_the_driver_by_the_
     assert r is None, (r, err)
 
 
+# Adversary pass 7 on fb5c5b1e (A2 an old record's reuse mark rejects a newer record, A3 an escaped second pid outside the parser's walk, A4 escaped pid
+# keys). r7. Folds RETIRE-WORKTREE-PID-JSON-PARSE-1: ONE parser-derived pid reader (Get-RecordPidMembers) feeds the pid rows and the root-stamp count.
+
+def _r7_old_stamped_marker(rd, now):
+    """An older lineage's stamped record for pid 999972: written before the snapshot, stamp differs from the snapshot row's creation time."""
+    _write_record(rd, "old.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(now - 86400)}, now - 86400 + 5)
+
+
+@pytest.mark.parametrize("new_kind", ["pid-file", "child-sorts-before-old", "child-sorts-after-old", "no-write-time"])
+def test_r7_a2_an_older_records_reused_mark_cannot_reject_a_newer_records_driver(tmp_path, new_kind):
+    """r7 A2: old.child.json (stamped, older than the snapshot) marks pid 999972 reused against the snapshot's git.exe row. The genuine driver took
+    the pid after the snapshot and published an UNSTAMPED record after it. The old mark is about an older lineage: the newer record is judged on its
+    own evidence (the snapshot's foreign image is the previous holder's), so the worktree is held. An unknown write time fails toward live too."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _r7_old_stamped_marker(rd, now)
+    prelude = ""
+    if new_kind == "pid-file":
+        _write_record(rd, "venue-driver.pid", "999972\n", now - 30)
+    elif new_kind == "no-write-time":
+        _write_record(rd, "new.child.json", '{"pid":999900}', now - 30)
+        prelude = ("function Read-RunDirRecordText { param([string]$Path) "
+                   "if ((Split-Path -Leaf $Path) -eq 'new.child.json') { $t = '{\"pid\":999972}'; [IO.File]::Delete($Path); return $t }; "
+                   "return [IO.File]::ReadAllText($Path) };")
+    else:
+        _write_record(rd, "a-new.child.json" if new_kind == "child-sorts-before-old" else "z-new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972}, now - 30)
+    row = _fake_proc_created(999972, "", "git.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r7_a2_a_snapshot_taken_after_the_newer_record_still_rejects_the_foreign_image(tmp_path):
+    """Guard: the snapshot is newer than every record, so its git.exe row IS the current holder of the pid: free."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _r7_old_stamped_marker(rd, now)
+    _write_record(rd, "z-new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972}, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, _fake_proc_created(999972, "", "git.exe", now - 3600)), runs)
+    assert r is None, (r, err)
+
+
+@pytest.mark.parametrize("extra", [
+    '"metadata":{"p\\u0069d":999974}',                     # escaped pid key one level down
+    '"containment":{"driver\\u0050id":999974}',            # escaped key under containment, outside the childPid/ownerPid/runnerPid walk
+    '"a":[{"b":{"o\\u0077nerPid":999974}}]',               # escaped key deep inside an array
+    '"metadata":{"pid":999974}',                           # guard: the plain spelling already counted two pids
+    '"containment":{"driverPid":999974}',                  # guard: plain containment.driverPid
+], ids=["metadata-escaped", "containment-escaped", "deep-escaped", "metadata-plain", "containment-plain"])
+def test_r7_a3_a_second_pid_at_any_nesting_level_voids_the_root_stamp(tmp_path, extra):
+    """r7 A3: the root stamp stands only when the record names exactly one pid; the count walks every nesting level and decodes escapes."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"createdUtc":"%s",%s}' % (_STALE, extra), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("key", ["p\\u0069d", "child\\u0050id", "driver\\u0050id", "runner\\u0050id", "owner\\u0050id"])
+def test_r7_a4_an_escaped_pid_key_still_names_its_live_driver(tmp_path, key):
+    """r7 A4 (= pass-5 A4, pass-7 A4): a legal JSON escape in a pid key must not hide the record's pid from the pid rows."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"%s":999972}' % key, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", now - 3600)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r7_a4_an_escaped_pid_key_with_a_stamp_for_another_process_is_still_reuse(tmp_path):
+    """Guard: the escaped key now yields a row, and the record's own stamp still proves a different process is free."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"p\\u0069d":999972,"createdUtc":"%s"}' % _iso(created), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r7_unparsable_json_in_a_run_dir_that_names_the_worktree_is_never_free(tmp_path):
+    """r7 (a): text that looks like JSON but does not parse is ambiguous (it may name any pid, e.g. through an escaped key). It fails toward live
+    through the unreadable-record path: a live pid that could be tied through the run dir refuses the worktree. Plain text with no JSON punctuation
+    and valid JSON with no pid are not ambiguous."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    row = _fake_proc_created(999972, "", "pwsh.exe", now - 3600)
+    _write_record(rd, "new.child.json", '{"p\\u0069d":999972,"createdUtc":', now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+    assert r is not None and r["reason"] == "rundir-census-failed" and "unparsable" in r["detail"], (r, err)
+    for ok in ('{"schema":"mlv-lane-child/v1"}', "no json punctuation here"):
+        _write_record(rd, "new.child.json", ok, now - 30)
+        r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+        assert r is None, (ok, r, err)
+
+
+def test_r7_one_reader_feeds_the_pid_rows_and_the_root_stamp_count():
+    """r7 (a), structural: the escape-blind pid regex lives only inside Get-RecordPidMembers; the index and the stamp map call that function."""
+    text = Path(HELPER).read_text(encoding="utf-8")
+    assert "function Get-PidsFromRecordText" not in text
+    body = re.search(r"function Get-RecordPidMembers.*?\n}\n", text, re.S)
+    assert body, "Get-RecordPidMembers is missing"
+    assert text.count("PidJsonRx") == body.group(0).count("PidJsonRx") + 1, "PidJsonRx used outside Get-RecordPidMembers (+1 for its definition)"
+    for fn in ("Get-RunDirPidIndex", "Get-RecordedCreatedUtcMap"):
+        m = re.search(r"function " + fn + r".*?\n}\n", text, re.S)
+        assert m and "Get-RecordPidMembers" in m.group(0), fn
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo

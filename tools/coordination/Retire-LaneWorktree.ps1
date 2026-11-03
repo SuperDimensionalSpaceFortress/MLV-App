@@ -642,19 +642,80 @@ function Test-PathNamed {
     return [regex]::IsMatch((ConvertTo-PathMatchText $Text), $rx, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
 }
 
-function Get-PidsFromRecordText([string]$Text) {
-    # A pid record: a bare number (venue-cpu17v9-ab.pid), or JSON whose pid / childPid / driverPid / runnerPid / ownerPid fields carry one
-    # (opus-001.child.json, *.receipt.json). Pids 0-4 are kernel pseudo-processes and never a driver.
-    # Plain loops, no pipeline: this runs once per record (thousands per index).
-    $ids = New-Object System.Collections.Generic.List[int]
-    if ([string]::IsNullOrWhiteSpace($Text)) { return , $ids.ToArray() }
-    $m = $script:PidBareRx.Match($Text)
-    if ($m.Success) { $n = [int]$m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; return , $ids.ToArray() }
-    foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = [int]$m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
-    return , $ids.ToArray()
-}
 $script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
 $script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
+$script:PidLeadRx = [regex]::new('^(\d{1,7})\b', 'Compiled')
+$script:PidMemberKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')
+
+function ConvertTo-MemberPid([System.Text.Json.JsonElement]$El) {
+    # A pid-valued member's value as an int (0 = no pid). The strict reader first (a JSON integer, or an integer string), then the leading
+    # digits of the number's or string's text (the shape the earlier regex accepted: "5000 ", 5000.0): a superset, so no member that was a pid is lost.
+    $n = ConvertTo-RecordedPid $El
+    if ($n -gt 0) { return $n }
+    $s = $null
+    if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) { $s = $El.GetRawText() }
+    elseif ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $s = $El.GetString() }
+    if ($s) { $m = $script:PidLeadRx.Match($s); if ($m.Success) { return [int]$m.Groups[1].Value } }
+    return 0
+}
+
+function Get-RecordPidMembers([string]$Text) {
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r7 (adversary pass 7 A3, A4; folds RETIRE-WORKTREE-PID-JSON-PARSE-1): THE ONE reader of the pids a
+    # run-dir record names. The pid rows (Get-RunDirPidIndex) and the root-stamp "exactly one pid" count (Get-RecordedCreatedUtcMap) both read ONLY
+    # this, so a record cannot name a pid to one and not to the other (r6 A2 and A3 were that split: an escape-blind regex beside a parser that
+    # decoded). Shapes:
+    #   empty / whitespace      no pids.
+    #   a bare number           (venue-cpu17v9-ab.pid) that pid.
+    #   anything else           PARSED as JSON (escapes decoded: "pid" is pid), and EVERY nesting level is walked (objects and arrays):
+    #                           each member whose decoded name is exactly pid / childPid / driverPid / runnerPid / ownerPid (ORDINAL compare) is a pid.
+    #   does not parse          AMBIGUOUS. It may name any pid, so the caller records an unreadable-record row (fails toward live: a live pid that
+    #                           could be tied through the run dir refuses the worktree). Pids a lenient scan can still see are returned too (more rows
+    #                           only moves a verdict toward live). Text with no JSON punctuation at all is not ambiguous, it is just not a record.
+    # Pids 0-4 are kernel pseudo-processes and never a driver. {Pids = distinct pids > 4 in first-seen order; Members = {Pid; Root} for every pid
+    # member (Pid 0 when its value is no pid; Root = a member of the ROOT object); Ambiguous; Why}. Plain loops, no pipeline: this runs once per
+    # record (thousands per index).
+    $ids = New-Object System.Collections.Generic.List[int]
+    $members = New-Object System.Collections.Generic.List[object]
+    $res = [pscustomobject]@{ Pids = $null; Members = $members; Ambiguous = $false; Why = '' }
+    if ([string]::IsNullOrWhiteSpace($Text)) { $res.Pids = $ids.ToArray(); return $res }
+    $m = $script:PidBareRx.Match($Text)
+    if ($m.Success) { $n = [int]$m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; $res.Pids = $ids.ToArray(); return $res }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($Text) }
+    catch {
+        foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = [int]$m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
+        if ($Text.IndexOfAny([char[]]@('{', '[', '"')) -ge 0) { $res.Ambiguous = $true; $res.Why = 'unparsable-pid-record: ' + ($_.Exception.Message -replace '\s+', ' ') }
+        $res.Pids = $ids.ToArray()
+        return $res
+    }
+    try {
+        $stack = New-Object System.Collections.Generic.Stack[object]
+        $stack.Push(@($doc.RootElement, $true))
+        while ($stack.Count) {
+            $item = $stack.Pop()
+            $el = [System.Text.Json.JsonElement]$item[0]
+            if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                foreach ($prop in $el.EnumerateObject()) {
+                    if (Test-OrdinalMember $prop.Name $script:PidMemberKeys) {
+                        $n = ConvertTo-MemberPid $prop.Value
+                        $members.Add([pscustomobject]@{ Pid = $n; Root = [bool]$item[1] })
+                        if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) }
+                    }
+                    $k = $prop.Value.ValueKind
+                    if ($k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $stack.Push(@($prop.Value, $false)) }
+                }
+            }
+            elseif ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                foreach ($e in $el.EnumerateArray()) {
+                    $k = $e.ValueKind
+                    if ($k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $stack.Push(@($e, $false)) }
+                }
+            }
+        }
+    } finally { $doc.Dispose() }
+    $res.Pids = $ids.ToArray()
+    return $res
+}
 
 function ConvertTo-RecordedUtc([object]$Value) {
     # An ISO stamp string -> UTC [datetime], or $null (not a string, or does not parse: no claim).
@@ -679,7 +740,8 @@ function Test-OrdinalMember([string]$Name, [string[]]$Set) {
     return $false
 }
 
-function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
+function Get-RecordedCreatedUtcMap([string]$Text, [object]$Members = $null) {
+    # $Members: the Get-RecordPidMembers result for this same text (the index passes the one it already has); read here when absent.
     # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1, B2): the process creation time(s) a record states, as @{ pid = UTC datetime }, read from
     # the PARSED record and only from fields that belong to a pid, never from a document-wide pattern (a nested metadata.createdUtc is not the
     # record's identity):
@@ -713,23 +775,18 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
         foreach ($prop in $root.EnumerateObject()) {
             if (-not $seenRoot.Add($prop.Name) -and (Test-OrdinalMember $prop.Name $rootIdKeys)) { return @{} }
         }
-        $allPids = New-Object System.Collections.Generic.HashSet[int]   # every pid the PARSER finds in a pid field (root or containment): see the root-stamp rule below (adversary A2, 6th pass)
+        # r7: the pids the record names come from Get-RecordPidMembers ONLY (every nesting level, escapes decoded), the same function that makes the pid rows.
+        $pm = if ($null -ne $Members) { $Members } else { Get-RecordPidMembers $Text }
+        foreach ($mem in $pm.Members) { if ($mem.Root -and $mem.Pid -gt 0) { $rootPids.Add([int]$mem.Pid) } }
         foreach ($prop in $root.EnumerateObject()) {
             if ([string]::Equals($prop.Name, 'createdUtc', [StringComparison]::Ordinal)) { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
-            elseif (Test-OrdinalMember $prop.Name $rootPidKeys) {
-                $rn = ConvertTo-RecordedPid $prop.Value
-                if ($rn -gt 0) { $rootPids.Add($rn) }
-                if ($rn -gt 4) { [void]$allPids.Add($rn) }   # pids 0-4 are never a driver (Get-PidsFromRecordText skips them too)
-            }
+            elseif (Test-OrdinalMember $prop.Name $rootPidKeys) { }   # a root pid member: counted by Get-RecordPidMembers above, nothing to read here
             elseif ([string]::Equals($prop.Name, 'containment', [StringComparison]::Ordinal) -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
                 $f = New-Object 'System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]' ([StringComparer]::Ordinal)
                 $innerIdKeys = @('childPid', 'childCreatedUtc', 'ownerPid', 'ownerCreatedUtc', 'runnerPid', 'runnerCreatedUtc')
                 foreach ($c in $prop.Value.EnumerateObject()) {
                     if ($f.ContainsKey($c.Name) -and (Test-OrdinalMember $c.Name $innerIdKeys)) { return @{} }
                     $f[$c.Name] = $c.Value
-                }
-                foreach ($pk in @('childPid', 'ownerPid', 'runnerPid')) {
-                    if ($f.ContainsKey($pk)) { $an = ConvertTo-RecordedPid $f[$pk]; if ($an -gt 4) { [void]$allPids.Add($an) } }
                 }
                 foreach ($pair in @(@('childPid', 'childCreatedUtc'), @('ownerPid', 'ownerCreatedUtc'), @('runnerPid', 'runnerCreatedUtc'))) {
                     if (-not $f.ContainsKey($pair[0]) -or -not $f.ContainsKey($pair[1])) { continue }
@@ -741,14 +798,11 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
                 }
             }
         }
-        # r6 (adversary A2, 6th pass): "names exactly one pid" is counted over BOTH readers. $PidList comes from a regex that does not decode JSON
-        # escapes; the parser does ('childPid' is childPid), so a record can name a second pid the regex never saw. The root stamp stands only
-        # when the union of the regex's pids and every pid the parser found (root fields and containment) is that one pid, and it is a root pid.
-        $union = New-Object 'System.Collections.Generic.HashSet[int]'
-        foreach ($x in @($PidList)) { [void]$union.Add([int]$x) }
-        foreach ($x in $allPids) { [void]$union.Add([int]$x) }
-        if ($null -ne $rootStamp -and $union.Count -eq 1 -and $rootPids.Contains([int]@($union)[0])) {
-            $rp = [int]@($union)[0]
+        # r6 (adversary A2, 6th pass) / r7 (A3): "names exactly one pid" is counted over EVERY pid member of the record at EVERY nesting level, escapes
+        # decoded: $pm.Pids from Get-RecordPidMembers, the same function that makes the pid rows (r6 counted a regex list and a shallow parser walk,
+        # and a second pid in metadata.pid or containment.driverPid escaped both). The root stamp stands only when that is one pid, and it is a root pid.
+        if ($null -ne $rootStamp -and @($pm.Pids).Count -eq 1 -and $rootPids.Contains([int]@($pm.Pids)[0])) {
+            $rp = [int]@($pm.Pids)[0]
             if (-not $claims.ContainsKey($rp)) { $claims[$rp] = New-Object 'System.Collections.Generic.List[datetime]' }
             $claims[$rp].Add($rootStamp)
         }
@@ -872,8 +926,12 @@ function Get-RunDirPidIndex {
                 # earlier version than the text just read, so NO write time is stated ($null: Test-RecordedPidBound makes no started-after claim).
                 $recordedAt = $null
                 try { $f.Refresh(); if ($f.Exists) { $recordedAt = $f.LastWriteTimeUtc; if ($cachedAt -gt $recordedAt) { $recordedAt = $cachedAt } } } catch { $recordedAt = $null }
-                $recIds = Get-PidsFromRecordText $text
-                $recCreated = Get-RecordedCreatedUtcMap -Text $text -PidList $recIds
+                # r7: ONE reader (Get-RecordPidMembers) for the pid rows and the stamp map's pid count. A record that does not parse is ambiguous:
+                # it also adds an unreadable-record row (Pid 0 + Error), which Find-RunDirDriverHolders reads as naming every live pid.
+                $pm = Get-RecordPidMembers $text
+                if ($pm.Ambiguous) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = 0; Error = "$($f.FullName) $($pm.Why)" }) }
+                $recIds = $pm.Pids
+                $recCreated = Get-RecordedCreatedUtcMap -Text $text -Members $pm
                 foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $recordedAt; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }) }) }
             }
         }
@@ -963,7 +1021,7 @@ function Find-RunDirDriverHolders {
         param($rec)
         return ((& $recNewer $rec) -and [bool](Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec))
     }
-    $exactMatch = @{}; $reused = @{}
+    $exactMatch = @{}; $reused = @{}; $reusedBy = @{}; $reusedAt = @{}
     foreach ($rec in $index) {
         if ($rec.Error -or -not $byPid.ContainsKey($rec.Pid)) { continue }
         $rc = $rec.PSObject.Properties['RecordedCreatedUtc']
@@ -981,10 +1039,33 @@ function Find-RunDirDriverHolders {
             }
             continue
         }
-        if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) { if (& $staleVsSnapshot $rec) { $exactMatch[$k] = $true } else { $reused[$k] = $true } }
+        if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) {
+            if (& $staleVsSnapshot $rec) { $exactMatch[$k] = $true }
+            else {
+                $reused[$k] = $true
+                $reusedBy["$k|$($rec.File)"] = $true
+                $mt = ([datetime]$rec.RecordedAtUtc).ToUniversalTime().Ticks   # known: an unknown write time is "newer", never a mismatch that rejects
+                if (-not $reusedAt.ContainsKey($k) -or $mt -gt $reusedAt[$k]) { $reusedAt[$k] = $mt }
+            }
+        }
         elseif ($byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) { $exactMatch[$k] = $true }
     }
     foreach ($k in @($exactMatch.Keys)) { $reused.Remove($k) }
+    # r7 (adversary pass 7 A2): a reuse mark belongs to the record that stated it and to OLDER records of the same (run dir, pid): it proves that an
+    # older lineage's process is not the live one. It must not reject a NEWER launcher-written record (a pid file or child record), which is judged on
+    # its own evidence: when the snapshot is older than that record, the snapshot's row (and its foreign image) is the previous holder of the pid.
+    # Rejected by the mark: the marking record itself, any receipt (its write time is the lane's END, r4 B1 keeps its mismatch-wins rule), and a record
+    # whose write time is known and STRICTLY older than the newest marking record. A record whose write time is unknown, or equal to the mark's,
+    # cannot be ordered against it: it is judged on its own evidence (fail toward live). Only ever moves a verdict toward live.
+    $rejectedAsReused = {
+        param($rec)
+        $k = "$($rec.RunDir)|$($rec.Pid)"
+        if (-not $reused.ContainsKey($k)) { return $false }
+        if ($reusedBy.ContainsKey("$k|$($rec.File)") -or $rec.File.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        $atv = $rec.PSObject.Properties['RecordedAtUtc']
+        if (-not $atv -or $atv.Value -isnot [datetime]) { return $false }
+        return (([datetime]$atv.Value).ToUniversalTime().Ticks -lt $reusedAt[$k])
+    }
     foreach ($rec in $index) {
         if ($rec.Error) { $unreadable.Add($rec); continue }
         if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
@@ -995,7 +1076,7 @@ function Find-RunDirDriverHolders {
             if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
             # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: the run-dir tie below needs the live pid to BE the recorded process (image + creation time);
             # a reused pid (tailscaled.exe, git.exe ... with an unreadable command line) is not a driver of this run dir.
-            elseif (-not $reused.ContainsKey("$($rec.RunDir)|$($rec.Pid)") -and ((& $recNewer $rec) -or (Test-RecordedPidBound -Proc $p -Record $rec).Bound) -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            elseif (-not (& $rejectedAsReused $rec) -and ((& $recNewer $rec) -or (Test-RecordedPidBound -Proc $p -Record $rec).Bound) -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
                 $matched = $rec.RunDir
                 if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }
