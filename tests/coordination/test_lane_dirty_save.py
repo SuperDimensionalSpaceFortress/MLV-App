@@ -2302,3 +2302,122 @@ def test_a_child_record_whose_folder_is_a_link_at_the_open_and_the_name_is_resto
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-ChildJson", str(records / "child.json")], capture_output=True, text=True)
     assert r.returncode in (20, 30), r.stdout + r.stderr  # ea31b1c7: exit 0, the live lane's work was saved from under it
     assert list(run.iterdir()) == []
+
+
+# ---- r17 sol r16 B1 + S106 (2968d520): a handle is judged against the requested path by the kernel's answer for BOTH, compared case-sensitively ----
+# A case-sensitive directory cannot be made here (it needs administrator rights), so the kernel is played by a test double of the saver's own native class (`LdsNative.Win`, defined before the saver would define it): every call is forwarded to kernel32 unchanged, except that the final path of ONE flagged handle comes back with a swapped case, which is exactly what a decoy folder `RECORDS` beside the requested `records` would report.
+CASE_DOUBLE = r"""
+Add-Type -TypeDefinition @'
+using System; using System.Text; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+namespace LdsNative {
+public static class Win {
+  [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)] static extern SafeFileHandle RealCreate(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", EntryPoint = "GetFinalPathNameByHandleW", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint RealFinal(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+  [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandleEx", SetLastError = true)] static extern bool RealEx(SafeFileHandle handle, int infoClass, [Out] byte[] buffer, uint length);
+  [DllImport("kernel32.dll", EntryPoint = "GetFileInformationByHandle", SetLastError = true)] static extern bool RealInfo(SafeFileHandle handle, [Out] byte[] buffer);
+  [DllImport("kernel32.dll", EntryPoint = "GetLongPathNameW", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint RealLong(string shortPath, StringBuilder buffer, uint length);
+  public static string FlipFrom = null, FlipTo = null, FlagOpenContaining = null;
+  static IntPtr flagged = IntPtr.Zero;
+  public static void Flag(SafeFileHandle h) { flagged = h.DangerousGetHandle(); }
+  public static SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template) {
+    SafeFileHandle h = RealCreate(name, access, share, security, disposition, flags, template);
+    if (FlagOpenContaining != null && flagged == IntPtr.Zero && !h.IsInvalid && System.IO.Path.GetFileName(name.TrimEnd((char)92)).StartsWith(FlagOpenContaining, StringComparison.OrdinalIgnoreCase)) flagged = h.DangerousGetHandle();
+    return h;
+  }
+  public static uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder b, uint len, uint fl) {
+    uint r = RealFinal(h, b, len, fl);
+    if (r != 0 && r < len && flagged != IntPtr.Zero && FlipFrom != null && h.DangerousGetHandle() == flagged) { string s = b.ToString().Replace(FlipFrom, FlipTo); b.Clear(); b.Append(s); }
+    return r;
+  }
+  public static bool GetFileInformationByHandleEx(SafeFileHandle h, int c, byte[] buf, uint len) { return RealEx(h, c, buf, len); }
+  public static bool GetFileInformationByHandle(SafeFileHandle h, byte[] buf) { return RealInfo(h, buf); }
+  public static uint GetLongPathNameW(string p, StringBuilder b, uint len) { return RealLong(p, b, len); }
+}
+}
+'@
+"""
+HANDLE_FUNCS = ["Assert-HandleAtPath", "ConvertTo-PlainPath", "ConvertTo-NativePath", "Initialize-LdsNative"]
+
+
+def _handle_at_path(opened, requested, flip=None):
+    """Open `opened` with a plain stream, optionally flag its handle so the double reports a case-swapped final path, then ask Assert-HandleAtPath whether that handle is at `requested`."""
+    pre = "$script:onWin = $true; " + CASE_DOUBLE + ("[LdsNative.Win]::FlipFrom = $env:LDS_FROM; [LdsNative.Win]::FlipTo = $env:LDS_TO; " if flip else "")
+    expr = ("$(try { $fs = [System.IO.File]::Open($env:LDS_OPEN, 'Open', 'Read', 'Read'); " + ("[LdsNative.Win]::Flag($fs.SafeFileHandle); " if flip else "") +
+            "Assert-HandleAtPath $fs.SafeFileHandle $env:LDS_REQ; 'ok' } catch { $_.Exception.Message })")
+    return run_ps_functions(HANDLE_FUNCS, expr, pre=pre, LDS_OPEN=str(opened), LDS_REQ=str(requested), LDS_FROM=(flip or ("", ""))[0], LDS_TO=(flip or ("", ""))[1])
+
+
+@pytest.fixture
+def record_file(tmp_path):
+    d = tmp_path / "records"
+    d.mkdir()
+    f = d / "child.json"
+    f.write_text("{}")
+    return f
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_handle_whose_real_path_differs_from_the_requested_path_only_in_case_is_refused(record_file):  # r17 sol r16 B1: lane-dirty-save.ps1:329 compared with OrdinalIgnoreCase, so on a case-sensitive directory `RECORDS` (the decoy the handle was really opened on) was accepted for the requested `records` and a live lane could be saved
+    assert _handle_at_path(record_file, record_file, flip=("records", "RECORDS")) == "opened-through-a-link"  # 2968d520: ok
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_genuine_record_requested_in_another_drive_letter_or_directory_case_is_still_accepted(record_file):  # r17 control: both sides come from handles, so how the caller SPELLED the path (drive letter, directory case, \\?\ prefix) is not a difference
+    p = str(record_file)
+    assert _handle_at_path(record_file, p) == "ok"
+    assert _handle_at_path(record_file, p[0].swapcase() + p[1:]) == "ok"
+    assert _handle_at_path(record_file, p.replace("records", "RECORDS")) == "ok"
+    assert _handle_at_path(record_file, "\\\\?\\" + p) == "ok"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_handle_on_another_file_and_a_path_that_cannot_be_opened_are_refused(record_file, tmp_path):  # r17 control: a different object is still refused, and failing to resolve the requested path is a refusal, not a pass
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "child.json").write_text("{}")
+    assert _handle_at_path(record_file, other / "child.json") == "opened-through-a-link"
+    assert _handle_at_path(record_file, tmp_path / "missing" / "child.json") == "cannot-resolve-path"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_child_record_handle_at_a_case_distinct_path_is_refused_by_the_saver(tmp_path):  # r17 sol r16 B1 end to end: the double flags the child record's handle, the record itself is harmless, and the saver must still refuse before any write
+    a, run, records = tmp_path / "wtA", tmp_path / "run", tmp_path / "records"
+    init_repo(a, b"BASE\n")
+    for d in (run, records):
+        d.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).isoformat()
+    (records / "child.json").write_text(json.dumps({"pid": dead_pid(), "createdUtc": old}))
+    flip = CASE_DOUBLE + "[LdsNative.Win]::FlipFrom = 'records'; [LdsNative.Win]::FlipTo = 'RECORDS'; "
+    hooked = _hooked(tmp_path, [("$ErrorActionPreference = 'Stop'", flip), ("if ($script:onWin) { try { Assert-HandleAtPath $cfs.SafeFileHandle $ChildJson }", "if ($script:onWin) { [LdsNative.Win]::Flag($cfs.SafeFileHandle) }; ")])
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-ChildJson", str(records / "child.json")], capture_output=True, text=True)
+    assert r.returncode in (20, 30), r.stdout + r.stderr  # 2968d520: exit 0, saved
+    assert list(run.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows kernel handle paths")
+def test_a_private_directory_whose_real_path_differs_from_its_name_only_in_case_is_refused_before_a_byte_is_written(repo, tmp_path):  # r17 sol r16 S106: the same comparison at the private directory's creation admitted a case-distinct junction target (a worktree folder) as the private directory
+    base = tmp_path / "tempbase"
+    base.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    flip = CASE_DOUBLE + "[LdsNative.Win]::FlagOpenContaining = 'lane-dirty-save-'; [LdsNative.Win]::FlipFrom = 'lane-dirty-save-'; [LdsNative.Win]::FlipTo = 'LANE-DIRTY-SAVE-'; "
+    hooked = _hooked(tmp_path, [("$ErrorActionPreference = 'Stop'", flip)])
+    r = _run_hooked(hooked, repo, tmp_path, base)
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout and "opened-through-a-link" in r.stdout, r.stdout + r.stderr  # 2968d520: exit 0, the artifacts were saved through it
+    assert saved(repo) == []
+    assert [p.name for d in base.glob("lane-dirty-save-*") for p in d.iterdir()] == []  # nothing was written into the refused directory
+
+
+# ---- r17 Dot/CoS G3 (2968d520): an unborn HEAD ----
+def test_a_repository_with_no_commit_ends_in_exit_40_and_writes_nothing(tmp_path):  # r17 Dot/CoS G3: there is no HEAD to diff against, so the saver cannot say what the dirt is relative to; it states that in its header and refuses with the documented git-failed status, never a clean tree (10) and never a save
+    wd, run = tmp_path / "unborn", tmp_path / "run"
+    wd.mkdir()
+    run.mkdir()
+    for a in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"]):
+        git(wd, *a)
+    (wd / "new.txt").write_text("work\n")
+    git(wd, "add", "new.txt")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(SCRIPT), "-WorkDir", str(wd), "-RunDir", str(run), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 40 and "DIRTY_SAVE_GIT_FAILED" in r.stdout, r.stdout + r.stderr
+    assert list(run.iterdir()) == []
+    assert "unborn HEAD" in SCRIPT.read_text(encoding="utf-8").split("param(", 1)[0]  # stated in the header
