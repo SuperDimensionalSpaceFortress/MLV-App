@@ -1090,6 +1090,11 @@ function ConvertTo-DvDouble {
     $null
 }
 
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 siblings on #447): a record marker must OPEN its record. It is the first text of the
+# record body (Get-DvLogRecordBody), after the writer's optional `[<utc>] [<level>] [<thread>] ` prefix (CrashForensics writeLogLine; a bare
+# record has none). The same rule as AttrCudaArtifacts' Get-AttrCudaEligibilityLineForSession.
+$script:DvRecordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
+
 function Get-DvSmokeSummaryFields {
     <#
     .SYNOPSIS
@@ -1108,19 +1113,21 @@ function Get-DvSmokeSummaryFields {
         # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r4 (r3 adversary A2 and advisory A3 on #726): every line is read as its record body, so a build path in a Qt
         # location suffix never selects the session or a line, and never adds a summary or conform field.
         $lines = Get-DvLogRecordBodies -LogText $LogText
-        foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
-        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 siblings on #447): and every marker must OPEN its record ($script:DvRecordStart), so a
+        # quoted value inside another record (an eligibility line's DLL path holds no ` (`) never selects the session or a line.
+        foreach ($line in $lines) { if ($line -match ($script:DvRecordStart + 'playback_smoke\.measured_session id=(?<s>\d+)(\s|$)')) { $session = $Matches['s']; break } }
+        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match ($script:DvRecordStart + 'playback_smoke\.summary session=(?<s>\d+)(\s|$)')) { $session = $Matches['s']; break } } }
         if ($null -ne $session) {
             $summaryLine = $null
-            foreach ($line in $lines) { if ($line -match ('playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
+            foreach ($line in $lines) { if ($line -match ($script:DvRecordStart + 'playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
             if ($null -ne $summaryLine) {
                 foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
             }
-            foreach ($line in $lines) { if ($line -match ('playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
+            foreach ($line in $lines) { if ($line -match ($script:DvRecordStart + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)')) { $conformLine = $line } }
         }
         # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
         # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
-        $iso = @($lines | Where-Object { $_ -match 'interaction_trace event=automation\.pacing_isolated(\s|$)' })
+        $iso = @($lines | Where-Object { $_ -match ($script:DvRecordStart + 'interaction_trace event=automation\.pacing_isolated(\s|$)') })
         $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
     }
     [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
@@ -1721,7 +1728,8 @@ function Get-DvSmokeSessionLineRead {
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
         if ($null -ne $session) {
-            $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+            # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5: the marker must OPEN its record (Get-DvSmokeSummaryFields' rule)
+            $pattern = $script:DvRecordStart + 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
             # r4 (r3 adversary A2 on #726): the marker is matched on each line's record body, so a later line whose build path holds
             # `playback_smoke.<Marker> session=<n>` is never selected
             foreach ($line in (Get-DvLogRecordBodies -LogText $LogText)) { if ($line -match $pattern) { $found = $line } }

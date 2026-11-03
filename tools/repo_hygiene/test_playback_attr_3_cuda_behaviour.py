@@ -1096,6 +1096,89 @@ class MeasuredSessionEligibilityVerdictTests(_PwshCase):
         self.assertEqual(new["tailLinesIgnored"], 0)
         self.assertEqual(new["measuredWindowRefusingLines"], 0)
 
+    def _job_function(self, name: str, end_marker: str) -> str:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index(f"function {name}(")
+        return text[start:text.index(end_marker, start)]
+
+    def test_t8_the_job_measured_session_id_is_read_only_from_a_record_that_opens_with_its_marker(self) -> None:
+        """r5 (adversary r4 A1 on e927e38a, introduced/major): the id the gate is handed comes from the job's
+        Get-MeasuredSmokeSessionId, whose marker match was unanchored, so marker text in a quoted DLL path or in a Qt
+        location suffix of ANOTHER record picked the warmup session and the gate admitted (exit 0) a measured session that
+        refuses (exit 15). The adversary's exact log; then the Qt-location shape; then the summary fallback (:2220)."""
+        def ts(second: int) -> str:
+            return f"[2026-11-03T06:00:{second:02d}.100Z] [I] [0x1] "
+        quoted = [
+            ts(1) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=0 '
+                    'cuda_backend_resolved="C:\\gpu playback_smoke.measured_session id=3 x\\backend.dll"',
+            ts(2) + "playback_smoke.start session=3",
+            ts(3) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=1 r16_reason="warmup"',
+            ts(4) + "playback_smoke.summary session=3",
+            ts(5) + "playback_smoke.start session=7",
+            ts(6) + "playback_smoke.measured_session id=7",
+            ts(7) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=0 r16_reason="measured fallback"',
+            ts(8) + "playback_smoke.summary session=7",
+        ]
+        located = [ts(1) + "app.ready (C:/b playback_smoke.measured_session id=3 x/MainWindow.cpp:1)"] + quoted[1:]
+        # No marker at all (a build before it): the first summary that OPENS its record is the measured one, not a path's.
+        fallback = [ts(1) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=1 '
+                            'cuda_backend_resolved="C:\\gpu playback_smoke.summary session=3 x\\backend.dll"',
+                    ts(2) + "playback_smoke.start session=7",
+                    ts(3) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=0 r16_reason="measured fallback"',
+                    ts(4) + "playback_smoke.summary session=7",
+                    ts(5) + "app.ready (C:/b playback_smoke.summary session=3 x/MainWindow.cpp:2)"]
+        fn = self._job_function("Get-MeasuredSmokeSessionId", "\nfunction Get-FrameRows(")
+        for name, lines in (("quoted DLL path", quoted), ("Qt location suffix", located), ("summary fallback", fallback)):
+            with self.subTest(case=name):
+                log = self.tmp / f"{name.replace(' ', '-')}.log"
+                log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                proc = self.run_with_module(
+                    fn + "\n"
+                    f"$text = [IO.File]::ReadAllText('{log}')\n"
+                    "$id = Get-MeasuredSmokeSessionId $text\n"
+                    "$v = Get-AttrCudaEligibilityVerdict -LogText $text -MeasuredSessionId $id\n"
+                    "Write-Output ('OUT=' + (@{ id = [string]$id; admitted = $v.admitted; exitCode = $v.exitCode; reason = $v.r16Reason } | ConvertTo-Json -Compress))\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                out = json.loads(next(x for x in proc.stdout.splitlines() if x.startswith("OUT="))[4:])
+                self.assertEqual(out["id"], "7", out)
+                self.assertFalse(out["admitted"], out)
+                self.assertEqual(out["exitCode"], 15, out)
+                self.assertEqual(out["reason"], "measured fallback", out)
+
+    def test_t9_the_core_partition_start_and_self_heal_reads_bind_the_marker_to_its_record(self) -> None:
+        """r5 (adversary r4 A1 siblings job.ps1:4979/4980 and AttrCudaArtifacts.psm1:3488): the core-partition playback start
+        and the self-heal pre-launch read choose the session by the same marker, and must not take it from another record's
+        quoted value or Qt location; the self-heal line read (:3493) must not take a record from a location suffix either."""
+        def ts(second: int) -> str:
+            return f"[2026-11-03T06:00:{second:02d}.100Z] [I] [0x1] "
+        spoof = ts(1) + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.measured_session id=3 x\\backend.dll"'
+        loc_spoof = ts(1) + "app.ready (C:/b playback_smoke.measured_session id=3 x/MainWindow.cpp:1)"
+        summary_spoof = ts(1) + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.summary session=3 x\\backend.dll"'
+        real = [ts(2) + "playback_smoke.summary session=3 presented_fps=10",
+                ts(3) + "playback_smoke.measured_session id=7",
+                ts(4) + "playback_smoke.summary session=7 presented_fps=24"]
+        cp = self._job_function("Get-CorePartitionPlaybackStart", "\n}\n") + "\n}\n"
+        for name, lines in (("quoted marker", [spoof, *real]), ("located marker", [loc_spoof, *real]),
+                            ("quoted summary, no marker", [summary_spoof, real[0].replace("session=3", "session=7"), real[2]])):
+            with self.subTest(reader="core partition", case=name):
+                log = self.tmp / "cp.log"
+                log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                proc = self.run_with_module(cp + f"\nWrite-Output ('SID=' + (Get-CorePartitionPlaybackStart ([IO.File]::ReadAllText('{log}')) 1 1 1 0).session)\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("SID=7", proc.stdout.splitlines(), proc.stdout + proc.stderr)
+        heal = self.tmp / "self-heal"
+        (heal / "pre-1").mkdir(parents=True)
+        (heal / "pre-1" / "pre-launch.json").write_text('{"rc": 0, "error": null}', encoding="utf-8")
+        for name, lines in (("quoted marker", [spoof, *real]), ("located marker", [loc_spoof, *real]),
+                            ("located summary after the real one", [*real, ts(5) + "app.ready (C:/b playback_smoke.summary session=7 presented_fps=99 x/x.cpp:1)"])):
+            with self.subTest(reader="self-heal", case=name):
+                (heal / "pre-1" / "result.json.run.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                proc = self.run_with_module(
+                    f"$m = Get-AttrCudaSelfHealMetrics -SelfHealDir '{heal}' -PreLaunches @('cuda') -MeasuredLogText '' -MeasuredSessionId ''\n"
+                    "Write-Output ('FPS=' + [string]$m['selfHealL1PresentedFps'])\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("FPS=24", proc.stdout.splitlines(), proc.stdout + proc.stderr)
+
 
 @requires_pwsh
 class MeasuredSessionScopeFieldsTests(_PwshCase):

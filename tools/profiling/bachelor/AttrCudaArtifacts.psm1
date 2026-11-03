@@ -3484,13 +3484,18 @@ function Get-AttrCudaSelfHealMetrics {
     $sessionLine = {
         param([string]$LogText, [string]$Session, [string]$Marker)
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 sibling): a record marker must OPEN its record (Get-AttrCudaEligibilityLineForSession's
+        # rule). The session marker and the <marker> line are read from each record BODY (the text before the first ' (', where the Qt
+        # location suffix starts), right after the optional "[<utc>] [<level>] [<thread>] " prefix. So another record's quoted value or a
+        # location suffix never names the session or supplies the line or its fields.
+        $recordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
+        $bodies = @(($LogText -split "`r?`n") | ForEach-Object { $_ -replace ' \(.*$', '' })
         if ([string]::IsNullOrEmpty($Session)) {
-            $sm = [regex]::Match($LogText, 'playback_smoke\.measured_session id=(\d+)')
-            if (-not $sm.Success) { return $null }
-            $Session = $sm.Groups[1].Value
+            foreach ($body in $bodies) { if ($body -match ($recordStart + 'playback_smoke\.measured_session id=(?<s>\d+)(\s|$)')) { $Session = $Matches['s']; break } }
+            if ([string]::IsNullOrEmpty($Session)) { return $null }
         }
         $found = $null
-        foreach ($lm in [regex]::Matches($LogText, '(?m)' + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        foreach ($body in $bodies) { if ($body -match ($recordStart + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>.*)$')) { $found = $Matches['rest'] } }
         if ($null -eq $found) { return $null }
         $fields = @{}
         foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }

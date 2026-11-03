@@ -446,10 +446,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured-session eligibility verdict (row B) and the summary's scope-feed fields (CoS #447). Ten regions: in the spliced
     # module functions, Get-AttrCudaLastEligibilityLine's help (1) and Get-AttrCudaEligibilityVerdict's help, parameter, measured-session override and result
     # fields (4), plus the Get-AttrCudaEligibilityLineForSession splice (1); in the job template the measured-session verdict call, the diagnostics fields, the
-    # cpu_summary_ext scope read and the two summary fields (4). Every baseline line stays verbatim outside them. Absent from the baseline.
+    # cpu_summary_ext scope read and the two summary fields (4). r5 (adversary r4 A1 on e927e38a) adds one: Get-MeasuredSmokeSessionId's anchored read,
+    # ahead of its baseline loops (1). Every baseline line stays verbatim outside them. Absent from the baseline.
     GPU_SCOPES_NO_VETO_OPEN = "PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>"
     GPU_SCOPES_NO_VETO_CLOSE = "PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
-    GPU_SCOPES_NO_VETO_REGIONS = 10
+    GPU_SCOPES_NO_VETO_REGIONS = 11
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the HFR (>= 50 fps native) 10 s floor branch the embedded source-frame
     # oracle (Get-AttrCudaSourceFramesVerdict) gains ahead of the unchanged 20 s branch, plus the HFR-only 10 s wording of the
     # "under N s of real footage" message. Two regions; the baseline's 20 s lines stay verbatim outside them.
@@ -11593,6 +11594,31 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
             with self.subTest(case=name):
                 v = self.verdict(self.ON, self.log(record))
                 self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+
+    def test_a_marker_inside_another_records_quoted_value_never_selects_the_session_or_a_line(self) -> None:
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 siblings DualVenueRunner.psm1:1111/1112 on #447): the body is cut at the first ` (`, but a
+        # quoted value inside ANOTHER record (an eligibility line's DLL path) holds no ` (` and spelled the marker, so Get-DvSmokeSummaryFields took the
+        # warmup session. A marker must OPEN its record (after the optional `[utc] [level] [thread] ` prefix) -- the session, the summary, conform and
+        # pacing_isolated lines, and Get-DvSmokeSessionLineRead's line all.
+        spoof = self.PREFIX + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.measured_session id=3 x\\backend.dll"'
+        real = [self.PREFIX + "playback_smoke.start session=3 worker_threads=2", self.PREFIX + "playback_smoke.summary session=3 presented_fps=10",
+                self.PREFIX + "playback_smoke.measured_session id=7", self.PREFIX + "playback_smoke.start session=7 worker_threads=8",
+                self.PREFIX + "interaction_trace event=automation.pacing_isolated settings_store=run_scoped",
+                self.PREFIX + "playback_smoke.summary session=7 presented_fps=24"]
+        later = [self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x playback_smoke.summary session=7 presented_fps=99"',
+                 self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x playback_smoke.start session=7 worker_threads=1"',
+                 self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x playback_smoke.conform session=7 conform_active=1"',
+                 self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x interaction_trace event=automation.pacing_isolated settings_store=venue"']
+        # without a marker the FIRST summary that OPENS its record is the measured one, never a DLL path's
+        no_marker = [self.PREFIX + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.summary session=3 x\\backend.dll"', *real[3:]]
+        for name, lines in (("quoted marker", [spoof, *real, *later]), ("quoted summary, no marker", no_marker)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("$f = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n$s = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'start'\n"
+                                          "[ordered]@{ session = $f.session; fps = $f.fields['presented_fps']; conform = $f.conformLine; isolated = $f.settingsIsolated;"
+                                          " workers = $s.fields['worker_threads'] } | ConvertTo-Json -Compress",
+                                          DVE_LOG="\n".join(lines) + "\n")
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertEqual(out, {"session": "7", "fps": "24", "conform": None, "isolated": True, "workers": "8"})
 
     def test_record_markers_inside_a_qt_location_never_count_or_select_a_record(self) -> None:
         # r4 (r3 adversary A2 on #726): markers were matched on the RAW line, before the location suffix was stripped, so a build path holding

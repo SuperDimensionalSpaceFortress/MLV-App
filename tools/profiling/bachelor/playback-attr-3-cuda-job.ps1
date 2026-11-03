@@ -2211,6 +2211,23 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     afterwards is chronologically LATER, and the FIRST playback_smoke.summary line's session id
     is still the measured one.
     #>
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    # r5 (adversary r4 A1 on e927e38a): a record marker must OPEN its record (Get-AttrCudaEligibilityLineForSession's rule, 9570ccf8).
+    # A marker is read only from a record BODY (the text before the first ' (', where the Qt location suffix starts), right after the
+    # writer's optional "[<utc>] [<level>] [<thread>] " prefix. So marker text in another record's quoted value (a cuda_backend_resolved
+    # DLL path, say) or in a location suffix never selects a warmup session. Without that rule the gate admitted (exit 0) a measured
+    # session that refuses (exit 15). The id must end at a space or the body's end. The baseline loops below are kept verbatim and
+    # are no longer reached.
+    $recordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
+    $recordBodies = @(($RawLog -split "`r?`n") | ForEach-Object { $_ -replace ' \(.*$', '' })
+    foreach ($body in $recordBodies) {
+        if ($body -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\d+)(\s|$)')) { return $Matches['session'] }
+    }
+    foreach ($body in $recordBodies) {
+        if ($body -match ($recordStart + 'playback_smoke\.summary session=(?<session>\d+)(\s|$)')) { return $Matches['session'] }
+    }
+    throw 'no playback_smoke.summary line found in the MLVApp log'
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -match 'playback_smoke\.measured_session id=(?<session>\d+)') {
             return $Matches['session']
@@ -4976,8 +4993,12 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
         $lines = @($LogText -split "`r?`n")
         $sid = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 siblings): Get-MeasuredSmokeSessionId's rule, a marker must OPEN its record. Each
+        # marker is read from the record body (before the first ' (') right after the optional "[<utc>] [<level>] [<thread>] " prefix, so
+        # another record's quoted value or Qt location never names the session.
+        $bodies = @($lines | ForEach-Object { $_ -replace ' \(.*$', '' })
+        foreach ($ln in $bodies) { $mm = [regex]::Match($ln, '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.measured_session id=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $bodies) { $mm = [regex]::Match($ln, '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.summary session=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
         if ($null -eq $sid) { return $r }
         $r.session = [int64]$sid
         $stamp = $null
