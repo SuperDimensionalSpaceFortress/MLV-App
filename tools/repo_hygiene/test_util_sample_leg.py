@@ -630,6 +630,25 @@ $r['r6Z1'] = @{ rows = $z1rows.Count; why = $z1p.why; cores = @($z1rows | ForEac
 $z1u = $H + (CpuRow $p0.AddSeconds(1) 25 1234 1 $p0 '0' 1000 1000) + (CpuRow $p0.AddSeconds(2) 25 1234 0.2 $p0.AddSeconds(1) '0' '' 1000)
 for ($i = 3; $i -le 21; $i++) { $z1u += (CpuRow $p0.AddSeconds($i) 25 1234 1 $p0.AddSeconds($i - 1) '0' 1000 1000) }
 $r['r6Z1Unbound'] = (Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $z1u) $run $x1w $okStop).status
+# ---- adversary a00b7766 A2 (r6 pass 10, exact case): every row total=50, pid 1234, cores=1. Rows 1..5 (P+n, from P+n-1, step 0, 1000/1000); row 6
+# (P+2.05, from P+5, step 4000, 1050/1050); row 7 (P+6, from P+6.05, step 3000, 950/950); row 8 (P+7, from P+3, step 0); rows 9..22 (P+n-1, from
+# P+n-2, step 0). Log: start session=1 at P, summary at P+19 s with elapsed_ms=20000. At a00b7766 rows 6 and 7 (fromUtc after utc) were dropped
+# as unparseable, the witness never saw their steps, and the summary said ok 50 / 1.0
+$w2t = $H
+for ($n = 1; $n -le 5; $n++) { $w2t += (CpuRow $p0.AddSeconds($n) 50 1234 1 $p0.AddSeconds($n - 1) '0' 1000 1000) }
+$w2t += "$($p0.AddMilliseconds(2050).ToString('o')),50,1234,1,$($p0.AddSeconds(5).ToString('o')),4000,1050,1050`n"
+$w2t += "$($p0.AddSeconds(6).ToString('o')),50,1234,1,$($p0.AddMilliseconds(6050).ToString('o')),3000,950,950`n"
+$w2t += (CpuRow $p0.AddSeconds(7) 50 1234 1 $p0.AddSeconds(3) '0' 1000 1000)
+for ($n = 9; $n -le 22; $n++) { $w2t += (CpuRow $p0.AddSeconds($n - 1) 50 1234 1 $p0.AddSeconds($n - 2) '0' 1000 1000) }
+$w2log = "[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:19.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=20000`n"
+$w2p = ConvertFrom-UtilSampleCpuCsv $w2t
+$w2w = Get-UtilSamplePlayWindow $w2log
+if ($null -ne $w2w) { $w2w['clockWhy'] = Get-UtilSampleClockWitness $w2p $run $w2w }
+$w2s = Get-UtilSampleCpuSummary $w2p $run $w2w $okStop
+# the same rows without the two stepped rows: row 8's interval start moved back from P+4 to P+3, which a steady clock never does
+$w2q = ConvertFrom-UtilSampleCpuCsv (@($w2t -split "`n" | Where-Object { $_ -notmatch ',(4000|3000),' }) -join "`n")
+$r['r6W2'] = @{ rows = $w2p.rows.Count; unparseable = $w2p.unparseable; why = $w2p.why; window = ($null -ne $w2w); clockWhy = $(if ($w2w) { $w2w.clockWhy }); status = $w2s.status; total = $w2s.totalMean
+    backwards = (Get-UtilSampleClockWitness $w2q $run ([ordered]@{ startUtc = $p0; endUtc = $p0.AddSeconds(19) })); backwardsUnparseable = $w2q.unparseable }
 # A2 (exact case, in-memory double): the CPU precheck saw no file; the child started; a second writer created cpu-util.csv holding KEEP-FOREIGN. The
 # stop reads HasExited=false, then the child refuses CreateNew and exits 1 before the stop completes: stopped=true, exitedBeforeStop=false, exitCode=1
 function New-ChildDouble([bool]$ExitsOnStop) {
@@ -898,6 +917,15 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertAlmostEqual(z1["mean"], 1.0, delta=0.03, msg=f"the windowed app cores mean is not one core: {z1}")
         self.assertGreaterEqual(z1["maxIntervalMs"], 700, f"the row after the stall should span it: {z1}")
         self.assertEqual(self.r["r6Z1Unbound"], "unavailable(cpu-app-interval-unbound)", "an undated snapshot interval fails closed, never a guessed weight")
+
+    def test_adv_a00b7766_a2_a_dropped_stepped_row_does_not_leave_a_verified_clock(self) -> None:
+        # r6 pass 10 exact case: at a00b7766 rows=20, unparseable=2, clockWhy=None, status ok, total 50.0
+        w2 = self.r["r6W2"]
+        self.assertEqual((w2["rows"], w2["unparseable"], w2["why"], w2["window"]), (20, 2, None, True), w2)
+        self.assertEqual(w2["clockWhy"], "sample-clock-unverified", f"a stepped row the parser dropped left the window verified: {w2}")
+        self.assertEqual((w2["status"], w2["total"]), ("unavailable(sample-clock-unverified)", None), w2)
+        self.assertEqual((w2["backwardsUnparseable"], w2["backwards"]), (0, "sample-clock-unverified"),
+                         "an interval start that moves backwards is a stepped clock even when every row parses")
 
     def test_adv_f685c478_a2_a_child_that_failed_owns_nothing_and_nothing_is_published(self) -> None:
         # exact case (in-memory double): stop read HasExited=false, then the child refused CreateNew over KEEP-FOREIGN and exited 1

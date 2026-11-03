@@ -7246,10 +7246,14 @@ function Get-UtilSampleClockWitness($Parsed, $Start, $Window) {
     try {
         if ($null -eq $Window) { return $null }
         if ($null -eq $Start -or $Start.status -cne 'running' -or $null -eq $Parsed -or $Parsed.why -or $Parsed.rows.Count -eq 0) { return 'sample-clock-unwitnessed' }
+        # adversary a00b7766 A2: a row the child wrote that does not parse (a stepped clock writes fromUtc after utc) may carry the very step the
+        # witness looks for, so any unparseable row leaves the clock unverified; and a row's interval start never moves backwards on a steady clock
+        if ($Parsed.Contains('unparseable') -and $Parsed.unparseable -gt 0) { return 'sample-clock-unverified' }
         $rows = @($Parsed.rows)
         if (-not (Test-UtilSampleClockSteady $rows)) { return 'sample-clock-unverified' }
         for ($i = 0; $i -lt $rows.Count; $i++) {
             if ($null -eq $rows[$i].step -or $rows[$i].step -gt 25) { return 'sample-clock-unverified' }
+            if ($i -gt 0 -and $rows[$i].fromUtc -lt $rows[$i - 1].fromUtc) { return 'sample-clock-unverified' }
             if ($i -gt 0 -and $rows[$i].fromUtc -gt $rows[$i - 1].utc) { return 'sample-clock-unwitnessed' }
         }
         if ($rows[0].fromUtc -gt $Window.startUtc -or $rows[$rows.Count - 1].utc -lt $Window.endUtc) { return 'sample-clock-unwitnessed' }
