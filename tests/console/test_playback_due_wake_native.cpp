@@ -630,3 +630,145 @@ TEST(PlaybackDueWakeI1, WithTheWakeOffThePendingAdvanceGateIsTheBaseCondition)
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
     ASSERT_EQ( 2, source.count( QStringLiteral( "playbackPendingAdvanceMayBeTaken( mlvappPlaybackDueWakeEnabled(), ui->actionPlay->isChecked()," ) ) );
 }
+
+// r5 (Dot B2, CoS on a5c8dc46): past the 16,384-value exact store the r4 histogram clamped an out-of-range sample into its
+// edge bin, and the summary line printed that bin's centre as a measured percentile. Every assertion below on percentile()
+// also compiles against the r4 header, and is RED there (79.995 / -19.995 where the rank is censored).
+namespace
+{
+PlaybackDueWakeSamples dueWakeSamplesOf( std::size_t n, double ms )
+{
+    PlaybackDueWakeSamples samples;
+    for( std::size_t i = 0; i < n; ++i ) samples.add( ms );
+    return samples;
+}
+}
+
+TEST(PlaybackDueWakeSamplesB2, AnUpperTailPastTheExactStoreIsCensoredNotTheEdgeBin)
+{
+    // the Dot B2 repro: 16,385 wakes of 500 ms gave p50 = p95 = 79.995 ms
+    const PlaybackDueWakeSamples late = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity + 1, 500.0 );
+    ASSERT_FALSE( late.exact() );
+    ASSERT_TRUE( std::isnan( late.percentile( 0.50 ) ) );
+    ASSERT_TRUE( std::isnan( late.percentile( 0.95 ) ) );
+    ASSERT_TRUE( std::isnan( late.percentile( 0.0 ) ) );
+    ASSERT_TRUE( late.rank( 0.50 ).censor == PlaybackDueWakeSamples::Censor::Overflow );
+    ASSERT_EQ( std::string( ">=80.000" ), playbackDueWakePercentileText( late, 0.50 ).toStdString() );
+    ASSERT_EQ( std::string( ">=80.000" ), playbackDueWakePercentileText( late, 0.95 ).toStdString() );
+    ASSERT_EQ( PlaybackDueWakeSamples::kExactCapacity + 1, late.overflow() );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), late.underflow() );
+    // the upper bound itself is out of range ([kMinMs, kMaxMs)); one ulp below it is the last bin
+    const PlaybackDueWakeSamples atMax = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity + 1, PlaybackDueWakeSamples::kMaxMs );
+    ASSERT_TRUE( std::isnan( atMax.percentile( 0.50 ) ) );
+    const PlaybackDueWakeSamples belowMax =
+        dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity + 1, std::nextafter( PlaybackDueWakeSamples::kMaxMs, 0.0 ) );
+    ASSERT_NEAR( PlaybackDueWakeSamples::kMaxMs, belowMax.percentile( 0.50 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), belowMax.overflow() );
+}
+
+TEST(PlaybackDueWakeSamplesB2, ALowerTailPastTheExactStoreIsCensoredNotTheEdgeBin)
+{
+    // below -20 ms saturated the same way (-19.995)
+    const PlaybackDueWakeSamples early = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity + 1, -50.0 );
+    ASSERT_FALSE( early.exact() );
+    ASSERT_TRUE( std::isnan( early.percentile( 0.50 ) ) );
+    ASSERT_TRUE( std::isnan( early.percentile( 1.0 ) ) );
+    ASSERT_TRUE( early.rank( 0.95 ).censor == PlaybackDueWakeSamples::Censor::Underflow );
+    ASSERT_EQ( std::string( "<=-20.000" ), playbackDueWakePercentileText( early, 0.50 ).toStdString() );
+    ASSERT_EQ( PlaybackDueWakeSamples::kExactCapacity + 1, early.underflow() );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), early.overflow() );
+    // the lower bound itself is in range (bin 0); NaN is never in range and counts as underflow, not as bin 0
+    const PlaybackDueWakeSamples atMin = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity + 1, PlaybackDueWakeSamples::kMinMs );
+    ASSERT_NEAR( PlaybackDueWakeSamples::kMinMs, atMin.percentile( 0.50 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), atMin.underflow() );
+    PlaybackDueWakeSamples withNan = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity, 5.0 );
+    withNan.add( std::numeric_limits<double>::quiet_NaN() );
+    ASSERT_EQ( static_cast<std::size_t>( 1 ), withNan.underflow() );
+    ASSERT_TRUE( std::isnan( withNan.percentile( 0.0 ) ) );
+    ASSERT_NEAR( 5.0, withNan.percentile( 0.50 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+}
+
+TEST(PlaybackDueWakeSamplesB2, TheSpillTransitionMeasuresExactlyUpToTheCapacityAndCensorsPastIt)
+{
+    // exactly kExactCapacity samples: still the exact store, so even out-of-range values are measured values
+    PlaybackDueWakeSamples late = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity, 500.0 );
+    ASSERT_TRUE( late.exact() );
+    ASSERT_EQ( 500.0, late.percentile( 0.50 ) );
+    ASSERT_EQ( 500.0, late.percentile( 0.95 ) );
+    ASSERT_EQ( std::string( "500.000" ), playbackDueWakePercentileText( late, 0.95 ).toStdString() );
+    ASSERT_EQ( PlaybackDueWakeSamples::kExactCapacity, late.overflow() );   // disclosed even while exact
+    // one more: the spill; the ranks are now in the overflow, so they are censored
+    late.add( 500.0 );
+    ASSERT_FALSE( late.exact() );
+    ASSERT_TRUE( std::isnan( late.percentile( 0.50 ) ) );
+    ASSERT_EQ( std::string( ">=80.000" ), playbackDueWakePercentileText( late, 0.50 ).toStdString() );
+    ASSERT_EQ( PlaybackDueWakeSamples::kExactCapacity + 1, late.overflow() );
+    // the Play-start reset clears the disclosure counts with the storage
+    late.reset();
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), late.overflow() );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), late.underflow() );
+    ASSERT_EQ( std::string( "0.000" ), playbackDueWakePercentileText( late, 0.50 ).toStdString() );   // no samples, as before
+}
+
+TEST(PlaybackDueWakeSamplesB2, AMixedSetKeepsInRangeRanksExactToTheBinAndCensorsTheTails)
+{
+    // 500 below the range, 12,000 in it, 4,000 above: 16,500 samples, past the exact store
+    PlaybackDueWakeSamples mixed;
+    std::vector<double> reference;
+    LatenessSource source;
+    for( int i = 0; i < 500; ++i ) { const double v = source.next( -60.0, -20.5 ); mixed.add( v ); reference.push_back( v ); }
+    for( int i = 0; i < 12000; ++i ) { const double v = source.next( -19.0, 79.0 ); mixed.add( v ); reference.push_back( v ); }
+    for( int i = 0; i < 4000; ++i ) { const double v = source.next( 80.5, 900.0 ); mixed.add( v ); reference.push_back( v ); }
+    ASSERT_FALSE( mixed.exact() );
+    ASSERT_EQ( static_cast<std::size_t>( 500 ), mixed.underflow() );
+    ASSERT_EQ( static_cast<std::size_t>( 4000 ), mixed.overflow() );
+    // nearest rank over 16,500: index = floor( p * 16499 + 0.5 ); [0, 500) underflow, [500, 12500) in range, the rest overflow
+    const double underflowPs[] = { 0.0, 0.01, 0.03 };                    // indices 0, 165, 495
+    const double inRangePs[] = { 0.0304, 0.05, 0.50, 0.70, 0.7575 };     // indices 502, 825, 8250, 11549, 12498
+    const double overflowPs[] = { 0.7577, 0.80, 0.95, 1.0 };             // indices 12501, 13199, 15674, 16499
+    for( const double p : underflowPs )
+    {
+        ASSERT_TRUE( std::isnan( mixed.percentile( p ) ) );
+        ASSERT_EQ( std::string( "<=-20.000" ), playbackDueWakePercentileText( mixed, p ).toStdString() );
+    }
+    for( const double p : inRangePs )
+    {
+        ASSERT_TRUE( mixed.rank( p ).censor == PlaybackDueWakeSamples::Censor::None );
+        ASSERT_NEAR( unboundedPercentile( reference, p ), mixed.percentile( p ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    }
+    for( const double p : overflowPs )
+    {
+        ASSERT_TRUE( std::isnan( mixed.percentile( p ) ) );
+        ASSERT_EQ( std::string( ">=80.000" ), playbackDueWakePercentileText( mixed, p ).toStdString() );
+    }
+}
+
+TEST(PlaybackDueWakeSamplesB2, TheLongPlaySummaryLineDisclosesEachSetsRangeAndCensoring)
+{
+    // the disclosure fields one set adds to the playback_due_wake line, after a long Play past the exact store
+    PlaybackDueWakeSamples late = dueWakeSamplesOf( PlaybackDueWakeSamples::kExactCapacity + 1, 500.0 );
+    late.add( -50.0 );
+    ASSERT_EQ( std::string( " late_exact=0 late_underflow=1 late_overflow=16385 late_range_ms=-20.000:80.000" ),
+               playbackDueWakeRangeFields( late, "late" ).toStdString() );
+    const PlaybackDueWakeSamples measured = dueWakeSamplesOf( 3, 4.25 );
+    ASSERT_EQ( std::string( " post_to_receive_exact=1 post_to_receive_underflow=0 post_to_receive_overflow=0 "
+                            "post_to_receive_range_ms=-20.000:80.000" ),
+               playbackDueWakeRangeFields( measured, "post_to_receive" ).toStdString() );
+    ASSERT_EQ( std::string( "4.250" ), playbackDueWakePercentileText( measured, 0.50 ).toStdString() );
+    // MainWindow emits every percentile of all three sets through the censoring text, and each set's disclosure fields
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    const QString line = functionBody( source, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
+                                       QStringLiteral( "//Paint the Audio Track Wave to GUI" ) );
+    ASSERT_FALSE( line.isEmpty() );
+    ASSERT_EQ( 6, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
+    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "DueToPostMs, 0.50 )", "DueToPostMs, 0.95 )",
+                                  "PostToReceiveMs, 0.50 )", "PostToReceiveMs, 0.95 )" };
+    for( const char *rank : ranks )
+        ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) + QLatin1String( rank ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, \"late\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeDueToPostMs, \"due_to_post\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveMs, \"post_to_receive\" )" ) ) );
+    // no raw double percentile is formatted on the line any more (that was the clamped value's path)
+    ASSERT_EQ( 0, line.count( QStringLiteral( ".percentile(" ) ) );
+    ASSERT_EQ( 0, line.count( QStringLiteral( "0, 'f', 3 )" ) ) );
+}

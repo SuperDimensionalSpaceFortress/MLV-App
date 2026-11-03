@@ -19676,20 +19676,26 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
 QString MainWindow::playbackDueWakeSummaryLine( void ) const
 {
     // r4 (Dot B1): the same nearest-rank percentiles, from bounded storage (exact up to kExactCapacity samples per Play)
-    const double p50 = m_playbackDueWakeLatenessMs.percentile( 0.50 );
-    const double p95 = m_playbackDueWakeLatenessMs.percentile( 0.95 );
+    // r5 (Dot B2): every percentile goes through playbackDueWakePercentileText, so a binned rank outside the histogram range
+    // prints CENSORED ("<=-20.000" / ">=80.000"), never the edge bin's centre as a measured value
+    const QString p50 = playbackDueWakePercentileText( m_playbackDueWakeLatenessMs, 0.50 );
+    const QString p95 = playbackDueWakePercentileText( m_playbackDueWakeLatenessMs, 0.95 );
     // r3: the lateness split at the post (post_stamped = how many fired wakes carried a post time; the rest are 0.000)
     const QString split = QStringLiteral( " post_stamped=%1 due_to_post_p50_ms=%2 due_to_post_p95_ms=%3 "
                                           "post_to_receive_p50_ms=%4 post_to_receive_p95_ms=%5" )
         .arg( static_cast<qulonglong>( m_playbackDueWakePostToReceiveMs.size() ) )
-        .arg( m_playbackDueWakeDueToPostMs.percentile( 0.50 ), 0, 'f', 3 )
-        .arg( m_playbackDueWakeDueToPostMs.percentile( 0.95 ), 0, 'f', 3 )
-        .arg( m_playbackDueWakePostToReceiveMs.percentile( 0.50 ), 0, 'f', 3 )
-        .arg( m_playbackDueWakePostToReceiveMs.percentile( 0.95 ), 0, 'f', 3 );
-    // r4 (Dot B1): binned=1 when a set outgrew its exact store this Play (percentiles then within 0.005 ms, bin centre)
+        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostMs, 0.95 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveMs, 0.95 ) );
+    // r4 (Dot B1): binned=1 when a set outgrew its exact store this Play. r5 (Dot B2): a binned percentile is within 0.005 ms
+    // (bin centre) for IN-RANGE ranks only; each set discloses its exactness, its underflow / overflow counts and the range
     const bool binned = !m_playbackDueWakeLatenessMs.exact() || !m_playbackDueWakeDueToPostMs.exact()
         || !m_playbackDueWakePostToReceiveMs.exact();
-    const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 );
+    const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 )
+        + playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, "late" )
+        + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostMs, "due_to_post" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveMs, "post_to_receive" );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
                            "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )
         .arg( m_playbackDueWakeArmed )
@@ -19697,8 +19703,8 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( m_playbackDueWakeAdvanced )
         .arg( m_playbackDueWakeRearmed )
         .arg( m_playbackDueWakeBusyDeferred )
-        .arg( p50, 0, 'f', 3 )
-        .arg( p95, 0, 'f', 3 )
+        .arg( p50 )
+        .arg( p95 )
         .arg( m_playbackDueWakeHiRes ? 1 : 0 )
         .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 )
         .arg( m_playbackDueWakeDelivery.isEmpty() ? QStringLiteral( "none" ) : m_playbackDueWakeDelivery )
