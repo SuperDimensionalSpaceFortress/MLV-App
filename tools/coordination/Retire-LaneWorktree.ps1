@@ -648,18 +648,61 @@ function Get-PidsFromRecordText([string]$Text) {
 }
 $script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
 $script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
-$script:CreatedUtcJsonRx = [regex]::new('"createdUtc"\s*:\s*"([^"]+)"', 'Compiled')
 
-function Get-RecordedCreatedUtc([string]$Text, [int]$PidCount) {
-    # The process creation time a record states for its pid (opus-001.child.json: {"pid":N,"createdUtc":"..."}), UTC, or $null. Used only when the
-    # record names exactly one pid, so the time cannot belong to another one; any other shape, or text that does not parse, is $null (no claim).
-    if ($PidCount -ne 1 -or [string]::IsNullOrWhiteSpace($Text)) { return $null }
-    $m = $script:CreatedUtcJsonRx.Match($Text)
-    if (-not $m.Success) { return $null }
+function ConvertTo-RecordedUtc([object]$Value) {
+    # An ISO stamp string -> UTC [datetime], or $null (not a string, or does not parse: no claim).
+    if ($Value -isnot [string]) { return $null }
     $t = [datetime]::MinValue
-    $ok = [datetime]::TryParse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$t)
-    if ($ok) { return $t }
+    if ([datetime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$t)) { return $t }
     return $null
+}
+
+function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1, B2): the process creation time(s) a record states, as @{ pid = UTC datetime }, read from
+    # the PARSED record and only from fields that belong to a pid, never from a document-wide pattern (a nested metadata.createdUtc is not the
+    # record's identity):
+    #   root         {"pid":N,"createdUtc":"..."} (opus-001.child.json, schema mlv-lane-child/v1): used only when the record names exactly one pid.
+    #   containment  a native lane receipt's block (Invoke-Lane.ps1): childPid/childCreatedUtc, ownerPid/ownerCreatedUtc, runnerPid/runnerCreatedUtc,
+    #                each stamp binding ITS pid (a null or unparsable stamp is no claim).
+    # Text that is not a JSON object makes no claim (the caller falls back to the image + record-write-time test).
+    $map = @{}
+    if ([string]::IsNullOrWhiteSpace($Text) -or $Text.IndexOf('reatedUtc', [StringComparison]::Ordinal) -lt 0) { return $map }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($Text) } catch { return $map }
+    try {
+        $root = $doc.RootElement
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $map }
+        $rootStamp = $null
+        foreach ($prop in $root.EnumerateObject()) {
+            if ($prop.Name -ceq 'createdUtc') { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
+            elseif ($prop.Name -ceq 'containment' -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                $f = @{}
+                foreach ($c in $prop.Value.EnumerateObject()) { $f[$c.Name] = $c.Value }
+                foreach ($pair in @(@('childPid', 'childCreatedUtc'), @('ownerPid', 'ownerCreatedUtc'), @('runnerPid', 'runnerCreatedUtc'))) {
+                    if (-not $f.ContainsKey($pair[0]) -or -not $f.ContainsKey($pair[1])) { continue }
+                    $pe = $f[$pair[0]]; $se = $f[$pair[1]]
+                    $pn = 0
+                    if ($pe.ValueKind -ne [System.Text.Json.JsonValueKind]::Number -or -not $pe.TryGetInt32([ref]$pn) -or $se.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { continue }
+                    $st = ConvertTo-RecordedUtc $se.GetString()
+                    if ($null -ne $st -and $pn -gt 4) { $map[$pn] = $st }
+                }
+            }
+        }
+        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and -not $map.ContainsKey([int]$PidList[0])) { $map[[int]$PidList[0]] = $rootStamp }
+    } catch { return @{} } finally { $doc.Dispose() }
+    return $map
+}
+
+function Test-RecordedCreatedMismatch {
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1): does a record state an EXACT creation time for this pid that the live process does not
+    # have (beyond RunDirPidCreatedSlackSec)? Such a mismatch from any one record proves the pid was reused, and no weaker same-pid evidence from
+    # another record (a later write time) can overrule it. $false when the process creation time is unreadable or the record states none.
+    param([object]$Proc, [object]$Record)
+    $cdp = $Proc.PSObject.Properties['CreationDate']
+    if (-not $cdp -or $cdp.Value -isnot [datetime]) { return $false }
+    $rc = $Record.PSObject.Properties['RecordedCreatedUtc']
+    if (-not $rc -or $rc.Value -isnot [datetime]) { return $false }
+    return ([math]::Abs((([datetime]$cdp.Value).ToUniversalTime() - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds) -gt [double]$script:RunDirPidCreatedSlackSec)
 }
 
 function Test-RecordedPidBound {
@@ -749,8 +792,8 @@ function Get-RunDirPidIndex {
                 # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: each row also carries when the record was written (RecordedAtUtc) and, when it states one for
                 # its only pid, the recorded process creation time (RecordedCreatedUtc), so Find-RunDirDriverHolders can bind the pid to its process.
                 $recIds = Get-PidsFromRecordText $text
-                $recCreated = Get-RecordedCreatedUtc -Text $text -PidCount @($recIds).Count
-                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $f.LastWriteTimeUtc; RecordedCreatedUtc = $recCreated }) }
+                $recCreated = Get-RecordedCreatedUtcMap -Text $text -PidList $recIds
+                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $f.LastWriteTimeUtc; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }) }) }
             }
         }
     }
@@ -810,7 +853,15 @@ function Find-RunDirDriverHolders {
     $seen = @{}
     $fail = $null
     $unreadable = New-Object System.Collections.Generic.List[object]
-    foreach ($rec in @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)) {
+    $index = @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1): a creation-time mismatch stated by ANY record for a pid proves the pid was reused; it is
+    # settled once per pid here, so a weaker match from another record (a later write time) cannot bind it, whichever record comes first.
+    $reused = @{}
+    foreach ($rec in $index) {
+        if ($rec.Error -or $reused.ContainsKey($rec.Pid) -or -not $byPid.ContainsKey($rec.Pid)) { continue }
+        if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) { $reused[$rec.Pid] = $true }
+    }
+    foreach ($rec in $index) {
         if ($rec.Error) { $unreadable.Add($rec); continue }
         if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
         $p = $byPid[$rec.Pid]
@@ -820,7 +871,7 @@ function Find-RunDirDriverHolders {
             if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
             # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: the run-dir tie below needs the live pid to BE the recorded process (image + creation time);
             # a reused pid (tailscaled.exe, git.exe ... with an unreadable command line) is not a driver of this run dir.
-            elseif ((Test-RecordedPidBound -Proc $p -Record $rec).Bound -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            elseif (-not $reused.ContainsKey($rec.Pid) -and (Test-RecordedPidBound -Proc $p -Record $rec).Bound -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
                 $matched = $rec.RunDir
                 if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }

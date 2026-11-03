@@ -2853,6 +2853,124 @@ def test_gate_retires_a_worktree_whose_only_recorded_driver_pid_was_reused(repo)
     assert "REFUSED" not in err, err
 
 
+# --- RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 on PR #744): record identity is read from the record's own fields, and a mismatch wins ---
+# B1: a native receipt carries containment.childCreatedUtc (Invoke-Lane.ps1 containment block); a later receipt mtime must not override a
+#     child record's exact creation-time mismatch for the same pid, in either record order.
+# B2: createdUtc is read from the ROOT object only; a nested metadata.createdUtc must not replace it.
+
+def _iso(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_record(rd, name, doc, mtime):
+    p = rd / name
+    p.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+    os.utime(p, (mtime, mtime))
+
+
+@pytest.mark.parametrize("child_first", [True, False], ids=["child-record-first", "receipt-first"])
+@pytest.mark.parametrize("receipt_states_created", [True, False], ids=["receipt-has-childCreatedUtc", "receipt-has-no-stamp"])
+def test_b1_exact_mismatch_from_one_record_is_not_overridden_by_a_weaker_record(tmp_path, child_first, receipt_states_created):
+    """sol r1 B1: child {pid,createdUtc=T0}; receipt {containment.childPid,childCreatedUtc=T0}, mtime later than the replacement process
+    that got the pid at T0+1h. The pid is a different process: FREE, in either record order."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    replacement = t0 + 3600
+    receipt_mtime = replacement + 3600           # written after the replacement process started
+    containment = {"childPid": 999974}
+    if receipt_states_created:
+        containment["childCreatedUtc"] = _iso(t0)
+    _write_record(rd, "a-first.child.json" if child_first else "z-last.child.json",
+                  {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t0)}, t0 + 5)
+    _write_record(rd, "z-last.receipt.json" if child_first else "a-first.receipt.json",
+                  {"state": "complete", "exitCode": 0, "workDir": str(wt), "containment": containment}, receipt_mtime)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", replacement)), runs)
+    assert r is None, (r, err)
+
+
+def test_b1_native_receipt_childcreatedutc_is_an_exact_stamp(tmp_path):
+    """sol r1 B1, receipt alone: containment.childCreatedUtc binds the pid to that exact process (match refuses, mismatch is free)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt),
+                  "containment": {"childPid": 999974, "childCreatedUtc": _iso(t0)}}, now - 60)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0 + 1)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, r
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0 + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_b1_full_native_containment_block_binds_each_pid_to_its_own_stamp(tmp_path):
+    """The real receipt shape (Invoke-Lane.ps1) names runnerPid, ownerPid and childPid: each stamp binds only ITS pid."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt), "containment": {
+        "runnerPid": 999971, "runnerCreatedUtc": _iso(t0 - 100), "ownerPid": 999972, "ownerCreatedUtc": _iso(t0 - 50),
+        "childPid": 999974, "childCreatedUtc": _iso(t0)}}, now - 60)
+    live = _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0))
+    r, _ = _live_refusal(wt, live, runs)
+    assert r is not None and r["processId"] == 999974, r
+    for pid, ok_at in ((999972, t0 - 50), (999974, t0)):
+        r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(pid, "", "pwsh.exe", ok_at)), runs)
+        assert r is not None and r["processId"] == pid, (pid, r)
+        r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(pid, "", "pwsh.exe", ok_at + 3600)), runs)
+        assert r is None, (pid, r, err)
+
+
+def test_b2_nested_createdutc_does_not_replace_the_root_stamp(tmp_path):
+    """sol r1 B2: {"metadata":{"createdUtc":OCTOBER},"pid":P,"createdUtc":NOV1}; the genuine driver created NOV1 must still refuse."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.child.json", '{"schema":"mlv-lane-child/v1","metadata":{"createdUtc":"2026-10-01T00:00:00Z"},"pid":999974,"createdUtc":"%s"}' % _iso(created), now - 60)
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+    # and the root stamp still decides a reused pid: the replacement is not the recorded process
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_b2_nested_stamp_copies_are_ignored_and_unparsable_text_makes_no_claim(tmp_path):
+    """Class: a nested copy of either stamp field, in any position, is not the record's identity; unparsable text makes no claim (image/mtime fallback)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","exitCode":0,"workDir":%s,"metadata":{"childCreatedUtc":"2026-10-01T00:00:00Z"},"containment":{"childPid":999974,"childCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), _iso(created)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    # unparsable JSON text: no stamp claim, so a pwsh.exe that started before the record was written is still treated as the driver
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","workDir":%s,"containment":{"childPid":999974,"childCreatedUtc":"2000-01-01T00:00:00Z"' % json.dumps(str(wt)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo
