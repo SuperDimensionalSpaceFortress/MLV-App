@@ -1186,19 +1186,39 @@ class MeasuredSessionScopeFieldsTests(_PwshCase):
     the measured session's playback_smoke.cpu_summary_ext line, run as the job runs it (the bracketed splice, verbatim), so a
     build path in the Qt location suffix can supply neither the marker nor either field."""
 
-    def scope_fields(self, raw_log: str, session: str = "7") -> dict:
+    def scope_fields(self, raw_log: str, session: str = "7", with_interval: bool = False) -> dict:
         text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
         start = text.index("# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>\n# r2 (CoS #447): where the MEASURED session's scope updates")
         end = text.index("# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<", start)
         log = self.tmp / "run.log"
         log.write_text(raw_log, encoding="utf-8")
+        fields = "s = $scopeSource; c = $scopeTapCompleted" + ("; i = $scopeTapInterval" if with_interval else "")
         proc = self.run_with_module(
             f"$rawLog = [IO.File]::ReadAllText('{log}')\n$measuredSmokeSessionId = '{session}'\n"
             + text[start:end]
-            + "\nWrite-Output ('OUT=' + (@{ s = $scopeSource; c = $scopeTapCompleted } | ConvertTo-Json -Compress))\n")
+            + "\nWrite-Output ('OUT=' + (@{ " + fields + " } | ConvertTo-Json -Compress))\n")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         line = next(x for x in proc.stdout.splitlines() if x.startswith("OUT="))
         return json.loads(line[4:])
+
+    def test_a_count_over_another_presenter_or_in_non_ascii_digits_is_no_count(self) -> None:
+        """r6 (Dot I1 on 44cebb07): scope_tap_interval=invalid (the presenter at the finish was not the one at the start) leaves
+        no count, so the leg is ineligible -- and a wrapped count beside it is never read. r6 (adversary r6 A2): a count in
+        non-ASCII digits (U+0661) is no count, not a thrown cast."""
+        ts = "[2026-11-03T23:00:04.000Z] [I] [0x1] "
+        head = ts + "playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap "
+        invalid = head + "scope_tap_requests=na scope_tap_completed=na scope_tap_w=256 scope_tap_h=144 scope_tap_interval=invalid\n"
+        self.assertEqual(self.scope_fields(invalid, with_interval=True), {"s": "gpu_tap", "c": None, "i": "invalid"})
+        wrapped = head + "scope_tap_completed=18446744073709551606 scope_tap_interval=invalid\n"
+        self.assertEqual(self.scope_fields(wrapped, with_interval=True), {"s": "gpu_tap", "c": None, "i": "invalid"})
+        stale_count = head + "scope_tap_completed=5 scope_tap_interval=invalid\n"
+        self.assertEqual(self.scope_fields(stale_count, with_interval=True), {"s": "gpu_tap", "c": None, "i": "invalid"})
+        valid = head + "scope_tap_completed=5 scope_tap_w=256 scope_tap_h=144 scope_tap_interval=valid\n"
+        self.assertEqual(self.scope_fields(valid, with_interval=True), {"s": "gpu_tap", "c": 5, "i": "valid"})
+        before_the_field = head + "scope_tap_completed=5 scope_tap_w=256 scope_tap_h=144\n"
+        self.assertEqual(self.scope_fields(before_the_field, with_interval=True), {"s": "gpu_tap", "c": 5, "i": None})
+        arabic_indic = head + "scope_tap_completed=١ scope_tap_interval=valid\n"
+        self.assertEqual(self.scope_fields(arabic_indic, with_interval=True), {"s": "gpu_tap", "c": None, "i": "valid"})
 
     def test_the_fields_come_from_the_record_body_only(self) -> None:
         ts = "[2026-11-02T09:00:04.000Z] [I] [0x1] "

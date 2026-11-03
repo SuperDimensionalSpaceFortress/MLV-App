@@ -655,6 +655,8 @@ private slots:
     void gpuScopeTapNeverPublishesAReadBackWhoseGlSequenceRaisedAnError();
     void gpuScopeTapRefusedOrFailingTapFallsBackToTheCpuScopeFeed();
     void gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedFramebuffer();
+    void gpuScopeTapWhoseFenceIsNullNeverPublishesAndFallsBackToTheCpuScopeFeed();
+    void gpuScopeTapIntervalIsInvalidAcrossAPresenterSwitchOrRecreation();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1552,6 +1554,8 @@ public:
     GLenum bufferDataError = GL_NO_ERROR;           // raised by glBufferData (the store is then left as it was)
     GLenum readPixelsError = GL_NO_ERROR;           // raised by glReadPixels (the store is then left as it was)
     GLenum genFramebuffersError = GL_NO_ERROR;      // r5: raised by glGenFramebuffers, which then leaves the name 0
+    bool fenceFails = false;                        // r6 (Dot I3): glFenceSync returns a null fence...
+    GLenum fenceError = GL_NO_ERROR;                // ...raising this error first (GL_NO_ERROR: null with no error)
     uint8_t picture[4] = { 255, 0, 0, 255 };        // RGBA of the picture a successful read copies
     int readPixelsCalls = 0;
     std::vector<GLuint> blitDrawTargets;            // r5: the draw framebuffer bound at each blit (0 = the displayed one)
@@ -1602,7 +1606,11 @@ public:
         if ( store.size() < bytes ) { raise(GL_INVALID_OPERATION); return; }
         for ( size_t i = 0; i < bytes; i += 4 ) std::memcpy(&store[i], picture, 4);
     }
-    GLsync glFenceSync(GLenum, GLbitfield) override { return reinterpret_cast<GLsync>(&m_fenceToken); }
+    GLsync glFenceSync(GLenum, GLbitfield) override
+    {
+        if ( fenceFails ) { raise(fenceError); return nullptr; }
+        return reinterpret_cast<GLsync>(&m_fenceToken);
+    }
     GLenum glClientWaitSync(GLsync, GLbitfield, GLuint64) override { return GL_ALREADY_SIGNALED; }
     void glDeleteSync(GLsync) override {}
     void *glMapBufferRange(GLenum, GLintptr, GLsizeiptr length, GLbitfield) override
@@ -1810,6 +1818,108 @@ void GuiSmokeTest::gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedF
     QVERIFY(!fakeScopeTapRound(refused, refusedGl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
     QVERIFY(!refused.usable());
     QCOMPARE(refused.counters().glErrors, quint64(1));
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r6 (Dot I3 on 44cebb07, GpuScopeTap.cpp:287): every earlier fake fence was non-null, so the
+// null-fence branch had no row. glFenceSync returns null -- after raising GL_INVALID_OPERATION, and (a driver that does
+// not say why) with no error at all. Each such read-back is not published and never left pending, and counts once in
+// issued=0, skipped and glErrors; kGlFailureLimit in a row make the tap unusable, so the scope takes the CPU feed. The
+// RED binary (the 1d3ea3f5 tap) counts none of them in glErrors.
+void GuiSmokeTest::gpuScopeTapWhoseFenceIsNullNeverPublishesAndFallsBackToTheCpuScopeFeed()
+{
+    int contextToken = 0;
+    const QOpenGLContext *context = reinterpret_cast<const QOpenGLContext *>(&contextToken);
+    for ( const GLenum fenceError : { GLenum(GL_INVALID_OPERATION), GLenum(GL_NO_ERROR) } )
+    {
+        GpuScopeTap tap("window");
+        tap.m_supportContext = context;
+        tap.m_supportCached = true;
+        FakeScopeTapGl gl;
+        gl.fenceFails = true;
+        gl.fenceError = fenceError;
+        std::vector<uint8_t> rgb8;
+        for ( int i = 1; i <= GpuScopeTap::kGlFailureLimit; ++i )
+        {
+            QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+            QVERIFY(!tap.pending());
+            QCOMPARE(tap.counters().issued, quint64(0));
+            QCOMPARE(tap.counters().completed, quint64(0));
+            QCOMPARE(tap.counters().skipped, quint64(i));
+            QCOMPARE(tap.counters().glErrors, quint64(i));
+            QCOMPARE(tap.usable(), i < GpuScopeTap::kGlFailureLimit);
+            QCOMPARE(tap.supportedCached(context), i < GpuScopeTap::kGlFailureLimit);   // false: CPU scope feed
+        }
+        QCOMPARE(gl.readPixelsCalls, GpuScopeTap::kGlFailureLimit);
+        QVERIFY(rgb8.empty());
+    }
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r6 (Dot I1 on 44cebb07, MainWindow.cpp:25744/30075): the measured session's scope_tap_*
+// counts were a subtraction of a start snapshot from whichever presenter was active at the finish, with no identity
+// binding. Started on presenter A with completed=10 and finished on a replacement B with completed=0, it wrapped to
+// 18446744073709551606. Now the interval is bound to the presenter: another presenter at the finish (a switch to the
+// other surface, the presenter re-created, its context re-created, or a presenter at only one end) makes it invalid,
+// with every delta 0 -- never a wrapped value. The same presenter at both ends still yields the right deltas. The RED
+// binary carries the 44cebb07 arithmetic (subtract regardless) behind GpuScopeTap::interval.
+void GuiSmokeTest::gpuScopeTapIntervalIsInvalidAcrossAPresenterSwitchOrRecreation()
+{
+    std::vector<uint8_t> rgb8;
+    auto completedRounds = [&rgb8](GpuScopeTap &tap, FakeScopeTapGl &gl, int rounds) {
+        for ( int i = 0; i < rounds; ++i )
+            QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    };
+    auto expectInvalid = [](const GpuScopeTap::Interval &in) {
+        QVERIFY(!in.valid);
+        QCOMPARE(in.requests, quint64(0));
+        QCOMPARE(in.completed, quint64(0));
+        QCOMPARE(in.notReady, quint64(0));
+        QCOMPARE(in.skipped, quint64(0));
+        QCOMPARE(in.mapMsTotal, 0.0);
+    };
+
+    // Switch: started on presenter A (completed=10), finished on presenter B (completed=0).
+    GpuScopeTap presenterA("widget");
+    FakeScopeTapGl glA;
+    completedRounds(presenterA, glA, 10);
+    const GpuScopeTap::Counters start = presenterA.counters();
+    QCOMPARE(start.completed, quint64(10));
+    {
+        GpuScopeTap presenterB("window");
+        QCOMPARE(presenterB.counters().completed, quint64(0));
+        QVERIFY(presenterB.counters().presenterId != start.presenterId);
+        expectInvalid(GpuScopeTap::interval(start, presenterB.counters()));
+    }
+    // Recreation: the replacement presenter has the same surface name and may sit at the same address; still another one.
+    {
+        GpuScopeTap replacement("widget");
+        FakeScopeTapGl glR;
+        completedRounds(replacement, glR, 12);   // even counts ABOVE the start's never pass as this interval's
+        expectInvalid(GpuScopeTap::interval(start, replacement.counters()));
+    }
+    // A presenter at only one end (no surface active at the start, or none at the finish).
+    expectInvalid(GpuScopeTap::interval(GpuScopeTap::Counters(), start));
+    expectInvalid(GpuScopeTap::interval(start, GpuScopeTap::Counters()));
+
+    // Same-presenter control: 3 more read-backs on A give completed=3, requests=3 and a valid interval.
+    completedRounds(presenterA, glA, 3);
+    const GpuScopeTap::Interval same = GpuScopeTap::interval(start, presenterA.counters());
+    QVERIFY(same.valid);
+    QCOMPARE(same.completed, quint64(3));
+    QCOMPARE(same.requests, quint64(3));
+    QCOMPARE(same.notReady, quint64(0));
+    QCOMPARE(same.skipped, quint64(0));
+    // No presenter at either end: valid and empty (nothing was measured, nothing wraps).
+    const GpuScopeTap::Interval none = GpuScopeTap::interval(GpuScopeTap::Counters(), GpuScopeTap::Counters());
+    QVERIFY(none.valid);
+    QCOMPARE(none.completed, quint64(0));
+
+    // The same object with its context re-created (destroy) is another presenter from then on: its counters carry on,
+    // but an interval that spans the recreation is invalid.
+    const GpuScopeTap::Counters beforeRecreate = presenterA.counters();
+    presenterA.destroy(false);
+    completedRounds(presenterA, glA, 1);
+    QCOMPARE(presenterA.counters().completed, beforeRecreate.completed + 1);
+    expectInvalid(GpuScopeTap::interval(beforeRecreate, presenterA.counters()));
 }
 
 // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: GpuScopeTap's no-GL state, shared by the viewport and GpuDisplayWindow.

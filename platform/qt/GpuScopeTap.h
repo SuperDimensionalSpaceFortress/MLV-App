@@ -72,7 +72,26 @@ public:
         double mapMsTotal = 0.0; // map + convert + unmap, summed over completed
         int lastWidth = 0;
         int lastHeight = 0;
+        // r6 (Dot I1 on 44cebb07): WHICH presenter these counters belong to. Process-unique and never reused: taken
+        // at construction (a new presenter, or the other surface's tap after a switch) and again at destroy() (its
+        // context re-created). 0 = no presenter answered. Two snapshots subtract only under one id (interval()).
+        quint64 presenterId = 0;
     };
+
+    /* r6 (Dot I1 on 44cebb07): the counters over a measured interval, from a snapshot at its start and one at its
+     * finish. valid is false -- and every delta 0 -- when the finish snapshot came from another presenter (a switch,
+     * a recreation, or a presenter at only one end) or a counter went backward: the counts are then not this
+     * interval's, and a subtraction would wrap (10 at start, 0 on a replacement presenter -> 18446744073709551606). */
+    struct Interval
+    {
+        bool valid = false;
+        quint64 requests = 0;
+        quint64 completed = 0;
+        quint64 notReady = 0;
+        quint64 skipped = 0;
+        double mapMsTotal = 0.0;
+    };
+    static Interval interval(const Counters &start, const Counters &finish);
 
     /* surfaceName is logged on the supported() line: "widget" or "window". */
     explicit GpuScopeTap(const char *surfaceName);

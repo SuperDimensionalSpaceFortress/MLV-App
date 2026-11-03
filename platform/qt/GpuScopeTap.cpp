@@ -13,6 +13,8 @@
 #include <QSize>
 #include <QtDebug>
 
+#include <atomic>
+
 namespace {
 
 // r4: the production side of the GpuScopeTapGl seam -- every call forwards to the current context's functions.
@@ -68,11 +70,36 @@ private:
     QOpenGLExtraFunctions *m_f;
 };
 
+// r6 (Dot I1): a presenter id is never 0 and never reused in the process, so a presenter re-created at the old one's
+// address still reads as another presenter.
+quint64 nextScopeTapPresenterId()
+{
+    static std::atomic<quint64> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 } // namespace
 
 GpuScopeTap::GpuScopeTap(const char *surfaceName)
     : m_surfaceName(surfaceName ? surfaceName : "unknown")
 {
+    m_counters.presenterId = nextScopeTapPresenterId();
+}
+
+GpuScopeTap::Interval GpuScopeTap::interval(const Counters &start, const Counters &finish)
+{
+    Interval out;
+    if ( start.presenterId != finish.presenterId ) return out;
+    if ( finish.requests < start.requests || finish.completed < start.completed || finish.notReady < start.notReady
+      || finish.skipped < start.skipped || finish.mapMsTotal < start.mapMsTotal )
+        return out;
+    out.valid = true;
+    out.requests = finish.requests - start.requests;
+    out.completed = finish.completed - start.completed;
+    out.notReady = finish.notReady - start.notReady;
+    out.skipped = finish.skipped - start.skipped;
+    out.mapMsTotal = finish.mapMsTotal - start.mapMsTotal;
+    return out;
 }
 
 bool GpuScopeTap::supported(QOpenGLContext *context, const QSurfaceFormat &requested) const
@@ -413,4 +440,5 @@ void GpuScopeTap::destroy(bool contextCurrent)
     m_supportCached = false;
     m_consecutiveGlFailures = 0;   // r4: a new context gets a fresh tap
     m_unusable = false;
+    m_counters.presenterId = nextScopeTapPresenterId();   // r6 (Dot I1): a re-created context is another presenter
 }

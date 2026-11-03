@@ -510,6 +510,12 @@ TEST(PlaybackScopesDuringPlayback, PGT07_MainWindowWiresTheReadBackWithoutRecurs
     }
     // The smoke's scope_tap_* counters read the active surface at both ends of the measured window.
     ASSERT_EQ(2, source.count(QStringLiteral("= playbackScopeTapCounters();")));
+    // r6 (Dot I1 on 44cebb07): the two ends are bound to one presenter -- the counts come from GpuScopeTap::interval
+    // (invalid across a switch or recreation; gui_tests drives it), never from a raw subtraction of the snapshots.
+    ASSERT_EQ(1, source.count(QStringLiteral("GpuScopeTap::interval( m_playbackSmokeStartScopeTapCounters, scopeTapNow )")));
+    ASSERT_TRUE(source.contains(QStringLiteral("scope_tap_interval=%23")));
+    ASSERT_FALSE(source.contains(QStringLiteral("scopeTapNow.requests -")));
+    ASSERT_FALSE(source.contains(QStringLiteral("scopeTapNow.completed -")));
     ASSERT_EQ(1, source.count(QStringLiteral("GpuDisplayViewport::scopeTapCountersFor( ui->graphicsView )"))); // the helper's own
     // NO RECURSION: the funnel -> playbackScopeGpuTapServesNow -> textureRouteEligibleIgnoringScopes -> the table. Neither of
     // the last two may call the funnel (or the scope-aware route check that calls it), so the call graph has no cycle.

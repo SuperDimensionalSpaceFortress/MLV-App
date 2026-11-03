@@ -1275,11 +1275,8 @@ private:
     uint64_t m_playbackSmokeStartScopeUpdates = 0;
     uint64_t m_playbackSmokeStartScopeSkips = 0;
     uint64_t m_playbackSmokeStartScopeGpuTapUpdates = 0;
-    uint64_t m_playbackSmokeStartScopeTapRequests = 0;
-    uint64_t m_playbackSmokeStartScopeTapCompleted = 0;
-    uint64_t m_playbackSmokeStartScopeTapNotReady = 0;
-    uint64_t m_playbackSmokeStartScopeTapSkipped = 0;
-    double m_playbackSmokeStartScopeTapMapMs = 0.0;
+    // r6 (Dot I1 on 44cebb07): the whole snapshot, presenterId included, so the finish binds to the same presenter.
+    GpuScopeTap::Counters m_playbackSmokeStartScopeTapCounters;
     uint64_t m_playbackSmokeStartAudioSyncRequests = 0;
     uint64_t m_playbackSmokeStartAudioSyncApplied = 0;
     uint64_t m_playbackSmokeStartAudioSyncSkipped = 0;

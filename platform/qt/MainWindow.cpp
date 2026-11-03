@@ -25740,14 +25740,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartScopeUpdates = m_playbackScopeUpdateCount;
     m_playbackSmokeStartScopeSkips = m_playbackScopeSkipCount;
     m_playbackSmokeStartScopeGpuTapUpdates = m_playbackScopeGpuTapUpdateCount;
-    {
-        const GpuScopeTap::Counters tapCounters = playbackScopeTapCounters();
-        m_playbackSmokeStartScopeTapRequests = tapCounters.requests;
-        m_playbackSmokeStartScopeTapCompleted = tapCounters.completed;
-        m_playbackSmokeStartScopeTapNotReady = tapCounters.notReady;
-        m_playbackSmokeStartScopeTapSkipped = tapCounters.skipped;
-        m_playbackSmokeStartScopeTapMapMs = tapCounters.mapMsTotal;
-    }
+    m_playbackSmokeStartScopeTapCounters = playbackScopeTapCounters();
     m_playbackSmokeStartAudioSyncRequests = m_playbackAudioSyncRequestCount;
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
@@ -30072,8 +30065,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
      * separately). */
     // PLAYBACK-GPU-SCOPES-NO-VETO-1: where the measured window's scope updates came from (cpu | gpu_tap |
     // mixed | none) and the GL viewport read-back's own counters over the same window.
+    // r6 (Dot I1 on 44cebb07): the counters subtract only when the presenter at the finish is the one snapshotted at the
+    // start. After a switch or a recreation the interval is invalid: scope_tap_interval=invalid and every count is "na",
+    // which the job reads as no count (ineligible), never a wrapped 18446744073709551606.
     const GpuScopeTap::Counters scopeTapNow = playbackScopeTapCounters();
-    const quint64 scopeTapCompleted = scopeTapNow.completed - m_playbackSmokeStartScopeTapCompleted;
+    const GpuScopeTap::Interval scopeTap = GpuScopeTap::interval( m_playbackSmokeStartScopeTapCounters, scopeTapNow );
+    const auto scopeTapCount = [&scopeTap]( quint64 value ) {
+        return scopeTap.valid ? QString::number( static_cast<qulonglong>( value ) ) : QStringLiteral("na");
+    };
+    const QString scopeTapAvgMapMs =
+        !scopeTap.valid ? QStringLiteral("na")
+      : QString::number( scopeTap.completed > 0 ? scopeTap.mapMsTotal / static_cast<double>( scopeTap.completed ) : 0.0, 'f', 3 );
     const quint64 scopeUpdatesGpuTap =
         m_playbackScopeGpuTapUpdateCount - m_playbackSmokeStartScopeGpuTapUpdates;
     const quint64 scopeUpdatesAll = m_playbackScopeUpdateCount - m_playbackSmokeStartScopeUpdates;
@@ -30099,7 +30101,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "avg_processed8_cache_store_ms=%14 "
                "scope_source=%15 scope_tap_requests=%16 scope_tap_completed=%17 "
                "scope_tap_not_ready=%18 scope_tap_skipped=%19 scope_tap_avg_map_ms=%20 "
-               "scope_tap_w=%21 scope_tap_h=%22" )
+               "scope_tap_w=%21 scope_tap_h=%22 scope_tap_interval=%23" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeCurveSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeGradationSumMs ), 0, 'f', 3 )
@@ -30115,15 +30117,14 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgProcessed8MsText( m_playbackSmokeProcessed8ThreadingOverheadSumMs ) )
                .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CacheStoreSumMs ) )
                .arg( scopeTapSource )
-               .arg( static_cast<qulonglong>( scopeTapNow.requests - m_playbackSmokeStartScopeTapRequests ) )
-               .arg( static_cast<qulonglong>( scopeTapCompleted ) )
-               .arg( static_cast<qulonglong>( scopeTapNow.notReady - m_playbackSmokeStartScopeTapNotReady ) )
-               .arg( static_cast<qulonglong>( scopeTapNow.skipped - m_playbackSmokeStartScopeTapSkipped ) )
-               .arg( scopeTapCompleted > 0
-                         ? ( scopeTapNow.mapMsTotal - m_playbackSmokeStartScopeTapMapMs ) / static_cast<double>( scopeTapCompleted )
-                         : 0.0, 0, 'f', 3 )
+               .arg( scopeTapCount( scopeTap.requests ) )
+               .arg( scopeTapCount( scopeTap.completed ) )
+               .arg( scopeTapCount( scopeTap.notReady ) )
+               .arg( scopeTapCount( scopeTap.skipped ) )
+               .arg( scopeTapAvgMapMs )
                .arg( scopeTapNow.lastWidth )
-               .arg( scopeTapNow.lastHeight );
+               .arg( scopeTapNow.lastHeight )
+               .arg( scopeTap.valid ? QStringLiteral("valid") : QStringLiteral("invalid") );
 
     qInfo().noquote()
         << QStringLiteral(

@@ -4293,6 +4293,9 @@ Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
 # served. Absent from a build that predates the fields: both stay $null, and a criterion on them fails (an absent metric never passes).
 $scopeSource = $null
 $scopeTapCompleted = $null
+# r6 (Dot I1 on 44cebb07): 'valid' | 'invalid' (the presenter at the finish was not the one at the start) | $null (a build before
+# the field). An invalid interval has no count: scopeTapCompleted stays $null, so a criterion on it fails (ineligible).
+$scopeTapInterval = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     # r3 (adversary A2 on ddceb595): the record BODY only, the text before the first ' (' (the Qt location suffix starts there and a
     # record body never holds ' ('), so a build path cannot supply the marker or either field.
@@ -4305,7 +4308,10 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     if ($body -match ('^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
         $scopeSource = if ($body -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
         # r5 (adversary r4 A4): a whole decimal count only (1.5, 1garbage or an overflow stay $null: fail closed, never a guess).
-        $scopeTapCompleted = if ($body -match '\sscope_tap_completed=(?<v>\d{1,18})(\s|$)') { [int64]$Matches['v'] } else { $null }
+        # r6 (adversary r6 A2 on 44cebb07): ASCII digits only -- \d also matches other scripts' digits, which the cast throws on.
+        $scopeTapCompleted = if ($body -match '\sscope_tap_completed=(?<v>[0-9]{1,18})(\s|$)') { [int64]$Matches['v'] } else { $null }
+        $scopeTapInterval = if ($body -match '\sscope_tap_interval=(?<v>valid|invalid)(\s|$)') { $Matches['v'] } else { $null }
+        if ($scopeTapInterval -eq 'invalid') { $scopeTapCompleted = $null }
     }
 }
 # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
@@ -4326,6 +4332,7 @@ Save-Json ([ordered]@{
     # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
     scopeSource = $scopeSource
     scopeTapCompleted = $scopeTapCompleted
+    scopeTapInterval = $scopeTapInterval
     # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     presentMonSamples = $pmRows.Count
     presentMonSelectedChain = $displayReport.selectedChain
