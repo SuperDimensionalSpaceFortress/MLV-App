@@ -19,6 +19,7 @@ Windows-only test below runs that script's pure-function cases (-UnitOnly, no he
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import math
 import os
@@ -74,6 +75,9 @@ def max_run_bounded_sec(timeout: float) -> float:
     return max_wait_and_kill_sec(timeout) + CAPTURE_CLOSE_BOUND_SEC + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
 
 
+_PARKED_CAPTURES: list = []  # capture handles whose close could not be started; kept alive so no finalizer closes them on the caller's thread
+
+
 def _close_captures(files: list) -> str:
     """Close the capture files under CAPTURE_CLOSE_BOUND_SEC (adversary r8 A1); return '' or a note naming what went wrong.
 
@@ -93,6 +97,9 @@ def _close_captures(files: list) -> str:
         closer = threading.Thread(target=close, name="close-capture", daemon=True)
         closer.start()
     except Exception as exc:  # noqa: BLE001 - a worker that cannot start must not replace the case-named verdict
+        # adversary r8 pass-12 A1: dropping the handles here would let the garbage collector close them synchronously on the caller's
+        # thread (traceback-frame clearing), unbounded. They are parked for the life of the process instead.
+        _PARKED_CAPTURES.extend(files)
         return f"capture close not started ({type(exc).__name__}: {exc})"
     closer.join(CAPTURE_CLOSE_BOUND_SEC)
     if closer.is_alive():
@@ -109,8 +116,11 @@ def _remove_capture_dir(path: str) -> str:
     left: dict[str, bool] = {}
 
     def remove() -> None:
-        shutil.rmtree(path, ignore_errors=True)
-        left["present"] = os.path.exists(path)  # ignore_errors hides a held or read-only file; the caller is told it stayed (adversary r7 A3)
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+            left["present"] = os.path.exists(path)  # ignore_errors hides a held or read-only file; the caller is told it stayed (adversary r7 A3)
+        except Exception as exc:  # noqa: BLE001 - adversary r8 A2: a worker that dies must not read as a finished removal
+            left["error"] = f"{type(exc).__name__}: {exc}"
 
     try:
         remover = threading.Thread(target=remove, name="rmtree-capture", daemon=True)
@@ -120,7 +130,9 @@ def _remove_capture_dir(path: str) -> str:
     remover.join(CAPTURE_CLEANUP_BOUND_SEC)
     if remover.is_alive():
         return f"capture cleanup abandoned after {CAPTURE_CLEANUP_BOUND_SEC:g} s: {path}"
-    if left.get("present"):
+    if "error" in left:
+        return f"capture cleanup failed ({left['error']}): {path}"
+    if left.get("present", True):  # no recorded answer means the worker ended without one: not a success
         return f"capture cleanup incomplete: {path} was not fully removed"
     return ""
 
@@ -1213,8 +1225,14 @@ class BoundedCaptureIoTests(unittest.TestCase):
                 raise RuntimeError("can't start new thread")
             real_start(thread)
 
-        with mock.patch.object(threading.Thread, "start", start):
-            caught = self._run_with_capture_close(lambda: None)
+        parked_before = len(_PARKED_CAPTURES)
+        try:
+            with mock.patch.object(threading.Thread, "start", start):
+                caught = self._run_with_capture_close(lambda: None)
+        finally:
+            for handle in _PARKED_CAPTURES[parked_before:]:  # the helper parks unclosable handles for the process; this test releases its own
+                handle.close()
+            del _PARKED_CAPTURES[parked_before:]
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("close-case exceeded its 3 s wall-clock bound", str(caught))
         self.assertIn("capture close not started (RuntimeError: can't start new thread)", str(caught))
@@ -1227,6 +1245,71 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIsInstance(caught, AssertionError, repr(caught))
         self.assertIn("close-case", str(caught))
         self.assertIn("capture close failed: OSError: [Errno 5] capture close failed", str(caught))
+
+    def test_captures_whose_close_could_not_start_are_never_closed_by_the_garbage_collector(self) -> None:
+        # adversary r8 pass-12 A1: with the close thread unstartable the handles were dropped, and clearing the traceback frames finalized
+        # them synchronously on the caller's thread (two 300 s closes took the helper 603 s against a 138 s ceiling). They are parked.
+        finalized: list[int] = []
+        parked_before = len(_PARKED_CAPTURES)
+
+        class Handle:
+            def close(self) -> None:
+                pass
+
+            def __del__(self) -> None:
+                finalized.append(1)
+
+        handles = [Handle(), Handle()]
+        real_start = threading.Thread.start
+
+        def start(thread: threading.Thread) -> None:
+            if thread.name == "close-capture":
+                raise RuntimeError("can't start new thread")
+            real_start(thread)
+
+        try:
+            with mock.patch.object(threading.Thread, "start", start):
+                note = _close_captures(handles)
+            del handles
+            gc.collect()
+            self.assertIn("capture close not started (RuntimeError: can't start new thread)", note)
+            self.assertEqual(finalized, [], "a parked handle must not be finalized (closed) by the collector")
+            self.assertEqual(len(_PARKED_CAPTURES), parked_before + 2)
+        finally:
+            del _PARKED_CAPTURES[parked_before:]
+
+    def test_a_cleanup_worker_that_dies_is_reported_not_read_as_a_removal(self) -> None:
+        # adversary r8 pass-12 A2: an exception out of shutil.rmtree (an audit hook, a patched seam) killed the worker before it recorded
+        # an answer, and the caller returned the empty success note.
+        path = tempfile.mkdtemp(prefix="heavy-slot-gate-dies-")
+        try:
+            with mock.patch.object(shutil, "rmtree", side_effect=PermissionError(13, "audit policy denies shutil.rmtree")):
+                note = _remove_capture_dir(path)
+            self.assertIn("capture cleanup failed (PermissionError: [Errno 13] audit policy denies shutil.rmtree)", note)
+            self.assertIn(path, note)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_a_cleanup_worker_that_ends_without_an_answer_is_not_a_success(self) -> None:
+        path = tempfile.mkdtemp(prefix="heavy-slot-gate-silent-")
+        try:
+            with mock.patch.object(shutil, "rmtree", side_effect=SystemExit(1)), mock.patch.object(threading, "excepthook", lambda args: None):
+                note = _remove_capture_dir(path)
+            self.assertIn("capture cleanup incomplete", note)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_directory_path_handed_to_the_capture_cleanup_is_reported_as_still_present(self) -> None:
+        # adversary r8 pass-12 A4: File.Exists(directory) is false, so a path that is a directory (nothing deleted) read as a clean removal.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$dir = Join-Path ([IO.Path]::GetTempPath()) ('mlv-r8-dir-' + [guid]::NewGuid().ToString('N'))\n"
+                  "$null = New-Item -ItemType Directory -Path $dir\n"
+                  "Write-Output ('DIR|' + (Remove-CaptureFiles @($dir)))\n"
+                  "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DIR|capture cleanup incomplete: still present: ", proc.stdout)
 
     def test_a_thread_constructor_that_fails_keeps_the_case_named_verdict(self) -> None:
         # adversary r8 A2: threading.Thread(...) itself (MemoryError) ran before the protected start() call, so it escaped.

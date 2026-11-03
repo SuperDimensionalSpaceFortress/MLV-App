@@ -507,7 +507,7 @@ function Initialize-BoundedCaptureIo {
         public static Task<string> Delete(string[] paths) {
             return Task.Run(() => {
                 var left = new System.Collections.Generic.List<string>();
-                foreach (string p in paths) { try { File.Delete(p); } catch (Exception) { } if (File.Exists(p)) { left.Add(p); } }
+                foreach (string p in paths) { try { File.Delete(p); } catch (Exception) { } if (File.Exists(p) || Directory.Exists(p)) { left.Add(p); } }
                 return string.Join(", ", left);
             });
         }
