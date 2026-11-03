@@ -193,13 +193,13 @@ def _kill_taskkill_child(taskkill: subprocess.Popen, problems: list[str]) -> Non
     """A taskkill that did not exit in time is killed and reaped under its own bound; a hung reap is reported, never waited on."""
     try:
         taskkill.kill()
-    except OSError as exc:
+    except Exception as exc:
         problems.append(f"taskkill kill failed: {exc!r}")
     try:
         taskkill.wait(timeout=TASKKILL_REAP_SEC)
     except subprocess.TimeoutExpired:
         problems.append(f"taskkill was still running {TASKKILL_REAP_SEC} s after its kill")
-    except OSError as exc:
+    except Exception as exc:
         problems.append(f"waiting for taskkill failed: {exc!r}")
 
 
@@ -208,12 +208,15 @@ def _kill_tree(proc: subprocess.Popen) -> str:
 
     Every wait below carries a timeout (subprocess.run(timeout=) does not: on expiry CPython kills the child and then waits for it
     with no timeout), so the whole cleanup stays inside CLEANUP_BOUND_SEC.
+
+    adversary r10 (pass 2) A1: every step records ANY Exception (MemoryError, a RuntimeError from an audit hook, ...) and carries on to the
+    next step, not just OSError / SubprocessError; only an interrupt (not an Exception) propagates.
     """
     problems: list[str] = []
     try:
         taskkill = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except Exception as exc:
         problems.append(f"taskkill failed: {exc!r}")
     else:
         try:
@@ -223,17 +226,17 @@ def _kill_tree(proc: subprocess.Popen) -> str:
         except subprocess.TimeoutExpired:
             problems.append(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s")
             _kill_taskkill_child(taskkill, problems)
-        except OSError as exc:
+        except Exception as exc:
             problems.append(f"taskkill failed: {exc!r}")
     try:
         proc.kill()
-    except OSError as exc:
+    except Exception as exc:
         problems.append(f"kill failed: {exc!r}")
     try:
         proc.wait(timeout=ROOT_REAP_SEC)
     except subprocess.TimeoutExpired:
         problems.append(f"the root process was still running {ROOT_REAP_SEC} s after the kill")
-    except OSError as exc:
+    except Exception as exc:
         problems.append(f"waiting for the root process failed: {exc!r}")
     return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
 
@@ -946,6 +949,62 @@ class BoundedRunOutputReadFailureTests(unittest.TestCase):
             self.assertIn("process tree kill is NOT confirmed", str(caught), label)
             self.assertIn("waiting for the root process failed", str(caught), label)
             self.assertNotIn("process tree was killed", str(caught), label)
+
+    def test_a_timeout_keeps_its_case_named_verdict_whatever_exception_a_cleanup_step_raises(self) -> None:
+        # adversary r10 (pass 2) A1: the cleanup steps caught only OSError / SubprocessError, so a MemoryError or a RuntimeError (an audit hook
+        # that denies the taskkill launch) from ANY step escaped, skipped the remaining steps (the root kill) and replaced the case-named
+        # AssertionError. Every step records any Exception and carries on; only an interrupt (not an Exception) still propagates.
+        def boom(exc: BaseException):
+            def raiser(*args: object, **kwargs: object) -> None:
+                raise exc
+            return raiser
+
+        def run(proc: object, taskkill: object, **popen_kwargs: object) -> BaseException:
+            with mock.patch.object(subprocess, "Popen", side_effect=self._popen_for(proc, taskkill, **popen_kwargs)):
+                try:
+                    run_bounded(["child"], 3, "stub-hang-case")
+                except BaseException as caught:  # noqa: BLE001 - the verdict type is the assertion
+                    return caught
+            self.fail("run_bounded returned instead of failing")
+
+        for exc in (MemoryError(), RuntimeError("audit denies taskkill")):
+            tk_wait = self._FakeTaskkill(0)
+            tk_wait.wait = boom(exc)  # type: ignore[method-assign]
+            tk_kill = self._FakeTaskkill(None, never_exits=True)
+            tk_kill.kill = boom(exc)  # type: ignore[method-assign]
+            tk_reap = self._FakeTaskkill(None, never_exits=True)
+            reaps: list[int] = []
+
+            def reap_wait(timeout: float | None = None, _tk: object = tk_reap, _reaps: list[int] = reaps, _exc: BaseException = exc) -> int:
+                _reaps.append(1)
+                if len(_reaps) == 1:
+                    raise subprocess.TimeoutExpired(["taskkill"], timeout)
+                raise _exc
+            tk_reap.wait = reap_wait  # type: ignore[method-assign]
+            proc_kill = self._TimedOutProc()
+            proc_kill.kill = boom(exc)  # type: ignore[method-assign]
+            proc_wait = self._TimedOutProc()
+
+            def root_wait(timeout: float | None = None, _p: object = proc_wait, _exc: BaseException = exc) -> int:
+                _p.waits += 1  # type: ignore[attr-defined]
+                if _p.waits == 1:  # type: ignore[attr-defined]
+                    raise subprocess.TimeoutExpired(["child"], timeout)
+                raise _exc
+            proc_wait.wait = root_wait  # type: ignore[method-assign]
+            cases = (
+                ("taskkill launch", run(self._TimedOutProc(), None, taskkill_launch_error=exc), "taskkill failed"),
+                ("taskkill wait", run(self._TimedOutProc(), tk_wait), "taskkill failed"),
+                ("taskkill kill", run(self._TimedOutProc(), tk_kill), "taskkill kill failed"),
+                ("taskkill reap", run(self._TimedOutProc(), tk_reap), "waiting for taskkill failed"),
+                ("root kill", run(proc_kill, self._FakeTaskkill(0)), "kill failed"),
+                ("root wait", run(proc_wait, self._FakeTaskkill(0)), "waiting for the root process failed"),
+            )
+            for label, caught, expect in cases:
+                with self.subTest(exc=repr(exc), step=label):
+                    self.assertIsInstance(caught, AssertionError, repr(caught))
+                    self.assertIn("stub-hang-case exceeded its 3 s wall-clock bound", str(caught))
+                    self.assertIn("process tree kill is NOT confirmed", str(caught))
+                    self.assertIn(expect, str(caught))
 
     def test_a_confirmed_kill_still_says_the_tree_was_killed(self) -> None:
         caught = self._run_failing_cleanup(taskkill=0)
