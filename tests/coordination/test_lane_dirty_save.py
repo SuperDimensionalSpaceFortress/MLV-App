@@ -1930,3 +1930,57 @@ def test_an_argument_holding_the_replacement_character_is_refused_because_argv_d
     r = run_saver(wd, tmp_path / "run")
     assert r.returncode == 30 and "reason=lossy-argument" in r.stdout, r.stdout + r.stderr  # 6d7b066f: 10 clean-tree
     assert list((tmp_path / "run").iterdir()) == []
+
+
+# ---- r15 (sol r14 B1 on 0b7a98cd): a swap of the captured git dir that is RESTORED before the final identity check ----
+def _swap_hooked_saver(work, run, tmp_path, start_anchor, end_anchor, other_git_dir=None):
+    """Run a COPY of the saver in which a peer replaces the captured git dir at `start_anchor` and puts it back at `end_anchor` (the in-memory stand-in for the POSIX rename dance: Windows holds the git dir open, so a real rename cannot be played there). While swapped, the identity reader names the git dir as another directory; with `other_git_dir` the collecting git calls also read THAT repository (HEAD, index and objects from it, the selected work tree on disk)."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(start_anchor) == 1 and text.count(end_anchor) == 1
+    start = ("$script:simSwap = $true; $script:origId = ${function:Get-DirId}; "
+             "function Get-DirId([string]$Path, [scriptblock]$ReadId = $null) { if ($script:simSwap -and [string]::Equals($Path, $gitDir, [System.StringComparison]::Ordinal)) { return 'swapped-in-repository' }; & $script:origId $Path $ReadId }; ")
+    if other_git_dir is not None:
+        start += f"$script:pin = @(('--git-dir=' + '{other_git_dir}'), ('--work-tree=' + $WorkDir)); "
+    hooked = tmp_path / "swap-hooked-saver.ps1"
+    hooked.write_text(text.replace(start_anchor, start + start_anchor).replace(end_anchor, "$script:simSwap = $false; " + end_anchor), encoding="utf-8")
+    return subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(work), "-RunDir", str(run), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+
+
+END_OF_COLLECTION = "if ($gitDir) { try { Assert-RepoUnchanged"
+
+
+def test_a_git_dir_swapped_in_for_the_first_read_and_restored_before_the_final_check_is_never_a_clean_tree(tmp_path):  # sol r14 B1 (= adversary pass 2 A1): A commits BASE and holds DIRT on disk; B commits DIRT. HEAD, index and objects come from B, the collection is empty, the restored original identities pass, and the run said clean-tree/10 for unsaved tracked work
+    a, b, run = tmp_path / "wtA", tmp_path / "wtB", tmp_path / "run"
+    init_repo(a, b"BASE\n")
+    init_repo(b, b"DIRT\n")
+    run.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    r = _swap_hooked_saver(a, run, tmp_path, "$headR = if ($top.Code -eq 0)", END_OF_COLLECTION, other_git_dir=str(b / ".git"))
+    assert r.returncode == 30 and "reason=repository-changed" in r.stdout, r.stdout + r.stderr  # 0b7a98cd: DIRTY_SAVE_NOTHING reason=clean-tree, exit 10
+    assert "clean-tree" not in r.stdout and list(run.iterdir()) == []
+
+
+def test_a_swap_that_lasts_for_the_middle_of_the_collection_only_is_refused_too(tmp_path):  # the same class one call later: the identity is re-read after EVERY collecting git call, not only at the end, so a swap that is back in place at the end still ends in exit 30 (0b7a98cd: the final check passed and the run saved as if nothing had happened)
+    a, run = tmp_path / "wtA", tmp_path / "run"
+    init_repo(a, b"BASE\n")
+    run.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    r = _swap_hooked_saver(a, run, tmp_path, "$git.patch = Invoke-GitBytes", "$git.untracked = Invoke-GitBytes")
+    assert r.returncode == 30 and "reason=repository-changed" in r.stdout, r.stdout + r.stderr
+    assert list(run.iterdir()) == []
+
+
+def test_an_unswapped_run_of_the_same_repository_still_saves_the_dirt(tmp_path):  # control: the two tests above fail on the swap and nothing else
+    a, run = tmp_path / "wtA", tmp_path / "run"
+    init_repo(a, b"BASE\n")
+    run.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    r = save(a, "-LanePid", str(dead_pid()))
+    assert r.returncode == 0 and any(p.name.endswith(".patch") for p in run.iterdir()), r.stdout + r.stderr
+
+
+def test_every_collecting_git_call_rechecks_the_repository_identity_in_the_saver_source():  # sol r14 B1 source pin: the check lives in Invoke-GitBytes (before and after the child), so no call site can forget it, and a changed repository outranks a git failure (exit 30 before exit 40)
+    text = SCRIPT.read_text(encoding="utf-8")
+    body = text[text.index("function Invoke-GitBytes"):text.index("function Remove-GitTerminator")]
+    assert body.count("Test-RepoSame") >= 2 and "$script:repoChanged" in text
+    assert text.index("if ($script:repoChanged)") < text.index("$bad = $git.Values")
