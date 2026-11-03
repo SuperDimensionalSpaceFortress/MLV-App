@@ -588,7 +588,8 @@ $r['r6A1'] = @{ parseWhy = $x1p.why; clock = $x1w.clockWhy; status = $x1s.status
 # A1 (loop): the snapshot after the second row's counter read stalls 1 s (the finding's deschedule); every row's counterMs must be the span between
 # the two counter reads it measured (recorded by the counter itself), not the snapshots' span
 $script:x1n = 0; $script:x1cm = [Collections.Generic.List[double]]::new(); $x1sw = [Diagnostics.Stopwatch]::StartNew()
-$x1loop = @(Invoke-UtilSampleCpuLoop (Join-Path $t 'r6a1.csv') (Join-Path $t 'r6a1.stop') 'no-such-process-name-xyz' 200 2600 { $script:x1cm.Add($x1sw.Elapsed.TotalMilliseconds); 5 } 0 0 0 0 $null '' { $script:x1n++; if ($script:x1n -eq 3) { Start-Sleep -Milliseconds 1000 }; @{} })
+$x1snap = { param($br, $sw) $script:x1n++; if ($script:x1n -eq 3) { Start-Sleep -Milliseconds 1000 }; if ($null -ne $br -and $null -ne $sw) { $br['a'] = $sw.Elapsed.TotalMilliseconds; $br['b'] = $br['a'] }; @{} }
+$x1loop = @(Invoke-UtilSampleCpuLoop (Join-Path $t 'r6a1.csv') (Join-Path $t 'r6a1.stop') 'no-such-process-name-xyz' 200 2600 { $script:x1cm.Add($x1sw.Elapsed.TotalMilliseconds); 5 } 0 0 0 0 $null '' $x1snap)
 $x1lines = @([IO.File]::ReadAllLines((Join-Path $t 'r6a1.csv')) | Select-Object -Skip 1)
 $x1bad = [Collections.Generic.List[string]]::new(); $x1stall = $null
 for ($i = 0; $i -lt $x1lines.Count -and $i + 1 -lt $script:x1cm.Count; $i++) {
@@ -600,6 +601,35 @@ for ($i = 0; $i -lt $x1lines.Count -and $i + 1 -lt $script:x1cm.Count; $i++) {
     if ([double]::Parse($f[6], $inv) -ge 900 -and $null -eq $x1stall) { $x1stall = @{ intervalMs = [math]::Round([double]::Parse($f[6], $inv)); counterMs = [math]::Round($got) } }
 }
 $r['r6A1Loop'] = @{ rows = $x1lines.Count; bad = @($x1bad); stall = $x1stall; outputs = $x1loop.Count; created = [bool]$x1loop[-1].created }
+# ---- adversary 793d5dee A1 (r6 pass 9, exact case scaled 1 s -> 200 ms): app pid 1234 (stable start time) uses exactly one core; the snapshot reads
+# its cumulative CPU time, then the sampler is descheduled 800 ms (the finding's 15.25 s -> 19.25 s) before the snapshot returns. Every row's
+# appCpuCores must stay 1.0 and the windowed mean 1.0 (it was 0.789 at 793d5dee: the stalled row's delta was divided by a span that included the
+# stall, and the compensating row fell outside Play). The fake CPU time is a stopwatch of the test's own, so the seam behaves the same on any head.
+$script:z1n = 0; $script:z1sw = [Diagnostics.Stopwatch]::StartNew()
+$z1snap = { param($br, $sw)
+    $script:z1n++
+    if ($null -ne $br -and $null -ne $sw) { $br['a'] = $sw.Elapsed.TotalMilliseconds }
+    $cpu = $script:z1sw.Elapsed.TotalSeconds
+    if ($null -ne $br -and $null -ne $sw) { $br['b'] = $sw.Elapsed.TotalMilliseconds }
+    if ($script:z1n -eq 5) { Start-Sleep -Milliseconds 800 }
+    @{ '1234,1' = @(1234, $cpu) } }
+[void](Invoke-UtilSampleCpuLoop (Join-Path $t 'r6z1.csv') (Join-Path $t 'r6z1.stop') 'no-such-process-name-xyz' 200 3000 { 25 } 0 0 0 0 $null '' $z1snap)
+$z1p = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText((Join-Path $t 'r6z1.csv')))
+$z1rows = @($z1p.rows)
+$z1w = $null; $z1s = $null
+# Play ends at the stalled row (snapshot call 5 = row 3), so the row after it, which carried the compensating delta at 793d5dee, is outside
+if ($z1rows.Count -gt 4) {
+    $z1w = [ordered]@{ startUtc = $z1rows[0].fromUtc; endUtc = $z1rows[3].utc }
+    $z1w['clockWhy'] = Get-UtilSampleClockWitness $z1p $run $z1w
+    $z1s = Get-UtilSampleCpuSummary $z1p $run $z1w $okStop
+}
+$r['r6Z1'] = @{ rows = $z1rows.Count; why = $z1p.why; cores = @($z1rows | ForEach-Object { if ($null -ne $_.cores) { [math]::Round([double]$_.cores, 3) } else { -1 } })
+    maxIntervalMs = $(if ($z1rows.Count) { [math]::Round((@($z1rows | ForEach-Object { if ($null -ne $_.intervalMs) { [double]$_.intervalMs } else { 0 } }) | Measure-Object -Maximum).Maximum) } else { -1 })
+    status = $(if ($z1s) { $z1s.status }); mean = $(if ($z1s) { $z1s.appCoresMean }) }
+# an appCpuCores row whose snapshot could not be dated (empty intervalMs) fails closed
+$z1u = $H + (CpuRow $p0.AddSeconds(1) 25 1234 1 $p0 '0' 1000 1000) + (CpuRow $p0.AddSeconds(2) 25 1234 0.2 $p0.AddSeconds(1) '0' '' 1000)
+for ($i = 3; $i -le 21; $i++) { $z1u += (CpuRow $p0.AddSeconds($i) 25 1234 1 $p0.AddSeconds($i - 1) '0' 1000 1000) }
+$r['r6Z1Unbound'] = (Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $z1u) $run $x1w $okStop).status
 # A2 (exact case, in-memory double): the CPU precheck saw no file; the child started; a second writer created cpu-util.csv holding KEEP-FOREIGN. The
 # stop reads HasExited=false, then the child refuses CreateNew and exits 1 before the stop completes: stopped=true, exitedBeforeStop=false, exitCode=1
 function New-ChildDouble([bool]$ExitsOnStop) {
@@ -856,6 +886,18 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertIsNotNone(loop["stall"], f"the stalled snapshot left no long row: {loop}")
         self.assertLess(loop["stall"]["counterMs"], 400, f"the stalled row's counter measured about 200 ms, not the snapshots' span: {loop}")
         self.assertEqual((loop["outputs"], loop["created"]), (1, True), "the loop emits one result, which says its CreateNew succeeded")
+
+    def test_adv_793d5dee_a1_a_stall_after_the_snapshot_reads_is_not_part_of_their_interval(self) -> None:
+        # r6 pass 9 exact case (scaled): one core used throughout, the sampler descheduled after the snapshot read its CPU times; at 793d5dee the
+        # stalled row read 0.197 cores, the next 4.214, and a Play window ending at the stalled row averaged 0.507
+        z1 = self.r["r6Z1"]
+        self.assertGreaterEqual(z1["rows"], 5, z1)
+        self.assertIsNone(z1["why"], z1)
+        self.assertTrue(all(abs(c - 1.0) <= 0.05 for c in z1["cores"]), f"a row's app cores are not the one core used over the interval its reads measured: {z1}")
+        self.assertEqual(z1["status"], "ok", z1)
+        self.assertAlmostEqual(z1["mean"], 1.0, delta=0.03, msg=f"the windowed app cores mean is not one core: {z1}")
+        self.assertGreaterEqual(z1["maxIntervalMs"], 700, f"the row after the stall should span it: {z1}")
+        self.assertEqual(self.r["r6Z1Unbound"], "unavailable(cpu-app-interval-unbound)", "an undated snapshot interval fails closed, never a guessed weight")
 
     def test_adv_f685c478_a2_a_child_that_failed_owns_nothing_and_nothing_is_published(self) -> None:
         # exact case (in-memory double): stop read HasExited=false, then the child refused CreateNew over KEEP-FOREIGN and exited 1

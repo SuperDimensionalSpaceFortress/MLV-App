@@ -6854,17 +6854,29 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
 # only while its start time matches. adversary 9d648094 A10: the parent is bound by pid AND start time ($ParentStartTicks, 0 = pid only).
 # The app's processes for one CPU row: "pid,startTicks" -> @(pid, cumulative CPU seconds). adversary 01d6ad51 A5: with $AppPath only a process
 # whose executable path is $AppPath counts (an unreadable path does not); A4: a process whose CPU time or start time cannot be read is left out.
-function Get-UtilSampleAppSnapshot($Procs, [string]$AppPath) {
+# adversary 793d5dee A1: the CPU times are read in one tight pass AFTER the processes are enumerated and bound (Get-Process and the path / start-time
+# reads take tens of ms on a busy host), and with $Watch and $Bracket that pass is bracketed by two monotonic reads ($Bracket.a / .b), so the loop
+# dates the snapshot by when it READ the CPU times, never by when it returned (a stall after the reads is not part of the interval they measured).
+function Get-UtilSampleAppSnapshot($Procs, [string]$AppPath, $Watch = $null, $Bracket = $null) {
     $o = @{}
+    $sel = [Collections.Generic.List[object]]::new()
     foreach ($q in @($Procs)) {
         try {
             if ($AppPath -and -not [string]::Equals([string]$q.Path, $AppPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
-            $cs = $q.TotalProcessorTime.TotalSeconds
             $st = $q.StartTime
-            if ($null -eq $cs -or $null -eq $st) { continue }
-            $o["$($q.Id),$($st.ToUniversalTime().Ticks)"] = @($q.Id, [double]$cs)
+            if ($null -eq $st) { continue }
+            $sel.Add(@($q, $st.ToUniversalTime().Ticks))
         } catch { }
     }
+    if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['a'] = $Watch.Elapsed.TotalMilliseconds }
+    foreach ($e in $sel) {
+        try {
+            $cs = $e[0].TotalProcessorTime.TotalSeconds
+            if ($null -eq $cs) { continue }
+            $o["$($e[0].Id),$($e[1])"] = @($e[0].Id, [double]$cs)
+        } catch { }
+    }
+    if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['b'] = $Watch.Elapsed.TotalMilliseconds }
     $o
 }
 
@@ -6889,15 +6901,21 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
     try {
         $ub = $u8.GetBytes("utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n")
         $uf.Write($ub, 0, $ub.Length); $uf.Flush()
+        # adversary 793d5dee A1: a snapshot is dated by the bracket around its CPU-time reads ($br.a / .b, filled by Get-UtilSampleAppSnapshot; a
+        # seam that fills none is bracketed by the whole call); intervalMs is the span between two such dates, and a bracket wider than 50 ms (or a
+        # previous one) leaves intervalMs empty: the summary refuses a window holding an appCpuCores without one (cpu-app-interval-unbound)
         $snap = $SnapSeam
-        if ($null -eq $snap) { $snap = { Get-UtilSampleAppSnapshot @(Get-Process -Name $AppName -ErrorAction SilentlyContinue) $AppPath } }
+        if ($null -eq $snap) { $snap = { param($br, $sw) Get-UtilSampleAppSnapshot @(Get-Process -Name $AppName -ErrorAction SilentlyContinue) $AppPath $sw $br } }
         $w = [Diagnostics.Stopwatch]::StartNew()
         $ck = @{ u = $null; m = 0.0; e = 0.0; maxStep = 0.0 }
         $from = Read-UtilSampleClock $ck $w $UtcTicks
         $prevCm = $null
         $cmA = $w.Elapsed.TotalMilliseconds
         try { [void](& $ReadTotal); $cmB = $w.Elapsed.TotalMilliseconds; if ($cmB - $cmA -le 50) { $prevCm = ($cmA + $cmB) / 2 } } catch { }
-        $prev = & $snap; $prevMs = $w.Elapsed.TotalMilliseconds; $next = $prevMs + $IntervalMs
+        $br = @{}; $sA = $w.Elapsed.TotalMilliseconds; $prev = & $snap $br $w; $prevMs = $w.Elapsed.TotalMilliseconds; $sB = $prevMs
+        if ($br.ContainsKey('a') -and $br.ContainsKey('b')) { $sA = [double]$br['a']; $sB = [double]$br['b'] }
+        $prevSm = $null; if ($sB - $sA -le 50) { $prevSm = ($sA + $sB) / 2 }
+        $next = $prevMs + $IntervalMs
         while ($true) {
             [void](Read-UtilSampleClock $ck $w $UtcTicks)
             if (Test-Path -LiteralPath $StopFile) { $res.endedBy = 'stop-file'; break }
@@ -6918,16 +6936,20 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             try { $total = ([double](& $ReadTotal)).ToString('0.###', $inv); $cmB = $w.Elapsed.TotalMilliseconds; if ($cmB - $cmA -le 50) { $cm = ($cmA + $cmB) / 2 } } catch { $res.counterErrors++ }
             if ($null -ne $cm -and $null -ne $prevCm) { $counterMs = ($cm - $prevCm).ToString('0.###', $inv) }
             $prevCm = $cm
-            $cur = & $snap; $nowMs = $w.Elapsed.TotalMilliseconds
+            $br = @{}; $sA = $w.Elapsed.TotalMilliseconds; $cur = & $snap $br $w; $nowMs = $w.Elapsed.TotalMilliseconds; $sB = $nowMs
+            if ($br.ContainsKey('a') -and $br.ContainsKey('b')) { $sA = [double]$br['a']; $sB = [double]$br['b'] }
+            $sm = $null; if ($sB - $sA -le 50) { $sm = ($sA + $sB) / 2 }
             $hi = Read-UtilSampleClock $ck $w $UtcTicks
             if ($next -le $nowMs) { $next = $nowMs + $IntervalMs }
             $sec = 0.0; $both = 0
             foreach ($k in @($cur.Keys)) { if ($prev.ContainsKey($k)) { $sec += [math]::Max(0.0, $cur[$k][1] - $prev[$k][1]); $both++ } }
             $pids = (@($cur.Values | ForEach-Object { [int]$_[0] } | Sort-Object) -join ';')
-            $dt = ($nowMs - $prevMs) / 1000.0
+            $dt = ($nowMs - $prevMs) / 1000.0; $ivMs = ''
+            if ($null -ne $sm -and $null -ne $prevSm) { $dt = ($sm - $prevSm) / 1000.0; $ivMs = ($sm - $prevSm).ToString('0.###', $inv) }
+            $prevSm = $sm
             $cores = ''
             if ($both -gt 0 -and $dt -gt 0) { $cores = ($sec / $dt).ToString('0.####', $inv) }
-            $ub = $u8.GetBytes("$($hi.ToString('o', $inv)),$total,$pids,$cores,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),$(($nowMs - $prevMs).ToString('0.###', $inv)),$counterMs`n")
+            $ub = $u8.GetBytes("$($hi.ToString('o', $inv)),$total,$pids,$cores,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),$ivMs,$counterMs`n")
             $uf.Write($ub, 0, $ub.Length); $uf.Flush()
             $res.rows++
             $prev = $cur; $prevMs = $nowMs; $from = $lo; $ck.maxStep = 0.0
@@ -7093,9 +7115,14 @@ function ConvertFrom-UtilSampleCpuRow([string]$Line) {
     if (-not [DateTime]::TryParse($f[0], $inv, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$u) -or $u.Kind -ne [DateTimeKind]::Utc) { return $null }
     if (-not [DateTime]::TryParse($f[4], $inv, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$fu) -or $fu.Kind -ne [DateTimeKind]::Utc -or $fu -gt $u) { return $null }
     if (-not [double]::TryParse($f[5], [Globalization.NumberStyles]::Float, $inv, [ref]$step) -or [double]::IsNaN($step) -or [double]::IsInfinity($step)) { return $null }
-    if (-not [double]::TryParse($f[6], [Globalization.NumberStyles]::Float, $inv, [ref]$iv) -or [double]::IsNaN($iv) -or [double]::IsInfinity($iv) -or $iv -lt 0) { return $null }
+    # adversary 793d5dee A1: intervalMs is empty when a snapshot's CPU-time reads could not be dated (appCpuCores then has no bound interval)
+    $ivn = $null
+    if ($f[6].Length -gt 0) {
+        if (-not [double]::TryParse($f[6], [Globalization.NumberStyles]::Float, $inv, [ref]$iv) -or [double]::IsNaN($iv) -or [double]::IsInfinity($iv) -or $iv -lt 0) { return $null }
+        $ivn = $iv
+    }
     if ($f[2].Length -gt 0 -and $f[2] -notmatch '^\d+(;\d+)*$') { return $null }
-    $out = [ordered]@{ utc = $u; total = $null; pids = $f[2]; cores = $null; fromUtc = $fu; step = $step; intervalMs = $iv; counterMs = $cm }
+    $out = [ordered]@{ utc = $u; total = $null; pids = $f[2]; cores = $null; fromUtc = $fu; step = $step; intervalMs = $ivn; counterMs = $cm }
     foreach ($pair in @(@(1, 'total'), @(3, 'cores'))) {
         $s = $f[$pair[0]]; $v = 0.0
         if ($s.Length -eq 0) { continue }
@@ -7307,6 +7334,8 @@ function Get-UtilSampleCpuSummary($Parsed, $Start, $Window, $Stop = $null) {
         $s.rowsInWindow = $in.Count
         # adversary f685c478 A1: a cpuTotalPct whose own counter interval is not bound (no counterMs) fails closed, never a guessed weight
         if (@($in | Where-Object { $null -ne $_['total'] -and $null -eq $_['counterMs'] }).Count -gt 0) { $s.status = 'unavailable(cpu-counter-interval-unbound)'; return $s }
+        # adversary 793d5dee A1: likewise an appCpuCores whose snapshot interval is not bound (no intervalMs)
+        if (@($in | Where-Object { $null -ne $_['cores'] -and $null -eq $_['intervalMs'] }).Count -gt 0) { $s.status = 'unavailable(cpu-app-interval-unbound)'; return $s }
         # sol r4 B4: duration-weighted, so a stalled tick's long row is not counted as one short interval; A1: each by the interval it measured
         $tot = Get-UtilSampleWeightedMean $in 'total' $Window 'counterMs'
         $cor = Get-UtilSampleWeightedMean $in 'cores' $Window 'intervalMs'
