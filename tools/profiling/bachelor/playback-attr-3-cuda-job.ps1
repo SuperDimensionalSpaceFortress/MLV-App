@@ -4279,8 +4279,10 @@ $scopeTapCompleted = $null
 foreach ($candidateLine in ($rawLog -split "`r?`n")) {
     # r3 (adversary A2 on ddceb595): the record BODY only, the text before the first ' (' (the Qt location suffix starts there and a
     # record body never holds ' ('), so a build path cannot supply the marker or either field.
-    $open = $candidateLine.IndexOf(' (', [StringComparison]::Ordinal)
-    $body = if ($open -ge 0) { $candidateLine.Substring(0, $open) } else { $candidateLine }
+    # r3 (CI run 41449047424, scanner rule R4): an operator, not a .NET member -- the publish-write scan allowlists neither .IndexOf() nor
+    # [StringComparison]::Ordinal. -replace drops everything from the FIRST ' (' on (leftmost match; a line holds no newline), which is
+    # exactly the text before the first ' (' that IndexOf + Substring returned, and the whole line when it holds none.
+    $body = $candidateLine -replace ' \(.*$', ''
     # r5 (adversary r4 A1 on 6b564afc): the marker must OPEN the record (after the "[<utc>] [<level>] [<thread>] " prefix), so a
     # quoted value inside another record that spells it (an eligibility line's DLL path) is never read as this record.
     if ($body -match ('^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
