@@ -50,18 +50,34 @@ struct PlaybackDueWake::Impl
     QAbstractNativeEventFilter *filter = nullptr;
 #endif
 
+    // r3 (adversary pass 7 A1): the gate's clock. On Windows it is QueryPerformanceCounter in ns, the clock the wait thread
+    // stamps the post time on, so the gate can drop a delivery posted before the armed due time; elsewhere QElapsedTimer.
+    qint64 qpcFrequency = 0;              // > 0 when the gate runs on QPC (decided once, at construction)
+    static qint64 ticksToNs( qint64 ticks, qint64 frequency )
+    {
+        return ( ticks / frequency ) * 1000000000LL + ( ( ticks % frequency ) * 1000000000LL ) / frequency;
+    }
+    qint64 nowNs() const
+    {
+#ifdef Q_OS_WIN
+        LARGE_INTEGER counter;
+        if( qpcFrequency > 0 && QueryPerformanceCounter( &counter ) ) return ticksToNs( counter.QuadPart, qpcFrequency );
+#endif
+        return clock.nsecsElapsed();
+    }
     // the notifier / Qt timer paths: the signal belongs to whatever is armed now (the gate drops an early one)
     void deliverCurrent()
     {
-        if( gate.accept( gate.generation(), clock.nsecsElapsed() ) && onFire ) onFire();
+        if( gate.accept( gate.generation(), nowNs() ) && onFire ) onFire();
     }
     // r3: the post time of the delivery firing now (ms on the QPC clock), < 0 when the delivery carries none
     double firingPostMs = -1.0;
-    // the native-message path: the message names its generation (and, r3, its post time)
-    void deliverGeneration( quint32 generation, double postMs = -1.0 )
+    // the native-message path: the message names its generation and (r3) its post time in QPC ticks (<= 0: none)
+    void deliverGeneration( quint32 generation, qint64 postTicks = 0 )
     {
-        if( !gate.accept( generation, clock.nsecsElapsed() ) || !onFire ) return;
-        firingPostMs = postMs;
+        const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
+        if( !gate.accept( generation, nowNs(), postNs ) || !onFire ) return;
+        firingPostMs = postNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;
         onFire();
         firingPostMs = -1.0;
     }
@@ -168,6 +184,10 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
     d->onFire = std::move( onFire );
     d->clock.start();
 #ifdef Q_OS_WIN
+    {
+        LARGE_INTEGER frequency;
+        if( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 ) d->qpcFrequency = frequency.QuadPart;
+    }
     d->handle = CreateWaitableTimerExW( nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS );
     d->highResolution = d->handle != nullptr;
     if( !d->handle )
@@ -279,7 +299,7 @@ void PlaybackDueWake::arm( double dueMs )
 {
     if( d->stopped ) return;
     if( !( dueMs > 0.0 ) ) dueMs = 0.0;
-    const quint32 generation = d->gate.arm( d->clock.nsecsElapsed(), static_cast<qint64>( dueMs * 1000000.0 ) );
+    const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );
     d->lastArmQtTimer = d->delivery == Delivery::QtTimer;
 #ifdef Q_OS_WIN
     d->postGeneration.store( generation, std::memory_order_release );   // before the timer can signal
@@ -336,13 +356,9 @@ bool PlaybackDueWake::handleNativeMessage( const void *msg )
     if( m->message != kNativeWakeMessage || !d->window || m->hwnd != d->window ) return false;
     const quint64 wParam = static_cast<quint64>( m->wParam );
     if( playbackDueWakeWParamTag( wParam ) != static_cast<quint32>( kNativeWakeTag ) ) return false;
-    // r3: the post time in the message, on the same QPC clock as mlv_stage_timing_now()
-    double postMs = -1.0;
-    LARGE_INTEGER frequency;
-    if( m->lParam > 0 && QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 )
-        postMs = static_cast<double>( m->lParam ) * 1000.0 / static_cast<double>( frequency.QuadPart );
-    // a stale generation (cancelled, re-armed or stopped since it was posted) is consumed and does nothing
-    d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), postMs );
+    // a stale generation (cancelled, re-armed or stopped since it was posted), or (r3, pass 7 A1) a signal posted before the
+    // current arm's due time, is consumed and does nothing; lParam is the post time in QPC ticks
+    d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), static_cast<qint64>( m->lParam ) );
     return true;
 #else
     Q_UNUSED( msg );

@@ -61,11 +61,17 @@ public:
         m_armed = false;
         nextGeneration();
     }
-    /*! True once, for the delivery that belongs to the current arm; the gate is disarmed before the caller fires. */
-    bool accept( quint32 generation, qint64 nowNs )
+    /*! True once, for the delivery that belongs to the current arm; the gate is disarmed before the caller fires.
+     *  r3 (adversary pass 7 A1): \a postNs >= 0 is when the delivery was POSTED, on the gate's clock. A waitable timer never
+     *  signals early, so a delivery posted before the armed due time is an EARLIER arm's signal whose wait thread read the
+     *  new generation after a re-arm: it is dropped (the gate stays armed) and the replacement's own message fires, carrying
+     *  its own post time. Without this the old signal disarmed the replacement and its stale post time became the lateness
+     *  split. \a postNs < 0 (the notifier / qtimer paths carry none) keeps the r2 rule. */
+    bool accept( quint32 generation, qint64 nowNs, qint64 postNs = -1 )
     {
         if( !m_armed || generation != m_generation ) return false;
         if( nowNs < m_dueNs - kStaleDeliveryNs ) return false;
+        if( postNs >= 0 && postNs < m_dueNs - kStaleDeliveryNs ) return false;
         m_armed = false;
         return true;
     }

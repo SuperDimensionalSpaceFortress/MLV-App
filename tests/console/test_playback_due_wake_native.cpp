@@ -123,6 +123,42 @@ TEST(PlaybackDueWakeGate, AStaleGenerationIsANoOpAndTheCurrentOneFiresOnce)
     ASSERT_FALSE( gate.armed() );
 }
 
+TEST(PlaybackDueWakeGate, AnEarlierArmsSignalPostedBeforeTheDueTimeNeverTakesTheReplacement)
+{
+    // r3 adversary pass 7 A1 input: at t=0 arm(2 ms), generation 1. At t=2 the wait thread consumes its signal and samples the
+    // post time, then pauses before it loads the generation. At t=3 arm(10 ms), generation 2, due t=13. At t=4 the thread resumes,
+    // loads generation 2 and posts the OLD signal stamped t=2. The GUI is busy until t=15; the genuine generation-2 message
+    // (posted t=13) follows it. Before r3's fix the old signal was accepted as generation 2 at t=15 (the post time was not
+    // consulted: the two-argument accept below), disarmed the replacement and recorded due-to-post -11 ms; the genuine message
+    // was then dropped.
+    const qint64 ms = 1000000;
+    PlaybackDueWakeGate before;
+    before.arm( 0, 2 * ms );
+    const quint32 replacedOnly = before.arm( 3 * ms, 10 * ms );
+    ASSERT_TRUE( before.accept( replacedOnly, 15 * ms ) );        // the bb06bf2b / 89c345d2 shape: no post time, accepted
+    PlaybackDueWakeGate gate;
+    const quint32 first = gate.arm( 0, 2 * ms );
+    const quint32 second = gate.arm( 3 * ms, 10 * ms );           // due t=13
+    ASSERT_TRUE( first != second );
+    ASSERT_FALSE( gate.accept( second, 15 * ms, 2 * ms ) );       // the old signal, posted t=2 < due 13: stale, dropped
+    ASSERT_TRUE( gate.armed() );                                  // the replacement is still armed
+    ASSERT_TRUE( gate.accept( second, 15 * ms, 13 * ms ) );       // the genuine message, posted at its due time, fires
+    ASSERT_FALSE( gate.armed() );
+    // the tolerance only absorbs clock-read skew; the notifier / qtimer paths (no post time) keep the r2 rule
+    PlaybackDueWakeGate skew;
+    const quint32 g = skew.arm( 0, 10 * ms );
+    ASSERT_TRUE( skew.accept( g, 10 * ms, 10 * ms - PlaybackDueWakeGate::kStaleDeliveryNs ) );
+    PlaybackDueWakeGate none;
+    const quint32 n = none.arm( 0, 10 * ms );
+    ASSERT_TRUE( none.accept( n, 11 * ms, -1 ) );
+    // the wiring: the native path hands the gate the message's post time, on the gate's (QPC) clock
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "if( !gate.accept( generation, nowNs(), postNs ) || !onFire ) return;" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), static_cast<qint64>( m->lParam ) );" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );" ) ) );
+    ASSERT_FALSE( source.contains( QStringLiteral( "gate.accept( gate.generation(), clock." ) ) );   // no gate call on the other clock
+}
+
 TEST(PlaybackDueWakeNative, TheKillSwitchTurnsTheWakeOffAndIsHonouredByTheArm)
 {
     const QByteArray saved = qgetenv( "MLVAPP_PLAYBACK_DUE_WAKE" );
