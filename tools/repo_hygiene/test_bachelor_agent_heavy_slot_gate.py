@@ -734,9 +734,9 @@ class BoundedRunTests(unittest.TestCase):
             script = ("$ReadBoundMs = 10000\n" + body + "\n"
                       "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
                       "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
-                      "Write-Output ('HUNG|' + (Read-CapturedText 'C:\\x\\stdout.txt' 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                      "Write-Output ('HUNG|' + (Read-CapturedText (Join-Path ([IO.Path]::GetTempPath()) 'stdout.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
                       "Write-Output ('GOOD|' + (Read-CapturedText '" + good.replace("'", "''") + "'))\n"
-                      "Write-Output ('MISSING|' + (Read-CapturedText 'C:\\no-such-dir-r6\\x.txt'))\n")
+                      "Write-Output ('MISSING|' + (Read-CapturedText (Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'no-such-dir-r6') 'x.txt')))\n")
             proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         finally:
             os.unlink(good)
@@ -1548,14 +1548,15 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # sol r9 B1 (catalogue B-01): an expired budget used to become Wait(0), and an already-completed task then returned success even
         # though its factory had spent the whole bound. The deadline is measured from the call's start: elapsed >= bound is a timeout.
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path: a drive-letter literal is not split on Linux (r11)
                   "$slowText = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$slowDel = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('') }\n"
                   "$fastText = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$fastDel = { param($p) [Threading.Tasks.Task]::FromResult('') }\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 50 $slowText\n"
+                  "$r = Read-CapturedResult $p 50 $slowText\n"
                   "Write-Output ('LATE-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('LATE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 50 $slowDel))\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $fastText\n"
+                  "$r = Read-CapturedResult $p 5000 $fastText\n"
                   "Write-Output ('FAST-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $fastDel) + ']')\n")
         proc = self._pwsh(script)
@@ -1572,11 +1573,12 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # The slow ToString makes the conversion cost deterministic. The check is the LAST step before a success is returned.
         script = ("class SlowText { [string] ToString() { Start-Sleep -Milliseconds 300; return 'payload' } }\n"
                   + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path (r11): see the leaf-name guard test
                   "$slow = { param($p) [Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 100 $slow\n"
+                  "$r = Read-CapturedResult $p 100 $slow\n"
                   "Write-Output ('SLOW-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('SLOW-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 100 $slow))\n"
-                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $slow\n"
+                  "$r = Read-CapturedResult $p 5000 $slow\n"
                   "Write-Output ('INSIDE-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $slow))\n")
         proc = self._pwsh(script)
@@ -1585,6 +1587,20 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("SLOW-DEL|capture cleanup abandoned after 0.1 s: C:\\x\\a.txt", proc.stdout)
         self.assertIn("INSIDE-READ|True|payload", proc.stdout, "a conversion that fits inside the bound still succeeds")
         self.assertIn("INSIDE-DEL|capture cleanup incomplete: payload", proc.stdout)
+
+    def test_a_test_that_asserts_a_leaf_name_never_feeds_the_reader_a_windows_literal_path(self) -> None:
+        # CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1 r11: [IO.Path]::GetFileName('C:\x\a.txt') is 'a.txt' on Windows but the WHOLE string on
+        # Linux, where a backslash is not a separator, so hosted ubuntu shard 3/4 went red on two r10 tests that asserted the leaf. The reader
+        # is right for native paths; a fixture whose assertion names the leaf must build its path natively (Join-Path) on every OS.
+        source = Path(__file__).read_text(encoding="utf-8")
+        offenders = []
+        for chunk in re.split(r"\n    (?:@unittest[^\n]*\n    )?def ", source):
+            name = chunk.split("(", 1)[0]
+            if name.startswith("test_a_test_that_asserts_a_leaf_name"):
+                continue
+            if "<read timed out: " in chunk and re.search(r"Read-Captured(?:Result|Text) '[A-Za-z]:\\\\", chunk):
+                offenders.append(name)
+        self.assertEqual(offenders, [], "a leaf-asserting test feeds Read-Captured* a drive-letter literal; use a Join-Path temp path")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_an_accepted_plain_completed_task_has_no_result_so_no_false_cleanup_problem_and_no_fabricated_text(self) -> None:
