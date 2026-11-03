@@ -772,3 +772,56 @@ TEST(PlaybackDueWakeSamplesB2, TheLongPlaySummaryLineDisclosesEachSetsRangeAndCe
     ASSERT_EQ( 0, line.count( QStringLiteral( ".percentile(" ) ) );
     ASSERT_EQ( 0, line.count( QStringLiteral( "0, 'f', 3 )" ) ) );
 }
+
+TEST(PlaybackDueWakeSamplesB2, ABinNeverWrapsBeforeThePlaysSampleCount)
+{
+    // r5 adversary pass 8 A1 input: add( 5.0 ) exactly 4,294,967,296 times without a reset. A uint32_t bin wrapped to 0 while
+    // the size_t count did not, so the rank scan fell through to a false Overflow (NaN, ">=80.000", overflow() == 0).
+    // addRepeated is that sequence of add() calls in O(1) once past the exact store.
+    ASSERT_TRUE( std::numeric_limits<PlaybackDueWakeSamples::BinCount>::max() >= std::numeric_limits<std::size_t>::max() );
+    const std::size_t n = static_cast<std::size_t>( 4294967296ull );
+    PlaybackDueWakeSamples samples;
+    samples.addRepeated( 5.0, n );
+    ASSERT_EQ( n, samples.size() );
+    ASSERT_FALSE( samples.exact() );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), samples.overflow() );
+    ASSERT_EQ( static_cast<std::size_t>( 0 ), samples.underflow() );
+    ASSERT_TRUE( samples.rank( 0.50 ).censor == PlaybackDueWakeSamples::Censor::None );
+    ASSERT_NEAR( 5.0, samples.percentile( 0.50 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_NEAR( 5.0, samples.percentile( 0.95 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_FALSE( playbackDueWakePercentileText( samples, 0.95 ).startsWith( QStringLiteral( ">=" ) ) );   // measured, not censored
+    // addRepeated is the same state as the add() loop, across the spill and in all three ranges
+    PlaybackDueWakeSamples looped, bulk;
+    for( int i = 0; i < 20000; ++i ) looped.add( 3.0 );
+    for( int i = 0; i < 300; ++i ) looped.add( -40.0 );
+    for( int i = 0; i < 700; ++i ) looped.add( 120.0 );
+    bulk.addRepeated( 3.0, 20000 );
+    bulk.addRepeated( -40.0, 300 );
+    bulk.addRepeated( 120.0, 700 );
+    ASSERT_EQ( looped.size(), bulk.size() );
+    ASSERT_EQ( looped.underflow(), bulk.underflow() );
+    ASSERT_EQ( looped.overflow(), bulk.overflow() );
+    for( const double p : { 0.0, 0.01, 0.5, 0.95, 0.99, 1.0 } )
+        ASSERT_EQ( playbackDueWakePercentileText( looped, p ).toStdString(), playbackDueWakePercentileText( bulk, p ).toStdString() );
+    // the storage bound still holds with 64-bit bins
+    ASSERT_TRUE( samples.storageBytes() <= PlaybackDueWakeSamples::maxStorageBytes() );
+    ASSERT_TRUE( PlaybackDueWakeSamples::maxStorageBytes() <= 256u * 1024u );
+}
+
+TEST(PlaybackDueWakeSamplesB2, ThePerPlayDueWakeCountersAreUnsigned64Bit)
+{
+    // r5 adversary pass 8 A2 input: 2^31 accepted due-wake callbacks in one looping Play. The counters were signed int, so the
+    // increment past INT_MAX was undefined behaviour. MainWindow cannot be built in the console suite: pin the declarations.
+    const QString header = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.h" ) );
+    ASSERT_FALSE( header.isEmpty() );
+    const char *const counters[] = { "Armed", "Fired", "Advanced", "Rearmed", "BusyDeferred", "UnpresentedDeferred" };
+    for( const char *counter : counters )
+    {
+        const QString name = QStringLiteral( "m_playbackDueWake" ) + QLatin1String( counter ) + QStringLiteral( " = 0;" );
+        ASSERT_EQ( 1, header.count( QStringLiteral( "quint64 " ) + name ) );
+        ASSERT_EQ( 0, header.count( QRegularExpression( QStringLiteral( "\\bint[ ]+" ) + QRegularExpression::escape( name ) ) ) );
+    }
+    // the only int one is the per-present re-arm count, which is reset every present and capped
+    ASSERT_EQ( 1, header.count( QStringLiteral( "int m_playbackDueWakeRearmsThisPresent = 0;" ) ) );
+    ASSERT_TRUE( std::numeric_limits<quint64>::max() >= 18446744073709551615ull );
+}

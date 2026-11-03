@@ -1194,13 +1194,15 @@ private:
     bool m_playbackTailAdvanceMovedFrame = false;   // finishPresentedFrame's tail timerFrameEvent reached a new frame
     bool m_playbackDueWakeHiRes = false;            // the wake ran on a high-resolution timer this Play (summary line)
     double m_playbackDueWakeDueAtMs = 0.0;      // stage-time ms the armed wake is due
-    int m_playbackDueWakeRearmsThisPresent = 0;
-    int m_playbackDueWakeArmed = 0;
-    int m_playbackDueWakeFired = 0;
-    int m_playbackDueWakeAdvanced = 0;
-    int m_playbackDueWakeRearmed = 0;
-    int m_playbackDueWakeBusyDeferred = 0;
-    int m_playbackDueWakeUnpresentedDeferred = 0;       // r2 A1: every-frame wake held until the requested frame presented
+    int m_playbackDueWakeRearmsThisPresent = 0;         // bounded: reset every present, capped at kPlaybackDueWakeMaxRearms
+    // r5 adversary pass 8 A2: the per-Play counters are unsigned 64-bit (a signed int overflowed, UB, after 2^31 events of a
+    // looping Play that never resets)
+    quint64 m_playbackDueWakeArmed = 0;
+    quint64 m_playbackDueWakeFired = 0;
+    quint64 m_playbackDueWakeAdvanced = 0;
+    quint64 m_playbackDueWakeRearmed = 0;
+    quint64 m_playbackDueWakeBusyDeferred = 0;
+    quint64 m_playbackDueWakeUnpresentedDeferred = 0;   // r2 A1: every-frame wake held until the requested frame presented
     long long m_playbackDueWakePresentedFrame = -1;     // r2 pass 4 A1: the frame whose present last ENDED (presentPlaybackPreparedFrame)
     QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
     bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism

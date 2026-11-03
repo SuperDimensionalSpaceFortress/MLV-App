@@ -36,6 +36,11 @@ public:
     static constexpr double kBinMs = 0.01;
     static constexpr std::size_t kBins = 10000;            // ( kMaxMs - kMinMs ) / kBinMs
 
+    //! r5 adversary pass 8 A1: a bin counts as many samples as the Play does (a uint32_t bin wrapped to 0 after 2^32 samples
+    //! of one value, and the rank scan then fell through to a false overflow). 10,000 x 8 B stays under the exact store's size.
+    using BinCount = std::uint64_t;
+    static_assert( sizeof( BinCount ) >= sizeof( std::size_t ), "a bin must hold every sample of the Play" );
+
     //! a binned rank outside [kMinMs, kMaxMs) is censored: only its side of the range is known
     enum class Censor { None, Underflow, Overflow };
     struct Rank
@@ -67,6 +72,18 @@ public:
             std::vector<double>().swap( m_exact );
         }
         if( side == Censor::None ) ++m_histogram[binOf( ms )];
+    }
+
+    //! \a n copies of \a ms: the same state as n add( ms ) calls, in O( min( n, kExactCapacity ) ) once past the exact store
+    void addRepeated( double ms, std::size_t n )
+    {
+        while( n > 0 && m_histogram.empty() ) { add( ms ); --n; }
+        if( n == 0 ) return;
+        m_count += n;
+        const Censor side = sideOf( ms );
+        if( side == Censor::Underflow ) m_underflow += n;
+        else if( side == Censor::Overflow ) m_overflow += n;
+        else m_histogram[binOf( ms )] += n;
     }
 
     //! nearest-rank rank, \a p in [0, 1]; { 0.0, None } with no samples (the summary line's old convention)
@@ -106,19 +123,19 @@ public:
     //! bytes held by the two buffers (their capacity, not their size)
     std::size_t storageBytes() const
     {
-        return m_exact.capacity() * sizeof( double ) + m_histogram.capacity() * sizeof( std::uint32_t );
+        return m_exact.capacity() * sizeof( double ) + m_histogram.capacity() * sizeof( BinCount );
     }
     static constexpr std::size_t maxStorageBytes()
     {
-        return kExactCapacity * sizeof( double ) > kBins * sizeof( std::uint32_t )
+        return kExactCapacity * sizeof( double ) > kBins * sizeof( BinCount )
             ? kExactCapacity * sizeof( double )
-            : kBins * sizeof( std::uint32_t );
+            : kBins * sizeof( BinCount );
     }
 
     void reset()
     {
         std::vector<double>().swap( m_exact );
-        std::vector<std::uint32_t>().swap( m_histogram );
+        std::vector<BinCount>().swap( m_histogram );
         m_count = 0;
         m_underflow = 0;
         m_overflow = 0;
@@ -142,7 +159,7 @@ private:
     }
 
     std::vector<double> m_exact;
-    std::vector<std::uint32_t> m_histogram;
+    std::vector<BinCount> m_histogram;
     std::size_t m_count = 0;
     std::size_t m_underflow = 0;
     std::size_t m_overflow = 0;
