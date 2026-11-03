@@ -1984,3 +1984,76 @@ def test_every_collecting_git_call_rechecks_the_repository_identity_in_the_saver
     body = text[text.index("function Invoke-GitBytes"):text.index("function Remove-GitTerminator")]
     assert body.count("Test-RepoSame") >= 2 and "$script:repoChanged" in text
     assert text.index("if ($script:repoChanged)") < text.index("$bad = $git.Values")
+
+
+# ---- r15 adversary pass on 79641666 (A1, A4) ----
+@pytest.mark.skipif(sys.platform != "win32", reason="a subst drive that is re-mapped is Windows")
+def test_the_private_directory_is_cleaned_up_by_its_real_path_not_by_a_drive_alias_that_can_be_re_mapped(repo, tmp_path):  # r15 adversary A1 (79641666): Get-PrivateBase proved the resolved directory and then returned the RAW candidate (TMP=S:\ with S: substituted to outside\), so a peer that re-mapped S: to another folder right before the clean-up made the recursive delete remove the OTHER folder's `lane-dirty-save-<guid>` (and outside\<guid> was left unnamed). The hook plays the peer
+    letter = next((c for c in "YXWVUTSR" if not os.path.exists(f"{c}:\\")), None)
+    if letter is None:
+        pytest.skip("no free drive letter")
+    outside, victim = tmp_path / "outside", tmp_path / "victim"
+    outside.mkdir()
+    victim.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    anchor = "for ($i = 0; $i -lt 5 -and $script:sealDir"
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1
+    hook = (f"$g = [System.IO.Path]::GetFileName($script:sealDir); $d = [System.IO.Path]::Combine('{victim}', $g); [void][System.IO.Directory]::CreateDirectory($d); [System.IO.File]::WriteAllText([System.IO.Path]::Combine($d, 'precious.txt'), \"KEEP`n\"); "
+            f"& subst {letter}: /d | Out-Null; & subst {letter}: '{victim}' | Out-Null; ")
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, hook + anchor), encoding="utf-8")
+    subprocess.run(["subst", f"{letter}:", str(outside)], check=True, capture_output=True)
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": f"{letter}:\\", "TEMP": f"{letter}:\\"})
+    finally:
+        subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True)
+    kept = list(victim.glob("*/precious.txt"))
+    assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 79641666: the other folder's directory was deleted
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert list(outside.iterdir()) == [], "the saver's own private directory is removed from where it was made"
+
+
+def test_a_child_record_whose_folder_is_swapped_for_a_link_after_the_check_is_never_read_through_it(tmp_path):  # r15 adversary A4 (79641666): the record's path was proved link-free and then read by NAME; a peer that renamed its folder and put a link to a decoy folder in its place made the saver read a dead decoy, judge the live lane dead and save. The record is opened first and the path is proved link-free again with the file open
+    a, run, records, decoy = tmp_path / "wtA", tmp_path / "run", tmp_path / "records", tmp_path / "decoy"
+    init_repo(a, b"BASE\n")
+    run.mkdir()
+    records.mkdir()
+    decoy.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).isoformat()
+    (records / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": old}))  # the live lane
+    (decoy / "child.json").write_text(json.dumps({"pid": dead_pid(), "createdUtc": old}))  # a dead one
+    anchor = "if (Test-LaneAlive) {"
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1
+    kind = "Junction" if sys.platform == "win32" else "SymbolicLink"
+    hook = f"[System.IO.Directory]::Move('{records}', '{records}.saved'); [void](New-Item -ItemType {kind} -Path '{records}' -Target '{decoy}'); "
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, hook + anchor), encoding="utf-8")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-ChildJson", str(records / "child.json")], capture_output=True, text=True)
+    assert r.returncode in (20, 30), r.stdout + r.stderr  # 79641666: exit 0, the live lane's work was saved from under it
+    assert list(run.iterdir()) == []
+
+
+def test_a_linked_worktrees_common_dir_pointer_rewritten_and_restored_during_the_run_is_never_a_clean_tree(tmp_path):  # r15 adversary A3 (79641666): the identity of the per-worktree git dir does not change when its `commondir` file is rewritten to name another repository, so refs and objects came from B while the index was A's: both diffs empty, the file restored before the end, clean-tree/10 for the staged work. The file's bytes are part of the repository identity now
+    a, b, run, linked = tmp_path / "wtA", tmp_path / "wtB", tmp_path / "run", tmp_path / "linked"
+    init_repo(a, b"BASE\n")
+    init_repo(b, b"DIRT\n")
+    git(b, "branch", "side")
+    git(a, "worktree", "add", "-q", "-b", "side", str(linked))
+    run.mkdir()
+    (linked / "a.txt").write_bytes(b"DIRT\n")
+    git(linked, "add", "a.txt")
+    text = SCRIPT.read_text(encoding="utf-8")
+    start_anchor, end_anchor = "$headR = if ($top.Code -eq 0)", END_OF_COLLECTION
+    assert text.count(start_anchor) == 1 and text.count(end_anchor) == 1
+    bgit = str(b / ".git").replace("'", "''")
+    cd = "[System.IO.Path]::Combine($gitDir, 'commondir')"
+    start = f"$script:cdOrig = [System.IO.File]::ReadAllBytes({cd}); [System.IO.File]::WriteAllText({cd}, '{bgit}' + \"`n\"); "
+    end = f"[System.IO.File]::WriteAllBytes({cd}, $script:cdOrig); "
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(start_anchor, start + start_anchor).replace(end_anchor, end + end_anchor), encoding="utf-8")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(linked), "-RunDir", str(run), "-LanePid", str(dead_pid())], capture_output=True, text=True)
+    assert r.returncode == 30 and "reason=repository-changed" in r.stdout, r.stdout + r.stderr  # 79641666: DIRTY_SAVE_NOTHING reason=clean-tree, exit 10
+    assert list(run.iterdir()) == []

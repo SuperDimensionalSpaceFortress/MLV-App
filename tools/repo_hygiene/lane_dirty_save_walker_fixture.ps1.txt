@@ -31,6 +31,7 @@
 # append to it (sol r20 B1 on #698), and removing a caller's disable is what exposed it. GIT_OPTIONAL_LOCKS=0 keeps git from refreshing the index.
 # NO CALLBACK CAN RUN (r10, sol r9 B1+B2): every call that reads the tree runs against a private git dir in the OS temp directory, or the RunDir when temp is not provably outside the worktree (never under the worktree or a git dir beneath it; removed on exit) whose config holds no program; system/global config are off and config-injecting env is stripped, so a clean/smudge/process filter, textconv, fsmonitor or diff.external, added at any time or in any submodule, has nothing to be read from. Submodules are scanned by NOTHING (--ignore-submodules=dirty keeps a changed gitlink commit, drops their dirty contents); the receipt says submodules="skipped <n>".
 # Every git call also gets --no-replace-objects: a refs/replace entry for HEAD would make the diffs read another commit's tree while the receipt names HEAD (adversary r9 A2). Path and name comparisons are ordinal, never by culture (U+00AD and case are ignored by culture compares).
+# r15 (sol r14 B1; adversary pass on 79641666 A1, A3, A4): the repository identity (git dir, work tree, and for a linked worktree the bytes of its `commondir` file) is re-read before and after EVERY git call; the private base is returned by its real path, never a re-mappable drive alias; the -ChildJson record is opened first and proved link-free again with the file held. OPEN, carried to r16: adversary A2 (a git dir replaced by another repository BEFORE the first identity read is indistinguishable from that repository having been selected; no re-read can tell) and any other repository metadata file a peer may rewrite and restore mid-run (alternates, packed-refs): the threat model excludes a peer with write access to the repository's own metadata during the run.
 param(
     [Parameter(Mandatory)][string]$WorkDir,
     [Parameter(Mandatory)][string]$RunDir,
@@ -214,6 +215,7 @@ function Get-PrivateBase {  # where the saver's own temporary directory may live
             }
             else { $real = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($cand)); if (-not [string]::Equals($cand, $RunDir, [System.StringComparison]::Ordinal)) { Assert-RunDirNotAlias $real $realWork } }  # throws when the temp directory is, or sits in, the worktree by identity, or when that cannot be proven: not used
             if (Test-Inside $realWork $real) { continue }
+            if ($script:onWin) { $cand = $real }  # r15 (adversary A1): the proven directory is returned by the kernel's own path, never by the candidate's spelling. A subst drive or loopback share can be re-mapped to another folder after this proof, and the clean-up would then have deleted the OTHER folder's `lane-dirty-save-<guid>`; the real path (and the open handle that holds it) cannot be re-mapped
             if ($script:onWin -and $cand.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {  # git rejects a \\?\ GIT_DIR, so it gets the plain spelling, and only when Win32 would not re-read it as another directory (a component ending in a dot or a space is trimmed)
                 $cand = if ($cand.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { '\\' + $cand.Substring(8) } else { $cand.Substring(4) }
                 if (@($cand.Split('\') | Where-Object { $_ -and ($_.EndsWith([char]46) -or $_.EndsWith([char]32)) }).Count) { continue }
@@ -231,10 +233,16 @@ function Assert-SameRepo([string]$Start, [string]$GitDir) {  # r14 (sol r13 B1):
     if ($a.Code -ne 0 -or $t.Code -ne 0) { throw 'worktree-redirect' }
     $ids = Get-DirIdList @($GitDir, (Remove-GitTerminator $a.Bytes), $WorkDir, (Remove-GitTerminator $t.Bytes))
     if (-not ([string]::Equals([string]$ids[0], [string]$ids[1], [System.StringComparison]::Ordinal) -and [string]::Equals([string]$ids[2], [string]$ids[3], [System.StringComparison]::Ordinal))) { throw 'worktree-redirect' }
+    $script:repoMeta = Get-RepoMeta $GitDir  # r15 (adversary A3): and the pointer file that decides WHICH repository a linked worktree's refs and objects come from
     $script:repoIds = @([string]$ids[0], [string]$ids[2])  # the identities every later step is measured against (Assert-RepoUnchanged)
+}
+function Get-RepoMeta([string]$GitDir) {  # r15 (adversary A3): the bytes of <git dir>/commondir, the file a linked worktree's git dir uses to name the repository whose refs and objects it reads. Rewriting it leaves the git dir's own file identity unchanged, so the identity alone could not see the swap. Absent (an ordinary repository) is a state of its own; any other read failure is thrown and ends the run in exit 30
+    try { return 'commondir=' + [System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes([System.IO.Path]::Combine($GitDir, 'commondir'))) }
+    catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return 'commondir=absent' }
 }
 function Assert-RepoUnchanged([string]$GitDir, [string]$Work, [string[]]$Want, [scriptblock]$ReadId = $null) {  # r14 (adversary pass 1 A2): the git dir and the work tree are read again at the END of collection and must still be the directories captured at the start. A path string is not an identity: a peer could have moved .git away and put another repository's git dir at the same path, and every read in between would then have come from the other repository (clean-tree/10 for the first one's dirt). Windows also HOLDS the git dir open for the whole run so the move is refused; POSIX has no such hold, so the swap is detected here and never reported as a clean tree
     $now = Get-DirIdList @($GitDir, $Work) $ReadId
+    if ($null -ne $script:repoMeta -and -not [string]::Equals((Get-RepoMeta $GitDir), $script:repoMeta, [System.StringComparison]::Ordinal)) { throw 'repository-changed' }
     if (-not ([string]::Equals([string]$now[0], $Want[0], [System.StringComparison]::Ordinal) -and [string]::Equals([string]$now[1], $Want[1], [System.StringComparison]::Ordinal))) { throw 'repository-changed' }
 }
 function Assert-LinkFree([string]$Path, [scriptblock]$ReadAttr = $null) {  # r13 (sol r12 F2): NO LINK IS RESOLVED, so none can be resolved wrongly. Resolve-RealPath used to follow each symlink with ResolveLinkTarget().FullName, which removes a `..` held in the link's TARGET before the OS follows the link (`runlink -> hop/../evidence` with `hop -> wt/sub`: the OS opens wt/evidence, the saver judged evidence). Now every component below the root of a fully qualified path is read (attributes and link target, never followed) and ANY reparse point, symbolic link or junction ends in a refusal (exit 30 reason=link-in-path); a component whose attributes cannot be read ends in reason=path-unreadable. Paths this function is given have no `..` segment (Test-HasDotDot ran first), so their text is their identity once no component is a link. Windows reads the same \\?\ spelling Get-FinalDir will open. $ReadAttr is a test seam: a scriptblock that takes a component path and returns its FileAttributes (or throws)
@@ -307,7 +315,9 @@ function Test-LaneAlive {
     $procId = $LanePid; $born = $null
     if ($ChildJson) {
         # System.Text.Json, not ConvertFrom-Json: PowerShell turns '/Date(0)/' into a DateTime, unwraps one-item lists and casts arrays to int, so every shape check was passed by something that is no ISO string (adversary r8 A2, A3)
-        $root = [System.Text.Json.JsonDocument]::Parse([System.IO.File]::ReadAllText($ChildJson)).RootElement
+        $cfs = [System.IO.File]::Open($ChildJson, 'Open', 'Read', 'Read')  # r15 (adversary A4): opened FIRST, then proved link-free again with the file held, then read from that handle: a folder swapped for a link after the first check (line "foreach ($raw in") cannot make the saver read another file by the same name
+        try { Assert-LinkFree $ChildJson; $cjson = [System.IO.StreamReader]::new($cfs).ReadToEnd() } finally { $cfs.Dispose() }
+        $root = [System.Text.Json.JsonDocument]::Parse($cjson).RootElement
         $pe = [System.Text.Json.JsonElement]::new(); $ce = [System.Text.Json.JsonElement]::new()
         if ($root.ValueKind -ne 'Object' -or -not $root.TryGetProperty('pid', [ref]$pe) -or $pe.ValueKind -ne 'Number' -or -not $pe.TryGetInt32([ref]$procId)) { throw 'bad-child-json' }
         if (-not $root.TryGetProperty('createdUtc', [ref]$ce) -or $ce.ValueKind -ne 'String') { throw 'bad-created-utc' }  # absent, null, a number (1 casts to year 0001), prose or '/Date(0)/' is no timestamp: without one a reused pid cannot be told from the lane (sol r4 B2, r7 B3)
