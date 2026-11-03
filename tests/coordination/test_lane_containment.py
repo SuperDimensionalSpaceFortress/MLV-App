@@ -2039,15 +2039,14 @@ def test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable(fixtur
 # repro sol gave: "CODEX_EXE is missing or unstartable ... Process.Start then throws".
 def test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_recorded(fixture_tree):
     def mutation(text):
-        old = ("} else {\n"
-               "    $psi.FileName = $exe\n"
-               "    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }\n"
+        # r11: the codex launch runs the resolved program (Resolve-CodexShimLaunch) with its literal prefix arguments.
+        old = ("    $psi.FileName = $launchFile\n"
+               "    foreach ($a in $launchArgv) { [void]$psi.ArgumentList.Add($a) }\n"
                "    $proc = [Diagnostics.Process]::Start($psi)\n"
                "}")
         assert old in text, "codex Process.Start block text has moved; update this fixture mutation"
-        new = ("} else {\n"
-               "    $psi.FileName = $exe\n"
-               "    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }\n"
+        new = ("    $psi.FileName = $launchFile\n"
+               "    foreach ($a in $launchArgv) { [void]$psi.ArgumentList.Add($a) }\n"
                "    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
                "}")
         return text.replace(old, new)
