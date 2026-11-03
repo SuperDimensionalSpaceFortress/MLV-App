@@ -1425,6 +1425,27 @@ try { 'FITS-NATIVE ' + (Assert-CodexCommandLineFits -Exe 'C:\\x\\codex.exe' -Arg
     assert "FITS-NATIVE 7666" in out,(out,r.stderr)
 
 
+def test_the_shim_reserve_covers_the_shims_own_literal_text(tmp_path):
+    # r10 fix iteration 1 (adversary A2 on b04222df): a shim with 1001 literal spaces before %* forwards a line ~1000 characters longer than
+    # the fixed 512 reserve allowed for, so cmd.exe refused after launch. The reserve is now at least the shim's own text.
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(('@echo off\r\nC:\\pins\\codex.exe'+' '*1001+'%*\r\n').encode("ascii"))
+    r=_cmdline_harness(tmp_path,f"""
+$exe = '{shim}'
+$text = [IO.File]::ReadAllText($exe)
+$l1 = Get-NativeCommandLineLength -Exe $exe -Argv @('exec', 'x')
+function Try-K($label, $k) {{
+  try {{ $label + ' FITS ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * $k)) -DelayedExpansion $false) }} catch {{ $label + ' REFUSED ' + $_.Exception.Message }}
+}}
+Try-K 'old-edge' (8191 - ($exe.Length + 512) - $l1 + 1)
+Try-K 'new-edge' (8191 - ($exe.Length + $text.Length) - $l1 + 1)
+Try-K 'new-past' (8191 - ($exe.Length + $text.Length) - $l1 + 2)
+""")
+    out=r.stdout
+    assert "old-edge REFUSED codex-args-too-long:" in out,(out,r.stderr)
+    assert "new-edge FITS " in out,(out,r.stderr)
+    assert "new-past REFUSED codex-args-too-long:" in out,(out,r.stderr)
+
+
 def test_the_codex_command_line_bound_refuses_an_argument_cmd_would_expand(tmp_path):
     # r8 iteration 2 (adversary A1 on 7ba1883b): the length was counted BEFORE cmd.exe expanded %NAME% (and, with delayed expansion, !NAME!),
     # so `-ModelOverride '%PAD%'` measured 332 characters and became 8419. Through a shim such an argument is refused; a native exe is not.
@@ -1514,6 +1535,9 @@ def test_registry_delayed_expansion_is_the_effective_setting_hkcu_over_hklm(tmp_
     '@echo off\r\n2>nul "x.exe" %*\r\n',
     '@echo off\r\n>nul 2>&1 C:\\x.exe %*\r\n',
     '@echo off\r\n"x.exe" %* 2>&1\r\n',
+    # r10 fix iteration 1: a nested cmd.exe whose /c command line is a native target is still off
+    '@echo off\r\nC:\\Windows\\System32\\cmd.exe /d /c C:\\x.exe %*\r\n',
+    '@echo off\r\ncmd.exe /d /s /c "x.exe" %*\r\n',
 ])
 def test_comment_lines_and_disabling_spellings_do_not_turn_delayed_expansion_on(tmp_path,shim_text):
     # sol r8 B1: both hives 0 plus a harmless comment refused every default C:\!Layi Wkspc run dir.
@@ -1649,6 +1673,15 @@ def test_the_npm_shim_relative_path_refusal_is_typed(tmp_path):
     # r10: a shim that runs no native program is not positively recognised (fable r9 note: a 0-byte shim read as off)
     '',
     '@echo off\r\n',
+    # r10 fix iteration 1 (adversary A1 on b04222df): a native cmd.exe runs ANOTHER command line; its /c or /k text is classified too
+    '@echo off\r\nC:\\Windows\\System32\\cmd.exe /d /c C:\\pins\\inner %*\r\n',
+    '@echo off\r\ncmd.exe /k C:\\pins\\inner %*\r\n',
+    '@echo off\r\ncmd.exe /c "C:\\pins\\inner" %*\r\n',
+    '@echo off\r\ncmd.exe /c 2>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\ncmd.exe /c "x.exe & C:\\pins\\inner" %*\r\n',
+    '@echo off\r\ncmd.exe /c ""C:\\a b\\x.exe" %*"\r\n',
+    '@echo off\r\ncmd.exe /d %*\r\n',
+    '@echo off\r\ncmd.exe /c cmd.exe /c cmd.exe /c x.exe %*\r\n',
 ])
 def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
     assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True

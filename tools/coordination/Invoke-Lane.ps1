@@ -1366,28 +1366,54 @@ function Test-CmdShimTextEnablesDelayedExpansion {
         # the command that follows leading '@' and redirections ('2>nul C:\pins\inner %*' runs inner.cmd), so those are stripped and the
         # remainder is classified; a redirection-only segment runs nothing. A redirection target, or a command token, this reading cannot
         # parse (an unquoted ',;=/', text glued to a quote) counts as ON. '>&1' / '<&0' is a handle duplication, not a command separator.
-        foreach ($seg in [regex]::Split($t, '(?:(?<![<>])&|(?<=[<>])&(?!\d)|[|()])(?=(?:[^"]*"[^"]*")*[^"]*$)')) {
-            $s = $seg.Trim()
-            if ($s.TrimStart('@').TrimStart().StartsWith(':')) { continue }
-            while ($true) {
-                $s = $s.TrimStart()
-                if ($s.StartsWith('@')) { $s = $s.Substring(1); continue }
-                if ($s -notmatch '\A\d?(>>?|<)') { break }
-                $r = [regex]::Match($s, '\A\d?(?:>>?|<)\s*(?:&\d|"[^"]*"|[A-Za-z0-9_.:\\~-]+)(?=\s|\z)')
-                if (-not $r.Success) { return $true }
-                $s = $s.Substring($r.Length)
-            }
-            if ($s -eq '') { continue }
-            $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)')
-            if (-not $m.Success) { return $true }
-            $cmd = if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }
-            if ($cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
-            if ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%' -and ($m.Groups['q'].Success -or $cmd -notmatch '[,;=/]')) { $sawNative = $true; continue }
-            return $true
-        }
+        $class = Get-CmdLineClass -Line $t
+        if ($class -eq 'on') { return $true }
+        if ($class -eq 'native') { $sawNative = $true }
     }
     # r10: a shim that runs no native program at all (a 0-byte shim, only internal commands) is not positively recognised either: ON.
     return (-not $sawNative)
+}
+function Get-CmdLineClass {
+    # r10: classifies one logical command line (carets already removed): 'on' when any segment is not positively recognised, else 'native'
+    # when some segment runs a native program, else 'none'. r10 fix iteration 1 (adversary A1 on b04222df): a native cmd.exe target runs
+    # ANOTHER command line ('cmd.exe /d /c C:\pins\inner %*' runs inner.cmd), so the text after its /c or /k is classified the same way;
+    # cmd.exe with neither switch, nested past depth 2, or with a quoting its /c rules may rewrite, counts as ON.
+    param([string]$Line, [int]$Depth = 0)
+    $sawNative = $false
+    foreach ($seg in [regex]::Split($Line, '(?:(?<![<>])&|(?<=[<>])&(?!\d)|[|()])(?=(?:[^"]*"[^"]*")*[^"]*$)')) {
+        $s = $seg.Trim()
+        if ($s.TrimStart('@').TrimStart().StartsWith(':')) { continue }
+        while ($true) {
+            $s = $s.TrimStart()
+            if ($s.StartsWith('@')) { $s = $s.Substring(1); continue }
+            if ($s -notmatch '\A\d?(>>?|<)') { break }
+            $r = [regex]::Match($s, '\A\d?(?:>>?|<)\s*(?:&\d|"[^"]*"|[A-Za-z0-9_.:\\~-]+)(?=\s|\z)')
+            if (-not $r.Success) { return 'on' }
+            $s = $s.Substring($r.Length)
+        }
+        if ($s -eq '') { continue }
+        $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)')
+        if (-not $m.Success) { return 'on' }
+        $cmd = if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }
+        if ($cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
+        if (-not ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%' -and ($m.Groups['q'].Success -or $cmd -notmatch '[,;=/]'))) { return 'on' }
+        if ([regex]::Replace($cmd, '\A.*[\\/:]', '') -match '(?i)\Acmd\.(exe|com)\z') {
+            $sw = [regex]::Match($s.Substring($m.Length), '(?i)/[ck]')
+            if ($Depth -ge 2 -or -not $sw.Success) { return 'on' }
+            $inner = $s.Substring($m.Length).Substring($sw.Index + 2).TrimStart()
+            # cmd /? : with a leading quote, /c may strip the first and the last quote of the line. Only the shape that strips to the same
+            # text is read (exactly two quotes around a first token with no whitespace or special character); any other leading quote is ON.
+            if ($inner.StartsWith('"')) {
+                $q = [regex]::Match($inner, '\A"(?<t>[^"\s&<>()@^|]+)"(?=\s|\z)')
+                if (-not $q.Success -or ($inner.Length - $inner.Replace('"', '').Length) -ne 2) { return 'on' }
+            }
+            $nested = Get-CmdLineClass -Line $inner -Depth ($Depth + 1)
+            if ($nested -ne 'native') { return 'on' }
+        }
+        $sawNative = $true
+    }
+    if ($sawNative) { return 'native' }
+    return 'none'
 }
 # The npm cmd-shim template, exactly as npm writes it (the real %APPDATA%\npm\codex.cmd), with LF line ends; only the target path varies.
 $NPM_CMD_SHIM_PATTERN = '\A@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\nIF EXIST "%dp0%\\node\.exe" \(\n  SET "_prog=%dp0%\\node\.exe"\n\) ELSE \(\n  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;\.JS;=;%\n\)\n\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\[^"%!^&|<>\n]+" %\*\n?\z'
@@ -1454,7 +1480,18 @@ function Assert-CodexCommandLineFits {
             throw "codex-arg-cmd-expansion: the codex argument '$($bad[0])' carries a character cmd.exe expands ('%', or '!' with delayed expansion on) in '$Exe', so neither the argument codex would receive nor the command-line length is knowable; refused before launch"
         }
     }
-    $limit = if ($isShim) { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $CMD_SHIM_RESERVE) } else { $CMD_LINE_LIMIT_NATIVE }
+    # r10 fix iteration 1 (adversary A2 on b04222df): the measured 512 is a floor, not a bound. A shim's own literal text is forwarded with the
+    # arguments, so a shim longer than that (1001 spaces before %*) is charged its whole text plus every %~dp0 / %dp0% expansion (its directory).
+    $reserve = $CMD_SHIM_RESERVE
+    if ($isShim) {
+        try {
+            $shimText = [System.IO.File]::ReadAllText($Exe)
+            $dirLen = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Exe)).Length + 1
+            $dp0 = [regex]::Matches($shimText, '(?i)%~dp0|%dp0%').Count
+            $reserve = [Math]::Max($CMD_SHIM_RESERVE, $shimText.Length + $dp0 * $dirLen)
+        } catch { $reserve = $CMD_SHIM_RESERVE }
+    }
+    $limit = if ($isShim) { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $reserve) } else { $CMD_LINE_LIMIT_NATIVE }
     if ($len -gt $limit) {
         $kind = if ($ImageCount -gt 0) { 'image-args-too-long' } else { 'codex-args-too-long' }
         throw "${kind}: the codex command line would be $len characters with $ImageCount image(s) attached; the limit through '$Exe' is $limit (attach fewer -ImagePaths entries or use a shorter -RunDir)"
