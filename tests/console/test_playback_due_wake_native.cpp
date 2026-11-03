@@ -160,7 +160,9 @@ TEST(PlaybackDueWakeGate, AnEarlierArmsSignalPostedBeforeTheDueTimeNeverTakesThe
     // the wiring: the native path hands the gate the message's post time, on the gate's (QPC) clock
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "if( !gate.accept( generation, nowNs(), postNs ) || !onFire ) return;" ) ) );
-    ASSERT_EQ( 1, source.count( QStringLiteral( "d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), static_cast<qint64>( m->lParam ) );" ) ) );
+    // r5 (pass 10 A3): the first stamp still reaches the gate; the post-return time is the third argument (pass 9 A1)
+    ASSERT_EQ( 1, source.count( QStringLiteral( "const qint64 postTicks = static_cast<qint64>( m->lParam );" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), postTicks, published ? returnTicks : 0 );" ) ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );" ) ) );
     ASSERT_FALSE( source.contains( QStringLiteral( "gate.accept( gate.generation(), clock." ) ) );   // no gate call on the other clock
 }
@@ -811,6 +813,14 @@ TEST(PlaybackDueWakeSamplesB2, ABinNeverWrapsBeforeThePlaysSampleCount)
     ASSERT_EQ( looped.overflow(), bulk.overflow() );
     for( const double p : { 0.0, 0.01, 0.5, 0.95, 0.99, 1.0 } )
         ASSERT_EQ( playbackDueWakePercentileText( looped, p ).toStdString(), playbackDueWakePercentileText( bulk, p ).toStdString() );
+    // r5 adversary pass 10 A5 input: SIZE_MAX samples, rank( 1.0 ) -- the endpoint rank rounded to 2^64 (out-of-range
+    // conversion); clamped, it is the last sample. A p outside [0, 1] clamps the same way.
+    PlaybackDueWakeSamples huge;
+    huge.addRepeated( 5.0, std::numeric_limits<std::size_t>::max() );
+    ASSERT_TRUE( huge.rank( 1.0 ).censor == PlaybackDueWakeSamples::Censor::None );
+    ASSERT_NEAR( 5.0, huge.percentile( 1.0 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_NEAR( 5.0, huge.percentile( -0.5 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
+    ASSERT_NEAR( 5.0, huge.percentile( 1.5 ), PlaybackDueWakeSamples::kBinMs / 2.0 + 1e-9 );
     // the storage bound still holds with 64-bit bins
     ASSERT_TRUE( samples.storageBytes() <= PlaybackDueWakeSamples::maxStorageBytes() );
     ASSERT_TRUE( PlaybackDueWakeSamples::maxStorageBytes() <= 256u * 1024u );

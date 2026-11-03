@@ -90,7 +90,11 @@ public:
     Rank rank( double p ) const
     {
         if( m_count == 0 ) return { 0.0, Censor::None };
-        const std::size_t index = static_cast<std::size_t>( std::floor( p * static_cast<double>( m_count - 1 ) + 0.5 ) );
+        // r5 adversary pass 10 A5: the double rank is clamped to [0, m_count - 1] before the conversion (a count near SIZE_MAX
+        // rounds up to 2^64, and a p outside [0, 1] goes negative: both were out-of-range conversions)
+        const double rankAt = std::floor( p * static_cast<double>( m_count - 1 ) + 0.5 );
+        const std::size_t index = !( rankAt > 0.0 ) ? 0
+            : ( rankAt >= static_cast<double>( m_count - 1 ) ? m_count - 1 : static_cast<std::size_t>( rankAt ) );
         if( m_histogram.empty() )
         {
             std::vector<double> values( m_exact );
