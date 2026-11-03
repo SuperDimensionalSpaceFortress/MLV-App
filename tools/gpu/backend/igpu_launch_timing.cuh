@@ -23,7 +23,10 @@
  *       rounding (stamp_rounding_ms) and the anchors' skew.
  *       With a CUDA error already pending, the recorder makes no CUDA call that can
  *       fail (no anchor, event, stamp or span that time), so it never replaces the
- *       backend's error; a recorder call that fails with none pending is cleared.
+ *       backend's error; a recorder call that fails with none pending is cleared,
+ *       but only when its code is one the recorder's own call produces
+ *       (igpu_lt_recorder_clearable) and the slot still holds exactly that code, so
+ *       an asynchronous backend fault is never consumed.
  *   IGPU_LT_SYNC_BLOCK(stage, statement);
  *       host time around a statement (e.g. a free of every clip buffer).
  *   igpu_lt::FrameScope f(width, height);   igpu_lt::TileScope t(top, left);
@@ -66,6 +69,10 @@
 #ifndef IGPU_LT_DLL_NAME
 #define IGPU_LT_DLL_NAME "probe"
 #endif
+
+static_assert(cudaErrorInvalidValue == 1 && cudaErrorMemoryAllocation == 2 && cudaErrorInvalidResourceHandle == 400
+                  && cudaErrorNotReady == 600,
+              "igpu_lt_recorder_clearable() names these cudaError_t values by number");
 
 namespace igpu_lt
 {
@@ -206,11 +213,12 @@ public:
         }
         p.rec.grid = to_dim(grid);
         p.rec.block = to_dim(block);
-        if (cudaEventRecord(p.start, stream) != cudaSuccess)
+        const cudaError_t started = cudaEventRecord(p.start, stream);
+        if (started != cudaSuccess)
         {
             std::lock_guard<std::mutex> lock(mu_);
-            destroy_events_locked(p);
-            drop_own_error(cudaSuccess);
+            const cudaError_t destroyed = destroy_events_locked(p);
+            drop_own_error_locked(destroyed != cudaSuccess ? destroyed : started);
             return false;
         }
         return true;
@@ -240,8 +248,8 @@ public:
             p.rec.err_name = cudaGetErrorName(e);
             finish_locked(p.rec);
             /* Events touched by a faulted context are not reused. */
-            destroy_events_locked(p);
-            if (!peek_launch) drop_own_error(cudaSuccess);
+            const cudaError_t destroyed = destroy_events_locked(p);
+            if (!peek_launch) drop_own_error_locked(destroyed != cudaSuccess ? destroyed : recorded);
             return;
         }
         if (pending_.size() >= kMaxPending)
@@ -423,43 +431,54 @@ private:
      * (igpu_lt_anchor_try_bracket); the shortest usable bracket of kAnchorTries is kept. This is
      * the recorder's only synchronising call; with the timer OFF it is never reached. attach()
      * calls it only with no CUDA error pending (adversary r2 pass 3 A4), and a failed call ends
-     * the tries, so every error left at the end is the recorder's own and is cleared. */
+     * the tries; `own` keeps the code of the recorder's last failed call, which
+     * drop_own_error_locked() clears only if it is the recorder's own (adversary r3 pass 4 A1). */
     void establish_anchor_locked()
     {
-        const cudaError_t prior = cudaPeekAtLastError();
+        cudaError_t own = cudaSuccess;
         for (int i = 0; i < kAnchorTries; ++i)
         {
             cudaEvent_t ev = nullptr;
-            if (cudaEventCreate(&ev) != cudaSuccess) break;
+            const cudaError_t created = cudaEventCreate(&ev);
+            if (created != cudaSuccess)
+            {
+                own = created;
+                break;
+            }
             const double steady_b0 = steady_ms();
             const double utc_before = utc_ms();
             const double steady_b1 = steady_ms();
-            const bool ok = cudaEventRecord(ev, 0) == cudaSuccess && cudaEventSynchronize(ev) == cudaSuccess;
+            const cudaError_t recorded = cudaEventRecord(ev, 0);
+            const cudaError_t waited = recorded == cudaSuccess ? cudaEventSynchronize(ev) : recorded;
             const double steady_a0 = steady_ms();
             const double utc_after = utc_ms();
             const double steady_a1 = steady_ms();
-            if (!ok)
+            if (waited != cudaSuccess)
             {
-                cudaEventDestroy(ev);
+                own = waited;
+                const cudaError_t destroyed = cudaEventDestroy(ev);
+                if (destroyed != cudaSuccess) own = destroyed;
                 break;
             }
             double bracket = 0.0;
+            cudaEvent_t drop = ev;
             if (igpu_lt_anchor_try_bracket(steady_b0, utc_before, steady_b1, steady_a0, utc_after, steady_a1, &bracket)
                 && (!anchor_ || bracket < anchor_bracket_ms_))
             {
-                if (anchor_) cudaEventDestroy(anchor_);
+                drop = anchor_;
                 anchor_ = ev;
                 anchor_utc_ms_ = utc_after;
                 /* the monotonic time of the utc_after read, to within half its pin */
                 anchor_steady_ms_ = 0.5 * (steady_a0 + steady_a1);
                 anchor_bracket_ms_ = bracket;
             }
-            else
+            if (drop)
             {
-                cudaEventDestroy(ev);
+                const cudaError_t destroyed = cudaEventDestroy(drop);
+                if (destroyed != cudaSuccess) own = destroyed;
             }
         }
-        drop_own_error(prior);
+        drop_own_error_locked(own);
     }
 
     /* Adversary r2 pass 3 A4: true when a CUDA error is pending. Every recorder-only path (the
@@ -468,27 +487,40 @@ private:
      * never replace the backend's pending error in the runtime's last-error slot. */
     static bool backend_error_pending() { return cudaPeekAtLastError() != cudaSuccess; }
 
-    /* Adversary r2 pass 2 A2: a recorder-only CUDA failure (the anchor's create/record/wait, an
-     * event-pool create, an elapsed read) must not stay pending for the backend's own
-     * CK(cudaGetLastError()). The last error is cleared only when none was pending before the
-     * recorder's call (`prior`), so a backend's own error is never lost either. */
-    static void drop_own_error(cudaError_t prior)
+    /* Adversary r2 pass 2 A2, r3 pass 4 A1: a recorder-only CUDA failure must not stay pending for
+     * the backend's own CK(cudaGetLastError()), and clearing it must never consume any other
+     * error. `own` is the code the recorder's last failed call returned (cudaSuccess: none failed,
+     * nothing is cleared). The slot is cleared only when `own` is a code the recorder's own call
+     * produces (igpu_lt_recorder_clearable: never an asynchronous launch fault) AND the slot still
+     * holds exactly that code; the last error is per host thread, so only this thread's calls
+     * reach it. If the clear itself observes another code (an asynchronous fault surfacing at that
+     * instant), the recorder cannot put it back, so it logs it as an error record
+     * (kind=recorder stage=clear), never silently. */
+    void drop_own_error_locked(cudaError_t own)
     {
-        if (prior == cudaSuccess) (void)cudaGetLastError();
+        if (own == cudaSuccess || !igpu_lt_recorder_clearable((int)own)) return;
+        if (cudaPeekAtLastError() != own) return;
+        const cudaError_t got = cudaGetLastError();
+        if (got == own || got == cudaSuccess) return;
+        IgpuLtRecord rec;
+        fill_locked(&rec, "recorder", "clear");
+        rec.err = (int)got;
+        rec.err_name = cudaGetErrorName(got);
+        finish_locked(rec);
     }
 
-    /* The device time of a completed event on the host's Unix-epoch ms scale. A failed elapsed
-     * read is cleared from the runtime's last error only if no earlier error was pending, so a
+    /* The device time of a completed event on the host's Unix-epoch ms scale. No read is made
+     * while an error is pending, and a failed read is cleared by drop_own_error_locked(), so a
      * backend's own CK(cudaGetLastError()) never sees this recorder's failure, nor loses its own. */
     bool dev_utc_locked(cudaEvent_t ev, double * out)
     {
         if (!anchor_ || !ev) return false;
-        const cudaError_t prior = cudaPeekAtLastError();
-        if (prior != cudaSuccess) return false;
+        if (backend_error_pending()) return false;
         float elapsed = 0.0f;
-        if (cudaEventElapsedTime(&elapsed, anchor_, ev) != cudaSuccess)
+        const cudaError_t read = cudaEventElapsedTime(&elapsed, anchor_, ev);
+        if (read != cudaSuccess)
         {
-            drop_own_error(prior);
+            drop_own_error_locked(read);
             return false;
         }
         /* Adversary r2 A2: no stamp past the float-precision age limit. */
@@ -508,10 +540,10 @@ private:
             pool_.pop_back();
             return true;
         }
-        const cudaError_t prior = cudaPeekAtLastError();
-        if (prior != cudaSuccess) return false;
-        if (cudaEventCreate(ev) == cudaSuccess) return true;
-        drop_own_error(prior);
+        if (backend_error_pending()) return false;
+        const cudaError_t created = cudaEventCreate(ev);
+        if (created == cudaSuccess) return true;
+        drop_own_error_locked(created);
         return false;
     }
 
@@ -522,12 +554,23 @@ private:
         p.start = p.stop = nullptr;
     }
 
-    /* Error branches and teardown: the handles are destroyed, never just dropped. */
-    void destroy_events_locked(Pending & p)
+    /* Error branches and teardown: the handles are destroyed, never just dropped. Returns the
+     * code of the last destroy that failed (cudaSuccess when none did). */
+    cudaError_t destroy_events_locked(Pending & p)
     {
-        if (p.start) cudaEventDestroy(p.start);
-        if (p.stop) cudaEventDestroy(p.stop);
+        cudaError_t failed = cudaSuccess;
+        if (p.start)
+        {
+            const cudaError_t e = cudaEventDestroy(p.start);
+            if (e != cudaSuccess) failed = e;
+        }
+        if (p.stop)
+        {
+            const cudaError_t e = cudaEventDestroy(p.stop);
+            if (e != cudaSuccess) failed = e;
+        }
         p.start = p.stop = nullptr;
+        return failed;
     }
 
     void fill_locked(IgpuLtRecord * rec, const char * kind, const char * stage)
@@ -536,7 +579,7 @@ private:
         const Context & c = context();
         rec->dll = IGPU_LT_DLL_NAME;
         rec->kind = kind;
-        rec->stage = stage;
+        rec->stage = stage ? stage : "?"; /* adversary r3 pass 4 A3: never a null C string downstream */
         rec->seq = ++seq_;
         rec->utc_ms = utc_ms();
         rec->width = c.width;

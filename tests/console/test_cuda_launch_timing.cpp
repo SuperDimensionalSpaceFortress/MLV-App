@@ -356,7 +356,8 @@ TEST(CudaLaunchTiming, AnchorTryPinsEachWallReadToTheMonotonicClock)
         "            const double steady_b0 = steady_ms();\n"
         "            const double utc_before = utc_ms();\n"
         "            const double steady_b1 = steady_ms();\n"
-        "            const bool ok = cudaEventRecord(ev, 0) == cudaSuccess && cudaEventSynchronize(ev) == cudaSuccess;\n"
+        "            const cudaError_t recorded = cudaEventRecord(ev, 0);\n"
+        "            const cudaError_t waited = recorded == cudaSuccess ? cudaEventSynchronize(ev) : recorded;\n"
         "            const double steady_a0 = steady_ms();\n"
         "            const double utc_after = utc_ms();\n"
         "            const double steady_a1 = steady_ms();\n")));
@@ -454,14 +455,14 @@ TEST(CudaLaunchTiming, RecorderMakesNoCudaCallWhileABackendErrorIsPending)
         "            std::lock_guard<std::mutex> lock(mu_);\n            discard_events_locked(p);\n            return;\n        }")));
     // Pool create and the stamps' elapsed reads.
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (prior != cudaSuccess) return false;\n"
-        "        if (cudaEventCreate(ev) == cudaSuccess) return true;")));
+        "        if (backend_error_pending()) return false;\n        const cudaError_t created = cudaEventCreate(ev);")));
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (prior != cudaSuccess) return false;\n"
-        "        float elapsed = 0.0f;\n        if (cudaEventElapsedTime(&elapsed, anchor_, ev) != cudaSuccess)")));
-    // A failed start record clears its own error (none was pending, so nothing else is lost).
+        "        if (backend_error_pending()) return false;\n"
+        "        float elapsed = 0.0f;\n        const cudaError_t read = cudaEventElapsedTime(&elapsed, anchor_, ev);")));
+    // A failed start record clears its own error (r3 pass 4 A1: by its own code only).
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "            destroy_events_locked(p);\n            drop_own_error(cudaSuccess);\n            return false;")));
+        "            const cudaError_t destroyed = destroy_events_locked(p);\n"
+        "            drop_own_error_locked(destroyed != cudaSuccess ? destroyed : started);\n            return false;")));
 }
 
 TEST(CudaLaunchTiming, RecorderOnlyCudaFailuresDoNotStayPendingForTheBackend)
@@ -470,21 +471,51 @@ TEST(CudaLaunchTiming, RecorderOnlyCudaFailuresDoNotStayPendingForTheBackend)
     // backend's next CK(cudaGetLastError()) must not see it. Every recorder-only CUDA call that can
     // fail (anchor create/record/wait, pool create, elapsed read) reads the pending error first and
     // clears its own failure only when none was pending (drop_own_error), so a backend error is kept.
+    // r3 pass 4 A1: the clear takes the failed call's own code (drop_own_error_locked).
     const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "    void establish_anchor_locked()\n    {\n        const cudaError_t prior = cudaPeekAtLastError();")));
-    ASSERT_TRUE(header.contains(QStringLiteral("            if (cudaEventCreate(&ev) != cudaSuccess) break;")));
-    ASSERT_TRUE(header.contains(QStringLiteral("            }\n        }\n        drop_own_error(prior);\n    }")));
+        "    void establish_anchor_locked()\n    {\n        cudaError_t own = cudaSuccess;")));
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (prior != cudaSuccess) return false;\n"
-        "        if (cudaEventCreate(ev) == cudaSuccess) return true;\n        drop_own_error(prior);\n        return false;")));
-    ASSERT_TRUE(header.contains(QStringLiteral("    static void drop_own_error(cudaError_t prior)\n    {\n"
-                                               "        if (prior == cudaSuccess) (void)cudaGetLastError();\n    }")));
-    ASSERT_EQ(3, (int)header.count(QStringLiteral("drop_own_error(prior);")));
+        "            const cudaError_t created = cudaEventCreate(&ev);\n            if (created != cudaSuccess)\n"
+        "            {\n                own = created;\n                break;\n            }")));
+    ASSERT_TRUE(header.contains(QStringLiteral("            }\n        }\n        drop_own_error_locked(own);\n    }")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        if (backend_error_pending()) return false;\n        const cudaError_t created = cudaEventCreate(ev);\n"
+        "        if (created == cudaSuccess) return true;\n        drop_own_error_locked(created);\n        return false;")));
+    // anchor, pool create, elapsed read, a start record, a span's stop record.
+    ASSERT_EQ(5, (int)header.count(QRegularExpression(QStringLiteral("drop_own_error_locked\\((?!cudaError_t |\\))"))));
     // No early return inside the anchor loop skips the clear.
     const int def = header.indexOf(QStringLiteral("    void establish_anchor_locked()"));
-    const int end = header.indexOf(QStringLiteral("        drop_own_error(prior);\n    }"), def);
+    const int end = header.indexOf(QStringLiteral("        drop_own_error_locked(own);\n    }"), def);
+    ASSERT_TRUE(end > def);
     ASSERT_FALSE(header.mid(def, end - def).contains(QStringLiteral("return")));
+}
+
+TEST(CudaLaunchTiming, RecorderClearsOnlyItsOwnErrorCode)
+{
+    // Adversary r3 pass 4 A1, its input: timer on; the anchor's calls all succeed, and just before
+    // the recorder's clear an earlier backend launch faults, so cudaGetLastError() would return
+    // cudaErrorLaunchFailure (719). The unconditional clear consumed it. Now nothing is cleared
+    // unless a recorder call failed, with a code only the recorder's own call produces, and the slot
+    // still holds exactly that code. The runtime probe (scenario 9, red-pass4-a1.txt) runs the input.
+    ASSERT_EQ(0, igpu_lt_recorder_clearable(719));
+    ASSERT_EQ(0, igpu_lt_recorder_clearable(700));
+    ASSERT_EQ(0, igpu_lt_recorder_clearable(9));
+    ASSERT_EQ(0, igpu_lt_recorder_clearable(0));
+    for (int own : {1, 2, 400, 600}) ASSERT_EQ(1, igpu_lt_recorder_clearable(own));
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "    void drop_own_error_locked(cudaError_t own)\n    {\n"
+        "        if (own == cudaSuccess || !igpu_lt_recorder_clearable((int)own)) return;\n"
+        "        if (cudaPeekAtLastError() != own) return;\n"
+        "        const cudaError_t got = cudaGetLastError();\n"
+        "        if (got == own || got == cudaSuccess) return;\n")));
+    // Advisory r3 pass 4 A3: a null stage never reaches the line or the stats key as a C string.
+    ASSERT_TRUE(header.contains(QStringLiteral("        rec->stage = stage ? stage : \"?\";")));
+    // The recorder's one clearing call is that one.
+    ASSERT_EQ(1, (int)header.count(QStringLiteral("cudaGetLastError();")));
+    ASSERT_FALSE(header.contains(QStringLiteral("drop_own_error(")));
+    ASSERT_TRUE(header.contains(QStringLiteral("static_assert(cudaErrorInvalidValue == 1 && cudaErrorMemoryAllocation == 2")));
 }
 
 TEST(CudaLaunchTiming, DeviceStampsAreNeverCutByAnInternalBuffer)
@@ -721,7 +752,7 @@ TEST(CudaLaunchTiming, RecorderDestroysEveryEventItCreates)
     // Adversary r2 A4: the one exception is the device-clock anchor, kept with the leaked recorder
     // (so later backends stamp against it); it is destroyed only when a better try replaces it, and
     // the contract says so.
-    ASSERT_EQ(1, (int)header.count(QStringLiteral("cudaEventDestroy(anchor_)")));
+    ASSERT_EQ(1, (int)header.count(QStringLiteral("                drop = anchor_;\n")));
     ASSERT_TRUE(header.contains(QStringLiteral("every event the recorder created, without waiting on the device, except\n"
                                                " *       the one device-clock anchor")));
     for (const char * dll : {"tools/gpu/backend/igpu_recon_cuda.cu", "tools/gpu/backend/igpu_amaze_debayer_cuda.cu"})
@@ -763,7 +794,7 @@ TEST(CudaLaunchTiming, OffCostsOneCachedTestPerSite)
     ASSERT_EQ(std::string("cudaEventSynchronize"), syncs.join(QStringLiteral(", ")).toStdString());
     const int anchorDef = header.indexOf(QStringLiteral("    void establish_anchor_locked()\n    {\n"));
     ASSERT_TRUE(anchorDef >= 0);
-    const int anchorEnd = header.indexOf(QStringLiteral("\n        drop_own_error(prior);\n    }\n"), anchorDef);
+    const int anchorEnd = header.indexOf(QStringLiteral("\n        drop_own_error_locked(own);\n    }\n"), anchorDef);
     ASSERT_TRUE(anchorEnd > anchorDef);
     const int syncAt = header.indexOf(syncCallPattern());
     ASSERT_TRUE(syncAt > anchorDef && syncAt < anchorEnd);

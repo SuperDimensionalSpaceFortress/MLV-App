@@ -366,6 +366,17 @@ static inline double igpu_lt_cross_dll_bound_ms(double bracket_a, double bracket
            + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS;
 }
 
+/* Adversary r3 pass 4 A1. The CUDA error codes a recorder-only call (an event create, record or
+ * destroy, an elapsed read) can produce from its own arguments or resources, and so the only ones
+ * the recorder may clear from the runtime's last-error slot: cudaErrorInvalidValue (1),
+ * cudaErrorMemoryAllocation (2), cudaErrorInvalidResourceHandle (400) and cudaErrorNotReady (600).
+ * Any other code (an asynchronous launch fault such as cudaErrorLaunchFailure, 719, observed by the
+ * recorder's call, or a context error) belongs to the backend and is never cleared. */
+static inline int igpu_lt_recorder_clearable(int err)
+{
+    return err == 1 || err == 2 || err == 400 || err == 600;
+}
+
 static inline int igpu_lt_dev_stamp(double anchor_utc_ms, double elapsed_ms, double * out)
 {
     if (!(elapsed_ms >= 0.0) || !(elapsed_ms < IGPU_LT_ANCHOR_MAX_AGE_MS)) return 0;
