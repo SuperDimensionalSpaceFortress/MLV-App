@@ -15,7 +15,7 @@ with its skips.
 
 Two independent signals mean "a lookup consulted the native entry unpinned":
   1. The forced entry records every call it receives, from any thread. No tracing is involved, so nothing the
-     test does to tracing can hide it.
+     test does to tracing can hide it. The count is NEVER cleared.
   2. A sys.monitoring observer (Python 3.12+; interpreter-wide, so it covers every thread, and a test's own
      sys.settrace / threading.settrace calls do not touch it) watches every frame whose code is
      `server._wrapper_process_entry`'s, however that frame was reached (module attribute, an alias captured at
@@ -25,14 +25,23 @@ Two independent signals mean "a lookup consulted the native entry unpinned":
      real-looking dict. No line number is consulted, so `if native is not None: return native` on one line
      or on two cannot change the answer. This signal is also what proves a pinned lookup HAPPENED.
 
+Both signals are armed BEFORE the test module is imported and stay armed until the verdict, so the whole life of
+the test process is covered: import of the test module, construction of the TestCase, the run, and process
+finalization (atexit callbacks the test registered, threads it left running). The verdict is computed and
+printed by an atexit callback registered before any of the ref's code is imported; atexit runs LIFO, so it runs
+after every callback the test registered, and after threading's shutdown joined the non-daemon threads. It then
+ends the child with os._exit and the matching exit code.
+
 Verdict (stdout, exactly one line; exit code):
   PINNED   (0)  the test ran and passed, was not skipped, an observed call looked a pid up and fell through to
-                the fallback at least once, no call consulted the native entry, and every observed fallback
-                returned a real entry: the test's own pin took effect.
-  UNPINNED (1)  some call returned the native result, or the forced entry was called.
+                the fallback at least once, no call at any time consulted the native entry, no thread other
+                than the main one is still alive at exit, no exception was ignored at shutdown, and every
+                observed fallback returned a real entry: the test's own pin took effect.
+  UNPINNED (1)  some call, at any time, returned the native result, or the forced entry was called.
   UNKNOWN  (2)  anything else: git/import/timeout error, Python older than 3.12, the test absent, skipped, failed
-                for another reason, the observer removed by the test, or no call observed. Never read UNKNOWN
-                as fixed.
+                for another reason, the observer removed by the test, a thread still running at exit, a
+                test-registered atexit callback that raised, the child printing after its verdict line, or no
+                call observed. Never read UNKNOWN as fixed.
 
 Trust: this EXECUTES the ref's own test code (as the test suite itself does). The verdict line carries a
 per-run nonce that is handed to the child on stdin, not argv, so an accidental `print("PINNED")` or an early
@@ -43,6 +52,7 @@ nothing here forces or sees) -- it could do anything else the interpreter allows
 Usage: py -3 tools/coordination/check_bridge_native_pin.py [REF]        (REF defaults to fork/master)
        --test-source PATH / --server-source PATH replace the extracted test file / server.py (fixtures only).
 """
+import atexit
 import io
 import os
 import secrets
@@ -64,6 +74,8 @@ FORCE_HOOK = "_BRIDGE_NATIVE_PIN_FORCED"
 TOOL_ID = 4
 CHILD_FLAG = "--child"
 VERDICT_CODE = {"PINNED": 0, "UNPINNED": 1, "UNKNOWN": 2}
+# A child that raised from a test-registered atexit callback leaves one of these on stderr (3.12/3.13 and older).
+ATEXIT_FAILURE_MARKERS = ("Exception ignored in atexit callback", "Error in atexit._run_exitfuncs")
 FORCING_STUB = (
     "\n\n# --- appended by tools/coordination/check_bridge_native_pin.py (retirement check only):\n"
     "# every execution of this file yields the forced native entry.\n"
@@ -73,56 +85,57 @@ FORCING_STUB = (
 )
 
 
-def _child(agent_dir, nonce):
+def _child(agent_dir, st):
+    """Arm everything, run the one test, and leave the verdict to _child_main's atexit callback (registered
+    before any of the ref's code is imported). An early out sets st["early"] and returns."""
     import builtins
     import importlib
     import unittest
 
-    def emit(text):
-        # The only line the parent believes: it carries the nonce.
-        print("RESULT %s %s" % (nonce, text))
-        return VERDICT_CODE[text.split(" ")[0]]
-
     mon = getattr(sys, "monitoring", None)
     if mon is None:
-        return emit("UNKNOWN (needs Python 3.12+ for sys.monitoring; running %d.%d)" % sys.version_info[:2])
+        st["early"] = "UNKNOWN (needs Python 3.12+ for sys.monitoring; running %d.%d)" % sys.version_info[:2]
+        return
 
     root = os.path.dirname(os.path.dirname(agent_dir))
-    forced_calls = []    # every call of the forced native entry, from any thread, through any alias
+    forced_calls = st["forced_calls"] = []    # every call of the forced native entry, any thread, any alias; NEVER cleared
+    counting = [True]
 
     def forced(pid):
-        forced_calls.append(pid)
+        if counting[0]:
+            forced_calls.append(pid)
         return {"pid": pid, "parent_pid": 0, "name": "python.exe", "command_line": FORCED,
                 "executable_path": None, "creation_date": None}
 
     setattr(builtins, FORCE_HOOK, forced)
-    # `root` makes the CI identity importable; `agent_dir` is where the bridge's own top-level imports live
-    # (the test file inserts it too).
-    sys.path.insert(0, root)
-    sys.path.insert(0, agent_dir)
-    import core.win_process as win_process
-    import server
 
-    if win_process.native_process_entry(0).get("command_line") != FORCED \
-            or server.native_process_entry(0).get("command_line") != FORCED:
-        return emit("UNKNOWN (could not force the native process entry)")
-    mod = importlib.import_module(TEST_MODULE)
+    # Unraisable exceptions (a raising atexit callback is one) are recorded; a test that swaps the hook is seen.
+    unraisable = st["unraisable"] = []
+    previous_hook = sys.unraisablehook
 
-    cls = getattr(mod, TEST_CLASS, None)
-    if cls is None or not callable(getattr(cls, TEST_NAME, None)):
-        return emit("UNKNOWN (the qualified test is absent; retired or renamed?)")
-    # The code object is captured ONCE, from the loaded module, before the suite runs. Every alias the test
-    # file can hold (import-time `from server import`, partial, class attribute, default argument) shares it,
-    # and a reloaded server has an EQUAL one.
-    code = server._wrapper_process_entry.__code__
-    if NATIVE_LOCAL not in code.co_varnames:
-        return emit("UNKNOWN (server._wrapper_process_entry has no `%s` local; cannot tell the fast path)" % NATIVE_LOCAL)
+    def hook(args):
+        unraisable.append("%s: %s" % (getattr(args.exc_type, "__name__", "?"), args.exc_value))
+        previous_hook(args)
+
+    sys.unraisablehook = hook
+    st["hook"] = hook
+
+    # The sys.monitoring observer is armed BEFORE any of the ref's code is imported: import, construction, run and
+    # finalization are all inside it. Until the real code object is known (server imported) a frame is recognised
+    # by its name and its `native` local; afterwards by equality, which an importlib.reload keeps.
+    state = {"code": None}
     missing = object()
-    frames = []    # one (kind, returned) per observed frame of the lookup, decided as the frame exits
-    problems = []
+    frames = st["frames"] = []    # one (kind, returned) per observed frame of the lookup, decided as the frame exits
+    problems = st["problems"] = []
+
+    def is_target(code_obj):
+        known = state["code"]
+        if known is None:
+            return code_obj.co_name == "_wrapper_process_entry" and NATIVE_LOCAL in code_obj.co_varnames
+        return code_obj is known or code_obj == known
 
     def observe(code_obj, returned):
-        if not (code_obj is code or code_obj == code):
+        if not is_target(code_obj):
             return False
         try:
             frame = sys._getframe(2)    # callback <- observe <- the monitored frame's exit
@@ -150,47 +163,117 @@ def _child(agent_dir, nonce):
 
     events = mon.events.PY_RETURN | mon.events.PY_UNWIND
     name = "bridge-native-pin"
-    suite = unittest.defaultTestLoader.loadTestsFromName(TEST_MODULE + "." + TEST_CLASS + "." + TEST_NAME)
-    forced_calls.clear()
     mon.use_tool_id(TOOL_ID, name)
-    try:
-        mon.register_callback(TOOL_ID, mon.events.PY_RETURN, on_return)
-        mon.register_callback(TOOL_ID, mon.events.PY_UNWIND, on_unwind)
-        mon.set_events(TOOL_ID, events)
-        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
-        disturbed = mon.get_tool(TOOL_ID) != name or mon.get_events(TOOL_ID) != events
-    finally:
-        mon.set_events(TOOL_ID, 0)
-        mon.register_callback(TOOL_ID, mon.events.PY_RETURN, None)
-        mon.register_callback(TOOL_ID, mon.events.PY_UNWIND, None)
-        mon.free_tool_id(TOOL_ID)
-    if problems:
-        return emit("UNKNOWN (observer error: %s)" % problems[0])
-    if forced_calls or any(kind == "fast" for kind, _ in frames):
-        return emit("UNPINNED (a lookup in the test consulted the native process entry)")
-    if disturbed:
-        return emit("UNKNOWN (the test replaced the observer; later calls were not observed)")
+    st["monitor"] = (mon, name, events)
+    mon.register_callback(TOOL_ID, mon.events.PY_RETURN, on_return)
+    mon.register_callback(TOOL_ID, mon.events.PY_UNWIND, on_unwind)
+    mon.set_events(TOOL_ID, events)
+
+    # `root` makes the CI identity importable; `agent_dir` is where the bridge's own top-level imports live
+    # (the test file inserts it too).
+    sys.path.insert(0, root)
+    sys.path.insert(0, agent_dir)
+    import core.win_process as win_process
+    import server
+
+    counting[0] = False    # the self-check below is ours, not the test's
+    forcing_works = (win_process.native_process_entry(0).get("command_line") == FORCED
+                     and server.native_process_entry(0).get("command_line") == FORCED)
+    counting[0] = True
+    if not forcing_works:
+        st["early"] = "UNKNOWN (could not force the native process entry)"
+        return
+    # The code object is captured ONCE, before the test module is imported. Every alias the test file can hold
+    # (import-time `from server import`, partial, class attribute, default argument) shares it, and a reloaded
+    # server has an EQUAL one.
+    code = server._wrapper_process_entry.__code__
+    if NATIVE_LOCAL not in code.co_varnames:
+        st["early"] = "UNKNOWN (server._wrapper_process_entry has no `%s` local; cannot tell the fast path)" % NATIVE_LOCAL
+        return
+    state["code"] = code
+
+    mod = importlib.import_module(TEST_MODULE)    # import-time lookups are observed and counted
+    cls = getattr(mod, TEST_CLASS, None)
+    if cls is None or not callable(getattr(cls, TEST_NAME, None)):
+        st["early"] = "UNKNOWN (the qualified test is absent; retired or renamed?)"
+        return
+    # Construction (the TestCase instance is built here) is observed and counted too; nothing is ever cleared.
+    suite = unittest.defaultTestLoader.loadTestsFromName(TEST_MODULE + "." + TEST_CLASS + "." + TEST_NAME)
+    st["result"] = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+
+
+def _verdict(st):
+    """The verdict text, computed at the last moment the child process allows (an atexit callback run last)."""
+    if st.get("early"):
+        return st["early"]
+    result = st.get("result")
+    mon, name, events = st["monitor"]
+    frames = st["frames"]
+    if st["problems"]:
+        return "UNKNOWN (observer error: %s)" % st["problems"][0]
+    # Facts first: a forced call or a fast-path return at ANY time (import, construction, run, a test-created
+    # thread or atexit callback) is UNPINNED, whatever else is true.
+    if st["forced_calls"] or any(kind == "fast" for kind, _ in frames):
+        return "UNPINNED (a lookup in the test consulted the native process entry)"
+    import threading
+    alive = [t.name for t in threading.enumerate() if t is not threading.main_thread() and t.is_alive()]
+    if alive:
+        return "UNKNOWN (a thread is still running at process exit: %s; a later lookup could not be seen)" % ", ".join(alive[:3])
+    if st["unraisable"] or sys.unraisablehook is not st["hook"]:
+        return "UNKNOWN (an exception was ignored at shutdown, or the hook was replaced: %s)" % (
+            st["unraisable"][0] if st["unraisable"] else "sys.unraisablehook replaced")
+    if mon.get_tool(TOOL_ID) != name or mon.get_events(TOOL_ID) != events:
+        return "UNKNOWN (the test replaced the observer; later calls were not observed)"
+    if result is None:
+        return "UNKNOWN (the test did not run to completion)"
     if result.skipped or result.expectedFailures or result.unexpectedSuccesses:
-        return emit("UNKNOWN (the test was skipped or marked expected-failure; a skipped test is not retired)")
+        return "UNKNOWN (the test was skipped or marked expected-failure; a skipped test is not retired)"
     if result.testsRun != 1 or not result.wasSuccessful():
         why = (result.errors + result.failures or [("", "")])[0][1].strip().splitlines()[-1:] or [""]
-        return emit("UNKNOWN (the test did not pass for a reason other than the fast path: run=%d errors=%d failures=%d: %s)"
-                    % (result.testsRun, len(result.errors), len(result.failures), why[0][:200]))
+        return ("UNKNOWN (the test did not pass for a reason other than the fast path: run=%d errors=%d failures=%d: %s)"
+                % (result.testsRun, len(result.errors), len(result.failures), why[0][:200]))
     if any(kind == "odd" for kind, _ in frames):
-        return emit("UNKNOWN (a call returned something other than the native result or the fallback's)")
+        return "UNKNOWN (a call returned something other than the native result or the fallback's)"
     lookups = [e for kind, e in frames if kind == "lookup"]
     if not lookups or not all(isinstance(e, dict) for e in lookups):
-        return emit("UNKNOWN (the test passed but no observed lookup returned a real entry; nothing was proven)")
-    return emit("PINNED")
+        return "UNKNOWN (the test passed but no observed lookup returned a real entry; nothing was proven)"
+    return "PINNED"
 
 
 def _child_main(agent_dir):
     nonce = sys.stdin.readline().strip()
+    st = {}
+
+    def finish():
+        # Registered with atexit before any of the ref's code runs, so atexit (LIFO) calls it after every callback
+        # the test registered; threading's shutdown has already joined the non-daemon threads. It prints the only
+        # line the parent believes (it carries the nonce) and ends the process with the matching exit code, so
+        # nothing the interpreter does afterwards can change either.
+        try:
+            text = _verdict(st)
+        except BaseException as e:  # noqa: BLE001
+            text = "UNKNOWN (%s computing the verdict: %s)" % (type(e).__name__, e)
+        try:
+            mon, _, _ = st["monitor"]
+            mon.set_events(TOOL_ID, 0)
+            mon.free_tool_id(TOOL_ID)
+        except BaseException:  # noqa: BLE001 -- the verdict is already decided
+            pass
+        out = sys.__stdout__ or sys.stdout
+        out.write("\nRESULT %s %s\n" % (nonce, text))    # leading newline: a test's unterminated print cannot hide it
+        out.flush()
+        try:
+            sys.stderr.flush()
+        except BaseException:  # noqa: BLE001
+            pass
+        os._exit(VERDICT_CODE[text.split(" ")[0]])
+
+    atexit.register(finish)
     try:
-        return _child(agent_dir, nonce)
+        _child(agent_dir, st)
     except BaseException as e:  # noqa: BLE001 -- an import error or an early SystemExit in the ref's code is UNKNOWN
-        print("RESULT %s UNKNOWN (%s: %s)" % (nonce, type(e).__name__, str(e).splitlines()[0] if str(e) else ""))
-        return VERDICT_CODE["UNKNOWN"]
+        st["early"] = "UNKNOWN (%s: %s)" % (type(e).__name__, str(e).splitlines()[0] if str(e) else "")
+    return VERDICT_CODE["UNKNOWN"]    # the exit code only if `finish` never ran; then there is no verdict line either
 
 
 def _replace(path, source):
@@ -229,7 +312,16 @@ def _parent(ref, test_source, server_source):
     verdicts = [l[len(prefix):] for l in proc.stdout.splitlines() if l.startswith(prefix)]
     if len(verdicts) == 1 and verdicts[0].split(" ")[0] in VERDICT_CODE \
             and proc.returncode == VERDICT_CODE[verdicts[0].split(" ")[0]]:
-        return verdicts[0], proc.returncode
+        verdict = verdicts[0]
+        if verdict.split(" ")[0] == "PINNED":
+            # A PINNED child is believed only if the process ended quietly: the verdict is the LAST thing it
+            # printed (the child ends with os._exit right after it), and no atexit callback failed.
+            after = proc.stdout.split(prefix + verdict, 1)[1] if (prefix + verdict) in proc.stdout else "?"
+            if after.strip("\r\n") != "":
+                return "UNKNOWN (the child printed after its verdict line)", 2
+            if any(marker in proc.stderr for marker in ATEXIT_FAILURE_MARKERS):
+                return "UNKNOWN (an atexit callback raised in the child)", 2
+        return verdict, proc.returncode
     tail = (proc.stderr.strip().splitlines() or ["no output"])[-1]
     return "UNKNOWN (the check run itself failed, exit %d: %s)" % (proc.returncode, tail), 2
 
