@@ -1939,6 +1939,32 @@ def test_r11_the_npm_template_launches_its_native_node_and_script_directly(tmp_p
     assert "KIND npm-node" in out and f"FILE {tmp_path / 'node.exe'}" in out and f"ARGS [{script}]" in out,out
 
 
+@pytest.mark.parametrize("pathext",[".EXE;\\..\\cmd.exe", "\\..\\cmd.exe", ".EXE;/../cmd.exe", ".EXE;:x"])
+def test_r11_a_pathext_entry_can_never_turn_the_node_search_into_another_program(tmp_path,pathext):
+    # r11 fix iteration 2 (adversary A1 on 06b68082, literal first row): with no node.exe beside the shim, 'node' + '\..\cmd.exe' resolved
+    # to <PATH entry>\cmd.exe and the npm template was launched as cmd.exe. A candidate must be the plain leaf <entry>\node<ext>.
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    p1=tmp_path/"p1"; p1.mkdir(); (p1/"cmd.exe").write_bytes(b"MZ")
+    out=_resolve(tmp_path,_NPM_SHIM,pre=f"$env:PATH = '{p1}'\n$env:PATHEXT = '{pathext}'\n")
+    assert "CAUGHT codex-shim-unsupported:" in out and "npm template" in out,(pathext,out)
+    assert "KIND npm-node" not in out,(pathext,out)
+
+
+def test_r11_the_npm_template_script_is_joined_to_the_shim_directory_as_cmd_builds_it(tmp_path):
+    # r11 fix iteration 2 (adversary A2 on 06b68082, literal): '"%dp0%\\codex.js"' names <shim dir>\codex.js, but Path.Combine(dir, '\codex.js')
+    # dropped the directory and selected <drive>:\codex.js. The script is the template text joined exactly as cmd.exe expands %dp0%.
+    (tmp_path/"codex.js").write_text("// A",encoding="ascii"); (tmp_path/"node.exe").write_bytes(b"MZ")
+    text=_NPM_SHIM.replace('"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js"','"%dp0%\\\\codex.js"')
+    assert '"%dp0%\\\\codex.js" %*' in text
+    out=_resolve(tmp_path,text)
+    assert "KIND npm-node" in out and f"ARGS [{tmp_path / 'codex.js'}]" in out,out
+    bin_dir=tmp_path/"a"/".bin"; bin_dir.mkdir(parents=True); (bin_dir/"node.exe").write_bytes(b"MZ")
+    (tmp_path/"a"/"pkg").mkdir(); (tmp_path/"a"/"pkg"/"codex.js").write_text("// B",encoding="ascii")
+    shim=bin_dir/"codex.cmd"; shim.write_bytes(_NPM_SHIM.replace('"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js"','"%dp0%\\..\\pkg\\codex.js"').encode("ascii"))
+    r=_cmdline_harness(tmp_path,f"$x = Resolve-CodexShimLaunch -Exe '{shim}'; 'ARGS [' + ($x.PrefixArgs -join '|') + ']'\n")
+    assert f"ARGS [{tmp_path / 'a' / 'pkg' / 'codex.js'}]" in r.stdout,(r.stdout,r.stderr)
+
+
 @pytest.mark.parametrize("first,ok",[("node.exe",True),("node.cmd",False),(None,False)])
 def test_r11_the_npm_template_needs_a_native_node_on_an_absolute_path_entry(tmp_path,first,ok):
     script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")

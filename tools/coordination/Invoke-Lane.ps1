@@ -1539,6 +1539,8 @@ function Read-CodexShimBytes {
 function Find-CodexProgramOnPath {
     # The first existing <dir>\<Name><ext> over the ABSOLUTE PATH entries, in PATH order and then $Extensions order. An empty or relative
     # entry is skipped: the program is launched by the absolute path returned here, never searched for again by anyone else.
+    # r11 fix iteration 2 (adversary A1 on 06b68082): PATHEXT '.EXE;\..\cmd.exe' made 'node' + '\..\cmd.exe' resolve to cmd.exe. A candidate
+    # counts only when it is a plain leaf name (no separator, ':' or '..') whose full path is exactly <entry>\<Name><ext>.
     param([Parameter(Mandatory = $true)][string]$Name, [string[]]$Extensions = @(''))
     foreach ($raw in (([string]$env:PATH) -split ';')) {
         $d = $raw.Trim().Trim('"')
@@ -1546,7 +1548,14 @@ function Find-CodexProgramOnPath {
         try { $qualified = (-not [string]::IsNullOrEmpty($d)) -and [System.IO.Path]::IsPathFullyQualified($d) } catch { $qualified = $false }
         if (-not $qualified) { continue }
         foreach ($e in $Extensions) {
-            try { $c = [System.IO.Path]::Combine($d, $Name + $e) } catch { continue }
+            $leaf = $Name + $e
+            if ($leaf -match '[\\/:]' -or $leaf.Contains('..') -or $leaf.Trim() -ne $leaf -or $leaf.EndsWith('.')) { continue }
+            try {
+                $c = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($d, $leaf))
+                $sameDir = [string]::Equals([System.IO.Path]::GetDirectoryName($c), [System.IO.Path]::GetFullPath($d).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
+                $sameLeaf = [string]::Equals([System.IO.Path]::GetFileName($c), $leaf, [System.StringComparison]::OrdinalIgnoreCase)
+            } catch { continue }
+            if (-not ($sameDir -and $sameLeaf)) { continue }
             if ([System.IO.File]::Exists($c)) { return $c }
         }
     }
@@ -1569,7 +1578,11 @@ function Resolve-CodexShimLaunch {
     if (-not $read.PrintableAscii) { & $refuse "holds a byte outside printable ASCII (TAB, CR, LF and 0x20-0x7E only)" }
     if ([regex]::IsMatch($lf, $NPM_CMD_SHIM_PATTERN)) {
         $rel = [regex]::Match($lf, '"%dp0%\\(?<rel>[^"%!^&|<>\n]+)" %\*\n?\z').Groups['rel'].Value
-        $script = try { [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($shimDir, $rel)) } catch { $null }
+        # r11 fix iteration 2 (adversary A2 on 06b68082): Path.Combine drops the shim directory when rel is rooted ('\codex.js' from
+        # '"%dp0%\\codex.js"'), so the text is joined exactly as cmd.exe builds it: '<shim dir>\' + '\' + rel. A ':' (a drive or a stream
+        # name) is refused.
+        if ($rel.Contains(':')) { & $refuse "is the npm template but its script '$rel' holds ':'" }
+        $script = try { [System.IO.Path]::GetFullPath($shimDir.TrimEnd('\') + '\\' + $rel) } catch { $null }
         if (-not $script -or -not [System.IO.File]::Exists($script)) { & $refuse "is the npm template but its script '$rel' does not exist beside it" }
         $node = $null
         try { $adj = [System.IO.Path]::Combine($shimDir, 'node.exe'); if ([System.IO.File]::Exists($adj)) { $node = $adj } } catch { $node = $null }
@@ -1578,7 +1591,7 @@ function Resolve-CodexShimLaunch {
             $node = Find-CodexProgramOnPath -Name 'node' -Extensions @($pathExt -split ';' | Where-Object { $_ })
         }
         if (-not $node) { & $refuse "is the npm template but no 'node' is on an absolute PATH entry" }
-        if ([System.IO.Path]::GetExtension($node) -notmatch '(?i)\A\.(exe|com)\z') { & $refuse "is the npm template but the first 'node' on PATH is '$node', not a native program" }
+        if ([System.IO.Path]::GetFileName($node) -notmatch '(?i)\Anode\.(exe|com)\z') { & $refuse "is the npm template but the first 'node' on PATH is '$node', not a native node.exe/node.com" }
         return [pscustomobject]@{ Kind = 'npm-node'; FileName = $node; PrefixArgs = @($script); Shim = $Exe; ShimSha256 = $read.Sha256 }
     }
     $lines = @($lf -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' -and $_ -notmatch '\A(?i)@echo\s+off\z' })
