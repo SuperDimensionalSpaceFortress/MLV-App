@@ -1395,7 +1395,9 @@ function Get-CmdLineClass {
         $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)')
         if (-not $m.Success) { return 'on' }
         $cmd = if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }
-        if ($cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
+        # r10 fix iteration 2 (adversary A1 on b0a71c84): a QUOTED name is never an internal command (measured with '"setlocal"'); cmd.exe
+        # searches PATH for it, so '"setlocal" %*' runs a setlocal.cmd. Only an unquoted name is read as internal.
+        if (-not $m.Groups['q'].Success -and $cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
         if (-not ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%' -and ($m.Groups['q'].Success -or $cmd -notmatch '[,;=/]'))) { return 'on' }
         if ([regex]::Replace($cmd, '\A.*[\\/:]', '') -match '(?i)\Acmd\.(exe|com)\z') {
             $sw = [regex]::Match($s.Substring($m.Length), '(?i)/[ck]')
@@ -1482,19 +1484,24 @@ function Assert-CodexCommandLineFits {
     }
     # r10 fix iteration 1 (adversary A2 on b04222df): the measured 512 is a floor, not a bound. A shim's own literal text is forwarded with the
     # arguments, so a shim longer than that (1001 spaces before %*) is charged its whole text plus every %~dp0 / %dp0% expansion (its directory).
+    # r10 fix iteration 2 (adversary A2 on b0a71c84): a shim that forwards the arguments more than once ('codex.exe %* %*', or %1..%9 references)
+    # puts them on its line that many times, so the counted length is charged once per forwarding reference (every %* and %1-%9 in the text).
     $reserve = $CMD_SHIM_RESERVE
+    $forwards = 1
     if ($isShim) {
         try {
             $shimText = [System.IO.File]::ReadAllText($Exe)
             $dirLen = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Exe)).Length + 1
             $dp0 = [regex]::Matches($shimText, '(?i)%~dp0|%dp0%').Count
             $reserve = [Math]::Max($CMD_SHIM_RESERVE, $shimText.Length + $dp0 * $dirLen)
-        } catch { $reserve = $CMD_SHIM_RESERVE }
+            $forwards = [Math]::Max(1, [regex]::Matches($shimText, '%\*|%~?[a-zA-Z]*[1-9]').Count)
+        } catch { $reserve = $CMD_SHIM_RESERVE; $forwards = 1 }
     }
     $limit = if ($isShim) { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $reserve) } else { $CMD_LINE_LIMIT_NATIVE }
-    if ($len -gt $limit) {
+    $charged = [int64]$len * $forwards
+    if ($charged -gt $limit) {
         $kind = if ($ImageCount -gt 0) { 'image-args-too-long' } else { 'codex-args-too-long' }
-        throw "${kind}: the codex command line would be $len characters with $ImageCount image(s) attached; the limit through '$Exe' is $limit (attach fewer -ImagePaths entries or use a shorter -RunDir)"
+        throw "${kind}: the codex command line would be $charged characters with $ImageCount image(s) attached; the limit through '$Exe' is $limit (attach fewer -ImagePaths entries or use a shorter -RunDir)"
     }
     return $len
 }

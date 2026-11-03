@@ -1446,6 +1446,28 @@ Try-K 'new-past' (8191 - ($exe.Length + $text.Length) - $l1 + 2)
     assert "new-past REFUSED codex-args-too-long:" in out,(out,r.stderr)
 
 
+def test_the_shim_bound_charges_every_forwarding_of_the_arguments(tmp_path):
+    # r10 fix iteration 2 (adversary A2 on b0a71c84): 'codex.exe %* %*' puts the arguments on its line twice, so a line counted at 4939 became
+    # 9851 after launch. The counted length is charged once per %* / %1-%9 reference in the shim text.
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(b'@echo off\r\nC:\\pins\\codex.exe %* %*\r\n')
+    r=_cmdline_harness(tmp_path,f"""
+$exe = '{shim}'
+$limit = 8191 - ($exe.Length + 512)
+$l1 = Get-NativeCommandLineLength -Exe $exe -Argv @('exec', 'x')
+function Try-K($label, $k) {{
+  try {{ $label + ' FITS ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * $k)) -ImageCount 1 -DelayedExpansion $false) }} catch {{ $label + ' REFUSED ' + $_.Exception.Message }}
+}}
+$kHalf = [int][Math]::Floor($limit / 2) - $l1 + 1
+Try-K 'half' $kHalf
+Try-K 'past-half' ($kHalf + 1)
+Try-K 'once-edge' ($limit - $l1 + 1)
+""")
+    out=r.stdout
+    assert "half FITS " in out,(out,r.stderr)
+    assert "past-half REFUSED image-args-too-long:" in out,(out,r.stderr)
+    assert "once-edge REFUSED image-args-too-long:" in out,(out,r.stderr)
+
+
 def test_the_codex_command_line_bound_refuses_an_argument_cmd_would_expand(tmp_path):
     # r8 iteration 2 (adversary A1 on 7ba1883b): the length was counted BEFORE cmd.exe expanded %NAME% (and, with delayed expansion, !NAME!),
     # so `-ModelOverride '%PAD%'` measured 332 characters and became 8419. Through a shim such an argument is refused; a native exe is not.
@@ -1682,6 +1704,10 @@ def test_the_npm_shim_relative_path_refusal_is_typed(tmp_path):
     '@echo off\r\ncmd.exe /c ""C:\\a b\\x.exe" %*"\r\n',
     '@echo off\r\ncmd.exe /d %*\r\n',
     '@echo off\r\ncmd.exe /c cmd.exe /c cmd.exe /c x.exe %*\r\n',
+    # r10 fix iteration 2 (adversary A1 on b0a71c84): a quoted internal name is looked up on PATH ('"setlocal" %*' runs setlocal.cmd)
+    '@echo off\r\n"setlocal" %*\r\nC:\\pins\\codex.exe %*\r\n',
+    '@echo off\r\n"echo" x\r\nC:\\pins\\codex.exe %*\r\n',
+    '@echo off\r\n2>nul "cd" x\r\nC:\\pins\\codex.exe %*\r\n',
 ])
 def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
     assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True
