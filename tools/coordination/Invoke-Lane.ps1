@@ -1532,7 +1532,9 @@ function Read-CodexShimBytes {
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
-    return [pscustomobject]@{ Text = [System.Text.Encoding]::ASCII.GetString($bytes); Sha256 = $hash }
+    $printable = $true
+    foreach ($b in $bytes) { if (($b -lt 0x20 -and $b -ne 9 -and $b -ne 10 -and $b -ne 13) -or $b -gt 0x7E) { $printable = $false; break } }
+    return [pscustomobject]@{ Text = [System.Text.Encoding]::ASCII.GetString($bytes); Sha256 = $hash; PrintableAscii = $printable }
 }
 function Find-CodexProgramOnPath {
     # The first existing <dir>\<Name><ext> over the ABSOLUTE PATH entries, in PATH order and then $Extensions order. An empty or relative
@@ -1562,6 +1564,9 @@ function Resolve-CodexShimLaunch {
     $shimDir = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Exe))
     $lf = $read.Text -replace '\r\n', "`n"
     $refuse = { param($why) throw "codex-shim-unsupported: the codex shim '$Exe' $why; refused before launch (only the npm cmd-shim template or ONE command line '<native .exe/.com> <literal args> %*' is launched)" }
+    # r11 fix iteration 1 (adversary A2 on 9de900bd): what a byte above 0x7F means to cmd.exe depends on the code page, and an ASCII decode
+    # turned UTF-8 'cafe-acute' into 'caf??', a different literal argument. Any byte outside printable ASCII (plus TAB, CR, LF) is refused.
+    if (-not $read.PrintableAscii) { & $refuse "holds a byte outside printable ASCII (TAB, CR, LF and 0x20-0x7E only)" }
     if ([regex]::IsMatch($lf, $NPM_CMD_SHIM_PATTERN)) {
         $rel = [regex]::Match($lf, '"%dp0%\\(?<rel>[^"%!^&|<>\n]+)" %\*\n?\z').Groups['rel'].Value
         $script = try { [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($shimDir, $rel)) } catch { $null }
@@ -1601,6 +1606,24 @@ function Resolve-CodexShimLaunch {
     $target = [string]$head[0].Value
     if ($target -match '(?i)\A%~dp0') { $target = $shimDir.TrimEnd('\') + '\' + $target.Substring(5) }
     if ($target -notmatch '(?i)\.(exe|com)\z') { & $refuse "runs '$target', which is not named as a native .exe/.com program" }
+    $prefix = @($head | Select-Object -Skip 1 | ForEach-Object { [string]$_.Value })
+    # r11 fix iteration 1 (adversary A1 on 9de900bd): a native program that parses its own command line again (cmd.exe /c, a PowerShell
+    # -Command, forfiles /c, wscript, node -e) re-reads the forwarded arguments, so 'C:\Review&QA' after -C split at '&'. Only an ALLOWLIST
+    # is launched: codex.exe with any literal args; node.exe with exactly one script; pwsh.exe / powershell.exe with only -NoProfile,
+    # -NonInteractive, -NoLogo and then -File <script> last. Any other program is refused, so an interpreter nobody listed is refused too.
+    $leaf = [regex]::Replace($target, '\A.*[\\/:]', '').ToLowerInvariant()
+    $n = $prefix.Count
+    $allowed = switch ($leaf) {
+        'codex.exe' { $true }
+        'node.exe' { $n -eq 1 -and -not $prefix[0].StartsWith('-') }
+        { $_ -eq 'pwsh.exe' -or $_ -eq 'powershell.exe' } {
+            $ok = $n -ge 2 -and $prefix[$n - 2] -ieq '-File' -and -not $prefix[$n - 1].StartsWith('-')
+            for ($k = 0; $ok -and $k -lt $n - 2; $k++) { $ok = $prefix[$k] -in @('-NoProfile', '-NonInteractive', '-NoLogo') }
+            $ok
+        }
+        default { $false }
+    }
+    if (-not $allowed) { & $refuse "runs '$leaf' with [$($prefix -join ' ')], which is not a launchable program (codex.exe; node.exe <script>; pwsh.exe or powershell.exe [-NoProfile] [-NonInteractive] [-NoLogo] -File <script>)" }
     $file = $null
     $qualified = $false
     try { $qualified = [System.IO.Path]::IsPathFullyQualified($target) } catch { $qualified = $false }
@@ -1612,7 +1635,6 @@ function Resolve-CodexShimLaunch {
         & $refuse "runs the relative path '$target'"
     }
     if (-not $file) { & $refuse "runs '$target', which does not exist (absolute PATH entries searched for a bare name)" }
-    $prefix = @($head | Select-Object -Skip 1 | ForEach-Object { [string]$_.Value })
     return [pscustomobject]@{ Kind = 'single-exe'; FileName = $file; PrefixArgs = $prefix; Shim = $Exe; ShimSha256 = $read.Sha256 }
 }
 # END Assert-CodexCommandLineFits

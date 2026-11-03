@@ -1869,7 +1869,21 @@ catch {{ 'CAUGHT ' + $_.Exception.Message }}
     ("@echo off\r\nbin\\codex.exe %*\r\n","relative path"),
     ("@echo off\r\nC:\\pins\\codex.exe a,b %*\r\n","separator"),
     ("@echo off\r\n\"C:\\pins\\codex.exe\"x %*\r\n","not a plain or fully quoted word"),
-    ("@echo off\r\nC:\\pins\\definitely-absent-r11.exe %*\r\n","does not exist"),
+    ("@echo off\r\nC:\\pins\\definitely-absent-r11\\codex.exe %*\r\n","does not exist"),
+    # r11 fix iteration 1 (adversary A1 on 9de900bd): a program that parses its own command line again (cmd.exe /c, a PowerShell -Command,
+    # forfiles /c, node -e) would re-read the forwarded arguments; only codex.exe, node.exe <script> and a PowerShell host running -File are
+    # launched (an allowlist, so an interpreter nobody listed is refused too).
+    ("@echo off\r\nC:\\Windows\\System32\\cmd.exe /d /c C:\\pin\\codex.exe %*\r\n","launchable program"),
+    ("@echo off\r\ncmd.exe /c C:\\pin\\codex.exe %*\r\n","launchable program"),
+    ("@echo off\r\nC:\\Windows\\System32\\forfiles.exe /c C:\\pin\\codex.exe %*\r\n","launchable program"),
+    ("@echo off\r\nC:\\Windows\\System32\\wscript.exe C:\\pin\\codex.js %*\r\n","launchable program"),
+    ("@echo off\r\npowershell.exe -NoProfile -Command C:\\pin\\codex.ps1 %*\r\n","launchable program"),
+    ("@echo off\r\npwsh.exe -c C:\\pin\\codex.ps1 %*\r\n","launchable program"),
+    ("@echo off\r\npwsh.exe -File C:\\pin\\codex.ps1 -Extra %*\r\n","launchable program"),
+    ("@echo off\r\npwsh.exe %*\r\n","launchable program"),
+    ("@echo off\r\nnode.exe -e x %*\r\n","launchable program"),
+    ("@echo off\r\nnode.exe %*\r\n","launchable program"),
+    ("@echo off\r\nC:\\pin\\tool.exe %*\r\n","launchable program"),
 ])
 def test_r11_every_shim_outside_the_two_launchable_shapes_is_refused_typed(tmp_path,shim_text,why):
     out=_resolve(tmp_path,shim_text)
@@ -1877,19 +1891,43 @@ def test_r11_every_shim_outside_the_two_launchable_shapes_is_refused_typed(tmp_p
 
 
 def test_r11_a_strict_one_line_shim_launches_the_program_it_names_with_its_literal_args(tmp_path):
-    exe=tmp_path/"tool.exe"; exe.write_bytes(b"MZ")
+    exe=tmp_path/"codex.exe"; exe.write_bytes(b"MZ")
     out=_resolve(tmp_path,f'@echo off\r\n"{exe}" -x "a b" %*\r\n')
     assert "KIND single-exe" in out and f"FILE {exe}" in out and "ARGS [-x|a b]" in out,out
-    out=_resolve(tmp_path,'@ECHO OFF\r\n\r\n%~dp0tool.exe %*\r\n')
+    out=_resolve(tmp_path,'@ECHO OFF\r\n\r\n%~dp0codex.exe %*\r\n')
     assert "KIND single-exe" in out and f"FILE {exe}" in out and "ARGS []" in out,out
+    js=tmp_path/"codex.js"; js.write_text("//",encoding="ascii"); node=tmp_path/"node.exe"; node.write_bytes(b"MZ")
+    out=_resolve(tmp_path,f'@echo off\r\n"{node}" "{js}" %*\r\n')
+    assert "KIND single-exe" in out and f"FILE {node}" in out and f"ARGS [{js}]" in out,out
+    out=_resolve(tmp_path,f'@echo off\r\npwsh.exe -NoProfile -NonInteractive -File "{js}" %*\r\n')
+    assert "KIND single-exe" in out and f"ARGS [-NoProfile|-NonInteractive|-File|{js}]" in out,out
 
 
 def test_r11_a_bare_program_name_is_resolved_on_absolute_path_entries_only(tmp_path):
-    rel=tmp_path/"rel"; rel.mkdir(); (rel/"tool-r11.exe").write_bytes(b"MZ")
-    good=tmp_path/"good"; good.mkdir(); (good/"tool-r11.exe").write_bytes(b"MZ")
+    rel=tmp_path/"rel"; rel.mkdir(); (rel/"codex.exe").write_bytes(b"MZ")
+    good=tmp_path/"good"; good.mkdir(); (good/"codex.exe").write_bytes(b"MZ")
     pre=f"Set-Location -LiteralPath '{tmp_path}'\n$env:PATH = 'rel;' + '{good}'\n"
-    out=_resolve(tmp_path,"@echo off\r\ntool-r11.exe %*\r\n",pre=pre)
-    assert "KIND single-exe" in out and f"FILE {good / 'tool-r11.exe'}" in out,out
+    out=_resolve(tmp_path,"@echo off\r\ncodex.exe %*\r\n",pre=pre)
+    assert "KIND single-exe" in out and f"FILE {good / 'codex.exe'}" in out,out
+
+
+@pytest.mark.parametrize("raw",[
+    "@echo off\r\nC:\\pin\\codex.exe -p café %*\r\n".encode("utf-8"),        # adversary A2 on 9de900bd, literal: UTF-8 'caf\xc3\xa9'
+    b"\xef\xbb\xbf@echo off\r\nC:\\pin\\codex.exe %*\r\n",                          # a UTF-8 BOM
+    "@echo off\r\nC:\\pin\\codex.exe -p café %*\r\n".encode("cp1252"),       # a single high byte
+    b"@echo off\r\nC:\\pin\\codex.exe -p a\x00b %*\r\n",                            # a NUL
+    b"@echo off\r\nC:\\pin\\codex.exe -p a\x1ab %*\r\n",                            # a control character (Ctrl-Z ends a cmd.exe read)
+])
+def test_r11_a_shim_byte_outside_printable_ascii_is_refused_typed(tmp_path,raw):
+    # r11 fix iteration 1 (adversary A2 on 9de900bd): the shim bytes were decoded as ASCII, so 'caf\xc3\xa9' became 'caf??' and was launched
+    # as a different literal argument. What a byte means to cmd.exe depends on the code page, so any byte outside printable ASCII
+    # (plus TAB, CR, LF) is refused, typed, instead of decoded.
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(raw)
+    r=_cmdline_harness(tmp_path,f"""
+try {{ $x = Resolve-CodexShimLaunch -Exe '{shim}'; 'KIND ' + $x.Kind + ' ARGS [' + ($x.PrefixArgs -join '|') + ']' }}
+catch {{ 'CAUGHT ' + $_.Exception.Message }}
+""")
+    assert "CAUGHT codex-shim-unsupported:" in r.stdout and "printable ASCII" in r.stdout,(raw,r.stdout,r.stderr)
 
 
 def test_r11_the_npm_template_launches_its_native_node_and_script_directly(tmp_path):
