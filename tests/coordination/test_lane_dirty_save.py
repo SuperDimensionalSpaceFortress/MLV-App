@@ -543,7 +543,7 @@ def test_a_run_dir_reached_through_a_loopback_share_of_the_worktree_drive_is_bad
 def test_the_checked_run_dir_cannot_be_renamed_away_while_the_saver_holds_it(tmp_path):  # r7 A3
     target = tmp_path / "run"
     target.mkdir()
-    prog = ("$script:onWin = $true; " + ps_functions("ConvertTo-NativePath", "Get-FinalDir") +
+    prog = ("$script:onWin = $true; " + ps_functions("ConvertTo-NativePath", "Initialize-LdsNative", "Get-FinalDir") +  # r14: the native declarations moved into Initialize-LdsNative (shared with the identity reader)
             "$h = Get-FinalDir $env:LDS_P; try { [System.IO.Directory]::Move($env:LDS_P, $env:LDS_P + '.moved'); $o = 'MOVED' } catch { $o = 'BLOCKED' }; "
             "$h.Handle.Dispose(); [Console]::Out.Write($o + ' ' + $h.Path)")
     r = subprocess.run([PWSH, "-NoProfile", "-Command", prog], capture_output=True, env={**os.environ, "LDS_P": str(target)})
@@ -1427,15 +1427,16 @@ def test_a_junction_inside_the_worktree_to_the_temp_directory_cannot_make_the_sa
     assert second.returncode == 0 and second.stdout == first.stdout and saved(repo) == before  # old code: a new GUID, so a new artifact set
 
 
-@pytest.mark.parametrize("raw, own, want", [
-    (b"a.txt\0lane-dirty-save-0f\0lane-dirty-save-0f/HEAD\0x/lane-dirty-save-0f/objects/info/alternates\0y/lane-dirty-save-0f\0u.txt\0", "lane-dirty-save-0f", b"a.txt\0u.txt\0"),
-    (b"lane-dirty-save-0f/HEAD\0", "lane-dirty-save-0f", b""),
-    (b"lane-dirty-save-0fx/HEAD\0lane-dirty-save-0\0xlane-dirty-save-0f/a\0", "lane-dirty-save-0f", b"lane-dirty-save-0fx/HEAD\0lane-dirty-save-0\0xlane-dirty-save-0f/a\0"),  # only a whole path component is the saver's own
-    (b"caf\xc3\xa9\0u\xffv\0", "lane-dirty-save-0f", b"caf\xc3\xa9\0u\xffv\0"),  # names that are not ASCII (or not UTF-8) pass through byte for byte
-    (b"", "lane-dirty-save-0f", b""),
+@pytest.mark.parametrize("raw, want", [
+    (b"a.txt\0lane-dirty-save-0f\0lane-dirty-save-0f/HEAD\0x/lane-dirty-save-0f/objects/info/alternates\0y/lane-dirty-save-0f\0u.txt\0", b"a.txt\0lane-dirty-save-0f\0lane-dirty-save-0f/HEAD\0x/lane-dirty-save-0f/objects/info/alternates\0y/lane-dirty-save-0f\0u.txt\0"),  # r14 CHANGED MEANING (sol r13 B2): this asserted that every name holding the private directory's basename is DROPPED; that is the defect. A name is dropped only when the directory it is below resolves into the private directory (identity), so with no alias every name stays
+    (b"lane-dirty-save-0f/HEAD\0", b"lane-dirty-save-0f/HEAD\0"),
+    (b"lane-dirty-save-0fx/HEAD\0lane-dirty-save-0\0xlane-dirty-save-0f/a\0", b"lane-dirty-save-0fx/HEAD\0lane-dirty-save-0\0xlane-dirty-save-0f/a\0"),
+    (b"caf\xc3\xa9\0u\xffv\0", b"caf\xc3\xa9\0u\xffv\0"),  # names that are not ASCII (or not UTF-8) pass through byte for byte
+    (b"", b""),
 ])
-def test_the_savers_own_directory_is_removed_from_the_untracked_names_by_whole_path_component(raw, own, want):  # r11 adversary pass 2 A1/A2
-    out = run_ps_functions(["Remove-OwnNames"], "([System.BitConverter]::ToString((Remove-OwnNames ([System.Convert]::FromHexString($env:LDS_RAW)) $env:LDS_OWN)))", LDS_RAW=raw.hex().upper(), LDS_OWN=own)
+def test_names_holding_the_savers_basename_are_kept_unless_their_directory_resolves_into_the_private_directory(raw, want):  # r11 adversary pass 2 A1/A2; r14 CHANGED MEANING (sol r13 B2), see the case comments
+    pre = "$script:onWin = $true; $script:probeWarnings = @(); function Get-FinalDir { @{ Path = 'P'; Handle = [System.IO.MemoryStream]::new() } }; function Test-ResolvesInto { param($w, $d, $p) $false }; "
+    out = run_ps_functions(["Remove-AliasedNames"], "([System.BitConverter]::ToString((Remove-AliasedNames ([System.Convert]::FromHexString($env:LDS_RAW)) 'W' 'P')))", pre=pre, LDS_RAW=raw.hex().upper())
     assert out == "-".join(f"{b:02X}" for b in want)
 
 
@@ -1570,13 +1571,14 @@ def test_a_junction_to_some_other_folder_stays_in_the_inventory(repo, tmp_path):
     assert b"alias/keep.txt" in inventory_of(tmp_path)
 
 
-@pytest.mark.parametrize("raw, own, want", [
-    (b"lane-dirty-save-0f\xad\0", "lane-dirty-save-0f", b"lane-dirty-save-0f\xad\0"),  # r12 sol r11 B4: the name is the saver's own plus a soft hyphen byte, a different name
-    (b"lane-dirty-save-0f\xad/HEAD\0x/lane-dirty-save-0f\xad\0", "lane-dirty-save-0f", b"lane-dirty-save-0f\xad/HEAD\0x/lane-dirty-save-0f\xad\0"),
-    (b"lane-dirty-save-0f\0", "lane-dirty-save-0f", b""),  # the exact name is still dropped
+@pytest.mark.parametrize("raw, want", [
+    (b"lane-dirty-save-0f\xad\0", b"lane-dirty-save-0f\xad\0"),  # r12 sol r11 B4: a soft hyphen byte is part of the name
+    (b"lane-dirty-save-0f\xad/HEAD\0x/lane-dirty-save-0f\xad\0", b"lane-dirty-save-0f\xad/HEAD\0x/lane-dirty-save-0f\xad\0"),
+    (b"lane-dirty-save-0f\0", b"lane-dirty-save-0f\0"),  # r14 CHANGED MEANING (sol r13 B2): the exact basename used to be dropped; it is a file name like any other now
 ])
-def test_a_name_that_differs_from_the_savers_own_only_by_an_ignorable_byte_is_kept(raw, own, want):  # r12 sol r11 B4 (a POSIX name may hold byte AD on its own; the helper is platform-independent)
-    out = run_ps_functions(["Remove-OwnNames"], "([System.BitConverter]::ToString((Remove-OwnNames ([System.Convert]::FromHexString($env:LDS_RAW)) $env:LDS_OWN)))", LDS_RAW=raw.hex().upper(), LDS_OWN=own)
+def test_a_name_with_an_ignorable_byte_reaches_the_inventory_byte_for_byte(raw, want):  # r12 sol r11 B4 (a POSIX name may hold byte AD on its own; the helper is platform-independent); r14 CHANGED MEANING (sol r13 B2): there is no name comparison left for an ignorable byte to fool, and no name is dropped by spelling
+    pre = "$script:onWin = $true; $script:probeWarnings = @(); function Get-FinalDir { @{ Path = 'P'; Handle = [System.IO.MemoryStream]::new() } }; function Test-ResolvesInto { param($w, $d, $p) $false }; "
+    out = run_ps_functions(["Remove-AliasedNames"], "([System.BitConverter]::ToString((Remove-AliasedNames ([System.Convert]::FromHexString($env:LDS_RAW)) 'W' 'P')))", pre=pre, LDS_RAW=raw.hex().upper())
     assert out == "-".join(f"{b:02X}" for b in want)
 
 
@@ -1690,10 +1692,12 @@ def test_the_chain_walk_refuses_a_link_or_an_unreadable_component_read_through_a
     assert out == want
 
 
-def test_a_directory_that_is_read_and_is_not_a_link_is_false_and_one_that_cannot_be_read_is_unknown(tmp_path):  # r13 sol r12 F3: the probe has THREE states; the catch used to answer false
+@pytest.mark.skipif(not WIN, reason="r14 CHANGED MEANING (sol r13 B2): the probe resolves every directory through the kernel (Windows) instead of answering false for a non-link without opening it; on POSIX Remove-AliasedNames never calls it")
+def test_a_directory_that_is_read_and_is_not_a_link_is_false_and_one_that_cannot_be_read_is_unknown(tmp_path):  # r13 sol r12 F3: the probe has THREE states; the catch used to answer false. r14: the private directory itself is true
     (tmp_path / "sub").mkdir()
-    probe = "('' + (Test-ResolvesInto $env:LDS_W 'sub' 'P') + ',' + $(if ($null -eq (Test-ResolvesInto $env:LDS_W 'gone' 'P')) { 'unknown' } else { 'known' }))"
-    assert run_ps_functions(["Test-ResolvesInto"], probe, LDS_W=str(tmp_path)) == "False,unknown"  # r12 saver: False,known
+    (tmp_path / "priv").mkdir()
+    probe = "('' + (Test-ResolvesInto $env:LDS_W 'sub' $env:LDS_P) + ',' + (Test-ResolvesInto $env:LDS_W 'priv' $env:LDS_P) + ',' + $(if ($null -eq (Test-ResolvesInto $env:LDS_W 'gone' $env:LDS_P)) { 'unknown' } else { 'known' }))"
+    assert run_ps_functions(["Test-ResolvesInto", "Get-FinalDir"] + IDENTITY_FUNCS, probe, pre=ONWIN, LDS_W=str(tmp_path), LDS_P=str(tmp_path / "priv")) == "False,True,unknown"  # r13 saver: False,known
 
 
 def test_names_below_a_directory_whose_alias_probe_cannot_be_read_are_kept_and_the_failure_is_named():  # r13 sol r12 F3: unknown is neither "unrelated" nor silent
@@ -1723,3 +1727,142 @@ def test_no_identity_or_ownership_probe_in_the_saver_answers_false_from_a_bare_c
     code = "\n".join(re.sub(r"\s#\s.*$", "", ln) for ln in SCRIPT.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
     assert not re.search(r"catch\s*\{\s*return\s+\$false\s*\}", code)
     assert "Remove-AliasedNames" in code and "probeWarnings" in code
+
+
+# ---- r14: sol r13 B1-B3 on 148f8b8a. Same rule as r13: decide by PROVEN IDENTITY or refuse; never by a name or a string ----
+def two_repos(tmp_path):
+    a, b = tmp_path / "A", tmp_path / "B"
+    init_repo(a, b"BASE\n")
+    init_repo(b, b"DIRT\n")  # B is clean: its HEAD, index and disk all say DIRT
+    return a, b
+
+
+def test_a_stored_core_worktree_naming_another_repository_is_refused_not_collected_as_that_repository(tmp_path):  # r14 sol r13 B1: A (HEAD BASE) names clean B as its work tree; the top-level lift adopted B and every later call rediscovered B, so A's BASE-to-DIRT change got no patch and the run ended clean-tree/10
+    a, b = two_repos(tmp_path)
+    subprocess.run(["git", "config", "--file", str(a / ".git" / "config"), "core.worktree", b.as_posix()], check=True, capture_output=True)
+    (tmp_path / "run").mkdir()
+    r = run_saver(a, tmp_path / "run")
+    assert r.returncode == 30 and "reason=worktree-redirect" in r.stdout, r.stdout + r.stderr  # r13 saver: exit 10, DIRTY_SAVE_NOTHING reason=clean-tree
+    assert list((tmp_path / "run").iterdir()) == []
+
+
+def redirect_env(kind, b):
+    if kind == "git-dir":
+        return {"GIT_DIR": str(b / ".git")}
+    if kind == "work-tree":
+        return {"GIT_WORK_TREE": str(b)}
+    if kind == "common-dir":
+        return {"GIT_COMMON_DIR": str(b / ".git")}
+    if kind == "config-env":
+        return {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.worktree", "GIT_CONFIG_VALUE_0": b.as_posix()}
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["git-dir", "work-tree", "common-dir", "config-env", "global-config"])
+def test_a_redirect_in_the_callers_environment_or_any_config_scope_is_refused_before_collection(tmp_path, kind):  # r14 sol r13 B1 class: one repository identity for the whole run, so GIT_DIR / GIT_WORK_TREE / GIT_COMMON_DIR in the environment and core.worktree at ANY scope are refused with a typed exit 30
+    a, b = two_repos(tmp_path)
+    (a / "a.txt").write_bytes(b"CHANGED\n")
+    (tmp_path / "run").mkdir()
+    if kind == "global-config":
+        gc = tmp_path / "global.cfg"
+        gc.write_text(f"[core]\n\tworktree = {b.as_posix()}\n")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": str(gc)}
+    else:
+        env = {**os.environ, **redirect_env(kind, b)}
+    r = run_saver(a, tmp_path / "run", env=env)
+    assert r.returncode == 30 and "reason=worktree-redirect" in r.stdout, r.stdout + r.stderr  # r13 saver: 0 (the environment was stripped and the config not asked)
+    assert list((tmp_path / "run").iterdir()) == []
+
+
+def test_a_linked_worktree_is_still_saved_with_the_git_dir_and_work_tree_captured_once(repo, tmp_path):  # r14 B1 guard: the explicit --git-dir/--work-tree pair must work for a linked worktree (git dir below .git/worktrees, objects in the common dir)
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "-q", str(linked), "-b", "side")
+    (linked / "a.txt").write_bytes(b"changed in the linked worktree\n")
+    (linked / "u.txt").write_text("u\n")
+    r = run_saver(linked, tmp_path / "run")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert b"changed in the linked worktree" in newest_patch(tmp_path) and b"u.txt" in inventory_of(tmp_path)
+
+
+def test_every_git_call_before_the_seal_is_pinned_to_the_captured_git_dir_and_work_tree():  # r14 B1 source pin
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "$script:pin + $script:noCallbacks" in text and "'--git-dir=' + " in text and "'--work-tree=' + " in text
+    assert "worktree-redirect" in text and "function Assert-SameRepo" in text
+
+
+def test_a_directory_named_like_the_private_directory_but_not_it_keeps_its_files_in_the_inventory(repo, tmp_path):  # r14 sol r13 B2: the basename filter dropped an unrelated copy/<private basename>/precious.txt before any identity check, so a repository whose only dirt was that file ended clean-tree/10
+    hook = ("$d = [System.IO.Path]::Combine($WorkDir.Replace('/', [System.IO.Path]::DirectorySeparatorChar), 'copy', [System.IO.Path]::GetFileName($script:sealDir)); "
+            "[void][System.IO.Directory]::CreateDirectory($d); [System.IO.File]::WriteAllText([System.IO.Path]::Combine($d, 'precious.txt'), 'p')")
+    r = save_with_hook(repo, tmp_path, hook)
+    assert r.returncode == 0, r.stdout + r.stderr  # r13 saver: 10 clean-tree, the evidence was silently lost
+    inv = inventory_of(tmp_path)
+    assert b"precious.txt" in inv and inv.startswith(b"copy/lane-dirty-save-"), inv
+
+
+def test_the_saver_has_no_name_based_filter_for_its_own_directory():  # r14 B2 source pin: the private base and every artifact are proven outside the worktree by identity, so no name is dropped by its spelling
+    code = "\n".join(re.sub(r"\s#\s.*$", "", ln) for ln in SCRIPT.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+    assert "Remove-OwnNames" not in code and "GetFileName($script:sealDir)" not in code
+
+
+def test_containment_is_decided_by_file_identity_never_by_path_comparison():  # r14 B3 source pin: GetRelativePath compares case-insensitively on Windows
+    code = "\n".join(re.sub(r"\s#\s.*$", "", ln) for ln in SCRIPT.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#"))
+    assert "GetRelativePath" not in code
+    assert "Get-DirIdList" in code and "Get-DirId" in code
+
+
+IDENTITY_FUNCS = ["Test-Inside", "Get-DirIdList", "Get-DirId", "Get-DirIds", "Invoke-Capture", "ConvertTo-NativePath", "Initialize-LdsNative"]
+ONWIN = "$script:onWin = [System.IO.Path]::DirectorySeparatorChar -eq [char]92; "
+
+
+def test_case_sensitive_siblings_wt_and_WT_are_different_directories_when_their_identities_differ():  # r14 sol r13 B3 through a stubbed identity reader (a case-sensitive NTFS directory needs admin to create on this host): GetRelativePath said '.' for wt vs WT
+    expr = ("$($r = [System.IO.Path]::Combine($env:LDS_ROOT, 'case'); $lo = [System.IO.Path]::Combine($r, 'wt'); $up = [System.IO.Path]::Combine($r, 'WT'); $sub = [System.IO.Path]::Combine($lo, 'sub'); $al = [System.IO.Path]::Combine($r, 'alias'); "
+            "$each = { param($p) $p }; $viaAlias = { param($p) if ([string]::Equals($p, $al, [System.StringComparison]::Ordinal)) { $lo } else { $p } }; "  # PowerShell variables are case-insensitive, so the two siblings are $lo and $up
+            "(@((Test-Inside $lo $up $each), (Test-Inside $lo $sub $each), (Test-Inside $up $sub $each), (Test-Inside $lo $lo $each), (Test-Inside $lo $al $viaAlias), (Test-Inside $up $al $viaAlias)) -join ','))")
+    out = run_ps_functions(IDENTITY_FUNCS, expr, pre=ONWIN, LDS_ROOT=str(Path(tempfile.gettempdir())))
+    assert out == "False,True,False,True,True,False"  # r13 saver: the call fails (no -ReadId); its string compare read wt and WT as one directory
+
+
+def test_an_identity_that_cannot_be_read_is_a_refusal_not_a_pass():  # r14 B3: unknown is never "outside"
+    expr = "$(try { Test-Inside 'P' 'Q' { param($p) throw 'denied' } } catch { $_.Exception.Message })"
+    out = run_ps_functions(IDENTITY_FUNCS, expr, pre=ONWIN)
+    assert out == "run-dir-identity-unprovable"
+
+
+def test_containment_on_real_directories_follows_identity(tmp_path):  # r14 B3 guard on the real readers (st_dev:st_ino on POSIX, volume serial + file index on Windows)
+    wt, run, near = tmp_path / "wt", tmp_path / "run", tmp_path / "wt2"
+    for d in (wt / "sub", run, near):
+        d.mkdir(parents=True)
+    expr = "(@((Test-Inside $env:LDS_WT $env:LDS_SUB), (Test-Inside $env:LDS_WT $env:LDS_WT), (Test-Inside $env:LDS_WT $env:LDS_RUN), (Test-Inside $env:LDS_WT $env:LDS_NEAR)) -join ',')"
+    out = run_ps_functions(IDENTITY_FUNCS, expr, pre=ONWIN, LDS_WT=str(wt), LDS_SUB=str(wt / "sub"), LDS_RUN=str(run), LDS_NEAR=str(near))
+    assert out == "True,True,False,False"  # a sibling whose name starts with the worktree's is not inside it
+
+
+@pytest.mark.skipif(not WIN, reason="8.3 spellings are Windows path forms")
+def test_a_short_name_spelling_of_a_directory_inside_the_worktree_is_inside_by_identity(tmp_path):  # r14 B3: identity, not spelling
+    wt = tmp_path / "worktree_with_a_long_name"
+    (wt / "sub").mkdir(parents=True)
+    short = subprocess.run([PWSH, "-NoProfile", "-Command", "[Console]::Out.Write((New-Object -ComObject Scripting.FileSystemObject).GetFolder($env:LDS_P).ShortPath)"], capture_output=True, text=True, env={**os.environ, "LDS_P": str(wt)}).stdout.strip()  # short_name() above shells out to cmd, whose quoting is wrong on this host (it prints C:\"C:\...)
+    if not short or short.lower() == str(wt).lower():
+        pytest.skip("8.3 names are disabled on this volume")
+    expr = "(Test-Inside $env:LDS_WT ([System.IO.Path]::Combine($env:LDS_SHORT, 'sub')))"
+    assert run_ps_functions(IDENTITY_FUNCS, expr, pre=ONWIN, LDS_WT=str(wt), LDS_SHORT=short) == "True"
+
+
+def make_case_sensitive(base):
+    r = subprocess.run(["fsutil", "file", "setCaseSensitiveInfo", str(base), "enable"], capture_output=True, text=True)
+    return r.returncode == 0
+
+
+@pytest.mark.skipif(not WIN, reason="a case-sensitive directory is an NTFS attribute")
+def test_a_case_sensitive_sibling_run_dir_is_outside_the_worktree_end_to_end(tmp_path):  # r14 sol r13 B3 end to end: wt dirty, RunDir WT, same parent. Skipped where fsutil needs admin (it does on the hub VM)
+    base = tmp_path / "case"
+    base.mkdir()
+    if not make_case_sensitive(base):
+        pytest.skip("fsutil file setCaseSensitiveInfo needs admin here; the stubbed-reader test carries the evidence")
+    wt, run = base / "wt", base / "WT"
+    init_repo(wt, b"one\n")
+    run.mkdir()
+    (wt / "a.txt").write_bytes(b"two\n")
+    r = run_saver(wt, run)
+    assert r.returncode == 0, r.stdout + r.stderr  # r13 saver: 30 run-dir-inside-worktree
+    assert any(p.name.endswith(".patch") for p in run.iterdir())

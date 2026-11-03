@@ -18,7 +18,11 @@
 # HEAD is resolved ONCE and both diffs run against that sha, so the receipt head is the patch base.
 # Exit: 0 saved (or already saved with these exact bytes), 10 nothing to save, 20 lane alive (refused, nothing written), 30 bad arguments, 40 git failed, 50 writing into RunDir failed (artifacts already written stay), 60 INCOMPLETE: git exited 0 but said something on stderr (an unreadable directory, a config it could not read), so the collection may be missing evidence. 60 is never "clean": with nothing to save it prints DIRTY_SAVE_INCOMPLETE and the warning text; with something saved the receipt carries collection=incomplete and warnings, and what was readable is still written.
 # Only git's line-ending conversion notices ("LF will be replaced by CRLF ...", printed for a file git DID compare) are not warnings, and only as WHOLE lines of git's known shape (r12, sol r11 B2). The private git dir also sets core.safecrlf=false (never the caller's value), so git prints no such notice in the first place (r12, adversary pass 2 A1). Everything else on stderr is (r11, sol r10 B2).
-# The untracked names exclude the saver's own files by name (its GUID path component) AND by identity: on Windows a name below a directory link that resolves into the private directory is dropped (r12, sol r11 B3). Every name comparison is ordinal, never by culture (r12, sol r11 B4).
+# r14 (sol r13 B1-B3) keeps the same rule: decide by PROVEN IDENTITY or refuse, never by a name or a string.
+#   worktree-redirect     (exit 30, before any collection, B1) the selected repository is not provably ONE repository: GIT_DIR, GIT_WORK_TREE or GIT_COMMON_DIR is set in the caller's environment; core.worktree is set at any scope (stored config, -c, GIT_CONFIG_*, includes: `git config --list` is the judge) so the work tree is another directory than the one git was started in; or git, asked again from the lifted top level, does not name the same work tree and git dir (by file identity). The git dir and work tree are then captured ONCE and handed to every later git call as --git-dir/--work-tree, so no call rediscovers a repository. A submodule checkout (core.worktree is set in it) is refused by this rule.
+#   B2: the saver's private directory and every artifact are proven OUTSIDE the worktree by identity (the private base is skipped, else exit 40, when it is not; a RunDir inside is exit 30), so no saver-owned path can be listed and no name is dropped by its spelling: an unrelated file under a directory that merely carries the private directory's name stays in the list. A directory reached through a link (a Windows junction from inside the worktree) is resolved by the kernel and its names are dropped only when it IS the private directory or below it.
+#   B3: "inside" and "the same directory" are decided by file identity (volume serial + file index on Windows, st_dev:st_ino on POSIX) along the parent chain, never by comparing path strings: Path.GetRelativePath compares case-insensitively on Windows, so distinct case-sensitive siblings `wt` and `WT` read as one. An identity that cannot be read is exit 30 (run-dir-identity-unprovable), never a pass.
+# The untracked names exclude names below a directory link that resolves into the private directory, by identity (r12, sol r11 B3; r14 B2). Every name comparison is ordinal, never by culture (r12, sol r11 B4).
 # Never stashes, resets, checks out, cleans or deletes (the one removal is its own private git dir, below). Each file is created CREATE_NEW; a name taken by different bytes is skipped (.2, .3 ... suffix), by the same bytes reused,
 # a DIRECTORY at a name is skipped too, and a taken name whose bytes stay unreadable after 5 tries is skipped and listed in the receipt as comparisonUnreadable (never called "different").
 # Every git call gets GIT_TRACE*=0 in its OWN environment (never the caller's): a trace variable or Trace2 config naming a tracked file would make git
@@ -36,11 +40,12 @@ $script:unreadable = @()
 $script:gitStderr = @()  # stderr of every git call that exited 0: a warning there is a collection that may be incomplete (r11 sol r10 B2)
 $script:seal = $null; $script:sealDir = $null
 $script:probeWarnings = @()  # identity probes that could not be read (r13 sol r12 F3): each is a warning, so the collection is incomplete
+$script:pin = @()  # r14 (sol r13 B1): --git-dir/--work-tree captured ONCE at the start; every pre-seal git call gets them, so none rediscovers a repository (a stored core.worktree can name another one)
 $script:noCallbacks = @('-c', 'core.fsmonitor=false')  # the few read-only calls made BEFORE the seal (toplevel, HEAD, paths, config list) run nothing, and core.fsmonitor is blanked anyway (sol r7 B1)
 function Invoke-GitBytes([string[]]$GitArgs, [switch]$KeepConfigEnv) {  # -KeepConfigEnv: the ONE call that reads the caller's effective config as data keeps the config-injecting environment (r11 sol r10 B1); every other call has it stripped
     try {
         $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
-        foreach ($a in (@('-C', $WorkDir, '--no-replace-objects') + $(if ($script:seal) { $script:seal.Args } else { $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
+        foreach ($a in (@('-C', $WorkDir, '--no-replace-objects') + $(if ($script:seal) { $script:seal.Args } else { $script:pin + $script:noCallbacks }) + $GitArgs)) { $psi.ArgumentList.Add($a) }
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false
         foreach ($k in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_DIFF_OPTS', 'GIT_CONFIG', 'GIT_REDIRECT_STDOUT', 'GIT_REDIRECT_STDERR', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_ATTR_SOURCE', 'GIT_NAMESPACE') { [void]$psi.Environment.Remove($k) }  # GIT_REDIRECT_STDOUT/STDERR make Git for Windows write its output into a named file, a tracked one included (r8 A4)
         if (-not $KeepConfigEnv) {  # the config-injecting variables would hand a callback to the sealed git (r10). The effective-config read keeps them, so a core.autocrlf, core.eol or core.excludesFile the caller injects reaches the private config like any other (r11 sol r10 B1); the allowlist, not this stripping, is what keeps a callback out
@@ -109,16 +114,9 @@ function Test-DirPresent([string]$Path) {  # $false ONLY when the directory is r
     catch [System.IO.DirectoryNotFoundException] { return $false }
     catch { return $true }
 }
-function Remove-OwnNames([byte[]]$Bytes, [string]$Own) {  # the saver never lists itself: its private directory is named by a random GUID, so any NUL-separated name holding that whole path component is the saver's own file, however git reached it (an inward junction to the temp directory, a directory swapped for a link after the placement check; adversary r11 pass 2 A1, A2). Where the directory is cannot be proven unreachable; what git lists can be filtered
-    if (-not $Own -or $Bytes.Length -eq 0) { return , $Bytes }
-    $keep = @([System.Text.Encoding]::Latin1.GetString($Bytes) -split "`0" | Where-Object { $_ -and -not ([string]::Equals($_, $Own, [System.StringComparison]::Ordinal) -or $_.StartsWith($Own + '/', [System.StringComparison]::Ordinal) -or $_.EndsWith('/' + $Own, [System.StringComparison]::Ordinal) -or $_.Contains('/' + $Own + '/')) })
-    if (-not $keep) { return , [byte[]]@() }
-    return , [System.Text.Encoding]::Latin1.GetBytes(($keep -join "`0") + "`0")
-}
-function Test-ResolvesInto([string]$Work, [string]$RelDir, [string]$Priv) {  # Windows: $true when the directory $RelDir (a git path below $Work) is a link whose final target is $Priv or below it, $false when it is read and is not. Identity, not spelling: both sides are read back by the kernel (Get-FinalDir), so 8.3 names, other casing and nested links cannot hide an alias. THREE states (r13 sol r12 F3): anything that cannot be examined is $null (unknown), never $false: the caller keeps the name AND reports the collection as incomplete
+function Test-ResolvesInto([string]$Work, [string]$RelDir, [string]$Priv) {  # Windows: $true when the directory $RelDir (a git path below $Work) IS the private directory $Priv or is below it, $false when it is read and is not. Identity, not spelling or name: the directory is opened and the kernel reads its true path back (Get-FinalDir), so 8.3 names, other casing, nested links and a path that only passes THROUGH a link (an inward junction to the temp directory: `jtemp/lane-dirty-save-<guid>`) are all resolved, then judged by file identity (Test-Inside). r14 (sol r13 B2): a directory that merely carries the private directory's NAME resolves elsewhere and stays. THREE states (r13 sol r12 F3): anything that cannot be examined is $null (unknown), never $false: the caller keeps the name AND reports the collection as incomplete
     try {
         $abs = [System.IO.Path]::Combine($Work, [System.Text.Encoding]::UTF8.GetString([System.Text.Encoding]::Latin1.GetBytes($RelDir)).Replace('/', '\'))
-        if (-not ([System.IO.File]::GetAttributes($abs) -band [System.IO.FileAttributes]::ReparsePoint)) { return $false }
         $f = Get-FinalDir $abs; $f.Handle.Dispose()
         return (Test-Inside $Priv $f.Path)
     } catch { return $null }
@@ -158,9 +156,37 @@ function Test-HasDotDot([string]$Path) {  # $true when a path holds a parent-dir
     }
     return $false
 }
-function Test-Inside([string]$Parent, [string]$Child) {  # $true when $Child is $Parent or below it; ordinal, both already resolved to real paths
-    $rel = [System.IO.Path]::GetRelativePath($Parent, $Child)
-    return -not ([string]::Equals($rel, '..', [System.StringComparison]::Ordinal) -or $rel.StartsWith('..' + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::Ordinal) -or [System.IO.Path]::IsPathRooted($rel))
+function Get-DirId([string]$Path, [scriptblock]$ReadId = $null) {  # r14 (sol r13 B3): one directory's FILE IDENTITY: Windows volume serial + file index (FILE_ID_INFO, else BY_HANDLE_FILE_INFORMATION), POSIX st_dev:st_ino. Two spellings of one directory share it, two directories that differ only by case (a case-sensitive NTFS folder) do not. $ReadId is a test seam: a scriptblock that takes the path and returns its identity (or throws). A read that fails is exit 30 (run-dir-identity-unprovable), never an answer
+    try {
+        if ($ReadId) { return [string](& $ReadId $Path) }
+        if (-not $script:onWin) { $r = Get-DirIds @($Path) $false; if ($null -eq $r) { throw 'unprovable' }; return [string]$r[0] }
+        Initialize-LdsNative
+        $h = [LdsNative.Win]::CreateFileW((ConvertTo-NativePath $Path), 0x80, 7, [System.IntPtr]::Zero, 3, 0x02000000, [System.IntPtr]::Zero)  # FILE_READ_ATTRIBUTES only (a parent that may be traversed but not listed still opens); share all; OPEN_EXISTING; BACKUP_SEMANTICS (a directory)
+        if ($h.IsInvalid) { throw 'cannot-open' }
+        try {
+            $b = [byte[]]::new(24)
+            if ([LdsNative.Win]::GetFileInformationByHandleEx($h, 18, $b, 24)) { return 'x:' + [System.BitConverter]::ToString($b) }  # FileIdInfo: 64-bit volume serial + 128-bit file id
+            $b = [byte[]]::new(52)
+            if (-not [LdsNative.Win]::GetFileInformationByHandle($h, $b)) { throw 'cannot-read' }
+            return 'b:' + [System.BitConverter]::ToString($b, 28, 4) + '-' + [System.BitConverter]::ToString($b, 44, 8)  # dwVolumeSerialNumber, nFileIndexHigh + nFileIndexLow
+        } finally { $h.Dispose() }
+    } catch { throw 'run-dir-identity-unprovable' }
+}
+function Get-DirIdList([string[]]$Paths, [scriptblock]$ReadId = $null) {  # the identities of $Paths, in order; throws when any cannot be read. POSIX asks for all of them in one stat call
+    if ($ReadId -or $script:onWin) {
+        $ids = @(); foreach ($p in $Paths) { $ids += Get-DirId $p $ReadId }
+        return , $ids
+    }
+    $r = Get-DirIds $Paths $false
+    if ($null -eq $r -or @($r).Count -ne $Paths.Count) { throw 'run-dir-identity-unprovable' }
+    return , @($r)
+}
+function Test-Inside([string]$Parent, [string]$Child, [scriptblock]$ReadId = $null) {  # $true when $Child IS $Parent or is below it, decided by FILE IDENTITY along $Child's parent chain (r14, sol r13 B3), never by comparing path strings: GetRelativePath compares case-insensitively on Windows, so distinct case-sensitive siblings `wt` and `WT` read as one directory. Throws (run-dir-identity-unprovable) when an identity cannot be read: unknown is a refusal
+    $chain = [System.Collections.Generic.List[string]]::new()
+    for ($d = $Child; $d -and $chain.Count -lt 4096; $d = [System.IO.Path]::GetDirectoryName($d)) { $chain.Add($d) }
+    $ids = Get-DirIdList (@($Parent) + $chain.ToArray()) $ReadId
+    for ($i = 1; $i -lt $ids.Count; $i++) { if ([string]::Equals([string]$ids[$i], [string]$ids[0], [System.StringComparison]::Ordinal)) { return $true } }
+    return $false
 }
 function Get-ShareOf([string]$Path) {  # Windows: the \\server\share a final path lives on, '' for a drive path. A share can expose a local folder (\\localhost\C$) and the kernel keeps the two spellings apart; only an identical \\server\share can be compared by name (r7 fix-2 A2)
     if ($Path.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return [System.IO.Path]::GetPathRoot($Path).ToLowerInvariant() }
@@ -185,6 +211,13 @@ function Get-PrivateBase {  # where the saver's own temporary directory may live
         } catch { continue }
     }
     throw 'no-private-dir-outside-worktree'
+}
+function Assert-SameRepo([string]$Start, [string]$GitDir) {  # r14 (sol r13 B1): called with $WorkDir already lifted to the top level git named. The top level must be the start directory or an ancestor of it, and git asked again FROM the top level must name the same git dir and the same work tree, all by file identity, never by spelling. Anything else (or an answer that cannot be had) is worktree-redirect: the lift would have moved the run to another repository
+    if (-not (Test-Inside $WorkDir $Start)) { throw 'worktree-redirect' }
+    $a = Invoke-GitBytes @('rev-parse', '--path-format=absolute', '--absolute-git-dir'); $t = Invoke-GitBytes @('rev-parse', '--show-toplevel')
+    if ($a.Code -ne 0 -or $t.Code -ne 0) { throw 'worktree-redirect' }
+    $ids = Get-DirIdList @($GitDir, (Remove-GitTerminator $a.Bytes), $WorkDir, (Remove-GitTerminator $t.Bytes))
+    if (-not ([string]::Equals([string]$ids[0], [string]$ids[1], [System.StringComparison]::Ordinal) -and [string]::Equals([string]$ids[2], [string]$ids[3], [System.StringComparison]::Ordinal))) { throw 'worktree-redirect' }
 }
 function Assert-LinkFree([string]$Path, [scriptblock]$ReadAttr = $null) {  # r13 (sol r12 F2): NO LINK IS RESOLVED, so none can be resolved wrongly. Resolve-RealPath used to follow each symlink with ResolveLinkTarget().FullName, which removes a `..` held in the link's TARGET before the OS follows the link (`runlink -> hop/../evidence` with `hop -> wt/sub`: the OS opens wt/evidence, the saver judged evidence). Now every component below the root of a fully qualified path is read (attributes and link target, never followed) and ANY reparse point, symbolic link or junction ends in a refusal (exit 30 reason=link-in-path); a component whose attributes cannot be read ends in reason=path-unreadable. Paths this function is given have no `..` segment (Test-HasDotDot ran first), so their text is their identity once no component is a link. Windows reads the same \\?\ spelling Get-FinalDir will open. $ReadAttr is a test seam: a scriptblock that takes a component path and returns its FileAttributes (or throws)
     $p = ConvertTo-NativePath $Path; $root = [System.IO.Path]::GetPathRoot($p); $cur = $root
@@ -228,15 +261,22 @@ function ConvertTo-NativePath([string]$Path) {  # Windows: \\?\ and \\.\ (any ca
     if ($p -match '^\\\\[?.]\\(?<rest>[A-Za-z]:\\.*)\z') { return '\\?\' + $Matches['rest'] }
     throw 'unsupported-extended-path'
 }
-function Get-FinalDir([string]$Path) {  # Windows: open the directory and read its true path back, so links, junctions, subst drives, 8.3 and \\?\ spellings are all resolved by the kernel (r7 A1, A2). The handle stays open (no share-delete), so the directory and its parents cannot be renamed or replaced before the artifacts are written (r7 A3)
+function Initialize-LdsNative {  # Windows: the kernel32 entry points the path and identity reads share (compiled once per process)
     if (-not ('LdsNative.Win' -as [type])) {
         Add-Type -Namespace LdsNative -Name Win -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
 public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, System.IntPtr security, uint disposition, uint flags, System.IntPtr template);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
 public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle handle, System.Text.StringBuilder buffer, uint length, uint flags);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle handle, int infoClass, [System.Runtime.InteropServices.Out] byte[] buffer, uint length);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle, [System.Runtime.InteropServices.Out] byte[] buffer);
 '@
     }
+}
+function Get-FinalDir([string]$Path) {  # Windows: open the directory and read its true path back, so links, junctions, subst drives, 8.3 and \\?\ spellings are all resolved by the kernel (r7 A1, A2). The handle stays open (no share-delete), so the directory and its parents cannot be renamed or replaced before the artifacts are written (r7 A3)
+    Initialize-LdsNative
     $h = [LdsNative.Win]::CreateFileW((ConvertTo-NativePath $Path), 0x81, 3, [System.IntPtr]::Zero, 3, 0x02000000, [System.IntPtr]::Zero)  # LIST_DIRECTORY+READ_ATTRIBUTES (an attributes-only open is exempt from sharing checks, so it would hold nothing); share read+write, not delete; OPEN_EXISTING; BACKUP_SEMANTICS (a directory)
     if ($h.IsInvalid) { throw 'cannot-open-directory' }
     $sb = [System.Text.StringBuilder]::new(32768)
@@ -284,6 +324,7 @@ function Save-Bytes([string]$Ext, [byte[]]$Bytes, [scriptblock]$Make = $null) { 
     }
 }
 try {
+    foreach ($v in 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR') { if ($null -ne [System.Environment]::GetEnvironmentVariable($v)) { throw 'worktree-redirect' } }  # r14 (sol r13 B1): the caller names the repository from outside; the saver's child processes never see these (they are removed), so what the saver then judged and what git opened could differ. Refused, never stripped silently
     foreach ($raw in $WorkDir, $RunDir, $ChildJson) { if ($raw -and (Test-HasDotDot $raw)) { throw 'dotdot-path' } }  # before any normalisation or read (r12 sol r11 B1); exit 30 with a reason of its own
     foreach ($raw in $WorkDir, $RunDir, $ChildJson) { if ($raw -and -not [System.IO.Path]::IsPathFullyQualified($raw)) { throw 'not-fully-qualified' } }  # r13 (sol r12 F1): on the RAW text, before any normalisation or read. `C:..\wt` has no `..` segment (its first segment is `C:..`) yet GetFullPath resolves it against the drive's current directory; a relative or root-relative path names whatever the current directory is. The old relative-path support (resolved against PowerShell's location) is gone with it: nothing is resolved against a current directory any more
     $WorkDir = [System.IO.Path]::GetFullPath($WorkDir); $RunDir = [System.IO.Path]::GetFullPath($RunDir)  # .NET only: PowerShell's path layer may re-spell a POSIX backslash as '/' (dot B1 on #722). Fully qualified and without `..`, so this only folds `.` segments and repeated separators
@@ -294,17 +335,26 @@ try {
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }
 $flags = @('--binary', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative', '--submodule=short', '--ignore-submodules=dirty', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/')
 $top = Invoke-GitBytes @('rev-parse', '--show-toplevel')
+$startDir = $WorkDir; $gitDir = $null
 if ($top.Code -eq 0) {
+    # r14 (sol r13 B1): ONE repository identity for the whole run. Asked from the directory the caller named, BEFORE the top level is adopted: the absolute git dir, and the effective config (`config --list` sees every scope: stored config, -c, GIT_CONFIG_*, includes). A core.worktree anywhere means the work tree is another directory than the one git was started in, and top-level lifting would adopt it (a dirty repository A naming clean B as its work tree was reported clean-tree/10). Refused, typed, before any collection
+    $gdR = Invoke-GitBytes @('rev-parse', '--path-format=absolute', '--absolute-git-dir'); $cfgR = Invoke-GitBytes @('config', '--null', '--list') -KeepConfigEnv
+    $failed = @($gdR, $cfgR) | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
+    if ($failed) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($failed.Err.Trim())"; exit 40 }  # a git dir or config git cannot give (an injection it cannot parse included, r11 hub ruling B1) is the existing typed git failure, before anything is collected
+    $redirect = $false
+    foreach ($e in ([System.Text.Encoding]::Latin1.GetString($cfgR.Bytes) -split "`0" | Where-Object { $_ })) { $i = $e.IndexOf([char]10); if ([string]::Equals($(if ($i -ge 0) { $e.Substring(0, $i) } else { $e }), 'core.worktree', [System.StringComparison]::OrdinalIgnoreCase)) { $redirect = $true } }
+    if ($redirect) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=worktree-redirect'; exit 30 }
     try { $WorkDir = Remove-GitTerminator $top.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=toplevel-not-utf8'; exit 30 }
+    try { $gitDir = Remove-GitTerminator $gdR.Bytes } catch { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=gitdir-not-utf8'; exit 30 }
 }
 try {
-    if ($top.Code -eq 0) { if (Test-HasDotDot $WorkDir) { throw 'dotdot-path' }; Assert-LinkFree $WorkDir }  # r13: the top level is what git printed (forward slashes on Windows); it is judged like the argument was, not trusted
+    if ($top.Code -eq 0) { if (Test-HasDotDot $WorkDir) { throw 'dotdot-path' }; Assert-LinkFree $WorkDir; Assert-SameRepo $startDir $gitDir; $script:pin = @(('--git-dir=' + $gitDir), ('--work-tree=' + $WorkDir)) }  # r13: the top level is what git printed (forward slashes on Windows); it is judged like the argument was, not trusted. r14: and it must be the SAME repository by identity; from here every git call is handed the captured git dir and work tree
     if ($script:onWin) {
         $script:held = @((Get-FinalDir $RunDir), (Get-FinalDir $WorkDir)); $RunDir = $script:held[0].Path; $realWork = $script:held[1].Path
         if (-not [string]::Equals((Get-ShareOf $RunDir), (Get-ShareOf $realWork), [System.StringComparison]::Ordinal)) { throw 'run-dir-namespace-unprovable' }  # see Get-ShareOf (r7 fix-2 A2)
     }
     else { $RunDir = [System.IO.Path]::TrimEndingDirectorySeparator($RunDir); $realWork = [System.IO.Path]::TrimEndingDirectorySeparator($WorkDir); if ($top.Code -eq 0) { Assert-RunDirNotAlias $RunDir $realWork } }  # no link is in either chain (Assert-LinkFree), so the text is the real path
-    $runInside = Test-Inside $realWork $RunDir
+    $runInside = ($top.Code -eq 0) -and (Test-Inside $realWork $RunDir)  # r14 (sol r13 B3): by file identity along the RunDir's parent chain, not by comparing path strings; an identity that cannot be read is exit 30 (run-dir-identity-unprovable). With no repository there is nothing to contain and git ends the run with 40
 } catch { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($_.Exception.Message)"; exit 30 }  # the directory that passes the containment test below IS the one written to: no re-spelling between check and use (dot B1 on #722)
 if ($top.Code -eq 0 -and $runInside) { Write-Output 'DIRTY_SAVE_BAD_ARGS reason=run-dir-inside-worktree'; exit 30 }
 $git = [ordered]@{}; $subs = 0
@@ -319,7 +369,7 @@ try {
         if ($git.index.Code -eq 0) { $subs = @([System.Text.Encoding]::Latin1.GetString($git.index.Bytes) -split "`0" | Where-Object { $_.StartsWith('160000 ', [System.StringComparison]::Ordinal) }).Count }
         $git.patch = Invoke-GitBytes (@('diff', $headFull) + $flags); $git.staged = Invoke-GitBytes (@('diff', '--cached', $headFull) + $flags)
         $git.untracked = Invoke-GitBytes @('ls-files', '-z', '--others', '--exclude-standard')
-        if ($git.untracked.Code -eq 0) { $git.untracked.Bytes = Remove-AliasedNames (Remove-OwnNames $git.untracked.Bytes ([System.IO.Path]::GetFileName($script:sealDir))) $WorkDir $script:sealDir }
+        if ($git.untracked.Code -eq 0) { $git.untracked.Bytes = Remove-AliasedNames $git.untracked.Bytes $WorkDir $script:sealDir }  # r14 (sol r13 B2): the private directory is proven outside the worktree (Get-PrivateBase), so no name is dropped by its spelling; only names below a directory that resolves INTO it are
     }
 }
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
