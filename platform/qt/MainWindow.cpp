@@ -1667,6 +1667,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include <windows.h>
 #endif
 #include "OutputDirIdentity.h"
+#include "VisualCaptureSourceGuard.h"
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
 static uint8_t applyZebrasToImage( QImage *image, bool enableZebras );
@@ -10611,6 +10612,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // while that clip is still the open one, else it is left out (fail closed), never taken from the newly opened clip.
         const visual_capture_source_difference::ClipToken visualCaptureClip =
             visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
+        // r7 (adversary r7 pass 1 A1): the clip's BYTES are held too, from here until the source hashing ends: no writer may
+        // open its files meanwhile, and a file replaced, resized or written since leaves every capture without a source id.
+        const visual_capture_source_difference::SourceWriteGuard visualSourceGuard(
+            m_pMlvObject ? m_pMlvObject->file : nullptr, m_pMlvObject ? m_pMlvObject->filenum : 0 );
         QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
         const bool visualUseGlContainer =
             GpuDisplayWindow::isActive() && visualGlContainer && visualGlContainer->isVisible();
@@ -10753,6 +10758,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         const visual_capture_source_difference::BoundSourceIds visualSourceIds = visual_capture_source_difference::bindSourceIds(
             visualCaptureClips, visualCaptureClip, m_clipLifecycleBarrier, m_pMlvObject,
+            [&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged(); },
             [&]( int displayFrame, quint64 *hash, bool *ok )
             {
                 uint64_t sourceHash = 0;

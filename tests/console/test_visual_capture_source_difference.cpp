@@ -14,6 +14,11 @@
 
 #include "../../platform/qt/VisualCaptureSourceDifference.h"
 #include "../../platform/qt/ClipLifecycleBarrier.h"
+#include "../../platform/qt/VisualCaptureSourceGuard.h"
+
+#include <QByteArray>
+#include <QTemporaryDir>
+#include <cstdio>
 
 #include <QFile>
 #include <QJsonObject>
@@ -204,6 +209,9 @@ struct FakeClip { int name = 0; };
 // whose frame i is a different picture per frame (encodeLj92(2048 + i, 12288)); six unforced play captures labelled 600..638.
 const int kA2Labels[6] = { 600, 608, 615, 623, 630, 638 };
 const quint64 kStaticAHash = 0xa0a0a0a0a0a0a0a0ull;
+// r7 pass 1 A1: clip A's frame 615 with byte frame_offset+7167 edited FF -> FE after the captures (adversary's in-memory hashes:
+// 08688fb28ee97125 unedited, 08688eb28ee96f72 edited)
+const quint64 kEditedAHash = 0x08688eb28ee96f72ull;
 quint64 clipBHash(int frame) { return 0xb000000000000000ull + static_cast<quint64>(2048 + frame); }
 
 struct ClipHarness
@@ -214,6 +222,8 @@ struct ClipHarness
     FakeClip *open = &a;
     int hashCalls = 0;
     int openBDuringHashCall = -1;   // when >= 0: the hash call with this ordinal opens B first (a clip change while hashing)
+    bool sourceUnchanged = true;    // what the capture run's SourceWriteGuard reports
+    int editSourceDuringHashCall = -1;   // when >= 0: the hash call with this ordinal reads bytes edited since the captures
 
     // what MainWindow does on a FileOpen: free the open clip behind the barrier, then open the new one
     void openB()
@@ -226,10 +236,13 @@ struct ClipHarness
     vcsd::BoundSourceIds bind(const QVector<vcsd::CaptureClip> & captures, const vcsd::ClipToken & captureClip)
     {
         return vcsd::bindSourceIds(captures, captureClip, barrier, open,
+            [this](bool * unchanged) { *unchanged = sourceUnchanged; },
             [this](int displayFrame, quint64 * hash, bool * ok) {
-                if (hashCalls++ == openBDuringHashCall) openB();
+                if (hashCalls == openBDuringHashCall) openB();
+                if (hashCalls == editSourceDuringHashCall) sourceUnchanged = false;
+                ++hashCalls;
                 *ok = true;
-                *hash = open == &a ? kStaticAHash : clipBHash(displayFrame);
+                *hash = open != &a ? clipBHash(displayFrame) : (sourceUnchanged ? kStaticAHash : kEditedAHash);
             });
     }
 };
@@ -361,4 +374,123 @@ TEST(VisualCaptureSourceDifferenceWiring, TheCaptureRunBindsItsSourceIdsToTheCli
     ASSERT_TRUE(settleGuard.contains(QStringLiteral("clipToken( m_clipLifecycleBarrier, m_pMlvObject ), visualCaptureClip )")));
     ASSERT_TRUE(lf.contains(QStringLiteral(
         "grab.settled && visual_capture_source_difference::sameClip( grab.clip, visualCaptureClip ) );")));
+    // r7 pass 1 A1: the clip's bytes are held from the same point, and the binding asks the guard before and after each hash
+    ASSERT_TRUE(source.contains(QStringLiteral("#include \"VisualCaptureSourceGuard.h\"")));
+    const int guardAt = lf.indexOf(QStringLiteral(
+        "const visual_capture_source_difference::SourceWriteGuard visualSourceGuard(\n"
+        "            m_pMlvObject ? m_pMlvObject->file : nullptr, m_pMlvObject ? m_pMlvObject->filenum : 0 );"));
+    ASSERT_TRUE(guardAt > startAt);
+    ASSERT_TRUE(lf.indexOf(QStringLiteral("processEvents(")) > guardAt);
+    ASSERT_TRUE(lf.mid(bindAt, 300).contains(QStringLiteral(
+        "[&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged(); },")));
+}
+
+// r7 (adversary r7 pass 1 A1 on 1a9748b6): an unchanged clip token accepted a reread of EDITED bytes. The json's input: a static
+// clip A captured at [600,608,615,623,630,638], then byte frame_offset+7167 of frame 615 changed FF -> FE and flushed before the
+// deferred hashing, headers, lengths, object and generation preserved. 1a9748b6 gave the earlier identical captures differing ids
+// ("differ" over a static display -> FROZEN_DISPLAY, counted=false).
+TEST(VisualCaptureSourceDifference, AnEditOfTheClipsBytesAfterTheCapturesLendsNoSourceId)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    for (int label : kA2Labels) captures.append(playCapture(label, clips.now()));
+    clips.sourceUnchanged = false;   // the edit lands after the captures, before the hashing; the clip token is unchanged
+    ASSERT_TRUE(vcsd::sameClip(clips.now(), captureClip));
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    assertNoSourceId(bound);
+    ASSERT_EQ(0, clips.hashCalls);   // nothing is read from bytes that are not the captures' bytes
+}
+
+TEST(VisualCaptureSourceDifference, AnEditWhileHashingDiscardsThatHashAndEveryLaterOne)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    for (int label : kA2Labels) captures.append(playCapture(label, clips.now()));
+    clips.editSourceDuringHashCall = 2;   // the third distinct frame (615) is read after the edit
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    ASSERT_TRUE(bound.valid.at(0));
+    ASSERT_TRUE(bound.valid.at(1));
+    for (int k = 2; k < 6; ++k) ASSERT_FALSE(bound.valid.at(k));
+    for (int k = 0; k < 6; ++k) ASSERT_TRUE(!bound.valid.at(k) || bound.hash.at(k) == kStaticAHash);
+    ASSERT_TRUE(vcsd::decide(bound.playIdentities) == vcsd::Verdict::Unknown);
+}
+
+namespace
+{
+
+QString writeSourceFile(const QTemporaryDir & dir)
+{
+    const QString path = dir.filePath(QStringLiteral("source.bin"));
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::WriteOnly));
+    QByteArray payload;
+    for (int i = 0; i < 64; ++i) payload += QByteArray(56, '\0') + QByteArray(56, '\xff');
+    ASSERT_EQ(7168, payload.size());
+    ASSERT_EQ(qint64(7168), file.write(payload));
+    file.close();
+    return path;
+}
+
+} // namespace
+
+TEST(VisualCaptureSourceGuard, NoWriterChangesTheBytesWhileTheGuardHoldsThem)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");   // the clip's own read handle, as the MLV reader opens it
+    ASSERT_TRUE(clipFile != nullptr);
+    {
+        const vcsd::SourceWriteGuard guard(&clipFile, 1);
+        ASSERT_TRUE(guard.held());
+        ASSERT_TRUE(guard.unchanged());
+        // the json's edit: byte 7167 FF -> FE, flushed
+        QFile writer(path);
+        const bool writerOpened = writer.open(QIODevice::ReadWrite);
+        if (writerOpened) {
+            ASSERT_TRUE(writer.seek(7167));
+            ASSERT_EQ(qint64(1), writer.write("\xfe", 1));
+            ASSERT_TRUE(writer.flush());
+            writer.close();
+            ASSERT_FALSE(guard.unchanged());   // a platform that cannot refuse the writer still sees the bytes moved
+        }
+#ifdef Q_OS_WIN
+        ASSERT_FALSE(writerOpened);   // Windows: the guard's handle shares read only, so no writer can open the clip
+        ASSERT_TRUE(guard.unchanged());
+#endif
+    }
+    // released: the clip is writable again (the guard holds the files only for the capture run)
+    QFile writer(path);
+    ASSERT_TRUE(writer.open(QIODevice::ReadWrite));
+    writer.close();
+    std::fclose(clipFile);
+}
+
+TEST(VisualCaptureSourceGuard, AGuardThatCannotBeTakenNeverSaysUnchanged)
+{
+    const vcsd::SourceWriteGuard none(nullptr, 0);
+    ASSERT_FALSE(none.held());
+    ASSERT_FALSE(none.unchanged());
+    FILE * missing = nullptr;
+    const vcsd::SourceWriteGuard nullFile(&missing, 1);
+    ASSERT_FALSE(nullFile.unchanged());
+#ifdef Q_OS_WIN
+    // a writer that already has the clip open: the guard cannot deny it, so it is not held
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    QFile writer(path);
+    ASSERT_TRUE(writer.open(QIODevice::ReadWrite));
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+    ASSERT_TRUE(clipFile != nullptr);
+    {
+        const vcsd::SourceWriteGuard guard(&clipFile, 1);
+        ASSERT_FALSE(guard.held());
+        ASSERT_FALSE(guard.unchanged());
+    }
+    std::fclose(clipFile);
+    writer.close();
+#endif
 }

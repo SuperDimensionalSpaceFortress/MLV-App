@@ -127,18 +127,28 @@ struct BoundSourceIds
 };
 
 /* Attach a source identity to each play capture ONLY from the clip the capture run started on, while
- * that clip is still open: a capture taken from another clip, or one hashed after the open clip changed,
+ * that clip is still open and its bytes unchanged (r7 pass 1 A1: an edit of the file under the same clip token): a capture taken from another clip, or one hashed after the open clip changed,
  * gets NO id (fail closed: source_difference becomes unknown), never another clip's. The open clip is
  * re-read before AND after each hash (hashFrame must not pump events, but a hash finished across a clip
  * change is discarded rather than trusted). hashFrame( int displayFrame, quint64 *hash, bool *ok ) reads
  * the currently open clip; a frame is hashed once. */
-template <class Barrier, class Object, class HashFrame>
+template <class Barrier, class Object, class SourceStill, class HashFrame>
 inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const ClipToken &captureClip,
-                                     const Barrier &barrier, Object *const &openClip, HashFrame hashFrame )
+                                     const Barrier &barrier, Object *const &openClip, SourceStill sourceStill,
+                                     HashFrame hashFrame )
 {
     BoundSourceIds out;
     QHash<int, quint64> known;
     QSet<int> failed;
+    // the capture's clip is still the open one AND its bytes are what they were when the captures were taken
+    // (sourceStill( bool *unchanged ): SourceWriteGuard::unchanged(), VisualCaptureSourceGuard.h); the clip is checked first,
+    // so sourceStill is never asked about a clip that has been replaced
+    const auto stillCaptureSource = [&]() {
+        if( !sameClip( clipToken( barrier, openClip ), captureClip ) ) return false;
+        bool unchanged = false;
+        sourceStill( &unchanged );
+        return unchanged;
+    };
     for( const CaptureClip &capture : captures )
     {
         bool valid = false;
@@ -148,30 +158,30 @@ inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const
             const bool fromCaptureClip = sameClip( capture.clip, captureClip );
             if( !fromCaptureClip ) ++out.clipChangedCaptures;
             if( fromCaptureClip && capture.displayFrame >= 0 && !failed.contains( capture.displayFrame )
-             && sameClip( clipToken( barrier, openClip ), captureClip ) )
+             && stillCaptureSource() )
             {
                 if( !known.contains( capture.displayFrame ) )
                 {
                     quint64 frameHash = 0;
                     bool ok = false;
                     hashFrame( capture.displayFrame, &frameHash, &ok );
-                    if( !sameClip( clipToken( barrier, openClip ), captureClip ) )
-                        ++out.clipChangedCaptures;   // hashed across a clip change: not this capture's clip
+                    if( !stillCaptureSource() )
+                        ++out.clipChangedCaptures;   // hashed across a clip or source change: not this capture's picture
                     else if( ok )
                         known.insert( capture.displayFrame, frameHash );
                     else
                         failed.insert( capture.displayFrame );
                 }
                 const auto at = known.constFind( capture.displayFrame );
-                if( at != known.constEnd() && sameClip( clipToken( barrier, openClip ), captureClip ) )
+                if( at != known.constEnd() && stillCaptureSource() )
                 {
                     valid = true;
                     hash = at.value();
                 }
             }
-            else if( fromCaptureClip && capture.displayFrame >= 0 && !sameClip( clipToken( barrier, openClip ), captureClip ) )
+            else if( fromCaptureClip && capture.displayFrame >= 0 && !failed.contains( capture.displayFrame ) )
             {
-                ++out.clipChangedCaptures;   // the open clip is no longer the capture's clip
+                ++out.clipChangedCaptures;   // the open clip, or its bytes, are no longer the capture's
             }
             PlayIdentity identity;
             identity.displayFrame = capture.displayFrame;

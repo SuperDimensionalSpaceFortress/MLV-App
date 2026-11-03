@@ -164,7 +164,8 @@ HEADERS += \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_budget.h \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
     $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h \
-    $$REPO_ROOT/platform/qt/VisualCaptureSourceDifference.h
+    $$REPO_ROOT/platform/qt/VisualCaptureSourceDifference.h \
+    $$REPO_ROOT/platform/qt/VisualCaptureSourceGuard.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)
