@@ -161,14 +161,30 @@ TEST(VisualCaptureSourceDifferenceWiring, SourceHashesAreReadAfterPlayStopsAndAp
     ASSERT_EQ(1, block.count(QStringLiteral("ui->actionPlay->setChecked(")));
 }
 
+TEST(VisualCaptureSourceDifference, OnlyTheForcedAndUnforcedPlayKindsCarryASourceId)
+{
+    ASSERT_TRUE(vcsd::isPlayCaptureKind(QStringLiteral("play")));
+    ASSERT_TRUE(vcsd::isPlayCaptureKind(QStringLiteral("play_unbound")));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("stop")));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("stop_unbound")));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("paused")));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("paused_unbound")));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("Play")));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QString()));
+}
+
 // Master merge (2026-11-02): the capture block now takes forced "play" and unforced "play_unbound" captures, and the
 // runner judges the frozen check on the unforced ones when present -- so both kinds are hashed and carry a source_id.
+// The kind predicate lives in the header: test_dual_venue_evidence pins that the capture block holds no `return`.
 TEST(VisualCaptureSourceDifferenceWiring, BothPlayCaptureKindsCarryASourceId)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
-    ASSERT_TRUE(source.contains(QStringLiteral(
+    const QString header = readRepoFile(QStringLiteral("platform/qt/VisualCaptureSourceDifference.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
         "return kind == QStringLiteral(\"play\") || kind == QStringLiteral(\"play_unbound\");")));
-    ASSERT_TRUE(source.contains(QStringLiteral("if( !isPlayCaptureKind( grab.kind ) ) continue;")));
-    ASSERT_TRUE(source.contains(QStringLiteral("if( isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "if( !visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ) continue;")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
     ASSERT_FALSE(source.contains(QStringLiteral("if( grab.kind != QStringLiteral(\"play\") ) continue;")));
 }

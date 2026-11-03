@@ -10728,16 +10728,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // The verdict across them is visual.json's source_difference (VisualCaptureSourceDifference.h).
         // Both play kinds carry a source_id: the forced "play" captures and the unforced "play_unbound"
         // ones (the runner judges the frozen check on the unforced ones whenever they exist).
-        auto isPlayCaptureKind = []( const QString &kind )
-        {
-            return kind == QStringLiteral("play") || kind == QStringLiteral("play_unbound");
-        };
         QHash<int, quint64> visualSourceHashes;
         QSet<int> visualSourceHashFailed;
         QVector<visual_capture_source_difference::PlayIdentity> visualPlayIdentities;
         for( const VisualGrab &grab : visualGrabs )
         {
-            if( !isPlayCaptureKind( grab.kind ) ) continue;
+            if( !visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ) continue;
             visual_capture_source_difference::PlayIdentity identity;
             identity.displayFrame = grab.displayFrame;
             if( m_pMlvObject && grab.displayFrame >= 0 && !visualSourceHashFailed.contains( grab.displayFrame ) )
@@ -10782,7 +10778,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
-            if( isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )
+            if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )
             {
                 const auto known = visualSourceHashes.constFind( grab.displayFrame );
                 if( known != visualSourceHashes.constEnd() )

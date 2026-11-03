@@ -67,6 +67,14 @@ inline void apply( QJsonObject &visualJson, Verdict verdict )
     }
 }
 
+/* Which visual.json capture kinds carry a source_id: the forced "play" captures and the unforced
+ * "play_unbound" ones. Lives here, not as a lambda in MainWindow::runGuiPlaybackSmoke, because
+ * test_dual_venue_evidence pins that the capture block contains no `return`. */
+inline bool isPlayCaptureKind( const QString &kind )
+{
+    return kind == QStringLiteral("play") || kind == QStringLiteral("play_unbound");
+}
+
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */
 inline QString sourceIdHex( quint64 hash )
 {
