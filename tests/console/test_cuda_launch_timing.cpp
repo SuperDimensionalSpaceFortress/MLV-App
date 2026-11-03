@@ -519,6 +519,14 @@ TEST(CudaLaunchTiming, CleanupNeverCallsCudaOverAPendingError)
     // teardown hands the pool to the guarded flush.
     ASSERT_TRUE(header.contains(QStringLiteral("        retired_.insert(retired_.end(), pool_.begin(), pool_.end());")));
     ASSERT_TRUE(header.contains(QStringLiteral("        flush_retired_locked();\n        write_summaries_locked(at);")));
+    // r4 pass 7 A1: retired handles never accumulate across failed launches the backend consumes
+    // without a poll: the next launch (nothing pending there) destroys them first (probe scenario 23).
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        if (backend_error_pending()) return false;\n        {\n            std::lock_guard<std::mutex> lock(mu_);\n")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "            if (!retired_.empty() && !flush_retired_locked()) return false;\n"
+        "            if (!take_event_locked(&p.start)) return false;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("        resolve_locked();\n        if (!retired_.empty()) flush_retired_locked();")));
 }
 
 TEST(CudaLaunchTiming, AFailedRecorderDestroyEndsTheAnchorTriesAndThePair)

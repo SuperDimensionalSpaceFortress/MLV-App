@@ -29,8 +29,9 @@
  *       an asynchronous backend fault is never consumed. A failed call's code is
  *       cleared BEFORE its cleanup, and cleanup (every cudaEventDestroy, a query or
  *       elapsed read in poll/teardown) makes no CUDA call while an error is pending:
- *       the handles wait in a retired list for a later destroy or teardown with
- *       nothing pending, so the backend always observes its error first.
+ *       the handles wait in a retired list for the next launch, poll, destroy or
+ *       teardown with nothing pending, so the backend always observes its error
+ *       first and a failed pair is never held past the backend's next launch.
  *   IGPU_LT_SYNC_BLOCK(stage, statement);
  *       host time around a statement (e.g. a free of every clip buffer).
  *   igpu_lt::FrameScope f(width, height);   igpu_lt::TileScope t(top, left);
@@ -206,6 +207,11 @@ public:
         if (backend_error_pending()) return false;
         {
             std::lock_guard<std::mutex> lock(mu_);
+            /* r4 pass 7 A1: handles retired over an error the backend has since consumed are
+             * destroyed at the next launch (nothing is pending here), so a failed launch's pair is
+             * never held past it, poll or no poll; a flush that fails or meets a pending error
+             * leaves this launch untimed. */
+            if (!retired_.empty() && !flush_retired_locked()) return false;
             if (!take_event_locked(&p.start)) return false;
             if (!take_event_locked(&p.stop))
             {
@@ -290,6 +296,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mu_);
         resolve_locked();
+        if (!retired_.empty()) flush_retired_locked(); /* r4 pass 7 A1 */
         const double now = steady_ms();
         if (at || now - last_summary_ms_ >= kSummaryIntervalMs)
         {
@@ -595,8 +602,9 @@ private:
 
     /* r4 (r3 pass 6 A1): every event the recorder destroys goes through here. True when it (and
      * every handle retired before it) was destroyed. With an error pending (the backend's, or an
-     * asynchronous fault) it makes no CUDA call: the handle stays in retired_ until a later
-     * destroy or teardown finds nothing pending, so the backend observes its error first. */
+     * asynchronous fault) it makes no CUDA call: the handle stays in retired_ until the next
+     * launch, poll, destroy or teardown finds nothing pending, so the backend observes its error
+     * first and a failed pair is held at most until the backend's next launch (r4 pass 7 A1). */
     bool destroy_event_locked(cudaEvent_t ev)
     {
         if (ev) retired_.push_back(ev);
