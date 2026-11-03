@@ -113,12 +113,21 @@ def _remove_capture_dir(path: str) -> str:
     The removal runs in a daemon thread that is abandoned if it does not finish, so a stalled temp store (a hung share, a slow
     enumeration, a held handle) cannot hold the verdict back. The note names the step and the path left behind.
     """
-    left: dict[str, bool] = {}
+    left: dict[str, object] = {}
 
     def remove() -> None:
         try:
             shutil.rmtree(path, ignore_errors=True)
-            left["present"] = os.path.exists(path)  # ignore_errors hides a held or read-only file; the caller is told it stayed (adversary r7 A3)
+            # ignore_errors hides a held, read-only or access-denied file, so the path is probed afterwards (adversary r7 A3). os.path.exists
+            # is not that probe: it answers False on a PermissionError too, so a denied delete plus a denied query read as a clean removal
+            # (sol r8 B2). Only FileNotFoundError proves the path is gone; any other OSError leaves the removal unconfirmed.
+            try:
+                os.lstat(path)
+                left["present"] = True
+            except FileNotFoundError:
+                left["present"] = False
+            except (OSError, ValueError) as exc:
+                left["unconfirmed"] = f"{type(exc).__name__}: {exc}"
         except Exception as exc:  # noqa: BLE001 - adversary r8 A2: a worker that dies must not read as a finished removal
             left["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -132,6 +141,8 @@ def _remove_capture_dir(path: str) -> str:
         return f"capture cleanup abandoned after {CAPTURE_CLEANUP_BOUND_SEC:g} s: {path}"
     if "error" in left:
         return f"capture cleanup failed ({left['error']}): {path}"
+    if "unconfirmed" in left:
+        return f"capture cleanup incomplete: removal of {path} could not be confirmed ({left['unconfirmed']})"
     if left.get("present", True):  # no recorded answer means the worker ended without one: not a success
         return f"capture cleanup incomplete: {path} was not fully removed"
     return ""
@@ -1152,6 +1163,57 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertIn(f"capture cleanup incomplete: {seen[0]} was not fully removed", str(caught.exception))
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _existence_probe_denied(denied: str):
+        """Every stat of `denied` raises PermissionError, and os.path.exists answers the way the CPython docs say it does on such an error
+        (False). Patching exists as well keeps the case independent of the platform's native exists (nt._path_exists on Windows)."""
+        real_stat, real_lstat = os.stat, os.lstat
+
+        def deny(real):
+            def probe(path, *args, **kwargs):
+                if os.fspath(path) == denied:
+                    raise PermissionError(13, "Access is denied")
+                return real(path, *args, **kwargs)
+            return probe
+
+        denying_stat, denying_lstat = deny(real_stat), deny(real_lstat)
+
+        def exists(path) -> bool:
+            try:
+                denying_stat(path)
+            except (OSError, ValueError):
+                return False
+            return True
+
+        with mock.patch.object(os, "stat", denying_stat), mock.patch.object(os, "lstat", denying_lstat), \
+                mock.patch.object(os.path, "exists", exists):
+            yield
+
+    def test_a_cleanup_whose_delete_and_existence_probe_are_both_denied_is_unconfirmed_not_a_removal(self) -> None:
+        # sol r8 B2: rmtree(ignore_errors=True) hid the denied delete and os.path.exists answers False on a PermissionError, so the retained
+        # capture directory read as a clean removal (note ''). Only FileNotFoundError proves the path is gone.
+        path = tempfile.mkdtemp(prefix="heavy-slot-gate-denied-")
+        try:
+            with mock.patch.object(shutil, "rmtree", lambda *args, **kwargs: None), self._existence_probe_denied(path):
+                note = _remove_capture_dir(path)
+            self.assertTrue(os.path.isdir(path), "the fixture directory must have been retained")
+            self.assertIn("capture cleanup incomplete", note)
+            self.assertIn("could not be confirmed", note)
+            self.assertIn("PermissionError", note)
+            self.assertIn(path, note)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def test_a_cleanup_whose_path_is_really_gone_is_still_a_clean_removal(self) -> None:
+        # The other side of sol r8 B2: only a FileNotFoundError from the probe counts as gone, and it must still read as success.
+        path = tempfile.mkdtemp(prefix="heavy-slot-gate-gone-")
+        try:
+            self.assertEqual(_remove_capture_dir(path), "")
+            self.assertFalse(os.path.exists(path))
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+
     def _run_with_capture_close(self, on_close, *, timeout_expires: bool = True, close_bound: float | None = None) -> BaseException:
         """run_bounded with in-memory Popen fakes where closing a capture file calls on_close() after really closing it."""
         proc = BoundedRunOutputReadFailureTests._TimedOutProc()
@@ -1311,6 +1373,27 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DIR|capture cleanup incomplete: still present: ", proc.stdout)
 
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_capture_whose_delete_and_existence_probe_both_fail_is_unconfirmed_not_a_removal(self) -> None:
+        # sol r8 B2 (PowerShell half): File.Delete threw (swallowed) and File.Exists / Directory.Exists return False on ANY error, so the
+        # helper reported an empty success note. A NUL in the path makes all three behave that way on every platform, without an ACL change.
+        # Only "file not found" / "directory not found" from the probe means gone; any other error leaves the removal unconfirmed.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$bad = 'C:\\x\\a' + [char]0 + 'b.tmp'\n"
+                  "$real = [IO.Path]::GetTempFileName()\n"
+                  "Write-Output ('BAD|' + (Remove-CaptureFiles @($bad)).Replace([string][char]0, '<NUL>'))\n"
+                  "Write-Output ('MIXED|' + (Remove-CaptureFiles @($real, $bad)).Replace([string][char]0, '<NUL>') + '|' + (Test-Path -LiteralPath $real))\n"
+                  "$gone = Join-Path ([IO.Path]::GetTempPath()) ('mlv-r9-gone-' + [guid]::NewGuid().ToString('N') + '.tmp')\n"
+                  "Write-Output ('GONE|[' + (Remove-CaptureFiles @($gone)) + ']')\n"
+                  "$noParent = Join-Path ([IO.Path]::GetTempPath()) ('mlv-r9-noparent-' + [guid]::NewGuid().ToString('N') + '\\a.tmp')\n"
+                  "Write-Output ('NOPARENT|[' + (Remove-CaptureFiles @($noParent)) + ']')\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"BAD\|capture cleanup incomplete: removal not confirmed: C:\\x\\a<NUL>b\.tmp \(ArgumentException", proc.stdout)
+        self.assertRegex(proc.stdout, r"MIXED\|capture cleanup incomplete: removal not confirmed: C:\\x\\a<NUL>b\.tmp \(ArgumentException.*\|False")
+        self.assertIn("GONE|[]", proc.stdout, "a file that is really gone is still a clean removal")
+        self.assertIn("NOPARENT|[]", proc.stdout, "a path whose parent directory is gone is still a clean removal")
+
     def test_a_thread_constructor_that_fails_keeps_the_case_named_verdict(self) -> None:
         # adversary r8 A2: threading.Thread(...) itself (MemoryError) ran before the protected start() call, so it escaped.
         real_init = threading.Thread.__init__
@@ -1415,25 +1498,52 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"STUCK\|capture cleanup incomplete: still present: .+\.tmp\|True")
 
+    @staticmethod
+    def _suite_stub_script() -> str:
+        """Invoke-BoundedSuite lifted out of the fifo script, with Start-Process, the bounded readers and the bounded removal stubbed (no
+        child, no file). $script:finish decides whether the suite exits; $script:stallReads stalls both captures, $script:stallErr only
+        the SECOND read (stderr); $script:cleanupNote is what the removal reports."""
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        start = fifo.index("function ConvertTo-CommandLineArg")
+        body = fifo[start:fifo.index("\n}\n", fifo.index("function Invoke-BoundedSuite")) + 3]
+        return ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'\n"
+                "function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw \"FAIL: $Message\" } }\n" + body + "\n"
+                "function Start-Process { param([string]$FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)\n"
+                "  $fin = if ($FilePath -eq 'taskkill.exe') { $true } else { $script:finish }\n"
+                "  $o = [pscustomobject]@{ Id = 4242; Handle = 1; ExitCode = 0 }\n"
+                "  $o | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value ([scriptblock]::Create('param($ms) $' + $fin.ToString().ToLower()))\n"
+                "  $o | Add-Member -MemberType ScriptMethod -Name Kill -Value { }\n"
+                "  $o }\n"
+                "function Read-CapturedResult([string]$Path) { $script:reads++\n"
+                "  if ($script:stallReads -or ($script:stallErr -and $script:reads -eq 2)) { [pscustomobject]@{ Ok = $false; Text = '<read timed out: x not readable within 10000 ms>' } } else { [pscustomobject]@{ Ok = $true; Text = '{\"a\":1}' } } }\n"
+                "function Remove-CaptureFiles([string[]]$Paths) { $script:removed += $Paths.Count; foreach ($f in $Paths) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }; $script:cleanupNote }\n")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_finished_suite_whose_stderr_capture_could_not_be_read_fails_by_name_instead_of_keeping_its_pass(self) -> None:
+        # sol r8 B1: only the stdout read was checked. A suite that exited 0 with readable JSON kept PASS when its stderr read timed out (or
+        # failed); the abandoned step survived only in unused diagnostic text. Stdout-only and stderr-only failures must both throw by name.
+        script = (self._suite_stub_script() +
+                  "function Case($label, $stallOut, $stallErr) {\n"
+                  "  $script:finish = $true; $script:stallReads = $stallOut; $script:stallErr = $stallErr; $script:cleanupNote = ''; $script:reads = 0; $script:removed = 0\n"
+                  "  try { $r = Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' 5 3>$null; Write-Output \"$label|RESULT|$($r.ExitCode)|$($r.Json)|removed=$($script:removed)\" }\n"
+                  "  catch { Write-Output \"$label|THROW|$($_.Exception.Message)|removed=$($script:removed)\" } }\n"
+                  "Case 'OK' $false $false\n"
+                  "Case 'ERRONLY' $false $true\n"
+                  "Case 'OUTONLY' $true $false\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {line.split("|", 1)[0]: line.split("|", 1)[1] for line in proc.stdout.splitlines() if line.split("|", 1)[0] in ("OK", "ERRONLY", "OUTONLY")}
+        self.assertEqual(rows["OK"], 'RESULT|0|{"a":1}|removed=2', proc.stdout)
+        self.assertIn("THROW|FAIL: case-x (C:\\s.ps1) finished but its stderr capture could not be read: <read timed out", rows["ERRONLY"])
+        self.assertTrue(rows["ERRONLY"].endswith("removed=2"), "the captures are still removed before the named failure is raised")
+        self.assertIn("THROW|FAIL: case-x (C:\\s.ps1) finished but its JSON result could not be read: <read timed out", rows["OUTONLY"])
+
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_the_suite_json_is_read_once_under_the_bound_and_every_stalled_step_fails_the_suite_by_name(self) -> None:
         # sol r6 B1/B2 through Invoke-BoundedSuite itself: Start-Process is a stub (no child), the bounded readers and the bounded removal are
         # stubs that report what a stalled step returns. The suite must (a) read each stream once, (b) fail by name when the JSON read
         # stalled, (c) name an abandoned cleanup in a timeout verdict, (d) name the timeout even when both reads stalled.
-        fifo = FIFO_TEST.read_text(encoding="ascii")
-        start = fifo.index("function ConvertTo-CommandLineArg")
-        body = fifo[start:fifo.index("\n}\n", fifo.index("function Invoke-BoundedSuite")) + 3]
-        script = ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'\n"
-                  "function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw \"FAIL: $Message\" } }\n" + body + "\n"
-                  "function Start-Process { param([string]$FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)\n"
-                  "  $fin = if ($FilePath -eq 'taskkill.exe') { $true } else { $script:finish }\n"
-                  "  $o = [pscustomobject]@{ Id = 4242; Handle = 1; ExitCode = 0 }\n"
-                  "  $o | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value ([scriptblock]::Create('param($ms) $' + $fin.ToString().ToLower()))\n"
-                  "  $o | Add-Member -MemberType ScriptMethod -Name Kill -Value { }\n"
-                  "  $o }\n"
-                  "function Read-CapturedResult([string]$Path) { $script:reads++\n"
-                  "  if ($script:stallReads) { [pscustomobject]@{ Ok = $false; Text = '<read timed out: x not readable within 10000 ms>' } } else { [pscustomobject]@{ Ok = $true; Text = '{\"a\":1}' } } }\n"
-                  "function Remove-CaptureFiles([string[]]$Paths) { $script:removed += $Paths.Count; foreach ($f in $Paths) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }; $script:cleanupNote }\n"
+        script = (self._suite_stub_script() +
                   "function Case($label, $finish, $stall, $note) {\n"
                   "  $script:finish = $finish; $script:stallReads = $stall; $script:cleanupNote = $note; $script:reads = 0; $script:removed = 0\n"
                   "  try { $r = Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' 5 3>$null; Write-Output \"$label|RESULT|$($r.ExitCode)|$($r.Json)|reads=$($script:reads)|removed=$($script:removed)\" }\n"

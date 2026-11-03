@@ -504,11 +504,24 @@ function Initialize-BoundedCaptureIo {
     using System.Threading.Tasks;
     public static class BoundedCaptureIo {
         public static Task<string> ReadAllText(string path) { return Task.Run(() => File.ReadAllText(path)); }
+        // Returns '' only when EVERY path is confirmed gone. File.Exists / Directory.Exists answer false on ANY error (an access-denied
+        // query included), so a denied delete plus a denied query read as a clean removal (sol r8 B2). GetAttributes is the probe instead:
+        // only "file not found" / "directory not found" proves a path is gone; any other error leaves that path unconfirmed.
         public static Task<string> Delete(string[] paths) {
             return Task.Run(() => {
-                var left = new System.Collections.Generic.List<string>();
-                foreach (string p in paths) { try { File.Delete(p); } catch (Exception) { } if (File.Exists(p) || Directory.Exists(p)) { left.Add(p); } }
-                return string.Join(", ", left);
+                var present = new System.Collections.Generic.List<string>();
+                var unconfirmed = new System.Collections.Generic.List<string>();
+                foreach (string p in paths) {
+                    try { File.Delete(p); } catch (Exception) { }
+                    try { File.GetAttributes(p); present.Add(p); }
+                    catch (FileNotFoundException) { }
+                    catch (DirectoryNotFoundException) { }
+                    catch (Exception e) { unconfirmed.Add(p + " (" + e.GetType().Name + ": " + e.Message + ")"); }
+                }
+                var parts = new System.Collections.Generic.List<string>();
+                if (present.Count > 0) { parts.Add("still present: " + string.Join(", ", present)); }
+                if (unconfirmed.Count > 0) { parts.Add("removal not confirmed: " + string.Join(", ", unconfirmed)); }
+                return string.Join("; ", parts);
             });
         }
     }
@@ -550,9 +563,10 @@ function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBo
         $task = Get-CaptureTask $Start $Paths { [BoundedCaptureIo]::Delete($Paths) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
         if ($task.Wait($left)) {
-            # The task reports the files a failed delete left behind (adversary r7 A3); a seam's plain Task has no Result and means none.
-            $present = if ($null -ne $task.PSObject.Properties['Result']) { [string]$task.Result } else { '' }
-            if ($present) { return "capture cleanup incomplete: still present: $present" }
+            # The task reports the files a failed delete left behind or could not confirm gone (adversary r7 A3, sol r8 B2); a seam's plain
+            # Task has no Result and means none.
+            $incomplete = if ($null -ne $task.PSObject.Properties['Result']) { [string]$task.Result } else { '' }
+            if ($incomplete) { return "capture cleanup incomplete: $incomplete" }
             return ''
         }
         return "capture cleanup abandoned after $([Math]::Round($BoundMs / 1000, 3)) s: $($Paths -join ', ')"
@@ -595,6 +609,9 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
         if (-not $finished) { $fail = "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text" }
         # A finished suite's JSON is the result: a read error or a stalled read here must surface, not aggregate as an empty result.
         elseif (-not $outR.Ok) { $fail = "$Name ($Script) finished but its JSON result could not be read: $($outR.Text)" }
+        # sol r8 B1: the stderr read is a step too. A suite that exited 0 with readable JSON must not keep PASS over an abandoned or failed
+        # stderr capture: the same named failure as the stdout one, so neither caller (nor the aggregate) can report PASS past it.
+        elseif (-not $errR.Ok) { $fail = "$Name ($Script) finished but its stderr capture could not be read: $($errR.Text)" }
         else { $result = [pscustomobject]@{ ExitCode = $p.ExitCode; Json = (($outR.Text.TrimEnd("`r", "`n")) -split '\r?\n') -join "`n"; Text = $text } }
     }
     # The removal is bounded too (sol r6 B2) and runs BEFORE the verdict is raised, so its note can be named in it.
