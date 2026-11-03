@@ -2667,6 +2667,26 @@
       "lines": [
         2960
       ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "( LONG ) ( delay_ms > 0 ? delay_ms : 0 ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test seam (adversary r1 passes 4-5 A1 RED test), not an elapsed-time inference: delay_ms is a requested sleep set only by llrpSetFakeGpuBackendLastTimingDelayMsForTesting for the in-process fake backend's timing getter (0 by default and always in the app). The comparison clamps a negative request to 0 before it is stored; it measures nothing and proves no run.",
+      "lines": [
+        1495
+      ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "if ( delay_ms > 0 ) Sleep ( ( DWORD ) delay_ms ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test seam (adversary r1 passes 4-5 A1 RED test), not an elapsed-time inference: delay_ms is a requested sleep set only by llrpSetFakeGpuBackendLastTimingDelayMsForTesting for the in-process fake backend's timing getter (0 by default and always in the app). The comparison selects whether the fake sleeps at all (0 skips Sleep so the default fake never yields); it measures nothing and proves no run (backend_calls and rc do).",
+      "lines": [
+        1504
+      ]
     }
   ]
 }

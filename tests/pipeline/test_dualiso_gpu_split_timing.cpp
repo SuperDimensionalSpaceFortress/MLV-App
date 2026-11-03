@@ -5,7 +5,8 @@
 // here, as the render thread's present or another run would hold it) reports that wait as mutex_wait_ms;
 // (e) so does a queued run then refused by the suppression re-check under the lock (adversary r1 A1); (c) the
 // thread's reset zeroes the record; (d) a run refused before the lock leaves the record untouched; (f) a run
-// whose caller asks for no timing (the export paths) still splits the GPU span (adversary r1 pass 3 A1).
+// whose caller asks for no timing (the export paths) still splits the GPU span (adversary r1 pass 3 A1); (g) that
+// run's own slow timing read is booked as post_run, not left to the enclosing residual (adversary r1 passes 4-5 A1).
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 
@@ -19,6 +20,7 @@ extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
 extern "C" int llrpResetGpuExportBackendForTesting(void);
 extern "C" void llrpHoldGpuReconBackendMutexForTesting(int hold);
 extern "C" long llrpGpuReconBackendLockArrivalsForTesting(void);
+extern "C" void llrpSetFakeGpuBackendLastTimingDelayMsForTesting(int delay_ms);
 
 namespace
 {
@@ -124,6 +126,31 @@ TEST(DualIsoGpuSplitTiming, ARunWhoseCallerAsksForNoTimingStillSplitsTheGpuSpan)
     ASSERT_EQ(3.0, s.run_gpu_ms);
     const double expectedSync = s.run_wall_ms > 3.0 ? s.run_wall_ms - 3.0 : 0.0;
     ASSERT_TRUE(s.sync_ms >= expectedSync - 1e-9 && s.sync_ms <= expectedSync + 1e-9);
+}
+
+// Adversary r1 passes 4-5 A1 (folded in r2): with no timing_out the split reads the backend's timing itself. That
+// read is held work after the run, so a slow getter (the fake sleeps 60 ms) is booked to post_run_ms. r1 took the
+// held-end stamp before the read, so post_run_ms stayed near 0 and the 60 ms fell into the enclosing other_ms.
+TEST(DualIsoGpuSplitTiming, ASlowTimingReadWithNoCallerTimingIsBookedAsPostRun)
+{
+    FakeBackendScope scope;
+    llrpResetLastRunTimingForCurrentThread();
+    const int delayMs = 60;
+    int rc = -99;
+    const llrpGpuPlaybackReconState_t state = splitValidatedState(7, 4, 4);
+    std::vector<uint16_t> input(16, 100);
+    std::vector<uint16_t> output(input.size());
+    llrpSetFakeGpuBackendLastTimingDelayMsForTesting(delayMs);
+    const int used = llrpGpuPlaybackReconRunCpu16Probe(&state, input.data(), input.size() * sizeof(uint16_t),
+                                                       output.data(), &rc, NULL);
+    llrpSetFakeGpuBackendLastTimingDelayMsForTesting(0);
+    ASSERT_NE(0, used);
+    ASSERT_EQ(0, rc);
+    const llrpDualIsoGpuSplitTiming_t s = lastSplit();
+    ASSERT_EQ(1, s.backend_calls);
+    ASSERT_EQ(3.0, s.run_gpu_ms);
+    // Sleep(60) lasts at least most of 60 ms; the bound asks for half, so it does not hinge on timer granularity.
+    ASSERT_TRUE(s.post_run_ms >= delayMs / 2.0);
 }
 
 namespace

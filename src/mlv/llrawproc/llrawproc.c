@@ -1483,10 +1483,25 @@ static int llrawproc_fake_gpu_backend_last_preupload_status(
     return 0;
 }
 
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test-only: the fake's timing getter
+ * sleeps this many ms (0, the default, sleeps not at all), so a test can pin
+ * where a slow timing read is booked in the dual_iso split. */
+static volatile LONG g_llrawproc_fake_gpu_backend_last_timing_delay_ms = 0;
+
+void llrpSetFakeGpuBackendLastTimingDelayMsForTesting(int delay_ms);
+void llrpSetFakeGpuBackendLastTimingDelayMsForTesting(int delay_ms)
+{
+    InterlockedExchange(&g_llrawproc_fake_gpu_backend_last_timing_delay_ms,
+                        (LONG)(delay_ms > 0 ? delay_ms : 0));
+}
+
 static int llrawproc_fake_gpu_backend_last_timing(igpu_recon_backend * b,
                                                    igpu_recon_timing_t * t)
 {
+    const LONG delay_ms =
+        InterlockedCompareExchange(&g_llrawproc_fake_gpu_backend_last_timing_delay_ms, 0, 0);
     (void)b;
+    if(delay_ms > 0) Sleep((DWORD)delay_ms);
     if(!t) return -1;
     memset(t, 0, sizeof(*t));
     t->upload_ms = 1.0;
@@ -2936,6 +2951,23 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
          * backend has no timing the run's wall stays unsplit (run_gpu_ms and sync_ms 0).
          * Taken before the device-loss scan, whose cost is not counted. */
         llrpDualIsoGpuSplitTiming_t * split = &g_llrawproc_last_dual_iso_gpu_split;
+        /* Adversary r1 pass 3 A1: a caller that asks for no timing (the export
+         * paths pass NULL timing_out) still gets the span split, read from the
+         * backend as the recon:run stage event above reads it.
+         * Adversary r1 passes 4-5 A1 (folded in r2): that fallback read is held
+         * work after the run, so it runs BEFORE the held-end stamp and a slow
+         * timing getter is booked to post_run_ms, not to the enclosing other_ms. */
+        double split_span_ms = -1.0;
+        if(run_called && run_rc == 0 && timing_out && timing_out->available)
+        {
+            split_span_ms = timing_out->total_ms;
+        }
+        else if(run_called && run_rc == 0 && g->last_timing)
+        {
+            igpu_recon_timing_t split_timing;
+            memset(&split_timing, 0, sizeof(split_timing));
+            if(g->last_timing(g->backend, &split_timing) == 0) split_span_ms = split_timing.total_ms;
+        }
         const double split_held_end_s = mlv_stage_timing_now();
         if(run_called)
         {
@@ -2943,20 +2975,6 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             split->configure_ms += (split_run_start_s - split_lock_acquired_s) * 1000.0;
             split->run_wall_ms += run_wall_ms;
             split->post_run_ms += (split_held_end_s - split_run_end_s) * 1000.0;
-            /* Adversary r1 pass 3 A1: a caller that asks for no timing (the export
-             * paths pass NULL timing_out) still gets the span split, read from the
-             * backend as the recon:run stage event above reads it. */
-            double split_span_ms = -1.0;
-            if(run_rc == 0 && timing_out && timing_out->available)
-            {
-                split_span_ms = timing_out->total_ms;
-            }
-            else if(run_rc == 0 && g->last_timing)
-            {
-                igpu_recon_timing_t split_timing;
-                memset(&split_timing, 0, sizeof(split_timing));
-                if(g->last_timing(g->backend, &split_timing) == 0) split_span_ms = split_timing.total_ms;
-            }
             if(split_span_ms >= 0.0)
             {
                 split->run_gpu_ms += split_span_ms;
