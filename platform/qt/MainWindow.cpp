@@ -19601,6 +19601,10 @@ void MainWindow::onPlaybackDueWake( void )
         m_playbackDueWakeDueToPostMs.add( postMs - m_playbackDueWakeDueAtMs );
         m_playbackDueWakePostToReceiveMs.add( nowMs - postMs );
     }
+    // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
+    // it is in neither split set (post_unsplit), never split at the first stamp
+    else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )
+        ++m_playbackDueWakePostUnsplit;
     // adversary r1 pass 2 A1: the wake honours m_frameStillDrawing exactly as the poll tick does and never recomputes it from the
     // render thread -- an idle renderer with a Ready frame whose notification is still queued would read as not busy, and the
     // advance would request the next frame over it (every-frame mode, CPU latest-ready acquisition: a skipped frame).
@@ -19662,6 +19666,7 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeRearmed = 0;
     m_playbackDueWakeBusyDeferred = 0;
     m_playbackDueWakeUnpresentedDeferred = 0;
+    m_playbackDueWakePostUnsplit = 0;
     m_playbackDueWakePresentedFrame = -1;   // nothing presented in this Play yet
     m_playbackDueWakeHiRes = false;
     m_playbackDueWakeDelivery = QStringLiteral( "none" );
@@ -19693,6 +19698,7 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
     const bool binned = !m_playbackDueWakeLatenessMs.exact() || !m_playbackDueWakeDueToPostMs.exact()
         || !m_playbackDueWakePostToReceiveMs.exact();
     const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 )
+        + QStringLiteral( " post_unsplit=%1" ).arg( m_playbackDueWakePostUnsplit )   // r5 pass 9 A1
         + playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, "late" )
         + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostMs, "due_to_post" )
         + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveMs, "post_to_receive" );

@@ -1203,6 +1203,7 @@ private:
     quint64 m_playbackDueWakeRearmed = 0;
     quint64 m_playbackDueWakeBusyDeferred = 0;
     quint64 m_playbackDueWakeUnpresentedDeferred = 0;   // r2 A1: every-frame wake held until the requested frame presented
+    quint64 m_playbackDueWakePostUnsplit = 0;           // r5 pass 9 A1: native deliveries taken before the post-return stamp
     long long m_playbackDueWakePresentedFrame = -1;     // r2 pass 4 A1: the frame whose present last ENDED (presentPlaybackPreparedFrame)
     QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
     bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism

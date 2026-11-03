@@ -47,6 +47,11 @@ struct PlaybackDueWake::Impl
     HANDLE stopEvent = nullptr;
     HANDLE thread = nullptr;
     std::atomic<quint32> postGeneration { 0 };   // the generation the wait thread posts (set before each SetWaitableTimer)
+    // r5 adversary pass 9 A1: the seqlock the wait thread publishes PostMessageW's return time through. postReturnFor is the
+    // first stamp (the message's lParam) that postReturnQpc belongs to; 0 while it is being written. QPC stamps only grow,
+    // so a reader that sees the same first stamp before and after reading postReturnQpc read that post's return time.
+    std::atomic<qint64> postReturnFor { 0 };
+    std::atomic<qint64> postReturnQpc { 0 };
     QAbstractNativeEventFilter *filter = nullptr;
 #endif
 
@@ -72,14 +77,20 @@ struct PlaybackDueWake::Impl
     }
     // r3: the post time of the delivery firing now (ms on the QPC clock), < 0 when the delivery carries none
     double firingPostMs = -1.0;
-    // the native-message path: the message names its generation and (r3) its post time in QPC ticks (<= 0: none)
-    void deliverGeneration( quint32 generation, qint64 postTicks = 0 )
+    bool firingUnsplit = false;           // r5 pass 9 A1: a stamped native delivery whose post-return time was not published yet
+    // the native-message path: the message names its generation and (r3) its first post stamp in QPC ticks (<= 0: none);
+    // r5: returnTicks is PostMessageW's return time for that stamp (<= 0: not published when the GUI thread took it). The gate
+    // still judges "posted before the due time" on the first stamp, the earliest the post can have been.
+    void deliverGeneration( quint32 generation, qint64 postTicks = 0, qint64 returnTicks = 0 )
     {
         const qint64 postNs = ( postTicks > 0 && qpcFrequency > 0 ) ? ticksToNs( postTicks, qpcFrequency ) : -1;
         if( !gate.accept( generation, nowNs(), postNs ) || !onFire ) return;
-        firingPostMs = postNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;
+        const qint64 returnNs = ( postNs >= 0 && returnTicks >= postTicks ) ? ticksToNs( returnTicks, qpcFrequency ) : -1;
+        firingPostMs = returnNs >= 0 ? static_cast<double>( returnNs ) / 1000000.0 : -1.0;
+        firingUnsplit = postNs >= 0 && returnNs < 0;
         onFire();
         firingPostMs = -1.0;
+        firingUnsplit = false;
     }
 };
 
@@ -130,6 +141,8 @@ struct WaitThreadArgs
     HANDLE timer;
     HWND window;
     std::atomic<quint32> *postGeneration;
+    std::atomic<qint64> *postReturnFor;
+    std::atomic<qint64> *postReturnQpc;
 };
 
 DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
@@ -150,6 +163,16 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
                           args.postGeneration->load( std::memory_order_acquire ),
                           static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
                       static_cast<LPARAM>( postQpc.QuadPart ) );
+        // r5 adversary pass 9 A1: the first stamp is taken BEFORE the post, so a pause of this thread between the two would
+        // read as GUI-queue time. Publish when PostMessageW returned, keyed by the first stamp (seqlock writer: invalidate,
+        // write, validate); the GUI thread splits at this time, or not at all
+        LARGE_INTEGER returnQpc;
+        if( postQpc.QuadPart > 0 && QueryPerformanceCounter( &returnQpc ) )
+        {
+            args.postReturnFor->store( 0 );
+            args.postReturnQpc->store( returnQpc.QuadPart );
+            args.postReturnFor->store( postQpc.QuadPart );
+        }
     }
     return 0;
 }
@@ -203,7 +226,8 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
         }
         if( d->stopEvent )
         {
-            WaitThreadArgs *args = new WaitThreadArgs { d->stopEvent, d->handle, d->window, &d->postGeneration };
+            WaitThreadArgs *args = new WaitThreadArgs { d->stopEvent, d->handle, d->window, &d->postGeneration,
+                                                        &d->postReturnFor, &d->postReturnQpc };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -316,6 +340,11 @@ void PlaybackDueWake::arm( double dueMs )
         }
         // could not arm: fall through to a Qt timer for this wake (delivered as "whatever is armed now"). The arm is
         // reported as a qtimer one, low resolution, whatever the construction chose (r2 adversary pass 5 A1).
+        // r5 adversary pass 9 A2: the failed SetWaitableTimer left the REPLACED arm's timer running, and its signal would
+        // have posted (or, on the notifier path, delivered) this arm's generation. Cancel it, and post generation 0 (never
+        // live) from now on, so only the QTimer delivers this arm.
+        CancelWaitableTimer( d->handle );
+        d->postGeneration.store( 0, std::memory_order_release );
         d->lastArmQtTimer = true;
         if( !d->timer )
         {
@@ -358,7 +387,13 @@ bool PlaybackDueWake::handleNativeMessage( const void *msg )
     if( playbackDueWakeWParamTag( wParam ) != static_cast<quint32>( kNativeWakeTag ) ) return false;
     // a stale generation (cancelled, re-armed or stopped since it was posted), or (r3, pass 7 A1) a signal posted before the
     // current arm's due time, is consumed and does nothing; lParam is the post time in QPC ticks
-    d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), static_cast<qint64>( m->lParam ) );
+    // r5 adversary pass 9 A1 (seqlock reader): PostMessageW's return time for exactly this message's first stamp, or none
+    const qint64 postTicks = static_cast<qint64>( m->lParam );
+    const qint64 forBefore = d->postReturnFor.load();
+    const qint64 returnTicks = d->postReturnQpc.load();
+    const qint64 forAfter = d->postReturnFor.load();
+    const bool published = postTicks > 0 && forBefore == postTicks && forAfter == postTicks;
+    d->deliverGeneration( playbackDueWakeWParamGeneration( wParam ), postTicks, published ? returnTicks : 0 );
     return true;
 #else
     Q_UNUSED( msg );
@@ -389,6 +424,11 @@ bool PlaybackDueWake::waitThreadRunning() const
 double PlaybackDueWake::lastDeliveryPostMs() const
 {
     return d->firingPostMs;
+}
+
+bool PlaybackDueWake::lastDeliveryUnsplit() const
+{
+    return d->firingUnsplit;
 }
 
 PlaybackDueWake::Delivery PlaybackDueWake::delivery() const

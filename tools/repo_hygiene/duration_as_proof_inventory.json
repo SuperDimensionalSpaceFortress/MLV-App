@@ -2587,6 +2587,37 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( ( postMs >= 0.0 ) != unsplit ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): postMs is a TIMESTAMP (PostMessageW's return time from lastDeliveryPostMs), and a negative value is the 'not published, unsplit' sentinel. The assert checks that a native delivery is exactly one of split or unsplit. That is the sentinel's contract; no duration is compared and nothing is proven to have run.",
+      "lines": [
+        454,
+        926
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( postMs >= 0.0 ) break ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): the retry loop stops at the first delivery whose post-return TIMESTAMP was published (sentinel < 0 = unsplit). It reads a sentinel and compares no duration. The delivery itself is proven by pumpDueWakeMessages returning 1.",
+      "lines": [
+        455
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( postMs >= 0.0 )",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): it selects a split delivery (post-return TIMESTAMP published, sentinel < 0 otherwise) before comparing that timestamp with the message's first stamp. It reads a sentinel, never a duration, and the delivery is proven by handleNativeMessage returning true.",
+      "lines": [
+        927
+      ]
+    },
+    {
       "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
       "anchor": "ASSERT_TRUE ( s . mutex_wait_ms >= 0.0 ) ;",
       "class": "not_run_proof_structural",

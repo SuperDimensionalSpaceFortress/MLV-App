@@ -196,8 +196,13 @@ public:
     bool waitThreadRunning() const;
     /*! r3: when the delivery that is firing now was posted, in ms on the QueryPerformanceCounter clock (the base of
      *  mlv_stage_timing_now() * 1000 on Windows). Valid inside the fire callback of a native-message delivery; < 0 on
-     *  the notifier / qtimer paths, which carry no post time. */
+     *  the notifier / qtimer paths, which carry no post time.
+     *  r5 adversary pass 9 A1: it is the time PostMessageW RETURNED (the wait thread's second stamp, handed over through a
+     *  seqlock), so a wait-thread pause between the wake and the post counts as due-to-post, not as the GUI queue. A native
+     *  delivery the GUI thread took before the wait thread published that stamp has no split: < 0 here, and
+     *  lastDeliveryUnsplit() is true (the summary line counts it as post_unsplit, in neither split set). */
     double lastDeliveryPostMs() const;
+    bool lastDeliveryUnsplit() const;
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
     void stop();
 

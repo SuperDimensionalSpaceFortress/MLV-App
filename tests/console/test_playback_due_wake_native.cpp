@@ -439,13 +439,21 @@ TEST(PlaybackDueWakeNative, TheMessageCarriesItsPostTimeAndTheLatenessIsSplitAtT
     };
     double postMs = -2.0;
     double receivedMs = -2.0;
+    bool unsplit = false;
     PlaybackDueWake *self = nullptr;
-    PlaybackDueWake wake( nullptr, [&]() { postMs = self->lastDeliveryPostMs(); receivedMs = qpcMs(); } );
+    PlaybackDueWake wake( nullptr, [&]() { postMs = self->lastDeliveryPostMs(); unsplit = self->lastDeliveryUnsplit(); receivedMs = qpcMs(); } );
     self = &wake;
     ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
-    const double armedMs = qpcMs();
-    wake.arm( 1.0 );
-    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    // r5 pass 9 A1: a delivery taken before the wait thread published PostMessageW's return time is unsplit (< 0); retry
+    double armedMs = qpcMs();
+    for( int attempt = 0; attempt < 20; ++attempt )
+    {
+        armedMs = qpcMs();
+        wake.arm( 1.0 );
+        ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+        ASSERT_TRUE( ( postMs >= 0.0 ) != unsplit );   // split at the return time, or counted unsplit: never both, never neither
+        if( postMs >= 0.0 ) break;
+    }
     ASSERT_TRUE( postMs >= armedMs );            // posted after the arm, on the same QPC clock
     ASSERT_TRUE( receivedMs >= postMs );         // received after the post
     ASSERT_TRUE( postMs - armedMs < 1000.0 );
@@ -824,4 +832,104 @@ TEST(PlaybackDueWakeSamplesB2, ThePerPlayDueWakeCountersAreUnsigned64Bit)
     // the only int one is the per-present re-arm count, which is reset every present and capped
     ASSERT_EQ( 1, header.count( QStringLiteral( "int m_playbackDueWakeRearmsThisPresent = 0;" ) ) );
     ASSERT_TRUE( std::numeric_limits<quint64>::max() >= 18446744073709551615ull );
+}
+
+TEST(PlaybackDueWakeNative, AFailedReArmCancelsTheReplacedNativeTimer)
+{
+    // r5 adversary pass 9 A2 input: a native arm(50) succeeds; arm(5) takes the SetWaitableTimer failure branch (QTimer). The
+    // replaced waitable timer stayed set: at 50 ms its wait thread posted the NEW generation, posted after the new due time,
+    // so the abandoned timer fired the replacement arm on the native path. Qt timers are not dispatched here (no
+    // processEvents), so only the native path could deliver.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    wake.arm( 50.0 );
+    wake.setWaitableTimerFailsForTest( true );
+    wake.arm( 5.0 );
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
+    ASSERT_EQ( 0, pumpDueWakeMessages( wake, 150 ) );   // the replaced timer was cancelled: nothing is posted
+    ASSERT_EQ( 0, fired );
+    // the fallback QTimer is what delivers the replacement arm, once
+    const ULONGLONG deadline = GetTickCount64() + 500;
+    while( fired < 1 && GetTickCount64() < deadline )
+    {
+        QCoreApplication::processEvents( QEventLoop::AllEvents, 5 );
+        Sleep( 1 );
+    }
+    ASSERT_EQ( 1, fired );
+#endif
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "        CancelWaitableTimer( d->handle );\n"
+                                                "        d->postGeneration.store( 0, std::memory_order_release );\n"
+                                                "        d->lastArmQtTimer = true;" ) ) );
+}
+
+TEST(PlaybackDueWakeNative, TheLatenessSplitsAtThePostReturnNotTheFirstStamp)
+{
+    // r5 adversary pass 9 A1 input: due at 100 ms, the wait thread stamps 100 ms, is descheduled before PostMessageW until
+    // 140 ms, and the GUI thread receives at 140.1 ms. Split at the first stamp, due-to-post read 0 and post-to-receive 40.1 ms
+    // (the wait thread's pause charged to the GUI queue). The split point is now PostMessageW's return, published by the wait
+    // thread through a seqlock keyed by the first stamp; a delivery taken before it is published is unsplit, never split early.
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_FALSE( source.isEmpty() );
+    const int post = source.indexOf( QStringLiteral( "PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage," ) );
+    const int invalidate = source.indexOf( QStringLiteral( "args.postReturnFor->store( 0 );" ), post );
+    const int write = source.indexOf( QStringLiteral( "args.postReturnQpc->store( returnQpc.QuadPart );" ), post );
+    const int validate = source.indexOf( QStringLiteral( "args.postReturnFor->store( postQpc.QuadPart );" ), post );
+    ASSERT_TRUE( post > 0 && invalidate > post && write > invalidate && validate > write );
+    const int before = source.indexOf( QStringLiteral( "const qint64 forBefore = d->postReturnFor.load();" ) );
+    const int value = source.indexOf( QStringLiteral( "const qint64 returnTicks = d->postReturnQpc.load();" ) );
+    const int after = source.indexOf( QStringLiteral( "const qint64 forAfter = d->postReturnFor.load();" ) );
+    ASSERT_TRUE( before > 0 && value > before && after > value );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "const bool published = postTicks > 0 && forBefore == postTicks && forAfter == postTicks;" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "published ? returnTicks : 0 );" ) ) );
+    // the fired post time is the return stamp; with none published the delivery is unsplit
+    ASSERT_EQ( 1, source.count( QStringLiteral( "firingPostMs = returnNs >= 0 ? static_cast<double>( returnNs ) / 1000000.0 : -1.0;" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "firingUnsplit = postNs >= 0 && returnNs < 0;" ) ) );
+    // MainWindow records an unsplit delivery in neither split set, counts it, and puts the count on the line
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "else if( m_playbackDueWake && m_playbackDueWake->lastDeliveryUnsplit() )\n"
+                                                    "        ++m_playbackDueWakePostUnsplit;" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "QStringLiteral( \" post_unsplit=%1\" ).arg( m_playbackDueWakePostUnsplit )" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostUnsplit = 0;" ) ) );
+#ifdef Q_OS_WIN
+    // a live delivery: the post time it reports is never before the first stamp the message carries
+    double postMs = -2.0;
+    bool unsplit = false;
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() { postMs = self->lastDeliveryPostMs(); unsplit = self->lastDeliveryUnsplit(); } );
+    self = &wake;
+    LARGE_INTEGER frequency;
+    ASSERT_TRUE( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 );
+    const HWND window = reinterpret_cast<HWND>( wake.nativeWindow() );
+    int split = 0;
+    for( int attempt = 0; attempt < 20 && split == 0; ++attempt )
+    {
+        wake.arm( 1.0 );
+        MSG msg = {};
+        const ULONGLONG deadline = GetTickCount64() + 200;
+        bool taken = false;
+        while( !taken && GetTickCount64() < deadline )
+        {
+            if( PeekMessageW( &msg, window, PlaybackDueWake::kNativeWakeMessage, PlaybackDueWake::kNativeWakeMessage, PM_REMOVE ) )
+            {
+                Sleep( 2 );   // let the wait thread publish the return time first, as a busy GUI thread does
+                ASSERT_TRUE( wake.handleNativeMessage( &msg ) );
+                taken = true;
+            }
+            else
+                Sleep( 0 );
+        }
+        ASSERT_TRUE( taken );
+        const double firstStampMs = static_cast<double>( msg.lParam ) * 1000.0 / static_cast<double>( frequency.QuadPart );
+        ASSERT_TRUE( ( postMs >= 0.0 ) != unsplit );
+        if( postMs >= 0.0 )
+        {
+            ASSERT_TRUE( postMs >= firstStampMs );
+            ++split;
+        }
+    }
+    ASSERT_EQ( 1, split );
+#endif
 }
