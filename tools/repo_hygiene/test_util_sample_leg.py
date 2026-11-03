@@ -185,7 +185,9 @@ class UtilSampleGeneratorTests(unittest.TestCase):
                 self.assertLess(region3.index("Get-UtilSampleClockWitness"), region3.index("Get-UtilSampleGpuSummary"))
                 # r5 B3: only a file the job created is published
                 self.assertEqual(text.count("if ($utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf))"), 1)
-                self.assertEqual(text.count("if ($utilSampleCpuStart.status -ceq 'running' -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf))"), 1)
+                self.assertEqual(text.count("if ((Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf))"), 1)
+                # adversary 01d6ad51 A5: the CPU child binds the app by the job's own exe path
+                self.assertIn("$utilSampleGpuPid $utilSampleGpuTicks ([string]$exePath)", text)
                 self.assertIn("$utilSampleStopped = Test-UtilSampleStopped $utilSampleStopRecord", text[starts[1]:text.index(CLOSE, starts[1])])
                 self.assertLess(text.index("$rawLog = [IO.File]::ReadAllText($logPath)"), starts[2], "the run log is read before the scalars")
                 # the outer finally stops and publishes on every other exit
@@ -225,7 +227,7 @@ class UtilSampleGeneratorTests(unittest.TestCase):
         child_path.write_text(child, encoding="utf-8")
         proc = run_pwsh(["-File", str(script), str(child_path)])
         self.assertIn("BAD=0", proc.stdout, proc.stdout + proc.stderr)
-        for name in ("function Read-UtilSampleClock", "function Invoke-UtilSampleCpuLoop", "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs"):
+        for name in ("function Read-UtilSampleClock", "function Invoke-UtilSampleCpuLoop", "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs"):
             self.assertIn(name, child)
 
 
@@ -243,9 +245,9 @@ $cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
 function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
 $ws = [DateTime]::new(2026, 11, 1, 14, 0, 0, 0, [DateTimeKind]::Utc); $we = $ws.AddMilliseconds(800)
 $win = [ordered]@{ startUtc = $ws; endUtc = $we; clockWhy = $null }
-$H = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs`n"
+$H = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs`n"
 # one r5 cpu-util.csv row: its interval fromUtc..utc stated, and its clock step
-function CpuRow([DateTime]$u, $t, $p, $c, [DateTime]$f, $s = '0') { "$($u.ToString('o')),$t,$p,$c,$($f.ToString('o')),$s`n" }
+function CpuRow([DateTime]$u, $t, $p, $c, [DateTime]$f, $s = '0', $iv = $null) { if ($null -eq $iv) { $iv = ($u - $f).TotalMilliseconds }; "$($u.ToString('o')),$t,$p,$c,$($f.ToString('o')),$s,$iv`n" }
 $gpuText = "2026/11/01 08:00:00.000, 40, 10, 1800, P2, 50.00`n2026/11/01 08:00:00.250, 60, 12, 1800, P2, 55.00`n2026/11/01 08:00:00.500, [N/A], 12, 1800, P2, [N/A]`n" +
            "2026/11/01 08:00:00.750, 80, 14, 1800, P2, 60.00`n2026/11/01 08:00:01.000, 99, 1, 1800, P2, 70.00`n2026/11/01 08:00:01.2"
 $g = ConvertFrom-UtilSampleGpuCsv $gpuText $cst
@@ -266,8 +268,8 @@ $r['gpuAllNa'] = (Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv "2026/1
 $r['gpuSkipped'] = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }) $win).status
 $r['gpuStartFailed'] = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing' }) $win).status
 $r['gpuSummerUtc'] = (ConvertFrom-UtilSampleGpuCsv "2026/07/01 08:00:00.000, 1, 1, 1, P0, 1.0`n" $cst).rows[0].utc.ToString('o')
-$cpuText = $H + "2026-11-01T13:59:59.5000000Z,10,,,2026-11-01T13:59:59.0000000Z,0`n2026-11-01T14:00:00.1000000Z,50,1234,2.5,2026-11-01T13:59:59.5000000Z,0`n" +
-           "2026-11-01T14:00:00.6000000Z,,1234,3.5,2026-11-01T14:00:00.1000000Z,0`n2026-11-01T14:00:01.5000000Z,90,1234;1240,8,2026-11-01T14:00:00.6000000Z,0`n2026-11-01T14:00:0"
+$cpuText = $H + "2026-11-01T13:59:59.5000000Z,10,,,2026-11-01T13:59:59.0000000Z,0,500`n2026-11-01T14:00:00.1000000Z,50,1234,2.5,2026-11-01T13:59:59.5000000Z,0,600`n" +
+           "2026-11-01T14:00:00.6000000Z,,1234,3.5,2026-11-01T14:00:00.1000000Z,0,500`n2026-11-01T14:00:01.5000000Z,90,1234;1240,8,2026-11-01T14:00:00.6000000Z,0,900`n2026-11-01T14:00:0"
 $c = ConvertFrom-UtilSampleCpuCsv $cpuText
 $r['cpuParse'] = @{ rows = $c.rows.Count; torn = $c.tornTail; why = $c.why }
 $cs = Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win
@@ -307,7 +309,7 @@ $r['cpuExitNonZero'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'runni
 $r['cpuStopClean'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })).status
 # A8: an overflowing mean is unavailable(non-finite), never ok without a number
 $big = [ordered]@{ rows = [Collections.Generic.List[object]]::new(); why = $null }
-foreach ($ms in 100, 200, 300) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1'; fromUtc = $ws.AddMilliseconds($ms - 50); step = 0.0 }) }
+foreach ($ms in 100, 200, 300) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1'; fromUtc = $ws.AddMilliseconds($ms - 50); step = 0.0; intervalMs = 50.0 }) }
 $r['gpuNonFinite'] = (Get-UtilSampleGpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 $r['cpuNonFinite'] = (Get-UtilSampleCpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 # T5 fail open
@@ -363,7 +365,7 @@ $r['stopAllNothing'] = (Stop-UtilSampleAll ([ordered]@{ status = 'unavailable'; 
 $a1log = "[2026-11-02T14:00:00.000Z] [info] [app] playback_smoke.start session=2`n[2026-11-02T14:00:00.001Z] [info] [app] playback_smoke.measured_session id=2`n" +
          "[2026-11-02T14:01:20.000Z] [info] [app] playback_smoke.summary session=2 reason=play-stop elapsed_ms=20000`n"
 $a1w = Get-UtilSamplePlayWindow $a1log
-$a1csv = $H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T14:00:00.0000000Z,0`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0`n2026-11-02T14:01:19.0000000Z,90,1234,9,2026-11-02T14:01:02.0000000Z,0`n"
+$a1csv = $H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T14:00:00.0000000Z,0,1000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000`n2026-11-02T14:01:19.0000000Z,90,1234,9,2026-11-02T14:01:02.0000000Z,0,17000`n"
 $a1c = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $a1csv) ([ordered]@{ status = 'running'; reason = $null }) $a1w ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })
 $r['r3A1'] = @{ windowNull = ($null -eq $a1w); status = $a1c.status; inWindow = $a1c.rowsInWindow; total = $a1c.rowsTotal }
 $a1ok = Get-UtilSamplePlayWindow ($a1log -replace '14:01:20\.000Z', '14:00:20.400Z')
@@ -414,14 +416,14 @@ $r['r3B2'] = @{ status = $b2.status; inWindow = $b2.rowsInWindow; total = $b2.to
 # r3 B3: a +60 s host-clock excursion mid-play and back leaves the endpoints agreeing but the sample stamps out of order: the subset is unverified, not ok
 $b3win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 2, 14, 0, 0, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 2, 14, 0, 20, 0, [DateTimeKind]::Utc) }
 # r5: the CPU stamps are out of order, so the witness the job computes says unverified, for the GPU summary as well
-$b3cpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.0000000Z,0`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0`n2026-11-02T14:00:21.0000000Z,10,1234,1,2026-11-02T14:00:19.0000000Z,0`n")
+$b3cpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.0000000Z,0,2000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000`n2026-11-02T14:00:21.0000000Z,10,1234,1,2026-11-02T14:00:19.0000000Z,0,2000`n")
 $b3gpu = ConvertFrom-UtilSampleGpuCsv "2026/11/02 08:00:01.000, 10, 10, 1200, P0, 40`n2026/11/02 08:01:02.000, 90, 10, 1200, P0, 40`n2026/11/02 08:00:19.000, 10, 10, 1200, P0, 40`n" $cst
 $b3run = [ordered]@{ status = 'running'; reason = $null }; $b3stop = [ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 }
 $b3win['clockWhy'] = Get-UtilSampleClockWitness $b3cpu $b3run $b3win
 $b3c = Get-UtilSampleCpuSummary $b3cpu $b3run $b3win $b3stop
 $b3g = Get-UtilSampleGpuSummary $b3gpu $b3run $b3win $b3stop
 $r['r3B3'] = @{ cpu = $b3c.status; gpu = $b3g.status; scalar = (Get-UtilSampleScalars $b3g $b3c $true).utilSampleStatus }
-$b3okcpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.5000000Z,0`n2026-11-02T14:00:02.0000000Z,20,1234,2,2026-11-02T14:00:01.0000000Z,0`n2026-11-02T14:00:03.0000000Z,30,1234,3,2026-11-02T14:00:02.0000000Z,0`n")
+$b3okcpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.5000000Z,0,1500`n2026-11-02T14:00:02.0000000Z,20,1234,2,2026-11-02T14:00:01.0000000Z,0,1000`n2026-11-02T14:00:03.0000000Z,30,1234,3,2026-11-02T14:00:02.0000000Z,0,1000`n")
 $b3ok = Get-UtilSampleCpuSummary $b3okcpu $b3run ([ordered]@{ startUtc = $b3win.startUtc; endUtc = $b3win.endUtc; clockWhy = $null }) $b3stop
 $r['r3B3Steady'] = @{ cpu = $b3ok.status; inWindow = $b3ok.rowsInWindow }
 # r4 adversary b544cdb8 A1: a PATH entry on an absent drive is skipped (Join-Path throws there), so System32\nvidia-smi.exe is still found
@@ -513,6 +515,7 @@ $g10 = Join-Path $t 'r5b3-fresh.csv'
 $b3f = Start-UtilSampleGpu 'cuda' $who $g10 { @{ state = 'D0'; reason = $null } }
 if ($null -ne $b3f.proc) { try { [void]$b3f.proc.WaitForExit(5000); if (-not $b3f.proc.HasExited) { $b3f.proc.Kill() } } catch { } }
 $r['r5B3Fresh'] = @{ status = $b3f.status; owned = [bool]$b3f.owned; exists = (Test-Path -LiteralPath $g10) }
+if ($null -ne $b3f.hold) { $b3f.hold.Dispose() }
 $c9 = Join-Path $t 'r5b3-cpu-occupied.csv'; [IO.File]::WriteAllText($c9, 'KEEP-UNOWNED-CPU')
 $b3cs = Start-UtilSampleCpu $who 'AAAA' $c9 (Join-Path $t 'r5b3.stop') 'MLVApp' 0 1000 0 0
 if ($null -ne $b3cs.proc) { try { $b3cs.proc.Kill() } catch { } }
@@ -523,6 +526,48 @@ $b4t = $H + (CpuRow $p0.AddSeconds(1) 100 1234 10 $p0.AddMilliseconds(-500)) + (
 for ($i = 7; $i -le 20; $i++) { $b4t += (CpuRow $p0.AddSeconds($i) 0 1234 0 $p0.AddSeconds($i - 1)) }
 $b4 = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $b4t) $run ([ordered]@{ startUtc = $p0; endUtc = $p0.AddSeconds(20); clockWhy = $null }) $okStop
 $r['r5B4'] = @{ status = $b4.status; total = $b4.totalMean; cores = $b4.appCoresMean; inWindow = $b4.rowsInWindow }
+# ---- adversary 01d6ad51 (r5 fix iteration) ----
+# A1: a step that lands inside every clock bracket for 300 ms (one read of each pair stepped +100 ms) must still be counted
+$script:a1t0 = $null; $script:a1n = 0
+$a1clock = { $n = [DateTime]::UtcNow.Ticks; if ($null -eq $script:a1t0) { $script:a1t0 = $n }; $el = ($n - $script:a1t0) / 1e4; if ($el -ge 500 -and $el -lt 800) { $script:a1n++; if ($script:a1n % 2 -eq 0) { return $n + 1000000 } }; $n }
+[void](Invoke-UtilSampleCpuLoop (Join-Path $t 'r5a1.csv') (Join-Path $t 'r5a1.stop') 'no-such-process-name-xyz' 200 1600 { 5 } 0 0 0 0 $a1clock)
+$a1s = @((ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText((Join-Path $t 'r5a1.csv')))).rows | ForEach-Object { $_.step } | Where-Object { $null -ne $_ })
+$r['advA1'] = @{ rows = $a1s.Count; maxStep = $(if ($a1s.Count) { ($a1s | Measure-Object -Maximum).Maximum } else { -1 }) }
+# A2 (exact case): the read begun at 2 s completes at 6 s; rows (end, start, total, cores, intervalMs): (1,0,0,0,1000) (6,1,100,1,5000) (7,2,0,0,1000),
+# then zero 1 s rows to 20 s: the 7 s row measured 1 s, not the 5 s its bounds span -> 25 % / 0.25 cores
+$a2t = $H + (CpuRow $p0.AddSeconds(1) 0 1234 0 $p0 '0' 1000) + (CpuRow $p0.AddSeconds(6) 100 1234 1 $p0.AddSeconds(1) '0' 5000) + (CpuRow $p0.AddSeconds(7) 0 1234 0 $p0.AddSeconds(2) '0' 1000)
+for ($i = 8; $i -le 20; $i++) { $a2t += (CpuRow $p0.AddSeconds($i) 0 1234 0 $p0.AddSeconds($i - 1) '0' 1000) }
+$a2w = [ordered]@{ startUtc = $p0; endUtc = $p0.AddSeconds(20) }
+$a2p = ConvertFrom-UtilSampleCpuCsv $a2t
+$a2w['clockWhy'] = Get-UtilSampleClockWitness $a2p $run $a2w
+$a2s = Get-UtilSampleCpuSummary $a2p $run $a2w $okStop
+$r['advA2'] = @{ clock = $a2w.clockWhy; status = $a2s.status; total = $a2s.totalMean; cores = $a2s.appCoresMean; inWindow = $a2s.rowsInWindow }
+# A3 (GPU): the job's created gpu-util.csv is held: it cannot be deleted or renamed (a hard link swapped in) while nvidia-smi runs, yet a writer
+# that truncates and writes it the way nvidia-smi -f does still can
+$a3p = Join-Path $t 'r5a3.csv'
+$a3o = New-UtilSampleOwnedFile $a3p
+$a3del = 'kept'; try { [IO.File]::Delete($a3p); if (-not (Test-Path -LiteralPath $a3p)) { $a3del = 'deleted' } } catch { $a3del = 'refused' }
+$a3mv = 'kept'; try { [IO.File]::Move($a3p, (Join-Path $t 'r5a3-moved.csv')); $a3mv = 'moved' } catch { $a3mv = 'refused' }
+$a3w = 'refused'; try { $ws2 = [IO.File]::Open($a3p, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $ws2.WriteByte(65); $ws2.Dispose(); $a3w = 'written' } catch { }
+if ($null -ne $a3o -and $null -ne $a3o.hold) { $a3o.hold.Dispose() }
+# A3 (CPU): a child whose CreateNew meets another writer's file ends (a throw), never loops on, and the bytes stay; only a child still running
+# at the stop owns its file
+$a3q = Join-Path $t 'r5a3-foreign.csv'; [IO.File]::WriteAllText($a3q, 'KEEP-FOREIGN')
+$a3refused = 'not-refused'; try { [void](Invoke-UtilSampleCpuLoop $a3q (Join-Path $t 'r5a3f.stop') 'no-such-process-name-xyz' 200 500 { 5 } 0 0 0 0) } catch { $a3refused = [string]$_.Exception.Message }
+$a3own = @(
+    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; exitedBeforeStop = $false } })),
+    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; exitedBeforeStop = $true } })),
+    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) $null),
+    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'unavailable' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; exitedBeforeStop = $false } })))
+$r['advA3'] = @{ held = ($null -ne $a3o -and $null -ne $a3o.hold); delete = $a3del; move = $a3mv; writer = $a3w; foreign = $a3refused; foreignBytes = [IO.File]::ReadAllText($a3q); owned = @($a3own) }
+# A4 / A5: an unreadable CPU time is no zero baseline, and only the job's own executable path counts
+$fs = [DateTime]::new(2026, 11, 2, 13, 0, 0, [DateTimeKind]::Utc)
+$pa = [pscustomobject]@{ Id = 1234; Path = 'C:\jobA\MLVApp.exe'; StartTime = $fs; TotalProcessorTime = $null }
+$pb = [pscustomobject]@{ Id = 1240; Path = 'C:\jobB\MLVApp.exe'; StartTime = $fs; TotalProcessorTime = [TimeSpan]::FromSeconds(100) }
+$pc = [pscustomobject]@{ Id = 1234; Path = 'C:\jobA\MLVApp.exe'; StartTime = $fs; TotalProcessorTime = [TimeSpan]::FromSeconds(101) }
+$s1 = Get-UtilSampleAppSnapshot @($pa, $pb) 'C:\jobA\MLVApp.exe'
+$s2 = Get-UtilSampleAppSnapshot @($pc, $pb) 'c:\JOBA\mlvapp.exe'
+$r['advA4A5'] = @{ unreadable = @($s1.Keys).Count; ownOnly = (@($s2.Keys) -join ';'); expected = "1234,$($fs.Ticks)"; noPath = @((Get-UtilSampleAppSnapshot @($pc, $pb) '').Keys).Count }
 Write-Output (J $r)
 """
 
@@ -697,6 +742,29 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         # sol r4 B4 exact case: unweighted it was ok 6.667 % / 0.667 cores; the retained intervals span 19 s with 5 loaded seconds
         self.assertEqual(self.r["r5B4"], {"status": "ok", "total": 26.316, "cores": 2.632, "inWindow": 15})
 
+    def test_adv_01d6ad51_a1_a_step_inside_every_clock_bracket_is_still_counted(self) -> None:
+        a1 = self.r["advA1"]
+        self.assertGreaterEqual(a1["rows"], 3, a1)
+        self.assertGreater(a1["maxStep"], 25, f"a +100 ms step hidden inside the brackets was absorbed by them: {a1}")
+
+    def test_adv_01d6ad51_a2_the_row_after_a_stalled_read_weighs_its_own_interval(self) -> None:
+        self.assertEqual(self.r["advA2"], {"clock": None, "status": "ok", "total": 25.0, "cores": 0.25, "inWindow": 16},
+                         "the 7 s row's bounds span 2..7 s because the read before it stalled, but it measured 1 s")
+
+    def test_adv_01d6ad51_a3_the_job_holds_its_csv_and_a_writer_refuses_foreign_bytes(self) -> None:
+        a3 = self.r["advA3"]
+        self.assertEqual((a3["held"], a3["delete"], a3["move"]), (True, "refused", "refused"), "the name could be swapped while nvidia-smi runs")
+        self.assertEqual(a3["writer"], "written", "an nvidia-smi -f style truncating writer must still open the held file")
+        self.assertIn("cpu-util-occupied", a3["foreign"], "a child whose CreateNew failed must end, not loop on a null handle")
+        self.assertEqual(a3["foreignBytes"], "KEEP-FOREIGN")
+        self.assertEqual(a3["owned"], [True, False, False, False], "only a child still running at the stop owns (and publishes) cpu-util.csv")
+
+    def test_adv_01d6ad51_a4_a5_unreadable_cpu_time_and_other_jobs_instances_are_left_out(self) -> None:
+        a = self.r["advA4A5"]
+        self.assertEqual(a["unreadable"], 0, "a null CPU time became a zero baseline, or another job's instance was counted")
+        self.assertEqual(a["ownOnly"], a["expected"], "only the job's own executable path counts (case-blind)")
+        self.assertEqual(a["noPath"], 2, "without a path the name alone binds, as before")
+
     def test_r5_an_empty_system_root_does_not_end_the_nvidia_smi_search(self) -> None:
         self.assertEqual(self.r["r5EmptyRoot"]["found"], self.r["r5EmptyRoot"]["expected"])
 
@@ -720,9 +788,9 @@ class UtilSamplePureHelperTests(unittest.TestCase):
     def test_t5_a_throwing_counter_still_writes_rows_and_ends_typed(self) -> None:
         got = self.r["cpuLoopThrowingCounter"]
         self.assertEqual(got["endedBy"], "deadline")
-        self.assertEqual(got["header"], "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs")
+        self.assertEqual(got["header"], "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs")
         self.assertGreaterEqual(got["rows"], 1)
-        self.assertRegex(got["firstRow"], r"^\d{4}-\d\d-\d\dT[^,]+Z,,,,\d{4}-\d\d-\d\dT[^,]+Z,\d+(\.\d+)?$",
+        self.assertRegex(got["firstRow"], r"^\d{4}-\d\d-\d\dT[^,]+Z,,,,\d{4}-\d\d-\d\dT[^,]+Z,\d+(\.\d+)?,\d+(\.\d+)?$",
                          "a throwing counter is an empty field, never a throw or a 0; the interval start and clock step are still stated")
         self.assertGreaterEqual(got["errors"], 1)
         self.assertEqual(self.r["stopNull"], {"stopped": False, "why": "not-started"})
