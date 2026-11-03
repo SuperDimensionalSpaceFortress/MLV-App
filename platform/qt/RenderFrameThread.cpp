@@ -2264,7 +2264,8 @@ bool RenderFrameThread::realWorkPendingLocked( void ) const
 
 playback_recon_warm_run::Reason RenderFrameThread::requestPlaybackReconWarm( uint32_t frameNumber,
                                                                              int scale,
-                                                                             quint64 clipGeneration )
+                                                                             quint64 clipGeneration,
+                                                                             quint64 stateGeneration )
 {
     QMutexLocker locker( &m_mutex );
     if( realWorkPendingLocked() ) return playback_recon_warm_run::Reason::RealRequestPending;
@@ -2274,6 +2275,7 @@ playback_recon_warm_run::Reason RenderFrameThread::requestPlaybackReconWarm( uin
     entry.warm = true;
     entry.warmScale = scale;
     entry.warmClipGeneration = clipGeneration;
+    entry.warmStateGeneration = stateGeneration;
     m_reconRequests.push_back( entry );
     m_reconWaitCondition.wakeOne();
     return playback_recon_warm_run::Reason::None;
@@ -2301,6 +2303,7 @@ void RenderFrameThread::warmReconForWorker( const ReconQueueEntry &entry,
     const double startStageTime = mlv_stage_timing_now();
     PlaybackReconWarmDone done;
     done.clipGeneration = entry.warmClipGeneration;
+    done.stateGeneration = entry.warmStateGeneration;
     done.frameNumber = entry.request.frameNumber;
     done.outcome.scale = entry.warmScale;
     if( entry.warmRealRequestPending )
