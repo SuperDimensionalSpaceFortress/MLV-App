@@ -13,6 +13,8 @@
 
 #include "../../platform/qt/PlaybackDueWake.h"
 
+#include <QCoreApplication>
+#include <QEventLoop>
 #include <QFile>
 #include <QString>
 #include <QTextStream>
@@ -225,8 +227,59 @@ TEST(PlaybackDueWakeNative, TheNotifierFallbackIsNamedWhenTheNativePathIsNotTake
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
     ASSERT_EQ( 1, source.count( QStringLiteral(
         "\"late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11\"" ) ) );
-    ASSERT_EQ( 1, source.count( QStringLiteral(
+    ASSERT_EQ( 0, source.count( QStringLiteral(
         "m_playbackDueWakeDelivery = PlaybackDueWake::deliveryName( m_playbackDueWake->delivery() );" ) ) );
+}
+
+TEST(PlaybackDueWakeNative, AnArmThatFellBackToAQtTimerIsReportedAsQtimerAndNotHighResolution)
+{
+    // r2 adversary pass 5 A1 input: Windows, the high-resolution timer and the native-message path constructed, Play active,
+    // arm(4.25); SetWaitableTimer returns FALSE, so the arm runs on a fallback QTimer. The line printed delivery=native-msg
+    // hires=1 for that wake.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    wake.arm( 0.5 );
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::NativeMessage );
+    const bool hiResOnTheWaitableTimer = wake.hiResActive();
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    wake.setWaitableTimerFailsForTest( true );
+    wake.arm( 4.25 );
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
+    ASSERT_FALSE( wake.hiResActive() );
+    // the fallback QTimer still delivers the wake, once
+    const ULONGLONG deadline = GetTickCount64() + 500;
+    while( fired < 2 && GetTickCount64() < deadline )
+    {
+        QCoreApplication::processEvents( QEventLoop::AllEvents, 5 );
+        Sleep( 1 );
+    }
+    ASSERT_EQ( 2, fired );
+    ASSERT_EQ( 0, pumpDueWakeMessages( wake, 20 ) );   // nothing on the native path for that arm
+    // the next arm that sets the waitable timer is native again
+    wake.setWaitableTimerFailsForTest( false );
+    wake.arm( 0.5 );
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::NativeMessage );
+    ASSERT_TRUE( wake.hiResActive() == hiResOnTheWaitableTimer );
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    ASSERT_EQ( 3, fired );
+#endif
+    // MainWindow records the mechanism after EVERY arm (first and re-arm) and never keeps a "hires" a later arm lost
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    const QString arm = functionBody( source, QStringLiteral( "void MainWindow::armPlaybackDueWake( void )" ),
+                                      QStringLiteral( "void MainWindow::notePlaybackDueWakeArmMechanism( void )" ) );
+    const QString wakeBody = functionBody( source, QStringLiteral( "void MainWindow::onPlaybackDueWake( void )" ),
+                                           QStringLiteral( "void MainWindow::cancelPlaybackDueWake( void )" ) );
+    const QString note = functionBody( source, QStringLiteral( "void MainWindow::notePlaybackDueWakeArmMechanism( void )" ),
+                                       QStringLiteral( "void MainWindow::onPlaybackDueWake( void )" ) );
+    ASSERT_TRUE( arm.indexOf( QStringLiteral( "notePlaybackDueWakeArmMechanism();" ) ) >
+                 arm.indexOf( QStringLiteral( "m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );" ) ) );
+    ASSERT_TRUE( wakeBody.lastIndexOf( QStringLiteral( "notePlaybackDueWakeArmMechanism();" ) ) >
+                 wakeBody.lastIndexOf( QStringLiteral( "m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );" ) ) );
+    ASSERT_TRUE( wakeBody.lastIndexOf( QStringLiteral( "m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );" ) ) > 0 );
+    ASSERT_TRUE( note.contains( QStringLiteral( "m_playbackDueWake->lastArmDelivery()" ) ) );
+    ASSERT_TRUE( note.contains( QStringLiteral( "m_playbackDueWakeHiRes = m_playbackDueWakeHiRes && hiResSoFar;" ) ) );
 }
 
 TEST(PlaybackDueWakeA1, EveryFrameModeAdvancesOnlyPastAPresentedFrame)

@@ -30,6 +30,8 @@ struct PlaybackDueWake::Impl
     QElapsedTimer clock;
     Delivery delivery = Delivery::QtTimer;
     bool stopped = false;
+    bool lastArmQtTimer = false;          // r2 pass 5 A1: the last arm could not set the waitable timer and ran on a QTimer
+    bool failSetTimerForTest = false;
     QTimer *timer = nullptr;              // non-Windows, or Windows when no waitable timer could be created
 #ifdef Q_OS_WIN
     HANDLE handle = nullptr;
@@ -265,6 +267,7 @@ void PlaybackDueWake::arm( double dueMs )
     if( d->stopped ) return;
     if( !( dueMs > 0.0 ) ) dueMs = 0.0;
     const quint32 generation = d->gate.arm( d->clock.nsecsElapsed(), static_cast<qint64>( dueMs * 1000000.0 ) );
+    d->lastArmQtTimer = d->delivery == Delivery::QtTimer;
 #ifdef Q_OS_WIN
     d->postGeneration.store( generation, std::memory_order_release );   // before the timer can signal
     if( d->handle )
@@ -273,8 +276,14 @@ void PlaybackDueWake::arm( double dueMs )
         // relative due, in 100 ns units (negative = relative); at least one unit so the timer always signals
         const LONGLONG units = static_cast<LONGLONG>( std::ceil( dueMs * 10000.0 ) );
         due.QuadPart = -( units > 0 ? units : 1 );
-        if( SetWaitableTimer( d->handle, &due, 0, nullptr, nullptr, FALSE ) ) return;
-        // could not arm: fall through to a Qt timer for this wake (delivered as "whatever is armed now")
+        if( !d->failSetTimerForTest && SetWaitableTimer( d->handle, &due, 0, nullptr, nullptr, FALSE ) )
+        {
+            if( d->timer ) d->timer->stop();   // an earlier fallback arm's QTimer belongs to a replaced arm
+            return;
+        }
+        // could not arm: fall through to a Qt timer for this wake (delivered as "whatever is armed now"). The arm is
+        // reported as a qtimer one, low resolution, whatever the construction chose (r2 adversary pass 5 A1).
+        d->lastArmQtTimer = true;
         if( !d->timer )
         {
             QObject *owner = d->notifier ? d->notifier->parent() : nullptr;
@@ -347,6 +356,16 @@ PlaybackDueWake::Delivery PlaybackDueWake::delivery() const
     return d->delivery;
 }
 
+PlaybackDueWake::Delivery PlaybackDueWake::lastArmDelivery() const
+{
+    return d->lastArmQtTimer ? Delivery::QtTimer : d->delivery;
+}
+
+void PlaybackDueWake::setWaitableTimerFailsForTest( bool fails )
+{
+    d->failSetTimerForTest = fails;
+}
+
 const char *PlaybackDueWake::deliveryName( Delivery delivery )
 {
     switch( delivery )
@@ -397,7 +416,8 @@ void PlaybackDueWake::endPlay()
 bool PlaybackDueWake::hiResActive() const
 {
 #ifdef Q_OS_WIN
-    return d->handle && ( d->highResolution || d->periodRaised );
+    // a fallback QTimer arm is not high resolution, whatever the waitable timer was created with (r2 pass 5 A1)
+    return d->handle && !d->lastArmQtTimer && ( d->highResolution || d->periodRaised );
 #else
     return false;
 #endif

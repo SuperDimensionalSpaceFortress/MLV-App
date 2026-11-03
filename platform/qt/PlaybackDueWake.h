@@ -127,8 +127,14 @@ public:
     /*! 1 when the wake runs on a high-resolution waitable timer, or on a plain one with the resolution raised. */
     bool hiResActive() const;
 
+    /*! The path chosen at construction (native-msg, or the notifier / qtimer fallback). */
     Delivery delivery() const;
+    /*! The path the LAST arm actually used: qtimer when SetWaitableTimer failed and the arm fell back to a QTimer
+     *  (r2 adversary pass 5 A1), else delivery(). hiResActive() is false after such an arm. */
+    Delivery lastArmDelivery() const;
     static const char *deliveryName( Delivery delivery );   // "native-msg" | "notifier" | "qtimer"
+    /*! Test hook: make arm() treat SetWaitableTimer as failed (the OS failure cannot be injected otherwise). */
+    void setWaitableTimerFailsForTest( bool fails );
 
     /*! A Win32 MSG* seen by the GUI thread: true (consumed) when it is this wake's message, whether it fired or was
      *  dropped as stale. Called by the installed native event filter and the window procedure. */

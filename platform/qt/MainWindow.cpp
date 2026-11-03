@@ -19560,12 +19560,30 @@ void MainWindow::armPlaybackDueWake( void )
                                                       mlvappPlaybackDueWakePreferNativeMessage() ) );
         m_playbackDueWake->beginPlay();   // created inside a Play: on_actionPlay_toggled could not begin it
     }
-    m_playbackDueWakeDelivery = PlaybackDueWake::deliveryName( m_playbackDueWake->delivery() );
+    // r2 adversary pass 5 A1: the delivery and resolution are recorded per ARM (notePlaybackDueWakeArmMechanism), not here
     m_playbackDueWakeDueAtMs = nowMs + dueMs + kPlaybackDueWakeSlackMs;
     m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
     ++m_playbackDueWakeArmed;
+    // adversary r1 A4 + r2 pass 5 A1: what this arm actually ran on (a SetWaitableTimer failure falls back to a QTimer)
+    notePlaybackDueWakeArmMechanism();
+}
+
+// r2 adversary pass 5 A1: after every arm, record what it ACTUALLY ran on. One arm that fell back to a QTimer (SetWaitableTimer
+// failed) shows in the Play's line as "<path>+qtimer" and hires=0, so the line never reports a mechanism no arm used.
+void MainWindow::notePlaybackDueWakeArmMechanism( void )
+{
+    if( !m_playbackDueWake ) return;
+    const bool firstArmThisPlay = !m_playbackDueWakeMechanismSeen;
+    const bool hiResSoFar = firstArmThisPlay || m_playbackDueWakeHiRes;
     // adversary r1 A4: what the wake runs on during this Play (endPlay() drops a raised resolution before the summary line)
     m_playbackDueWakeHiRes = m_playbackDueWake->hiResActive();
+    m_playbackDueWakeHiRes = m_playbackDueWakeHiRes && hiResSoFar;
+    const QString used = QString::fromLatin1( PlaybackDueWake::deliveryName( m_playbackDueWake->lastArmDelivery() ) );
+    if( firstArmThisPlay )
+        m_playbackDueWakeDelivery = used;
+    else if( !m_playbackDueWakeDelivery.split( QLatin1Char( '+' ) ).contains( used ) )
+        m_playbackDueWakeDelivery += QLatin1Char( '+' ) + used;
+    m_playbackDueWakeMechanismSeen = true;
 }
 
 void MainWindow::onPlaybackDueWake( void )
@@ -19618,6 +19636,7 @@ void MainWindow::onPlaybackDueWake( void )
     ++m_playbackDueWakeRearmed;
     m_playbackDueWakeDueAtMs = rearmNowMs + dueMs + kPlaybackDueWakeSlackMs;
     m_playbackDueWake->arm( dueMs + kPlaybackDueWakeSlackMs );
+    notePlaybackDueWakeArmMechanism();   // r2 adversary pass 5 A1: a re-arm can fall back too
 }
 
 void MainWindow::cancelPlaybackDueWake( void )
@@ -19636,7 +19655,8 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeUnpresentedDeferred = 0;
     m_playbackDueWakePresentedFrame = -1;   // nothing presented in this Play yet
     m_playbackDueWakeHiRes = false;
-    m_playbackDueWakeDelivery = "none";
+    m_playbackDueWakeDelivery = QStringLiteral( "none" );
+    m_playbackDueWakeMechanismSeen = false;
     m_playbackDueWakeLatenessMs.clear();
 }
 
@@ -19664,7 +19684,7 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         .arg( p95, 0, 'f', 3 )
         .arg( m_playbackDueWakeHiRes ? 1 : 0 )
         .arg( mlvappPlaybackDueWakeEnabled() ? 0 : 1 )
-        .arg( QString::fromLatin1( m_playbackDueWakeDelivery ) )
+        .arg( m_playbackDueWakeDelivery.isEmpty() ? QStringLiteral( "none" ) : m_playbackDueWakeDelivery )
         .arg( m_playbackDueWakeUnpresentedDeferred );
 }
 

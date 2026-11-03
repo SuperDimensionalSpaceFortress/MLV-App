@@ -1201,7 +1201,8 @@ private:
     int m_playbackDueWakeBusyDeferred = 0;
     int m_playbackDueWakeUnpresentedDeferred = 0;       // r2 A1: every-frame wake held until the requested frame presented
     long long m_playbackDueWakePresentedFrame = -1;     // r2 pass 4 A1: the frame whose present last ENDED (presentPlaybackPreparedFrame)
-    const char *m_playbackDueWakeDelivery = "none";     // r2: native-msg | notifier | qtimer (summary line)
+    QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
+    bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism
     std::vector<double> m_playbackDueWakeLatenessMs;
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
@@ -1962,6 +1963,7 @@ private:
     double playbackPaceGuardFps( void );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: wake the paced advance at the frame's due time, not the next poll tick
     void armPlaybackDueWake( void );
+    void notePlaybackDueWakeArmMechanism( void );
     void onPlaybackDueWake( void );
     void cancelPlaybackDueWake( void );
     void resetPlaybackDueWakeCounters( void );
