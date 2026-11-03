@@ -524,31 +524,27 @@ void mlv_phase4bv_reset_env_cache_for_testing(void);
  * Needs memory to return to, sized: sizeof(float) * getMlvHeight(urvid) * getMlvWidth(urvid)
  * Output values will be in range 0-65535 (16 bit), float is only because AMAzE uses it */
 int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
-/* PLAYBACK-SOURCE-FRAME-IDENTITY-1: a 64-bit identity of a frame's SOURCE bytes, for the
- * --visual-capture-dir writer's visual.json source_id / source_difference. It is FNV-1a 64
- * over exactly the byte span the decoder reads for the frame (the encoded VIDF payload at
- * video_index[frameIndex].frame_offset: frame_size bytes for LJ92 and JPEG2K, the packed RAW
- * size otherwise), read under main_file_mutex[chunk] without decoding. Returns 0 and sets
- * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs,
- * MCRAW and CinemaDNG-folder sources (MLV containers only), an index out of range, a missing
- * index or file, a zero byte count, an encoded frame_size the decoder refuses (mlvRawFrameInputCapacity, r5),
- * a failed seek (r5), or a short read. Not for the playback path: it reads disk.
- * r6 (adversary A1 on a9ae667a): for LJ92 it hashes only the bytes the decoder reads
- * (mlvLj92FrameSourceHash64), so two frames that decode alike are never known to differ. */
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1: a 64-bit identity of a frame's SOURCE picture, for the
+ * --visual-capture-dir writer's visual.json source_id / source_difference. For LJ92 (r5, adversary r5 A1
+ * on e57fd03e and opus r3 B1 on 27da457e) it is FNV-1a 64 over the picture liblj92 DECODES from the
+ * frame's encoded VIDF payload (mlvLj92FrameSourceHash64), so two frames that decode alike always share
+ * an identity and two that decode differently never do (up to a 64-bit collision). Otherwise (JPEG2K,
+ * uncompressed RAW) it is FNV-1a 64 over the byte span the decoder reads (frame_size bytes for JPEG2K,
+ * the packed RAW size otherwise). The bytes are read under main_file_mutex[chunk]. Returns 0 and sets
+ * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs, MCRAW and
+ * CinemaDNG-folder sources (MLV containers only), an index out of range, a missing index or file, a zero
+ * byte count, an encoded frame_size the decoder refuses (mlvRawFrameInputCapacity, r5), a failed seek (r5),
+ * a short read, or an LJ92 frame the display decode refuses (lj92_open/lj92_decode fail, or the decoded size
+ * or bit depth is not RAWI's). Not for the playback path: it reads disk and decodes.
+ */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
-/* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: FNV-1a 64 over the fields
- * liblj92 reads -- the last DHT's 16 code counts and first sum(counts) values (the default parser does not
- * advance past a DHT, so the marker walk goes through its bytes); the last SOF3's precision, height,
- * width and component count; the SOS component count and predictor -- then every byte from the end
- * of the SOS header to the end of the payload (never stopped at an EOI: liblj92 steps over one inside
- * the entropy data, so "identical" is never false). Markers are walked as lj92.c walks them, so
- * COM/APPn and every other skipped segment, header bytes the decoder ignores (component ids,
- * selectors) and filler between markers are not hashed. Returns 0 and sets *hashOut, or nonzero
- * (no identity) for NULL inputs, a payload under 4 bytes, no SOI, EOI before the scan, no DHT or
- * SOF3 before it, a predictor over 7, or a segment length the decoder would refuse.
- * r5 (opus r3 B1): the walk runs over a private COPY on which each DHT's class/id byte is set to 0 as liblj92's
- * parseHuff sets it in the buffer it parses, so a later marker, segment length or scan header read that lands on that
- * byte reads 0, as the decoder does. The caller's payload is never written. */
+/* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: decodes a private copy with liblj92
+ * (lj92_open, then lj92_decode of every sample, no skip, no linearisation, as the display decode calls it) and
+ * returns FNV-1a 64 over the decoded width, height, component count and samples. Bytes the decoder never
+ * uses -- COM/APPn segments, header fields it ignores, a table symbol the bitstream never selects, bytes after
+ * the scan -- cannot change it; any change to the decoded picture does. Returns 0 and sets *hashOut, or
+ * nonzero (no identity) for NULL inputs, a payload under 4 bytes or over INT_MAX, or a payload liblj92 refuses.
+ * The caller's payload is never written. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
  * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves

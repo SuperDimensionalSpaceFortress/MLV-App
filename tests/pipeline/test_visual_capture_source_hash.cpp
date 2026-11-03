@@ -1,7 +1,7 @@
 // PLAYBACK-SOURCE-FRAME-IDENTITY-1: pins getMlvFrameSourceHash64, the source-frame identity the
 // --visual-capture-dir writer puts in visual.json (source_id per play frame, and the
 // source_difference verdict across them). It hashes the bytes the decoder reads for a frame
-// (the encoded VIDF payload at video_index[frame].frame_offset) without decoding, so it must be
+// (the encoded VIDF payload at video_index[frame].frame_offset; r5: for LJ92, the picture liblj92 decodes from it), so it must be
 // stable for one frame, differ between two frames of a moving clip, and refuse (nonzero, no
 // identity) every input it cannot answer for, which makes the writer omit the field.
 #include "../common/minitest.h"
@@ -71,6 +71,26 @@ uint64_t lj92Hash(const std::vector<uint8_t> & payload, int * status)
     uint64_t hash = 0;
     *status = mlvLj92FrameSourceHash64(payload.data(), payload.size(), &hash);
     return hash;
+}
+
+// r5 (adversary r5 A1 on e57fd03e, opus r3 B1 on 27da457e): the LJ92 identity FOLLOWS THE DECODED PICTURE. A payload
+// liblj92 refuses has no identity; two it decodes have equal identities exactly when their pictures are equal (equal
+// pictures sharing one is what keeps a static clip OK; different pictures never sharing one is what keeps a frozen
+// display from being waived). Returns how many of the two decoded.
+int expectIdentityFollowsPicture(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b)
+{
+    std::vector<uint16_t> aPicture;
+    std::vector<uint16_t> bPicture;
+    const bool aDecoded = decodeLj92(a, &aPicture);
+    const bool bDecoded = decodeLj92(b, &bPicture);
+    int aStatus = -1;
+    int bStatus = -1;
+    const uint64_t aHash = lj92Hash(a, &aStatus);
+    const uint64_t bHash = lj92Hash(b, &bStatus);
+    ASSERT_EQ(aDecoded, aStatus == 0);
+    ASSERT_EQ(bDecoded, bStatus == 0);
+    if (aDecoded && bDecoded) ASSERT_EQ(aPicture == bPicture, aHash == bHash);
+    return (aDecoded ? 1 : 0) + (bDecoded ? 1 : 0);
 }
 
 } // namespace
@@ -167,9 +187,9 @@ TEST(VisualCaptureSourceHash, Lj92AnEoiSpelledInTheScanHeaderNeverEndsTheHash)
 }
 
 // r8 (adversary r7 A2 on abbf1839): liblj92 reads entropy bytes by pixel count and steps over an FF D9 inside them, so
-// the hash never stops at an EOI: every byte after the SOS header counts. A picture that differs only after an FF D9 in
-// the entropy data keeps a different identity ("identical" is never false); unread bytes after the scan read "differ"
-// (the loud direction -- a FROZEN_DISPLAY a person looks at, never a frozen display waived as a static clip).
+// a picture that differs only after an FF D9 in the entropy data keeps a different identity ("identical" is never false).
+// r5 (adversary r5 A1): bytes after the scan that the decoder never uses no longer read "differ" either -- the identity is
+// the decoded picture, so a padded payload that decodes the same picture is the same source frame.
 TEST(VisualCaptureSourceHash, Lj92BytesAfterAnEoiInTheScanStillCount)
 {
     // The adversary's stream: 14-bit 64x64, one 1-bit code per category (0: diff 0, 1: diff +-1), predictor 1.
@@ -190,21 +210,23 @@ TEST(VisualCaptureSourceHash, Lj92BytesAfterAnEoiInTheScanStillCount)
     second.insert(second.end(), 511, 0x00);
     second.insert(second.end(), {0xFF, 0xD9});
     ASSERT_EQ(first.size(), second.size());
-    int status = -1;
-    const uint64_t firstHash = lj92Hash(first, &status);
-    ASSERT_EQ(0, status);
-    const uint64_t secondHash = lj92Hash(second, &status);
-    ASSERT_EQ(0, status);
-    ASSERT_TRUE(firstHash != secondHash);
+    expectIdentityFollowsPicture(first, second);
 
-    // Bytes after the scan's EOI are hashed too: conservative, never "identical" for bytes that might be read.
+    // Bytes after the scan the decoder never uses: the same picture, so the same identity (r5 A1; this assertion was
+    // "differ" under the r8 byte walk, the loud direction A1 shows fails a healthy static clip as FROZEN_DISPLAY).
     const std::vector<uint8_t> plain = encodeLj92(2048, 12288);
     std::vector<uint8_t> padded = plain;
     padded.push_back(0x00);
     padded.push_back(0x7F);
+    std::vector<uint16_t> plainPicture;
+    std::vector<uint16_t> paddedPicture;
+    ASSERT_TRUE(decodeLj92(plain, &plainPicture));
+    ASSERT_TRUE(decodeLj92(padded, &paddedPicture));
+    ASSERT_TRUE(plainPicture == paddedPicture);
+    int status = -1;
     const uint64_t plainHash = lj92Hash(plain, &status);
     ASSERT_EQ(0, status);
-    ASSERT_TRUE(lj92Hash(padded, &status) != plainHash);
+    ASSERT_TRUE(lj92Hash(padded, &status) == plainHash);
     ASSERT_EQ(0, status);
 }
 
@@ -244,12 +266,8 @@ TEST(VisualCaptureSourceHash, Lj92AScanSpelledInsideADhtIsTheScanTheDecoderUses)
                                                          kSos, { v }, zeros(511), { 0xFF, 0xD9 } });
         return bytes({ { 0xFF, 0xD8 }, kSof3, embeddedDht, n, kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
     };
-    int status = -1;
-    const uint64_t first = lj92Hash(build(0x00), &status);
-    ASSERT_EQ(0, status);
-    const uint64_t second = lj92Hash(build(0xC0), &status);
-    ASSERT_EQ(0, status);
-    ASSERT_TRUE(first != second);
+    // r5: the identity follows the picture the decoder reads from the scan it uses (asserted against liblj92 itself).
+    expectIdentityFollowsPicture(build(0x00), build(0xC0));
 }
 
 // r9 A2: a DHT value past sum(counts) is never read, so two payloads that differ only there are the same picture.
@@ -260,19 +278,16 @@ TEST(VisualCaptureSourceHash, Lj92ADhtValueBeyondTheDeclaredSymbolsIsNotHashed)
         return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02 }, zeros(15), { 0x00, 0x01, unused },
                        kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
     };
-    int status = -1;
-    const uint64_t first = lj92Hash(build(0x41), &status);
-    ASSERT_EQ(0, status);
-    const uint64_t second = lj92Hash(build(0x42), &status);
-    ASSERT_EQ(0, status);
-    ASSERT_TRUE(first == second);
-    // ...while a DECLARED symbol still counts.
-    auto declared = [&](uint8_t value)
+    expectIdentityFollowsPicture(build(0x41), build(0x42));
+    // ...while a DECLARED symbol counts exactly when the bitstream uses it (r5 A1): the all-zero entropy selects only
+    // symbol 0, so symbol 1's value cannot change the picture; a leading 1 bit selects it.
+    auto declared = [&](uint8_t value, uint8_t firstEntropyByte)
     {
         return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02 }, zeros(15), { 0x00, value, 0x41 },
-                       kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
+                       kSof3, kSos, { firstEntropyByte }, zeros(511), { 0xFF, 0xD9 } });
     };
-    ASSERT_TRUE(lj92Hash(declared(0x01), &status) != lj92Hash(declared(0x02), &status));
+    expectIdentityFollowsPicture(declared(0x01, 0x00), declared(0x02, 0x00));
+    expectIdentityFollowsPicture(declared(0x01, 0x80), declared(0x02, 0x80));
 }
 
 // r9 (pass 2 A1 on 375023ab): an over-subscribed table (two 1-bit codes and a 2-bit code) fills the four-entry LUT with
@@ -284,19 +299,60 @@ TEST(VisualCaptureSourceHash, Lj92AnOverSubscribedTablesUnreadSymbolIsNotHashed)
         return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02, 0x01 }, zeros(14), { 0x00, 0x0D, unread },
                        kSof3, kSos, zeros(64), { 0xFF, 0xD9 } });
     };
-    int status = -1;
-    const uint64_t first = lj92Hash(build(0x41), &status);
-    ASSERT_EQ(0, status);
-    const uint64_t second = lj92Hash(build(0x42), &status);
-    ASSERT_EQ(0, status);
-    ASSERT_TRUE(first == second);
-    // The second symbol of the first level IS read (LUT entries 2 and 3).
-    auto second_symbol = [&](uint8_t value)
+    expectIdentityFollowsPicture(build(0x41), build(0x42));
+    // The second symbol of the first level IS in the LUT (entries 2 and 3); it changes the picture, and so the identity,
+    // only where the bitstream selects it (r5 A1).
+    auto second_symbol = [&](uint8_t value, uint8_t firstEntropyByte)
     {
         return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02, 0x01 }, zeros(14), { 0x00, value, 0x41 },
-                       kSof3, kSos, zeros(64), { 0xFF, 0xD9 } });
+                       kSof3, kSos, { firstEntropyByte }, zeros(63), { 0xFF, 0xD9 } });
     };
-    ASSERT_TRUE(lj92Hash(second_symbol(0x0D), &status) != lj92Hash(second_symbol(0x0E), &status));
+    expectIdentityFollowsPicture(second_symbol(0x0D, 0x00), second_symbol(0x0E, 0x00));
+    expectIdentityFollowsPicture(second_symbol(0x0D, 0x80), second_symbol(0x0E, 0x80));
+}
+
+// r5 (adversary r5 A1 on e57fd03e, verbatim input): a table symbol (U) the bitstream never selects. P(1) and P(2) decode
+// to the same 64x64 two-level picture, so they are one source frame; the r9 byte walk hashed U and called them different,
+// which fails a healthy static clip as FROZEN_DISPLAY (counted=false).
+TEST(VisualCaptureSourceHash, Lj92ATableSymbolTheBitstreamNeverSelectsIsNotAnIdentity)
+{
+    // Each row: 32 zero bits (code 0 = diff 0), 10 (code 10 = 13 extra bits) 1000000000000 (+4096), 31 zero bits.
+    std::vector<uint8_t> entropy;
+    uint32_t acc = 0;
+    int nbits = 0;
+    auto put = [&](uint32_t value, int count)
+    {
+        for (int i = count - 1; i >= 0; --i)
+        {
+            acc = (acc << 1) | ((value >> i) & 1u);
+            if (++nbits == 8)
+            {
+                entropy.push_back(static_cast<uint8_t>(acc));
+                acc = 0;
+                nbits = 0;
+            }
+        }
+    };
+    for (int row = 0; row < 64; ++row)
+    {
+        put(0, 32);
+        put(0x2, 2);
+        put(0x1000, 13);
+        put(0, 31);
+    }
+    ASSERT_EQ(0, nbits);
+    auto build = [&](uint8_t u)
+    {
+        return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x01, 0x02 }, zeros(14), { 0x00, 0x0D, u },
+                       kSof3, kSos, entropy, { 0xFF, 0xD9 } });
+    };
+    ASSERT_EQ(static_cast<size_t>(675), build(0x01).size());
+    std::vector<uint16_t> first;
+    std::vector<uint16_t> second;
+    ASSERT_TRUE(decodeLj92(build(0x01), &first));
+    ASSERT_TRUE(decodeLj92(build(0x02), &second));
+    ASSERT_TRUE(first == second);
+    ASSERT_EQ(2, expectIdentityFollowsPicture(build(0x01), build(0x02)));
 }
 
 namespace
@@ -411,8 +467,9 @@ TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)
     ASSERT_NE(0, status);
     lj92Hash({0xFF, 0xD8, 0xFF, 0xD9, 0x00}, &status); // EOI before any scan
     ASSERT_NE(0, status);
-    lj92Hash(withSegmentAfterSoi(plain, {0xFF, 0xFE, 0x00, 0x01}), &status); // a segment length under 2
-    ASSERT_NE(0, status);
+    // r5: a COM of length 1 is NOT refused by liblj92 (parseBlock steps one byte and the marker search finds the DHT),
+    // so it is no longer "no identity" (the r9 walk refused it): it decodes the plain picture and has its identity.
+    ASSERT_EQ(2, expectIdentityFollowsPicture(withSegmentAfterSoi(plain, {0xFF, 0xFE, 0x00, 0x01}), plain));
     uint64_t hash = 0;
     ASSERT_NE(0, mlvLj92FrameSourceHash64(nullptr, 8, &hash));
     ASSERT_NE(0, mlvLj92FrameSourceHash64(plain.data(), plain.size(), nullptr));

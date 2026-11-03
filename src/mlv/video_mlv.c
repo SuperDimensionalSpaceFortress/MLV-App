@@ -4145,147 +4145,80 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
     return hash;
 }
 
-/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r6 (adversary A1 on a9ae667a): see video_mlv.h. The walk is
- * liblj92's own (lj92.c find / parseImage / parseBlock), so two payloads that differ only in header
- * bytes the decoder never reads -- a COM or APPn segment, any other skipped marker segment, filler
- * between markers -- hash the same and are never "known to differ". Every byte after the SOS header
- * is hashed (r8), so no byte the decoder reads is ever left out: "identical" is never false. */
-/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (opus r3 key B1 on 27da457e): the walk runs over a buffer it MAY WRITE, the way
- * liblj92 does: parseHuff sets the DHT class/id byte (huffhead[2]) to 0 in the buffer it parses, and because the default
- * parser does not advance past a DHT, the next marker search, segment length or scan header read can land on that zeroed
- * byte. Reading the ORIGINAL byte there (the old walk) put the hash's scan start 256*classid bytes after the decoder's,
- * so decoder-read entropy bytes went unhashed and two different pictures hashed equal. Every read below is of `data`
- * after the zeroing, so the walk is the decoder's walk byte for byte. */
-static int mlv_lj92_source_hash_in_place(uint8_t * data, size_t length, uint64_t * hashOut)
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (adversary r5 A1 on e57fd03e; opus r3 key B1 on 27da457e): see video_mlv.h.
+ * The LJ92 identity is the picture liblj92 DECODES from the payload, not a replay of its parser. Nine rounds of
+ * mirroring lj92.c's marker walk in a second copy each left a byte the two read differently: the zeroed DHT class/id
+ * (B1: two different pictures hashed equal, waiving FROZEN_DISPLAY) and a DHT symbol the table holds but the bitstream
+ * never uses (A1: two equal pictures hashed different, failing a static clip as FROZEN_DISPLAY). Hashing the decoder's
+ * own output makes both directions exact: equal pictures give equal identities, and different pictures differ
+ * (up to an FNV-1a 64 collision). `payload` is the caller's buffer and liblj92 writes into it (parseHuff zeroes each
+ * DHT class/id byte), exactly as it does when it decodes the frame for display. */
+static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length,
+                                         int expectedWidth, int expectedHeight, int expectedBitdepth,
+                                         uint64_t * hashOut)
 {
-    if (!data || !hashOut || length < 4) return 1;
-    /* r7 (adversary r6 A1/A2 on 1fb39703), r9 (adversary r3 A1/A2 on 9487c66f): the FIELDS liblj92 reads, walked the way
-     * its DEFAULT (non-SLOW_HUFF) parser walks them -- and the last DHT / SOF3 before the scan, as each one parsed
-     * replaces the decoder's state:
-     *   DHT  (parseHuff): the 16 code counts and the first sum(counts) values. Its length is only checked against the
-     *        payload end; the class/id byte (huffhead[2]) is overwritten with 0 IN THE BUFFER (so is it here, r5) and any later read of it reads 0; a value past
-     *        sum(counts) is never read. The default parser does NOT advance past a DHT (only SLOW_HUFF does), so the
-     *        next marker search starts AT the DHT's length field and walks through its own bytes: an FF xx inside the
-     *        counts or values is a marker the decoder acts on (r9 A1);
-     *   SOF3 (parseSof3): precision, height, width, component count (the per-component specs are not read);
-     *   SOS  (parseScan): component count and predictor -- then every byte from the END of the SOS header
-     *        (scanstart + its length) to the end of the payload (r8: never stopped at an EOI). */
-    const uint8_t * dht = NULL;
-    size_t dhtMaxbits = 0, dhtCountsRead = 0, dhtValues = 0;
-    uint8_t sofFields[6]; /* parseSof3's reads, taken when it parses: precision, height, width, component count */
-    int haveSof = 0;
-    size_t ix = 0;
-    int sawSoi = 0;
-    for (;;)
+    if (!payload || !hashOut || length < 4 || length > (size_t)INT_MAX) return 1;
+    lj92 decoder;
+    int width = 0, height = 0, bitdepth = 0, components = 0;
+    if (lj92_open(&decoder, payload, (int)length, &width, &height, &bitdepth, &components) != LJ92_ERROR_NONE)
+        return 1;
+    /* getMlvRawFrameUint16Direct's checks on what lj92_open reports, so a frame the display refuses has no identity. */
+    int ok = width > 0 && height > 0 && (components == 1 || components == 2)
+        && (size_t)width <= SIZE_MAX / (size_t)height
+        && (size_t)width * (size_t)height <= SIZE_MAX / (size_t)components;
+    const size_t samples = ok ? (size_t)width * (size_t)height * (size_t)components : 0;
+    if (ok && (samples > (size_t)INT_MAX || samples > SIZE_MAX / sizeof(uint16_t))) ok = 0;
+    if (ok && expectedWidth > 0)
+        ok = bitdepth == expectedBitdepth
+            && samples == (size_t)expectedWidth * (size_t)expectedHeight;
+    uint16_t * picture = ok ? (uint16_t *)calloc(samples, sizeof(uint16_t)) : NULL;
+    if (!picture)
     {
-        /* lj92.c find(): the next 0xFF, and the marker is the byte after it (over the zeroed buffer, as the decoder sees it). */
-        while (ix < length - 1 && data[ix] != 0xFF) ix++;
-        ix += 2;
-        if (ix >= length) return 1;
-        const uint8_t marker = data[ix - 1];
-        if (!sawSoi)
-        {
-            if (marker != 0xD8) return 1; /* findSoI */
-            sawSoi = 1;
-            continue;
-        }
-        if (marker == 0xD9) return 1; /* EOI before a scan: the decoder has no picture */
-        if (ix + 2 > length) return 1;
-        const size_t segment = ((size_t)data[ix] << 8) | (size_t)data[ix + 1];
-        if (marker == 0xDA)
-        {
-            if (!dht || !haveSof) return 1; /* the decoder has no table or no frame header to decode with */
-            if (ix + 2 >= length) return 1;
-            const size_t components = data[ix + 2];
-            const size_t predictorAt = ix + 3 + 2 * components;
-            const size_t entropyStart = ix + segment;
-            if (segment < 2 || predictorAt >= length || entropyStart > length) return 1;
-            if (data[predictorAt] > 7) return 1; /* parseScan refuses it */
-            /* r8 (adversary r7 A2 on abbf1839): to the END of the payload, never to an EOI. liblj92 reads entropy bytes
-             * by pixel count and steps over an FF D9 inside them, so stopping at one could leave read bytes unhashed and
-             * call two different pictures identical (the silent direction: it waives the frozen gate). Unread bytes
-             * after the scan can only make two alike pictures read "differ" (the loud direction). */
-            const size_t end = length;
-            uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
-            const uint8_t tableShape[2] = { (uint8_t)dhtMaxbits, (uint8_t)dhtCountsRead };
-            hash = mlv_source_hash_fnv1a64(hash, tableShape, 2);           /* huffbits, and how many counts the LUT fill consulted */
-            hash = mlv_source_hash_fnv1a64(hash, dht + 3, dhtCountsRead);  /* those counts */
-            hash = mlv_source_hash_fnv1a64(hash, dht + 19, dhtValues);     /* the symbols the LUT fill read, no more */
-            hash = mlv_source_hash_fnv1a64(hash, sofFields, 6);            /* precision, height, width, components */
-            hash = mlv_source_hash_fnv1a64(hash, data + ix + 2, 1);        /* scan component count */
-            hash = mlv_source_hash_fnv1a64(hash, data + predictorAt, 1);   /* predictor */
-            *hashOut = mlv_source_hash_fnv1a64(hash, data + entropyStart, end - entropyStart);
-            return 0;
-        }
-        if (segment < 2 || ix + segment >= length) return 1; /* parseBlock / parseHuff: corrupt */
-        if (marker == 0xC4)
-        {
-            if (segment < 19) return 1; /* the decoder reads 16 counts after the class/id byte */
-            data[ix + 2] = 0; /* parseHuff: bits[0] = 0, in the buffer it parses (r5 B1) */
-            /* r9 (adversary r3 pass 2 A1 on 375023ab): replay parseHuff's LUT fill (lj92.c, "Calculate huffman direct lut")
-             * to learn which counts and which symbols it really reads. An over-subscribed table fills the LUT before it
-             * reaches its later levels or values, so those bytes never reach the decoder and must not reach the hash. */
-            const uint8_t * bits = data + ix + 2; /* bits[k] = the code count of length k, k = 1..16 */
-            size_t maxbits = 16;
-            while (maxbits > 0 && !bits[maxbits]) maxbits--;
-            size_t lutEntry = 0, symbol = 0, repeat = 0, withinLevel = 0, level = 1;
-            size_t countsRead = 0, valuesRead = 0;
-            while (lutEntry < ((size_t)1 << maxbits) && level <= maxbits)
-            {
-                if (level > countsRead) countsRead = level;
-                if (withinLevel >= bits[level])
-                {
-                    level++;
-                    withinLevel = 0;
-                    continue;
-                }
-                if (repeat == ((size_t)1 << (maxbits - level)))
-                {
-                    repeat = 0;
-                    withinLevel++;
-                    symbol++;
-                    continue;
-                }
-                if (symbol + 1 > valuesRead) valuesRead = symbol + 1;
-                lutEntry++;
-                repeat++;
-            }
-            if (ix + 19 + valuesRead > length) return 1; /* the lookup table would read past the payload */
-            dht = data + ix;
-            dhtMaxbits = maxbits;
-            dhtCountsRead = countsRead;
-            dhtValues = valuesRead;
-            /* No `ix += segment`: the default parseHuff leaves ix at the length field. */
-        }
-        else
-        {
-            if (marker == 0xC3)
-            {
-                if (segment < 8) return 1; /* parseSof3 reads up to ix + 7 */
-                memcpy(sofFields, data + ix + 2, sizeof sofFields);
-                haveSof = 1;
-            }
-            ix += segment;
-        }
+        lj92_close(decoder);
+        return 1;
     }
+    /* The display decode's call: one row of every sample, no skip, no linearisation table. */
+    const int ret = lj92_decode(decoder, picture, (int)samples, 0, NULL, 0);
+    lj92_close(decoder);
+    if (ret != LJ92_ERROR_NONE)
+    {
+        free(picture);
+        return 1;
+    }
+    uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+    const uint8_t shape[9] = { (uint8_t)(width >> 24), (uint8_t)(width >> 16), (uint8_t)(width >> 8), (uint8_t)width,
+                               (uint8_t)(height >> 24), (uint8_t)(height >> 16), (uint8_t)(height >> 8), (uint8_t)height,
+                               (uint8_t)components };
+    hash = mlv_source_hash_fnv1a64(hash, shape, sizeof shape);
+    for (size_t i = 0; i < samples; ++i)
+    {
+        const uint8_t sample[2] = { (uint8_t)(picture[i] & 0xFFu), (uint8_t)(picture[i] >> 8) };
+        hash = mlv_source_hash_fnv1a64(hash, sample, 2);
+    }
+    free(picture);
+    *hashOut = hash;
+    return 0;
 }
 
-/* The const entry point walks a private copy, so the caller's payload is never written. */
+/* The const entry point decodes a private copy (with the 4 zeroed look-ahead bytes the display decode's buffer
+ * also has), so the caller's payload is never written. No expected size: the picture lj92_open reports is hashed. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut)
 {
-    if (!data || !hashOut || length < 4) return 1;
-    uint8_t * copy = (uint8_t *)malloc(length);
+    if (!data || !hashOut || length < 4 || length > (size_t)INT_MAX) return 1;
+    uint8_t * copy = (uint8_t *)calloc(length + 4u, 1);
     if (!copy) return 1;
     memcpy(copy, data, length);
-    const int status = mlv_lj92_source_hash_in_place(copy, length, hashOut);
+    const int status = mlv_lj92_decoded_picture_hash(copy, length, 0, 0, 0, hashOut);
     free(copy);
     return status;
 }
 
 /* PLAYBACK-SOURCE-FRAME-IDENTITY-1: see video_mlv.h. Reads the same byte span
  * getMlvRawFrameUint16Direct reads for an MLV frame, under the same per-chunk
- * mutex, into its own bounded buffer; it never decodes, never touches the
- * prefetch ring, the per-thread telemetry or video->VIDF. */
+ * mutex, into its own bounded buffer; it never touches the prefetch ring, the
+ * g_mlv_last_raw_uint16_* telemetry or video->VIDF. r5: an LJ92 frame is decoded with
+ * liblj92 into a private picture (never the display's buffers) and that picture is hashed;
+ * liblj92's own per-thread last-decode state on the CALLING thread is updated, as any decode updates it. */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut)
 {
     if (!video || !hashOut) return 1;
@@ -4327,18 +4260,21 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
 
     if (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
     {
-        /* r6 (adversary A1 on a9ae667a): the whole payload (the decoder reads it whole too), then
-         * only the bytes liblj92 reads are hashed (mlvLj92FrameSourceHash64). */
-        uint8_t * payload = (uint8_t *)malloc(byte_count);
+        /* r5 (adversary r5 A1 on e57fd03e): the whole payload, decoded as the display decodes it, and the
+         * decoded picture hashed (mlv_lj92_decoded_picture_hash). The buffer is the display decode's shape:
+         * frame_size bytes plus 4 look-ahead bytes (zeroed here, so the identity is deterministic). */
+        uint8_t * payload = (uint8_t *)calloc(byte_count + 4u, 1);
         if (!payload) return 1;
         pthread_mutex_lock(video->main_file_mutex + chunk);
         /* r5: a failed seek is no identity (the read after it would hash whatever the stream was positioned on). */
         const int seekFailed = file_set_pos(video->file[chunk], entry->frame_offset, SEEK_SET) != 0;
         const size_t got = seekFailed ? 0 : fread(payload, 1, byte_count, video->file[chunk]);
         pthread_mutex_unlock(video->main_file_mutex + chunk);
-        /* payload is this function's own buffer, so the walk zeroes class/id bytes in it the way parseHuff does (r5 B1). */
+        /* payload is this function's own buffer: liblj92 may write into it, as it writes into raw_frame. The
+         * expected size and bit depth are the display decode's (RAWI), so a frame it refuses has no identity. */
         const int lj92Failed = seekFailed || got != byte_count
-            || mlv_lj92_source_hash_in_place(payload, byte_count, hashOut) != 0;
+            || mlv_lj92_decoded_picture_hash(payload, byte_count, video->RAWI.xRes, video->RAWI.yRes,
+                                             video->RAWI.raw_info.bits_per_pixel, hashOut) != 0;
         free(payload);
         return lj92Failed ? 1 : 0;
     }

@@ -125,13 +125,13 @@ too. Display-side hashes cannot tell the two apart (a frozen display freezes the
 Play has stopped (step (4) of the capture block, never in the timed window or the tail), for each distinct `display_frame` of
 the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
 `video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
-own mutex, without decoding, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). For LJ92 it
-hashes only the fields liblj92 reads (`mlvLj92FrameSourceHash64`): the last DHT's table, the last SOF3's precision and size, the
-SOS component count and predictor, then every byte from the end of the SOS header to the end of the payload. COM, APPn and every
-other skipped segment, header bytes the decoder ignores and filler between markers are left out, so those never make two frames
-"known to differ". The tail is never cut at an EOI, because liblj92 steps over an `FF D9` inside the entropy data. "known
-identical" is therefore never false. Unread bytes after the scan can still read "differ", the loud direction: a FROZEN_DISPLAY
-someone looks at, never a frozen display waived as a static clip.
+own mutex, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). For LJ92 (r5) it decodes the
+payload with liblj92, as the display decodes it, and hashes the decoded picture (`mlvLj92FrameSourceHash64`). Two frames that
+decode to the same picture always share an identity, and two that decode differently never do (up to a 64-bit collision):
+bytes the decoder never uses -- COM/APPn segments, ignored header fields, a table symbol the bitstream never selects, bytes
+after the scan -- cannot make a static clip read "known to differ", and no byte the decoder uses can make two pictures read
+"known identical". (Rounds r6-r9 replayed the decoder's marker walk instead, and each replay missed a byte it reads
+differently: the DHT class/id byte liblj92 zeroes in place, and a table symbol the bitstream never selects.)
 
 * `frames[].source_id` (play entries only, both the forced `play` and the unforced `play_unbound` captures -- the frozen check is
   judged on the unforced ones whenever they exist): that hash as 16 lowercase hex digits. Absent when it could not be read.
