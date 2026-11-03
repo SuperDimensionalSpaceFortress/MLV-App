@@ -309,7 +309,8 @@ TEST(CudaLaunchTiming, AnchorTryAcrossAWallClockStepIsUnusable)
     ASSERT_NEAR(-1.0, bracket, 0.0);
     // A clean try: the bracket is the longer of the two intervals (here the wall one).
     ASSERT_EQ(1, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.127, 5000.0, 5000.125, &bracket));
-    ASSERT_NEAR(0.127, bracket, 1e-6);
+    // r3: at 1.79e12 ms a double's step is 2^-12 ms, so the wall interval is the representable one.
+    ASSERT_NEAR(1791774588000.127 - 1791774588000.0, bracket, 1e-9);
 }
 
 TEST(CudaLaunchTiming, AnchorBracketCoversTheWallClockAnchor)
@@ -633,8 +634,9 @@ TEST(CudaLaunchTiming, OffCostsOneCachedTestPerSite)
     ASSERT_TRUE(header.contains(QStringLiteral(
         "        live_backends_ += 1;\n        if (!anchor_tried_)\n        {\n            anchor_tried_ = true;\n"
         "            establish_anchor_locked();")));
-    ASSERT_TRUE(header.contains(QStringLiteral("inline void record_span(const char * stage, cudaEvent_t t0, cudaEvent_t mark0, cudaEvent_t mark1,\n"
-                                               "                        cudaEvent_t t1, double ms)\n{\n    if (!enabled()) return;")));
+    // Adversary r2 pass 3 A5: the pin follows record_span's signature since pass 2 (issue_utc after stage).
+    ASSERT_TRUE(header.contains(QStringLiteral("inline void record_span(const char * stage, double issue_utc, cudaEvent_t t0, cudaEvent_t mark0,\n"
+                                               "                        cudaEvent_t mark1, cudaEvent_t t1, double ms)\n{\n    if (!enabled()) return;")));
     ASSERT_TRUE(header.contains(QStringLiteral("if (!enabled()) return;\n        active_ = Recorder::get().begin_kernel(pending_, stage, dim3(0, 0, 0)")));
 }
 
