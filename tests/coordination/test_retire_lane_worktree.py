@@ -3702,6 +3702,97 @@ def test_r8_pass10_a1_a_cached_record_stamp_is_re_read_before_it_proves_reuse(tm
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
 
 
+# --- r9 (Dot B2, cos-feedback pr-744 2026-11-03T17:15:09Z on 25e1dd9b; hub ACK issuecomment-6610883431): the identity is cached per pid (:1015-1032)
+# and the reuse proof re-read the record and compared its NEW stamp to that STALE identity (:1038-1047). Reuse is proven only by ONE consistent pair:
+# read the record, read the live creation time, re-read the record byte-unchanged. A changed record, or a cached identity the live read disagrees with,
+# is UNCERTAIN = HOLDER.
+
+def _r9_live_sequence(pid, first, rest):
+    """Get-LivePidIdentity seam: the FIRST query for $pid answers (name, epoch) `first`, every later query answers `rest`."""
+    def one(nm_ep):
+        return f"[pscustomobject]@{{ Name = '{nm_ep[0]}'; CreationDate = {_utc_expr(nm_ep[1])} }}"
+    return ("$global:r9q = 0; function Get-LivePidIdentity { param([int]$ProcessId) "
+            f"if ($ProcessId -ne {pid}) {{ return $null }}; $global:r9q++; if ($global:r9q -eq 1) {{ return {one(first)} }}; return {one(rest)} }};")
+
+
+def _r9_reads_change(path, from_read, text):
+    """Read-RunDirRecordText seam: read number `from_read` (1-based) of `path` and every later one return `text`; earlier reads see the file."""
+    p = str(path).replace("'", "''")
+    t = text.replace("'", "''")
+    return ("$global:r9r = 0; function Read-RunDirRecordText { param([string]$Path) "
+            f"if ($Path -eq '{p}') {{ $global:r9r++; if ($global:r9r -ge {from_read}) {{ return '{t}' }} }}; return Read-SharedText -Path $Path }};")
+
+
+def test_r9_dot_b2_a_record_re_stamped_after_the_identity_query_is_not_a_reuse_proof(tmp_path):
+    """Dot B2 (:1015-1032, :1038-1047, :1071): the index reads new.child.json as P/T0; the per-pid query answers an unrelated P/T1 (git.exe), which
+    exits; a genuine driver reuses P at T2 and re-stamps the same tied record P/T2. T0, T1 and T2 are pairwise > 5 s apart, and the command line
+    names nothing. Comparing the re-read T2 to the cached T1 'proved' reuse and freed the worktree. The record changed, so the tie is uncertain: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.child.json"
+    t0, t1, t2 = now - 7200, now - 3600, now - 60
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(t0)}, now - 7000)
+    fresh = json.dumps({"pid": 999972, "createdUtc": _iso(t2)}).replace("'", "''")
+    row = _fake_proc_created(999972, "", "git.exe", t1)
+    prelude = (_r9_live_sequence(999972, ("git.exe", t1), ("pwsh.exe", t2))
+               + f" $snap = ({_fake_snapshot(row)}); $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}'; "
+               f"[IO.File]::WriteAllText('{rec}', '{fresh}');")
+    r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("precached", [True, False], ids=["index-cached-before-the-call", "index-built-in-the-call"])
+def test_r9_an_unchanged_stamped_record_and_a_different_live_creation_still_prove_reuse(tmp_path, precached):
+    """r9 control (hub B2 rule): the stamped record is byte-unchanged across the re-read and every live query answers the same process, created
+    long after the stamp. That is one consistent pair, so genuine reuse is still proven: free."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    stamp, live = now - 7200, now - 30
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(stamp)}, now - 7000)
+    row = _fake_proc_created(999972, "", "git.exe", live)
+    prelude = _r9_live_sequence(999972, ("git.exe", live), ("git.exe", live)) + f" $snap = ({_fake_snapshot(row)});"
+    if precached:
+        prelude += f" $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}';"
+    r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    assert r is None, (r, err)
+
+
+@pytest.mark.parametrize("from_read,stamp_shift,extra", [
+    (2, 1800, False),   # re-stamped after the index read, before the pair (the start head's one re-read sees it)
+    (3, 1800, False),   # re-stamped between the pair's two reads
+    (3, 0, True),       # same stamp, other bytes, between the pair's two reads
+], ids=["re-stamped-before-the-pair", "re-stamped-inside-the-pair", "content-changed-inside-the-pair"])
+def test_r9_a_record_changed_between_reads_is_uncertain_even_when_the_identities_match(tmp_path, from_read, stamp_shift, extra):
+    """r9 (hub B2 rule): every live query answers the same process (cached and live identities agree), and both the original and the changed record
+    state a stamp that differs from it. The record changed between reads, so no consistent pair exists: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.child.json"
+    stamp, live = now - 7200, now - 30
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(stamp)}, now - 7000)
+    changed = {"pid": 999972, "createdUtc": _iso(stamp + stamp_shift)}
+    if extra:
+        changed["state"] = "running"
+    row = _fake_proc_created(999972, "", "git.exe", live)
+    prelude = (_r9_live_sequence(999972, ("git.exe", live), ("git.exe", live))
+               + _r9_reads_change(rec, from_read, json.dumps(changed)))
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("pid_name", ["git.exe", "pwsh.exe"], ids=["same-image", "other-image"])
+def test_r9_a_live_identity_that_disagrees_with_the_cached_one_is_uncertain(tmp_path, pid_name):
+    """r9 (hub B2 rule, 'cached and live identities disagree'): the record is unchanged and states T0; the first query answers git.exe/T1 and the
+    pair's live read answers <image>/T2 (the pid changed process between queries). Two queries are not one consistent pair: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    t0, t1, t2 = now - 7200, now - 3600, now - 60
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(t0)}, now - 7000)
+    row = _fake_proc_created(999972, "", "git.exe", t1)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=_r9_live_sequence(999972, ("git.exe", t1), (pid_name, t2)))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
 @pytest.mark.parametrize("doc", [
     '{"pid":999972,"createdUtc":"12:00"}',                                                   # time only: TryParse invents today's date
     '{"pid":999972,"createdUtc":"2026-11-01"}',                                              # date only

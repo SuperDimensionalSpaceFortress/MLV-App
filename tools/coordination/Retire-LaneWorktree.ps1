@@ -287,7 +287,8 @@ $script:RunDirTieMaxBytes = 1048576
 # pass found a new clock or stale-row boundary). The rule in Find-RunDirDriverHolders is now:
 #   A live pid named by a record in a run dir tied to the worktree is a HOLDER unless reuse is POSITIVELY PROVEN, and the ONLY proof is: the record
 #   carries a kernel process-creation stamp (createdUtc, containment.<x>CreatedUtc) AND the pid's CURRENT creation time, read by a per-pid query at
-#   decision time (Get-LivePidIdentity), differs from it by more than RunDirPidCreatedSlackSec.
+#   decision time (Get-LivePidIdentity), differs from it by more than RunDirPidCreatedSlackSec. r9 (Dot B2): the stamp and the creation time must be
+#   ONE consistent pair (record read, live read, record re-read unchanged, all agreeing with the cached reads); otherwise the tie is uncertain = HOLDER.
 #   - No wall-clock or snapshot-age comparison (record write time, snapshot capture time) is part of the per-record decision, so a clock step,
 #     forward or backward, cannot turn a record into a reuse proof. (Pre-existing, not changed here: which run dirs and receipts are READ at all is
 #     bounded by RunDirMaxAgeDays / RunDirReceiptMaxAgeHours against the wall clock - advisory A4 of pass 10.)
@@ -995,6 +996,7 @@ function Find-RunDirDriverHolders {
     #   3. else HOLDER when the record's run dir names the worktree, UNLESS the record carries a creation stamp and the identity's creation time is
     #      readable and differs from it (Test-RecordedCreatedMismatch): the only proof of reuse, and it rejects only the record that states it.
     #      The proof is re-read from the record at decision time ($reuseProven); a stamp must be complete ISO 8601 with a zone (ConvertTo-RecordedUtc).
+    #      r9 (Dot B2): the proof is one consistent pair (record, live identity, record unchanged); any disagreement is uncertain = HOLDER.
     # No record write time, snapshot capture time, image or non-matching command line takes part, so a clock step or a stale row (the pid's previous
     # holder) can never free a worktree. False refusals are accepted: the next sweep asks again (ruling f).
     param([string]$WorktreePath, [object]$Snapshot, [string]$RunsRoot)
@@ -1016,7 +1018,12 @@ function Find-RunDirDriverHolders {
     $identity = @{}
     $identityOf = {
         param([int]$P)
-        if ($identity.ContainsKey($P)) { return $identity[$P] }
+        if (-not $identity.ContainsKey($P)) { $identity[$P] = & $readIdentity $P }
+        return $identity[$P]
+    }
+    # The uncached read: the pair in $reuseProven calls it again after its first record read (r9, Dot B2).
+    $readIdentity = {
+        param([int]$P)
         $id = $null
         $f = Get-LivePidIdentity -ProcessId $P
         if ($null -ne $f) {
@@ -1028,23 +1035,52 @@ function Find-RunDirDriverHolders {
             $rc = $byPid[$P].PSObject.Properties['CreationDate']
             $id = [pscustomobject]@{ Name = [string]$byPid[$P].Name; CreationDate = $(if ($rc -and $rc.Value -is [datetime]) { ([datetime]$rc.Value).ToUniversalTime() } else { $null }) }
         }
-        $identity[$P] = $id
         return $id
     }
+    # The complete stamp a record's text states for pid $P, or $null (gone, unreadable, ambiguous, no longer naming the pid, unstamped).
+    $stampIn = {
+        param([object]$Text, [int]$P)
+        if ($null -eq $Text) { return $null }
+        $pm = Get-RecordPidMembers ([string]$Text)
+        if ($pm.Ambiguous -or -not (@($pm.Pids) -contains $P)) { return $null }
+        $map = Get-RecordedCreatedUtcMap -Text ([string]$Text) -Members $pm
+        if (-not $map.ContainsKey($P) -or $map[$P] -isnot [datetime]) { return $null }
+        return [datetime]$map[$P]
+    }
+    # Two identity reads name the same process: same image name and the same readable creation time, exactly.
+    $sameIdentity = {
+        param($A, $B)
+        if ($null -eq $A -or $null -eq $B) { return $false }
+        if (-not [string]::Equals([string]$A.Name, [string]$B.Name, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if ($A.CreationDate -isnot [datetime] -or $B.CreationDate -isnot [datetime]) { return $false }
+        return ([datetime]$A.CreationDate -eq [datetime]$B.CreationDate)
+    }
     # r8 (pass-10 A1): the index may be a cache from an earlier read (a sweep's shared snapshot, the gate's -ReuseRunIndex retry), and the record can
-    # have been rewritten since (a replacement driver's own stamp). A reuse proof is therefore RE-READ from the record at decision time: it stands only
-    # when the record read now still names the pid with a complete stamp that differs from the identity. Gone, unreadable, ambiguous, no longer naming
-    # the pid, unstamped or matching: no proof (fail toward holder).
+    # have been rewritten since (a replacement driver's own stamp), so the proof is re-read from the record at decision time.
+    # r9 (Dot B2, hub B2 rule): and $id is itself a cache (the first query for this pid in this call). Comparing a re-read stamp to it compares two
+    # reads taken at different moments: an unrelated process P/T1 answered the query, exited, and a genuine driver reused P and re-stamped the record
+    # P/T2; T2 vs T1 'proved' reuse. Reuse is proven ONLY by ONE consistent pair, in this order:
+    #   1. read the record: it names the pid with a complete stamp S, and S is the stamp the index holds ($rec.RecordedCreatedUtc);
+    #   2. read the live identity again (uncached): it is the same process as $id (name and creation time);
+    #   3. re-read the record: its text is ordinal-equal to read 1 (one deterministic decoder, so equal text = the same evidence);
+    #   4. S differs from that live creation time (Test-RecordedCreatedMismatch).
+    # Anything else (a changed stamp or record, a live read that disagrees with the cached one, a read that fails) is UNCERTAIN = HOLDER. A second
+    # identity query on its own is not atomic; it counts only inside this pair, bracketed by two equal record reads.
     $reuseProven = {
         param($rec, $id)
         if (-not (Test-RecordedCreatedMismatch -Proc $id -Record $rec)) { return $false }
-        $now = $null
-        try { $now = Read-RunDirRecordText -Path (Join-Path $rec.RunDir $rec.File) } catch { return $false }
-        $pm = Get-RecordPidMembers $now
-        if ($pm.Ambiguous -or -not (@($pm.Pids) -contains [int]$rec.Pid)) { return $false }
-        $map = Get-RecordedCreatedUtcMap -Text $now -Members $pm
-        if (-not $map.ContainsKey([int]$rec.Pid)) { return $false }
-        return [bool](Test-RecordedCreatedMismatch -Proc $id -Record ([pscustomobject]@{ RecordedCreatedUtc = $map[[int]$rec.Pid] }))
+        $path = Join-Path $rec.RunDir $rec.File
+        $P = [int]$rec.Pid
+        $t1 = $null
+        try { $t1 = Read-RunDirRecordText -Path $path } catch { return $false }
+        $s = & $stampIn $t1 $P
+        if ($null -eq $s -or $s -ne [datetime]$rec.RecordedCreatedUtc) { return $false }
+        $live = & $readIdentity $P
+        if (-not (& $sameIdentity $id $live)) { return $false }
+        $t2 = $null
+        try { $t2 = Read-RunDirRecordText -Path $path } catch { return $false }
+        if ($null -eq $t2 -or -not [string]::Equals([string]$t1, [string]$t2, [StringComparison]::Ordinal)) { return $false }
+        return [bool](Test-RecordedCreatedMismatch -Proc $live -Record ([pscustomobject]@{ RecordedCreatedUtc = $s }))
     }
     $ties = @{}
     $tiedOf = {
