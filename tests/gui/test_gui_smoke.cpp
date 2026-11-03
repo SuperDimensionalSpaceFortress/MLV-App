@@ -654,6 +654,7 @@ private slots:
     void gpuScopeTapCountsOnlyDroppedRequestsAndInvalidateDropsStaleReadBacks();
     void gpuScopeTapNeverPublishesAReadBackWhoseGlSequenceRaisedAnError();
     void gpuScopeTapRefusedOrFailingTapFallsBackToTheCpuScopeFeed();
+    void gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedFramebuffer();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1550,8 +1551,10 @@ public:
     GLenum blitError = GL_NO_ERROR;                 // raised by glBlitFramebuffer
     GLenum bufferDataError = GL_NO_ERROR;           // raised by glBufferData (the store is then left as it was)
     GLenum readPixelsError = GL_NO_ERROR;           // raised by glReadPixels (the store is then left as it was)
+    GLenum genFramebuffersError = GL_NO_ERROR;      // r5: raised by glGenFramebuffers, which then leaves the name 0
     uint8_t picture[4] = { 255, 0, 0, 255 };        // RGBA of the picture a successful read copies
     int readPixelsCalls = 0;
+    std::vector<GLuint> blitDrawTargets;            // r5: the draw framebuffer bound at each blit (0 = the displayed one)
 
     GLenum glGetError() override
     {
@@ -1564,13 +1567,22 @@ public:
     void glDeleteRenderbuffers(GLsizei, const GLuint *) override {}
     void glBindRenderbuffer(GLenum, GLuint) override {}
     void glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei) override { raise(renderbufferError); }
-    void glGenFramebuffers(GLsizei n, GLuint *names) override { gen(n, names); }
+    void glGenFramebuffers(GLsizei n, GLuint *names) override
+    {
+        if ( genFramebuffersError != GL_NO_ERROR ) { raise(genFramebuffersError); return; }
+        gen(n, names);
+    }
     void glDeleteFramebuffers(GLsizei, const GLuint *) override {}
-    void glBindFramebuffer(GLenum, GLuint) override {}
+    void glBindFramebuffer(GLenum target, GLuint name) override
+    {
+        if ( target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER ) m_drawFramebuffer = name;
+    }
     void glFramebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint) override {}
-    GLenum glCheckFramebufferStatus(GLenum) override { return framebufferStatus; }
+    // The default framebuffer (0) is complete, as a driver reports it: completeness alone cannot prove the tap's own FBO.
+    GLenum glCheckFramebufferStatus(GLenum) override { return m_drawFramebuffer == 0 ? GLenum(GL_FRAMEBUFFER_COMPLETE) : framebufferStatus; }
     void glBlitFramebuffer(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) override
     {
+        blitDrawTargets.push_back(m_drawFramebuffer);
         raise(blitError);
     }
     void glGenBuffers(GLsizei n, GLuint *names) override { gen(n, names); }
@@ -1605,6 +1617,7 @@ private:
     void raise(GLenum e) { if ( e != GL_NO_ERROR ) errors.push_back(e); }
     GLuint m_nextName = 0;
     GLuint m_bound = 0;
+    GLuint m_drawFramebuffer = 0;
     int m_fenceToken = 0;
     QMap<GLuint, std::vector<uint8_t>> m_stores;
 };
@@ -1749,6 +1762,45 @@ void GuiSmokeTest::gpuScopeTapRefusedOrFailingTapFallsBackToTheCpuScopeFeed()
         QVERIFY(!tap.usable());
         QVERIFY(!servesWith(tap, context));
     }
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 on 1d3ea3f5, GpuScopeTap.cpp:193): glGenFramebuffers raises
+// GL_OUT_OF_MEMORY and leaves the name 0, then every later call succeeds. Completeness was checked on framebuffer 0 (the
+// displayed one, which is complete) and the setup error was drained before the blit. So the tap blitted the frame into
+// the displayed framebuffer and published it. A tap setup that raised an error, or produced no name, is a failed
+// request: no blit, no read, nothing published. It counts as a GL failure (kGlFailureLimit in a row: CPU scope feed).
+// The next request sets up afresh, and a clean one publishes.
+void GuiSmokeTest::gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedFramebuffer()
+{
+    int contextToken = 0;
+    const QOpenGLContext *context = reinterpret_cast<const QOpenGLContext *>(&contextToken);
+    GpuScopeTap tap("window");
+    tap.m_supportContext = context;
+    tap.m_supportCached = true;
+    FakeScopeTapGl gl;
+    gl.genFramebuffersError = GL_OUT_OF_MEMORY;
+    std::vector<uint8_t> rgb8;
+    QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(gl.blitDrawTargets.empty());        // never into framebuffer 0, nor anywhere
+    QCOMPARE(gl.readPixelsCalls, 0);
+    QCOMPARE(tap.counters().completed, quint64(0));
+    QCOMPARE(tap.counters().glErrors, quint64(1));
+    QVERIFY(tap.usable());                      // one failure is not yet a fallback
+    for ( int i = 1; i < GpuScopeTap::kGlFailureLimit; ++i )
+        QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(gl.blitDrawTargets.empty());
+    QVERIFY(!tap.usable());
+    QVERIFY(!tap.supportedCached(context));    // the CPU scope feed takes over
+
+    // A new context sets up afresh: with glGenFramebuffers working the tap blits into its own FBO and publishes.
+    tap.destroy(false);
+    tap.m_supportContext = context;
+    tap.m_supportCached = true;
+    gl.genFramebuffersError = GL_NO_ERROR;
+    QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QCOMPARE(int(gl.blitDrawTargets.size()), 1);
+    QVERIFY(gl.blitDrawTargets[0] != 0);
+    QCOMPARE(tap.counters().completed, quint64(1));
 }
 
 // PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: GpuScopeTap's no-GL state, shared by the viewport and GpuDisplayWindow.
@@ -3088,7 +3140,9 @@ QByteArray read_rgba16_texture(QOpenGLFunctions *gl, GLuint textureId, int width
     gl->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureId, 0);
     QByteArray bytes;
-    if (gl->glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 sibling): a framebuffer that was never generated (0) is the
+    // displayed one, whose status reads complete; reading it would return the window, not the texture.
+    if (fbo != 0 && gl->glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
         bytes.resize(width * height * 4 * static_cast<int>(sizeof(uint16_t)));
         gl->glPixelStorei(GL_PACK_ALIGNMENT, 1);
         gl->glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT, bytes.data());

@@ -180,6 +180,14 @@ void GpuScopeTap::issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &so
     }
     const QSize tapSize = playbackScopeTapSize(source.width(), source.height(), m_maxWidth);
 
+    // r4 (adversary r3 A1 on b99325e7): every GL call from here to the fence is error-checked, and a read-back whose
+    // sequence raised an error is discarded -- no fence, no serial, never published. A failed blit or glReadPixels can
+    // leave the reused PBO holding the PREVIOUS picture, which would otherwise map cleanly and publish as this one.
+    // Errors left pending by other code are drained first (bounded), so they are not blamed on this read.
+    // r5 (adversary r4 A1 on 1d3ea3f5): drained BEFORE the tap's own FBO setup, not after it, so a setup error is never
+    // drained away -- it is this request's own failure.
+    for ( int drained = 0; drained < 8 && gl->glGetError() != GL_NO_ERROR; ++drained ) {}
+
     if ( !m_fbo || m_fboWidth != tapSize.width() || m_fboHeight != tapSize.height() )
     {
         if ( m_fbo ) gl->glDeleteFramebuffers(1, &m_fbo);
@@ -194,17 +202,27 @@ void GpuScopeTap::issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &so
         gl->glBindFramebuffer(GL_FRAMEBUFFER, m_fbo);
         gl->glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_color);
         const GLenum status = gl->glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        // r5 (adversary r4 A1 on 1d3ea3f5): a setup call that raised an error, or a name that was never generated, is
+        // a failed setup even when the status reads complete. glGenFramebuffers that fails leaves the name 0, and the
+        // status of framebuffer 0 is the DISPLAYED framebuffer's (complete), so the blit would draw into the picture.
+        const GLenum setupError = gl->glGetError();
         gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
-        if ( status != GL_FRAMEBUFFER_COMPLETE )
+        const bool incomplete = status != GL_FRAMEBUFFER_COMPLETE;
+        if ( incomplete || setupError != GL_NO_ERROR || !m_fbo || !m_color )
         {
-            gl->glDeleteFramebuffers(1, &m_fbo);
-            gl->glDeleteRenderbuffers(1, &m_color);
+            if ( m_fbo ) gl->glDeleteFramebuffers(1, &m_fbo);
+            if ( m_color ) gl->glDeleteRenderbuffers(1, &m_color);
             m_fbo = 0;
             m_color = 0;
             m_fboWidth = 0;
             m_fboHeight = 0;
             ++m_counters.skipped;
-            noteGlFailure("fbo_incomplete", true);
+            if ( incomplete ) noteGlFailure("fbo_incomplete", true);
+            else
+            {
+                ++m_counters.glErrors;
+                noteGlFailure("fbo_setup", false);
+            }
             return;
         }
         m_fboWidth = tapSize.width();
@@ -215,18 +233,15 @@ void GpuScopeTap::issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &so
     const int bytes = tapSize.width() * tapSize.height() * 4;
     if ( !slot.pbo ) gl->glGenBuffers(1, &slot.pbo);
 
-    // r4 (adversary r3 A1 on b99325e7): every GL call from here to the fence is error-checked, and a read-back whose
-    // sequence raised an error is discarded -- no fence, no serial, never published. A failed blit or glReadPixels can
-    // leave the reused PBO holding the PREVIOUS picture, which would otherwise map cleanly and publish as this one.
-    // Errors left pending by other code are drained first (bounded), so they are not blamed on this read.
-    for ( int drained = 0; drained < 8 && gl->glGetError() != GL_NO_ERROR; ++drained ) {}
+    // r4: one check below covers the PBO name, the binds and the blit (the r4 drain now runs before the FBO setup).
     gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFbo);
     gl->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo);
     gl->glBlitFramebuffer(source.left(), source.top(), source.left() + source.width(), source.top() + source.height(),
                           0, 0, tapSize.width(), tapSize.height(), GL_COLOR_BUFFER_BIT, GL_LINEAR);
     gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, m_fbo);
     gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
-    if ( gl->glGetError() != GL_NO_ERROR )
+    // r5 (A1 sibling): no PBO name means glReadPixels would write to client address 0, so it fails like an error.
+    if ( gl->glGetError() != GL_NO_ERROR || !slot.pbo )
     {
         gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
