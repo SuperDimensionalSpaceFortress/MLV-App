@@ -65,6 +65,14 @@ struct IgpuLtRecord
     double ms;             /* < 0: no duration (an error before it resolved) */
     int err;               /* cudaError_t value; 0 = success */
     const char * err_name; /* NULL when err == 0 */
+    /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: device-clock stamps, Unix epoch ms, set only when
+     * the pair resolved against the DLL's anchor event (anchor_utc_ms + cudaEventElapsedTime
+     * from the anchor). has_dev == 0 leaves the line byte-identical to the format without them. */
+    int has_dev;
+    double dev_t0_utc_ms;  /* the start event */
+    double dev_t1_utc_ms;  /* the stop event */
+    int dev_marks;         /* 0, or 2: inner marks (recon kind=span stage=run: ev_after_up, ev_after_kernel) */
+    double dev_mark_utc_ms[2];
 };
 
 struct IgpuLtStats
@@ -207,13 +215,22 @@ static inline int igpu_lt_format_record(char * out, std::size_t cap, const IgpuL
     char err[96] = "";
     if (r.err != 0)
         std::snprintf(err, sizeof(err), " err=%d err_name=%s", r.err, r.err_name ? r.err_name : "unknown");
+    char dev[160] = "";
+    if (r.has_dev)
+    {
+        int used = std::snprintf(dev, sizeof(dev), " dev_t0_utc_ms=%.3f dev_t1_utc_ms=%.3f",
+                                 r.dev_t0_utc_ms, r.dev_t1_utc_ms);
+        if (r.dev_marks == 2 && used > 0 && used < (int)sizeof(dev))
+            std::snprintf(dev + used, sizeof(dev) - (std::size_t)used, " dev_marks_utc_ms=%.3f,%.3f",
+                          r.dev_mark_utc_ms[0], r.dev_mark_utc_ms[1]);
+    }
     return std::snprintf(out, cap,
                          "igpu_launch_timing dll=%s kind=%s stage=%s seq=%llu utc_ms=%.3f "
-                         "grid=%ux%ux%u block=%ux%ux%u w=%d h=%d%s ms=%s%s",
+                         "grid=%ux%ux%u block=%ux%ux%u w=%d h=%d%s ms=%s%s%s",
                          r.dll ? r.dll : "?", r.kind ? r.kind : "?", r.stage ? r.stage : "?",
                          r.seq, r.utc_ms,
                          r.grid.x, r.grid.y, r.grid.z, r.block.x, r.block.y, r.block.z,
-                         r.width, r.height, tile, ms, err);
+                         r.width, r.height, tile, ms, err, dev);
 }
 
 static inline int igpu_lt_format_summary(char * out, std::size_t cap,
@@ -244,6 +261,19 @@ static inline int igpu_lt_format_config(char * out, std::size_t cap, const char 
 {
     return std::snprintf(out, cap, "igpu_launch_timing_config dll=%s enabled=1 min_ms=%.3f",
                          dll ? dll : "?", min_ms);
+}
+
+/* The config line of a DLL whose recorder holds a device-clock anchor: the event recorded and
+ * waited on once at backend create, the host clock read right after (anchor_utc_ms), and the
+ * shortest host bracket [before record, after wait] of the tries (anchor_bracket_ms), which
+ * bounds the anchor's host/device offset error. */
+static inline int igpu_lt_format_config_anchored(char * out, std::size_t cap, const char * dll, double min_ms,
+                                                 double anchor_utc_ms, double anchor_bracket_ms)
+{
+    return std::snprintf(out, cap,
+                         "igpu_launch_timing_config dll=%s enabled=1 min_ms=%.3f device_clock=anchored "
+                         "anchor_utc_ms=%.3f anchor_bracket_ms=%.3f",
+                         dll ? dll : "?", min_ms, anchor_utc_ms, anchor_bracket_ms);
 }
 
 #endif /* IGPU_LAUNCH_TIMING_FORMAT_H */

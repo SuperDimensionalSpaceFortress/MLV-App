@@ -2267,6 +2267,8 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
     CK(cudaEventElapsedTime(&kern, b->ev_after_up,     b->ev_after_kernel));
     CK(cudaEventElapsedTime(&dl,   b->ev_after_kernel, b->ev_after_dl));
     CK(cudaEventElapsedTime(&tot,  b->ev_start,        b->ev_after_dl));
+    /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: the run window on the device clock (env-gated). */
+    igpu_lt::record_span("run", b->ev_start, b->ev_after_up, b->ev_after_kernel, b->ev_after_dl, (double)tot);
     b->last_timing.upload_ms   = (double)up;
     b->last_timing.match_ms    = 0.0;   /* CPU match is host-side; not run here */
     b->last_timing.kernel_ms   = (double)kern;

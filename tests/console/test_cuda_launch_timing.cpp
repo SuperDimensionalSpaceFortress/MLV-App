@@ -233,6 +233,70 @@ TEST(CudaLaunchTiming, ConfigLineFormat)
     ASSERT_EQ(std::string("igpu_launch_timing_config dll=amaze enabled=1 min_ms=2.000"), std::string(line));
 }
 
+// CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: device-clock stamps. A record whose pair resolved against
+// the backend's anchor event carries has_dev, and its line APPENDS the two anchored stamps; a record
+// without them renders byte-identical to the goldens above, whatever the dev fields hold.
+TEST(CudaLaunchTiming, DeviceStampedRecordAppendsTheAnchoredStamps)
+{
+    IgpuLtRecord r = sampleKernel();
+    r.has_dev = 1;
+    r.dev_t0_utc_ms = 1791774588083.250;
+    r.dev_t1_utc_ms = 1791774588083.662;
+    ASSERT_EQ(std::string("igpu_launch_timing dll=recon kind=kernel stage=k_promote_match seq=12 "
+                          "utc_ms=1791774588083.125 grid=120x51x1 block=16x16x1 w=1920 h=804 ms=0.412 "
+                          "dev_t0_utc_ms=1791774588083.250 dev_t1_utc_ms=1791774588083.662"),
+              formatRecord(r));
+}
+
+TEST(CudaLaunchTiming, RecordWithoutDeviceStampsIsByteIdenticalToTheGolden)
+{
+    const std::string golden("igpu_launch_timing dll=recon kind=kernel stage=k_promote_match seq=12 "
+                             "utc_ms=1791774588083.125 grid=120x51x1 block=16x16x1 w=1920 h=804 ms=0.412");
+    IgpuLtRecord r = sampleKernel();
+    ASSERT_EQ(golden, formatRecord(r));
+    // Stale dev values with has_dev=0 (e.g. an anchor that failed) never reach the line.
+    r.dev_t0_utc_ms = 1.0;
+    r.dev_t1_utc_ms = 2.0;
+    r.dev_marks = 2;
+    r.dev_mark_utc_ms[0] = 3.0;
+    r.dev_mark_utc_ms[1] = 4.0;
+    ASSERT_EQ(golden, formatRecord(r));
+}
+
+TEST(CudaLaunchTiming, RunSpanLineCarriesItsTwoInnerMarks)
+{
+    // The recon run span: [ev_start, ev_after_dl] with ev_after_up and ev_after_kernel as marks.
+    IgpuLtRecord r = sampleKernel();
+    r.kind = "span";
+    r.stage = "run";
+    r.grid = {0, 0, 0};
+    r.block = {0, 0, 0};
+    r.ms = 1.25;
+    r.has_dev = 1;
+    r.dev_t0_utc_ms = 1791774588083.000;
+    r.dev_t1_utc_ms = 1791774588084.250;
+    r.dev_marks = 2;
+    r.dev_mark_utc_ms[0] = 1791774588083.100;
+    r.dev_mark_utc_ms[1] = 1791774588083.900;
+    ASSERT_EQ(std::string("igpu_launch_timing dll=recon kind=span stage=run seq=12 "
+                          "utc_ms=1791774588083.125 grid=0x0x0 block=0x0x0 w=1920 h=804 ms=1.250 "
+                          "dev_t0_utc_ms=1791774588083.000 dev_t1_utc_ms=1791774588084.250 "
+                          "dev_marks_utc_ms=1791774588083.100,1791774588083.900"),
+              formatRecord(r));
+}
+
+TEST(CudaLaunchTiming, AnchoredConfigLineNamesTheAnchorAndItsBracket)
+{
+    char line[256];
+    igpu_lt_format_config_anchored(line, sizeof(line), "recon", 0.0, 1791774588000.125, 0.0120);
+    ASSERT_EQ(std::string("igpu_launch_timing_config dll=recon enabled=1 min_ms=0.000 "
+                          "device_clock=anchored anchor_utc_ms=1791774588000.125 anchor_bracket_ms=0.012"),
+              std::string(line));
+    // Without an anchor the config line is the unchanged golden.
+    igpu_lt_format_config(line, sizeof(line), "amaze", 2.0);
+    ASSERT_EQ(std::string("igpu_launch_timing_config dll=amaze enabled=1 min_ms=2.000"), std::string(line));
+}
+
 TEST(CudaLaunchTiming, StatsKeepTheLongestLaunchAndCountOverThreshold)
 {
     IgpuLtStats s;
@@ -421,6 +485,46 @@ TEST(CudaLaunchTiming, OffCostsOneCachedTestPerSite)
     ASSERT_TRUE(header.contains(QStringLiteral("if (!enabled()) return;\n        active_ = Recorder::get().begin_kernel(")));
     ASSERT_TRUE(header.contains(QStringLiteral("if (!enabled()) return call();")));
     ASSERT_TRUE(header.contains(QStringLiteral("inline void poll(const char * at = nullptr)\n{\n    if (!enabled()) return;")));
-    // The launch timer never synchronises: no Synchronize call anywhere in the recorder.
-    ASSERT_FALSE(header.contains(syncCallPattern()));
+    // The launch timer never synchronises per frame. CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: its one
+    // synchronising call is the device-clock anchor's cudaEventSynchronize, inside
+    // establish_anchor_locked(), which only the first attach() (backend create) reaches.
+    QStringList syncs;
+    auto it = syncCallPattern().globalMatch(header);
+    while (it.hasNext()) syncs << it.next().captured(1);
+    ASSERT_EQ(std::string("cudaEventSynchronize"), syncs.join(QStringLiteral(", ")).toStdString());
+    const int anchorDef = header.indexOf(QStringLiteral("    void establish_anchor_locked()\n    {\n"));
+    ASSERT_TRUE(anchorDef >= 0);
+    const int anchorEnd = header.indexOf(QStringLiteral("\n    }\n"), header.indexOf(QStringLiteral("\n        }\n    }\n"), anchorDef));
+    const int syncAt = header.indexOf(syncCallPattern());
+    ASSERT_TRUE(syncAt > anchorDef && syncAt < anchorEnd);
+    ASSERT_EQ(2, (int)header.count(QStringLiteral("establish_anchor_locked()")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        live_backends_ += 1;\n        if (!anchor_tried_)\n        {\n            anchor_tried_ = true;\n"
+        "            establish_anchor_locked();")));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline void record_span(const char * stage, cudaEvent_t t0, cudaEvent_t mark0, cudaEvent_t mark1,\n"
+                                               "                        cudaEvent_t t1, double ms)\n{\n    if (!enabled()) return;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("if (!enabled()) return;\n        active_ = Recorder::get().begin_kernel(pending_, stage, dim3(0, 0, 0)")));
+}
+
+TEST(CudaLaunchTiming, DeviceSpansSitOnTheirOwnStreamAfterTheExistingWaits)
+{
+    // CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1. Recon: one run span per run, after the run's own
+    // cudaEventSynchronize(ev_after_dl) and its elapsed reads, so its four events are complete and
+    // no wait is added. AMaZE: the stream-0 GL handoff (map, copy, unmap) is bracketed by a span
+    // on stream 0, closed right after the unmap.
+    const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
+    const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
+    const QString span = QStringLiteral(
+        "igpu_lt::record_span(\"run\", b->ev_start, b->ev_after_up, b->ev_after_kernel, b->ev_after_dl, (double)tot);");
+    ASSERT_EQ(1, (int)recon.count(span));
+    ASSERT_TRUE(recon.indexOf(QStringLiteral("CK(cudaEventElapsedTime(&tot,  b->ev_start,        b->ev_after_dl));"))
+                < recon.indexOf(span));
+    ASSERT_TRUE(recon.indexOf(QStringLiteral("cudaEventSynchronize(b->ev_after_dl)")) < recon.indexOf(span));
+    ASSERT_TRUE(amaze.contains(QStringLiteral(
+        "igpu_lt::SpanScope handoff(\"gl_rgba16_direct:handoff\", 0);\n"
+        "        cudaError_t rc = IGPU_LT_SYNC_CALL(\"gl_rgba16_direct:map\", cudaGraphicsMapResources(1, &resource, 0));")));
+    ASSERT_TRUE(amaze.contains(QStringLiteral(
+        "IGPU_LT_SYNC_CALL(\"gl_rgba16_direct:unmap\", cudaGraphicsUnmapResources(1, &resource, 0));\n"
+        "        handoff.end();")));
+    ASSERT_EQ(1, (int)amaze.count(QStringLiteral("igpu_lt::SpanScope ")));
 }
