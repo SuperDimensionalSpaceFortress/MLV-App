@@ -130,11 +130,11 @@ the play captures it reads the bytes the decoder reads for that frame -- the enc
 `video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
 own mutex, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). For LJ92 (r5) it decodes the
 payload with liblj92, as the display decodes it, and hashes the decoded picture (`mlvLj92FrameSourceHash64`). For JPEG2K (r8) it
-hashes the 36-byte bayer header plus the four declared channel spans, the only bytes the decoder consumes
-(`mlvJpeg2kFrameSourceHash64`; a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no identity). The ids are
-attached only while the clip's files are still exactly as they were when the clip was OPENED, before any frame of it was decoded
-(r8: `SourceWriteGuard` matches the open-time stamp, then holds the files share-read until the hashing ends), so a frame a cache
-decoded before an edit never gets an id read from the edited bytes. Two frames that
+hashes the layout version plus the four declared channel spans (each one's size and bytes, never where it lies), what the
+decoder decodes (`mlvJpeg2kFrameSourceHash64`; a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no
+identity). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
+ends (r8: a `--visual-capture-dir` run opens every clip under a share-read `SourceWriteGuard`, so no writer can change its bytes,
+and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes. Two frames that
 decode to the same picture always share an identity, and two that decode differently never do (up to a 64-bit collision):
 bytes the decoder never uses -- COM/APPn segments, ignored header fields, a table symbol the bitstream never selects, bytes
 after the scan -- cannot make a static clip read "known to differ", and no byte the decoder uses can make two pictures read

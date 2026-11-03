@@ -1024,6 +1024,31 @@ TEST(VisualCaptureSourceHash, Jpeg2kBytesOutsideTheDeclaredSpansAreNotHashed)
     ASSERT_TRUE(gap00 == gapA5);
 }
 
+// r8 pass 1 A2 on d9836349: the r8 hash still included the 36-byte header, so the SAME four codestreams laid out at other offsets
+// (the adversary's: channel 0 at 65572 vs 36, the others sharing one span) got another id for one picture. The offsets only say
+// where a span lies: spans in reversed physical order, and channels sharing one span, are the picture of the sequential layout.
+TEST(VisualCaptureSourceHash, Jpeg2kWhereASpanLiesIsNotHashed)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    const std::vector<uint8_t> sequential = j2kPayload(kJ2kCodestream, 0, 0, {});
+    const uint32_t n = static_cast<uint32_t>(kJ2kCodestream.size());
+    std::vector<uint8_t> reversed = sequential;   // channel c's span placed where channel 3 - c's was
+    for (int c = 0; c < 4; ++c) putLe32(reversed, 4 + 8 * c, 36u + static_cast<uint32_t>(3 - c) * n);
+    std::vector<uint8_t> shared(36, 0);           // every channel reads the one span at 36; the frame is header + one span
+    putLe32(shared, 0, 1u);
+    for (int c = 0; c < 4; ++c) { putLe32(shared, 4 + 8 * c, 36u); putLe32(shared, 8 + 8 * c, n); }
+    shared.insert(shared.end(), kJ2kCodestream.begin(), kJ2kCodestream.end());
+    uint64_t hSequential = 0;
+    uint64_t hReversed = 0;
+    uint64_t hShared = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, sequential, &hSequential));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, reversed, &hReversed));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, shared, &hShared));
+    ASSERT_TRUE(hSequential == hReversed);
+    ASSERT_TRUE(hSequential == hShared);
+}
+
 TEST(VisualCaptureSourceHash, Jpeg2kAChangedSpanByteStillHashesDifferently)
 {
     MlvPipelineFixture fixture;
@@ -1052,13 +1077,17 @@ TEST(VisualCaptureSourceHash, Jpeg2kTheInMemoryHashIsTheHeaderPlusTheDeclaredSpa
     ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 64, 64, &ha));
     ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(b.data(), b.size(), 64, 64, &hb));
     ASSERT_TRUE(ha == hb);
-    // FNV-1a 64 of header + spans, computed here independently
+    // FNV-1a 64 of the version word, then per channel its size (LE32) and its span, computed here independently
     uint64_t expected = 0xcbf29ce484222325ull;
     auto mix = [&expected](const uint8_t * p, size_t count) {
         for (size_t i = 0; i < count; ++i) { expected ^= p[i]; expected *= 0x100000001b3ull; }
     };
-    mix(a.data(), 36);
-    for (int c = 0; c < 4; ++c) mix(kJ2kCodestream.data(), kJ2kCodestream.size());
+    mix(a.data(), 4);
+    for (int c = 0; c < 4; ++c)
+    {
+        mix(a.data() + 8 + 8 * c, 4);
+        mix(kJ2kCodestream.data(), kJ2kCodestream.size());
+    }
     ASSERT_TRUE(ha == expected);
     // what the display decode refuses has no identity
     uint64_t hash = 0x77;

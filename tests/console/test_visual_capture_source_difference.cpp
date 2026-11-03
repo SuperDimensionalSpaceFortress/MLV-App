@@ -387,8 +387,12 @@ TEST(VisualCaptureSourceDifferenceWiring, TheCaptureRunBindsItsSourceIdsToTheCli
     ASSERT_TRUE(stampClip.contains(QStringLiteral("visualOpenStampClip.generation = m_clipOpenSourceStampGeneration;")));
     ASSERT_TRUE(stampClip.contains(QStringLiteral("visualOpenStampClip.object = m_clipOpenSourceStampObject;")));
     ASSERT_TRUE(lf.indexOf(QStringLiteral("processEvents(")) > guardAt);
+    // r8 pass 1 A1: the ids also need the guard that has held this clip since its open
     ASSERT_TRUE(lf.mid(bindAt, 300).contains(QStringLiteral(
-        "[&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged(); },")));
+        "[&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },")));
+    ASSERT_TRUE(lf.contains(QStringLiteral(
+        "visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip )\n"
+        "                ? m_clipOpenSourceGuard : std::shared_ptr<visual_capture_source_difference::SourceWriteGuard>();")));
 }
 
 // r8 (fable r7 key A1): every clip open stamps the new clip's files the moment it becomes m_pMlvObject, before anything can decode
@@ -410,12 +414,26 @@ TEST(VisualCaptureSourceDifferenceWiring, EveryClipOpenStampsItsFilesBeforeAnyFr
     ASSERT_TRUE(stampAt > openMlvAt && processingAt > stampAt);
     const int defAt = source.indexOf(QStringLiteral("void MainWindow::recordClipOpenSourceStamp()"));
     ASSERT_TRUE(defAt >= 0);
-    const QString def = source.mid(defAt, 600);
+    const int defEnd = source.indexOf(QStringLiteral("\n}\n"), defAt);
+    ASSERT_TRUE(defEnd > defAt);
+    const QString def = source.mid(defAt, defEnd - defAt);
     ASSERT_TRUE(def.contains(QStringLiteral(
         "visual_capture_source_difference::SourceWriteGuard::openStamp( m_pMlvObject->file, m_pMlvObject->filenum )")));
     ASSERT_TRUE(def.contains(QStringLiteral(
         "m_clipOpenSourceStampGeneration = static_cast<quint64>( m_clipLifecycleBarrier.generation() );")));
     ASSERT_TRUE(def.contains(QStringLiteral("m_clipOpenSourceStampObject = static_cast<const void *>( m_pMlvObject );")));
+    // r8 pass 1 A1: a visual-capture run HOLDS the clip from that point (share-read handles), released when the clip is freed
+    ASSERT_TRUE(def.contains(QStringLiteral("if( m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )")));
+    ASSERT_TRUE(def.contains(QStringLiteral("m_clipOpenSourceGuard = std::make_shared<visual_capture_source_difference::SourceWriteGuard>(")));
+    ASSERT_TRUE(source.contains(QStringLiteral("m_holdClipSourceFromOpen = !options.visualCaptureDir.isEmpty();")));
+    const int smokeAt = source.indexOf(QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"));
+    const int holdAt = source.indexOf(QStringLiteral("m_holdClipSourceFromOpen = !options.visualCaptureDir.isEmpty();"));
+    const int smokeOpenAt = source.indexOf(QStringLiteral("openMlvSet( QStringList() <<"), smokeAt);
+    ASSERT_TRUE(smokeAt >= 0 && holdAt > smokeAt && smokeOpenAt > holdAt);
+    const int freeAt = source.indexOf(QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"));
+    const int freeCall = source.indexOf(QStringLiteral("freeMlvObject( m_pMlvObject );"), freeAt);
+    const int releaseAt = source.indexOf(QStringLiteral("m_clipOpenSourceGuard.reset();"), freeAt);
+    ASSERT_TRUE(freeAt >= 0 && releaseAt > freeAt && freeCall > releaseAt);
 }
 
 // r7 (adversary r7 pass 1 A1 on 1a9748b6): an unchanged clip token accepted a reread of EDITED bytes. The json's input: a static
@@ -613,6 +631,42 @@ TEST(VisualCaptureSourceGuard, AClipUntouchedSinceItOpenedKeepsTheGuardAndItsSou
         const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
         for (bool valid : bound.valid) ASSERT_TRUE(valid);
         ASSERT_TRUE(vcsd::decide(bound.playIdentities) == vcsd::Verdict::Identical);
+    }
+    std::fclose(clipFile);
+}
+
+// r8 pass 1 A1 on d9836349: a stamp alone is forgeable -- edit a byte, then restore the last-write FILETIME with SetFileTime: same
+// identity, size and write time, so a stamp-only check passes over edited bytes. A visual-capture run therefore holds the clip from
+// its open (MainWindow::recordClipOpenSourceStamp): while held, the edit itself cannot happen, so there is nothing to hide.
+TEST(VisualCaptureSourceGuard, AClipHeldFromItsOpenCannotBeEditedSoNoWriteTimeCanHideAnEdit)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+    ASSERT_TRUE(clipFile != nullptr);
+    const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+    {
+        const vcsd::SourceWriteGuard heldFromOpen(&clipFile, 1, opened);   // taken at the open, before any decode
+        ASSERT_TRUE(heldFromOpen.held());
+        QFile writer(path);
+        const bool writerOpened = writer.open(QIODevice::ReadWrite);
+#ifdef Q_OS_WIN
+        ASSERT_FALSE(writerOpened);   // the adversary's edit (frame_offset+53 0x20 -> 0x21) cannot be written at all
+#endif
+        if (writerOpened) {
+            // a platform that cannot refuse the writer: the edit moves ctime, which no utimes() can restore
+            ASSERT_TRUE(writer.seek(53));
+            ASSERT_EQ(qint64(1), writer.write("\x21", 1));
+            writer.close();
+            ASSERT_FALSE(heldFromOpen.unchanged());
+        }
+        // the capture's own guard taken later still shares read with the open guard
+        const vcsd::SourceWriteGuard captureGuard(&clipFile, 1, opened);
+#ifdef Q_OS_WIN
+        ASSERT_TRUE(captureGuard.held());
+        ASSERT_TRUE(captureGuard.unchanged() && heldFromOpen.unchanged());
+#endif
     }
     std::fclose(clipFile);
 }

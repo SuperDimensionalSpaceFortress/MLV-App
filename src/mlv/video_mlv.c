@@ -4266,12 +4266,18 @@ int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, i
     uint32_t hw = 0;
     uint32_t hh = 0;
     if (!mlvJpeg2kBayerLayoutIsValid(length, width, height, offsets, sizes, &hw, &hh)) return 1;
-    /* exactly the bytes the decoder consumes: the header, then each channel's declared span in channel order. The header
-     * carries every span's offset and size, so the concatenation is unambiguous; bytes outside the spans never count. */
+    /* what the decoder decodes: the layout version, then each channel's declared span (its size, then its bytes) in channel
+     * order. r8 pass 1 A2: NOT the span offsets -- they only say where a span lies, so the same four codestreams laid out at
+     * other offsets are the same picture; the sizes keep the concatenation unambiguous. Bytes outside the spans never count. */
     uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
-    hash = mlv_source_hash_fnv1a64(hash, data, MLV_JPEG2K_BAYER_HEADER_BYTES);
+    hash = mlv_source_hash_fnv1a64(hash, data, 4u); /* the version word */
     for (int c = 0; c < 4; ++c)
+    {
+        const uint8_t sizeBytes[4] = { (uint8_t)sizes[c], (uint8_t)(sizes[c] >> 8), (uint8_t)(sizes[c] >> 16),
+                                       (uint8_t)(sizes[c] >> 24) };
+        hash = mlv_source_hash_fnv1a64(hash, sizeBytes, sizeof(sizeBytes));
         hash = mlv_source_hash_fnv1a64(hash, data + offsets[c], (size_t)sizes[c]);
+    }
     *hashOut = hash;
     return 0;
 #else

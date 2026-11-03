@@ -4120,11 +4120,18 @@ bool MainWindow::waitForRenderThreadIdleBeforeCoreMutation( const char *reason )
 // cache, but before the guard, leaves every capture without a source id instead of an id read from bytes the picture never had.
 void MainWindow::recordClipOpenSourceStamp()
 {
+    m_clipOpenSourceGuard.reset();
     m_clipOpenSourceStamp = m_pMlvObject
         ? visual_capture_source_difference::SourceWriteGuard::openStamp( m_pMlvObject->file, m_pMlvObject->filenum )
         : QByteArray();
     m_clipOpenSourceStampGeneration = static_cast<quint64>( m_clipLifecycleBarrier.generation() );
     m_clipOpenSourceStampObject = static_cast<const void *>( m_pMlvObject );
+    // r8 pass 1 A1: a visual-capture run holds the clip's files from here (no writer can open them) until the clip is freed
+    if( m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )
+    {
+        m_clipOpenSourceGuard = std::make_shared<visual_capture_source_difference::SourceWriteGuard>(
+            m_pMlvObject->file, m_pMlvObject->filenum, m_clipOpenSourceStamp );
+    }
 }
 
 // r2 (CoS B1): returns whether the prep drain inside allows a borrow-freeing mutation.
@@ -4157,6 +4164,7 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
             .arg( reasonText )
             .arg( static_cast<qulonglong>( generation ) ),
         true );
+    m_clipOpenSourceGuard.reset();   // r8 pass 1 A1: the clip's files are released with the clip
     freeMlvObject( m_pMlvObject );
     return prepMutationAllowed;
 }
@@ -9094,6 +9102,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     QTextStream out(stdout);
     QTextStream err(stderr);
     m_lookAssistAutoWarmupDeferralCount = 0;
+    // PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 pass 1 A1: a visual-capture run holds every clip it opens from the open (see recordClipOpenSourceStamp)
+    m_holdClipSourceFromOpen = !options.visualCaptureDir.isEmpty();
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2: Loop is forced OFF at every automation entry, before anything else.
     forceLoopOffForAutomation( "gui-smoke-entry" );
     isolateAutomationPacing( "gui-smoke-entry" );
@@ -10636,6 +10646,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const visual_capture_source_difference::SourceWriteGuard visualSourceGuard(
             m_pMlvObject ? m_pMlvObject->file : nullptr, m_pMlvObject ? m_pMlvObject->filenum : 0,
             visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip ) ? m_clipOpenSourceStamp : QByteArray() );
+        // r8 pass 1 A1: and the clip must have been HELD since its open (a forged last-write time cannot fake that): the open guard
+        // of this same clip, still held and unchanged, else no source id
+        const std::shared_ptr<visual_capture_source_difference::SourceWriteGuard> visualOpenGuard =
+            visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip )
+                ? m_clipOpenSourceGuard : std::shared_ptr<visual_capture_source_difference::SourceWriteGuard>();
         QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
         const bool visualUseGlContainer =
             GpuDisplayWindow::isActive() && visualGlContainer && visualGlContainer->isVisible();
@@ -10778,7 +10793,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         const visual_capture_source_difference::BoundSourceIds visualSourceIds = visual_capture_source_difference::bindSourceIds(
             visualCaptureClips, visualCaptureClip, m_clipLifecycleBarrier, m_pMlvObject,
-            [&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged(); },
+            [&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },
             [&]( int displayFrame, quint64 *hash, bool *ok )
             {
                 uint64_t sourceHash = 0;

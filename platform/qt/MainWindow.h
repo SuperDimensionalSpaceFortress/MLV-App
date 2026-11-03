@@ -70,9 +70,13 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <memory>
 
 namespace Ui {
 class MainWindow;
+}
+namespace visual_capture_source_difference {
+class SourceWriteGuard;
 }
 
 class QAction;
@@ -1051,6 +1055,11 @@ private:
     QByteArray m_clipOpenSourceStamp;
     quint64 m_clipOpenSourceStampGeneration = 0;
     const void *m_clipOpenSourceStampObject = nullptr;
+    // r8 pass 1 A1: a stamp alone can be forged (an edit, then the last-write time restored with SetFileTime). A --visual-capture-dir
+    // run therefore HOLDS the clip from its open until it is freed: share-read-only handles, so no writer can change a byte a cache
+    // may already have decoded. Taken only when m_holdClipSourceFromOpen (set at the visual-capture smoke entry); released on free.
+    bool m_holdClipSourceFromOpen = false;
+    std::shared_ptr<visual_capture_source_difference::SourceWriteGuard> m_clipOpenSourceGuard;
     void recordClipOpenSourceStamp();
     QString m_phase3ClipPlaytimeFingerprint;
     qint64 m_phase3ClipPlaytimePendingMs = 0;
