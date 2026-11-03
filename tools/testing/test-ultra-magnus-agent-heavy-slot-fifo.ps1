@@ -589,6 +589,17 @@ function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBo
 # END bounded capture io
 # The largest bound Invoke-BoundedSuite accepts: the same range the public -QuietLeaseBoundSec / -StageExemptBoundSec carry.
 $SuiteBoundMaxSec = 3600
+# adversary r11 A1: everything done to a capture AFTER the bounded read must itself be bounded. The diagnostic keeps only the last
+# $DiagnosticTailChars of each stream (an 8,000,000-line capture took 31.8 s to split, filter and join), and a finished suite's JSON larger
+# than $JsonMaxChars is a named failure instead of being normalised line by line. Substring/Length are O(1)-ish, so the verdict never scales
+# with what the suite printed.
+$DiagnosticTailChars = 4000
+$JsonMaxChars = 262144
+function Get-DiagnosticTail([string]$Text) {
+    if ($null -eq $Text) { return '' }
+    if ($Text.Length -le $DiagnosticTailChars) { return $Text }
+    return '...' + $Text.Substring($Text.Length - $DiagnosticTailChars)
+}
 function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
     # sol r5 B1: the bound is checked, and converted to milliseconds, BEFORE any file or child exists. A direct call with 2147484 (or
     # 0, or a negative) used to launch the suite and only then fail in WaitForExit, leaving the child running with no named verdict.
@@ -618,13 +629,14 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
         # Each file is opened and read ONCE, under the bound (sol r6 B1): the same text feeds the diagnostic and, for a finished suite, the JSON.
         $outR = Read-CapturedResult $outF
         $errR = Read-CapturedResult $errF
-        $text = (@($outR.Text, $errR.Text) | ForEach-Object { $_ -split '\r?\n' } | Where-Object { $_ }) -join ' | '
+        $text = (@((Get-DiagnosticTail $outR.Text), (Get-DiagnosticTail $errR.Text)) | ForEach-Object { $_ -split '\r?\n' } | Where-Object { $_ }) -join ' | '
         if (-not $finished) { $fail = "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text" }
         # A finished suite's JSON is the result: a read error or a stalled read here must surface, not aggregate as an empty result.
         elseif (-not $outR.Ok) { $fail = "$Name ($Script) finished but its JSON result could not be read: $($outR.Text)" }
         # sol r8 B1: the stderr read is a step too. A suite that exited 0 with readable JSON must not keep PASS over an abandoned or failed
         # stderr capture: the same named failure as the stdout one, so neither caller (nor the aggregate) can report PASS past it.
         elseif (-not $errR.Ok) { $fail = "$Name ($Script) finished but its stderr capture could not be read: $($errR.Text)" }
+        elseif ($outR.Text.Length -gt $JsonMaxChars) { $fail = "$Name ($Script) finished but its JSON result is larger than $JsonMaxChars characters ($($outR.Text.Length)); it was not parsed" }
         else { $result = [pscustomobject]@{ ExitCode = $p.ExitCode; Json = (($outR.Text.TrimEnd("`r", "`n")) -split '\r?\n') -join "`n"; Text = $text } }
     }
     # The removal is bounded too (sol r6 B2) and runs BEFORE the verdict is raised, so its note can be named in it.

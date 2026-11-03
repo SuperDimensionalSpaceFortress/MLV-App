@@ -1710,6 +1710,30 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("output so far: <read timed out: x not readable within 10000 ms>", rows["D"])
         self.assertIn("exceeded its 5 s bound", rows["D"])
 
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_huge_captured_output_cannot_stretch_the_verdict_past_its_post_wait_allowance(self) -> None:
+        # adversary r11 A1 (major): after the wait and kill the diagnostic text was built by splitting, filtering and joining the WHOLE capture
+        # (8,000,000 lines took 31.8 s), and the finished-suite JSON was normalised the same way, so the named verdict and cleanup ran far
+        # past the advertised post-wait allowance. The diagnostic keeps only a bounded tail; a JSON result over the cap is a named failure.
+        script = (self._suite_stub_script() +
+                  "$big = 'x' + [char]10; $big = $big * 2000000\n"
+                  "function Read-CapturedResult([string]$Path) { [pscustomobject]@{ Ok = $true; Text = $big } }\n"
+                  "function Case($label, $finish) {\n"
+                  "  $script:finish = $finish; $script:cleanupNote = ''; $script:removed = 0\n"
+                  "  $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "  try { $r = Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' 5 3>$null; $m = 'RESULT|' + $r.Text.Length }\n"
+                  "  catch { $m = 'THROW|' + $_.Exception.Message.Length + '|' + $_.Exception.Message.Substring(0, [Math]::Min(120, $_.Exception.Message.Length)) }\n"
+                  "  Write-Output \"$label|$m|fast=$($sw.Elapsed.TotalSeconds -lt 3)|secs=$([int]$sw.Elapsed.TotalSeconds)\" }\n"
+                  "Case 'HUNG' $false\n"
+                  "Case 'DONE' $true\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rows = {line.split("|", 1)[0]: line.split("|", 1)[1] for line in proc.stdout.splitlines() if line[:5] in ("HUNG|", "DONE|")}
+        for label in ("HUNG", "DONE"):
+            self.assertIn("fast=True", rows[label], f"{label}: the verdict must not scale with the captured size: {rows[label]}")
+        self.assertRegex(rows["HUNG"], r"^THROW\|\d{1,5}\|FAIL: case-x \(C:\\s\.ps1\) exceeded its 5 s bound", rows["HUNG"])
+        self.assertRegex(rows["DONE"], r"^THROW\|\d{1,5}\|FAIL: case-x \(C:\\s\.ps1\) finished but its JSON result is larger than 262144 characters", rows["DONE"])
+
 
 class BoundedCleanupTests(unittest.TestCase):
     """sol r4b B1 / B2: the cleanup after a timeout is bounded end to end, and the regression's ceiling is derived from that bound.
