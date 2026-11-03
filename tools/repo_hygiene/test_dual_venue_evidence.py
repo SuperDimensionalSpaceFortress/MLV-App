@@ -195,6 +195,10 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
 Q1_CPU_LOOK_PAIRED_LEGS = {f"legs/m16-1243-q1-cpu-look-paired-{mode}-s{scale}.json": f"legs/m16-1243-q1-cpu-look-{mode}-s{scale}.json"
                            for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *Q1_CPU_LOOK_PAIRED_LEGS)
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r14: the same-frame copies of the paired fullscreen cells (look.pairedSeekFrames 50..550, forwarded to the app's
+# --contact-sheet-seek-frames), so an H and a C arm pause on the SAME frames (SAMEFRAME r2). test_dual_venue_paired_seek.SameFrameLegSpecTests pins their shape.
+Q1_CPU_LOOK_SAMEFRAME_LEGS = tuple(f"legs/m16-1243-q1-cpu-look-sameframe-fullscreen-s{scale}.json" for scale in (2, 4))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *Q1_CPU_LOOK_SAMEFRAME_LEGS)
 # HFR-NATIVE-M16-1457-RECON-LUT-KEEP-1 r2: the paced M16-1457 native s2/s4 legs (the #420 s1 native shape with legId and scaleFactor changed, card
 # CUDA-HEADROOM-1, Look Assist forced Cinematic, visual strips on): the paced picture evidence for the NO_PUBLISH LUT-keep change.
 NATIVE_PACED_LEGS = tuple(f"legs/m16-1457-native-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
@@ -7079,9 +7083,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(fullscreen|windowed)-s[24]$", path.name)
                 self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
-            elif spec["card"] == "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1":   # the paired-seek copies of the quality-1 Look Assist legs
+            elif spec["card"] == "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1":   # the paired-seek copies of the quality-1 Look Assist legs (r14: and their same-frame fullscreen copies)
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-paired-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(paired-(fullscreen|windowed)|sameframe-fullscreen)-s[24]$", path.name)
                 self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
                 self.assertIs(spec["look"]["pairedSeek"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
@@ -7283,7 +7287,9 @@ NO_PACE_TWIN_BY_DESIGN = {
        for mode in ("fullscreen", "windowed") for scale in (2, 4)},
     **{f"m16-1243-q1-cpu-look-paired-{mode}-s{scale}": "paired-seek copy of a quality-1 look cell: playing vs paused frames of one leg, and no capture-free pace leg runs at quality mode 1"
        for mode in ("fullscreen", "windowed") for scale in (2, 4)},
-    "m16-1243-look": "Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
+    **{f"m16-1243-q1-cpu-look-sameframe-fullscreen-s{scale}": "same-frame copy of a paired quality-1 look cell: H vs C paused at the same listed frames, and no capture-free pace leg runs at quality mode 1"
+       for scale in (2, 4)},
+    "m16-1243-look":"Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-scale2": "Classic flavor-parity contact-sheet leg at scale 2; pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-film": "Film flavor-parity contact-sheet leg; no merged PR cites an absolute figure from it",
     "m16-1243-look-scale2-film": "Film flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",

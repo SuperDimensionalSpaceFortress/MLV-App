@@ -545,6 +545,10 @@ try {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: the same frames captured paused after the Play (seek), beside the in-pass ones.
         if ($spec.look.PSObject.Properties['pairedSeek'] -and $spec.look.pairedSeek -is [bool] -and $spec.look.pairedSeek) { $gen['ContactSheetPairedSeek'] = $true }
+        # r14 (SAMEFRAME r1 INCONCLUSIVE, sol r13 B3): the committed look.pairedSeekFrames reach the app as the generator's -ContactSheetSeekFrames (the app's
+        # --contact-sheet-seek-frames, #735), so every arm pauses on the SAME frames instead of on its own in-pass ones. The list exists only on a pairedSeek
+        # leg and is already strictly ascending, 0..999999999 and contactSheetFrames long (Get-DvLegSpecShapeRefusal), so the generator's refusal never trips.
+        if ($null -ne $pairedSeekFramesRequested -and $gen.ContainsKey('ContactSheetPairedSeek')) { $gen['ContactSheetSeekFrames'] = [int[]]@($pairedSeekFramesRequested) }
         $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
         if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
     }

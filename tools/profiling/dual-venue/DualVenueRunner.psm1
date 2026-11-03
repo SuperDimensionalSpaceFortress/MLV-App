@@ -2129,7 +2129,8 @@ function Read-DvContactFrames {
 # (adversary r5 A1) Invoke-VenueLeg refuses these before its terminal try; the batch preflight (Get-LegSpecRefusal) calls this same function, so a spec the
 # leg would refuse is refused before a lease opens, never after it (LEG_FAILED, no receipt). A control container the runner reads members of must be ONE
 # JSON object when present (r5, sol r4 B1: an array reads through member enumeration but has no PSObject property, so its controls were dropped), and
-# look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg. Returns the refusal text, or $null.
+# look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg (r14: and, as the generator's
+# -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
@@ -2172,6 +2173,10 @@ function Get-DvLegSpecShapeRefusal {
         elseif (@($items | Where-Object { -not ($_ -is [int] -or $_ -is [long]) -or $_ -lt 0 }).Count -gt 0) { 'must hold non-negative integers' }
         elseif (@($items | Sort-Object -Unique).Count -ne $items.Count) { 'must not repeat a frame' }
         elseif ($items.Count -ne [int]$look.contactSheetFrames) { "names $($items.Count) frame(s) but look.contactSheetFrames is $($look.contactSheetFrames)" }
+        # r14: Invoke-VenueLeg hands the list to the generator's -ContactSheetSeekFrames, whose contract (and the app's) is strictly ascending, each
+        # 0..999999999 (CONTACT_SHEET_SEEK_FRAMES_INVALID, untyped to the leg and after the batch's lease). A list it would refuse is refused here instead.
+        elseif (@($items | Where-Object { $_ -gt 999999999 }).Count -gt 0) { 'must hold frames 0..999999999 (the generator''s -ContactSheetSeekFrames range)' }
+        elseif (@(for ($i = 1; $i -lt $items.Count; $i++) { if ($items[$i] -le $items[$i - 1]) { $i } }).Count -gt 0) { 'must be strictly ascending (the generator''s -ContactSheetSeekFrames order)' }
         else { $null })
     if ($null -ne $bad) { return "look.pairedSeekFrames $bad" }
     $null
@@ -2477,7 +2482,10 @@ function Get-DvPairedSeekVerdict {
                 elseif ($null -ne ($partnerImageProblem = Get-DvPngImageProblem ([byte[]]$inPassBytes["$stillName.png"]))) {
                     $problem = "$stillName's in-pass partner image contact-sheet\raw\$stillName.png is not a decodable PNG image: $partnerImageProblem, so there is no playing frame to compare its paused still with"
                 }
-                elseif ($shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
+                # r14 (SAMEFRAME r1, sol r13 B3): only a LISTLESS still must show its partner's frame -- the app replays the in-pass frames there. A listed leg
+                # hands the list to the app (--contact-sheet-seek-frames), which seeks to it, so its still is bound to the requested frame above and its partner
+                # is the frame THIS arm's measured pass grabbed (r1: H 249 for 250, C 44 for 50); the partner's provenance and image checks above still bind it.
+                elseif (-not $frameList -and $shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
             }
         }
         $reported.Add($shown)

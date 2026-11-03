@@ -261,7 +261,8 @@ class PairedSeekFrameListTests(RunnerHarness, unittest.TestCase):
     def test_the_schema_types_paired_seek_frames(self) -> None:
         prop = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))["properties"]["look"]["properties"]["pairedSeekFrames"]
         self.assertEqual(prop["type"], "array")
-        self.assertEqual(prop["items"], {"type": "integer", "minimum": 0})
+        # (r14: the generator's -ContactSheetSeekFrames range, 0..999999999, so a committed list the generator would refuse fails schema validation too)
+        self.assertEqual(prop["items"], {"type": "integer", "minimum": 0, "maximum": 999999999})
         self.assertIs(prop["uniqueItems"], True)
 
     def test_stills_that_report_the_requested_frames_pass_and_are_recorded(self) -> None:
@@ -768,6 +769,9 @@ class BatchPreflightParityTests(unittest.TestCase):
             "arr-gen": (dict(base, generatorArgs=[base["generatorArgs"]]), "generatorArgs must be a single JSON object"),
             "dupe-frames": (dict(base, look=dict(look, pairedSeekFrames=[50, 50])), "pairedSeekFrames must not repeat a frame"),
             "count-frames": (dict(base, look=dict(look, pairedSeekFrames=[50])), "pairedSeekFrames names 1 frame(s)"),
+            # r14: the generator's -ContactSheetSeekFrames contract, refused before a lease (the generator's own refusal is untyped to the leg)
+            "order-frames": (dict(base, look=dict(look, pairedSeekFrames=[150, 50])), "pairedSeekFrames must be strictly ascending"),
+            "range-frames": (dict(base, look=dict(look, pairedSeekFrames=[50, 1000000000])), "999999999"),
             "root-array": ([base], "is not a JSON object"),
         }
         tmp = tempfile.TemporaryDirectory(prefix="preflight-parity-")
@@ -967,14 +971,18 @@ class PairedSeekCommittedStillSetTests(PairedStillsHarness, unittest.TestCase):
                 receipt = self.run_case(self.shipped_spec("set-shifted" + ("-f" if claim else "")), [provenance_sidecar(f) for f in shifted], claim=claim)
                 self.assert_not_a_pass(receipt, "PAIRED_SEEK", "frame-00", "in-pass partner", final=claim is not None)
 
-    def test_r8_fix2_a2_a_listed_still_must_also_match_its_in_pass_partner(self) -> None:
-        # adversary r8 fix-1 A2: pairedSeekFrames [50, 150] honoured by the paused stills, but the in-pass partners show 51 and 151
+    def test_r8_fix2_a2_a_listed_still_keeps_its_in_pass_partner_but_not_the_partners_frame(self) -> None:
+        # adversary r8 fix-1 A2 bound a listed still to its in-pass partner's display_frame, when the app could not steer a seek and replayed the in-pass
+        # frames. r14: the runner now hands the list to the app (--contact-sheet-seek-frames), which seeks to it, so the partner shows the frame THIS
+        # arm's measured pass grabbed (SAMEFRAME r1: H 249 for 250, C 44 for 50). Partners at 51 and 151 under a [50, 150] list are a PASS; the
+        # pairing itself stays -- a partner that is not a playing in-pass grab with its image is still a mismatch (PairedSeekFramesForwardTests).
         for claim in (None, claimed_block([50, 150], requested=[50, 150])):
             with self.subTest(final_validation=claim is not None):
                 self.fresh()
                 receipt = self.run_case(self.paired_spec("set-listed-partner" + ("-f" if claim else "")), [provenance_sidecar(50), provenance_sidecar(150)], claim=claim,
                                         partners=[51, 151])
-                self.assert_not_a_pass(receipt, "frame-00", "in-pass partner", final=claim is not None)
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertIs(receipt["look"]["pairedSeek"]["framesHonoured"], True)
 
     def test_the_complete_six_still_paused_control_passes(self) -> None:
         for claim in (None, claimed_block(SIX_FRAMES)):
@@ -1608,6 +1616,145 @@ class PairedSeekImageContentTests(PairedStillsHarness, unittest.TestCase):
                     receipt = self.run_image_case(f"img-control-{'l' if listed else 'n'}", None, listed=listed, final=final)
                     self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
                     self.assertIs(receipt["look"]["pairedSeek"]["framesHonoured"], True)
+
+
+# r14 (SAMEFRAME r1 INCONCLUSIVE, sol r13 B3): the generator's own seek-list parameter, as playback-attr-3-cuda-job.ps1 declares it, so the stub records
+# the list the runner binds (a plain-param stub would put an undeclared splatted key in $args, where the call log never shows it).
+SEEK_LIST_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,[switch]$ContactSheetPairedSeek,[int[]]$ContactSheetSeekFrames)")
+# SAMEFRAME r1 leg 2 (C = d36cba60, fullscreen s2): the in-pass display_frames a slower arm's measured pass grabbed -- never the requested list.
+C_ARM_IN_PASS = [44, 139, 231, 321, 405, 488]
+SAMEFRAME_SPECS = {scale: DV / "legs" / f"m16-1243-q1-cpu-look-sameframe-fullscreen-s{scale}.json" for scale in (2, 4)}
+
+
+def bound_generator_args(call: str) -> dict[str, str]:
+    return dict(part.split("=", 1) for part in call.split(";") if "=" in part)
+
+
+@requires_windows_pwsh
+class PairedSeekFramesForwardTests(PairedStillsHarness, unittest.TestCase):
+    """r14 (SAMEFRAME r1 INCONCLUSIVE, sol r13 B3): a committed look.pairedSeekFrames reaches the app. Invoke-VenueLeg read the list and checked the
+    stills against it, but bound only ContactSheet, ContactSheetFrames and ContactSheetPairedSeek, so each arm paused on its OWN in-pass frames
+    (r1: H 50,150,249,..., C 44,139,231,...) and no H/C pair shared a frame. The list is now bound as the generator's -ContactSheetSeekFrames (the
+    app's --contact-sheet-seek-frames, #735). Because the app then seeks to the LIST, each paused still is bound to its requested frame and its in-pass
+    partner keeps its provenance and image checks, but no longer has to show the same frame: the partner is the frame THIS arm's measured pass grabbed."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.gen.write_text(SEEK_LIST_STUB_GENERATOR, encoding="utf-8")
+
+    def fresh(self) -> None:
+        self.doCleanups()
+        self.setUp()
+
+    def six_frame_spec(self, leg_id: str, frames: list[int] | None = SIX_FRAMES) -> Path:
+        path = self.write_spec(leg_type="look", leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        spec["look"] = {"contactSheetFrames": 6, "lookFlavor": "classic", "pairedSeek": True}
+        if frames is not None:
+            spec["look"]["pairedSeekFrames"] = list(frames)
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def run_six(self, spec: Path, stills: list[bytes], partners: list[int], final: bool = False):
+        runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claimed_block(SIX_FRAMES, requested=SIX_FRAMES))])} if final else {}
+        self.write_artifacts(sheet=True, raw_frames=True)
+        self.write_seek_stills(stills)
+        write_in_pass_partners(self.artifacts, len(partners), frames=partners)
+        proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"], **runner)
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        return receipt
+
+    def test_r14_the_listed_frames_are_bound_as_the_generators_contact_sheet_seek_frames(self) -> None:
+        self.run_six(self.six_frame_spec("fwd-listed"), [provenance_sidecar(f) for f in SIX_FRAMES], SIX_FRAMES)
+        bound = bound_generator_args(self.generator_calls()[-1])
+        self.assertEqual(bound.get("ContactSheetPairedSeek"), "True")
+        self.assertEqual(bound.get("ContactSheetFrames"), "6")
+        self.assertEqual(bound.get("ContactSheetSeekFrames"), "50 150 250 350 450 550", "the committed look.pairedSeekFrames, in order, as the app's seek list")
+
+    def test_r14_a_listless_paired_leg_binds_no_seek_list(self) -> None:
+        self.run_six(self.six_frame_spec("fwd-listless", frames=None), [provenance_sidecar(f) for f in SIX_FRAMES], SIX_FRAMES)
+        bound = bound_generator_args(self.generator_calls()[-1])
+        self.assertEqual(bound.get("ContactSheetPairedSeek"), "True")
+        self.assertNotIn("ContactSheetSeekFrames", bound, "a listless leg's job is the text it was: the app replays its in-pass frames")
+
+    def test_r14_a_listed_leg_whose_in_pass_partners_show_other_frames_passes(self) -> None:
+        # the C arm of SAMEFRAME r1: the app seeks to the list, the measured pass grabbed 44, 139, ... -- a same-frame cross-arm still set, not a mismatch
+        for final in (False, True):
+            with self.subTest(final_validation=final):
+                self.fresh()
+                receipt = self.run_six(self.six_frame_spec("fwd-c-arm" + ("-f" if final else "")), [provenance_sidecar(f) for f in SIX_FRAMES], C_ARM_IN_PASS, final=final)
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                info = receipt["look"]["pairedSeek"]
+                self.assertEqual(info["requestedFrames"], SIX_FRAMES)
+                self.assertEqual(info["reportedFrames"], SIX_FRAMES)
+                self.assertIs(info["framesHonoured"], True)
+
+    def test_r14_a_listed_still_at_another_frame_than_requested_is_still_not_a_pass(self) -> None:
+        stills = [provenance_sidecar(f) for f in SIX_FRAMES[:5]] + [provenance_sidecar(549)]
+        receipt = self.run_six(self.six_frame_spec("fwd-off"), stills, C_ARM_IN_PASS)
+        PairedSeekCommittedStillSetTests.assert_not_a_pass(self, receipt, "PAIRED_SEEK_FRAMES_NOT_HONOURED", "frame-05 reported display_frame 549, requested 550")
+
+    def test_r14_a_listed_leg_still_needs_a_playing_in_pass_partner_with_an_image(self) -> None:
+        for case in ("paused-partner", "no-partner-png"):
+            for final in (False, True):
+                with self.subTest(case=case, final_validation=final):
+                    self.fresh()
+                    spec = self.six_frame_spec(f"fwd-{case}" + ("-f" if final else ""))
+                    runner = {"dv": self.mutated_runner([("Invoke-VenueLeg.ps1", VERDICT_DONE_ANCHOR, VERDICT_DONE_ANCHOR + claimed_block(SIX_FRAMES, requested=SIX_FRAMES))])} if final else {}
+                    self.write_artifacts(sheet=True, raw_frames=True)
+                    self.write_seek_stills([provenance_sidecar(f) for f in SIX_FRAMES])
+                    write_in_pass_partners(self.artifacts, 6, frames=C_ARM_IN_PASS)
+                    raw = self.artifacts.joinpath(*IN_PASS_RAW)
+                    if case == "paused-partner":
+                        (raw / "frame-02.json").write_bytes(provenance_sidecar(C_ARM_IN_PASS[2]))
+                    else:
+                        (raw / "frame-02.png").unlink()
+                    proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"], **runner)
+                    self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+                    PairedSeekCommittedStillSetTests.assert_not_a_pass(self, receipt, "PAIRED_SEEK", "frame-02", "in-pass partner", final=final)
+
+    def test_r14_a_list_the_generator_would_refuse_is_refused_before_anything_runs(self) -> None:
+        # the generator's -ContactSheetSeekFrames contract: strictly ascending, each 0..999999999 (CONTACT_SHEET_SEEK_FRAMES_INVALID otherwise, an
+        # untyped throw to the leg, after the batch has opened its lease). Distinct-but-unordered and out-of-range lists are shape refusals now.
+        for frames, leg_id, needle in (([150, 50, 250, 350, 450, 550], "bad-order", "strictly ascending"),
+                                       ([50, 150, 250, 350, 450, 1000000000], "bad-range", "999999999"),
+                                       ([50, 150, 250, 350, 450, 3000000000], "bad-int32", "999999999")):
+            with self.subTest(case=leg_id):
+                proc, receipt, submitted = self.run_leg("ultra-magnus", self.six_frame_spec(leg_id, frames), extra=["-Backend", "cpu"])
+                out = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, out)
+                self.assertIn("DVE_LEG_SPEC_INVALID look.pairedSeekFrames", out)
+                self.assertIn(needle, out)
+                self.assertIsNone(receipt)
+                self.assertEqual(submitted, [], "nothing is submitted")
+                self.assertEqual(self.generator_calls(), [], "nothing is generated")
+
+
+@requires_pwsh
+class SameFrameLegSpecTests(unittest.TestCase):
+    """r14: the two committed same-frame specs SAMEFRAME r2 runs (production refuses an uncommitted spec, LEG_SPEC_NOT_COMMITTED). Each is its paired
+    fullscreen spec plus look.pairedSeekFrames at 50, 150, ..., 550: one frame per contact-sheet still, strictly ascending, inside the measured pass of
+    M16-1243 at 25 s (SAMEFRAME r1 H: timeline_delta 599, presented 596-599; the clip has 937 frames), and the lease batch's preflight admits both."""
+
+    def test_r14_each_sameframe_spec_is_its_paired_fullscreen_spec_plus_the_frame_list(self) -> None:
+        for scale, path in SAMEFRAME_SPECS.items():
+            with self.subTest(scale=scale):
+                spec = json.loads(path.read_text(encoding="utf-8"))
+                paired = json.loads((DV / "legs" / f"m16-1243-q1-cpu-look-paired-fullscreen-s{scale}.json").read_text(encoding="utf-8"))
+                self.assertEqual(spec["legId"], path.stem)
+                expected = dict(paired, legId=path.stem, look=dict(paired["look"], pairedSeekFrames=SIX_FRAMES))
+                self.assertEqual(spec, expected, "legId and look.pairedSeekFrames are the only differences")
+                frames = spec["look"]["pairedSeekFrames"]
+                self.assertEqual(len(frames), spec["look"]["contactSheetFrames"])
+                self.assertEqual(frames, sorted(set(frames)), "strictly ascending")
+                self.assertLess(max(frames), int(spec["playSeconds"] * 23.976), "inside the measured pass at the clip's native rate")
+
+    def test_r14_the_lease_batch_preflight_admits_both_sameframe_specs(self) -> None:
+        cases = {path.stem: (json.loads(path.read_text(encoding="utf-8")), "") for path in SAMEFRAME_SPECS.values()}
+        rows = run_preflight_probe(self, cases)
+        for name in cases:
+            with self.subTest(spec=name):
+                self.assertEqual(rows[name][0], "", rows[name][1])
 
 
 if __name__ == "__main__":
