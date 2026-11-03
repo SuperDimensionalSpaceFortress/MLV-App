@@ -278,3 +278,59 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossT
     ASSERT_EQ(0u, f.tracker.wraps());
     ASSERT_EQ(1u, f.tracker.backwardJumps());
 }
+
+// r18 (adversary A1 on 26f235a4): Loop on, drop-frame off, cut 1..720 (0..719). The measured Play's FIRST presented
+// frame, 719, was requested with stamp 0, and the draw that presents it runs its early advance first, which wraps the
+// engine (live 1) before notePlaybackSmokePresentedFrame reads the count. Then 0 and 1 at 1.000, 1.045, 1.090 s.
+// e9b8b047 let the first presentation consume every pending wrap whatever its stamp, so 719 took the wrap and
+// 719 -> 0 was a backward jump: advanced 1, wraps 0, backward 1, 11.111 fps. The first presentation consumes only
+// the wraps before its own request; this wrap stays pending for 0: advanced 2, wraps 1, backward 0, 22.222 fps.
+TEST(PlaybackSourceAdvanceTracker, R18AdversaryA1TheFirstFrameRequestedBeforeTheWrapLeavesItPending)
+{
+    PresentDriver d;
+    d.startMeasuredPlay();
+    const int stamp719 = d.engineWraps;      // 719 is requested before the wrap ...
+    ++d.engineWraps;                         // ... and the draw that presents it wraps the engine first
+    d.present(1.000, 719, true, 0, 719, stamp719);
+    d.present(1.045, 0, true, 0, 719);       // requested after the wrap
+    d.present(1.090, 1, true, 0, 719);
+    ASSERT_EQ(2, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(0u, d.tracker.backwardJumps());
+    ASSERT_NEAR(2.0 / 0.090, d.tracker.sourceFps(), 1e-9);
+    // the wrap was taken once: a later user seek back is a backward jump, not a second wrap
+    d.present(1.135, 0, true, 0, 719);
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(1u, d.tracker.backwardJumps());
+    // earlier Plays' wraps stay out: a first frame stamped below the count at the Play's start lowers nothing
+    PresentDriver e;
+    e.engineWraps = 4;
+    e.startMeasuredPlay();
+    const int stale = 2;                     // requested before the measured Play started
+    ++e.engineWraps;                         // and this Play's own wrap lands before it is presented
+    e.present(1.000, 719, true, 0, 719, stale);
+    e.present(1.045, 0, true, 0, 719);
+    ASSERT_EQ(1u, e.tracker.wraps());
+    ASSERT_EQ(0u, e.tracker.backwardJumps());
+    ASSERT_EQ(1, static_cast<int>(e.tracker.advancedFrames()));
+    // a wrap BEFORE the first frame's request (r16 c9b4ca5e) is still consumed by that first presentation
+    PresentDriver p;
+    p.startMeasuredPlay();
+    ++p.engineWraps;
+    p.present(0.0, 0, true, 0, 719, p.engineWraps);
+    p.present(1 / 24.0, 1, true, 0, 719);
+    p.present(2 / 24.0, 0, true, 0, 719);
+    ASSERT_EQ(0u, p.tracker.wraps());
+    ASSERT_EQ(1u, p.tracker.backwardJumps());
+    // the same wrap pending across a forward in-flight sibling of the first frame: still taken by the backward one
+    PresentDriver g;
+    g.startMeasuredPlay();
+    const int both = g.engineWraps;          // 718 and 719 requested together (lookahead), then the wrap
+    ++g.engineWraps;
+    g.present(1.000, 718, true, 0, 719, both);
+    g.present(1.045, 719, true, 0, 719, both);
+    g.present(1.090, 0, true, 0, 719);
+    ASSERT_EQ(2, static_cast<int>(g.tracker.advancedFrames()));
+    ASSERT_EQ(1u, g.tracker.wraps());
+    ASSERT_EQ(0u, g.tracker.backwardJumps());
+}

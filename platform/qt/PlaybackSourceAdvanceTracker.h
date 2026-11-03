@@ -112,9 +112,12 @@ private:
  *    reused after it (speculative 0 stamped 0: adversary A1 on eb5af034).
  *  So a wrap is PENDING while the live count is above consumedEngineWraps. A pending wrap is taken by the
  *  first presentation that goes backward: that one IS the wrap. A pending wrap is consumed without counting
- *  as a wrap by the measured Play's first presentation, or by a frame requested after every wrap so far
- *  (stamp >= live), which is the wrap's forward landing (r16 c9b4ca5e). It stays pending across a forward
- *  or repeated frame requested before it (stamp < live): an in-flight frame from before the wrap.
+ *  as a wrap by a frame requested after it: the measured Play's first presentation, or a forward frame,
+ *  whose stamp counts the wrap, is the wrap's forward landing (r16 c9b4ca5e). A non-wrap presentation
+ *  therefore raises consumedEngineWraps to min(stamp, live). A wrap stays pending across a forward or
+ *  repeated frame requested before it (stamp below it): an in-flight frame from before the wrap. r18
+ *  (adversary A1 on 26f235a4): that includes the measured Play's FIRST presentation. 719 requested with
+ *  stamp 0 whose draw wraps the engine first used to consume the wrap, so 719 -> 0 counted backward.
  *  consumedEngineWraps is the caller's running count. It is set to the live count when the measured Play
  *  starts and only ever rises.
  *  \param havePrevious a frame was presented before this one in the measured Play */
@@ -124,7 +127,16 @@ inline bool presentationIsLoopWrap( int liveEngineWraps, int requestEngineWraps,
     if( liveEngineWraps <= consumedEngineWraps ) return false;   // no wrap pending
     const bool wrap = havePrevious && frame < lastFrame;
     const bool requestedBeforeTheWrap = requestEngineWraps < liveEngineWraps;
-    if( wrap || !havePrevious || !requestedBeforeTheWrap ) consumedEngineWraps = liveEngineWraps;
+    if( wrap || !requestedBeforeTheWrap )
+    {
+        consumedEngineWraps = liveEngineWraps;
+    }
+    else if( requestEngineWraps > consumedEngineWraps )
+    {
+        // r18 (adversary A1 on 26f235a4): a non-wrap presentation, the first one included, consumes only the
+        // wraps that came before its own request. A later wrap stays pending for the frame that crosses it.
+        consumedEngineWraps = requestEngineWraps;
+    }
     return wrap;
 }
 
