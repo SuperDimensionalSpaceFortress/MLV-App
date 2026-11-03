@@ -1901,3 +1901,32 @@ def test_a_repository_whose_identity_changed_during_the_run_is_a_refusal_not_a_c
 def test_the_repository_identity_is_held_and_rechecked_in_the_saver_source():  # r14 A2 source pin
     text = SCRIPT.read_text(encoding="utf-8")
     assert "$script:heldGit = Get-FinalDir $gitDir" in text and "Assert-RepoUnchanged $gitDir $WorkDir $script:repoIds" in text and "reason=repository-changed" in text
+
+
+@pytest.mark.skipif(not WIN, reason="a directory handle that blocks a rename is Windows")
+def test_the_private_base_cannot_be_replaced_by_a_junction_into_the_worktree_between_the_proof_and_the_write(repo, tmp_path):  # r14 adversary pass 2 A2 (6d7b066f): Get-PrivateBase proved the OS temp directory outside the worktree and then released its handle; a peer could move it away and put a junction to a worktree folder in its place, and the private git dir was then created INSIDE the worktree. The hook plays the peer right before the private directory is created
+    base = tmp_path / "tempbase"
+    base.mkdir()
+    marker = tmp_path / "rename-result.txt"
+    anchor = "foreach ($sub in @('objects', 'info'), @('refs'), @('info')) {"
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert text.count(anchor) == 1
+    hook = (f"try {{ $b = [System.IO.Path]::GetDirectoryName($sg); [System.IO.Directory]::Move($b, $b + '.saved'); $o = 'MOVED' }} catch {{ $o = 'BLOCKED' }}; Set-Content -LiteralPath '{marker}' -Value $o -NoNewline; ")
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, hook + anchor), encoding="utf-8")
+    (repo / "u.txt").write_text("u\n")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base)})
+    outcome = marker.read_text()
+    if outcome == "MOVED" and (tmp_path / "tempbase.saved").exists():
+        (tmp_path / "tempbase.saved").rename(base) if not base.exists() else None
+    assert outcome == "BLOCKED", r.stdout + r.stderr  # 6d7b066f: MOVED, the proof's handle was already released
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_an_argument_holding_the_replacement_character_is_refused_because_argv_decoding_may_have_made_it(tmp_path):  # r14 adversary pass 2 A3 (6d7b066f): a raw non-UTF-8 byte in an argument reaches the saver as U+FFFD, which names a different (valid) sibling; the saver cannot tell the two apart after the host's lossy decode, so it refuses the character (exit 30 reason=lossy-argument) instead of collecting the wrong repository
+    wd = tmp_path / ("wt" + "�")
+    init_repo(wd, b"one\n")  # a clean repository: the sibling that the lossy decode would select
+    (tmp_path / "run").mkdir()
+    r = run_saver(wd, tmp_path / "run")
+    assert r.returncode == 30 and "reason=lossy-argument" in r.stdout, r.stdout + r.stderr  # 6d7b066f: 10 clean-tree
+    assert list((tmp_path / "run").iterdir()) == []
