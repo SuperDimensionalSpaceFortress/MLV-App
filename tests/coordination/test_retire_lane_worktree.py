@@ -3309,6 +3309,121 @@ def test_r5c_a3_a_snapshot_older_than_the_record_cannot_prove_the_recorded_proce
     assert r is None, (r, err)
 
 
+# Adversary pass 6 on 7916f88a (A1 linguistic key match, A2 escaped second pid, A3 snapshot time taken after the scan / absent, A4 stale foreign image). r6.
+
+def _r6_run_dir(tmp_path, now):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    return wt, runs, rd
+
+
+@pytest.mark.parametrize("doc,stale_first", [
+    ('{"pid":999972,"created\\u00adUtc":"%s","createdUtc":"%s"}', True),                                       # root stamp lookalike (soft hyphen) BEFORE the real one
+    ('{"pid":999972,"createdUtc":"%s","created\\u00adUtc":"%s"}', False),                                      # ... and after it
+    ('{"state":"complete","contain\\u00adment":{"childPid":999972,"childCreatedUtc":"%s"},"x":"%s"}', True),   # containment lookalike alone
+    ('{"state":"complete","containment":{"childPid":999972,"child\\u00adCreatedUtc":"%s","childCreatedUtc":"%s"}}', True),   # inner stamp lookalike first
+], ids=["root-lookalike-first", "root-lookalike-last", "containment-lookalike", "inner-lookalike"])
+def test_r6_a1_identity_keys_compare_ordinally_so_a_lookalike_key_is_not_an_identity_claim(tmp_path, doc, stale_first):
+    """r6 A1: -ceq / -cin / -ccontains compare linguistically, where U+00AD is ignorable: 'created<soft hyphen>Utc' (a JSON escape) read as the
+    identity key createdUtc, and an unrelated stale stamp replaced the genuine one so the live driver read as reused. Names compare ORDINALLY."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    first, second = (_STALE, _iso(created)) if stale_first else (_iso(created), _STALE)
+    _write_record(rd, "new.child.json", doc % (first, second), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("key", ["child\\u0050id", "driver\\u0050id", "runner\\u0050id", "owner\\u0050id"])
+def test_r6_a2_a_root_stamp_needs_exactly_one_pid_by_the_parsers_count_not_the_regexs(tmp_path, key):
+    """r6 A2: the pid list comes from a regex that does not decode JSON escapes, the claims from a parser that does. A record that names a second
+    pid through an escaped key has TWO pids; its root createdUtc is then ambiguous and must not mark the genuine driver reused."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"%s":999974,"createdUtc":"%s"}' % (key, _STALE), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r6_a2_an_escaped_second_pid_inside_containment_also_voids_the_root_stamp(tmp_path):
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"createdUtc":"%s","containment":{"child\\u0050id":999974}}' % _STALE, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r6_a2_a_single_pid_root_stamp_still_binds_it(tmp_path):
+    """Guard: one pid + one root stamp is still an identity claim (a different process on that pid is free)."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"createdUtc":"%s"}' % _iso(created), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r6_a3_the_snapshot_capture_time_is_taken_before_the_process_scan(tmp_path):
+    """r6 A3: CapturedUtc was assigned AFTER Get-CimInstance returned, so a record published while the scan ran looked older than the snapshot and
+    the scan's stale row for its pid read as fresh evidence of reuse. The capture time is taken BEFORE the scan: every row is at least that new."""
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        f". '{HELPER}'; "
+        "function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName) $script:scanAt = [DateTime]::UtcNow; Start-Sleep -Milliseconds 600; "
+        "[pscustomobject]@{ ProcessId = [int]$PID; ParentProcessId = 0; Name = 'pwsh.exe'; CommandLine = ''; CreationDate = [DateTime]::UtcNow } }; "
+        "$s = Get-LaneProcessSnapshot; "
+        "if ($s.CapturedUtc -le $script:scanAt) { 'BEFORE' } else { 'AFTER' }"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert p.stdout.strip() == "BEFORE", p.stdout + p.stderr
+
+
+def test_r6_a3_a_stamped_record_with_no_write_time_and_no_snapshot_time_is_not_proof_of_reuse(tmp_path):
+    """r6 A3 (2nd variant): the post-read stat failed (no write time) and the snapshot states no capture time. Neither side can show the snapshot
+    row is current, so the stamp 'mismatch' (the row may be the previous holder of the pid) must not mark the process reused: fail toward live."""
+    now = time.time()
+    created = now - 300
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999900}', now - 30)
+    text = '{"schema":"mlv-lane-child/v1","pid":999972,"createdUtc":"%s"}' % _iso(created)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq 'new.child.json') {{ $t = '{text}'; [IO.File]::Delete($Path); return $t }}; "
+            "return [IO.File]::ReadAllText($Path) };")
+    old_row = _fake_proc_created(999972, "", "pwsh.exe", now - 86400)
+    r, err = _live_refusal(wt, _fake_snapshot(old_row), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("stamped", [True, False], ids=["stamped", "unstamped"])
+@pytest.mark.parametrize("image", ["git.exe", "tailscaled.exe"])
+def test_r6_a4_a_snapshot_older_than_the_record_cannot_reject_the_driver_by_the_previous_holders_image(tmp_path, stamped, image):
+    """r6 A4: the snapshot (taken 120 s ago) lists the pid as git.exe; the genuine pwsh driver took the pid afterwards and published its record
+    after the snapshot. The row is the PREVIOUS holder's, so its image says nothing about the recorded process: the worktree is held. A snapshot
+    taken after the record still rejects the foreign image."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    doc = {"schema": "mlv-lane-child/v1", "pid": 999972}
+    if stamped:
+        doc["createdUtc"] = _iso(now - 60)
+    _write_record(rd, "new.child.json", doc, now - 30)
+    row = _fake_proc_created(999972, "", image, now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs)
+    assert r is None, (r, err)
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo

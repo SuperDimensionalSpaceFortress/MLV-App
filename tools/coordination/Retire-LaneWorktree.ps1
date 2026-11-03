@@ -396,6 +396,10 @@ function Get-LaneProcessSnapshot {
     # column. Measured 2026-10-03: the old per-ancestor `Get-CimInstance -Filter "ProcessId=N"` loop cost
     # ~31 s of a ~36 s gate call; the one full scan costs ~2.4 s. Throws when the scan fails (the caller
     # turns that into cannot-determine, never into "no live process").
+    # r6 (adversary A3, 6th pass): the capture time is taken BEFORE the scan, never after it. Every row is then at least this new, and a run-dir
+    # record written while the scan ran is NEWER than the snapshot (so its stamp / image are not contradicted by a row that may be the pid's
+    # previous holder); stamped after the scan returned, the same record would look older and a stale row would read as fresh evidence.
+    $capturedAt = (Get-Date).ToUniversalTime()
     $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
     $byPid = @{}
     foreach ($p in $all) { $byPid[[int]$p.ProcessId] = $p }
@@ -412,7 +416,7 @@ function Get-LaneProcessSnapshot {
         # TRAPS.md:15482-15492). Every live non-self process stays; the cmdline check simply cannot match it.
         Procs       = @($all | Where-Object { $self -notcontains $_.ProcessId })
         SelfPids    = $self
-        CapturedUtc = (Get-Date).ToUniversalTime()
+        CapturedUtc = $capturedAt
     }
 }
 
@@ -668,6 +672,13 @@ function ConvertTo-RecordedPid([System.Text.Json.JsonElement]$El) {
     return 0
 }
 
+function Test-OrdinalMember([string]$Name, [string[]]$Set) {
+    # True when $Name is exactly one of $Set, compared ORDINALLY. PowerShell's -ceq / -cin / -ccontains are culture-aware: a name containing an
+    # ignorable character (U+00AD ...) would equal a recognised key. Used for every identity-key test on a parsed JSON record.
+    foreach ($s in $Set) { if ([string]::Equals($Name, $s, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
 function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
     # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1, B2): the process creation time(s) a record states, as @{ pid = UTC datetime }, read from
     # the PARSED record and only from fields that belong to a pid, never from a document-wide pattern (a nested metadata.createdUtc is not the
@@ -693,23 +704,32 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
         # at the root; the three pid/stamp pairs inside containment) that appears twice makes the WHOLE record state no identity: the map is empty
         # and the caller falls back to the image + record-write-time test exactly as for unparsable text. A duplicate must never leave one copy
         # standing as the claim (a parser keeps the last, a reader the first): a stale stamp would then mark the genuine driver reused.
+        # r6 (adversary A1, 6th pass): PowerShell's -ceq / -cin / -ccontains are case-sensitive but LINGUISTIC (culture-aware), where U+00AD and other
+        # ignorable characters vanish, so a key spelled 'created<soft hyphen>Utc' (a JSON escape) matched createdUtc and an unrelated stale stamp could
+        # replace the genuine one. Every key test below is [string]::Equals(..., Ordinal) through Test-OrdinalMember.
         $rootIdKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid', 'createdUtc', 'containment')
+        $rootPidKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')
         $seenRoot = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
         foreach ($prop in $root.EnumerateObject()) {
-            if (-not $seenRoot.Add($prop.Name) -and $rootIdKeys -ccontains $prop.Name) { return @{} }
+            if (-not $seenRoot.Add($prop.Name) -and (Test-OrdinalMember $prop.Name $rootIdKeys)) { return @{} }
         }
+        $allPids = New-Object System.Collections.Generic.HashSet[int]   # every pid the PARSER finds in a pid field (root or containment): see the root-stamp rule below (adversary A2, 6th pass)
         foreach ($prop in $root.EnumerateObject()) {
-            if ($prop.Name -ceq 'createdUtc') { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
-            elseif ($prop.Name -cin @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')) {
+            if ([string]::Equals($prop.Name, 'createdUtc', [StringComparison]::Ordinal)) { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
+            elseif (Test-OrdinalMember $prop.Name $rootPidKeys) {
                 $rn = ConvertTo-RecordedPid $prop.Value
                 if ($rn -gt 0) { $rootPids.Add($rn) }
+                if ($rn -gt 4) { [void]$allPids.Add($rn) }   # pids 0-4 are never a driver (Get-PidsFromRecordText skips them too)
             }
-            elseif ($prop.Name -ceq 'containment' -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+            elseif ([string]::Equals($prop.Name, 'containment', [StringComparison]::Ordinal) -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
                 $f = New-Object 'System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]' ([StringComparer]::Ordinal)
                 $innerIdKeys = @('childPid', 'childCreatedUtc', 'ownerPid', 'ownerCreatedUtc', 'runnerPid', 'runnerCreatedUtc')
                 foreach ($c in $prop.Value.EnumerateObject()) {
-                    if ($f.ContainsKey($c.Name) -and $innerIdKeys -ccontains $c.Name) { return @{} }
+                    if ($f.ContainsKey($c.Name) -and (Test-OrdinalMember $c.Name $innerIdKeys)) { return @{} }
                     $f[$c.Name] = $c.Value
+                }
+                foreach ($pk in @('childPid', 'ownerPid', 'runnerPid')) {
+                    if ($f.ContainsKey($pk)) { $an = ConvertTo-RecordedPid $f[$pk]; if ($an -gt 4) { [void]$allPids.Add($an) } }
                 }
                 foreach ($pair in @(@('childPid', 'childCreatedUtc'), @('ownerPid', 'ownerCreatedUtc'), @('runnerPid', 'runnerCreatedUtc'))) {
                     if (-not $f.ContainsKey($pair[0]) -or -not $f.ContainsKey($pair[1])) { continue }
@@ -721,8 +741,14 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
                 }
             }
         }
-        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and $rootPids.Contains([int]$PidList[0])) {
-            $rp = [int]$PidList[0]
+        # r6 (adversary A2, 6th pass): "names exactly one pid" is counted over BOTH readers. $PidList comes from a regex that does not decode JSON
+        # escapes; the parser does ('childPid' is childPid), so a record can name a second pid the regex never saw. The root stamp stands only
+        # when the union of the regex's pids and every pid the parser found (root fields and containment) is that one pid, and it is a root pid.
+        $union = New-Object 'System.Collections.Generic.HashSet[int]'
+        foreach ($x in @($PidList)) { [void]$union.Add([int]$x) }
+        foreach ($x in $allPids) { [void]$union.Add([int]$x) }
+        if ($null -ne $rootStamp -and $union.Count -eq 1 -and $rootPids.Contains([int]@($union)[0])) {
+            $rp = [int]@($union)[0]
             if (-not $claims.ContainsKey($rp)) { $claims[$rp] = New-Object 'System.Collections.Generic.List[datetime]' }
             $claims[$rp].Add($rootStamp)
         }
@@ -920,12 +946,22 @@ function Find-RunDirDriverHolders {
     $snapAt = $null
     $snapProp = $Snapshot.PSObject.Properties['CapturedUtc']
     if ($snapProp -and $snapProp.Value -is [datetime]) { $snapAt = ([datetime]$snapProp.Value).ToUniversalTime() }
+    # r6 (adversary A3, A4; 6th pass): $recNewer = the snapshot cannot be shown to be at least as new as the record. That is when the record was written
+    # after the capture, or its write time is unknown (the post-read stat failed), whether or not the snapshot states a capture time: with no write
+    # time on either side the row may be the pid's previous holder, so it is not evidence. (A known write time with NO capture time cannot be
+    # compared, and stays "not newer": hand-built snapshots without a time keep the earlier rules.) $staleVsSnapshot = newer AND the stamp differs:
+    # the "mismatch" is then only the old holder's row, so it is never proof of reuse. Both only ever move a verdict toward LIVE.
+    $recNewer = {
+        param($rec)
+        $atv = $rec.PSObject.Properties['RecordedAtUtc']
+        $unknownAt = (-not $atv) -or ($atv.Value -isnot [datetime])
+        if ($unknownAt) { return $true }
+        if ($null -eq $snapAt) { return $false }
+        return (([datetime]$atv.Value).ToUniversalTime() -gt $snapAt)
+    }
     $staleVsSnapshot = {
         param($rec)
-        if ($null -eq $snapAt) { return $false }
-        $atv = $rec.PSObject.Properties['RecordedAtUtc']
-        $newer = (-not $atv) -or ($atv.Value -isnot [datetime]) -or (([datetime]$atv.Value).ToUniversalTime() -gt $snapAt)
-        return ($newer -and [bool](Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec))
+        return ((& $recNewer $rec) -and [bool](Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec))
     }
     $exactMatch = @{}; $reused = @{}
     foreach ($rec in $index) {
@@ -959,7 +995,7 @@ function Find-RunDirDriverHolders {
             if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
             # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: the run-dir tie below needs the live pid to BE the recorded process (image + creation time);
             # a reused pid (tailscaled.exe, git.exe ... with an unreadable command line) is not a driver of this run dir.
-            elseif (-not $reused.ContainsKey("$($rec.RunDir)|$($rec.Pid)") -and (((& $staleVsSnapshot $rec) -and ([string]$p.Name -match $script:RunDirDriverImagePattern)) -or (Test-RecordedPidBound -Proc $p -Record $rec).Bound) -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            elseif (-not $reused.ContainsKey("$($rec.RunDir)|$($rec.Pid)") -and ((& $recNewer $rec) -or (Test-RecordedPidBound -Proc $p -Record $rec).Bound) -and (-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
                 $matched = $rec.RunDir
                 if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }
