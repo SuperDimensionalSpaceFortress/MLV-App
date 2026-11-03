@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <vector>
 
 extern "C" {
@@ -215,6 +216,63 @@ TEST(VisualCaptureSourceHash, Lj92APictureTheDecoderReadsDifferentlyHashesDiffer
     const uint64_t second = lj92Hash(encodeLj92(2048, 12289), &status);
     ASSERT_EQ(0, status);
     ASSERT_TRUE(first != second);
+}
+
+namespace
+{
+// r9 (adversary r3 on 9487c66f): hand-built 64x64 14-bit LJ92 headers. Z(n) = n zero bytes.
+std::vector<uint8_t> bytes(std::initializer_list<std::vector<uint8_t>> parts)
+{
+    std::vector<uint8_t> out;
+    for (const std::vector<uint8_t> & part : parts) out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+std::vector<uint8_t> zeros(size_t n) { return std::vector<uint8_t>(n, 0); }
+const std::vector<uint8_t> kSof3 = { 0xFF, 0xC3, 0x00, 0x0B, 0x0E, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00 };
+const std::vector<uint8_t> kSos = { 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00 };
+} // namespace
+
+// r9 A1: the default liblj92 parseHuff does not advance past a DHT, so the next marker search walks the DHT's own bytes.
+// An SOS spelled INSIDE a DHT's values is the scan the decoder uses; the bytes after it are the entropy data, and a
+// difference there is a different picture (the old walk skipped the whole DHT and hashed only the later, equal data).
+TEST(VisualCaptureSourceHash, Lj92AScanSpelledInsideADhtIsTheScanTheDecoderUses)
+{
+    const std::vector<uint8_t> n = bytes({ { 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 } });
+    auto build = [&](uint8_t v)
+    {
+        const std::vector<uint8_t> embeddedDht = bytes({ { 0xFF, 0xC4, 0x02, 0x21, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 },
+                                                         kSos, { v }, zeros(511), { 0xFF, 0xD9 } });
+        return bytes({ { 0xFF, 0xD8 }, kSof3, embeddedDht, n, kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
+    };
+    int status = -1;
+    const uint64_t first = lj92Hash(build(0x00), &status);
+    ASSERT_EQ(0, status);
+    const uint64_t second = lj92Hash(build(0xC0), &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(first != second);
+}
+
+// r9 A2: a DHT value past sum(counts) is never read, so two payloads that differ only there are the same picture.
+TEST(VisualCaptureSourceHash, Lj92ADhtValueBeyondTheDeclaredSymbolsIsNotHashed)
+{
+    auto build = [&](uint8_t unused)
+    {
+        return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02 }, zeros(15), { 0x00, 0x01, unused },
+                       kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
+    };
+    int status = -1;
+    const uint64_t first = lj92Hash(build(0x41), &status);
+    ASSERT_EQ(0, status);
+    const uint64_t second = lj92Hash(build(0x42), &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(first == second);
+    // ...while a DECLARED symbol still counts.
+    auto declared = [&](uint8_t value)
+    {
+        return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02 }, zeros(15), { 0x00, value, 0x41 },
+                       kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
+    };
+    ASSERT_TRUE(lj92Hash(declared(0x01), &status) != lj92Hash(declared(0x02), &status));
 }
 
 TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)

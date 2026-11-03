@@ -4153,25 +4153,35 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut)
 {
     if (!data || !hashOut || length < 4) return 1;
-    /* r7 (adversary r6 A1/A2 on 1fb39703): the FIELDS liblj92 reads, not whole segments -- and the last DHT / SOF3
-     * before the scan, as each one parsed replaces the decoder's state:
-     *   DHT  (parseHuff): its length, the 16 code counts and the values (huffhead[2], the class/id byte, is
-     *        overwritten as bits[0] = 0 and never read);
+    /* r7 (adversary r6 A1/A2 on 1fb39703), r9 (adversary r3 A1/A2 on 9487c66f): the FIELDS liblj92 reads, walked the way
+     * its DEFAULT (non-SLOW_HUFF) parser walks them -- and the last DHT / SOF3 before the scan, as each one parsed
+     * replaces the decoder's state:
+     *   DHT  (parseHuff): the 16 code counts and the first sum(counts) values. Its length is only checked against the
+     *        payload end; the class/id byte (huffhead[2]) is overwritten with 0 and never read; a value past
+     *        sum(counts) is never read. The default parser does NOT advance past a DHT (only SLOW_HUFF does), so the
+     *        next marker search starts AT the DHT's length field and walks through its own bytes: an FF xx inside the
+     *        counts or values is a marker the decoder acts on (r9 A1);
      *   SOF3 (parseSof3): precision, height, width, component count (the per-component specs are not read);
      *   SOS  (parseScan): component count and predictor -- then every byte from the END of the SOS header
      *        (scanstart + its length) to the end of the payload (r8: never stopped at an EOI). */
     const uint8_t * dht = NULL;
-    size_t dhtLength = 0;
+    size_t dhtValues = 0;
+    size_t zeroedAt = (size_t)-1; /* the class/id byte parseHuff set to 0 in the decoder's buffer */
     const uint8_t * sof = NULL;
     size_t ix = 0;
     int sawSoi = 0;
     for (;;)
     {
-        /* lj92.c find(): the next 0xFF, and the marker is the byte after it. */
+        /* lj92.c find(): the next 0xFF, and the marker is the byte after it. The zeroed class/id byte is not an FF. */
         while (ix < length - 1 && data[ix] != 0xFF) ix++;
+        if (ix == zeroedAt)
+        {
+            ix++;
+            continue;
+        }
         ix += 2;
         if (ix >= length) return 1;
-        const uint8_t marker = data[ix - 1];
+        const uint8_t marker = (ix - 1 == zeroedAt) ? 0 : data[ix - 1];
         if (!sawSoi)
         {
             if (marker != 0xD8) return 1; /* findSoI */
@@ -4196,8 +4206,8 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
              * after the scan can only make two alike pictures read "differ" (the loud direction). */
             const size_t end = length;
             uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
-            hash = mlv_source_hash_fnv1a64(hash, dht, 2);                  /* DHT length */
-            hash = mlv_source_hash_fnv1a64(hash, dht + 3, dhtLength - 3);  /* counts and values */
+            hash = mlv_source_hash_fnv1a64(hash, dht + 3, 16);             /* the 16 code counts */
+            hash = mlv_source_hash_fnv1a64(hash, dht + 19, dhtValues);     /* the declared symbols, no more */
             hash = mlv_source_hash_fnv1a64(hash, sof + 2, 6);              /* precision, height, width, components */
             hash = mlv_source_hash_fnv1a64(hash, data + ix + 2, 1);        /* scan component count */
             hash = mlv_source_hash_fnv1a64(hash, data + predictorAt, 1);   /* predictor */
@@ -4208,15 +4218,23 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
         if (marker == 0xC4)
         {
             if (segment < 19) return 1; /* the decoder reads 16 counts after the class/id byte */
+            size_t values = 0;
+            for (size_t i = 0; i < 16; ++i) values += data[ix + 3 + i];
+            if (ix + 19 + values > length) return 1; /* the lookup table would read past the payload */
             dht = data + ix;
-            dhtLength = segment;
+            dhtValues = values;
+            zeroedAt = ix + 2;
+            /* No `ix += segment`: the default parseHuff leaves ix at the length field. */
         }
-        else if (marker == 0xC3)
+        else
         {
-            if (segment < 8) return 1; /* parseSof3 reads up to ix + 7 */
-            sof = data + ix;
+            if (marker == 0xC3)
+            {
+                if (segment < 8) return 1; /* parseSof3 reads up to ix + 7 */
+                sof = data + ix;
+            }
+            ix += segment;
         }
-        ix += segment;
     }
 }
 
