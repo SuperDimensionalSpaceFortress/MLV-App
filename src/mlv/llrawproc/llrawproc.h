@@ -533,6 +533,26 @@ void llrpResetLastPreDualIsoFixTelemetry(void);
 void llrpResetLastRunTimingForCurrentThread(void);
 double llrpGetLastDualIsoMilliseconds(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
+/* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the steps inside the llrawproc wall that the
+ * seven stage timers above (dark frame .. chroma smooth) do not cover, timed
+ * with the same clock on the same thread-local last-run convention. Every
+ * field is disjoint from those seven and from the others here, so the playback
+ * llrawproc_other_ms is the wall minus all of them. The scaled (with_dims)
+ * entry sets every field; the full-resolution entry sets the LUT fields only.
+ * lut_rebuild_ms / lut_rebuilds count the raw2ev/ev2raw rebuilds in
+ * llrawproc_worker_ensure_luts on either entry (a cache hit costs nothing). */
+typedef struct
+{
+    double setup_ms;               /* entry to make_14bit: extents, worker acquire, raw_info */
+    double make_14bit_ms;          /* make_14bit, plus undo_14bit on the success path */
+    double lut_rebuild_ms;         /* raw2ev/ev2raw rebuilds in ensure_luts */
+    int lut_rebuilds;
+    double snapshot_lock_wait_ms;  /* pthread_mutex_lock of the shared-state snapshot */
+    double snapshot_locked_ms;     /* held: df_init, dark-frame copy sync, snapshot */
+    double failure_backup_ms;      /* dual-ISO failure backup copy (LJ92 restricted) */
+    double publish_ms;             /* runtime-state capture, publish lock or restore */
+} llrpResidualSubstageTiming_t;
+void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void);
 double llrpGetLastDualIsoPreviewRegressionMilliseconds(void);

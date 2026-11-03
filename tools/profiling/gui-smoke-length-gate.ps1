@@ -312,6 +312,7 @@ $script:GuiSmokeOptionPolicy = @{
     'screenshot-output' = 'allow'; 'window-screenshot-output' = 'allow'
     'contact-sheet-dir' = 'allow'; 'contact-sheet-frames' = 'allow'; 'contact-sheet-seek-mode' = 'allow'
     'contact-sheet-seek-dir' = 'allow'         # paired seek capture after the stop; never plays
+    'contact-sheet-seek-frames' = 'allow'      # explicit seek targets for the capture after the stop; never plays, never changes what is played or for how long
     'visual-capture-dir' = 'allow'             # window captures AFTER the measured window closes: the same Play runs ~3 s on (no restart, no loop), then pauses
     'scope' = 'allow'; 'playback-debayer' = 'allow'; 'playback-processing' = 'allow'
     'gpu-viewport' = 'allow'; 'gpu-preview-processing' = 'allow'; 'gpu-bilinear-debayer' = 'allow'

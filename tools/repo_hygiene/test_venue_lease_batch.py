@@ -21,6 +21,7 @@ claim lives in a temp -ClaimDir. Nothing here reaches a venue. Windows-only (Pow
 
 from __future__ import annotations
 
+import ctypes
 import ast
 import json
 import os
@@ -51,6 +52,27 @@ MANIFEST = "b" * 64
 # r13 (adversary r13 A1): the three artifact digests the leg job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks), in every staged manifest
 ARTIFACT_SHAS = {"packageZip": {"sha256": "a" * 64}, "exe": {"sha256": "b" * 64}, "dll": {"sha256": "c" * 64}}
 ABSENT = object()   # a staged build manifest field left out (stage(): dllPairManifestSha256=ABSENT)
+
+# r13 (PR #729, hosted shard 4/8 job 124969603389): the DOCUMENTED reserved device names, hard-coded from Microsoft's "Naming Files, Paths, and Namespaces" page
+# (https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file): CON, PRN, AUX, NUL, COM1-COM9, COM1-3 superscript, LPT1-LPT9, LPT1-3 superscript; "also avoid these names
+# followed immediately by an extension" (NUL.txt and NUL.tar.gz are NUL). COM0 and LPT0 are not on the list. This is the PRIMARY oracle for the helper's device rule: it does not
+# depend on the host. RtlIsDosDeviceName_U is host-dependent (Windows Server 2025 10.0.26100 returned 0 for every COM/LPT name inside `C:\x\.claude-state\<name>`, where
+# 10.0.19045 returns non-zero), so the native classifier is only a corroborating check, in its own test method.
+DOCUMENTED_DOS_DEVICE_STEMS = frozenset(["CON", "PRN", "AUX", "NUL"] + [f"{p}{d}" for p in ("COM", "LPT") for d in "123456789\u00b9\u00b2\u00b3"])
+
+
+def documented_dos_device(name: str) -> bool:
+    """True when the documented reserved set names this component: the stem before the first dot, with the spaces Win32 drops before an extension removed, compared case-insensitively."""
+    return name.split(".", 1)[0].rstrip(" ").upper() in DOCUMENTED_DOS_DEVICE_STEMS
+
+
+# the device-rule matrix: COM/LPT with every ASCII digit and the three superscripts, bare, with an extension and with spaces before it; the other documented names; lower case;
+# and near misses that are ordinary names (COM10, CONSOLE, NULL, COM1x, a superscript 0/4 and a fullwidth 1 are not on the documented list)
+DEVICE_MATRIX_NAMES = (
+    [f"{p}{d}{tail}" for p in ("COM", "LPT") for d in [str(n) for n in range(10)] + ["\u00b9", "\u00b2", "\u00b3"] for tail in ("", ".txt", " .txt")]
+    + ["CON", "PRN", "AUX", "NUL", "CON.txt", "NUL .txt", "NUL.tar.gz", "AUX  .log", "prn.x", "com1", "lpt\u00b2.log", "nul"]
+    + ["COM10", "LPT10", "CONSOLE", "NULL", "AUXX", "COM1x", "LPT9-a", "COM\u2070", "COM\u2074", "COM\uff11", "CON_", "XCOM1"]
+)
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
@@ -181,8 +203,10 @@ throw "fake um-run: unexpected job $JobId"
 # share's outbox (admission.leaseBatch on the current lease, or another one when the call index is in FAKE_LEG_LOSE), a receipt and its summary.json
 # (pre-load FAKE_LEG_PRELOADS), and DVE_OUTCOME from FAKE_LEG_OUTCOMES. Each call is logged with UTC ticks and its -LeaseBatch.
 FAKE_LEG = r"""
-param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '')
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '', [string]$ReceiptRoot = '')
 $share = $env:FAKE_SHARE
+# LEASE-BATCH-RECEIPT-ROOT-1: one line per call saying whether -ReceiptRoot was passed at all (absent and empty are different: the batch must forward NOTHING when it has none)
+Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'leg-receiptroot.log') -Value ("bound={0} root={1}" -f $PSBoundParameters.ContainsKey('ReceiptRoot'), $ReceiptRoot)
 $st = Get-Content -LiteralPath (Join-Path $share 'fake-agent-state.json') -Raw | ConvertFrom-Json
 $cf = Join-Path $share 'fake-leg-count.txt'
 $k = $(if (Test-Path -LiteralPath $cf) { [int](Get-Content -LiteralPath $cf) } else { 0 })
@@ -225,10 +249,12 @@ if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 
 # writes its receipt (DVE_OUTCOME=UNRESOLVED) and exits 0
 if ($legMode -ne 'unresolved') { $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json") }
 $id = [guid]::NewGuid().ToString()
-$rdir = Join-Path $env:FAKE_LEG_ROOT "receipts\CARD-1\$leaf\$Venue"
+# LEASE-BATCH-RECEIPT-ROOT-1: like the real leg, the receipt goes under -ReceiptRoot when given and its evidence in the directory beside the root (the default root is <case>\receipts)
+$rroot = $(if ($ReceiptRoot) { $ReceiptRoot } else { Join-Path $env:FAKE_LEG_ROOT 'receipts' })
+$rdir = Join-Path $rroot "CARD-1\$leaf\$Venue"
 New-Item -ItemType Directory -Force -Path $rdir | Out-Null
 $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
-$edir = Join-Path $env:FAKE_LEG_ROOT "evidence\$id"; New-Item -ItemType Directory -Force -Path $edir | Out-Null
+$edir = Join-Path (Join-Path (Split-Path -Parent $rroot) 'evidence') $id; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
@@ -296,6 +322,18 @@ def psq(value: object) -> str:
     """`value` for the inside of a PowerShell single-quoted literal: every embedded single-quote character (the ASCII one and the four typographic ones PowerShell also accepts) is
     doubled, so a temp dir or a message that carries an apostrophe cannot end the literal."""
     return "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(value))
+
+
+def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> str:
+    """PowerShell (to follow an Import-Module of DualVenueRunner.psm1) that runs the REAL receipt-root admission of Invoke-VenueLeg.ps1 on `root`: its own three statements, from
+    `$rrCert = ...` (certify) through the refusal to `$ReceiptRoot = $rrCert` (replace the raw value). Prints `ACCEPTED <the root the leg would write to>` or `REFUSED <message>`."""
+    return (
+        f"$legText = [IO.File]::ReadAllText('{psq(leg)}')\n"
+        "$m = [regex]::Match($legText, '(?s)\\$rrCert = .*?\\$ReceiptRoot = \\$rrCert')\n"
+        "if (-not $m.Success) { throw 'the leg receipt-root guard was not found' }\n"
+        f"$ReceiptRoot = '{psq(root)}'; $OfflineTestMode = ${'true' if offline else 'false'}\n"
+        "try { . ([scriptblock]::Create($m.Value)); 'ACCEPTED ' + $ReceiptRoot } catch { 'REFUSED ' + $_.Exception.Message }\n"
+    )
 
 
 def utc_iso(dt: datetime) -> str:
@@ -6447,6 +6485,1139 @@ del _name, _case, _cls
 # [DateTime] of Kind Utc. Get-LeaseEndUtc used to run it through [string] + DateTimeOffset.Parse, which drops the Kind and assumes the HOST's local offset, so on a
 # Central host every lease end landed 5 h early (roomSec=-15301) and no leg ever started. CI hosts are UTC (offset 0), where the old code passes, so the behavioural
 # cases below only go red on a non-UTC host; the source case is the one that guards on UTC.
+@requires_windows_pwsh
+class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
+    """LEASE-BATCH-RECEIPT-ROOT-1: -ReceiptRoot reaches every Invoke-VenueLeg call, an empty one forwards nothing, and a root outside .claude-state is refused before any lease.
+    Same fakes and harness as VenueLeaseBatchRunnerTests (borrowed, not inherited, so its cases are not run a second time); nothing reaches a venue."""
+
+    setUpClass = VenueLeaseBatchRunnerTests.__dict__["setUpClass"]
+    tearDownClass = VenueLeaseBatchRunnerTests.__dict__["tearDownClass"]
+    setUp = VenueLeaseBatchRunnerTests.setUp
+    _init_case = VenueLeaseBatchRunnerTests._init_case
+    run_batch = VenueLeaseBatchRunnerTests.run_batch
+    batch_cmd = VenueLeaseBatchRunnerTests.batch_cmd
+    kinds = VenueLeaseBatchRunnerTests.kinds
+    batches = VenueLeaseBatchRunnerTests.batches
+
+    def scratch_root(self) -> Path:
+        # a root the way a calibration round gives one: <scratch>\.claude-state\<dual-venue dir>\<receipts dir> (the evidence directory lands beside it, also under .claude-state;
+        # the spelling avoids the literal path the receipt-reader inventory in test_dual_venue_evidence.py scans for: this file reads no real receipt, only the fake leg's)
+        return self.case / "scratch" / ".claude-state" / "dual-venue" / "receipts"
+
+    def clean_base(self) -> Path:
+        """A fresh directory whose path has no .claude-state segment (the temp dir may have one: a lane runs with TEMP under its worktree's .claude-state)."""
+        for parent in (Path(tempfile.gettempdir()), ROOT.parent, Path(os.environ.get("SystemDrive", "C:") + "\\")):
+            if ".claude-state" in parent.resolve().parts:
+                continue
+            try:
+                d = Path(tempfile.mkdtemp(prefix="venue-rr-clean-", dir=parent))
+            except OSError:
+                continue
+            self.addCleanup(shutil.rmtree, d, True)
+            return d
+        self.skipTest("no writable directory without a .claude-state segment")
+
+    def long_form(self, p: Path) -> Path:
+        """The fully resolved long form of a path under the case dir. The script resolves -ReceiptRoot through [IO.Path]::GetFullPath, which on Windows expands 8.3 short names
+        (a hosted runner's temp dir is C:/Users/RUNNER~1/..., the script forwards C:/Users/runneradmin/...): expect the long form, as the script and the real leg see it."""
+        return Path(os.path.realpath(self.case)) / p.relative_to(self.case)
+
+    def default_root(self) -> Path:
+        return self.case / "receipts"   # the fake leg's default root (the real leg's is under the main checkout's .claude-state)
+
+    def leg_calls(self) -> list[str]:
+        f = self.case / "leg-receiptroot.log"
+        return f.read_text(encoding="utf-8").splitlines() if f.exists() else []
+
+    @staticmethod
+    def files_under(root: Path) -> list[Path]:
+        return sorted(p for p in root.rglob("*.json")) if root.exists() else []
+
+    def assert_nothing_started(self, r: subprocess.CompletedProcess) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(self.events_text(), "", "a refused root must reach no um-run, quiet probe or leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "a refused root took the venue claim")
+        self.assertFalse(self.run_dir.exists(), "a refused root created the run dir")
+
+    def events_text(self) -> str:
+        return self.events.read_text(encoding="utf-8") if self.events.exists() else ""
+
+    # (a) RED on the old script: it has no -ReceiptRoot, so the leg wrote into the default root
+    def test_a_receipt_root_sends_every_leg_receipt_to_it_and_none_to_the_default_root(self) -> None:
+        root = self.scratch_root()
+        r = self.run_batch(self.specs, "-ReceiptRoot", str(root))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.files_under(self.default_root()), [], "a receipt landed in the default root")
+        self.assertFalse(self.default_root().exists(), "the default root was created")
+        landed = self.files_under(root)
+        self.assertEqual(len(landed), 3, landed)
+        self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(root)}"] * 3)
+        [b] = self.batches()
+        self.assertTrue(all(Path(os.path.realpath(l["receipt"])).parent.parent.parent.parent == self.long_form(root) for l in b["legs"]), [l["receipt"] for l in b["legs"]])
+        # the read-back: the pre-load mean is found in the evidence directory beside THIS root (a default-root read would find none and leave the leg uncounted)
+        self.assertEqual([l["class"] for l in b["legs"]], ["QUIET_PRELOAD_OK"] * 3, b["legs"])
+        self.assertEqual((b["legsRan"], b["legsCounted"]), (3, 3))
+        self.assertIn(f" receiptRoot={self.long_form(root)}", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_a_receipt_root_is_forwarded_to_the_in_lease_retry_too(self) -> None:
+        root = self.scratch_root()
+        r = self.run_batch([self.specs[0]], "-ReceiptRoot", str(root), FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual([l["status"] for l in b["legs"]], ["RETRY", "RAN"])
+        self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(root)}"] * 2)
+        self.assertEqual(len(self.files_under(root)), 2)
+        self.assertFalse(self.default_root().exists())
+
+    def test_a_relative_receipt_root_is_forwarded_as_a_full_path(self) -> None:
+        args, e = self.batch_cmd(None, "-ReceiptRoot", os.path.join("rel", ".claude-state", "dual-venue", "receipts"))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e, cwd=str(self.case))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        want = self.long_form(self.case / "rel" / ".claude-state" / "dual-venue" / "receipts")
+        self.assertEqual(self.leg_calls(), [f"bound=True root={want}"] * 2)
+
+    def test_adversary_a1_a_relative_receipt_root_resolves_against_the_powershell_location_like_rundir_does(self) -> None:
+        # adversary f1c42e80 A1: the process directory (what [IO.Path]::GetFullPath uses) and the PowerShell location (what Resolve-Path -RunDir uses) differ once a caller has
+        # done Set-Location. The script is run in-process from a session whose location is cwd-b while the process directory is cwd-a: the root belongs under cwd-b.
+        proc_dir, ps_dir = self.case / "cwd-a", self.case / "cwd-b"
+        proc_dir.mkdir()
+        ps_dir.mkdir()
+        rel = os.path.join("rel", ".claude-state", "dual-venue", "receipts")
+        args, e = self.batch_cmd(None, "-ReceiptRoot", rel)
+        i = args.index("-File")
+        runner, rest = args[i + 1], args[i + 2:]
+        call = " ".join(x if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", x) else f"'{psq(x)}'" for x in rest)
+        command = f"Set-Location -LiteralPath '{psq(ps_dir)}'; & '{psq(runner)}' {call}; exit $LASTEXITCODE"
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=600, env=e, cwd=str(proc_dir))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        want = ps_dir / "rel" / ".claude-state" / "dual-venue" / "receipts"
+        self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(want)}"] * 2, r.stdout + r.stderr)
+        self.assertEqual(len(self.files_under(want)), 2)
+        self.assertFalse((proc_dir / "rel").exists(), "the root was resolved against the process directory")
+
+    # (b) RED on the old script for the explicit empty/blank spellings (an unknown parameter); the omitted spelling is the byte-for-byte guard
+    def test_an_empty_or_blank_receipt_root_forwards_no_argument(self) -> None:
+        for spelling in (None, "", "   "):
+            with self.subTest(spelling=spelling):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, *(() if spelling is None else ("-ReceiptRoot", spelling)))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.leg_calls(), ["bound=False root="] * 2, "the leg was handed a -ReceiptRoot it should not have been")
+                self.assertEqual(len(self.files_under(self.default_root())), 2)
+                self.assertNotIn("receiptRoot=", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    # (c) RED on the old script: a root outside .claude-state is refused before the run dir, the claim, the lease or a leg
+    def test_a_receipt_root_outside_claude_state_is_refused_before_any_lease_or_leg(self) -> None:
+        # the case dirs sit in the temp dir, which on a lane (TEMP under the worktree's .claude-state) is itself under .claude-state: the refused roots live in a base with no such segment
+        base = self.clean_base()
+        cases = {
+            "outside": base / "plain" / "dual-venue" / "receipts",
+            # a root that IS .claude-state: the root passes, the evidence directory beside it (<parent>\evidence) does not
+            "evidence-beside-it-outside": base / "scratch" / ".claude-state",
+            # the segment must be a whole directory name, not a substring
+            "substring-only": base / "x.claude-state" / "receipts",
+        }
+        for name, root in cases.items():
+            with self.subTest(name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(root))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+    # Dot A1 (PR #729 comment 6540489428): a path component was compared with -ceq, which is culture-aware (InvariantCulture) and skips ignorable code points, so a directory
+    # named ".claude-state<U+00AD>" passed as the gitignored ".claude-state". Each spelling below is one the old comparison accepts on this host (the first assertion proves it).
+    IGNORABLE = {"soft-hyphen": "\u00ad", "zero-width-joiner": "\u200d", "zero-width-space": "\u200b", "bom": "\ufeff"}
+
+    @staticmethod
+    def old_comparison_accepts(component: str) -> bool:
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ('{psq(component)}' -ceq '.claude-state')"],
+                             capture_output=True, text=True, encoding="utf-8", timeout=120)
+        return out.stdout.strip() == "True"
+
+    def ignorable_roots(self) -> dict:
+        base = self.clean_base()
+        roots = {}
+        for name, cp in self.IGNORABLE.items():
+            roots[f"{name}-suffix"] = (f".claude-state{cp}", base / f".claude-state{cp}" / "dual-venue" / "receipts")
+            roots[f"{name}-prefix"] = (f"{cp}.claude-state", base / f"{cp}.claude-state" / "dual-venue" / "receipts")
+        return roots
+
+    def test_adversary_dot_a1_an_ignorable_code_point_in_the_boundary_name_is_not_claude_state_at_the_batch_entry(self) -> None:
+        for name, (component, root) in self.ignorable_roots().items():
+            with self.subTest(name=name):
+                self.assertTrue(self.old_comparison_accepts(component), f"{name}: the culture-aware comparison no longer accepts it on this host, so this case proves nothing")
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(root))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+    def test_adversary_dot_a1_an_ignorable_code_point_in_the_boundary_name_is_refused_at_the_real_leg_entry(self) -> None:
+        # the real Invoke-VenueLeg.ps1 receipt-root check (DVE_RECEIPT_ROOT_MUST_STAY_LOCAL), reached by its own text: the shared helper it calls decides
+        leg = DV / "Invoke-VenueLeg.ps1"
+        for name, (component, root) in self.ignorable_roots().items():
+            with self.subTest(name=name):
+                script = (
+                    f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                    + leg_receipt_root_guard_ps(leg, root)
+                )
+                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertTrue(out.stdout.strip().startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), out.stdout + out.stderr)
+
+    def test_adversary_dot_a1_a_plain_claude_state_root_still_passes_the_shared_helper(self) -> None:
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "[ordered]@{ plain = (Test-DvUnderClaudeState -Path 'C:\\x\\.claude-state\\dual-venue\\receipts'); fwd = (Test-DvUnderClaudeState -Path 'C:/x/.claude-state/a'); "
+            "caseDiffers = (Test-DvUnderClaudeState -Path 'C:\\x\\.Claude-State\\a'); substring = (Test-DvUnderClaudeState -Path 'C:\\x\\x.claude-state\\a') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"plain": True, "fwd": True, "caseDiffers": False, "substring": False})
+
+    # Dot A2 (PR #729 comment 6542192087) + adversary A1: a path component named .claude-state is satisfied INSIDE a network share. The refusal must come before any write:
+    # these roots name a share that does not exist for the test, and a UNC GetFullPath does no network I/O, so a regression here would fail on a missing share, never write one.
+    NETWORK_ROOTS = {
+        "production-agent-share": "\\\\bachelor\\mlv-agent\\.claude-state\\receipts",
+        "admin-share-of-localhost": "\\\\localhost\\c$\\mlvtmp\\.claude-state\\receipts",
+        "forward-slash-unc": "//bachelor/mlv-agent/.claude-state/receipts",
+        "extended-unc": "\\\\?\\UNC\\bachelor\\mlv-agent\\.claude-state\\receipts",
+        "agent-share-itself": "\\\\bachelor\\mlv-agent\\receipts\\.claude-state",
+    }
+
+    def test_adversary_dot_a2_a_receipt_root_on_a_network_share_is_refused_at_the_batch_entry(self) -> None:
+        for name, root in self.NETWORK_ROOTS.items():
+            with self.subTest(name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", root)
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+
+    def test_adversary_dot_a2_a_receipt_root_on_a_network_share_is_refused_at_the_real_leg_entry(self) -> None:
+        leg = DV / "Invoke-VenueLeg.ps1"
+        for name, root in self.NETWORK_ROOTS.items():
+            with self.subTest(name=name):
+                script = (
+                    f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                    + leg_receipt_root_guard_ps(leg, root)
+                )
+                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=120)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertTrue(out.stdout.strip().startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), out.stdout + out.stderr)
+
+    def test_adversary_dot_a2_the_shared_locality_helper_refuses_a_venue_share_prefix_and_keeps_local_roots(self) -> None:
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "$shares = @('C:\\fake\\agent-share', '\\\\bachelor\\mlv-agent')\n"
+            "function L($p) { $null -ne (Test-DvLocalReceiptRoot -Path $p -AgentShares $shares) }\n"
+            "[ordered]@{\n"
+            "  localPlain = (L 'C:\\x\\.claude-state\\dual-venue\\receipts'); localFwd = (L 'C:/x/.claude-state/a'); localLongPrefix = (L '\\\\?\\C:\\x\\.claude-state\\a')\n"
+            "  underShare = (L 'C:\\fake\\agent-share\\.claude-state\\receipts'); underShareCase = (L 'c:\\FAKE\\Agent-Share\\.claude-state\\receipts'); underShareFwd = (L 'C:/fake/agent-share/.claude-state/r')\n"
+            "  shareItself = (L 'C:\\fake\\agent-share'); siblingOfShare = (L 'C:\\fake\\agent-share2\\.claude-state\\receipts')\n"
+            "  unc = (L '\\\\bachelor\\mlv-agent\\.claude-state\\r'); uncOther = (L '\\\\localhost\\c$\\x\\.claude-state\\r'); deviceNonDrive = (L '\\\\?\\GLOBALROOT\\x\\.claude-state\\r')\n"
+            "  noMarker = (L 'C:\\x\\receipts'); ignorable = (L \"C:\\x\\.claude-state$([char]0xAD)\\r\")\n"
+            "  configured = ($null -ne (Test-DvLocalReceiptRoot -Path '\\\\bachelor\\mlv-agent\\.claude-state\\r'))\n"
+            "} | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {
+            "localPlain": True, "localFwd": True, "localLongPrefix": True,
+            "underShare": False, "underShareCase": False, "underShareFwd": False,
+            "shareItself": False, "siblingOfShare": True,
+            "unc": False, "uncOther": False, "deviceNonDrive": False,
+            "noMarker": False, "ignorable": False, "configured": False,
+        })
+
+    def test_adversary_dot_a2_every_write_root_guard_goes_through_the_locality_helper(self) -> None:
+        # the class, not the instance: no script outside the helper itself asks Test-DvUnderClaudeState alone about a root that is written to
+        offenders = []
+        for p in sorted(DV.glob("*.ps1")):
+            for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if "Test-DvUnderClaudeState" in line and not line.lstrip().startswith("#") and "Test-DvLocalReceiptRoot" not in line and "Import-Module" not in line:
+                    offenders.append(f"{p.name}:{n}: {line.strip()[:140]}")
+        self.assertEqual(offenders, [], "a write-root guard that tests only for the marker directory name accepts the same name inside a network share")
+
+    # ---- r4: the four MAJOR gaps the r3 adversary pass found in the invariant r3 claims ("every owner-evidence write root is local"): review-adversary-LEASE-BATCH-RECEIPT-ROOT-1-r3-28991373, successor cards ADV-A1..A4.
+    # The helper (Test-DvLocalReceiptRoot) now RETURNS the normalised full path it certified, or $null; every caller writes to that value.
+    def judge(self, shares: list, cases: dict, location: Path | None = None, process_dir: Path | None = None) -> dict:
+        """Run Test-DvLocalReceiptRoot on each named path with `shares` as the venue agentShares; the value is the certified path or None (a refusal). `location` is the PowerShell location
+        and `process_dir` the process directory the helper runs with (they differ once a caller has done Set-Location)."""
+        script = "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"   # r7 G9: a certified path may carry a non-ASCII name (a superscript digit); the OEM code page is not UTF-8
+        script += f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+        if location is not None:
+            script += f"Set-Location -LiteralPath '{psq(location)}'\n[Environment]::CurrentDirectory = '{psq(process_dir)}'\n"
+        script += (
+            f"$shares = @('{psq(json.dumps(shares))}' | ConvertFrom-Json)\n"
+            f"$cases = '{psq(json.dumps(cases))}' | ConvertFrom-Json\n"
+            "$out = [ordered]@{}\n"
+            "foreach ($p in $cases.PSObject.Properties) { $out[$p.Name] = Test-DvLocalReceiptRoot -Path ([string]$p.Value) -AgentShares $shares }\n"
+            "$out | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=180)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout)
+
+    @staticmethod
+    def same_path(a: str | None, b: Path | str) -> bool:
+        return a is not None and os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(str(b)))
+
+    def pair_guard_ps(self, script_path: Path, out_dir: str) -> str:
+        """PowerShell that runs the REAL -OutDir admission of a pair script (its own text, from `$outFull = Test-DvLocalReceiptRoot` to `$OutDir = $outFull`) on `out_dir`."""
+        return (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            f"$text = [IO.File]::ReadAllText('{psq(script_path)}')\n"
+            "$m = [regex]::Match($text, '(?s)\\$outFull = Test-DvLocalReceiptRoot.*?\\$OutDir = \\$outFull')\n"
+            "if (-not $m.Success) { throw 'the pair OutDir guard was not found' }\n"
+            f"$OutDir = '{psq(out_dir)}'\n"
+            "try { . ([scriptblock]::Create($m.Value)); 'ACCEPTED ' + $OutDir } catch { 'REFUSED ' + $_.Exception.Message }\n"
+        )
+
+    def run_ps(self, script: str, cwd: Path | None = None) -> str:
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, encoding="utf-8", timeout=180, cwd=None if cwd is None else str(cwd))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout.strip()
+
+    def test_adversary_r3_a1_both_pair_scripts_refuse_a_unc_or_device_out_dir_before_any_write(self) -> None:
+        # adversary A1: New-VenueSheetPair.ps1 tested only for the .claude-state name, so a UNC -OutDir with that name created staging directories and wrote captured frame bytes on the venue share.
+        # The guard text is taken from each script itself; the refusal comes before any New-Item / WriteAllBytes (a UNC GetFullPath does no network I/O, so a regression fails on a missing share, never writes one).
+        for script in ("New-VenueSheetPair.ps1", "New-VenueFlavorPair.ps1"):
+            for label, out_dir in (("unc", "\\\\bachelor\\mlv-agent\\.claude-state\\pair-r3"), ("forward-slash-unc", "//bachelor/mlv-agent/.claude-state/pair-r3"),
+                                   ("extended-unc", "\\\\?\\UNC\\bachelor\\mlv-agent\\.claude-state\\pair-r3"), ("device", "\\\\.\\C:\\x\\.claude-state\\pair-r3")):
+                with self.subTest(script=script, case=label):
+                    got = self.run_ps(self.pair_guard_ps(DV / script, out_dir))
+                    self.assertTrue(got.startswith("REFUSED PAIR_OWNER_SHEET_MUST_STAY_LOCAL"), got)
+            with self.subTest(script=script, case="local-relative-is-replaced-by-the-certified-full-path"):
+                base = self.clean_base()
+                got = self.run_ps(self.pair_guard_ps(DV / script, os.path.join("rel", ".claude-state", "pair")), cwd=base)
+                self.assertTrue(got.startswith("ACCEPTED "), got)
+                self.assertTrue(self.same_path(got[len("ACCEPTED "):], base / "rel" / ".claude-state" / "pair"), got)
+        text = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
+        guard = text.index("Test-DvLocalReceiptRoot -Path $OutDir")
+        self.assertLess(guard, text.index("New-Item -ItemType Directory -Force -Path $OutDir"), "the guard must come before the first write")
+
+    def test_adversary_r3_a2_a_relative_root_is_judged_where_the_writer_resolves_it(self) -> None:
+        # adversary A2: the helper judged C:\review\r3\.claude-state\sheets (process directory) while the writer resolved the SAME relative value against the PowerShell location (the share).
+        share = self.clean_base() / "agent-share"
+        share.mkdir()
+        elsewhere = self.clean_base() / "elsewhere"
+        elsewhere.mkdir()
+        rel = "r3\\.claude-state\\sheets"
+        got = self.judge([str(share)], {"rel": rel}, location=share, process_dir=elsewhere)
+        self.assertIsNone(got["rel"], "PowerShell location is the venue share: the relative root lands on the share and must be refused")
+        got = self.judge([str(share)], {"rel": rel}, location=elsewhere, process_dir=share)
+        self.assertTrue(self.same_path(got["rel"], elsewhere / "r3" / ".claude-state" / "sheets"), f"the certified path is resolved against the PowerShell location: {got}")
+        # the leg uses the RETURNED value from then on (it replaces -SheetCopyDir), so the value judged is the value written
+        leg = DV / "Invoke-VenueLeg.ps1"
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            f"Set-Location -LiteralPath '{psq(elsewhere)}'; [Environment]::CurrentDirectory = '{psq(share)}'\n"
+            f"$legText = [IO.File]::ReadAllText('{psq(leg)}')\n"
+            "$m = [regex]::Match($legText, '(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}')\n"
+            "if (-not $m.Success) { throw 'the leg SheetCopyDir guard was not found' }\n"
+            f"$SheetCopyDir = '{psq(rel)}'\n"
+            ". ([scriptblock]::Create($m.Value))\n"
+            "$SheetCopyDir\n"
+        )
+        self.assertTrue(self.same_path(self.run_ps(script), elsewhere / "r3" / ".claude-state" / "sheets"))
+
+    def test_adversary_r3_a3_a_local_spelling_or_link_that_reaches_a_venue_share_is_refused(self) -> None:
+        base = self.clean_base()
+        share = base / "agent-share-long-name"
+        (share / "inner").mkdir(parents=True)
+        other = base / "other-local-dir"
+        other.mkdir()
+        state = base / ".claude-state"
+        state.mkdir()
+        links = {}
+        for name, target in (("to-share", share), ("to-other", other)):
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / name), str(target)], capture_output=True, text=True)
+            if made.returncode != 0:
+                self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+            links[name] = state / name
+        cases = {
+            "junction-onto-share": str(links["to-share"] / "receipts"),
+            "junction-onto-share-subdir": str(links["to-share"] / "inner" / "deeper" / "receipts"),
+            # r6 G7 / ADV-A3 (inverted from r4's "stays-allowed"): the junction's target has no .claude-state component, so the location actually written is outside the marker
+            "junction-onto-a-local-dir-outside-claude-state-is-refused": str(links["to-other"] / "receipts"),
+            "share-extended-spelling": "\\\\?\\" + str(share / ".claude-state" / "r"),
+            "share-upper-case-and-trailing-separator": str(share / ".claude-state" / "r").upper() + "\\",
+            "share-forward-slashes": str(share / ".claude-state" / "r").replace("\\", "/"),
+            "share-dot-dot-detour": str(share / "inner" / ".." / ".claude-state" / "r"),
+            "sibling-of-share-stays-allowed": str(base / "agent-share-long-name-2" / ".claude-state" / "r"),
+        }
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(share), buf, 1024) and buf.value.lower() != str(share).lower():
+            cases["share-8dot3-alias"] = str(Path(buf.value) / ".claude-state" / "r")
+        got = self.judge([str(share)], cases)
+        for name in ("junction-onto-share", "junction-onto-share-subdir", "share-extended-spelling", "share-upper-case-and-trailing-separator", "share-forward-slashes", "share-dot-dot-detour", "share-8dot3-alias"):
+            if name in cases:
+                self.assertIsNone(got[name], f"{name}: {cases[name]} reaches the venue share and must be refused")
+        self.assertIsNone(got["junction-onto-a-local-dir-outside-claude-state-is-refused"], got)
+        self.assertTrue(self.same_path(got["sibling-of-share-stays-allowed"], base / "agent-share-long-name-2" / ".claude-state" / "r"), got)
+
+    def test_adversary_r3_a4_a_device_path_is_refused_everywhere_and_only_the_c_drive_extended_form_is_local(self) -> None:
+        bad = {"dot-device": "\\\\.\\C:\\x\\.claude-state\\receipts", "dot-device-forward": "//./C:/x/.claude-state/receipts", "question-forward": "//?/C:/x/.claude-state/receipts",
+               "extended-unc": "\\\\?\\UNC\\bachelor\\mlv-agent\\.claude-state\\r", "globalroot": "\\\\?\\GLOBALROOT\\x\\.claude-state\\r", "volume-guid": "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\x\\.claude-state\\r"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "extended-c-drive": "\\\\?\\C:\\x\\.claude-state\\receipts"})
+        for name in bad:
+            self.assertIsNone(got[name], name)
+        self.assertEqual(got["extended-c-drive"].lower(), "c:\\x\\.claude-state\\receipts", "the one allowed extended form is certified AND returned as the plain drive path")
+        # the batch entry
+        for name in ("dot-device", "dot-device-forward"):
+            with self.subTest(entry="batch", name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", bad[name])
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_", r.stderr)
+        # the real leg entry
+        leg = DV / "Invoke-VenueLeg.ps1"
+        for name in ("dot-device", "dot-device-forward", "extended-unc"):
+            with self.subTest(entry="leg", name=name):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(leg, bad[name]))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_adversary_r4_local_roots_still_pass_and_come_back_as_full_paths(self) -> None:
+        base = self.clean_base()
+        local = str(base / ".claude-state" / "dual-venue" / "receipts")
+        cases = {"plain": local, "forward": local.replace("\\", "/"), "extended": "\\\\?\\" + local, "trailing": local + "\\", "relative": "rel\\.claude-state\\receipts"}
+        got = self.judge(["C:\\fake\\agent-share"], cases, location=base, process_dir=base)
+        for name, path in (("plain", local), ("forward", local), ("extended", local), ("trailing", local), ("relative", base / "rel" / ".claude-state" / "receipts")):
+            self.assertTrue(self.same_path(got[name], path), f"{name}: {got[name]}")
+            self.assertFalse(got[name].endswith("\\"), got[name])
+            self.assertTrue(os.path.isabs(got[name]) and not got[name].startswith("\\\\"), got[name])
+        # the real leg entry keeps the in-lease root: certified, and replaces the raw value
+        got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", "\\\\?\\" + local))
+        self.assertTrue(got_leg.startswith("ACCEPTED "), got_leg)
+        self.assertTrue(self.same_path(got_leg[len("ACCEPTED "):], local), got_leg)
+
+    def test_adversary_r4_every_caller_writes_to_the_returned_path_and_no_inline_guard_is_left(self) -> None:
+        # the class, not the instance: a call of the helper that does not keep its return value would test one spelling and write another (A2); an inline `.claude-state` split guard is a
+        # second, weaker admission rule (A1: New-VenueSheetPair.ps1 and New-VenueFlavorPair.ps1 each carried one). Wait-VenueQuiet.ps1 -GateLog is the one reviewed exception: it is a probe
+        # log (not owner footage), it already refuses every venue agentShare, and its alternative scope is the run's own -WorkDir.
+        offenders = []
+        for p in sorted(DV.glob("*.ps1")):
+            for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                code = line.lstrip()
+                if code.startswith("#"):
+                    continue
+                if "Test-DvLocalReceiptRoot" in line and not re.search(r"\$\w+\s*=\s*(?:\$\(.*)?Test-DvLocalReceiptRoot", line) and "Import-Module" not in line:
+                    offenders.append(f"{p.name}:{n}: result not kept: {code[:120]}")
+                if re.search(r"Equals\(\$_, '\.claude-state'", line) and p.name != "Wait-VenueQuiet.ps1":
+                    offenders.append(f"{p.name}:{n}: inline marker guard: {code[:120]}")
+        self.assertEqual(offenders, [])
+
+    def test_adversary_r5_a1_a_raw_unc_or_device_spelling_of_either_slash_is_refused_before_any_normalisation(self) -> None:
+        # ADV-A1: the provider turned `\/bachelor\...` into a ONE-separator path and GetFullPath rooted it on the current drive (C:\bachelor\...), so the raw refusal never saw it.
+        # The refusal is on the RAW text: two leading separators of EITHER slash is a UNC; the only device spelling kept is `\\?\C:\...` written with backslashes.
+        bad = {
+            "mixed-bs-fs": "\\/bachelor\\mlv-agent\\.claude-state\\r", "mixed-fs-bs": "/\\bachelor\\mlv-agent\\.claude-state\\r", "forward-unc": "//bachelor/mlv-agent/.claude-state/r",
+            "half-forward-unc": "\\\\bachelor/mlv-agent/.claude-state/r", "mixed-device-q": "\\/?\\C:\\x\\.claude-state\\r", "mixed-device-dot": "/\\.\\C:\\x\\.claude-state\\r",
+            "forward-device-q": "//?/C:/x/.claude-state/receipts", "forward-device-dot": "//./C:/x/.claude-state/receipts", "half-forward-device": "\\\\?/C:/x/.claude-state/r",
+            "nt-prefix": "\\??\\C:\\x\\.claude-state\\r", "nt-prefix-fwd": "/??/C:/x/.claude-state/r", "extended-unc-fwd": "//?/UNC/bachelor/mlv-agent/.claude-state/r",
+            "admin-share": "\\\\localhost\\c$\\x\\.claude-state\\r",
+        }
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "extended-c-drive-still-local": "\\\\?\\C:\\x\\.claude-state\\receipts"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {bad[name]!r} was certified as {got[name]!r}")
+        self.assertEqual(got["extended-c-drive-still-local"].lower(), "c:\\x\\.claude-state\\receipts")
+        # the batch entry hands the RAW value to the helper (no normalisation of its own first): the forward-slash device spelling is refused there too
+        for name in ("forward-device-q", "mixed-bs-fs", "forward-unc"):
+            with self.subTest(entry="batch", name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", bad[name])
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_", r.stderr)
+        for name in ("forward-device-q", "mixed-bs-fs", "nt-prefix"):
+            with self.subTest(entry="leg", name=name):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", bad[name]))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+        batch_text = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("GetUnresolvedProviderPathFromPSPath", batch_text, "the batch guard must not normalise -ReceiptRoot before the one helper judges the raw spelling")
+        # a provider-qualified or drive-relative spelling stays refused (the helper resolves a relative value through the file system only)
+        base = self.clean_base()
+        odd = {"registry": "HKLM:\\Software\\.claude-state\\r", "env-drive": "Env:\\x\\.claude-state\\r", "drive-relative": "C:rel\\.claude-state\\r",
+               "provider-qualified": "Microsoft.PowerShell.Core\\FileSystem::" + str(base / ".claude-state" / "r")}
+        got = self.judge(["C:\\fake\\agent-share"], odd, location=base, process_dir=base)
+        for name in odd:
+            self.assertIsNone(got[name], f"{name}: {odd[name]!r} was certified as {got[name]!r}")
+
+    def test_adversary_r5_a2_a_path_equal_to_or_under_a_share_is_refused_across_links_and_extended_spellings(self) -> None:
+        # ADV-A2: the share keys got lexical normalisation only, while the candidate had its extended prefix removed and its links followed, so a share named through a link
+        # (C:\Users\All Users -> C:\ProgramData) or through `\\?\C:\x` never matched the candidate that sits under it.
+        base = self.clean_base()
+        real = base / "real-share-dir"
+        (real / "inner").mkdir(parents=True)
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(base / "share-link"), str(real)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        elsewhere = base / "elsewhere"
+        elsewhere.mkdir()
+        cand_real = str(real / ".claude-state" / "r")
+        cand_under = str(real / "inner" / "deeper" / ".claude-state" / "r")
+        cand_other = str(elsewhere / ".claude-state" / "r")
+        # the share is NAMED through the junction; the candidate is spelled with the junction's target
+        got = self.judge([str(base / "share-link")], {"equal-via-link-share": cand_real, "under-via-link-share": cand_under, "elsewhere": cand_other})
+        self.assertIsNone(got["equal-via-link-share"], got)
+        self.assertIsNone(got["under-via-link-share"], got)
+        self.assertTrue(self.same_path(got["elsewhere"], cand_other), got)
+        # the share is spelled with the extended prefix / forward slashes / device prefix; the candidate is plain
+        for label, share in (("extended-share", "\\\\?\\" + str(real)), ("forward-share", str(real).replace("\\", "/")), ("trailing-share", str(real) + "\\"), ("upper-share", str(real).upper())):
+            got = self.judge([share], {"cand": cand_real, "under": cand_under, "elsewhere": cand_other})
+            self.assertIsNone(got["cand"], f"{label}: {got}")
+            self.assertIsNone(got["under"], f"{label}: {got}")
+            self.assertTrue(self.same_path(got["elsewhere"], cand_other), f"{label}: {got}")
+        # the candidate itself goes through the junction onto the share (r4 A3, kept)
+        got = self.judge([str(real)], {"via-link": str(base / "share-link" / ".claude-state" / "r")})
+        self.assertIsNone(got["via-link"], got)
+
+    def test_adversary_r5_g5_the_helper_returns_the_resolved_path_it_judged(self) -> None:
+        # Grok G5: the helper judged the link-resolved path and returned the original spelling, so a writer followed the link on its own. The value checked is the value written.
+        # r6 G7 / Dot 6546717175 / ADV-A3 (INVERTED): a junction target with no .claude-state component is REFUSED (r5 certified it, outside the marker); the resolved-path return is kept
+        # for a target that is itself under .claude-state.
+        base = self.clean_base()
+        target = base / "link-target-dir"
+        target.mkdir()
+        marked = base / "marked" / ".claude-state" / "link-target-dir"
+        marked.mkdir(parents=True)
+        state = base / ".claude-state"
+        state.mkdir()
+        for name, tgt in (("to-target", target), ("to-marked", marked)):
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(state / name), str(tgt)], capture_output=True, text=True)
+            if made.returncode != 0:
+                self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        got = self.judge(["C:\\fake\\agent-share"], {"via-junction": str(state / "to-target" / "receipts"), "via-junction-marked": str(state / "to-marked" / "receipts"),
+                                                     "plain": str(state / "plain" / "receipts")})
+        self.assertIsNone(got["via-junction"], f"the junction's target is outside every .claude-state component: {got}")
+        # compared by real path (a runner's temp dir is spelled with an 8.3 short name, e.g. RUNNER~1, while the link target comes back in long form), plus the junction's own name must be gone
+        self.assertTrue(self.same_path(got["via-junction-marked"], marked / "receipts"), f"the certified path is the junction's TARGET: {got}")
+        self.assertNotIn("to-marked", got["via-junction-marked"].lower(), f"the certified path must not keep the spelling that reached the junction: {got}")
+        self.assertTrue(self.same_path(got["plain"], state / "plain" / "receipts"), got)
+
+    def test_adversary_r5_g6_the_real_leg_strip_dir_is_the_certified_spelling_before_any_branch_uses_it(self) -> None:
+        # Grok G6: `$stripDir = $stripCert` ran only inside the primary-strip branch, so the self-heal loop (which tests `$stripCert`, not the primary strip) could write to the UNCERTIFIED spelling.
+        text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        cert = text.index("$stripCert = $(if ($OfflineTestMode)")
+        assign = re.search(r"if \(\$stripCert\) \{ \$stripDir = \$stripCert \}", text[cert:])
+        self.assertIsNotNone(assign, "the certified strip dir must replace $stripDir as soon as it is certified")
+        primary = text.index("if ($receipt.visual.stripPath -and $stripCert)", cert)
+        self.assertLess(cert + assign.start(), primary, "the replacement must come BEFORE the primary-strip branch")
+        for m in re.finditer(r"Join-Path \$stripDir ", text):
+            self.assertGreater(m.start(), cert + assign.start(), "no strip copy path may be built from $stripDir before it is the certified spelling")
+
+    # ---- r6 CONVERGENCE (Grok G7 6546677256 = Dot 6546717175 = r5 ADV-A3; r5 ADV-A1, ADV-A2, ADV-A4): ONE invariant, judged on the spelling AND on the FINAL link-resolved path,
+    # which is the path returned and the path written. Fixtures are real junctions under a clean base OUTSIDE .claude-state.
+    def make_junction(self, link: Path, target: Path) -> Path:
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction: " + made.stdout + made.stderr)
+        return link
+
+    @staticmethod
+    def files_in(d: Path) -> list:
+        return sorted(str(p) for p in d.rglob("*")) if d.exists() else []
+
+    def link_fixture(self) -> dict:
+        base = self.clean_base()
+        outside = base / "published"   # no .claude-state component anywhere on its path
+        outside.mkdir()
+        real = base / "other" / ".claude-state" / "real"   # a target that is itself under .claude-state
+        real.mkdir(parents=True)
+        state = base / "review" / ".claude-state"
+        state.mkdir(parents=True)
+        self.make_junction(state / "to-public", outside)
+        self.make_junction(state / "to-real", real)
+        (base / "cs").mkdir()
+        cs = self.make_junction(base / "cs" / ".claude-state", outside)   # a `.claude-state` component that IS a junction onto the outside directory
+        return {"base": base, "outside": outside, "real": real, "state": state, "cs": cs}
+
+    def test_r6_g7_a3_the_marker_is_judged_on_the_final_link_resolved_path(self) -> None:
+        f = self.link_fixture()
+        got = self.judge(["C:\\fake\\agent-share"], {
+            "a3-literal-junction-out": str(f["state"] / "to-public" / "sheets"),
+            "claude-state-is-a-junction-out": str(f["cs"] / "dual-venue" / "receipts"),
+            "junction-onto-a-claude-state-target": str(f["state"] / "to-real" / "sheets"),
+        })
+        self.assertIsNone(got["a3-literal-junction-out"], f"certified outside the marker: {got}")
+        self.assertIsNone(got["claude-state-is-a-junction-out"], f"certified outside the marker: {got}")
+        self.assertTrue(self.same_path(got["junction-onto-a-claude-state-target"], f["real"] / "sheets"), got)
+        self.assertNotIn("to-real", got["junction-onto-a-claude-state-target"].lower(), got)
+        self.assertEqual(self.files_in(f["outside"]), [], "the helper writes nothing")
+
+    def test_r6_every_certificate_re_judges_to_itself(self) -> None:
+        # idempotence: helper(helper(x)) == helper(x), so a caller that re-judges a certified value (the leg's strip dir re-judges -SheetCopyDir) accepts its own certificate
+        f = self.link_fixture()
+        base = f["base"]
+        local = str(base / "plain" / ".claude-state" / "dual-venue" / "receipts")
+        cases = {"plain": local, "forward": local.replace("\\", "/"), "extended": "\\\\?\\" + local, "trailing": local + "\\", "relative": "rel\\.claude-state\\receipts",
+                 "dot-dot": str(base / "plain" / "x" / ".." / ".claude-state" / "r"), "via-junction-onto-a-claude-state-target": str(f["state"] / "to-real" / "sheets")}
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(base), buf, 1024) and buf.value.lower() != str(base).lower():
+            cases["short-name-base"] = str(Path(buf.value) / "plain" / ".claude-state" / "r")
+        shares = ["C:\\fake\\agent-share"]
+        first = self.judge(shares, cases, location=base, process_dir=base)
+        for name, value in first.items():
+            self.assertIsNotNone(value, f"{name} must be accepted: {first}")
+        self.assertEqual(self.judge(shares, first), first, "a certificate must re-judge to itself")
+
+    def leg_strip_block_ps(self, sheet_copy_dir: str, receipt_root: str, evidence_dir: Path, png: Path) -> str:
+        """PowerShell that runs the REAL strip-copy and self-heal block of Invoke-VenueLeg.ps1 (its own text, from `$stripDir = $(if` through the self-heal loop) with stub captures."""
+        return (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            f"$legText = [IO.File]::ReadAllText('{psq(DV / 'Invoke-VenueLeg.ps1')}')\n"
+            "$a = $legText.IndexOf('    $stripDir = $(if')\n"
+            "$e = $(if ($a -ge 0) { $legText.IndexOf('Write-Output \"DVE_VISUAL_$($preDir.Name)', $a) } else { -1 })\n"
+            "if ($a -lt 0 -or $e -lt 0) { throw 'the leg strip block was not found' }\n"
+            "$e = $legText.IndexOf(\"`n\", $e)\n"
+            "$block = $legText.Substring($a, $e - $a) + \"`n        }`n    }`n\"\n"
+            "function global:Read-DvVisualCaptures { param($Requested, $ArtifactsDir, $EvidenceDir, $LegId, $Header) "
+            f"[pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null; verdict = 'OK'; reason = '' }} }}\n"
+            f"$receipt = [ordered]@{{ visual = [pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null }} }}\n"
+            "$spec = [pscustomobject]@{ legId = 'leg-r6' }; $Venue = 'bachelor'; $Backend = 'cuda'; $SourceCommit = '0123456789abcdef0123'; $runStamp = '20261031T000000Z'; $OfflineTestMode = $false\n"
+            f"$SheetCopyDir = '{psq(sheet_copy_dir)}'; $ReceiptRoot = '{psq(receipt_root)}'; $evidenceDir = '{psq(evidence_dir)}'\n"
+            "$null = . ([scriptblock]::Create($block))\n"
+            "'PRIMARY=' + [string]$receipt.visual.stripCopyPath\n"
+            "foreach ($k in @($receipt['selfHealVisual'].Keys)) { 'SELFHEAL ' + $k + '=' + [string]$receipt['selfHealVisual'][$k].stripCopyPath }\n"
+        )
+
+    def strip_inputs(self, base: Path) -> tuple:
+        png = base / "captures" / "strip.png"
+        png.parent.mkdir(parents=True)
+        png.write_bytes(b"\x89PNG\r\n\x1a\nr6")
+        evidence = base / "ev" / ".claude-state" / "evidence" / "rid"
+        (evidence / "self-heal" / "pre-1").mkdir(parents=True)
+        return png, evidence
+
+    def test_r6_g7_the_real_leg_strip_copy_and_self_heal_write_nothing_through_a_marker_junction_onto_an_outside_dir(self) -> None:
+        f = self.link_fixture()
+        png, evidence = self.strip_inputs(f["base"])
+        # (1) -SheetCopyDir through the junction: the leg's own entry guard throws before anything
+        bad_sheets = str(f["state"] / "to-public" / "sheets")
+        guard = self.run_ps(
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            f"$legText = [IO.File]::ReadAllText('{psq(DV / 'Invoke-VenueLeg.ps1')}')\n"
+            "$m = [regex]::Match($legText, '(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}')\n"
+            "if (-not $m.Success) { throw 'the leg SheetCopyDir guard was not found' }\n"
+            f"$SheetCopyDir = '{psq(bad_sheets)}'\n"
+            "try { . ([scriptblock]::Create($m.Value)); 'ACCEPTED ' + $SheetCopyDir } catch { 'REFUSED ' + $_.Exception.Message }\n")
+        self.assertTrue(guard.startswith("REFUSED DVE_SHEET_COPY_MUST_STAY_LOCAL"), guard)
+        # (2) the strip block itself, primary strip AND self-heal pre-launch, by both routes: -SheetCopyDir given, and the default <receipts>\..\sheets beside a junctioned root
+        for label, sheet_dir, root in (("sheet-copy-dir", bad_sheets, str(f["base"] / "x" / ".claude-state" / "receipts")),
+                                       ("default-beside-root", "", str(f["state"] / "to-public" / "receipts"))):
+            with self.subTest(route=label):
+                out = self.run_ps(self.leg_strip_block_ps(sheet_dir, root, evidence, png))
+                self.assertIn("PRIMARY=\n", out + "\n", out)
+                self.assertIn("SELFHEAL pre-1=", out)
+                self.assertNotRegex(out, r"SELFHEAL pre-1=\S", out)
+                self.assertEqual(self.files_in(f["outside"]), [], f"{label}: owner strip images were written outside .claude-state")
+
+    def test_r6_g7_the_real_leg_strip_copy_writes_through_a_junction_whose_target_is_under_claude_state(self) -> None:
+        f = self.link_fixture()
+        png, evidence = self.strip_inputs(f["base"])
+        out = self.run_ps(self.leg_strip_block_ps("", str(f["state"] / "to-real" / "receipts"), evidence, png))
+        written = [Path(p) for p in self.files_in(f["base"] / "other") if p.endswith(".png")]
+        self.assertEqual(len(written), 2, out)   # the primary strip and the self-heal pre-1 strip
+        for p in written:
+            self.assertTrue(self.same_path(str(p.parent), f["real"] / "sheets"), written)
+        self.assertRegex(out, r"PRIMARY=\S")
+        self.assertNotIn("to-real", out.lower(), "the copy path is built from the certificate (the resolved target), not the spelling that reached the junction")
+
+    def test_r6_d_a_batch_whose_claude_state_is_a_junction_onto_an_outside_dir_refuses_before_side_effects(self) -> None:
+        f = self.link_fixture()
+        r = self.run_batch(None, "-ReceiptRoot", str(f["cs"] / "dual-venue" / "receipts"))
+        self.assert_nothing_started(r)
+        self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+        self.assertEqual(self.files_in(f["outside"]), [])
+        # the real leg entry refuses the same root
+        got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(f["cs"] / "dual-venue" / "receipts")))
+        self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_r6_adv_a1_an_aliased_spelling_of_a_share_is_refused(self) -> None:
+        # ADV-A1 literal: AgentShares = the lane worktree; Path = '<worktree> \.claude-state\receipt-r5' (trailing space) and '<worktree>. \...'. Win32 strips a trailing space or dot
+        # from a name, so such a component is an alias: every component must be a name the file system writes as spelled.
+        wt = str(ROOT)
+        got = self.judge([wt], {"literal-trailing-space": wt + " \\.claude-state\\receipt-r5", "literal-dot-space": wt + ". \\.claude-state\\receipt-r5",
+                                "trailing-dot": wt + ".\\.claude-state\\receipt-r5", "as-spelled": wt + "\\.claude-state\\receipt-r5"})
+        for name, value in got.items():
+            self.assertIsNone(value, f"{name}: {got}")
+        base = self.clean_base()
+        share = base / "lane-share"
+        (share / ".claude-state").mkdir(parents=True)
+        cases = {"space": str(share) + " \\.claude-state\\r", "dot-space": str(share) + ". \\.claude-state\\r", "space-in-tail": str(base / "x" / ".claude-state" / "r ") + "\\a",
+                 "dot-in-tail": str(base / "x" / ".claude-state" / "r. ") + "\\a"}
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(str(share), buf, 1024) and buf.value.lower() != str(share).lower():
+            cases["short-name"] = str(Path(buf.value) / ".claude-state" / "r")
+        got = self.judge([str(share)], {**cases, "sibling-stays-allowed": str(base / "lane-share-2" / ".claude-state" / "r")})
+        for name in cases:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertTrue(self.same_path(got["sibling-stays-allowed"], base / "lane-share-2" / ".claude-state" / "r"), got)
+
+    def test_r6_adv_a2_a_powershell_drive_naming_a_unc_is_refused_in_every_spelling(self) -> None:
+        # ADV-A2 literal: a non-persistent FileSystem PSDrive Q: whose Root is \\bachelor\mlv-agent (stubbed, as the adversary did: no share is touched), SheetCopyDir '\\?\Q:\.claude-state\sheets'
+        stub = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "function global:Get-PSDrive { [CmdletBinding()] param([string]$Name)\n"
+            "  if ($Name -eq 'Q') { return [pscustomobject]@{ Name = 'Q'; Provider = [pscustomobject]@{ Name = 'FileSystem' }; Root = '\\\\bachelor\\mlv-agent\\'; DisplayRoot = '' } }\n"
+            "  Microsoft.PowerShell.Management\\Get-PSDrive @PSBoundParameters }\n"
+        )
+        cases = {"extended-literal": "\\\\?\\Q:\\.claude-state\\sheets", "plain": "Q:\\.claude-state\\sheets", "forward": "Q:/.claude-state/sheets"}
+        script = stub + "$o = [ordered]@{}\n" + "".join(f"$o['{k}'] = Test-DvLocalReceiptRoot -Path '{psq(v)}' -AgentShares @('C:\\fake\\agent-share')\n" for k, v in cases.items())
+        script += "$o['c-drive-still-local'] = Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\sheets' -AgentShares @('C:\\fake\\agent-share')\n$o | ConvertTo-Json -Compress\n"
+        got = json.loads(self.run_ps(script))
+        for name in cases:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["c-drive-still-local"].lower(), "c:\\x\\.claude-state\\sheets")
+        # the real leg -SheetCopyDir entry, on the literal input
+        leg = self.run_ps(stub +
+            f"$legText = [IO.File]::ReadAllText('{psq(DV / 'Invoke-VenueLeg.ps1')}')\n"
+            "$m = [regex]::Match($legText, '(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}')\n"
+            "if (-not $m.Success) { throw 'the leg SheetCopyDir guard was not found' }\n"
+            "$SheetCopyDir = '\\\\?\\Q:\\.claude-state\\sheets'\n"
+            "try { . ([scriptblock]::Create($m.Value)); 'ACCEPTED ' + $SheetCopyDir } catch { 'REFUSED ' + $_.Exception.Message }\n")
+        self.assertTrue(leg.startswith("REFUSED DVE_SHEET_COPY_MUST_STAY_LOCAL"), leg)
+
+    def test_r6_adv_a4_an_unparsable_destination_fails_closed_before_any_batch_side_effect(self) -> None:
+        # ADV-A4 literal: ReceiptRoot 'C:\x\.claude-state\bad<root>' (also bad|root, bad"root, bad?root); plus DOS device names, which the file system never writes as a directory
+        bad = {"lt": "C:\\x\\.claude-state\\bad<root>", "pipe": "C:\\x\\.claude-state\\bad|root", "quote": "C:\\x\\.claude-state\\bad\"root", "question": "C:\\x\\.claude-state\\bad?root",
+               "star": "C:\\x\\.claude-state\\bad*root", "control": "C:\\x\\.claude-state\\bad\u0001root", "nul": "C:\\x\\.claude-state\\NUL\\r", "con-ext": "C:\\x\\.claude-state\\con.txt\\r",
+               "com1": "C:\\x\\.claude-state\\COM1",
+               # r7 G9: Windows also reserves COM and LPT followed by a superscript one, two or three (U+00B9, U+00B2, U+00B3), bare or with an extension
+               "com-sup1": "C:\\x\\.claude-state\\COM\u00b9", "com-sup2-ext": "C:\\x\\.claude-state\\com\u00b2.txt\\r", "com-sup3": "C:\\x\\.claude-state\\COM\u00b3",
+               "lpt-sup1": "C:\\x\\.claude-state\\LPT\u00b9", "lpt-sup2-lower": "C:\\x\\.claude-state\\lpt\u00b2\\r", "lpt-sup3-ext": "C:\\x\\.claude-state\\LPT\u00b3.log"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "fine": "C:\\x\\.claude-state\\good-root"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        base = self.clean_base()
+        for name in ("lt", "pipe"):
+            with self.subTest(entry="batch", name=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(base / ".claude-state" / bad[name].rsplit("\\", 1)[1]))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=name):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", bad[name]))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    # ---- r8 (PR #729 r7 keys; sol B1/B2/B3, opus+sol A3, fable G9): the helper's component rule and PowerShell-drive rule, stated against the round-1 contract "a bad root takes no batch resources".
+    def test_r8_b1_a_dos_device_name_with_spaces_before_the_extension_is_refused_on_every_component(self) -> None:
+        # sol B1 literal: RtlIsDosDeviceName_U treats `COM1 .txt`, `NUL .txt`, `LPT<sup2> .log` as devices (a run of spaces between the stem and the extension is dropped). Not only the last component.
+        s1, s2, s3 = "\u00b9", "\u00b2", "\u00b3"
+        bad = {
+            "com1-space-ext-last": "C:\\x\\.claude-state\\COM1 .txt\\receipts", "com1-space-ext-middle": "C:\\x\\.claude-state\\a\\COM1 .txt\\b\\receipts",
+            "com1-space-ext-final": "C:\\x\\.claude-state\\COM1 .txt", "com1-two-spaces-ext": "C:\\x\\.claude-state\\COM1   .txt\\r",
+            "nul-space-ext": "C:\\x\\.claude-state\\NUL .txt\\receipts", "nul-lower-space-ext": "C:\\x\\.claude-state\\nul  .log\\r",
+            "lpt-sup2-space-ext": f"C:\\x\\.claude-state\\LPT{s2} .log\\receipts", "com-sup1-space-ext": f"C:\\x\\.claude-state\\COM{s1} .txt\\receipts", "com-sup3-space-ext": f"C:\\x\\.claude-state\\com{s3} .dat\\r",
+            "con-space-ext": "C:\\x\\.claude-state\\CON .x\\r", "prn-space-ext": "C:\\x\\.claude-state\\PRN .x\\r", "aux-space-ext": "C:\\x\\.claude-state\\AUX .x\\r",
+            "conin-space-ext": "C:\\x\\.claude-state\\CONIN$ .x\\r", "conout-space-ext": "C:\\x\\.claude-state\\CONOUT$ .x\\r",
+            "lpt9-space-dotted-ext": "C:\\x\\.claude-state\\LPT9 .a.b\\r",
+        }
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "com10-is-not-a-device": "C:\\x\\.claude-state\\COM10 .txt\\r", "console-is-not-a-device": "C:\\x\\.claude-state\\CONSOLE .txt\\r",
+                                                      "fine": "C:\\x\\.claude-state\\good-root"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["com10-is-not-a-device"].lower(), "c:\\x\\.claude-state\\com10 .txt\\r", got)
+        self.assertEqual(got["console-is-not-a-device"].lower(), "c:\\x\\.claude-state\\console .txt\\r", got)
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        # the batch entry refuses before the run dir, the claim or a leg; the real leg entry refuses the same root
+        base = self.clean_base()
+        for label, comp in (("com1-space-ext", "COM1 .txt"), ("nul-space-ext", "NUL .txt")):
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(base / ".claude-state" / comp / "receipts"))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=label):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(base / ".claude-state" / comp / "receipts")))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_r8_g9_a_dos_device_name_as_a_middle_component_is_refused_and_the_superscript_class_is_exercised(self) -> None:
+        # fable G9: .NET GetFullPath refuses a superscript device name as the LAST component, so the regex never ran on it; a MIDDLE component reaches the regex
+        s1, s2, s3 = "\u00b9", "\u00b2", "\u00b3"
+        bad = {"com1-middle": "C:\\x\\.claude-state\\COM1\\r", "lpt3-ext-middle": "C:\\x\\.claude-state\\LPT3.log\\r",
+               "com-sup1-middle": f"C:\\x\\.claude-state\\COM{s1}\\r", "com-sup2-middle": f"C:\\x\\.claude-state\\COM{s2}\\r", "com-sup3-middle": f"C:\\x\\.claude-state\\COM{s3}\\r",
+               "lpt-sup1-middle": f"C:\\x\\.claude-state\\LPT{s1}\\r", "lpt-sup2-middle": f"C:\\x\\.claude-state\\LPT{s2}\\r", "lpt-sup3-ext-middle": f"C:\\x\\.claude-state\\LPT{s3}.log\\r",
+               "com-sup1-ext-middle": f"C:\\x\\.claude-state\\com{s1}.txt\\r", "com-sup3-deep-middle": f"C:\\x\\.claude-state\\a\\COM{s3}\\b\\r"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, "fine": "C:\\x\\.claude-state\\good-root"})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+
+    def test_r8_g9_the_superscript_class_in_the_device_rule_is_all_three_digits_not_one(self) -> None:
+        # mutation proof: with the class cut back to U+00B2 only, the middle-component rows above must go red (the rule is read from the module text, not assumed)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertEqual(text.count("COM[1-9\\u00B9\\u00B2\\u00B3]"), 1, "the device rule's COM class changed shape; update this mutation")   # r12: the digit class starts at 1 (COM0 is not a device)
+        mutated = text.replace("COM[1-9\\u00B9\\u00B2\\u00B3]", "COM[1-9\\u00B2]").replace("LPT[1-9\\u00B9\\u00B2\\u00B3]", "LPT[1-9\\u00B2]")
+        self.assertNotEqual(mutated, text)
+        d = Path(tempfile.mkdtemp(prefix="venue-rr-mut-", dir=self.clean_base()))
+        shutil.copy2(DV / "venues.json", d / "venues.json")
+        (d / "DualVenueRunner.psm1").write_text(mutated, encoding="utf-8")
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n" f"Import-Module '{psq(d / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  "$o = [ordered]@{}\n"
+                  + "".join(f"$o['{k}'] = [bool](Test-DvLocalReceiptRoot -Path ('C:\\x\\.claude-state\\COM' + [char]0x{c:04X} + '\\r') -AgentShares @('C:\\fake'))\n"
+                            for k, c in (("com-sup1", 0xB9), ("com-sup3", 0xB3)))
+                  + "$o | ConvertTo-Json -Compress\n")
+        got = json.loads(self.run_ps(script))
+        self.assertEqual(got, {"com-sup1": True, "com-sup3": True}, f"the mutated rule still refused a superscript device name (it should accept U+00B9/U+00B3 once cut back): {got}")
+
+    def test_r9_b1_a_component_that_ends_in_a_dot_or_a_space_is_refused_on_the_raw_spelling_terminal_and_middle(self) -> None:
+        # sol r8 B1 literals: GetFullPath strips a trailing dot / space, so the r8 `EndsWith` check ran on an already-normalised name and never fired. The RAW components are judged before any normalisation.
+        pre = "C:\\x\\.claude-state\\"
+        bad = {
+            "terminal-dot": pre + "receipts.", "terminal-space": pre + "receipts ", "middle-dot": pre + "r.\\receipts", "middle-space": pre + "r \\receipts",
+            "terminal-two-dots": pre + "receipts..", "terminal-three-dots": pre + "receipts...", "terminal-dot-trailing-sep": pre + "receipts.\\",
+            "forward-slash-middle-dot": "C:/x/.claude-state/r./receipts", "extended-prefix-middle-dot": "\\\\?\\C:\\x\\.claude-state\\r.\\receipts",
+            "marker-component-with-dot": "C:\\x\\.claude-state.\\receipts", "outer-component-with-space": "C:\\x \\.claude-state\\receipts",
+            "dotted-before-parent-nav": pre + "r.\\..\\receipts",
+        }
+        controls = {"fine": pre + "good-root", "dot-nav": pre + "a\\.\\r", "dotdot-nav": pre + "a\\..\\r", "inner-dot-name": pre + "r.x\\receipts", "dotted-extension-name": pre + "receipts.d"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, **controls})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {got}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        self.assertEqual(got["dot-nav"].lower(), "c:\\x\\.claude-state\\a\\r", got)
+        self.assertEqual(got["dotdot-nav"].lower(), "c:\\x\\.claude-state\\r", got)
+        self.assertEqual(got["inner-dot-name"].lower(), "c:\\x\\.claude-state\\r.x\\receipts", got)
+        self.assertEqual(got["dotted-extension-name"].lower(), "c:\\x\\.claude-state\\receipts.d", got)
+        # a relative spelling is judged raw too (resolved against the PowerShell location only after the components are checked)
+        loc = self.clean_base() / ".claude-state"
+        loc.mkdir()
+        rel = self.judge(["C:\\fake\\agent-share"], {"rel-middle-dot": "r.\\receipts", "rel-terminal-dot": "receipts.", "rel-fine": "receipts"}, location=loc, process_dir=loc)
+        self.assertIsNone(rel["rel-middle-dot"], rel)
+        self.assertIsNone(rel["rel-terminal-dot"], rel)
+        # r10 C2: the helper returns the link-resolved (8.3-expanded) path it judged, and a hosted runner's temp dir is the short `RUNNER~1` spelling of `runneradmin`: compare the resolved long
+        # path of BOTH sides (lower-casing is not file-system identity)
+        self.assertEqual(os.path.normcase(os.path.realpath(rel["rel-fine"])), os.path.normcase(os.path.join(os.path.realpath(str(loc)), "receipts")), rel)
+        # the batch entry refuses before the run dir, the claim or a leg; the real leg entry refuses the same root
+        base = self.clean_base()
+        for label, rootp in (("terminal-dot", base / ".claude-state" / "receipts."), ("middle-dot", base / ".claude-state" / "r." / "receipts")):
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", str(rootp))
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=label):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(rootp)))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def _tr_tr_child(self, body: str) -> dict:
+        """Run `body` in a FRESH child pwsh whose thread culture is tr-TR BEFORE the module (and so any regex it builds) exists; a regex built under en-US is cached and would hide the defect."""
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n"
+                  "[System.Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'\n[System.Threading.Thread]::CurrentThread.CurrentUICulture = 'tr-TR'\n"
+                  f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  "$o = [ordered]@{ culture = [Globalization.CultureInfo]::CurrentCulture.Name }\n" + body + "$o | ConvertTo-Json -Compress\n")
+        return json.loads(self.run_ps(script))
+
+    def test_r9_b2_the_dos_device_refusal_does_not_depend_on_the_process_culture(self) -> None:
+        # sol r8 B2 literals: under tr-TR the inline `(?i:...)` folded `i` to U+0130, so lowercase `conin$` and `conin$ .txt` were not devices; uppercase `CONIN$` was (the control).
+        pre = "C:\\x\\.claude-state\\"
+        names = {"conin-lower": "conin$", "conin-lower-space-ext": "conin$ .txt", "conin-upper": "CONIN$", "conin-mixed": "Conin$", "conout-lower": "conout$", "conout-upper-space-ext": "CONOUT$ .x",
+                 "nul-lower": "nul", "con-lower": "con", "aux-lower": "aux", "prn-lower": "prn", "com1-lower-space-ext": "com1 .txt", "lpt-upper-middle": "LPT9"}
+        body = ("$cases = '" + psq(json.dumps({k: pre + v + "\\r" for k, v in names.items()}))
+                + "' | ConvertFrom-Json\nforeach ($p in $cases.PSObject.Properties) { $o[$p.Name] = [bool](Test-DvLocalReceiptRoot -Path ([string]$p.Value) -AgentShares @('C:\\fake\\agent-share')) }\n"
+                + "$o['fine'] = [bool](Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\good-root' -AgentShares @('C:\\fake\\agent-share'))\n"
+                + "$o['console-not-a-device'] = [bool](Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\console\\r' -AgentShares @('C:\\fake\\agent-share'))\n")
+        got = self._tr_tr_child(body)
+        self.assertEqual(got["culture"], "tr-TR", got)
+        for name in names:
+            self.assertFalse(got[name], f"{name}: a DOS device name was certified under tr-TR: {got}")
+        self.assertTrue(got["fine"], got)
+        self.assertTrue(got["console-not-a-device"], got)
+
+    def test_r9_b2_the_consent_path_shaped_refusal_does_not_depend_on_the_process_culture(self) -> None:
+        # the same class at DualVenueRunner.psm1 (Read-DvClipConsent): `(?i)[a-z]:` under tr-TR does not match the capital I drive letter, so `I:\clip` was not "path-shaped"
+        body = ("$t = [pscustomobject]@{ venues = [pscustomobject]@{} }\n"
+                "foreach ($txt in @('I:\\a', 'i:\\a', 'C:\\a', 'Z:\\a')) { $o[$txt] = [string](Read-DvClipConsent -Text $txt -Table $t).reason }\n")   # the path-shape check runs before the JSON parse, so a bare value is enough (and no double quote for the command line to mangle)
+        got = self._tr_tr_child(body)
+        for k, v in got.items():
+            if k != "culture":
+                self.assertIn("path-shaped", v, f"{k}: {got}")
+
+    def test_r9_b2_the_runner_output_name_match_does_not_depend_on_the_process_culture(self) -> None:
+        # the same class at Invoke-VenueLeaseBatch.ps1 (the runner-owned leaf names): `-imatch` of `quiet-...` under tr-TR missed the upper-case spelling the file system treats as the same file
+        text = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("-imatch $p", text, "the runner-owned leaf match is a culture-dependent -imatch")
+        opt = "[System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant"
+        self.assertEqual(text.count(f"[regex]::IsMatch($c.Name, $p, {opt})"), 2, "both leaf-name matches go through the culture-invariant option")
+        self.assertEqual(text.count(f"[regex]::IsMatch($leaf, $p, {opt})"), 1, "the leaf match in the same guard goes through it too")
+        # r10 C1: the claim guard runs these functions in a separate runspace that never receives a $script: variable, so the option is spelled out at the call (a $null third argument has no IsMatch overload)
+        self.assertNotIn("$script:DvCultureFreeIgnoreCase", text, "no $script: option variable: the guard worker runspace would see $null")
+        pat = "'^quiet-.+\\.out\\.txt\\z'"
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n[System.Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'\n"
+                  "$opt = [Text.RegularExpressions.RegexOptions]'IgnoreCase,CultureInvariant'\n"
+                  f"$o = [ordered]@{{ upper = [regex]::IsMatch('QUIET-A.OUT.TXT', {pat}, $opt); lower = [regex]::IsMatch('quiet-a.out.txt', {pat}, $opt) }}\n$o | ConvertTo-Json -Compress\n")
+        self.assertEqual(json.loads(self.run_ps(script)), {"upper": True, "lower": True})
+
+    def test_r8_b2_a_powershell_drive_rooted_in_a_subdirectory_of_its_own_letter_is_not_certified(self) -> None:
+        # sol B2 literal, run for real in a CHILD pwsh over a temp directory: the C PSDrive is re-rooted so PowerShell cmdlets resolve `C:\x\...` UNDER that directory (here a venue agentShare), while the
+        # helper certified the literal `C:\x\...`. Nothing is created: the helper only reads. The drive root must be exactly `<letter>:\`.
+        base = self.clean_base()
+        share = base / "agent-share"
+        share.mkdir()
+        letter = os.environ.get("SystemDrive", "C:")[0]
+        script = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "$o = [ordered]@{}\n"
+            f"$o['before'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{psq(share)}'))\n"
+            "[void](1 | ConvertTo-Json)\n"   # preload the cmdlet: once the drive is re-rooted, command discovery on it fails
+            "Set-Location Env:\\\n"
+            f"Remove-PSDrive -Name {letter} -Force -ErrorAction Stop\n"
+            f"New-PSDrive -Name {letter} -PSProvider FileSystem -Root '{psq(share)}' -Scope Global -ErrorAction Stop | Out-Null\n"
+            f"$o['writerResolves'] = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('{letter}:\\x\\.claude-state\\sheets')\n"
+            f"$o['rerooted'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{psq(share)}'))\n"
+            f"$o['rerootedAnyShare'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{letter}:\\fake\\agent-share'))\n"
+            f"$o['rerootedExtended'] = [bool](Test-DvLocalReceiptRoot -Path '\\\\?\\{letter}:\\x\\.claude-state\\sheets' -AgentShares @('{letter}:\\fake\\agent-share'))\n"
+            f"$o['rerootedForward'] = [bool](Test-DvLocalReceiptRoot -Path '{letter}:/x/.claude-state/sheets' -AgentShares @('{letter}:\\fake\\agent-share'))\n"
+            "$o | ConvertTo-Json -Compress\n"
+        )
+        got = json.loads(self.run_ps(script))
+        self.assertTrue(got["before"], f"the control: an un-remapped drive certifies the path: {got}")
+        self.assertTrue(got["writerResolves"].lower().startswith(str(share).lower()), f"the fixture did not re-root the drive: {got}")
+        for k in ("rerooted", "rerootedAnyShare", "rerootedExtended", "rerootedForward"):
+            self.assertFalse(got[k], f"{k}: a drive rooted in a subdirectory of its own letter was certified: {got}")
+
+    def test_r8_b2_the_drive_root_must_be_exactly_the_letter_root_in_any_case(self) -> None:
+        stub = (
+            f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+            "$script:rootFor = 'C:\\'\n"
+            "function global:Get-PSDrive { [CmdletBinding()] param([string]$Name)\n"
+            "  if ($Name -eq 'C') { return [pscustomobject]@{ Name = 'C'; Provider = [pscustomobject]@{ Name = 'FileSystem' }; Root = $global:r8Root; DisplayRoot = '' } }\n"
+            "  Microsoft.PowerShell.Management\\Get-PSDrive @PSBoundParameters }\n"
+            "$o = [ordered]@{}\n"
+        )
+        for key, root in (("exact", "C:\\"), ("lower", "c:\\"), ("windows", "C:\\Windows\\"), ("windows-bare", "C:\\Windows"), ("one-deep", "C:\\x"), ("backslash-less", "C:")):
+            stub += f"$global:r8Root = '{root}'; $o['{key}'] = [bool](Test-DvLocalReceiptRoot -Path 'C:\\x\\.claude-state\\sheets' -AgentShares @('C:\\fake\\agent-share'))\n"
+        got = json.loads(self.run_ps(stub + "$o | ConvertTo-Json -Compress\n"))
+        self.assertEqual(got, {"exact": True, "lower": True, "windows": False, "windows-bare": False, "one-deep": False, "backslash-less": False})
+
+    def test_r8_b3_a_component_longer_than_the_volume_maximum_is_refused_before_any_side_effect(self) -> None:
+        # sol B3 literal: a 256-character component is certified though GetVolumeInformationW reports 255 for the volume (such a directory cannot be created)
+        drive = os.environ.get("SystemDrive", "C:") + "\\"
+        buf = ctypes.c_uint32(0)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(ctypes.c_wchar_p(drive), None, 0, None, ctypes.byref(buf), None, None, 0)
+        limit = min(255, buf.value) if ok and buf.value else 255
+        pre = f"{drive}x\\.claude-state\\"
+        astral = "\U0001F600"   # two UTF-16 code units
+        bad = {"over-last": pre + "a" * (limit + 1) + "\\receipts", "over-middle": pre + "a" * (limit + 1) + "\\inner\\receipts", "over-final": pre + "a" * (limit + 1),
+               "over-by-surrogates": pre + astral * (limit // 2 + 1) + "\\r",
+               "far-over": pre + "a" * 5000 + "\\r"}
+        edge = {"at-limit-last": pre + "b" * limit + "\\receipts", "at-limit-final": pre + "b" * limit, "at-limit-surrogates": pre + astral * (limit // 2) + "\\r"}
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, **edge})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {str(got)[:300]}")
+        for name in edge:
+            self.assertIsNotNone(got[name], f"{name} (a name of exactly the volume's maximum is legal): {str(got)[:300]}")
+        base = self.clean_base()
+        with self.subTest(entry="batch"):
+            self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+            r = self.run_batch(None, "-ReceiptRoot", str(base / ".claude-state" / ("a" * (limit + 1)) / "receipts"))
+            self.assert_nothing_started(r)
+            self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+        with self.subTest(entry="leg"):
+            got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", str(base / ".claude-state" / ("a" * (limit + 1)) / "receipts")))
+            self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+
+    def test_r11_a_malformed_original_component_followed_by_parent_navigation_is_refused_on_every_entry(self) -> None:
+        # Dot (pr-729.md) / sol 6559605502 / adversary A1 (r10 e0104f07): GetFullPath removes `bad\..` BEFORE the character, device and length checks ran, so a malformed ORIGINAL component
+        # followed by `..` was certified (leg ACCEPTED, batch PASSED_BEFORE_RUNDIR) while the same component without the `..` refused. Every ORIGINAL component is judged before any normalisation.
+        drive = os.environ.get("SystemDrive", "C:") + "\\"
+        buf = ctypes.c_uint32(0)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(ctypes.c_wchar_p(drive), None, 0, None, ctypes.byref(buf), None, None, 0)
+        limit = min(255, buf.value) if ok and buf.value else 255
+        classes = {
+            "bad-root-angle": "bad<root>", "bad-root-quote": 'bad"root', "bad-root-pipe": "bad|root", "bad-root-star": "bad*root", "bad-root-question": "bad?root", "bad-root-colon": "bad:root",
+            "device-nul": "NUL", "device-con-ext": "CON.txt", "device-com1-space-ext": "COM1 .txt", "device-superscript": "COM\u00b9", "device-conin": "conin$",
+            "over-volume-max": "a" * (limit + 1),
+            "control-x01": "ctl\x01x", "control-x1f": "ctl\x1fx", "control-tab": "ctl\tx", "control-newline": "ctl\nx", "nul-char": "n\x00x",
+        }
+        pre = "C:\\x\\.claude-state\\"
+        bad: dict[str, str] = {}
+        for name, comp in classes.items():
+            bad[f"{name}/after-marker"] = pre + comp + "\\..\\receipts"
+            bad[f"{name}/after-marker-forward-slash"] = "C:/x/.claude-state/" + comp + "/../receipts"
+            bad[f"{name}/nested-then-two-parents"] = pre + "a\\" + comp + "\\..\\..\\receipts"
+            bad[f"{name}/before-marker"] = "C:\\x\\" + comp + "\\..\\.claude-state\\receipts"
+            bad[f"{name}/dot-then-parent"] = pre + comp + "\\.\\..\\receipts"
+            bad[f"{name}/terminal-with-parent"] = pre + "receipts\\" + comp + "\\.."
+            bad[f"{name}/extended-prefix"] = "\\\\?\\" + pre + comp + "\\..\\receipts"
+        bad["far-over-volume-max/after-marker"] = pre + "a" * 5000 + "\\..\\receipts"   # one case only: the judge script travels on the command line
+        controls = {
+            "fine": pre + "good-root", "parent-nav-over-a-good-name": pre + "a\\..\\receipts", "dot-nav": pre + "a\\.\\r",
+            "com10-is-not-a-device": pre + "COM10\\..\\receipts", "console-is-not-a-device": pre + "CONSOLE\\..\\receipts",
+            "at-limit-then-parent": pre + "b" * limit + "\\..\\receipts", "ordinary-dotted-name": pre + "r.x\\..\\receipts",
+        }
+        got = self.judge(["C:\\fake\\agent-share"], {**bad, **controls})
+        for name in bad:
+            self.assertIsNone(got[name], f"{name}: {str(got[name])[:200]}")
+        self.assertEqual(got["fine"].lower(), "c:\\x\\.claude-state\\good-root")
+        self.assertEqual(got["parent-nav-over-a-good-name"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["dot-nav"].lower(), "c:\\x\\.claude-state\\a\\r")
+        self.assertEqual(got["com10-is-not-a-device"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["console-is-not-a-device"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["at-limit-then-parent"].lower(), "c:\\x\\.claude-state\\receipts")
+        self.assertEqual(got["ordinary-dotted-name"].lower(), "c:\\x\\.claude-state\\receipts")
+        # a RELATIVE spelling (resolved once against the PowerShell location) is judged component by component too
+        here = self.clean_base()
+        rel_bad = {f"{n}/relative": ".claude-state\\" + c + "\\..\\receipts" for n, c in classes.items() if n in ("bad-root-angle", "device-nul", "over-volume-max", "control-x01", "nul-char")}
+        rel_bad["bad-root-angle/rooted-on-current-drive"] = "\\" + str(here)[3:] + "\\.claude-state\\bad<root>\\..\\receipts"
+        rel_ctl = {"relative-fine": ".claude-state\\a\\..\\receipts"}
+        got_rel = self.judge(["C:\\fake\\agent-share"], {**rel_bad, **rel_ctl}, location=here, process_dir=here)
+        for name in rel_bad:
+            self.assertIsNone(got_rel[name], f"{name}: {str(got_rel[name])[:200]}")
+        self.assertIsNotNone(got_rel["relative-fine"], got_rel)
+        # the batch entry (Invoke-VenueLeaseBatch.ps1 -ReceiptRoot) refuses before the run dir, the claim or any leg; the real leg entry (Invoke-VenueLeg.ps1) refuses the same root.
+        # argv cannot carry a NUL character, so that class is judged by the helper above only.
+        base = self.clean_base()
+        entries = {k: v for k, v in classes.items() if k in ("bad-root-angle", "device-nul", "over-volume-max", "control-x01", "control-x1f", "device-com1-space-ext")}
+        for label, comp in entries.items():
+            root = str(base) + "\\.claude-state\\" + comp + "\\..\\receipts"
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r = self.run_batch(None, "-ReceiptRoot", root)
+                self.assert_nothing_started(r)
+                self.assertIn("RECEIPT_ROOT_MUST_STAY_LOCAL", r.stderr)
+            with self.subTest(entry="leg", name=label):
+                got_leg = self.run_ps(f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n" + leg_receipt_root_guard_ps(DV / "Invoke-VenueLeg.ps1", root))
+                self.assertTrue(got_leg.startswith("REFUSED DVE_RECEIPT_ROOT_MUST_STAY_LOCAL"), got_leg)
+        # the same root with the malformed component REMOVED is certified (the refusal is the component, not the `..`)
+        with self.subTest(entry="batch", name="control-good-component-then-parent"):
+            self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+            r = self.run_batch(None, "-ReceiptRoot", str(base) + "\\.claude-state\\a\\..\\receipts")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # ---- r12 (PR #729 r11 keys; sol INV-5 blocker): the device rule is the Windows reserved set exactly. COM0 and LPT0 are NOT devices (RtlIsDosDeviceName_U = 0), so a root that
+    # names one (bare, with an extension, with spaces before the extension, followed by `..`) is ordinary and certifies; COM1-COM9, LPT1-LPT9 and the superscript forms still refuse.
+    def test_r12_com0_and_lpt0_are_ordinary_names_and_certify_on_every_entry(self) -> None:
+        pre = "C:\\x\\.claude-state\\"
+        legal = {"com0-then-parent": pre + "COM0\\..\\receipts", "lpt0-then-parent": pre + "LPT0\\..\\receipts",
+                 "com0-ext-then-parent": pre + "COM0.txt\\..\\receipts", "lpt0-space-ext-then-parent": pre + "LPT0 .txt\\..\\receipts"}   # sol r11's four literal inputs
+        legal_kept = {"com0-middle": pre + "COM0\\r", "lpt0-lower-middle": pre + "lpt0\\r", "com0-terminal": pre + "COM0", "lpt0-ext-terminal": pre + "LPT0.log"}
+        refused = {"com1-then-parent": pre + "COM1\\..\\receipts", "lpt9-then-parent": pre + "LPT9\\..\\receipts", "nul-then-parent": pre + "NUL\\..\\receipts",
+                   "con-ext-then-parent": pre + "CON.txt\\..\\receipts", "com1-middle": pre + "COM1\\r", "lpt9-middle": pre + "LPT9\\r", "nul-middle": pre + "NUL\\r",
+                   "con-ext-middle": pre + "CON.txt\\r", "com-sup1-then-parent": pre + "COM\u00b9\\..\\receipts", "lpt-sup3-space-ext-then-parent": pre + "LPT\u00b3 .log\\..\\receipts",
+                   # r11 is not weakened: a malformed component followed by `..` still refuses
+                   "ctl-then-parent": pre + "ctl\x01x\\..\\receipts", "over-max-then-parent": pre + "a" * 256 + "\\..\\receipts", "bad-root-then-parent": pre + "bad<root>\\..\\receipts"}
+        got = self.judge(["C:\\fake\\agent-share"], {**legal, **legal_kept, **refused})
+        for name in legal:
+            self.assertEqual(str(got[name]).lower(), "c:\\x\\.claude-state\\receipts", f"{name}: a non-device name was refused: {got[name]}")
+        for name, value in legal_kept.items():
+            self.assertEqual(str(got[name]).lower(), value.lower(), f"{name}: {got[name]}")
+        for name in refused:
+            self.assertIsNone(got[name], f"{name}: {str(got[name])[:200]}")
+        # r13: the rule is judged against the DOCUMENTED reserved set (host-independent; the native classifier corroborates in its own method below, so a host whose
+        # RtlIsDosDeviceName_U differs can no longer stop the caller sweep and the batch runs after this point). The oracle's own positive and negative controls first.
+        self.assertTrue(all(documented_dos_device(n) for n in ("COM1", "LPT9", "COM\u00b9", "LPT\u00b3 .log", "NUL", "CON.txt", "aux", "PRN.tar.gz")))
+        self.assertFalse(any(documented_dos_device(n) for n in ("COM0", "LPT0 .txt", "COM10", "CONSOLE", "COM\uff11", "COM\u2070")))
+        # keyed by position: PowerShell property names are case-insensitive, and the matrix holds `COM1` and `com1`
+        got_pos = self.judge(["C:\\fake\\agent-share"], {f"m{i:03d}": pre + n + "\\r" for i, n in enumerate(DEVICE_MATRIX_NAMES)})
+        got_all = {n: got_pos[f"m{i:03d}"] for i, n in enumerate(DEVICE_MATRIX_NAMES)}
+        mismatch = {n: (documented_dos_device(n), got_all[n]) for n in DEVICE_MATRIX_NAMES if documented_dos_device(n) != (got_all[n] is None)}
+        self.assertEqual(mismatch, {}, "the helper's device rule and the documented reserved set disagree (name: (documented device, certificate))")
+        self.assertGreaterEqual(sum(documented_dos_device(n) for n in DEVICE_MATRIX_NAMES), 80, "the matrix lost its reserved-name refusals")
+        self.assertGreaterEqual(sum(not documented_dos_device(n) for n in DEVICE_MATRIX_NAMES), 18, "the matrix lost its ordinary-name positives")
+        # CONIN$ and CONOUT$ are console device names the helper also refuses (stricter than the documented list), middle and terminal
+        got_con = self.judge(["C:\\fake\\agent-share"], {"conin-middle": pre + "CONIN$\\r", "conout-ext-terminal": pre + "conout$.txt"})
+        self.assertEqual(got_con, {"conin-middle": None, "conout-ext-terminal": None})
+        # every admission site Sol swept goes through the one helper: the real guard statements of the leg (-ReceiptRoot, -SheetCopyDir), both pair scripts (-OutDir), the baseline
+        # (-TrendFile / -RunDir) and the stage nightly (-ReceiptFile), each taken from its own script text
+        guards = {
+            "leg-receipt-root": (DV / "Invoke-VenueLeg.ps1", "(?s)\\$rrCert = .*?\\$ReceiptRoot = \\$rrCert", "$ReceiptRoot = $v; $OfflineTestMode = $false", "$ReceiptRoot"),
+            "leg-sheet-copy-dir": (DV / "Invoke-VenueLeg.ps1", "(?s)if \\(-not \\[string\\]::IsNullOrWhiteSpace\\(\\$SheetCopyDir\\)\\) \\{\\s*\\$SheetCopyDir = Test-DvLocalReceiptRoot.*?\\r?\\n\\}", "$SheetCopyDir = $v", "$SheetCopyDir"),
+            "sheet-pair-out-dir": (DV / "New-VenueSheetPair.ps1", "(?s)\\$outFull = Test-DvLocalReceiptRoot.*?\\$OutDir = \\$outFull", "$OutDir = $v", "$OutDir"),
+            "flavor-pair-out-dir": (DV / "New-VenueFlavorPair.ps1", "(?s)\\$outFull = Test-DvLocalReceiptRoot.*?\\$OutDir = \\$outFull", "$OutDir = $v", "$OutDir"),
+            "baseline-trend-and-run-dir": (DV / "Invoke-VenueBaseline.ps1", "(?s)\\$trendCert = Test-DvLocalReceiptRoot.*?\\$RunDir = \\$runDirCert", "$TrendFile = $v; $RunDir = $v", "$TrendFile + '|' + $RunDir"),
+            "nightly-receipt-file": (DV / "Invoke-VenueStageNightly.ps1", "(?s)\\$receiptCert = Test-DvLocalReceiptRoot.*?\\$ReceiptFile = \\$receiptCert", "$ReceiptFile = $v", "$ReceiptFile"),
+        }
+        inputs = {**legal, "com1-then-parent": refused["com1-then-parent"], "nul-then-parent": refused["nul-then-parent"]}
+        script = ("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\n" f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  "function Stop-Baseline { param($k, $m) throw \"$k $m\" }\nfunction Stop-Nightly { param($k, $m) throw \"$k $m\" }\n$o = [ordered]@{}\n")
+        for g, (path, pattern, assign, result) in guards.items():
+            script += (f"$m = [regex]::Match([IO.File]::ReadAllText('{psq(path)}'), '{psq(pattern)}')\nif (-not $m.Success) {{ throw 'guard {g} was not found' }}\n$sb = [scriptblock]::Create($m.Value)\n")
+            for k, v in inputs.items():
+                script += f"$v = '{psq(v)}'; {assign}\ntry {{ . $sb; $o['{g}|{k}'] = 'ACCEPTED ' + ({result}) }} catch {{ $o['{g}|{k}'] = 'REFUSED ' + $_.Exception.Message }}\n"
+        script += "$o | ConvertTo-Json -Compress\n"
+        out = json.loads(self.run_ps(script))
+        for g in guards:
+            for k in inputs:
+                with self.subTest(guard=g, name=k):
+                    if k in legal:
+                        self.assertTrue(out[f"{g}|{k}"].startswith("ACCEPTED "), out[f"{g}|{k}"])
+                        self.assertNotIn("..", out[f"{g}|{k}"], "the guard went on with the raw spelling, not the certified one")
+                    else:
+                        self.assertTrue(out[f"{g}|{k}"].startswith("REFUSED "), out[f"{g}|{k}"])
+        # the batch entry runs to the end on a COM0 root and every leg is handed the certified root (the `..` resolved away)
+        for label, comp in (("com0", "COM0"), ("lpt0-space-ext", "LPT0 .txt")):
+            with self.subTest(entry="batch", name=label):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                root = self.case / "scratch" / ".claude-state" / comp / ".." / "receipts"
+                r = self.run_batch(None, "-ReceiptRoot", str(root))
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.leg_calls(), [f"bound=True root={self.long_form(self.case / 'scratch' / '.claude-state' / 'receipts')}"] * 2)
+
+    # ---- r13 (hosted shard 4/8 job 124969603389, CoS 6563973648): the native classifier CORROBORATES the documented set, in its own method so a host difference cannot hide the
+    # caller sweep. RtlIsDosDeviceName_U's answer depends on the input form and the OS build, MEASURED:
+    #   10.0.19045 (Virtual-Ten): every form (bare, `.\`, `C:\x\`, the full .claude-state path) classifies all 84 documented spellings, extensions and `NAME .ext` included.
+    #   10.0.26100 (hosted windows-2025-vs2026, Tests 41358897524 job 125004796490): bare classifies exactly the 30 bare documented stems (any case, superscripts included) and no
+    #   extension form (CON.txt, `COM1 .txt` are ordinary); every path form classifies NUL only.
+    # So the host-independent corroboration is: the BARE STEMS are devices and agree exactly with the documented set; and in EVERY form, whatever the kernel calls a device is in
+    # the documented set (the helper refuses that set, so it is never looser than the kernel). A form that also classifies the extension controls must agree in full (19045).
+    def test_r13_native_classifier_corroborates_the_documented_device_set_on_the_bare_component(self) -> None:
+        is_dev = ctypes.windll.ntdll.RtlIsDosDeviceName_U
+        is_dev.argtypes, is_dev.restype = [ctypes.c_wchar_p], ctypes.c_uint32
+        forms = {"bare": "{n}", "dot-relative": ".\\{n}", "drive-dir": "C:\\x\\{n}", "full-claude-state": "C:\\x\\.claude-state\\{n}"}
+        native = {f: {n: bool(is_dev(pat.format(n=n))) for n in DEVICE_MATRIX_NAMES} for f, pat in forms.items()}
+        v = sys.getwindowsversion()
+        host = f"os={v.major}.{v.minor}.{v.build} platform={sys.platform}"
+        fact = host + " | " + " | ".join(f"{f}: {sum(m.values())} devices [{' '.join(sorted(n for n, d in m.items() if d))}]" for f, m in native.items())
+        print(f"\nNATIVE-DOS-DEVICE-HOST-FACT {fact}".encode("ascii", "backslashreplace").decode(), file=sys.stderr)
+        positives = ("COM1", "LPT9", "COM\u00b9", "LPT\u00b3", "NUL", "CON", "PRN", "AUX", "com1", "nul")
+        self.assertTrue(all(native["bare"][n] for n in positives),
+                        f"HOST-FACT-NATIVE-CLASSIFIER-BLIND-ON-BARE-NAMES: RtlIsDosDeviceName_U does not classify the documented positive controls {positives} even as a bare name on {fact}")
+        # (1) bare stems (no dot, no space): the kernel and the documented set agree EXACTLY, both directions (COM0, LPT0, COM10, CONSOLE, fullwidth 1 ... are ordinary)
+        stems = [n for n in DEVICE_MATRIX_NAMES if "." not in n and " " not in n]
+        self.assertGreaterEqual(len(stems), 40)   # 30 documented stems, 14 ordinary near misses
+        mismatch = {n: native["bare"][n] for n in stems if native["bare"][n] != documented_dos_device(n)}
+        self.assertEqual(mismatch, {}, f"the documented reserved set and RtlIsDosDeviceName_U on the bare stem disagree (name: native device) on {fact}")
+        # (2) every form: the kernel never calls a name a device that the documented set (so the helper) treats as ordinary
+        for f, m in native.items():
+            with self.subTest(form=f, check="native-device-is-documented"):
+                self.assertEqual(sorted(n for n, d in m.items() if d and not documented_dos_device(n)), [], f"{f}: the kernel classifies a name the helper would certify, on {fact}")
+        # (3) a form that also classifies the extension controls must agree with the documented set in full (10.0.19045: every form)
+        ext_positives = ("CON.txt", "NUL .txt", "COM1.txt", "LPT\u00b2 .txt")
+        for f, m in native.items():
+            if all(m[n] for n in positives + ext_positives):
+                with self.subTest(form=f, check="full-agreement"):
+                    self.assertEqual({n: d for n, d in m.items() if d != documented_dos_device(n)}, {}, f"{f} on {fact}")
+
+    def test_r8_a3_a_link_chain_is_bounded_per_link_sixteen_pass_seventeen_are_refused(self) -> None:
+        # opus/sol A3 (ADV-A3): ResolveLinkTarget($true) collapsed a whole chain inside one outer hop, so the stated 16-link bound was never enforced. Real junctions: j00 -> j01 -> ... -> j16 -> final (17 links).
+        base = self.clean_base()
+        state = base / "chain" / ".claude-state"
+        final = state / "final"
+        final.mkdir(parents=True)
+        prev = final
+        for n in range(16, -1, -1):
+            prev = self.make_junction(state / f"j{n:02d}", prev)
+        got = self.judge(["C:\\fake\\agent-share"], {"seventeen-links": str(state / "j00" / "receipts"), "sixteen-links": str(state / "j01" / "receipts"), "one-link": str(state / "j16" / "receipts")})
+        self.assertIsNone(got["seventeen-links"], got)
+        self.assertTrue(self.same_path(got["sixteen-links"], final / "receipts"), f"a chain of 16 links settles on its target: {got}")
+        self.assertTrue(self.same_path(got["one-link"], final / "receipts"), got)
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertNotIn("ResolveLinkTarget($true)", text, "the walk must follow ONE link per hop (ResolveLinkTarget($false)) or the hop bound counts outer rewrites only")
+
+    def test_adversary_dot_a1_no_boundary_directory_name_is_compared_with_a_culture_aware_operator(self) -> None:
+        # the class, not the instance: every PowerShell file under tools/ that tests a path component against .claude-state goes through [string]::Equals(..., Ordinal)
+        offenders = []
+        for p in sorted((ROOT / "tools").rglob("*.ps*1")):
+            if p.suffix not in (".ps1", ".psm1"):
+                continue
+            for n, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                if re.search(r"-[ci]?(?:eq|ne|like|notlike|match|notmatch|contains|in|notin)\s+['\"]\.claude-state['\"]|['\"]\.claude-state['\"]\s+-[ci]?(?:eq|ne|like|contains)\b", line, re.I):
+                    offenders.append(f"{p.relative_to(ROOT).as_posix()}:{n}: {line.strip()[:140]}")
+        self.assertEqual(offenders, [], "a path component compared with .claude-state by a culture-aware operator accepts ignorable code points (U+00AD ...)")
+
+
 @requires_windows_pwsh
 class LeaseEndUtcTimezoneTests(unittest.TestCase):
     ENDED = datetime(2026, 10, 25, 1, 19, 14, 720994, tzinfo=timezone.utc)   # the r7 open result's endedUtc
