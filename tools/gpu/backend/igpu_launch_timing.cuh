@@ -26,7 +26,11 @@
  *       backend's error; a recorder call that fails with none pending is cleared,
  *       but only when its code is one the recorder's own call produces
  *       (igpu_lt_recorder_clearable) and the slot still holds exactly that code, so
- *       an asynchronous backend fault is never consumed.
+ *       an asynchronous backend fault is never consumed. A failed call's code is
+ *       cleared BEFORE its cleanup, and cleanup (every cudaEventDestroy, a query or
+ *       elapsed read in poll/teardown) makes no CUDA call while an error is pending:
+ *       the handles wait in a retired list for a later destroy or teardown with
+ *       nothing pending, so the backend always observes its error first.
  *   IGPU_LT_SYNC_BLOCK(stage, statement);
  *       host time around a statement (e.g. a free of every clip buffer).
  *   igpu_lt::FrameScope f(width, height);   igpu_lt::TileScope t(top, left);
@@ -217,8 +221,10 @@ public:
         if (started != cudaSuccess)
         {
             std::lock_guard<std::mutex> lock(mu_);
-            const cudaError_t destroyed = destroy_events_locked(p);
-            drop_own_error_locked(destroyed != cudaSuccess ? destroyed : started);
+            /* r4 (r3 pass 6 A1 sibling :220): the recorder's own failure is cleared FIRST; an
+             * asynchronous fault stays pending, and the destroy then makes no call over it. */
+            drop_own_error_locked(started);
+            destroy_events_locked(p);
             return false;
         }
         return true;
@@ -228,28 +234,34 @@ public:
      * its own) checks only its stop record, so an earlier unrelated error is not pinned on it.
      * Adversary r2 pass 3 A4: a span whose bracketed work left an error pending is dropped with no
      * further CUDA call (its events go back to the pool), and a failed stop record of a span is the
-     * recorder's own, so it is cleared after it is logged. */
+     * recorder's own, so it is cleared after it is logged. r4 (r3 pass 6 A1 siblings :240 :251): the
+     * pending error is read BEFORE the stop record, so a kernel's launch error is logged and its
+     * events are retired with no CUDA call over it; a failed stop record (none pending before it)
+     * is the recorder's own for a kernel too, and is cleared before its events are destroyed. */
     void end_kernel(Pending & p, cudaStream_t stream, bool peek_launch = true)
     {
-        if (!peek_launch && backend_error_pending())
+        const cudaError_t launch = cudaPeekAtLastError();
+        if (launch != cudaSuccess)
         {
             std::lock_guard<std::mutex> lock(mu_);
-            discard_events_locked(p);
+            if (!peek_launch)
+            {
+                discard_events_locked(p);
+                return;
+            }
+            fail_pending_locked(p, launch);
+            /* Events touched by a faulted context are not reused; over the pending error
+             * destroy_events_locked() makes no CUDA call and only retires them. */
+            destroy_events_locked(p);
             return;
         }
         const cudaError_t recorded = cudaEventRecord(p.stop, stream);
-        const cudaError_t launch = peek_launch ? cudaPeekAtLastError() : cudaSuccess;
         std::lock_guard<std::mutex> lock(mu_);
-        if (launch != cudaSuccess || recorded != cudaSuccess)
+        if (recorded != cudaSuccess)
         {
-            const cudaError_t e = launch != cudaSuccess ? launch : recorded;
-            p.rec.ms = -1.0;
-            p.rec.err = (int)e;
-            p.rec.err_name = cudaGetErrorName(e);
-            finish_locked(p.rec);
-            /* Events touched by a faulted context are not reused. */
-            const cudaError_t destroyed = destroy_events_locked(p);
-            if (!peek_launch) drop_own_error_locked(destroyed != cudaSuccess ? destroyed : recorded);
+            fail_pending_locked(p, recorded);
+            drop_own_error_locked(recorded);
+            destroy_events_locked(p);
             return;
         }
         if (pending_.size() >= kMaxPending)
@@ -321,13 +333,16 @@ public:
      * resolves what has completed (never blocks), writes the summaries, and
      * destroys the idle pool. The last live backend also destroys the pairs
      * still pending; cudaEventDestroy on an unfinished event returns at once
-     * and the runtime frees it when the device reaches it. */
+     * and the runtime frees it when the device reaches it. r4 (r3 pass 6 A1
+     * siblings :330 :335): every handle goes through destroy_events_locked() /
+     * flush_retired_locked(), so over a pending error none is destroyed (they stay
+     * retired for a later teardown with nothing pending). */
     void teardown(const char * at)
     {
         std::lock_guard<std::mutex> lock(mu_);
         resolve_locked();
         if (live_backends_ > 0) live_backends_ -= 1;
-        for (cudaEvent_t ev : pool_) cudaEventDestroy(ev);
+        retired_.insert(retired_.end(), pool_.begin(), pool_.end());
         pool_.clear();
         if (live_backends_ == 0)
         {
@@ -335,15 +350,20 @@ public:
             for (Pending & p : pending_) destroy_events_locked(p);
             pending_.clear();
         }
+        flush_retired_locked();
         write_summaries_locked(at);
         last_summary_ms_ = steady_ms();
     }
 
 private:
+    /* r4 (r3 pass 6 A1 siblings :347 :356 :379): no query, elapsed read or destroy is made while an
+     * error is pending (the pairs wait for a later poll, or the last teardown); a failed query or
+     * read is cleared by its own code before the pair's events are destroyed. */
     void resolve_locked()
     {
         for (auto it = pending_.begin(); it != pending_.end();)
         {
+            if (backend_error_pending()) return;
             const cudaError_t q = cudaEventQuery(it->stop);
             if (q == cudaErrorNotReady)
             {
@@ -367,6 +387,7 @@ private:
                     it->rec.ms = -1.0;
                     it->rec.err = (int)e;
                     it->rec.err_name = cudaGetErrorName(e);
+                    drop_own_error_locked(e);
                 }
             }
             else
@@ -374,11 +395,20 @@ private:
                 it->rec.ms = -1.0;
                 it->rec.err = (int)q;
                 it->rec.err_name = cudaGetErrorName(q);
+                drop_own_error_locked(q);
             }
             finish_locked(it->rec);
             destroy_events_locked(*it); /* no-op when the pair went back to the pool */
             it = pending_.erase(it);
         }
+    }
+
+    void fail_pending_locked(Pending & p, cudaError_t e)
+    {
+        p.rec.ms = -1.0;
+        p.rec.err = (int)e;
+        p.rec.err_name = cudaGetErrorName(e);
+        finish_locked(p.rec);
     }
 
     /* The config line is written by the first attach() (after the anchor, so it can name it),
@@ -430,19 +460,20 @@ private:
      * with a long pin or across which the wall clock stepped is dropped
      * (igpu_lt_anchor_try_bracket); the shortest usable bracket of kAnchorTries is kept. This is
      * the recorder's only synchronising call; with the timer OFF it is never reached. attach()
-     * calls it only with no CUDA error pending (adversary r2 pass 3 A4), and a failed call ends
-     * the tries; `own` keeps the code of the recorder's last failed call, which
-     * drop_own_error_locked() clears only if it is the recorder's own (adversary r3 pass 4 A1). */
+     * calls it only with no CUDA error pending (adversary r2 pass 3 A4), a failed call ends the
+     * tries, and no try starts over a pending error. A failed call's code is passed at once to
+     * drop_own_error_locked(), which clears it only if it is the recorder's own (adversary r3 pass
+     * 4 A1), BEFORE any cleanup: r4 (r3 pass 6 A1, :459) an asynchronous fault (719) from the wait
+     * stays pending, and the try's event is then retired with no CUDA call over it. */
     void establish_anchor_locked()
     {
-        cudaError_t own = cudaSuccess;
-        for (int i = 0; i < kAnchorTries; ++i)
+        for (int i = 0; i < kAnchorTries && !backend_error_pending(); ++i)
         {
             cudaEvent_t ev = nullptr;
             const cudaError_t created = cudaEventCreate(&ev);
             if (created != cudaSuccess)
             {
-                own = created;
+                drop_own_error_locked(created);
                 break;
             }
             const double steady_b0 = steady_ms();
@@ -455,9 +486,8 @@ private:
             const double steady_a1 = steady_ms();
             if (waited != cudaSuccess)
             {
-                own = waited;
-                const cudaError_t destroyed = cudaEventDestroy(ev);
-                if (destroyed != cudaSuccess) own = destroyed;
+                drop_own_error_locked(waited);
+                destroy_event_locked(ev);
                 break;
             }
             double bracket = 0.0;
@@ -472,18 +502,9 @@ private:
                 anchor_steady_ms_ = 0.5 * (steady_a0 + steady_a1);
                 anchor_bracket_ms_ = bracket;
             }
-            if (drop)
-            {
-                const cudaError_t destroyed = cudaEventDestroy(drop);
-                if (destroyed != cudaSuccess)
-                {
-                    /* adversary r3 pass 5 A2: a failed call ends the tries, a destroy included */
-                    own = destroyed;
-                    break;
-                }
-            }
+            /* adversary r3 pass 5 A2: a failed call ends the tries, a destroy included */
+            if (drop && !destroy_event_locked(drop)) break;
         }
-        drop_own_error_locked(own);
     }
 
     /* Adversary r2 pass 3 A4: true when a CUDA error is pending. Every recorder-only path (the
@@ -561,17 +582,47 @@ private:
         p.start = p.stop = nullptr;
     }
 
-    /* Error branches and teardown: the handles are destroyed, never just dropped. Returns the
-     * code of the destroy that failed (cudaSuccess when none did). Adversary r3 pass 5 A2: once a
-     * destroy fails, the other is not attempted over that pending error (its handle is given up;
-     * a failing destroy means a faulted context). */
-    cudaError_t destroy_events_locked(Pending & p)
+    /* Error branches and teardown: the handles are destroyed, never just dropped. Adversary r3
+     * pass 5 A2: once a destroy fails, the other is not attempted over that pending error. r4 (r3
+     * pass 6 A1 sibling :571): both go through destroy_event_locked(). */
+    void destroy_events_locked(Pending & p)
     {
-        cudaError_t failed = cudaSuccess;
-        if (p.start) failed = cudaEventDestroy(p.start);
-        if (p.stop && failed == cudaSuccess) failed = cudaEventDestroy(p.stop);
+        if (p.start) retired_.push_back(p.start);
+        if (p.stop) retired_.push_back(p.stop);
         p.start = p.stop = nullptr;
-        return failed;
+        flush_retired_locked();
+    }
+
+    /* r4 (r3 pass 6 A1): every event the recorder destroys goes through here. True when it (and
+     * every handle retired before it) was destroyed. With an error pending (the backend's, or an
+     * asynchronous fault) it makes no CUDA call: the handle stays in retired_ until a later
+     * destroy or teardown finds nothing pending, so the backend observes its error first. */
+    bool destroy_event_locked(cudaEvent_t ev)
+    {
+        if (ev) retired_.push_back(ev);
+        return flush_retired_locked();
+    }
+
+    /* Destroys retired handles while no error is pending. A destroy that fails is the recorder's
+     * own call (nothing was pending before it): its code is cleared only if drop_own_error_locked()
+     * says it is the recorder's own, and the handle is given up (a failing destroy means a faulted
+     * context); an asynchronous fault it returns stays pending and stops the flush. */
+    bool flush_retired_locked()
+    {
+        bool ok = true;
+        while (!retired_.empty())
+        {
+            if (backend_error_pending()) return false;
+            const cudaEvent_t ev = retired_.back();
+            retired_.pop_back();
+            const cudaError_t destroyed = cudaEventDestroy(ev);
+            if (destroyed != cudaSuccess)
+            {
+                ok = false;
+                drop_own_error_locked(destroyed);
+            }
+        }
+        return ok;
     }
 
     void fill_locked(IgpuLtRecord * rec, const char * kind, const char * stage)
@@ -636,6 +687,8 @@ private:
 
     std::mutex mu_;
     std::vector<cudaEvent_t> pool_;
+    /* r4: handles to destroy once no error is pending (flush_retired_locked) */
+    std::vector<cudaEvent_t> retired_;
     std::deque<Pending> pending_;
     std::map<std::string, IgpuLtStats> stats_;
     unsigned long long seq_ = 0;

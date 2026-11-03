@@ -766,7 +766,7 @@ TEST(GpuFieldTelemetry, LaunchTimingRecorderIsUntouched)
     ASSERT_TRUE(file.open(QIODevice::ReadOnly));
     QByteArray bytes = file.readAll();
     bytes.replace("\r", "");
-    ASSERT_EQ(std::string("623bede5af93bc72d99a721bbd9d07b1bd645186cc67419556180bf86240f10c"),
+    ASSERT_EQ(std::string("9465631e0593b0dcbcb63c533141849974b7d7e1f7008e9fca03768ea49b1168"),
               QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().toStdString());
 }
 
