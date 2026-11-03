@@ -1505,6 +1505,116 @@ function Assert-CodexCommandLineFits {
     }
     return $len
 }
+# r11 (sol r10 B1, sol r10 B2, fable r10 B1; hub step E): rounds 7-10 each read one more cmd.exe parsing shape and each left a sibling.
+# The codex launch no longer runs a .cmd/.bat through cmd.exe at all, so no shim-side expansion, redirection, delayed expansion,
+# registry setting or later rewrite of the shim can change the arguments codex receives or the length of its command line:
+# - the standard npm cmd-shim template is launched as the native node it would run plus its script (Resolve-CodexShimLaunch, kind
+#   'npm-node');
+# - any other shim must be exactly ONE command line '<native .exe/.com> <literal args> %*' (optional '@echo off' and blank lines), and
+#   that program is launched directly with the literal args (kind 'single-exe');
+# - every other shim is refused, typed 'codex-shim-unsupported', before launch: a '%' other than the one '%*' (and a leading '%~dp0'),
+#   any '!', any '<' '>' '|' '&' '^' '(' ')', more than one command line, a target that is not a native program, or an unparsable token.
+# The shim bytes are hashed when they are read here and re-hashed immediately before Process.Start ('codex-shim-changed' on a change).
+$CODEX_SHIM_MAX_BYTES = 65536
+function Read-CodexShimBytes {
+    # One read through one handle that denies writers, so the hashed bytes are a single version of the file.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try {
+            if ($fs.Length -gt $CODEX_SHIM_MAX_BYTES) { throw [System.IO.InvalidDataException]::new("larger than $CODEX_SHIM_MAX_BYTES bytes") }
+            $ms = [System.IO.MemoryStream]::new()
+            $fs.CopyTo($ms)
+            $bytes = $ms.ToArray()
+        } finally { $fs.Dispose() }
+    } catch {
+        throw "codex-shim-unreadable: the codex shim '$Path' could not be read ($($_.Exception.GetBaseException().Message)); refused before launch"
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    return [pscustomobject]@{ Text = [System.Text.Encoding]::ASCII.GetString($bytes); Sha256 = $hash }
+}
+function Find-CodexProgramOnPath {
+    # The first existing <dir>\<Name><ext> over the ABSOLUTE PATH entries, in PATH order and then $Extensions order. An empty or relative
+    # entry is skipped: the program is launched by the absolute path returned here, never searched for again by anyone else.
+    param([Parameter(Mandatory = $true)][string]$Name, [string[]]$Extensions = @(''))
+    foreach ($raw in (([string]$env:PATH) -split ';')) {
+        $d = $raw.Trim().Trim('"')
+        $qualified = $false
+        try { $qualified = (-not [string]::IsNullOrEmpty($d)) -and [System.IO.Path]::IsPathFullyQualified($d) } catch { $qualified = $false }
+        if (-not $qualified) { continue }
+        foreach ($e in $Extensions) {
+            try { $c = [System.IO.Path]::Combine($d, $Name + $e) } catch { continue }
+            if ([System.IO.File]::Exists($c)) { return $c }
+        }
+    }
+    return $null
+}
+function Resolve-CodexShimLaunch {
+    # Returns { Kind; FileName; PrefixArgs; Shim; ShimSha256 }: the program Process.Start runs and the literal arguments placed before the
+    # codex argv. A native -Exe is returned unchanged (Kind 'native'). Throws 'codex-shim-unsupported' / 'codex-shim-unreadable'.
+    param([Parameter(Mandatory = $true)][string]$Exe)
+    $ext = [System.IO.Path]::GetExtension($Exe).ToLowerInvariant()
+    if ($ext -ne '.cmd' -and $ext -ne '.bat') {
+        return [pscustomobject]@{ Kind = 'native'; FileName = $Exe; PrefixArgs = @(); Shim = $null; ShimSha256 = $null }
+    }
+    $read = Read-CodexShimBytes -Path $Exe
+    $shimDir = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Exe))
+    $lf = $read.Text -replace '\r\n', "`n"
+    $refuse = { param($why) throw "codex-shim-unsupported: the codex shim '$Exe' $why; refused before launch (only the npm cmd-shim template or ONE command line '<native .exe/.com> <literal args> %*' is launched)" }
+    if ([regex]::IsMatch($lf, $NPM_CMD_SHIM_PATTERN)) {
+        $rel = [regex]::Match($lf, '"%dp0%\\(?<rel>[^"%!^&|<>\n]+)" %\*\n?\z').Groups['rel'].Value
+        $script = try { [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($shimDir, $rel)) } catch { $null }
+        if (-not $script -or -not [System.IO.File]::Exists($script)) { & $refuse "is the npm template but its script '$rel' does not exist beside it" }
+        $node = $null
+        try { $adj = [System.IO.Path]::Combine($shimDir, 'node.exe'); if ([System.IO.File]::Exists($adj)) { $node = $adj } } catch { $node = $null }
+        if (-not $node) {
+            $pathExt = if ([string]::IsNullOrEmpty($env:PATHEXT)) { '.COM;.EXE;.BAT;.CMD' } else { $env:PATHEXT }
+            $node = Find-CodexProgramOnPath -Name 'node' -Extensions @($pathExt -split ';' | Where-Object { $_ })
+        }
+        if (-not $node) { & $refuse "is the npm template but no 'node' is on an absolute PATH entry" }
+        if ([System.IO.Path]::GetExtension($node) -notmatch '(?i)\A\.(exe|com)\z') { & $refuse "is the npm template but the first 'node' on PATH is '$node', not a native program" }
+        return [pscustomobject]@{ Kind = 'npm-node'; FileName = $node; PrefixArgs = @($script); Shim = $Exe; ShimSha256 = $read.Sha256 }
+    }
+    $lines = @($lf -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' -and $_ -notmatch '\A(?i)@echo\s+off\z' })
+    if ($lines.Count -ne 1) { & $refuse "holds $($lines.Count) command lines" }
+    $line = [string]$lines[0]
+    if ($line -match '[!<>|&^()]') { & $refuse "has a cmd.exe operator or '!' ('$($Matches[0])') in '$line'" }
+    $tokens = [System.Collections.Generic.List[object]]::new()
+    $at = 0
+    while ($at -lt $line.Length) {
+        $m = [regex]::new('\G\s*(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)').Match($line, $at)
+        if (-not $m.Success -or $m.Length -eq 0) { & $refuse "has a token that is not a plain or fully quoted word in '$line'" }
+        $tokens.Add([pscustomobject]@{ Quoted = $m.Groups['q'].Success; Value = $(if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }) })
+        $at = $m.Index + $m.Length
+        while ($at -lt $line.Length -and [char]::IsWhiteSpace($line[$at])) { $at++ }
+    }
+    if ($tokens.Count -lt 2 -or $tokens[$tokens.Count - 1].Quoted -or $tokens[$tokens.Count - 1].Value -ne '%*') { & $refuse "does not end in exactly one unquoted '%*'" }
+    $head = @($tokens | Select-Object -SkipLast 1)
+    for ($i = 0; $i -lt $head.Count; $i++) {
+        $v = [string]$head[$i].Value
+        $probe = if ($i -eq 0) { [regex]::Replace($v, '(?i)\A%~dp0', '') } else { $v }
+        if ($probe.Contains('%')) { & $refuse "has a '%' expansion other than the one forwarding '%*' ('$v')" }
+        if (-not $head[$i].Quoted -and $v -match '[,;=]') { & $refuse "has an unquoted cmd.exe separator in '$v'" }
+        if ($head[$i].Quoted -and ($v -eq '' -or $v.EndsWith('\'))) { & $refuse "has a quoted argument a program would read differently ('`"$v`"')" }
+    }
+    $target = [string]$head[0].Value
+    if ($target -match '(?i)\A%~dp0') { $target = $shimDir.TrimEnd('\') + '\' + $target.Substring(5) }
+    if ($target -notmatch '(?i)\.(exe|com)\z') { & $refuse "runs '$target', which is not named as a native .exe/.com program" }
+    $file = $null
+    $qualified = $false
+    try { $qualified = [System.IO.Path]::IsPathFullyQualified($target) } catch { $qualified = $false }
+    if ($qualified) {
+        if ([System.IO.File]::Exists($target)) { $file = $target }
+    } elseif ($target -notmatch '[\\/:]') {
+        $file = Find-CodexProgramOnPath -Name $target
+    } else {
+        & $refuse "runs the relative path '$target'"
+    }
+    if (-not $file) { & $refuse "runs '$target', which does not exist (absolute PATH entries searched for a bare name)" }
+    $prefix = @($head | Select-Object -Skip 1 | ForEach-Object { [string]$_.Value })
+    return [pscustomobject]@{ Kind = 'single-exe'; FileName = $file; PrefixArgs = $prefix; Shim = $Exe; ShimSha256 = $read.Sha256 }
+}
 # END Assert-CodexCommandLineFits
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
@@ -2201,6 +2311,13 @@ if ($cfg.engine -eq 'claude') {
               '-')
     # r8 (ADV-A2): refuse, typed, a command line cmd.exe would reject, before the child is started (see Assert-CodexCommandLineFits).
     $null = Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount @($ImageAttachments).Count -WorkingDirectory $WorkDir
+    # r11 (sol r10 B1/B2, fable r10 B1): the codex child is never a cmd.exe running the shim (see Resolve-CodexShimLaunch); an
+    # unsupported shim is refused here, typed, before launch, and the bytes read here are re-hashed immediately before Process.Start.
+    $codexLaunch = Resolve-CodexShimLaunch -Exe $exe
+    $launchFile = [string]$codexLaunch.FileName
+    $launchArgv = @($codexLaunch.PrefixArgs) + $argv
+    # post-shim-resolution-tick
+    Write-Host ("[codex-launch] {0}: {1}{2}" -f $codexLaunch.Kind, $launchFile, $(if ($codexLaunch.Shim) { " (shim $($codexLaunch.Shim) sha256 $($codexLaunch.ShimSha256))" } else { '' }))
     # '-' MEANS "READ THE PROMPT FROM STDIN", and it is not optional here.
     # Passing a multi-line prompt POSITIONALLY is silently TRUNCATED AT THE FIRST
     # NEWLINE, because the launcher is a .cmd batch wrapper and cmd.exe breaks the
@@ -2366,8 +2483,15 @@ $enc=[Text.UTF8Encoding]::new($false)
     [MlvLaneJob]::AssignOrThrow($jobHandle, $proc.Handle)
     $jobAssigned = $true
 } else {
-    $psi.FileName = $exe
-    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }
+    # r11 (sol r10 B2): the shim bytes Resolve-CodexShimLaunch read must still be the bytes on disk now; a change is refused, typed.
+    if ($codexLaunch.Shim) {
+        $shimNow = (Read-CodexShimBytes -Path $codexLaunch.Shim).Sha256
+        if ($shimNow -ne $codexLaunch.ShimSha256) {
+            throw "codex-shim-changed: the codex shim '$($codexLaunch.Shim)' changed between inspection (sha256 $($codexLaunch.ShimSha256)) and launch (sha256 $shimNow); refused before launch"
+        }
+    }
+    $psi.FileName = $launchFile
+    foreach ($a in $launchArgv) { [void]$psi.ArgumentList.Add($a) }
     $proc = [Diagnostics.Process]::Start($psi)
 }
 

@@ -1739,6 +1739,179 @@ def test_a_run_dir_with_a_bang_is_refused_for_every_codex_argument_when_the_shim
     assert not (root/"args.json").exists()
 
 
+# r11 (sol r10 B1, sol r10 B2, fable r10 B1; hub step E): the codex child is never a cmd.exe running the shim. The npm template launches
+# its native node + script, a strict one-line shim launches the program it names, and every other shim is refused, typed, before launch.
+def _bang_run_dir_case(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    run_dir=root/"!OS!"; run_dir.mkdir()
+    (root/"Windows_NT").mkdir(); (root/"Windows_NT"/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+    return root,png,sha,run_dir
+
+
+def _assert_never_q_read_p_certified(root, run_dir):
+    receipt=run_dir/"terra-001.receipt.json"
+    if (root/"image-bytes.json").exists() and receipt.exists():
+        seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+        entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+        assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+
+
+def test_r11_sol_b1_a_shim_side_expansion_is_refused_typed_before_launch(fixture_tree):
+    # sol r10 B1: 'C:\pins\codex.exe %PAD% %*' with PAD = 7800 spaces measured 1,109 characters before launch and 8,903 after cmd.exe expanded
+    # the shim line, so cmd.exe refused AFTER launch. Here the fixture shim carries the same %PAD% reference in front of %*.
+    fixture_tree["shim"].write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %PAD% %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["PAD"]=" "*7800
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unsupported" in text and "%PAD%" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists(), "a shim whose own text expands must be refused before the codex child starts"
+
+
+def test_r11_fable_b1_a_redirection_glued_to_the_command_token_never_certifies_a_file_codex_did_not_read(fixture_tree):
+    # fable r10 B1: 'C:\pins\inner>nul.exe %*' read as the native 'inner>nul.exe'; cmd.exe runs inner.cmd, which enables delayed expansion, and
+    # codex opened the Windows_NT sibling Q while held P certified. The shim must be refused, typed, before launch. End to end this uses
+    # fable's '<nul.exe' sibling: '>nul.exe' also swallows the pre-launch 'codex mcp list' answer, which refuses the lane earlier for
+    # another reason; the literal '>nul.exe' row is in test_r11_every_shim_outside_the_two_launchable_shapes_is_refused_typed.
+    if _registry_delayed_expansion_on(): pytest.skip("this host turns cmd.exe delayed expansion on, so every '!' path is refused before this shape matters")
+    inner=fixture_tree["root"]/"inner"
+    if " " in str(inner): pytest.skip("the unquoted glued target needs a space-free fixture path")
+    (fixture_tree["root"]/"inner.cmd").write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    fixture_tree["shim"].write_text(f'@echo off\r\n{inner}<nul.exe %*\r\n',encoding="ascii")
+    root,png,sha,run_dir=_bang_run_dir_case(fixture_tree)
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    _assert_never_q_read_p_certified(root,run_dir)
+    text=_failure_text(r,run_dir/"terra-001.receipt.json")
+    assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+_PROC_START_CODEX = "    $proc = [Diagnostics.Process]::Start($psi)\n}\n"
+
+
+def _swap_shim_mutation(fixture_tree, anchor, before):
+    swapped=f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n'
+    swap=(f"[System.IO.File]::WriteAllText('{str(fixture_tree['shim']).replace(chr(39),chr(39)*2)}', "
+          f"'{swapped.replace(chr(39),chr(39)*2)}'.Replace('\\r\\n', [string][char]13 + [char]10))\n")
+    def mutation(text):
+        assert text.count(anchor)==1, "launch anchor moved; update this fixture mutation"
+        return text.replace(anchor, (swap+anchor) if before else (anchor+swap))
+    return mutation
+
+
+def test_r11_sol_b2_a_shim_replaced_after_inspection_never_certifies_a_file_codex_did_not_read(fixture_tree):
+    # sol r10 B2: a safe shim is inspected (delayed expansion off, so '!' is permitted in the snapshot path), then replaced by one that enables
+    # delayed expansion just before Process.Start. cmd.exe expanded !OS! and codex opened Q while held P certified. The child must read P.
+    if _registry_delayed_expansion_on(): pytest.skip("this host turns cmd.exe delayed expansion on, so every '!' path is refused before this shape matters")
+    root,png,sha,run_dir=_bang_run_dir_case(fixture_tree)
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra",mutation=_swap_shim_mutation(fixture_tree,_PROC_START_CODEX,before=True))
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    _assert_never_q_read_p_certified(root,run_dir)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads((run_dir/"terra-001.receipt.json").read_text(encoding="utf-8"))["imagePaths"][0]
+    assert seen[0]["path"]==entry["path"] and "!OS!" in seen[0]["path"],(entry,seen)
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"]==sha,(entry,seen)
+
+
+def test_r11_a_shim_changed_between_inspection_and_launch_is_refused_typed(fixture_tree):
+    # hub step E (2): the shim is bound by its content hash where it is inspected and re-hashed immediately before launch.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=_swap_shim_mutation(fixture_tree,"    # post-shim-resolution-tick\n",before=False))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-changed" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+def _resolve(tmp_path, shim_text, pre=""):
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(shim_text.encode("ascii"))
+    r=_cmdline_harness(tmp_path,pre+f"""
+try {{ $x = Resolve-CodexShimLaunch -Exe '{shim}'; 'KIND ' + $x.Kind; 'FILE ' + $x.FileName; 'ARGS [' + ($x.PrefixArgs -join '|') + ']' }}
+catch {{ 'CAUGHT ' + $_.Exception.Message }}
+""")
+    assert ("KIND " in r.stdout) or ("CAUGHT " in r.stdout),(r.stdout,r.stderr)
+    return r.stdout
+
+
+# One row per refusal class of hub step E (1), with the three literal reviewer inputs first.
+@pytest.mark.parametrize("shim_text,why",[
+    ("@echo off\r\nC:\\pins\\codex.exe %PAD% %*\r\n","'%' expansion"),                    # sol r10 B1, literal
+    ("@echo off\r\nC:\\pins\\codex.exe %PAD:~0,7800% %*\r\n","'%' expansion"),
+    ("@echo off\r\nC:\\pins\\codex.exe %PAD% %PAD% %*\r\n","'%' expansion"),
+    ("@echo off\r\nC:\\pins\\inner>nul.exe %*\r\n","cmd.exe operator"),                     # fable r10 B1, literal
+    ("@echo off\r\nC:\\pins\\inner<nul.exe %*\r\n","cmd.exe operator"),
+    ("@echo off\r\ncmd>nul.exe /c C:\\pins\\inner %*\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\codex.exe %* | more\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\codex.exe %* & C:\\pins\\inner\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\co^dex.exe %*\r\n","cmd.exe operator"),
+    ("@echo off\r\n(C:\\pins\\codex.exe %*)\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\codex.exe !X! %*\r\n","'!'"),
+    ("@echo off\r\nsetlocal enabledelayedexpansion\r\nC:\\pins\\codex.exe %*\r\n","command lines"),  # sol r10 B2's replacement shim
+    ("@echo off\r\nC:\\pins\\codex.exe %*\r\nC:\\pins\\codex.exe %*\r\n","command lines"),
+    ("","command lines"),
+    ("@echo off\r\nC:\\pins\\codex.exe %* %*\r\n","'%' expansion"),
+    ("@echo off\r\nC:\\pins\\codex.exe %1\r\n","exactly one unquoted '%*'"),
+    ("@echo off\r\nC:\\pins\\codex.exe \"%*\"\r\n","exactly one unquoted '%*'"),
+    ("@echo off\r\nC:\\pins\\inner %*\r\n","not named as a native"),
+    ("@echo off\r\nC:\\pins\\node.cmd C:\\pins\\codex.js %*\r\n","not named as a native"),
+    ("@echo off\r\nbin\\codex.exe %*\r\n","relative path"),
+    ("@echo off\r\nC:\\pins\\codex.exe a,b %*\r\n","separator"),
+    ("@echo off\r\n\"C:\\pins\\codex.exe\"x %*\r\n","not a plain or fully quoted word"),
+    ("@echo off\r\nC:\\pins\\definitely-absent-r11.exe %*\r\n","does not exist"),
+])
+def test_r11_every_shim_outside_the_two_launchable_shapes_is_refused_typed(tmp_path,shim_text,why):
+    out=_resolve(tmp_path,shim_text)
+    assert "CAUGHT codex-shim-unsupported:" in out and why in out,(shim_text,out)
+
+
+def test_r11_a_strict_one_line_shim_launches_the_program_it_names_with_its_literal_args(tmp_path):
+    exe=tmp_path/"tool.exe"; exe.write_bytes(b"MZ")
+    out=_resolve(tmp_path,f'@echo off\r\n"{exe}" -x "a b" %*\r\n')
+    assert "KIND single-exe" in out and f"FILE {exe}" in out and "ARGS [-x|a b]" in out,out
+    out=_resolve(tmp_path,'@ECHO OFF\r\n\r\n%~dp0tool.exe %*\r\n')
+    assert "KIND single-exe" in out and f"FILE {exe}" in out and "ARGS []" in out,out
+
+
+def test_r11_a_bare_program_name_is_resolved_on_absolute_path_entries_only(tmp_path):
+    rel=tmp_path/"rel"; rel.mkdir(); (rel/"tool-r11.exe").write_bytes(b"MZ")
+    good=tmp_path/"good"; good.mkdir(); (good/"tool-r11.exe").write_bytes(b"MZ")
+    pre=f"Set-Location -LiteralPath '{tmp_path}'\n$env:PATH = 'rel;' + '{good}'\n"
+    out=_resolve(tmp_path,"@echo off\r\ntool-r11.exe %*\r\n",pre=pre)
+    assert "KIND single-exe" in out and f"FILE {good / 'tool-r11.exe'}" in out,out
+
+
+def test_r11_the_npm_template_launches_its_native_node_and_script_directly(tmp_path):
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    (tmp_path/"node.exe").write_bytes(b"MZ")
+    text=_NPM_SHIM
+    assert "GOTO start" in text, "the real npm template fixture text is required"
+    out=_resolve(tmp_path,text)
+    assert "KIND npm-node" in out and f"FILE {tmp_path / 'node.exe'}" in out and f"ARGS [{script}]" in out,out
+
+
+@pytest.mark.parametrize("first,ok",[("node.exe",True),("node.cmd",False),(None,False)])
+def test_r11_the_npm_template_needs_a_native_node_on_an_absolute_path_entry(tmp_path,first,ok):
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    p1=tmp_path/"p1"; p1.mkdir(); p2=tmp_path/"p2"; p2.mkdir(); (p2/"node.exe").write_bytes(b"MZ")
+    if first: (p1/first).write_bytes(b"MZ")
+    path=f"{p1};{p2}" if first else f"{p1}"
+    out=_resolve(tmp_path,_NPM_SHIM,pre=f"$env:PATH = '{path}'\n$env:PATHEXT = '.COM;.EXE;.BAT;.CMD'\n")
+    if ok: assert "KIND npm-node" in out and f"FILE {p1 / 'node.exe'}".lower() in out.lower(),out  # the PATHEXT spelling ('.EXE') is kept
+    else: assert "CAUGHT codex-shim-unsupported:" in out and "npm template" in out,out
+
+
 def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):
     # r8 (ADV-A2): every accepted -ImagePaths entry became one `-i <snapshot>` pair, and 120 of them pushed the command line past cmd.exe's
     # 8191 characters: the shim answered "The command line is too long." and codex never ran. The launcher must refuse it typed instead.
@@ -2928,10 +3101,15 @@ def _pin_case(fixture_tree, pin=None, exe_version=PIN_VERSION, create_exe=True, 
     pinned = pin_root / PIN_VERSION / "node_modules" / ".bin" / "codex.cmd"
     if create_exe:
         pinned.parent.mkdir(parents=True)
+        # r11: the launcher runs only a one-line shim (or the npm template) and never through cmd.exe, so the pinned fixture's
+        # --version answer and its 'pinned' marker live in a PowerShell copy of the child instead of in batch lines.
+        pinned_child = root / "pinned-child.ps1"
+        pinned_child.write_text(
+            f"if($args.Count -ge 1 -and $args[0] -eq '--version'){{[Console]::Out.Write(\"codex-cli {exe_version}`n\"); exit 0}}\n"
+            "'pinned'|Set-Content -Encoding ascii -LiteralPath $env:MLV_FIXTURE_VIA\n"
+            + fixture_tree["child"].read_text(encoding="ascii"), encoding="ascii")
         pinned.write_text("@echo off\r\n"
-                          f'if "%~1"=="--version" (echo codex-cli {exe_version}& exit /b 0)\r\n'
-                          'echo pinned> "%MLV_FIXTURE_VIA%"\r\n'
-                          f'"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n', encoding="ascii")
+                          f'"{PWSH}" -NoProfile -NonInteractive -File "{pinned_child}" %*\r\n', encoding="ascii")
     if pin is None:
         # probedModels: the fixture cache's highest sol (gpt-6-sol) is what a sol lane resolves to
         # (MODEL-POSTURE-R16-1: a pin only covers the models its promotion exec-probed).
