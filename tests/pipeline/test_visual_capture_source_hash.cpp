@@ -275,6 +275,30 @@ TEST(VisualCaptureSourceHash, Lj92ADhtValueBeyondTheDeclaredSymbolsIsNotHashed)
     ASSERT_TRUE(lj92Hash(declared(0x01), &status) != lj92Hash(declared(0x02), &status));
 }
 
+// r9 (pass 2 A1 on 375023ab): an over-subscribed table (two 1-bit codes and a 2-bit code) fills the four-entry LUT with
+// symbols 0,0,1,1 before it reaches the 2-bit level, so the third symbol (U) and the level-2 count are never read.
+TEST(VisualCaptureSourceHash, Lj92AnOverSubscribedTablesUnreadSymbolIsNotHashed)
+{
+    auto build = [&](uint8_t unread)
+    {
+        return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02, 0x01 }, zeros(14), { 0x00, 0x0D, unread },
+                       kSof3, kSos, zeros(64), { 0xFF, 0xD9 } });
+    };
+    int status = -1;
+    const uint64_t first = lj92Hash(build(0x41), &status);
+    ASSERT_EQ(0, status);
+    const uint64_t second = lj92Hash(build(0x42), &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(first == second);
+    // The second symbol of the first level IS read (LUT entries 2 and 3).
+    auto second_symbol = [&](uint8_t value)
+    {
+        return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x16, 0x00, 0x02, 0x01 }, zeros(14), { 0x00, value, 0x41 },
+                       kSof3, kSos, zeros(64), { 0xFF, 0xD9 } });
+    };
+    ASSERT_TRUE(lj92Hash(second_symbol(0x0D), &status) != lj92Hash(second_symbol(0x0E), &status));
+}
+
 TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)
 {
     const std::vector<uint8_t> plain = encodeLj92(2048, 12288);

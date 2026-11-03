@@ -4165,7 +4165,7 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
      *   SOS  (parseScan): component count and predictor -- then every byte from the END of the SOS header
      *        (scanstart + its length) to the end of the payload (r8: never stopped at an EOI). */
     const uint8_t * dht = NULL;
-    size_t dhtValues = 0;
+    size_t dhtMaxbits = 0, dhtCountsRead = 0, dhtValues = 0;
     size_t zeroedAt = (size_t)-1; /* the class/id byte parseHuff set to 0 in the decoder's buffer */
     const uint8_t * sof = NULL;
     size_t ix = 0;
@@ -4206,8 +4206,10 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
              * after the scan can only make two alike pictures read "differ" (the loud direction). */
             const size_t end = length;
             uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
-            hash = mlv_source_hash_fnv1a64(hash, dht + 3, 16);             /* the 16 code counts */
-            hash = mlv_source_hash_fnv1a64(hash, dht + 19, dhtValues);     /* the declared symbols, no more */
+            const uint8_t tableShape[2] = { (uint8_t)dhtMaxbits, (uint8_t)dhtCountsRead };
+            hash = mlv_source_hash_fnv1a64(hash, tableShape, 2);           /* huffbits, and how many counts the LUT fill consulted */
+            hash = mlv_source_hash_fnv1a64(hash, dht + 3, dhtCountsRead);  /* those counts */
+            hash = mlv_source_hash_fnv1a64(hash, dht + 19, dhtValues);     /* the symbols the LUT fill read, no more */
             hash = mlv_source_hash_fnv1a64(hash, sof + 2, 6);              /* precision, height, width, components */
             hash = mlv_source_hash_fnv1a64(hash, data + ix + 2, 1);        /* scan component count */
             hash = mlv_source_hash_fnv1a64(hash, data + predictorAt, 1);   /* predictor */
@@ -4218,11 +4220,39 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
         if (marker == 0xC4)
         {
             if (segment < 19) return 1; /* the decoder reads 16 counts after the class/id byte */
-            size_t values = 0;
-            for (size_t i = 0; i < 16; ++i) values += data[ix + 3 + i];
-            if (ix + 19 + values > length) return 1; /* the lookup table would read past the payload */
+            /* r9 (adversary r3 pass 2 A1 on 375023ab): replay parseHuff's LUT fill (lj92.c, "Calculate huffman direct lut")
+             * to learn which counts and which symbols it really reads. An over-subscribed table fills the LUT before it
+             * reaches its later levels or values, so those bytes never reach the decoder and must not reach the hash. */
+            const uint8_t * bits = data + ix + 2; /* bits[k] = the code count of length k, k = 1..16 */
+            size_t maxbits = 16;
+            while (maxbits > 0 && !bits[maxbits]) maxbits--;
+            size_t lutEntry = 0, symbol = 0, repeat = 0, withinLevel = 0, level = 1;
+            size_t countsRead = 0, valuesRead = 0;
+            while (lutEntry < ((size_t)1 << maxbits) && level <= maxbits)
+            {
+                if (level > countsRead) countsRead = level;
+                if (withinLevel >= bits[level])
+                {
+                    level++;
+                    withinLevel = 0;
+                    continue;
+                }
+                if (repeat == ((size_t)1 << (maxbits - level)))
+                {
+                    repeat = 0;
+                    withinLevel++;
+                    symbol++;
+                    continue;
+                }
+                if (symbol + 1 > valuesRead) valuesRead = symbol + 1;
+                lutEntry++;
+                repeat++;
+            }
+            if (ix + 19 + valuesRead > length) return 1; /* the lookup table would read past the payload */
             dht = data + ix;
-            dhtValues = values;
+            dhtMaxbits = maxbits;
+            dhtCountsRead = countsRead;
+            dhtValues = valuesRead;
             zeroedAt = ix + 2;
             /* No `ix += segment`: the default parseHuff leaves ix at the length field. */
         }
