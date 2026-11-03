@@ -28053,6 +28053,43 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                    .arg( telemetryDoubleValue( timing, "llrawproc_residual_other_ms" ), 0, 'f', 3 )
                    .arg( telemetryDoubleValue(
                        timing, "llrawproc_residual_stage_timers_ms" ), 0, 'f', 3 );
+            // CUDA-RECON-DUALISO-TIMER-SPLIT-1: where dual_iso's time goes on the CUDA texture
+            // route (RenderFrameThread insertLlrawprocDualIsoGpuSplitTelemetry). Every value is
+            // from ONE llrawproc run: dual_iso_ms = prepare + preupload + mutex_wait + configure
+            // + run_wall + post_run + other; run_wall = run_gpu + sync when the backend timed it and
+            // its span fits inside the wall (the real backend blocks on its last event; sync is
+            // floored at 0, so a span longer than the wall, as the test fake's fixed 3.0 ms, is not).
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_smoke.dual_iso_split session=%1 index=%2 serial=%3 "
+                   "dual_iso_ms=%4 prepare_ms=%5 preupload_ms=%6 mutex_wait_ms=%7 "
+                   "configure_ms=%8 run_wall_ms=%9 run_gpu_ms=%10 sync_ms=%11 "
+                   "post_run_ms=%12 other_ms=%13 backend_calls=%14" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokePresentedFrames )
+                   .arg( static_cast<qulonglong>( readyFrame.requestSerial ) )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_dual_iso_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_prepare_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_preupload_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_mutex_wait_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_configure_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_run_wall_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_run_gpu_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_sync_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_post_run_ms" ), 0, 'f', 3 )
+                   .arg( telemetryDoubleValue(
+                       timing, "llrawproc_dual_iso_split_other_ms" ), 0, 'f', 3 )
+                   .arg( telemetryIntValue(
+                       timing, "llrawproc_dual_iso_split_backend_calls" ) );
             qInfo().noquote()
                 << QStringLiteral(
                        "playback_smoke.early_yield session=%1 index=%2 serial=%3 "
