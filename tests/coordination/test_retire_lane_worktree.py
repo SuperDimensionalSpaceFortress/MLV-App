@@ -3877,6 +3877,51 @@ def test_r9_a5_an_unrepresentable_stamp_is_no_stamp(stamp, want):
     assert out == ("" if not want else "Utc " + want), out
 
 
+# --- r10 adversary pass 12 on 21805daf (review-adversary-RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1-r9-21805daf): A1 :1029, A2 :850.
+
+def test_r10_a1_a_pid_not_running_at_its_first_query_is_asked_again_for_a_later_record(tmp_path):
+    """r10 pass-12 A1 (:1029, siblings :1030, :1115, :1116, :1171, :1731, core.py:1578): the snapshot lists nothing; a.pid=999972, b.pid=999973,
+    c.pid=999972 in a tied run dir. The first query for 999972 finds no process; 999972 then starts (a genuine driver) before c.pid is judged. A
+    cached NULL identity skipped c.pid and freed the worktree. A null identity is never cached as a negative answer: c.pid re-queries, held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    for name, pid in (("a.pid", 999972), ("b.pid", 999973), ("c.pid", 999972)):
+        _write_record(rd, name, f"{pid}\n", now - 30)
+    prelude = ("$global:r10q = 0; function Get-LivePidIdentity { param([int]$ProcessId) "
+               "if ($ProcessId -ne 999972) { return $null }; $global:r10q++; if ($global:r10q -eq 1) { return $null }; "
+               f"return [pscustomobject]@{{ Name = 'pwsh.exe'; CreationDate = {_utc_expr(now - 20)} }} }};")
+    r, err = _live_refusal(wt, _fake_snapshot(), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("slack", ["-1", "-0.000001", "-1e9", "[double]::NegativeInfinity"], ids=["minus-one", "tiny", "huge", "neg-inf"])
+def test_r10_a2_a_negative_slack_never_turns_equal_creation_times_into_a_reuse_proof(tmp_path, slack):
+    """r10 pass-12 A2 (:850, siblings :299, :1080, :1094): RunDirPidCreatedSlackSec overridden below 0. The tied record is unchanged and states the
+    exact creation time the live pid has (snapshot and both live queries agree). 0 > -1 made equal times a 'mismatch' and freed the worktree.
+    A negative slack is refused (no proof) and equal times are never a mismatch: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    created = int(now - 600)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(created)}, now - 30)
+    row = _fake_proc_created(999972, "", "pwsh.exe", created)
+    prelude = _r8_live(999972, "pwsh.exe", created) + f" $script:RunDirPidCreatedSlackSec = {slack};"
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("slack,delta,want", [
+    ("-1", 0, "False"), ("-1", 3600, "False"), ("[double]::NaN", 3600, "False"),
+    ("0", 0, "False"), ("0", 1, "True"), ("5", 5, "False"), ("5", 6, "True"),
+], ids=["neg-equal", "neg-different", "nan", "zero-equal", "zero-different", "default-at-slack", "default-past-slack"])
+def test_r10_a2_the_mismatch_test_refuses_an_invalid_slack(slack, delta, want):
+    """r10 pass-12 A2, unit: Test-RecordedCreatedMismatch states a mismatch only for a valid slack (>= 0, a number) and a difference strictly
+    beyond it. A negative or NaN slack proves nothing (fail toward HOLDER); equal times are never a mismatch."""
+    expr = (f"$script:RunDirPidCreatedSlackSec = {slack}; $t = {_utc_expr(1_700_000_000)}; "
+            f"Test-RecordedCreatedMismatch -Proc ([pscustomobject]@{{ CreationDate = $t.AddSeconds({delta}) }}) "
+            "-Record ([pscustomobject]@{ RecordedCreatedUtc = $t })")
+    assert _r9_eval(expr) == want
+
+
 @pytest.mark.parametrize("doc", [
     '{"pid":999972,"createdUtc":"12:00"}',                                                   # time only: TryParse invents today's date
     '{"pid":999972,"createdUtc":"2026-11-01"}',                                              # date only

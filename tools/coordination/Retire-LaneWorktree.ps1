@@ -842,12 +842,16 @@ function Test-RecordedCreatedMismatch {
     # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: does a record state an EXACT creation time for this pid that $Proc (r8: the pid's CURRENT identity,
     # from Get-LivePidIdentity) does not have (beyond RunDirPidCreatedSlackSec)? r8: the ONLY proof of reuse, and it proves it for THIS record only.
     # $false when the creation time is unreadable or the record states none (an unstamped record is never proof).
+    # r10 (pass-12 A2): $false too when the slack is not a number >= 0 (an override below 0 made equal times a 'mismatch'); equal times never are.
     param([object]$Proc, [object]$Record)
     $cdp = $Proc.PSObject.Properties['CreationDate']
     if (-not $cdp -or $cdp.Value -isnot [datetime]) { return $false }
     $rc = $Record.PSObject.Properties['RecordedCreatedUtc']
     if (-not $rc -or $rc.Value -isnot [datetime]) { return $false }
-    return ([math]::Abs((([datetime]$cdp.Value).ToUniversalTime() - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds) -gt [double]$script:RunDirPidCreatedSlackSec)
+    $slack = [double]$script:RunDirPidCreatedSlackSec
+    if ([double]::IsNaN($slack) -or $slack -lt 0) { return $false }
+    $diff = [math]::Abs((([datetime]$cdp.Value).ToUniversalTime() - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds)
+    return ($diff -gt 0 -and $diff -gt $slack)
 }
 
 function Get-LivePidIdentity {
@@ -1023,10 +1027,17 @@ function Find-RunDirDriverHolders {
     $unreadable = New-Object System.Collections.Generic.List[object]
     $index = @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)
     # One identity query per pid and one tie answer per run dir in this call (a tie that cannot be settled is cached as its error and thrown again).
+    # r10 (pass-12 A1): only a FOUND identity is kept for the call. $null (no process now, no snapshot row) is asked again for the next record that
+    # names the pid, because the pid can start between two records; keeping "not running" would skip a live driver. (A read that fails is a found
+    # identity with no creation time: it never proves reuse, so keeping it only ever holds.)
     $identity = @{}
     $identityOf = {
         param([int]$P)
-        if (-not $identity.ContainsKey($P)) { $identity[$P] = & $readIdentity $P }
+        if (-not $identity.ContainsKey($P)) {
+            $v = & $readIdentity $P
+            if ($null -eq $v) { return $null }
+            $identity[$P] = $v
+        }
         return $identity[$P]
     }
     # The uncached read: the pair in $reuseProven calls it again after its first record read (r9, Dot B2).
