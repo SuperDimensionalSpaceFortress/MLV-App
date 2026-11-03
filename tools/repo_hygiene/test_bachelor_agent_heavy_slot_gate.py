@@ -1507,6 +1507,27 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("FAST-DEL|[]", proc.stdout)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_the_deadline_is_checked_after_the_result_is_converted_not_before(self) -> None:
+        # adversary r10 A1 (major): the elapsed check ran BEFORE the completed task's result was turned into text, so a result whose
+        # conversion spent the bound (a 200000-element array took 286 ms under a 50 ms bound) still returned Ok / an "incomplete" note.
+        # The slow ToString makes the conversion cost deterministic. The check is the LAST step before a success is returned.
+        script = ("class SlowText { [string] ToString() { Start-Sleep -Milliseconds 300; return 'payload' } }\n"
+                  + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$slow = { param($p) [Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
+                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 100 $slow\n"
+                  "Write-Output ('SLOW-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('SLOW-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 100 $slow))\n"
+                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $slow\n"
+                  "Write-Output ('INSIDE-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('INSIDE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $slow))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SLOW-READ|False|<read timed out: a.txt not readable within 100 ms>", proc.stdout)
+        self.assertIn("SLOW-DEL|capture cleanup abandoned after 0.1 s: C:\\x\\a.txt", proc.stdout)
+        self.assertIn("INSIDE-READ|True|payload", proc.stdout, "a conversion that fits inside the bound still succeeds")
+        self.assertIn("INSIDE-DEL|capture cleanup incomplete: payload", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_an_accepted_plain_completed_task_has_no_result_so_no_false_cleanup_problem_and_no_fabricated_text(self) -> None:
         # sol r9 B2: a plain [Task]::CompletedTask exposes the runtime type System.Threading.Tasks.VoidTaskResult as its Result. A non-generic
         # Task has no result: cleanup reports no problem and the reader returns empty text, never the type name.

@@ -555,8 +555,10 @@ function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scrip
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
         # sol r9 B1: the deadline is measured from the call's start. A factory that spent the whole bound is a timeout even when the task it
         # handed back has already completed (Wait(0) on a finished task is true).
-        if (-not $task.Wait($left) -or $clock.Elapsed.TotalMilliseconds -ge $BoundMs) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
-        return [pscustomobject]@{ Ok = $true; Text = [string](Get-CaptureTaskResult $task) }
+        # adversary r10 A1: turning the result into text is part of the step, so the elapsed check is the LAST thing before a success.
+        $text = if ($task.Wait($left)) { [string](Get-CaptureTaskResult $task) } else { $null }
+        if ($null -eq $text -or $clock.Elapsed.TotalMilliseconds -ge $BoundMs) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
+        return [pscustomobject]@{ Ok = $true; Text = $text }
     }
     catch {
         $inner = $_.Exception
@@ -572,11 +574,11 @@ function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBo
     try {
         $task = Get-CaptureTask $Start $Paths { [BoundedCaptureIo]::Delete($Paths) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
-        # sol r9 B1: elapsed >= bound is an abandoned step even when the task completed (see Read-CapturedResult).
-        if ($task.Wait($left) -and $clock.Elapsed.TotalMilliseconds -lt $BoundMs) {
-            # The task reports the files a failed delete left behind or could not confirm gone (adversary r7 A3, sol r8 B2); a seam's plain
-            # Task has no Result and means none (sol r9 B2: Get-CaptureTaskResult, not the Result property, which is VoidTaskResult).
-            $incomplete = [string](Get-CaptureTaskResult $task)
+        # sol r9 B1 / adversary r10 A1: elapsed >= bound is an abandoned step even when the task completed, and the result conversion counts
+        # toward it (see Read-CapturedResult). The task reports the files a failed delete left behind or could not confirm gone (adversary
+        # r7 A3, sol r8 B2); a seam's plain Task has no Result and means none (sol r9 B2: Get-CaptureTaskResult, not the Result property).
+        $incomplete = if ($task.Wait($left)) { [string](Get-CaptureTaskResult $task) } else { $null }
+        if ($null -ne $incomplete -and $clock.Elapsed.TotalMilliseconds -lt $BoundMs) {
             if ($incomplete) { return "capture cleanup incomplete: $incomplete" }
             return ''
         }
