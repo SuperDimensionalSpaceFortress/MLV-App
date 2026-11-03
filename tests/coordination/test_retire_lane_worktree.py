@@ -3045,7 +3045,8 @@ def test_a2_a_root_stamp_does_not_bind_a_nested_containment_pid(tmp_path):
 
 def test_a3_a_small_backward_clock_step_does_not_free_a_genuine_driver(tmp_path):
     """A3: with no stamp in the record, the write-time rule tolerates clock skew: a genuine driver that started up to a minute AFTER the file's
-    mtime (a backward clock adjustment before the pid file was published) is still the driver; a process minutes later is still a reused pid."""
+    mtime (a backward clock adjustment before the pid file was published) is still the driver; a process minutes later is still a reused pid.
+    SUPERSEDED r8 (ruling b, f), second half: started-after-record is a wall-clock comparison and the pid file is unstamped: HOLDS. Was: free."""
     wt = tmp_path / "lane-X-1"
     wt.mkdir()
     runs = tmp_path / "fleet-runs"
@@ -3055,7 +3056,7 @@ def test_a3_a_small_backward_clock_step_does_not_free_a_genuine_driver(tmp_path)
     r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, "", "pwsh.exe", written + 60)), runs)
     assert r is not None and r["reason"] == "live-driver", (r, err)
     r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, "", "pwsh.exe", written + 600)), runs)
-    assert r is None, (r, err)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999973, (r, err)
 
 
 def test_b2_nested_createdutc_does_not_replace_the_root_stamp(tmp_path):
@@ -3172,7 +3173,8 @@ def test_r5_a2_a_record_replaced_between_enumeration_and_read_is_judged_by_its_n
 
 
 def test_r5_a2_an_unchanged_record_is_still_judged_by_its_write_time(tmp_path):
-    """Guard: re-statting after the read must not loosen the started-after rule for a file nobody touched."""
+    """Guard: re-statting after the read must not loosen the started-after rule for a file nobody touched.
+    SUPERSEDED r8 (ruling b, f): the started-after rule (a wall-clock comparison) is gone and the pid file is unstamped: the live pid HOLDS. Was: free."""
     wt = tmp_path / "lane-CURRENT"
     wt.mkdir()
     runs = tmp_path / "fleet-runs"
@@ -3180,7 +3182,7 @@ def test_r5_a2_an_unchanged_record_is_still_judged_by_its_write_time(tmp_path):
     written = time.time() - 3600
     _stamp_run_dir(rd, written)
     r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", written + 600)), runs)
-    assert r is None, (r, err)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
 
 
 # Adversary pass r5 on 380df5f7 (A1 a launch-written pid file vs an old stamp, A2 conflicting stamps for one pid in one record, A3 no post-read stat).
@@ -3681,6 +3683,60 @@ def test_r8_an_unreadable_record_is_not_cleared_by_a_live_pids_foreign_command_l
     row = _fake_proc_created(999972, "git.exe -C C:\\other status", "git.exe", now - 3600)
     r, err = _live_refusal(wt, _fake_snapshot(row), runs)
     assert r is not None and r["reason"] == "rundir-census-failed" and "unparsable" in r["detail"], (r, err)
+
+
+def test_r8_pass10_a1_a_cached_record_stamp_is_re_read_before_it_proves_reuse(tmp_path):
+    """r8 pass-10 A1 (:1042, siblings :900 index cache, gate retry -ReuseRunIndex, sweep): the run-dir index was cached when new.child.json still held
+    the OLD lineage's stamp; the replacement driver has since rewritten it with its own (matching) stamp. A stamp read before the decision is not
+    decision-time evidence: the proof of reuse is re-read from the record, and a record that no longer states the mismatch proves nothing: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.child.json"
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 7200)}, now - 7000)
+    fresh = json.dumps({"pid": 999972, "createdUtc": _iso(now - 600)}).replace("'", "''")
+    row = _fake_proc_created(999972, _driver_cmdline(rd), "pwsh.exe", now - 600)
+    prelude = (_r8_live(999972, "pwsh.exe", now - 600)
+               + f" $snap = ({_fake_snapshot(row)}); $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}'; "
+               f"[IO.File]::WriteAllText('{rec}', '{fresh}');")
+    r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("doc", [
+    '{"pid":999972,"createdUtc":"12:00"}',                                                   # time only: TryParse invents today's date
+    '{"pid":999972,"createdUtc":"2026-11-01"}',                                              # date only
+    '{"pid":999972,"createdUtc":"2026-11-01T12:00:00"}',                                     # no zone: local or UTC is unknown
+    '{"pid":999972,"createdUtc":"11/01/2026 12:00:00 +00:00"}',                              # not ISO 8601
+    '{"state":"complete","containment":{"childPid":999972,"childCreatedUtc":"12:00"}}',      # containment child
+    '{"state":"complete","containment":{"ownerPid":999972,"ownerCreatedUtc":"12:00"}}',      # containment owner
+    '{"state":"complete","containment":{"runnerPid":999972,"runnerCreatedUtc":"12:00"}}',    # containment runner
+], ids=["time-only", "date-only", "no-zone", "not-iso", "child-time-only", "owner-time-only", "runner-time-only"])
+def test_r8_pass10_a2_an_incomplete_stamp_is_no_stamp_and_never_proves_reuse(tmp_path, doc):
+    """r8 pass-10 A2 (:715, siblings :779-:793, :829, :1042): only a COMPLETE kernel creation identity (ISO 8601 date, time and zone) may prove reuse.
+    A stamp missing its date or zone is no stamp, and an unstamped record + a live pid holds (ruling f)."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.receipt.json" if "containment" in doc else "new.child.json", doc, now - 30)
+    row = _fake_proc_created(999972, "", "pwsh.exe", now - 2 * 86400)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 2 * 86400))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("name,text", [
+    ("venue-driver.pid", "10000000\n"),
+    ("new.child.json", '{"pid":"10000000 "}'),
+    ("new.child.json", '{"pid":10000000}'),
+    ("new.receipt.json", '{"containment":{"childPid":10000000}}'),
+], ids=["bare-8-digit", "padded-string-8-digit", "json-number-8-digit", "containment-8-digit"])
+def test_r8_pass10_a5_a_pid_of_eight_or_more_digits_is_still_a_pid(tmp_path, name, text):
+    """r8 pass-10 A5 (:673, siblings :648-:650, :729): Windows pids are DWORDs; a seven-digit cap dropped 10000000 from the pid rows (no row, no
+    holder). Every reader accepts up to ten digits within the int range."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, name, text, now - 30)
+    row = _fake_proc_created(10000000, _driver_cmdline(rd), "pwsh.exe", now - 600)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 10000000, (r, err)
 
 
 def test_r8_no_wall_clock_heuristic_remains_in_the_driver_decision():

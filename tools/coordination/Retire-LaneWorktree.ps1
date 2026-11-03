@@ -288,8 +288,9 @@ $script:RunDirTieMaxBytes = 1048576
 #   A live pid named by a record in a run dir tied to the worktree is a HOLDER unless reuse is POSITIVELY PROVEN, and the ONLY proof is: the record
 #   carries a kernel process-creation stamp (createdUtc, containment.<x>CreatedUtc) AND the pid's CURRENT creation time, read by a per-pid query at
 #   decision time (Get-LivePidIdentity), differs from it by more than RunDirPidCreatedSlackSec.
-#   - No wall-clock or snapshot-age comparison (record write time, snapshot capture time) is part of the decision, so a clock step, forward or
-#     backward, can never free a worktree.
+#   - No wall-clock or snapshot-age comparison (record write time, snapshot capture time) is part of the per-record decision, so a clock step,
+#     forward or backward, cannot turn a record into a reuse proof. (Pre-existing, not changed here: which run dirs and receipts are READ at all is
+#     bounded by RunDirMaxAgeDays / RunDirReceiptMaxAgeHours against the wall clock - advisory A4 of pass 10.)
 #   - A command line or image (the snapshot row may be the PREVIOUS holder of the pid) only ever ADDS a holder; it never rejects a record.
 #   - A pid absent from the snapshot but running now is judged by the same rule; a pid not running now is judged from its snapshot row, if any.
 #   - An UNSTAMPED record + a live pid = HOLDER, always; an unreadable current creation time proves nothing.
@@ -645,9 +646,10 @@ function Test-PathNamed {
     return [regex]::IsMatch((ConvertTo-PathMatchText $Text), $rx, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
 }
 
-$script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
-$script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
-$script:PidLeadRx = [regex]::new('^(\d{1,7})\b', 'Compiled')
+# r8 (pass-10 A5): Windows pids are DWORDs; up to ten digits are read, and ConvertTo-PidValue drops a value beyond the int range (no pid).
+$script:PidBareRx = [regex]::new('^\s*(\d{1,10})\s*$', 'Compiled')
+$script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,10})\b', 'Compiled')
+$script:PidLeadRx = [regex]::new('^(\d{1,10})\b', 'Compiled')
 $script:PidMemberKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')
 
 function Get-RecordPidMembers([string]$Text) {
@@ -670,11 +672,11 @@ function Get-RecordPidMembers([string]$Text) {
     $res = [pscustomobject]@{ Pids = $null; Members = $members; Ambiguous = $false; Why = '' }
     if ([string]::IsNullOrWhiteSpace($Text)) { $res.Pids = $ids.ToArray(); return $res }
     $m = $script:PidBareRx.Match($Text)
-    if ($m.Success) { $n = [int]$m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; $res.Pids = $ids.ToArray(); return $res }
+    if ($m.Success) { $n = ConvertTo-PidValue $m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; $res.Pids = $ids.ToArray(); return $res }
     $doc = $null
     try { $doc = [System.Text.Json.JsonDocument]::Parse($Text) }
     catch {
-        foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = [int]$m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
+        foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = ConvertTo-PidValue $m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
         if ($Text.IndexOfAny([char[]]@('{', '[', '"')) -ge 0) { $res.Ambiguous = $true; $res.Why = 'unparsable-pid-record: ' + ($_.Exception.Message -replace '\s+', ' ') }
         $res.Pids = $ids.ToArray()
         return $res
@@ -708,9 +710,20 @@ function Get-RecordPidMembers([string]$Text) {
     return $res
 }
 
+function ConvertTo-PidValue([string]$Digits) {
+    # r8 (pass-10 A5): a run of up to ten digits as a pid, or 0 (no pid) when it is beyond the int range. Never throws.
+    $n = [long]0
+    if ([long]::TryParse($Digits, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -and $n -le [int]::MaxValue) { return [int]$n }
+    return 0
+}
+
+# r8 (pass-10 A2): a creation stamp is a COMPLETE identity only: ISO 8601 date, time and an explicit zone (Z or +hh:mm). A time without a date (TryParse
+# supplies today's), a date without a time, or a time without a zone (local or UTC unknown) states no identity, so it can never prove reuse.
+$script:RecordedUtcRx = [regex]::new('^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?(Z|[+-]\d{2}:\d{2})$', 'Compiled')
+
 function ConvertTo-RecordedUtc([object]$Value) {
-    # An ISO stamp string -> UTC [datetime], or $null (not a string, or does not parse: no claim).
-    if ($Value -isnot [string]) { return $null }
+    # A complete ISO 8601 stamp string -> UTC [datetime], or $null (not a string, incomplete, or does not parse: no claim).
+    if ($Value -isnot [string] -or -not $script:RecordedUtcRx.IsMatch($Value)) { return $null }
     $t = [datetime]::MinValue
     if ([datetime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$t)) { return $t }
     return $null
@@ -726,7 +739,7 @@ function ConvertTo-RecordedPid([System.Text.Json.JsonElement]$El) {
     $s = $null
     if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) { $s = $El.GetRawText() }
     elseif ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $s = $El.GetString() }
-    if ($s) { $m = $script:PidLeadRx.Match($s); if ($m.Success) { return [int]$m.Groups[1].Value } }
+    if ($s) { $m = $script:PidLeadRx.Match($s); if ($m.Success) { return (ConvertTo-PidValue $m.Groups[1].Value) } }
     return 0
 }
 
@@ -981,6 +994,7 @@ function Find-RunDirDriverHolders {
     #   2. HOLDER when the snapshot row's command line (raw or decoded -EncodedCommand) names the worktree: command-line evidence only ADDS.
     #   3. else HOLDER when the record's run dir names the worktree, UNLESS the record carries a creation stamp and the identity's creation time is
     #      readable and differs from it (Test-RecordedCreatedMismatch): the only proof of reuse, and it rejects only the record that states it.
+    #      The proof is re-read from the record at decision time ($reuseProven); a stamp must be complete ISO 8601 with a zone (ConvertTo-RecordedUtc).
     # No record write time, snapshot capture time, image or non-matching command line takes part, so a clock step or a stale row (the pid's previous
     # holder) can never free a worktree. False refusals are accepted: the next sweep asks again (ruling f).
     param([string]$WorktreePath, [object]$Snapshot, [string]$RunsRoot)
@@ -1017,6 +1031,21 @@ function Find-RunDirDriverHolders {
         $identity[$P] = $id
         return $id
     }
+    # r8 (pass-10 A1): the index may be a cache from an earlier read (a sweep's shared snapshot, the gate's -ReuseRunIndex retry), and the record can
+    # have been rewritten since (a replacement driver's own stamp). A reuse proof is therefore RE-READ from the record at decision time: it stands only
+    # when the record read now still names the pid with a complete stamp that differs from the identity. Gone, unreadable, ambiguous, no longer naming
+    # the pid, unstamped or matching: no proof (fail toward holder).
+    $reuseProven = {
+        param($rec, $id)
+        if (-not (Test-RecordedCreatedMismatch -Proc $id -Record $rec)) { return $false }
+        $now = $null
+        try { $now = Read-RunDirRecordText -Path (Join-Path $rec.RunDir $rec.File) } catch { return $false }
+        $pm = Get-RecordPidMembers $now
+        if ($pm.Ambiguous -or -not (@($pm.Pids) -contains [int]$rec.Pid)) { return $false }
+        $map = Get-RecordedCreatedUtcMap -Text $now -Members $pm
+        if (-not $map.ContainsKey([int]$rec.Pid)) { return $false }
+        return [bool](Test-RecordedCreatedMismatch -Proc $id -Record ([pscustomobject]@{ RecordedCreatedUtc = $map[[int]$rec.Pid] }))
+    }
     $ties = @{}
     $tiedOf = {
         param([string]$RunDir)
@@ -1039,7 +1068,7 @@ function Find-RunDirDriverHolders {
         $matched = $null; $enc = ''
         try {
             if ((Test-PathNamed -Text $cl -Path $wd) -or (Test-PathNamed -Text $dt -Path $wd)) { $matched = $wd }
-            elseif (-not (Test-RecordedCreatedMismatch -Proc $id -Record $rec) -and (& $tiedOf $rec.RunDir)) {
+            elseif (-not (& $reuseProven $rec $id) -and (& $tiedOf $rec.RunDir)) {
                 $matched = $rec.RunDir
                 if (-not (Test-PathNamed -Text $cl -Path $rec.RunDir) -and (Test-PathNamed -Text $dt -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }
