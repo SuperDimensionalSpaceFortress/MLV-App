@@ -327,3 +327,40 @@ TEST(Debayered16HonourScaleWiring, ExportNeverNamesTheReducedReconEntries)
         ASSERT_FALSE(body.contains(QStringLiteral("renderFrame(")));
     }
 }
+
+// CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r15 (master merge): the save/restore X-macro claims
+// "every record the reset above clears". The merge brought CUDA-RECON-DUALISO-TIMER-SPLIT-1's
+// g_llrawproc_last_dual_iso_gpu_split into the reset; a record the reset clears but the save
+// misses comes back zero after the consuming debayer while dual_iso_ms is restored, so the
+// split bundle's other_ms would claim the whole dual_iso. Every last-run record the reset names
+// is in the macro.
+TEST(Debayered16HonourScaleWiring, SaveRestoreCoversEveryRecordTheResetClears)
+{
+    const QString llrawproc = readRepoFile(QStringLiteral("src/mlv/llrawproc/llrawproc.c"));
+    const QString reset = functionBody(llrawproc, QStringLiteral("void llrpResetLastRunTimingForCurrentThread(void)\n{"));
+    const int macroAt = llrawproc.indexOf(QStringLiteral("#define LLRP_LAST_RUN_TIMING(X)"));
+    ASSERT_TRUE(macroAt >= 0);
+    const int macroEnd = llrawproc.indexOf(QStringLiteral("\n\n"), macroAt);
+    ASSERT_TRUE(macroEnd > macroAt);
+    const QString macro = llrawproc.mid(macroAt, macroEnd - macroAt);
+    QStringList names;
+    int at = 0;
+    const QString prefix = QStringLiteral("g_llrawproc_last_");
+    while ((at = reset.indexOf(prefix, at)) >= 0)
+    {
+        int end = at + prefix.size();
+        while (end < reset.size() && (reset.at(end).isLetterOrNumber() || reset.at(end) == QLatin1Char('_'))) ++end;
+        const QString name = reset.mid(at, end - at);
+        if (!names.contains(name)) names.append(name);
+        at = end;
+    }
+    ASSERT_TRUE(names.contains(QStringLiteral("g_llrawproc_last_dual_iso_gpu_split")));
+    ASSERT_TRUE(names.size() >= 13);
+    for (const QString & name : names) ASSERT_TRUE(macro.contains(QStringLiteral(", ") + name + QStringLiteral(")")));
+    // The two helper resets clear these.
+    ASSERT_TRUE(reset.contains(QStringLiteral("llrawproc_reset_dual_iso_full20bit_timing();")));
+    ASSERT_TRUE(macro.contains(QStringLiteral(", g_llrawproc_last_dual_iso_full20bit_timing)")));
+    ASSERT_TRUE(reset.contains(QStringLiteral("llrpResetLastPreDualIsoFixTelemetry();")));
+    ASSERT_TRUE(macro.contains(QStringLiteral(", g_llrawproc_last_pre_dualiso_fix_ms)")));
+    ASSERT_TRUE(macro.contains(QStringLiteral(", g_llrawproc_last_pre_dualiso_fix_completed)")));
+}

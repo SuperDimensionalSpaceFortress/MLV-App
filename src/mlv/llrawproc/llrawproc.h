@@ -557,6 +557,41 @@ typedef struct
     double publish_ms;             /* runtime-state capture, publish lock or restore */
 } llrpResidualSubstageTiming_t;
 void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing);
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1: where the dual_iso stage timer's time goes
+ * on the CUDA texture route (LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE). Every field
+ * is INSIDE llrawproc_dual_iso_ms (not part of the residual set above), timed
+ * with the same clock on the same thread-local last-run convention and reset
+ * at the same points. The backend fields accumulate over every
+ * llrawproc_gpu_recon_run_backend call on this thread during the run
+ * (backend_calls counts them), so they stay zero on a CPU recon.
+ *   prepare_ms        diso_prepare_gpu_recon_state (CPU match + state)
+ *   preupload_ms      llrpGpuPlaybackReconPreuploadFrame (async H2D submit)
+ *   mutex_wait_ms     pthread_mutex_lock of the GPU recon backend mutex (also
+ *                     booked by a call the suppression re-check then refuses)
+ *   configure_ms      held, before the run: checks, set_clip, set_luts, notch
+ *                     (or up to a refusal under the lock)
+ *   run_wall_ms       host wall of igpu_recon_run / run_preuploaded
+ *   run_gpu_ms        the backend's own event span of that run (upload ..
+ *                     handoff, igpu_recon_last_timing total_ms)
+ *   sync_ms           run_wall_ms - run_gpu_ms, floored at 0: host launch and
+ *                     the wait for the stream beyond the run's own GPU span
+ *   post_run_ms       held, after the run: device output query, retain (D2D
+ *                     copy + stream sync), allocated bytes, timing read
+ * dual_iso_ms of the same run, minus prepare, preupload, mutex_wait, configure,
+ * run_wall and post_run, is the dual_iso time outside the GPU route's steps. */
+typedef struct
+{
+    double prepare_ms;
+    double preupload_ms;
+    double mutex_wait_ms;
+    double configure_ms;
+    double run_wall_ms;
+    double run_gpu_ms;
+    double sync_ms;
+    double post_run_ms;
+    int backend_calls;
+} llrpDualIsoGpuSplitTiming_t;
+void llrpGetLastDualIsoGpuSplitTiming(llrpDualIsoGpuSplitTiming_t * timing);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);
 double llrpGetLastDualIsoPreviewHistogramMilliseconds(void);
 double llrpGetLastDualIsoPreviewRegressionMilliseconds(void);

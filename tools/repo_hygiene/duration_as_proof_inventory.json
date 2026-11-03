@@ -2631,6 +2631,168 @@
       "lines": [
         86
       ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_TRUE ( s . mutex_wait_ms >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Non-negativity sanity check of a CUDA-RECON-DUALISO-TIMER-SPLIT-1 split sub-timer after one fake-backend run; >= 0.0 cannot tell 'ran' from 'did not run'. the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read.",
+      "lines": [
+        88
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_TRUE ( s . configure_ms >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Non-negativity sanity check of a CUDA-RECON-DUALISO-TIMER-SPLIT-1 split sub-timer after one fake-backend run; >= 0.0 cannot tell 'ran' from 'did not run'. the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read.",
+      "lines": [
+        89
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_TRUE ( s . post_run_ms >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Non-negativity sanity check of a CUDA-RECON-DUALISO-TIMER-SPLIT-1 split sub-timer after one fake-backend run; >= 0.0 cannot tell 'ran' from 'did not run'. the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read.",
+      "lines": [
+        90
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_TRUE ( s . run_wall_ms >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Non-negativity sanity check of a CUDA-RECON-DUALISO-TIMER-SPLIT-1 split sub-timer after one fake-backend run; >= 0.0 cannot tell 'ran' from 'did not run'. the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read.",
+      "lines": [
+        91
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . prepare_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Negative-lane check: run_backend never books the texture route caller's prepare/preupload timers, so they stay 0 after a direct run_backend call; the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(1, s.backend_calls)).",
+      "lines": [
+        97
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . preupload_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Negative-lane check: run_backend never books the texture route caller's prepare/preupload timers, so they stay 0 after a direct run_backend call; the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(1, s.backend_calls)).",
+      "lines": [
+        98
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , q . split . run_wall_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Negative-lane check: a run refused by the suppression re-check under the lock books no run wall; the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(1, q.split.backend_calls), ASSERT_EQ(0, q.used)).",
+      "lines": [
+        190
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . mutex_wait_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "The thread reset zeroes every field of the split record (reset contract, as the #738 residual record); the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(0, s.backend_calls) on the same record). Also at the refused-before-the-lock test, whose record shows backend_calls 0.",
+      "lines": [
+        207,
+        229
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . configure_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "The thread reset zeroes every field of the split record (reset contract, as the #738 residual record); the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(0, s.backend_calls) on the same record).",
+      "lines": [
+        208
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . run_wall_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "The thread reset zeroes every field of the split record (reset contract, as the #738 residual record); the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(0, s.backend_calls) on the same record). Also at the refused-before-the-lock test, whose record shows backend_calls 0.",
+      "lines": [
+        209,
+        230
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . run_gpu_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "The thread reset zeroes every field of the split record (reset contract, as the #738 residual record); the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(0, s.backend_calls) on the same record).",
+      "lines": [
+        210
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . sync_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "The thread reset zeroes every field of the split record (reset contract, as the #738 residual record); the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(0, s.backend_calls) on the same record).",
+      "lines": [
+        211
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , s . post_run_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "The thread reset zeroes every field of the split record (reset contract, as the #738 residual record); the run itself is proven by the backend_calls counter asserted beside it (and rc/used), never by this duration read (ASSERT_EQ(0, s.backend_calls) on the same record).",
+      "lines": [
+        212
+      ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "if ( split_span_ms >= 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r1 (adversary pass 3 A1) sentinel, not an elapsed-time inference: llrawproc_gpu_recon_run_backend initialises split_span_ms to -1.0 ('no backend span read') and only a successful run whose backend reports its event timing (timing_out->available, or g->last_timing() == 0 when the caller passed no timing_out) overwrites it with igpu_recon_timing_t.total_ms. The >= 0.0 test selects whether the telemetry-only split books run_gpu_ms / sync_ms; it gates no behaviour and proves no run (backend_calls and run_rc do).",
+      "lines": [
+        2960
+      ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "( LONG ) ( delay_ms > 0 ? delay_ms : 0 ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test seam (adversary r1 passes 4-5 A1 RED test), not an elapsed-time inference: delay_ms is a requested sleep set only by llrpSetFakeGpuBackendLastTimingDelayMsForTesting for the in-process fake backend's timing getter (0 by default and always in the app). The comparison clamps a negative request to 0 before it is stored; it measures nothing and proves no run.",
+      "lines": [
+        1495
+      ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "if ( delay_ms > 0 ) Sleep ( ( DWORD ) delay_ms ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test seam (adversary r1 passes 4-5 A1 RED test), not an elapsed-time inference: delay_ms is a requested sleep set only by llrpSetFakeGpuBackendLastTimingDelayMsForTesting for the in-process fake backend's timing getter (0 by default and always in the app). The comparison selects whether the fake sleeps at all (0 skips Sleep so the default fake never yields); it measures nothing and proves no run (backend_calls and rc do).",
+      "lines": [
+        1504
+      ]
     }
   ]
 }

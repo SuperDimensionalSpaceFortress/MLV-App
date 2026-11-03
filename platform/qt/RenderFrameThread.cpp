@@ -331,6 +331,38 @@ void captureRawUint16DecodeTelemetry( RawUint16DecodeTelemetry &raw, double rawU
     raw.copyMs = getMlvLastRawUint16CopyMilliseconds();
 }
 
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1: where the dual_iso stage timer's time goes on
+ * the CUDA texture route (llrawproc.h llrpDualIsoGpuSplitTiming_t). Every field is
+ * INSIDE llrawproc_dual_iso_ms, so none is subtracted from llrawproc_other_ms. The
+ * bundle carries the dual_iso of the SAME run (llrawproc_dual_iso_split_dual_iso_ms)
+ * and the part of it outside the timed GPU-route steps (..._other_ms), so a reader
+ * never pairs one thread's split with another thread's dual_iso. Called only from
+ * insertLlrawprocResidualSubstageTelemetry, so it shares that bundle's guard. */
+void insertLlrawprocDualIsoGpuSplitTelemetry( QJsonObject &target )
+{
+    llrpDualIsoGpuSplitTiming_t split = {};
+    llrpGetLastDualIsoGpuSplitTiming( &split );
+    const double dualIsoMs = llrpGetLastDualIsoMilliseconds();
+    const double timedMs = split.prepare_ms
+        + split.preupload_ms
+        + split.mutex_wait_ms
+        + split.configure_ms
+        + split.run_wall_ms
+        + split.post_run_ms;
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_dual_iso_ms"), dualIsoMs );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_prepare_ms"), split.prepare_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_preupload_ms"), split.preupload_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_mutex_wait_ms"), split.mutex_wait_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_configure_ms"), split.configure_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_run_wall_ms"), split.run_wall_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_run_gpu_ms"), split.run_gpu_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_sync_ms"), split.sync_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_post_run_ms"), split.post_run_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_backend_calls"), split.backend_calls );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_other_ms"),
+                   qMax( 0.0, dualIsoMs - timedMs ) );
+}
+
 /* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the llrawproc steps outside the seven stage
  * timers, emitted beside them; returns their sum so llrawproc_other_ms is the
  * residual of the finer set. Every field is disjoint (llrawproc.h). The bundle
@@ -366,6 +398,8 @@ double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target,
                    llrawprocStageTimersMs );
     target.insert( QStringLiteral("llrawproc_residual_other_ms"),
                    qMax( 0.0, llrawprocTotalMs - llrawprocStageTimersMs - substageMs ) );
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside dual_iso, not in substageMs. */
+    insertLlrawprocDualIsoGpuSplitTelemetry( target );
     return substageMs;
 }
 
