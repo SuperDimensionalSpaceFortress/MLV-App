@@ -4,7 +4,8 @@
 // GPU span (the fake reports total_ms 3.0) plus a floored sync; (b) a run queued on the backend mutex (held
 // here, as the render thread's present or another run would hold it) reports that wait as mutex_wait_ms;
 // (e) so does a queued run then refused by the suppression re-check under the lock (adversary r1 A1); (c) the
-// thread's reset zeroes the record; (d) a run refused before the lock leaves the record untouched.
+// thread's reset zeroes the record; (d) a run refused before the lock leaves the record untouched; (f) a run
+// whose caller asks for no timing (the export paths) still splits the GPU span (adversary r1 pass 3 A1).
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 
@@ -103,6 +104,26 @@ TEST(DualIsoGpuSplitTiming, OneRunIsOneBackendCallAndItsWallSplitsIntoGpuSpanPlu
     ASSERT_EQ(2, two.backend_calls);
     ASSERT_EQ(6.0, two.run_gpu_ms);
     ASSERT_TRUE(two.run_wall_ms >= s.run_wall_ms);
+}
+
+// Adversary r1 pass 3 A1: the export callers pass no timing_out. The split still books the backend's own GPU
+// span (the fake's 3.0 ms) and the floored sync; r1 left run_gpu_ms 0 and sync_ms unbooked for such a call.
+TEST(DualIsoGpuSplitTiming, ARunWhoseCallerAsksForNoTimingStillSplitsTheGpuSpan)
+{
+    FakeBackendScope scope;
+    llrpResetLastRunTimingForCurrentThread();
+    int rc = -99;
+    const llrpGpuPlaybackReconState_t state = splitValidatedState(6, 4, 4);
+    std::vector<uint16_t> input(16, 100);
+    std::vector<uint16_t> output(input.size());
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, input.data(), input.size() * sizeof(uint16_t),
+                                                   output.data(), &rc, NULL));
+    ASSERT_EQ(0, rc);
+    const llrpDualIsoGpuSplitTiming_t s = lastSplit();
+    ASSERT_EQ(1, s.backend_calls);
+    ASSERT_EQ(3.0, s.run_gpu_ms);
+    const double expectedSync = s.run_wall_ms > 3.0 ? s.run_wall_ms - 3.0 : 0.0;
+    ASSERT_TRUE(s.sync_ms >= expectedSync - 1e-9 && s.sync_ms <= expectedSync + 1e-9);
 }
 
 namespace

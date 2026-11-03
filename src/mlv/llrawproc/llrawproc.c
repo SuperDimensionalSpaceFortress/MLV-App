@@ -2931,8 +2931,9 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     {
         /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: held time before and after the run.
-         * The GPU span is the backend's own event total for a successful run;
-         * without it the run's wall stays unsplit (run_gpu_ms and sync_ms 0).
+         * The GPU span is the backend's own event total for a successful run
+         * (from timing_out, or read here when the caller passed none); when the
+         * backend has no timing the run's wall stays unsplit (run_gpu_ms and sync_ms 0).
          * Taken before the device-loss scan, whose cost is not counted. */
         llrpDualIsoGpuSplitTiming_t * split = &g_llrawproc_last_dual_iso_gpu_split;
         const double split_held_end_s = mlv_stage_timing_now();
@@ -2942,10 +2943,24 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             split->configure_ms += (split_run_start_s - split_lock_acquired_s) * 1000.0;
             split->run_wall_ms += run_wall_ms;
             split->post_run_ms += (split_held_end_s - split_run_end_s) * 1000.0;
+            /* Adversary r1 pass 3 A1: a caller that asks for no timing (the export
+             * paths pass NULL timing_out) still gets the span split, read from the
+             * backend as the recon:run stage event above reads it. */
+            double split_span_ms = -1.0;
             if(run_rc == 0 && timing_out && timing_out->available)
             {
-                split->run_gpu_ms += timing_out->total_ms;
-                split->sync_ms += MAX(0.0, run_wall_ms - timing_out->total_ms);
+                split_span_ms = timing_out->total_ms;
+            }
+            else if(run_rc == 0 && g->last_timing)
+            {
+                igpu_recon_timing_t split_timing;
+                memset(&split_timing, 0, sizeof(split_timing));
+                if(g->last_timing(g->backend, &split_timing) == 0) split_span_ms = split_timing.total_ms;
+            }
+            if(split_span_ms >= 0.0)
+            {
+                split->run_gpu_ms += split_span_ms;
+                split->sync_ms += MAX(0.0, run_wall_ms - split_span_ms);
             }
         }
         else
