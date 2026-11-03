@@ -39,7 +39,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $script:gitStderr = @()  # stderr of every git call that exited 0: a warning there is a collection that may be incomplete (r11 sol r10 B2)
-$script:seal = $null; $script:sealDir = $null
+$script:seal = $null; $script:sealDir = $null; $script:sealId = $null; $script:heldSeal = $null
 $script:probeWarnings = @()  # identity probes that could not be read (r13 sol r12 F3): each is a warning, so the collection is incomplete
 $script:repoChanged = $null  # r15 (sol r14 B1): set by Test-RepoSame the first time the captured repository is found to be another directory (or unreadable) before or after a git call; the run then ends in exit 30 whatever the git calls returned
 $script:pin = @()  # r14 (sol r13 B1): --git-dir/--work-tree captured ONCE at the start; every pre-seal git call gets them, so none rediscovers a repository (a stored core.worktree can name another one)
@@ -102,18 +102,22 @@ function New-SealedGit([string]$HeadFull) {  # r10 (sol r9 B1, B2): no git call 
     foreach ($k in $vals.Keys) { $cfg += "`t" + $k.Substring(5) + $(if ($null -eq $vals[$k]) { '' } else { ' = "' + $vals[$k].Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`t", '\t').Replace("`b", '\b') + '"' }) + "`n" }
     if ($sha256) { $cfg += "[extensions]`n`tobjectformat = sha256`n" }
     $sg = [System.IO.Path]::Combine((Get-PrivateBase), 'lane-dirty-save-' + [guid]::NewGuid().ToString('N')); $script:sealDir = $sg  # never under the worktree or a git dir inside it (a separate git dir can sit there): the untracked scan would list the saver's own files and the clean-up would then delete them (r11 sol r10 B3)
+    [void][System.IO.Directory]::CreateDirectory($sg)  # r16 (adversary pass 1 A1): the directory is made, then HELD and proved to be at its own name BEFORE anything is written into it. Windows: opened without share-delete, so it cannot be moved away and replaced by a junction into the worktree, and its kernel final path must equal its own long path (a name that already resolves elsewhere is refused before a byte is written). POSIX cannot hold it: every private file is CREATE_NEW (an existing file is never truncated) and the directory is proved link-free and outside the worktree once written
+    if ($script:onWin) { $script:heldSeal = Get-FinalDir $sg; Assert-HandleAtPath $script:heldSeal.Handle $sg }
+    $script:sealId = $null; try { $script:sealId = Get-DirId $sg } catch { }  # r16 (adversary A2): the identity of the directory this run made; the leftover is reported verified only while the name still holds it
     foreach ($sub in @('objects', 'info'), @('refs'), @('info')) { [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::Combine([string[]](@($sg) + $sub))) }  # one segment per argument: a \\?\ path (the RunDir fall-back) does not translate a slash
     $enc = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD'), "$HeadFull`n", $enc)
-    [System.IO.File]::WriteAllBytes([System.IO.Path]::Combine($sg, 'config'), [System.Text.Encoding]::Latin1.GetBytes($cfg))
+    Write-NewFile ([System.IO.Path]::Combine($sg, 'HEAD')) $enc.GetBytes("$HeadFull`n")
+    Write-NewFile ([System.IO.Path]::Combine($sg, 'config')) ([System.Text.Encoding]::Latin1.GetBytes($cfg))
     $alt = if ($objects.IndexOfAny([char[]]@("`n", "`r", '"', '\')) -ge 0 -or $objects.StartsWith('#', [System.StringComparison]::Ordinal)) { '"' + $objects.Replace('\', '\\').Replace('"', '\"').Replace("`n", '\n').Replace("`r", '\r') + '"' } else { $objects }  # alternates is one path per LINE: a path holding an LF or a quote is written C-quoted (adversary r10 A3)
-    [System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates'), "$alt`n", $enc)
+    Write-NewFile ([System.IO.Path]::Combine($sg, 'objects', 'info', 'alternates')) $enc.GetBytes("$alt`n")
     foreach ($pair in @(, @($attr, 'attributes')) + @(, @($excl, 'exclude'))) {  # attribute and ignore RULES are data; a filter attribute without a configured driver runs nothing
         $dest = [System.IO.Path]::Combine($sg, 'info', $pair[1])
         try { [System.IO.File]::Copy($pair[0], $dest) }
         catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { continue }  # absent is the only silent case: File.Exists answers false for a file it may not look at, which dropped the rules and let the sealed git compare by other ones (adversary r11 A2). Any other failure ends in the typed private-git-dir refusal (40)
         [System.IO.File]::SetAttributes($dest, [System.IO.FileAttributes]::Normal)
     }
+    if (-not $script:onWin) { Assert-LinkFree $sg; if (Test-Inside $realWork $sg) { throw 'private-dir-inside-worktree' } }  # r16 (adversary A1): POSIX cannot hold the directory, so after the CREATE_NEW writes it is proved link-free and outside the worktree
     $nullDev = if ($script:onWin) { 'NUL' } else { '/dev/null' }
     $script:seal = @{ Args = $script:noCallbacks; Env = @{ GIT_DIR = $sg; GIT_WORK_TREE = $WorkDir; GIT_INDEX_FILE = $index; GIT_CONFIG_NOSYSTEM = '1'; GIT_CONFIG_GLOBAL = $nullDev } }  # the REAL index file: copying it would reset its timestamp and hide racily-clean entries
 }
@@ -296,6 +300,8 @@ public static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.
 public static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle handle, int infoClass, [System.Runtime.InteropServices.Out] byte[] buffer, uint length);
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
 public static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle handle, [System.Runtime.InteropServices.Out] byte[] buffer);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern uint GetLongPathNameW(string shortPath, System.Text.StringBuilder buffer, uint length);
 '@
     }
 }
@@ -308,12 +314,31 @@ function Get-FinalDir([string]$Path) {  # Windows: open the directory and read i
     if ($n -eq 0 -or $n -ge 32768) { $h.Dispose(); throw 'cannot-resolve-directory' }
     return @{ Path = $sb.ToString(); Handle = $h }  # the kernel's own spelling, \\?\C:\... or \\?\UNC\..., which Win32 and .NET then use without trimming
 }
+function ConvertTo-PlainPath([string]$P) {  # the \\?\ namespace prefix removed, so a kernel final path and a long path compare as text
+    if ($P.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) { return '\\' + $P.Substring(8) }
+    if ($P.StartsWith('\\?\', [System.StringComparison]::Ordinal)) { return $P.Substring(4) }
+    return $P
+}
+function Assert-HandleAtPath($Handle, [string]$Path) {  # r16 (adversary A1, A3): Windows. The kernel says where an open file or directory REALLY is (GetFinalPathNameByHandle resolves every link and junction on the way); GetLongPathName only respells the same path in its long form and follows nothing. A handle whose real path is not the requested path was reached THROUGH a link, whatever the name holds a moment later, so no flip of the name after the open can change this answer. Anything unreadable is a refusal
+    Initialize-LdsNative
+    $fin = [System.Text.StringBuilder]::new(32768); $lng = [System.Text.StringBuilder]::new(32768)
+    $n = [LdsNative.Win]::GetFinalPathNameByHandleW($Handle, $fin, 32768, 0)
+    if ($n -eq 0 -or $n -ge 32768) { throw 'cannot-resolve-handle' }
+    $m = [LdsNative.Win]::GetLongPathNameW((ConvertTo-NativePath $Path), $lng, 32768)
+    if ($m -eq 0 -or $m -ge 32768) { throw 'cannot-resolve-path' }
+    if (-not [string]::Equals((ConvertTo-PlainPath $fin.ToString()), (ConvertTo-PlainPath $lng.ToString()), [System.StringComparison]::OrdinalIgnoreCase)) { throw 'opened-through-a-link' }
+}
+function Write-NewFile([string]$Path, [byte[]]$Bytes) {  # r16 (adversary A1): a private file is only ever CREATED; one that already exists (a worktree file reached through a swapped link included) is an error, never truncated
+    $fs = [System.IO.File]::Open($Path, 'CreateNew', 'Write', 'None')
+    try { $fs.Write($Bytes, 0, $Bytes.Length) } finally { $fs.Dispose() }
+}
 function Test-LaneAlive {
     if ($LanePid -and $ChildJson) { throw 'mixed-selectors' }  # one pid with another lane's createdUtc would judge a live lane reused (dot B1 on #722)
     $procId = $LanePid; $born = $null
     if ($ChildJson) {
         # System.Text.Json, not ConvertFrom-Json: PowerShell turns '/Date(0)/' into a DateTime, unwraps one-item lists and casts arrays to int, so every shape check was passed by something that is no ISO string (adversary r8 A2, A3)
         $cfs = [System.IO.File]::Open($ChildJson, 'Open', 'Read', 'Read')  # r15 (adversary A4): opened FIRST, then proved link-free again with the file held, then read from that handle: a folder swapped for a link after the first check (line "foreach ($raw in") cannot make the saver read another file by the same name
+        if ($script:onWin) { try { Assert-HandleAtPath $cfs.SafeFileHandle $ChildJson } catch { $cfs.Dispose(); throw } }  # r16 (adversary A3): the open file must really BE at the requested path, by the kernel's answer; a folder that was a link when it was opened is refused whatever the name holds afterwards
         try { Assert-LinkFree $ChildJson; $cjson = [System.IO.StreamReader]::new($cfs).ReadToEnd() } finally { $cfs.Dispose() }
         if (-not [string]::Equals([System.IO.File]::ReadAllText($ChildJson), $cjson, [System.StringComparison]::Ordinal)) { throw 'child-record-changed' }  # r15 (adversary pass 2 A3): a link that was in place when the file was opened and removed before the second proof left the saver holding the decoy; the name now holds another file, so the two reads disagree and the run is refused
         $root = [System.Text.Json.JsonDocument]::Parse($cjson).RootElement
@@ -397,7 +422,9 @@ try {
 catch { $git.seal = @{ Code = -1; Err = "private-git-dir: $($_.Exception.Message)" } }
 # r16 (sol r15 B1, hub ruling a): the saver removes NOTHING. A removal by name that follows an ownership check can act on a directory that replaced the checked one (no check is atomic with it), and a failed identity capture made it worse (it removed with no proof at all). The private directory is left where this run made it, and is NAMED in the output and the receipt as privateGitDirLeft, never swallowed (adversary r10 A4).
 $left = if ($script:sealDir -and (Test-DirPresent $script:sealDir)) { $script:sealDir } else { $null }
-$leftNote = if ($left) { " privateGitDirLeft=$left" } else { '' }
+$leftUnverified = $false  # r16 (adversary A2): the leftover is named as the directory this run made only while its name still holds that directory (file identity); a name that now holds another directory, or an identity that cannot be read, is reported as unverified, never as a plain match
+if ($left) { try { $leftUnverified = -not ($script:sealId -and [string]::Equals((Get-DirId $left), $script:sealId, [System.StringComparison]::Ordinal)) } catch { $leftUnverified = $true } }
+$leftNote = if ($left) { " privateGitDirLeft=$left" + $(if ($leftUnverified) { ' privateGitDirLeftIdentity=unverified' } else { '' }) } else { '' }
 if ($script:repoChanged) { Write-Output "DIRTY_SAVE_BAD_ARGS reason=$($script:repoChanged)$leftNote"; exit 30 }  # r15 (sol r14 B1): a collection that could have read another repository is never a clean tree (10), a git failure (40) or a save: it fails closed, typed, and writes nothing
 $bad = $git.Values | Where-Object { $_.Code -ne 0 } | Select-Object -First 1
 if ($bad) { Write-Output "DIRTY_SAVE_GIT_FAILED reason=$($bad.Err.Trim())$leftNote"; exit 40 }
@@ -414,7 +441,7 @@ if (-not $todo) {
 $head8 = $headFull.Substring(0, 8)
 $ext = @{ patch = 'patch'; staged = 'staged.patch'; untracked = 'untracked.txt' }
 $r = [ordered]@{ schema = 'lane-dirty-save/v1'; head = $headFull; untrackedFormat = 'nul-separated'; untrackedContents = 'not-saved'; submodules = "skipped $subs" }
-if ($left) { $r.privateGitDirLeft = $left }
+if ($left) { $r.privateGitDirLeft = $left; if ($leftUnverified) { $r.privateGitDirLeftIdentity = 'unverified' } }
 if ($warnLines) { $r.collection = 'incomplete'; $r.warnings = @($warnShown) }
 try {
     foreach ($k in $todo) { $r[$k] = Save-Bytes $ext[$k] $git[$k].Bytes }

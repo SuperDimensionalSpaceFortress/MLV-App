@@ -2081,10 +2081,10 @@ def test_the_clean_up_never_deletes_a_directory_that_took_the_private_directorys
     victim.mkdir()
     (victim / "precious.txt").write_text("KEEP\n")
     (repo / "a.txt").write_bytes(b"changed\n")
-    hook = f"[System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir); "
+    hook = f"try {{ [System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir) }} catch {{ }}; "  # r16 adversary A1: refused on Windows (the directory is held), done elsewhere
     hooked = _hooked(tmp_path, [("$left = if ($script:sealDir", hook)])  # r16: the clean-up loop that stood here is gone (sol r15 B1)
     r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base)})
-    kept = list(base.glob("lane-dirty-save-*/precious.txt"))
+    kept = _victim_survivors(base, victim)
     assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 5d62d133: the other folder was deleted
     assert "privateGitDirLeft" in r.stdout, r.stdout  # and the remainder is named, not silently reported as clean
 
@@ -2152,7 +2152,11 @@ def _run_hooked(hooked, repo, tmp_path, base):
     return subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(repo), "-RunDir", str(tmp_path / "run"), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base), "TMPDIR": str(base)})
 
 
-SWAP_AWAY = "[System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir); "
+SWAP_AWAY = "try {{ [System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir) }} catch {{ }}; "  # r16 adversary A1: the private directory is held open on Windows, so the move is REFUSED there and the victim stays where it was; elsewhere the swap happens. Either way nothing may be deleted
+
+
+def _victim_survivors(base, victim):
+    return [p for p in list(base.glob("lane-dirty-save-*/precious.txt")) + [victim / "precious.txt"] if p.exists()]
 
 
 def test_a_directory_that_replaced_the_private_one_after_the_ownership_check_is_never_deleted(repo, tmp_path):  # r16 sol r15 B1: Get-DirId closed its handle and Directory.Delete then acted on the NAME, so a folder moved to the name in between was deleted recursively. The saver now deletes nothing at all: no check can be followed by a delete
@@ -2162,7 +2166,7 @@ def test_a_directory_that_replaced_the_private_one_after_the_ownership_check_is_
     (victim / "precious.txt").write_text("KEEP\n")
     (repo / "a.txt").write_bytes(b"changed\n")
     r = _run_hooked(_cleanup_hook(tmp_path, SWAP_AWAY.format(victim=victim)), repo, tmp_path, base)
-    kept = list(base.glob("lane-dirty-save-*/precious.txt"))
+    kept = _victim_survivors(base, victim)
     assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 8a11b142: the other folder was deleted
     assert r.returncode == 0 and "privateGitDirLeft" in r.stdout, r.stdout + r.stderr
 
@@ -2174,7 +2178,7 @@ def test_a_failed_identity_capture_never_permits_a_deletion(repo, tmp_path):  # 
     (victim / "precious.txt").write_text("KEEP\n")
     (repo / "a.txt").write_bytes(b"changed\n")
     r = _run_hooked(_cleanup_hook(tmp_path, "$script:sealId = $null; " + SWAP_AWAY.format(victim=victim)), repo, tmp_path, base)
-    kept = list(base.glob("lane-dirty-save-*/precious.txt"))
+    kept = _victim_survivors(base, victim)
     assert len(kept) == 1 and kept[0].read_text() == "KEEP\n", r.stdout + r.stderr  # 8a11b142: deleted without any proof
     assert r.returncode == 0 and "privateGitDirLeft" in r.stdout, r.stdout + r.stderr
 
@@ -2235,3 +2239,66 @@ def test_a_name_that_became_a_link_between_the_attribute_check_and_the_read_is_n
     receipt = last_receipt(r)
     assert receipt["untracked"] != name.name, r.stdout  # 8a11b142: the swapped-in link was reused
     assert not (run / receipt["untracked"]).is_symlink() and (run / receipt["untracked"]).read_bytes() == b"names.txt\0u.txt\0"
+
+
+# ---- r16 adversary pass 1 on ea31b1c7 (A1-A3) ----
+LINK_KIND = "Junction" if sys.platform == "win32" else "SymbolicLink"
+FIRST_PRIVATE_WRITE = ("[System.IO.File]::WriteAllText([System.IO.Path]::Combine($sg, 'HEAD')", "Write-NewFile ([System.IO.Path]::Combine($sg, 'HEAD')")  # ea31b1c7 / the fixed saver: the first write into the private directory
+
+
+def _swap_private_dir(tmp_path, target, marker):
+    return (f"try {{ [System.IO.Directory]::Move($sg, $sg + '.owned'); [void](New-Item -ItemType {LINK_KIND} -Path $sg -Target '{target}'); $o = 'SWAPPED' }} catch {{ $o = 'BLOCKED' }}; "
+            f"Set-Content -LiteralPath '{marker}' -Value $o -NoNewline; ")
+
+
+def test_a_private_directory_swapped_for_a_link_into_the_worktree_never_has_a_tracked_file_written_through_it(tmp_path):  # r16 adversary A1 (ea31b1c7): only the private BASE was held; the directory made in it could be moved away and a junction to a worktree folder put at its name, and the next write (HEAD) truncated a tracked file there. The directory is held open now (Windows: the move is refused), every private file is CreateNew (an existing file is never overwritten), and a name that resolves elsewhere is refused
+    a, run, base = tmp_path / "wtA", tmp_path / "run", tmp_path / "tempbase"
+    init_repo(a, b"BASE\n")
+    (a / "payload").mkdir()
+    (a / "payload" / "HEAD").write_bytes(b"orig\n")
+    git(a, "add", "payload/HEAD")
+    git(a, "commit", "-q", "-m", "payload")
+    (a / "payload" / "HEAD").write_bytes(b"KEEP\n")  # the unsaved work
+    run.mkdir()
+    base.mkdir()
+    marker = tmp_path / "swap-result.txt"
+    text = SCRIPT.read_text(encoding="utf-8")
+    anchor = next(x for x in FIRST_PRIVATE_WRITE if text.count(x) == 1)
+    hooked = tmp_path / "hooked-saver.ps1"
+    hooked.write_text(text.replace(anchor, _swap_private_dir(tmp_path, a / "payload", marker) + anchor), encoding="utf-8")
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-LanePid", str(dead_pid())], capture_output=True, text=True, env={**os.environ, "TMP": str(base), "TEMP": str(base), "TMPDIR": str(base)})
+    assert (a / "payload" / "HEAD").read_bytes() == b"KEEP\n", r.stdout + r.stderr  # ea31b1c7: truncated to the HEAD sha
+    if sys.platform == "win32":
+        assert marker.read_text() == "BLOCKED", r.stdout + r.stderr  # the held directory cannot be moved
+        assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_leftover_whose_name_was_taken_by_another_directory_is_not_named_as_verified(repo, tmp_path):  # r16 adversary A2 (ea31b1c7): after the private directory was moved away and another folder took its name, the output named that folder as privateGitDirLeft with nothing to say its identity was not the one this run made (and the real one was lost to the report). On Windows the directory is held, so the move is refused and the leftover is verified; elsewhere the output says the identity is unverified
+    base, victim, marker = tmp_path / "tempbase", tmp_path / "victim", tmp_path / "swap-result.txt"
+    base.mkdir()
+    victim.mkdir()
+    (repo / "a.txt").write_bytes(b"changed\n")
+    hook = (f"try {{ [System.IO.Directory]::Move($script:sealDir, $script:sealDir + '.owned'); [System.IO.Directory]::Move('{victim}', $script:sealDir); $o = 'SWAPPED' }} catch {{ $o = 'BLOCKED' }}; Set-Content -LiteralPath '{marker}' -Value $o -NoNewline; ")
+    r = _run_hooked(_cleanup_hook(tmp_path, hook), repo, tmp_path, base)
+    assert r.returncode == 0 and '"privateGitDirLeft":' in r.stdout, r.stdout + r.stderr
+    assert ("privateGitDirLeftIdentity=unverified" in r.stdout or '"privateGitDirLeftIdentity":"unverified"' in r.stdout) == (marker.read_text() == "SWAPPED"), r.stdout  # ea31b1c7: never flagged
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the kernel's final path of the open handle is the proof; POSIX has no equivalent and keeps the documented limit")
+def test_a_child_record_whose_folder_is_a_link_at_the_open_and_the_name_is_restored_for_the_proofs_is_refused(tmp_path):  # r16 adversary A3 (ea31b1c7): link at the open, original for the second link-free proof, link again for the final by-name read: the held handle and the name agreed on the dead decoy. The handle is judged by where the kernel says the file object IS, which no later flip of the name can change
+    a, run, records, decoy = tmp_path / "wtA", tmp_path / "run", tmp_path / "records", tmp_path / "decoy"
+    init_repo(a, b"BASE\n")
+    for d in (run, records, decoy):
+        d.mkdir()
+    (a / "a.txt").write_bytes(b"DIRT\n")
+    old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).isoformat()
+    live = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=1)).isoformat()
+    (records / "child.json").write_text(json.dumps({"pid": os.getpid(), "createdUtc": live}))
+    (decoy / "child.json").write_text(json.dumps({"pid": dead_pid(), "createdUtc": old}))
+    swap = f"[System.IO.Directory]::Move('{records}', '{records}.saved'); [void](New-Item -ItemType Junction -Path '{records}' -Target '{decoy}'); "
+    restore = f"[System.IO.Directory]::Delete('{records}'); [System.IO.Directory]::Move('{records}.saved', '{records}'); "
+    flip_again = f"[System.IO.Directory]::Move('{records}', '{records}.saved2'); [void](New-Item -ItemType Junction -Path '{records}' -Target '{decoy}'); "
+    hooked = _hooked(tmp_path, [("$cfs = [System.IO.File]::Open($ChildJson", swap), ("try { Assert-LinkFree $ChildJson; $cjson", restore), ("if (-not [string]::Equals([System.IO.File]::ReadAllText($ChildJson), $cjson", flip_again)])
+    r = subprocess.run([PWSH, "-NoProfile", "-File", str(hooked), "-WorkDir", str(a), "-RunDir", str(run), "-ChildJson", str(records / "child.json")], capture_output=True, text=True)
+    assert r.returncode in (20, 30), r.stdout + r.stderr  # ea31b1c7: exit 0, the live lane's work was saved from under it
+    assert list(run.iterdir()) == []
