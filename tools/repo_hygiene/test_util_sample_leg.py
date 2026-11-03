@@ -227,7 +227,9 @@ class UtilSampleGeneratorTests(unittest.TestCase):
         child_path.write_text(child, encoding="utf-8")
         proc = run_pwsh(["-File", str(script), str(child_path)])
         self.assertIn("BAD=0", proc.stdout, proc.stdout + proc.stderr)
-        for name in ("function Read-UtilSampleClock", "function Invoke-UtilSampleCpuLoop", "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs"):
+        # adversary f685c478 A2: the child's exit 0 (its ownership signal) is emitted only once its CreateNew succeeded
+        for name in ("function Read-UtilSampleClock", "function Invoke-UtilSampleCpuLoop", "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs",
+                     "if ($null -ne $us -and $us.created) { exit 0 }\nexit 6"):
             self.assertIn(name, child)
 
 
@@ -245,9 +247,10 @@ $cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
 function J($v) { $v | ConvertTo-Json -Depth 8 -Compress }
 $ws = [DateTime]::new(2026, 11, 1, 14, 0, 0, 0, [DateTimeKind]::Utc); $we = $ws.AddMilliseconds(800)
 $win = [ordered]@{ startUtc = $ws; endUtc = $we; clockWhy = $null }
-$H = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs`n"
-# one r5 cpu-util.csv row: its interval fromUtc..utc stated, and its clock step
-function CpuRow([DateTime]$u, $t, $p, $c, [DateTime]$f, $s = '0', $iv = $null) { if ($null -eq $iv) { $iv = ($u - $f).TotalMilliseconds }; "$($u.ToString('o')),$t,$p,$c,$($f.ToString('o')),$s,$iv`n" }
+$H = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n"
+# one r6 cpu-util.csv row: its interval fromUtc..utc stated, its clock step, its snapshot span and its counter-read span ($cm: $null = the
+# snapshot span, i.e. a counter read and a snapshot that sat together; '' = no bound counter interval)
+function CpuRow([DateTime]$u, $t, $p, $c, [DateTime]$f, $s = '0', $iv = $null, $cm = $null) { if ($null -eq $iv) { $iv = ($u - $f).TotalMilliseconds }; if ($null -eq $cm) { $cm = $iv }; "$($u.ToString('o')),$t,$p,$c,$($f.ToString('o')),$s,$iv,$cm`n" }
 $gpuText = "2026/11/01 08:00:00.000, 40, 10, 1800, P2, 50.00`n2026/11/01 08:00:00.250, 60, 12, 1800, P2, 55.00`n2026/11/01 08:00:00.500, [N/A], 12, 1800, P2, [N/A]`n" +
            "2026/11/01 08:00:00.750, 80, 14, 1800, P2, 60.00`n2026/11/01 08:00:01.000, 99, 1, 1800, P2, 70.00`n2026/11/01 08:00:01.2"
 $g = ConvertFrom-UtilSampleGpuCsv $gpuText $cst
@@ -268,8 +271,8 @@ $r['gpuAllNa'] = (Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv "2026/1
 $r['gpuSkipped'] = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }) $win).status
 $r['gpuStartFailed'] = (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing' }) $win).status
 $r['gpuSummerUtc'] = (ConvertFrom-UtilSampleGpuCsv "2026/07/01 08:00:00.000, 1, 1, 1, P0, 1.0`n" $cst).rows[0].utc.ToString('o')
-$cpuText = $H + "2026-11-01T13:59:59.5000000Z,10,,,2026-11-01T13:59:59.0000000Z,0,500`n2026-11-01T14:00:00.1000000Z,50,1234,2.5,2026-11-01T13:59:59.5000000Z,0,600`n" +
-           "2026-11-01T14:00:00.6000000Z,,1234,3.5,2026-11-01T14:00:00.1000000Z,0,500`n2026-11-01T14:00:01.5000000Z,90,1234;1240,8,2026-11-01T14:00:00.6000000Z,0,900`n2026-11-01T14:00:0"
+$cpuText = $H + "2026-11-01T13:59:59.5000000Z,10,,,2026-11-01T13:59:59.0000000Z,0,500,500`n2026-11-01T14:00:00.1000000Z,50,1234,2.5,2026-11-01T13:59:59.5000000Z,0,600,600`n" +
+           "2026-11-01T14:00:00.6000000Z,,1234,3.5,2026-11-01T14:00:00.1000000Z,0,500,500`n2026-11-01T14:00:01.5000000Z,90,1234;1240,8,2026-11-01T14:00:00.6000000Z,0,900,900`n2026-11-01T14:00:0"
 $c = ConvertFrom-UtilSampleCpuCsv $cpuText
 $r['cpuParse'] = @{ rows = $c.rows.Count; torn = $c.tornTail; why = $c.why }
 $cs = Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win
@@ -309,7 +312,7 @@ $r['cpuExitNonZero'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'runni
 $r['cpuStopClean'] = (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'running'; reason = $null }) $win ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })).status
 # A8: an overflowing mean is unavailable(non-finite), never ok without a number
 $big = [ordered]@{ rows = [Collections.Generic.List[object]]::new(); why = $null }
-foreach ($ms in 100, 200, 300) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1'; fromUtc = $ws.AddMilliseconds($ms - 50); step = 0.0; intervalMs = 50.0 }) }
+foreach ($ms in 100, 200, 300) { $big.rows.Add([ordered]@{ utc = $ws.AddMilliseconds($ms); util = 1.7e308; total = 1.7e308; cores = 1.7e308; pids = '1'; fromUtc = $ws.AddMilliseconds($ms - 50); step = 0.0; intervalMs = 50.0; counterMs = 50.0 }) }
 $r['gpuNonFinite'] = (Get-UtilSampleGpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 $r['cpuNonFinite'] = (Get-UtilSampleCpuSummary $big ([ordered]@{ status = 'running'; reason = $null }) $win).status
 # T5 fail open
@@ -365,7 +368,7 @@ $r['stopAllNothing'] = (Stop-UtilSampleAll ([ordered]@{ status = 'unavailable'; 
 $a1log = "[2026-11-02T14:00:00.000Z] [info] [app] playback_smoke.start session=2`n[2026-11-02T14:00:00.001Z] [info] [app] playback_smoke.measured_session id=2`n" +
          "[2026-11-02T14:01:20.000Z] [info] [app] playback_smoke.summary session=2 reason=play-stop elapsed_ms=20000`n"
 $a1w = Get-UtilSamplePlayWindow $a1log
-$a1csv = $H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T14:00:00.0000000Z,0,1000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000`n2026-11-02T14:01:19.0000000Z,90,1234,9,2026-11-02T14:01:02.0000000Z,0,17000`n"
+$a1csv = $H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T14:00:00.0000000Z,0,1000,1000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000,61000`n2026-11-02T14:01:19.0000000Z,90,1234,9,2026-11-02T14:01:02.0000000Z,0,17000,17000`n"
 $a1c = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $a1csv) ([ordered]@{ status = 'running'; reason = $null }) $a1w ([ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 })
 $r['r3A1'] = @{ windowNull = ($null -eq $a1w); status = $a1c.status; inWindow = $a1c.rowsInWindow; total = $a1c.rowsTotal }
 $a1ok = Get-UtilSamplePlayWindow ($a1log -replace '14:01:20\.000Z', '14:00:20.400Z')
@@ -416,14 +419,14 @@ $r['r3B2'] = @{ status = $b2.status; inWindow = $b2.rowsInWindow; total = $b2.to
 # r3 B3: a +60 s host-clock excursion mid-play and back leaves the endpoints agreeing but the sample stamps out of order: the subset is unverified, not ok
 $b3win = [ordered]@{ startUtc = [DateTime]::new(2026, 11, 2, 14, 0, 0, 0, [DateTimeKind]::Utc); endUtc = [DateTime]::new(2026, 11, 2, 14, 0, 20, 0, [DateTimeKind]::Utc) }
 # r5: the CPU stamps are out of order, so the witness the job computes says unverified, for the GPU summary as well
-$b3cpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.0000000Z,0,2000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000`n2026-11-02T14:00:21.0000000Z,10,1234,1,2026-11-02T14:00:19.0000000Z,0,2000`n")
+$b3cpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.0000000Z,0,2000,2000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000,61000`n2026-11-02T14:00:21.0000000Z,10,1234,1,2026-11-02T14:00:19.0000000Z,0,2000,2000`n")
 $b3gpu = ConvertFrom-UtilSampleGpuCsv "2026/11/02 08:00:01.000, 10, 10, 1200, P0, 40`n2026/11/02 08:01:02.000, 90, 10, 1200, P0, 40`n2026/11/02 08:00:19.000, 10, 10, 1200, P0, 40`n" $cst
 $b3run = [ordered]@{ status = 'running'; reason = $null }; $b3stop = [ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 }
 $b3win['clockWhy'] = Get-UtilSampleClockWitness $b3cpu $b3run $b3win
 $b3c = Get-UtilSampleCpuSummary $b3cpu $b3run $b3win $b3stop
 $b3g = Get-UtilSampleGpuSummary $b3gpu $b3run $b3win $b3stop
 $r['r3B3'] = @{ cpu = $b3c.status; gpu = $b3g.status; scalar = (Get-UtilSampleScalars $b3g $b3c $true).utilSampleStatus }
-$b3okcpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.5000000Z,0,1500`n2026-11-02T14:00:02.0000000Z,20,1234,2,2026-11-02T14:00:01.0000000Z,0,1000`n2026-11-02T14:00:03.0000000Z,30,1234,3,2026-11-02T14:00:02.0000000Z,0,1000`n")
+$b3okcpu = ConvertFrom-UtilSampleCpuCsv ($H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T13:59:59.5000000Z,0,1500,1500`n2026-11-02T14:00:02.0000000Z,20,1234,2,2026-11-02T14:00:01.0000000Z,0,1000,1000`n2026-11-02T14:00:03.0000000Z,30,1234,3,2026-11-02T14:00:02.0000000Z,0,1000,1000`n")
 $b3ok = Get-UtilSampleCpuSummary $b3okcpu $b3run ([ordered]@{ startUtc = $b3win.startUtc; endUtc = $b3win.endUtc; clockWhy = $null }) $b3stop
 $r['r3B3Steady'] = @{ cpu = $b3ok.status; inWindow = $b3ok.rowsInWindow }
 # r4 adversary b544cdb8 A1: a PATH entry on an absent drive is skipped (Join-Path throws there), so System32\nvidia-smi.exe is still found
@@ -555,8 +558,8 @@ if ($null -ne $a3o -and $null -ne $a3o.hold) { $a3o.hold.Dispose() }
 $a3q = Join-Path $t 'r5a3-foreign.csv'; [IO.File]::WriteAllText($a3q, 'KEEP-FOREIGN')
 $a3refused = 'not-refused'; try { [void](Invoke-UtilSampleCpuLoop $a3q (Join-Path $t 'r5a3f.stop') 'no-such-process-name-xyz' 200 500 { 5 } 0 0 0 0) } catch { $a3refused = [string]$_.Exception.Message }
 $a3own = @(
-    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; exitedBeforeStop = $false } })),
-    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; exitedBeforeStop = $true } })),
+    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $false; exitCode = 0 } })),
+    (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; killed = $false; exitedBeforeStop = $true; exitCode = 0 } })),
     (Test-UtilSampleCpuOwned ([ordered]@{ status = 'running' }) $null),
     (Test-UtilSampleCpuOwned ([ordered]@{ status = 'unavailable' }) ([ordered]@{ cpu = [ordered]@{ stopped = $true; exitedBeforeStop = $false } })))
 $r['advA3'] = @{ held = ($null -ne $a3o -and $null -ne $a3o.hold); delete = $a3del; move = $a3mv; writer = $a3w; foreign = $a3refused; foreignBytes = [IO.File]::ReadAllText($a3q); owned = @($a3own) }
@@ -568,6 +571,83 @@ $pc = [pscustomobject]@{ Id = 1234; Path = 'C:\jobA\MLVApp.exe'; StartTime = $fs
 $s1 = Get-UtilSampleAppSnapshot @($pa, $pb) 'C:\jobA\MLVApp.exe'
 $s2 = Get-UtilSampleAppSnapshot @($pc, $pb) 'c:\JOBA\mlvapp.exe'
 $r['advA4A5'] = @{ unreadable = @($s1.Keys).Count; ownOnly = (@($s2.Keys) -join ';'); expected = "1234,$($fs.Ticks)"; noPath = @((Get-UtilSampleAppSnapshot @($pc, $pb) '').Keys).Count }
+# ---- adversary f685c478 (r6) ----
+# A1 (exact case): Play 14:00:00..14:00:20. Counter baseline at 0, a zero sample at 1, the 100 % sample read at 2, then a deschedule after that counter
+# read until the app snapshot at 6; samples resume at 7..21, all zero. Rows (utc, from, total, cores, intervalMs) as the finding states, plus the
+# counter-read span the loop writes for each: (1,0,0,0,1000 | 1000) (6,1,100,0.2,5000 | 1000) (7,2,0,0,1000 | 5000) then (i,i-1,0,0,1000 | 1000).
+# The counter measured 1 s at 100 % over a 20 s window: 5.0 %, not 25.0; the app cores keep the snapshot weights (0.2 x 5 s / 20 s = 0.05)
+$x1t = $H + (CpuRow $p0.AddSeconds(1) 0 1234 0 $p0 '0' 1000 1000) + (CpuRow $p0.AddSeconds(6) 100 1234 0.2 $p0.AddSeconds(1) '0' 5000 1000) + (CpuRow $p0.AddSeconds(7) 0 1234 0 $p0.AddSeconds(2) '0' 1000 5000)
+for ($i = 8; $i -le 21; $i++) { $x1t += (CpuRow $p0.AddSeconds($i) 0 1234 0 $p0.AddSeconds($i - 1) '0' 1000 1000) }
+$x1p = ConvertFrom-UtilSampleCpuCsv $x1t
+$x1w = [ordered]@{ startUtc = $p0; endUtc = $p0.AddSeconds(20) }
+$x1w['clockWhy'] = Get-UtilSampleClockWitness $x1p $run $x1w
+$x1s = Get-UtilSampleCpuSummary $x1p $run $x1w $okStop
+# the same rows with the 6 s row's counter interval unbound (its read was not bracketed, or the read before it failed): fail closed
+$x1u = Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv ($x1t -replace '(T14:00:06\.0000000Z,100,[^\n]*,5000),1000', '$1,')) $run $x1w $okStop
+$r['r6A1'] = @{ parseWhy = $x1p.why; clock = $x1w.clockWhy; status = $x1s.status; total = $x1s.totalMean; cores = $x1s.appCoresMean; inWindow = $x1s.rowsInWindow; unbound = $x1u.status }
+# A1 (loop): the snapshot after the second row's counter read stalls 1 s (the finding's deschedule); every row's counterMs must be the span between
+# the two counter reads it measured (recorded by the counter itself), not the snapshots' span
+$script:x1n = 0; $script:x1cm = [Collections.Generic.List[double]]::new(); $x1sw = [Diagnostics.Stopwatch]::StartNew()
+$x1loop = @(Invoke-UtilSampleCpuLoop (Join-Path $t 'r6a1.csv') (Join-Path $t 'r6a1.stop') 'no-such-process-name-xyz' 200 2600 { $script:x1cm.Add($x1sw.Elapsed.TotalMilliseconds); 5 } 0 0 0 0 $null '' { $script:x1n++; if ($script:x1n -eq 3) { Start-Sleep -Milliseconds 1000 }; @{} })
+$x1lines = @([IO.File]::ReadAllLines((Join-Path $t 'r6a1.csv')) | Select-Object -Skip 1)
+$x1bad = [Collections.Generic.List[string]]::new(); $x1stall = $null
+for ($i = 0; $i -lt $x1lines.Count -and $i + 1 -lt $script:x1cm.Count; $i++) {
+    $f = $x1lines[$i] -split ','
+    $want = $script:x1cm[$i + 1] - $script:x1cm[$i]
+    if ($f.Count -lt 8 -or $f[7] -eq '') { $x1bad.Add("row$i-no-counterMs"); continue }
+    $got = [double]::Parse($f[7], $inv)
+    if ([math]::Abs($got - $want) -gt 25) { $x1bad.Add("row$i-counterMs-$([math]::Round($got))-measured-$([math]::Round($want))") }
+    if ([double]::Parse($f[6], $inv) -ge 900 -and $null -eq $x1stall) { $x1stall = @{ intervalMs = [math]::Round([double]::Parse($f[6], $inv)); counterMs = [math]::Round($got) } }
+}
+$r['r6A1Loop'] = @{ rows = $x1lines.Count; bad = @($x1bad); stall = $x1stall; outputs = $x1loop.Count; created = [bool]$x1loop[-1].created }
+# A2 (exact case, in-memory double): the CPU precheck saw no file; the child started; a second writer created cpu-util.csv holding KEEP-FOREIGN. The
+# stop reads HasExited=false, then the child refuses CreateNew and exits 1 before the stop completes: stopped=true, exitedBeforeStop=false, exitCode=1
+function New-ChildDouble([bool]$ExitsOnStop) {
+    $d = [pscustomobject]@{ exited = $false; code = $null; onStop = $ExitsOnStop }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $this.exited }
+    $d | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { $this.code }
+    $d | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.exited }
+    $d | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.exited = $true; $this.code = -1 }
+    $d
+}
+$y2dir = Join-Path $t 'r6a2'; [void](New-Item -ItemType Directory -Force -Path $y2dir); $y2pub = Join-Path $t 'r6a2-pub'; [void](New-Item -ItemType Directory -Force -Path $y2pub)
+$y2csv = Join-Path $y2dir 'cpu-util.csv'
+$y2d = New-ChildDouble $true
+$y2rec = Stop-UtilSampleAll ([ordered]@{ proc = $null }) ([ordered]@{ proc = $y2d }) { [IO.File]::WriteAllText($y2csv, 'KEEP-FOREIGN'); $y2d.exited = $true; $y2d.code = 1 } 100
+$y2own = Test-UtilSampleCpuOwned $run $y2rec
+# a child the stop had to kill gave no ownership signal either, even over a well-formed foreign file; one that exited 0 on the stop owns its file
+$y2k = New-ChildDouble $false
+$y2krec = Stop-UtilSampleAll ([ordered]@{ proc = $null }) ([ordered]@{ proc = $y2k }) { } 100
+$y2c = New-ChildDouble $true
+$y2crec = Stop-UtilSampleAll ([ordered]@{ proc = $null }) ([ordered]@{ proc = $y2c }) { $y2c.exited = $true; $y2c.code = 0 } 100
+# the job's own region 3 and Publish-UtilSampleFiles, lifted from the generator's emitted text, run against those records
+$genAst = [System.Management.Automation.Language.Parser]::ParseFile($env:US_GEN, [ref]$null, [ref]$null)
+$genStrings = @($genAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
+$pubSrc = @($genStrings | Where-Object { $_.Contains('function Publish-UtilSampleFiles') })[0]
+$pubAst = [System.Management.Automation.Language.Parser]::ParseInput($pubSrc, [ref]$null, [ref]$null)
+. ([scriptblock]::Create($pubAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Publish-UtilSampleFiles' }, $true).Extent.Text))
+$region3 = @($genStrings | Where-Object { $_.Contains('$utilSampleCpuParsed = ConvertFrom-UtilSampleCpuCsv') })[0]
+function Write-JobTrace([string]$m) { }
+function Publish-AttrCudaFileCopy([string]$Source, [string]$Destination) { $sx = [IO.File]::ReadAllText($Source); $script:y2pubs.Add([IO.Path]::GetFileName($Destination) + '=' + $sx.Substring(0, [math]::Min(12, $sx.Length))); [IO.File]::Copy($Source, $Destination, $true) }
+$rawLog = "[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:20.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=20000`n"
+$Pub = $y2pub; $utilSampleGpuCsv = Join-Path $y2dir 'gpu-util.csv'; $utilSampleCpuCsv = $y2csv
+$utilSampleGpuStart = [ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing'; owned = $false }; $utilSampleCpuStart = $run
+function Invoke-Region3($Rec) {
+    $script:utilSampleStopRecord = $Rec; $script:utilSamplePublished = $false; $script:utilSampleScalars = $null; $script:y2pubs = [Collections.Generic.List[string]]::new()
+    . ([scriptblock]::Create($region3))
+    @{ reason = [string]$utilSampleScalars['utilSampleReason']; total = $utilSampleScalars['cpuTotalMean']; published = @($script:y2pubs); pubFile = (Test-Path -LiteralPath (Join-Path $Pub 'cpu-util.csv')) }
+}
+$y2run = Invoke-Region3 $y2rec
+$y2fin = $(Remove-Item -LiteralPath (Join-Path $Pub 'cpu-util.csv') -ErrorAction SilentlyContinue; $script:utilSampleStopRecord = $y2rec; $script:utilSamplePublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new(); Publish-UtilSampleFiles; @($script:y2pubs))
+# a well-formed foreign file (a clean witness's rows) under the killed and the clean records
+$y2good = $H; for ($i = 0; $i -le 21; $i++) { $iu = $p0.AddSeconds($i); $y2good += (CpuRow $iu 50 1234 1 $iu.AddSeconds(-1) '0.4') }
+[IO.File]::WriteAllText($y2csv, $y2good)
+$y2killRun = Invoke-Region3 $y2krec
+Remove-Item -LiteralPath (Join-Path $Pub 'cpu-util.csv') -ErrorAction SilentlyContinue
+$y2cleanRun = Invoke-Region3 $y2crec
+$r['r6A2'] = @{ exit = $y2rec.cpu.exitCode; stopped = $y2rec.cpu.stopped; early = $y2rec.cpu.exitedBeforeStop; foreignFileOwned = [bool]$y2own; region3 = $y2run; finallyPublished = @($y2fin)
+    killed = @{ killed = $y2krec.cpu.killed; owned = [bool](Test-UtilSampleCpuOwned $run $y2krec); run = $y2killRun; summary = (Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $y2good) $run $x1w $y2krec.cpu).status }
+    clean = @{ owned = [bool](Test-UtilSampleCpuOwned $run $y2crec); run = $y2cleanRun } }
 Write-Output (J $r)
 """
 
@@ -757,13 +837,42 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual(a3["writer"], "written", "an nvidia-smi -f style truncating writer must still open the held file")
         self.assertIn("cpu-util-occupied", a3["foreign"], "a child whose CreateNew failed must end, not loop on a null handle")
         self.assertEqual(a3["foreignBytes"], "KEEP-FOREIGN")
-        self.assertEqual(a3["owned"], [True, False, False, False], "only a child still running at the stop owns (and publishes) cpu-util.csv")
+        self.assertEqual(a3["owned"], [True, False, False, False], "only a child still running at the stop, which exited 0, owns (and publishes) cpu-util.csv")
 
     def test_adv_01d6ad51_a4_a5_unreadable_cpu_time_and_other_jobs_instances_are_left_out(self) -> None:
         a = self.r["advA4A5"]
         self.assertEqual(a["unreadable"], 0, "a null CPU time became a zero baseline, or another job's instance was counted")
         self.assertEqual(a["ownOnly"], a["expected"], "only the job's own executable path counts (case-blind)")
         self.assertEqual(a["noPath"], 2, "without a path the name alone binds, as before")
+
+    def test_adv_f685c478_a1_a_cpu_percentage_weighs_the_interval_its_counter_measured(self) -> None:
+        # exact case: the 100 % sample was read at 2 s and the snapshot stalled to 6 s; at f685c478 the row took the snapshots' 5 s weight (25.0)
+        self.assertEqual(self.r["r6A1"], {"parseWhy": None, "clock": None, "status": "ok", "total": 5.0, "cores": 0.05, "inWindow": 16,
+                                          "unbound": "unavailable(cpu-counter-interval-unbound)"},
+                         "cpuTotalPct is weighted by its counter-read span; one without a bound counter interval fails closed")
+        loop = self.r["r6A1Loop"]
+        self.assertGreaterEqual(loop["rows"], 3, loop)
+        self.assertEqual(loop["bad"], [], f"a row's counterMs is not the span between the two counter reads it measured: {loop}")
+        self.assertIsNotNone(loop["stall"], f"the stalled snapshot left no long row: {loop}")
+        self.assertLess(loop["stall"]["counterMs"], 400, f"the stalled row's counter measured about 200 ms, not the snapshots' span: {loop}")
+        self.assertEqual((loop["outputs"], loop["created"]), (1, True), "the loop emits one result, which says its CreateNew succeeded")
+
+    def test_adv_f685c478_a2_a_child_that_failed_owns_nothing_and_nothing_is_published(self) -> None:
+        # exact case (in-memory double): stop read HasExited=false, then the child refused CreateNew over KEEP-FOREIGN and exited 1
+        a2 = self.r["r6A2"]
+        self.assertEqual((a2["exit"], a2["stopped"], a2["early"]), (1, True, False), a2)
+        self.assertFalse(a2["foreignFileOwned"], "a child that exited 1 gave no ownership signal (it was True at f685c478)")
+        self.assertEqual(a2["region3"], {"published": [], "total": None, "pubFile": False,
+                                         "reason": "gpu:unavailable(nvidia-smi-missing)+cpu:unavailable(cpu-sampler-exit-1)"},
+                         "the job's region 3 published KEEP-FOREIGN or summarised it")
+        self.assertEqual(a2["finallyPublished"], [], "the outer finally's publish must not publish it either")
+        self.assertEqual(a2["killed"], {"killed": True, "owned": False, "summary": "unavailable(cpu-util-unowned)",
+                                        "run": {"published": [], "total": None, "pubFile": False,
+                                                "reason": "gpu:unavailable(nvidia-smi-missing)+cpu:unavailable(cpu-util-unowned)"}},
+                         "a killed child gave no ownership signal: a well-formed foreign file is neither summarised nor published")
+        self.assertEqual(a2["clean"], {"owned": True, "run": {"published": ["cpu-util.csv=utc,cpuTotal"], "total": 50.0, "pubFile": True,
+                                                              "reason": "gpu:unavailable(nvidia-smi-missing)"}},
+                         "a child that exited 0 on the stop owns, summarises and publishes its file")
 
     def test_r5_an_empty_system_root_does_not_end_the_nvidia_smi_search(self) -> None:
         self.assertEqual(self.r["r5EmptyRoot"]["found"], self.r["r5EmptyRoot"]["expected"])
@@ -788,9 +897,9 @@ class UtilSamplePureHelperTests(unittest.TestCase):
     def test_t5_a_throwing_counter_still_writes_rows_and_ends_typed(self) -> None:
         got = self.r["cpuLoopThrowingCounter"]
         self.assertEqual(got["endedBy"], "deadline")
-        self.assertEqual(got["header"], "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs")
+        self.assertEqual(got["header"], "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs")
         self.assertGreaterEqual(got["rows"], 1)
-        self.assertRegex(got["firstRow"], r"^\d{4}-\d\d-\d\dT[^,]+Z,,,,\d{4}-\d\d-\d\dT[^,]+Z,\d+(\.\d+)?,\d+(\.\d+)?$",
+        self.assertRegex(got["firstRow"], r"^\d{4}-\d\d-\d\dT[^,]+Z,,,,\d{4}-\d\d-\d\dT[^,]+Z,\d+(\.\d+)?,\d+(\.\d+)?,$",
                          "a throwing counter is an empty field, never a throw or a 0; the interval start and clock step are still stated")
         self.assertGreaterEqual(got["errors"], 1)
         self.assertEqual(self.r["stopNull"], {"stopped": False, "why": "not-started"})

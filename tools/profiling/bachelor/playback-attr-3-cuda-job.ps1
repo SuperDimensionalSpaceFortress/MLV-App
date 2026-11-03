@@ -6871,23 +6871,32 @@ function Get-UtilSampleAppSnapshot($Procs, [string]$AppPath) {
 # adversary 01d6ad51: A3 the child creates its CSV with CreateNew and a name already there ends it at once (a throw, exit 1: a method exception
 # alone would leave the loop running on a $null handle), so the job, which publishes only a file whose child was still running at the stop
 # (Test-UtilSampleCpuOwned), never publishes another writer's bytes; A4 / A5 Get-UtilSampleAppSnapshot ($AppPath = the job's own exe).
-# intervalMs (A2) is the monotonic span between the row's two snapshots, its duration weight.
-function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$AppName, [int]$IntervalMs, [int64]$DeadlineMs, $ReadTotal, [int]$ParentPid, [int64]$ParentStartTicks, [int]$GpuPid, [int64]$GpuStartTicks, $UtcTicks = $null, [string]$AppPath = '') {
-    $res = [ordered]@{ endedBy = $null; rows = 0; counterErrors = 0; gpuKilled = $false }
+# intervalMs (A2) is the monotonic span between the row's two snapshots, the duration weight of appCpuCores.
+# adversary f685c478 A1: cpuTotalPct is what the counter measured between ITS two reads, which a stall between the counter read and the snapshot
+# separates from the snapshots' span, so counterMs (the monotonic span from the previous row's counter read to this row's) is its weight. Each counter
+# read is bracketed by two monotonic reads; a bracket wider than 50 ms, a failed read, or a previous read that failed or was unbracketed leaves
+# counterMs empty, and the summary refuses a window holding a cpuTotalPct without one (cpu-counter-interval-unbound). res.created is set only once
+# CreateNew succeeded (A2: the child's exit 0 is its positive ownership signal). $SnapSeam: a test seam for the app snapshot ($null = Get-Process).
+function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$AppName, [int]$IntervalMs, [int64]$DeadlineMs, $ReadTotal, [int]$ParentPid, [int64]$ParentStartTicks, [int]$GpuPid, [int64]$GpuStartTicks, $UtcTicks = $null, [string]$AppPath = '', $SnapSeam = $null) {
+    $res = [ordered]@{ endedBy = $null; rows = 0; counterErrors = 0; gpuKilled = $false; created = $false }
     if ($null -eq $UtcTicks) { $UtcTicks = { [DateTime]::UtcNow.Ticks } }
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $u8 = [Text.UTF8Encoding]::new($false)
     try {
         $uf = [IO.File]::Open($CsvPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     } catch { throw ('cpu-util-occupied: ' + ([string]$_.Exception.Message -replace '\s+', ' ')) }
+    $res.created = $true
     try {
-        $ub = $u8.GetBytes("utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs`n")
+        $ub = $u8.GetBytes("utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n")
         $uf.Write($ub, 0, $ub.Length); $uf.Flush()
-        $snap = { Get-UtilSampleAppSnapshot @(Get-Process -Name $AppName -ErrorAction SilentlyContinue) $AppPath }
+        $snap = $SnapSeam
+        if ($null -eq $snap) { $snap = { Get-UtilSampleAppSnapshot @(Get-Process -Name $AppName -ErrorAction SilentlyContinue) $AppPath } }
         $w = [Diagnostics.Stopwatch]::StartNew()
         $ck = @{ u = $null; m = 0.0; e = 0.0; maxStep = 0.0 }
         $from = Read-UtilSampleClock $ck $w $UtcTicks
-        try { [void](& $ReadTotal) } catch { }
+        $prevCm = $null
+        $cmA = $w.Elapsed.TotalMilliseconds
+        try { [void](& $ReadTotal); $cmB = $w.Elapsed.TotalMilliseconds; if ($cmB - $cmA -le 50) { $prevCm = ($cmA + $cmB) / 2 } } catch { }
         $prev = & $snap; $prevMs = $w.Elapsed.TotalMilliseconds; $next = $prevMs + $IntervalMs
         while ($true) {
             [void](Read-UtilSampleClock $ck $w $UtcTicks)
@@ -6904,8 +6913,11 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             # one plus one interval, which would emit a burst of near-zero-width rows that the summary then weights as whole intervals.
             $next += $IntervalMs
             $lo = Read-UtilSampleClock $ck $w $UtcTicks
-            $total = ''
-            try { $total = ([double](& $ReadTotal)).ToString('0.###', $inv) } catch { $res.counterErrors++ }
+            $total = ''; $cm = $null; $counterMs = ''
+            $cmA = $w.Elapsed.TotalMilliseconds
+            try { $total = ([double](& $ReadTotal)).ToString('0.###', $inv); $cmB = $w.Elapsed.TotalMilliseconds; if ($cmB - $cmA -le 50) { $cm = ($cmA + $cmB) / 2 } } catch { $res.counterErrors++ }
+            if ($null -ne $cm -and $null -ne $prevCm) { $counterMs = ($cm - $prevCm).ToString('0.###', $inv) }
+            $prevCm = $cm
             $cur = & $snap; $nowMs = $w.Elapsed.TotalMilliseconds
             $hi = Read-UtilSampleClock $ck $w $UtcTicks
             if ($next -le $nowMs) { $next = $nowMs + $IntervalMs }
@@ -6915,7 +6927,7 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             $dt = ($nowMs - $prevMs) / 1000.0
             $cores = ''
             if ($both -gt 0 -and $dt -gt 0) { $cores = ($sec / $dt).ToString('0.####', $inv) }
-            $ub = $u8.GetBytes("$($hi.ToString('o', $inv)),$total,$pids,$cores,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),$(($nowMs - $prevMs).ToString('0.###', $inv))`n")
+            $ub = $u8.GetBytes("$($hi.ToString('o', $inv)),$total,$pids,$cores,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),$(($nowMs - $prevMs).ToString('0.###', $inv)),$counterMs`n")
             $uf.Write($ub, 0, $ub.Length); $uf.Flush()
             $res.rows++
             $prev = $cur; $prevMs = $nowMs; $from = $lo; $ck.maxStep = 0.0
@@ -6978,8 +6990,15 @@ function Stop-UtilSampleAll($GpuStart, $CpuStart, $WriteStop, [int]$WaitMs) {
 
 # adversary 01d6ad51 A3: cpu-util.csv is the job's own only when its child was running when the job stopped it (a child whose CreateNew refused an
 # occupied name exits at once, before any stop), so only then is it published.
+# adversary f685c478 A2: "running when stopped" is not proof that THIS child created the file (a child stopped during pwsh startup can still refuse
+# CreateNew and exit 1, leaving another writer's file). Ownership needs the child's positive signal: it exits 0 only after its CreateNew succeeded
+# (res.created; a refusal throws, exit 1), so a non-zero or unknown exit code, a killed child, or one that ended before the stop owns nothing.
 function Test-UtilSampleCpuOwned($Start, $StopRecord) {
-    try { return ($null -ne $Start -and $Start.status -ceq 'running' -and $null -ne $StopRecord -and $null -ne $StopRecord.cpu -and [bool]$StopRecord.cpu.stopped -and -not $StopRecord.cpu.exitedBeforeStop) } catch { return $false }
+    try {
+        if ($null -eq $Start -or $Start.status -cne 'running' -or $null -eq $StopRecord -or $null -eq $StopRecord.cpu) { return $false }
+        $c = $StopRecord.cpu
+        return ([bool]$c.stopped -and -not $c.exitedBeforeStop -and -not $c.killed -and $null -ne $c.exitCode -and [int]$c.exitCode -eq 0)
+    } catch { return $false }
 }
 
 # A sampler file's text, read shared (the writer may still hold it); $null when absent or unreadable.
@@ -7061,17 +7080,22 @@ function ConvertFrom-UtilSampleGpuCsv($Text, [TimeZoneInfo]$Zone) {
 # witness, is never a row).
 # adversary 01d6ad51 A2: intervalMs (the monotonic span between the row's two snapshots, >= 0) is the row's duration weight; fromUtc..utc only
 # bounds where that interval lies (it is wider when a read stalled), so it decides inclusion, never weight.
+# adversary f685c478 A1: counterMs (empty, or the monotonic span between this row's counter read and the previous one, >= 0) is cpuTotalPct's weight.
 function ConvertFrom-UtilSampleCpuRow([string]$Line) {
     $f = $Line.Split(',')
-    if ($f.Count -ne 7) { return $null }
+    if ($f.Count -ne 8) { return $null }
     $inv = [Globalization.CultureInfo]::InvariantCulture
-    $u = [DateTime]::MinValue; $fu = [DateTime]::MinValue; $step = 0.0; $iv = 0.0
+    $u = [DateTime]::MinValue; $fu = [DateTime]::MinValue; $step = 0.0; $iv = 0.0; $cmv = 0.0; $cm = $null
+    if ($f[7].Length -gt 0) {
+        if (-not [double]::TryParse($f[7], [Globalization.NumberStyles]::Float, $inv, [ref]$cmv) -or [double]::IsNaN($cmv) -or [double]::IsInfinity($cmv) -or $cmv -lt 0) { return $null }
+        $cm = $cmv
+    }
     if (-not [DateTime]::TryParse($f[0], $inv, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$u) -or $u.Kind -ne [DateTimeKind]::Utc) { return $null }
     if (-not [DateTime]::TryParse($f[4], $inv, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$fu) -or $fu.Kind -ne [DateTimeKind]::Utc -or $fu -gt $u) { return $null }
     if (-not [double]::TryParse($f[5], [Globalization.NumberStyles]::Float, $inv, [ref]$step) -or [double]::IsNaN($step) -or [double]::IsInfinity($step)) { return $null }
     if (-not [double]::TryParse($f[6], [Globalization.NumberStyles]::Float, $inv, [ref]$iv) -or [double]::IsNaN($iv) -or [double]::IsInfinity($iv) -or $iv -lt 0) { return $null }
     if ($f[2].Length -gt 0 -and $f[2] -notmatch '^\d+(;\d+)*$') { return $null }
-    $out = [ordered]@{ utc = $u; total = $null; pids = $f[2]; cores = $null; fromUtc = $fu; step = $step; intervalMs = $iv }
+    $out = [ordered]@{ utc = $u; total = $null; pids = $f[2]; cores = $null; fromUtc = $fu; step = $step; intervalMs = $iv; counterMs = $cm }
     foreach ($pair in @(@(1, 'total'), @(3, 'cores'))) {
         $s = $f[$pair[0]]; $v = 0.0
         if ($s.Length -eq 0) { continue }
@@ -7088,7 +7112,7 @@ function ConvertFrom-UtilSampleCpuCsv($Text) {
     $r.tornTail = $sp.torn
     $all = @($sp.lines)
     if ($all.Count -eq 0) { $r.why = 'cpu-util-no-rows'; return $r }
-    if ($all[0] -cne 'utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs') { $r.why = 'cpu-util-unparseable'; return $r }
+    if ($all[0] -cne 'utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs') { $r.why = 'cpu-util-unparseable'; return $r }
     for ($i = 1; $i -lt $all.Count; $i++) {
         $r.lines++
         $row = ConvertFrom-UtilSampleCpuRow $all[$i]
@@ -7150,14 +7174,17 @@ function Get-UtilSampleStats($Values) {
 # Duration-weighted mean of one field of interval rows (sol r4 B4): each row weighs the interval it measured (intervalMs, adversary 01d6ad51 A2),
 # capped at its bounds clipped to $Window, so a row that covers a 5 s stall weighs five times a 1 s row and the row after a stalled read weighs
 # only its own span; rows with a $null value or no weight are left out. n is the rows used; mean $null for none or non-finite.
-function Get-UtilSampleWeightedMean($Rows, [string]$Field, $Window) {
+# adversary f685c478 A1: $WeightField names the interval the field measured: intervalMs (snapshot to snapshot) for appCpuCores, counterMs (counter
+# read to counter read) for cpuTotalPct.
+function Get-UtilSampleWeightedMean($Rows, [string]$Field, $Window, [string]$WeightField = 'intervalMs') {
     $sv = 0.0; $sw = 0.0; $n = 0
     foreach ($row in @($Rows)) {
         $v = $row[$Field]
         if ($null -eq $v) { continue }
+        if ($null -eq $row[$WeightField]) { continue }
         $a = $row.fromUtc; $b = $row.utc
         if ($null -ne $Window) { if ($a -lt $Window.startUtc) { $a = $Window.startUtc }; if ($b -gt $Window.endUtc) { $b = $Window.endUtc } }
-        $wt = [math]::Min([double]$row.intervalMs, ($b - $a).TotalMilliseconds)
+        $wt = [math]::Min([double]$row[$WeightField], ($b - $a).TotalMilliseconds)
         if (-not ($wt -gt 0)) { continue }
         $sv += [double]$v * $wt; $sw += $wt; $n++
     }
@@ -7270,15 +7297,19 @@ function Get-UtilSampleCpuSummary($Parsed, $Start, $Window, $Stop = $null) {
             if ($Stop.exitedBeforeStop) { $s.status = 'unavailable(cpu-sampler-exited-early)'; return $s }
             if (-not $Stop.stopped -and $Stop.why -cne 'not-started') { $s.status = 'unavailable(cpu-sampler-stop-failed)'; return $s }
             if ($Stop.stopped -and -not $Stop.killed -and $null -ne $Stop.exitCode -and [int]$Stop.exitCode -ne 0) { $s.status = "unavailable(cpu-sampler-exit-$([int]$Stop.exitCode))"; return $s }
+            # adversary f685c478 A2: a file whose child gave no ownership signal (killed, or no exit code) is not summarised
+            if (-not (Test-UtilSampleCpuOwned $Start ([ordered]@{ cpu = $Stop }))) { $s.status = 'unavailable(cpu-util-unowned)'; return $s }
         }
         if ($Parsed.why) { $s.status = "unavailable($($Parsed.why))"; return $s }
         if ($null -ne $Window) { $cw = Get-UtilSampleWindowClockWhy $Window; if ($cw) { $s.status = "unavailable($cw)"; return $s } }
         if ($null -ne $Window -and -not (Test-UtilSampleClockSteady $Parsed.rows)) { $s.status = 'unavailable(sample-clock-unverified)'; return $s }
         $in = @(Select-UtilSampleWindowRows $Parsed.rows $Window $true)
         $s.rowsInWindow = $in.Count
-        # sol r4 B4: duration-weighted, so a stalled tick's long row is not counted as one short interval
-        $tot = Get-UtilSampleWeightedMean $in 'total' $Window
-        $cor = Get-UtilSampleWeightedMean $in 'cores' $Window
+        # adversary f685c478 A1: a cpuTotalPct whose own counter interval is not bound (no counterMs) fails closed, never a guessed weight
+        if (@($in | Where-Object { $null -ne $_['total'] -and $null -eq $_['counterMs'] }).Count -gt 0) { $s.status = 'unavailable(cpu-counter-interval-unbound)'; return $s }
+        # sol r4 B4: duration-weighted, so a stalled tick's long row is not counted as one short interval; A1: each by the interval it measured
+        $tot = Get-UtilSampleWeightedMean $in 'total' $Window 'counterMs'
+        $cor = Get-UtilSampleWeightedMean $in 'cores' $Window 'intervalMs'
         $s.totalMean = $tot.mean; $s.appCoresMean = $cor.mean
         $ids = @($in | ForEach-Object { if ($_.pids) { $_.pids.Split(';') } } | Where-Object { $_ } | ForEach-Object { [int]$_ } | Sort-Object -Unique)
         if ($ids.Count -gt 0) { $s.appPids = ($ids -join ';') }
@@ -7351,7 +7382,9 @@ if ($utilSampleEmit) {
 $pc = $null
 try { $pc = [Diagnostics.PerformanceCounter]::new('Processor', '% Processor Time', '_Total') } catch { }
 $rt = { if ($null -eq $pc) { throw 'counter-unavailable' }; $pc.NextValue() }
-[void](Invoke-UtilSampleCpuLoop ([string]$env:MLV_US_CSV) ([string]$env:MLV_US_STOP) ([string]$env:MLV_US_APP) 1000 ([int64]$env:MLV_US_DEADLINE_MS) $rt ([int]$env:MLV_US_PARENT) ([int64]$env:MLV_US_PARENT_START) ([int]$env:MLV_US_GPU_PID) ([int64]$env:MLV_US_GPU_START) $null ([string]$env:MLV_US_APP_PATH))
+$us = Invoke-UtilSampleCpuLoop ([string]$env:MLV_US_CSV) ([string]$env:MLV_US_STOP) ([string]$env:MLV_US_APP) 1000 ([int64]$env:MLV_US_DEADLINE_MS) $rt ([int]$env:MLV_US_PARENT) ([int64]$env:MLV_US_PARENT_START) ([int]$env:MLV_US_GPU_PID) ([int64]$env:MLV_US_GPU_START) $null ([string]$env:MLV_US_APP_PATH)
+if ($null -ne $us -and $us.created) { exit 0 }
+exit 6
 '@
     $usChild = (@($usChild -split "\r?\n" | ForEach-Object { $_.TrimStart() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }) -join "`n")
     $usEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($usChild))
@@ -7375,7 +7408,8 @@ $utilSampleScalars = $null
 function Publish-UtilSampleFiles {
     if ($script:utilSamplePublished) { return }
     $script:utilSamplePublished = $true
-    # sol r4 B3: only a file this job created is published (the GPU side's CreateNew, the CPU side's child start); an occupied name never is
+    # sol r4 B3: only a file this job created is published (the GPU side's CreateNew; the CPU side's child exit 0 after its CreateNew, adversary
+    # f685c478 A2); an occupied name never is
     try { if ($utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $utilSampleGpuCsv -Destination (Join-Path $Pub 'gpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=gpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
     try { if ((Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $utilSampleCpuCsv -Destination (Join-Path $Pub 'cpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=cpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
 }
@@ -7403,7 +7437,13 @@ try {
     $utilSampleWindow = Get-UtilSamplePlayWindow $rawLog
     $utilSampleStopGpu = $null; $utilSampleStopCpu = $null
     if ($null -ne $utilSampleStopRecord) { $utilSampleStopGpu = $utilSampleStopRecord.gpu; $utilSampleStopCpu = $utilSampleStopRecord.cpu }
-    $utilSampleCpuParsed = ConvertFrom-UtilSampleCpuCsv (Read-UtilSampleText $utilSampleCpuCsv)
+    # adversary f685c478 A2: cpu-util.csv is read only when its child proved it created it (exit 0 after CreateNew); otherwise it is unowned, which
+    # also leaves the clock witness unwitnessed for both summaries
+    $utilSampleCpuText = $null
+    $utilSampleCpuOwned = Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord
+    if ($utilSampleCpuOwned) { $utilSampleCpuText = Read-UtilSampleText $utilSampleCpuCsv }
+    $utilSampleCpuParsed = ConvertFrom-UtilSampleCpuCsv $utilSampleCpuText
+    if (-not $utilSampleCpuOwned) { $utilSampleCpuParsed.why = 'cpu-util-unowned' }
     # sol r4 B2: the CPU child's clock witness decides whether the window maps onto the sample stamps, for both summaries
     if ($null -ne $utilSampleWindow) { $utilSampleWindow['clockWhy'] = Get-UtilSampleClockWitness $utilSampleCpuParsed $utilSampleCpuStart $utilSampleWindow }
     $utilSampleGpu = Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv (Read-UtilSampleText $utilSampleGpuCsv) ([TimeZoneInfo]::Local)) $utilSampleGpuStart $utilSampleWindow $utilSampleStopGpu
