@@ -62,6 +62,22 @@ int pumpDueWakeMessages( PlaybackDueWake & wake, DWORD waitMs )
     }
     return taken;
 }
+
+// True once a message of this wake sits in the queue (left there), within waitMs.
+bool dueWakeMessageQueued( PlaybackDueWake & wake, DWORD waitMs )
+{
+    const HWND window = reinterpret_cast<HWND>( wake.nativeWindow() );
+    const ULONGLONG deadline = GetTickCount64() + waitMs;
+    MSG msg;
+    while( GetTickCount64() < deadline )
+    {
+        if( PeekMessageW( &msg, window, PlaybackDueWake::kNativeWakeMessage, PlaybackDueWake::kNativeWakeMessage,
+                          PM_NOREMOVE ) )
+            return true;
+        Sleep( 1 );
+    }
+    return false;
+}
 #endif
 }
 
@@ -170,15 +186,17 @@ TEST(PlaybackDueWakeNative, TheWaitThreadDeliversOnceAndAMessageQueuedBeforeACan
     ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
     ASSERT_EQ( 1, fired );
     ASSERT_FALSE( wake.armed() );
-    // posted while nobody pumps, then cancelled (Play stopped) before the GUI thread reads it: consumed, does nothing
+    // posted while nobody pumps, then cancelled (Play stopped) before the GUI thread reads it: consumed, does nothing.
+    // (adversary pass 4 A2: wait until the message is really queued, never a fixed sleep, before cancelling or re-arming --
+    // a re-arm before the wait thread consumed the old expiry resets the timer and only one message would ever post)
     wake.arm( 0.5 );
-    Sleep( 30 );
+    ASSERT_TRUE( dueWakeMessageQueued( wake, 500 ) );
     wake.cancel();
     ASSERT_EQ( 1, pumpDueWakeMessages( wake, 60 ) );
     ASSERT_EQ( 1, fired );
     // re-armed while the old message is queued: the old one is dropped, the new one fires once
     wake.arm( 0.5 );
-    Sleep( 30 );
+    ASSERT_TRUE( dueWakeMessageQueued( wake, 500 ) );
     wake.arm( 2.0 );
     ASSERT_EQ( 2, pumpDueWakeMessages( wake, 200 ) );
     ASSERT_EQ( 2, fired );
@@ -232,7 +250,33 @@ TEST(PlaybackDueWakeA1, EveryFrameModeAdvancesOnlyPastAPresentedFrame)
     const int advance = wake.indexOf( QStringLiteral( "timerFrameEvent( true );" ) );
     ASSERT_TRUE( gate > 0 && advance > gate );
     const QString held = wake.mid( gate, advance - gate );
-    ASSERT_TRUE( held.contains( QStringLiteral( "m_lastPresentedPlaybackFrame, ui->horizontalSliderPosition->value() ) )" ) ) );
+    ASSERT_TRUE( held.contains( QStringLiteral( "m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )" ) ) );
     ASSERT_TRUE( held.contains( QStringLiteral( "m_playbackFrameAdvancePending = true;" ) ) );
     ASSERT_TRUE( held.contains( QStringLiteral( "++m_playbackDueWakeUnpresentedDeferred;" ) ) );
+}
+
+TEST(PlaybackDueWakeA1, TheGateReadsTheFrameWhosePresentEndedNotTheOneAcceptedForPreparation)
+{
+    // r2 adversary pass 4 A1 input: CPU, 60 fps, every-frame mode, lookahead 0, zebras on. Frame 8 on screen; the tail requests 9
+    // at 1000 ms; 8's present ends at 1001 ms and arms the wake for 1016.9 ms. drawFrameReady accepts 9 at 1010 ms and records it
+    // as m_lastPresentedPlaybackFrame BEFORE its background preparation, whose worker is descheduled until 1020 ms. At the wake the
+    // accepted frame equals the slider (9 == 9), so a gate on it advanced to 10, whose enqueued preparation replaced 9's: 9 was
+    // never shown. The frame whose present ENDED is still 8, so the wake must hold.
+    const long long presentEnded = 8;
+    const long long acceptedForPreparation = 9;
+    const int slider = 9;
+    ASSERT_TRUE( playbackDueWakeMayAdvance( false, false, acceptedForPreparation, slider ) );   // the pass 4 shape on dc7b5c43
+    ASSERT_FALSE( playbackDueWakeMayAdvance( false, false, presentEnded, slider ) );            // held until 9's present ends
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    const QString wake = functionBody( source, QStringLiteral( "void MainWindow::onPlaybackDueWake( void )" ),
+                                       QStringLiteral( "void MainWindow::cancelPlaybackDueWake( void )" ) );
+    ASSERT_FALSE( wake.contains( QStringLiteral( "m_lastPresentedPlaybackFrame" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "m_playbackDueWakePresentedFrame = static_cast<long long>( display_frame );" ) ) );
+    // set at the END of presentPlaybackPreparedFrame, right before the wake is armed from that present
+    const int set = source.indexOf( QStringLiteral( "m_playbackDueWakePresentedFrame = static_cast<long long>( display_frame );" ) );
+    const int armed = source.indexOf( QStringLiteral( "    armPlaybackDueWake();\n" ), set );
+    const int present = source.lastIndexOf( QStringLiteral( "void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )" ), set );
+    const int finish = source.lastIndexOf( QStringLiteral( "    finishPresentedFrame( display_frame," ), set );
+    ASSERT_TRUE( present > 0 && finish > present && set > finish && armed > set && armed - set < 400 );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "m_playbackDueWakePresentedFrame = -1;" ) ) );   // reset with the counters at Play
 }

@@ -6664,6 +6664,10 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     if( ui->actionPlay->isChecked() )
         m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
+    // r2 adversary pass 4 A1: the frame the due wake may advance past is the one whose present ENDED here, not the one
+    // drawFrameReady accepted (m_lastPresentedPlaybackFrame is set before background preparation, which a newer request
+    // can still replace before it presents)
+    m_playbackDueWakePresentedFrame = static_cast<long long>( display_frame );
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the next advance is due when the pace credit covers the next whole
     // frame, not at the next poll tick (10-16 ms later on Windows).
     armPlaybackDueWake();
@@ -19584,7 +19588,7 @@ void MainWindow::onPlaybackDueWake( void )
     // not sent yet does not read as busy above, so without this the wake requested N+1 over the unpresented N and
     // latest-ready acquisition skipped N; drawFrameReady presents N and its advance consumes the pending flag.
     if( !playbackDueWakeMayAdvance( m_frameStillDrawing, ui->actionDropFrameMode->isChecked(),
-                                    m_lastPresentedPlaybackFrame, ui->horizontalSliderPosition->value() ) )
+                                    m_playbackDueWakePresentedFrame, ui->horizontalSliderPosition->value() ) )
     {
         m_playbackFrameAdvancePending = true;
         ++m_playbackDueWakeUnpresentedDeferred;
@@ -19630,6 +19634,7 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeRearmed = 0;
     m_playbackDueWakeBusyDeferred = 0;
     m_playbackDueWakeUnpresentedDeferred = 0;
+    m_playbackDueWakePresentedFrame = -1;   // nothing presented in this Play yet
     m_playbackDueWakeHiRes = false;
     m_playbackDueWakeDelivery = "none";
     m_playbackDueWakeLatenessMs.clear();
