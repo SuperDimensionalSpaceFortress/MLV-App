@@ -1,0 +1,203 @@
+# ps_ast_inventory.ps1 - LANE-HUBCHAT-DETACHED-DISPATCH-1 r15 (folds LANE-DIRTY-SAVE-CENSUS-PS-AST-1); r16 adds scoped_vars and strings (sol r15b B1).
+# Reads a JSON array of PowerShell source texts on stdin and writes a JSON array of inventories on stdout, one per text, in order.
+# It only PARSES ([System.Management.Automation.Language.Parser]::ParseInput); nothing in a text is run, imported or compiled.
+# The parser has already resolved backticks, whitespace, quoting and escapes, so a name read here is the name PowerShell binds, whatever its spelling.
+# POLICY LIVES IN THE CALLER (tools/repo_hygiene/test_owner_footage_no_hardlink_class.py, lane_dirty_save_violations): this file only reports what is there.
+# Each inventory:
+#   errors      [{line, message}]                      parse errors (the caller fails closed on any)
+#   commands    [{line, name, text, operator, head, head_var, pipeline, elements}]
+#               name is the literal command name, or null when it is computed (a variable, an expression, an expandable string);
+#               head is the AST type of the first element; head_var the unqualified variable name when that element is a variable;
+#               elements (after the head): [{kind, param, param_arg, value, string_type, splatted}] (value: a string's text, an expandable string unexpanded)
+#   members     [{line, name, kind, static, on, invoke, args}]  name null when the member is computed; on = the type literal a static member is read from;
+#               args = AST types of the invoked arguments
+#   functions   [{line, name}]
+#   types       [{line, name, where}]                  type literals, type constraints and attributes
+#   drive_vars  [{line, path, drive}]                  ${drive:name} references (function:, alias:, env:, ...; the parser does NOT count variable: as a drive)
+#   scoped_vars [{line, path, qualifier}]              every variable reference written with a qualifier ($variable:x, ${function:x}, $global:x, $env:x, ...) (r16)
+#   strings     [{line, value}]                        every string literal (an expandable string unexpanded) that holds a ':', so a provider path in any
+#                                                      argument, pipeline input or assignment is seen (r16)
+#   assignments [{line, name, names, operator, right}] name = the one variable assigned (null otherwise); names = every variable on the left;
+#                                                      right = AST type of the assigned expression
+#   foreach_vars [{line, name}]
+#   params      [{line, name, types}]
+#   ref_vars    [{line, name}]                         [ref]$name
+#   uses        [{line, name, site}]                   every use of a variable named in -UseNames, with the text of its site (Get-UseSite)
+#   using       [{line, text}]                         using module / assembly / namespace statements
+#   requires    {modules, assemblies, snapins}         #Requires entries that load code
+#   other       [{line, kind}]                         class / enum / configuration / dynamic keyword definitions
+# ASCII only. PowerShell 7.
+param([string]$UseNames = '')  # comma-separated variable names whose every use is reported in 'uses'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Get-UnqualifiedName($VariablePath) {
+    $path = [string]$VariablePath.UserPath
+    if ($VariablePath.IsDriveQualified) { return $path }
+    # variable: is the variable provider's own qualifier, not a drive to the parser: $variable:psi IS $psi (r16, sol r15b B1)
+    return ($path -replace '^(?i)(global|script|local|private|using|workflow|variable):', '')
+}
+
+function Get-ExpressionKind($Statement) {
+    # the AST type a statement evaluates to, looking through a one-element pipeline and a command expression
+    $node = $Statement
+    if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0] }
+    if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression }
+    return $node.GetType().Name
+}
+
+function Get-UseSite($Var) {
+    # where a variable is used: the OUTERMOST assignment, command or expression statement that holds it within its statement, else its parameter or
+    # foreach header, so an alias ($x = $psi), a call through it ($psi.ArgumentList.Add(...)) and an assignment used as a value ($x = ($psi = ...),
+    # r16 adversary a11c4459-A1) are each their own site
+    $node = $Var.Parent
+    $site = $null
+    while ($null -ne $node) {
+        if ($node -is [System.Management.Automation.Language.StatementBlockAst] -or $node -is [System.Management.Automation.Language.NamedBlockAst] -or $node -is [System.Management.Automation.Language.ScriptBlockAst]) { break }
+        if ($null -eq $site -and $node -is [System.Management.Automation.Language.ParameterAst]) { return 'param ' + $node.Extent.Text }
+        # a foreach or switch header hands its value to its body ($a, $_), and so does a pipeline to its next element: each is the site, whatever is inside it
+        # (r16 iter 2, adversary 31a40a36-A1: switch ($psi = New-Object ...) { default { $x = $_ } })
+        if ($node -is [System.Management.Automation.Language.ForEachStatementAst]) { return 'foreach (' + $node.Variable.Extent.Text + ' in ' + $node.Condition.Extent.Text + ')' }
+        if ($node -is [System.Management.Automation.Language.SwitchStatementAst]) { return 'switch (' + $node.Condition.Extent.Text + ')' }
+        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -or $node -is [System.Management.Automation.Language.CommandAst] -or $node -is [System.Management.Automation.Language.CommandExpressionAst] -or
+            $node -is [System.Management.Automation.Language.ReturnStatementAst] -or $node -is [System.Management.Automation.Language.ThrowStatementAst] -or $node -is [System.Management.Automation.Language.ExitStatementAst] -or
+            ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -gt 1)) { $site = $node.Extent.Text }
+        $node = $node.Parent
+    }
+    return $site
+}
+
+function Get-Inventory([string]$Text) {
+    $tokens = $null
+    $errors = $null
+    $root = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
+    $inv = [ordered]@{
+        errors = @(); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); scoped_vars = @(); strings = @(); assignments = @()
+        foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @()
+    }
+    foreach ($e in @($errors)) { $inv.errors += [ordered]@{ line = $e.Extent.StartLineNumber; message = $e.Message } }
+    foreach ($u in @($root.UsingStatements)) { $inv.using += [ordered]@{ line = $u.Extent.StartLineNumber; text = $u.Extent.Text } }
+    $req = $root.ScriptRequirements
+    if ($null -ne $req) {
+        $inv.requires.modules = @($req.RequiredModules).Count
+        $inv.requires.assemblies = @($req.RequiredAssemblies).Count
+        $snapins = $req.PSObject.Properties['RequiresPSSnapIns']  # Windows PowerShell only
+        if ($null -ne $snapins) { $inv.requires.snapins = @($snapins.Value).Count }
+    }
+    foreach ($node in $root.FindAll({ $true }, $true)) {
+        $line = $node.Extent.StartLineNumber
+        switch ($node) {
+            { $_ -is [System.Management.Automation.Language.CommandAst] } {
+                $head = $node.CommandElements[0]
+                $headVar = $null
+                if ($head -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $head.Splatted) { $headVar = Get-UnqualifiedName $head.VariablePath }
+                $elements = @()
+                foreach ($el in @($node.CommandElements | Select-Object -Skip 1)) {
+                    $row = [ordered]@{ kind = $el.GetType().Name; text = $el.Extent.Text; param = $null; param_arg = $null; value = $null; string_type = $null; splatted = $false }
+                    if ($el -is [System.Management.Automation.Language.CommandParameterAst]) {
+                        $row.param = $el.ParameterName
+                        if ($null -ne $el.Argument) {
+                            $row.param_arg = $el.Argument.GetType().Name
+                            if ($el.Argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $row.value = $el.Argument.Value }
+                        }
+                    } elseif ($el -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                        $row.value = $el.Value
+                        $row.string_type = $el.StringConstantType.ToString()
+                    } elseif ($el -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+                        $row.value = $el.Value
+                        $row.string_type = $el.StringConstantType.ToString()
+                    } elseif ($el -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                        $row.splatted = [bool]$el.Splatted
+                    }
+                    $elements += $row
+                }
+                $pipeline = 0
+                if ($node.Parent -is [System.Management.Automation.Language.PipelineAst]) { $pipeline = $node.Parent.PipelineElements.Count }
+                $inv.commands += [ordered]@{
+                    line = $line; name = $node.GetCommandName(); text = $head.Extent.Text; operator = $node.InvocationOperator.ToString()
+                    head = $head.GetType().Name; head_var = $headVar; pipeline = $pipeline; elements = $elements
+                }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.MemberExpressionAst] } {
+                $name = $null
+                if ($node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $name = $node.Member.Value }
+                $invoke = $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+                $on = $null
+                $onVar = $null
+                if ($node.Expression -is [System.Management.Automation.Language.VariableExpressionAst]) { $onVar = Get-UnqualifiedName $node.Expression.VariablePath }
+                if ($node.Static -and $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) { $on = $node.Expression.TypeName.FullName }
+                $argKinds = @()
+                if ($invoke) { foreach ($a in @($node.Arguments)) { if ($null -ne $a) { $argKinds += $a.GetType().Name } } }
+                $inv.members += [ordered]@{ line = $line; name = $name; kind = $node.Member.GetType().Name; text = $node.Extent.Text; static = [bool]$node.Static; on = $on; on_var = $onVar; invoke = $invoke; args = $argKinds }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } { $inv.functions += [ordered]@{ line = $line; name = $node.Name }; break }
+            { $_ -is [System.Management.Automation.Language.TypeExpressionAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'literal' }; break }
+            { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'constraint' }; break }
+            { $_ -is [System.Management.Automation.Language.AttributeAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'attribute' }; break }
+            { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $_ -is [System.Management.Automation.Language.ExpandableStringExpressionAst] } {
+                if ([string]$node.Value -match ':') { $inv.strings += [ordered]@{ line = $line; value = [string]$node.Value } }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } {
+                $userPath = [string]$node.VariablePath.UserPath
+                if ($userPath -match '^([^:]+):') { $inv.scoped_vars += [ordered]@{ line = $line; path = $userPath; qualifier = $Matches[1] } }
+                if ($node.VariablePath.IsDriveQualified) { $inv.drive_vars += [ordered]@{ line = $line; path = $node.VariablePath.UserPath; drive = $node.VariablePath.DriveName } }
+                elseif ($useNameList -contains (Get-UnqualifiedName $node.VariablePath)) { $inv.uses += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.VariablePath); site = (Get-UseSite $node) } }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] } {
+                $left = $node.Left
+                while ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+                $name = $null
+                if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) { $name = Get-UnqualifiedName $left.VariablePath }
+                # every variable named anywhere on the left ($a, $b = ..., $x.P = ..., $h[$k] = ...), so a multiple assignment cannot hide a target
+                $names = @($node.Left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { Get-UnqualifiedName $_.VariablePath })
+                $drive = $null
+                if ($left -is [System.Management.Automation.Language.VariableExpressionAst] -and $left.VariablePath.IsDriveQualified) { $drive = $left.VariablePath.UserPath }
+                $inv.assignments += [ordered]@{ line = $line; name = $name; names = $names; drive = $drive; operator = $node.Operator.ToString(); right = (Get-ExpressionKind $node.Right); left_text = $node.Left.Extent.Text; right_text = $node.Right.Extent.Text }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.UnaryExpressionAst] -and $_.TokenKind -in 'PlusPlus', 'MinusMinus', 'PostfixPlusPlus', 'PostfixMinusMinus' } {
+                # ++$x / $x-- write $x too: reported as an assignment whose operator is the token (r16 adversary a11c4459-A4)
+                $left = $node.Child
+                $name = $null
+                $drive = $null
+                if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $name = Get-UnqualifiedName $left.VariablePath
+                    if ($left.VariablePath.IsDriveQualified) { $drive = $left.VariablePath.UserPath }
+                }
+                $names = @($left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { Get-UnqualifiedName $_.VariablePath })
+                $inv.assignments += [ordered]@{ line = $line; name = $name; names = $names; drive = $drive; operator = $node.TokenKind.ToString(); right = 'UnaryExpressionAst'; left_text = $left.Extent.Text; right_text = '' }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.ForEachStatementAst] } { $inv.foreach_vars += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Variable.VariablePath); in_text = $node.Condition.Extent.Text }; break }
+            { $_ -is [System.Management.Automation.Language.ParameterAst] } {
+                $types = @($node.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | ForEach-Object { $_.TypeName.FullName })
+                $inv.params += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Name.VariablePath); types = $types }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.ConvertExpressionAst] } {
+                if ($node.Type.TypeName.FullName -eq 'ref' -and $node.Child -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $inv.ref_vars += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Child.VariablePath) }
+                }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.TypeDefinitionAst] -or $_ -is [System.Management.Automation.Language.DynamicKeywordStatementAst] -or $_ -is [System.Management.Automation.Language.ConfigurationDefinitionAst] } {
+                $inv.other += [ordered]@{ line = $line; kind = $node.GetType().Name }
+                break
+            }
+        }
+    }
+    return $inv
+}
+
+$useNameList = @($UseNames -split '[,\s]+' | Where-Object { $_ })  # pwsh -File may hand a comma list over joined by spaces
+$texts = @([Console]::In.ReadToEnd() | ConvertFrom-Json -NoEnumerate)
+if ($texts.Count -eq 1 -and $texts[0] -is [System.Array]) { $texts = @($texts[0]) }
+$out = @(foreach ($t in $texts) {
+    # one text that the inventory cannot read fails itself (an error row the caller reports), never the batch
+    try { Get-Inventory ([string]$t) } catch { [ordered]@{ errors = @([ordered]@{ line = 0; message = "inventory failed: $($_.Exception.Message)" }); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); scoped_vars = @(); strings = @(); assignments = @(); foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @() } }
+})
+[Console]::Out.Write((ConvertTo-Json -InputObject $out -Depth 8 -Compress -EscapeHandling EscapeNonAscii))
