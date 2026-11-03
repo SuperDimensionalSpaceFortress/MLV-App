@@ -1337,7 +1337,7 @@ function Test-CmdShimTextEnablesDelayedExpansion {
     $npm = [regex]::Match(($Text -replace '\r\n', "`n"), $NPM_CMD_SHIM_PATTERN)
     if ($npm.Success) { return (-not (Test-NpmShimForwardsToNativeNode -ShimDir $ShimDir -WorkingDirectory $WorkingDirectory)) }
     $logical = [System.Collections.Generic.List[object]]::new()
-    $buf = $null; $joined = $false
+    $buf = $null; $joined = $false; $sawNative = $false
     foreach ($phys in ($Text -split '\r?\n')) {
         $tail = [regex]::Match($phys, '\^+$')
         $continues = $tail.Success -and ($tail.Length % 2 -eq 1)
@@ -1362,18 +1362,32 @@ function Test-CmdShimTextEnablesDelayedExpansion {
         # r9 fix iteration 2 (adversary A1 on 353df92c): 'C:\pins\inner %*' runs inner.cmd, which can enable it before forwarding. Every
         # command a shim runs must be a harmless internal command or name a native program by its .exe/.com extension; anything else (an
         # extensionless or batch target, or if/else, whose inner command is not at the segment start) counts as ON.
-        foreach ($seg in [regex]::Split($t, '[&|()](?=(?:[^"]*"[^"]*")*[^"]*$)')) {
-            $s = $seg.Trim().TrimStart('@').Trim()
-            if ($s -eq '' -or $s.StartsWith(':')) { continue }
-            $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"?|(?<w>[^\s"]+))')
+        # r10 (sol r9 B1, fable r9 B1): the shim is OFF only when EVERY segment is POSITIVELY recognised; the default is ON. cmd.exe runs
+        # the command that follows leading '@' and redirections ('2>nul C:\pins\inner %*' runs inner.cmd), so those are stripped and the
+        # remainder is classified; a redirection-only segment runs nothing. A redirection target, or a command token, this reading cannot
+        # parse (an unquoted ',;=/', text glued to a quote) counts as ON. '>&1' / '<&0' is a handle duplication, not a command separator.
+        foreach ($seg in [regex]::Split($t, '(?:(?<![<>])&|(?<=[<>])&(?!\d)|[|()])(?=(?:[^"]*"[^"]*")*[^"]*$)')) {
+            $s = $seg.Trim()
+            if ($s.TrimStart('@').TrimStart().StartsWith(':')) { continue }
+            while ($true) {
+                $s = $s.TrimStart()
+                if ($s.StartsWith('@')) { $s = $s.Substring(1); continue }
+                if ($s -notmatch '\A\d?(>>?|<)') { break }
+                $r = [regex]::Match($s, '\A\d?(?:>>?|<)\s*(?:&\d|"[^"]*"|[A-Za-z0-9_.:\\~-]+)(?=\s|\z)')
+                if (-not $r.Success) { return $true }
+                $s = $s.Substring($r.Length)
+            }
+            if ($s -eq '') { continue }
+            $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)')
+            if (-not $m.Success) { return $true }
             $cmd = if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }
             if ($cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
-            if ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%') { continue }
-            if ($s -match '\A\d?\s*>') { continue }
+            if ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%' -and ($m.Groups['q'].Success -or $cmd -notmatch '[,;=/]')) { $sawNative = $true; continue }
             return $true
         }
     }
-    return $false
+    # r10: a shim that runs no native program at all (a 0-byte shim, only internal commands) is not positively recognised either: ON.
+    return (-not $sawNative)
 }
 # The npm cmd-shim template, exactly as npm writes it (the real %APPDATA%\npm\codex.cmd), with LF line ends; only the target path varies.
 $NPM_CMD_SHIM_PATTERN = '\A@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\nIF EXIST "%dp0%\\node\.exe" \(\n  SET "_prog=%dp0%\\node\.exe"\n\) ELSE \(\n  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;\.JS;=;%\n\)\n\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\[^"%!^&|<>\n]+" %\*\n?\z'
@@ -1387,7 +1401,8 @@ function Test-NpmShimForwardsToNativeNode {
     try { if ([System.IO.File]::Exists([System.IO.Path]::Combine($ShimDir, 'node.exe'))) { return $true } } catch { return $false }
     $pathExt = if ([string]::IsNullOrEmpty($env:PATHEXT)) { '.COM;.EXE;.BAT;.CMD' } else { $env:PATHEXT }
     $exts = @($pathExt -split ';' | Where-Object { $_ })
-    $pathDirs = @(([string]$env:PATH) -split ';' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { $_ })
+    # r10 (sol r9 B2): empty entries are KEPT so the search below can refuse them (they used to be dropped silently).
+    $pathDirs = @(([string]$env:PATH) -split ';' | ForEach-Object { $_.Trim().Trim('"') })
     # r9 fix iteration 2 (adversary A2 on 353df92c): NoDefaultCurrentDirectoryInExePath makes cmd.exe skip the working directory. Rather
     # than model that switch, both searches (with and without the working directory first) must find a native node.
     $searches = @(, $pathDirs)
@@ -1395,6 +1410,15 @@ function Test-NpmShimForwardsToNativeNode {
     foreach ($dirs in $searches) {
         $native = $false
         :search foreach ($d in $dirs) {
+            # r10 (sol r9 B2): File.Exists resolves a relative entry against THIS process's directory, while the codex child runs in its own
+            # working directory, so the two can pick different 'node' files. Only absolute entries are searched: an empty or relative entry
+            # ('rel', '.', '.\bin', 'C:rel', '\bin') reached before the hit makes the exemption unavailable (ON), resolved against neither.
+            $qualified = $false
+            try { $qualified = (-not [string]::IsNullOrEmpty($d)) -and [System.IO.Path]::IsPathFullyQualified($d) } catch { $qualified = $false }
+            if (-not $qualified) {
+                Write-Warning "npm-shim-node-path-relative: the search for the 'node' the npm codex shim runs reached the empty or relative entry '$d' (PATH or working directory) before any node, so the native-node exemption is unavailable and delayed expansion counts as on"
+                return $false
+            }
             foreach ($e in $exts) {
                 try { $c = [System.IO.Path]::Combine($d, 'node' + $e) } catch { continue }
                 if ([System.IO.File]::Exists($c)) { $native = ($e -ieq '.exe' -or $e -ieq '.com'); break search }

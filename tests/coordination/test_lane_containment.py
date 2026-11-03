@@ -1285,11 +1285,18 @@ try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGH
     ("!OS!","Windows_NT",True),("a!b",None,True),("a(b",None,False),("a)b",None,False),
     # r9 (sol r8 B2): the shim enables it with an escaped spelling cmd.exe still obeys; r8 read it as off and certified bytes Q never read.
     ("!OS!","Windows_NT","setlocal enable^delayedexpansion"),
+    # r10 (sol r9 B1, fable r9 B1): the shim forwards through '2>nul <extensionless inner>' and inner.cmd enables it before forwarding %*.
+    ("!OS!","Windows_NT","2>nul-inner"),
 ])
 def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded,delayed):
     # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
     # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
-    if delayed:
+    if delayed=="2>nul-inner":
+        inner=fixture_tree["root"]/"inner"
+        if " " in str(inner): pytest.skip("the unquoted extensionless target needs a space-free fixture path")
+        (fixture_tree["root"]/"inner.cmd").write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+        fixture_tree["shim"].write_text(f'@echo off\r\n2>nul {inner} %*\r\n',encoding="ascii")
+    elif delayed:
         enable=delayed if isinstance(delayed,str) else "setlocal enabledelayedexpansion"
         fixture_tree["shim"].write_text(f'@echo off\r\n{enable}\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
     root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
@@ -1503,6 +1510,10 @@ def test_registry_delayed_expansion_is_the_effective_setting_hkcu_over_hklm(tmp_
     '@echo off\r\ncmd.exe /v:offx /c "x.exe" %*\r\n',
     # forwarded positional references are static: %*, %1, %~dp0
     '@echo off\r\n"%~dp0x.exe" %1 %*\r\n',
+    # r10: a redirection before or after a native target is still off (the target is what runs); '2>&1' is not a command separator
+    '@echo off\r\n2>nul "x.exe" %*\r\n',
+    '@echo off\r\n>nul 2>&1 C:\\x.exe %*\r\n',
+    '@echo off\r\n"x.exe" %* 2>&1\r\n',
 ])
 def test_comment_lines_and_disabling_spellings_do_not_turn_delayed_expansion_on(tmp_path,shim_text):
     # sol r8 B1: both hives 0 plus a harmless comment refused every default C:\!Layi Wkspc run dir.
@@ -1547,6 +1558,45 @@ def test_the_npm_shim_is_on_when_only_the_working_directory_holds_a_native_node(
     assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is True
 
 
+@pytest.mark.parametrize("entry,parent_rel,child_rel",[
+    # sol r9 B2: the launcher process (parent) sits in 'producer' and holds node.exe at the entry; the codex child runs in WorkDir 'child'
+    # and holds node.cmd there. r9 resolved the relative entry with File.Exists, i.e. against the PARENT's directory, and read OFF.
+    ("rel","rel","rel"),
+    (".\\bin","bin","bin"),
+    ("..\\bin","..\\bin","..\\bin"),
+    # '.' is the child's working directory, which the with-working-directory search already reaches first; kept as a class row
+    (".","",""),
+    # an empty entry is unknowable too: refused, not dropped
+    ("","",None),
+])
+def test_the_npm_shim_native_node_exemption_refuses_a_relative_path_entry(tmp_path,entry,parent_rel,child_rel):
+    # r10 (sol r9 B2): only ABSOLUTE PATH entries may grant the exemption; a relative or empty entry reached before the hit makes it
+    # unavailable (ON) with a typed warning, resolved against neither directory. The filesystem boundary is the process directory:
+    # [IO.Directory]::SetCurrentDirectory moves the parent to 'producer' while -WorkingDirectory names the child's 'child'.
+    producer=tmp_path/"p"/"producer"; child=tmp_path/"child"; ok=tmp_path/"ok"
+    for d in (producer,child,ok): d.mkdir(parents=True)
+    (producer/parent_rel).mkdir(parents=True,exist_ok=True); (producer/parent_rel/"node.exe").write_bytes(b"MZ")
+    if child_rel is not None:
+        (child/child_rel).mkdir(parents=True,exist_ok=True); (child/child_rel/"node.cmd").write_bytes(b"@setlocal enabledelayedexpansion\r\n")
+    (ok/"node.exe").write_bytes(b"MZ")
+    path=f"{entry};{ok}"
+    pre=(f"\n[System.IO.Directory]::SetCurrentDirectory('{producer}'); $env:PATH = '{path}'; $env:PATHEXT = '.EXE;.CMD'\n"
+         "Remove-Item Env:NoDefaultCurrentDirectoryInExePath -ErrorAction SilentlyContinue\n")
+    assert not (tmp_path/"node.exe").exists()
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(child)) is True
+    # the same layout with only absolute entries is still off (the real shims on this host have only absolute PATH entries); for '.' the
+    # child's node.cmd sits in the working directory itself, which the with-working-directory search reaches first, so it stays on
+    if child_rel!="": assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre.replace(f"'{path}'",f"'{ok}'"),wd=str(child)) is False
+
+
+def test_the_npm_shim_relative_path_refusal_is_typed(tmp_path):
+    ok=tmp_path/"ok"; ok.mkdir(); (ok/"node.exe").write_bytes(b"MZ")
+    shim=tmp_path/"shim.cmd"; shim.write_bytes(_NPM_SHIM.encode("ascii"))
+    r=_cmdline_harness(tmp_path,_REG_MOCK.format(hkcu="[int]0",hklm="[int]0")+
+        f"\n$env:PATH = 'rel;{ok}'; $env:PATHEXT = '.EXE;.CMD'\n'DETECTED ' + (Test-CmdDelayedExpansion -Shim '{shim}' -WorkingDirectory '{tmp_path}' 3>&1 | Out-String)\n")
+    assert "npm-shim-node-path-relative:" in r.stdout and "'rel'" in r.stdout and "True" in r.stdout,(r.stdout,r.stderr)
+
+
 @pytest.mark.parametrize("shim_text",[
     # sol r8 B2 (measured: cmd.exe removed the caret and expanded !OS! to Windows_NT)
     '@echo off\r\nsetlocal enable^delayedexpansion\r\n"x.exe" %*\r\n',
@@ -1580,6 +1630,25 @@ def test_the_npm_shim_is_on_when_only_the_working_directory_holds_a_native_node(
     '@echo off\r\nC:\\pins\\inner %*\r\n',
     '@echo off\r\nnode C:\\pins\\codex.js %*\r\n',
     '@echo off\r\nif exist "C:\\x.exe" C:\\pins\\inner %*\r\n',
+    # r10 (sol r9 B1, fable r9 B1): cmd.exe runs the command after a leading redirection, so the r9 skip of a redirection-led segment read
+    # these as off. Each is red on 7a695393. The class: every redirection spelling and '@' before an extensionless, bare or batch target.
+    '@echo off\r\n>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n2>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n>>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n1>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n>nul 2>&1 C:\\pins\\inner %*\r\n',
+    '@echo off\r\n@2>nul node %*\r\n',
+    '@echo off\r\n> nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n2>"C:\\log dir\\x.txt" C:\\pins\\inner %*\r\n',
+    '@echo off\r\n<nul C:\\pins\\inner %*\r\n',
+    # r10 fail-closed default: a redirection target or command token this reading cannot parse is ON, not skipped
+    '@echo off\r\n>nul,C:\\pins\\inner C:\\a.exe %*\r\n',
+    '@echo off\r\nC:\\pins\\inner,C:\\a.exe %*\r\n',
+    '@echo off\r\n"C:\\a.exe"C:\\pins\\inner %*\r\n',
+    '@echo off\r\n>\r\nC:\\a.exe %*\r\n',
+    # r10: a shim that runs no native program is not positively recognised (fable r9 note: a 0-byte shim read as off)
+    '',
+    '@echo off\r\n',
 ])
 def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
     assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True
