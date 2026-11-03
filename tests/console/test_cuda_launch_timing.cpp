@@ -307,9 +307,70 @@ TEST(CudaLaunchTiming, AnchorTryAcrossAWallClockStepIsUnusable)
     ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774589000.125, 5000.0, 5000.125, &bracket));
     ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.0, 5000.125, 5000.0, &bracket));
     ASSERT_NEAR(-1.0, bracket, 0.0);
-    // A clean try: the bracket is the monotonic interval.
+    // A clean try: the bracket is the longer of the two intervals (here the wall one).
     ASSERT_EQ(1, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.127, 5000.0, 5000.125, &bracket));
-    ASSERT_NEAR(0.125, bracket, 1e-9);
+    ASSERT_NEAR(0.127, bracket, 1e-6);
+}
+
+TEST(CudaLaunchTiming, AnchorBracketCoversTheWallClockAnchor)
+{
+    // Adversary r2 pass 2 A1, its input: utc_before=U, steady 5000.0 -> 5000.020, utc_after=U+0.029
+    // (inside the step tolerance), event at U+0.001. The anchor is utc_after, 0.028 ms after the
+    // event, so the bracket must be at least that: it is the wall interval, 0.029.
+    const double u = 1791774588000.0;
+    double bracket = 0.0;
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(u, u + 0.029, 5000.0, 5000.020, &bracket));
+    ASSERT_TRUE(bracket >= (u + 0.029) - (u + 0.001) - 1e-6);
+    // And when the monotonic interval is the longer, it is kept.
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(u, u + 0.020, 5000.0, 5000.029, &bracket));
+    ASSERT_NEAR(0.029, bracket, 1e-6);
+}
+
+TEST(CudaLaunchTiming, RecorderOnlyCudaFailuresDoNotStayPendingForTheBackend)
+{
+    // Adversary r2 pass 2 A2, its input: the anchor's event allocation fails at create, and the
+    // backend's next CK(cudaGetLastError()) must not see it. Every recorder-only CUDA call that can
+    // fail (anchor create/record/wait, pool create, elapsed read) reads the pending error first and
+    // clears its own failure only when none was pending (drop_own_error), so a backend error is kept.
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "    void establish_anchor_locked()\n    {\n        const cudaError_t prior = cudaPeekAtLastError();")));
+    ASSERT_TRUE(header.contains(QStringLiteral("            if (cudaEventCreate(&ev) != cudaSuccess) break;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("            }\n        }\n        drop_own_error(prior);\n    }")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (cudaEventCreate(ev) == cudaSuccess) return true;\n"
+        "        drop_own_error(prior);\n        return false;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("    static void drop_own_error(cudaError_t prior)\n    {\n"
+                                               "        if (prior == cudaSuccess) (void)cudaGetLastError();\n    }")));
+    ASSERT_EQ(3, (int)header.count(QStringLiteral("drop_own_error(prior);")));
+    // No early return inside the anchor loop skips the clear.
+    const int def = header.indexOf(QStringLiteral("    void establish_anchor_locked()"));
+    const int end = header.indexOf(QStringLiteral("        drop_own_error(prior);\n    }"), def);
+    ASSERT_FALSE(header.mid(def, end - def).contains(QStringLiteral("return")));
+}
+
+TEST(CudaLaunchTiming, DeviceStampsAreNeverCutByAnInternalBuffer)
+{
+    // Adversary r2 pass 2 A4: stamps of any magnitude reach the line, and the return is the full
+    // length (so a short buffer reports truncation instead of a silently cut line).
+    IgpuLtRecord r = sampleKernel();
+    r.kind = "span";
+    r.stage = "run";
+    r.has_dev = 1;
+    r.dev_t0_utc_ms = 1e60;
+    r.dev_t1_utc_ms = 2e60;
+    r.dev_marks = 2;
+    r.dev_mark_utc_ms[0] = 3e60;
+    r.dev_mark_utc_ms[1] = 4e60;
+    const int need = igpu_lt_format_record(nullptr, 0, r);
+    std::string line((std::size_t)need + 1, '\0');
+    ASSERT_EQ(need, igpu_lt_format_record(&line[0], line.size(), r));
+    line.resize((std::size_t)need);
+    ASSERT_TRUE(line.find(" dev_marks_utc_ms=") != std::string::npos);
+    ASSERT_EQ(std::size_t(line.size() - 4), line.rfind(".000"));
+    char tiny[200];
+    ASSERT_EQ(need, igpu_lt_format_record(tiny, sizeof(tiny), r));
+    ASSERT_EQ(std::size_t(sizeof(tiny) - 1), std::strlen(tiny));
 }
 
 TEST(CudaLaunchTiming, AnchorsAcrossAWallClockStepAreNotComparable)
@@ -564,7 +625,8 @@ TEST(CudaLaunchTiming, OffCostsOneCachedTestPerSite)
     ASSERT_EQ(std::string("cudaEventSynchronize"), syncs.join(QStringLiteral(", ")).toStdString());
     const int anchorDef = header.indexOf(QStringLiteral("    void establish_anchor_locked()\n    {\n"));
     ASSERT_TRUE(anchorDef >= 0);
-    const int anchorEnd = header.indexOf(QStringLiteral("\n    }\n"), header.indexOf(QStringLiteral("\n        }\n    }\n"), anchorDef));
+    const int anchorEnd = header.indexOf(QStringLiteral("\n        drop_own_error(prior);\n    }\n"), anchorDef);
+    ASSERT_TRUE(anchorEnd > anchorDef);
     const int syncAt = header.indexOf(syncCallPattern());
     ASSERT_TRUE(syncAt > anchorDef && syncAt < anchorEnd);
     ASSERT_EQ(2, (int)header.count(QStringLiteral("establish_anchor_locked()")));
@@ -585,8 +647,16 @@ TEST(CudaLaunchTiming, DeviceSpansSitOnTheirOwnStreamAfterTheExistingWaits)
     const QString recon = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_recon_cuda.cu"));
     const QString amaze = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_amaze_debayer_cuda.cu"));
     const QString span = QStringLiteral(
-        "igpu_lt::record_span(\"run\", b->ev_start, b->ev_after_up, b->ev_after_kernel, b->ev_after_dl, (double)tot);");
+        "igpu_lt::record_span(\"run\", lt_issue_utc, b->ev_start, b->ev_after_up, b->ev_after_kernel, b->ev_after_dl,\n"
+        "                         (double)tot);");
     ASSERT_EQ(1, (int)recon.count(span));
+    // Adversary r2 pass 2 A3: the span's utc_ms is the host clock at issue, read just before ev_start.
+    ASSERT_TRUE(recon.contains(QStringLiteral(
+        "    const double lt_issue_utc = igpu_lt::issue_utc_ms(); /* the run span's host issue time (env-gated) */\n"
+        "    CK(cudaEventRecord(b->ev_start, 0));")));
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral("        fill_locked(&rec, \"span\", stage);\n        rec.utc_ms = issue_utc;")));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline double issue_utc_ms()\n{\n    if (!enabled()) return 0.0;")));
     ASSERT_TRUE(recon.indexOf(QStringLiteral("CK(cudaEventElapsedTime(&tot,  b->ev_start,        b->ev_after_dl));"))
                 < recon.indexOf(span));
     ASSERT_TRUE(recon.indexOf(QStringLiteral("cudaEventSynchronize(b->ev_after_dl)")) < recon.indexOf(span));

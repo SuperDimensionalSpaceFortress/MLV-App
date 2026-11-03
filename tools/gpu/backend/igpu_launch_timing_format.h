@@ -215,22 +215,26 @@ static inline int igpu_lt_format_record(char * out, std::size_t cap, const IgpuL
     char err[96] = "";
     if (r.err != 0)
         std::snprintf(err, sizeof(err), " err=%d err_name=%s", r.err, r.err_name ? r.err_name : "unknown");
-    char dev[160] = "";
-    if (r.has_dev)
-    {
-        int used = std::snprintf(dev, sizeof(dev), " dev_t0_utc_ms=%.3f dev_t1_utc_ms=%.3f",
-                                 r.dev_t0_utc_ms, r.dev_t1_utc_ms);
-        if (r.dev_marks == 2 && used > 0 && used < (int)sizeof(dev))
-            std::snprintf(dev + used, sizeof(dev) - (std::size_t)used, " dev_marks_utc_ms=%.3f,%.3f",
-                          r.dev_mark_utc_ms[0], r.dev_mark_utc_ms[1]);
-    }
-    return std::snprintf(out, cap,
-                         "igpu_launch_timing dll=%s kind=%s stage=%s seq=%llu utc_ms=%.3f "
-                         "grid=%ux%ux%u block=%ux%ux%u w=%d h=%d%s ms=%s%s%s",
-                         r.dll ? r.dll : "?", r.kind ? r.kind : "?", r.stage ? r.stage : "?",
-                         r.seq, r.utc_ms,
-                         r.grid.x, r.grid.y, r.grid.z, r.block.x, r.block.y, r.block.z,
-                         r.width, r.height, tile, ms, err, dev);
+    int n = std::snprintf(out, cap,
+                          "igpu_launch_timing dll=%s kind=%s stage=%s seq=%llu utc_ms=%.3f "
+                          "grid=%ux%ux%u block=%ux%ux%u w=%d h=%d%s ms=%s%s",
+                          r.dll ? r.dll : "?", r.kind ? r.kind : "?", r.stage ? r.stage : "?",
+                          r.seq, r.utc_ms,
+                          r.grid.x, r.grid.y, r.grid.z, r.block.x, r.block.y, r.block.z,
+                          r.width, r.height, tile, ms, err);
+    if (n < 0 || !r.has_dev) return n;
+    /* Adversary r2 pass 2 A4: the device stamps are appended straight into `out` (no fixed
+     * intermediate buffer), and the return is the FULL length, so a caller that sizes from it
+     * gets every field and a short buffer is reported as truncated, never cut silently. */
+    const auto append = [&](const char * fmt, double a, double b) {
+        const std::size_t at = (std::size_t)n < cap ? (std::size_t)n : (cap ? cap - 1 : 0);
+        const std::size_t room = cap > at ? cap - at : 0;
+        const int m = std::snprintf(room ? out + at : nullptr, room, fmt, a, b);
+        if (m > 0) n += m;
+    };
+    append(" dev_t0_utc_ms=%.3f dev_t1_utc_ms=%.3f", r.dev_t0_utc_ms, r.dev_t1_utc_ms);
+    if (r.dev_marks == 2) append(" dev_marks_utc_ms=%.3f,%.3f", r.dev_mark_utc_ms[0], r.dev_mark_utc_ms[1]);
+    return n;
 }
 
 static inline int igpu_lt_format_summary(char * out, std::size_t cap,
@@ -280,18 +284,20 @@ static inline int igpu_lt_format_config_anchored(char * out, std::size_t cap, co
 }
 
 /* Adversary r2 A1. One anchor try reads the wall clock, then the monotonic clock, records and
- * waits, then reads the monotonic clock and the wall clock. Its bracket is the MONOTONIC interval
- * (never negative). The wall interval must match it within IGPU_LT_ANCHOR_STEP_TOL_MS; a try
- * across which the wall clock stepped (backward, or forward) is unusable. Returns 1 and writes
- * the bracket for a usable try, else 0. */
+ * waits, then reads the monotonic clock and the wall clock. The wall interval must match the
+ * monotonic one within IGPU_LT_ANCHOR_STEP_TOL_MS; a try across which the wall clock stepped
+ * (backward, or forward) is unusable. The bracket is the LONGER of the two intervals (adversary
+ * r2 pass 2 A1): the anchor is the wall clock read last, and the event ran inside the wall
+ * interval, so anchor_utc_ms - event time <= bracket. Returns 1 and writes the bracket for a
+ * usable try, else 0. */
 #define IGPU_LT_ANCHOR_STEP_TOL_MS 0.010
 static inline int igpu_lt_anchor_try_bracket(double utc_before, double utc_after, double steady_before,
                                              double steady_after, double * bracket_ms)
 {
     const double mono = steady_after - steady_before;
     const double wall = utc_after - utc_before;
-    if (!(mono >= 0.0) || !(std::fabs(wall - mono) <= IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
-    if (bracket_ms) *bracket_ms = mono;
+    if (!(mono >= 0.0) || !(wall >= 0.0) || !(std::fabs(wall - mono) <= IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
+    if (bracket_ms) *bracket_ms = wall > mono ? wall : mono;
     return 1;
 }
 

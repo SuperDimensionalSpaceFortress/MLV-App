@@ -11,9 +11,10 @@
  *   cudaError_t e = IGPU_LT_SYNC_CALL(stage, <synchronising runtime call>);
  *       host time around a synchronising call; the call's own result is
  *       returned unchanged, so CK(IGPU_LT_SYNC_CALL(...)) keeps CK outside.
- *       This header synchronises once per DLL and never per frame: the device-clock
- *       anchor at the first attach() (CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1).
- *   igpu_lt::SpanScope s(stage, stream);   igpu_lt::record_span(stage, t0, m0, m1, t1, ms);
+ *       This header waits on the device only at each DLL's first attach() (backend
+ *       create), never per frame: one call site, run kAnchorTries times, for
+ *       the device-clock anchor (CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1).
+ *   igpu_lt::SpanScope s(stage, stream);   igpu_lt::record_span(stage, issue, t0, m0, m1, t1, ms);
  *       kind=span records: an event pair around non-kernel device work, or four
  *       events the caller already waited on. Resolved pairs carry dev_t0_utc_ms /
  *       dev_t1_utc_ms: device times on the host epoch scale (anchor_utc_ms +
@@ -263,13 +264,15 @@ public:
 
     /* A span the caller bounded with events it already recorded and already waited on (the
      * recon run: ev_start, ev_after_up, ev_after_kernel, ev_after_dl, after the run's own
-     * wait on ev_after_dl). Reads elapsed times only; never waits. */
-    void record_span(const char * stage, cudaEvent_t t0, cudaEvent_t mark0, cudaEvent_t mark1,
-                     cudaEvent_t t1, double ms)
+     * wait on ev_after_dl). Reads elapsed times only; never waits. utc_ms is the caller's host
+     * clock at issue (adversary r2 pass 2 A3), not the time this record is written. */
+    void record_span(const char * stage, double issue_utc, cudaEvent_t t0, cudaEvent_t mark0,
+                     cudaEvent_t mark1, cudaEvent_t t1, double ms)
     {
         std::lock_guard<std::mutex> lock(mu_);
         IgpuLtRecord rec;
         fill_locked(&rec, "span", stage);
+        rec.utc_ms = issue_utc;
         rec.ms = ms;
         stamp_locked(&rec, t0, t1);
         if (rec.has_dev && dev_utc_locked(mark0, &rec.dev_mark_utc_ms[0])
@@ -404,10 +407,11 @@ private:
      * the recorder's only synchronising call; with the timer OFF it is never reached. */
     void establish_anchor_locked()
     {
+        const cudaError_t prior = cudaPeekAtLastError();
         for (int i = 0; i < kAnchorTries; ++i)
         {
             cudaEvent_t ev = nullptr;
-            if (cudaEventCreate(&ev) != cudaSuccess) return;
+            if (cudaEventCreate(&ev) != cudaSuccess) break;
             const double utc_before = utc_ms();
             const double steady_before = steady_ms();
             const bool ok = cudaEventRecord(ev, 0) == cudaSuccess && cudaEventSynchronize(ev) == cudaSuccess;
@@ -428,6 +432,16 @@ private:
                 cudaEventDestroy(ev);
             }
         }
+        drop_own_error(prior);
+    }
+
+    /* Adversary r2 pass 2 A2: a recorder-only CUDA failure (the anchor's create/record/wait, an
+     * event-pool create, an elapsed read) must not stay pending for the backend's own
+     * CK(cudaGetLastError()). The last error is cleared only when none was pending before the
+     * recorder's call (`prior`), so a backend's own error is never lost either. */
+    static void drop_own_error(cudaError_t prior)
+    {
+        if (prior == cudaSuccess) (void)cudaGetLastError();
     }
 
     /* The device time of a completed event on the host's Unix-epoch ms scale. A failed elapsed
@@ -440,7 +454,7 @@ private:
         float elapsed = 0.0f;
         if (cudaEventElapsedTime(&elapsed, anchor_, ev) != cudaSuccess)
         {
-            if (prior == cudaSuccess) (void)cudaGetLastError();
+            drop_own_error(prior);
             return false;
         }
         /* Adversary r2 A2: no stamp past the float-precision age limit. */
@@ -460,7 +474,10 @@ private:
             pool_.pop_back();
             return true;
         }
-        return cudaEventCreate(ev) == cudaSuccess;
+        const cudaError_t prior = cudaPeekAtLastError();
+        if (cudaEventCreate(ev) == cudaSuccess) return true;
+        drop_own_error(prior);
+        return false;
     }
 
     void discard_events_locked(Pending & p)
@@ -659,13 +676,21 @@ inline void teardown(const char * at)
     Recorder::get().teardown(at);
 }
 
+/* The host wall clock to pass as a later record_span's issue time; 0 when OFF. */
+inline double issue_utc_ms()
+{
+    if (!enabled()) return 0.0;
+    return utc_ms();
+}
+
 /* One kind=span record over four events the caller has already waited on (t0, two inner
- * marks, t1), with `ms` the caller's own elapsed(t0, t1). Never waits; a no-op when OFF. */
-inline void record_span(const char * stage, cudaEvent_t t0, cudaEvent_t mark0, cudaEvent_t mark1,
-                        cudaEvent_t t1, double ms)
+ * marks, t1), with `ms` the caller's own elapsed(t0, t1) and `issue_utc` its issue_utc_ms()
+ * from just before t0 was recorded. Never waits; a no-op when OFF. */
+inline void record_span(const char * stage, double issue_utc, cudaEvent_t t0, cudaEvent_t mark0,
+                        cudaEvent_t mark1, cudaEvent_t t1, double ms)
 {
     if (!enabled()) return;
-    Recorder::get().record_span(stage, t0, mark0, mark1, t1, ms);
+    Recorder::get().record_span(stage, issue_utc, t0, mark0, mark1, t1, ms);
 }
 
 } // namespace igpu_lt
