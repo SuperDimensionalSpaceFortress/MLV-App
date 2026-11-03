@@ -2492,6 +2492,24 @@ static void llrawproc_gpu_recon_luts_key_from_state(
     key->dark_noise = state->dark_noise;
 }
 
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1 (adversary r1 A1): a run_backend call refused
+ * after it took the backend mutex still books what it spent there. Refused by the
+ * suppression re-check (before the acquire stamp): the whole wait, as one call. */
+static void llrawproc_gpu_split_book_suppressed_wait(double lock_start_s)
+{
+    g_llrawproc_last_dual_iso_gpu_split.mutex_wait_ms +=
+        (mlv_stage_timing_now() - lock_start_s) * 1000.0;
+    g_llrawproc_last_dual_iso_gpu_split.backend_calls++;
+}
+
+/* ...refused by a later check (after the acquire stamp, which booked the wait):
+ * the held time so far, as configure_ms. */
+static void llrawproc_gpu_split_book_held_refusal(double lock_acquired_s)
+{
+    g_llrawproc_last_dual_iso_gpu_split.configure_ms +=
+        (mlv_stage_timing_now() - lock_acquired_s) * 1000.0;
+}
+
 static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * state,
                                            const uint16_t * gpu_input,
                                            uint16_t * gpu_output,
@@ -2599,23 +2617,27 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
      * check above and then waited here through a loss must not reach CUDA. */
     if(llrpGpuCudaSuppressed())
     {
+        llrawproc_gpu_split_book_suppressed_wait(split_lock_start_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
         return 0;
     }
     /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: the wait for the backend mutex (the
-     * suppression read above is a single volatile flag load). */
+     * suppression read above is a single volatile flag load). Every later
+     * refusal books its held time (llrawproc_gpu_split_book_held_refusal). */
     split_lock_acquired_s = mlv_stage_timing_now();
     g_llrawproc_last_dual_iso_gpu_split.mutex_wait_ms +=
         (split_lock_acquired_s - split_lock_start_s) * 1000.0;
     g_llrawproc_last_dual_iso_gpu_split.backend_calls++;
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         return 0;
     }
     if(out_kind == IGPU_OUT_DEVICE_BAYER16 && !g->last_device_output)
     {
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = -3;
         return 0;
@@ -2636,6 +2658,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
       || g->configured_clip.height != clip.height))
     {
         ++g->clip_dims_change_refusals;
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CLIP_DIMS_BUSY;
         return 0;
@@ -2643,6 +2666,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(reduced_iso_notch && !g->set_reduced_iso_notch)
     {
         /* An older DLL: a reduced recon without the notch shows the ISO mesh. */
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH;
         return 0;

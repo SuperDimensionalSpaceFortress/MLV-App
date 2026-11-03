@@ -562,8 +562,10 @@ void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing);
  * (backend_calls counts them), so they stay zero on a CPU recon.
  *   prepare_ms        diso_prepare_gpu_recon_state (CPU match + state)
  *   preupload_ms      llrpGpuPlaybackReconPreuploadFrame (async H2D submit)
- *   mutex_wait_ms     pthread_mutex_lock of the GPU recon backend mutex
+ *   mutex_wait_ms     pthread_mutex_lock of the GPU recon backend mutex (also
+ *                     booked by a call the suppression re-check then refuses)
  *   configure_ms      held, before the run: checks, set_clip, set_luts, notch
+ *                     (or up to a refusal under the lock)
  *   run_wall_ms       host wall of igpu_recon_run / run_preuploaded
  *   run_gpu_ms        the backend's own event span of that run (upload ..
  *                     handoff, igpu_recon_last_timing total_ms)

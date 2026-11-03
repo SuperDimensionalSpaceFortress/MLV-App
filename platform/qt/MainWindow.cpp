@@ -27988,7 +27988,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             // CUDA-RECON-DUALISO-TIMER-SPLIT-1: where dual_iso's time goes on the CUDA texture
             // route (RenderFrameThread insertLlrawprocDualIsoGpuSplitTelemetry). Every value is
             // from ONE llrawproc run: dual_iso_ms = prepare + preupload + mutex_wait + configure
-            // + run_wall + post_run + other; run_wall = run_gpu + sync when the backend timed it.
+            // + run_wall + post_run + other; run_wall = run_gpu + sync when the backend timed it and
+            // its span fits inside the wall (the real backend blocks on its last event; sync is
+            // floored at 0, so a span longer than the wall, as the test fake's fixed 3.0 ms, is not).
             qInfo().noquote()
                 << QStringLiteral(
                        "playback_smoke.dual_iso_split session=%1 index=%2 serial=%3 "

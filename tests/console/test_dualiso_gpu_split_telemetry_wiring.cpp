@@ -136,6 +136,21 @@ TEST(DualIsoGpuSplitTelemetryWiring, BackendTimersBracketTheMutexWaitAndBothRunC
     const int bookAt = body.indexOf(QStringLiteral("split->post_run_ms +="));
     const int scanAt = body.indexOf(QStringLiteral("llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);"));
     ASSERT_TRUE(bookAt >= 0 && bookAt < scanAt);
+    // Adversary r1 A1 census: every refusal after the lock books what it spent there before it unlocks -- the
+    // suppression re-check (before the acquire stamp) its wait, every later refusal its held time. Each
+    // unlock-then-return-0 branch between the lock and the run is preceded by a booking call.
+    const int runAt = body.indexOf(QStringLiteral("rc = g->run_preuploaded(g->backend,"));
+    const QString unlock = QStringLiteral("pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);");
+    int refusals = 0;
+    for (int at = body.indexOf(unlock, lockAt); at >= 0 && at < runAt; at = body.indexOf(unlock, at + 1)) {
+        const int branchOpen = body.lastIndexOf(QLatin1Char('{'), at);
+        const QString branch = body.mid(branchOpen, at - branchOpen);
+        ASSERT_TRUE(branch.contains(QStringLiteral("llrawproc_gpu_split_book_")));
+        ++refusals;
+    }
+    ASSERT_EQ(5, refusals);
+    ASSERT_EQ(1, (int)body.count(QStringLiteral("llrawproc_gpu_split_book_suppressed_wait(split_lock_start_s);")));
+    ASSERT_EQ(4, (int)body.count(QStringLiteral("llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);")));
     // Every reset point that zeroes the residual record zeroes the split too.
     ASSERT_EQ((int)source.count(QStringLiteral("memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));")),
               (int)source.count(QStringLiteral("memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));")));

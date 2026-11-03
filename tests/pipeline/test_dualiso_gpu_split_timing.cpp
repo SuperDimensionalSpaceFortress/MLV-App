@@ -1,8 +1,9 @@
 // CUDA-RECON-DUALISO-TIMER-SPLIT-1: the per-run split of the dual_iso timer on the CUDA route
 // (llrawproc.h llrpDualIsoGpuSplitTiming_t), through the real llrawproc_gpu_recon_run_backend on the
 // in-process fake backend. (a) one run is one backend call whose run wall splits into the backend's own
-// GPU span (the fake reports total_ms 3.0) plus sync; (b) a run queued on the backend mutex (held here, as
-// the render thread's present or another run would hold it) reports that wait as mutex_wait_ms; (c) the
+// GPU span (the fake reports total_ms 3.0) plus a floored sync; (b) a run queued on the backend mutex (held
+// here, as the render thread's present or another run would hold it) reports that wait as mutex_wait_ms;
+// (e) so does a queued run then refused by the suppression re-check under the lock (adversary r1 A1); (c) the
 // thread's reset zeroes the record; (d) a run refused before the lock leaves the record untouched.
 #include "../common/minitest.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
@@ -72,7 +73,10 @@ llrpDualIsoGpuSplitTiming_t lastSplit()
 
 } // namespace
 
-TEST(DualIsoGpuSplitTiming, OneRunIsOneBackendCallAndItsWallSplitsIntoGpuSpanPlusSync)
+// Adversary r1 A3: the fake reports a fixed 3.0 ms GPU span however short its host call is, so here the span can
+// exceed the wall and sync is floored at 0. The real backend's run blocks on its last event, so its wall covers
+// its span and run_wall = run_gpu + sync there; this test pins the floor, not that equality.
+TEST(DualIsoGpuSplitTiming, OneRunIsOneBackendCallAndItsWallSplitsIntoGpuSpanPlusFlooredSync)
 {
     FakeBackendScope scope;
     llrpResetLastRunTimingForCurrentThread();
@@ -101,45 +105,93 @@ TEST(DualIsoGpuSplitTiming, OneRunIsOneBackendCallAndItsWallSplitsIntoGpuSpanPlu
     ASSERT_TRUE(two.run_wall_ms >= s.run_wall_ms);
 }
 
-TEST(DualIsoGpuSplitTiming, AWaitOnTheBackendMutexIsReportedAsMutexWait)
+namespace
 {
-    FakeBackendScope scope;
-    const int holdMs = 60;
-    std::atomic<bool> done{false};
-    int rc = -99;
+
+struct QueuedRun
+{
+    bool arrived = false;
     int used = -1;
-    llrpDualIsoGpuSplitTiming_t queuedSplit = {};
+    int rc = -99;
+    llrpDualIsoGpuSplitTiming_t split = {};
+};
+
+// One run queued on the backend mutex held here for holdMs after its arrival. suppressWhileQueued delivers a
+// device-loss suppression while it waits, so the run is refused by the re-check under the lock (adversary r1 A1).
+QueuedRun runQueuedOnTheBackendMutex(uint64_t frameId, int holdMs, bool suppressWhileQueued)
+{
+    QueuedRun out;
+    std::atomic<bool> done{false};
     const long arrivalsBefore = llrpGpuReconBackendLockArrivalsForTesting();
     llrpHoldGpuReconBackendMutexForTesting(1);
     std::thread queued([&]() {
         llrpResetLastRunTimingForCurrentThread();
-        used = splitRunOnce(3, &rc);
-        queuedSplit = lastSplit(); // thread-local: read on the thread that ran
+        out.used = splitRunOnce(frameId, &out.rc);
+        out.split = lastSplit(); // thread-local: read on the thread that ran
         done.store(true);
     });
     // Pre-lock rendezvous (as test_gpu_device_loss_selfheal.cpp): the run counts its arrival just before it
-    // starts the wait timer and takes the mutex held here. Bounded: a run that never arrives fails below.
+    // starts the wait timer and takes the mutex held here. Bounded: a run that never arrives fails the caller.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore && !done.load()
            && std::chrono::steady_clock::now() < deadline)
         std::this_thread::yield();
-    const bool arrived = llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore + 1 && !done.load();
+    out.arrived = llrpGpuReconBackendLockArrivalsForTesting() == arrivalsBefore + 1 && !done.load();
     std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+    if (suppressWhileQueued) llrpSetGpuCudaSuppressed(1);
     llrpHoldGpuReconBackendMutexForTesting(0);
     queued.join();
-    ASSERT_TRUE(arrived);
-    ASSERT_NE(0, used);
-    ASSERT_EQ(0, rc);
-    ASSERT_EQ(1, queuedSplit.backend_calls);
-    // At least most of the hold (the run may be descheduled between its arrival and its timer start), and the
-    // wait is not booked as run, configure or post-run time.
-    ASSERT_TRUE(queuedSplit.mutex_wait_ms >= holdMs / 2.0);
-    ASSERT_TRUE(queuedSplit.run_wall_ms < queuedSplit.mutex_wait_ms);
-    ASSERT_TRUE(queuedSplit.configure_ms < queuedSplit.mutex_wait_ms);
-    ASSERT_TRUE(queuedSplit.post_run_ms < queuedSplit.mutex_wait_ms);
+    if (suppressWhileQueued) llrpSetGpuCudaSuppressed(0);
+    return out;
+}
+
+} // namespace
+
+TEST(DualIsoGpuSplitTiming, AWaitOnTheBackendMutexIsReportedAsMutexWait)
+{
+    FakeBackendScope scope;
+    const int holdMs = 60;
+    // Adversary r1 A2: the run can be descheduled between its arrival and its timer start, or inside a timed
+    // step, so the bound is asked of up to three attempts; a real miss fails all three.
+    bool met = false;
+    for (int attempt = 0; attempt < 3 && !met; ++attempt)
+    {
+        const QueuedRun q = runQueuedOnTheBackendMutex(uint64_t(10 + attempt), holdMs, false);
+        ASSERT_TRUE(q.arrived);
+        ASSERT_NE(0, q.used);
+        ASSERT_EQ(0, q.rc);
+        ASSERT_EQ(1, q.split.backend_calls);
+        // Most of the hold, and the wait is not booked as run, configure or post-run time.
+        met = q.split.mutex_wait_ms >= holdMs / 2.0
+              && q.split.run_wall_ms < q.split.mutex_wait_ms
+              && q.split.configure_ms < q.split.mutex_wait_ms
+              && q.split.post_run_ms < q.split.mutex_wait_ms;
+    }
+    ASSERT_TRUE(met);
     // This thread ran no backend call, so its own record shows none.
     llrpResetLastRunTimingForCurrentThread();
     ASSERT_EQ(0, lastSplit().backend_calls);
+}
+
+// Adversary r1 A1: a run that waited on the mutex and was then refused by the suppression re-check under it
+// still reports that wait (r1 returned before booking it: mutex_wait_ms 0 after a 60 ms wait).
+TEST(DualIsoGpuSplitTiming, ARunRefusedUnderTheLockStillReportsItsWait)
+{
+    FakeBackendScope scope;
+    const int holdMs = 60;
+    bool met = false;
+    for (int attempt = 0; attempt < 3 && !met; ++attempt)
+    {
+        const QueuedRun q = runQueuedOnTheBackendMutex(uint64_t(20 + attempt), holdMs, true);
+        ASSERT_TRUE(q.arrived);
+        ASSERT_EQ(0, q.used);
+        ASSERT_EQ(LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED, q.rc);
+        ASSERT_EQ(1, q.split.backend_calls);
+        ASSERT_EQ(0.0, q.split.run_wall_ms);
+        met = q.split.mutex_wait_ms >= holdMs / 2.0;
+    }
+    ASSERT_TRUE(met);
+    ASSERT_EQ(0, llrpGpuCudaSuppressed());
 }
 
 TEST(DualIsoGpuSplitTiming, TheThreadResetZeroesTheRecord)
