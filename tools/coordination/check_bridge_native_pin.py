@@ -122,16 +122,31 @@ def _child(agent_dir, st):
     sys.unraisablehook = hook
     st["hook"] = hook
 
+    # An exception that kills a thread goes through threading.excepthook, not the unraisable hook: recorded the same way.
+    import threading
+    thread_errors = st["thread_errors"] = []
+    previous_thread_hook = threading.excepthook
+
+    def thread_hook(args):
+        thread_errors.append("%s: %s" % (getattr(args.exc_type, "__name__", "?"), args.exc_value))
+        previous_thread_hook(args)
+
+    threading.excepthook = thread_hook
+    st["thread_hook"] = thread_hook
+
     # The sys.monitoring observer is armed BEFORE any of the ref's code is imported: import, construction, run and
     # finalization are all inside it. Until the real code object is known (server imported) a frame is recognised
     # by its name and its `native` local; afterwards by equality, which an importlib.reload keeps.
     state = {"code": None}
     missing = object()
-    # One (kind, returned, phase) per observed frame of the lookup, decided as the frame exits. The phase is
-    # "load" (import, construction), "run" (inside unittest's run of the one test) or "done" (afterwards:
-    # finalization, test-created threads). Only a "run" lookup proves the test's own pin took effect; a module-level
-    # pinned lookup cannot vouch for a method that was shadowed by an empty one.
+    # One (kind, returned, phase) per observed frame of the lookup, decided as the frame exits. The phase is the one
+    # the frame STARTED in (PY_START), not the one it returns in: "load" (import, construction), "run" (unittest is
+    # running the test: setUp, tearDown, cleanups), "method" (inside TestCase._callTestMethod, i.e. the test method
+    # itself) or "done" (afterwards: finalization, test-created threads). Only a "method" lookup proves the test's
+    # own pin took effect; a module-level, construction-time or setUp lookup cannot vouch for a method that was
+    # shadowed by an empty one.
     phase = st["phase"] = ["load"]
+    starts = {}    # monitored frame -> phase at its start
     frames = st["frames"] = []
     problems = st["problems"] = []
 
@@ -146,17 +161,18 @@ def _child(agent_dir, st):
             return False
         try:
             frame = sys._getframe(2)    # callback <- observe <- the monitored frame's exit
+            started = starts.pop(frame, "load")    # a frame whose start was not seen proves nothing
             native = frame.f_locals.get(NATIVE_LOCAL, missing)
             if frame.f_code is not code_obj:
                 problems.append("monitored frame not found")
             elif native is missing:
-                frames.append(("nolookup", returned, phase[0]))    # exited before the native lookup (e.g. not win32)
+                frames.append(("nolookup", returned, started))    # exited before the native lookup (e.g. not win32)
             elif native is None:
-                frames.append(("lookup", returned, phase[0]))      # the native lookup answered None: the fallback ran
+                frames.append(("lookup", returned, started))      # the native lookup answered None: the fallback ran
             elif returned is native:
-                frames.append(("fast", returned, phase[0]))        # returned exactly what the native lookup gave it
+                frames.append(("fast", returned, started))        # returned exactly what the native lookup gave it
             else:
-                frames.append(("odd", returned, phase[0]))
+                frames.append(("odd", returned, started))
         except BaseException as e:  # noqa: BLE001 -- an unreadable frame must not read as a pass
             problems.append("%s: %s" % (type(e).__name__, e))
         return True
@@ -168,10 +184,17 @@ def _child(agent_dir, st):
     def on_unwind(code_obj, offset, exc):
         observe(code_obj, None)
 
-    events = mon.events.PY_RETURN | mon.events.PY_UNWIND
+    def on_start(code_obj, offset):
+        if not is_target(code_obj):
+            return mon.DISABLE
+        starts[sys._getframe(1)] = phase[0]    # callback <- the monitored frame
+        return None
+
+    events = mon.events.PY_START | mon.events.PY_RETURN | mon.events.PY_UNWIND
     name = "bridge-native-pin"
     mon.use_tool_id(TOOL_ID, name)
     st["monitor"] = (mon, name, events)
+    mon.register_callback(TOOL_ID, mon.events.PY_START, on_start)
     mon.register_callback(TOOL_ID, mon.events.PY_RETURN, on_return)
     mon.register_callback(TOOL_ID, mon.events.PY_UNWIND, on_unwind)
     mon.set_events(TOOL_ID, events)
@@ -206,6 +229,17 @@ def _child(agent_dir, st):
         return
     # Construction (the TestCase instance is built here) is observed and counted too; nothing is ever cleared.
     suite = unittest.defaultTestLoader.loadTestsFromName(TEST_MODULE + "." + TEST_CLASS + "." + TEST_NAME)
+    original_call = unittest.TestCase._callTestMethod
+
+    def call_test_method(self, method):
+        before = phase[0]
+        phase[0] = "method"
+        try:
+            return original_call(self, method)
+        finally:
+            phase[0] = before
+
+    unittest.TestCase._callTestMethod = call_test_method
     phase[0] = "run"
     try:
         st["result"] = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
@@ -244,6 +278,9 @@ def _verdict(st):
     if st["unraisable"] or sys.unraisablehook is not st["hook"]:
         return "UNKNOWN (an exception was ignored at shutdown, or the hook was replaced: %s)" % (
             st["unraisable"][0] if st["unraisable"] else "sys.unraisablehook replaced")
+    if st["thread_errors"] or threading.excepthook is not st["thread_hook"]:
+        return "UNKNOWN (a thread died with an exception, or threading.excepthook was replaced: %s)" % (
+            st["thread_errors"][0] if st["thread_errors"] else "threading.excepthook replaced")
     if mon.get_tool(TOOL_ID) != name or mon.get_events(TOOL_ID) != events:
         return "UNKNOWN (the test replaced the observer; later calls were not observed)"
     if result is None:
@@ -259,8 +296,8 @@ def _verdict(st):
     lookups = [(e, ph) for kind, e, ph in frames if kind == "lookup"]
     if not all(isinstance(e, dict) for e, _ in lookups):
         return "UNKNOWN (a pinned lookup did not return a real entry; nothing was proven)"
-    if not any(ph == "run" for _, ph in lookups):
-        return "UNKNOWN (no pinned lookup happened while the test ran; an import-time or construction-time lookup proves nothing about the test)"
+    if not any(ph == "method" for _, ph in lookups):
+        return "UNKNOWN (no pinned lookup started inside the test method; a lookup at import, construction or setUp proves nothing about it)"
     return "PINNED"
 
 
@@ -273,6 +310,16 @@ def _child_main(agent_dir):
         # the test registered; threading's shutdown has already joined the non-daemon threads. It prints the only
         # line the parent believes (it carries the nonce) and ends the process with the matching exit code, so
         # nothing the interpreter does afterwards can change either.
+        # Streams the TEST may have replaced are flushed BEFORE the verdict is computed: whatever their flush does
+        # (a native lookup, an exception) is then seen by the verdict. After it, nothing the test controls is run:
+        # only the interpreter's original streams are touched.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream is not None:
+                    stream.flush()
+            except BaseException as e:  # noqa: BLE001
+                st.setdefault("problems", []).append("flushing %s failed: %s: %s" % (
+                    "stdout" if stream is sys.stdout else "stderr", type(e).__name__, e))
         try:
             text = _verdict(st)
         except BaseException as e:  # noqa: BLE001
@@ -287,7 +334,7 @@ def _child_main(agent_dir):
         out.write("\nRESULT %s %s\n" % (nonce, text))    # leading newline: a test's unterminated print cannot hide it
         out.flush()
         try:
-            sys.stderr.flush()
+            (sys.__stderr__ or sys.stderr).flush()
         except BaseException:  # noqa: BLE001
             pass
         os._exit(VERDICT_CODE[text.split(" ")[0]])
