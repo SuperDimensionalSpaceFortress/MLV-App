@@ -489,6 +489,179 @@ TEST(VisualCaptureSourceHash, Lj92AShortScanDecodesInsideTheDisplaySizedCopy)
     expectIdentityFollowsPicture(shortScan, padded);
 }
 
+namespace
+{
+// r6 (adversary r5 pass 3 A1/A2 on e747c5a4, verbatim): Z(n) = n zero bytes. A 64x64 14-bit LJ92 frame, one 1-bit code per
+// category (0: diff 0, 1: diff +-1), predictor 1, whose 64 entropy bytes hold 512 of its 4096 samples: the scan runs out.
+std::vector<uint8_t> shortScanPayload()
+{
+    return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 }, kSof3, kSos, zeros(64) });
+}
+
+// lj92_open's verdict on a COPY of `payload` (datalen = its size) followed by `slack` zero bytes; the handle is closed.
+int lj92OpenStatus(std::vector<uint8_t> payload, size_t slack)
+{
+    const int length = static_cast<int>(payload.size());
+    payload.resize(payload.size() + slack, 0);
+    lj92 decoder = nullptr;
+    int width = 0, height = 0, bitdepth = 0, components = 0;
+    const int ret = lj92_open(&decoder, payload.data(), length, &width, &height, &bitdepth, &components);
+    if (ret == LJ92_ERROR_NONE) lj92_close(decoder);
+    return ret;
+}
+
+// The display decode's call (getMlvRawFrameUint16Direct: lj92_open with datalen = frame_size, then lj92_decode of every
+// sample) on a buffer holding `payload` and then `tail`, the bytes the display's raw_frame happens to hold after the read.
+int decodeWithTail(std::vector<uint8_t> payload, const std::vector<uint8_t> & tail, std::vector<uint16_t> * picture)
+{
+    const int length = static_cast<int>(payload.size());
+    payload.insert(payload.end(), tail.begin(), tail.end());
+    lj92 decoder = nullptr;
+    int width = 0, height = 0, bitdepth = 0, components = 0;
+    int ret = lj92_open(&decoder, payload.data(), length, &width, &height, &bitdepth, &components);
+    if (ret != LJ92_ERROR_NONE) return ret;
+    picture->assign(static_cast<size_t>(width) * height * components, 0);
+    ret = lj92_decode(decoder, picture->data(), width * height * components, 0, nullptr, 0);
+    lj92_close(decoder);
+    return ret;
+}
+
+// FNV-1a 64 over the samples, low byte first: mlvLj92FrameSourceHash64's identity of a decoded picture.
+uint64_t pictureIdentity(const std::vector<uint16_t> & picture)
+{
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (const uint16_t sample : picture)
+        for (const uint8_t byte : { static_cast<uint8_t>(sample & 0xFFu), static_cast<uint8_t>(sample >> 8) })
+        {
+            hash ^= byte;
+            hash *= 0x100000001b3ull;
+        }
+    return hash;
+}
+} // namespace
+
+// r6 (adversary r5 pass 3 A2 on e747c5a4, verbatim input): A1's 112-byte payload with the SOS length (bytes 40, 41) set to
+// FF FF. lj92_open accepted it and every scan variant started its bit reader at scanstart + 65535, past the allocation.
+// liblj92 now refuses it, so the display decode, the source identity and the fuzz harness all refuse it.
+TEST(VisualCaptureSourceHash, Lj92AScanHeaderLongerThanThePayloadIsRefused)
+{
+    std::vector<uint8_t> payload = shortScanPayload();
+    ASSERT_EQ(static_cast<size_t>(112), payload.size());
+    ASSERT_EQ(0xDA, payload[39]);
+    payload[40] = 0xFF;
+    payload[41] = 0xFF;
+    ASSERT_NE(LJ92_ERROR_NONE, lj92OpenStatus(payload, 7172 - 112 + 65536)); // refused before any scan is read
+    int status = 0;
+    lj92Hash(payload, &status);
+    ASSERT_NE(0, status);
+
+    // The class: every marker-segment length field, and every segment end, lies inside the payload.
+    const std::vector<uint8_t> sof3Head = { 0xFF, 0xC3, 0x00, 0x0B, 0x0E, 0x00, 0x40, 0x00, 0x40 };
+    const std::vector<std::vector<uint8_t>> refused = {
+        // the SOS ends exactly at the payload end: no entropy byte inside it
+        bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 }, kSof3, kSos }),
+        // the SOS length field is cut after its first byte
+        bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 }, kSof3, { 0xFF, 0xDA, 0x00 } }),
+        // a COM, an APP1 and an SOF3 whose lengths (FF FF) run past the payload
+        withSegmentAfterSoi(shortScanPayload(), { 0xFF, 0xFE, 0xFF, 0xFF }),
+        withSegmentAfterSoi(shortScanPayload(), { 0xFF, 0xE1, 0xFF, 0xFF }),
+        bytes({ { 0xFF, 0xD8, 0xFF, 0xC3, 0xFF, 0xFF, 0x0E, 0x00, 0x40, 0x00, 0x40, 0x01, 0x01, 0x11, 0x00 }, zeros(8) }),
+        // an SOF3 cut before its component count (byte ix + 7)
+        bytes({ { 0xFF, 0xD8 }, sof3Head }),
+        // a DHT whose 16 counts are cut, and one whose declared symbols run past the payload
+        bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(5) }),
+        bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x03, 0x00, 0x02 }, zeros(14), { 0xFF } }),
+        // an SOS whose predictor byte (scanstart + 3 + 2 * component count) is past the payload
+        bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x02 }, zeros(15), { 0x00, 0x01 }, kSof3,
+                { 0xFF, 0xDA, 0x00, 0x02, 0xFF }, zeros(8) }),
+    };
+    for (const std::vector<uint8_t> & bad : refused)
+    {
+        ASSERT_NE(LJ92_ERROR_NONE, lj92OpenStatus(bad, 65536));
+        if (bad.size() >= 4)
+        {
+            lj92Hash(bad, &status);
+            ASSERT_NE(0, status);
+        }
+    }
+}
+
+// r6 (adversary r5 pass 3 A1 on e747c5a4, verbatim input): one payload, two display decodes. The scan runs out of its 112
+// bytes after 512 samples; the display's raw_frame is max(frame_size, packed) + 4 = 7172 bytes, read up to frame_size and
+// (at e747c5a4) left uninitialised after it. Frame 1's tail is zero, frame 2's is zero except byte 112 = 0x80: the bit
+// reader read that byte and the two calls showed different pictures while the identity (decoded over a zeroed tail) was
+// one. liblj92 now reads zero bits past datalen, so the tail cannot change the picture (and the display zeroes it anyway).
+TEST(VisualCaptureSourceHash, Lj92AScanThatRunsPastThePayloadIsOnePictureWhateverFollowsIt)
+{
+    const std::vector<uint8_t> payload = shortScanPayload();
+    ASSERT_EQ(static_cast<size_t>(112), payload.size());
+    std::vector<uint8_t> zeroTail(7172 - 112, 0x00);
+    std::vector<uint8_t> markedTail = zeroTail;
+    markedTail[0] = 0x80;
+    std::vector<uint8_t> noisyTail(7172 - 112, 0x00);
+    for (size_t i = 0; i < noisyTail.size(); ++i) noisyTail[i] = static_cast<uint8_t>(0x5Bu * (i + 1u) + (i >> 3));
+
+    std::vector<uint16_t> first;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeWithTail(payload, zeroTail, &first));
+    ASSERT_EQ(static_cast<size_t>(4096), first.size());
+    std::vector<uint16_t> second;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeWithTail(payload, markedTail, &second));
+    ASSERT_TRUE(first == second); // same payload, same picture, two calls
+    std::vector<uint16_t> third;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeWithTail(payload, noisyTail, &third));
+    ASSERT_TRUE(first == third);
+    std::vector<uint16_t> bare;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeWithTail(payload, {}, &bare)); // no slack at all: nothing past the payload is read
+    ASSERT_TRUE(first == bare);
+
+    // The identity is the picture the display shows.
+    int status = -1;
+    const uint64_t identity = lj92Hash(payload, &status);
+    ASSERT_EQ(0, status);
+    ASSERT_TRUE(identity == pictureIdentity(second));
+
+    // The class: every scan variant (predictor 1 fast path, the generic scan via predictor 2, predictor 6) gives one
+    // verdict and, when it decodes, one picture, whatever follows the payload.
+    for (const uint8_t predictor : std::initializer_list<uint8_t>{ 1, 2, 6 })
+    {
+        std::vector<uint8_t> variant = payload;
+        ASSERT_EQ(0x01, variant[45]); // kSos's Ss (predictor) byte
+        variant[45] = predictor;
+        std::vector<uint16_t> a;
+        std::vector<uint16_t> b;
+        const int aStatus = decodeWithTail(variant, zeroTail, &a);
+        const int bStatus = decodeWithTail(variant, markedTail, &b);
+        ASSERT_EQ(aStatus, bStatus);
+        if (aStatus == LJ92_ERROR_NONE) ASSERT_TRUE(a == b);
+        const int cStatus = decodeWithTail(variant, noisyTail, &b);
+        ASSERT_EQ(aStatus, cStatus);
+        if (aStatus == LJ92_ERROR_NONE) ASSERT_TRUE(a == b);
+    }
+}
+
+// r6 (A1 class, found by the r6 sweep): lookup-table entries liblj92 never wrote. A table with no codes at all wrote none
+// (every sample read uninitialised memory) and is refused; a code the table leaves undefined (here '1', with only '0'
+// declared) decodes the same way on every call.
+TEST(VisualCaptureSourceHash, Lj92LookupEntriesTheTableNeverDefinesAreNeverReadUninitialised)
+{
+    const std::vector<uint8_t> noCodes = bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x13, 0x00 }, zeros(16), kSof3, kSos,
+                                                 zeros(64), { 0xFF, 0xD9 } });
+    ASSERT_NE(LJ92_ERROR_NONE, lj92OpenStatus(noCodes, 65536));
+    int status = 0;
+    lj92Hash(noCodes, &status);
+    ASSERT_NE(0, status);
+
+    const std::vector<uint8_t> undefinedCode = bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01 }, zeros(15),
+                                                       { 0x00 }, kSof3, kSos, { 0x80 }, zeros(511), { 0xFF, 0xD9 } });
+    std::vector<uint16_t> first;
+    std::vector<uint16_t> second;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeWithTail(undefinedCode, {}, &first));
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeWithTail(undefinedCode, {}, &second));
+    ASSERT_TRUE(first == second);
+    ASSERT_TRUE(lj92Hash(undefinedCode, &status) == pictureIdentity(first));
+    ASSERT_EQ(0, status);
+}
+
 TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)
 {
     const std::vector<uint8_t> plain = encodeLj92(2048, 12288);

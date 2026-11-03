@@ -3317,6 +3317,15 @@ static void frame_index_sort(frame_index_t *frame_index, uint32_t entries)
     } while (n > 1);
 }
 
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r6 (adversary r5 pass 3 A1): getMlvRawFrameUint16Direct mallocs raw_frame at
+ * mlvRawFrameInputCapacity's size (max(frame_size, packed) + 4) and fread()s fewer bytes into it. The slack after
+ * the read is zeroed, never the whole buffer, so no decoder ever sees heap leftovers there and one payload is one
+ * picture on every call (the source identity decodes with the same zeroed slack). O(slack) bytes per frame. */
+static void mlv_zero_raw_frame_slack(uint8_t * raw_frame, size_t bytes_read, size_t capacity)
+{
+    if (raw_frame && bytes_read < capacity) memset(raw_frame + bytes_read, 0, capacity - bytes_read);
+}
+
 int mlvRawFrameInputCapacity(int width, int height, int bitdepth,
                              uint32_t encoded_size,
                              size_t * packed_size,
@@ -3725,6 +3734,7 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
         }
 
         pthread_mutex_unlock(video->main_file_mutex + chunk);
+        mlv_zero_raw_frame_slack(raw_frame, (size_t)frame_size, raw_frame_capacity); /* r6 A1 */
         g_mlv_last_raw_uint16_disk_read_ms = (mlv_stage_timing_now() - disk_read_start) * 1000.0;
 
         const double decompress_start = mlv_stage_timing_now();
@@ -3827,6 +3837,7 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
             }
 
             pthread_mutex_unlock(video->main_file_mutex + chunk);
+            mlv_zero_raw_frame_slack(raw_frame, (size_t)frame_size, raw_frame_capacity); /* r6 A1 */
             g_mlv_last_raw_uint16_disk_read_ms = (mlv_stage_timing_now() - disk_read_start) * 1000.0;
 
             const int expected_width = width;
@@ -3937,6 +3948,7 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
             }
 
             pthread_mutex_unlock(video->main_file_mutex + chunk);
+            mlv_zero_raw_frame_slack(raw_frame, (size_t)frame_size, raw_frame_capacity); /* r6 A1 */
 
             /* Parse bayer JPEG2K header: version + 8 u32s (offset/size for 4 channels) */
             uint32_t hdr[9];
@@ -4088,6 +4100,7 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
             }
 
             pthread_mutex_unlock(video->main_file_mutex + chunk);
+            mlv_zero_raw_frame_slack(raw_frame, packed_frame_size, raw_frame_capacity); /* r6 A1 */
             g_mlv_last_raw_uint16_disk_read_ms = (mlv_stage_timing_now() - disk_read_start) * 1000.0;
 
             const double unpack_start = mlv_stage_timing_now();
@@ -4153,9 +4166,10 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
  * own output makes both directions exact: equal pictures give equal identities, and different pictures differ
  * (up to an FNV-1a 64 collision). `payload` is the caller's buffer and liblj92 writes into it (parseHuff zeroes each
  * DHT class/id byte), exactly as it does when it decodes the frame for display. */
-/* r5 (adversary r5 pass 2 A2 on 787b70cc): `capacity` is the zero-filled allocation behind `payload`; liblj92's bit
- * reader runs by sample count and can read past `length`, so the decode is refused unless the buffer is at least the
- * display decode's (getMlvRawFrameUint16Direct: max(frame_size, packed picture) + 4, mlvRawFrameInputCapacity). */
+/* r5 (adversary r5 pass 2 A2 on 787b70cc): `capacity` is the zero-filled allocation behind `payload`, and the decode is
+ * refused unless the buffer is at least the display decode's (getMlvRawFrameUint16Direct: max(frame_size, packed
+ * picture) + 4, mlvRawFrameInputCapacity). r6 (pass 3 A1/A2): liblj92 itself now refuses a scan header past `length`
+ * and its bit reader reads zero bytes past `length`, never the slack; the display zeroes its slack too. */
 static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length, size_t capacity,
                                          int expectedWidth, int expectedHeight, int expectedBitdepth,
                                          uint64_t * hashOut)
@@ -4289,7 +4303,7 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
     {
         /* r5 (adversary r5 A1 on e57fd03e): the whole payload, decoded as the display decodes it, and the
          * decoded picture hashed (mlv_lj92_decoded_picture_hash). The buffer is the display decode's shape:
-         * frame_size bytes plus 4 look-ahead bytes (zeroed here, so the identity is deterministic). */
+         * frame_size bytes plus its slack, zeroed here as the display zeroes it (r6 A1, mlv_zero_raw_frame_slack). */
         uint8_t * payload = (uint8_t *)calloc(lj92_capacity, 1); /* pass 2 A2: the display decode's raw_frame size */
         if (!payload) return 1;
         pthread_mutex_lock(video->main_file_mutex + chunk);

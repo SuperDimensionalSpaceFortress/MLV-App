@@ -540,7 +540,8 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
 /* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: decodes a private copy with liblj92
  * (lj92_open, then lj92_decode of every sample, no skip, no linearisation, as the display decode calls it) and
- * returns FNV-1a 64 over the decoded width, height, component count and samples. Bytes the decoder never
+ * returns FNV-1a 64 over the decoded samples only (r5 pass 2 A1: not the header's shape). r6: liblj92 never reads
+ * past `length` (a scan that runs out reads zero bits), so bytes after the payload cannot change it. Bytes the decoder never
  * uses -- COM/APPn segments, header fields it ignores, a table symbol the bitstream never selects, bytes after
  * the scan -- cannot change it; any change to the decoded picture does. Returns 0 and sets *hashOut, or
  * nonzero (no identity) for NULL inputs, a payload under 4 bytes or over INT_MAX, or a payload liblj92 refuses.
