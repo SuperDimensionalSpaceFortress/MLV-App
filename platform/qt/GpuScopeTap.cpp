@@ -13,6 +13,63 @@
 #include <QSize>
 #include <QtDebug>
 
+namespace {
+
+// r4: the production side of the GpuScopeTapGl seam -- every call forwards to the current context's functions.
+class QtGpuScopeTapGl final : public GpuScopeTapGl
+{
+public:
+    explicit QtGpuScopeTapGl(QOpenGLExtraFunctions *f) : m_f(f) {}
+    GLenum glGetError() override { return m_f->glGetError(); }
+    void glGenRenderbuffers(GLsizei n, GLuint *names) override { m_f->glGenRenderbuffers(n, names); }
+    void glDeleteRenderbuffers(GLsizei n, const GLuint *names) override { m_f->glDeleteRenderbuffers(n, names); }
+    void glBindRenderbuffer(GLenum target, GLuint name) override { m_f->glBindRenderbuffer(target, name); }
+    void glRenderbufferStorage(GLenum target, GLenum format, GLsizei width, GLsizei height) override
+    {
+        m_f->glRenderbufferStorage(target, format, width, height);
+    }
+    void glGenFramebuffers(GLsizei n, GLuint *names) override { m_f->glGenFramebuffers(n, names); }
+    void glDeleteFramebuffers(GLsizei n, const GLuint *names) override { m_f->glDeleteFramebuffers(n, names); }
+    void glBindFramebuffer(GLenum target, GLuint name) override { m_f->glBindFramebuffer(target, name); }
+    void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum rbTarget, GLuint rb) override
+    {
+        m_f->glFramebufferRenderbuffer(target, attachment, rbTarget, rb);
+    }
+    GLenum glCheckFramebufferStatus(GLenum target) override { return m_f->glCheckFramebufferStatus(target); }
+    void glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                           GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter) override
+    {
+        m_f->glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+    }
+    void glGenBuffers(GLsizei n, GLuint *names) override { m_f->glGenBuffers(n, names); }
+    void glBindBuffer(GLenum target, GLuint name) override { m_f->glBindBuffer(target, name); }
+    void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) override
+    {
+        m_f->glBufferData(target, size, data, usage);
+    }
+    void glPixelStorei(GLenum pname, GLint param) override { m_f->glPixelStorei(pname, param); }
+    void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) override
+    {
+        m_f->glReadPixels(x, y, width, height, format, type, pixels);
+    }
+    GLsync glFenceSync(GLenum condition, GLbitfield flags) override { return m_f->glFenceSync(condition, flags); }
+    GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) override
+    {
+        return m_f->glClientWaitSync(sync, flags, timeout);
+    }
+    void glDeleteSync(GLsync sync) override { m_f->glDeleteSync(sync); }
+    void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) override
+    {
+        return m_f->glMapBufferRange(target, offset, length, access);
+    }
+    GLboolean glUnmapBuffer(GLenum target) override { return m_f->glUnmapBuffer(target); }
+
+private:
+    QOpenGLExtraFunctions *m_f;
+};
+
+} // namespace
+
 GpuScopeTap::GpuScopeTap(const char *surfaceName)
     : m_surfaceName(surfaceName ? surfaceName : "unknown")
 {
@@ -74,9 +131,10 @@ void GpuScopeTap::noteDrawnRect(double leftPx, double topPx, double rightPx, dou
 void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
                         double leftPx, double topPx, double rightPx, double bottomPx, int fbWidth, int fbHeight)
 {
-    QOpenGLExtraFunctions *gl = ( context && QOpenGLContext::currentContext() == context ) ? context->extraFunctions() : nullptr;
+    QOpenGLExtraFunctions *functions =
+        ( context && QOpenGLContext::currentContext() == context ) ? context->extraFunctions() : nullptr;
     QRect source;
-    if ( !gl
+    if ( !functions
          || !supportedCached(context)
          || ( m_namesContext && m_namesContext != context )
          || !playbackScopeTapFramebufferRect(leftPx, topPx, rightPx, bottomPx, fbWidth, fbHeight, &source) )
@@ -84,6 +142,31 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
         ++m_counters.skipped;
         return;
     }
+    // Both slots busy means names already exist, and they belong to this context (checked above).
+    m_namesContext = context;
+    QtGpuScopeTapGl gl(functions);
+    issueWith(&gl, sourceFbo, source);
+}
+
+// r4 (adversary r3 A2): a tap that only ever skips must not keep the scope off the CPU feed. A refused FBO is
+// structural (it fails again every request), so it disables the tap at once; any other GL failure (a refused PBO, an
+// errored blit/read, no fence, a failed map) does after kGlFailureLimit in a row. A published read-back resets the run.
+void GpuScopeTap::noteGlFailure(const char *reason, bool structural)
+{
+    ++m_consecutiveGlFailures;
+    if ( m_unusable ) return;
+    if ( structural || m_consecutiveGlFailures >= kGlFailureLimit )
+    {
+        m_unusable = true;
+        qWarning().nospace() << "playback_scope_gpu_tap unusable=1 reason=" << reason
+                             << " consecutive_gl_failures=" << m_consecutiveGlFailures
+                             << " gl_errors=" << m_counters.glErrors
+                             << " surface=" << m_surfaceName << " fallback=cpu_scope_feed";
+    }
+}
+
+void GpuScopeTap::issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &source)
+{
     int slotIndex = -1;
     for ( int i = 0; i < 2 && slotIndex < 0; ++i )
     {
@@ -95,7 +178,6 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
         ++m_counters.skipped;
         return;
     }
-    m_namesContext = context;
     const QSize tapSize = playbackScopeTapSize(source.width(), source.height(), m_maxWidth);
 
     if ( !m_fbo || m_fboWidth != tapSize.width() || m_fboHeight != tapSize.height() )
@@ -122,6 +204,7 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
             m_fboWidth = 0;
             m_fboHeight = 0;
             ++m_counters.skipped;
+            noteGlFailure("fbo_incomplete", true);
             return;
         }
         m_fboWidth = tapSize.width();
@@ -132,18 +215,31 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
     const int bytes = tapSize.width() * tapSize.height() * 4;
     if ( !slot.pbo ) gl->glGenBuffers(1, &slot.pbo);
 
+    // r4 (adversary r3 A1 on b99325e7): every GL call from here to the fence is error-checked, and a read-back whose
+    // sequence raised an error is discarded -- no fence, no serial, never published. A failed blit or glReadPixels can
+    // leave the reused PBO holding the PREVIOUS picture, which would otherwise map cleanly and publish as this one.
+    // Errors left pending by other code are drained first (bounded), so they are not blamed on this read.
+    for ( int drained = 0; drained < 8 && gl->glGetError() != GL_NO_ERROR; ++drained ) {}
     gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFbo);
     gl->glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_fbo);
     gl->glBlitFramebuffer(source.left(), source.top(), source.left() + source.width(), source.top() + source.height(),
                           0, 0, tapSize.width(), tapSize.height(), GL_COLOR_BUFFER_BIT, GL_LINEAR);
     gl->glBindFramebuffer(GL_READ_FRAMEBUFFER, m_fbo);
     gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, slot.pbo);
+    if ( gl->glGetError() != GL_NO_ERROR )
+    {
+        gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
+        ++m_counters.skipped;
+        ++m_counters.glErrors;
+        noteGlFailure("blit", false);
+        return;
+    }
     if ( slot.capacityBytes < bytes )
     {
         // r5 (adversary r4 A2 on 6b564afc): the capacity is recorded only once the store exists. A refused allocation
         // (GL_OUT_OF_MEMORY) leaves an empty store; caching its size would skip every later allocation and never complete
-        // a read-back. Drained first (bounded) so an older error is not mistaken for this one.
-        for ( int drained = 0; drained < 8 && gl->glGetError() != GL_NO_ERROR; ++drained ) {}
+        // a read-back. No error is pending here (checked just above), so the next one is this allocation's.
         gl->glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
         if ( gl->glGetError() != GL_NO_ERROR )
         {
@@ -151,6 +247,8 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
             gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
             gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
             ++m_counters.skipped;
+            ++m_counters.glErrors;
+            noteGlFailure("pbo_allocate", false);
             return;
         }
         slot.capacityBytes = bytes;
@@ -158,12 +256,22 @@ void GpuScopeTap::issue(QOpenGLContext *context, GLuint sourceFbo,
     gl->glPixelStorei(GL_PACK_ALIGNMENT, 4);
     // Into the bound PBO (offset 0): the GPU copies asynchronously; nothing reaches client memory here.
     gl->glReadPixels(0, 0, tapSize.width(), tapSize.height(), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    const GLenum readError = gl->glGetError();
     gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    if ( readError != GL_NO_ERROR )
+    {
+        gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
+        ++m_counters.skipped;
+        ++m_counters.glErrors;
+        noteGlFailure("read_pixels", false);
+        return;
+    }
     slot.fence = gl->glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     gl->glBindFramebuffer(GL_FRAMEBUFFER, sourceFbo);
     if ( !slot.fence )
     {
         ++m_counters.skipped;
+        noteGlFailure("fence", false);
         return;
     }
     slot.width = tapSize.width();
@@ -177,9 +285,14 @@ void GpuScopeTap::poll(QOpenGLContext *context)
 {
     if ( !pending() ) return;
     if ( !context || QOpenGLContext::currentContext() != context || m_namesContext != context ) return;
-    QOpenGLExtraFunctions *gl = context->extraFunctions();
-    if ( !gl ) return;
+    QOpenGLExtraFunctions *functions = context->extraFunctions();
+    if ( !functions ) return;
+    QtGpuScopeTapGl gl(functions);
+    pollWith(&gl);
+}
 
+void GpuScopeTap::pollWith(GpuScopeTapGl *gl)
+{
     // Oldest first, so a newer read-back is never overwritten by an older one.
     int order[2] = { 0, 1 };
     if ( m_slots[1].fence && ( !m_slots[0].fence || m_slots[1].serial < m_slots[0].serial ) )
@@ -222,8 +335,17 @@ void GpuScopeTap::poll(QOpenGLContext *context)
                 m_counters.lastWidth = slot.width;
                 m_counters.lastHeight = slot.height;
                 m_counters.mapMsTotal += static_cast<double>(mapClock.nsecsElapsed()) / 1.0e6;
+                m_consecutiveGlFailures = 0;   // r4: a published read-back ends a failure run
+            }
+            else
+            {
+                noteGlFailure("map", false);   // r4 (A2 siblings :207/:213): a map that keeps failing falls back too
             }
             gl->glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        }
+        else if ( state == GL_WAIT_FAILED )
+        {
+            noteGlFailure("fence_wait", false);
         }
         // Signalled (mapped, stale or not) or GL_WAIT_FAILED: this read-back is finished either way.
         gl->glDeleteSync(slot.fence);
@@ -275,4 +397,6 @@ void GpuScopeTap::destroy(bool contextCurrent)
     m_drawnRectCapturable = false;
     m_supportContext = nullptr;
     m_supportCached = false;
+    m_consecutiveGlFailures = 0;   // r4: a new context gets a fresh tap
+    m_unusable = false;
 }

@@ -19,11 +19,43 @@
 
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
+#include <QRect>
 #include <QSurfaceFormat>
 #include <QtGlobal>
 
 #include <cstdint>
 #include <vector>
+
+/* PLAYBACK-GPU-SCOPES-NO-VETO-1 r4: the GL calls GpuScopeTap's issue/poll make, behind one seam so a headless test
+ * can inject a GL error, a refused allocation or an incomplete FBO (adversary r3 A1/A2). Production forwards every
+ * call to the current context's QOpenGLExtraFunctions (GpuScopeTap.cpp). */
+class GpuScopeTapGl
+{
+public:
+    virtual ~GpuScopeTapGl() = default;
+    virtual GLenum glGetError() = 0;
+    virtual void glGenRenderbuffers(GLsizei n, GLuint *names) = 0;
+    virtual void glDeleteRenderbuffers(GLsizei n, const GLuint *names) = 0;
+    virtual void glBindRenderbuffer(GLenum target, GLuint name) = 0;
+    virtual void glRenderbufferStorage(GLenum target, GLenum format, GLsizei width, GLsizei height) = 0;
+    virtual void glGenFramebuffers(GLsizei n, GLuint *names) = 0;
+    virtual void glDeleteFramebuffers(GLsizei n, const GLuint *names) = 0;
+    virtual void glBindFramebuffer(GLenum target, GLuint name) = 0;
+    virtual void glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum rbTarget, GLuint rb) = 0;
+    virtual GLenum glCheckFramebufferStatus(GLenum target) = 0;
+    virtual void glBlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                   GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter) = 0;
+    virtual void glGenBuffers(GLsizei n, GLuint *names) = 0;
+    virtual void glBindBuffer(GLenum target, GLuint name) = 0;
+    virtual void glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) = 0;
+    virtual void glPixelStorei(GLenum pname, GLint param) = 0;
+    virtual void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void *pixels) = 0;
+    virtual GLsync glFenceSync(GLenum condition, GLbitfield flags) = 0;
+    virtual GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) = 0;
+    virtual void glDeleteSync(GLsync sync) = 0;
+    virtual void *glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) = 0;
+    virtual GLboolean glUnmapBuffer(GLenum target) = 0;
+};
 
 class GpuScopeTap
 {
@@ -35,6 +67,8 @@ public:
         quint64 completed = 0;   // fences signalled, buffers mapped and converted
         quint64 notReady = 0;    // requests DROPPED because both read-backs were still in flight (CoS #447)
         quint64 skipped = 0;     // a requested read-back the paint did not issue (rect outside the framebuffer, no FBO)
+        quint64 glErrors = 0;    // r4 (adversary r3 A1): read-backs discarded because a GL call in the issue sequence
+                                 // (blit, bind, allocate, glReadPixels) raised an error -- never published
         double mapMsTotal = 0.0; // map + convert + unmap, summed over completed
         int lastWidth = 0;
         int lastHeight = 0;
@@ -54,8 +88,13 @@ public:
     /* The answer supported() cached for this context; false when it has not been evaluated for it yet. No GL. */
     bool supportedCached(const QOpenGLContext *context) const
     {
-        return context && m_supportContext == context && m_supportCached;
+        return context && m_supportContext == context && m_supportCached && !m_unusable;
     }
+    /* r4 (adversary r3 A2): false once this context's tap FBO was refused (incomplete), or kGlFailureLimit read-backs
+     * in a row failed in GL. supportedCached() then answers false, so the scope keeps the CPU feed (the pre-#447 path)
+     * instead of waiting on a read-back that only ever skips. Reset by destroy() (a new context is evaluated afresh). */
+    bool usable(void) const { return !m_unusable; }
+    static constexpr int kGlFailureLimit = 3;
 
     /* Ask the next paint for a read-back at most maxWidth wide. Dropped (counted in notReady) only when both
      * read-backs are still in flight. */
@@ -93,7 +132,14 @@ public:
     const Counters &counters(void) const { return m_counters; }
 
 private:
-    friend class GuiSmokeTest; // drives the no-GL state (request/take/invalidate) without a context
+    friend class GuiSmokeTest; // drives the no-GL state (request/take/invalidate) and the GL seam without a context
+
+    /* The GL part of issue()/poll(), after the context checks; gl is the seam above. */
+    void issueWith(GpuScopeTapGl *gl, GLuint sourceFbo, const QRect &source);
+    void pollWith(GpuScopeTapGl *gl);
+    /* r4: one issue() refused by GL. structural (the FBO itself is incomplete) disables the tap at once; any other
+     * failure does after kGlFailureLimit in a row. Logged once, on the transition. */
+    void noteGlFailure(const char *reason, bool structural);
 
     struct Slot
     {
@@ -124,6 +170,8 @@ private:
     quint64 m_resultSerial = 0;
     bool m_resultReady = false;
     Counters m_counters;
+    int m_consecutiveGlFailures = 0;
+    bool m_unusable = false;
     mutable const QOpenGLContext *m_supportContext = nullptr;
     mutable bool m_supportCached = false;
 };
