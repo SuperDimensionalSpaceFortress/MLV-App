@@ -291,7 +291,7 @@ TEST(CudaLaunchTiming, AnchoredConfigLineNamesTheAnchorAndItsBracket)
     igpu_lt_format_config_anchored(line, sizeof(line), "recon", 0.0, 1791774588000.125, 0.0120, 86400123.250);
     ASSERT_EQ(std::string("igpu_launch_timing_config dll=recon enabled=1 min_ms=0.000 "
                           "device_clock=anchored anchor_utc_ms=1791774588000.125 anchor_bracket_ms=0.012 "
-                          "anchor_steady_ms=86400123.250"),
+                          "anchor_steady_ms=86400123.250 stamp_rounding_ms=0.015625"),
               std::string(line));
     // Without an anchor the config line is the unchanged golden.
     igpu_lt_format_config(line, sizeof(line), "amaze", 2.0);
@@ -301,14 +301,15 @@ TEST(CudaLaunchTiming, AnchoredConfigLineNamesTheAnchorAndItsBracket)
 TEST(CudaLaunchTiming, AnchorTryAcrossAWallClockStepIsUnusable)
 {
     // Adversary r2 A1, its input: before=1791774588000, after=1791774587000 (a 1000 ms backward step).
+    // Arguments (r3, pass 3 A1): steady_b0, utc_before, steady_b1, steady_a0, utc_after, steady_a1.
     double bracket = -1.0;
-    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774587000.0, 5000.0, 5000.125, &bracket));
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(5000.0, 1791774588000.0, 5000.0, 5000.125, 1791774587000.0, 5000.125, &bracket));
     // A forward step inside the try is refused too; a negative monotonic interval never is a bracket.
-    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774589000.125, 5000.0, 5000.125, &bracket));
-    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.0, 5000.125, 5000.0, &bracket));
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(5000.0, 1791774588000.0, 5000.0, 5000.125, 1791774589000.125, 5000.125, &bracket));
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(5000.125, 1791774588000.0, 5000.125, 5000.0, 1791774588000.0, 5000.0, &bracket));
     ASSERT_NEAR(-1.0, bracket, 0.0);
     // A clean try: the bracket is the longer of the two intervals (here the wall one).
-    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.127, 5000.0, 5000.125, &bracket));
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(5000.0, 1791774588000.0, 5000.0, 5000.125, 1791774588000.127, 5000.125, &bracket));
     // r3: at 1.79e12 ms a double's step is 2^-12 ms, so the wall interval is the representable one.
     ASSERT_NEAR(1791774588000.127 - 1791774588000.0, bracket, 1e-9);
 }
@@ -320,11 +321,147 @@ TEST(CudaLaunchTiming, AnchorBracketCoversTheWallClockAnchor)
     // event, so the bracket must be at least that: it is the wall interval, 0.029.
     const double u = 1791774588000.0;
     double bracket = 0.0;
-    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(u, u + 0.029, 5000.0, 5000.020, &bracket));
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(5000.0, u, 5000.0, 5000.020, u + 0.029, 5000.020, &bracket));
     ASSERT_TRUE(bracket >= (u + 0.029) - (u + 0.001) - 1e-6);
     // And when the monotonic interval is the longer, it is kept.
-    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(u, u + 0.020, 5000.0, 5000.029, &bracket));
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(5000.0, u, 5000.0, 5000.029, u + 0.020, 5000.029, &bracket));
     ASSERT_NEAR(0.029, bracket, 1e-6);
+}
+
+TEST(CudaLaunchTiming, AnchorTryPinsEachWallReadToTheMonotonicClock)
+{
+    // Adversary r2 pass 3 A1, its input: U=1791774588000; utc_before=U, steady 5000 -> 5000.125 around
+    // the record and wait (event at 5000.0625); then a 1000 ms scheduling gap holding a -1000 ms
+    // wall-clock step; utc_after=U+0.125. Both intervals are 0.125, so a try that reads each clock once
+    // keeps it, and an event 1000.125 ms after the anchor is stamped about 1000 ms wrong. Each wall read
+    // is now pinned between two monotonic reads (steady, wall, steady), so the gap shows up as a
+    // 1000 ms pin, and the try is unusable.
+    const double u = 1791774588000.0;
+    double bracket = -1.0;
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(5000.0, u, 5000.0, 5000.125, u + 0.125, 6000.125, &bracket));
+    // The same gap before the first wall read is caught by that read's own pin.
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(4000.0, u, 5000.0, 5000.125, u + 0.125, 5000.125, &bracket));
+    // A pin just past the tolerance is unusable even when the two intervals agree.
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(5000.0, u, 5000.0, 5000.125, u + 0.125,
+                                            5000.125 + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS, &bracket));
+    ASSERT_NEAR(-1.0, bracket, 0.0);
+    // Pins inside the tolerance: usable, and the bracket covers the longest monotonic time between the
+    // first pin's start and the last pin's end, which bounds anchor_utc_ms - event time.
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(5000.0, u, 5000.004, 5000.125, u + 0.125, 5000.129, &bracket));
+    ASSERT_TRUE(bracket >= 5000.129 - 5000.0 - 1e-9);
+    ASSERT_TRUE(bracket >= 5000.129 - 5000.0625 - 1e-9);
+    // The recorder takes its reads in that order and passes all six.
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "            const double steady_b0 = steady_ms();\n"
+        "            const double utc_before = utc_ms();\n"
+        "            const double steady_b1 = steady_ms();\n"
+        "            const bool ok = cudaEventRecord(ev, 0) == cudaSuccess && cudaEventSynchronize(ev) == cudaSuccess;\n"
+        "            const double steady_a0 = steady_ms();\n"
+        "            const double utc_after = utc_ms();\n"
+        "            const double steady_a1 = steady_ms();\n")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "igpu_lt_anchor_try_bracket(steady_b0, utc_before, steady_b1, steady_a0, utc_after, steady_a1, &bracket)")));
+}
+
+TEST(CudaLaunchTiming, CrossDllBoundCoversTheStampsFloatRounding)
+{
+    // Adversary r2 pass 3 A2, its input: brackets 0.002 ms; DLL A's anchor event at device time 0
+    // (anchor UTC U+0.0009765625), DLL B's at 1000.0078125 (anchor UTC U+1000.0087890625), so the
+    // anchors' skew is 0; one device instant 300000.0078125 ms after A's anchor is read as float
+    // elapsed 300000 (A) and 299000 (B). The stamps differ by 0.0078125 ms, more than the brackets'
+    // sum: the bound also carries both stamps' float rounding and the anchors' skew.
+    const double u = 1791774588000.0;
+    const double utcA = u + 0.0009765625;
+    const double utcB = u + 1000.0087890625;
+    const double steadyA = 7000.0;
+    const double steadyB = 7000.0 + 1000.0078125;
+    ASSERT_EQ(1, igpu_lt_anchors_comparable(utcA, steadyA, 0.002, utcB, steadyB, 0.002));
+    const double skew = igpu_lt_anchor_skew_ms(utcA, steadyA, utcB, steadyB);
+    const float ea = (float)300000.0078125;
+    const float eb = (float)(300000.0078125 - 1000.0078125);
+    ASSERT_NEAR(300000.0, (double)ea, 0.0);
+    ASSERT_NEAR(299000.0, (double)eb, 0.0);
+    double sa = 0.0;
+    double sb = 0.0;
+    ASSERT_EQ(1, igpu_lt_dev_stamp(utcA, (double)ea, &sa));
+    ASSERT_EQ(1, igpu_lt_dev_stamp(utcB, (double)eb, &sb));
+    const double diff = std::fabs(sa - sb);
+    ASSERT_TRUE(diff > 0.002 + 0.002);
+    ASSERT_TRUE(diff <= igpu_lt_cross_dll_bound_ms(0.002, 0.002, skew));
+    ASSERT_NEAR(0.004 + 2.0 * IGPU_LT_ANCHOR_ROUNDING_MS + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS,
+                igpu_lt_cross_dll_bound_ms(0.002, 0.002, 0.0), 1e-12);
+    // A measured skew widens the bound by its size.
+    ASSERT_NEAR(igpu_lt_cross_dll_bound_ms(0.002, 0.002, 0.0) + 0.003, igpu_lt_cross_dll_bound_ms(0.002, 0.002, -0.003), 1e-12);
+    // Every instant inside the age limit stays inside the bound.
+    for (double d = 1000.0078125 + 0.001; d < IGPU_LT_ANCHOR_MAX_AGE_MS; d = d * 1.37 + 0.0078125)
+    {
+        ASSERT_EQ(1, igpu_lt_dev_stamp(utcA, (double)(float)d, &sa));
+        ASSERT_EQ(1, igpu_lt_dev_stamp(utcB, (double)(float)(d - 1000.0078125), &sb));
+        ASSERT_TRUE(std::fabs(sa - sb) <= igpu_lt_cross_dll_bound_ms(0.002, 0.002, skew));
+    }
+    // The config line publishes the per-stamp rounding, so a reader of the log alone can add it.
+    char line[512];
+    igpu_lt_format_config_anchored(line, sizeof(line), "amaze", 0.0, utcA, 0.002, steadyA);
+    ASSERT_TRUE(std::string(line).find(" stamp_rounding_ms=0.015625") != std::string::npos);
+}
+
+TEST(CudaLaunchTiming, AnchoredConfigPrintsTheBracketRoundedUp)
+{
+    // Adversary r2 pass 3 A3, its input: a valid bracket of 0.012451171875 ms. %.3f rounds it to
+    // nearest (0.012), below the bound it states; the line prints it rounded UP (0.013).
+    char line[512];
+    igpu_lt_format_config_anchored(line, sizeof(line), "recon", 0.0, 1791774588000.0, 0.012451171875, 5000.0);
+    ASSERT_TRUE(std::string(line).find(" anchor_bracket_ms=0.013 ") != std::string::npos);
+    ASSERT_NEAR(0.012, igpu_lt_ceil_ms3(0.012), 0.0);
+    ASSERT_NEAR(0.013, igpu_lt_ceil_ms3(0.0120001), 0.0);
+    ASSERT_NEAR(0.0, igpu_lt_ceil_ms3(0.0), 0.0);
+    ASSERT_NEAR(0.001, igpu_lt_ceil_ms3(1e-12), 0.0);
+    // Whatever the value, the printed text read back is never below it, and never a full step above.
+    for (int k = 0; k < 60000; ++k)
+    {
+        const double v = k * 0.000001 + (k % 7) * 1e-10;
+        char text[64];
+        std::snprintf(text, sizeof(text), "%.3f", igpu_lt_ceil_ms3(v));
+        const double back = std::strtod(text, nullptr);
+        ASSERT_TRUE(back >= v);
+        ASSERT_TRUE(back - v < 0.001 + 1e-12);
+    }
+}
+
+TEST(CudaLaunchTiming, RecorderMakesNoCudaCallWhileABackendErrorIsPending)
+{
+    // Adversary r2 pass 3 A4, its input: timer on; a backend error (cudaErrorInvalidConfiguration, 9)
+    // is pending when a recorder-only call (cudaEventCreate) fails with cudaErrorMemoryAllocation (2).
+    // That call replaces the last error with 2, and the backend's next cudaGetLastError() gets 2, not
+    // 9. Every recorder-only path now peeks first and, with an error pending, makes no CUDA call that
+    // could fail (no anchor, event, stamp or span that time). The runtime probe with a last-error stub
+    // is in the r3 run dir (red-a4.txt); this pins the guards in the source.
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "    static bool backend_error_pending() { return cudaPeekAtLastError() != cudaSuccess; }")));
+    // The anchor: attach() tries it only with no error pending (and tries again at a later attach).
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        live_backends_ += 1;\n        if (!anchor_tried_ && !backend_error_pending())\n        {\n"
+        "            anchor_tried_ = true;\n            establish_anchor_locked();")));
+    // Event pairs (kernel launches and spans) start only with no error pending.
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "                      cudaStream_t stream, const char * kind = \"kernel\")\n    {\n"
+        "        if (backend_error_pending()) return false;\n")));
+    // A span whose bracketed work left an error pending is dropped with no further CUDA call.
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        if (!peek_launch && backend_error_pending())\n        {\n"
+        "            std::lock_guard<std::mutex> lock(mu_);\n            discard_events_locked(p);\n            return;\n        }")));
+    // Pool create and the stamps' elapsed reads.
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (prior != cudaSuccess) return false;\n"
+        "        if (cudaEventCreate(ev) == cudaSuccess) return true;")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (prior != cudaSuccess) return false;\n"
+        "        float elapsed = 0.0f;\n        if (cudaEventElapsedTime(&elapsed, anchor_, ev) != cudaSuccess)")));
+    // A failed start record clears its own error (none was pending, so nothing else is lost).
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "            destroy_events_locked(p);\n            drop_own_error(cudaSuccess);\n            return false;")));
 }
 
 TEST(CudaLaunchTiming, RecorderOnlyCudaFailuresDoNotStayPendingForTheBackend)
@@ -339,8 +476,8 @@ TEST(CudaLaunchTiming, RecorderOnlyCudaFailuresDoNotStayPendingForTheBackend)
     ASSERT_TRUE(header.contains(QStringLiteral("            if (cudaEventCreate(&ev) != cudaSuccess) break;")));
     ASSERT_TRUE(header.contains(QStringLiteral("            }\n        }\n        drop_own_error(prior);\n    }")));
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (cudaEventCreate(ev) == cudaSuccess) return true;\n"
-        "        drop_own_error(prior);\n        return false;")));
+        "        const cudaError_t prior = cudaPeekAtLastError();\n        if (prior != cudaSuccess) return false;\n"
+        "        if (cudaEventCreate(ev) == cudaSuccess) return true;\n        drop_own_error(prior);\n        return false;")));
     ASSERT_TRUE(header.contains(QStringLiteral("    static void drop_own_error(cudaError_t prior)\n    {\n"
                                                "        if (prior == cudaSuccess) (void)cudaGetLastError();\n    }")));
     ASSERT_EQ(3, (int)header.count(QStringLiteral("drop_own_error(prior);")));
@@ -632,7 +769,7 @@ TEST(CudaLaunchTiming, OffCostsOneCachedTestPerSite)
     ASSERT_TRUE(syncAt > anchorDef && syncAt < anchorEnd);
     ASSERT_EQ(2, (int)header.count(QStringLiteral("establish_anchor_locked()")));
     ASSERT_TRUE(header.contains(QStringLiteral(
-        "        live_backends_ += 1;\n        if (!anchor_tried_)\n        {\n            anchor_tried_ = true;\n"
+        "        live_backends_ += 1;\n        if (!anchor_tried_ && !backend_error_pending())\n        {\n            anchor_tried_ = true;\n"
         "            establish_anchor_locked();")));
     // Adversary r2 pass 3 A5: the pin follows record_span's signature since pass 2 (issue_utc after stage).
     ASSERT_TRUE(header.contains(QStringLiteral("inline void record_span(const char * stage, double issue_utc, cudaEvent_t t0, cudaEvent_t mark0,\n"

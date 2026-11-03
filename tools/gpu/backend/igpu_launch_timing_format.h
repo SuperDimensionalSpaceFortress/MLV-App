@@ -267,50 +267,9 @@ static inline int igpu_lt_format_config(char * out, std::size_t cap, const char 
                          dll ? dll : "?", min_ms);
 }
 
-/* The config line of a DLL whose recorder holds a device-clock anchor: the event recorded and
- * waited on once at backend create, the wall clock read right after (anchor_utc_ms), the
- * shortest monotonic bracket [before record, after wait] of the tries (anchor_bracket_ms), which
- * bounds the anchor's host/device offset error, and the monotonic clock at the anchor
- * (anchor_steady_ms), so a reader can check two DLLs' anchors with
- * igpu_lt_anchors_comparable(). snprintf-style: size the buffer from the return. */
-static inline int igpu_lt_format_config_anchored(char * out, std::size_t cap, const char * dll, double min_ms,
-                                                 double anchor_utc_ms, double anchor_bracket_ms,
-                                                 double anchor_steady_ms)
-{
-    return std::snprintf(out, cap,
-                         "igpu_launch_timing_config dll=%s enabled=1 min_ms=%.3f device_clock=anchored "
-                         "anchor_utc_ms=%.3f anchor_bracket_ms=%.3f anchor_steady_ms=%.3f",
-                         dll ? dll : "?", min_ms, anchor_utc_ms, anchor_bracket_ms, anchor_steady_ms);
-}
-
-/* Adversary r2 A1. One anchor try reads the wall clock, then the monotonic clock, records and
- * waits, then reads the monotonic clock and the wall clock. The wall interval must match the
- * monotonic one within IGPU_LT_ANCHOR_STEP_TOL_MS; a try across which the wall clock stepped
- * (backward, or forward) is unusable. The bracket is the LONGER of the two intervals (adversary
- * r2 pass 2 A1): the anchor is the wall clock read last, and the event ran inside the wall
- * interval, so anchor_utc_ms - event time <= bracket. Returns 1 and writes the bracket for a
- * usable try, else 0. */
+/* Adversary r2 A1. The tolerance for one monotonic interval to stand in for another: a wall read's
+ * own pin (the monotonic time around it), and the wall-vs-monotonic agreement of one anchor try. */
 #define IGPU_LT_ANCHOR_STEP_TOL_MS 0.010
-static inline int igpu_lt_anchor_try_bracket(double utc_before, double utc_after, double steady_before,
-                                             double steady_after, double * bracket_ms)
-{
-    const double mono = steady_after - steady_before;
-    const double wall = utc_after - utc_before;
-    if (!(mono >= 0.0) || !(wall >= 0.0) || !(std::fabs(wall - mono) <= IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
-    if (bracket_ms) *bracket_ms = wall > mono ? wall : mono;
-    return 1;
-}
-
-/* Adversary r2 A1. Stamps from two DLLs share one time axis, within the sum of their brackets,
- * only if no wall-clock step fell between their anchors: the two anchors' wall-clock offset must
- * equal their monotonic offset within the summed brackets (plus the per-try tolerance). 1 when
- * comparable; a reader drops cross-DLL comparisons otherwise. */
-static inline int igpu_lt_anchors_comparable(double utc_a, double steady_a, double bracket_a,
-                                             double utc_b, double steady_b, double bracket_b)
-{
-    const double skew = (utc_a - utc_b) - (steady_a - steady_b);
-    return std::fabs(skew) <= bracket_a + bracket_b + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS;
-}
 
 /* Adversary r2 A2. cudaEventElapsedTime returns a float (24-bit mantissa), so an elapsed time far
  * from the anchor loses precision. A device stamp is written only for an elapsed time in
@@ -318,6 +277,95 @@ static inline int igpu_lt_anchors_comparable(double utc_a, double steady_a, doub
  * (half of 2^(19-24) ms). Past that age a record carries no stamp (has_dev=0), never a coarse one. */
 #define IGPU_LT_ANCHOR_MAX_AGE_MS 524288.0
 #define IGPU_LT_ANCHOR_ROUNDING_MS 0.015625
+
+/* Adversary r2 pass 3 A3. A bound printed with %.3f rounds to nearest, so a bracket of
+ * 0.012451171875 ms would print as 0.012, below the bound it states. igpu_lt_ceil_ms3(v) is the
+ * smallest multiple of 0.001 ms whose double is >= v, so %.3f prints it exactly and the text read
+ * back is never below v (v itself when it is negative, NaN or too large to scale). */
+static inline double igpu_lt_ceil_ms3(double v)
+{
+    if (!(v >= 0.0) || !(v * 1000.0 < 9.0e15)) return v;
+    double k = std::ceil(v * 1000.0);
+    while (k / 1000.0 < v) k += 1.0;
+    while (k >= 1.0 && (k - 1.0) / 1000.0 >= v) k -= 1.0;
+    return k / 1000.0;
+}
+
+/* The config line of a DLL whose recorder holds a device-clock anchor: the event recorded and
+ * waited on once at backend create, the wall clock read right after (anchor_utc_ms), the
+ * shortest usable bracket of the tries (anchor_bracket_ms, printed rounded UP to 0.001 ms), which
+ * bounds the anchor's host/device offset error, the monotonic clock at the anchor
+ * (anchor_steady_ms), so a reader can check two DLLs' anchors with igpu_lt_anchors_comparable(),
+ * and the float rounding each stamp may carry (stamp_rounding_ms), which
+ * igpu_lt_cross_dll_bound_ms() adds. snprintf-style: size the buffer from the return. */
+static inline int igpu_lt_format_config_anchored(char * out, std::size_t cap, const char * dll, double min_ms,
+                                                 double anchor_utc_ms, double anchor_bracket_ms,
+                                                 double anchor_steady_ms)
+{
+    return std::snprintf(out, cap,
+                         "igpu_launch_timing_config dll=%s enabled=1 min_ms=%.3f device_clock=anchored "
+                         "anchor_utc_ms=%.3f anchor_bracket_ms=%.3f anchor_steady_ms=%.3f stamp_rounding_ms=%.6f",
+                         dll ? dll : "?", min_ms, anchor_utc_ms, igpu_lt_ceil_ms3(anchor_bracket_ms),
+                         anchor_steady_ms, IGPU_LT_ANCHOR_ROUNDING_MS);
+}
+
+/* Adversary r2 A1 (pass 3 A1: each wall read pinned). One anchor try reads, in order: the
+ * monotonic clock (steady_b0), the wall clock (utc_before), the monotonic clock (steady_b1); records
+ * the event and waits for it; then the monotonic clock (steady_a0), the wall clock (utc_after), the
+ * monotonic clock (steady_a1). Each wall read's pin (steady_b1 - steady_b0, steady_a1 - steady_a0)
+ * must be within IGPU_LT_ANCHOR_STEP_TOL_MS, so a scheduling gap next to a wall read (where a
+ * wall-clock step could hide) makes the try unusable; and the wall interval must lie within the
+ * monotonic time between the two wall reads ([a0 - b1, a1 - b0], widened by the tolerance), so a step
+ * between them makes it unusable too. The event ran in [b1, a0] and the anchor is utc_after, read in
+ * [a0, a1], so anchor_utc_ms - event time <= a1 - b1 <= a1 - b0; the bracket is the longer of
+ * a1 - b0 and the wall interval. Returns 1 and writes the bracket for a usable try, else 0. */
+static inline int igpu_lt_anchor_try_bracket(double steady_b0, double utc_before, double steady_b1,
+                                             double steady_a0, double utc_after, double steady_a1,
+                                             double * bracket_ms)
+{
+    const double pin_before = steady_b1 - steady_b0;
+    const double pin_after = steady_a1 - steady_a0;
+    if (!(pin_before >= 0.0) || !(pin_before <= IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
+    if (!(pin_after >= 0.0) || !(pin_after <= IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
+    const double mono_lo = steady_a0 - steady_b1;
+    const double mono_hi = steady_a1 - steady_b0;
+    const double wall = utc_after - utc_before;
+    if (!(mono_lo >= 0.0) || !(wall >= 0.0)) return 0;
+    if (!(wall >= mono_lo - IGPU_LT_ANCHOR_STEP_TOL_MS) || !(wall <= mono_hi + IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
+    if (bracket_ms) *bracket_ms = wall > mono_hi ? wall : mono_hi;
+    return 1;
+}
+
+/* Adversary r2 pass 3 A2. The two anchors' wall-clock offset minus their monotonic offset: zero
+ * unless the wall clock stepped (or slewed) between them. */
+static inline double igpu_lt_anchor_skew_ms(double utc_a, double steady_a, double utc_b, double steady_b)
+{
+    return (utc_a - utc_b) - (steady_a - steady_b);
+}
+
+/* Adversary r2 A1. Stamps from two DLLs share one time axis only if no wall-clock step fell between
+ * their anchors: the anchors' skew must be within the summed brackets (plus twice the per-read
+ * tolerance). 1 when comparable; a reader drops cross-DLL comparisons otherwise. */
+static inline int igpu_lt_anchors_comparable(double utc_a, double steady_a, double bracket_a,
+                                             double utc_b, double steady_b, double bracket_b)
+{
+    const double skew = igpu_lt_anchor_skew_ms(utc_a, steady_a, utc_b, steady_b);
+    return std::fabs(skew) <= bracket_a + bracket_b + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS;
+}
+
+/* Adversary r2 pass 3 A2. Two comparable DLLs' stamps of one device instant differ by at most this:
+ * each stamp's anchor offset error lies in [0, its bracket]; each stamp's float elapsed time is
+ * rounded by at most IGPU_LT_ANCHOR_ROUNDING_MS; and a wall-clock disagreement between the anchors
+ * shifts one DLL's axis by at most |skew| plus the two anchors' read pins
+ * (2 x IGPU_LT_ANCHOR_STEP_TOL_MS). It takes the device and host clocks to tick at one rate between
+ * the two anchors (both are taken at backend create); the bench's stream-0 calibration
+ * (CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1 overlap_b.py) checks that on the data. */
+static inline double igpu_lt_cross_dll_bound_ms(double bracket_a, double bracket_b, double skew_ms)
+{
+    return bracket_a + bracket_b + 2.0 * IGPU_LT_ANCHOR_ROUNDING_MS + std::fabs(skew_ms)
+           + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS;
+}
+
 static inline int igpu_lt_dev_stamp(double anchor_utc_ms, double elapsed_ms, double * out)
 {
     if (!(elapsed_ms >= 0.0) || !(elapsed_ms < IGPU_LT_ANCHOR_MAX_AGE_MS)) return 0;
