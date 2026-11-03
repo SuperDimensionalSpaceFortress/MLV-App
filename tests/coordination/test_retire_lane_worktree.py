@@ -2932,6 +2932,61 @@ def test_b1_full_native_containment_block_binds_each_pid_to_its_own_stamp(tmp_pa
         assert r is None, (pid, r, err)
 
 
+# Adversary pass r4 on 26405132 (A1-A3).
+
+@pytest.mark.parametrize("old_dir_first", [True, False], ids=["stale-dir-first", "current-dir-first"])
+def test_a1_a_stale_record_for_a_reused_pid_number_does_not_hide_the_current_exact_match(tmp_path, old_dir_first):
+    """A1: pid 999974 was recorded (createdUtc T_old) by an OLD run dir and again (createdUtc T_cur) by the CURRENT one, which names the worktree.
+    The live process was created at T_cur: the current record matches EXACTLY, so the stale mismatch must not suppress it (either dir order)."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    now = time.time()
+    t_old, t_cur = now - 30 * 3600, now - 6 * 3600
+    old = runs / ("a-old" if old_dir_first else "z-old")
+    cur = runs / ("z-cur" if old_dir_first else "a-cur")
+    for rd in (old, cur):
+        rd.mkdir(parents=True)
+        (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(old, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t_old)}, t_old + 5)
+    _write_record(cur, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t_cur)}, t_cur + 5)
+    _write_record(cur, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t_cur)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+def test_a2_a_root_stamp_does_not_bind_a_nested_containment_pid(tmp_path):
+    """A2: the root createdUtc belongs to a ROOT pid field only. A receipt with an unrelated root createdUtc and containment.childPid whose own
+    childCreatedUtc is null states no identity for that pid, so the genuine driver (created long after the root stamp) still refuses."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", '{"createdUtc":"2026-10-01T00:00:00Z","state":"complete","workDir":%s,"containment":{"childPid":999974,"childCreatedUtc":null}}'
+                  % json.dumps(str(wt)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+
+
+def test_a3_a_small_backward_clock_step_does_not_free_a_genuine_driver(tmp_path):
+    """A3: with no stamp in the record, the write-time rule tolerates clock skew: a genuine driver that started up to a minute AFTER the file's
+    mtime (a backward clock adjustment before the pid file was published) is still the driver; a process minutes later is still a reused pid."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r3", 999973, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, "", "pwsh.exe", written + 60)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, "", "pwsh.exe", written + 600)), runs)
+    assert r is None, (r, err)
+
+
 def test_b2_nested_createdutc_does_not_replace_the_root_stamp(tmp_path):
     """sol r1 B2: {"metadata":{"createdUtc":OCTOBER},"pid":P,"createdUtc":NOV1}; the genuine driver created NOV1 must still refuse."""
     wt = tmp_path / "lane-X-1"

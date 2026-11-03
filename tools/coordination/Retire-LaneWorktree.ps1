@@ -289,6 +289,9 @@ $script:RunDirTieMaxBytes = 1048576
 # the image test alone; a record or process that cannot be read at all keeps the existing fail-closed paths.
 $script:RunDirDriverImagePattern = '(?i)^(pwsh|pwsh-preview|powershell|claude|codex|node|cmd|python|pythonw|py)(\.exe)?$'
 $script:RunDirPidCreatedSlackSec = 5
+# r4 (adversary A3): a record WITHOUT a stamp is bound by its write time alone, and the wall clock can step backwards between a process starting and
+# its pid file being published; a process that started up to this many seconds after the file's mtime is still read as the recorded one (fail toward live).
+$script:RunDirRecordClockSkewSec = 120
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -673,8 +676,14 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
         $root = $doc.RootElement
         if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $map }
         $rootStamp = $null
+        $rootPids = New-Object System.Collections.Generic.List[int]   # pids carried by ROOT-level fields: the only pids the root createdUtc can belong to (adversary A2)
         foreach ($prop in $root.EnumerateObject()) {
             if ($prop.Name -ceq 'createdUtc') { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
+            elseif ($prop.Name -cin @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')) {
+                $rn = 0
+                if ($prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and $prop.Value.TryGetInt32([ref]$rn)) { $rootPids.Add($rn) }
+                elseif ($prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and [int]::TryParse($prop.Value.GetString(), [ref]$rn)) { $rootPids.Add($rn) }
+            }
             elseif ($prop.Name -ceq 'containment' -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
                 $f = @{}
                 foreach ($c in $prop.Value.EnumerateObject()) { $f[$c.Name] = $c.Value }
@@ -688,7 +697,7 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
                 }
             }
         }
-        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and -not $map.ContainsKey([int]$PidList[0])) { $map[[int]$PidList[0]] = $rootStamp }
+        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and $rootPids.Contains([int]$PidList[0]) -and -not $map.ContainsKey([int]$PidList[0])) { $map[[int]$PidList[0]] = $rootStamp }
     } catch { return @{} } finally { $doc.Dispose() }
     return $map
 }
@@ -726,7 +735,7 @@ function Test-RecordedPidBound {
     }
     $at = $Record.PSObject.Properties['RecordedAtUtc']
     if ($at -and $at.Value -is [datetime]) {
-        if (($created - ([datetime]$at.Value).ToUniversalTime()).TotalSeconds -gt $slack) { return [pscustomobject]@{ Bound = $false; Why = "started-after-record:$($created.ToString('o')) > $(([datetime]$at.Value).ToUniversalTime().ToString('o'))" } }
+        if (($created - ([datetime]$at.Value).ToUniversalTime()).TotalSeconds -gt [double]$script:RunDirRecordClockSkewSec) { return [pscustomobject]@{ Bound = $false; Why = "started-after-record:$($created.ToString('o')) > $(([datetime]$at.Value).ToUniversalTime().ToString('o'))" } }
     }
     return [pscustomobject]@{ Bound = $true; Why = 'created-fits-record' }
 }
@@ -856,11 +865,17 @@ function Find-RunDirDriverHolders {
     $index = @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)
     # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1): a creation-time mismatch stated by ANY record for a pid proves the pid was reused; it is
     # settled once per pid here, so a weaker match from another record (a later write time) cannot bind it, whichever record comes first.
-    $reused = @{}
+    # Precedence per pid (adversary A1): an exact creation-time MATCH from any record proves it is the recorded process (a stale record of an older
+    # run that once held the same pid number cannot hide it); else an exact MISMATCH proves reuse; else the weaker write-time rule decides.
+    $exactMatch = @{}; $reused = @{}
     foreach ($rec in $index) {
-        if ($rec.Error -or $reused.ContainsKey($rec.Pid) -or -not $byPid.ContainsKey($rec.Pid)) { continue }
+        if ($rec.Error -or -not $byPid.ContainsKey($rec.Pid)) { continue }
+        $rc = $rec.PSObject.Properties['RecordedCreatedUtc']
+        if (-not $rc -or $rc.Value -isnot [datetime]) { continue }
         if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) { $reused[$rec.Pid] = $true }
+        elseif ($byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) { $exactMatch[$rec.Pid] = $true }
     }
+    foreach ($k in @($exactMatch.Keys)) { $reused.Remove($k) }
     foreach ($rec in $index) {
         if ($rec.Error) { $unreadable.Add($rec); continue }
         if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
