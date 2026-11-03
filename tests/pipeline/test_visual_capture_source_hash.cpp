@@ -662,6 +662,85 @@ TEST(VisualCaptureSourceHash, Lj92LookupEntriesTheTableNeverDefinesAreNeverReadU
     ASSERT_EQ(0, status);
 }
 
+namespace
+{
+// The display's call into a target that already holds `fill` in every sample (the display's unpackedFrame keeps the
+// previous frame): a decode that reports success must have written every sample it reported.
+int decodeOverFill(const std::vector<uint8_t> & payload, uint16_t fill, std::vector<uint16_t> * picture)
+{
+    std::vector<uint8_t> copy = payload;
+    lj92 decoder = nullptr;
+    int width = 0, height = 0, bitdepth = 0, components = 0;
+    int ret = lj92_open(&decoder, copy.data(), static_cast<int>(copy.size()), &width, &height, &bitdepth, &components);
+    if (ret != LJ92_ERROR_NONE) return ret;
+    picture->assign(static_cast<size_t>(width) * height * components, fill);
+    ret = lj92_decode(decoder, picture->data(), width * height * components, 0, nullptr, 0);
+    lj92_close(decoder);
+    return ret;
+}
+
+// r6 pass 1 A1 (adversary on be8e2c33, verbatim): a 32x64 two-component SOF3 (4096 samples, RAWI 64x64) whose SOS asks
+// for predictor 6, with one 1-bit code (diff 0) and 512 zero entropy bytes.
+std::vector<uint8_t> twoComponentPayload(uint8_t predictor)
+{
+    return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01 }, zeros(15), { 0x00 },
+                   { 0xFF, 0xC3, 0x00, 0x0E, 0x0E, 0x00, 0x40, 0x00, 0x20, 0x02, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00 },
+                   { 0xFF, 0xDA, 0x00, 0x0A, 0x02, 0x01, 0x00, 0x02, 0x00, predictor, 0x00, 0x00 }, zeros(512),
+                   { 0xFF, 0xD9 } });
+}
+} // namespace
+
+// r6 pass 1 A1 (adversary on be8e2c33, verbatim input): liblj92's predictor-6 fast path decoded x * y samples whatever the
+// component count and returned success, so a two-component frame left half the display's samples as the previous frame
+// held them (1000 in one call, 2000 in the next) while the identity hashed zeros there. Every scan variant now writes
+// every sample it reports success for, so the picture, and the identity, do not depend on what the target held.
+TEST(VisualCaptureSourceHash, Lj92ADecodeThatSucceedsWritesEverySample)
+{
+    const std::vector<uint8_t> payload = twoComponentPayload(6);
+    ASSERT_EQ(static_cast<size_t>(566), payload.size());
+    std::vector<uint16_t> first;
+    std::vector<uint16_t> second;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeOverFill(payload, 1000, &first));
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeOverFill(payload, 2000, &second));
+    ASSERT_EQ(static_cast<size_t>(4096), first.size());
+    ASSERT_TRUE(first == second);
+    int status = -1;
+    ASSERT_TRUE(lj92Hash(payload, &status) == pictureIdentity(first));
+    ASSERT_EQ(0, status);
+
+    // The class: every predictor, one and two components.
+    for (int predictor = 1; predictor <= 7; ++predictor)
+    {
+        std::vector<uint8_t> oneComponent = bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01 }, zeros(15), { 0x00 },
+                                                    kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
+        oneComponent[oneComponent.size() - 512 - 2 - 3] = static_cast<uint8_t>(predictor); // kSos's Ss byte
+        for (const std::vector<uint8_t> & variant : { twoComponentPayload(static_cast<uint8_t>(predictor)), oneComponent })
+        {
+            std::vector<uint16_t> a;
+            std::vector<uint16_t> b;
+            const int aStatus = decodeOverFill(variant, 1000, &a);
+            const int bStatus = decodeOverFill(variant, 2000, &b);
+            ASSERT_EQ(aStatus, bStatus);
+            if (aStatus != LJ92_ERROR_NONE) continue;
+            ASSERT_TRUE(a == b);
+            ASSERT_TRUE(lj92Hash(variant, &status) == pictureIdentity(a));
+            ASSERT_EQ(0, status);
+        }
+    }
+}
+
+// r6 pass 1 A2 (advisory, pre-existing, verbatim input): an LJ92 payload with no DHT opened, and the first sample read the
+// lookup table liblj92 never allocated (a NULL dereference). It is refused, so the display and the identity refuse it.
+TEST(VisualCaptureSourceHash, Lj92APayloadWithoutAHuffmanTableIsRefused)
+{
+    const std::vector<uint8_t> payload = bytes({ { 0xFF, 0xD8 }, kSof3, kSos, zeros(512), { 0xFF, 0xD9 } });
+    ASSERT_EQ(static_cast<size_t>(539), payload.size());
+    ASSERT_NE(LJ92_ERROR_NONE, lj92OpenStatus(payload, 0));
+    int status = 0;
+    lj92Hash(payload, &status);
+    ASSERT_NE(0, status);
+}
+
 TEST(VisualCaptureSourceHash, Lj92APayloadTheDecoderRefusesHasNoIdentity)
 {
     const std::vector<uint8_t> plain = encodeLj92(2048, 12288);

@@ -1005,7 +1005,10 @@ static int parseScan(ljp* self) {
                                      compcount,
                                      pred,
                                      g_lj92_last_generic_split_requested);
-    if (pred==6) return parsePred6(self); // Fast path
+    /* r6 pass 1 A1 (adversary on be8e2c33): parsePred6 decodes x * y samples, one component per column, so a
+     * multi-component pred-6 scan returned success with x * y * (components - 1) samples never written. It takes
+     * the generic scan below, which writes every component of every column. */
+    if (pred==6 && self->components == 1) return parsePred6(self); // Fast path
     if (g_lj92_last_pred1_fast_path_eligible)
         return g_lj92_last_pred1_fast_path_measurement_requested
             ? parseScanPred1FastMeasured(self)
@@ -1200,6 +1203,14 @@ int lj92_open(lj92* lj,
     self->datalen = datalen;
 
     int ret = findSoI(self);
+
+    /* r6 pass 1 A2 (advisory, pre-existing): a scan with no Huffman table before it decoded through a NULL lookup
+     * table. It can decode nothing, so it is refused. */
+#ifdef SLOW_HUFF
+    if (ret == LJ92_ERROR_NONE && self->maxcode == NULL) ret = LJ92_ERROR_CORRUPT;
+#else
+    if (ret == LJ92_ERROR_NONE && self->hufflut == NULL) ret = LJ92_ERROR_CORRUPT;
+#endif
 
     if (ret == LJ92_ERROR_NONE) {
         if (self->x <= 0 || self->components <= 0
