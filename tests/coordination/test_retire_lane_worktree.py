@@ -3793,6 +3793,90 @@ def test_r9_a_live_identity_that_disagrees_with_the_cached_one_is_uncertain(tmp_
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
 
 
+# --- r9 adversary pass 11 on 7eaaa06b (review-adversary-RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1-r9-7eaaa06b): A1 :1077, A2 :1088, advisories A4 :699,
+# A5 :729.
+
+def _r9_live_map(procs):
+    """Get-LivePidIdentity seam: {pid: (name, epoch)} running now; any other pid is not running."""
+    arms = " ".join(f"if ($ProcessId -eq {p}) {{ return [pscustomobject]@{{ Name = '{n}'; CreationDate = {_utc_expr(e)} }} }};"
+                    for p, (n, e) in procs.items())
+    return "function Get-LivePidIdentity { param([int]$ProcessId) " + arms + " return $null };"
+
+
+@pytest.mark.parametrize("when", ["after-a-cached-index", "between-the-index-and-the-pair"])
+def test_r9_a1_a_record_that_gained_a_pid_since_the_index_is_not_a_reuse_proof(tmp_path, when):
+    """r9 pass-11 A1 (:1077, siblings :914 index cache, :1713/:1715 gate -ReuseRunIndex, :1937, :2155, core.py:1578): the index read the receipt as
+    {containment.childPid 999972, childCreatedUtc T0}. Before the proof, the receipt gains runnerPid 999973 (runnerCreatedUtc T3) and then stays
+    unchanged across both pair reads. 999972 now runs git.exe (T1 != T0); 999973 is the live runner (T3). The proof for 999972 used to stand on the
+    unchanged stamp and free the worktree, discarding 999973 (never in the cached rows). The record changed since the index read: uncertain, held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.receipt.json"
+    t0, t1, t3 = now - 7200, now - 3600, now - 60
+    _write_record(rd, "new.receipt.json", {"containment": {"childPid": 999972, "childCreatedUtc": _iso(t0)}}, now - 7000)
+    grown = json.dumps({"containment": {"childPid": 999972, "childCreatedUtc": _iso(t0), "runnerPid": 999973, "runnerCreatedUtc": _iso(t3)}})
+    row = _fake_proc_created(999972, "", "git.exe", t1)
+    live = _r9_live_map({999972: ("git.exe", t1), 999973: ("pwsh.exe", t3)})
+    if when == "after-a-cached-index":
+        prelude = (live + f" $snap = ({_fake_snapshot(row)}); $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}'; "
+                   f"[IO.File]::WriteAllText('{rec}', '{grown}');")
+        r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    else:
+        r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=live + _r9_reads_change(rec, 2, grown))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] in (999972, 999973), (r, err)
+
+
+def test_r9_a2_a_negative_tie_answer_is_asked_again_for_the_next_record(tmp_path):
+    """r9 pass-11 A2 (:1088, siblings :1089, :1093, :1107): a.pid=999972 and b.pid=999973 are unstamped and live, command lines unreadable. The first
+    tie read sees the receipt as {"state":"running"} (no workDir yet); the producer then publishes workDir. A cached negative tie answer suppressed
+    the later positive one and freed the worktree; only a positive (or unknown) tie is kept for the call, so the second record is held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    receipt = rd / "opus-001.receipt.json"
+    _write_record(rd, "a.pid", "999972\n", now - 30)
+    _write_record(rd, "b.pid", "999973\n", now - 30)
+    rows = [_fake_proc_created(999972, "", "pwsh.exe", now - 600), _fake_proc_created(999973, "", "pwsh.exe", now - 600)]
+    prelude = (_r9_live_map({999972: ("pwsh.exe", now - 600), 999973: ("pwsh.exe", now - 600)})
+               + "$global:r9t = 0; function Read-RunDirRecordText { param([string]$Path) "
+               f"if ($Path -eq '{receipt}') {{ $global:r9t++; if ($global:r9t -le 2) {{ return '{{\"state\":\"running\"}}' }} }}; "
+               "return Read-SharedText -Path $Path };")
+    r, err = _live_refusal(wt, _fake_snapshot(*rows), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] in (999972, 999973), (r, err)
+
+
+def _r9_eval(expr):
+    script = f"$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; . '{HELPER}'; {expr}"
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return p.stdout.strip()
+
+
+@pytest.mark.parametrize("doc,want", [
+    ('{"a":{"pid":5000},"b":{"pid":6000}}', "5000,6000"),
+    ('[{"pid":5000},{"pid":6000}]', "5000,6000"),
+    ('{"a":{"x":{"pid":5001}},"pid":5002}', "5001,5002"),
+    ('{"pid":5003,"containment":{"childPid":5004,"runnerPid":5005}}', "5003,5004,5005"),
+], ids=["sibling-objects", "array", "nested-before-root-member", "root-then-containment"])
+def test_r9_a4_record_pids_come_back_in_document_order(doc, want):
+    """r9 pass-11 advisory A4 (:699, sibling :705): Get-RecordPidMembers returns distinct pids in first-seen (document) order; LIFO pops reversed
+    sibling traversal order."""
+    d = doc.replace("'", "''")
+    assert _r9_eval(f"(Get-RecordPidMembers '{d}').Pids -join ','") == want
+
+
+@pytest.mark.parametrize("stamp,want", [
+    ("0001-01-01T00:00:00+14:00", ""),                                    # UTC underflow: no claim
+    ("9999-12-31T23:59:59-14:00", ""),                                    # UTC overflow: no claim
+    ("2026-11-01T12:00:00+02:00", "2026-11-01T10:00:00.0000000Z"),
+    ("2026-11-01T12:00:00.1234567Z", "2026-11-01T12:00:00.1234567Z"),
+], ids=["underflow", "overflow", "offset", "fraction"])
+def test_r9_a5_an_unrepresentable_stamp_is_no_stamp(stamp, want):
+    """r9 pass-11 advisory A5 (:729, siblings :793, :807): a complete stamp converts exactly to UTC, or states no claim when the instant is outside
+    the representable range (DateTime clamped it to a wrong instant, which could 'prove' reuse)."""
+    out = _r9_eval(f"$t = ConvertTo-RecordedUtc '{stamp}'; if ($null -eq $t) {{ '' }} else {{ $t.Kind.ToString() + ' ' + $t.ToString('o') }}")
+    assert out == ("" if not want else "Utc " + want), out
+
+
 @pytest.mark.parametrize("doc", [
     '{"pid":999972,"createdUtc":"12:00"}',                                                   # time only: TryParse invents today's date
     '{"pid":999972,"createdUtc":"2026-11-01"}',                                              # date only

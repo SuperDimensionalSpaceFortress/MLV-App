@@ -683,28 +683,33 @@ function Get-RecordPidMembers([string]$Text) {
         return $res
     }
     try {
+        # r9 (pass-11 A4): a depth-first walk in DOCUMENT order. Each frame is @(element, inRootObject, isPidMember); a container's children are pushed
+        # in reverse so the LIFO pops visit them first to last, and a pid member is recorded when its own frame is popped, i.e. in document order.
         $stack = New-Object System.Collections.Generic.Stack[object]
-        $stack.Push(@($doc.RootElement, $true))
+        $stack.Push(@($doc.RootElement, $false, $false, $true))
         while ($stack.Count) {
             $item = $stack.Pop()
             $el = [System.Text.Json.JsonElement]$item[0]
+            if ([bool]$item[2]) {
+                $n = ConvertTo-RecordedPid $el
+                $members.Add([pscustomobject]@{ Pid = $n; Root = [bool]$item[1] })
+                if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) }
+            }
+            $kids = New-Object System.Collections.Generic.List[object]
             if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
                 foreach ($prop in $el.EnumerateObject()) {
-                    if (Test-OrdinalMember $prop.Name $script:PidMemberKeys) {
-                        $n = ConvertTo-RecordedPid $prop.Value
-                        $members.Add([pscustomobject]@{ Pid = $n; Root = [bool]$item[1] })
-                        if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) }
-                    }
+                    $isPid = Test-OrdinalMember $prop.Name $script:PidMemberKeys
                     $k = $prop.Value.ValueKind
-                    if ($k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $stack.Push(@($prop.Value, $false)) }
+                    if ($isPid -or $k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $kids.Add(@($prop.Value, [bool]$item[3], $isPid, $false)) }
                 }
             }
             elseif ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
                 foreach ($e in $el.EnumerateArray()) {
                     $k = $e.ValueKind
-                    if ($k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $stack.Push(@($e, $false)) }
+                    if ($k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $kids.Add(@($e, $false, $false, $false)) }
                 }
             }
+            for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push($kids[$i]) }
         }
     } finally { $doc.Dispose() }
     $res.Pids = $ids.ToArray()
@@ -724,9 +729,11 @@ $script:RecordedUtcRx = [regex]::new('^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{
 
 function ConvertTo-RecordedUtc([object]$Value) {
     # A complete ISO 8601 stamp string -> UTC [datetime], or $null (not a string, incomplete, or does not parse: no claim).
+    # r9 (pass-11 A5): parsed as a DateTimeOffset, which REJECTS an instant whose UTC value is outside the DateTime range ('0001-01-01T00:00:00+14:00');
+    # DateTime.TryParse clamped it to a wrong instant, which could then 'differ' from a live creation time. Rejected = no claim.
     if ($Value -isnot [string] -or -not $script:RecordedUtcRx.IsMatch($Value)) { return $null }
-    $t = [datetime]::MinValue
-    if ([datetime]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$t)) { return $t }
+    $o = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$o)) { return $o.UtcDateTime }
     return $null
 }
 
@@ -945,7 +952,8 @@ function Get-RunDirPidIndex {
                 if ($pm.Ambiguous) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = 0; Error = "$($f.FullName) $($pm.Why)" }) }
                 $recIds = $pm.Pids
                 $recCreated = Get-RecordedCreatedUtcMap -Text $text -Members $pm
-                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $recordedAt; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }) }) }
+                # r9 (pass-11 A1): RecordText is the text these rows were read from; a reuse proof stands only while the record still reads exactly so.
+                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $recordedAt; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }); RecordText = [string]$text }) }
             }
         }
     }
@@ -1060,7 +1068,8 @@ function Find-RunDirDriverHolders {
     # r9 (Dot B2, hub B2 rule): and $id is itself a cache (the first query for this pid in this call). Comparing a re-read stamp to it compares two
     # reads taken at different moments: an unrelated process P/T1 answered the query, exited, and a genuine driver reused P and re-stamped the record
     # P/T2; T2 vs T1 'proved' reuse. Reuse is proven ONLY by ONE consistent pair, in this order:
-    #   1. read the record: it names the pid with a complete stamp S, and S is the stamp the index holds ($rec.RecordedCreatedUtc);
+    #   1. read the record: its text is ordinal-equal to the text the index rows came from ($rec.RecordText; r9 pass-11 A1: a record that changed
+    #      since, even with the same stamp for this pid, may name a pid the cached rows do not have), and it names the pid with a complete stamp S;
     #   2. read the live identity again (uncached): it is the same process as $id (name and creation time);
     #   3. re-read the record: its text is ordinal-equal to read 1 (one deterministic decoder, so equal text = the same evidence);
     #   4. S differs from that live creation time (Test-RecordedCreatedMismatch).
@@ -1073,6 +1082,8 @@ function Find-RunDirDriverHolders {
         $P = [int]$rec.Pid
         $t1 = $null
         try { $t1 = Read-RunDirRecordText -Path $path } catch { return $false }
+        $rt = $rec.PSObject.Properties['RecordText']
+        if ($null -eq $t1 -or -not $rt -or $null -eq $rt.Value -or -not [string]::Equals([string]$rt.Value, [string]$t1, [StringComparison]::Ordinal)) { return $false }
         $s = & $stampIn $t1 $P
         if ($null -eq $s -or $s -ne [datetime]$rec.RecordedCreatedUtc) { return $false }
         $live = & $readIdentity $P
@@ -1082,12 +1093,17 @@ function Find-RunDirDriverHolders {
         if ($null -eq $t2 -or -not [string]::Equals([string]$t1, [string]$t2, [StringComparison]::Ordinal)) { return $false }
         return [bool](Test-RecordedCreatedMismatch -Proc $live -Record ([pscustomobject]@{ RecordedCreatedUtc = $s }))
     }
+    # r9 (pass-11 A2): only a POSITIVE or UNKNOWN tie answer is kept for the call. A negative one is asked again for the next record, because a
+    # producer can publish the tie (a receipt's workDir) between two records; keeping "not tied" would suppress the later positive answer.
     $ties = @{}
     $tiedOf = {
         param([string]$RunDir)
         if (-not $ties.ContainsKey($RunDir)) {
-            try { $ties[$RunDir] = [pscustomobject]@{ Tied = [bool](Test-RunDirNamesPath -RunDir $RunDir -Path $wd); Error = $null } }
-            catch { $ties[$RunDir] = [pscustomobject]@{ Tied = $false; Error = $_.Exception.Message } }
+            $ans = $null
+            try { $ans = [pscustomobject]@{ Tied = [bool](Test-RunDirNamesPath -RunDir $RunDir -Path $wd); Error = $null } }
+            catch { $ans = [pscustomobject]@{ Tied = $false; Error = $_.Exception.Message } }
+            if (-not ($ans.Tied -or $ans.Error)) { return $false }
+            $ties[$RunDir] = $ans
         }
         if ($ties[$RunDir].Error) { throw $ties[$RunDir].Error }
         return $ties[$RunDir].Tied
