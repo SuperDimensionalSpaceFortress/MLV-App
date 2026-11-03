@@ -264,16 +264,59 @@ static inline int igpu_lt_format_config(char * out, std::size_t cap, const char 
 }
 
 /* The config line of a DLL whose recorder holds a device-clock anchor: the event recorded and
- * waited on once at backend create, the host clock read right after (anchor_utc_ms), and the
- * shortest host bracket [before record, after wait] of the tries (anchor_bracket_ms), which
- * bounds the anchor's host/device offset error. */
+ * waited on once at backend create, the wall clock read right after (anchor_utc_ms), the
+ * shortest monotonic bracket [before record, after wait] of the tries (anchor_bracket_ms), which
+ * bounds the anchor's host/device offset error, and the monotonic clock at the anchor
+ * (anchor_steady_ms), so a reader can check two DLLs' anchors with
+ * igpu_lt_anchors_comparable(). snprintf-style: size the buffer from the return. */
 static inline int igpu_lt_format_config_anchored(char * out, std::size_t cap, const char * dll, double min_ms,
-                                                 double anchor_utc_ms, double anchor_bracket_ms)
+                                                 double anchor_utc_ms, double anchor_bracket_ms,
+                                                 double anchor_steady_ms)
 {
     return std::snprintf(out, cap,
                          "igpu_launch_timing_config dll=%s enabled=1 min_ms=%.3f device_clock=anchored "
-                         "anchor_utc_ms=%.3f anchor_bracket_ms=%.3f",
-                         dll ? dll : "?", min_ms, anchor_utc_ms, anchor_bracket_ms);
+                         "anchor_utc_ms=%.3f anchor_bracket_ms=%.3f anchor_steady_ms=%.3f",
+                         dll ? dll : "?", min_ms, anchor_utc_ms, anchor_bracket_ms, anchor_steady_ms);
+}
+
+/* Adversary r2 A1. One anchor try reads the wall clock, then the monotonic clock, records and
+ * waits, then reads the monotonic clock and the wall clock. Its bracket is the MONOTONIC interval
+ * (never negative). The wall interval must match it within IGPU_LT_ANCHOR_STEP_TOL_MS; a try
+ * across which the wall clock stepped (backward, or forward) is unusable. Returns 1 and writes
+ * the bracket for a usable try, else 0. */
+#define IGPU_LT_ANCHOR_STEP_TOL_MS 0.010
+static inline int igpu_lt_anchor_try_bracket(double utc_before, double utc_after, double steady_before,
+                                             double steady_after, double * bracket_ms)
+{
+    const double mono = steady_after - steady_before;
+    const double wall = utc_after - utc_before;
+    if (!(mono >= 0.0) || !(std::fabs(wall - mono) <= IGPU_LT_ANCHOR_STEP_TOL_MS)) return 0;
+    if (bracket_ms) *bracket_ms = mono;
+    return 1;
+}
+
+/* Adversary r2 A1. Stamps from two DLLs share one time axis, within the sum of their brackets,
+ * only if no wall-clock step fell between their anchors: the two anchors' wall-clock offset must
+ * equal their monotonic offset within the summed brackets (plus the per-try tolerance). 1 when
+ * comparable; a reader drops cross-DLL comparisons otherwise. */
+static inline int igpu_lt_anchors_comparable(double utc_a, double steady_a, double bracket_a,
+                                             double utc_b, double steady_b, double bracket_b)
+{
+    const double skew = (utc_a - utc_b) - (steady_a - steady_b);
+    return std::fabs(skew) <= bracket_a + bracket_b + 2.0 * IGPU_LT_ANCHOR_STEP_TOL_MS;
+}
+
+/* Adversary r2 A2. cudaEventElapsedTime returns a float (24-bit mantissa), so an elapsed time far
+ * from the anchor loses precision. A device stamp is written only for an elapsed time in
+ * [0, IGPU_LT_ANCHOR_MAX_AGE_MS); there its rounding is at most IGPU_LT_ANCHOR_ROUNDING_MS
+ * (half of 2^(19-24) ms). Past that age a record carries no stamp (has_dev=0), never a coarse one. */
+#define IGPU_LT_ANCHOR_MAX_AGE_MS 524288.0
+#define IGPU_LT_ANCHOR_ROUNDING_MS 0.015625
+static inline int igpu_lt_dev_stamp(double anchor_utc_ms, double elapsed_ms, double * out)
+{
+    if (!(elapsed_ms >= 0.0) || !(elapsed_ms < IGPU_LT_ANCHOR_MAX_AGE_MS)) return 0;
+    if (out) *out = anchor_utc_ms + elapsed_ms;
+    return 1;
 }
 
 #endif /* IGPU_LAUNCH_TIMING_FORMAT_H */

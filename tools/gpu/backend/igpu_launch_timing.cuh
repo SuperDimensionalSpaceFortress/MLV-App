@@ -25,7 +25,9 @@
  *       the frame dims / tile origin stamped on every record on this thread.
  *   igpu_lt::attach();   igpu_lt::teardown("destroy");
  *       backend create / the last step of backend destroy: teardown destroys
- *       every event the recorder created, without waiting on the device.
+ *       every event the recorder created, without waiting on the device, except
+ *       the one device-clock anchor, which lives with the (leaked) recorder so a
+ *       later backend of the same DLL stamps against the same anchor.
  *
  * OFF: every site above tests one cached bool and does nothing else.
  * Each DLL is one translation unit, so each has its own recorder; define
@@ -356,15 +358,35 @@ private:
      * or before the first other line if one comes first. */
     Recorder() : min_ms_(min_ms()), last_summary_ms_(steady_ms()) {}
 
+    /* Adversary r2 A3: every line is sized from its formatter's return, so a long value (e.g.
+     * MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=1e308) never truncates the fields after it. */
+    template <typename F>
+    static void write_line(F && format)
+    {
+        char small[512];
+        const int need = format(small, sizeof(small));
+        if (need < 0) return;
+        if ((std::size_t)need < sizeof(small))
+        {
+            std::fprintf(stderr, "%s\n", small);
+            return;
+        }
+        std::vector<char> big((std::size_t)need + 1);
+        format(big.data(), big.size());
+        std::fprintf(stderr, "%s\n", big.data());
+    }
+
     void write_config_locked()
     {
-        char line[256];
         if (anchor_)
-            igpu_lt_format_config_anchored(line, sizeof(line), IGPU_LT_DLL_NAME, min_ms_, anchor_utc_ms_,
-                                           anchor_bracket_ms_);
+            write_line([&](char * out, std::size_t cap) {
+                return igpu_lt_format_config_anchored(out, cap, IGPU_LT_DLL_NAME, min_ms_, anchor_utc_ms_,
+                                                      anchor_bracket_ms_, anchor_steady_ms_);
+            });
         else
-            igpu_lt_format_config(line, sizeof(line), IGPU_LT_DLL_NAME, min_ms_);
-        std::fprintf(stderr, "%s\n", line);
+            write_line([&](char * out, std::size_t cap) {
+                return igpu_lt_format_config(out, cap, IGPU_LT_DLL_NAME, min_ms_);
+            });
         config_written_ = true;
     }
 
@@ -375,9 +397,10 @@ private:
 
     /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: the device-clock anchor. Called once per DLL, from
      * the first attach() (backend create), never on a per-frame path. Each try records an event
-     * on stream 0, waits for it, and reads the host clock right after; the event's device time
-     * lies inside [host before the record, host after the wait], so that bracket bounds the
-     * anchor's host/device offset error. The shortest of kAnchorTries brackets is kept. This is
+     * on stream 0, waits for it, and reads the clocks right after; the event's device time lies
+     * inside the monotonic bracket [before the record, after the wait], which bounds the anchor's
+     * host/device offset error. A try across which the wall clock stepped is dropped
+     * (igpu_lt_anchor_try_bracket); the shortest usable bracket of kAnchorTries is kept. This is
      * the recorder's only synchronising call; with the timer OFF it is never reached. */
     void establish_anchor_locked()
     {
@@ -385,15 +408,20 @@ private:
         {
             cudaEvent_t ev = nullptr;
             if (cudaEventCreate(&ev) != cudaSuccess) return;
-            const double before = utc_ms();
+            const double utc_before = utc_ms();
+            const double steady_before = steady_ms();
             const bool ok = cudaEventRecord(ev, 0) == cudaSuccess && cudaEventSynchronize(ev) == cudaSuccess;
-            const double after = utc_ms();
-            if (ok && (!anchor_ || after - before < anchor_bracket_ms_))
+            const double steady_after = steady_ms();
+            const double utc_after = utc_ms();
+            double bracket = 0.0;
+            if (ok && igpu_lt_anchor_try_bracket(utc_before, utc_after, steady_before, steady_after, &bracket)
+                && (!anchor_ || bracket < anchor_bracket_ms_))
             {
                 if (anchor_) cudaEventDestroy(anchor_);
                 anchor_ = ev;
-                anchor_utc_ms_ = after;
-                anchor_bracket_ms_ = after - before;
+                anchor_utc_ms_ = utc_after;
+                anchor_steady_ms_ = steady_after;
+                anchor_bracket_ms_ = bracket;
             }
             else
             {
@@ -415,8 +443,8 @@ private:
             if (prior == cudaSuccess) (void)cudaGetLastError();
             return false;
         }
-        *out = anchor_utc_ms_ + (double)elapsed;
-        return true;
+        /* Adversary r2 A2: no stamp past the float-precision age limit. */
+        return igpu_lt_dev_stamp(anchor_utc_ms_, (double)elapsed, out) != 0;
     }
 
     void stamp_locked(IgpuLtRecord * rec, cudaEvent_t start, cudaEvent_t stop)
@@ -480,23 +508,21 @@ private:
             error_lines_ += 1;
             if (error_lines_ > kMaxErrorLines) return;
         }
-        char line[512];
-        igpu_lt_format_record(line, sizeof(line), rec);
-        std::fprintf(stderr, "%s\n", line);
+        write_line([&](char * out, std::size_t cap) { return igpu_lt_format_record(out, cap, rec); });
     }
 
     void write_summaries_locked(const char * at)
     {
         ensure_config_locked();
-        char line[640];
         for (const auto & kv : stats_)
         {
             const std::size_t sep = kv.first.find('\x1f');
             const std::string kind = kv.first.substr(0, sep);
             const std::string stage = kv.first.substr(sep + 1);
-            igpu_lt_format_summary(line, sizeof(line), IGPU_LT_DLL_NAME, kind.c_str(), stage.c_str(), at,
-                                   kv.second);
-            std::fprintf(stderr, "%s\n", line);
+            write_line([&](char * out, std::size_t cap) {
+                return igpu_lt_format_summary(out, cap, IGPU_LT_DLL_NAME, kind.c_str(), stage.c_str(), at,
+                                              kv.second);
+            });
         }
         if (dropped_ || abandoned_ || error_lines_ > kMaxErrorLines)
         {
@@ -522,9 +548,10 @@ private:
     bool config_written_ = false;
     bool anchor_tried_ = false;
     /* Created once and kept for the recorder's (leaked) lifetime, so every later backend of
-     * this DLL stamps against the same anchor. */
+     * this DLL stamps against the same anchor: the one event teardown() does not destroy. */
     cudaEvent_t anchor_ = nullptr;
     double anchor_utc_ms_ = 0.0;
+    double anchor_steady_ms_ = 0.0;
     double anchor_bracket_ms_ = 0.0;
 };
 

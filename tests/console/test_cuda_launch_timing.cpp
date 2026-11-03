@@ -288,13 +288,77 @@ TEST(CudaLaunchTiming, RunSpanLineCarriesItsTwoInnerMarks)
 TEST(CudaLaunchTiming, AnchoredConfigLineNamesTheAnchorAndItsBracket)
 {
     char line[256];
-    igpu_lt_format_config_anchored(line, sizeof(line), "recon", 0.0, 1791774588000.125, 0.0120);
+    igpu_lt_format_config_anchored(line, sizeof(line), "recon", 0.0, 1791774588000.125, 0.0120, 86400123.250);
     ASSERT_EQ(std::string("igpu_launch_timing_config dll=recon enabled=1 min_ms=0.000 "
-                          "device_clock=anchored anchor_utc_ms=1791774588000.125 anchor_bracket_ms=0.012"),
+                          "device_clock=anchored anchor_utc_ms=1791774588000.125 anchor_bracket_ms=0.012 "
+                          "anchor_steady_ms=86400123.250"),
               std::string(line));
     // Without an anchor the config line is the unchanged golden.
     igpu_lt_format_config(line, sizeof(line), "amaze", 2.0);
     ASSERT_EQ(std::string("igpu_launch_timing_config dll=amaze enabled=1 min_ms=2.000"), std::string(line));
+}
+
+TEST(CudaLaunchTiming, AnchorTryAcrossAWallClockStepIsUnusable)
+{
+    // Adversary r2 A1, its input: before=1791774588000, after=1791774587000 (a 1000 ms backward step).
+    double bracket = -1.0;
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774587000.0, 5000.0, 5000.125, &bracket));
+    // A forward step inside the try is refused too; a negative monotonic interval never is a bracket.
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774589000.125, 5000.0, 5000.125, &bracket));
+    ASSERT_EQ(0, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.0, 5000.125, 5000.0, &bracket));
+    ASSERT_NEAR(-1.0, bracket, 0.0);
+    // A clean try: the bracket is the monotonic interval.
+    ASSERT_EQ(1, igpu_lt_anchor_try_bracket(1791774588000.0, 1791774588000.127, 5000.0, 5000.125, &bracket));
+    ASSERT_NEAR(0.125, bracket, 1e-9);
+}
+
+TEST(CudaLaunchTiming, AnchorsAcrossAWallClockStepAreNotComparable)
+{
+    // Adversary r2 A1, its input: a 1000 ms backward wall-clock step between the two DLLs' anchors,
+    // brackets 0.125 ms. Same monotonic gap, wall gap 1000 ms shorter: not comparable.
+    ASSERT_EQ(0, igpu_lt_anchors_comparable(1791774590000.0, 7000.0, 0.125, 1791774588000.0 + 1000.0, 5000.0, 0.125));
+    // No step: the wall and monotonic offsets agree, comparable.
+    ASSERT_EQ(1, igpu_lt_anchors_comparable(1791774590000.0, 7000.0, 0.125, 1791774588000.0, 5000.0, 0.125));
+    // Disagreement inside the summed brackets is still comparable.
+    ASSERT_EQ(1, igpu_lt_anchors_comparable(1791774590000.2, 7000.0, 0.125, 1791774588000.0, 5000.0, 0.125));
+}
+
+TEST(CudaLaunchTiming, NoDeviceStampPastTheFloatPrecisionAge)
+{
+    // Adversary r2 A2, its input: anchor-relative elapsed times 16777216.5 and 16777215.5 ms, where a
+    // float's step is 1-2 ms. Neither gets a stamp; a young elapsed time does, exactly.
+    double out = -1.0;
+    ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588000.0, 16777216.5, &out));
+    ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588001.0, 16777215.5, &out));
+    ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588000.0, -0.5, &out));
+    ASSERT_EQ(0, igpu_lt_dev_stamp(1791774588000.0, IGPU_LT_ANCHOR_MAX_AGE_MS, &out));
+    ASSERT_NEAR(-1.0, out, 0.0);
+    ASSERT_EQ(1, igpu_lt_dev_stamp(1791774588000.0, 1234.5, &out));
+    ASSERT_NEAR(1791774589234.5, out, 1e-6);
+    // Inside the limit a float's half-step is at most IGPU_LT_ANCHOR_ROUNDING_MS.
+    const double young = IGPU_LT_ANCHOR_MAX_AGE_MS - 0.7;
+    const float f = (float)young;
+    ASSERT_TRUE(std::fabs((double)f - young) <= IGPU_LT_ANCHOR_ROUNDING_MS);
+}
+
+TEST(CudaLaunchTiming, HugeMinMsNeverTruncatesTheAnchorFields)
+{
+    // Adversary r2 A3, its input: MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=1e308 (accepted by the parser). The
+    // line needs more than 256 bytes; sized from the formatter's return it keeps every anchor field.
+    ASSERT_NEAR(1e308, igpu_lt_parse_min_ms("1e308"), 1e292);
+    const int need = igpu_lt_format_config_anchored(nullptr, 0, "recon", 1e308, 1791774588000.125, 0.012, 5000.0);
+    ASSERT_TRUE(need > 256);
+    std::string line((std::size_t)need + 1, '\0');
+    ASSERT_EQ(need, igpu_lt_format_config_anchored(&line[0], line.size(), "recon", 1e308, 1791774588000.125, 0.012, 5000.0));
+    line.resize((std::size_t)need);
+    ASSERT_TRUE(line.find(" device_clock=anchored anchor_utc_ms=1791774588000.125 anchor_bracket_ms=0.012 "
+                          "anchor_steady_ms=5000.000") != std::string::npos);
+    // The recorder writes every line through write_line, which sizes from that return.
+    const QString header = readRepoFile(QStringLiteral("tools/gpu/backend/igpu_launch_timing.cuh"));
+    ASSERT_TRUE(header.contains(QStringLiteral("std::vector<char> big((std::size_t)need + 1);")));
+    ASSERT_FALSE(header.contains(QStringLiteral("char line[")));
+    // config (anchored and plain), record, summary.
+    ASSERT_EQ(4, (int)header.count(QStringLiteral("write_line([&](char * out, std::size_t cap)")));
 }
 
 TEST(CudaLaunchTiming, StatsKeepTheLongestLaunchAndCountOverThreshold)
@@ -455,6 +519,12 @@ TEST(CudaLaunchTiming, RecorderDestroysEveryEventItCreates)
     ASSERT_TRUE(header.count(QStringLiteral("destroy_events_locked(p);")) >= 3);
     ASSERT_TRUE(header.contains(QStringLiteral("destroy_events_locked(*it);")));
     ASSERT_FALSE(header.contains(QStringLiteral("p.start = p.stop = nullptr;\n            return;")));
+    // Adversary r2 A4: the one exception is the device-clock anchor, kept with the leaked recorder
+    // (so later backends stamp against it); it is destroyed only when a better try replaces it, and
+    // the contract says so.
+    ASSERT_EQ(1, (int)header.count(QStringLiteral("cudaEventDestroy(anchor_)")));
+    ASSERT_TRUE(header.contains(QStringLiteral("every event the recorder created, without waiting on the device, except\n"
+                                               " *       the one device-clock anchor")));
     for (const char * dll : {"tools/gpu/backend/igpu_recon_cuda.cu", "tools/gpu/backend/igpu_amaze_debayer_cuda.cu"})
     {
         const QString source = readRepoFile(QString::fromLatin1(dll));
