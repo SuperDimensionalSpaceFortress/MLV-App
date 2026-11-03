@@ -8,7 +8,12 @@
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
 
+#include <QByteArray>
+#include <QFile>
+#include <QTemporaryDir>
+
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <vector>
@@ -933,4 +938,139 @@ TEST(VisualCaptureSourceHash, NullInputsHaveNoIdentity)
     MlvPipelineFixture fixture;
     ASSERT_TRUE(openLargeDualIso(fixture));
     ASSERT_NE(0, getMlvFrameSourceHash64(fixture.video(), 0, nullptr));
+}
+
+// r8 (fable r7 key A2 = Dot B2 on 09973e83): the JPEG2K branch hashed every frame_size byte, but mlvJpeg2kBayerLayoutIsValid only
+// requires each channel span to lie inside the frame, and the display decode reads the 36-byte header and the four declared spans,
+// nothing else. The key's input: LE32[1,36,n,36+n,n,36+2n,n,36+3n,n] + C x4 + one trailing byte 00 vs 01: one picture, two ids,
+// "differ", FROZEN_DISPLAY counted=false on a static JPEG2K clip. Expected: equal ids; a changed span byte still differs.
+namespace
+{
+
+const std::vector<uint8_t> kJ2kCodestream = {0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x2F, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44};
+
+void putLe32(std::vector<uint8_t> & out, size_t at, uint32_t value)
+{
+    for (int i = 0; i < 4; ++i) out[at + i] = static_cast<uint8_t>(value >> (8 * i));
+}
+
+// A JPEG2K bayer frame payload: header, then the four channel spans of `channel` each followed by `gap` filler bytes, then
+// `trailing`. The spans are declared exactly; the gaps and the trailing bytes are inside frame_size but outside every span.
+std::vector<uint8_t> j2kPayload(const std::vector<uint8_t> & channel, uint8_t gapFill, size_t gap,
+                                const std::vector<uint8_t> & trailing)
+{
+    const uint32_t n = static_cast<uint32_t>(channel.size());
+    std::vector<uint8_t> out(36, 0);
+    putLe32(out, 0, 1u);
+    for (int c = 0; c < 4; ++c)
+    {
+        putLe32(out, 4 + 8 * c, static_cast<uint32_t>(out.size()));
+        putLe32(out, 8 + 8 * c, n);
+        out.insert(out.end(), channel.begin(), channel.end());
+        out.insert(out.end(), gap, gapFill);
+    }
+    out.insert(out.end(), trailing.begin(), trailing.end());
+    return out;
+}
+
+// The JPEG2K frame `payload` as frame 0 of the open clip: the object's videoClass, frame 0's index entry and chunk file are swapped
+// for the duration of one getMlvFrameSourceHash64 call (the public entry the capture writer calls), then restored.
+int hashAsClipFrame(MlvPipelineFixture & fixture, const std::vector<uint8_t> & payload, uint64_t * hash)
+{
+    mlvObject_t * video = fixture.video();
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QByteArray path = QFile::encodeName(dir.filePath(QStringLiteral("frame.j2k")));
+    FILE * file = std::fopen(path.constData(), "w+b");
+    ASSERT_TRUE(file != nullptr);
+    const std::vector<uint8_t> lead(17, 0x5A);   // the frame does not start at offset 0
+    ASSERT_EQ(lead.size(), std::fwrite(lead.data(), 1, lead.size(), file));
+    ASSERT_EQ(payload.size(), std::fwrite(payload.data(), 1, payload.size(), file));
+    ASSERT_EQ(0, std::fflush(file));
+    frame_index_t * entry = &video->video_index[0];
+    const int chunk = static_cast<int>(entry->chunk_num);
+    FILE * const savedFile = video->file[chunk];
+    const frame_index_t savedEntry = *entry;
+    const uint32_t savedClass = video->MLVI.videoClass;
+    video->file[chunk] = file;
+    entry->frame_offset = lead.size();
+    entry->frame_size = static_cast<uint32_t>(payload.size());
+    video->MLVI.videoClass = MLV_VIDEO_CLASS_FLAG_JPEG2K;
+    const int status = getMlvFrameSourceHash64(video, 0, hash);
+    video->MLVI.videoClass = savedClass;
+    *entry = savedEntry;
+    video->file[chunk] = savedFile;
+    std::fclose(file);
+    return status;
+}
+
+} // namespace
+
+TEST(VisualCaptureSourceHash, Jpeg2kBytesOutsideTheDeclaredSpansAreNotHashed)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    ASSERT_TRUE(getMlvWidth(fixture.video()) >= 4 && getMlvHeight(fixture.video()) >= 4);
+    uint64_t trailing00 = 0;
+    uint64_t trailing01 = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0, 0, {0x00}), &trailing00));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0, 0, {0x01}), &trailing01));
+    ASSERT_TRUE(trailing00 == trailing01);   // the key's input: one trailing unused byte
+    // the same for bytes between two spans
+    uint64_t gap00 = 0;
+    uint64_t gapA5 = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0x00, 3, {}), &gap00));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0xA5, 3, {}), &gapA5));
+    ASSERT_TRUE(gap00 == gapA5);
+}
+
+TEST(VisualCaptureSourceHash, Jpeg2kAChangedSpanByteStillHashesDifferently)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    std::vector<uint8_t> otherChannel = kJ2kCodestream;
+    otherChannel.back() ^= 0x01;
+    uint64_t plain = 0;
+    uint64_t changed = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0, 0, {0x00}), &plain));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(otherChannel, 0, 0, {0x00}), &changed));
+    ASSERT_TRUE(plain != changed);
+    // only the last channel's span changed: a one-byte edit inside ANY declared span counts
+    std::vector<uint8_t> lastSpanEdited = j2kPayload(kJ2kCodestream, 0, 0, {0x00});
+    lastSpanEdited[36 + 3 * kJ2kCodestream.size() + 1] ^= 0x80;
+    uint64_t edited = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, lastSpanEdited, &edited));
+    ASSERT_TRUE(plain != edited);
+}
+
+TEST(VisualCaptureSourceHash, Jpeg2kTheInMemoryHashIsTheHeaderPlusTheDeclaredSpans)
+{
+    const std::vector<uint8_t> a = j2kPayload(kJ2kCodestream, 0x00, 2, {0x00, 0x00});
+    const std::vector<uint8_t> b = j2kPayload(kJ2kCodestream, 0xEE, 2, {0x7F, 0x80});
+    uint64_t ha = 0;
+    uint64_t hb = 0;
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 64, 64, &ha));
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(b.data(), b.size(), 64, 64, &hb));
+    ASSERT_TRUE(ha == hb);
+    // FNV-1a 64 of header + spans, computed here independently
+    uint64_t expected = 0xcbf29ce484222325ull;
+    auto mix = [&expected](const uint8_t * p, size_t count) {
+        for (size_t i = 0; i < count; ++i) { expected ^= p[i]; expected *= 0x100000001b3ull; }
+    };
+    mix(a.data(), 36);
+    for (int c = 0; c < 4; ++c) mix(kJ2kCodestream.data(), kJ2kCodestream.size());
+    ASSERT_TRUE(ha == expected);
+    // what the display decode refuses has no identity
+    uint64_t hash = 0x77;
+    std::vector<uint8_t> badVersion = a;
+    badVersion[0] = 2;
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(badVersion.data(), badVersion.size(), 64, 64, &hash));
+    std::vector<uint8_t> spanPastEnd = a;
+    putLe32(spanPastEnd, 32, static_cast<uint32_t>(a.size()));   // channel 3's size runs past frame_size
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(spanPastEnd.data(), spanPastEnd.size(), 64, 64, &hash));
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), 35, 64, 64, &hash));          // shorter than the header
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 63, 64, &hash));   // odd geometry
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(nullptr, a.size(), 64, 64, &hash));
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 64, 64, nullptr));
+    ASSERT_TRUE(hash == 0x77);   // never written on a refusal
 }

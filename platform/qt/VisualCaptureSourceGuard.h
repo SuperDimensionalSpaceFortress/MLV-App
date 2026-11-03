@@ -10,7 +10,15 @@
  *    while the guard holds it, and the reopen itself fails when a writer already has it open (the guard is then not held);
  *  - every platform: a stamp of each file's identity, size and last write time, read from the guard's OWN handles (never
  *    from the clip object, which a FileOpen may have freed), must be what it was when the guard was taken.
- * unchanged() is false when the guard could not be taken or the stamp moved: then no source id is attached (fail closed). */
+ * unchanged() is false when the guard could not be taken or the stamp moved: then no source id is attached (fail closed).
+ *
+ * r8 (fable r7 key A1, adversary r7 A1 on 09973e83): the guard is taken at the start of the capture block, AFTER the measured
+ * Play has decoded frames that the caches (raw prefetch ring, raw RGB cache, processed caches) later serve with no file read,
+ * so a byte edited after such a decode and before the guard was baked into the guard's own stamp: the cached picture was the
+ * old bytes, the deferred hash read the new ones. Now the guard must also MATCH the stamp taken when the clip was OPENED
+ * (openStamp(), from the clip's own read handles, before any frame of it is decoded): any write to the files between the open
+ * and the end of the hashing moves the stamp, the guard is not held, and no source id is attached. Every decode a cache can
+ * serve happened after the open, so no cached picture can predate the bytes the identity is read from. */
 
 #include <QByteArray>
 #include <QVector>
@@ -35,7 +43,28 @@ namespace visual_capture_source_difference
 class SourceWriteGuard
 {
 public:
-    SourceWriteGuard( FILE * const *files, int count )
+    // r8: the stamp of the clip's files as they are NOW, read through the clip's own open handles (no reopen, no lock).
+    // Taken when the clip is opened, before any frame of it is decoded. Empty when any file is missing or unreadable.
+    static QByteArray openStamp( FILE * const *files, int count )
+    {
+        QByteArray out;
+        if( !files || count <= 0 ) return out;
+        for( int i = 0; i < count; ++i )
+        {
+            if( !files[i] ) return QByteArray();
+#ifdef Q_OS_WIN
+            const intptr_t os = _get_osfhandle( _fileno( files[i] ) );
+            if( os == -1 || !appendStamp( out, reinterpret_cast<HANDLE>( os ) ) ) return QByteArray();
+#else
+            if( !appendStamp( out, fileno( files[i] ) ) ) return QByteArray();
+#endif
+        }
+        return out;
+    }
+
+    // clipOpenStamp: openStamp() of these same files, taken when the clip was opened (r8). The guard is held only when the
+    // files are still exactly what they were then; an empty clipOpenStamp (unknown open state) is never held.
+    SourceWriteGuard( FILE * const *files, int count, const QByteArray &clipOpenStamp )
     {
         bool held = files != nullptr && count > 0;
 #ifdef Q_OS_WIN
@@ -62,7 +91,8 @@ public:
 #endif
         }
         if( held ) m_stamp = stamp();
-        m_held = held && !m_stamp.isEmpty();
+        // r8: a write since the clip was opened (before this guard) is a write the cached pictures may predate
+        m_held = held && !m_stamp.isEmpty() && !clipOpenStamp.isEmpty() && m_stamp == clipOpenStamp;
     }
 
     ~SourceWriteGuard()
@@ -83,38 +113,49 @@ public:
     bool unchanged() const { return m_held && stamp() == m_stamp; }
 
 private:
+    // One file's identity, size and last write time (POSIX: and change time), the same text for any handle of that file.
+#ifdef Q_OS_WIN
+    static bool appendStamp( QByteArray &out, HANDLE h )
+    {
+        BY_HANDLE_FILE_INFORMATION info;
+        if( !GetFileInformationByHandle( h, &info ) ) return false;
+        const quint64 values[] = {
+            info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow, info.nFileSizeHigh, info.nFileSizeLow,
+            info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime };
+        for( quint64 value : values ) out += QByteArray::number( value ) + ':';
+        out += ';';
+        return true;
+    }
+#else
+    static bool appendStamp( QByteArray &out, int fd )
+    {
+        struct stat st;
+        if( fd < 0 || fstat( fd, &st ) != 0 ) return false;
+#if defined(Q_OS_MACOS) || defined(Q_OS_DARWIN)
+        const long long mtimeNs = static_cast<long long>( st.st_mtimespec.tv_nsec );
+        const long long ctimeNs = static_cast<long long>( st.st_ctimespec.tv_nsec );
+#else
+        const long long mtimeNs = static_cast<long long>( st.st_mtim.tv_nsec );
+        const long long ctimeNs = static_cast<long long>( st.st_ctim.tv_nsec );
+#endif
+        const long long values[] = {
+            static_cast<long long>( st.st_dev ), static_cast<long long>( st.st_ino ), static_cast<long long>( st.st_size ),
+            static_cast<long long>( st.st_mtime ), mtimeNs, static_cast<long long>( st.st_ctime ), ctimeNs };
+        for( long long value : values ) out += QByteArray::number( value ) + ':';
+        out += ';';
+        return true;
+    }
+#endif
+
     QByteArray stamp() const
     {
         QByteArray out;
 #ifdef Q_OS_WIN
         for( HANDLE h : m_handles )
-        {
-            BY_HANDLE_FILE_INFORMATION info;
-            if( !GetFileInformationByHandle( h, &info ) ) return QByteArray();
-            const quint64 values[] = {
-                info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow, info.nFileSizeHigh, info.nFileSizeLow,
-                info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime };
-            for( quint64 value : values ) out += QByteArray::number( value ) + ':';
-            out += ';';
-        }
+            if( !appendStamp( out, h ) ) return QByteArray();
 #else
         for( int fd : m_handles )
-        {
-            struct stat st;
-            if( fstat( fd, &st ) != 0 ) return QByteArray();
-#if defined(Q_OS_MACOS) || defined(Q_OS_DARWIN)
-            const long long mtimeNs = static_cast<long long>( st.st_mtimespec.tv_nsec );
-            const long long ctimeNs = static_cast<long long>( st.st_ctimespec.tv_nsec );
-#else
-            const long long mtimeNs = static_cast<long long>( st.st_mtim.tv_nsec );
-            const long long ctimeNs = static_cast<long long>( st.st_ctim.tv_nsec );
-#endif
-            const long long values[] = {
-                static_cast<long long>( st.st_dev ), static_cast<long long>( st.st_ino ), static_cast<long long>( st.st_size ),
-                static_cast<long long>( st.st_mtime ), mtimeNs, static_cast<long long>( st.st_ctime ), ctimeNs };
-            for( long long value : values ) out += QByteArray::number( value ) + ':';
-            out += ';';
-        }
+            if( !appendStamp( out, fd ) ) return QByteArray();
 #endif
         return out;
     }

@@ -4114,6 +4114,19 @@ bool MainWindow::waitForRenderThreadIdleBeforeCoreMutation( const char *reason )
     return prepMutationAllowed;
 }
 
+// PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 (fable r7 key A1): called right after a newly opened clip becomes m_pMlvObject and before
+// anything can decode a frame of it (setMlvProcessing, the first render and every cache fill come later). The --visual-capture-dir
+// SourceWriteGuard is held only while the clip's files still match this stamp, so a byte written after a frame was decoded into a
+// cache, but before the guard, leaves every capture without a source id instead of an id read from bytes the picture never had.
+void MainWindow::recordClipOpenSourceStamp()
+{
+    m_clipOpenSourceStamp = m_pMlvObject
+        ? visual_capture_source_difference::SourceWriteGuard::openStamp( m_pMlvObject->file, m_pMlvObject->filenum )
+        : QByteArray();
+    m_clipOpenSourceStampGeneration = static_cast<quint64>( m_clipLifecycleBarrier.generation() );
+    m_clipOpenSourceStampObject = static_cast<const void *>( m_pMlvObject );
+}
+
 // r2 (CoS B1): returns whether the prep drain inside allows a borrow-freeing mutation.
 // The mlv object itself is always freed (no prep task borrows it), so delete-clip,
 // rename-clip and the smoke close, which only load an empty object next, proceed. The
@@ -10614,8 +10627,15 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
         // r7 (adversary r7 pass 1 A1): the clip's BYTES are held too, from here until the source hashing ends: no writer may
         // open its files meanwhile, and a file replaced, resized or written since leaves every capture without a source id.
+        // r8 (fable r7 key A1): "since" is since the clip was OPENED, not since this guard: the measured Play already decoded
+        // frames the caches serve with no file read, so the guard must match the stamp taken at the open (before any decode);
+        // a stamp of another clip, or none, is never matched.
+        visual_capture_source_difference::ClipToken visualOpenStampClip;
+        visualOpenStampClip.generation = m_clipOpenSourceStampGeneration;
+        visualOpenStampClip.object = m_clipOpenSourceStampObject;
         const visual_capture_source_difference::SourceWriteGuard visualSourceGuard(
-            m_pMlvObject ? m_pMlvObject->file : nullptr, m_pMlvObject ? m_pMlvObject->filenum : 0 );
+            m_pMlvObject ? m_pMlvObject->file : nullptr, m_pMlvObject ? m_pMlvObject->filenum : 0,
+            visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip ) ? m_clipOpenSourceStamp : QByteArray() );
         QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
         const bool visualUseGlContainer =
             GpuDisplayWindow::isActive() && visualGlContainer && visualGlContainer->isVisible();
@@ -11479,6 +11499,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     /* Set to NEW object with a NEW MLV clip! */
     m_pMlvObject = new_MlvObject;
     m_clipLifecycleBarrier.reopen();
+    recordClipOpenSourceStamp();
 
     if( isMcraw )
     {
@@ -11728,6 +11749,7 @@ int MainWindow::openMlv( QString fileName )
     /* Set to NEW object with a NEW MLV clip! */
     m_pMlvObject = new_MlvObject;
     m_clipLifecycleBarrier.reopen();
+    recordClipOpenSourceStamp();
 
     /* If use has terminal this is useful */
 #ifndef STDOUT_SILENT

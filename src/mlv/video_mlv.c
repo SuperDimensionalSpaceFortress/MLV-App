@@ -4252,6 +4252,35 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
     return status;
 }
 
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 (fable r7 key A2 = Dot B2): see video_mlv.h. */
+int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, int height, uint64_t * hashOut)
+{
+#ifdef ENABLE_JPEG2K
+    if (!data || !hashOut || length < MLV_JPEG2K_BAYER_HEADER_BYTES) return 1;
+    /* the display decode's own parse (getMlvRawFrameUint16Direct, JPEG2K branch): version + 4 x (offset, size) */
+    uint32_t hdr[9];
+    memcpy(hdr, data, sizeof(hdr));
+    if (hdr[0] != 1) return 1;
+    const uint32_t sizes[4] = { hdr[2], hdr[4], hdr[6], hdr[8] };
+    const uint32_t offsets[4] = { hdr[1], hdr[3], hdr[5], hdr[7] };
+    uint32_t hw = 0;
+    uint32_t hh = 0;
+    if (!mlvJpeg2kBayerLayoutIsValid(length, width, height, offsets, sizes, &hw, &hh)) return 1;
+    /* exactly the bytes the decoder consumes: the header, then each channel's declared span in channel order. The header
+     * carries every span's offset and size, so the concatenation is unambiguous; bytes outside the spans never count. */
+    uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+    hash = mlv_source_hash_fnv1a64(hash, data, MLV_JPEG2K_BAYER_HEADER_BYTES);
+    for (int c = 0; c < 4; ++c)
+        hash = mlv_source_hash_fnv1a64(hash, data + offsets[c], (size_t)sizes[c]);
+    *hashOut = hash;
+    return 0;
+#else
+    /* the display refuses every JPEG2K frame on this build, so none has an identity */
+    (void)data; (void)length; (void)width; (void)height; (void)hashOut;
+    return 1;
+#endif
+}
+
 /* PLAYBACK-SOURCE-FRAME-IDENTITY-1: see video_mlv.h. Reads the same byte span
  * getMlvRawFrameUint16Direct reads for an MLV frame, under the same per-chunk
  * mutex, into its own bounded buffer; it never touches the prefetch ring, the
@@ -4320,6 +4349,26 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
         return lj92Failed ? 1 : 0;
     }
 
+    if (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_JPEG2K)
+    {
+        /* r8 (fable r7 key A2 = Dot B2): r7 hashed every frame_size byte, but the layout only requires each channel span to
+         * lie inside the frame and the decoder reads the 36-byte header and the four spans, nothing else: two payloads that
+         * differ in an unused trailing byte decoded to one picture and got two ids. Now the frame is read as the display reads
+         * it and only the header plus the declared spans are hashed (mlvJpeg2kFrameSourceHash64, which also refuses every
+         * frame on a build without ENABLE_JPEG2K, whose display refuses it). */
+        uint8_t * payload = (uint8_t *)malloc(byte_count);
+        if (!payload) return 1;
+        pthread_mutex_lock(video->main_file_mutex + chunk);
+        const int seekFailed = file_set_pos(video->file[chunk], entry->frame_offset, SEEK_SET) != 0;
+        const size_t got = seekFailed ? 0 : fread(payload, 1, byte_count, video->file[chunk]);
+        pthread_mutex_unlock(video->main_file_mutex + chunk);
+        const int jpeg2kFailed = seekFailed || got != byte_count
+            || mlvJpeg2kFrameSourceHash64(payload, byte_count, video->RAWI.xRes, video->RAWI.yRes, hashOut) != 0;
+        free(payload);
+        return jpeg2kFailed ? 1 : 0;
+    }
+
+    /* uncompressed RAW: exactly the packed_frame_size bytes the decoder unpacks (byte_count above) */
     const size_t block_capacity = (size_t)1 << 20;
     uint8_t * block = (uint8_t *)malloc(block_capacity);
     if (!block) return 1;

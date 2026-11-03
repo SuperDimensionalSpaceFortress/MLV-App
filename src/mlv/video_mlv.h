@@ -528,14 +528,17 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * --visual-capture-dir writer's visual.json source_id / source_difference. For LJ92 (r5, adversary r5 A1
  * on e57fd03e and opus r3 B1 on 27da457e) it is FNV-1a 64 over the picture liblj92 DECODES from the
  * frame's encoded VIDF payload (mlvLj92FrameSourceHash64), so two frames that decode alike always share
- * an identity and two that decode differently never do (up to a 64-bit collision). Otherwise (JPEG2K,
- * uncompressed RAW) it is FNV-1a 64 over the byte span the decoder reads (frame_size bytes for JPEG2K,
- * the packed RAW size otherwise). The bytes are read under main_file_mutex[chunk]. Returns 0 and sets
+ * an identity and two that decode differently never do (up to a 64-bit collision). For JPEG2K (r8, fable r7
+ * key A2 = Dot B2) it is mlvJpeg2kFrameSourceHash64 over the frame_size bytes read: the 36-byte header plus
+ * the four declared channel spans, the only bytes the decoder consumes. For uncompressed RAW it is FNV-1a 64
+ * over the packed RAW size the decoder unpacks. The bytes are read under main_file_mutex[chunk]. Returns 0 and sets
  * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs, MCRAW and
  * CinemaDNG-folder sources (MLV containers only), an index out of range, a missing index or file, a zero
  * byte count, an encoded frame_size the decoder refuses (mlvRawFrameInputCapacity, r5), a failed seek (r5),
- * a short read, or an LJ92 frame the display decode refuses (lj92_open/lj92_decode fail, or the decoded size
- * or bit depth is not RAWI's). Not for the playback path: it reads disk and decodes.
+ * a short read, an LJ92 frame the display decode refuses (lj92_open/lj92_decode fail, or the decoded size
+ * or bit depth is not RAWI's), or a JPEG2K frame whose header the display refuses (version not 1, a channel
+ * table mlvJpeg2kBayerLayoutIsValid rejects) or any JPEG2K frame on a build without ENABLE_JPEG2K. Not for the
+ * playback path: it reads disk and decodes.
  */
 int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
 /* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: decodes a private copy with liblj92
@@ -547,6 +550,12 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
  * nonzero (no identity) for NULL inputs, a payload under 4 bytes or over INT_MAX, or a payload liblj92 refuses.
  * The caller's payload is never written. */
 int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
+/* The JPEG2K half of getMlvFrameSourceHash64 (r8), over one in-memory frame payload of `length` (frame_size) bytes:
+ * FNV-1a 64 over the 36-byte bayer header followed by the four declared channel spans in channel order, exactly the
+ * bytes the display decode consumes; bytes outside the spans (trailing or between spans) never change it. Returns 0 and
+ * sets *hashOut, or nonzero (no identity) for NULL inputs, a payload under the header size, a header version other than 1,
+ * a channel table or geometry mlvJpeg2kBayerLayoutIsValid rejects, and always on a build without ENABLE_JPEG2K. */
+int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, int height, uint64_t * hashOut);
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
  * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves
  * no frame a later request could hit. Same return contract (0 = ok). */

@@ -1045,6 +1045,13 @@ private:
     // worker reads freed memory (0xC0000005 on fast clip switching).
     std::atomic<int> m_lookAssistWorkersInFlight{0};
     ClipLifecycleBarrier m_clipLifecycleBarrier;
+    // PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 (fable r7 key A1): the open clip's files as they were when it was opened, before
+    // any frame of it was decoded (SourceWriteGuard::openStamp), and the clip (lifecycle generation + object) they belong to.
+    // The --visual-capture-dir source guard is held only while the files still match it.
+    QByteArray m_clipOpenSourceStamp;
+    quint64 m_clipOpenSourceStampGeneration = 0;
+    const void *m_clipOpenSourceStampObject = nullptr;
+    void recordClipOpenSourceStamp();
     QString m_phase3ClipPlaytimeFingerprint;
     qint64 m_phase3ClipPlaytimePendingMs = 0;
     qint64 m_phase3ClipPlaytimeSinceFlushMs = 0;
