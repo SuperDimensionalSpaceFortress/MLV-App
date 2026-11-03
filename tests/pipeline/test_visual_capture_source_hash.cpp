@@ -729,6 +729,138 @@ TEST(VisualCaptureSourceHash, Lj92ADecodeThatSucceedsWritesEverySample)
     }
 }
 
+namespace
+{
+// r6 pass 2: a small 14-bit LJ92 frame of `components` interleaved components, `width` columns and `height` rows, with
+// codes '0' (diff 0) and '10' + 2 bits (diff +-2/+-3), predictor `predictor`, entropy = `diffs` encoded in sample order.
+std::vector<uint8_t> smallFrame(int width, int height, int components, uint8_t predictor, const std::vector<int> & diffs)
+{
+    std::vector<uint8_t> entropy;
+    uint32_t acc = 0;
+    int nbits = 0;
+    auto put = [&](uint32_t value, int count)
+    {
+        for (int i = count - 1; i >= 0; --i)
+        {
+            acc = (acc << 1) | ((value >> i) & 1u);
+            if (++nbits == 8)
+            {
+                entropy.push_back(static_cast<uint8_t>(acc)); // never FF: no code has 8 ones in a row
+                acc = 0;
+                nbits = 0;
+            }
+        }
+    };
+    for (const int diff : diffs)
+    {
+        if (diff == 0) put(0, 1);
+        else
+        {
+            put(0x2, 2);
+            put(static_cast<uint32_t>(diff > 0 ? diff : diff + 3), 2);
+        }
+    }
+    if (nbits) put(0, 8 - nbits);
+    entropy.insert(entropy.end(), 4, 0x00);
+    std::vector<uint8_t> sof = { 0xFF, 0xC3, 0x00, static_cast<uint8_t>(8 + 3 * components), 0x0E,
+                                 static_cast<uint8_t>(height >> 8), static_cast<uint8_t>(height),
+                                 static_cast<uint8_t>(width >> 8), static_cast<uint8_t>(width),
+                                 static_cast<uint8_t>(components) };
+    std::vector<uint8_t> sos = { 0xFF, 0xDA, 0x00, static_cast<uint8_t>(6 + 2 * components), static_cast<uint8_t>(components) };
+    for (int c = 0; c < components; ++c)
+    {
+        sof.insert(sof.end(), { static_cast<uint8_t>(c + 1), 0x11, 0x00 });
+        sos.insert(sos.end(), { static_cast<uint8_t>(c + 1), 0x00 });
+    }
+    sos.insert(sos.end(), { predictor, 0x00, 0x00 });
+    return bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x01, 0x01 }, zeros(14), { 0x00, 0x02 }, sof, sos, entropy,
+                   { 0xFF, 0xD9 } });
+}
+
+// Lossless JPEG (ITU T.81 H.1.2.1) with liblj92's first-row / first-column rules, each component predicted from its own
+// neighbours: Ra left, Rb above, Rc above-left.
+std::vector<uint16_t> referencePicture(int width, int height, int components, int predictor, const std::vector<int> & diffs)
+{
+    std::vector<uint16_t> out(static_cast<size_t>(width) * height * components, 0);
+    size_t k = 0;
+    auto at = [&](int row, int col, int c) -> int { return out[(static_cast<size_t>(row) * width + col) * components + c]; };
+    for (int row = 0; row < height; ++row)
+        for (int col = 0; col < width; ++col)
+            for (int c = 0; c < components; ++c)
+            {
+                int px;
+                if (row == 0 && col == 0) px = 1 << 13;
+                else if (row == 0) px = at(row, col - 1, c);
+                else if (col == 0) px = at(row - 1, col, c);
+                else
+                {
+                    const int ra = at(row, col - 1, c), rb = at(row - 1, col, c), rc = at(row - 1, col - 1, c);
+                    switch (predictor)
+                    {
+                    case 1: px = ra; break;
+                    case 2: px = rb; break;
+                    case 3: px = rc; break;
+                    case 4: px = ra + rb - rc; break;
+                    case 5: px = ra + ((rb - rc) >> 1); break;
+                    case 6: px = rb + ((ra - rc) >> 1); break;
+                    default: px = (ra + rb) >> 1; break;
+                    }
+                }
+                out[(static_cast<size_t>(row) * width + col) * components + c] = static_cast<uint16_t>(px + diffs[k++]);
+            }
+    return out;
+}
+} // namespace
+
+// r6 pass 2 A1 (adversary on f1659d6a, verbatim input): the generic scan predicted with the previous sample of ANY
+// component (scalar `left`) where predictors 4-7 need the same component's left neighbour; a 2x4 two-component
+// predictor-6 frame decoded [8193,8193] where the picture is [8192,8194]. r6 pass 2 A2 (advisory, pre-existing,
+// verbatim input): the second row buffer started x samples in, not x * components, so a two-component predictor-2 frame
+// overwrote the row above before reading it. Both now decode the reference picture, for every predictor and both
+// component counts (the predictor-1 and predictor-6 fast paths included), and the identity is that picture's.
+TEST(VisualCaptureSourceHash, Lj92EveryComponentIsPredictedFromItsOwnNeighbours)
+{
+    const std::vector<uint8_t> a1 = bytes({ { 0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x15, 0x00, 0x01, 0x01 }, zeros(14), { 0x00, 0x02 },
+                                            { 0xFF, 0xC3, 0x00, 0x0E, 0x0E, 0x00, 0x04, 0x00, 0x02, 0x02, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00 },
+                                            { 0xFF, 0xDA, 0x00, 0x0A, 0x02, 0x01, 0x00, 0x02, 0x00, 0x06, 0x00, 0x00 },
+                                            { 0x50, 0x00, 0x00, 0xFF, 0xD9 } });
+    ASSERT_EQ(static_cast<size_t>(58), a1.size());
+    std::vector<uint16_t> picture;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeOverFill(a1, 0, &picture));
+    const std::vector<uint16_t> a1Expected = { 8192, 8194, 8192, 8194, 8192, 8194, 8192, 8194,
+                                               8192, 8194, 8192, 8194, 8192, 8194, 8192, 8194 };
+    ASSERT_TRUE(picture == a1Expected);
+
+    std::vector<uint8_t> a2 = a1;
+    a2[a2.size() - 5 - 3] = 0x02; // predictor 2
+    a2[a2.size() - 5] = 0x2A;
+    a2[a2.size() - 4] = 0x80;
+    ASSERT_EQ(LJ92_ERROR_NONE, decodeOverFill(a2, 0, &picture));
+    const std::vector<uint16_t> a2Expected = { 8192, 8192, 8194, 8194, 8192, 8192, 8194, 8194,
+                                               8192, 8192, 8194, 8194, 8192, 8192, 8194, 8194 };
+    ASSERT_TRUE(picture == a2Expected);
+
+    // The class, against the reference decoder.
+    const int pattern[] = { 0, 2, -3, 3, 0, -2, 2, 0, 3, -3, 0, 0, -2, 2, 3 };
+    const int shapes[][3] = { { 4, 4, 1 }, { 4, 4, 2 }, { 1, 4, 2 }, { 3, 2, 2 } };
+    for (const auto & shape : shapes)
+    {
+        const int width = shape[0], height = shape[1], components = shape[2];
+        std::vector<int> diffs(static_cast<size_t>(width) * height * components);
+        for (size_t i = 0; i < diffs.size(); ++i) diffs[i] = pattern[(i * 7u + 3u) % 15u];
+        for (int predictor = 1; predictor <= 7; ++predictor)
+        {
+            const std::vector<uint8_t> frame = smallFrame(width, height, components, static_cast<uint8_t>(predictor), diffs);
+            std::vector<uint16_t> decoded;
+            ASSERT_EQ(LJ92_ERROR_NONE, decodeOverFill(frame, 0x5A5A, &decoded));
+            ASSERT_TRUE(decoded == referencePicture(width, height, components, predictor, diffs));
+            int status = -1;
+            ASSERT_TRUE(lj92Hash(frame, &status) == pictureIdentity(decoded));
+            ASSERT_EQ(0, status);
+        }
+    }
+}
+
 // r6 pass 1 A2 (advisory, pre-existing, verbatim input): an LJ92 payload with no DHT opened, and the first sample read the
 // lookup table liblj92 never allocated (a NULL dereference). It is refused, so the display and the identity refuse it.
 TEST(VisualCaptureSourceHash, Lj92APayloadWithoutAHuffmanTableIsRefused)

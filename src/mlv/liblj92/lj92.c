@@ -1044,7 +1044,11 @@ static int parseScan(ljp* self) {
                     Px = lastrow[c];  // Use value above for first pixel in row
                 } else {
                     int prev_colx = (col - 1) * self->components;
-   
+                    /* r6 pass 2 A1 (adversary on f1659d6a): Ra is the same component's left neighbour. The scalar
+                     * `left` is the previous sample of ANY component, which is Ra only when components == 1 (it then
+                     * equals thisrow[prev_colx + c], so one-component pictures are unchanged). */
+                    const int Ra = thisrow[prev_colx + c];
+
                     switch (pred) {
                         case 0:
                           Px = 0;
@@ -1059,16 +1063,16 @@ static int parseScan(ljp* self) {
                           Px = lastrow[prev_colx + c];
                           break;
                         case 4:
-                          Px = left + lastrow[colx + c] - lastrow[prev_colx + c];
+                          Px = Ra + lastrow[colx + c] - lastrow[prev_colx + c];
                           break;
                         case 5:
-                          Px = left + ((lastrow[colx + c] - lastrow[prev_colx + c]) >> 1);
+                          Px = Ra + ((lastrow[colx + c] - lastrow[prev_colx + c]) >> 1);
                           break;
                         case 6:
-                          Px = lastrow[colx + c] + ((left - lastrow[prev_colx + c]) >> 1);
+                          Px = lastrow[colx + c] + ((Ra - lastrow[prev_colx + c]) >> 1);
                           break;
                         case 7:
-                          Px = (left + lastrow[colx + c]) >> 1;
+                          Px = (Ra + lastrow[colx + c]) >> 1;
                           break;
                     }
                 }
@@ -1231,7 +1235,9 @@ int lj92_open(lj92* lj,
         else {
             self->rowcache = rowcache;
             self->outrow[0] = rowcache;
-            self->outrow[1] = &rowcache[self->x];
+            /* r6 pass 2 A2 (advisory, pre-existing): a row holds x * components samples, so the second row starts
+             * there; at x it overlapped the first row whenever components > 1 (one component: unchanged). */
+            self->outrow[1] = &rowcache[row_elements];
         }
     }
 
