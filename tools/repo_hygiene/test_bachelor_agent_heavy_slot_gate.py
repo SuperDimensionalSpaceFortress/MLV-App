@@ -1484,6 +1484,49 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("STALLED|capture cleanup abandoned after 0.3 s: C:\\x\\a.txt, C:\\x\\b.txt|True", proc.stdout)
         self.assertIn("CLEAN|[]|False", proc.stdout)
 
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_factory_that_consumes_the_bound_before_returning_a_completed_task_is_a_timeout_not_a_late_success(self) -> None:
+        # sol r9 B1 (catalogue B-01): an expired budget used to become Wait(0), and an already-completed task then returned success even
+        # though its factory had spent the whole bound. The deadline is measured from the call's start: elapsed >= bound is a timeout.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$slowText = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('payload') }\n"
+                  "$slowDel = { param($p) Start-Sleep -Milliseconds 300; [Threading.Tasks.Task]::FromResult('') }\n"
+                  "$fastText = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
+                  "$fastDel = { param($p) [Threading.Tasks.Task]::FromResult('') }\n"
+                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 50 $slowText\n"
+                  "Write-Output ('LATE-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('LATE-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 50 $slowDel))\n"
+                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $fastText\n"
+                  "Write-Output ('FAST-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('FAST-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $fastDel) + ']')\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("LATE-READ|False|<read timed out: a.txt not readable within 50 ms>", proc.stdout)
+        self.assertIn("LATE-DEL|capture cleanup abandoned after 0.05 s: C:\\x\\a.txt", proc.stdout)
+        self.assertIn("FAST-READ|True|payload", proc.stdout, "a task that finishes inside its bound still succeeds")
+        self.assertIn("FAST-DEL|[]", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_an_accepted_plain_completed_task_has_no_result_so_no_false_cleanup_problem_and_no_fabricated_text(self) -> None:
+        # sol r9 B2: a plain [Task]::CompletedTask exposes the runtime type System.Threading.Tasks.VoidTaskResult as its Result. A non-generic
+        # Task has no result: cleanup reports no problem and the reader returns empty text, never the type name.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$plain = { param($p) [Threading.Tasks.Task]::CompletedTask }\n"
+                  "$ran = { param($p) [Threading.Tasks.Task]::Delay(1) }\n"
+                  "Write-Output ('PLAIN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $plain) + ']')\n"
+                  "Write-Output ('RUN-DEL|[' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $ran) + ']')\n"
+                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $plain\n"
+                  "Write-Output ('PLAIN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n"
+                  "$r = Read-CapturedResult 'C:\\x\\a.txt' 5000 $ran\n"
+                  "Write-Output ('RUN-READ|' + $r.Ok + '|[' + $r.Text + ']')\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("VoidTaskResult", proc.stdout)
+        self.assertIn("PLAIN-DEL|[]", proc.stdout)
+        self.assertIn("RUN-DEL|[]", proc.stdout)
+        self.assertIn("PLAIN-READ|True|[]", proc.stdout)
+        self.assertIn("RUN-READ|True|[]", proc.stdout)
+
     @unittest.skipUnless(os.name == "nt" and PWSH is not None,
                          "a read-only attribute blocks File.Delete only on Windows; on POSIX the delete succeeds and nothing is left behind")
     def test_a_capture_file_that_cannot_be_deleted_is_reported_as_still_present(self) -> None:

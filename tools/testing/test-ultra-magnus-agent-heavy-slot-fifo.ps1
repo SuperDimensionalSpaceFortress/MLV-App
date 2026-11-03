@@ -538,6 +538,14 @@ function Get-CaptureTask([scriptblock]$Start, $Argument, [scriptblock]$Default) 
     if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
     $made[0]
 }
+function Get-CaptureTaskResult($Task) {
+    # sol r9 B2: a plain (non-generic) Task has NO result. On this runtime [Task]::CompletedTask still exposes a Result property whose value is
+    # the internal VoidTaskResult, so the property's presence proves nothing: only a Task<T> whose T is a real type carries a result.
+    $type = $Task.GetType()
+    if (-not $type.IsGenericType) { return $null }
+    if ($type.GetGenericArguments()[0].FullName -eq 'System.Threading.Tasks.VoidTaskResult') { return $null }
+    return $Task.Result
+}
 function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) {
     Assert-CaptureIoBound 'captured-output read' $BoundMs
     $name = [IO.Path]::GetFileName($Path)
@@ -545,8 +553,10 @@ function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scrip
     try {
         $task = Get-CaptureTask $Start $Path { [BoundedCaptureIo]::ReadAllText($Path) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
-        if (-not $task.Wait($left)) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
-        return [pscustomobject]@{ Ok = $true; Text = [string]$task.Result }
+        # sol r9 B1: the deadline is measured from the call's start. A factory that spent the whole bound is a timeout even when the task it
+        # handed back has already completed (Wait(0) on a finished task is true).
+        if (-not $task.Wait($left) -or $clock.Elapsed.TotalMilliseconds -ge $BoundMs) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
+        return [pscustomobject]@{ Ok = $true; Text = [string](Get-CaptureTaskResult $task) }
     }
     catch {
         $inner = $_.Exception
@@ -562,10 +572,11 @@ function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBo
     try {
         $task = Get-CaptureTask $Start $Paths { [BoundedCaptureIo]::Delete($Paths) }
         $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
-        if ($task.Wait($left)) {
+        # sol r9 B1: elapsed >= bound is an abandoned step even when the task completed (see Read-CapturedResult).
+        if ($task.Wait($left) -and $clock.Elapsed.TotalMilliseconds -lt $BoundMs) {
             # The task reports the files a failed delete left behind or could not confirm gone (adversary r7 A3, sol r8 B2); a seam's plain
-            # Task has no Result and means none.
-            $incomplete = if ($null -ne $task.PSObject.Properties['Result']) { [string]$task.Result } else { '' }
+            # Task has no Result and means none (sol r9 B2: Get-CaptureTaskResult, not the Result property, which is VoidTaskResult).
+            $incomplete = [string](Get-CaptureTaskResult $task)
             if ($incomplete) { return "capture cleanup incomplete: $incomplete" }
             return ''
         }
