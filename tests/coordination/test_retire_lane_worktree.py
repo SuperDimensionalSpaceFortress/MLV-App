@@ -3156,6 +3156,91 @@ def test_r5_a2_an_unchanged_record_is_still_judged_by_its_write_time(tmp_path):
     assert r is None, (r, err)
 
 
+# Adversary pass r5 on 380df5f7 (A1 a launch-written pid file vs an old stamp, A2 conflicting stamps for one pid in one record, A3 no post-read stat).
+
+@pytest.mark.parametrize("pid_name", ["a-driver.pid", "z-driver.pid"])
+def test_r5b_a1_a_launch_written_pid_file_that_fits_the_process_outranks_an_old_stamp_in_the_same_run_dir(tmp_path, pid_name):
+    """r5 A1 (2nd pass): child.json states an OLD creation time for pid 999972 (an earlier lineage); venue-driver.pid, written at launch AFTER the
+    live process started, names the same pid. A pid file written after the process started proves the process is the recorded one, so the old
+    stamp must not suppress it (either record name order). A receipt's terminal write time stays weaker evidence (the B1 tests)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(created - 86400)}, created - 86400 + 5)
+    _write_record(rd, pid_name, "999972\n", created + 3600)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("doc", [
+    '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","ownerPid":999972,"ownerCreatedUtc":"%s"}}',
+    '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","runnerPid":999972,"runnerCreatedUtc":"%s"}}',
+    '{"state":"complete","workDir":%s,"pid":999972,"createdUtc":"%s","containment":{"childPid":999972,"childCreatedUtc":"%s"}}',
+    '{"state":"complete","workDir":%s,"pid":999972,"createdUtc":"%s","containment":{"ownerPid":999972,"ownerCreatedUtc":"%s"}}',
+], ids=["child-vs-owner", "child-vs-runner", "root-vs-child", "root-vs-owner"])
+@pytest.mark.parametrize("match_first", [True, False], ids=["match-first", "mismatch-first"])
+def test_r5b_a2_conflicting_stamps_for_one_pid_in_one_record_are_ambiguous_not_last_wins(tmp_path, doc, match_first):
+    """r5 A2 (2nd pass): two claims for ONE pid in ONE record that disagree (beyond the slack) are ambiguous and state nothing for that pid (the
+    last claim must not silently replace a matching one); the genuine driver, whose creation time the record fits by write time, still refuses."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    good, bad = _iso(created), _iso(created - 86400)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    first, second = (good, bad) if match_first else (bad, good)
+    _write_record(rd, "opus-001.receipt.json", doc % (json.dumps(str(wt)), first, second), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r5b_a2_agreeing_stamps_for_one_pid_still_bind_it(tmp_path):
+    """Guard: two claims for one pid that AGREE are one claim; a replacement process with another creation time is still free."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","ownerPid":999972,"ownerCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), _iso(created), _iso(created)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r5b_a3_a_record_that_vanishes_after_the_read_makes_no_write_time_claim(tmp_path):
+    """r5 A3 (2nd pass): the index re-stats after the read; when that stat is unavailable (the file is gone) the cached enumeration mtime must not be
+    paired with the NEW text: no write-time claim is made (fail toward live), so the genuine new driver still refuses."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "venue-driver.pid", "999900\n", created - 600)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            "if ((Split-Path -Leaf $Path) -eq 'venue-driver.pid') { [IO.File]::WriteAllText($Path, \"999974`n\"); "
+            "$t = [IO.File]::ReadAllText($Path); [IO.File]::Delete($Path); return $t }; "
+            "return [IO.File]::ReadAllText($Path) };")
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo

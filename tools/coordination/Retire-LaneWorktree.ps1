@@ -686,7 +686,8 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
         $root = $doc.RootElement
         if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $map }
         $rootStamp = $null
-        $rootPids = New-Object System.Collections.Generic.List[int]   # pids carried by ROOT-level fields: the only pids the root createdUtc can belong to (adversary A2)
+        $claims = @{}   # pid -> every creation time this record states for it (see the reconciliation below)
+        $rootPids =New-Object System.Collections.Generic.List[int]   # pids carried by ROOT-level fields: the only pids the root createdUtc can belong to (adversary A2)
         # Property names compare ORDINALLY (a differently-cased key is another key, never the recognised one). r5 (adversary A1): a key that
         # appears twice in one object is ambiguous, and an IDENTITY key (pid / childPid / driverPid / runnerPid / ownerPid, createdUtc, containment
         # at the root; the three pid/stamp pairs inside containment) that appears twice makes the WHOLE record state no identity: the map is empty
@@ -716,11 +717,24 @@ function Get-RecordedCreatedUtcMap([string]$Text, [int[]]$PidList) {
                     $pn = ConvertTo-RecordedPid $f[$pair[0]]
                     if ($pn -le 4 -or $se.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { continue }
                     $st = ConvertTo-RecordedUtc $se.GetString()
-                    if ($null -ne $st) { $map[$pn] = $st }
+                    if ($null -ne $st) { if (-not $claims.ContainsKey($pn)) { $claims[$pn] = New-Object 'System.Collections.Generic.List[datetime]' }; $claims[$pn].Add($st) }
                 }
             }
         }
-        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and $rootPids.Contains([int]$PidList[0]) -and -not $map.ContainsKey([int]$PidList[0])) { $map[[int]$PidList[0]] = $rootStamp }
+        if ($null -ne $rootStamp -and @($PidList).Count -eq 1 -and $rootPids.Contains([int]$PidList[0])) {
+            $rp = [int]$PidList[0]
+            if (-not $claims.ContainsKey($rp)) { $claims[$rp] = New-Object 'System.Collections.Generic.List[datetime]' }
+            $claims[$rp].Add($rootStamp)
+        }
+        # r5 (adversary A2, 2nd pass): several claims for ONE pid in one record (root + containment, or child / owner / runner naming the same pid)
+        # stand only when they AGREE within RunDirPidCreatedSlackSec. A disagreement is ambiguous and states nothing for that pid (the write-time
+        # rule decides): the last claim must never silently replace a matching one, nor a root claim be dropped because containment filled the map.
+        foreach ($k in @($claims.Keys)) {
+            $l = $claims[$k]
+            $agree = $true
+            foreach ($t in $l) { if ([math]::Abs(($t - $l[0]).TotalSeconds) -gt [double]$script:RunDirPidCreatedSlackSec) { $agree = $false } }
+            if ($agree) { $map[[int]$k] = $l[0] }
+        }
     } catch { return @{} } finally { $doc.Dispose() }
     return $map
 }
@@ -815,6 +829,7 @@ function Get-RunDirPidIndex {
             foreach ($f in $files) {
                 if ($f.Name.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and $f.LastWriteTimeUtc -lt $cut) { continue }
                 $text = $null
+                $cachedAt = $f.LastWriteTimeUtc   # the write time as ENUMERATED, before the read
                 try { $text = Read-RunDirRecordText -Path $f.FullName }
                 catch {
                     $why = Get-RunDirReadFailure $_
@@ -826,9 +841,10 @@ function Get-RunDirPidIndex {
                 # r5 (adversary A2): $f carries the mtime cached at ENUMERATION, but the text was read just now; a producer that replaced the file in
                 # between would pair its new pid text with the old mtime, and a genuine new driver would read as started-after-record. Re-stat AFTER
                 # the read and take the later of the two: a later write time can only make the started-after rejection more lenient (toward live).
-                # A file that vanished since the read keeps the cached value.
-                $recordedAt = $f.LastWriteTimeUtc
-                try { $f.Refresh(); if ($f.Exists -and $f.LastWriteTimeUtc -gt $recordedAt) { $recordedAt = $f.LastWriteTimeUtc } } catch { }
+                # r5 (adversary A3, 2nd pass): when that re-stat is unavailable (the file is gone, or the stat throws) the cached value describes an
+                # earlier version than the text just read, so NO write time is stated ($null: Test-RecordedPidBound makes no started-after claim).
+                $recordedAt = $null
+                try { $f.Refresh(); if ($f.Exists) { $recordedAt = $f.LastWriteTimeUtc; if ($cachedAt -gt $recordedAt) { $recordedAt = $cachedAt } } } catch { $recordedAt = $null }
                 $recIds = Get-PidsFromRecordText $text
                 $recCreated = Get-RecordedCreatedUtcMap -Text $text -PidList $recIds
                 foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $recordedAt; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }) }) }
@@ -901,8 +917,20 @@ function Find-RunDirDriverHolders {
     foreach ($rec in $index) {
         if ($rec.Error -or -not $byPid.ContainsKey($rec.Pid)) { continue }
         $rc = $rec.PSObject.Properties['RecordedCreatedUtc']
-        if (-not $rc -or $rc.Value -isnot [datetime]) { continue }
         $k = "$($rec.RunDir)|$($rec.Pid)"
+        if (-not $rc -or $rc.Value -isnot [datetime]) {
+            # r5 (adversary A1, 2nd pass): a record that states NO creation time but was written by the launcher (a pid file or child record, not a
+            # lane's terminal receipt) AFTER the live process started proves that process is the recorded one: the launcher wrote a pid it saw
+            # alive, and the process created before that write has held the pid ever since. Such a record outranks an older lineage's stamp in the
+            # same run dir. A receipt's write time is the lane's END, so it is not that proof (sol r1 B1 keeps its mismatch-wins rule against it).
+            $at = $rec.PSObject.Properties['RecordedAtUtc']
+            if ($at -and $at.Value -is [datetime] -and -not $rec.File.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and
+                $byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) {
+                $b = Test-RecordedPidBound -Proc $byPid[$rec.Pid] -Record $rec
+                if ($b.Bound -and $b.Why -eq 'created-fits-record') { $exactMatch[$k] = $true }
+            }
+            continue
+        }
         if (Test-RecordedCreatedMismatch -Proc $byPid[$rec.Pid] -Record $rec) { $reused[$k] = $true }
         elseif ($byPid[$rec.Pid].PSObject.Properties['CreationDate'] -and $byPid[$rec.Pid].CreationDate -is [datetime]) { $exactMatch[$k] = $true }
     }
