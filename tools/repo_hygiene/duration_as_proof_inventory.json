@@ -2657,6 +2657,16 @@
       "lines": [
         212
       ]
+    },
+    {
+      "path": "src/mlv/llrawproc/llrawproc.c",
+      "anchor": "if ( split_span_ms >= 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CUDA-RECON-DUALISO-TIMER-SPLIT-1 r1 (adversary pass 3 A1) sentinel, not an elapsed-time inference: llrawproc_gpu_recon_run_backend initialises split_span_ms to -1.0 ('no backend span read') and only a successful run whose backend reports its event timing (timing_out->available, or g->last_timing() == 0 when the caller passed no timing_out) overwrites it with igpu_recon_timing_t.total_ms. The >= 0.0 test selects whether the telemetry-only split books run_gpu_ms / sync_ms; it gates no behaviour and proves no run (backend_calls and run_rc do).",
+      "lines": [
+        2960
+      ]
     }
   ]
 }
