@@ -405,7 +405,11 @@ WRITE_ALLOWED = {
         "name in the job's own per-leg output directory $legOut) with FileMode.CreateNew, so a name that already exists (a planted hard link) is "
         "refused, never truncated; it never opens footage and names no owner path or view entry.",
     ("playback-attr-3-cuda-job.ps1", "$uf.Write($ub, 0, $ub.Length); $uf.Flush()"):
-        "CPU utilisation sampler: writes its header and its own counter rows (utc, CPU percent, app pids, app cores) to that same CreateNew handle, never footage bytes.",
+        "CPU utilisation sampler: writes its header and its own counter rows (utc, CPU percent, app pids, app cores, interval start, clock step) to that same CreateNew handle, never footage bytes.",
+    ("playback-attr-3-cuda-job.ps1", "$own = [IO.File]::Open($CsvPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
+        "GPU utilisation sampler, Start-UtilSampleGpu (sol r4 B3): creates nvidia-smi's output CSV ('gpu-util.csv', a fixed name in the job's own "
+        "per-leg output directory $legOut) with FileMode.CreateNew and closes it at once without writing, so a name that already exists (a planted "
+        "hard link, another writer's file) is refused before nvidia-smi -f could truncate it; it never opens footage and names no owner path or view entry.",
     # ---- Attr3FootageStageJob.psm1 -------------------------------------------------------------
     ("Attr3FootageStageJob.psm1", "$localDstStream = [IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
         "the target-volume partial, created by THIS attempt with CreateNew under a per-attempt name carrying the "
