@@ -2978,6 +2978,10 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             if(split_span_ms >= 0.0)
             {
                 split->run_gpu_ms += split_span_ms;
+                /* sync_ms (CoS #745 I1a): wall-clock remainder of the run not
+                 * covered by the recorded event pairs; not a device sync time.
+                 * Host setup before the first event and bookkeeping after the
+                 * last one land here as well as any wait for the stream. */
                 split->sync_ms += MAX(0.0, run_wall_ms - split_span_ms);
             }
         }
