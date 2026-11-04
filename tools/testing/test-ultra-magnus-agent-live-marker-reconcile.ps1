@@ -19,17 +19,20 @@ param(
 #   unit  the agent's real functions, lifted from its AST:
 #         inbox-job-left-alone       a job whose script is in inbox\ is the live set: no recovery runs, even with marker + result
 #         own-claim-retire-retried   this agent's own unlaunched claim whose retire failed stays quarantined, then clears
+#         completed-tmp-kept-on-failed-move  the marker moved but the completed tmp could not: the tmp is KEPT, the job quarantined, then recovery completes it
 # Prints one JSON object. Exit 0 = every row passed. Exit 1 = a row failed; the object says which (a RED run needs the rows, not the first throw).
 
 $ErrorActionPreference = 'Stop'
+# PowerShell variables are case-insensitive: assigning $agentScript below also assigns $AgentScript, so the override is captured first.
+$agentScriptOverridden = [bool]$AgentScript
 $agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
-$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried')
+$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Want([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "FAIL: $Message" } }
 
-$runId = 'agent-live-marker-{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID
+$runId = 'agent-live-marker-{0}-{1}-{2}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID, [guid]::NewGuid().ToString('N').Substring(0, 8)
 $base = Join-Path $RepoRoot ".claude-state\testing\$runId"
 New-Item -ItemType Directory -Force -Path $base | Out-Null
 
@@ -174,6 +177,8 @@ try {
             Assert-True ($polls -le 2) "cleared within one poll: the heartbeat generation moved $polls"
             Assert-True (Test-Path -LiteralPath (Join-Path $c.processed "$job.started.completed.json")) 'the marker went to processed\ by the start-up path (status completed)'
             Assert-True (@(Get-ChildItem -LiteralPath $c.running -Filter "$tmp.stale-*").Count -eq 1) 'the tmp is preserved as a set-aside record, never deleted'
+            # The agent logs after it retires, so the line can land a few ms after running\ empties: wait for it, then count.
+            Assert-True (Wait-Until { @(Get-LogLines $c "live marker reconcile job=$job").Count -ge 1 } 8) 'the agent logs the reconcile'
             Assert-True (@(Get-LogLines $c "live marker reconcile job=$job").Count -eq 1) 'one agent log line for the job'
             Assert-True ((Get-Content -LiteralPath (Join-Path $c.outbox "$job.result.json") -Raw | ConvertFrom-Json).fixture -eq $true) 'the published result is untouched'
             return [ordered]@{ agentPollsToClear = $polls; runningCounted = 0 }
@@ -276,7 +281,7 @@ try {
     function Skip-OnBase([string]$Name) {
         if ($hasFix) { return $false }
         if (Want $Name) {
-            if ($AgentScript) { $results[$Name] = [ordered]@{ status = 'NA'; detail = 'the base agent has no Invoke-LiveMarkerReconcile' } }
+            if ($agentScriptOverridden) { $results[$Name] = [ordered]@{ status = 'NA'; detail = 'the base agent has no Invoke-LiveMarkerReconcile' } }
             else { $results[$Name] = [ordered]@{ status = 'FAIL'; error = 'FAIL: the agent defines no Invoke-LiveMarkerReconcile' } }
         }
         return $true
@@ -338,6 +343,55 @@ try {
             Assert-True (-not (Test-Path -LiteralPath $markerPath)) 'the marker is retired'
             Assert-True (-not $script:RecoveryQuarantine.ContainsKey($job)) 'the quarantine is released'
             return 'retried, then retired'
+        }
+    }
+
+    # sol A1: the marker moved to processed\ but the replacing rename of the completion had not landed, so the completed record is only the tmp.
+    # If that tmp cannot move either, deleting it leaves processed\ holding status=started with nothing left to retry. Keep it; recovery completes it.
+    if (-not (Skip-OnBase 'completed-tmp-kept-on-failed-move')) {
+        Invoke-Row 'completed-tmp-kept-on-failed-move' {
+            $c = New-Case 'completed-tmp-kept-on-failed-move'
+            $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed
+            $script:RecoveryQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+            $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $script:Logged = [System.Collections.Generic.List[string]]::new()
+            $lift = @('Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Complete-StartedMarker', 'Set-MarkerRetireQuarantine', 'Set-OwnPendingMarkerTmp', 'Clear-OwnPendingMarkerTmp',
+                'Get-MarkerTempFiles', 'Read-MarkerArtifact', 'Move-MarkerTmpAside', 'Resolve-JobMarkerTemps', 'Resolve-StrandedResult', 'Resolve-StartedMarkerFile', 'Get-JobRecoveryPending', 'Resolve-JobRecovery')
+            foreach ($name in $lift) { . ([scriptblock]::Create((Get-AgentFunction $name).Extent.Text)) }
+            function Add-AgentLogLine { param([string]$Message) $script:Logged.Add($Message) }
+            $job = 'tmp-kept'
+            $markerPath = Join-Path $c.running "$job.started.json"
+            $resultPath = Join-Path $c.outbox "$job.result.json"
+            Put-File $markerPath (New-MarkerJson $job)
+            Put-File $resultPath (New-ResultJson $job)
+            # Filesystem sharing violations, simulated: the replacing rename never lands (its tmp stays), the marker move works, the tmp move is denied.
+            function Write-JsonFileAtomic {
+                param([string]$Path, $InputObject, [int]$Depth = 8)
+                $tmp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+                [IO.File]::WriteAllText($tmp, ($InputObject | ConvertTo-Json -Depth 8))
+                return [pscustomobject]@{ ok = $false; tmp = $tmp; error = 'denied' }
+            }
+            function Move-FileChecked {
+                param([string]$Source, [string]$Destination, [bool]$Overwrite = $false, [int]$Attempts = 10, [int]$DelayMs = 200)
+                if ($Source -like '*.tmp') { return [pscustomobject]@{ ok = $false; attempts = $Attempts; error = 'IOException: denied' } }
+                [IO.File]::Move($Source, $Destination, $Overwrite)
+                return [pscustomobject]@{ ok = $true; attempts = 1; error = $null }
+            }
+            $ErrorActionPreference = 'Continue'   # the agent's own policy
+            try { Complete-StartedMarker -MarkerPath $markerPath -Status 'completed' -ResultPath $resultPath } finally { $ErrorActionPreference = 'Stop' }
+            $tmps = @(Get-ChildItem -LiteralPath $c.running | Where-Object { $_.Name -match '\.tmp$' })
+            Assert-True ($tmps.Count -eq 1) "the completed tmp is kept while its move is denied: [$((Get-ChildItem -LiteralPath $c.running).Name -join ',')]"
+            Assert-True ((Get-Content -LiteralPath $tmps[0].FullName -Raw | ConvertFrom-Json).status -eq 'completed') 'the kept tmp is the completed record'
+            Assert-True ($script:RecoveryQuarantine.ContainsKey($job)) "the job is quarantined so recovery retries it: $($script:Logged -join ' | ')"
+            # The sharing violation ends: the REAL move and write functions are back, and the per-poll retry finishes the job.
+            foreach ($name in @('Move-FileChecked', 'Write-JsonFileAtomic')) { . ([scriptblock]::Create((Get-AgentFunction $name).Extent.Text)) }
+            $ErrorActionPreference = 'Continue'
+            try { $ok = Resolve-JobRecovery -JobId $job } finally { $ErrorActionPreference = 'Stop' }
+            Assert-True $ok "recovery reconciles it once the reader lets go: $($script:Logged -join ' | ')"
+            Assert-True (@(Get-ChildItem -LiteralPath $c.running | Where-Object { $_.Name -notmatch $setAsideRecordPattern }).Count -eq 0) 'running\ is empty'
+            $rec = Get-Content -LiteralPath (Join-Path $c.processed "$job.started.completed.json") -Raw | ConvertFrom-Json
+            Assert-True ($rec.status -eq 'completed') "processed\ holds the completed record: $($rec | ConvertTo-Json -Compress)"
+            return 'kept, then completed'
         }
     }
 }

@@ -1100,7 +1100,12 @@ function Complete-StartedMarker {
     if ($w.tmp) {
         $mt = Move-FileChecked -Source $w.tmp -Destination $dest -Overwrite $true
         if ($mt.ok) { $script:OwnPendingMarkerTmp.Remove($MarkerPath) }
-        else { Add-AgentLogLine "completed record not kept job=$($marker.jobId) $($w.tmp) $($mt.error)" }
+        else {
+            # sol A1: the tmp is now the ONLY completed record (processed\ holds status=started). It stays pending in running\ and the job is quarantined, so the
+            # per-poll retry (Resolve-JobMarkerTemps promotes it, then this function completes the marker again). Clearing it here would delete the only record.
+            Set-MarkerRetireQuarantine -JobId ([string]$marker.jobId) -Why "status=${Status}: the completed record $([IO.Path]::GetFileName($w.tmp)) could not be moved to processed\ after $($mt.attempts) attempts: $($mt.error)"
+            return
+        }
     }
     # Nothing of this agent's stays pending for a retired marker. One this cannot remove is retired by Invoke-LiveMarkerReconcile on the next poll.
     Clear-OwnPendingMarkerTmp -Path $MarkerPath
