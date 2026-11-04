@@ -512,8 +512,24 @@ function Initialize-BoundedCaptureIo {
             return Task.Run(() => { File.WriteAllText(path + ".tmp", text); File.Move(path + ".tmp", path); });
         }
         // sol r12 B1: ends a capture worker and every process it started. '' when the kill call returned; otherwise what it raised.
+        // adversary r13 A3: called even when the worker itself has ended. On Windows the held process handle still lets Kill(true) find the
+        // processes it left behind (by parent id and start time); on POSIX an ended worker's orphans are reparented, so KillGroup below ends them.
         public static Task<string> KillTree(Process process) {
             return Task.Run(() => { try { process.Kill(true); return ""; } catch (Exception e) { return e.GetType().Name + ": " + e.Message; } });
+        }
+        [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+        private static extern int kill(int pid, int sig);
+        // POSIX only (a worker launched by setsid leads its own process group): SIGKILL to the whole group. '' when it was sent or the group is
+        // already empty (ESRCH); otherwise the errno or what the call raised.
+        public static Task<string> KillGroup(int groupId) {
+            return Task.Run(() => {
+                try {
+                    if (kill(-groupId, 9) == 0) { return ""; }
+                    int errno = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    return errno == 3 ? "" : "kill(-" + groupId + ", SIGKILL) failed with errno " + errno;
+                }
+                catch (Exception e) { return e.GetType().Name + ": " + e.Message; }
+            });
         }
         // '' only when the directory is confirmed gone (the same rule as Delete below).
         public static Task<string> DeleteDirectory(string dir) {
@@ -570,35 +586,64 @@ function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
 $CaptureWorkerStartMs = 30000
 $CaptureWorkerKillMs = 5000
 $CaptureWorkerReapMs = 5000
-$CaptureWorkerScript = @'
+# adversary r13 A1/A2: the request and the answer cross the process boundary LOSSLESSLY. Every string travels as the base64 of its raw UTF-16
+# code units, so nothing is reinterpreted on the way (JSON had turned an ISO date string into a DateTime), $null stays distinct from '', and
+# the argument keeps its shape (a one-element or empty string[] stays a string[]; a scalar stays a scalar). The same text defines these
+# functions here and at the top of the worker's script.
+$CaptureWireText = @'
+function ConvertTo-CaptureWire($Value) {
+    if ($null -eq $Value) { return '-' }
+    $s = [string]$Value
+    $b = [byte[]]::new($s.Length * 2)
+    [Buffer]::BlockCopy($s.ToCharArray(), 0, $b, 0, $b.Length)
+    return '+' + [Convert]::ToBase64String($b)
+}
+function ConvertFrom-CaptureWire([string]$Wire) {
+    if ($Wire -ceq '-') { return $null }
+    if (-not $Wire.StartsWith('+')) { throw 'malformed capture worker field' }
+    $b = [Convert]::FromBase64String($Wire.Substring(1))
+    $c = [char[]]::new([int]($b.Length / 2))
+    [Buffer]::BlockCopy($b, 0, $c, 0, $b.Length)
+    return [string]::new($c)
+}
+'@ + "`n"
+. ([scriptblock]::Create($CaptureWireText))
+$CaptureWorkerScript = $CaptureWireText + @'
 # The capture worker: one -Start factory, run in its own process so its caller's deadline can end it.
 $ErrorActionPreference = 'Stop'   # a statement-terminating error in the factory fails the step by name instead of letting it carry on
-$answerPath = Join-Path $PSScriptRoot 'answer.json'
-function Write-WorkerAnswer($Answer) {
+$answerPath = Join-Path $PSScriptRoot 'answer.txt'
+function Write-WorkerAnswer([string]$Kind, $Value) {
     $tmp = $answerPath + '.tmp'
-    [IO.File]::WriteAllText($tmp, (ConvertTo-Json -InputObject $Answer -Compress -Depth 2))
+    [IO.File]::WriteAllText($tmp, $Kind + "`n" + (ConvertTo-CaptureWire $Value))
     [IO.File]::Move($tmp, $answerPath)
 }
 try {
     # Start-up, before 'ready': the first use of each of these costs a cold process far more than a later one, and is not the step's.
-    $null = '{"a":["x"]}' | ConvertFrom-Json
-    $null = ConvertTo-Json -InputObject ([ordered]@{ a = 'x' }) -Compress -Depth 2
+    $null = ConvertFrom-CaptureWire (ConvertTo-CaptureWire 'x')
     $null = @(& ([scriptblock]::Create('param($x) [Threading.Tasks.Task]::FromResult([string]$x)')) 'x')[0].Wait(0)
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'ready'), '')
     $goPath = Join-Path $PSScriptRoot 'go'
     while (-not [IO.File]::Exists($goPath)) { [Threading.Thread]::Sleep(1) }
-    $req = [IO.File]::ReadAllText($goPath) | ConvertFrom-Json
-    . ([scriptblock]::Create("function Get-CaptureTaskResult {$($req.ResultFnText)}"))
-    $argument = if ($req.ArgIsArray) { [string[]]@($req.Arg) } else { $req.Arg }
-    $made = @(& ([scriptblock]::Create($req.FactoryText)) $argument)
+    # The request: wait ms, factory, result function, argument kind, argument count, then one field per argument.
+    $req = [IO.File]::ReadAllText($goPath).Split("`n")
+    $count = [int]$req[4]
+    if ($req.Count -ne 5 + $count) { throw 'malformed capture worker request' }
+    if ($req[3] -ceq 'scalar' -and $count -eq 1) { $argument = ConvertFrom-CaptureWire $req[5] }
+    elseif ($req[3] -ceq 'array') {
+        $argument = [string[]]::new($count)
+        for ($i = 0; $i -lt $count; $i++) { $argument[$i] = ConvertFrom-CaptureWire $req[5 + $i] }
+    }
+    else { throw 'malformed capture worker request' }
+    . ([scriptblock]::Create("function Get-CaptureTaskResult {$(ConvertFrom-CaptureWire $req[2])}"))
+    $made = @(& ([scriptblock]::Create((ConvertFrom-CaptureWire $req[1]))) $argument)
     if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
-    if (-not $made[0].Wait([int]$req.WaitMs)) { Write-WorkerAnswer ([ordered]@{ Done = $false; Text = '' }) }
-    else { Write-WorkerAnswer ([ordered]@{ Done = $true; Text = [string](Get-CaptureTaskResult $made[0]) }) }
+    if (-not $made[0].Wait([int]$req[0])) { Write-WorkerAnswer 'pending' $null }
+    else { Write-WorkerAnswer 'done' ([string](Get-CaptureTaskResult $made[0])) }
 }
 catch {
     $e = $_.Exception
     while ($null -ne $e.InnerException) { $e = $e.InnerException }
-    Write-WorkerAnswer ([ordered]@{ Error = [string]$e.Message })
+    Write-WorkerAnswer 'error' ([string]$e.Message)
 }
 '@
 function Get-CaptureWorkerExitText($Worker) {
@@ -606,25 +651,32 @@ function Get-CaptureWorkerExitText($Worker) {
     return 'exit code unknown'
 }
 function Stop-CaptureWorker($Worker) {
-    # Kills the worker's process tree if it is still there, reaps it, and removes its scratch directory, each under its own bound.
+    # Kills the worker's process tree, reaps it, and removes its scratch directory, each under its own bound.
+    # adversary r13 A3: the tree is killed EVEN WHEN the worker has already ended. Its root ending proves nothing about what it started (a
+    # factory that launched a process and then threw left that process running). POSIX: the worker leads its own process group (setsid), so the
+    # group is killed too, which reaches orphans that were reparented away from it.
     # Returns '' or a note naming what could not be confirmed. Never throws.
     if ($null -eq $Worker) { return '' }
     $notes = [Collections.Generic.List[string]]::new()
     $p = $Worker.Process
     if ($null -ne $p) {
-        $alive = $true
-        try { $alive = -not $p.HasExited } catch { $notes.Add("capture worker state unknown ($($_.Exception.Message))") }
-        if ($alive) {
+        if ($null -ne $Worker.Group) {
             try {
-                $kill = [BoundedCaptureIo]::KillTree($p)
-                if (-not $kill.Wait($CaptureWorkerKillMs)) { $notes.Add("the kill of capture worker $($p.Id) did not return within $CaptureWorkerKillMs ms") }
-                elseif ($kill.Result) { $notes.Add("the kill of capture worker $($p.Id) failed ($($kill.Result))") }
+                $group = [BoundedCaptureIo]::KillGroup([int]$Worker.Group)
+                if (-not $group.Wait($CaptureWorkerKillMs)) { $notes.Add("the kill of capture worker group $($Worker.Group) did not return within $CaptureWorkerKillMs ms") }
+                elseif ($group.Result) { $notes.Add("the kill of capture worker group $($Worker.Group) failed ($($group.Result))") }
             }
-            catch { $notes.Add("the kill of capture worker $($p.Id) failed ($($_.Exception.Message))") }
-            $reaped = $false
-            try { $reaped = $p.WaitForExit($CaptureWorkerReapMs) } catch { $notes.Add("the reap of capture worker $($p.Id) failed ($($_.Exception.Message))") }
-            if (-not $reaped) { $notes.Add("capture worker $($p.Id) is not confirmed ended after $CaptureWorkerReapMs ms") }
+            catch { $notes.Add("the kill of capture worker group $($Worker.Group) failed ($($_.Exception.Message))") }
         }
+        try {
+            $kill = [BoundedCaptureIo]::KillTree($p)
+            if (-not $kill.Wait($CaptureWorkerKillMs)) { $notes.Add("the kill of capture worker $($p.Id) did not return within $CaptureWorkerKillMs ms") }
+            elseif ($kill.Result) { $notes.Add("the kill of capture worker $($p.Id) failed ($($kill.Result))") }
+        }
+        catch { $notes.Add("the kill of capture worker $($p.Id) failed ($($_.Exception.Message))") }
+        $reaped = $false
+        try { $reaped = $p.WaitForExit($CaptureWorkerReapMs) } catch { $notes.Add("the reap of capture worker $($p.Id) failed ($($_.Exception.Message))") }
+        if (-not $reaped) { $notes.Add("capture worker $($p.Id) is not confirmed ended after $CaptureWorkerReapMs ms") }
     }
     try {
         $del = [BoundedCaptureIo]::DeleteDirectory($Worker.Dir)
@@ -643,22 +695,33 @@ function Close-CaptureWorker($Worker) {
 function Start-CaptureWorker {
     # Starts a capture worker and waits (bounded) until it is ready, BEFORE the step's clock starts. Throws a named failure when it cannot
     # start; any process it did start is killed first.
-    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null }
+    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null; Group = $null }
     try {
         $null = [IO.Directory]::CreateDirectory($worker.Dir)
         [IO.File]::WriteAllText((Join-Path $worker.Dir 'worker.ps1'), $CaptureWorkerScript)
+        $null = ConvertFrom-CaptureWire (ConvertTo-CaptureWire 'x')   # warm this side too
         # The script is named relative to its working directory, so no path is ever quoted into a command line.
-        $null = ConvertTo-Json -Compress -InputObject ([ordered]@{ a = 'x' }); $null = '{"a":1}' | ConvertFrom-Json   # warm this side too
-        $worker.Process = Start-Process -FilePath (Get-Process -Id $PID).Path -WorkingDirectory $worker.Dir -NoNewWindow -PassThru `
-            -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'worker.ps1') `
+        $exe = (Get-Process -Id $PID).Path
+        $argv = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'worker.ps1')
+        # adversary r13 A3 (POSIX): setsid makes the worker the leader of a new process group, so its teardown can end the whole group.
+        $setsid = $null
+        if (-not $IsWindows) { foreach ($candidate in '/usr/bin/setsid', '/bin/setsid') { if ([IO.File]::Exists($candidate)) { $setsid = $candidate; break } } }
+        if ($null -ne $setsid) { $argv = @($exe) + $argv; $exe = $setsid }
+        $worker.Process = Start-Process -FilePath $exe -WorkingDirectory $worker.Dir -NoNewWindow -PassThru -ArgumentList $argv `
             -RedirectStandardOutput (Join-Path $worker.Dir 'stdout.txt') -RedirectStandardError (Join-Path $worker.Dir 'stderr.txt')
-        $null = $worker.Process.Handle   # keeps ExitCode readable after the exit
+        $null = $worker.Process.Handle   # keeps ExitCode readable after the exit, and lets Kill(true) find what an ended worker left behind
         $ready = Join-Path $worker.Dir 'ready'
         $clock = [Diagnostics.Stopwatch]::StartNew()
         while (-not [IO.File]::Exists($ready)) {
             if ($worker.Process.HasExited) { throw "the capture worker ended before it was ready ($(Get-CaptureWorkerExitText $worker))" }
             if ($clock.ElapsedMilliseconds -ge $CaptureWorkerStartMs) { throw "the capture worker was not ready within $CaptureWorkerStartMs ms" }
             Start-Sleep -Milliseconds 10
+        }
+        if ($null -ne $setsid) {
+            # The group is recorded only when /proc confirms the worker leads it (field 5 of /proc/<pid>/stat), so no other group is ever killed.
+            $stat = [IO.File]::ReadAllText("/proc/$($worker.Process.Id)/stat")
+            $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
+            if ([int]$fields[2] -eq $worker.Process.Id) { $worker.Group = $worker.Process.Id }
         }
         return $worker
     }
@@ -684,20 +747,30 @@ function Invoke-CaptureFactory($Worker, [scriptblock]$Factory, $Argument, [Diagn
     # Hands the factory to the ready worker and waits for the worker to END inside what is left of the bound. Returns its answer, or $null
     # when it did not end in time (the caller's teardown then kills its tree).
     $left = [Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)
-    $request = ConvertTo-Json -Compress -Depth 3 -InputObject ([ordered]@{
-        FactoryText = $Factory.ToString(); Arg = $Argument; ArgIsArray = ($Argument -is [array]); WaitMs = $left
-        ResultFnText = ${function:Get-CaptureTaskResult}.ToString() })
-    $sent = [BoundedCaptureIo]::WriteAtomic((Join-Path $Worker.Dir 'go'), $request)
+    # adversary r13 A1/A2: the line format the worker reads (see $CaptureWorkerScript); every string is a lossless wire field.
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add([string]$left)
+    $lines.Add((ConvertTo-CaptureWire $Factory.ToString()))
+    $lines.Add((ConvertTo-CaptureWire ${function:Get-CaptureTaskResult}.ToString()))
+    if ($Argument -is [array]) {
+        $lines.Add('array'); $lines.Add([string]$Argument.Count)
+        foreach ($item in $Argument) { $lines.Add((ConvertTo-CaptureWire $item)) }
+    }
+    else { $lines.Add('scalar'); $lines.Add('1'); $lines.Add((ConvertTo-CaptureWire $Argument)) }
+    $sent = [BoundedCaptureIo]::WriteAtomic((Join-Path $Worker.Dir 'go'), ($lines -join "`n"))
     if (-not $sent.Wait([Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds))) { return $null }
     $ended = $false
     try { $ended = $Worker.Process.WaitForExit([Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)) } catch { $ended = $false }
     if (-not $ended) { return $null }
-    $read = [BoundedCaptureIo]::ReadIfPresent((Join-Path $Worker.Dir 'answer.json'))
+    $read = [BoundedCaptureIo]::ReadIfPresent((Join-Path $Worker.Dir 'answer.txt'))
     if (-not $read.Wait([Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds))) { return $null }
     if ($null -eq $read.Result) { throw "the capture worker ended without an answer ($(Get-CaptureWorkerExitText $Worker))" }
-    $answer = $read.Result | ConvertFrom-Json
-    if ($null -ne $answer.PSObject.Properties['Error']) { throw [string]$answer.Error }
-    return $answer
+    $answer = $read.Result.Split("`n")
+    if ($answer.Count -ne 2) { throw 'malformed capture worker answer' }
+    if ($answer[0] -ceq 'error') { throw [Exception]::new((ConvertFrom-CaptureWire $answer[1])) }
+    if ($answer[0] -ceq 'pending') { return [pscustomobject]@{ Done = $false; Text = '' } }
+    if ($answer[0] -ceq 'done') { return [pscustomobject]@{ Done = $true; Text = (ConvertFrom-CaptureWire $answer[1]) } }
+    throw 'malformed capture worker answer'
 }
 function Get-CaptureStepText($Worker, [scriptblock]$Start, $Argument, [scriptblock]$Default, [Diagnostics.Stopwatch]$Clock, [int]$BoundMs) {
     # The text a finished step produced ('' for a plain Task, which has no result), or $null when it did not finish inside the bound.

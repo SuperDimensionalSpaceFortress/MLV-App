@@ -1732,6 +1732,89 @@ class BoundedCaptureIoTests(unittest.TestCase):
                                       self._FOREVER_CONVERSION)
         self.assertRegex(out, r"FOREVER-DEL\|capture cleanup abandoned after 0\.2 s: .*a\.txt")
 
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_the_worker_hands_back_every_text_and_every_error_message_exactly(self) -> None:
+        # adversary r13 A1: the r13 worker's JSON transport turned an ISO date string into a DateTime, so '2026-11-04T12:00:00Z' came back as
+        # '11/04/2026 12:00:00' with Ok=True. Each text is rebuilt in the factory from its code units (the factory is self-contained), and
+        # must come back code unit for code unit through the reader's text, the reader's failure and the cleanup's note.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$texts = @('2026-11-04T12:00:00Z', '{\"a\":1}', ' padded ', 'true', ('nul' + [char]0 + 'x'), ([string][char]0x00e9 + [char]0xD800 + 'z'))\n"
+                  "$i = 0\n"
+                  "foreach ($t in $texts) {\n"
+                  "  $units = ($t.ToCharArray() | ForEach-Object { [int]$_ }) -join ','\n"
+                  "  $make = '[string]::new([char[]]@(' + $units + '))'\n"
+                  "  $ok = [scriptblock]::Create('param($p) [Threading.Tasks.Task]::FromResult(' + $make + ')')\n"
+                  "  $bad = [scriptblock]::Create('param($p) throw ' + $make)\n"
+                  "  $r = Read-CapturedResult $p 10000 $ok\n"
+                  "  Write-Output (\"TEXT|$i|\" + ($r.Ok -and $r.Text -ceq $t))\n"
+                  "  $r = Read-CapturedResult $p 10000 $bad\n"
+                  "  Write-Output (\"ERROR|$i|\" + ((-not $r.Ok) -and $r.Text -ceq \"<read failed: $t>\"))\n"
+                  "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) 10000 $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
+                  "  $i++\n"
+                  "}\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for kind in ("TEXT", "ERROR", "NOTE"):
+            for i in range(6):
+                self.assertIn(f"{kind}|{i}|True", proc.stdout, f"{kind} {i}\n{proc.stdout}{proc.stderr}")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_the_worker_hands_the_factory_its_argument_in_the_shape_it_was_given(self) -> None:
+        # adversary r13 A2: a one-element string[] reached the cleanup factory as a String (so $paths[0] was 'C'), an empty one as $null.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$shape = { param($x) [Threading.Tasks.Task]::FromResult('type=' + $x.GetType().FullName + ' n=' + @($x).Count + ' items=' + ($x -join '|')) }\n"
+                  "$none = { param($x) [Threading.Tasks.Task]::FromResult('null=' + ($null -eq $x) + ' type=' + $(if ($null -ne $x) { $x.GetType().FullName })) }\n"
+                  "Write-Output ('ONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 5000 $shape))\n"
+                  "Write-Output ('TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 5000 $shape))\n"
+                  "Write-Output ('EMPTY|' + (Remove-CaptureFiles @() 5000 $none))\n"
+                  "Write-Output ('SCALAR|' + (Read-CapturedResult $p 5000 $shape).Text)\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ONE|capture cleanup incomplete: type=System.String[] n=1 items=C:\\x\\a.txt", proc.stdout)
+        self.assertIn("TWO|capture cleanup incomplete: type=System.String[] n=2 items=C:\\x\\a.txt|C:\\x\\b.txt", proc.stdout)
+        self.assertIn("EMPTY|capture cleanup incomplete: null=False type=System.String[]", proc.stdout)
+        self.assertRegex(proc.stdout, r"SCALAR\|type=System\.String n=1 items=.*a\.txt")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_process_the_factory_started_ends_with_the_worker_even_when_the_worker_ended_first(self) -> None:
+        # adversary r13 A3: teardown skipped the tree kill once the worker root had ended, so a process the factory launched before throwing (or
+        # before handing back a finished task) kept running. Each factory starts a 600 s sleeper and records its pid; after the helper returns,
+        # the sleeper must be gone (Windows: Kill(true) through the held handle; POSIX: the worker's own process group).
+        pid_dir = tempfile.mkdtemp(prefix="heavy-slot-gate-a3-")
+        try:
+            pid_files = [os.path.join(pid_dir, name) for name in ("throw.pid", "finish.pid")]
+
+            def spawner(pid_file: str, tail: str) -> str:
+                quoted = pid_file.replace("'", "''")
+                return ("{ param($p) $c = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
+                        "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
+                        f"[IO.File]::WriteAllText('{quoted}', [string]$c.Id); {tail} }}")
+
+            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                      "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                      "$throwing = " + spawner(pid_files[0], "throw 'factory exploded'") + "\n"
+                      "$finishing = " + spawner(pid_files[1], "[Threading.Tasks.Task]::FromResult('')") + "\n"
+                      "$r = Read-CapturedResult $p 20000 $throwing\n"
+                      "Write-Output ('THROW-READ|' + $r.Ok + '|' + $r.Text)\n"
+                      "Write-Output ('FINISH-DEL|[' + (Remove-CaptureFiles @($p) 20000 $finishing) + ']')\n"
+                      "foreach ($f in @(" + ", ".join("'" + f.replace("'", "''") + "'" for f in pid_files) + ")) {\n"
+                      "  $id = [int][IO.File]::ReadAllText($f); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                      "  while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
+                      "  $alive = $null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue)\n"
+                      "  Write-Output (\"ALIVE|$([IO.Path]::GetFileName($f))|$alive\")\n"
+                      "  if ($alive) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }\n"
+                      "}\n")
+            proc = self._pwsh(script)
+        finally:
+            shutil.rmtree(pid_dir, ignore_errors=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("THROW-READ|False|<read failed: factory exploded>", proc.stdout)
+        self.assertIn("FINISH-DEL|[]", proc.stdout)
+        self.assertIn("ALIVE|throw.pid|False", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ALIVE|finish.pid|False", proc.stdout, proc.stdout + proc.stderr)
+
     def test_the_bounded_capture_region_never_forces_its_process_to_exit(self) -> None:
         # sol r12 B1 acceptance: the fix must not be a forced exit in the helpers either.
         region = _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii"))
