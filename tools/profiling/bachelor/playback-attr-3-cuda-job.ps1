@@ -6858,37 +6858,42 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
 # reads take tens of ms on a busy host), and with $Watch and $Bracket that pass is bracketed by two monotonic reads ($Bracket.a / .b), so the loop
 # dates the snapshot by when it READ the CPU times, never by when it returned (a stall after the reads is not part of the interval they measured).
 # sol r6 key B1 (adversary 25d5c970 A1): a Process from Get-Process holds no handle, so each read reopens by pid and a pid reused between the
-# selection and the CPU read would put another process's CPU time under the original "pid,startTicks" key (a false delta). The start time is read
-# FIRST and read AGAIN after the CPU read (a third pass, outside the bracket): a pid is never reused back to an exited process, so equal start times
-# on both sides bind the path and the CPU time between them to that one process, and a mismatch (or an unreadable re-read) drops the sample.
+# selection and the CPU read would put another process's CPU time under the original "pid,startTicks" key (a false delta).
+# adversary c0d9d471 A1: Process.StartTime is cached on its first read, so reading it again cannot see a reuse. The process handle is therefore
+# opened FIRST (.Handle; a process whose handle cannot be opened is left out) and held until the snapshot ends: Windows does not reuse a pid while
+# a handle to its process is open, and the start time, the path and the CPU time are all read after it, so all three are that one process. The
+# start time is still compared after the CPU read (a mismatch drops the sample) for an object that does not cache it; every Process is disposed.
 function Get-UtilSampleAppSnapshot($Procs, [string]$AppPath, $Watch = $null, $Bracket = $null) {
     $o = @{}
     $sel = [Collections.Generic.List[object]]::new()
-    foreach ($q in @($Procs)) {
-        try {
-            $st = $q.StartTime
-            if ($null -eq $st) { continue }
-            if ($AppPath -and -not [string]::Equals([string]$q.Path, $AppPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
-            $sel.Add(@($q, $st.ToUniversalTime().Ticks))
-        } catch { }
-    }
     $read = [Collections.Generic.List[object]]::new()
-    if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['a'] = $Watch.Elapsed.TotalMilliseconds }
-    foreach ($e in $sel) {
-        try {
-            $cs = $e[0].TotalProcessorTime.TotalSeconds
-            if ($null -eq $cs) { continue }
-            $read.Add(@($e[0], $e[1], [double]$cs))
-        } catch { }
-    }
-    if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['b'] = $Watch.Elapsed.TotalMilliseconds }
-    foreach ($e in $read) {
-        try {
-            $st2 = $e[0].StartTime
-            if ($null -eq $st2 -or $st2.ToUniversalTime().Ticks -ne $e[1]) { continue }
-            $o["$($e[0].Id),$($e[1])"] = @($e[0].Id, $e[2])
-        } catch { }
-    }
+    try {
+        foreach ($q in @($Procs)) {
+            try {
+                [void]$q.Handle
+                $st = $q.StartTime
+                if ($null -eq $st) { continue }
+                if ($AppPath -and -not [string]::Equals([string]$q.Path, $AppPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $sel.Add(@($q, $st.ToUniversalTime().Ticks))
+            } catch { }
+        }
+        if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['a'] = $Watch.Elapsed.TotalMilliseconds }
+        foreach ($e in $sel) {
+            try {
+                $cs = $e[0].TotalProcessorTime.TotalSeconds
+                if ($null -eq $cs) { continue }
+                $read.Add(@($e[0], $e[1], [double]$cs))
+            } catch { }
+        }
+        if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['b'] = $Watch.Elapsed.TotalMilliseconds }
+        foreach ($e in $read) {
+            try {
+                $st2 = $e[0].StartTime
+                if ($null -eq $st2 -or $st2.ToUniversalTime().Ticks -ne $e[1]) { continue }
+                $o["$($e[0].Id),$($e[1])"] = @($e[0].Id, $e[2])
+            } catch { }
+        }
+    } finally { foreach ($q in @($Procs)) { try { $q.Dispose() } catch { } } }
     $o
 }
 
@@ -7019,16 +7024,23 @@ function Test-UtilSampleStopped($Rec) {
 }
 
 # Both samplers: nvidia-smi by its pid; the CPU child by its stop file ($WriteStop), then its pid if it outstays $WaitMs.
-function Stop-UtilSampleAll($GpuStart, $CpuStart, $WriteStop, [int]$WaitMs) {
+# adversary c0d9d471 A3: $Prev is the record of an earlier stop (the outer finally's retry passes it). A side that record already shows stopped is
+# kept as it was, never stopped again: a CPU child that exited 0 on the first stop would otherwise read as exited before the retry's stop, which
+# drops the ownership of a file it did create.
+function Stop-UtilSampleAll($GpuStart, $CpuStart, $WriteStop, [int]$WaitMs, $Prev = $null) {
     $r = [ordered]@{ gpu = $null; cpu = $null; stopFileWhy = $null }
-    $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true
+    $pg = $null; $pc = $null
+    try { if ($null -ne $Prev -and $null -ne $Prev.gpu -and $Prev.gpu.stopped) { $pg = $Prev.gpu } } catch { }
+    try { if ($null -ne $Prev -and $null -ne $Prev.cpu -and $Prev.cpu.stopped) { $pc = $Prev.cpu; $r.stopFileWhy = $Prev.stopFileWhy } } catch { }
+    if ($null -ne $pg) { $r.gpu = $pg } else { $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true }
     $cp = $(if ($null -ne $CpuStart) { $CpuStart.proc })
+    if ($null -ne $pc) { $cp = $null }
     $cpuExitedBefore = $null
     if ($null -ne $cp) {
         try { $cpuExitedBefore = [bool]$cp.HasExited } catch { }
         try { & $WriteStop } catch { $r.stopFileWhy = 'stop-file: ' + ([string]$_.Exception.Message -replace '\s+', ' ') }
     }
-    $r.cpu = Stop-UtilSampleProcess $cp $WaitMs $false $cpuExitedBefore
+    if ($null -ne $pc) { $r.cpu = $pc } else { $r.cpu = Stop-UtilSampleProcess $cp $WaitMs $false $cpuExitedBefore }
     # adversary 01d6ad51 A3: gpu-util.csv's name is released only once nvidia-smi is stopped (or never started)
     try { if ($null -ne $GpuStart -and $null -ne $GpuStart.hold -and ($r.gpu.stopped -or $r.gpu.why -ceq 'not-started')) { $GpuStart.hold.Dispose() } } catch { }
     $r
@@ -7525,7 +7537,7 @@ Write-JobTrace "step util-sample summary status=$($utilSampleScalars['utilSample
         try {
             # adversary 9d648094 A6: a stop that left a sampler running (a Kill that threw twice) is retried here, up to twice, on every exit
             for ($utilSampleTry = 0; -not $utilSampleStopped -and $utilSampleTry -lt 2; $utilSampleTry++) {
-                $utilSampleStopRecord = Stop-UtilSampleAll $utilSampleGpuStart $utilSampleCpuStart { [void](Publish-AttrCudaText -Path $utilSampleStopFile -Value 'stop') } 5000
+                $utilSampleStopRecord = Stop-UtilSampleAll $utilSampleGpuStart $utilSampleCpuStart { [void](Publish-AttrCudaText -Path $utilSampleStopFile -Value 'stop') } 5000 $utilSampleStopRecord
                 $utilSampleStopped = Test-UtilSampleStopped $utilSampleStopRecord
                 Write-JobTrace "step util-sample stop site=finally try=$utilSampleTry gpuStopped=$($utilSampleStopRecord.gpu.stopped) cpuStopped=$($utilSampleStopRecord.cpu.stopped)"
             }
