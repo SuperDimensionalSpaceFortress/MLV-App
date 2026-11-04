@@ -411,6 +411,7 @@ function Get-CodexMcpDisableArgs {
         $probeBudgetMs = [math]::Max(1, $TimeoutMs)
         $probeSw = [System.Diagnostics.Stopwatch]::StartNew()
         Set-CodexLaunchStartInfo -Psi $listPsi -Launch $CodexLaunch -Argv @('mcp', 'list', '--json', '-c', 'features.plugins=false')
+        if ($probeSw.ElapsedMilliseconds -ge $probeBudgetMs) { throw [TimeoutException]::new('launch-budget-exhausted') }
         $listProc = [System.Diagnostics.Process]::Start($listPsi)
         $listProc.StandardInput.Close()
         $pipes = @(
@@ -451,6 +452,7 @@ function Get-CodexMcpDisableArgs {
         $listText = $pipes[0].Text.ToString()
         $listErrText = $pipes[1].Text.ToString()
     } catch {
+        if ($_.Exception -is [TimeoutException]) { throw }
         if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*' -or $_.Exception.Message -like 'codex-shim-*' -or $_.Exception.Message -like 'codex-args-too-long:*') { throw }
         throw "codex-mcp-list-unreadable: could not run 'codex mcp list --json': $($_.Exception.Message)"
     }
@@ -508,6 +510,7 @@ function Get-CodexCliVersion {
         [Parameter(Mandatory = $true)][string]$CodexExe,
         [int]$TimeoutMs = 15000
     )
+    $outerShimDeadline = $script:CodexShimDeadline
     try {
         if (-not (Test-Path -LiteralPath $CodexExe -PathType Leaf)) { return $null }
         $vPsi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -515,6 +518,7 @@ function Get-CodexCliVersion {
         # the lane refuses it, typed, at its own resolution); the shim is re-hashed immediately before this Process.Start.
         # r12 fix iteration 1 (adversary A2 on 2d55c467): the shim reads count against the same $TimeoutMs as the process wait.
         $vSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $script:CodexShimDeadline = Get-CodexShimDeadline -Ms $TimeoutMs
         $vLaunch = Resolve-CodexShimLaunch -Exe $CodexExe
         $vPsi.UseShellExecute = $false
         $vPsi.CreateNoWindow = $true
@@ -1609,12 +1613,28 @@ public static class MlvBoundedRead {
 }
 '@
 }
+# r13 fix iteration 2 (adversary A1 on afdc228b): a read gets what is left of its caller's budget, not a fresh 5000 ms. The deadline is a monotonic timestamp: the lane
+# sets it when its stopwatch starts, and a probe narrows it for its own duration. A read cut short by that budget is a timeout of the caller, not an unreadable shim.
+$script:CodexShimDeadline = $null
+function Get-CodexShimDeadline {
+    param([Parameter(Mandatory = $true)][double]$Ms)
+    $d = [System.Diagnostics.Stopwatch]::GetTimestamp() + [int64]($Ms * [System.Diagnostics.Stopwatch]::Frequency / 1000.0)
+    if ($null -ne $script:CodexShimDeadline -and $script:CodexShimDeadline -lt $d) { return $script:CodexShimDeadline }
+    return $d
+}
 function Read-CodexShimBytes {
     # One read through one handle that denies writers, so the hashed bytes are a single version of the file.
     param([Parameter(Mandatory = $true)][string]$Path)
+    $limitMs = $CODEX_SHIM_READ_TIMEOUT_MS; $budgetBinds = $false
+    if ($null -ne $script:CodexShimDeadline) {
+        $leftMs = [math]::Floor(($script:CodexShimDeadline - [System.Diagnostics.Stopwatch]::GetTimestamp()) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency)
+        if ($leftMs -le $limitMs) { $limitMs = [int][math]::Max(0.0, $leftMs); $budgetBinds = $true }
+    }
+    if ($budgetBinds -and $limitMs -eq 0) { throw [TimeoutException]::new('launch-budget-exhausted') }
     try {
-        $bytes = [MlvBoundedRead]::ReadFile($Path, $CODEX_SHIM_MAX_BYTES, $CODEX_SHIM_READ_TIMEOUT_MS)
+        $bytes = [MlvBoundedRead]::ReadFile($Path, $CODEX_SHIM_MAX_BYTES, $limitMs)
     } catch {
+        if ($budgetBinds -and $_.Exception.GetBaseException() -is [TimeoutException]) { throw [TimeoutException]::new('launch-budget-exhausted') }
         throw "codex-shim-unreadable: the codex shim '$Path' could not be read ($($_.Exception.GetBaseException().Message)); refused before launch"
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -1998,6 +2018,7 @@ Write-Utf8NoBom $rcptPath (([ordered]@{
 # is the exact defect this runner's own card list called SWEEP-RECEIPT-1.
 $startedUtc = (Get-Date).ToUniversalTime()
 $sw         = [System.Diagnostics.Stopwatch]::StartNew()
+$script:CodexShimDeadline = Get-CodexShimDeadline -Ms ($TimeoutSec * 1000.0)
 $exitCode   = -999
 $timedOut   = $false
 $final      = ''
@@ -2777,14 +2798,15 @@ if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int][math]::Min(2147483647.0,
         try { [void]$proc.WaitForExit(15000) } catch { }
     }
 }
+# r13 (Dot B2 on 01fa433d): the tree before anything else: a clean exit of the direct process says nothing about a descendant it left running. r13 fix iteration 2
+# (adversary A2 on afdc228b): before the stopwatch stops, so this wait is charged to the budget the verification below is given what is left of.
+if ($ImageHolds.Count -gt 0) { $imageHoldRelease = Stop-CodexImageReaderTree -Job $jobHandle }
 $sw.Stop()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
 
 # r4 B2: the codex child has exited (or been killed), so the snapshots it could read have been held read-only since the copy. Re-read each
 # through its held handle and compare with the digest the receipt carries; a mismatch is a typed failure, never a silent pass.
 if ($ImageHolds.Count -gt 0) {
-    # r13 (Dot B2 on 01fa433d): first the tree: a clean exit of the direct process says nothing about a descendant it left running.
-    $imageHoldRelease = Stop-CodexImageReaderTree -Job $jobHandle
     # r5: three distinct outcomes, never conflated. `mutated` = both digests were computed and differ. `unverifiable` = the re-read failed or ran
     # past its bound (the reason, IOException message included, is kept). `pathchanged` = the held object is no longer at the path codex was
     # given, or that path gained a reparse-point ancestor: what codex opened may not be what was hashed.

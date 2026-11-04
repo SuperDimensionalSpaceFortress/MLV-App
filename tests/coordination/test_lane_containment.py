@@ -2391,6 +2391,52 @@ def test_r13_iter1_a1_sibling_a_stale_host_drain_marker_is_never_a_drain_timeout
     assert q["outputDrain"]["hostReportedTimeout"] is False,q["outputDrain"]
 
 
+def test_r13_iter2_a2_the_reader_tree_wait_is_charged_to_the_budget_verification_is_given(fixture_tree):
+    # adversary A2 on afdc228b: the stopwatch stopped before the cleanup wait, so verification got the budget back that the wait had spent. A wait that spends the whole budget leaves the floor.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    out=root/"verify-limit.txt"
+    verify_anchor="$verifyClock = [System.Diagnostics.Stopwatch]::StartNew()\n"
+    def mutation(text):
+        assert text.count(_WAIT_NEW)==1 and text.count(verify_anchor)==1, "the tree wait or the verify clock moved; update this fixture mutation"
+        text=text.replace(_WAIT_NEW,"$(Start-Sleep -Seconds 12; $true)")
+        return text.replace(verify_anchor,f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',[string]$verifyLimitMs)\n"+verify_anchor)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    cmd[cmd.index("-TimeoutSec")+1]="12"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    assert float(out.read_text())==5000.0, (out.read_text(),r.returncode,r.stdout[-1500:])
+
+
+def test_r13_iter2_a1_a_stalled_shim_read_spends_the_lane_budget_and_is_a_lane_timeout(fixture_tree):
+    # adversary A1 on afdc228b: a read got a fresh 5000 ms past a shorter lane budget, and its expiry read as an unreadable shim (127). It is the lane's own timeout (124).
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-TimeoutSec")+1]="3"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    with _OplockedFile(fixture_tree["shim"]) as lock:
+        r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,90))
+        assert lock.broken(), "the launcher never asked for the shim's data, so this test exercised nothing"
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==124,(r.returncode,q)
+    assert "codex-shim-unreadable" not in (q["failure"] or ""),q
+
+
+def test_r13_iter2_a1_sibling_the_mcp_probe_starts_no_process_after_its_deadline_and_stays_a_timeout(fixture_tree):
+    # adversary A1 sibling: a shim re-hash that used up the probe's budget still started the probe's process, and the expiry read as codex-mcp-list-unreadable.
+    root=fixture_tree["root"]
+    old="$probeBudgetMs = [math]::Max(1, $TimeoutMs)"
+    def mutation(text):
+        assert text.count(old)==1, "the probe budget moved; update this fixture mutation"
+        return text.replace(old,"$probeBudgetMs = 1")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert not (root/"mcp-args.json").exists(), "the probe process started after its deadline"
+    assert r.returncode==124 and "codex-mcp-list-unreadable" not in (q["failure"] or ""),(r.returncode,q)
+
+
 class _OplockedFile:
     # A real stalled open: a level 1 oplock whose break is never acknowledged blocks every other open of the file that reads data, while metadata stays immediate.
     # Local stand-in for adversary A2's slow share.
