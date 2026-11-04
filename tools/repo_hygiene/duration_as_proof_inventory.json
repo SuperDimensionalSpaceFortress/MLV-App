@@ -2808,6 +2808,76 @@
       "lines": [
         1504
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( answerDelayMs > 0 ) Sleep ( static_cast < DWORD > ( answerDelayMs ) ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 18 A1 RED-test seam), not an elapsed-time inference: answerDelayMs is a requested pause set only by setSettleAnswerDelayMsForTest (0 by default and always in the app). The comparison selects whether the wait thread pauses at all; it measures nothing and proves no run (settleAck and postFailures do).",
+      "lines": [
+        219
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( retryWaitMs == 0 ) break ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): retryWaitMs is the NEXT wait playbackDueWakeSliceWaitMs computed from GetTickCount64 and the retry deadline (time left, clamped to 1 ms); 0 means the retry budget is spent, so the loop starts no further wait or attempt. A budget bound, not a proof that anything ran (postRefusals / postFailures count what happened).",
+      "lines": [
+        255
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackDueWake.cpp",
+      "anchor": "if ( settleWaitMs == 0 ) return d -> settleAck . load ( ) >= request ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2 sibling): settleWaitMs is the next settle wait (time left to the GetTickCount64 deadline, clamped to kSettleSliceMs); 0 means the deadline passed. The return value is the acknowledgement counter (settleAck >= request), never the duration: the duration only ends the wait.",
+      "lines": [
+        626
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0u , playbackDueWakeSliceWaitMs ( 100 , 100 , 1 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): pure arithmetic check of playbackDueWakeSliceWaitMs on the finding's synthetic input (now == deadline 100 ms): no wait is left. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1623
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0u , playbackDueWakeSliceWaitMs ( 150 , 100 , 1 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): pure arithmetic check on the finding's input (the worker resumes at 150 ms past a 100 ms budget): 0, so no attempt starts. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1624
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0u , playbackDueWakeSliceWaitMs ( 1500 , 1100 , PlaybackDueWake :: kSettleSliceMs ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2 sibling): pure arithmetic check on the finding's input (the settle resumes at 1500 ms past its 1100 ms deadline): 0, no stale relative wait. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1628
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "const int retrySpent = source . indexOf ( QStringLiteral ( \"if( retryWaitMs == 0 ) break;\" ) , retryWait ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): a source-text pin (QString::indexOf over PlaybackDueWake.cpp) that the retry loop stops when the computed wait is 0; the duration token is inside a string literal. Nothing is timed or proven to have run.",
+      "lines": [
+        1637
+      ]
     }
   ]
 }
