@@ -501,7 +501,42 @@ function Initialize-BoundedCaptureIo {
     Add-Type -TypeDefinition @'
     using System;
     using System.IO;
+    using System.Management.Automation;
+    using System.Management.Automation.Runspaces;
+    using System.Threading;
     using System.Threading.Tasks;
+    // sol r11 B2: runs a script on a BACKGROUND thread. A runspace's own pipeline thread is a foreground thread, so an abandoned worker
+    // stuck in Thread.Sleep(Infinite) would keep the whole process from exiting; UseCurrentThread makes the pipeline run on THIS
+    // background thread instead, and a background thread never holds the process.
+    public sealed class CaptureWorker {
+        private readonly ManualResetEventSlim done = new ManualResetEventSlim(false);
+        public object[] Answer;
+        public Exception Error;
+        public CaptureWorker(string script, object[] args) {
+            var thread = new Thread(() => {
+                try {
+                    using (var rs = RunspaceFactory.CreateRunspace()) {
+                        rs.ThreadOptions = PSThreadOptions.UseCurrentThread;
+                        rs.Open();
+                        using (var ps = PowerShell.Create()) {
+                            ps.Runspace = rs;
+                            ps.AddScript(script);
+                            foreach (object a in args) { ps.AddArgument(a); }
+                            var output = ps.Invoke();
+                            var answer = new object[output.Count];
+                            for (int i = 0; i < answer.Length; i++) { answer[i] = output[i]; }
+                            Answer = answer;
+                        }
+                    }
+                }
+                catch (Exception e) { Error = e; }
+                finally { done.Set(); }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+        public bool Wait(int milliseconds) { return done.Wait(milliseconds); }
+    }
     public static class BoundedCaptureIo {
         public static Task<string> ReadAllText(string path) { return Task.Run(() => File.ReadAllText(path)); }
         // Returns '' only when EVERY path is confirmed gone. File.Exists / Directory.Exists answer false on ANY error (an access-denied
@@ -531,32 +566,79 @@ function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
     # A bound that is below 1 (-1 is an infinite wait to Task.Wait) or above the cap is refused before anything is opened.
     if ($BoundMs -lt 1 -or $BoundMs -gt $CaptureIoMaxMs) { throw "FAIL: $What bound $BoundMs ms is outside 1..$CaptureIoMaxMs ms; nothing was opened" }
 }
-function Get-CaptureTask([scriptblock]$Start, $Argument, [scriptblock]$Default) {
-    # adversary r7 A4: the open/delete factory must hand back exactly ONE Task. An array of tasks makes `$task.Wait($left)` a truthy
-    # array, so pending work read as finished; anything else is refused by name, inside the caller's try.
-    $made = if ($null -eq $Start) { Initialize-BoundedCaptureIo; @(& $Default) } else { @(& $Start $Argument) }
-    if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
-    $made[0]
-}
 function Get-CaptureTaskResult($Task) {
     # sol r9 B2: a plain (non-generic) Task has NO result. On this runtime [Task]::CompletedTask still exposes a Result property whose value is
     # the internal VoidTaskResult, so the property's presence proves nothing: only a Task<T> whose T is a real type carries a result.
+    # sol r11 B1: the generic type is found by walking the BaseType chain, never by asking the runtime type. A class that derives from
+    # Task<string> is itself NOT generic (IsGenericType is False) yet carries a real result that a plain IsGenericType test threw away.
+    $open = [Threading.Tasks.Task`1]
     $type = $Task.GetType()
-    if (-not $type.IsGenericType) { return $null }
+    while ($null -ne $type -and -not ($type.IsGenericType -and $type.GetGenericTypeDefinition() -eq $open)) { $type = $type.BaseType }
+    if ($null -eq $type) { return $null }
     if ($type.GetGenericArguments()[0].FullName -eq 'System.Threading.Tasks.VoidTaskResult') { return $null }
     return $Task.Result
+}
+# sol r11 B2: ONE deadline for the whole step. A factory seam (-Start) is a script block, and calling it on the caller's thread cannot be
+# interrupted: a Thread.Sleep(Infinite) inside it, or a slow ToString on its result, withheld the named verdict because the elapsed check
+# only ran AFTER the call returned. The factory, the wait for its task AND the conversion of the task's result now all run in a worker
+# (a PowerShell instance in its own runspace, on a background thread) that the caller waits on for the time left of the bound; a worker
+# that overruns is ABANDONED (never awaited, never stopped, never disposed) and the step is a timeout.
+# The accepted -Start input is therefore SELF-CONTAINED script text: it runs in a fresh runspace, so a variable of the calling scope is
+# not visible there (the step fails by name instead).
+$CaptureWorkerScript = @'
+param([string]$FactoryText, $Argument, [int]$WaitMs, [string]$ResultFnText)
+$ErrorActionPreference = 'Stop'   # a statement-terminating error in the factory fails the step by name instead of letting it carry on
+. ([scriptblock]::Create("function Get-CaptureTaskResult {$ResultFnText}"))
+$made = @(& ([scriptblock]::Create($FactoryText)) $Argument)
+if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
+if (-not $made[0].Wait($WaitMs)) { return [pscustomobject]@{ Done = $false; Text = '' } }
+[pscustomobject]@{ Done = $true; Text = [string](Get-CaptureTaskResult $made[0]) }
+'@
+function Initialize-CaptureStep([scriptblock]$Start) {
+    # One-time process setup, done BEFORE a step's clock starts so it never eats the bound it is not part of: the compile of the .NET helpers
+    # and, for a factory seam, one trivial worker run (the first runspace of a process costs far more than a later one).
+    Initialize-BoundedCaptureIo
+    if ($null -ne $Start -and -not $script:CaptureWorkerWarm) {
+        $script:CaptureWorkerWarm = $true
+        $null = [CaptureWorker]::new('1', [object[]]@()).Wait(30000)
+    }
+}
+function Invoke-CaptureFactory([scriptblock]$Factory, $Argument, [Diagnostics.Stopwatch]$Clock, [int]$BoundMs) {
+    # Returns the worker's answer, or $null when the worker did not answer inside what is left of the bound (it is abandoned).
+    $leftAtStart = [Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)
+    $worker = [CaptureWorker]::new($CaptureWorkerScript, [object[]]@($Factory.ToString(), $Argument, $leftAtStart, ${function:Get-CaptureTaskResult}.ToString()))
+    $left = [Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)
+    if (-not $worker.Wait($left)) { return $null }
+    if ($null -ne $worker.Error) { throw $worker.Error }
+    if ($worker.Answer.Count -ne 1) { throw "the capture worker answered $($worker.Answer.Count) values, not one" }
+    return $worker.Answer[0]
+}
+function Get-CaptureStepText([scriptblock]$Start, $Argument, [scriptblock]$Default, [Diagnostics.Stopwatch]$Clock, [int]$BoundMs) {
+    # The text a finished step produced ('' for a plain Task, which has no result), or $null when it did not finish inside the bound.
+    # Throws for a factory that fails or hands back anything but exactly one Task (adversary r7 A4: an array of tasks makes
+    # `$task.Wait($left)` a truthy array, so pending work read as finished).
+    if ($null -ne $Start) {
+        $answer = Invoke-CaptureFactory $Start $Argument $Clock $BoundMs
+        if ($null -eq $answer -or -not $answer.Done) { return $null }
+        return [string]$answer.Text
+    }
+    # The default open/delete is plain .NET: Task.Run hands back at once, so nothing synchronous can outlast the bound.
+    $made = @(& $Default $Argument)
+    if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
+    $left = [Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)
+    if (-not $made[0].Wait($left)) { return $null }
+    return [string](Get-CaptureTaskResult $made[0])
 }
 function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) {
     Assert-CaptureIoBound 'captured-output read' $BoundMs
     $name = [IO.Path]::GetFileName($Path)
+    Initialize-CaptureStep $Start
     $clock = [Diagnostics.Stopwatch]::StartNew()   # started BEFORE the open, so a slow start counts against the same bound
     try {
-        $task = Get-CaptureTask $Start $Path { [BoundedCaptureIo]::ReadAllText($Path) }
-        $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
         # sol r9 B1: the deadline is measured from the call's start. A factory that spent the whole bound is a timeout even when the task it
-        # handed back has already completed (Wait(0) on a finished task is true).
-        # adversary r10 A1: turning the result into text is part of the step, so the elapsed check is the LAST thing before a success.
-        $text = if ($task.Wait($left)) { [string](Get-CaptureTaskResult $task) } else { $null }
+        # handed back has already completed. adversary r10 A1 / sol r11 B2: turning the result into text is part of the step (it runs in the
+        # same worker as the factory), so the elapsed check is the LAST thing before a success.
+        $text = Get-CaptureStepText $Start $Path { param($a) [BoundedCaptureIo]::ReadAllText($a) } $clock $BoundMs
         if ($null -eq $text -or $clock.Elapsed.TotalMilliseconds -ge $BoundMs) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
         return [pscustomobject]@{ Ok = $true; Text = $text }
     }
@@ -570,14 +652,13 @@ function Read-CapturedText([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptb
 function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBoundMs, [scriptblock]$Start = $null) {
     # Returns '' or a note naming the abandoned step and the files left behind.
     Assert-CaptureIoBound 'capture cleanup' $BoundMs
+    Initialize-CaptureStep $Start
     $clock = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $task = Get-CaptureTask $Start $Paths { [BoundedCaptureIo]::Delete($Paths) }
-        $left = [Math]::Max(0, $BoundMs - [int]$clock.ElapsedMilliseconds)
-        # sol r9 B1 / adversary r10 A1: elapsed >= bound is an abandoned step even when the task completed, and the result conversion counts
-        # toward it (see Read-CapturedResult). The task reports the files a failed delete left behind or could not confirm gone (adversary
+        # sol r9 B1 / adversary r10 A1 / sol r11 B2: elapsed >= bound is an abandoned step even when the task completed, and the factory and
+        # the result conversion count toward it. The task reports the files a failed delete left behind or could not confirm gone (adversary
         # r7 A3, sol r8 B2); a seam's plain Task has no Result and means none (sol r9 B2: Get-CaptureTaskResult, not the Result property).
-        $incomplete = if ($task.Wait($left)) { [string](Get-CaptureTaskResult $task) } else { $null }
+        $incomplete = Get-CaptureStepText $Start $Paths { param($a) [BoundedCaptureIo]::Delete($a) } $clock $BoundMs
         if ($null -ne $incomplete -and $clock.Elapsed.TotalMilliseconds -lt $BoundMs) {
             if ($incomplete) { return "capture cleanup incomplete: $incomplete" }
             return ''

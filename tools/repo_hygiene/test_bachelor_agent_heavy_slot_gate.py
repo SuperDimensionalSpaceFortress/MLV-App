@@ -1571,7 +1571,9 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # adversary r10 A1 (major): the elapsed check ran BEFORE the completed task's result was turned into text, so a result whose
         # conversion spent the bound (a 200000-element array took 286 ms under a 50 ms bound) still returned Ok / an "incomplete" note.
         # The slow ToString makes the conversion cost deterministic. The check is the LAST step before a success is returned.
-        script = ("class SlowText { [string] ToString() { Start-Sleep -Milliseconds 300; return 'payload' } }\n"
+        # r12 (sol r11 B2): the factory and the conversion run in the worker's own runspace, so the slow ToString is a compiled type
+        # (Add-Type is process wide and its cost does not depend on a PowerShell session).
+        script = ("Add-Type -TypeDefinition 'public class SlowText { public override string ToString() { System.Threading.Thread.Sleep(300); return \"payload\"; } }'\n"
                   + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path (r11): see the leaf-name guard test
                   "$slow = { param($p) [Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
@@ -1622,6 +1624,108 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("RUN-DEL|[]", proc.stdout)
         self.assertIn("PLAIN-READ|True|[]", proc.stdout)
         self.assertIn("RUN-READ|True|[]", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_task_that_derives_from_task_of_string_keeps_its_result_in_both_callers(self) -> None:
+        # sol r11 B1: Get-CaptureTaskResult asked the RUNTIME type whether it is generic. A class derived from Task<string> is not
+        # (IsGenericType is False) yet carries a real result, so the reader returned Ok with empty text and the cleanup reported success
+        # over 'still present: a.txt'. The generic base is now found by walking the BaseType chain. The ordinary Task<string> is the control.
+        script = ("Add-Type -TypeDefinition 'public class DerivedTextTask : System.Threading.Tasks.Task<string> { public DerivedTextTask(string r) : base(() => r) {} }'\n"
+                  + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$derived = { param($p) $t = [DerivedTextTask]::new('payload'); $t.RunSynchronously(); $t }\n"
+                  "$derivedDel = { param($p) $t = [DerivedTextTask]::new('still present: a.txt'); $t.RunSynchronously(); $t }\n"
+                  "$plain = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
+                  "$plainDel = { param($p) [Threading.Tasks.Task]::FromResult('still present: a.txt') }\n"
+                  "Write-Output ('DERIVED-TYPE|' + (& $derived $p).GetType().IsGenericType)\n"
+                  "$r = Read-CapturedResult $p 5000 $derived\n"
+                  "Write-Output ('DERIVED-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('DERIVED-DEL|' + (Remove-CaptureFiles @($p) 5000 $derivedDel))\n"
+                  "$r = Read-CapturedResult $p 5000 $plain\n"
+                  "Write-Output ('PLAIN-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('PLAIN-DEL|' + (Remove-CaptureFiles @($p) 5000 $plainDel))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DERIVED-TYPE|False", proc.stdout, "the repro must really be a non-generic runtime type")
+        self.assertIn("DERIVED-READ|True|payload", proc.stdout)
+        self.assertIn("DERIVED-DEL|capture cleanup incomplete: still present: a.txt", proc.stdout)
+        self.assertIn("PLAIN-READ|True|payload", proc.stdout, "control: the ordinary Task<string>")
+        self.assertIn("PLAIN-DEL|capture cleanup incomplete: still present: a.txt", proc.stdout, "control: the ordinary Task<string>")
+
+    # sol r11 B2: a synchronous factory, and the synchronous conversion of the result, used to run on the caller's thread, so the elapsed
+    # check classified an expiry only AFTER they returned (a 1 ms bound returned after 386 ms; Thread.Sleep(Infinite) never returned). The
+    # ceilings below are generous on purpose: the operation takes 4 s, the bound is 50 ms and the call must be back inside 2.5 s.
+    _SLOW_TEXT_TYPE = ("Add-Type -TypeDefinition 'public class Slow4sText { public override string ToString() "
+                       "{ System.Threading.Thread.Sleep(4000); return \"payload\"; } }'\n")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_synchronous_factory_or_result_conversion_that_outlasts_the_bound_returns_the_named_timeout_inside_a_generous_ceiling(self) -> None:
+        script = (self._SLOW_TEXT_TYPE + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$slowFactory = { param($p) [Threading.Thread]::Sleep(4000); [Threading.Tasks.Task]::FromResult('payload') }\n"
+                  "$slowFactoryDel = { param($p) [Threading.Thread]::Sleep(4000); [Threading.Tasks.Task]::FromResult('') }\n"
+                  "$slowConv = { param($p) [Threading.Tasks.Task]::FromResult([object][Slow4sText]::new()) }\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "$r = Read-CapturedResult $p 50 $slowFactory\n"
+                  "Write-Output ('FACTORY-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "$sw.Restart(); $n = Remove-CaptureFiles @($p) 50 $slowFactoryDel\n"
+                  "Write-Output ('FACTORY-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "$sw.Restart(); $r = Read-CapturedResult $p 50 $slowConv\n"
+                  "Write-Output ('CONV-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "$sw.Restart(); $n = Remove-CaptureFiles @($p) 50 $slowConv\n"
+                  "Write-Output ('CONV-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("FACTORY-READ|False|<read timed out: a.txt not readable within 50 ms>|True", proc.stdout)
+        self.assertIn("CONV-READ|False|<read timed out: a.txt not readable within 50 ms>|True", proc.stdout)
+        self.assertRegex(proc.stdout, r"FACTORY-DEL\|capture cleanup abandoned after 0\.05 s: .*a\.txt\|True")
+        self.assertRegex(proc.stdout, r"CONV-DEL\|capture cleanup abandoned after 0\.05 s: .*a\.txt\|True")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_factory_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits(self) -> None:
+        # sol r11 B2: Thread.Sleep(Infinite) in an accepted factory prevented the named verdict entirely. The worker is abandoned, not joined.
+        # A worker that can never be stopped still holds its runspace, and pwsh waits for every open runspace when it shuts down on its own,
+        # so a caller that abandons one ends its process with [Environment]::Exit (the test seam only; the default path has no worker).
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$forever = { param($p) [Threading.Thread]::Sleep([Threading.Timeout]::Infinite); [Threading.Tasks.Task]::FromResult('x') }\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "$r = Read-CapturedResult $p 200 $forever\n"
+                  "Write-Output ('FOREVER-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "$sw.Restart(); $n = Remove-CaptureFiles @($p) 200 $forever\n"
+                  "Write-Output ('FOREVER-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "[Environment]::Exit(0)\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("FOREVER-READ|False|<read timed out: a.txt not readable within 200 ms>|True", proc.stdout)
+        self.assertRegex(proc.stdout, r"FOREVER-DEL\|capture cleanup abandoned after 0\.2 s: .*a\.txt\|True")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_factory_the_worker_cannot_run_is_a_named_failure_not_a_hang_or_a_success(self) -> None:
+        # r12: the factory runs in its own runspace, so it must be self-contained. A variable of the calling scope, a missing type and a
+        # throw are all named failures (the same <read failed: ...> / cleanup failed note), never a hang or a success.
+        script = ("$callerOnly = 'x'\n" + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$callerClass = { param($p) if ($null -eq $callerOnly) { throw 'the caller scope is not visible in the worker' }; [Threading.Tasks.Task]::FromResult('x') }\n"
+                  "$noType = { param($p) [NoSuchTypeAnywhere12]::new(); [Threading.Tasks.Task]::FromResult('x') }\n"
+                  "$boom = { param($p) throw 'factory exploded' }\n"
+                  "$r = Read-CapturedResult $p 5000 $callerClass\n"
+                  "Write-Output ('CLASS-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('CLASS-DEL|' + (Remove-CaptureFiles @($p) 5000 $callerClass))\n"
+                  "$r = Read-CapturedResult $p 5000 $noType\n"
+                  "Write-Output ('NOTYPE-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('NOTYPE-DEL|' + (Remove-CaptureFiles @($p) 5000 $noType))\n"
+                  "$r = Read-CapturedResult $p 5000 $boom\n"
+                  "Write-Output ('BOOM-READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "Write-Output ('BOOM-DEL|' + (Remove-CaptureFiles @($p) 5000 $boom))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("CLASS-READ|False|<read failed: the caller scope is not visible in the worker>", proc.stdout)
+        self.assertIn("CLASS-DEL|capture cleanup failed: the caller scope is not visible in the worker: ", proc.stdout)
+        self.assertIn("NOTYPE-READ|False|<read failed: ", proc.stdout)
+        self.assertIn("NOTYPE-DEL|capture cleanup failed: ", proc.stdout)
+        self.assertIn("BOOM-READ|False|<read failed: factory exploded>", proc.stdout)
+        self.assertIn("BOOM-DEL|capture cleanup failed: factory exploded: ", proc.stdout)
 
     @unittest.skipUnless(os.name == "nt" and PWSH is not None,
                          "a read-only attribute blocks File.Delete only on Windows; on POSIX the delete succeeds and nothing is left behind")
