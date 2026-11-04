@@ -184,8 +184,14 @@ class UtilSampleGeneratorTests(unittest.TestCase):
                 self.assertIn("$utilSampleWindow['clockWhy'] = Get-UtilSampleClockWitness $utilSampleCpuParsed $utilSampleCpuStart $utilSampleWindow", region3)
                 self.assertLess(region3.index("Get-UtilSampleClockWitness"), region3.index("Get-UtilSampleGpuSummary"))
                 # r5 B3: only a file the job created is published
-                self.assertEqual(text.count("if ($utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf))"), 1)
-                self.assertEqual(text.count("if ((Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf))"), 1)
+                # adversary 1697fe31 A3: each side is published once, by its own flag
+                self.assertEqual(text.count("if (-not $script:utilSampleGpuPublished -and $utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf))"), 1)
+                self.assertEqual(text.count("if (-not $script:utilSampleCpuPublished -and (Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf))"), 1)
+                # adversary 1697fe31 A2: the host zone is read before nvidia-smi starts and again at the stop; the GPU rows are read in that zone
+                self.assertLess(text.index("$utilSampleZoneAtStart = Get-UtilSampleHostZone"), text.index("$utilSampleGpuStart = Start-UtilSampleGpu"))
+                self.assertIn("$utilSampleZoneAtStop = Get-UtilSampleHostZone", text[starts[1]:text.index(CLOSE, starts[1])])
+                self.assertIn("Resolve-UtilSampleCaptureZone $utilSampleZoneAtStart $utilSampleZoneAtStop", region3)
+                self.assertNotIn("[TimeZoneInfo]::Local", region3)
                 # adversary 01d6ad51 A5: the CPU child binds the app by the job's own exe path
                 self.assertIn("$utilSampleGpuPid $utilSampleGpuTicks ([string]$exePath)", text)
                 self.assertIn("$utilSampleStopped = Test-UtilSampleStopped $utilSampleStopRecord", text[starts[1]:text.index(CLOSE, starts[1])])
@@ -683,12 +689,12 @@ $rawLog = "[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=
 $Pub = $y2pub; $utilSampleGpuCsv = Join-Path $y2dir 'gpu-util.csv'; $utilSampleCpuCsv = $y2csv
 $utilSampleGpuStart = [ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing'; owned = $false }; $utilSampleCpuStart = $run
 function Invoke-Region3($Rec) {
-    $script:utilSampleStopRecord = $Rec; $script:utilSamplePublished = $false; $script:utilSampleScalars = $null; $script:y2pubs = [Collections.Generic.List[string]]::new()
+    $script:utilSampleStopRecord = $Rec; $script:utilSamplePublished = $false; $script:utilSampleGpuPublished = $false; $script:utilSampleCpuPublished = $false; $script:utilSampleScalars = $null; $script:y2pubs = [Collections.Generic.List[string]]::new()
     . ([scriptblock]::Create($region3))
     @{ reason = [string]$utilSampleScalars['utilSampleReason']; total = $utilSampleScalars['cpuTotalMean']; published = @($script:y2pubs); pubFile = (Test-Path -LiteralPath (Join-Path $Pub 'cpu-util.csv')) }
 }
 $y2run = Invoke-Region3 $y2rec
-$y2fin = $(Remove-Item -LiteralPath (Join-Path $Pub 'cpu-util.csv') -ErrorAction SilentlyContinue; $script:utilSampleStopRecord = $y2rec; $script:utilSamplePublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new(); Publish-UtilSampleFiles; @($script:y2pubs))
+$y2fin = $(Remove-Item -LiteralPath (Join-Path $Pub 'cpu-util.csv') -ErrorAction SilentlyContinue; $script:utilSampleStopRecord = $y2rec; $script:utilSamplePublished = $false; $script:utilSampleGpuPublished = $false; $script:utilSampleCpuPublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new(); Publish-UtilSampleFiles; @($script:y2pubs))
 # a well-formed foreign file (a clean witness's rows) under the killed and the clean records
 $y2good = $H; for ($i = 0; $i -le 21; $i++) { $iu = $p0.AddSeconds($i); $y2good += (CpuRow $iu 50 1234 1 $iu.AddSeconds(-1) '0.4') }
 [IO.File]::WriteAllText($y2csv, $y2good)
@@ -753,7 +759,7 @@ $a3finally = @($genStrings | Where-Object { $_.Contains('a stop that left a samp
 function Publish-AttrCudaText([string]$Path, [string]$Value) { }
 $Pub = $a3pub; $utilSampleCpuCsv = $a3cpu; $utilSampleGpuCsv = Join-Path $a3dir 'gpu-util.csv'; $utilSampleStopFile = Join-Path $a3dir 'util-sample.stop'
 $utilSampleGpuStart = [ordered]@{ status = 'running'; proc = $a3g; owned = $false }; $utilSampleCpuStart = [ordered]@{ status = 'running'; proc = $a3c }
-$script:utilSampleStopRecord = $a3first; $script:utilSampleStopped = Test-UtilSampleStopped $a3first; $script:utilSamplePublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new()
+$script:utilSampleStopRecord = $a3first; $script:utilSampleStopped = Test-UtilSampleStopped $a3first; $script:utilSamplePublished = $false; $script:utilSampleGpuPublished = $false; $script:utilSampleCpuPublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new()
 $a3firstOwned = [bool](Test-UtilSampleCpuOwned $utilSampleCpuStart $a3first)
 . ([scriptblock]::Create($a3finally))
 # ---- adversary 88e10edc A1 (scaled): two rows are written on a steady clock; right after row 2's closing clock read the wall clock steps back
@@ -872,6 +878,49 @@ $f3efirst = Stop-UtilSampleAll ([ordered]@{ proc = $f3eg }) ([ordered]@{ proc = 
 $f3eg.exited = $true
 $f3eretry = Stop-UtilSampleAll ([ordered]@{ proc = $f3eg }) ([ordered]@{ proc = $f3e }) { } 5000 $f3efirst
 $r['f3A3Early'] = @{ early = [bool]$f3eretry.cpu.exitedBeforeStop; owned = [bool](Test-UtilSampleCpuOwned $run $f3eretry) }
+# ---- adversary 1697fe31 A3 (exact case, in-memory double): the smoke succeeds; the CPU child created its CSV and is running at the first stop;
+# WaitForExit(5000)=false and both Kills throw Win32Exception(5) (stopped=false, preStop=false). Region 3 publishes before the child exits; the child
+# then sees the original stop file and exits 0 before the outer finally's retry. At 1697fe31 the first publication set the one published flag
+# while skipping the unowned CPU file, so the retry proved ownership and the finally's publication returned at once: published=[]
+$p3dir = Join-Path $t 'p3'; [void](New-Item -ItemType Directory -Force -Path $p3dir); $p3pub = Join-Path $t 'p3-pub'; [void](New-Item -ItemType Directory -Force -Path $p3pub)
+$p3cpu = Join-Path $p3dir 'cpu-util.csv'; [IO.File]::WriteAllText($p3cpu, $y2good)
+$p3c = New-StuckDouble
+$Pub = $p3pub; $utilSampleCpuCsv = $p3cpu; $utilSampleGpuCsv = Join-Path $p3dir 'gpu-util.csv'; $utilSampleStopFile = Join-Path $p3dir 'util-sample.stop'
+$utilSampleGpuStart = [ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing'; proc = $null; owned = $false }; $utilSampleCpuStart = [ordered]@{ status = 'running'; proc = $p3c }
+$p3first = Stop-UtilSampleAll $utilSampleGpuStart $utilSampleCpuStart { } 5000
+$script:utilSampleStopped = Test-UtilSampleStopped $p3first
+$p3r3 = Invoke-Region3 $p3first
+$p3c.exited = $true; $p3c.code = 0
+$script:y2pubs = [Collections.Generic.List[string]]::new()
+. ([scriptblock]::Create($a3finally))
+$r['p3A3'] = @{ firstOwned = [bool](Test-UtilSampleCpuOwned $utilSampleCpuStart $p3first); region3Published = @($p3r3.published); kills = $p3c.kills; stopped = [bool]$utilSampleStopped
+    retryOwned = [bool](Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord); retryEarly = [bool]$utilSampleStopRecord.cpu.exitedBeforeStop; finallyPublished = @($script:y2pubs) }
+# ---- adversary 1697fe31 A2 (exact input, scaled to the job's own region 3): the UTC window is 2026-11-03T00:00:00Z..00:30:00Z; nvidia-smi stamped
+# 7200 rows at 250 ms in India Standard Time (utilization 0 for i<3600, 100 after; the rest 0,1200,P0,50); the CPU witness is steady and both stops
+# succeeded. The zone then changes before region 3. At 1697fe31 region 3 read the zone at summary time ([TimeZoneInfo]::Local), so the rows
+# shifted against the window (Nepal: status=ok mean=100 over half the rows); here the summary host zone is this machine's, which is not IST either
+$z2w0 = [DateTime]::new(2026, 11, 3, 0, 0, 0, 0, [DateTimeKind]::Utc)
+$z2ist = [TimeZoneInfo]::FindSystemTimeZoneById('India Standard Time'); $z2npt = [TimeZoneInfo]::FindSystemTimeZoneById('Nepal Standard Time')
+$z2inv = [Globalization.CultureInfo]::InvariantCulture
+$z2gpu = [Text.StringBuilder]::new()
+for ($i = 0; $i -lt 7200; $i++) { [void]$z2gpu.Append([TimeZoneInfo]::ConvertTimeFromUtc($z2w0.AddMilliseconds(250 * $i), $z2ist).ToString('yyyy/MM/dd HH:mm:ss.fff', $z2inv)).Append(', ').Append($(if ($i -lt 3600) { '0' } else { '100' })).Append(", 0, 1200, P0, 50`n") }
+$z2cpu = [Text.StringBuilder]::new($H); for ($i = 1; $i -le 1800; $i++) { [void]$z2cpu.Append((CpuRow $z2w0.AddSeconds($i) 50 1234 1 $z2w0.AddSeconds($i - 1) '0' 1000 1000)) }
+function Invoke-ZoneRegion3([string]$AtStart, [string]$AtStop) {
+    $zdir = Join-Path $t ('z2-' + [guid]::NewGuid().ToString('N')); [void](New-Item -ItemType Directory -Path $zdir)
+    $Pub = Join-Path $zdir 'pub'; [void](New-Item -ItemType Directory -Path $Pub)
+    $utilSampleGpuCsv = Join-Path $zdir 'gpu-util.csv'; [IO.File]::WriteAllText($utilSampleGpuCsv, $z2gpu.ToString())
+    $utilSampleCpuCsv = Join-Path $zdir 'cpu-util.csv'; [IO.File]::WriteAllText($utilSampleCpuCsv, $z2cpu.ToString())
+    $utilSampleGpuStart = [ordered]@{ status = 'running'; reason = $null; owned = $true }; $utilSampleCpuStart = $run
+    $utilSampleZoneAtStart = $AtStart; $utilSampleZoneAtStop = $AtStop
+    $rawLog = "[2026-11-03T00:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-03T00:30:00.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=1800000`n"
+    $utilSampleStopRecord = [ordered]@{ gpu = [ordered]@{ stopped = $true; killed = $true; exitCode = 1; exitedBeforeStop = $false; why = $null }; cpu = $okStop }
+    $script:utilSamplePublished = $false; $script:utilSampleGpuPublished = $false; $script:utilSampleCpuPublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new()
+    $utilSampleScalars = $null; $utilSampleGpu = $null; $utilSampleCpu = $null
+    . ([scriptblock]::Create($region3))
+    @{ status = $utilSampleGpu.status; mean = $utilSampleGpu.mean; inWindow = $utilSampleGpu.rowsInWindow; total = $utilSampleGpu.rowsTotal; cpu = $utilSampleCpu.status }
+}
+$z2s = $z2ist.ToSerializedString()
+$r['z2A2'] = @{ hostIsIst = ([TimeZoneInfo]::Local.Id -ceq 'India Standard Time'); captured = (Invoke-ZoneRegion3 $z2s $z2s); changedInCapture = (Invoke-ZoneRegion3 $z2s $z2npt.ToSerializedString()); unknown = (Invoke-ZoneRegion3 $z2s '') }
 Write-Output (J $r)
 """
 
@@ -1190,6 +1239,23 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual((a3["gpuFirstStopped"], a3["gpuRetryStopped"], a3["gpuRetryEarly"]), (False, True, False), a3)
         # control: a child that had ended before the first stop is still exitedBeforeStop after the retry, and owns nothing
         self.assertEqual(self.r["f3A3Early"], {"early": True, "owned": False})
+
+    def test_adv_1697fe31_a3_the_finally_publishes_a_cpu_csv_its_retried_stop_proved_owned(self) -> None:
+        # exact case: at 1697fe31 region 3's publication set the one flag while the CPU file was not yet owned; the finally published nothing
+        p3 = self.r["p3A3"]
+        self.assertEqual((p3["firstOwned"], p3["region3Published"], p3["kills"]), (False, [], 2), f"the first stop's shape is not the finding's: {p3}")
+        self.assertEqual((p3["stopped"], p3["retryOwned"], p3["retryEarly"]), (True, True, False), p3)
+        self.assertEqual(p3["finallyPublished"], ["cpu-util.csv=utc,cpuTotal"], f"the finally did not publish the CSV the retried stop proved owned: {p3}")
+
+    def test_adv_1697fe31_a2_gpu_rows_are_read_in_the_zone_they_were_stamped_in(self) -> None:
+        # exact input: IST capture, a different zone at summary time; at 1697fe31 region 3 read [TimeZoneInfo]::Local and the rows shifted
+        z = self.r["z2A2"]
+        if z["hostIsIst"]:
+            self.skipTest("this host's own zone is India Standard Time, so the summary-time zone cannot differ from the capture zone here")
+        self.assertEqual(z["captured"], {"status": "ok", "mean": 50, "inWindow": 7200, "total": 7200, "cpu": "ok"},
+                         f"the GPU rows were not mapped through the zone they were stamped in: {z}")
+        self.assertEqual(z["changedInCapture"]["status"], "unavailable(host-zone-changed)", z)
+        self.assertEqual(z["unknown"]["status"], "unavailable(host-zone-unknown)", z)
 
     def test_r5_an_empty_system_root_does_not_end_the_nvidia_smi_search(self) -> None:
         self.assertEqual(self.r["r5EmptyRoot"]["found"], self.r["r5EmptyRoot"]["expected"])

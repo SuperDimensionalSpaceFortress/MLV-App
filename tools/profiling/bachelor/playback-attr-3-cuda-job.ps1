@@ -7334,6 +7334,17 @@ function Get-UtilSampleClockWitness($Parsed, $Start, $Window) {
     } catch { return 'sample-clock-unwitnessed' }
 }
 
+# adversary 1697fe31 A2: nvidia-smi stamps host-local wall time, so its rows map onto UTC only through the zone they were stamped in, which a zone
+# read at summary time is not (the host zone can change after the capture). The job reads the host zone fresh (ClearCachedData) when the samplers
+# start and again at the stop; Resolve-UtilSampleCaptureZone turns the two into the capture zone, or a typed refusal: host-zone-changed (the zone
+# changed inside the capture: no single mapping) or host-zone-unknown (a read failed). Residual by design: a change and its undo between the reads.
+function Get-UtilSampleHostZone { [TimeZoneInfo]::ClearCachedData(); [TimeZoneInfo]::Local.ToSerializedString() }
+function Resolve-UtilSampleCaptureZone([string]$AtStart, [string]$AtStop) {
+    if ([string]::IsNullOrEmpty($AtStart) -or [string]::IsNullOrEmpty($AtStop)) { return @{ zone = $null; why = 'host-zone-unknown' } }
+    if ($AtStart -cne $AtStop) { return @{ zone = $null; why = 'host-zone-changed' } }
+    try { return @{ zone = [TimeZoneInfo]::FromSerializedString($AtStart); why = $null } } catch { return @{ zone = $null; why = 'host-zone-unknown' } }
+}
+
 # The window's clock verdict for a summary: $Window.clockWhy when the job stored one, else sample-clock-unwitnessed (fail closed).
 function Get-UtilSampleWindowClockWhy($Window) {
     try { if ($Window.Contains('clockWhy')) { return $Window.clockWhy } } catch { }
@@ -7497,7 +7508,7 @@ exit 6
     if ($usEncoded.Length -gt 32000) { throw "DUAL_VENUE_UTIL_SAMPLE_CHILD_TOO_LONG the encoded CPU sampler is $($usEncoded.Length) chars (limit 32000, one command line)" }
     $usAffinity = [int64]0
     if ($CorePartitionHelperMask) { $usAffinity = ConvertFrom-CorePartitionMask $CorePartitionHelperMask 'CorePartitionHelperMask' }
-    $usFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Start-UtilSampleCpu}, ${function:Stop-UtilSampleProcess}, ${function:Test-UtilSampleStopped}, ${function:Stop-UtilSampleAll}, ${function:Test-UtilSampleCpuOwned},${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:ConvertFrom-UtilSampleGpuRow}, ${function:ConvertFrom-UtilSampleGpuCsv}, ${function:ConvertFrom-UtilSampleCpuRow}, ${function:ConvertFrom-UtilSampleCpuCsv}, ${function:Get-UtilSamplePlayWindow},${function:Get-UtilSampleStats}, ${function:Get-UtilSampleWeightedMean}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleClockWitness}, ${function:Get-UtilSampleWindowClockWhy}, ${function:Test-UtilSampleClockSteady}, ${function:Get-UtilSampleGpuSummary}, ${function:Get-UtilSampleCpuSummary}, ${function:Get-UtilSampleScalars}) "`n"
+    $usFunctions = Get-CorePartitionFunctionSource @(${function:Resolve-UtilSampleNvidiaSmi}, ${function:Get-UtilSampleDgpuState}, ${function:New-UtilSampleOwnedFile}, ${function:Start-UtilSampleGpu}, ${function:Start-UtilSampleCpu}, ${function:Stop-UtilSampleProcess}, ${function:Test-UtilSampleStopped}, ${function:Stop-UtilSampleAll}, ${function:Test-UtilSampleCpuOwned},${function:Read-UtilSampleText}, ${function:Split-UtilSampleLines}, ${function:ConvertFrom-UtilSampleGpuRow}, ${function:ConvertFrom-UtilSampleGpuCsv}, ${function:ConvertFrom-UtilSampleCpuRow}, ${function:ConvertFrom-UtilSampleCpuCsv}, ${function:Get-UtilSamplePlayWindow},${function:Get-UtilSampleStats}, ${function:Get-UtilSampleWeightedMean}, ${function:Select-UtilSampleWindowRows}, ${function:Get-UtilSampleClockWitness}, ${function:Get-UtilSampleHostZone}, ${function:Resolve-UtilSampleCaptureZone}, ${function:Get-UtilSampleWindowClockWhy}, ${function:Test-UtilSampleClockSteady}, ${function:Get-UtilSampleGpuSummary}, ${function:Get-UtilSampleCpuSummary}, ${function:Get-UtilSampleScalars}) "`n"
     $usLaunchLine = "Write-JobTrace 'step smoke-launch start (app launch + load + playback)'"
     $usDoneLine = 'Write-JobTrace "step smoke-launch done rc=$smokeRc"'
     $usStart = $usOpen + "`n" + $usFunctions + "`n" + "`$utilSampleBackend = '$(([string]$Backend).ToLowerInvariant())'`n`$utilSampleAffinity = [int64]$usAffinity`n`$utilSampleEncoded = '$usEncoded'`n" + @'
@@ -7508,17 +7519,22 @@ $utilSampleGpuStart = [ordered]@{ status = 'unavailable'; reason = 'start-threw'
 $utilSampleCpuStart = [ordered]@{ status = 'unavailable'; reason = 'start-threw'; proc = $null; pid = $null }
 $utilSampleStopped = $false
 $utilSampleStopRecord = $null
-$utilSamplePublished = $false
+$utilSampleGpuPublished = $false
+$utilSampleCpuPublished = $false
 $utilSampleScalars = $null
-# Both CSVs beside presentmon.csv, once, whichever site reaches it first (the success summary, else the outer finally); a failure is a trace line.
+$utilSampleZoneAtStart = $null
+$utilSampleZoneAtStop = $null
+# Both CSVs beside presentmon.csv, each once, at the first site (the success summary, else the outer finally) where it is the job's own; a failure
+# is a trace line. adversary 1697fe31 A3: each side keeps its own flag, so a CPU file not yet owned at the success summary (its stop failed) is
+# published by the outer finally once the retried stop proves the child's clean exit.
 function Publish-UtilSampleFiles {
-    if ($script:utilSamplePublished) { return }
-    $script:utilSamplePublished = $true
     # sol r4 B3: only a file this job created is published (the GPU side's CreateNew; the CPU side's child exit 0 after its CreateNew, adversary
     # f685c478 A2); an occupied name never is
-    try { if ($utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $utilSampleGpuCsv -Destination (Join-Path $Pub 'gpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=gpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
-    try { if ((Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $utilSampleCpuCsv -Destination (Join-Path $Pub 'cpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=cpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try { if (-not $script:utilSampleGpuPublished -and $utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf)) { $script:utilSampleGpuPublished = $true; [void](Publish-AttrCudaFileCopy -Source $utilSampleGpuCsv -Destination (Join-Path $Pub 'gpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=gpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try { if (-not $script:utilSampleCpuPublished -and (Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf)) { $script:utilSampleCpuPublished = $true; [void](Publish-AttrCudaFileCopy -Source $utilSampleCpuCsv -Destination (Join-Path $Pub 'cpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=cpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
 }
+# adversary 1697fe31 A2: the host zone nvidia-smi will stamp in, read before it starts (and again at the stop)
+try { $utilSampleZoneAtStart = Get-UtilSampleHostZone } catch { }
 try { $utilSampleGpuStart = Start-UtilSampleGpu $utilSampleBackend (Resolve-UtilSampleNvidiaSmi) $utilSampleGpuCsv ${function:Get-UtilSampleDgpuState} } catch { }
 $utilSampleGpuPid = 0; $utilSampleGpuTicks = [int64]0
 if ($null -ne $utilSampleGpuStart.pid) { $utilSampleGpuPid = [int]$utilSampleGpuStart.pid }
@@ -7532,6 +7548,7 @@ Write-JobTrace "step util-sample start gpu=$($utilSampleGpuStart.status) gpuReas
 try {
     $utilSampleStopRecord = Stop-UtilSampleAll $utilSampleGpuStart $utilSampleCpuStart { [void](Publish-AttrCudaText -Path $utilSampleStopFile -Value 'stop') } 5000
     $utilSampleStopped = Test-UtilSampleStopped $utilSampleStopRecord
+    try { $utilSampleZoneAtStop = Get-UtilSampleHostZone } catch { }
     Write-JobTrace "step util-sample stop site=smoke-launch-done gpuStopped=$($utilSampleStopRecord.gpu.stopped) gpuKilled=$($utilSampleStopRecord.gpu.killed) cpuStopped=$($utilSampleStopRecord.cpu.stopped) cpuKilled=$($utilSampleStopRecord.cpu.killed) cpuExit=$($utilSampleStopRecord.cpu.exitCode) stopFile=$($utilSampleStopRecord.stopFileWhy)"
 } catch { Write-JobTrace "step util-sample stop site=smoke-launch-done error=$([string]$_.CategoryInfo.Reason)" }
 '@ + "`n" + $usClose + "`n"
@@ -7539,7 +7556,6 @@ try {
     $usMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $usMetrics = $usOpen + "`n" + @'
 try {
-    [TimeZoneInfo]::ClearCachedData()
     $utilSampleWindow = Get-UtilSamplePlayWindow $rawLog
     $utilSampleStopGpu = $null; $utilSampleStopCpu = $null
     if ($null -ne $utilSampleStopRecord) { $utilSampleStopGpu = $utilSampleStopRecord.gpu; $utilSampleStopCpu = $utilSampleStopRecord.cpu }
@@ -7552,7 +7568,11 @@ try {
     if (-not $utilSampleCpuOwned) { $utilSampleCpuParsed.why = 'cpu-util-unowned' }
     # sol r4 B2: the CPU child's clock witness decides whether the window maps onto the sample stamps, for both summaries
     if ($null -ne $utilSampleWindow) { $utilSampleWindow['clockWhy'] = Get-UtilSampleClockWitness $utilSampleCpuParsed $utilSampleCpuStart $utilSampleWindow }
-    $utilSampleGpu = Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv (Read-UtilSampleText $utilSampleGpuCsv) ([TimeZoneInfo]::Local)) $utilSampleGpuStart $utilSampleWindow $utilSampleStopGpu
+    # adversary 1697fe31 A2: the GPU rows are read in the zone they were stamped in (the zone at the start, unchanged at the stop), never the zone now
+    $utilSampleZone = Resolve-UtilSampleCaptureZone $utilSampleZoneAtStart $utilSampleZoneAtStop
+    $utilSampleGpuParsed = ConvertFrom-UtilSampleGpuCsv (Read-UtilSampleText $utilSampleGpuCsv) $(if ($null -ne $utilSampleZone.zone) { $utilSampleZone.zone } else { [TimeZoneInfo]::Utc })
+    if ($utilSampleZone.why) { $utilSampleGpuParsed.why = $utilSampleZone.why }
+    $utilSampleGpu = Get-UtilSampleGpuSummary $utilSampleGpuParsed $utilSampleGpuStart $utilSampleWindow $utilSampleStopGpu
     $utilSampleCpu = Get-UtilSampleCpuSummary $utilSampleCpuParsed $utilSampleCpuStart $utilSampleWindow $utilSampleStopCpu
     $utilSampleScalars = Get-UtilSampleScalars $utilSampleGpu $utilSampleCpu ($null -ne $utilSampleWindow)
 } catch { }
