@@ -4796,8 +4796,12 @@ _PWSH_IDENTITY_REAL = _pwsh_identity  # the tests replace the module name; this 
 # count as "something"; a probe row (`"op"`, the JSON _cache_probe parses) or any other text makes it a real failure.
 LINT_PROBE_CRASH_BANNER = "An error has occurred that was not properly handled. Additional information is shown below. The PowerShell process will exit."
 LINT_PROBE_ASSEMBLY_LOAD = "The given assembly name was invalid."
-_LINT_PROBE_ASSEMBLY_FILE = re.compile(r"^File name: 'System\.[A-Za-z0-9_.]+, Version=\d+(\.\d+){3}, Culture=")
-_LINT_PROBE_DOTNET_FRAME = re.compile(r"^\s+at System\.[A-Za-z0-9_.`]+\(.*\)$")
+# Every accepted stderr line is matched WHOLE (adversary r1 A1): the message line may only carry an exception-type prefix, the File name line ends in the
+# public key (its token may be garbled into non-ASCII, as in the real log), and a frame's parameters are `Type name` pairs. Nothing else may follow.
+_LINT_PROBE_ASSEMBLY_MESSAGE = re.compile(r"^(?:Unhandled exception\.\s+)?(?:--->\s+)?(?:System\.[A-Za-z0-9_.]*Exception:\s+)?" + re.escape(LINT_PROBE_ASSEMBLY_LOAD) + "$")
+_LINT_PROBE_ASSEMBLY_FILE = re.compile(r"^File name: 'System\.[A-Za-z0-9_.]+, Version=\d+(?:\.\d+){3}, Culture=[A-Za-z0-9-]+, PublicKey(?:Token=(?:[0-9a-f]{16}|null))?[^\x00-\x7f]*'$")
+_LINT_PROBE_FRAME_PARAM = r"[A-Za-z0-9_.`<>\[\]]+[*&]? [A-Za-z0-9_]+"
+_LINT_PROBE_DOTNET_FRAME = re.compile(rf"^at System\.[A-Za-z0-9_.`]+\((?:{_LINT_PROBE_FRAME_PARAM}(?:, {_LINT_PROBE_FRAME_PARAM})*)?\)$")
 
 
 def _only_start_crash_text(stdout: "str | bytes | None", stderr: "str | bytes | None") -> bool:
@@ -4806,14 +4810,14 @@ def _only_start_crash_text(stdout: "str | bytes | None", stderr: "str | bytes | 
     streams = [text.decode("utf-8", errors="replace") if isinstance(text, bytes) else (text or "") for text in (stdout, stderr)]
     if not any(text.strip() for text in streams):
         return True  # the original SIGSEGV shape: it said nothing
-    out_lines, err_lines = ([line for line in text.splitlines() if line.strip()] for text in streams)
+    out_lines, err_lines = ([line.strip() for line in text.splitlines() if line.strip()] for text in streams)
     if any('"op"' in line for line in out_lines + err_lines):
         return False  # a probe row: the probe ran, so this is not a start-up abort
-    if any(line.strip() != LINT_PROBE_CRASH_BANNER for line in out_lines):
+    if any(line != LINT_PROBE_CRASH_BANNER for line in out_lines):
         return False
-    if not all(LINT_PROBE_ASSEMBLY_LOAD in line or _LINT_PROBE_ASSEMBLY_FILE.match(line) or _LINT_PROBE_DOTNET_FRAME.match(line) for line in err_lines):
+    if not all(_LINT_PROBE_ASSEMBLY_MESSAGE.match(line) or _LINT_PROBE_ASSEMBLY_FILE.match(line) or _LINT_PROBE_DOTNET_FRAME.match(line) for line in err_lines):
         return False
-    return bool(out_lines) or any(LINT_PROBE_ASSEMBLY_LOAD in line for line in err_lines)
+    return bool(out_lines) or any(_LINT_PROBE_ASSEMBLY_MESSAGE.match(line) for line in err_lines)
 
 
 def _is_start_crash(done: "subprocess.CompletedProcess", elapsed: float) -> bool:
@@ -5268,6 +5272,40 @@ class LintCacheProbeBoundTests(unittest.TestCase):
         _, message, started, _ = self._scripted([subprocess.TimeoutExpired(["pwsh"], 600)], elapsed=600)
         self.assertEqual(1, len(started), "(d) a timeout is not retried")
         self.assertIn("timed out", message)
+
+    def test_unrelated_text_that_merely_contains_the_assembly_literal_is_a_real_failure(self):
+        """Adversary r1 A1 (sol): every accepted line is matched whole, not by substring. The literal inside other text, a File name line with a suffix,
+        and a frame whose parameters are prose all stay real failures, and the retry is not taken for them."""
+        a = "The given assembly name was invalid."
+        file_ok = "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKeyﾰ'"
+        frame = "   at System.Reflection.AssemblyName.ParseAsAssemblySpec(Char* pAssemblyName, Void* pAssemblySpec)"
+        bad = (
+            f"FAIL: lint cache state corrupt; {a} (quoted input)",
+            f"{a} and then the lint printed FAIL",
+            f"prefix text {a}",
+            f"{a} (quoted input)",
+            "Unhandled exception. System.ArgumentException: FAIL " + a,
+            "Unhandled exception. System.ArgumentException: " + a + " trailing",
+            file_ok[:-1] + " rest of the line 'x",
+            file_ok + " and more",
+            "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKey FAIL lint cache state corrupt'",
+            "   at System.Foo.Bar(FAIL lint cache state corrupt)",
+            "   at System.Foo.Bar(x) FAIL later",
+        )
+        for text in bad:
+            for stdout in ("", self.BANNER):
+                done = subprocess.CompletedProcess([], -6, stdout=stdout, stderr=text)
+                self.assertFalse(_is_start_crash(done, 0.9), f"{text!r} (stdout {stdout[:8]!r}) must stay a real failure")
+            self.assertFalse(_is_start_crash(subprocess.CompletedProcess([], -6, stdout=self.BANNER, stderr=f"{a}\n{text}"), 0.9), f"{text!r} beside the real message")
+        _, message, started, err = self._scripted([subprocess.CompletedProcess([], -6, stdout="", stderr=f"FAIL: lint cache state corrupt; {a} (quoted input)"), self.GOOD], elapsed=0.9)
+        self.assertEqual(1, len(started), "unrelated text is not retried")
+        self.assertNotIn("running the probe once more", err)
+        self.assertIn("rc=-6", message)
+        # the real shapes still stand (message with every allowed prefix, a PublicKeyToken file name, a frame with parameters)
+        for text in (a, "System.ArgumentException: " + a, "Unhandled exception. System.IO.FileLoadException: " + a, "---> System.ArgumentException: " + a,
+                     file_ok, "File name: 'System.Runtime, Version=10.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'", frame):
+            stderr = text if a in text else f"{a}\n{text}"
+            self.assertTrue(_is_start_crash(subprocess.CompletedProcess([], -6, stdout="", stderr=stderr), 0.9), text)
 
     def test_a_non_signal_failure_is_not_retried(self):
         for rc in (1, 7):
