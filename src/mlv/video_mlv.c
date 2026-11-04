@@ -4394,6 +4394,19 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
     }
     if (byte_count == 0) return 1;
 
+    /* r11 (adversary r11 pass 1 A1 on 9ae728fc): getMlvRawFrameUint16Direct reads the frame's VIDF header at block_offset before
+     * its payload and refuses the frame when that read fails, so a frame whose header cannot be read has no identity, however
+     * readable its payload is. Every class below passes here. The header goes to a local, never to video->VIDF. A failed seek is
+     * no identity either (the r5 rule; the display does not check its seek, so this can only withhold an id, never grant one). */
+    {
+        mlv_vidf_hdr_t vidf_header;
+        pthread_mutex_lock(video->main_file_mutex + chunk);
+        const int headerRead = file_set_pos(video->file[chunk], entry->block_offset, SEEK_SET) == 0
+            && fread(&vidf_header, sizeof(mlv_vidf_hdr_t), 1, video->file[chunk]) == 1;
+        pthread_mutex_unlock(video->main_file_mutex + chunk);
+        if (!headerRead) return 1;
+    }
+
     if (video->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
     {
         /* r5 (adversary r5 A1 on e57fd03e): the whole payload, decoded as the display decodes it, and the

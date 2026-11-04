@@ -1075,7 +1075,8 @@ int hashAsClipFrame(MlvPipelineFixture & fixture, const std::vector<uint8_t> & p
     const QByteArray path = QFile::encodeName(dir.filePath(QStringLiteral("frame.j2k")));
     FILE * file = std::fopen(path.constData(), "w+b");
     ASSERT_TRUE(file != nullptr);
-    const std::vector<uint8_t> lead(17, 0x5A);   // the frame does not start at offset 0
+    // the frame does not start at offset 0, and its VIDF header (r11: read first, as the display reads it) sits before it
+    const std::vector<uint8_t> lead(sizeof(mlv_vidf_hdr_t) + 17, 0x5A);
     ASSERT_EQ(lead.size(), std::fwrite(lead.data(), 1, lead.size(), file));
     ASSERT_EQ(payload.size(), std::fwrite(payload.data(), 1, payload.size(), file));
     ASSERT_EQ(0, std::fflush(file));
@@ -1087,6 +1088,7 @@ int hashAsClipFrame(MlvPipelineFixture & fixture, const std::vector<uint8_t> & p
     const auto savedXRes = video->RAWI.xRes;
     const auto savedYRes = video->RAWI.yRes;
     video->file[chunk] = file;
+    entry->block_offset = 0;
     entry->frame_offset = lead.size();
     entry->frame_size = static_cast<uint32_t>(payload.size());
     video->MLVI.videoClass = MLV_VIDEO_CLASS_FLAG_JPEG2K;
@@ -1321,8 +1323,12 @@ namespace
 
 // `payload` as frame 0 of the open clip, with videoClass `videoClass`, RAWI 64x64 at `bitsPerPixel` and the CURV table `lut`
 // (nullptr: none), for one getMlvFrameSourceHash64 call; everything is restored after it.
+// r11: headerBytesBeforeEnd >= 0 puts the index entry's block_offset that many bytes before the end of the chunk file (0: at its
+// size, the adversary's input); -1 puts it at offset 0, a whole header before the frame. displayStatus, when given, is the display
+// reader's answer for the same entry, asked only where it refuses at the header (it stops before any decode state).
 int hashAsClipFrameWithCurve(MlvPipelineFixture & fixture, const std::vector<uint8_t> & payload, uint32_t videoClass,
-                             int bitsPerPixel, uint16_t * lut, uint64_t * hash)
+                             int bitsPerPixel, uint16_t * lut, uint64_t * hash,
+                             int headerBytesBeforeEnd = -1, int * displayStatus = nullptr)
 {
     mlvObject_t * video = fixture.video();
     QTemporaryDir dir;
@@ -1330,7 +1336,7 @@ int hashAsClipFrameWithCurve(MlvPipelineFixture & fixture, const std::vector<uin
     const QByteArray path = QFile::encodeName(dir.filePath(QStringLiteral("frame.bin")));
     FILE * file = std::fopen(path.constData(), "w+b");
     ASSERT_TRUE(file != nullptr);
-    const std::vector<uint8_t> lead(17, 0x5A);
+    const std::vector<uint8_t> lead(sizeof(mlv_vidf_hdr_t) + 17, 0x5A);
     ASSERT_EQ(lead.size(), std::fwrite(lead.data(), 1, lead.size(), file));
     ASSERT_EQ(payload.size(), std::fwrite(payload.data(), 1, payload.size(), file));
     ASSERT_EQ(0, std::fflush(file));
@@ -1344,6 +1350,8 @@ int hashAsClipFrameWithCurve(MlvPipelineFixture & fixture, const std::vector<uin
     const auto savedBits = video->RAWI.raw_info.bits_per_pixel;
     uint16_t * const savedLut = video->linearise_lut;
     video->file[chunk] = file;
+    entry->block_offset = headerBytesBeforeEnd < 0
+        ? 0 : static_cast<uint64_t>(lead.size() + payload.size()) - static_cast<uint64_t>(headerBytesBeforeEnd);
     entry->frame_offset = lead.size();
     entry->frame_size = static_cast<uint32_t>(payload.size());
     video->MLVI.videoClass = videoClass;
@@ -1352,6 +1360,12 @@ int hashAsClipFrameWithCurve(MlvPipelineFixture & fixture, const std::vector<uin
     video->RAWI.raw_info.bits_per_pixel = bitsPerPixel;
     video->linearise_lut = lut;
     const int status = getMlvFrameSourceHash64(video, 0, hash);
+    if (displayStatus) {
+        std::vector<uint16_t> shown(static_cast<size_t>(kJ2kFrameSide) * kJ2kFrameSide);
+        const mlv_vidf_hdr_t savedVidf = video->VIDF;
+        *displayStatus = getMlvRawFrameUint16Uncached(video, 0, shown.data());
+        video->VIDF = savedVidf;
+    }
     video->linearise_lut = savedLut;
     video->RAWI.raw_info.bits_per_pixel = savedBits;
     video->RAWI.xRes = savedXRes;
@@ -1439,6 +1453,66 @@ TEST(VisualCaptureSourceHash, RawTwoFramesTheCurveShowsAsOnePictureShareTheIdent
     ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, rawClass, 14, nullptr, &na));
     ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, rawClass, 14, nullptr, &nb));
     ASSERT_TRUE(na != nb);
+}
+
+// r11 (adversary r11 pass 1 A1 on 9ae728fc): the display reads a frame's VIDF header at block_offset before its payload and refuses
+// the frame when that read fails; the identity skipped the read, so a frame the display refuses got an id. The json's input: an entry
+// whose block_offset is the chunk file's size N, its payload valid. 9ae728fc returned 0 for every class (harness: 20 of 30).
+namespace
+{
+
+void assertAFrameWithNoReadableHeaderHasNoIdentity(MlvPipelineFixture & fixture, const std::vector<uint8_t> & payload,
+                                                   uint32_t videoClass, uint16_t * lut)
+{
+    ASSERT_FALSE(payload.empty());
+    uint64_t reference = 0;
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, payload, videoClass, 14, lut, &reference));
+    const int headerSize = static_cast<int>(sizeof(mlv_vidf_hdr_t));
+    for (const int before : { 0, headerSize - 1 }) {   // the json's input; a partial header
+        uint64_t hash = reference;
+        int display = 0;
+        ASSERT_NE(0, hashAsClipFrameWithCurve(fixture, payload, videoClass, 14, lut, &hash, before, &display));
+        ASSERT_NE(0, display);
+    }
+    // control: a whole header ending exactly at the end of the file is readable, so the frame keeps its one identity
+    uint64_t whole = 0;
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, payload, videoClass, 14, lut, &whole, headerSize));
+    ASSERT_TRUE(whole == reference);
+}
+
+} // namespace
+
+TEST(VisualCaptureSourceHash, Lj92AFrameWithNoReadableVidfHeaderHasNoIdentity)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    std::vector<uint16_t> curve = halvingCurve();
+    const uint32_t lj92Class = rawVideoClass(fixture) | MLV_VIDEO_CLASS_FLAG_LJ92;
+    const std::vector<uint8_t> frame = encodeLj92(1000, 9000);
+    assertAFrameWithNoReadableHeaderHasNoIdentity(fixture, frame, lj92Class, nullptr);
+    assertAFrameWithNoReadableHeaderHasNoIdentity(fixture, frame, lj92Class, curve.data());
+}
+
+TEST(VisualCaptureSourceHash, Jpeg2kAFrameWithNoReadableVidfHeaderHasNoIdentity)
+{
+    OjphRealCodecScope realCodec;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    const uint32_t j2kClass = rawVideoClass(fixture) | MLV_VIDEO_CLASS_FLAG_JPEG2K;
+    assertAFrameWithNoReadableHeaderHasNoIdentity(fixture, j2kPayload(encodeJ2kQuarter(j2kQuarterPicture(2048, 12288)), 0, 0, {}),
+                                                  j2kClass, nullptr);
+}
+
+TEST(VisualCaptureSourceHash, RawAFrameWithNoReadableVidfHeaderHasNoIdentity)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    std::vector<uint16_t> flat(MLV_LINEARISE_LUT_ENTRIES, 777);
+    const uint32_t rawClass = rawVideoClass(fixture);
+    std::vector<uint8_t> frame(static_cast<size_t>(kJ2kFrameSide) * kJ2kFrameSide * 14 / 8, 0x00);
+    for (size_t i = 0; i < frame.size(); i += 7) frame[i] = 0x5A;
+    assertAFrameWithNoReadableHeaderHasNoIdentity(fixture, frame, rawClass, nullptr);
+    assertAFrameWithNoReadableHeaderHasNoIdentity(fixture, frame, rawClass, flat.data());
 }
 
 // r10 (Dot B3, lj92.c find()): the marker scan's bounds, through lj92_open (find() is static to lj92.c). Payloads of datalen 0..3

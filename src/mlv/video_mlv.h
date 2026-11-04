@@ -545,7 +545,7 @@ int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * un
  * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs, MCRAW and
  * CinemaDNG-folder sources (MLV containers only), an index out of range, a missing index or file, a zero
  * byte count, an encoded frame_size the decoder refuses (mlvRawFrameInputCapacity, r5), a failed seek (r5),
- * a short read, an LJ92 frame the display decode refuses (lj92_open/lj92_decode fail, or the decoded size
+ * a frame whose VIDF header at block_offset cannot be read (the display refuses it, r11), a short read, an LJ92 frame the display decode refuses (lj92_open/lj92_decode fail, or the decoded size
  * or bit depth is not RAWI's), or a JPEG2K frame the display decode refuses (version not 1, a channel table
  * mlvJpeg2kBayerLayoutIsValid rejects, a probe, geometry or decode failure) or any JPEG2K frame on a build without ENABLE_JPEG2K. Not for the
  * playback path: it reads disk and decodes.

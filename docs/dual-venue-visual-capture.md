@@ -128,7 +128,8 @@ too. Display-side hashes cannot tell the two apart (a frozen display freezes the
 Play has stopped (step (4) of the capture block, never in the timed window or the tail), for each distinct `display_frame` of
 the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
 `video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
-own mutex, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). For LJ92 (r5) it decodes the
+own mutex, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). A frame whose VIDF header at
+`video_index[frame].block_offset` cannot be read has no id, because the display refuses it (r11). For LJ92 (r5) it decodes the
 payload with liblj92, as the display decodes it, and hashes the decoded picture (`mlvLj92FrameSourceHash64`). For JPEG2K (r9) it
 decodes the four declared channel spans through the display's own OpenJPH decode into private buffers and hashes the decoded
 samples as the display stores them (uint16, channel 0..3, row-major); codestream bytes are never the id, so an equal-length COM
