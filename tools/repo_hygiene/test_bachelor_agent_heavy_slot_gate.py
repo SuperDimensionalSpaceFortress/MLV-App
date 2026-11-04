@@ -2037,10 +2037,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
         fifo = FIFO_TEST.read_text(encoding="ascii")
         suite_start = fifo.index("function Invoke-BoundedSuite")
         suite = fifo[suite_start:fifo.index("\n}\n", suite_start) + 3]
-        quote = fifo[fifo.index("function ConvertTo-CommandLineArg"):]
-        quote = quote[:quote.index("\n}\n") + 3]
         tail = fifo[fifo.index("function Get-DiagnosticTail"):]
-        quote += tail[:tail.index("\n}\n") + 3]
+        quote = tail[:tail.index("\n}\n") + 3]   # Get-DiagnosticTail lives outside the region; ConvertTo-CommandLineArg is inside it (r14 A1)
         return ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'; $script:launched = 0; $script:initCalls = 0\n"
                 "$SuiteBoundMaxSec = 3600; $DiagnosticTailChars = 4000; $JsonMaxChars = 262144\n"
                 "function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw \"FAIL: $Message\" } }\n"
@@ -2115,6 +2113,51 @@ class BoundedCaptureIoTests(unittest.TestCase):
         setsid_lines = [line.strip() for line in worker.splitlines() if "$exe = $setsid" in line]
         self.assertEqual(len(setsid_lines), 1, setsid_lines)
         self.assertRegex(setsid_lines[0], r"\$argv = @\(ConvertTo-CommandLineArg \$exe\) \+ \$argv", setsid_lines[0])
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_b2_adversary_a1_the_bounded_capture_region_calls_nothing_the_script_defines_outside_it(self) -> None:
+        # adversary r14 A1 (major, introduced): the B2 fix called ConvertTo-CommandLineArg from Start-CaptureWorker, but that function was
+        # defined OUTSIDE the BEGIN/END region every region-only driver (and every Ubuntu test above) dot-sources, so the setsid branch raised
+        # command-not-found. The class: no command the region calls may be a function the script defines outside the region.
+        script = ("$text = [IO.File]::ReadAllText('" + str(FIFO_TEST).replace("'", "''") + "')\n"
+                  "$i = $text.IndexOf('# BEGIN bounded capture io'); $j = $text.IndexOf('# END bounded capture io')\n"
+                  "$region = $text.Substring($i, $j - $i)\n"
+                  "$t = $null; $e = $null\n"
+                  "$file = [Management.Automation.Language.Parser]::ParseInput($text, [ref]$t, [ref]$e)\n"
+                  "$reg = [Management.Automation.Language.Parser]::ParseInput($region, [ref]$t, [ref]$e)\n"
+                  "$fileDefined = @($file.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)\n"
+                  "$regDefined = @($reg.FindAll({ param($a) $a -is [Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object Name)\n"
+                  "$regCalled = @($reg.FindAll({ param($a) $a -is [Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | Sort-Object -Unique)\n"
+                  "$missing = @($regCalled | Where-Object { $fileDefined -contains $_ -and $regDefined -notcontains $_ })\n"
+                  "Write-Output ('MISSING|' + ($missing -join ','))\n"
+                  "Write-Output ('QUOTE-IN-REGION|' + ($regDefined -contains 'ConvertTo-CommandLineArg'))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("MISSING|\n", proc.stdout.replace("\r", "") + "\n", proc.stdout + proc.stderr)
+        self.assertIn("QUOTE-IN-REGION|True", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_b2_adversary_a2_a_posix_host_without_setsid_is_a_named_failure_not_an_untracked_worker(self) -> None:
+        # adversary r14 A2 (major, introduced): without /usr/bin/setsid or /bin/setsid the worker started with neither a job nor a process
+        # group, so a process the factory orphaned survived teardown while the reader returned Ok=True. Windows already makes "no job" a named
+        # failure; POSIX now does the same for "no setsid". The resolver takes the platform and the candidates, so this runs on any host.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$here = [IO.Path]::GetTempFileName()\n"
+                  "Write-Output ('WINDOWS|[' + (Resolve-CaptureWorkerSetsid -Windows $true -Candidates @('/no/such/setsid')) + ']')\n"
+                  "Write-Output ('FOUND|' + ((Resolve-CaptureWorkerSetsid -Windows $false -Candidates @('/no/such/setsid', $here)) -ceq $here))\n"
+                  "try { $null = Resolve-CaptureWorkerSetsid -Windows $false -Candidates @('/no/such/setsid', '/no/such/either'); Write-Output 'NONE|returned' }\n"
+                  "catch { Write-Output ('NONE|' + $_.Exception.Message) }\n"
+                  "Remove-Item -LiteralPath $here -Force\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("WINDOWS|[]", proc.stdout)
+        self.assertIn("FOUND|True", proc.stdout)
+        self.assertRegex(proc.stdout, r"NONE\|the capture worker cannot be tracked: no setsid at /no/such/setsid, /no/such/either", proc.stdout + proc.stderr)
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("function Start-CaptureWorker")
+        worker = fifo[begin:fifo.index("function Get-CaptureTaskResult", begin)]
+        self.assertIn("$setsid = Resolve-CaptureWorkerSetsid", worker)
+        self.assertRegex(worker, r"if \(\[int\]\$fields\[2\] -eq \$worker\.Process\.Id\) \{ \$worker\.Group = \$worker\.Process\.Id \}\s*\n\s*else \{ throw", "an unconfirmed group is a named failure too")
 
     @staticmethod
     def _link_or_copy(src: str, dst: str) -> str:

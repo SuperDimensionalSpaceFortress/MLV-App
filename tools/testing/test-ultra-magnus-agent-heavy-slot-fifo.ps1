@@ -484,15 +484,17 @@ $results.unit = $unit
 # heavy-slot.py, so this script's status-mode mocks never meet them. A failure there fails this run.
 # CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1: each sub-suite runs under a wall-clock bound, so a hung one fails by name (and its
 # whole process tree is killed) instead of running to the CI job cap. Measured 272 s (quiet-lease) and 48 s (stage-exempt) locally.
+# BEGIN bounded capture io (sol r6 B1/B2, adversary r6 A2). After the child is launched EVERY step before the named verdict (the capture
+# open, the read, the completed suite's JSON and the final removal) runs on a pool thread under its own bound; a step that overruns is
+# ABANDONED and named in the verdict, never awaited. Only plain .NET runs on those threads (a PowerShell scriptblock needs a runspace).
+# The worst case after the wait and the kill is 2 x $ReadBoundMs + $CaptureCleanupBoundMs; a Python pin sums it into the outer guard.
+# adversary r14 A1: this region must be SELF-CONTAINED (every test dot-sources only it), so the quoting function it and Invoke-BoundedSuite
+# both call lives inside it; a Python pin fails if the region calls any function the script defines outside it.
 function ConvertTo-CommandLineArg([string]$Value) {
     # Start-Process joins -ArgumentList with spaces and quotes nothing, so each value is quoted by the Windows rules: backslashes
     # before a quote (and before the closing quote) are doubled, or a RepoRoot ending in "\" escapes its closing quote (adversary r4 A1).
     '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
-# BEGIN bounded capture io (sol r6 B1/B2, adversary r6 A2). After the child is launched EVERY step before the named verdict (the capture
-# open, the read, the completed suite's JSON and the final removal) runs on a pool thread under its own bound; a step that overruns is
-# ABANDONED and named in the verdict, never awaited. Only plain .NET runs on those threads (a PowerShell scriptblock needs a runspace).
-# The worst case after the wait and the kill is 2 x $ReadBoundMs + $CaptureCleanupBoundMs; a Python pin sums it into the outer guard.
 $ReadBoundMs = 10000
 $CaptureCleanupBoundMs = 10000
 $CaptureIoMaxMs = 60000
@@ -738,6 +740,14 @@ function Close-CaptureWorker($Worker) {
     try { $note = Stop-CaptureWorker $Worker } catch { $note = "capture worker teardown failed ($($_.Exception.Message))" }
     if ($note) { [Console]::Error.WriteLine("WARNING: $note") }
 }
+function Resolve-CaptureWorkerSetsid([bool]$Windows = $IsWindows, [string[]]$Candidates = @('/usr/bin/setsid', '/bin/setsid')) {
+    # adversary r14 A2: $null on Windows (the worker is tracked by a job object instead). On POSIX the worker is launched through setsid so it
+    # leads its own process group, which is the only way its teardown reaches a process the factory orphaned; a host without setsid is a named
+    # failure, exactly as a missing job object is on Windows (no tracking means no tree guarantee).
+    if ($Windows) { return $null }
+    foreach ($candidate in $Candidates) { if ([IO.File]::Exists($candidate)) { return $candidate } }
+    throw "the capture worker cannot be tracked: no setsid at $($Candidates -join ', '), so its process group cannot be ended"
+}
 function Start-CaptureWorker {
     # Starts a capture worker and waits (bounded) until it is ready, BEFORE the step's clock starts. Throws a named failure when it cannot
     # start; any process it did start is killed first.
@@ -750,8 +760,7 @@ function Start-CaptureWorker {
         $exe = (Get-Process -Id $PID).Path
         $argv = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'worker.ps1')
         # adversary r13 A3 (POSIX): setsid makes the worker the leader of a new process group, so its teardown can end the whole group.
-        $setsid = $null
-        if (-not $IsWindows) { foreach ($candidate in '/usr/bin/setsid', '/bin/setsid') { if ([IO.File]::Exists($candidate)) { $setsid = $candidate; break } } }
+        $setsid = Resolve-CaptureWorkerSetsid
         # Dot B2: Start-Process joins -ArgumentList with spaces and quotes nothing, so the pwsh path handed to setsid as its first operand is
         # quoted here (a path with a space, such as /opt/Power Shell/pwsh, would otherwise split in two and setsid would exec the first half).
         if ($null -ne $setsid) { $argv = @(ConvertTo-CommandLineArg $exe) + $argv; $exe = $setsid }
@@ -775,6 +784,7 @@ function Start-CaptureWorker {
             $stat = [IO.File]::ReadAllText("/proc/$($worker.Process.Id)/stat")
             $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
             if ([int]$fields[2] -eq $worker.Process.Id) { $worker.Group = $worker.Process.Id }
+            else { throw "the capture worker does not lead its own process group (pgrp $($fields[2]), pid $($worker.Process.Id)), so its tree cannot be ended" }
         }
         return $worker
     }
