@@ -1103,6 +1103,22 @@ $h1Real = @'
 '@
 $h1rw = Get-UtilSamplePlayWindow $h1Real
 $r['h1Real'] = @{ window = ($null -ne $h1rw); start = $(if ($h1rw) { $h1rw.startUtc.ToString('o') }); end = $(if ($h1rw) { $h1rw.endUtc.ToString('o') }); session = $(if ($h1rw) { $h1rw.session }) }
+# ---- adversary 91784c71 A2 (literal input): twenty rows, each a measured 1000 ms (intervalMs and counterMs), whose wall stamps dither 20 ms (a step under the
+# limit): odd rows close 20 ms early with total 0 and cores 0, even rows close on the second with total 100 and cores 2. The true means are 50 and 1. At 91784c71
+# the wall span capped the weight (odd rows 980, even rows 1000): CPU ok, totalMean 50.505, appCoresMean 1.01
+$k2csv = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n"; $k2from = $p0
+for ($k2i = 1; $k2i -le 20; $k2i++) {
+    $k2u = $p0.AddMilliseconds(1000 * $k2i - 20 * ($k2i % 2))
+    $k2csv += (CpuRow $k2u $(if ($k2i % 2) { 0 } else { 100 }) 1234 $(if ($k2i % 2) { 0 } else { 2 }) $k2from '20' 1000 1000)
+    $k2from = $k2u
+}
+$k2w = Get-UtilSamplePlayWindow "[2026-11-02T14:00:00.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [0x1] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$k2p = ConvertFrom-UtilSampleCpuCsv $k2csv
+$k2w['clockWhy'] = Get-UtilSampleClockWitness $k2p $run $k2w
+$k2start = [ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }
+$k2g = Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv $null $cst) $k2start $k2w
+$k2c = Get-UtilSampleCpuSummary $k2p $run $k2w $okStop
+$r['k2A2'] = @{ rows = $k2p.rows.Count; clockWhy = $k2w.clockWhy; gpu = $k2g.status; cpu = $k2c.status; total = $k2c.totalMean; cores = $k2c.appCoresMean; inWindow = $k2c.rowsInWindow; overall = (Get-UtilSampleScalars $k2g $k2c $true).utilSampleStatus }
 # ---- adversary f8fbeab3 A3 (literal input): first read P.Ticks at monotonic 0, then P.Ticks + i*10000000 + 250004 at i*1000 ms, so the true cumulative
 # offset is 25.0004 ms. At f8fbeab3 the row's 0.### format wrote 25, and the witness's "> 25" passed it. Both write sites run through the real loop:
 # a stubbed clock read states the raw value on every row (g3Row) or only on the read after the last row (g3Tail: the tail row alone carries it).
@@ -1473,6 +1489,12 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual((a1["start"], a1["end"]), ("2026-11-02T14:00:00.5000000Z", "2026-11-02T14:00:20.0000000Z"), f"the window left the measured Play: {a1}")
         self.assertEqual((a1["clockWhy"], a1["gpu"], a1["gpuMean"], a1["cpu"], a1["cpuRows"]), (None, "ok", 0.0, "ok", 19), a1)
         self.assertEqual(a1["lateEnd"], "2026-11-02T14:00:20.0000000Z", f"a late summary line must not extend the window: {a1}")
+
+    def test_adv_91784c71_a2_a_dithering_wall_clock_does_not_move_the_cpu_weights(self) -> None:
+        # literal input: at 91784c71 the wall span capped the monotonic weight: CPU ok, totalMean 50.505, appCoresMean 1.01, on true means of 50 and 1
+        a2 = self.r["k2A2"]
+        self.assertEqual((a2["rows"], a2["inWindow"], a2["clockWhy"], a2["cpu"], a2["overall"]), (20, 20, None, "ok", "ok"), f"the probe did not build the finding's shape: {a2}")
+        self.assertEqual((a2["total"], a2["cores"]), (50.0, 1.0), f"fromUtc..utc decides inclusion, never weight: {a2}")
 
     def test_sol_r9_b1_both_late_stamps_keep_post_play_rows_out_of_the_ok_summary(self) -> None:
         # sol's literal input (= adversary e1ea9878 A1): at e1ea9878 the window ended P+20.5 s: GPU ok, mean 2.469 over 81 rows, overall ok, on a true mean of 0

@@ -7300,10 +7300,12 @@ function Get-UtilSampleStats($Values) {
 }
 
 # Duration-weighted mean of one field of interval rows (sol r4 B4): each row weighs the interval it measured (intervalMs, adversary 01d6ad51 A2),
-# capped at its bounds clipped to $Window, so a row that covers a 5 s stall weighs five times a 1 s row and the row after a stalled read weighs
-# only its own span; rows with a $null value or no weight are left out. n is the rows used; mean $null for none or non-finite.
+# so a row that covers a 5 s stall weighs five times a 1 s row and the row after a stalled read weighs only its own span; rows with a $null value or
+# no weight are left out. n is the rows used; mean $null for none or non-finite.
 # adversary f685c478 A1: $WeightField names the interval the field measured: intervalMs (snapshot to snapshot) for appCpuCores, counterMs (counter
 # read to counter read) for cpuTotalPct.
+# adversary 91784c71 A2: that interval is monotonic, so the wall stamps fromUtc..utc (clipped to $Window) decide only whether the row counts, never its
+# weight: a clock dithering under the witness limit would otherwise weigh rows by its own error.
 function Get-UtilSampleWeightedMean($Rows, [string]$Field, $Window, [string]$WeightField = 'intervalMs') {
     $sv = 0.0; $sw = 0.0; $n = 0
     foreach ($row in @($Rows)) {
@@ -7312,7 +7314,8 @@ function Get-UtilSampleWeightedMean($Rows, [string]$Field, $Window, [string]$Wei
         if ($null -eq $row[$WeightField]) { continue }
         $a = $row.fromUtc; $b = $row.utc
         if ($null -ne $Window) { if ($a -lt $Window.startUtc) { $a = $Window.startUtc }; if ($b -gt $Window.endUtc) { $b = $Window.endUtc } }
-        $wt = [math]::Min([double]$row[$WeightField], ($b - $a).TotalMilliseconds)
+        if (-not (($b - $a).TotalMilliseconds -gt 0)) { continue }
+        $wt = [double]$row[$WeightField]
         if (-not ($wt -gt 0)) { continue }
         $sv += [double]$v * $wt; $sw += $wt; $n++
     }
