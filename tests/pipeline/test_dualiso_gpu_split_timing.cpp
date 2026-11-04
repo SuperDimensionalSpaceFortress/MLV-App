@@ -175,16 +175,27 @@ enum class HoldStart
     AtBlockedInTheWait   // A2: hold from the run seen blocked in the mutex wait, bound the measured hold
 };
 // The RED build of A2 (qmake "DEFINES+=DUALISO_SPLIT_TIMING_A2_RED") restores the fork/master rendezvous and
-// bound, so the deterministic timeline test below fails on it; every other build uses the A2 rendezvous.
+// bound, so the deterministic timeline test below fails on it; every other build models the A2 rendezvous.
 #if defined(DUALISO_SPLIT_TIMING_A2_RED)
-constexpr HoldStart kHoldStart = HoldStart::AtArrival;
+constexpr HoldStart kModelHoldStart = HoldStart::AtArrival;
 #else
-constexpr HoldStart kHoldStart = HoldStart::AtBlockedInTheWait;
+constexpr HoldStart kModelHoldStart = HoldStart::AtBlockedInTheWait;
+#endif
+// The live contention tests use it too, except where the thread-state probe below has no layout (it is x64 only;
+// adversary A2 r1 pass 1 A3): such a build keeps the fork/master rendezvous rather than fail on a probe it lacks.
+#if defined(_WIN64)
+constexpr HoldStart kHoldStart = kModelHoldStart;
+#else
+constexpr HoldStart kHoldStart = HoldStart::AtArrival;
 #endif
 
 // Both stamps below and the split use QueryPerformanceCounter (mlv_stage_timing_now, StageTiming.h), so the
 // slack covers only the double rounding of the ms conversions, not a second clock.
 constexpr double kQpcSlackMs = 0.01;
+
+// How long the parent waits to see the arrived run blocked in the mutex wait before it gives up (adversary A2 r1
+// pass 1 A2). The test needs SOME liveness bound; this one only fails a run kept off the CPU for a whole minute.
+constexpr int kSeenBlockedDeadlineSeconds = 60;
 
 double qpcNowMs()
 {
@@ -195,10 +206,10 @@ double qpcNowMs()
     return double(now.QuadPart) * 1000.0 / double(freq.QuadPart);
 }
 
-// The lower bound a correct split owes a queued run's mutex_wait_ms.
-bool queuedWaitBoundMet(double mutexWaitMs, double measuredHoldMs, int requestedHoldMs)
+// The lower bound a correct split owes a queued run's mutex_wait_ms under rendezvous `start`.
+bool queuedWaitBoundMet(HoldStart start, double mutexWaitMs, double measuredHoldMs, int requestedHoldMs)
 {
-    if (kHoldStart == HoldStart::AtArrival) return mutexWaitMs >= requestedHoldMs / 2.0;
+    if (start == HoldStart::AtArrival) return mutexWaitMs >= requestedHoldMs / 2.0;
     return mutexWaitMs >= measuredHoldMs - kQpcSlackMs;
 }
 
@@ -287,6 +298,8 @@ struct QueuedRun
     bool seenBlocked = false;     // the parent saw the run blocked in the mutex wait before it started the hold
     ULONG lastWaitReason = 0;     // the run's KWAIT_REASON at the parent's last look (diagnostic)
     double measuredHoldMs = 0.0;  // parent, QPC: hold start (kHoldStart) .. just before the unlock
+    double releaseAtMs = 0.0;     // parent, QPC: just before the unlock (the run acquires after it)
+    double callEndAtMs = 0.0;     // run thread, QPC: just after splitRunOnce returned
     double callWallMs = 0.0;      // run thread, QPC: just before splitRunOnce .. just after it
     int used = -1;
     int rc = -99;
@@ -308,7 +321,8 @@ QueuedRun runQueuedOnTheBackendMutex(uint64_t frameId, int holdMs, bool suppress
         llrpResetLastRunTimingForCurrentThread();
         const double callStart = qpcNowMs();
         out.used = splitRunOnce(frameId, &out.rc);
-        out.callWallMs = qpcNowMs() - callStart;
+        out.callEndAtMs = qpcNowMs();
+        out.callWallMs = out.callEndAtMs - callStart;
         out.split = lastSplit(); // thread-local: read on the thread that ran
         done.store(true);
     });
@@ -322,28 +336,33 @@ QueuedRun runQueuedOnTheBackendMutex(uint64_t frameId, int holdMs, bool suppress
     if (kHoldStart == HoldStart::AtBlockedInTheWait)
     {
         // However long the run is descheduled after its arrival, the hold does not start until it is in the wait.
+        const auto blockedDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(kSeenBlockedDeadlineSeconds);
         while (out.arrived && !(out.seenBlocked = threadBlockedInAUserWait(runTid.load(), &out.lastWaitReason))
-               && std::chrono::steady_clock::now() < deadline)
+               && std::chrono::steady_clock::now() < blockedDeadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     const double holdStart = qpcNowMs();
     while (qpcNowMs() - holdStart < double(holdMs)) // a Sleep that returns early cannot shorten the hold
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (suppressWhileQueued) llrpSetGpuCudaSuppressed(1);
-    out.measuredHoldMs = qpcNowMs() - holdStart; // the run cannot acquire before the unlock below
+    out.releaseAtMs = qpcNowMs(); // the run cannot acquire before the unlock below
+    out.measuredHoldMs = out.releaseAtMs - holdStart;
     llrpHoldGpuReconBackendMutexForTesting(0);
     queued.join();
     if (suppressWhileQueued) llrpSetGpuCudaSuppressed(0);
     return out;
 }
 
-// The split's held intervals of one call (wait, configure, run, post-run) are disjoint and inside the call, so
-// their sum cannot exceed the call's own wall: a wait booked twice (as mutex_wait and as configure, run or
-// post-run time) breaks this under any schedule, where "configure < wait" can false-fail on a deschedule.
+// The wait is not booked again as configure, run or post-run time. Those three intervals start at the acquire,
+// which is after the parent's release stamp, and end before the call returns, so they fit in [release stamp, call
+// end] under any schedule; a 60 ms wait booked into any of them overflows that window unless the run is itself
+// held off the CPU for as long between its return and its end stamp (adversary A2 r1 pass 1 A1: a missed catch
+// then, never a false failure). The whole split (with the wait) also fits the call's own wall.
 bool heldIntervalsFitTheCall(const QueuedRun & q)
 {
-    const double held = q.split.mutex_wait_ms + q.split.configure_ms + q.split.run_wall_ms + q.split.post_run_ms;
-    return held <= q.callWallMs + kQpcSlackMs;
+    const double afterAcquire = q.split.configure_ms + q.split.run_wall_ms + q.split.post_run_ms;
+    return afterAcquire <= q.callEndAtMs - q.releaseAtMs + kQpcSlackMs
+           && q.split.mutex_wait_ms + afterAcquire <= q.callWallMs + kQpcSlackMs;
 }
 
 } // namespace
@@ -359,18 +378,20 @@ TEST(DualIsoGpuSplitTiming, ADescheduleBetweenArrivalAndTheWaitTimerCannotFailTh
     {
         const double arrival = 0.0;
         const double timerStart = arrival + descheduledMs;
-        const double holdStart = kHoldStart == HoldStart::AtBlockedInTheWait ? timerStart : arrival;
+        const double holdStart = kModelHoldStart == HoldStart::AtBlockedInTheWait ? timerStart : arrival;
         const double unlock = holdStart + holdMs;
         const double acquire = unlock > timerStart ? unlock : timerStart;
         const double correctWaitMs = acquire - timerStart;
-        if (!queuedWaitBoundMet(correctWaitMs, unlock - holdStart, holdMs))
+        const bool met = queuedWaitBoundMet(kModelHoldStart, correctWaitMs, unlock - holdStart, holdMs);
+        if (!met)
             fprintf(stderr, "    deschedule %.0f ms: correct mutex_wait_ms %.3f fails the bound\n",
                     descheduledMs, correctWaitMs);
-        ASSERT_TRUE(queuedWaitBoundMet(correctWaitMs, unlock - holdStart, holdMs));
+        ASSERT_TRUE(met);
     }
     // ...and the bound still rejects a split that never times the wait (0) or books half of it.
-    ASSERT_FALSE(queuedWaitBoundMet(0.0, double(holdMs), holdMs));
-    if (kHoldStart == HoldStart::AtBlockedInTheWait) ASSERT_FALSE(queuedWaitBoundMet(holdMs / 2.0, double(holdMs), holdMs));
+    ASSERT_FALSE(queuedWaitBoundMet(kModelHoldStart, 0.0, double(holdMs), holdMs));
+    if (kModelHoldStart == HoldStart::AtBlockedInTheWait)
+        ASSERT_FALSE(queuedWaitBoundMet(kModelHoldStart, holdMs / 2.0, double(holdMs), holdMs));
 }
 
 TEST(DualIsoGpuSplitTiming, AWaitOnTheBackendMutexIsReportedAsMutexWait)
@@ -387,7 +408,7 @@ TEST(DualIsoGpuSplitTiming, AWaitOnTheBackendMutexIsReportedAsMutexWait)
     ASSERT_EQ(1, q.split.backend_calls);
     fprintf(stderr, "    measured hold %.3f ms, mutex_wait_ms %.3f, call wall %.3f\n", q.measuredHoldMs,
             q.split.mutex_wait_ms, q.callWallMs);
-    ASSERT_TRUE(queuedWaitBoundMet(q.split.mutex_wait_ms, q.measuredHoldMs, holdMs));
+    ASSERT_TRUE(queuedWaitBoundMet(kHoldStart, q.split.mutex_wait_ms, q.measuredHoldMs, holdMs));
     // ...and the wait is not booked again as run, configure or post-run time.
     ASSERT_TRUE(heldIntervalsFitTheCall(q));
     // This thread ran no backend call, so its own record shows none.
@@ -411,7 +432,7 @@ TEST(DualIsoGpuSplitTiming, ARunRefusedUnderTheLockStillReportsItsWait)
     ASSERT_EQ(0.0, q.split.run_wall_ms);
     fprintf(stderr, "    measured hold %.3f ms, mutex_wait_ms %.3f, call wall %.3f\n", q.measuredHoldMs,
             q.split.mutex_wait_ms, q.callWallMs);
-    ASSERT_TRUE(queuedWaitBoundMet(q.split.mutex_wait_ms, q.measuredHoldMs, holdMs));
+    ASSERT_TRUE(queuedWaitBoundMet(kHoldStart, q.split.mutex_wait_ms, q.measuredHoldMs, holdMs));
     ASSERT_TRUE(heldIntervalsFitTheCall(q));
     ASSERT_EQ(0, llrpGpuCudaSuppressed());
 }
