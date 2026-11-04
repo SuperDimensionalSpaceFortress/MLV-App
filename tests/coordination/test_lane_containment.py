@@ -2114,6 +2114,26 @@ def test_r12_a3_an_unsupported_shim_is_never_run_by_any_probe(fixture_tree):
     assert not (root/"args.json").exists()
 
 
+def test_r12_iter1_a1_a_codex_child_alive_when_the_launch_path_throws_is_killed_before_its_holds_are_released(fixture_tree):
+    # adversary A1 on 2d55c467: the stdin write to a codex child that closed fd 0 throws, and the catch released every image hold without
+    # killing the child, which could then read a changed snapshot. The throw is injected right after Process.Start; the fixture child
+    # blocks reading stdin, so a child that survives the lane gets EOF when the lane exits and writes prompt.txt. It must be dead instead.
+    anchor="    $proc = [Diagnostics.Process]::Start($psi)\n}"
+    def mutation(text):
+        assert text.count(anchor)==1, "codex Process.Start block text has moved; update this fixture mutation"
+        return text.replace(anchor,"    $proc = [Diagnostics.Process]::Start($psi)\n    $waitChild=[Diagnostics.Stopwatch]::StartNew(); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_CHILD) -and $waitChild.ElapsedMilliseconds -lt 20000){Start-Sleep -Milliseconds 50}\n    throw [System.IO.IOException]::new('fixture-stdin-write-failed')\n}")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in text,(r.returncode,text[-4000:])
+    assert (root/"child.json").exists(), "the injected failure must come after the codex child started"
+    time.sleep(8)
+    assert not (root/"prompt.txt").exists(), "the codex child outlived the failed launch path (its image holds were released while it ran)"
+
+
 def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):
     # r8 (ADV-A2): every accepted -ImagePaths entry became one `-i <snapshot>` pair, and 120 of them pushed the command line past cmd.exe's
     # 8191 characters: the shim answered "The command line is too long." and codex never ran. The launcher must refuse it typed instead.
@@ -2209,12 +2229,10 @@ def test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_r
     def mutation(text):
         # r11: the codex launch runs the resolved program (Resolve-CodexShimLaunch) with its literal prefix arguments.
         # r12: the start info is set by Set-CodexLaunchStartInfo (bound, re-hash, FileName/ArgumentList) right before Process.Start.
-        old = ("    Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count\n"
-               "    $proc = [Diagnostics.Process]::Start($psi)\n"
+        old = ("    $proc = [Diagnostics.Process]::Start($psi)\n"
                "}")
-        assert old in text, "codex Process.Start block text has moved; update this fixture mutation"
-        new = ("    Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count\n"
-               "    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
+        assert text.count(old)==1, "codex Process.Start block text has moved; update this fixture mutation"
+        new = ("    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
                "}")
         return text.replace(old, new)
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)

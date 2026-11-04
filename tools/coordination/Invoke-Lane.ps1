@@ -513,6 +513,8 @@ function Get-CodexCliVersion {
         $vPsi = [System.Diagnostics.ProcessStartInfo]::new()
         # r12 (ADVISORY A3 on c4f381a7): the probe runs the RESOLVED launch, so an unsupported shim is never run (it answers $null here and
         # the lane refuses it, typed, at its own resolution); the shim is re-hashed immediately before this Process.Start.
+        # r12 fix iteration 1 (adversary A2 on 2d55c467): the shim reads count against the same $TimeoutMs as the process wait.
+        $vSw = [System.Diagnostics.Stopwatch]::StartNew()
         $vLaunch = Resolve-CodexShimLaunch -Exe $CodexExe
         $vPsi.UseShellExecute = $false
         $vPsi.CreateNoWindow = $true
@@ -520,11 +522,13 @@ function Get-CodexCliVersion {
         $vPsi.RedirectStandardOutput = $true
         $vPsi.RedirectStandardError = $true
         Set-CodexLaunchStartInfo -Psi $vPsi -Launch $vLaunch -Argv @('--version')
+        $vLeftMs = [int]($TimeoutMs - $vSw.ElapsedMilliseconds)
+        if ($vLeftMs -le 0) { return $null }
         $vProc = [System.Diagnostics.Process]::Start($vPsi)
         $vProc.StandardInput.Close()
         $vOut = $vProc.StandardOutput.ReadToEndAsync()
         $vErr = $vProc.StandardError.ReadToEndAsync()
-        if (-not $vProc.WaitForExit($TimeoutMs)) {
+        if (-not $vProc.WaitForExit($vLeftMs)) {
             try { $vProc.Kill($true) } catch { }
             return $null
         }
@@ -1523,17 +1527,23 @@ function Assert-CodexCommandLineFits {
 #   any '!', any '<' '>' '|' '&' '^' '(' ')', more than one command line, a target that is not a native program, or an unparsable token.
 # The shim bytes are hashed when they are read here and re-hashed immediately before Process.Start ('codex-shim-changed' on a change).
 $CODEX_SHIM_MAX_BYTES = 65536
+# r12 fix iteration 1 (adversary A2 on 2d55c467): a shim on a slow share made the synchronous read (and the re-hash) unbounded, ahead of every
+# probe timeout and the lane deadline. Each read is asynchronous with its own deadline; one that does not finish is refused, typed.
+$CODEX_SHIM_READ_TIMEOUT_MS = 5000
 function Read-CodexShimBytes {
     # One read through one handle that denies writers, so the hashed bytes are a single version of the file.
     param([Parameter(Mandatory = $true)][string]$Path)
     try {
-        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
+        $cts = [System.Threading.CancellationTokenSource]::new($CODEX_SHIM_READ_TIMEOUT_MS)
         try {
             if ($fs.Length -gt $CODEX_SHIM_MAX_BYTES) { throw [System.IO.InvalidDataException]::new("larger than $CODEX_SHIM_MAX_BYTES bytes") }
             $ms = [System.IO.MemoryStream]::new()
-            $fs.CopyTo($ms)
+            $copy = $fs.CopyToAsync($ms, 81920, $cts.Token)
+            if (-not $copy.Wait($CODEX_SHIM_READ_TIMEOUT_MS)) { $cts.Cancel(); throw [System.TimeoutException]::new("the read did not finish within $CODEX_SHIM_READ_TIMEOUT_MS ms") }
+            if ($ms.Length -gt $CODEX_SHIM_MAX_BYTES) { throw [System.IO.InvalidDataException]::new("larger than $CODEX_SHIM_MAX_BYTES bytes") }
             $bytes = $ms.ToArray()
-        } finally { $fs.Dispose() }
+        } finally { $fs.Dispose(); $cts.Dispose() }
     } catch {
         throw "codex-shim-unreadable: the codex shim '$Path' could not be read ($($_.Exception.GetBaseException().Message)); refused before launch"
     }
@@ -2562,6 +2572,7 @@ $enc=[Text.UTF8Encoding]::new($false)
 } else {
     # r11 (sol r10 B2): the shim bytes Resolve-CodexShimLaunch read must still be the bytes on disk now; a change is refused, typed.
     Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count
+    if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) { throw [TimeoutException]::new('launch-budget-exhausted') }
     $proc = [Diagnostics.Process]::Start($psi)
 }
 
@@ -2837,6 +2848,11 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
+    # r12 fix iteration 1 (adversary A1 on 2d55c467): a codex child still running when this path throws (a stdin write to a child that
+    # closed fd 0, ...) could read a snapshot after its hold is released. It is killed, tree and all, and waited for FIRST.
+    if ($cfg.engine -eq 'codex' -and $null -ne $proc) {
+        try { if (-not $proc.HasExited) { $proc.Kill($true); [void]$proc.WaitForExit(15000) } } catch { }
+    }
     foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
     $ImageHolds.Clear()
     $noChildCause = $_.Exception.Message
