@@ -4209,6 +4209,47 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
                 self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
 
+    def test_r8_dualiso_a_scalar_leg_spec_the_leg_would_refuse_by_shape_is_refused_before_the_claim(self) -> None:
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): scalar -LegSpec mode skipped Get-LegSpecRefusal, so a look leg whose look is an array (or
+        # absent) opened the lease and the leg then threw DVE_LEG_SPEC_INVALID (LEG_FAILED, no receipt). The leg's shape predicate now runs before any claim.
+        # fix 2 (adversary r8 fix-1 A1): a JSON null root and bytes that are not JSON, which the leg rejects after the lease too
+        base = json.loads(self._valid_leg_spec_text())
+        for case, text in (("look-array", json.dumps({**base, "legType": "look", "look": []})), ("look-absent", json.dumps({**base, "legType": "look"})),
+                           ("generatorArgs-array", json.dumps({**base, "generatorArgs": [{"qualityMode": "hq"}]})),
+                           ("null-root", "null"), ("not-json", "this is not json")):
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"shape-{case}.json"
+                spec.write_text(text, encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r9_dualiso_a_scalar_leg_spec_whose_legtype_is_not_one_enumerated_string_is_refused_before_the_claim(self) -> None:
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r9 (adversary r8 cc8061a2 A1): legType ["look","speed"] with no look stringified to 'look speed', passed the shared
+        # shape predicate, opened the lease, and the leg then indexed the absent look (LEG_FAILED, no receipt). Every non-enum legType is refused before any claim.
+        # fix 1 (adversary r9 a0936637 A2): and a look leg whose look.contactSheetFrames is outside the generator's 1..60, or not a whole number
+        base = {k: v for k, v in json.loads(self._valid_leg_spec_text()).items() if k != "look"}
+        cases = [(case, {**base, "legType": value}, "legType must be one of")
+                 for case, value in (("array", ["look", "speed"]), ("object", {"type": "look"}), ("number", 1), ("null", None), ("empty", ""), ("case", "LOOK"))]
+        cases += [(f"count-{n}", {**base, "legType": "look", "look": {"contactSheetFrames": n, "lookFlavor": "classic"}}, "look.contactSheetFrames must be a whole number")
+                  for n in (61, 0, 1.4)]
+        for case, doc, needle in cases:
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"legtype-{case}.json"
+                spec.write_text(json.dumps(doc), encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertIn(needle, r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
     def test_r9_a_spec_in_the_run_dir_under_another_name_is_not_refused(self) -> None:
         # the guard names the runner's outputs, not the directory: a spec kept beside them under any other name still runs
         shutil.rmtree(self.run_dir, ignore_errors=True)
@@ -7070,12 +7111,20 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             "if ($a -lt 0 -or $e -lt 0) { throw 'the leg strip block was not found' }\n"
             "$e = $legText.IndexOf(\"`n\", $e)\n"
             "$block = $legText.Substring($a, $e - $a) + \"`n        }`n    }`n\"\n"
+            # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r12: the block may call a helper the LEG defines (Invoke-DvCollect wraps every copy). Carry each
+            # top-level leg function the block names, from the leg's own text, so the block runs as the leg runs it; and any error the block raises
+            # fails the test instead of printing a copy path for a copy that never happened (the r11 hosted red: PRIMARY=<path>, 0 PNGs written).
+            "$legAst = [System.Management.Automation.Language.Parser]::ParseInput($legText, [ref]$null, [ref]$null)\n"
+            "foreach ($fn in @($legAst.FindAll({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false))) {\n"
+            "    if ($block -match ('(?<![\\w-])' + [regex]::Escape($fn.Name) + '(?![\\w-])')) { . ([scriptblock]::Create($fn.Extent.Text)) } }\n"
             "function global:Read-DvVisualCaptures { param($Requested, $ArtifactsDir, $EvidenceDir, $LegId, $Header) "
             f"[pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null; verdict = 'OK'; reason = '' }} }}\n"
             f"$receipt = [ordered]@{{ visual = [pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null }} }}\n"
             "$spec = [pscustomobject]@{ legId = 'leg-r6' }; $Venue = 'bachelor'; $Backend = 'cuda'; $SourceCommit = '0123456789abcdef0123'; $runStamp = '20261031T000000Z'; $OfflineTestMode = $false\n"
             f"$SheetCopyDir = '{psq(sheet_copy_dir)}'; $ReceiptRoot = '{psq(receipt_root)}'; $evidenceDir = '{psq(evidence_dir)}'\n"
+            "$Error.Clear()\n"
             "$null = . ([scriptblock]::Create($block))\n"
+            "if ($Error.Count -gt 0) { throw ('the leg strip block raised: ' + [string]$Error[0]) }\n"
             "'PRIMARY=' + [string]$receipt.visual.stripCopyPath\n"
             "foreach ($k in @($receipt['selfHealVisual'].Keys)) { 'SELFHEAL ' + $k + '=' + [string]$receipt['selfHealVisual'][$k].stripCopyPath }\n"
         )
