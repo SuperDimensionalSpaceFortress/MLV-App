@@ -7205,6 +7205,10 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             }
         }
     }
+    // r19 (adversary A1 on 1df419eb): the engine's own request for this frame, with the wrap count then; a lookahead
+    // frame reused for it is stamped by this request, not by the one that spawned it (presentationRequestStamp)
+    m_playbackEngineRequestFrame = requestedFrame;
+    m_playbackEngineRequestWraps = requestContext.engineWrapsAtRequest;
     const bool playbackLookaheadCoversCurrent =
         ui->actionPlay->isChecked()
         && m_pRenderThread
@@ -26269,8 +26273,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // frame requested across the boundary before the wrap still can (719 -> speculative 0).
     // r19 (sol r18 B1; adversary A1 on 924d3d6f): a forward landing takes its wrap too, and each landing is
     // credited one cut width per wrap it crossed.
+    // r19 (adversary A1 on 1df419eb): a reused lookahead frame takes the stamp of the engine's own request for it.
+    const int sourceAdvanceRequestStamp = presentationRequestStamp( requestContext.playbackLookaheadRequest,
+                                                                    requestContext.engineWrapsAtRequest,
+                                                                    static_cast<int>( displayFrame ),
+                                                                    m_playbackEngineRequestFrame,
+                                                                    m_playbackEngineRequestWraps );
     const int sourceAdvanceWraps = presentationLoopWraps( m_playbackWrapRecorder.engineWraps,
-                                                          requestContext.engineWrapsAtRequest,
+                                                          sourceAdvanceRequestStamp,
                                                           m_playbackSmokeTrackerEngineWraps,
                                                           m_playbackSmokePresentedFrames > 0,
                                                           m_playbackSmokeLastPresentedFrame,

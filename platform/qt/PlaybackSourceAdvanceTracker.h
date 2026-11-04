@@ -135,6 +135,24 @@ private:
  *  consumedEngineWraps is the caller's running count. It is set to the live count when the measured Play
  *  starts and only ever rises, never above the live count.
  *  \param havePrevious a frame was presented before this one in the measured Play */
+/*! r19 fix iteration 2 (adversary A1 on 1df419eb): the request stamp presentationLoopWraps reads. A playback
+ *  LOOKAHEAD frame is requested by the render thread ahead of the timeline, stamped with the wrap count of the
+ *  request that spawned it, and the engine REUSES it when the timeline reaches that frame (MainWindow::drawFrame:
+ *  hasPlaybackLookaheadRequest). That stamp can predate a wrap the timeline crossed before reaching the frame:
+ *  Loop + drop-frame, cut 0..2, 0 presented, lookahead 1 stamped 0, the engine wraps and lands on 1, and the cached
+ *  1 is presented stamped 0, so the forward landing read as an in-flight frame (advanced 1, wraps 0, not 4 and 1).
+ *  The engine's OWN request for the frame is the authority: when a lookahead frame is the frame the engine last
+ *  requested, its stamp is the later of the two counts. A frame that is not a lookahead, or not the engine's last
+ *  request (an in-flight frame from before a wrap whose draw already requested the next frame, 718 -> 719), keeps
+ *  its own stamp. \param engineRequestFrame the frame drawFrame last requested (-1 = none yet)
+ *  \param engineRequestStamp the live wrap count when it did */
+inline int presentationRequestStamp( bool lookaheadFrame, int contextStamp, int frame,
+                                     int engineRequestFrame, int engineRequestStamp )
+{
+    if( lookaheadFrame && frame == engineRequestFrame && engineRequestStamp > contextStamp ) return engineRequestStamp;
+    return contextStamp;
+}
+
 inline int presentationLoopWraps( int liveEngineWraps, int requestEngineWraps, int &consumedEngineWraps,
                                   bool havePrevious, int lastFrame, int frame )
 {

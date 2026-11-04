@@ -1175,6 +1175,10 @@ private:
     int m_playbackSmokeLastPresentedFrame = -1;
     // r16 (adversary A1): engine wraps the source-advance tracker has taken (presentationLoopWraps)
     int m_playbackSmokeTrackerEngineWraps = 0;
+    // r19 (adversary A1 on 1df419eb): the frame drawFrame last requested and the wrap count then, so a reused
+    // lookahead frame is stamped by the engine's own request for it (presentationRequestStamp)
+    int m_playbackEngineRequestFrame = -1;
+    int m_playbackEngineRequestWraps = 0;
     // CUDA-PLAYBACK-CONTACT-SHEET-2 (BLOCKER fix): set when a presented display_frame goes
     // backwards during the measured session -- the only way that happens is a Loop wrap
     // (cutOut back to cutIn), since playback otherwise only advances. Reset per session in

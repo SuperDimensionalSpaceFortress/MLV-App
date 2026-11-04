@@ -476,3 +476,50 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1EachLandingTakesOnlyTheWrapsItC
     ASSERT_EQ(20, static_cast<int>(t.advancedFrames()));
     ASSERT_EQ(3u, t.wraps());
 }
+
+// r19 fix iteration 2 (adversary A1 on 1df419eb): Loop + drop-frame, cut 1..3 (0..2), lookahead depth 2. 0 is presented
+// (stamp 0); the cached lookahead 1 was spawned with stamp 0; the engine wraps, advanceDropFrameTick(0, 3, 1, 3, true)
+// lands on 1, and drawFrame's request for 1 (at count 1) reuses the cached 1. 1df419eb read the cached frame's own stamp
+// 0, so the forward landing looked like an in-flight frame: advanced 1, wraps 0, 20 source fps. The engine's own request
+// for the frame stamps a reused lookahead (presentationRequestStamp, as MainWindow::notePlaybackSmokePresentedFrame
+// calls it): 1 + 3 - 0 = 4, wraps 1, 80 source fps.
+TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEnginesOwnRequest)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, 3.0, 1, 3, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(1, static_cast<int>(tick.position));
+    PresentDriver d;
+    d.startMeasuredPlay();
+    d.present(1.000, 0, true, 0, 2);
+    const int lookaheadStamp = d.engineWraps;                 // the cached 1 was spawned before the wrap
+    ++d.engineWraps;                                          // the engine wraps ...
+    const int engineRequestFrame = static_cast<int>(tick.position);
+    const int engineRequestStamp = d.engineWraps;             // ... and drawFrame requests 1 after it
+    const int stamp = presentationRequestStamp(true, lookaheadStamp, 1, engineRequestFrame, engineRequestStamp);
+    ASSERT_EQ(1, stamp);
+    d.present(1.050, 1, true, 0, 2, stamp);
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(0, d.tracker.maxJump());
+    ASSERT_NEAR(4.0 / 0.050, d.tracker.sourceFps(), 1e-9);
+    // the stamp rule keeps every earlier case: a frame that is not a lookahead keeps its own stamp (an in-flight 719
+    // requested before the wrap, while the engine already asked for 0), and so does a lookahead the engine did not
+    // last request, or one whose own stamp is already the later count
+    ASSERT_EQ(0, presentationRequestStamp(false, 0, 1, 1, 1));
+    ASSERT_EQ(0, presentationRequestStamp(true, 0, 719, 0, 1));
+    ASSERT_EQ(2, presentationRequestStamp(true, 2, 5, 5, 1));
+    ASSERT_EQ(0, presentationRequestStamp(true, 0, 5, -1, 0));
+    // the reused speculative 0 of eb5af034 (lookahead stamped 0, the engine's request for 0 after the wrap) still lands
+    // the wrap backward, once
+    PresentDriver e;
+    e.startMeasuredPlay();
+    e.present(1.000, 718, true, 0, 719);
+    e.present(1.045, 719, true, 0, 719);
+    const int spec0 = e.engineWraps;
+    ++e.engineWraps;
+    e.present(1.090, 0, true, 0, 719, presentationRequestStamp(true, spec0, 0, 0, e.engineWraps));
+    ASSERT_EQ(1u, e.tracker.wraps());
+    ASSERT_EQ(2, static_cast<int>(e.tracker.advancedFrames()));
+    ASSERT_EQ(0u, e.tracker.backwardJumps());
+}
