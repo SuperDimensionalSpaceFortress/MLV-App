@@ -6793,11 +6793,13 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
 {
     if (!out || !bayer || bw <= 0 || bh <= 0 || out_w <= 0 || out_h <= 0) return 0;
     const uint64_t bayer_rgb_words = (uint64_t)bw * (uint64_t)bh * 3u;
-    /* The filtered branches debayer into thread-local scratch: below 4 rows
-     * debayerBasicU16 reconstructs no row pair and would leave a previous frame's
-     * scratch in place (adversary A3), so they refuse such a Bayer. */
+    /* The filtered branches debayer into thread-local scratch: below 4 rows, at an
+     * odd height (the last row pair is not reconstructed) or under 4 columns
+     * debayerBasicU16 leaves rows of a previous frame's scratch in place
+     * (adversary A3, pass 2 A2), so they refuse such a Bayer. The planners only
+     * produce even heights (whole 4*S-row blocks) and widths of at least 4. */
     const int filtered_branch = (displayScale == 2 * bayerScale) || (displayScale == 2 && bayerScale == 2);
-    if (filtered_branch && bh < 4) return 0;
+    if (filtered_branch && (bh < 4 || (bh & 1) != 0 || bw < 4)) return 0;
     int rows = 0;
     if (displayScale == 2 * bayerScale)
     {
@@ -9136,7 +9138,9 @@ int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
                                                         0,
                                                         normalizedScale,
                                                         0,
-                                                        full_h - reducedHeight * normalizedScale);
+                                                        /* H2C-PORT-1 (adversary pass 2 A1): the rows
+                                                         * the shrink cropped, at the Bayer's scale. */
+                                                        full_h - reducedHeight * bayer_scale);
     }
     else
     {
