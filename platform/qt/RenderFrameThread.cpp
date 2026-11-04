@@ -2465,6 +2465,7 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
          * sensor. Anything the plan or the run rejects is reconstructed at full
          * resolution exactly as before, and the reason is recorded. */
         slot.reducedReconScale = 1;
+        slot.reducedReconBayerScale = 1;
         slot.reducedReconOnGpu = false;
         slot.reducedReconWidth = 0;
         slot.reducedReconHeight = 0;
@@ -2527,6 +2528,7 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                     if( reducedRc == 1 )
                     {
                         slot.reducedReconScale = gpuPlan.scale;
+                        slot.reducedReconBayerScale = gpuPlan.bayerScale;
                         slot.reducedReconWidth = gpuPlan.reducedWidth;
                         slot.reducedReconHeight = gpuPlan.reducedHeight;
                         slot.reducedReconOnGpu = true;
@@ -2586,9 +2588,11 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                                                  reconContext.playbackScaleFactor,
                                                  &reducedPlan ) )
             {
+                /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the Bayer the shrink writes
+                 * (x2 for an x4 plan). */
                 const size_t reducedWords =
-                    static_cast<size_t>( reducedPlan.reducedWidth )
-                    * static_cast<size_t>( reducedPlan.reducedHeight );
+                    static_cast<size_t>( reducedPlan.bayerWidth )
+                    * static_cast<size_t>( reducedPlan.bayerHeight );
                 bool reducedBufferReady = false;
                 try
                 {
@@ -2615,8 +2619,9 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                     if( reducedRc == 1 )
                     {
                         slot.reducedReconScale = reducedPlan.scale;
-                        slot.reducedReconWidth = reducedPlan.reducedWidth;
-                        slot.reducedReconHeight = reducedPlan.reducedHeight;
+                        slot.reducedReconBayerScale = reducedPlan.bayerScale;
+                        slot.reducedReconWidth = reducedPlan.bayerWidth;
+                        slot.reducedReconHeight = reducedPlan.bayerHeight;
                     }
                     else
                     {
@@ -2654,6 +2659,9 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         slot.stageTimingTelemetry.insert(
             reconScaleKeyPrefix + QStringLiteral("scale"),
             slot.reducedReconScale );
+        slot.stageTimingTelemetry.insert(
+            reconScaleKeyPrefix + QStringLiteral("bayer_scale"),
+            slot.reducedReconScale > 1 ? slot.reducedReconBayerScale : 1 );
         slot.stageTimingTelemetry.insert(
             reconScaleKeyPrefix + QStringLiteral("width"),
             slot.reducedReconScale > 1 ? slot.reducedReconWidth : m_imageWidth );
@@ -5316,6 +5324,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
             if ( debayered16InlineReducedReconWanted( inlineReduced ) )
             {
                 slot.reducedReconScale = 1;
+                slot.reducedReconBayerScale = 1;
                 slot.reducedReconOnGpu = false;
                 slot.reducedReconWidth = 0;
                 slot.reducedReconHeight = 0;
@@ -5330,6 +5339,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
                 if ( inlineReducedRecon.reconstructed )
                 {
                     slot.reducedReconScale = inlineReducedRecon.scale;
+                    slot.reducedReconBayerScale = inlineReducedRecon.bayerScale;
                     slot.reducedReconWidth = inlineReducedRecon.reducedWidth;
                     slot.reducedReconHeight = inlineReducedRecon.reducedHeight;
                     /* The reduced debayer clears these thread-locals. */
@@ -5339,6 +5349,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
                 slot.stageTimingTelemetry.insert(
                     QStringLiteral("cpu_dualiso_recon_scale"),
                     slot.reducedReconScale );
+                slot.stageTimingTelemetry.insert(
+                    QStringLiteral("cpu_dualiso_recon_bayer_scale"),
+                    slot.reducedReconScale > 1 ? slot.reducedReconBayerScale : 1 );
                 slot.stageTimingTelemetry.insert(
                     QStringLiteral("cpu_dualiso_recon_width"),
                     slot.reducedReconScale > 1 ? slot.reducedReconWidth : m_imageWidth );

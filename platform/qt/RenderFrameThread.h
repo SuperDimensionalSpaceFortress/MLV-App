@@ -502,8 +502,12 @@ private:
          * consume reducedReconBayer. 1 = rawImage16 is the full-res recon. */
         std::vector<uint16_t> reducedReconBayer;
         int reducedReconScale = 1;
+        /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedReconWidth x Height are the
+         * reduced BAYER's dims at reducedReconBayerScale (the CPU plan at x4
+         * reconstructs at x2; the consumers box to the display scale). */
         int reducedReconWidth = 0;
         int reducedReconHeight = 0;
+        int reducedReconBayerScale = 1;
         /* PLAYBACK-CUDA-HONOUR-SCALE-1: the reduced recon ran on the CUDA
          * texture route. reducedReconBayer is then the prepared recon INPUT
          * (not a reconstruction); the reconstruction is the retained device

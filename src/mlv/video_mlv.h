@@ -244,8 +244,14 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
  * (Height / reconScale) RGB16 pixels, returned in outWidth / outHeight. No
  * decode, no llrawproc, no cache read or publish. A nonzero bit shift is applied
  * to reducedReconnedRaw in place. Returns 1 on success, 0 (nothing written) unless
- * reconScale is 2 or 4, reducedWidth == Width / reconScale, 0 < reducedHeight <=
- * Height / reconScale and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
+ * reconScale is 2 or 4, reducedWidth == Width / bayerScale, 0 < reducedHeight <=
+ * Height / bayerScale and the debayer is bilinear (doesMlvAlwaysUseAmaze == 0).
+ * CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedWidth / reducedHeight are the
+ * reduced BAYER's dims (plan.bayerWidth / bayerHeight); bayerScale = Width /
+ * reducedWidth is reconScale, or 2 when reconScale is 4 (the x4 "H2c" route:
+ * debayer at x2, chroma-only horizontal [1 2 1], 2x2 box). At x2 (bayerScale ==
+ * reconScale == 2) the debayered RGB takes the chroma-only [1 2 1] ("H0c"); at x4
+ * with bayerScale 4 the bytes are the bilinear debayer's, as before.
  * reconHqDualIso selects the bit shift as in ...FromReconnedRaw16. */
 int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     uint64_t frameIndex,
@@ -300,6 +306,15 @@ typedef struct
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
     int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (both
                              * plans, x2/x4); 0: the Phase 4B decimator (x8) */
+    /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the dims the shrink writes and the recon
+     * runs on (the reduced Bayer, bayerWidth x bayerHeight words). Equal to
+     * scale / reducedWidth / reducedHeight everywhere except the CPU plan at x4, which
+     * shrinks and reconstructs at x2 (bayerScale 2, fullWidth / 2 x sourceHeight / 2);
+     * its consumers debayer at x2, take the chroma-only [1 2 1] and box to x4 ("H2c").
+     * reducedWidth / reducedHeight stay the display dims. */
+    int bayerScale;
+    int bayerWidth;
+    int bayerHeight;
 } mlvDualIsoPreviewScaleRecon_t;
 
 /* Process-wide counters of the phase-tent shrink (successful shrinks and their summed

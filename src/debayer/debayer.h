@@ -26,6 +26,12 @@ int debayerBasicU16Avx2Active(void);
  * RGB16, mirrored edge columns; the reduced texture route's horizontal Nyquist zero.
  * out and in must not alias. */
 void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w, int h);
+/* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the chroma-only twin. G passes through;
+ * R' = G + h121(R - G), B' = G + h121(B - G) along x with h121 = (l + 2c + r) / 4,
+ * the same mirrored edge columns, signed arithmetic rounded as the Nyquist zero
+ * rounds ((s + 2) >> 2, floor), clamped to [0, 65535]. Rows are independent
+ * (threads > 1: OpenMP over rows). out and in must not alias. */
+void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads);
 /* Quite quick bilinear debayer, floating point sadly; threads argument is unused */
 void debayerBasic(uint16_t * __restrict debayerto, float * __restrict bayerdata, int width, int height, int threads);
 /* More useable amaze, threads number should be the number of cores(or threads if >= i7) your cpu has */

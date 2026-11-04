@@ -534,6 +534,40 @@ void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w,
     }
 }
 
+/* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the chroma-only [1,2,1]/4 along x (see
+ * debayer.h). The x4 CPU reduced route runs it on its x2 debayer before the 2x2 box
+ * ("H2c"), the x2 route on its debayer ("H0c"): it lowpasses R-G and B-G across the
+ * columns, where the shrunk Bayer's colour sites sit a full reduced pixel apart, and
+ * leaves G (the picture's sharpness) alone. */
+void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
+{
+    if (!out || !in || w <= 0 || h <= 0) return;
+    #pragma omp parallel for if(threads > 1) num_threads(threads)
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t *src = in + (size_t)y * (size_t)w * 3u;
+        uint16_t *dst = out + (size_t)y * (size_t)w * 3u;
+        for (int x = 0; x < w; ++x)
+        {
+            const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+            const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+            const uint16_t *pl = src + (size_t)xl * 3u;
+            const uint16_t *pm = src + (size_t)x * 3u;
+            const uint16_t *pr = src + (size_t)xr * 3u;
+            const int g = (int)pm[1];
+            for (int c = 0; c < 3; c += 2)
+            {
+                const int s = ((int)pl[c] - (int)pl[1]) + 2 * ((int)pm[c] - g) + ((int)pr[c] - (int)pr[1]);
+                int v = g + ((s + 2) >> 2);
+                if (v < 0) v = 0;
+                if (v > 65535) v = 65535;
+                dst[(size_t)x * 3u + (size_t)c] = (uint16_t)v;
+            }
+            dst[(size_t)x * 3u + 1u] = (uint16_t)g;
+        }
+    }
+}
+
 typedef struct
 {
     amazeinfo_t * info;

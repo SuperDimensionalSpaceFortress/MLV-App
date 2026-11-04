@@ -6743,6 +6743,95 @@ void mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread(void)
     llrpRestoreLastRunTimingForCurrentThread();
 }
 
+/* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the reduced Bayer's scale for a CPU reduced
+ * recon displayed at reconScale (2, 4 or 8): full_w / reducedWidth when that is
+ * reconScale, or 2 at reconScale 4 (the x4 plan reconstructs at x2). 0 = not a
+ * reduced Bayer of this clip. */
+static int mlv_reduced_recon_bayer_scale(int full_w, int reducedWidth, int reconScale)
+{
+    if (reconScale != 2 && reconScale != 4 && reconScale != 8) return 0;
+    if (full_w <= 0 || reducedWidth <= 0) return 0;
+    if (reducedWidth == full_w / reconScale) return reconScale;
+    if (reconScale == 4 && reducedWidth == full_w / 2) return 2;
+    return 0;
+}
+
+/* Two scratch RGB16 frames at the reduced Bayer's dims, disjoint from every other
+ * thread-local slot (the processed8 consumer's output is the scaled-input slot). */
+static uint16_t * mlv_ensure_thread_reduced_recon_rgb_a(uint64_t required_words)
+{
+    static MLV_THREAD_LOCAL uint16_t * tls_buffer = NULL;
+    static MLV_THREAD_LOCAL uint64_t tls_capacity_words = 0;
+    return mlv_ensure_u16_buffer(&tls_buffer, &tls_capacity_words, required_words);
+}
+
+static uint16_t * mlv_ensure_thread_reduced_recon_rgb_b(uint64_t required_words)
+{
+    static MLV_THREAD_LOCAL uint16_t * tls_buffer = NULL;
+    static MLV_THREAD_LOCAL uint64_t tls_capacity_words = 0;
+    return mlv_ensure_u16_buffer(&tls_buffer, &tls_capacity_words, required_words);
+}
+
+/* The CPU reduced recon's debayer at the display dims (out_w x out_h RGB16 in out):
+ *  - displayScale == 2 * bayerScale (x4 from an x2 Bayer, "H2c"): bilinear at
+ *    bw x bh, chroma-only horizontal [1 2 1], 2x2 box (whole row pairs only);
+ *  - displayScale == bayerScale == 2 ("H0c"): bilinear, chroma-only [1 2 1];
+ *  - otherwise: the bilinear debayer's bytes, as before this card.
+ * Then the rows past the reconstructed height repeat its last row. bayer takes the
+ * bit shift in place (debayerBasicU16). Returns 0 (out untouched) when the dims do
+ * not fit or a scratch frame cannot be had. */
+static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
+                                              uint16_t * bayer,
+                                              int bw,
+                                              int bh,
+                                              int bayerScale,
+                                              int displayScale,
+                                              int out_w,
+                                              int out_h,
+                                              int threads,
+                                              int bit_shift)
+{
+    if (!out || !bayer || bw <= 0 || bh <= 0 || out_w <= 0 || out_h <= 0) return 0;
+    const uint64_t bayer_rgb_words = (uint64_t)bw * (uint64_t)bh * 3u;
+    int rows = 0;
+    if (displayScale == 2 * bayerScale)
+    {
+        const int box_h = bh & ~1;
+        if (bw != 2 * out_w || box_h <= 0 || box_h / 2 > out_h) return 0;
+        uint16_t * debayered = mlv_ensure_thread_reduced_recon_rgb_a(bayer_rgb_words);
+        uint16_t * filtered = mlv_ensure_thread_reduced_recon_rgb_b(bayer_rgb_words);
+        if (!debayered || !filtered) return 0;
+        debayerBasicU16RecordingKernelMilliseconds(debayered, bayer, bw, bh, threads, bit_shift);
+        debayer_reduced_hchroma121_rgb16(filtered, debayered, bw, bh, threads);
+        if (!processingRgbU16BoxDownsample(filtered, out, bw, box_h, 2, threads)) return 0;
+        rows = box_h / 2;
+    }
+    else if (displayScale == 2 && bayerScale == 2)
+    {
+        if (bw != out_w || bh > out_h) return 0;
+        uint16_t * debayered = mlv_ensure_thread_reduced_recon_rgb_a(bayer_rgb_words);
+        if (!debayered) return 0;
+        debayerBasicU16RecordingKernelMilliseconds(debayered, bayer, bw, bh, threads, bit_shift);
+        debayer_reduced_hchroma121_rgb16(out, debayered, bw, bh, threads);
+        rows = bh;
+    }
+    else
+    {
+        if (bw != out_w || bh > out_h) return 0;
+        debayerBasicU16RecordingKernelMilliseconds(out, bayer, bw, bh, threads, bit_shift);
+        rows = bh;
+    }
+    /* Rows the kernel's block crop dropped repeat the last reconstructed row,
+     * as in the v3 core. */
+    const size_t row_words = (size_t)out_w * 3u;
+    const uint16_t * last_row = out + (size_t)(rows - 1) * row_words;
+    for (int y = rows; y < out_h; ++y)
+    {
+        memcpy(out + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
+    }
+    return 1;
+}
+
 int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     uint64_t frameIndex,
                                                     const uint16_t * reducedReconnedRaw,
@@ -6761,7 +6850,8 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
     if (full_w <= 0 || full_h <= 0 || frameIndex >= getMlvFrames(video)) return 0;
     const int out_w = full_w / reconScale;
     const int out_h = full_h / reconScale;
-    if (reducedWidth != out_w || reducedHeight <= 0 || reducedHeight > out_h) return 0;
+    const int bayer_scale = mlv_reduced_recon_bayer_scale(full_w, reducedWidth, reconScale);
+    if (bayer_scale == 0 || reducedHeight <= 0 || reducedHeight > full_h / bayer_scale) return 0;
     /* The reduced recon is debayered bilinear, the debayer this route runs at
      * full resolution with type 0; any other debayer stays full resolution. */
     if (doesMlvAlwaysUseAmaze(video) != 0) return 0;
@@ -6778,16 +6868,13 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
     const int bit_shift = (reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel))
                         + g_mlv_debayered16_reduced_bit_shift_error_for_testing;
     /* debayerBasicU16 applies a nonzero bit shift to its input in place; the
-     * caller's reduced Bayer is not read again after this frame. */
-    debayerBasicU16RecordingKernelMilliseconds(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
-                    getMlvCpuCores(video), bit_shift);
-    /* Rows the kernel's block crop dropped repeat the last reconstructed row,
-     * as getMlvProcessedFrame8ScaledFromReducedReconnedRaw16 does. */
-    const size_t row_words = (size_t)out_w * 3u;
-    const uint16_t * last_row = outputFrame + (size_t)(reducedHeight - 1) * row_words;
-    for (int y = reducedHeight; y < out_h; ++y)
+     * caller's reduced Bayer is not read again after this frame. The helper pads
+     * the rows the kernel's block crop dropped, as the processed8 consumer does. */
+    if (!mlv_reduced_bayer_to_display_rgb16(outputFrame, (uint16_t *)reducedReconnedRaw, reducedWidth,
+                                            reducedHeight, bayer_scale, reconScale, out_w, out_h,
+                                            getMlvCpuCores(video), bit_shift))
     {
-        memcpy(outputFrame + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
+        return 0;
     }
     if (outWidth) *outWidth = out_w;
     if (outHeight) *outHeight = out_h;
@@ -8768,6 +8855,13 @@ static int mlv_dualiso_preview_scale_recon_plan_internal(mlvObject_t * video,
      * fringes and a shifted picture against the paused frame at x2/x4). x8 keeps
      * its decimator: the tent supports 2 and 4 only. */
     plan->phaseTentShrink = (scale == 2 || scale == 4) ? 1 : 0;
+    /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the CPU plan at x4 shrinks and
+     * reconstructs at x2 (its consumers debayer there, take the chroma-only [1 2 1]
+     * and box to x4); sourceHeight keeps the x4 block crop, so the box reads whole
+     * row pairs. The GPU plan and x2 / x8 shrink at the display scale. */
+    plan->bayerScale = (!gpu && scale == 4) ? 2 : scale;
+    plan->bayerWidth = full_w / plan->bayerScale;
+    plan->bayerHeight = source_h / plan->bayerScale;
     return 1;
 }
 
@@ -8834,36 +8928,36 @@ int mlvDualIsoPreviewScaleReconShrink(mlvObject_t * video,
     int out_w = 0;
     int out_h = 0;
     int rc = -1;
-    if (plan->phaseTentShrink && (plan->scale == 2 || plan->scale == 4))
+    if (plan->phaseTentShrink && (plan->bayerScale == 2 || plan->bayerScale == 4))
     {
         rc = pl_downsample_bayer_to_bayer_phase_tent(fullRaw, full_w, plan->sourceHeight,
-                                                     reducedOut, plan->scale,
+                                                     reducedOut, plan->bayerScale,
                                                      &out_w, &out_h, threads);
         const double ms = (mlv_stage_timing_now() - downsample_start) * 1000.0;
-        if (rc == 0 && out_w == plan->reducedWidth && out_h == plan->reducedHeight)
+        if (rc == 0 && out_w == plan->bayerWidth && out_h == plan->bayerHeight)
         {
             __atomic_fetch_add(&g_mlv_phase_tent_shrink_frames, 1, __ATOMIC_RELAXED);
             __atomic_fetch_add(&g_mlv_phase_tent_shrink_micros,
                                (uint64_t)(ms * 1000.0 + 0.5), __ATOMIC_RELAXED);
         }
     }
-    else if (plan->scale == 2)
+    else if (plan->bayerScale == 2)
     {
         rc = pl_downsample_bayer_to_bayer_2x(fullRaw, full_w, plan->sourceHeight,
                                              reducedOut, &out_w, &out_h, threads);
     }
-    else if (plan->scale == 4)
+    else if (plan->bayerScale == 4)
     {
         rc = pl_downsample_bayer_to_bayer_4x(fullRaw, full_w, plan->sourceHeight,
                                              reducedOut, &out_w, &out_h, threads);
     }
-    else if (plan->scale == 8)
+    else if (plan->bayerScale == 8)
     {
         rc = pl_downsample_bayer_to_bayer_8x(fullRaw, full_w, plan->sourceHeight,
                                              reducedOut, &out_w, &out_h, threads);
     }
     if (downsampleMs) *downsampleMs = (mlv_stage_timing_now() - downsample_start) * 1000.0;
-    if (rc != 0 || out_w != plan->reducedWidth || out_h != plan->reducedHeight)
+    if (rc != 0 || out_w != plan->bayerWidth || out_h != plan->bayerHeight)
     {
         return mutated ? -1 : 0;
     }
@@ -8887,9 +8981,9 @@ static int mlv_dualiso_preview_scale_recon_run_internal(mlvObject_t * video,
     const int mutated = shrunk == 2;
 
     const size_t reduced_bytes =
-        (size_t)plan->reducedWidth * (size_t)plan->reducedHeight * sizeof(uint16_t);
+        (size_t)plan->bayerWidth * (size_t)plan->bayerHeight * sizeof(uint16_t);
     if (!applyLLRawProcObjectWorker_with_dims(video, reducedOut, reduced_bytes,
-                                              plan->reducedWidth, plan->reducedHeight,
+                                              plan->bayerWidth, plan->bayerHeight,
                                               worker,
                                               LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED
                                               | LLRP_WITH_DIMS_NO_PUBLISH
@@ -8974,11 +9068,14 @@ int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
     const int out_h = (normalizedScale > 1) ? (full_h / normalizedScale) : full_h;
     const uint64_t rgb_frame_size = (uint64_t)out_w * (uint64_t)out_h * 3u;
     uint16_t * rgb = (normalizedScale > 1) ? mlv_ensure_thread_scaled_input_buffer(rgb_frame_size) : NULL;
+    /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedWidth x reducedHeight are the
+     * reduced Bayer's dims (x2 for an x4 recon). */
+    const int bayer_scale = mlv_reduced_recon_bayer_scale(full_w, reducedWidth, reconScale);
     if (!rgb
      || normalizedScale != reconScale
-     || reducedWidth != out_w
+     || bayer_scale == 0
      || reducedHeight <= 0
-     || reducedHeight > out_h
+     || reducedHeight > full_h / bayer_scale
      || !mlv_can_use_direct_processed_frame8_path(video)
      || !processingCanUseDirect8BitOutput(video->processing))
     {
@@ -8989,14 +9086,13 @@ int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
 
     const double debayer_start = mlv_stage_timing_now();
     const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
-    debayerBasicU16RecordingKernelMilliseconds(rgb, reducedReconnedRaw, reducedWidth, reducedHeight, threads, bit_shift);
-    /* Rows the kernel's block crop dropped repeat the last reconstructed row,
-     * as in the v3 core. */
-    const size_t row_words = (size_t)out_w * 3u;
-    const uint16_t * last_row = rgb + (size_t)(reducedHeight - 1) * row_words;
-    for (int y = reducedHeight; y < out_h; ++y)
+    /* The helper pads the rows the kernel's block crop dropped (v3 core). */
+    if (!mlv_reduced_bayer_to_display_rgb16(rgb, (uint16_t *)reducedReconnedRaw, reducedWidth, reducedHeight,
+                                            bayer_scale, reconScale, out_w, out_h, threads, bit_shift))
     {
-        memcpy(rgb + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
+        processingSetPlaybackAggressivePreviewMode(previous_aggressive_preview_mode);
+        processingSetPlaybackPreviewMode(previous_preview_mode);
+        return 0;
     }
     g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
     mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
