@@ -6982,6 +6982,14 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             $res.rows++
             $prev = $cur; $prevMs = $nowMs; $from = $lo; $ck.maxStep = 0.0
         }
+        # adversary 88e10edc A1: a clock step observed after the last row (a poll before the stop file, the deadline or the parent check ended the
+        # loop) must not be dropped with the loop: when it is past the witness limit (25 ms) one tail row carries it, with no values, so the
+        # witness refuses the window instead of finding every written row steady.
+        $tl = Read-UtilSampleClock $ck $w $UtcTicks
+        if ([double]$ck.maxStep -gt 25) {
+            $ub = $u8.GetBytes("$($tl.ToString('o', $inv)),,,,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),,`n")
+            $uf.Write($ub, 0, $ub.Length); $uf.Flush()
+        }
     } finally { $uf.Dispose() }
     if ($null -ne $gHeld) {
         try { if ($res.endedBy -cne 'stop-file' -and -not $gHeld.HasExited) { $gHeld.Kill(); $res.gpuKilled = $true } } catch { }

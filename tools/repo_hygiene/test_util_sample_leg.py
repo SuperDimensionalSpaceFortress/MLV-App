@@ -755,6 +755,20 @@ $utilSampleGpuStart = [ordered]@{ status = 'running'; proc = $a3g; owned = $fals
 $script:utilSampleStopRecord = $a3first; $script:utilSampleStopped = Test-UtilSampleStopped $a3first; $script:utilSamplePublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new()
 $a3firstOwned = [bool](Test-UtilSampleCpuOwned $utilSampleCpuStart $a3first)
 . ([scriptblock]::Create($a3finally))
+# ---- adversary 88e10edc A1 (scaled): two rows are written on a steady clock; right after row 2's closing clock read the wall clock steps back
+# 100 ms and the stop file appears, so the next poll's clock read observes the step and the stop-file check ends the loop before another row. At
+# 88e10edc that pending step was dropped with the loop: every written row was steady and the witness verified the window (null)
+$script:e1sq = 0; $script:e1armAt = -1; $script:e1stepped = $false; $script:e1n = 0; $e1stop = Join-Path $t 'e1.stop'
+$e1clock = { $script:e1sq++
+    if ($script:e1armAt -gt 0 -and $script:e1sq -ge $script:e1armAt -and -not $script:e1stepped) { $script:e1stepped = $true; [IO.File]::WriteAllText($e1stop, 'stop') }
+    if ($script:e1stepped) { [DateTime]::UtcNow.Ticks - 1000000 } else { [DateTime]::UtcNow.Ticks } }
+$e1snap = { param($br, $sw) $script:e1n++; if ($script:e1n -eq 3) { $script:e1armAt = $script:e1sq + 3 }; if ($null -ne $br -and $null -ne $sw) { $br['a'] = $sw.Elapsed.TotalMilliseconds; $br['b'] = $br['a'] }; @{} }
+$e1res = Invoke-UtilSampleCpuLoop (Join-Path $t 'e1.csv') $e1stop 'no-such-process-name-xyz' 200 5000 { 5 } 0 0 0 0 $e1clock '' $e1snap
+$e1p = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText((Join-Path $t 'e1.csv')))
+$e1rows = @($e1p.rows)
+$e1w = $(if ($e1rows.Count -ge 2) { [ordered]@{ startUtc = $e1rows[0].fromUtc; endUtc = $e1rows[1].utc } })
+$r['e1A1'] = @{ endedBy = $e1res.endedBy; stepped = $script:e1stepped; realRows = @($e1rows | Where-Object { $null -ne $_.total }).Count
+    witness = $(if ($e1w) { Get-UtilSampleClockWitness $e1p $run $e1w } else { 'no-window' }) }
 $r['c0A3'] = @{ firstGpuStopped = [bool]$a3first.gpu.stopped; firstOwned = $a3firstOwned; stopped = [bool]$utilSampleStopped; kills = $script:a3kills
     cpuEarly = [bool]$utilSampleStopRecord.cpu.exitedBeforeStop; owned = [bool](Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord); published = @($script:y2pubs) }
 # ---- sol r6 key B2 (adversary 25d5c970 A2, exact case, in-memory double): endedBy=deadline, GpuPid=1234, GpuStartTicks=639293111400000000. A pid
@@ -1068,6 +1082,12 @@ class UtilSamplePureHelperTests(unittest.TestCase):
                          "a pid whose start time is not the sampler's is never held or killed")
         self.assertEqual((b2["stopFile"]["endedBy"], b2["stopFile"]["killed"], b2["stopFile"]["held"]), ("stop-file", [], 0),
                          "a stop-file end kills nothing and releases the handle")
+
+    def test_adv_88e10edc_a1_a_step_seen_after_the_last_row_is_not_dropped_with_the_loop(self) -> None:
+        # exact class (scaled): at 88e10edc the step observed by the poll that saw the stop file was discarded, and the witness said verified (None)
+        e1 = self.r["e1A1"]
+        self.assertEqual((e1["endedBy"], e1["stepped"], e1["realRows"]), ("stop-file", True, 2), f"the probe did not build the finding's shape: {e1}")
+        self.assertEqual(e1["witness"], "sample-clock-unverified", f"a step seen after the last row left the window verified: {e1}")
 
     def test_adv_c0d9d471_a3_the_finally_retry_keeps_a_cpu_child_that_already_stopped_cleanly(self) -> None:
         # exact case: at c0d9d471 the retry re-stopped the exited child (exitedBeforeStop=true) and the finally published nothing
