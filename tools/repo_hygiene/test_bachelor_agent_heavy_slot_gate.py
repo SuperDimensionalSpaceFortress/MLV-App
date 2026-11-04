@@ -315,6 +315,10 @@ def _fifo_capture_io_region(fifo: str) -> str:
     return fifo[begin:fifo.index("# END bounded capture io")]
 
 
+# sol r12 B1: what a forced end of a pwsh process looks like in code. Neither the bounded capture helpers nor the proof of their exit may use it.
+_FORCED_EXIT = re.compile(r"(?im)Environment\]?::Exit|Environment\.Exit|Environment\.FailFast|SetShouldExit|(?:^|[;{}])\s*exit\b")
+
+
 def _code_lines(text: str) -> list[str]:
     """Agent lines with full-line comments dropped (pins are about code, not prose)."""
     return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
@@ -1515,12 +1519,13 @@ class BoundedCaptureIoTests(unittest.TestCase):
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$two = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task; [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
                   "$none = { param($p) }\n"
-                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
-                  "Write-Output ('READ-TWO|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $two))\n"
-                  "Write-Output ('READ-NONE|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $none))\n"
-                  "Write-Output ('DEL-TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $two))\n"
-                  "Write-Output ('DEL-NONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $none))\n"
-                  "Write-Output ('FAST|' + ($sw.ElapsedMilliseconds -lt 5000))\n")
+                  # r13 (sol r12 B1): each seam call starts its own worker process (~1 s), so the 5 s ceiling is per call, not for all four.
+                  "$fast = $true; $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "Write-Output ('READ-TWO|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $two)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000; $sw.Restart()\n"
+                  "Write-Output ('READ-NONE|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $none)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000; $sw.Restart()\n"
+                  "Write-Output ('DEL-TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $two)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000; $sw.Restart()\n"
+                  "Write-Output ('DEL-NONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $none)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000\n"
+                  "Write-Output ('FAST|' + $fast)\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         for label in ("READ-TWO", "READ-NONE"):
@@ -1571,12 +1576,12 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # adversary r10 A1 (major): the elapsed check ran BEFORE the completed task's result was turned into text, so a result whose
         # conversion spent the bound (a 200000-element array took 286 ms under a 50 ms bound) still returned Ok / an "incomplete" note.
         # The slow ToString makes the conversion cost deterministic. The check is the LAST step before a success is returned.
-        # r12 (sol r11 B2): the factory and the conversion run in the worker's own runspace, so the slow ToString is a compiled type
-        # (Add-Type is process wide and its cost does not depend on a PowerShell session).
-        script = ("Add-Type -TypeDefinition 'public class SlowText { public override string ToString() { System.Threading.Thread.Sleep(300); return \"payload\"; } }'\n"
-                  + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        # r13 (sol r12 B1): the factory and the conversion run in a worker PROCESS, so the slow type is defined inside the factory itself
+        # (a PowerShell class: no compile, and a type of the calling process is not visible in the worker).
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"   # native path (r11): see the leaf-name guard test
-                  "$slow = { param($p) [Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
+                  "$slow = { param($p) class SlowText { [string] ToString() { [Threading.Thread]::Sleep(300); return 'payload' } }; "
+                  "[Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
                   "$r = Read-CapturedResult $p 100 $slow\n"
                   "Write-Output ('SLOW-READ|' + $r.Ok + '|' + $r.Text)\n"
                   "Write-Output ('SLOW-DEL|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 100 $slow))\n"
@@ -1630,11 +1635,12 @@ class BoundedCaptureIoTests(unittest.TestCase):
         # sol r11 B1: Get-CaptureTaskResult asked the RUNTIME type whether it is generic. A class derived from Task<string> is not
         # (IsGenericType is False) yet carries a real result, so the reader returned Ok with empty text and the cleanup reported success
         # over 'still present: a.txt'. The generic base is now found by walking the BaseType chain. The ordinary Task<string> is the control.
-        script = ("Add-Type -TypeDefinition 'public class DerivedTextTask : System.Threading.Tasks.Task<string> { public DerivedTextTask(string r) : base(() => r) {} }'\n"
-                  + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        # r13 (sol r12 B1): the derived type is defined inside each factory (the factory runs in a worker process of its own).
+        derived_type = "class DerivedTextTask : System.Threading.Tasks.Task[string] { DerivedTextTask([Func[string]]$f) : base($f) {} }; "
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                  "$derived = { param($p) $t = [DerivedTextTask]::new('payload'); $t.RunSynchronously(); $t }\n"
-                  "$derivedDel = { param($p) $t = [DerivedTextTask]::new('still present: a.txt'); $t.RunSynchronously(); $t }\n"
+                  "$derived = { param($p) " + derived_type + "$t = [DerivedTextTask]::new([Func[string]]{ 'payload' }); $t.RunSynchronously(); $t }\n"
+                  "$derivedDel = { param($p) " + derived_type + "$t = [DerivedTextTask]::new([Func[string]]{ 'still present: a.txt' }); $t.RunSynchronously(); $t }\n"
                   "$plain = { param($p) [Threading.Tasks.Task]::FromResult('payload') }\n"
                   "$plainDel = { param($p) [Threading.Tasks.Task]::FromResult('still present: a.txt') }\n"
                   "Write-Output ('DERIVED-TYPE|' + (& $derived $p).GetType().IsGenericType)\n"
@@ -1654,26 +1660,28 @@ class BoundedCaptureIoTests(unittest.TestCase):
 
     # sol r11 B2: a synchronous factory, and the synchronous conversion of the result, used to run on the caller's thread, so the elapsed
     # check classified an expiry only AFTER they returned (a 1 ms bound returned after 386 ms; Thread.Sleep(Infinite) never returned). The
-    # ceilings below are generous on purpose: the operation takes 4 s, the bound is 50 ms and the call must be back inside 2.5 s.
-    _SLOW_TEXT_TYPE = ("Add-Type -TypeDefinition 'public class Slow4sText { public override string ToString() "
-                       "{ System.Threading.Thread.Sleep(4000); return \"payload\"; } }'\n")
+    # ceilings below are generous on purpose: the operation takes 20 s, the bound is 50 ms and the call must be back inside 10 s.
+    # r13 (sol r12 B1): each call now also starts a worker process (~1 s) before its clock, so the operation and the ceiling were scaled
+    # together (4 s / 2.5 s -> 20 s / 10 s): the call is still back long before the operation could have finished. The slow type is a
+    # PowerShell class defined inside the factory, because the factory runs in the worker process.
+    _SLOW_TEXT_TYPE = "class Slow20sText { [string] ToString() { [Threading.Thread]::Sleep(20000); return 'payload' } }; "
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_synchronous_factory_or_result_conversion_that_outlasts_the_bound_returns_the_named_timeout_inside_a_generous_ceiling(self) -> None:
-        script = (self._SLOW_TEXT_TYPE + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                  "$slowFactory = { param($p) [Threading.Thread]::Sleep(4000); [Threading.Tasks.Task]::FromResult('payload') }\n"
-                  "$slowFactoryDel = { param($p) [Threading.Thread]::Sleep(4000); [Threading.Tasks.Task]::FromResult('') }\n"
-                  "$slowConv = { param($p) [Threading.Tasks.Task]::FromResult([object][Slow4sText]::new()) }\n"
+                  "$slowFactory = { param($p) [Threading.Thread]::Sleep(20000); [Threading.Tasks.Task]::FromResult('payload') }\n"
+                  "$slowFactoryDel = { param($p) [Threading.Thread]::Sleep(20000); [Threading.Tasks.Task]::FromResult('') }\n"
+                  "$slowConv = { param($p) " + self._SLOW_TEXT_TYPE + "[Threading.Tasks.Task]::FromResult([object][Slow20sText]::new()) }\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "$r = Read-CapturedResult $p 50 $slowFactory\n"
-                  "Write-Output ('FACTORY-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "Write-Output ('FACTORY-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n"
                   "$sw.Restart(); $n = Remove-CaptureFiles @($p) 50 $slowFactoryDel\n"
-                  "Write-Output ('FACTORY-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "Write-Output ('FACTORY-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n"
                   "$sw.Restart(); $r = Read-CapturedResult $p 50 $slowConv\n"
-                  "Write-Output ('CONV-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
+                  "Write-Output ('CONV-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n"
                   "$sw.Restart(); $n = Remove-CaptureFiles @($p) 50 $slowConv\n"
-                  "Write-Output ('CONV-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n")
+                  "Write-Output ('CONV-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("FACTORY-READ|False|<read timed out: a.txt not readable within 50 ms>|True", proc.stdout)
@@ -1681,28 +1689,58 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertRegex(proc.stdout, r"FACTORY-DEL\|capture cleanup abandoned after 0\.05 s: .*a\.txt\|True")
         self.assertRegex(proc.stdout, r"CONV-DEL\|capture cleanup abandoned after 0\.05 s: .*a\.txt\|True")
 
-    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
-    def test_a_factory_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits(self) -> None:
-        # sol r11 B2: Thread.Sleep(Infinite) in an accepted factory prevented the named verdict entirely. The worker is abandoned, not joined.
-        # A worker that can never be stopped still holds its runspace, and pwsh waits for every open runspace when it shuts down on its own,
-        # so a caller that abandons one ends its process with [Environment]::Exit (the test seam only; the default path has no worker).
+    # sol r12 B1: an accepted factory, or a result conversion, that NEVER returns. r12 ran it in an in-process runspace: the helper returned
+    # its named timeout, but the abandoned runspace stayed open inside ps.Invoke and ordinary pwsh shutdown (which disposes every open
+    # runspace and stops its pipeline) blocked forever; the r12 test hid that with [Environment]::Exit(0). Each case is now a child pwsh that
+    # runs ONE caller and then simply reaches the end of its script. It must print the named timeout AND end on its own inside the ceiling;
+    # run_bounded kills it and fails the case by name if it does not. No forced exit of any kind is in the script.
+    _NEVER_ENDING_PROCESS_CEILING_SEC = 30
+    _FOREVER_FACTORY = "{ param($p) [Threading.Thread]::Sleep([Threading.Timeout]::Infinite); [Threading.Tasks.Task]::FromResult('x') }"
+    _FOREVER_CONVERSION = ("{ param($p) class ForeverText { [string] ToString() { [Threading.Thread]::Sleep([Threading.Timeout]::Infinite); return 'x' } }; "
+                           "[Threading.Tasks.Task]::FromResult([object][ForeverText]::new()) }")
+
+    def _never_ending_case(self, case: str, call: str, factory: str) -> str:
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                  "$forever = { param($p) [Threading.Thread]::Sleep([Threading.Timeout]::Infinite); [Threading.Tasks.Task]::FromResult('x') }\n"
+                  f"$forever = {factory}\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
-                  "$r = Read-CapturedResult $p 200 $forever\n"
-                  "Write-Output ('FOREVER-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
-                  "$sw.Restart(); $n = Remove-CaptureFiles @($p) 200 $forever\n"
-                  "Write-Output ('FOREVER-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 2500))\n"
-                  "[Environment]::Exit(0)\n")
-        proc = self._pwsh(script)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("FOREVER-READ|False|<read timed out: a.txt not readable within 200 ms>|True", proc.stdout)
-        self.assertRegex(proc.stdout, r"FOREVER-DEL\|capture cleanup abandoned after 0\.2 s: .*a\.txt\|True")
+                  f"{call}\n"
+                  "Write-Output ('ELAPSED-OK|' + ($sw.ElapsedMilliseconds -lt 15000))\n")
+        code_lines = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith(("#", "//")))
+        self.assertNotRegex(code_lines, _FORCED_EXIT, "the proof must end its process the ordinary way")
+        code, out, err = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                                     self._NEVER_ENDING_PROCESS_CEILING_SEC, case)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ELAPSED-OK|True", out, out + err)
+        return out
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_factory_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits(self) -> None:
+        out = self._never_ending_case("forever-factory-reader", "$r = Read-CapturedResult $p 200 $forever; Write-Output ('FOREVER-READ|' + $r.Ok + '|' + $r.Text)",
+                                      self._FOREVER_FACTORY)
+        self.assertIn("FOREVER-READ|False|<read timed out: a.txt not readable within 200 ms>", out)
+        out = self._never_ending_case("forever-factory-cleanup", "Write-Output ('FOREVER-DEL|' + (Remove-CaptureFiles @($p) 200 $forever))",
+                                      self._FOREVER_FACTORY)
+        self.assertRegex(out, r"FOREVER-DEL\|capture cleanup abandoned after 0\.2 s: .*a\.txt")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_result_conversion_that_never_returns_still_gets_the_named_timeout_and_the_process_still_exits(self) -> None:
+        out = self._never_ending_case("forever-conversion-reader", "$r = Read-CapturedResult $p 200 $forever; Write-Output ('FOREVER-READ|' + $r.Ok + '|' + $r.Text)",
+                                      self._FOREVER_CONVERSION)
+        self.assertIn("FOREVER-READ|False|<read timed out: a.txt not readable within 200 ms>", out)
+        out = self._never_ending_case("forever-conversion-cleanup", "Write-Output ('FOREVER-DEL|' + (Remove-CaptureFiles @($p) 200 $forever))",
+                                      self._FOREVER_CONVERSION)
+        self.assertRegex(out, r"FOREVER-DEL\|capture cleanup abandoned after 0\.2 s: .*a\.txt")
+
+    def test_the_bounded_capture_region_never_forces_its_process_to_exit(self) -> None:
+        # sol r12 B1 acceptance: the fix must not be a forced exit in the helpers either.
+        region = _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii"))
+        code_lines = "\n".join(line for line in region.splitlines() if not line.lstrip().startswith(("#", "//")))
+        self.assertNotRegex(code_lines, _FORCED_EXIT)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_factory_the_worker_cannot_run_is_a_named_failure_not_a_hang_or_a_success(self) -> None:
-        # r12: the factory runs in its own runspace, so it must be self-contained. A variable of the calling scope, a missing type and a
+        # r12/r13: the factory runs in its own worker process, so it must be self-contained. A variable of the calling scope, a missing type and a
         # throw are all named failures (the same <read failed: ...> / cleanup failed note), never a hang or a success.
         script = ("$callerOnly = 'x'\n" + _fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
