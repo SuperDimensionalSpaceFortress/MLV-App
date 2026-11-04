@@ -1062,6 +1062,8 @@ function Complete-StartedMarker {
 
     $marker = Read-JsonFile -Path $MarkerPath
     if ($null -eq $marker) {
+        # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: a marker that is there but cannot be read now is not retired, and is never silently left behind.
+        if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) { Set-MarkerRetireQuarantine -JobId ([IO.Path]::GetFileName($MarkerPath) -replace '\.started\.json$', '') -Why "status=${Status}: the marker cannot be read" }
         return
     }
     # r2d: retire a marker only once its result is really on disk. A result whose ONE rename failed (PROMOTE FAILED,
@@ -1082,7 +1084,35 @@ function Complete-StartedMarker {
     # r2d: this write supersedes this agent's older pending tmp; a failed one stays on disk as the newest record.
     if ($w.ok) { Clear-OwnPendingMarkerTmp -Path $MarkerPath } elseif ($w.tmp) { Set-OwnPendingMarkerTmp -Path $MarkerPath -Tmp $w.tmp }
     $dest = Join-Path $processed ("{0}.started.{1}.json" -f $marker.jobId, $Status)
-    Move-Item -Force -LiteralPath $MarkerPath -Destination $dest
+    # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: this was an unchecked Move-Item. A reader holding the marker without delete sharing (um-run.ps1's
+    # Get-Content, or a handle a network flap left open on the share) denies the replacing rename above AND this move. Under the agent's Continue
+    # error policy both failures ran straight on, silently: the caller then moved the job out of inbox\, so nothing ever looked at the marker
+    # again, and <id>.started.json plus its completion tmp stayed in running\ with the result published (2026-11-04: GATE_BUSY for 2.4 h).
+    $mv = Move-FileChecked -Source $MarkerPath -Destination $dest -Overwrite $true
+    if (-not $mv.ok) {
+        # The result is on disk and the final marker holds the rest, so this agent's own completion tmp records nothing recovery needs; removing
+        # it keeps one retry per poll from piling up set-aside records while the reader stays. A kill now leaves marker + result: start-up retires it.
+        Clear-OwnPendingMarkerTmp -Path $MarkerPath
+        Set-MarkerRetireQuarantine -JobId ([string]$marker.jobId) -Why "status=${Status}: the marker could not be moved to processed\ after $($mv.attempts) attempts: $($mv.error)"
+        return
+    }
+    # The marker moved, but its replacing rename may not have landed: then the completed record is still the tmp, and it is the one to keep.
+    if ($w.tmp) {
+        $mt = Move-FileChecked -Source $w.tmp -Destination $dest -Overwrite $true
+        if ($mt.ok) { $script:OwnPendingMarkerTmp.Remove($MarkerPath) }
+        else { Add-AgentLogLine "completed record not kept job=$($marker.jobId) $($w.tmp) $($mt.error)" }
+    }
+    # Nothing of this agent's stays pending for a retired marker. One this cannot remove is retired by Invoke-LiveMarkerReconcile on the next poll.
+    Clear-OwnPendingMarkerTmp -Path $MarkerPath
+}
+
+function Set-MarkerRetireQuarantine {
+    # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: a marker that could not be retired stays in running\ and goes to the retry Invoke-QuarantineReconcile
+    # runs every poll. One log line when it enters quarantine, not one per retry; Resolve-JobRecovery logs any change of reason from there on.
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Why)
+    if ($script:RecoveryQuarantine.ContainsKey($JobId)) { return }
+    Add-AgentLogLine "marker kept job=${JobId}: $Why; quarantined until recovery retires it"
+    $script:RecoveryQuarantine[$JobId] = $Why
 }
 
 function Set-OwnPendingMarkerTmp {
@@ -1804,6 +1834,9 @@ function Resolve-JobRecovery {
         if ($fa.state -eq "ok") {
             $null = Resolve-StartedMarkerFile -Marker $fa.marker -MarkerPath $final
             $left = Get-JobRecoveryPending -JobId $JobId -IgnoreQuarantine
+            # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: this agent's own unlaunched claim reads as admissible above, but with its result published the marker
+            # should be gone by now. Still here means its retire failed, so it stays quarantined and is retried, not released with the marker left behind.
+            if (-not $left -and (Test-Path -LiteralPath (Join-Path $outbox "$JobId.result.json") -PathType Leaf) -and (Test-Path -LiteralPath $final -PathType Leaf)) { $left = "its result is published but its marker could not be retired" }
             if ($left) { $ok = $false; $script:LastRecoveryWhy = "recovery ran but left: $left" }
         }
         elseif ($fa.state -ne "missing") { $ok = $false; $script:LastRecoveryWhy = "final marker $($fa.state): $($fa.why)" }
@@ -1826,15 +1859,38 @@ function Invoke-QuarantineReconcile {
     foreach ($id in @($script:RecoveryQuarantine.Keys)) { $null = Resolve-JobRecovery -JobId $id }
 }
 
-function Resolve-StartedMarkers {
-    # r2d: every job with ANY marker artifact in running\ -- a final marker, a tmp, or one that cannot be read -- is
-    # reconciled at startup; one that cannot be is QUARANTINED (Resolve-JobRecovery) and retried every poll.
+function Get-RunningMarkerJobIds {
+    # Every job with a marker artifact in running\: a final marker or an unresolved tmp, sorted. A set-aside record is resolved and is not listed.
     $ids = [System.Collections.Generic.SortedSet[string]]::new([StringComparer]::Ordinal)
     foreach ($f in @(Get-ChildItem -LiteralPath $running -Filter *.started.json -File -ErrorAction SilentlyContinue)) {
         if ($f.Name -like "*.started.json") { [void]$ids.Add($f.Name.Substring(0, $f.Name.Length - ".started.json".Length)) }
     }
     foreach ($t in @((Get-MarkerTempFiles).items)) { [void]$ids.Add($t.JobId) }
-    foreach ($id in $ids) { $null = Resolve-JobRecovery -JobId $id }
+    return @($ids)
+}
+
+function Resolve-StartedMarkers {
+    # r2d: every job with ANY marker artifact in running\ -- a final marker, a tmp, or one that cannot be read -- is
+    # reconciled at startup; one that cannot be is QUARANTINED (Resolve-JobRecovery) and retried every poll.
+    foreach ($id in @(Get-RunningMarkerJobIds)) { $null = Resolve-JobRecovery -JobId $id }
+}
+
+function Invoke-LiveMarkerReconcile {
+    # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: defence in depth, every poll of the live loop. A marker artifact whose job has a published result and is
+    # not live is a leak: Wait-VenueQuiet counts it, so every quiet probe reads GATE_BUSY until the agent restarts. Complete-StartedMarker now catches
+    # its own failures; this catches a leak from any other route, including an agent that deployed before that fix.
+    #   live    a job whose script is still in inbox\ is this agent's live set: queued, held at the gate, running (Move-JobArtifacts is its last step), or
+    #           left queued after a refused launch. Never touched here; the inbox loop owns it. The loop is single-threaded and this runs between jobs.
+    #   no result  NOT touched: an unfinished job's recovery (adopt, orphan, re-queue) stays start-up only.
+    #   quarantined  left to Invoke-QuarantineReconcile, which already retries it every poll.
+    foreach ($id in @(Get-RunningMarkerJobIds)) {
+        if ($script:RecoveryQuarantine.ContainsKey($id)) { continue }
+        if (Test-Path -LiteralPath (Join-Path $inbox "$id.job.ps1") -PathType Leaf) { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $outbox "$id.result.json") -PathType Leaf)) { continue }
+        # The start-up path: settle the tmps (Resolve-JobMarkerTemps), then complete the marker (Complete-StartedMarker). A failure quarantines the job.
+        $settled = Resolve-JobRecovery -JobId $id
+        Add-AgentLogLine "live marker reconcile job=${id}: result published, job not live; $(if ($settled) { 'marker artifacts retired' } else { "quarantined: $($script:RecoveryQuarantine[$id])" })"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -4424,6 +4480,8 @@ try {
         Update-LeaseBatchHold
         # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: a snapshot probe still running when its job ended is logged, or killed at its bound, from here.
         Update-LeaseSlotSnapshots
+        # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: a finished job's leaked marker artifacts are retired on the next poll, not at the next restart.
+        Invoke-LiveMarkerReconcile
 
         $jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
         if (@($jobs).Count -eq 0) { Invoke-GateIdleSample }
