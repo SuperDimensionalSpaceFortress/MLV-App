@@ -3423,6 +3423,140 @@ int mlvJpeg2kBayerLayoutIsValid(size_t frame_size, int width, int height,
     return 1;
 }
 
+#ifdef ENABLE_JPEG2K
+/* The display's sample for one decoded JPEG2K value: clamped to the uint16 range the bayer frame holds. */
+static inline uint16_t mlv_jpeg2k_display_sample(int32_t val)
+{
+    if(val < 0) val = 0;
+    if(val > 65535) val = 65535;
+    return (uint16_t)val;
+}
+
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r9: the JPEG2K display decode of one bayer frame, moved verbatim out of
+ * getMlvRawFrameUint16Direct so the source identity (mlvJpeg2kFrameSourceHash64) decodes through the SAME lines.
+ * `frame` holds frame_size bytes: the layout header (version + 4 x (offset, size)), then the four channel codestreams.
+ * On success returns 0, sets *quarter_width / *quarter_height and four malloc'd hw*hh int32 quarter pictures in channel
+ * order 0=x0y0, 1=x1y0, 2=x0y1, 3=x1y1 (the caller frees them). Any refusal (version, layout, geometry, allocation,
+ * probe or decode) returns 1 with every quarter_bufs[c] NULL. */
+static int mlv_jpeg2k_decode_bayer_quarters(const uint8_t * frame, size_t frame_size, int width, int height,
+                                            int32_t * quarter_bufs[4],
+                                            uint32_t * quarter_width, uint32_t * quarter_height)
+{
+    for(int c = 0; c < 4; c++) quarter_bufs[c] = NULL;
+    if(!frame || frame_size < MLV_JPEG2K_BAYER_HEADER_BYTES) return 1;
+
+    /* Parse bayer JPEG2K header: version + 8 u32s (offset/size for 4 channels) */
+    uint32_t hdr[9];
+    memcpy(hdr, frame, sizeof(hdr));
+    if(hdr[0] != 1)
+    {
+        DEBUG( printf("JPEG2K decoder: unsupported version of JPEG2K MLV layout.\n"); )
+        return 1;
+    }
+    uint32_t sizes[4]  = { hdr[2], hdr[4], hdr[6], hdr[8] };
+    uint32_t offsets[4] = { hdr[1], hdr[3], hdr[5], hdr[7] };
+
+    uint32_t hw = 0;
+    uint32_t hh = 0;
+    if(!mlvJpeg2kBayerLayoutIsValid(frame_size, width, height,
+                                    offsets, sizes, &hw, &hh))
+    {
+        DEBUG( printf("JPEG2K decoder: malformed channel table or geometry.\n"); )
+        return 1;
+    }
+    size_t quarter_pixels = (size_t)hw * hh;
+
+    /* Allocate 4 separate quarter buffers */
+    int alloc_ok = 1;
+    for(int c = 0; c < 4; c++)
+    {
+        quarter_bufs[c] = (int32_t *)malloc(quarter_pixels * sizeof(int32_t));
+        if(!quarter_bufs[c])
+        {
+            DEBUG( printf("JPEG2K decoder: memory allocation failed\n"); )
+            alloc_ok = 0;
+            break;
+        }
+    }
+    if(!alloc_ok)
+    {
+        for(int c = 0; c < 4; c++) { free(quarter_bufs[c]); quarter_bufs[c] = NULL; }
+        return 1;
+    }
+
+    /* Decode 4 channels in parallel into separate buffers */
+    int decode_errors[4] = { 0, 0, 0, 0 };
+    #pragma omp parallel for num_threads(4)
+    for(int c = 0; c < 4; c++)
+    {
+        const uint8_t *encoded = frame + offsets[c];
+        uint32_t enc_size = sizes[c];
+
+        void *decoder = ojph_decoder_new();
+        if(!decoder)
+        {
+            DEBUG( printf("JPEG2K decoder: failed to create decoder\n"); )
+            decode_errors[c] = 1;
+            continue;
+        }
+
+        uint32_t dw = 0, dh = 0, nc = 0, bd = 0;
+        int is_signed = 0;
+        int ret = ojph_decoder_probe(decoder, encoded, enc_size,
+                                     &dw, &dh, &nc, &bd, &is_signed);
+        if(ret != 0)
+        {
+            DEBUG( printf("JPEG2K decoder: probe failed channel %d (error %d)\n", c, ret); )
+            ojph_decoder_free(decoder);
+            decode_errors[c] = 1;
+            continue;
+        }
+
+        /* The probed geometry is attacker-controlled. It must match the
+         * quarter frame derived from RAWI exactly - decoding a larger
+         * image into quarter_bufs[c] would write out of bounds, and a
+         * smaller one would leave the scatter reading uninitialised
+         * samples. Reject either, never clamp. */
+        if(dw != hw || dh != hh || nc != 1u)
+        {
+            DEBUG( printf("JPEG2K decoder: channel %d geometry mismatch\n", c); )
+            ojph_decoder_free(decoder);
+            decode_errors[c] = 1;
+            continue;
+        }
+
+        size_t pix_count = quarter_pixels;
+        size_t decoded = ojph_decoder_decode_into(decoder, encoded, enc_size,
+                                                   quarter_bufs[c], quarter_pixels,
+                                                   &dw, &dh, &nc);
+        if(decoded == 0 || decoded != pix_count
+           || dw != hw || dh != hh || nc != 1u)
+        {
+            DEBUG( printf("JPEG2K decoder: decode failed channel %d\n", c); )
+            ojph_decoder_free(decoder);
+            decode_errors[c] = 1;
+            continue;
+        }
+
+        ojph_decoder_free(decoder);
+    }
+
+    /* Check for decode errors */
+    for(int c = 0; c < 4; c++)
+    {
+        if(decode_errors[c])
+        {
+            for(int c2 = 0; c2 < 4; c2++) { free(quarter_bufs[c2]); quarter_bufs[c2] = NULL; }
+            return 1;
+        }
+    }
+
+    *quarter_width = hw;
+    *quarter_height = hh;
+    return 0;
+}
+#endif /* ENABLE_JPEG2K */
+
 int mlvDngSequenceGeometryIsRepresentable(uint32_t width, uint32_t height,
                                           uint32_t bits_per_sample,
                                           size_t * pixel_count)
@@ -3950,115 +4084,16 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
             pthread_mutex_unlock(video->main_file_mutex + chunk);
             mlv_zero_raw_frame_slack(raw_frame, (size_t)frame_size, raw_frame_capacity); /* r6 A1 */
 
-            /* Parse bayer JPEG2K header: version + 8 u32s (offset/size for 4 channels) */
-            uint32_t hdr[9];
-            memcpy(hdr, raw_frame, sizeof(hdr));
-            if(hdr[0] != 1)
-            {
-                DEBUG( printf("JPEG2K decoder: unsupported version of JPEG2K MLV layout.\n"); )
-                free(raw_frame);
-                return 1;
-            }
-            uint32_t sizes[4]  = { hdr[2], hdr[4], hdr[6], hdr[8] };
-            uint32_t offsets[4] = { hdr[1], hdr[3], hdr[5], hdr[7] };
-
+            /* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r9: the parse, validation and 4-channel decode moved, unchanged, into
+             * mlv_jpeg2k_decode_bayer_quarters, which the source identity (mlvJpeg2kFrameSourceHash64) also calls. */
+            int32_t *quarter_bufs[4] = { NULL, NULL, NULL, NULL };
             uint32_t hw = 0;
             uint32_t hh = 0;
-            if(!mlvJpeg2kBayerLayoutIsValid((size_t)frame_size, width, height,
-                                            offsets, sizes, &hw, &hh))
+            if(mlv_jpeg2k_decode_bayer_quarters((const uint8_t *)raw_frame, (size_t)frame_size, width, height,
+                                                quarter_bufs, &hw, &hh) != 0)
             {
-                DEBUG( printf("JPEG2K decoder: malformed channel table or geometry.\n"); )
                 free(raw_frame);
                 return 1;
-            }
-            size_t quarter_pixels = (size_t)hw * hh;
-
-            /* Allocate 4 separate quarter buffers */
-            int32_t *quarter_bufs[4] = { NULL, NULL, NULL, NULL };
-            int alloc_ok = 1;
-            for(int c = 0; c < 4; c++)
-            {
-                quarter_bufs[c] = (int32_t *)malloc(quarter_pixels * sizeof(int32_t));
-                if(!quarter_bufs[c])
-                {
-                    DEBUG( printf("JPEG2K decoder: memory allocation failed\n"); )
-                    alloc_ok = 0;
-                    break;
-                }
-            }
-            if(!alloc_ok)
-            {
-                for(int c = 0; c < 4; c++) free(quarter_bufs[c]);
-                free(raw_frame);
-                return 1;
-            }
-
-            /* Decode 4 channels in parallel into separate buffers */
-            int decode_errors[4] = { 0, 0, 0, 0 };
-            #pragma omp parallel for num_threads(4)
-            for(int c = 0; c < 4; c++)
-            {
-                uint8_t *encoded = ((uint8_t *)raw_frame) + offsets[c];
-                uint32_t enc_size = sizes[c];
-
-                void *decoder = ojph_decoder_new();
-                if(!decoder)
-                {
-                    DEBUG( printf("JPEG2K decoder: failed to create decoder\n"); )
-                    decode_errors[c] = 1;
-                    continue;
-                }
-
-                uint32_t dw = 0, dh = 0, nc = 0, bd = 0;
-                int is_signed = 0;
-                int ret = ojph_decoder_probe(decoder, encoded, enc_size,
-                                             &dw, &dh, &nc, &bd, &is_signed);
-                if(ret != 0)
-                {
-                    DEBUG( printf("JPEG2K decoder: probe failed channel %d (error %d)\n", c, ret); )
-                    ojph_decoder_free(decoder);
-                    decode_errors[c] = 1;
-                    continue;
-                }
-
-                /* The probed geometry is attacker-controlled. It must match the
-                 * quarter frame derived from RAWI exactly - decoding a larger
-                 * image into quarter_bufs[c] would write out of bounds, and a
-                 * smaller one would leave the scatter reading uninitialised
-                 * samples. Reject either, never clamp. */
-                if(dw != hw || dh != hh || nc != 1u)
-                {
-                    DEBUG( printf("JPEG2K decoder: channel %d geometry mismatch\n", c); )
-                    ojph_decoder_free(decoder);
-                    decode_errors[c] = 1;
-                    continue;
-                }
-
-                size_t pix_count = quarter_pixels;
-                size_t decoded = ojph_decoder_decode_into(decoder, encoded, enc_size,
-                                                           quarter_bufs[c], quarter_pixels,
-                                                           &dw, &dh, &nc);
-                if(decoded == 0 || decoded != pix_count
-                   || dw != hw || dh != hh || nc != 1u)
-                {
-                    DEBUG( printf("JPEG2K decoder: decode failed channel %d\n", c); )
-                    ojph_decoder_free(decoder);
-                    decode_errors[c] = 1;
-                    continue;
-                }
-
-                ojph_decoder_free(decoder);
-            }
-
-            /* Check for decode errors */
-            for(int c = 0; c < 4; c++)
-            {
-                if(decode_errors[c])
-                {
-                    for(int c2 = 0; c2 < 4; c2++) free(quarter_bufs[c2]);
-                    free(raw_frame);
-                    return 1;
-                }
             }
 
             /* Scatter 4 quarter buffers into full bayer frame
@@ -4072,10 +4107,8 @@ static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, 
                 {
                     for(uint32_t x = 0; x < hw; x++)
                     {
-                        int32_t val = quarter_bufs[c][y * hw + x];
-                        if(val < 0) val = 0;
-                        if(val > 65535) val = 65535;
-                        unpackedFrame[((y * 2 + y_off) * width) + (x * 2 + x_off)] = (uint16_t)val;
+                        unpackedFrame[((y * 2 + y_off) * width) + (x * 2 + x_off)] =
+                            mlv_jpeg2k_display_sample(quarter_bufs[c][y * hw + x]);
                     }
                 }
             }
@@ -4252,31 +4285,32 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
     return status;
 }
 
-/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 (fable r7 key A2 = Dot B2): see video_mlv.h. */
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r9 (r8 adversary pass 2 A1 = Dot B2 surviving r8): see video_mlv.h. r8 hashed the bytes of
+ * each declared channel span, but OpenJPH skips main-header COM segments (ojph_codestream_local.cpp, read_headers: marker 13
+ * -> skip_marker "COM"), so two codestreams differing only in an equal-length comment decoded to one picture and got two ids.
+ * The identity is now the DECODED picture, as LJ92's is: the frame goes through the display's own decode
+ * (mlv_jpeg2k_decode_bayer_quarters) into private quarter buffers, and FNV-1a 64 runs over every sample as the display stores
+ * it (clamped to uint16, little-endian), channel 0..3, row-major. Codestream bytes are never the id; a frame the display
+ * refuses has none. */
 int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, int height, uint64_t * hashOut)
 {
 #ifdef ENABLE_JPEG2K
     if (!data || !hashOut || length < MLV_JPEG2K_BAYER_HEADER_BYTES) return 1;
-    /* the display decode's own parse (getMlvRawFrameUint16Direct, JPEG2K branch): version + 4 x (offset, size) */
-    uint32_t hdr[9];
-    memcpy(hdr, data, sizeof(hdr));
-    if (hdr[0] != 1) return 1;
-    const uint32_t sizes[4] = { hdr[2], hdr[4], hdr[6], hdr[8] };
-    const uint32_t offsets[4] = { hdr[1], hdr[3], hdr[5], hdr[7] };
+    int32_t * quarter_bufs[4] = { NULL, NULL, NULL, NULL };
     uint32_t hw = 0;
     uint32_t hh = 0;
-    if (!mlvJpeg2kBayerLayoutIsValid(length, width, height, offsets, sizes, &hw, &hh)) return 1;
-    /* what the decoder decodes: the layout version, then each channel's declared span (its size, then its bytes) in channel
-     * order. r8 pass 1 A2: NOT the span offsets -- they only say where a span lies, so the same four codestreams laid out at
-     * other offsets are the same picture; the sizes keep the concatenation unambiguous. Bytes outside the spans never count. */
+    if (mlv_jpeg2k_decode_bayer_quarters(data, length, width, height, quarter_bufs, &hw, &hh) != 0) return 1;
+    const size_t quarter_pixels = (size_t)hw * (size_t)hh;
     uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
-    hash = mlv_source_hash_fnv1a64(hash, data, 4u); /* the version word */
     for (int c = 0; c < 4; ++c)
     {
-        const uint8_t sizeBytes[4] = { (uint8_t)sizes[c], (uint8_t)(sizes[c] >> 8), (uint8_t)(sizes[c] >> 16),
-                                       (uint8_t)(sizes[c] >> 24) };
-        hash = mlv_source_hash_fnv1a64(hash, sizeBytes, sizeof(sizeBytes));
-        hash = mlv_source_hash_fnv1a64(hash, data + offsets[c], (size_t)sizes[c]);
+        for (size_t i = 0; i < quarter_pixels; ++i)
+        {
+            const uint16_t value = mlv_jpeg2k_display_sample(quarter_bufs[c][i]);
+            const uint8_t sample[2] = { (uint8_t)(value & 0xFFu), (uint8_t)(value >> 8) };
+            hash = mlv_source_hash_fnv1a64(hash, sample, 2);
+        }
+        free(quarter_bufs[c]);
     }
     *hashOut = hash;
     return 0;
@@ -4359,9 +4393,10 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
     {
         /* r8 (fable r7 key A2 = Dot B2): r7 hashed every frame_size byte, but the layout only requires each channel span to
          * lie inside the frame and the decoder reads the 36-byte header and the four spans, nothing else: two payloads that
-         * differ in an unused trailing byte decoded to one picture and got two ids. Now the frame is read as the display reads
-         * it and only the header plus the declared spans are hashed (mlvJpeg2kFrameSourceHash64, which also refuses every
-         * frame on a build without ENABLE_JPEG2K, whose display refuses it). */
+         * differ in an unused trailing byte decoded to one picture and got two ids. r9 (r8 pass 2 A1 = Dot B2): a span's own
+         * bytes are not the picture either (OpenJPH skips COM segments). The frame is read as the display reads it and decoded
+         * by the display's decode into private buffers, and the decoded picture is hashed (mlvJpeg2kFrameSourceHash64, which
+         * refuses whatever that decode refuses, and every frame on a build without ENABLE_JPEG2K, whose display refuses it). */
         uint8_t * payload = (uint8_t *)malloc(byte_count);
         if (!payload) return 1;
         pthread_mutex_lock(video->main_file_mutex + chunk);

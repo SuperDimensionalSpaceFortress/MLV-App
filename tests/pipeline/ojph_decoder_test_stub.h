@@ -19,6 +19,12 @@
  *
  * The counters exist so a test can prove that a malformed frame is rejected
  * *before* any byte of it reaches a decoder.
+ *
+ * PLAYBACK-SOURCE-FRAME-IDENTITY-1 r9: the JPEG2K source identity is the
+ * decoded picture, which only a real codestream through the real decoder can
+ * pin, so OpenJPH is now linked too, its wrapper renamed to ojph_real_*
+ * (ojph_real_codec.cpp). A test opts in with OjphRealCodecScope; the stub
+ * remains the default.
  */
 
 struct OjphStubPlan {
@@ -30,6 +36,18 @@ struct OjphStubPlan {
     /* 0 means "fill the whole capacity the caller offered and report it". */
     size_t decode_pixels = 0;
     int32_t fill_value = 1234;
+    /* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r9: when set, every ojph_* entry point forwards to the REAL OpenJPH codec
+     * (tests/pipeline/ojph_real_codec.cpp, the product wrapper under ojph_real_* names) and the fields above are
+     * ignored; the counters still count. Off by default, so every other test keeps the stub. */
+    bool real_codec = false;
+};
+
+/* r9: the real codec for the lifetime of the scope (installs a real_codec plan, restores the default stub plan). */
+struct OjphRealCodecScope {
+    OjphRealCodecScope();
+    ~OjphRealCodecScope();
+    OjphRealCodecScope(const OjphRealCodecScope &) = delete;
+    OjphRealCodecScope & operator=(const OjphRealCodecScope &) = delete;
 };
 
 /* Plan that decodes one quarter-resolution bayer channel successfully. */

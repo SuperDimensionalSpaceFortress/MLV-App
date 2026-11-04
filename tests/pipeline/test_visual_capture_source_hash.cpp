@@ -1,12 +1,15 @@
 // PLAYBACK-SOURCE-FRAME-IDENTITY-1: pins getMlvFrameSourceHash64, the source-frame identity the
 // --visual-capture-dir writer puts in visual.json (source_id per play frame, and the
 // source_difference verdict across them). It hashes the bytes the decoder reads for a frame
-// (the encoded VIDF payload at video_index[frame].frame_offset; r5: for LJ92, the picture liblj92 decodes from it), so it must be
+// (the encoded VIDF payload at video_index[frame].frame_offset; r5: for LJ92, the picture liblj92 decodes from it; r9: for
+// JPEG2K, the picture OpenJPH decodes from its four channel spans), so it must be
 // stable for one frame, differ between two frames of a moving clip, and refuse (nonzero, no
 // identity) every input it cannot answer for, which makes the writer omit the field.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
+#include "ojph_decoder_test_stub.h"
+#include "ojph_real_codec.h"
 
 #include <QByteArray>
 #include <QFile>
@@ -14,8 +17,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <initializer_list>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -943,38 +948,125 @@ TEST(VisualCaptureSourceHash, NullInputsHaveNoIdentity)
 // r8 (fable r7 key A2 = Dot B2 on 09973e83): the JPEG2K branch hashed every frame_size byte, but mlvJpeg2kBayerLayoutIsValid only
 // requires each channel span to lie inside the frame, and the display decode reads the 36-byte header and the four declared spans,
 // nothing else. The key's input: LE32[1,36,n,36+n,n,36+2n,n,36+3n,n] + C x4 + one trailing byte 00 vs 01: one picture, two ids,
-// "differ", FROZEN_DISPLAY counted=false on a static JPEG2K clip. Expected: equal ids; a changed span byte still differs.
+// "differ", FROZEN_DISPLAY counted=false on a static JPEG2K clip.
+// r9 (r8 adversary pass 2 A1 = Dot B2 surviving r8, on e139944c): a span's own bytes are not the picture either. OpenJPH skips a
+// main-header COM segment (ojph_codestream_local.cpp read_headers, marker 13 -> skip_marker "COM"), so two codestreams that differ
+// only in an equal-length comment decode to one picture, yet r8 gave them two ids. The identity is now the DECODED picture (as
+// LJ92's is). Every fixture below is a REAL codestream made by the vendored OpenJPH encoder and decoded by the real OpenJPH decoder
+// (OjphRealCodecScope; tests/pipeline/ojph_real_codec.cpp). The r8 tests that still describe true behaviour (bytes outside the spans,
+// where a span lies) are kept on real codestreams; the two that pinned span-bytes hashing (a changed span byte differs; the
+// in-memory hash is the header plus the spans) are rewritten to the decoded picture.
 namespace
 {
 
-const std::vector<uint8_t> kJ2kCodestream = {0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x2F, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44};
+// A 64x64 RAWI frame: four 32x32 quarter channels. 14-bit samples, like the adversary's input.
+constexpr uint32_t kJ2kQuarter = 32;
+constexpr int kJ2kFrameSide = 64;
+
+// A two-level quarter picture (x < 16 ? left : right): not flat, so a decode that ignored the codestream could not pass.
+std::vector<int32_t> j2kQuarterPicture(int32_t left, int32_t right)
+{
+    std::vector<int32_t> picture(kJ2kQuarter * kJ2kQuarter);
+    for (uint32_t y = 0; y < kJ2kQuarter; ++y)
+        for (uint32_t x = 0; x < kJ2kQuarter; ++x)
+            picture[y * kJ2kQuarter + x] = x < 16 ? left : right;
+    return picture;
+}
+
+// The vendored OpenJPH encoder (the product wrapper, ojph_real_*): one component, 14-bit, lossless, no decompositions.
+std::vector<uint8_t> encodeJ2kQuarter(const std::vector<int32_t> & picture)
+{
+    ASSERT_EQ(static_cast<size_t>(kJ2kQuarter) * kJ2kQuarter, picture.size());
+    void * encoder = ojph_real_encoder_new();
+    ASSERT_TRUE(encoder != nullptr);
+    ojph_real_encoder_set_image(encoder, kJ2kQuarter, kJ2kQuarter, 1, 14, 0);
+    ojph_real_encoder_set_lossless(encoder, 1);
+    ojph_real_encoder_set_decompositions(encoder, 0);
+    std::vector<uint8_t> out(65536, 0);
+    const size_t written = ojph_real_encoder_encode_into(encoder, picture.data(), out.data(), out.size());
+    ojph_real_encoder_free(encoder);
+    ASSERT_TRUE(written > 0 && written < out.size());
+    out.resize(written);
+    return out;
+}
+
+// The real OpenJPH decoder on one codestream (what the display decode runs per channel).
+std::vector<int32_t> decodeJ2kQuarter(const std::vector<uint8_t> & codestream)
+{
+    void * decoder = ojph_real_decoder_new();
+    ASSERT_TRUE(decoder != nullptr);
+    std::vector<int32_t> picture(kJ2kQuarter * kJ2kQuarter, -1);
+    uint32_t w = 0, h = 0, components = 0;
+    const size_t decoded = ojph_real_decoder_decode_into(decoder, codestream.data(), codestream.size(), picture.data(),
+                                                         picture.size(), &w, &h, &components);
+    ojph_real_decoder_free(decoder);
+    ASSERT_EQ(picture.size(), decoded);
+    ASSERT_TRUE(w == kJ2kQuarter && h == kJ2kQuarter && components == 1u);
+    return picture;
+}
+
+// The index of the last payload byte of the encoder's main-header COM segment (FF 64, Lcom, Rcom, "      OpenJPH Ver a.b.c."),
+// which must lie before the first tile-part (SOT, FF 90).
+size_t j2kMainHeaderComLastByte(const std::vector<uint8_t> & codestream)
+{
+    size_t com = 0;
+    while (com + 1 < codestream.size() && !(codestream[com] == 0xFF && codestream[com + 1] == 0x64)) ++com;
+    ASSERT_TRUE(com + 6 < codestream.size());
+    size_t sot = 0;
+    while (sot + 1 < codestream.size() && !(codestream[sot] == 0xFF && codestream[sot + 1] == 0x90)) ++sot;
+    ASSERT_TRUE(com < sot && sot + 1 < codestream.size());
+    const size_t length = (static_cast<size_t>(codestream[com + 2]) << 8) | codestream[com + 3];   // Lcom: from Lcom to the end
+    ASSERT_TRUE(length > 4 && com + 2 + length <= sot);
+    const std::string comment(codestream.begin() + static_cast<std::ptrdiff_t>(com + 6),
+                              codestream.begin() + static_cast<std::ptrdiff_t>(com + 2 + length));
+    ASSERT_TRUE(comment.find("OpenJPH Ver") != std::string::npos);
+    return com + 2 + length - 1;
+}
+
+// The codestream's twin: the same length, only the COM comment's final byte changed (the adversary's 0x2e '.' -> 0x2f '/').
+std::vector<uint8_t> j2kComTwin(const std::vector<uint8_t> & codestream)
+{
+    std::vector<uint8_t> twin = codestream;
+    const size_t last = j2kMainHeaderComLastByte(codestream);
+    ASSERT_EQ(static_cast<uint8_t>(0x2e), twin[last]);
+    twin[last] = 0x2f;
+    return twin;
+}
 
 void putLe32(std::vector<uint8_t> & out, size_t at, uint32_t value)
 {
     for (int i = 0; i < 4; ++i) out[at + i] = static_cast<uint8_t>(value >> (8 * i));
 }
 
-// A JPEG2K bayer frame payload: header, then the four channel spans of `channel` each followed by `gap` filler bytes, then
-// `trailing`. The spans are declared exactly; the gaps and the trailing bytes are inside frame_size but outside every span.
-std::vector<uint8_t> j2kPayload(const std::vector<uint8_t> & channel, uint8_t gapFill, size_t gap,
+// A JPEG2K bayer frame payload: header, then the four channel spans (channel c's codestream `channels[c]`), each followed by
+// `gap` filler bytes, then `trailing`. The spans are declared exactly; the gaps and the trailing bytes are inside frame_size
+// but outside every span.
+std::vector<uint8_t> j2kPayload(const std::vector<std::vector<uint8_t>> & channels, uint8_t gapFill, size_t gap,
                                 const std::vector<uint8_t> & trailing)
 {
-    const uint32_t n = static_cast<uint32_t>(channel.size());
+    ASSERT_EQ(static_cast<size_t>(4), channels.size());
     std::vector<uint8_t> out(36, 0);
     putLe32(out, 0, 1u);
     for (int c = 0; c < 4; ++c)
     {
         putLe32(out, 4 + 8 * c, static_cast<uint32_t>(out.size()));
-        putLe32(out, 8 + 8 * c, n);
-        out.insert(out.end(), channel.begin(), channel.end());
+        putLe32(out, 8 + 8 * c, static_cast<uint32_t>(channels[c].size()));
+        out.insert(out.end(), channels[c].begin(), channels[c].end());
         out.insert(out.end(), gap, gapFill);
     }
     out.insert(out.end(), trailing.begin(), trailing.end());
     return out;
 }
 
-// The JPEG2K frame `payload` as frame 0 of the open clip: the object's videoClass, frame 0's index entry and chunk file are swapped
-// for the duration of one getMlvFrameSourceHash64 call (the public entry the capture writer calls), then restored.
+std::vector<uint8_t> j2kPayload(const std::vector<uint8_t> & channel, uint8_t gapFill, size_t gap,
+                                const std::vector<uint8_t> & trailing)
+{
+    return j2kPayload({channel, channel, channel, channel}, gapFill, gap, trailing);
+}
+
+// The JPEG2K frame `payload` as frame 0 of the open clip: the object's videoClass, RAWI geometry (64x64), frame 0's index entry
+// and chunk file are swapped for the duration of one getMlvFrameSourceHash64 call (the public entry the capture writer calls),
+// then restored.
 int hashAsClipFrame(MlvPipelineFixture & fixture, const std::vector<uint8_t> & payload, uint64_t * hash)
 {
     mlvObject_t * video = fixture.video();
@@ -992,11 +1084,17 @@ int hashAsClipFrame(MlvPipelineFixture & fixture, const std::vector<uint8_t> & p
     FILE * const savedFile = video->file[chunk];
     const frame_index_t savedEntry = *entry;
     const uint32_t savedClass = video->MLVI.videoClass;
+    const auto savedXRes = video->RAWI.xRes;
+    const auto savedYRes = video->RAWI.yRes;
     video->file[chunk] = file;
     entry->frame_offset = lead.size();
     entry->frame_size = static_cast<uint32_t>(payload.size());
     video->MLVI.videoClass = MLV_VIDEO_CLASS_FLAG_JPEG2K;
+    video->RAWI.xRes = kJ2kFrameSide;
+    video->RAWI.yRes = kJ2kFrameSide;
     const int status = getMlvFrameSourceHash64(video, 0, hash);
+    video->RAWI.xRes = savedXRes;
+    video->RAWI.yRes = savedYRes;
     video->MLVI.videoClass = savedClass;
     *entry = savedEntry;
     video->file[chunk] = savedFile;
@@ -1006,39 +1104,102 @@ int hashAsClipFrame(MlvPipelineFixture & fixture, const std::vector<uint8_t> & p
 
 } // namespace
 
-TEST(VisualCaptureSourceHash, Jpeg2kBytesOutsideTheDeclaredSpansAreNotHashed)
+// r9 (r8 adversary pass 2 A1 = Dot B2): the finding's input. A real codestream C and its twin C' that differs ONLY in the final
+// byte of the encoder's main-header COM comment (equal length). The real decoder gives both the same samples, so the frame whose
+// channel 3 is C' is the frame whose channel 3 is C: one id. On e139944c the span bytes were hashed: two ids.
+TEST(VisualCaptureSourceHash, Jpeg2kACommentOpenJphSkipsIsNotTheIdentity)
 {
+    OjphRealCodecScope realCodec;
     MlvPipelineFixture fixture;
     ASSERT_TRUE(openLargeDualIso(fixture));
-    ASSERT_TRUE(getMlvWidth(fixture.video()) >= 4 && getMlvHeight(fixture.video()) >= 4);
+    const std::vector<int32_t> picture = j2kQuarterPicture(2048, 12288);
+    const std::vector<uint8_t> c = encodeJ2kQuarter(picture);
+    const std::vector<uint8_t> twin = j2kComTwin(c);
+    ASSERT_EQ(c.size(), twin.size());
+    ASSERT_TRUE(c != twin);
+    // decoder equivalence, shown by the decoder: equal samples, and they are the encoded picture (lossless)
+    ASSERT_TRUE(decodeJ2kQuarter(c) == decodeJ2kQuarter(twin));
+    ASSERT_TRUE(decodeJ2kQuarter(c) == picture);
+    uint64_t plain = 0;
+    uint64_t commented = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload({c, c, c, c}, 0, 0, {}), &plain));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload({c, c, c, twin}, 0, 0, {}), &commented));
+    ASSERT_TRUE(plain == commented);
+    uint64_t allCommented = 0;   // every channel's comment changed
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(twin, 0, 0, {}), &allCommented));
+    ASSERT_TRUE(plain == allCommented);
+    // the in-memory entry agrees
+    const std::vector<uint8_t> a = j2kPayload({c, c, c, c}, 0, 0, {});
+    const std::vector<uint8_t> b = j2kPayload({c, c, c, twin}, 0, 0, {});
+    uint64_t ha = 0;
+    uint64_t hb = 0;
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), kJ2kFrameSide, kJ2kFrameSide, &ha));
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(b.data(), b.size(), kJ2kFrameSide, kJ2kFrameSide, &hb));
+    ASSERT_TRUE(ha == hb);
+    ASSERT_TRUE(ha == plain);
+}
+
+// r9 control (rewrites r8's Jpeg2kAChangedSpanByteStillHashesDifferently, which pinned span-bytes hashing: a byte edited in a span
+// is not a changed picture when OpenJPH skips it). A different picture: ONE sample changed, in one channel, re-encoded.
+TEST(VisualCaptureSourceHash, Jpeg2kOneChangedSampleChangesTheIdentity)
+{
+    OjphRealCodecScope realCodec;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    const std::vector<int32_t> picture = j2kQuarterPicture(2048, 12288);
+    std::vector<int32_t> oneSampleChanged = picture;
+    oneSampleChanged[5 * kJ2kQuarter + 7] += 1;
+    const std::vector<uint8_t> c = encodeJ2kQuarter(picture);
+    const std::vector<uint8_t> changed = encodeJ2kQuarter(oneSampleChanged);
+    ASSERT_TRUE(decodeJ2kQuarter(changed) == oneSampleChanged);
+    uint64_t plain = 0;
+    uint64_t lastChannel = 0;
+    uint64_t firstChannel = 0;
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload({c, c, c, c}, 0, 0, {}), &plain));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload({c, c, c, changed}, 0, 0, {}), &lastChannel));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload({changed, c, c, c}, 0, 0, {}), &firstChannel));
+    ASSERT_TRUE(plain != lastChannel);
+    ASSERT_TRUE(plain != firstChannel);
+    ASSERT_TRUE(lastChannel != firstChannel);   // which channel holds the change is part of the picture
+}
+
+// r8 (kept; real codestreams since r9): bytes outside every declared span (trailing, or between spans) are not the picture.
+TEST(VisualCaptureSourceHash, Jpeg2kBytesOutsideTheDeclaredSpansAreNotHashed)
+{
+    OjphRealCodecScope realCodec;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    const std::vector<uint8_t> c = encodeJ2kQuarter(j2kQuarterPicture(2048, 12288));
     uint64_t trailing00 = 0;
     uint64_t trailing01 = 0;
-    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0, 0, {0x00}), &trailing00));
-    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0, 0, {0x01}), &trailing01));
-    ASSERT_TRUE(trailing00 == trailing01);   // the key's input: one trailing unused byte
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(c, 0, 0, {0x00}), &trailing00));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(c, 0, 0, {0x01}), &trailing01));
+    ASSERT_TRUE(trailing00 == trailing01);   // the r7 key's input: one trailing unused byte
     // the same for bytes between two spans
     uint64_t gap00 = 0;
     uint64_t gapA5 = 0;
-    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0x00, 3, {}), &gap00));
-    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0xA5, 3, {}), &gapA5));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(c, 0x00, 3, {}), &gap00));
+    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(c, 0xA5, 3, {}), &gapA5));
     ASSERT_TRUE(gap00 == gapA5);
+    ASSERT_TRUE(trailing00 == gap00);
 }
 
-// r8 pass 1 A2 on d9836349: the r8 hash still included the 36-byte header, so the SAME four codestreams laid out at other offsets
-// (the adversary's: channel 0 at 65572 vs 36, the others sharing one span) got another id for one picture. The offsets only say
-// where a span lies: spans in reversed physical order, and channels sharing one span, are the picture of the sequential layout.
+// r8 pass 1 A2 on d9836349 (kept; real codestreams since r9): where a span lies is not the picture. Spans in reversed physical
+// order, and channels sharing one span, are the picture of the sequential layout.
 TEST(VisualCaptureSourceHash, Jpeg2kWhereASpanLiesIsNotHashed)
 {
+    OjphRealCodecScope realCodec;
     MlvPipelineFixture fixture;
     ASSERT_TRUE(openLargeDualIso(fixture));
-    const std::vector<uint8_t> sequential = j2kPayload(kJ2kCodestream, 0, 0, {});
-    const uint32_t n = static_cast<uint32_t>(kJ2kCodestream.size());
+    const std::vector<uint8_t> c = encodeJ2kQuarter(j2kQuarterPicture(2048, 12288));
+    const std::vector<uint8_t> sequential = j2kPayload(c, 0, 0, {});
+    const uint32_t n = static_cast<uint32_t>(c.size());
     std::vector<uint8_t> reversed = sequential;   // channel c's span placed where channel 3 - c's was
-    for (int c = 0; c < 4; ++c) putLe32(reversed, 4 + 8 * c, 36u + static_cast<uint32_t>(3 - c) * n);
+    for (int ch = 0; ch < 4; ++ch) putLe32(reversed, 4 + 8 * ch, 36u + static_cast<uint32_t>(3 - ch) * n);
     std::vector<uint8_t> shared(36, 0);           // every channel reads the one span at 36; the frame is header + one span
     putLe32(shared, 0, 1u);
-    for (int c = 0; c < 4; ++c) { putLe32(shared, 4 + 8 * c, 36u); putLe32(shared, 8 + 8 * c, n); }
-    shared.insert(shared.end(), kJ2kCodestream.begin(), kJ2kCodestream.end());
+    for (int ch = 0; ch < 4; ++ch) { putLe32(shared, 4 + 8 * ch, 36u); putLe32(shared, 8 + 8 * ch, n); }
+    shared.insert(shared.end(), c.begin(), c.end());
     uint64_t hSequential = 0;
     uint64_t hReversed = 0;
     uint64_t hShared = 0;
@@ -1049,57 +1210,77 @@ TEST(VisualCaptureSourceHash, Jpeg2kWhereASpanLiesIsNotHashed)
     ASSERT_TRUE(hSequential == hShared);
 }
 
-TEST(VisualCaptureSourceHash, Jpeg2kAChangedSpanByteStillHashesDifferently)
+// r9 (rewrites r8's Jpeg2kTheInMemoryHashIsTheHeaderPlusTheDeclaredSpans): the in-memory identity is FNV-1a 64 over the decoded
+// samples as the display stores them (uint16, 2 bytes LE), channel 0..3, row-major -- computed here independently from the
+// pictures that were encoded (lossless). Four different channel pictures pin the channel order.
+TEST(VisualCaptureSourceHash, Jpeg2kTheInMemoryHashIsTheDecodedPicture)
 {
-    MlvPipelineFixture fixture;
-    ASSERT_TRUE(openLargeDualIso(fixture));
-    std::vector<uint8_t> otherChannel = kJ2kCodestream;
-    otherChannel.back() ^= 0x01;
-    uint64_t plain = 0;
-    uint64_t changed = 0;
-    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(kJ2kCodestream, 0, 0, {0x00}), &plain));
-    ASSERT_EQ(0, hashAsClipFrame(fixture, j2kPayload(otherChannel, 0, 0, {0x00}), &changed));
-    ASSERT_TRUE(plain != changed);
-    // only the last channel's span changed: a one-byte edit inside ANY declared span counts
-    std::vector<uint8_t> lastSpanEdited = j2kPayload(kJ2kCodestream, 0, 0, {0x00});
-    lastSpanEdited[36 + 3 * kJ2kCodestream.size() + 1] ^= 0x80;
-    uint64_t edited = 0;
-    ASSERT_EQ(0, hashAsClipFrame(fixture, lastSpanEdited, &edited));
-    ASSERT_TRUE(plain != edited);
-}
-
-TEST(VisualCaptureSourceHash, Jpeg2kTheInMemoryHashIsTheHeaderPlusTheDeclaredSpans)
-{
-    const std::vector<uint8_t> a = j2kPayload(kJ2kCodestream, 0x00, 2, {0x00, 0x00});
-    const std::vector<uint8_t> b = j2kPayload(kJ2kCodestream, 0xEE, 2, {0x7F, 0x80});
+    OjphRealCodecScope realCodec;
+    std::vector<std::vector<int32_t>> pictures;
+    std::vector<std::vector<uint8_t>> channels;
+    for (int ch = 0; ch < 4; ++ch)
+    {
+        pictures.push_back(j2kQuarterPicture(1000 + 100 * ch, 9000 - 700 * ch));
+        channels.push_back(encodeJ2kQuarter(pictures.back()));
+    }
+    const std::vector<uint8_t> a = j2kPayload(channels, 0x00, 2, {0x00, 0x00});
+    const std::vector<uint8_t> b = j2kPayload(channels, 0xEE, 2, {0x7F, 0x80});
     uint64_t ha = 0;
     uint64_t hb = 0;
-    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 64, 64, &ha));
-    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(b.data(), b.size(), 64, 64, &hb));
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), kJ2kFrameSide, kJ2kFrameSide, &ha));
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(b.data(), b.size(), kJ2kFrameSide, kJ2kFrameSide, &hb));
     ASSERT_TRUE(ha == hb);
-    // FNV-1a 64 of the version word, then per channel its size (LE32) and its span, computed here independently
     uint64_t expected = 0xcbf29ce484222325ull;
-    auto mix = [&expected](const uint8_t * p, size_t count) {
-        for (size_t i = 0; i < count; ++i) { expected ^= p[i]; expected *= 0x100000001b3ull; }
-    };
-    mix(a.data(), 4);
-    for (int c = 0; c < 4; ++c)
-    {
-        mix(a.data() + 8 + 8 * c, 4);
-        mix(kJ2kCodestream.data(), kJ2kCodestream.size());
-    }
+    for (const std::vector<int32_t> & picture : pictures)
+        for (int32_t value : picture)
+        {
+            const uint8_t sample[2] = {static_cast<uint8_t>(value & 0xFF), static_cast<uint8_t>((value >> 8) & 0xFF)};
+            for (uint8_t byte : sample) { expected ^= byte; expected *= 0x100000001b3ull; }
+        }
     ASSERT_TRUE(ha == expected);
-    // what the display decode refuses has no identity
+    // channel order is part of it: channels 0 and 1 swapped is another picture
+    const std::vector<uint8_t> swapped = j2kPayload({channels[1], channels[0], channels[2], channels[3]}, 0, 0, {});
+    uint64_t hs = 0;
+    ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(swapped.data(), swapped.size(), kJ2kFrameSide, kJ2kFrameSide, &hs));
+    ASSERT_TRUE(hs != ha);
+    // what the display decode refuses has no identity, and the hash is never written
     uint64_t hash = 0x77;
     std::vector<uint8_t> badVersion = a;
     badVersion[0] = 2;
-    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(badVersion.data(), badVersion.size(), 64, 64, &hash));
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(badVersion.data(), badVersion.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
     std::vector<uint8_t> spanPastEnd = a;
     putLe32(spanPastEnd, 32, static_cast<uint32_t>(a.size()));   // channel 3's size runs past frame_size
-    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(spanPastEnd.data(), spanPastEnd.size(), 64, 64, &hash));
-    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), 35, 64, 64, &hash));          // shorter than the header
-    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 63, 64, &hash));   // odd geometry
-    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(nullptr, a.size(), 64, 64, &hash));
-    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 64, 64, nullptr));
-    ASSERT_TRUE(hash == 0x77);   // never written on a refusal
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(spanPastEnd.data(), spanPastEnd.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), 35, kJ2kFrameSide, kJ2kFrameSide, &hash));   // shorter than the header
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 63, kJ2kFrameSide, &hash));       // odd geometry
+    // the codestreams are 32x32: RAWI 128x128 asks for 64x64 quarters, which the display's probe check refuses
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), 2 * kJ2kFrameSide, 2 * kJ2kFrameSide, &hash));
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(nullptr, a.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(a.data(), a.size(), kJ2kFrameSide, kJ2kFrameSide, nullptr));
+    ASSERT_TRUE(hash == 0x77);
+}
+
+// r9 (b): fail closed. A frame whose decode the codec refuses has no identity -- never a hash of its bytes. The stub codec
+// (no OjphRealCodecScope) stands in for a probe that fails and a decode that returns short; the layout is valid, so on
+// e139944c (which never decoded) both still got an id.
+TEST(VisualCaptureSourceHash, Jpeg2kAFrameTheDecoderRefusesHasNoIdentity)
+{
+    const std::vector<uint8_t> codestream = {0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x2F, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44};
+    const std::vector<uint8_t> frame = j2kPayload(codestream, 0, 0, {});
+    struct RestoreStubPlan { ~RestoreStubPlan() { ojphStubReset(OjphStubPlan()); } } restore;
+    uint64_t hash = 0x77;
+    OjphStubPlan probeFails = ojphStubQuarterFramePlan(kJ2kQuarter, kJ2kQuarter);
+    probeFails.probe_result = -1;
+    ojphStubReset(probeFails);
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
+    ASSERT_TRUE(ojphStubProbeCount() > 0);
+    OjphStubPlan decodeShort = ojphStubQuarterFramePlan(kJ2kQuarter, kJ2kQuarter);
+    decodeShort.decode_pixels = kJ2kQuarter * kJ2kQuarter - 1;
+    ojphStubReset(decodeShort);
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
+    ASSERT_TRUE(ojphStubDecodeCount() > 0);
+    OjphStubPlan wrongGeometry = ojphStubQuarterFramePlan(kJ2kQuarter / 2, kJ2kQuarter);
+    ojphStubReset(wrongGeometry);
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
+    ASSERT_TRUE(hash == 0x77);
 }

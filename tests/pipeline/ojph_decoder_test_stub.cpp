@@ -55,6 +55,15 @@ void ojphStubReset(const OjphStubPlan & new_plan)
     decodeCount().store(0);
 }
 
+OjphRealCodecScope::OjphRealCodecScope()
+{
+    OjphStubPlan real;
+    real.real_codec = true;
+    ojphStubReset(real);
+}
+
+OjphRealCodecScope::~OjphRealCodecScope() { ojphStubReset(OjphStubPlan()); }
+
 int ojphStubDecoderNewCount() { return decoderNewCount().load(); }
 int ojphStubProbeCount() { return probeCount().load(); }
 int ojphStubDecodeCount() { return decodeCount().load(); }
@@ -62,12 +71,14 @@ int ojphStubDecodeCount() { return decodeCount().load(); }
 #ifdef ENABLE_JPEG2K
 
 #include "../../src/mlv/OpenJPH/ojph_wrapper.h"
+#include "ojph_real_codec.h"
 
 extern "C" {
 
 void * ojph_decoder_new()
 {
     decoderNewCount().fetch_add(1);
+    if (plan().real_codec) return ojph_real_decoder_new();   // r9: a real handle, never &g_handle
     return &g_handle;
 }
 
@@ -77,6 +88,7 @@ int ojph_decoder_probe(void * d, const uint8_t * data, size_t size,
                        int * is_signed)
 {
     probeCount().fetch_add(1);
+    if (d && d != &g_handle) return ojph_real_decoder_probe(d, data, size, w, h, num_comps, bit_depth, is_signed);
     if (!d || !data || size == 0) return -1;
     const OjphStubPlan & p = plan();
     if (w) *w = p.probe_width;
@@ -93,6 +105,8 @@ size_t ojph_decoder_decode_into(void * d, const uint8_t * data, size_t size,
                                 uint32_t * out_num_comps)
 {
     decodeCount().fetch_add(1);
+    if (d && d != &g_handle)
+        return ojph_real_decoder_decode_into(d, data, size, out_pixels, out_pixels_cap, out_w, out_h, out_num_comps);
     if (!d || !data || size == 0 || !out_pixels || out_pixels_cap == 0) return 0;
     const OjphStubPlan & p = plan();
     const size_t produced = p.decode_pixels ? p.decode_pixels : out_pixels_cap;
@@ -106,7 +120,10 @@ size_t ojph_decoder_decode_into(void * d, const uint8_t * data, size_t size,
     return produced;
 }
 
-void ojph_decoder_free(void *) {}
+void ojph_decoder_free(void * d)
+{
+    if (d && d != &g_handle) ojph_real_decoder_free(d);
+}
 
 /* The JPEG2000 export branch is compiled too; it is not under test, so the
  * encoder seam simply refuses. */

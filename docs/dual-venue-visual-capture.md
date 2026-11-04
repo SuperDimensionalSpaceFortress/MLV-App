@@ -129,10 +129,11 @@ Play has stopped (step (4) of the capture block, never in the timed window or th
 the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
 `video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
 own mutex, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). For LJ92 (r5) it decodes the
-payload with liblj92, as the display decodes it, and hashes the decoded picture (`mlvLj92FrameSourceHash64`). For JPEG2K (r8) it
-hashes the layout version plus the four declared channel spans (each one's size and bytes, never where it lies), what the
-decoder decodes (`mlvJpeg2kFrameSourceHash64`; a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no
-identity). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
+payload with liblj92, as the display decodes it, and hashes the decoded picture (`mlvLj92FrameSourceHash64`). For JPEG2K (r9) it
+decodes the four declared channel spans through the display's own OpenJPH decode into private buffers and hashes the decoded
+samples as the display stores them (uint16, channel 0..3, row-major); codestream bytes are never the id, so an equal-length COM
+comment OpenJPH skips, bytes outside the spans or where a span lies change nothing (`mlvJpeg2kFrameSourceHash64`; a frame that
+decode refuses, and every frame on a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no identity). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
 ends (r8: a `--visual-capture-dir` run opens every clip under a share-read `SourceWriteGuard`, so no writer can change its bytes,
 and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes. Two frames that
 decode to the same picture always share an identity, and two that decode differently never do (up to a 64-bit collision):
