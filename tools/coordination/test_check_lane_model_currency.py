@@ -30,7 +30,7 @@ class CurrencyFixture(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(self.runs, ignore_errors=True))
         self.count = 0
 
-    def receipt(self, lane, model, hours_ago, effort="high", state="complete"):
+    def receipt(self, lane, model, hours_ago, effort="high", state="complete", timeout=None):
         self.count += 1
         run = self.runs / ("run-%03d" % self.count)
         run.mkdir()
@@ -38,6 +38,8 @@ class CurrencyFixture(unittest.TestCase):
                 "resolvedModel": model, "card": "TEST"}
         if effort is None:
             del body["effort"]
+        if timeout is not None:
+            body["timeoutSec"] = timeout
         (run / ("%s-001.receipt.json" % lane)).write_text(json.dumps(body), encoding="utf-8")
 
     def evaluate(self, **kwargs):
@@ -225,6 +227,130 @@ class MissingEvidenceTests(CurrencyFixture):
         self.assertIn("unrecordedEffort=1", sonnet)
         self.assertNotIn("unrecordedEffort", fable)
         self.assertIn("INCOMPLETE", lines[0])
+
+
+class InFlightTests(CurrencyFixture):
+    """CURRENCY-CHECK-WIRED-INTO-HUB-TICK-1: a lane whose newest receipt is a LIVE running run (no
+    resolvedModel and no effort yet, by design) is IN-FLIGHT, judged on its newest finished run. A dead
+    running receipt (past startedUtc + timeoutSec + grace) is not in flight and stays unproven."""
+
+    def running(self, lane, hours_ago, timeout=7200):
+        self.receipt(lane, None, hours_ago, effort=None, state="running", timeout=timeout)
+
+    def test_running_newest_over_a_current_finished_run_is_in_flight_and_names_the_run(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        result = self.evaluate()
+        entry = result["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "IN-FLIGHT")
+        self.assertEqual(entry["inFlightRuns"], 1)
+        self.assertEqual(entry["judgedOn"]["model"], "claude-opus-5-5")
+        self.assertEqual(entry["unrecordedEffort"], 0)       # the running receipt is not evidence either way
+        self.assertEqual(result["verdict"], "CURRENT")        # IN-FLIGHT alone never taints the overall verdict
+        self.assertEqual(result["inFlightLanes"], ["opus"])
+
+    def test_running_newest_over_a_stale_pair_keeps_stale(self):
+        self.receipt("sol", "gpt-6-sol", 30)
+        self.receipt("sol", "gpt-6-sol", 20)
+        self.receipt("peer", "gpt-6.1-sol", 10)
+        self.running("sol", 1)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "STALE")
+        self.assertEqual(result["verdict"], "STALE")
+
+    def test_running_newest_over_an_incomplete_finished_run_keeps_incomplete(self):
+        self.receipt("sonnet", "claude-sonnet-5-5", 10, effort=None)
+        self.running("sonnet", 1)
+        self.assertEqual(self.evaluate()["lanes"]["sonnet"]["verdict"], "INCOMPLETE")
+
+    def test_running_with_no_finished_run_stays_no_data(self):
+        self.running("opus", 1)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["opus"]["verdict"], "NO-DATA")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+        self.assertIsNone(result["lanes"]["opus"]["judgedOn"])
+
+    def test_a_running_receipt_past_its_timeout_is_dead_not_in_flight(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 5, timeout=3600)                 # bound = 1 h + grace; 5 h old
+        result = self.evaluate()
+        entry = result["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "NO-DATA")
+        self.assertEqual(entry["inFlightRuns"], 0)
+        self.assertEqual(entry["deadRunning"], 1)
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_the_liveness_bound_is_timeout_plus_grace(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1.0, timeout=3600)               # exactly at timeout: still live
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+
+    def test_a_running_receipt_with_no_timeout_cannot_be_proven_live(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 1, effort=None, state="running")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_running_receipt_that_already_has_an_end_time_is_not_live(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        path = next(p for p in self.runs.glob("*/opus-001.receipt.json") if "running" in p.read_text())
+        body = json.loads(path.read_text())
+        body["endedUtc"] = _ts(0.5)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_failed_newest_run_still_reads_no_data(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 2, state="failed")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_failed_run_before_a_live_running_one_is_not_papered_over(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 3, state="failed")
+        self.running("opus", 1)
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_live_running_run_older_than_a_finished_one_is_ignored_as_evidence(self):
+        self.running("opus", 3, timeout=14400)                # still live (3 h of 4 h), but not the newest receipt
+        self.receipt("opus", "claude-opus-5-5", 1)
+        entry = self.evaluate()["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "CURRENT")
+        self.assertEqual(entry["unrecordedEffort"], 0)
+
+    def test_in_flight_beside_a_no_data_lane_leaves_the_overall_incomplete(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        self.receipt("fable", None, 2, state="failed")
+        self.assertEqual(self.evaluate()["verdict"], "INCOMPLETE")
+
+    def test_the_table_shows_in_flight_and_the_run_it_was_judged_on(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        line = next(l for l in check.render(self.evaluate()).splitlines() if l.strip().startswith("opus"))
+        self.assertIn("IN-FLIGHT", line)
+        self.assertIn("judged-on=claude-opus-5-5", line)
+
+    def test_cli_exit_zero_when_the_only_non_current_lane_is_in_flight(self):
+        # The CLI judges against the real clock, so these receipts are stamped relative to it.
+        real_now = datetime.datetime.now(datetime.timezone.utc)
+
+        def write(name, lane, hours_ago, **fields):
+            run = self.runs / name
+            run.mkdir()
+            started = (real_now - datetime.timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+            body = {"lane": lane, "startedUtc": started, "card": "TEST"}
+            body.update(fields)
+            (run / ("%s-001.receipt.json" % lane)).write_text(json.dumps(body), encoding="utf-8")
+
+        write("a", "fable", 2, state="complete", effort="high", resolvedModel="claude-fable-5-1")
+        write("b", "opus", 2, state="complete", effort="high", resolvedModel="claude-opus-5-5")
+        write("c", "opus", 0.5, state="running", timeoutSec=7200)
+        result = subprocess.run([sys.executable, str(SCRIPT), "--runs-dir", str(self.runs), "--since-hours", "0",
+                                 "--json"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(payload["verdict"], "CURRENT")
 
 
 class WindowTests(CurrencyFixture):

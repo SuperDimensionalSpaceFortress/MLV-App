@@ -24,18 +24,41 @@ null never count) take part in the model rule.
 Missing evidence is never CURRENT (r3 blocker B1). A lane's verdict is, in order:
 
   STALE       a STALE-MODEL or BAD-EFFORT reason above.
-  NO-DATA     the lane has no proven model, or its NEWEST run in the window has none (a failed or
-              still-running run, resolvedModel null/'unknown'): what the lane runs now is unproven.
-  INCOMPLETE  the model is proven but at least one run in the window recorded no effort, so
+  NO-DATA     the lane has no proven model, or its NEWEST finished run in the window has none (a
+              failed run, or a running receipt that is not provably alive; resolvedModel null/'unknown'):
+              what the lane runs now is unproven.
+  INCOMPLETE  the model is proven but at least one finished run in the window recorded no effort, so
               'high' is unproven; counted in `unrecordedEffort` and shown in the table.
+  IN-FLIGHT   the lane's newest receipt is a run that is provably still running, AND the lane's newest
+              finished run is proven and would itself read CURRENT. See the next paragraph.
   CURRENT     a proven model, every effort recorded and 'high'.
 
-The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
-else NO-DATA when no lane ran in the window, else CURRENT.
+IN-FLIGHT (CURRENCY-CHECK-WIRED-INTO-HUB-TICK-1). A running receipt records no resolvedModel and no
+effort yet (Invoke-Lane.ps1 writes both at the end), so before this verdict a lane that was merely busy
+read NO-DATA and pulled the overall verdict to INCOMPLETE. A receipt counts as LIVE when it says
+state=running, has no endedUtc, has a positive timeoutSec, and now is no later than
+startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the wrapper's post-run cleanup and the hub clock's
+measured skew of up to ~20 s). That is an AGE BOUND derived from the receipt's own timeout, not a process
+probe: this script reads receipts only, and the board's authoritative liveness rule (hub-queue-lib.ps1
+Get-LaneRunState: child pid alive, command line names the run dir, start time matches within 10 s) needs
+the process table. The cost of the weaker rule is bounded and one-sided: a dead lane inside its own
+timeout reads IN-FLIGHT, and only ever when the finished run before it is CURRENT, so it can hide
+nothing worse than a lane that is current anyway. A receipt left at state=running past the bound is DEAD:
+it stays an unproven run (counted in `deadRunning`), so the lane reads NO-DATA, never IN-FLIGHT. A running
+receipt with no timeoutSec cannot be bounded and is treated as dead for the same reason.
+Live running receipts are not evidence in either direction: they are left out of the model rule, the
+effort rule and `unrecordedEffort`, and the lane is judged on its finished runs alone, with the run it was
+judged on named in `judgedOn` and in the table. IN-FLIGHT is given only when the newest FINISHED run is
+proven too: a failed run in between is not papered over (the lane stays NO-DATA), and a lane with no
+proven finished run in the window stays NO-DATA, because missing evidence is never CURRENT.
 
-Exit code: 0 overall CURRENT, 1 at least one STALE-MODEL or BAD-EFFORT, 2 the runs directory is
-unreadable, 3 overall INCOMPLETE or NO-DATA (evidence missing, not a violation). One JSON object with
---json, else a short table.
+The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
+else NO-DATA when no lane ran in the window, else CURRENT. IN-FLIGHT lanes count as CURRENT here and are
+listed in `inFlightLanes`: being busy alone never makes the overall verdict INCOMPLETE.
+
+Exit code (unchanged numbers; IN-FLIGHT adds none): 0 overall CURRENT (IN-FLIGHT lanes included), 1 at
+least one STALE-MODEL or BAD-EFFORT, 2 the runs directory is unreadable, 3 overall INCOMPLETE or NO-DATA
+(evidence missing, not a violation). One JSON object with --json, else a short table.
 
 --posture swaps the receipt check for a BOUNDED TEXT LINT (MODEL-POSTURE-R19-ADOPT-1, bus R19.1
 clause 3): Astra is an occasional diversity seat, never a default or a gate. It is NOT proof that Astra
@@ -67,6 +90,7 @@ CODEX_ID_RE = re.compile(r"^gpt-(?P<version>[0-9]+(?:\.[0-9]+)*)-(?P<family>[a-z
 REQUIRED_EFFORT = "high"
 CONSECUTIVE_STALE_RUNS = 2
 DEFAULT_SINCE_HOURS = 72.0
+LIVE_GRACE_SEC = 300.0
 RECEIPT_GLOB = "*/*-001.receipt.json"
 TIERING_REL = "agents/orchestration-tiering.md"
 INVOKE_LANE_REL = "tools/coordination/Invoke-Lane.ps1"
@@ -151,8 +175,11 @@ def load_receipts(runs_dir):
             unreadable += 1
             continue
         resolved = data.get("resolvedModel")
+        timeout = data.get("timeoutSec")
         receipts.append({
             "path": path, "lane": data["lane"], "started": started, "state": data.get("state"),
+            "ended": data.get("endedUtc"),
+            "timeoutSec": timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else None,
             "card": data.get("card"), "effort": data.get("effort"),
             "resolvedModel": resolved if isinstance(resolved, str) else None,
             "parsed": parse_model_id(resolved),
@@ -175,6 +202,16 @@ def newest_per_family(receipts, overrides):
     return newest
 
 
+def is_live_running(receipt, now):
+    """True only for a receipt that is provably still running by its own timeout (see the docstring)."""
+    if receipt["state"] != "running" or receipt["ended"]:
+        return False
+    timeout = receipt["timeoutSec"]
+    if not timeout or timeout <= 0:
+        return False
+    return now <= receipt["started"] + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC)
+
+
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     # The family's newest id is judged over every receipt, the window only decides what is reported.
@@ -189,7 +226,10 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
         lanes.setdefault(receipt["lane"], []).append(receipt)
     report = {}
     for lane in sorted(lanes):
-        runs = lanes[lane]
+        # A live running receipt has no model or effort yet: it is neither evidence nor a gap.
+        live = [r for r in lanes[lane] if is_live_running(r, now)]
+        runs = [r for r in lanes[lane] if r not in live]
+        dead_running = [r for r in runs if r["state"] == "running"]
         proven = [r for r in runs if r["parsed"]]
         reasons = []
         # STALE-MODEL: the two most recent proven runs are both older than their family's newest.
@@ -214,26 +254,32 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
             verdict = "NO-DATA"
         elif unrecorded:
             verdict = "INCOMPLETE"
+        elif live and live[-1]["started"] > runs[-1]["started"]:
+            verdict = "IN-FLIGHT"       # newest receipt is running; the newest finished run is proven and CURRENT
         else:
             verdict = "CURRENT"
         report[lane] = {
             "verdict": verdict,
-            "runsInWindow": len(runs), "provenModelRuns": len(proven),
+            "runsInWindow": len(lanes[lane]), "provenModelRuns": len(proven),
             "latestModel": latest["resolvedModel"] if latest else None,
             "familyNewest": newest[latest["parsed"][0]][1] if latest else None,
             "reasons": reasons, "unrecordedEffort": len(unrecorded),
+            "inFlightRuns": len(live), "deadRunning": len(dead_running),
+            "judgedOn": ({"model": runs[-1]["resolvedModel"], "startedUtc": runs[-1]["started"].isoformat(),
+                          "receipt": runs[-1]["path"]} if proven and runs[-1]["parsed"] else None),
         }
     verdicts = {entry["verdict"] for entry in report.values()}
+    in_flight = sorted(lane for lane, entry in report.items() if entry["verdict"] == "IN-FLIGHT")
     if "STALE" in verdicts:
         overall = "STALE"
-    elif verdicts - {"CURRENT"}:
+    elif verdicts - {"CURRENT", "IN-FLIGHT"}:
         overall = "INCOMPLETE"
     else:
         overall = "CURRENT" if report else "NO-DATA"
     return {
         "sinceHours": since_hours, "receiptsRead": len(receipts), "receiptsInWindow": len(window),
         "familyNewest": {family: pair[1] for family, pair in sorted(newest.items())},
-        "lanes": report, "verdict": overall,
+        "lanes": report, "verdict": overall, "inFlightLanes": in_flight,
     }
 
 
@@ -253,9 +299,11 @@ def render(result):
     lines = ["lane model currency (window %sh, %d of %d receipts) -> %s" % (
         result["sinceHours"], result["receiptsInWindow"], result["receiptsRead"], result["verdict"])]
     for lane, entry in result["lanes"].items():
-        lines.append("  %-7s %-10s latest=%s family-newest=%s runs=%d%s" % (
+        lines.append("  %-7s %-10s latest=%s family-newest=%s runs=%d%s%s%s" % (
             lane, entry["verdict"], entry["latestModel"], entry["familyNewest"], entry["runsInWindow"],
-            " unrecordedEffort=%d" % entry["unrecordedEffort"] if entry["unrecordedEffort"] else ""))
+            " unrecordedEffort=%d" % entry["unrecordedEffort"] if entry["unrecordedEffort"] else "",
+            " judged-on=%s" % entry["judgedOn"]["model"] if entry["verdict"] == "IN-FLIGHT" else "",
+            " deadRunning=%d" % entry["deadRunning"] if entry["deadRunning"] else ""))
         for reason in entry["reasons"]:
             if reason["kind"] == "STALE-MODEL":
                 lines.append("          STALE-MODEL: ran %s, newest %s %s" % (
