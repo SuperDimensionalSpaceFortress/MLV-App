@@ -255,8 +255,27 @@ launch. When `high` is what runs, Codex receives its normal reasoning configurat
 and Claude receives `CLAUDE_CODE_EFFORT_LEVEL=high` in the child environment -- the same
 pre-existing, out-of-scope-for-this-PR assignment tracked under
 NA3-CHILD-ENV-SCOPE-1 above. The receipt records the effective effort; user settings
-and the parent environment are unchanged. Codex continues through its existing direct
-process path; the new Windows job containment applies to Claude.
+and the parent environment are unchanged. A Codex lane with no image continues through its
+existing direct process path; the Windows job containment applies to Claude and to a Codex
+lane that carries `-ImagePaths`.
+
+**Image holds are released by job membership (VISUAL-JUDGE-TERRA-LANE-1 r13).** A Codex lane
+with images starts an inert host, assigns it to a kill-on-close job, and only then tells it
+what to run, so the child and every descendant are in the job. The child inherits the host's
+stdout and stderr, so the lane's pipes stream as on the direct path. Before any hold is
+released, on the completion, timeout and throwing paths alike, the lane terminates the job
+whether or not the direct process has exited, and waits for the job to report no live member.
+The receipt's `imageHoldRelease` records the outcome:
+
+- `released`: the holds were closed with no possible reader left. Either the job reported no
+  live member, or no reader was ever started.
+- `uncertain:kill-failed`, `uncertain:wait-timeout`, `uncertain:tree-unreadable`: the readers
+  are not known to be gone. The holds stay open until the lane process exits, the lane fails
+  with `image-hold-uncertain:<cause>`, and every image reports `consumedVerified=false`.
+
+Limit: a process created outside the job's inheritance, such as one started through the
+Secondary Logon service under another account, is not a job member, so `released` makes no
+claim about it. Whether Codex's elevated sandbox starts its tools that way is not measured here.
 
 Run the real Windows fixture suite with:
 

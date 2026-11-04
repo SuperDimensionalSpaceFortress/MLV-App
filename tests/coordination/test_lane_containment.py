@@ -253,6 +253,14 @@ if($env:MLV_FIXTURE_HOLD_PIPE_SECONDS){
   [void][System.Diagnostics.Process]::Start($hp)
   $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_HOLD_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
 }
+# VISUAL-JUDGE-TERRA-LANE-1 r13 (Dot B2; test-only, unset = no-op): MLV_FIXTURE_READER_SCRIPT leaves a descendant, handed the -i snapshot path, alive AFTER this process exits.
+if($env:MLV_FIXTURE_READER_SCRIPT){
+  $snap=$null; for($i=0;$i -lt $args.Count-1;$i++){ if($args[$i] -eq '-i'){ $snap=[string]$args[$i+1] } }
+  $hp=[System.Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath); $hp.UseShellExecute=$false
+  foreach($x in @('-NoProfile','-NonInteractive','-File',$env:MLV_FIXTURE_READER_SCRIPT,$snap)){[void]$hp.ArgumentList.Add($x)}
+  [void][System.Diagnostics.Process]::Start($hp)
+  $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_READER_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
+}
 # LANE-MODEL-CURRENCY-1: lets a test substitute the child's own JSON result (e.g. to add a
 # modelUsage block) without touching the fixed default every other test still relies on.
 if($env:MLV_FIXTURE_RESULT_JSON){
@@ -2114,24 +2122,292 @@ def test_r12_a3_an_unsupported_shim_is_never_run_by_any_probe(fixture_tree):
     assert not (root/"args.json").exists()
 
 
-def test_r12_iter1_a1_a_codex_child_alive_when_the_launch_path_throws_is_killed_before_its_holds_are_released(fixture_tree):
-    # adversary A1 on 2d55c467: the stdin write to a codex child that closed fd 0 throws, and the catch released every image hold without
-    # killing the child, which could then read a changed snapshot. The throw is injected right after Process.Start; the fixture child
-    # blocks reading stdin, so a child that survives the lane gets EOF when the lane exits and writes prompt.txt. It must be dead instead.
-    anchor="    $proc = [Diagnostics.Process]::Start($psi)\n}"
+_AFTER_STDIN_ANCHOR = "$timedOut = $false\n$remainingMs = "
+_HOLD_STATE_ANCHOR = "exit $propagated"
+
+
+def _throw_while_alive(wait_for):
+    # adversary A1 on 2d55c467 / Dot B2: a later launch-path operation throws. Injected after stdin is closed, once the named state file exists.
+    wait=(f"$waitChild=[Diagnostics.Stopwatch]::StartNew(); while(-not (Test-Path -LiteralPath {wait_for}) -and $waitChild.ElapsedMilliseconds -lt 40000)"
+          "{Start-Sleep -Milliseconds 50}\nthrow [System.IO.IOException]::new('fixture-late-stream-failure')\n")
     def mutation(text):
-        assert text.count(anchor)==1, "codex Process.Start block text has moved; update this fixture mutation"
-        return text.replace(anchor,"    $proc = [Diagnostics.Process]::Start($psi)\n    $waitChild=[Diagnostics.Stopwatch]::StartNew(); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_CHILD) -and $waitChild.ElapsedMilliseconds -lt 20000){Start-Sleep -Milliseconds 50}\n    throw [System.IO.IOException]::new('fixture-stdin-write-failed')\n}")
+        assert text.count(_AFTER_STDIN_ANCHOR)==1, "the post-stdin anchor moved; update this fixture mutation"
+        return text.replace(_AFTER_STDIN_ANCHOR,wait+_AFTER_STDIN_ANCHOR)
+    return mutation
+
+
+def _throw_after_the_child_exits(text):
+    # Dot B2 (a): the direct process has already exited when the later stream operation throws.
+    assert text.count(_AFTER_STDIN_ANCHOR)==1, "the post-stdin anchor moved; update this fixture mutation"
+    return text.replace(_AFTER_STDIN_ANCHOR,"[void]$proc.WaitForExit(40000)\nthrow [System.IO.IOException]::new('fixture-late-stream-failure')\n"+_AFTER_STDIN_ANCHOR)
+
+
+def _record_hold_state(out):
+    # At the very end of the lane process: can the snapshot be opened exclusively? A kept hold refuses that; a released one does not (the snapshot is read-only, so a write open would fail either way).
+    probe=(f"try {{ $h=[System.IO.File]::Open([string]$ImageAttachments[0].path,'Open','Read','None'); $h.Dispose(); $hs='released' }} catch {{ $hs=if($_.Exception.GetBaseException().HResult -eq -2147024864){{'held'}}else{{'probe-error: '+$_.Exception.GetBaseException().Message}} }}\n"
+           f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',$hs)\n")
+    def mutation(text):
+        assert text.count(_HOLD_STATE_ANCHOR)>=1, "the final exit moved; update this fixture mutation"
+        return (probe+_HOLD_STATE_ANCHOR).join(text.rsplit(_HOLD_STATE_ANCHOR,1))
+    return mutation
+
+
+def _chain(*mutations):
+    def mutation(text):
+        for m in mutations: text=m(text)
+        return text
+    return mutation
+
+
+def _reader_env(fixture_tree, env):
+    # A descendant handed the snapshot path: it tries to open the snapshot exclusively, standing for any change to it, until it can; only an open hold prevents that.
+    root=fixture_tree["root"]; script=root/"reader.ps1"
+    script.write_text("param($Snap)\n$t=$env:MLV_FIXTURE_READER_PID+'.tmp'; Set-Content -LiteralPath $t -Value $PID; Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_READER_PID\n"
+                      "$end=(Get-Date).AddSeconds(90); while((Get-Date) -lt $end){ try { $h=[IO.File]::Open($Snap,'Open','Read','None'); $h.Dispose(); Set-Content -LiteralPath $env:MLV_FIXTURE_READER_WROTE -Value 'wrote'; break } catch { Start-Sleep -Milliseconds 100 } }\nStart-Sleep -Seconds 90\n",encoding="ascii")
+    env=dict(env); env["MLV_FIXTURE_READER_SCRIPT"]=str(script); env["MLV_FIXTURE_READER_PID"]=str(root/"reader.pid"); env["MLV_FIXTURE_READER_WROTE"]=str(root/"reader.wrote")
+    return env
+
+
+def _reader_pid(root):
+    return int((root/"reader.pid").read_text(encoding="utf-8-sig").strip())
+
+
+def _pid_alive(pid):
+    r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"if(Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue){{exit 0}};exit 3"],capture_output=True,timeout=PWSH_PROBE_TIMEOUT_SEC)
+    return r.returncode==0
+
+
+def _stop_pid(pid):
+    subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"Stop-Process -Id {int(pid)} -Force -ErrorAction SilentlyContinue"],capture_output=True,timeout=PWSH_PROBE_TIMEOUT_SEC,check=False)
+
+
+def _assert_the_reader_was_gone_before_release(root, q):
+    pid=_reader_pid(root)
+    try:
+        time.sleep(1.5)
+        assert not (root/"reader.wrote").exists(), "the hold was released while a descendant holding the snapshot path was alive: it took the snapshot"
+        assert not _pid_alive(pid), "a descendant holding the snapshot path outlived the lane"
+        assert q.get("imageHoldRelease")=="released",q
+    finally:
+        _stop_pid(pid)
+
+
+def test_r12_iter1_a1_a_codex_child_alive_when_the_launch_path_throws_is_killed_before_its_holds_are_released(fixture_tree):
+    # adversary A1 on 2d55c467: the live-direct-child control of Dot B2. A child alive when a later launch-path operation throws is killed, tree and all, before the holds go.
     root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
     cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="terra",mutation=_throw_while_alive("$env:MLV_FIXTURE_GRAND"))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,90))
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "fixture-late-stream-failure" in text,(r.returncode,text[-4000:])
+    assert (root/"child.json").exists() and (root/"grand.json").exists(), "the injected failure must come after the codex child and its descendant started"
+    wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),30)
+    wait_absent(json.loads((root/"grand.json").read_text(encoding="utf-8-sig")),30)
+
+
+def test_r13_b2_a_an_exited_parent_with_a_live_descendant_is_killed_before_release_on_the_completion_path(fixture_tree):
+    # Dot B2 (a) on 01fa433d: the direct process exits 0 and leaves a descendant holding the snapshot path. The holds must not go until that descendant is gone.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=_reader_env(fixture_tree,env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    _assert_the_reader_was_gone_before_release(root,q)
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+    assert q["imagePaths"][0]["consumedVerified"] is True,q["imagePaths"]
+
+
+def test_r13_b2_a_an_exited_parent_with_a_live_descendant_is_killed_before_release_on_the_throwing_path(fixture_tree):
+    # Dot B2 (a), its literal shape: the parent spawned the descendant and exited, and a later stream operation throws. The catch used to skip the tree kill because HasExited was true.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=_throw_after_the_child_exits)
+    env=_reader_env(fixture_tree,env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    _assert_the_reader_was_gone_before_release(root,q)
+    assert r.returncode!=0 and "fixture-late-stream-failure" in (q["failure"] or ""),(r.returncode,q)
+
+
+def test_r13_b2_a_a_lane_timeout_kills_the_whole_tree_before_release(fixture_tree):
+    # The timeout sibling of Dot B2: a child and a descendant alive at the deadline.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"timeout",lane="terra",mutation=_record_hold_state(root/"hold-state.txt"))
+    cmd[cmd.index("-TimeoutSec")+1]="12"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==124,(r.returncode,q)
+    assert q.get("imageHoldRelease")=="released",q
+    assert (root/"hold-state.txt").read_text()=="released"
+    for name in ("child.json","grand.json"):
+        if (root/name).exists(): wait_absent(json.loads((root/name).read_text(encoding="utf-8-sig")),30)
+
+
+_KILL_NEW = "[MlvLaneJob]::TerminateOrThrow($Job)"
+_WAIT_NEW = "[MlvLaneJob]::WaitJobEmpty($Job, $IMAGE_READER_KILL_WAIT_MS)"
+_KILL_OLD_CATCH = "$proc.Kill($true); [void]$proc.WaitForExit(15000)"
+_KILL_OLD_TIMEOUT = "try { $proc.Kill($true) } catch { }\n    try { [void]$proc.WaitForExit(15000) } catch { }\n}\n$sw.Stop()"
+
+
+def _fault_kill(text):
+    # (b): the kill throws. On the pre-r13 shapes the same fault is the swallowed Kill.
+    text=text.replace(_KILL_NEW,"throw [ComponentModel.Win32Exception]::new(5, 'fixture-kill-failed')")
+    text=text.replace(_KILL_OLD_CATCH,"throw [ComponentModel.Win32Exception]::new(5, 'fixture-kill-failed')")
+    return text.replace(_KILL_OLD_TIMEOUT,"}\n$sw.Stop()")
+
+
+def _fault_wait(text):
+    # (c): the kill "worked" and the wait for the tree expires with a member still alive. The real kill is left out so that the member really is alive.
+    text=text.replace(_KILL_NEW,"$null = $Job")
+    text=text.replace(_WAIT_NEW,"$false")
+    text=text.replace(_KILL_OLD_CATCH,"$null = $false")
+    return text.replace(_KILL_OLD_TIMEOUT,"}\n$sw.Stop()")
+
+
+def _fault_tree(text):
+    # The job cannot be asked.
+    text=text.replace(_KILL_NEW,"$null = $Job")
+    text=text.replace(_WAIT_NEW,"$(throw [ComponentModel.Win32Exception]::new(6, 'fixture-query-failed'))")
+    return text.replace(_KILL_OLD_CATCH,"throw [ComponentModel.Win32Exception]::new(6, 'fixture-query-failed')")
+
+
+@pytest.mark.parametrize("path",["throwing","completion","timeout"])
+@pytest.mark.parametrize("fault,token",[(_fault_kill,"kill-failed"),(_fault_wait,"wait-timeout"),(_fault_tree,"tree-unreadable")],ids=["b-kill-failed","c-wait-timeout","tree-unreadable"])
+def test_r13_b2_an_uncertain_tree_keeps_the_holds_to_process_exit_and_never_claims_a_clean_release(fixture_tree,fault,token,path):
+    # Dot B2 (b), (c), and the unreadable tree, on each path that releases holds. The holds are still open at the very end of the lane process, the receipt says why,
+    # and nothing is reported as consumed-and-verified.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    mode={"throwing":"hold","completion":"normal","timeout":"timeout"}[path]
+    muts=[fault,_record_hold_state(root/"hold-state.txt")]
+    if path=="throwing": muts.append(_throw_while_alive("$env:MLV_FIXTURE_CHILD"))
+    cmd,env,receipt=prepare(fixture_tree,mode,lane="terra",mutation=_chain(*muts))
+    if path=="timeout": cmd[cmd.index("-TimeoutSec")+1]="12"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert (root/"hold-state.txt").read_text()=="held", "the holds were released before the readers were known gone"
+    assert q.get("imageHoldRelease")==f"uncertain:{token}",q
+    assert q["state"]=="failed" and f"image-hold-uncertain:{token}" in (q["failure"] or ""),q
+    assert r.returncode!=0,(r.returncode,q)
+    assert q["imagePaths"][0]["consumedVerified"] is False and token in q["imagePaths"][0]["consumedVerifyReason"],q["imagePaths"]
+
+
+def test_r13_a_clean_codex_image_lane_releases_its_holds_and_passes_the_child_through_the_host_unchanged(fixture_tree):
+    # The control for the host launch: exit code, stdout, stderr, the prompt on stdin (non-ASCII included) and a non-ASCII snapshot path reach and leave the child as on the direct path.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra","gpt-6-sol")),encoding="utf-8")
+    run_dir=root/"run dir caf\u00e9"
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=_record_hold_state(root/"hold-state.txt"))
+    cmd[cmd.index("-RunDir")+1]=str(run_dir); receipt=run_dir/"terra-001.receipt.json"
+    prompt="judge caf\u00e9 \u03b1 2026-11-04T10:00:00Z"
+    cmd[cmd.index("-Prompt")+1]=prompt
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+    assert q["imageHoldRelease"]=="released" and q["imagePaths"][0]["consumedVerified"] is True,q
+    assert (root/"hold-state.txt").read_text()=="released", "the probe cannot tell a released hold from a kept one"
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    assert seen[0]["path"]==q["imagePaths"][0]["path"] and seen[0]["sha256"]==q["imagePaths"][0]["sha256"],(seen,q["imagePaths"])
+    assert "fixture-err" in (run_dir/"terra-001.err.txt").read_text(encoding="utf-8"),"the child's stderr must reach the lane"
+    # The direct path, same prompt: the child reads the same text on either route.
+    via_host=(root/"prompt.txt").read_bytes()
+    (root/"prompt.txt").unlink(); (root/"child.json").unlink()
+    direct=[*cmd[:cmd.index("-Lane")+1],"sol",*cmd[cmd.index("-Lane")+2:]]
+    r2=run_lane(direct,env)
+    assert r2.returncode==0,(r2.returncode,r2.stdout,r2.stderr)
+    assert (root/"prompt.txt").read_bytes()==via_host, "the host changed the stdin bytes"
+
+
+def test_r13_a_codex_image_host_that_cannot_start_the_child_is_a_typed_no_child_failure(fixture_tree):
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    missing=str(root/"no-such-codex.exe").replace("'","''")
+    def mutation(text):
+        old="(& $hostText $codexImageHost.Program)"
+        assert text.count(old)==1, "the host frame moved; update this fixture mutation"
+        return text.replace(old,f"(& $hostText '{missing}')")
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
     r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==127 and q["state"]=="failed" and "codex-start-failed" in (q["failure"] or ""),(r.returncode,q)
+    assert not (root/"child.json").exists()
+    assert q["imageHoldRelease"]=="released",q
+
+
+def test_r13_a_codex_image_host_outside_the_job_is_never_told_what_to_run(fixture_tree):
+    # The order the job guarantee rests on: no assignment, no frame, so no reader can exist outside the job.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",assignment_failure=True)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-assignment-failure" in (q["failure"] or ""),(r.returncode,q)
+    time.sleep(2)
+    assert not (root/"child.json").exists(), "the codex child ran although its host was never in the job"
+    assert q["imageHoldRelease"]=="released",q
+
+
+class _OplockedFile:
+    # A real stalled open: a level 1 oplock whose break is never acknowledged blocks every other open of the file that reads data, while metadata stays immediate.
+    # Local stand-in for adversary A2's slow share.
+    def __init__(self, path):
+        import ctypes
+        from ctypes import wintypes
+        class OVERLAPPED(ctypes.Structure):
+            _fields_=[("Internal",ctypes.c_void_p),("InternalHigh",ctypes.c_void_p),("Offset",wintypes.DWORD),("OffsetHigh",wintypes.DWORD),("hEvent",wintypes.HANDLE)]
+        self.k=ctypes.WinDLL("kernel32",use_last_error=True)
+        self.k.CreateFileW.restype=wintypes.HANDLE
+        self.k.CreateFileW.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
+        self.k.CreateEventW.restype=wintypes.HANDLE
+        self.k.CreateEventW.argtypes=[ctypes.c_void_p,wintypes.BOOL,wintypes.BOOL,wintypes.LPCWSTR]
+        self.k.DeviceIoControl.argtypes=[wintypes.HANDLE,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),ctypes.POINTER(OVERLAPPED)]
+        self.k.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD]
+        self.k.CloseHandle.argtypes=[wintypes.HANDLE]
+        self.h=None; self.ov=OVERLAPPED(); self.path=path; self.ctypes=ctypes; self.wintypes=wintypes
+    def __enter__(self):
+        end=time.monotonic()+20
+        while True:
+            h=self.k.CreateFileW(str(self.path),0x80000000,7,None,3,0x40000000,None)
+            assert h not in (None,self.ctypes.c_void_p(-1).value), self.ctypes.get_last_error()
+            self.ov.hEvent=self.k.CreateEventW(None,True,False,None)
+            ret=self.wintypes.DWORD(0)
+            ok=self.k.DeviceIoControl(h,0x00090000,None,0,None,0,self.ctypes.byref(ret),self.ctypes.byref(self.ov))
+            err=self.ctypes.get_last_error()
+            if not ok and err==997:
+                self.h=h
+                return self
+            # A scanner still has the fresh file open, so the oplock was not granted yet.
+            self.k.CloseHandle(h); self.k.CloseHandle(self.ov.hEvent)
+            assert time.monotonic()<end, f"the oplock was never granted (last error {err})"
+            time.sleep(.25)
+    def broken(self):
+        # True once some other open of the file asked for its data, i.e. that open is now stalled on this oplock.
+        return self.k.WaitForSingleObject(self.ov.hEvent,0)==0
+    def __exit__(self,*a):
+        self.k.CloseHandle(self.h); self.k.CloseHandle(self.ov.hEvent)
+
+
+def test_r13_adversary_a2_a_shim_whose_open_stalls_is_refused_typed_within_the_read_bound(fixture_tree):
+    # adversary A2 on 2d55c467 (fixed in 01fa433d with no RED test, and its asynchronous read left the OPEN unbounded): a shim read that stalls must not hold the lane. An unbounded
+    # read parks the launcher past this test's budget with no receipt; the bound answers codex-shim-unreadable.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    with _OplockedFile(fixture_tree["shim"]) as lock:
+        r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,90))
+        assert lock.broken(), "the launcher never asked for the shim's data, so this test exercised nothing"
     text=_failure_text(r,receipt)
-    assert r.returncode!=0 and "fixture-stdin-write-failed" in text,(r.returncode,text[-4000:])
-    assert (root/"child.json").exists(), "the injected failure must come after the codex child started"
-    time.sleep(8)
-    assert not (root/"prompt.txt").exists(), "the codex child outlived the failed launch path (its image holds were released while it ran)"
+    assert r.returncode!=0 and "codex-shim-unreadable" in text,(r.returncode,text[-4000:])
+    assert not (root/"child.json").exists()
 
 
 def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):

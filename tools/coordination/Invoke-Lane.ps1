@@ -902,13 +902,16 @@ function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
 }
 
 # Windows job ownership is established around an inert PowerShell host before that
-# host receives any provider configuration. Descendants then inherit kill-on-close. This is the Claude-engine path only: a Codex lane is started
-# without a job object, so nothing here contains its descendants.
+# host receives any provider configuration. Descendants then inherit kill-on-close. This is the Claude-engine path, and (r13, Dot B2) the path of a
+# Codex lane that carries -ImagePaths, because its image holds are released by job membership. A Codex lane with no image is still started without a job.
 if (-not ('MlvLaneJob' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 public static class MlvLaneJob {
   [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS { public UInt64 a,b,c,d,e,f; }
   [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT {
@@ -951,6 +954,33 @@ public static class MlvLaneJob {
     if(!AssignProcessToJobObject(job,process))
       throw new Win32Exception(Marshal.GetLastWin32Error(),"AssignProcessToJobObject");
   }
+  // r13 (Dot B2): a tree kill that does not depend on the direct process being alive, and the job's own count of live members.
+  [StructLayout(LayoutKind.Sequential)] struct BASIC_ACCOUNTING {
+    public Int64 TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+    public UInt32 TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out BASIC_ACCOUNTING info, uint length, IntPtr returned);
+  public static void TerminateOrThrow(IntPtr job) {
+    if(!TerminateJobObject(job,1)) throw new Win32Exception(Marshal.GetLastWin32Error(),"TerminateJobObject");
+  }
+  public static bool WaitJobEmpty(IntPtr job, int timeoutMs) {
+    Stopwatch clock=Stopwatch.StartNew();
+    while(true) {
+      BASIC_ACCOUNTING info;
+      if(!QueryInformationJobObject(job,1,out info,(uint)Marshal.SizeOf(typeof(BASIC_ACCOUNTING)),IntPtr.Zero))
+        throw new Win32Exception(Marshal.GetLastWin32Error(),"QueryInformationJobObject");
+      if(info.ActiveProcesses==0) return true;
+      if(clock.ElapsedMilliseconds>=timeoutMs) return false;
+      Thread.Sleep(25);
+    }
+  }
+  // r13 (Dot B2): an image hold whose readers are not known gone stays open until the lane PROCESS exits. Rooted here so that neither the end of a
+  // caller's scope nor a finalizer can close it earlier.
+  static readonly List<object> keptToProcessExit=new List<object>();
+  public static void KeepToProcessExit(object item) { lock(keptToProcessExit) { keptToProcessExit.Add(item); } }
 }
 '@
 }
@@ -994,6 +1024,30 @@ if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
 $ImageAttachments = @()
 # r4 B2: one held read handle per snapshot, kept open from the copy until the codex child has exited (never serialised into the receipt).
 $ImageHolds = [System.Collections.Generic.List[object]]::new()
+# r13 (Dot B2 on 01fa433d): what the receipt says about releasing those holds: 'released', or 'uncertain:<kill-failed|wait-timeout|tree-unreadable>'.
+$imageHoldRelease = $null
+# The inert host of a codex lane with images (see the launch below); $null on every other lane.
+$codexImageHost = $null
+$IMAGE_READER_KILL_WAIT_MS = 15000
+# r13 (Dot B2): the readers of a snapshot are the members of the lane's job, not the direct process: a descendant that was handed the path can outlive
+# its parent. The tree kill runs whether or not the direct process has exited, and only the job reporting no live member answers 'released'. Never throws.
+function Stop-CodexImageReaderTree {
+    param([IntPtr]$Job)
+    if ($Job -eq [IntPtr]::Zero) { return 'uncertain:tree-unreadable' }
+    try { [MlvLaneJob]::TerminateOrThrow($Job) } catch { return 'uncertain:kill-failed' }
+    try {
+        if (-not ([MlvLaneJob]::WaitJobEmpty($Job, $IMAGE_READER_KILL_WAIT_MS))) { return 'uncertain:wait-timeout' }
+    } catch { return 'uncertain:tree-unreadable' }
+    return 'released'
+}
+# Closes the holds on 'released'; on any uncertain outcome they stay open until this process exits, so a reader still alive keeps seeing the held bytes.
+function Complete-CodexImageHolds {
+    param([Parameter(Mandatory = $true)][string]$Outcome)
+    foreach ($hold in $ImageHolds) {
+        if ($Outcome -eq 'released') { try { $hold.Dispose() } catch { } } else { [MlvLaneJob]::KeepToProcessExit($hold) }
+    }
+    $ImageHolds.Clear()
+}
 # `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
 # -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
 # single -ImagePaths value (`-ImagePaths 'a.png|b.png'`); a real array from `&`/dot-calls works unchanged.
@@ -1528,22 +1582,38 @@ function Assert-CodexCommandLineFits {
 # The shim bytes are hashed when they are read here and re-hashed immediately before Process.Start ('codex-shim-changed' on a change).
 $CODEX_SHIM_MAX_BYTES = 65536
 # r12 fix iteration 1 (adversary A2 on 2d55c467): a shim on a slow share made the synchronous read (and the re-hash) unbounded, ahead of every
-# probe timeout and the lane deadline. Each read is asynchronous with its own deadline; one that does not finish is refused, typed.
+# probe timeout and the lane deadline. r13: the OPEN is bounded too; an asynchronous read only covered the read. The whole open-and-read runs on a pool
+# thread that this call stops waiting for at the deadline, and one that does not finish is refused, typed.
 $CODEX_SHIM_READ_TIMEOUT_MS = 5000
+if (-not ('MlvBoundedRead' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading.Tasks;
+public static class MlvBoundedRead {
+  public static byte[] ReadFile(string path, long maxBytes, int timeoutMs) {
+    Task<byte[]> work=Task.Run(() => {
+      using(FileStream fs=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read,4096)) {
+        if(fs.Length>maxBytes) throw new InvalidDataException("larger than "+maxBytes+" bytes");
+        MemoryStream ms=new MemoryStream(); byte[] buf=new byte[81920]; int n;
+        while((n=fs.Read(buf,0,buf.Length))>0) {
+          ms.Write(buf,0,n);
+          if(ms.Length>maxBytes) throw new InvalidDataException("larger than "+maxBytes+" bytes");
+        }
+        return ms.ToArray();
+      }
+    });
+    if(!work.Wait(timeoutMs)) throw new TimeoutException("the open and read did not finish within "+timeoutMs+" ms");
+    return work.Result;
+  }
+}
+'@
+}
 function Read-CodexShimBytes {
     # One read through one handle that denies writers, so the hashed bytes are a single version of the file.
     param([Parameter(Mandatory = $true)][string]$Path)
     try {
-        $fs = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
-        $cts = [System.Threading.CancellationTokenSource]::new($CODEX_SHIM_READ_TIMEOUT_MS)
-        try {
-            if ($fs.Length -gt $CODEX_SHIM_MAX_BYTES) { throw [System.IO.InvalidDataException]::new("larger than $CODEX_SHIM_MAX_BYTES bytes") }
-            $ms = [System.IO.MemoryStream]::new()
-            $copy = $fs.CopyToAsync($ms, 81920, $cts.Token)
-            if (-not $copy.Wait($CODEX_SHIM_READ_TIMEOUT_MS)) { $cts.Cancel(); throw [System.TimeoutException]::new("the read did not finish within $CODEX_SHIM_READ_TIMEOUT_MS ms") }
-            if ($ms.Length -gt $CODEX_SHIM_MAX_BYTES) { throw [System.IO.InvalidDataException]::new("larger than $CODEX_SHIM_MAX_BYTES bytes") }
-            $bytes = $ms.ToArray()
-        } finally { $fs.Dispose(); $cts.Dispose() }
+        $bytes = [MlvBoundedRead]::ReadFile($Path, $CODEX_SHIM_MAX_BYTES, $CODEX_SHIM_READ_TIMEOUT_MS)
     } catch {
         throw "codex-shim-unreadable: the codex shim '$Path' could not be read ($($_.Exception.GetBaseException().Message)); refused before launch"
     }
@@ -2513,7 +2583,7 @@ if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) {
 
 if ($cfg.engine -eq 'claude') {
     # This trusted host is inert until it reads frame one. It is assigned to the job
-    # before frame one is sent, so the provider and every descendant inherit the job. Claude-engine lanes only: the Codex branch below has no job.
+    # before frame one is sent, so the provider and every descendant inherit the job. A Codex lane with images uses the same order below; one without has no job.
     $hostSource = @'
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -2573,7 +2643,40 @@ $enc=[Text.UTF8Encoding]::new($false)
     # r11 (sol r10 B2): the shim bytes Resolve-CodexShimLaunch read must still be the bytes on disk now; a change is refused, typed.
     Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count
     if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) { throw [TimeoutException]::new('launch-budget-exhausted') }
+    # r13 (Dot B2 on 01fa433d): a lane holding image snapshots needs every reader in a job, and Process.Start has no suspended start, so a job assigned
+    # after it could miss a descendant. As on the Claude path, an inert host is assigned first and only then told what to run. The child inherits the
+    # host's stdout and stderr, so the lane's pipes stream exactly as they do on the direct path. Frame: '.'-joined base64 (UTF-16 text, no JSON date
+    # coercion, no console code page): failure path, stdin bytes, cwd, program, then each argument.
+    if ($ImageHolds.Count -gt 0) {
+        $codexImageHost = [pscustomobject]@{ Program = [string]$psi.FileName; Args = @($psi.ArgumentList); FailurePath = "$base.codex-host-failure.txt" }
+        $codexHostSource = @'
+$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+$line=[Console]::In.ReadLine(); if([string]::IsNullOrEmpty($line)){exit 126}
+$t=$line.Split('.')
+function Text([int]$i){[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($t[$i]))}
+function Fail([string]$kind,$err){
+  $path=Text 0; $tmp=$path+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+  [IO.File]::WriteAllText($tmp,"${kind}: $($err.Exception.GetBaseException().Message)",[Text.UTF8Encoding]::new($false)); [IO.File]::Move($tmp,$path); exit 127
+}
+$p=[Diagnostics.ProcessStartInfo]::new(); $p.WorkingDirectory=Text 2; $p.FileName=Text 3
+for($i=4;$i -lt $t.Count;$i++){[void]$p.ArgumentList.Add((Text $i))}
+$p.UseShellExecute=$false; $p.RedirectStandardInput=$true
+try{$c=[Diagnostics.Process]::Start($p)}catch{Fail 'codex-start-failed' $_}
+try{$b=[Convert]::FromBase64String($t[1]);$c.StandardInput.BaseStream.Write($b,0,$b.Length);$c.StandardInput.Close()}catch{Fail 'codex-stdin-write-failed' $_}
+$c.WaitForExit(); exit $c.ExitCode
+'@
+        $psi.FileName = (Get-Command pwsh.exe -ErrorAction Stop).Source
+        $psi.ArgumentList.Clear()
+        foreach ($a in @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($codexHostSource)))) {
+            [void]$psi.ArgumentList.Add($a)
+        }
+        $jobHandle = [MlvLaneJob]::CreateKillOnClose()
+    }
     $proc = [Diagnostics.Process]::Start($psi)
+}
+if ($null -ne $codexImageHost) {
+    [MlvLaneJob]::AssignOrThrow($jobHandle, $proc.Handle)
+    $jobAssigned = $true
 }
 
 # Start the async reads BEFORE waiting: a child that fills a redirected pipe
@@ -2638,6 +2741,13 @@ if ($cfg.engine -eq 'claude') {
     $promptDelivered = $true; $containment.promptDelivered = $true
     Write-Utf8NoBomAtomic $rcptPath ($runningReceipt | ConvertTo-Json -Depth 6)
     $proc.StandardInput.Close()
+} elseif ($null -ne $codexImageHost) {
+    # The same bytes the direct path's StandardInput.Write would send, written by the host once the child exists.
+    $hostText = { param([string]$s) [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($s)) }
+    $hostFrame = @((& $hostText $codexImageHost.FailurePath), [Convert]::ToBase64String($proc.StandardInput.Encoding.GetBytes($stdinContent)), (& $hostText $WorkDir), (& $hostText $codexImageHost.Program))
+    $hostFrame += @($codexImageHost.Args | ForEach-Object { & $hostText $_ })
+    $proc.StandardInput.WriteLine($hostFrame -join '.')
+    $proc.StandardInput.Close()
 } else {
     $proc.StandardInput.Write($stdinContent)
     $proc.StandardInput.Close()
@@ -2647,15 +2757,18 @@ $timedOut = $false
 $remainingMs = [math]::Max(0.0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
 if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int][math]::Min(2147483647.0, $remainingMs))) {
     $timedOut = $true
-    # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane has no
-    # job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
+    # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane with no image has
+    # no job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
     # harvesting pipes, which descendants could otherwise keep open indefinitely.
-    if ($jobHandle -ne [IntPtr]::Zero) {
-        [void][MlvLaneJob]::CloseHandle($jobHandle)
-        $jobHandle = [IntPtr]::Zero
+    # r13 (Dot B2): a codex lane with images keeps its job open: Stop-CodexImageReaderTree below kills the tree and must still be able to ask whether it is empty.
+    if ($null -eq $codexImageHost) {
+        if ($jobHandle -ne [IntPtr]::Zero) {
+            [void][MlvLaneJob]::CloseHandle($jobHandle)
+            $jobHandle = [IntPtr]::Zero
+        }
+        try { $proc.Kill($true) } catch { }
+        try { [void]$proc.WaitForExit(15000) } catch { }
     }
-    try { $proc.Kill($true) } catch { }
-    try { [void]$proc.WaitForExit(15000) } catch { }
 }
 $sw.Stop()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
@@ -2663,6 +2776,8 @@ $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
 # r4 B2: the codex child has exited (or been killed), so the snapshots it could read have been held read-only since the copy. Re-read each
 # through its held handle and compare with the digest the receipt carries; a mismatch is a typed failure, never a silent pass.
 if ($ImageHolds.Count -gt 0) {
+    # r13 (Dot B2 on 01fa433d): first the tree: a clean exit of the direct process says nothing about a descendant it left running.
+    $imageHoldRelease = Stop-CodexImageReaderTree -Job $jobHandle
     # r5: three distinct outcomes, never conflated. `mutated` = both digests were computed and differ. `unverifiable` = the re-read failed or ran
     # past its bound (the reason, IOException message included, is kept). `pathchanged` = the held object is no longer at the path codex was
     # given, or that path gained a reparse-point ancestor: what codex opened may not be what was hashed.
@@ -2671,6 +2786,8 @@ if ($ImageHolds.Count -gt 0) {
     $verifyClock = [System.Diagnostics.Stopwatch]::StartNew()
     for ($hi = 0; $hi -lt $ImageHolds.Count; $hi++) {
         $verified = $false; $verifyReason = $null
+        # r13 (Dot B2): a reader may still be alive, so a digest taken now would prove nothing about what it reads next.
+        if ($imageHoldRelease -ne 'released') { continue }
         try {
             $nowPath = [MlvImageSnap]::FinalPath($ImageHolds[$hi].SafeFileHandle)
             $nowReparse = Get-ImageReparseAncestor -Path $nowPath
@@ -2694,8 +2811,7 @@ if ($ImageHolds.Count -gt 0) {
         $ImageAttachments[$hi].consumedVerified = $verified
         if ($null -ne $verifyReason) { $ImageAttachments[$hi]['consumedVerifyReason'] = $verifyReason }
     }
-    foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
-    $ImageHolds.Clear()
+    Complete-CodexImageHolds -Outcome $imageHoldRelease
     $imageProblems = @()
     if ($imageMutated.Count -gt 0) { $imageProblems += "image-snapshot-mutated: the image snapshot(s) differ from the receipt's sha256/bytes after the child exited: $($imageMutated -join '; ')" }
     if ($imageUnverifiable.Count -gt 0) { $imageProblems += "image-snapshot-unverifiable: the image snapshot(s) could not be re-read after the child exited, so consumedVerified is false (see imagePaths[].consumedVerifyReason): $($imageUnverifiable -join '; ')" }
@@ -2713,6 +2829,12 @@ $drain = Complete-BoundedOutputDrain -OutTask $outTask -ErrTask $errTask -OutBuf
     -OutStream $outStream -ErrStream $errStream -GraceMs $OUTPUT_DRAIN_GRACE_MS
 $stdout = [string]$drain.stdout
 $stderrText = [string]$drain.stderr
+# r13: what the codex image host could not do (typed, like the same throw on the direct path). A start failure means no child ever ran.
+if ($null -ne $codexImageHost -and (Test-Path -LiteralPath $codexImageHost.FailurePath)) {
+    $hostFailure = try { [System.IO.File]::ReadAllText($codexImageHost.FailurePath) } catch { "codex-host-failure-unreadable: $($_.Exception.Message)" }
+    $failure = if ($failure) { "$hostFailure | $failure" } else { $hostFailure }
+    if ($hostFailure -like 'codex-start-failed:*' -and -not $timedOut) { $exitCode = -999 }
+}
 # The contained host runs the same bounded drain on the CHILD's pipes and leaves this marker when it had to give up on them.
 $hostDrain = $null
 if ($cfg.engine -eq 'claude' -and (Test-Path -LiteralPath $hostDrainPath)) {
@@ -2848,13 +2970,18 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
-    # r12 fix iteration 1 (adversary A1 on 2d55c467): a codex child still running when this path throws (a stdin write to a child that
-    # closed fd 0, ...) could read a snapshot after its hold is released. It is killed, tree and all, and waited for FIRST.
-    if ($cfg.engine -eq 'codex' -and $null -ne $proc) {
-        try { if (-not $proc.HasExited) { $proc.Kill($true); [void]$proc.WaitForExit(15000) } } catch { }
+    # r12 fix iteration 1 (adversary A1 on 2d55c467): a codex child still running when this path throws could read a snapshot after its hold is released.
+    # r13 (Dot B2 on 01fa433d): the outcome comes from the job, whether or not the direct process has exited; a kill failure, a wait timeout or an
+    # unreadable job keeps the holds. A host never assigned to the job was never sent a frame, so no reader exists; it is stopped here, and exits on its own at EOF if that fails.
+    if ($ImageHolds.Count -gt 0) {
+        if ($jobAssigned) {
+            $imageHoldRelease = Stop-CodexImageReaderTree -Job $jobHandle
+        } else {
+            if ($null -ne $proc) { try { $proc.Kill() } catch { } }
+            $imageHoldRelease = 'released'
+        }
+        Complete-CodexImageHolds -Outcome $imageHoldRelease
     }
-    foreach ($hold in $ImageHolds) { try { $hold.Dispose() } catch { } }
-    $ImageHolds.Clear()
     $noChildCause = $_.Exception.Message
     $noChildCauseType = $_.Exception.GetType().Name
     # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
@@ -3015,6 +3142,16 @@ catch {
 }
 finally {
 
+# r13 (Dot B2): on every path, an uncertain release is a typed failure and no image is reported as consumed-and-verified.
+if ([string]$imageHoldRelease -like 'uncertain:*') {
+    foreach ($att in $ImageAttachments) {
+        $att.consumedVerified = $false
+        $att['consumedVerifyReason'] = "image-hold-${imageHoldRelease}: a reader of the snapshot may still be alive, so the hold is kept until the lane process exits"
+    }
+    $holdProblem = "image-hold-${imageHoldRelease}: the image readers are not known to be gone; the holds stay open until the lane process exits"
+    $failure = if ($failure) { "$failure | $holdProblem" } else { $holdProblem }
+    if ($exitCode -eq 0) { $exitCode = 1 }
+}
 # Cleanup must precede all receipt construction and I/O, including exceptional
 # startup paths. Failure to write evidence cannot keep a provider running.
 if ($jobHandle -ne [IntPtr]::Zero) {
@@ -3349,6 +3486,9 @@ if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
 # Each entry is {source, path, sha256, bytes, ext}: `source` is the caller's file, `path` the run-dir COPY handed to
 # `codex exec -i`, sha256/bytes are of that copy (hashed after copying). Null path/sha256 = the launch failed first.
 if ($ImageAttachments.Count -gt 0) { $receipt['imagePaths'] = @($ImageAttachments) }
+# r13 (Dot B2): 'released' = the holds were closed with no possible reader left (the job reported no live member, or no reader was ever started).
+# 'uncertain:<kill-failed|wait-timeout|tree-unreadable>' = they were kept until the lane process exits.
+if ($ImageAttachments.Count -gt 0) { $receipt['imageHoldRelease'] = if ($imageHoldRelease) { $imageHoldRelease } else { 'released' } }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {
