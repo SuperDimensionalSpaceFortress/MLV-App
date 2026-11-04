@@ -12,7 +12,10 @@ WHAT IS PINNED
   * T5 fail open: a missing nvidia-smi, a D3 dGPU on a cpu leg, a D-state read that throws, a CPU counter that throws and a sampler process
     that cannot start each give a typed status and never throw, and a skipped start starts no process;
   * T6 forwarding: Invoke-VenueLeg passes UtilSample only for a JSON true (stub generator), never for "true", false or absent;
-  * T7 schema: generatorArgs.utilSample is a boolean (a string is refused), and the one committed utilsample leg validates.
+  * T7 schema: generatorArgs.utilSample is a boolean (a string is refused), and the one committed utilsample leg validates;
+  * T8 the Play window's anchor (sol r9 B1): the window closes at the play.toggled.begin stamp + elapsed_ms, a session without a usable begin line has no
+    window, and the source pin keeps that line before the Play clock read in platform/qt/MainWindow.cpp. Test logs stamp the begin line at the TRUE Play instant,
+    never at the start stamp, or their late-start inputs would stop testing anything.
 No test launches MLVApp (owner rule 2026-10-11): the generator only writes job text, and the runner runs against stubs.
 """
 
@@ -295,9 +298,9 @@ $r['scalarsNoWindow'] = Get-UtilSampleScalars $gn $cn $false
 $r['scalarsSkipped'] = Get-UtilSampleScalars (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'skipped_wake_risk'; reason = 'dgpu-D3' }) $win) $cs $true
 $r['scalarsNone'] = Get-UtilSampleScalars (Get-UtilSampleGpuSummary $g ([ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing' }) $win) (Get-UtilSampleCpuSummary $c ([ordered]@{ status = 'unavailable'; reason = 'cpu-sampler-start-failed' }) $win) $true
 # adversary 9d648094 A1/A2: the window is the measured session's Play span from the run log, never PresentMon's capture offsets
-$log = "[2026-11-01T13:59:58.000Z] [info] [main] app.start`n[2026-11-01T14:00:01.000Z] [info] [main] playback_smoke.start session=1`n" +
+$log = "[2026-11-01T13:59:58.000Z] [info] [main] app.start`n[2026-11-01T14:00:01.000Z] [info] [main] interaction_trace event=play.toggled.begin checked=1 file_loaded=1`n[2026-11-01T14:00:01.000Z] [info] [main] playback_smoke.start session=1`n" +
        "[2026-11-01T14:00:05.000Z] [info] [main] playback_smoke.summary session=1 frames=10 elapsed_ms=4000`n" +
-       "[2026-11-01T14:00:09.000Z] [info] [main] playback_smoke.measured_session id=2`n[2026-11-01T14:00:10.001Z] [info] [main] playback_smoke.start session=2`n" +
+       "[2026-11-01T14:00:09.000Z] [info] [main] playback_smoke.measured_session id=2`n[2026-11-01T14:00:10.001Z] [info] [main] interaction_trace event=play.toggled.begin checked=1 file_loaded=1`n[2026-11-01T14:00:10.001Z] [info] [main] playback_smoke.start session=2`n" +
        "[2026-11-01T14:00:30.200Z] [info] [main] playback_smoke.summary session=2 frames=480 elapsed_ms=20000 fps=24`n"
 $pw2 = Get-UtilSamplePlayWindow $log
 $r['window'] = @{ startUtc = $pw2.startUtc.ToString('o'); endUtc = $pw2.endUtc.ToString('o'); session = $pw2.session }
@@ -372,7 +375,7 @@ $st = Stop-UtilSampleProcess $null 100
 $r['stopNull'] = @{ stopped = $st.stopped; why = $st.why }
 $r['stopAllNothing'] = (Stop-UtilSampleAll ([ordered]@{ status = 'unavailable'; proc = $null }) ([ordered]@{ status = 'unavailable'; proc = $null }) { param($p) throw 'no stop file' } 100).gpu.why
 # r3 adversary 693bf053 A1: a summary stamp that disagrees with start + elapsed_ms (a stepped host clock) is no window, so no ok answer
-$a1log = "[2026-11-02T14:00:00.000Z] [info] [app] playback_smoke.start session=2`n[2026-11-02T14:00:00.001Z] [info] [app] playback_smoke.measured_session id=2`n" +
+$a1log = "[2026-11-02T14:00:00.000Z] [info] [app] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.000Z] [info] [app] playback_smoke.start session=2`n[2026-11-02T14:00:00.001Z] [info] [app] playback_smoke.measured_session id=2`n" +
          "[2026-11-02T14:01:20.000Z] [info] [app] playback_smoke.summary session=2 reason=play-stop elapsed_ms=20000`n"
 $a1w = Get-UtilSamplePlayWindow $a1log
 $a1csv = $H + "2026-11-02T14:00:01.0000000Z,10,1234,1,2026-11-02T14:00:00.0000000Z,0,1000,1000`n2026-11-02T14:01:02.0000000Z,90,1234,9,2026-11-02T14:00:01.0000000Z,0,61000,61000`n2026-11-02T14:01:19.0000000Z,90,1234,9,2026-11-02T14:01:02.0000000Z,0,17000,17000`n"
@@ -385,12 +388,12 @@ $r['r3A1BadSummaryStamp'] = ($null -eq $a1nostamp)
 # r3 A3: a marker quoted inside a source-location suffix is not the measured-session / summary line (only the log sink's line prefix counts)
 $a3log = "[2026-11-02T14:00:00.000Z] [info] [0x1] interaction_trace event=automation.start (C:/b playback_smoke.measured_session id=1 x/MainWindow.cpp:1)`n" +
          "[2026-11-02T14:00:01.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:05.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=4000`n" +
-         "[2026-11-02T14:00:10.000Z] [info] [0x1] playback_smoke.start session=2 position=0`n[2026-11-02T14:00:10.001Z] [info] [0x1] playback_smoke.measured_session id=2`n" +
+         "[2026-11-02T14:00:10.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:10.000Z] [info] [0x1] playback_smoke.start session=2 position=0`n[2026-11-02T14:00:10.001Z] [info] [0x1] playback_smoke.measured_session id=2`n" +
          "[2026-11-02T14:00:30.000Z] [info] [0x1] playback_smoke.summary session=2 reason=play-stop elapsed_ms=20000`n"
 $a3w = Get-UtilSamplePlayWindow $a3log
 $r['r3A3Measured'] = @{ session = $(if ($a3w) { $a3w.session }); start = $(if ($a3w) { $a3w.startUtc.ToString('o') }) }
 $a3log2 = "[2026-11-02T14:00:00.000Z] [info] [0x1] trace (C:/b playback_smoke.summary session=9 elapsed_ms=5 x/MainWindow.cpp:1)`n" +
-          "[2026-11-02T14:00:01.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:05.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=4000`n"
+          "[2026-11-02T14:00:01.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:01.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:05.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=4000`n"
 $a3w2 = Get-UtilSamplePlayWindow $a3log2
 $r['r3A3Summary'] = @{ session = $(if ($a3w2) { $a3w2.session }) }
 # r3 A2: a sampler whose stop failed (stopped=false, a live process after both Kills) is a typed failure, never ok / utilSampleStatus ok
@@ -647,7 +650,7 @@ $w2t += "$($p0.AddMilliseconds(2050).ToString('o')),50,1234,1,$($p0.AddSeconds(5
 $w2t += "$($p0.AddSeconds(6).ToString('o')),50,1234,1,$($p0.AddMilliseconds(6050).ToString('o')),3000,950,950`n"
 $w2t += (CpuRow $p0.AddSeconds(7) 50 1234 1 $p0.AddSeconds(3) '0' 1000 1000)
 for ($n = 9; $n -le 22; $n++) { $w2t += (CpuRow $p0.AddSeconds($n - 1) 50 1234 1 $p0.AddSeconds($n - 2) '0' 1000 1000) }
-$w2log = "[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:19.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=20000`n"
+$w2log = "[2026-11-02T14:00:00.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:19.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=20000`n"
 $w2p = ConvertFrom-UtilSampleCpuCsv $w2t
 $w2w = Get-UtilSamplePlayWindow $w2log
 if ($null -ne $w2w) { $w2w['clockWhy'] = Get-UtilSampleClockWitness $w2p $run $w2w }
@@ -685,7 +688,7 @@ $pubAst = [System.Management.Automation.Language.Parser]::ParseInput($pubSrc, [r
 $region3 = @($genStrings | Where-Object { $_.Contains('$utilSampleCpuParsed = ConvertFrom-UtilSampleCpuCsv') })[0]
 function Write-JobTrace([string]$m) { }
 function Publish-AttrCudaFileCopy([string]$Source, [string]$Destination) { $sx = [IO.File]::ReadAllText($Source); $script:y2pubs.Add([IO.Path]::GetFileName($Destination) + '=' + $sx.Substring(0, [math]::Min(12, $sx.Length))); [IO.File]::Copy($Source, $Destination, $true) }
-$rawLog = "[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:20.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=20000`n"
+$rawLog = "[2026-11-02T14:00:00.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-02T14:00:20.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=20000`n"
 $Pub = $y2pub; $utilSampleGpuCsv = Join-Path $y2dir 'gpu-util.csv'; $utilSampleCpuCsv = $y2csv
 $utilSampleGpuStart = [ordered]@{ status = 'unavailable'; reason = 'nvidia-smi-missing'; owned = $false }; $utilSampleCpuStart = $run
 function Invoke-Region3($Rec) {
@@ -821,7 +824,7 @@ $r['k2B2'] = @{
 # total=50 cover the window, then a stepped row (step=100) is appended without its newline and with only six fields. At fa1197b4 the split dropped
 # it as tornTail, the witness checked only unparseable, and the window was verified: status=ok, totalMean=50
 $f1p = [DateTime]::new(2026, 11, 2, 14, 0, 0, 0, [DateTimeKind]::Utc)
-$f1log = "[2026-11-02T14:00:00.000Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$f1log = "[2026-11-02T14:00:00.000Z] [info] [smoke] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.000Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
 $f1body = $H; for ($i = 1; $i -le 20; $i++) { $f1body += (CpuRow $f1p.AddSeconds($i) 50 1234 1 $f1p.AddSeconds($i - 1) '0' 1000 1000) }
 function F1Case([string]$Text) {
     $p = ConvertFrom-UtilSampleCpuCsv $Text
@@ -912,7 +915,7 @@ function Invoke-ZoneRegion3([string]$AtStart, [string]$AtStop) {
     $utilSampleCpuCsv = Join-Path $zdir 'cpu-util.csv'; [IO.File]::WriteAllText($utilSampleCpuCsv, $z2cpu.ToString())
     $utilSampleGpuStart = [ordered]@{ status = 'running'; reason = $null; owned = $true }; $utilSampleCpuStart = $run
     $utilSampleZoneAtStart = $AtStart; $utilSampleZoneAtStop = $AtStop
-    $rawLog = "[2026-11-03T00:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-03T00:30:00.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=1800000`n"
+    $rawLog = "[2026-11-03T00:00:00.000Z] [info] [0x1] interaction_trace event=play.toggled.begin checked=1`n[2026-11-03T00:00:00.000Z] [info] [0x1] playback_smoke.start session=1 position=0`n[2026-11-03T00:30:00.000Z] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=1800000`n"
     $utilSampleStopRecord = [ordered]@{ gpu = [ordered]@{ stopped = $true; killed = $true; exitCode = 1; exitedBeforeStop = $false; why = $null }; cpu = $okStop }
     $script:utilSamplePublished = $false; $script:utilSampleGpuPublished = $false; $script:utilSampleCpuPublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new()
     $utilSampleScalars = $null; $utilSampleGpu = $null; $utilSampleCpu = $null
@@ -964,7 +967,8 @@ function Invoke-DriftCase([scriptblock]$Offset, [double]$StartMs, [double]$Summa
         $gt += "$($gu.ToString('yyyy/MM/dd HH:mm:ss.fff', $inv)), $(if ($HotGpu -contains $g) { 100 } else { 0 }), 0, 1800, P2, 50`n"
     }
     $lf = { param($ms) $p0.AddMilliseconds($ms).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", $inv) }
-    $dl = "[$(& $lf $StartMs)] [info] [smoke] playback_smoke.start session=1`n[$(& $lf $SummaryMs)] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+    # sol r9 B1: the begin line is stamped at the true Play instant on this clock (offset included), never later than the log's stated start stamp
+    $dl = "[$(& $lf ([math]::Min($StartMs, [double](& $Offset 0.0))))] [info] [smoke] interaction_trace event=play.toggled.begin checked=1`n[$(& $lf $StartMs)] [info] [smoke] playback_smoke.start session=1`n[$(& $lf $SummaryMs)] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
     $dw2 = Get-UtilSamplePlayWindow $dl
     $dcp = ConvertFrom-UtilSampleCpuCsv $csv
     if ($null -ne $dw2) { $dw2['clockWhy'] = Get-UtilSampleClockWitness $dcp $run $dw2 }
@@ -980,6 +984,8 @@ $d1Slew = { param($x) if ($x -le 19500) { 0.0 } elseif ($x -le 20000) { ($x - 19
 # the adversary's and key3's literal input: +10 ms per 50 ms poll for the 500 ms before Play, -10 ms per poll for the 500 ms after
 $d1Pre = { param($x) if ($x -le -500 -or $x -ge 500) { 0.0 } elseif ($x -le 0) { ($x + 500) / 5.0 } else { (500 - $x) / 5.0 } }
 function Get-RampOffset([double]$Peak) { { param($x) if ($x -le 19500) { 0.0 } elseif ($x -le 20000) { ($x - 19500) * $Peak / 500.0 } else { $Peak } }.GetNewClosure() }
+# 0 at Play-1000 ms (the first read), $AtStart at Play, then a slow ramp to $NearEnd at Play+19500 ms, held
+function Get-SwingOffset([double]$AtStart, [double]$NearEnd) { { param($x) if ($x -le 0) { $AtStart * ($x + 1000) / 1000.0 } elseif ($x -le 19500) { $AtStart + ($NearEnd - $AtStart) * $x / 19500.0 } else { $NearEnd } }.GetNewClosure() }
 $r['d1B1'] = @{
     steady = (Invoke-DriftCase { param($x) 0.0 } 0 20000 @(19950.0) 100)
     slewed = (Invoke-DriftCase $d1Slew 0 20100 @(19950.0) 100)
@@ -991,7 +997,29 @@ $r['d1B1'] = @{
     crystal = (Invoke-DriftCase { param($x) ($x + 1000) * 0.0005 } 0 20000 @(19950.0) 100)
     under = (Invoke-DriftCase (Get-RampOffset 24) 0 20000 @(19950.0) 100)
     over = (Invoke-DriftCase (Get-RampOffset 26) 0 20000 @(19950.0) 100)
+    # Dot B4: -24 ms at Play start and +20 ms near the end. Each stays under 25 ms from the first reading (offset 0 at Play-1000 ms), the two differ by 44 ms
+    spread = (Invoke-DriftCase (Get-SwingOffset -24 20) -24 20020 @(19950.0) 100)
+    spreadUnder = (Invoke-DriftCase (Get-SwingOffset -12 12) -12 20012 @(19950.0) 100)
 }
+# ---- Dot B4 (the bookkeeping on stated brackets): the first read's three brackets are all 10 ms wide (half-width 5); then zero-width reads at offsets +3,
+# +8, -7, 0 against its midpoint, with maxStep reset before the last two as the loop's per-row reset does. Against the first read alone (e1ea9878) the
+# last read states only its own 7 ms step; the spread (8 - -7) is never reset per row
+$h4t0 = $p0.Ticks
+$h4ck = @{ u = $null; m = 0.0; e = 0.0; maxStep = 0.0 }; $h4w = @{ Elapsed = @{ TotalMilliseconds = 0.0 } }
+$script:h4q = [Collections.Generic.Queue[int64]]::new()
+foreach ($i in 1..3) { $script:h4q.Enqueue($h4t0 - 50000); $script:h4q.Enqueue($h4t0 + 50000) }
+[void](Read-UtilSampleClock $h4ck $h4w { $script:h4q.Dequeue() })
+$h4 = [ordered]@{ first = $h4ck.maxStep }
+function Read-H4([double]$Mono, [double]$Off) {
+    $h4w.Elapsed.TotalMilliseconds = $Mono
+    foreach ($i in 1..2) { $script:h4q.Enqueue($h4t0 + [int64](1e4 * ($Mono + $Off))) }
+    [void](Read-UtilSampleClock $h4ck $h4w { $script:h4q.Dequeue() })
+    $h4ck.maxStep
+}
+$h4['plus3'] = Read-H4 1000 3; $h4['plus8'] = Read-H4 2000 8
+$h4ck.maxStep = 0.0; $h4['minus7'] = Read-H4 3000 -7
+$h4ck.maxStep = 0.0; $h4['back0'] = Read-H4 4000 0
+$r['h4B4'] = $h4
 # ---- the same class through the real loop (scaled): the wall clock slews 100 ms over 500 ms (about 12 ms per real poll) and is never put back
 $script:d2t0 = $null
 $d2clock = { $n = [DateTime]::UtcNow.Ticks; if ($null -eq $script:d2t0) { $script:d2t0 = $n }; $el = ($n - $script:d2t0) / 1e4; $n + [int64](1e4 * [math]::Min(100.0, [math]::Max(0.0, ($el - 400) / 5.0))) }
@@ -1015,7 +1043,7 @@ $r['d3Tail'] = @{ endedBy = $d3res.endedBy; stepped = $script:d3stepped; realRow
 # ---- adversary f8fbeab3 A1 (literal input): the app starts its Play clock, then stalls 500 ms before it logs the start line, so the start stamp is
 # P+0.5 s while the summary (stamp P+20 s, elapsed_ms=20000) still agrees within the 1 s tolerance. GPU 0 through P+20 s, 100 afterwards. At f8fbeab3 the
 # window ran P+0.5..P+20.5 s, past the end of Play: clockWhy null, GPU ok, mean 2.469 although Play's true mean is 0
-$g1log = "[2026-11-02T14:00:00.500Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$g1log = "[2026-11-02T14:00:00.000Z] [info] [smoke] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.500Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
 $g1csv = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n"; for ($i = 0; $i -le 22; $i++) { $g1csv += (CpuRow $p0.AddSeconds($i) 5 1234 0 $p0.AddSeconds($i - 1) '0' 1000 1000) }
 $g1gt = ''; for ($g = 0; $g -le 21500; $g += 250) { $g1gt += "$([TimeZoneInfo]::ConvertTimeFromUtc($p0.AddMilliseconds($g), $cst).ToString('yyyy/MM/dd HH:mm:ss.fff', $inv)), $(if ($g -le 20000) { 0 } else { 100 }), 0, 1800, P2, 50`n" }
 $g1w = Get-UtilSamplePlayWindow $g1log
@@ -1024,8 +1052,57 @@ $g1w['clockWhy'] = Get-UtilSampleClockWitness $g1c $run $g1w
 $g1g = Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv $g1gt $cst) $run $g1w $okStop
 $g1s = Get-UtilSampleCpuSummary $g1c $run $g1w $okStop
 # a summary stamp LATER than start + elapsed_ms keeps the computed end (the summary's own line was the late one)
-$g1late = Get-UtilSamplePlayWindow "[2026-11-02T14:00:00.000Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.400Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$g1late = Get-UtilSamplePlayWindow "[2026-11-02T14:00:00.000Z] [info] [smoke] interaction_trace event=play.toggled.begin checked=1`n[2026-11-02T14:00:00.000Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.400Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
 $r['g1A1'] = @{ start = $g1w.startUtc.ToString('o'); end = $g1w.endUtc.ToString('o'); clockWhy = $g1w.clockWhy; gpu = $g1g.status; gpuMean = $g1g.mean; cpu = $g1s.status; cpuRows = $g1s.rowsInWindow; lateEnd = $g1late.endUtc.ToString('o') }
+# ---- sol r9 B1 (= adversary e1ea9878 A1, literal input): the true Play is P..P+20000 ms. The start line is stamped P+500 ms and the summary line P+20750 ms,
+# so those two stamps agree within the tolerance and the old window ended P+20500 ms. GPU 0 through P+20000 ms, 100 afterwards. At e1ea9878: clockWhy null,
+# GPU ok, mean 2.469 over 81 rows, CPU ok, overall ok, on a true mean of 0. Every case below runs those rows through the real window, witness, summaries, scalars.
+function Get-H1Log([string]$Before, [string]$Start = '00.500', [string]$Summary = '20.750', [string]$Th = 'smoke') { "$($Before)[2026-11-02T14:00:$Start`Z] [info] [$Th] playback_smoke.start session=1`n[2026-11-02T14:00:$Summary`Z] [info] [$Th] playback_smoke.summary session=1 elapsed_ms=20000`n" }
+function Get-H1Begin([string]$At = '00.000', [string]$Th = 'smoke', [string]$Rest = 'checked=1 file_loaded=1 position=0') { "[2026-11-02T14:00:$At`Z] [info] [$Th] interaction_trace event=play.toggled.begin $Rest`n" }
+function Invoke-H1Case([string]$LogText) {
+    $w = Get-UtilSamplePlayWindow $LogText
+    $cp = ConvertFrom-UtilSampleCpuCsv $g1csv; $gp = ConvertFrom-UtilSampleGpuCsv $g1gt $cst
+    if ($null -ne $w) { $w['clockWhy'] = Get-UtilSampleClockWitness $cp $run $w }
+    $gs = Get-UtilSampleGpuSummary $gp $run $w $okStop; $cs = Get-UtilSampleCpuSummary $cp $run $w $okStop
+    $sc = Get-UtilSampleScalars $gs $cs ($null -ne $w)
+    @{ window = ($null -ne $w); start = $(if ($w) { $w.startUtc.ToString('o') }); end = $(if ($w) { $w.endUtc.ToString('o') }); clockWhy = $(if ($w) { $w.clockWhy })
+        lastGpu = $(if ($w) { @(Select-UtilSampleWindowRows $gp.rows $w)[-1].utc.ToString('o') }); gpu = $gs.status; gpuMean = $gs.mean; gpuRows = $gs.rowsInWindow
+        cpu = $cs.status; cpuRows = $cs.rowsInWindow; cpuMean = $cs.totalMean; overall = $sc.utilSampleStatus; reason = $sc.utilSampleReason }
+}
+$h1Other = "[2026-11-02T14:00:00.000Z] [info] [smoke] "
+$r['h1B1'] = @{
+    literal = (Invoke-H1Case (Get-H1Log (Get-H1Begin)))
+    # the literal stamps with no usable begin line: each of these is the only candidate
+    noBegin = (Invoke-H1Case (Get-H1Log ''))
+    anchorLate = (Invoke-H1Case (Get-H1Log (Get-H1Begin '00.501')))
+    badStamp = (Invoke-H1Case (Get-H1Log "[not-a-time] [info] [smoke] interaction_trace event=play.toggled.begin checked=1`n"))
+    checked0 = (Invoke-H1Case (Get-H1Log (Get-H1Begin -Rest 'checked=0 file_loaded=1')))
+    checked10 = (Invoke-H1Case (Get-H1Log (Get-H1Begin -Rest 'checked=10 file_loaded=1')))
+    otherThread = (Invoke-H1Case (Get-H1Log (Get-H1Begin -Th '0x2')))
+    afterStart = (Invoke-H1Case ((Get-H1Log '') + (Get-H1Begin '20.800')))
+    quotedText = (Invoke-H1Case (Get-H1Log ($h1Other + "note interaction_trace event=play.toggled.begin checked=1`n")))
+    quotedSuffix = (Invoke-H1Case (Get-H1Log ($h1Other + "trace (C:/b interaction_trace event=play.toggled.begin checked=1 x/MainWindow.cpp:1)`n")))
+    # a start line between the begin line and this session's start line: that begin line was the earlier session's Play
+    earlierSession = (Invoke-H1Case ((Get-H1Begin '00.000') + "[2026-11-02T14:00:00.001Z] [info] [smoke] playback_smoke.start session=7`n[2026-11-02T14:00:00.200Z] [info] [smoke] playback_smoke.summary session=7 elapsed_ms=199`n[2026-11-02T14:00:00.300Z] [info] [smoke] playback_smoke.measured_session id=1`n" + (Get-H1Log '')))
+    # the anchor is the LAST begin line on the start line's thread: an earlier one, and a later one on another thread, do not move it
+    lastOfTwo = (Invoke-H1Case (Get-H1Log ((Get-H1Begin '00.000' 'smoke' 'checked=0') + (Get-H1Begin '00.000'))))
+    pickLast = (Invoke-H1Case ("[2026-11-02T13:59:50.000Z] [info] [smoke] interaction_trace event=play.toggled.begin checked=1`n" + (Get-H1Log (Get-H1Begin))))
+    pickThread = (Invoke-H1Case (Get-H1Log ((Get-H1Begin) + (Get-H1Begin '00.400' '0x2'))))
+    # controls: true stamps; a begin line equal to the start stamp; a summary stamp earlier than anchor + elapsed still closes the window
+    steady = (Invoke-H1Case (Get-H1Log (Get-H1Begin) '00.000' '20.000'))
+    sameMs = (Invoke-H1Case (Get-H1Log (Get-H1Begin '00.500')))
+    summaryEarly = (Invoke-H1Case (Get-H1Log (Get-H1Begin) '00.000' '19.500'))
+}
+# the literal line shape of a real run log (.claude-state\profiling\20260908-pr72-historical-aa-r7\a\result.json.run.log:236-237 and :282, pasted; not in the tree)
+$h1Real = @'
+[2026-09-08T16:54:16.540Z] [INFO] [0xfbf8] interaction_trace event=timer_frame.idle play_checked=0 frame_changed=0 dont_draw=0 opening=0 position=80
+[2026-09-08T16:54:16.567Z] [INFO] [0xfbf8] interaction_trace event=play.toggled.begin checked=1 file_loaded=1 position=80 cut_in=1 cut_out=1 frame_changed=0 still_drawing=0 pending_advance=0
+[2026-09-08T16:54:16.568Z] [INFO] [0xfbf8] playback_smoke.start session=1 position=80 cut_in=1 cut_out=1 scale_request=4 quality_mode=1 worker_threads=1 start_serial=3 frame_telemetry=1 drop_frame=0 audio=1 scopes=0 zebras=0 file_loaded=1 env_force_threads=unset env_force_singlethread=unset env_playback_max_threads=1 env_disable_playback_thread_cap=unset env_playback_scale=unset env_hq_mean23=unset env_playback_smoke_telemetry=1 env_playback_scope_interval_ms=unset env_omp_num_threads=unset env_disable_raw_uint16_prefetch=unset env_disable_play_start_preroll=unset preview_mode=sharp_smooth env_aggressive_preview=unset env_preview_mode=unset env_quality_mode=1
+[2026-09-08T16:54:16.568Z] [INFO] [0xfbf8] interaction_trace event=frame_refresh.request reason=play-start reset_current=1 file_loaded=1 frame_changed_before=1 still_drawing=0 play_checked=1 position=80
+[2026-09-08T16:54:16.710Z] [INFO] [0xfbf8] playback_smoke.summary session=1 reason=play-stop elapsed_ms=140.000
+'@
+$h1rw = Get-UtilSamplePlayWindow $h1Real
+$r['h1Real'] = @{ window = ($null -ne $h1rw); start = $(if ($h1rw) { $h1rw.startUtc.ToString('o') }); end = $(if ($h1rw) { $h1rw.endUtc.ToString('o') }); session = $(if ($h1rw) { $h1rw.session }) }
 # ---- adversary f8fbeab3 A3 (literal input): first read P.Ticks at monotonic 0, then P.Ticks + i*10000000 + 250004 at i*1000 ms, so the true cumulative
 # offset is 25.0004 ms. At f8fbeab3 the row's 0.### format wrote 25, and the witness's "> 25" passed it. Both write sites run through the real loop:
 # a stubbed clock read states the raw value on every row (g3Row) or only on the read after the last row (g3Tail: the tail row alone carries it).
@@ -1397,6 +1474,63 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual((a1["clockWhy"], a1["gpu"], a1["gpuMean"], a1["cpu"], a1["cpuRows"]), (None, "ok", 0.0, "ok", 19), a1)
         self.assertEqual(a1["lateEnd"], "2026-11-02T14:00:20.0000000Z", f"a late summary line must not extend the window: {a1}")
 
+    def test_sol_r9_b1_both_late_stamps_keep_post_play_rows_out_of_the_ok_summary(self) -> None:
+        # sol's literal input (= adversary e1ea9878 A1): at e1ea9878 the window ended P+20.5 s: GPU ok, mean 2.469 over 81 rows, overall ok, on a true mean of 0
+        c = self.r["h1B1"]["literal"]
+        self.assertEqual((c["start"], c["end"]), ("2026-11-02T14:00:00.5000000Z", "2026-11-02T14:00:20.0000000Z"), f"the window left the measured Play: {c}")
+        self.assertLessEqual(c["lastGpu"], "2026-11-02T14:00:20.0000000Z", f"a post-Play row entered the window: {c}")
+        self.assertEqual((c["clockWhy"], c["gpu"], c["gpuMean"], c["gpuRows"], c["cpu"], c["cpuRows"], c["overall"]), (None, "ok", 0.0, 79, "ok", 19, "ok"), c)
+
+    def test_sol_r9_b1_no_usable_begin_line_is_no_window(self) -> None:
+        # each case is the literal input with the only candidate line changed. At e1ea9878 every one of them read ok with the 2.469 mean
+        for name in ("noBegin", "anchorLate", "badStamp", "checked0", "checked10", "otherThread", "afterStart", "quotedText", "quotedSuffix", "earlierSession"):
+            with self.subTest(case=name):
+                c = self.r["h1B1"][name]
+                self.assertFalse(c["window"], f"{name} gave a window: {c}")
+                self.assertEqual((c["gpu"], c["cpu"], c["overall"], c["reason"]),
+                                 ("partial(no_window)", "partial(no_window)", "partial", "no_window"), f"{name}: {c}")
+
+    def test_sol_r9_b1_the_anchor_is_the_last_begin_line_on_the_start_lines_thread(self) -> None:
+        # the first case holds a checked=0 line first; the second an older checked=1 line; the third a later checked=1 line on another thread. At e1ea9878 each ended P+20.5 s
+        for name in ("lastOfTwo", "pickLast", "pickThread"):
+            with self.subTest(case=name):
+                c = self.r["h1B1"][name]
+                self.assertEqual((c["window"], c["end"], c["gpuMean"]), (True, "2026-11-02T14:00:20.0000000Z", 0.0), f"{name}: {c}")
+
+    def test_sol_r9_b1_controls_keep_their_numbers(self) -> None:
+        h = self.r["h1B1"]
+        s = h["steady"]
+        self.assertEqual((s["start"], s["end"], s["clockWhy"], s["gpu"], s["gpuMean"], s["gpuRows"], s["cpu"], s["cpuMean"], s["cpuRows"], s["overall"]),
+                         ("2026-11-02T14:00:00.0000000Z", "2026-11-02T14:00:20.0000000Z", None, "ok", 0.0, 81, "ok", 5.0, 20, "ok"), f"the steady control moved: {s}")
+        same = h["sameMs"]
+        self.assertEqual((same["window"], same["start"], same["end"]), (True, "2026-11-02T14:00:00.5000000Z", "2026-11-02T14:00:20.5000000Z"),
+                         f"a begin line sharing the start line's millisecond is not later than it: {same}")
+        early = h["summaryEarly"]
+        self.assertEqual((early["window"], early["end"]), (True, "2026-11-02T14:00:19.5000000Z"), f"the summary stamp still closes the window: {early}")
+
+    def test_sol_r9_b1_the_real_run_log_line_shape_anchors_the_window(self) -> None:
+        self.assertEqual(self.r["h1Real"], {"window": True, "start": "2026-09-08T16:54:16.5680000Z", "end": "2026-09-08T16:54:16.7070000Z", "session": 1},
+                         "begin stamp .567 + elapsed_ms 140.000, under the summary stamp .710")
+
+    def test_dot_b4_offsets_of_opposite_sign_are_bounded_by_their_spread(self) -> None:
+        # Dot B4: at e1ea9878 each offset was judged against the first read only, so -24 ms and +20 ms both passed and the comment's 25 ms bound was wrong
+        b1 = self.r["d1B1"]
+        s = b1["spread"]
+        self.assertAlmostEqual(s["stated"], 44.0, delta=0.01, msg=f"the rows must state the spread: {s}")
+        self.assertEqual((s["window"], s["clockWhy"], s["gpu"], s["cpu"], s["overall"]),
+                         (True, "sample-clock-unverified", "unavailable(sample-clock-unverified)", "unavailable(sample-clock-unverified)", "unavailable"), s)
+        u = b1["spreadUnder"]
+        self.assertAlmostEqual(u["stated"], 24.0, delta=0.01, msg=f"-12 and +12 are a 24 ms spread: {u}")
+        self.assertEqual((u["window"], u["clockWhy"], u["overall"]), (True, None, "ok"), f"a spread under the limit keeps its session: {u}")
+
+    def test_dot_b4_the_spread_counts_half_widths_and_survives_the_per_row_reset(self) -> None:
+        h4 = self.r["h4B4"]
+        self.assertEqual(h4["first"], 10.0, f"the first read's own bracket is the spread +5 to -5: {h4}")
+        self.assertEqual(h4["plus3"], 10.0, f"+3 stays inside +5 to -5: {h4}")
+        self.assertEqual(h4["plus8"], 13.0, f"+8 to -5: {h4}")
+        self.assertEqual(h4["minus7"], 15.0, f"+8 to -7, after the per-row reset: {h4}")
+        self.assertEqual(h4["back0"], 15.0, f"the spread is never reset per row, so the next row still states it: {h4}")
+
     def test_adv_f8fbeab3_a3_the_written_step_never_rounds_below_the_limit(self) -> None:
         # literal input: at f8fbeab3 raw 25.0004 was written as 25, so clockWhy None and CPU ok; row site and tail site
         a3 = self.r["g3A3"]
@@ -1554,6 +1688,99 @@ class UtilSampleSpecTests(unittest.TestCase):
     def test_t7_the_card_has_venue_roles(self) -> None:
         roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
         self.assertEqual(roles["CUDA-HEADROOM-UTIL-SAMPLER-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
+
+def play_anchor_source_breaks(text: str) -> list[str]:
+    """What the sampler's Play-window anchor needs from platform/qt/MainWindow.cpp; each string names a claim the text no longer meets (sol r9 B1).
+
+    Get-UtilSamplePlayWindow closes the window at the play.toggled.begin stamp + elapsed_ms. That is safe only while the line is unconditional, comes before
+    the one call that reads the Play clock, and elapsed_ms is measured from that clock."""
+    breaks: list[str] = []
+    if "bool traceOnly = false" not in text:
+        breaks.append("the logInteractionEvent signature lost `bool traceOnly = false`")
+    if text.count("beginPlaybackSmokeTelemetry();") != 1:
+        breaks.append("beginPlaybackSmokeTelemetry(); is not called exactly once")
+    if text.count("m_playbackSmokeStartTime = mlv_stage_timing_now();") != 1:
+        breaks.append("the Play clock is not read exactly once")
+    finish_at = text.find("void MainWindow::finishPlaybackSmokeTelemetry(")
+    finish_end = text.find("\n}\n", finish_at)
+    if finish_at < 0 or finish_end < 0 or "const double elapsedMs = ( now - m_playbackSmokeStartTime ) * 1000.0;" not in text[finish_at:finish_end]:
+        breaks.append("finishPlaybackSmokeTelemetry does not compute elapsedMs from the Play clock")
+    toggled_at = text.find("void MainWindow::on_actionPlay_toggled(bool checked)")
+    toggled_end = text.find("\n}\n", toggled_at)
+    body = text[toggled_at:toggled_end] if toggled_at >= 0 and toggled_end >= 0 else ""
+    begin_at = body.find('QStringLiteral("play.toggled.begin")')
+    call_at = body.find("beginPlaybackSmokeTelemetry();")
+    if begin_at < 0 or call_at < 0 or begin_at > call_at:
+        breaks.append("on_actionPlay_toggled does not log play.toggled.begin before beginPlaybackSmokeTelemetry();")
+        return breaks
+    open_at = body.rfind("logInteractionEvent(", 0, begin_at)
+    if open_at < 0 or body[open_at + len("logInteractionEvent("):begin_at].strip():
+        breaks.append("play.toggled.begin is not the first argument of a logInteractionEvent call")
+        return breaks
+    # the call's top-level arguments: two, so traceOnly keeps its default and the line never depends on the interactive-trace switch
+    depth, top_commas, close_at, in_str = 0, 0, -1, False
+    for i in range(open_at + len("logInteractionEvent"), len(body)):
+        ch = body[i]
+        if ch == '"' and body[i - 1] != "\\":
+            in_str = not in_str
+        if in_str:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_at = i
+                break
+        elif ch == "," and depth == 1:
+            top_commas += 1
+    if close_at < 0 or top_commas != 1:
+        breaks.append("the play.toggled.begin call does not pass exactly two arguments")
+    call = body[begin_at:close_at]
+    if 'QStringLiteral("checked=%1 ' not in call or call.find(".arg(") != call.find(".arg( bool01( checked ) )"):
+        breaks.append("checked= is no longer the line's first field, which the sampler's marker reads")
+    return breaks
+
+
+class UtilSamplePlayAnchorSourceTests(unittest.TestCase):
+    """sol r9 B1: the sampler reads the app's existing log line as a wall stamp from before the Play clock read. No app line was added, so this pin is what
+    keeps that reading true (read as text; nothing is built or launched). The sink's stamp: platform/qt/CrashForensics.cpp writeLogLine stamps before it writes."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8", errors="replace")
+
+    def test_sol_r9_b1_the_source_keeps_the_begin_line_before_the_play_clock(self) -> None:
+        self.assertEqual(play_anchor_source_breaks(self.text), [])
+
+    def test_sol_r9_b1_the_source_pin_is_red_on_each_mutation(self) -> None:
+        begin_call = 'beginPlaybackSmokeTelemetry();'
+        clock = "m_playbackSmokeStartTime = mlv_stage_timing_now();"
+        elapsed = "const double elapsedMs = ( now - m_playbackSmokeStartTime ) * 1000.0;"
+        toggled = self.text[self.text.index("void MainWindow::on_actionPlay_toggled(bool checked)"):]
+        args_at = toggled.index('QStringLiteral("play.toggled.begin")')
+        args_end = toggled.index(".arg( bool01( m_playbackFrameAdvancePending ) ) );")
+        args = toggled[args_at:args_end]
+        def moved_after_call(t: str) -> str:
+            # the log call moved to just after the Play clock's call
+            call = t[t.rindex("logInteractionEvent(", 0, t.index('QStringLiteral("play.toggled.begin")')):t.index(".arg( bool01( m_playbackFrameAdvancePending ) ) );") + len(".arg( bool01( m_playbackFrameAdvancePending ) ) );")]
+            return t.replace(call, "", 1).replace(begin_call, begin_call + "\n" + call, 1)
+        finish = "void MainWindow::finishPlaybackSmokeTelemetry("
+        finish_at = self.text.index(finish)
+        mutants = {
+            "the logInteractionEvent signature": self.text.replace("bool traceOnly = false", "bool traceOnly = true", 1),
+            "beginPlaybackSmokeTelemetry(); is not called exactly once": self.text.replace(begin_call, begin_call + "\n" + begin_call, 1),
+            "the Play clock is not read exactly once": self.text.replace(clock, clock + "\n    " + clock, 1),
+            "finishPlaybackSmokeTelemetry does not compute": self.text[:finish_at] + self.text[finish_at:].replace(elapsed, "const double elapsedMs = now * 1000.0;", 1),
+            "on_actionPlay_toggled does not log": moved_after_call(self.text),
+            "does not pass exactly two arguments": self.text.replace(args + ".arg( bool01( m_playbackFrameAdvancePending ) ) );", args + ".arg( bool01( m_playbackFrameAdvancePending ) ), true );", 1),
+            "checked= is no longer": self.text.replace('QStringLiteral("checked=%1 file_loaded=%2', 'QStringLiteral("file_loaded=%2 checked=%1', 1),
+        }
+        for needle, mutant in mutants.items():
+            with self.subTest(claim=needle):
+                self.assertNotEqual(mutant, self.text, "the mutation did not apply")
+                self.assertTrue(any(needle in b for b in play_anchor_source_breaks(mutant)), f"{needle}: {play_anchor_source_breaks(mutant)}")
 
 
 if __name__ == "__main__":

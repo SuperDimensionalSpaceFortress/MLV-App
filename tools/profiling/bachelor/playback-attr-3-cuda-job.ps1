@@ -6843,8 +6843,9 @@ function Start-UtilSampleCpu([string]$PwshPath, [string]$Encoded, [string]$CsvPa
 # time since it, beyond both brackets' half-widths (ms). $UtcTicks returns DateTime ticks (the child passes UtcNow; a test passes a stepped clock).
 # adversary 01d6ad51 A1: a bracket wider than 2 ms is read again (up to three times), and the bracket half-widths are ADDED to the step (an upper
 # bound), never subtracted: a step that lands inside a bracket widens it and so is counted, it cannot hide there.
-# sol r8 key B1 (adversary f63d8a08 A1): a slew under the limit per poll accumulates, so every read is also judged against the session's FIRST read
-# (an offset the clock already had by then is no drift), and maxStep is whichever is larger: the witness's limit bounds the cumulative offset too.
+# sol r8 key B1 (adversary f63d8a08 A1): a slew under the limit per poll accumulates, so every read's signed offset from the session's FIRST read counts
+# too (an offset the clock already had by then is no drift). Dot B4: maxStep also takes the SPREAD of those offsets across the session, half-widths included
+# (sHi - sLo, never reset per row), so any two accepted reads differ by at most the witness's limit, whichever side of the first read they fall on.
 function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
     for ($try = 0; $try -lt 3; $try++) {
         $u1 = [int64](& $UtcTicks); $m = $Watch.Elapsed.TotalMilliseconds; $u2 = [int64](& $UtcTicks)
@@ -6854,9 +6855,11 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
     if ($null -ne $Ck.u) {
         $step = [math]::Abs((($u - $Ck.u) / 1e4) - ($m - $Ck.m)) + $e + $Ck.e
         if ($step -gt $Ck.maxStep) { $Ck.maxStep = $step }
-        $off = [math]::Abs((($u - $Ck.u0) / 1e4) - ($m - $Ck.m0)) + $e + $Ck.e0
-        if ($off -gt $Ck.maxStep) { $Ck.maxStep = $off }
-    } else { $Ck.u0 = $u; $Ck.m0 = $m; $Ck.e0 = $e }
+        $s = (($u - $Ck.u0) / 1e4) - ($m - $Ck.m0)
+        if ($s + $e -gt $Ck.sHi) { $Ck.sHi = $s + $e }
+        if ($s - $e -lt $Ck.sLo) { $Ck.sLo = $s - $e }
+    } else { $Ck.u0 = $u; $Ck.m0 = $m; $Ck.sHi = $e; $Ck.sLo = -$e }
+    if ($Ck.sHi - $Ck.sLo -gt $Ck.maxStep) { $Ck.maxStep = $Ck.sHi - $Ck.sLo }
     $Ck.u = $u; $Ck.m = $m; $Ck.e = $e
     [DateTime]::new($u, [DateTimeKind]::Utc)
 }
@@ -6867,8 +6870,8 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
 # sol r4 B1: the row's interval is stated, never inferred from when a row was written: fromUtc is the clock read taken just BEFORE the previous
 # row's counter read and snapshot (a lower bound of where this interval starts) and utc the read taken just AFTER this row's snapshot (an upper
 # bound of where it ends), so a delayed write cannot move an interval boundary. sol r4 B2: the clock is read on every poll (about 50 ms) and
-# clockStepMs is the largest wall-against-monotonic step, or offset from the session's first read, seen since the previous row (the summaries' clock
-# witness).
+# clockStepMs is the largest wall-against-monotonic step seen since the previous row, or the spread of the session's offsets so far if larger (the
+# summaries' clock witness).
 # It ends on the stop file, its monotonic deadline, or its parent's exit; on the last two it also ends the job's nvidia-smi, that pid only and
 # only while its start time matches. adversary 9d648094 A10: the parent is bound by pid AND start time ($ParentStartTicks, 0 = pid only).
 # The app's processes for one CPU row: "pid,startTicks" -> @(pid, cumulative CPU seconds). adversary 01d6ad51 A5: with $AppPath only a process
@@ -7228,9 +7231,16 @@ function ConvertFrom-UtilSampleCpuCsv($Text) {
 # The measured Play window in UTC, from the app's own run log (adversary 9d648094 A1/A2: the display report's windowStartMs / windowEndMs are
 # offsets on PresentMon's frame clock and span the app's whole capture, startup included, so they are not a Play window). The session is
 # Get-CorePartitionPlaybackStart's rule (the playback_smoke.measured_session marker, else the first playback_smoke.summary session); the window
-# opens at that session's playback_smoke.start stamp (UTC, the log sink's) and closes elapsed_ms later (the same session's first summary line,
-# measured on the app's monotonic clock from the start of Play), or at that summary line's own stamp when it is earlier. $null when any part is
-# missing or the window is empty.
+# opens at that session's playback_smoke.start stamp (UTC, the log sink's) and closes at the anchor plus elapsed_ms (the same session's first summary
+# line, measured on the app's monotonic clock from the Play clock read), or at that summary line's own stamp when it is earlier. $null when any part
+# is missing or the window is empty.
+# sol r9 B1 (adversary e1ea9878 A1): both of those lines can be late, and equal delays agree exactly, so neither stamp can carry the end. The anchor is the
+# stamp of the last "interaction_trace event=play.toggled.begin checked=1" line before the session's start line on the same thread tag: on_actionPlay_toggled
+# logs it unconditionally on the GUI thread before the only call that reads the Play clock (MainWindow.cpp; test_util_sample_leg.py pins this), and the sink
+# stamps a line before it writes it, from the one clock of every stamp here (CrashForensics.cpp writeLogLine), so no stall moves the anchor past the clock
+# read and the window cannot run past Play. A stall between the anchor and the clock read ends the window that much early; it never adds a post-Play row.
+# No such line, an unparseable stamp, or an anchor later than the start stamp (the wall clock stepped) is no window. A begin line before another session's
+# start line was that session's Play, so it is not this session's anchor.
 function Get-UtilSamplePlayWindow([string]$LogText) {
     try {
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
@@ -7241,15 +7251,25 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.measured_session id=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
         if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[[^\]]+\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
         if ($null -eq $sid) { return $null }
-        $stamp = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.start session=' + $sid + '(\s|$)'); if ($mm.Success) { $stamp = $mm.Groups['ts'].Value; break } }
-        if ($null -eq $stamp) { return $null }
+        $stamp = $null; $startTh = $null
+        $begins = [Collections.Generic.Dictionary[string, string]]::new()
+        foreach ($ln in $lines) {
+            $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] interaction_trace event=play\.toggled\.begin checked=1(\s|$)')
+            if ($mm.Success) { $begins[$mm.Groups['th'].Value] = $mm.Groups['ts'].Value; continue }
+            $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[(?<th>[^\]]*)\] playback_smoke\.start session=(?<id>\d+)(\s|$)')
+            if (-not $mm.Success) { continue }
+            if ($mm.Groups['id'].Value -ceq $sid) { $stamp = $mm.Groups['ts'].Value; $startTh = $mm.Groups['th'].Value; break }
+            [void]$begins.Remove($mm.Groups['th'].Value)
+        }
+        if ($null -eq $stamp -or -not $begins.ContainsKey($startTh)) { return $null }
         $el = $null; $sumStamp = $null
         foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=' + $sid + '\s[^\r\n]*?\belapsed_ms=(?<e>\d+(?:\.\d+)?)(\s|$)'); if ($mm.Success) { $el = $mm.Groups['e'].Value; $sumStamp = $mm.Groups['ts'].Value; break } }
         if ($null -eq $el) { return $null }
         $inv = [Globalization.CultureInfo]::InvariantCulture
-        $pt = [DateTime]::MinValue; $ms = 0.0; $st = [DateTime]::MinValue
+        $pt = [DateTime]::MinValue; $ms = 0.0; $st = [DateTime]::MinValue; $at = [DateTime]::MinValue
         if (-not [DateTime]::TryParse($stamp, $inv, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$pt)) { return $null }
+        if (-not [DateTime]::TryParse($begins[$startTh], $inv, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$at)) { return $null }
+        if ($at -gt $pt) { return $null }
         if (-not [double]::TryParse($el, [Globalization.NumberStyles]::Float, $inv, [ref]$ms) -or [double]::IsInfinity($ms) -or $ms -le 0) { return $null }
         # adversary 693bf053 A1: the window's end is the start stamp plus a MONOTONIC elapsed_ms; the summary line's own wall-clock stamp must agree with it
         # (1 s: the sink's ms resolution and scheduling), else the host clock stepped inside the session, the CSV rows' clock no longer maps onto the log's,
@@ -7257,9 +7277,9 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         if (-not [DateTime]::TryParse($sumStamp, $inv, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$st)) { return $null }
         if ([math]::Abs((($st.Ticks - $pt.Ticks) / 1e4) - $ms) -gt 1000) { return $null }
         $s = [DateTime]::SpecifyKind($pt, [DateTimeKind]::Utc)
-        $e = $s.AddTicks([int64][math]::Round($ms * 10000))
-        # adversary f8fbeab3 A1: the app starts its Play clock before it logs the start line, so a stall between them moves the start stamp later and,
-        # with elapsed_ms measured from the clock, this end past the end of Play. The summary line is logged after Play ended: the window never runs past it.
+        $e = [DateTime]::SpecifyKind($at, [DateTimeKind]::Utc).AddTicks([int64][math]::Round($ms * 10000))
+        # adversary f8fbeab3 A1: the summary line is logged after Play ended, so the window never runs past it either (a clock that ran slow for the session
+        # puts the anchor's end after that stamp). The start stamp stays in the disagreement check above: it can be late, so it never carries the end.
         $se = [DateTime]::SpecifyKind($st, [DateTimeKind]::Utc)
         if ($se -lt $e) { $e = $se }
         if ($e -le $s) { return $null }
@@ -7319,12 +7339,13 @@ function Select-UtilSampleWindowRows($Rows, $Window, [bool]$IntervalRows = $fals
 
 # sol r4 B2: the clock witness for a window. An ordered excursion (the host clock stepped out and back) keeps every stamp in order, so stamp order
 # alone cannot verify that a sample stamped inside the window was taken there. The CPU child reads the wall clock against its monotonic clock on
-# every poll and states the largest step, or offset from its first read, per row (clockStepMs). $null (verified) when the running child's rows cover
-# the window with no gap, in order, and no value passed 25 ms; sample-clock-unverified for a step, a cumulative offset or out-of-order stamps;
+# every poll and states the largest step, or the spread of its offsets from its first read, per row (clockStepMs). $null (verified) when the running child's
+# rows cover the window with no gap, in order, and no value passed 25 ms; sample-clock-unverified for a step, a spread or out-of-order stamps;
 # sample-clock-unwitnessed for no running child, no rows, a gap between rows or rows that do not cover the window. The job stores it on the window
 # (clockWhy); both summaries refuse a window without a $null clockWhy. Residual by design: an excursion that starts and ends between two polls (about
-# 50 ms) is not seen, and an offset under the limit moves the window's edges by at most that much against the stamps (it can decide only a row within
-# 25 ms of an edge). sol r8 key B1: the 25 ms leaves a steady host its session: 340 ppm for the 73 s of a real leg, and this VM measured 22 ppm.
+# 50 ms) is not seen, and a spread under the limit decides only a row within 25 ms of the window's end edge (Dot B4: any two accepted reads differ by at
+# most clockStepMs, and only that edge is computed from another read's stamp). sol r8 key B1: the 25 ms leaves a steady host its session: 340 ppm for
+# the 73 s of a real leg, and this VM measured 22 ppm.
 function Get-UtilSampleClockWitness($Parsed, $Start, $Window) {
     try {
         if ($null -eq $Window) { return $null }
