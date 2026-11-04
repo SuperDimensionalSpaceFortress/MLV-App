@@ -19705,14 +19705,15 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
                                           "post_to_receive_p95_lo_ms=%8 post_to_receive_p95_hi_ms=%9 "
                                           "post_call_p50_ms=%10 post_call_p95_ms=%11" )
         .arg( static_cast<qulonglong>( m_playbackDueWakePostCallMs.size() ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostLoMs, 0.50 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostHiMs, 0.50 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostLoMs, 0.95 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostHiMs, 0.95 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveLoMs, 0.50 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveHiMs, 0.50 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveLoMs, 0.95 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveHiMs, 0.95 ) )
+        // r6 adversary pass 11 A1: the bounds are rounded OUTWARD (bin edge, floor / ceil to 0.001), never to the bin centre
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostLoMs, 0.50, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostHiMs, 0.50, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostLoMs, 0.95, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakeDueToPostHiMs, 0.95, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveLoMs, 0.50, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveHiMs, 0.50, PlaybackDueWakeBoundSide::Upper ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveLoMs, 0.95, PlaybackDueWakeBoundSide::Lower ) )
+        .arg( playbackDueWakePercentileBoundText( m_playbackDueWakePostToReceiveHiMs, 0.95, PlaybackDueWakeBoundSide::Upper ) )
         .arg( playbackDueWakePercentileText( m_playbackDueWakePostCallMs, 0.50 ) )
         .arg( playbackDueWakePercentileText( m_playbackDueWakePostCallMs, 0.95 ) );
     // r4 (Dot B1): binned=1 when a set outgrew its exact store this Play. r5 (Dot B2): a binned percentile is within 0.005 ms

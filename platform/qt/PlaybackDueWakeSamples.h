@@ -34,6 +34,7 @@ public:
     static constexpr double kMinMs = -20.0;                // histogram range [kMinMs, kMaxMs)
     static constexpr double kMaxMs = 80.0;
     static constexpr double kBinMs = 0.01;
+    static constexpr double kBinsPerMs = 100.0;            // 1 / kBinMs, exact (r6: the bin edges are computed from it)
     static constexpr std::size_t kBins = 10000;            // ( kMaxMs - kMinMs ) / kBinMs
 
     //! r5 adversary pass 8 A1: a bin counts as many samples as the Play does (a uint32_t bin wrapped to 0 after 2^32 samples
@@ -47,6 +48,10 @@ public:
     {
         double ms;       // the measured value (exact store), the bin centre (in range), or the crossed bound (censored)
         Censor censor;
+        //! r6 (adversary pass 11 A1): every value the rank can be is in [loMs, hiMs]: the measured value itself (exact store),
+        //! the bin's edges (binned, in range), or the crossed bound (censored)
+        double loMs;
+        double hiMs;
     };
 
     void add( double ms )
@@ -89,7 +94,7 @@ public:
     //! nearest-rank rank, \a p in [0, 1]; { 0.0, None } with no samples (the summary line's old convention)
     Rank rank( double p ) const
     {
-        if( m_count == 0 ) return { 0.0, Censor::None };
+        if( m_count == 0 ) return { 0.0, Censor::None, 0.0, 0.0 };
         // r5 adversary pass 10 A5: the double rank is clamped to [0, m_count - 1] before the conversion (a count near SIZE_MAX
         // rounds up to 2^64, and a p outside [0, 1] goes negative: both were out-of-range conversions)
         const double rankAt = std::floor( p * static_cast<double>( m_count - 1 ) + 0.5 );
@@ -99,17 +104,18 @@ public:
         {
             std::vector<double> values( m_exact );
             std::nth_element( values.begin(), values.begin() + static_cast<std::ptrdiff_t>( index ), values.end() );
-            return { values[index], Censor::None };
+            return { values[index], Censor::None, values[index], values[index] };
         }
         // ascending order: underflow, the bins, overflow
-        if( index < m_underflow ) return { kMinMs, Censor::Underflow };
+        if( index < m_underflow ) return { kMinMs, Censor::Underflow, kMinMs, kMinMs };
         std::size_t seen = m_underflow;
         for( std::size_t bin = 0; bin < kBins; ++bin )
         {
             seen += m_histogram[bin];
-            if( seen > index ) return { kMinMs + ( static_cast<double>( bin ) + 0.5 ) * kBinMs, Censor::None };
+            if( seen > index )
+                return { kMinMs + ( static_cast<double>( bin ) + 0.5 ) * kBinMs, Censor::None, binEdgeMs( bin ), binEdgeMs( bin + 1 ) };
         }
-        return { kMaxMs, Censor::Overflow };
+        return { kMaxMs, Censor::Overflow, kMaxMs, kMaxMs };
     }
 
     //! the measured percentile, or NaN when the rank is censored (never a clamped bound)
@@ -153,6 +159,13 @@ private:
         return Censor::None;
     }
 
+    //! r6 (pass 11 A1): bin \a edge's lower edge, as ( edge - 2000 ) / 100 so an edge on the 0.01 ms grid is the nearest double
+    //! to its decimal value (kMinMs + edge * kBinMs accumulated error, and 20.01 - 20 printed 0.011 once ceiled)
+    static double binEdgeMs( std::size_t edge )
+    {
+        return ( static_cast<double>( edge ) + kMinMs * kBinsPerMs ) / kBinsPerMs;
+    }
+
     //! an in-range sample's bin (the clamp only absorbs the floating-point rounding just below kMaxMs)
     static std::size_t binOf( double ms )
     {
@@ -179,6 +192,24 @@ inline QString playbackDueWakePercentileText( const PlaybackDueWakeSamples &samp
     if( r.censor == PlaybackDueWakeSamples::Censor::Overflow )
         return QStringLiteral( ">=%1" ).arg( PlaybackDueWakeSamples::kMaxMs, 0, 'f', 3 );
     return QStringLiteral( "%1" ).arg( r.ms, 0, 'f', 3 );   // the r4 line's own formatting
+}
+
+//! r6 (adversary pass 11 A1): which end of a [lo, hi] split interval a percentile field is
+enum class PlaybackDueWakeBoundSide { Lower, Upper };
+
+//! a percentile field that is a BOUND (the lateness split's lo / hi sets): rounded OUTWARD, never to the nearest. Binned, a
+//! lower bound is its bin's lower edge and an upper bound its upper edge (the bin centre could cross the true value); either
+//! way it is floored (Lower) / ceiled (Upper) to the printed 0.001 ms. So the printed lower bound is <= every value its rank
+//! can be, and the printed upper bound >= it; the double rounding of an edge only ever loosens the bound by one 0.001 step.
+//! A censored rank prints as playbackDueWakePercentileText does (its side of the range is all that is known).
+inline QString playbackDueWakePercentileBoundText( const PlaybackDueWakeSamples &samples, double p, PlaybackDueWakeBoundSide side )
+{
+    const PlaybackDueWakeSamples::Rank r = samples.rank( p );
+    if( r.censor != PlaybackDueWakeSamples::Censor::None ) return playbackDueWakePercentileText( samples, p );
+    const bool lower = side == PlaybackDueWakeBoundSide::Lower;
+    const double scaled = ( lower ? r.loMs : r.hiMs ) * 1000.0;
+    const double rounded = ( lower ? std::floor( scaled ) : std::ceil( scaled ) ) / 1000.0;
+    return QStringLiteral( "%1" ).arg( rounded == 0.0 ? 0.0 : rounded, 0, 'f', 3 );   // never "-0.000"
 }
 
 //! one set's disclosure on the playback_due_wake line: whether its percentiles are exact, how many samples fell below / at

@@ -774,14 +774,23 @@ TEST(PlaybackDueWakeSamplesB2, TheLongPlaySummaryLineDisclosesEachSetsRangeAndCe
     const QString line = functionBody( source, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
                                        QStringLiteral( "//Paint the Audio Track Wave to GUI" ) );
     ASSERT_FALSE( line.isEmpty() );
-    // r6 (pass 10 A2): lateness p50 / p95, the four split bounds at p50 / p95, and the post-call span at p50 / p95
-    ASSERT_EQ( 12, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
-    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "DueToPostLoMs, 0.50 )", "DueToPostLoMs, 0.95 )",
-                                  "DueToPostHiMs, 0.50 )", "DueToPostHiMs, 0.95 )", "PostToReceiveLoMs, 0.50 )",
-                                  "PostToReceiveLoMs, 0.95 )", "PostToReceiveHiMs, 0.50 )", "PostToReceiveHiMs, 0.95 )",
-                                  "PostCallMs, 0.50 )", "PostCallMs, 0.95 )" };
+    // r6 (pass 10 A2): lateness p50 / p95 and the post-call span at p50 / p95 are values; the four split bounds at p50 / p95
+    // are bounds, rounded outward (pass 11 A1)
+    ASSERT_EQ( 4, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
+    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "PostCallMs, 0.50 )", "PostCallMs, 0.95 )" };
     for( const char *rank : ranks )
         ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) + QLatin1String( rank ) ) );
+    ASSERT_EQ( 8, line.count( QStringLiteral( "playbackDueWakePercentileBoundText( m_playbackDueWake" ) ) );
+    const char *const bounds[] = { "DueToPostLoMs, 0.50, PlaybackDueWakeBoundSide::Lower )",
+                                   "DueToPostLoMs, 0.95, PlaybackDueWakeBoundSide::Lower )",
+                                   "DueToPostHiMs, 0.50, PlaybackDueWakeBoundSide::Upper )",
+                                   "DueToPostHiMs, 0.95, PlaybackDueWakeBoundSide::Upper )",
+                                   "PostToReceiveLoMs, 0.50, PlaybackDueWakeBoundSide::Lower )",
+                                   "PostToReceiveLoMs, 0.95, PlaybackDueWakeBoundSide::Lower )",
+                                   "PostToReceiveHiMs, 0.50, PlaybackDueWakeBoundSide::Upper )",
+                                   "PostToReceiveHiMs, 0.95, PlaybackDueWakeBoundSide::Upper )" };
+    for( const char *bound : bounds )
+        ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakePercentileBoundText( m_playbackDueWake" ) + QLatin1String( bound ) ) );
     ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, \"late\" )" ) ) );
     ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeDueToPostLoMs, \"due_to_post_lo\" )" ) ) );
     ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeDueToPostHiMs, \"due_to_post_hi\" )" ) ) );
@@ -1104,4 +1113,60 @@ TEST(PlaybackDueWakeSplit, ADescheduleAfterPostMessageReturnsIsBoundedNotCharged
     ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "const double firstStampMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostFirstMs() : -1.0;" ) ) );
     const QString wake = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     ASSERT_EQ( 1, wake.count( QStringLiteral( "firingFirstMs = returnNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;" ) ) );
+}
+
+TEST(PlaybackDueWakeSplit, ThePrintedBoundsEncloseTheTrueSplitPastTheExactStoreAndAtThePrintedPrecision)
+{
+    // r6 adversary pass 11 A1 input: one looping Play of 16,385 native deliveries, each with due D, first stamp D + 0.002 ms,
+    // actual post D + 0.003, return stamp D + 0.004, receive D + 0.020. Binned, d608cd40 printed both due-to-post ends as the
+    // bin centre 0.005 ([0.005, 0.005] excludes the true 0.003) and both post-to-receive ends as 0.015 (excludes 0.017).
+    const PlaybackDueWakeSplitBounds b = playbackDueWakeSplitBounds( 0.0, 0.002, 0.004, 0.020 );
+    PlaybackDueWakeSamples dueLo, dueHi, receiveLo, receiveHi;
+    dueLo.addRepeated( b.dueToPostLoMs, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    dueHi.addRepeated( b.dueToPostHiMs, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    receiveLo.addRepeated( b.postToReceiveLoMs, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    receiveHi.addRepeated( b.postToReceiveHiMs, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    ASSERT_FALSE( dueLo.exact() );
+    const auto lower = []( const PlaybackDueWakeSamples &s, double p )
+    { return playbackDueWakePercentileBoundText( s, p, PlaybackDueWakeBoundSide::Lower ).toDouble(); };
+    const auto upper = []( const PlaybackDueWakeSamples &s, double p )
+    { return playbackDueWakePercentileBoundText( s, p, PlaybackDueWakeBoundSide::Upper ).toDouble(); };
+    for( const double p : { 0.50, 0.95 } )
+    {
+        ASSERT_TRUE( lower( dueLo, p ) <= 0.003 && 0.003 <= upper( dueHi, p ) );
+        ASSERT_TRUE( lower( receiveLo, p ) <= 0.017 && 0.017 <= upper( receiveHi, p ) );
+    }
+    ASSERT_EQ( std::string( "0.000" ), playbackDueWakePercentileBoundText( dueLo, 0.50, PlaybackDueWakeBoundSide::Lower ).toStdString() );
+    ASSERT_EQ( std::string( "0.010" ), playbackDueWakePercentileBoundText( dueHi, 0.50, PlaybackDueWakeBoundSide::Upper ).toStdString() );
+    // the exact store: rounded outward at the printed precision, not to the nearest (0.0026 is not printed as 0.003 when
+    // it is a lower bound, nor 0.0024 as 0.002 when it is an upper bound)
+    PlaybackDueWakeSamples exactLo, exactHi;
+    exactLo.add( 0.0026 );
+    exactHi.add( 0.0024 );
+    ASSERT_TRUE( exactLo.exact() );
+    ASSERT_EQ( std::string( "0.002" ), playbackDueWakePercentileBoundText( exactLo, 0.50, PlaybackDueWakeBoundSide::Lower ).toStdString() );
+    ASSERT_EQ( std::string( "0.003" ), playbackDueWakePercentileBoundText( exactHi, 0.50, PlaybackDueWakeBoundSide::Upper ).toStdString() );
+    // a negative lower bound floors away from zero; a value on the printed grid is printed as itself
+    PlaybackDueWakeSamples negative, onGrid;
+    negative.add( -0.0004 );
+    onGrid.add( 0.25 );
+    ASSERT_EQ( std::string( "-0.001" ), playbackDueWakePercentileBoundText( negative, 0.50, PlaybackDueWakeBoundSide::Lower ).toStdString() );
+    ASSERT_EQ( std::string( "0.000" ), playbackDueWakePercentileBoundText( negative, 0.50, PlaybackDueWakeBoundSide::Upper ).toStdString() );
+    ASSERT_EQ( std::string( "0.250" ), playbackDueWakePercentileBoundText( onGrid, 0.50, PlaybackDueWakeBoundSide::Lower ).toStdString() );
+    // a censored rank keeps its censored text on either side
+    PlaybackDueWakeSamples late;
+    late.addRepeated( 500.0, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    ASSERT_EQ( std::string( ">=80.000" ), playbackDueWakePercentileBoundText( late, 0.50, PlaybackDueWakeBoundSide::Lower ).toStdString() );
+    ASSERT_EQ( std::string( ">=80.000" ), playbackDueWakePercentileBoundText( late, 0.50, PlaybackDueWakeBoundSide::Upper ).toStdString() );
+    // in range, binned: every rank's bin edges enclose its exact value, over a wide spread of samples
+    PlaybackDueWakeSamples spread;
+    std::vector<double> reference;
+    LatenessSource source;
+    for( int i = 0; i < 20000; ++i ) { const double v = source.next( -19.0, 79.0 ); spread.add( v ); reference.push_back( v ); }
+    ASSERT_FALSE( spread.exact() );
+    for( const double p : { 0.0, 0.05, 0.50, 0.95, 1.0 } )
+    {
+        const double truth = unboundedPercentile( reference, p );
+        ASSERT_TRUE( lower( spread, p ) <= truth && truth <= upper( spread, p ) );
+    }
 }
