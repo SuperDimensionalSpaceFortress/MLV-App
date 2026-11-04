@@ -752,7 +752,9 @@ function Start-CaptureWorker {
         # adversary r13 A3 (POSIX): setsid makes the worker the leader of a new process group, so its teardown can end the whole group.
         $setsid = $null
         if (-not $IsWindows) { foreach ($candidate in '/usr/bin/setsid', '/bin/setsid') { if ([IO.File]::Exists($candidate)) { $setsid = $candidate; break } } }
-        if ($null -ne $setsid) { $argv = @($exe) + $argv; $exe = $setsid }
+        # Dot B2: Start-Process joins -ArgumentList with spaces and quotes nothing, so the pwsh path handed to setsid as its first operand is
+        # quoted here (a path with a space, such as /opt/Power Shell/pwsh, would otherwise split in two and setsid would exec the first half).
+        if ($null -ne $setsid) { $argv = @(ConvertTo-CommandLineArg $exe) + $argv; $exe = $setsid }
         $worker.Process = Start-Process -FilePath $exe -WorkingDirectory $worker.Dir -NoNewWindow -PassThru -ArgumentList $argv `
             -RedirectStandardOutput (Join-Path $worker.Dir 'stdout.txt') -RedirectStandardError (Join-Path $worker.Dir 'stderr.txt')
         $null = $worker.Process.Handle   # keeps ExitCode readable after the exit, and lets Kill(true) find what an ended worker left behind
@@ -842,9 +844,11 @@ function Get-CaptureStepText($Worker, [scriptblock]$Start, $Argument, [scriptblo
 function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) {
     Assert-CaptureIoBound 'captured-output read' $BoundMs
     $name = [IO.Path]::GetFileName($Path)
-    Initialize-BoundedCaptureIo
     $worker = $null
     try {
+        # Dot B1: the setup is inside the try, so a setup failure is this read's own diagnostic and never an exception that escapes before
+        # the caller builds its suite-named verdict. (Invoke-BoundedSuite establishes the setup before the suite starts.)
+        Initialize-BoundedCaptureIo
         if ($null -ne $Start) { $worker = Start-CaptureWorker }
         $clock = [Diagnostics.Stopwatch]::StartNew()   # started BEFORE the open, so a slow start counts against the same bound
         # sol r9 B1: the deadline is measured from the call's start. A factory that spent the whole bound is a timeout even when the task it
@@ -865,9 +869,9 @@ function Read-CapturedText([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptb
 function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBoundMs, [scriptblock]$Start = $null) {
     # Returns '' or a note naming the abandoned step and the files left behind.
     Assert-CaptureIoBound 'capture cleanup' $BoundMs
-    Initialize-BoundedCaptureIo
     $worker = $null
     try {
+        Initialize-BoundedCaptureIo   # Dot B1: inside the try, so a setup failure is a cleanup note, never an exception from the caller's finally
         if ($null -ne $Start) { $worker = Start-CaptureWorker }
         $clock = [Diagnostics.Stopwatch]::StartNew()
         # sol r9 B1 / adversary r10 A1 / sol r11 B2: elapsed >= bound is an abandoned step even when the task completed, and the factory and
@@ -902,7 +906,10 @@ function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
     # 0, or a negative) used to launch the suite and only then fail in WaitForExit, leaving the child running with no named verdict.
     if ($TimeoutSec -lt 1 -or $TimeoutSec -gt $SuiteBoundMaxSec) { throw "FAIL: $Name ($Script) bound $TimeoutSec s is outside 1..$SuiteBoundMaxSec s; no child was started" }
     $waitMs = [int]($TimeoutSec * 1000)
-    $outF = [IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
+    # Dot B1: the capture setup is established BEFORE the suite starts and before any capture file exists. If it fails, the run fails by its
+    # own named setup error and the suite never starts; the helpers below then only ever repeat a setup that already succeeded.
+    try { Initialize-BoundedCaptureIo } catch { throw "FAIL: $Name ($Script) capture setup failed: $($_.Exception.Message); no child was started" }
+    $outF =[IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
     $fail = $null; $result = $null; $cleanupNote = ''
     try {
         $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { ConvertTo-CommandLineArg $_ }

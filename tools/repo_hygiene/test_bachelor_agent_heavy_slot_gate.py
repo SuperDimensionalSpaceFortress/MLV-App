@@ -726,6 +726,7 @@ class BoundedRunTests(unittest.TestCase):
         bounds = (2147484, 3601, 0, -1)
         script = ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'; $script:launched = 0\n"
                   "function Start-Process { $script:launched++; throw 'LAUNCH-ATTEMPTED' }\n" + body + "\n"
+                  "function Initialize-BoundedCaptureIo { }\n"
                   "foreach ($t in " + ",".join(str(b) for b in bounds) + ",1) { try { Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' $t } "
                   "catch { Write-Output ('RESULT|' + $t + '|' + $_.Exception.Message + '|' + $script:launched) } }\n")
         proc = _run_pwsh_script(script)
@@ -1936,6 +1937,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         body = fifo[start:fifo.index("\n}\n", fifo.index("function Invoke-BoundedSuite")) + 3]
         return ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'\n"
                 "function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw \"FAIL: $Message\" } }\n" + body + "\n"
+                "function Initialize-BoundedCaptureIo { }\n"
                 "function Start-Process { param([string]$FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)\n"
                 "  $fin = if ($FilePath -eq 'taskkill.exe') { $true } else { $script:finish }\n"
                 "  $o = [pscustomobject]@{ Id = 4242; Handle = 1; ExitCode = 0 }\n"
@@ -2022,6 +2024,180 @@ class BoundedCaptureIoTests(unittest.TestCase):
             self.assertIn("fast=True", rows[label], f"{label}: the verdict must not scale with the captured size: {rows[label]}")
         self.assertRegex(rows["HUNG"], r"^THROW\|\d{1,5}\|FAIL: case-x \(C:\\s\.ps1\) exceeded its 5 s bound", rows["HUNG"])
         self.assertRegex(rows["DONE"], r"^THROW\|\d{1,5}\|FAIL: case-x \(C:\\s\.ps1\) finished but its JSON result is larger than 262144 characters", rows["DONE"])
+
+    # ---- Dot B1 (PR #717 comments 6620616030, 6620858041): capture initialization must never replace the suite-named verdict -------------
+    @staticmethod
+    def _init_injection_script(fail_from_suite_too: bool) -> str:
+        """The real Read-CapturedResult / Remove-CaptureFiles / Invoke-BoundedSuite with ONLY Start-Process stubbed (a suite that never
+        exits, and a counter of launches) and Initialize-BoundedCaptureIo replaced by a stub that throws 'compile denied'.
+
+        fail_from_suite_too=False lets the call made by Invoke-BoundedSuite itself through (its own early setup succeeded), so every later
+        call from a helper throws: the verdict must stay the suite-named timeout with the failures as secondary diagnostics.
+        fail_from_suite_too=True makes that early setup fail as well: the run must fail by its own setup error and never start the suite."""
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        suite_start = fifo.index("function Invoke-BoundedSuite")
+        suite = fifo[suite_start:fifo.index("\n}\n", suite_start) + 3]
+        quote = fifo[fifo.index("function ConvertTo-CommandLineArg"):]
+        quote = quote[:quote.index("\n}\n") + 3]
+        tail = fifo[fifo.index("function Get-DiagnosticTail"):]
+        quote += tail[:tail.index("\n}\n") + 3]
+        return ("$RepoRoot = 'C:\\repo'; $agentScript = 'C:\\repo\\agent.ps1'; $script:launched = 0; $script:initCalls = 0\n"
+                "$SuiteBoundMaxSec = 3600; $DiagnosticTailChars = 4000; $JsonMaxChars = 262144\n"
+                "function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw \"FAIL: $Message\" } }\n"
+                "$work = Join-Path ([IO.Path]::GetTempPath()) ('b1-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $work\n"
+                "$env:TMP = $work; $env:TEMP = $work; $env:TMPDIR = $work\n"
+                + _fifo_capture_io_region(fifo) + "\n" + quote + suite + "\n"
+                "$realInit = ${function:Initialize-BoundedCaptureIo}\n"
+                "function Initialize-BoundedCaptureIo {\n"
+                "  $script:initCalls++\n"
+                f"  $fromSuite = (Get-PSCallStack)[1].FunctionName -eq 'Invoke-BoundedSuite' -and -not ${str(fail_from_suite_too).lower()}\n"
+                "  if ($fromSuite) { & $realInit; return }\n"
+                "  throw 'compile denied'\n"
+                "}\n"
+                "function Start-Process { param([string]$FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)\n"
+                "  $script:launched++\n"
+                "  $fin = $FilePath -eq 'taskkill.exe'\n"
+                "  $o = [pscustomobject]@{ Id = 4242; Handle = 1; ExitCode = 0 }\n"
+                "  $o | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value ([scriptblock]::Create('param($ms) $' + $fin.ToString().ToLower()))\n"
+                "  $o | Add-Member -MemberType ScriptMethod -Name Kill -Value { }\n"
+                "  $o }\n"
+                "try { $r = Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' 1 3>$null; Write-Output ('RESULT|' + $r.ExitCode) }\n"
+                "catch { Write-Output ('THROW|' + $_.Exception.Message) }\n"
+                "Write-Output ('LAUNCHED|' + $script:launched)\n"
+                "Write-Output ('LEFTOVER|' + @(Get-ChildItem -LiteralPath $work -Force).Count)\n"
+                "Get-ChildItem -LiteralPath $work -Force | Remove-Item -Force -ErrorAction SilentlyContinue\n"
+                "Remove-Item -LiteralPath $work -Force -ErrorAction SilentlyContinue\n")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_b1_a_capture_setup_that_fails_after_a_timeout_stays_a_secondary_diagnostic_of_the_suite_named_verdict(self) -> None:
+        # Dot B1 (b)+(c): Initialize-BoundedCaptureIo ran before the `try` of Read-CapturedResult and Remove-CaptureFiles, so a setup throw
+        # ('compile denied') at the stdout read escaped before the timeout verdict was built, and the finally's removal repeated it.
+        proc = self._pwsh(self._init_injection_script(fail_from_suite_too=False))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        throw = next((line for line in proc.stdout.splitlines() if line.startswith("THROW|")), "")
+        self.assertRegex(throw, r"^THROW\|FAIL: case-x \(C:\\s\.ps1\) exceeded its 1 s bound", proc.stdout + proc.stderr)
+        self.assertIn("<read failed: compile denied>", throw, "the read's setup failure is kept as the output diagnostic")
+        self.assertIn("capture cleanup failed: compile denied", throw, "the cleanup's setup failure is kept as a cleanup diagnostic")
+        self.assertIn("LAUNCHED|2", proc.stdout, "the suite and its taskkill")
+        self.assertIn("LEFTOVER|2", proc.stdout, "the two captures the failed cleanup could not remove are named, and this test removes them")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_b1_a_capture_setup_that_fails_before_the_suite_starts_is_a_named_setup_failure_and_no_suite_runs(self) -> None:
+        # Dot B1 (a)+(c): the capture setup is established BEFORE the suite starts; if it fails, the run fails by its own named setup error.
+        proc = self._pwsh(self._init_injection_script(fail_from_suite_too=True))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        throw = next((line for line in proc.stdout.splitlines() if line.startswith("THROW|")), "")
+        self.assertRegex(throw, r"^THROW\|FAIL: case-x \(C:\\s\.ps1\) capture setup failed: compile denied; no child was started", proc.stdout + proc.stderr)
+        self.assertIn("LAUNCHED|0", proc.stdout, "the suite must never start when the capture setup failed")
+        self.assertIn("LEFTOVER|0", proc.stdout, "no capture file is created before the setup is established")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_b1_the_helpers_return_a_failure_note_when_their_own_setup_throws(self) -> None:
+        # Dot B1 (b): called directly, with the setup failing, neither helper throws; each reports the failure in its own return value.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        script = (_fifo_capture_io_region(fifo) + "\n"
+                  "function Initialize-BoundedCaptureIo { throw 'compile denied' }\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "try { $r = Read-CapturedResult $p; Write-Output ('READ|' + $r.Ok + '|' + $r.Text) } catch { Write-Output ('READ-THREW|' + $_.Exception.Message) }\n"
+                  "try { Write-Output ('DEL|' + (Remove-CaptureFiles @($p))) } catch { Write-Output ('DEL-THREW|' + $_.Exception.Message) }\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("READ|False|<read failed: compile denied>", proc.stdout, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"DEL\|capture cleanup failed: compile denied: .*a\.txt", proc.stdout + proc.stderr)
+
+    # ---- Dot B2 (PR #717 comments 6633365895, 6633763672): the setsid branch of Start-CaptureWorker with a pwsh whose real path has a space ----
+    def test_b2_the_setsid_operand_is_quoted_before_start_process_joins_the_arguments(self) -> None:
+        # Source pin (runs on every OS, including this Windows hub): Start-Process joins -ArgumentList with spaces and quotes nothing, so
+        # the pwsh path handed to setsid as an operand must go through ConvertTo-CommandLineArg. The executed proof is the two tests below.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("function Start-CaptureWorker")
+        worker = fifo[begin:fifo.index("function Get-CaptureTaskResult", begin)]
+        setsid_lines = [line.strip() for line in worker.splitlines() if "$exe = $setsid" in line]
+        self.assertEqual(len(setsid_lines), 1, setsid_lines)
+        self.assertRegex(setsid_lines[0], r"\$argv = @\(ConvertTo-CommandLineArg \$exe\) \+ \$argv", setsid_lines[0])
+
+    @staticmethod
+    def _link_or_copy(src: str, dst: str) -> str:
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+        return dst
+
+    def _run_worker_driver(self, pwsh_exe: str, work: str) -> subprocess.CompletedProcess:
+        """Runs the real Start-CaptureWorker (through Read-CapturedResult and Remove-CaptureFiles) under `pwsh_exe`, with a private TMPDIR.
+
+        The factory starts a 600 s sleeper under the worker; after the helpers return the sleeper must be gone (the worker's group is killed)
+        and no capture-worker scratch directory may be left in TMPDIR."""
+        tmp = os.path.join(work, "tmp")
+        os.makedirs(tmp, exist_ok=True)
+        pid_file = os.path.join(work, "sleeper.pid")
+        sleeper = ("{ param($p) $c = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
+                   "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
+                   "[IO.File]::WriteAllText('" + pid_file.replace("'", "''") + "', [string]$c.Id); [Threading.Tasks.Task]::FromResult('hello from the factory') }")
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  f"$factory = {sleeper}\n"
+                  "Write-Output ('EXE|' + (Get-Process -Id $PID).Path)\n"
+                  "$r = Read-CapturedResult $p 60000 $factory\n"
+                  "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n"
+                  "$id = [int][IO.File]::ReadAllText('" + pid_file.replace("'", "''") + "'); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
+                  "$alive = $null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue)\n"
+                  "Write-Output ('ALIVE|' + $alive)\n"
+                  "if ($alive) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }\n"
+                  "Write-Output ('SCRATCH|' + @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Filter 'mlv-capture-worker-*' -Force).Count)\n")
+        script_path = os.path.join(work, "driver.ps1")
+        Path(script_path).write_text(script, encoding="utf-8")
+        env = dict(os.environ, TMPDIR=tmp)
+        return subprocess.run([pwsh_exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], capture_output=True, text=True, timeout=240, env=env)
+
+    def _skip_unless_setsid_branch(self) -> None:
+        if os.name != "posix":
+            self.skipTest("SKIPPED: Start-CaptureWorker's setsid branch exists only on POSIX (os.name=" + os.name + "); hosted Ubuntu CI executes it")
+        if not any(os.path.exists(p) for p in ("/usr/bin/setsid", "/bin/setsid")):
+            self.skipTest("SKIPPED: no setsid at /usr/bin/setsid or /bin/setsid, so the setsid branch of Start-CaptureWorker is not taken")
+        if PWSH is None:
+            self.skipTest("SKIPPED: pwsh is not on PATH")
+
+    def _assert_worker_driver_ok(self, proc: subprocess.CompletedProcess) -> None:
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("READ|True|hello from the factory", proc.stdout, "the capture worker was not ready / returned no result\n" + out)
+        self.assertIn("ALIVE|False", proc.stdout, "the worker's process group was not ended\n" + out)
+        self.assertIn("SCRATCH|0", proc.stdout, "the worker's scratch directory was not removed\n" + out)
+
+    def test_b2_the_capture_worker_starts_runs_and_tears_down_under_an_ordinary_pwsh_path(self) -> None:
+        # The control: the same driver under the ordinary pwsh path.
+        self._skip_unless_setsid_branch()
+        work = tempfile.mkdtemp(prefix="heavy-slot-gate-b2-control-")
+        try:
+            self._assert_worker_driver_ok(self._run_worker_driver(PWSH, work))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_b2_the_capture_worker_starts_runs_and_tears_down_under_a_pwsh_whose_real_path_contains_a_space(self) -> None:
+        # Dot B2: `$argv = @($exe) + $argv` handed setsid the pwsh path unquoted, Start-Process split '/.../Power Shell/pwsh' into two operands,
+        # setsid could not exec the first, the worker ended before it was ready and the -Start seam failed instead of running its factory.
+        # (Get-Process).Path resolves symlinks on Linux, so the spaced pwsh is a hard-linked (or copied) tree of $PSHOME, not a symlink.
+        self._skip_unless_setsid_branch()
+        home = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-Command", "[Console]::Out.Write($PSHOME)"], capture_output=True, text=True, timeout=60).stdout.strip()
+        work = tempfile.mkdtemp(prefix="heavy-slot-gate-b2-spaced-")
+        try:
+            spaced = os.path.join(work, "Power Shell")
+            try:
+                shutil.copytree(home, spaced, symlinks=True, copy_function=self._link_or_copy)
+            except (OSError, shutil.Error) as exc:
+                self.skipTest(f"SKIPPED: could not build a pwsh install under a path with a space from {home} ({type(exc).__name__}: {exc})")
+            spaced_pwsh = os.path.join(spaced, "pwsh")
+            probe = subprocess.run([spaced_pwsh, "-NoLogo", "-NoProfile", "-Command", "(Get-Process -Id $PID).Path"], capture_output=True, text=True, timeout=120)
+            if probe.returncode != 0 or " " not in probe.stdout.strip():
+                self.skipTest(f"SKIPPED: the copied pwsh does not run, or its real path has no space (exit {probe.returncode}, path {probe.stdout.strip()!r}, {probe.stderr.strip()[:200]!r})")
+            proc = self._run_worker_driver(spaced_pwsh, work)
+            self.assertRegex(proc.stdout, r"EXE\|.*Power Shell.*pwsh", proc.stdout + proc.stderr)
+            self._assert_worker_driver_ok(proc)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 class BoundedCleanupTests(unittest.TestCase):
