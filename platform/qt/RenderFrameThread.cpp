@@ -312,6 +312,57 @@ void insertDualIsoWarmupInstrumentationTelemetry(
                    dualIsoFull20.phase_implied_pattern );
 }
 
+/* The calling thread's last raw decode, for a thread other than the render's or
+ * before anything on this thread clears it. */
+template <typename RawUint16DecodeTelemetry>
+void captureRawUint16DecodeTelemetry( RawUint16DecodeTelemetry &raw, double rawUint16Ms )
+{
+    raw.valid = true;
+    raw.rawUint16Ms = rawUint16Ms;
+    raw.prefetchHit = getMlvLastRawUint16PrefetchHit() != 0;
+    raw.source = getMlvLastRawUint16Source();
+    raw.frameLj92Ms = getMlvLastRawUint16FrameLj92Milliseconds();
+    raw.inflightWaitMs = getMlvLastRawUint16InflightWaitMilliseconds();
+    raw.diskReadMs = getMlvLastRawUint16DiskReadMilliseconds();
+    raw.decompressMs = getMlvLastRawUint16DecompressMilliseconds();
+    raw.decompressPrepareMs = getMlvLastRawUint16DecompressPrepareMilliseconds();
+    raw.decompressExecuteMs = getMlvLastRawUint16DecompressExecuteMilliseconds();
+    raw.unpackMs = getMlvLastRawUint16UnpackMilliseconds();
+    raw.copyMs = getMlvLastRawUint16CopyMilliseconds();
+}
+
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1: where the dual_iso stage timer's time goes on
+ * the CUDA texture route (llrawproc.h llrpDualIsoGpuSplitTiming_t). Every field is
+ * INSIDE llrawproc_dual_iso_ms, so none is subtracted from llrawproc_other_ms. The
+ * bundle carries the dual_iso of the SAME run (llrawproc_dual_iso_split_dual_iso_ms)
+ * and the part of it outside the timed GPU-route steps (..._other_ms), so a reader
+ * never pairs one thread's split with another thread's dual_iso. Called only from
+ * insertLlrawprocResidualSubstageTelemetry, so it shares that bundle's guard. */
+void insertLlrawprocDualIsoGpuSplitTelemetry( QJsonObject &target )
+{
+    llrpDualIsoGpuSplitTiming_t split = {};
+    llrpGetLastDualIsoGpuSplitTiming( &split );
+    const double dualIsoMs = llrpGetLastDualIsoMilliseconds();
+    const double timedMs = split.prepare_ms
+        + split.preupload_ms
+        + split.mutex_wait_ms
+        + split.configure_ms
+        + split.run_wall_ms
+        + split.post_run_ms;
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_dual_iso_ms"), dualIsoMs );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_prepare_ms"), split.prepare_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_preupload_ms"), split.preupload_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_mutex_wait_ms"), split.mutex_wait_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_configure_ms"), split.configure_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_run_wall_ms"), split.run_wall_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_run_gpu_ms"), split.run_gpu_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_sync_ms"), split.sync_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_post_run_ms"), split.post_run_ms );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_backend_calls"), split.backend_calls );
+    target.insert( QStringLiteral("llrawproc_dual_iso_split_other_ms"),
+                   qMax( 0.0, dualIsoMs - timedMs ) );
+}
+
 /* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the llrawproc steps outside the seven stage
  * timers, emitted beside them; returns their sum so llrawproc_other_ms is the
  * residual of the finer set. Every field is disjoint (llrawproc.h). The bundle
@@ -347,6 +398,8 @@ double insertLlrawprocResidualSubstageTelemetry( QJsonObject &target,
                    llrawprocStageTimersMs );
     target.insert( QStringLiteral("llrawproc_residual_other_ms"),
                    qMax( 0.0, llrawprocTotalMs - llrawprocStageTimersMs - substageMs ) );
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside dual_iso, not in substageMs. */
+    insertLlrawprocDualIsoGpuSplitTelemetry( target );
     return substageMs;
 }
 
@@ -2120,19 +2173,8 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
                                   entry.request.frameNumber,
                                   slot.rawImage16.data() ) == 0;
         /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: these thread-locals live on THIS thread; drawFrame reads the snapshot. */
-        FrameSlot::RawUint16DecodeTelemetry &raw = slot.rawDecodeTelemetry;
-        raw.valid = true;
-        raw.rawUint16Ms = ( mlv_stage_timing_now() - rawStart ) * 1000.0;
-        raw.prefetchHit = getMlvLastRawUint16PrefetchHit() != 0;
-        raw.source = getMlvLastRawUint16Source();
-        raw.frameLj92Ms = getMlvLastRawUint16FrameLj92Milliseconds();
-        raw.inflightWaitMs = getMlvLastRawUint16InflightWaitMilliseconds();
-        raw.diskReadMs = getMlvLastRawUint16DiskReadMilliseconds();
-        raw.decompressMs = getMlvLastRawUint16DecompressMilliseconds();
-        raw.decompressPrepareMs = getMlvLastRawUint16DecompressPrepareMilliseconds();
-        raw.decompressExecuteMs = getMlvLastRawUint16DecompressExecuteMilliseconds();
-        raw.unpackMs = getMlvLastRawUint16UnpackMilliseconds();
-        raw.copyMs = getMlvLastRawUint16CopyMilliseconds();
+        captureRawUint16DecodeTelemetry( slot.rawDecodeTelemetry,
+                                         ( mlv_stage_timing_now() - rawStart ) * 1000.0 );
     }
     const double decodeEndStageTime = mlv_stage_timing_now();
     if( playbackSmokeTimelineTelemetryEnabled() )
@@ -3995,8 +4037,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const uint64_t reconQueuedRequestSerial = slot.queuedRequest.requestSerial;
     const Debayered16ReconProvenance reconProvenance = slot.reconProvenance;
     /* PLAYBACK-LJ92-DECODE-THROUGHPUT-1: a frame the DecodeWorker decoded reports the worker's snapshot; the
-     * render-thread thread-locals describe it only when this thread decoded the frame itself (runSerial). */
-    const FrameSlot::RawUint16DecodeTelemetry workerRawTelemetry =
+     * render-thread thread-locals describe it only when this thread decoded the frame itself (runSerial).
+     * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: an inline reduced recon snapshots its own decode here too. */
+    FrameSlot::RawUint16DecodeTelemetry workerRawTelemetry =
         decodedRawFrame ? slot.rawDecodeTelemetry : FrameSlot::RawUint16DecodeTelemetry();
     slot.resetMetadata();
     const double prologueAfterResetMetadataStageTime =
@@ -4665,6 +4708,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     /* CPU-DEBAYERED16-HONOUR-SCALE-1: the OutputDebayered16 CPU branch debayered
      * the slot's reduced recon (renderedImageWidth/Height are then reduced). */
     bool debayered16ReducedReconConsumed = false;
+    Debayered16InlineReducedRecon inlineReducedRecon;
 
     GpuAmazeDebayerBackendAvailability r16AmazeTextureAvailability;
     r16AmazeTextureAvailability.available =
@@ -5255,6 +5299,65 @@ void RenderFrameThread::drawFrame( int slotIndex,
             const size_t reconPixelCount =
                 static_cast<size_t>( qMax( 0, m_imageWidth ) )
                 * static_cast<size_t>( qMax( 0, m_imageHeight ) );
+            /* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: with Phase 3 Disabled no worker
+             * ran, so an admitted x2/x4 frame reaches this branch unreconned. The
+             * reduced recon runs here instead; whatever it refuses leaves the slot
+             * unreconned and today's path below renders the frame. */
+            Debayered16InlineReducedReconInputs inlineReduced;
+            inlineReduced.slotReconned =
+                decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;
+            inlineReduced.phase3Disabled = phase3Mode() == Phase3Mode::Disabled;
+            inlineReduced.honourScaleAdmitted =
+                m_activePresentationContext.cpuDebayered16HonourScaleAdmitted;
+            inlineReduced.playbackActive = m_activePresentationContext.playbackActive;
+            inlineReduced.scale = playbackScaleFactor;
+            inlineReduced.frameCacheMayServe =
+                !m_pMlvObject || mlvRawDebayerCacheMayServeFrame( m_pMlvObject, frameNumber ) != 0;
+            if ( debayered16InlineReducedReconWanted( inlineReduced ) )
+            {
+                slot.reducedReconScale = 1;
+                slot.reducedReconOnGpu = false;
+                slot.reducedReconWidth = 0;
+                slot.reducedReconHeight = 0;
+                inlineReducedRecon = debayered16RunInlineReducedRecon(
+                    m_pMlvObject,
+                    frameNumber,
+                    playbackScaleFactor,
+                    qMax( 1, m_pMlvObject->cpu_cores ),
+                    slot.rawImage16.data(),
+                    slot.rawImage16.size(),
+                    slot.reducedReconBayer );
+                if ( inlineReducedRecon.reconstructed )
+                {
+                    slot.reducedReconScale = inlineReducedRecon.scale;
+                    slot.reducedReconWidth = inlineReducedRecon.reducedWidth;
+                    slot.reducedReconHeight = inlineReducedRecon.reducedHeight;
+                    /* The reduced debayer clears these thread-locals. */
+                    captureRawUint16DecodeTelemetry( workerRawTelemetry,
+                                                     inlineReducedRecon.decodeMs );
+                }
+                slot.stageTimingTelemetry.insert(
+                    QStringLiteral("cpu_dualiso_recon_scale"),
+                    slot.reducedReconScale );
+                slot.stageTimingTelemetry.insert(
+                    QStringLiteral("cpu_dualiso_recon_width"),
+                    slot.reducedReconScale > 1 ? slot.reducedReconWidth : m_imageWidth );
+                slot.stageTimingTelemetry.insert(
+                    QStringLiteral("cpu_dualiso_recon_height"),
+                    slot.reducedReconScale > 1 ? slot.reducedReconHeight : m_imageHeight );
+                slot.stageTimingTelemetry.insert(
+                    QStringLiteral("cpu_dualiso_recon_fullres_fixes_ms"),
+                    inlineReducedRecon.fullResFixesMs );
+                slot.stageTimingTelemetry.insert(
+                    QStringLiteral("cpu_dualiso_recon_downsample_ms"),
+                    inlineReducedRecon.downsampleMs );
+                if ( slot.reducedReconScale <= 1 )
+                {
+                    slot.stageTimingTelemetry.insert(
+                        QStringLiteral("cpu_dualiso_recon_fallback_reason"),
+                        QString::fromLatin1( inlineReducedRecon.fallbackReason ) );
+                }
+            }
             Debayered16ReconReuseInputs reuse;
             reuse.consumeReconnedRaw =
                 decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;
@@ -5292,6 +5395,13 @@ void RenderFrameThread::drawFrame( int slotIndex,
                 && m_imageWidth == static_cast<int>( getMlvWidth( m_pMlvObject ) )
                 && m_imageHeight == static_cast<int>( getMlvHeight( m_pMlvObject ) )
                 && slot.rawImage16.size() >= reconPixelCount * 3u;
+            if ( inlineReducedRecon.reconstructed )
+            {
+                applyDebayered16InlineReducedRecon( inlineReducedRecon,
+                                                    frameNumber,
+                                                    slot.requestSerial,
+                                                    reuse );
+            }
             phase3ReconReuseOutcome =
                 renderDebayered16FromSlot( m_pMlvObject,
                                            frameNumber,
@@ -5403,8 +5513,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
             QString::fromLatin1( debayered16ReconRefusalName( phase3ReconReuseOutcome ) ) );
         slot.stageTimingTelemetry.insert(
             QStringLiteral("debayered16_recon_worker_llrawproc_total_ms"),
-            preservedGpuPlaybackReconTextureTelemetry.value(
-                QStringLiteral("render_thread_recon_worker_llrawproc_total_ms") ).toDouble() );
+            inlineReducedRecon.reconstructed
+                ? inlineReducedRecon.llrawprocMs
+                : preservedGpuPlaybackReconTextureTelemetry.value(
+                      QStringLiteral("render_thread_recon_worker_llrawproc_total_ms") ).toDouble() );
         slot.stageTimingTelemetry.insert(
             QStringLiteral("gpu_bilinear_debayer_active"),
             usedGpuBilinearDebayer );
@@ -5775,8 +5887,16 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * struct fields also written by the processed8-prefetch worker thread
      * rendering concurrently on the same mlvObject), they cannot read a
      * value written by that other thread's frame. */
-    const double llrawprocPreDualIsoFixMs = llrpGetLastPreDualIsoFixMilliseconds();
-    const bool preDualIsoFixActive = llrpGetLastPreDualIsoFixCompleted() != 0;
+    /* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the reduced debayer clears both, so a
+     * frame the render reconstructed itself reports what its recon captured. */
+    const bool inlineReconConsumed =
+        debayered16ReducedReconConsumed && inlineReducedRecon.reconstructed;
+    const double llrawprocPreDualIsoFixMs = inlineReconConsumed
+        ? inlineReducedRecon.preDualIsoFixMs
+        : llrpGetLastPreDualIsoFixMilliseconds();
+    const bool preDualIsoFixActive = inlineReconConsumed
+        ? inlineReducedRecon.preDualIsoFixCompleted
+        : llrpGetLastPreDualIsoFixCompleted() != 0;
     const int preDualIsoFixWidth = preDualIsoFixActive ? sourceWidth : 0;
     const int preDualIsoFixHeight = preDualIsoFixActive ? sourceHeight : 0;
     QString phase4bFallbackReason = QStringLiteral("none");
@@ -6162,8 +6282,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
 
     const bool rawFromWorker = workerRawTelemetry.valid;
-    /* The render thread's own raw_uint16 ms is what its debayered-frame total contains. */
-    const double renderThreadRawUint16Ms = getMlvLastRawUint16Milliseconds();
+    /* The render thread's own raw_uint16 ms is what its debayered-frame total contains.
+     * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: an inline recon's decode and llrawproc ran
+     * before the reduced debayer, outside that total; their records survive it. */
+    const double renderThreadRawUint16Ms =
+        inlineReconConsumed ? 0.0 : getMlvLastRawUint16Milliseconds();
     const double rawUint16Ms = rawFromWorker ? workerRawTelemetry.rawUint16Ms : renderThreadRawUint16Ms;
     const double rawUint16DiskReadMs = rawFromWorker
         ? workerRawTelemetry.diskReadMs : getMlvLastRawUint16DiskReadMilliseconds();
@@ -6234,7 +6357,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         ? ( workerRawTelemetry.prefetchHit ? 1 : 0 ) : getMlvLastRawUint16PrefetchHit();
     const quint64 rawUint16PrefetchDecodeFailures =
         static_cast<quint64>( getMlvRawUint16PrefetchDecodeFailures( m_pMlvObject ) );
-    const double llrawprocMs = getMlvLastLlrawprocMilliseconds();
+    const double renderThreadLlrawprocMs = getMlvLastLlrawprocMilliseconds();
+    const double llrawprocMs =
+        inlineReconConsumed ? inlineReducedRecon.llrawprocMs : renderThreadLlrawprocMs;
     const double llrawprocDarkFrameMs = llrpGetLastDarkFrameMilliseconds();
     const double llrawprocVerticalStripesMs = llrpGetLastVerticalStripesMilliseconds();
     const double llrawprocFocusPixelsMs = llrpGetLastFocusPixelsMilliseconds();
@@ -6276,7 +6401,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const double debayerExclusiveMs = qMax( 0.0,
                                             getMlvLastDebayeredFrameMilliseconds()
                                                 - renderThreadRawUint16Ms
-                                                - llrawprocMs );
+                                                - renderThreadLlrawprocMs );
     const double debayerKnownMs =
         rawFloatConvertMs +
         debayerWbPrepareMs +

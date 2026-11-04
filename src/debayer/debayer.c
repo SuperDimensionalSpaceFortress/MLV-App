@@ -74,12 +74,16 @@ static void debayer_basic_u16_rows_scalar(uint16_t * __restrict debayerto,
             int pixm1 = pix - width;
             int pixp1 = pix + width;
             int pixp2 = pixp1 + width;
+            /* At an odd width the last block's x+2 is past the row (one word past
+             * the frame on the final row pair). Mirror it onto x, the same CFA
+             * colour; it only feeds column x+1, which the edge fix-up overwrites. */
+            const int r2 = (x + 2 < width) ? 2 : 0;
 
             int bPix[16] = {
-                ( pixm1-1 ), ( pixm1 ), ( pixm1+1 ), ( pixm1+2 ),
-                ( pix - 1 ), (  pix  ), ( pix + 1 ), ( pix + 2 ),
-                ( pixp1-1 ), ( pixp1 ), ( pixp1+1 ), ( pixp1+2 ),
-                ( pixp2-1 ), ( pixp2 ), ( pixp2+1 ), ( pixp2+2 ),
+                ( pixm1-1 ), ( pixm1 ), ( pixm1+1 ), ( pixm1+r2 ),
+                ( pix - 1 ), (  pix  ), ( pix + 1 ), ( pix + r2 ),
+                ( pixp1-1 ), ( pixp1 ), ( pixp1+1 ), ( pixp1+r2 ),
+                ( pixp2-1 ), ( pixp2 ), ( pixp2+1 ), ( pixp2+r2 ),
             };
 
             int rgbPix[4] = {
@@ -307,12 +311,14 @@ static void debayer_basic_u16_rows_avx2(uint16_t * __restrict debayerto,
             int pixm1 = pix - width;
             int pixp1 = pix + width;
             int pixp2 = pixp1 + width;
+            /* Odd-width right edge: as in the scalar body. */
+            const int r2 = (x + 2 < width) ? 2 : 0;
 
             int bPix[16] = {
-                ( pixm1-1 ), ( pixm1 ), ( pixm1+1 ), ( pixm1+2 ),
-                ( pix - 1 ), (  pix  ), ( pix + 1 ), ( pix + 2 ),
-                ( pixp1-1 ), ( pixp1 ), ( pixp1+1 ), ( pixp1+2 ),
-                ( pixp2-1 ), ( pixp2 ), ( pixp2+1 ), ( pixp2+2 ),
+                ( pixm1-1 ), ( pixm1 ), ( pixm1+1 ), ( pixm1+r2 ),
+                ( pix - 1 ), (  pix  ), ( pix + 1 ), ( pix + r2 ),
+                ( pixp1-1 ), ( pixp1 ), ( pixp1+1 ), ( pixp1+r2 ),
+                ( pixp2-1 ), ( pixp2 ), ( pixp2+1 ), ( pixp2+r2 ),
             };
             int rgbPix[4] = {
                 (bPix[5] * 3), (bPix[ 6] * 3),
@@ -811,13 +817,15 @@ void debayerBasic(uint16_t * __restrict debayerto, float * __restrict bayerdata,
             int pixm1 = pix - width; /* Pixel of previous row by 1 */
             int pixp1 = pix + width; /* Next row pixel */
             int pixp2 = pixp1 + width; /* Row + 2 */
+            /* Odd-width right edge: as in debayerBasicU16's scalar body. */
+            const int r2 = (x + 2 < width) ? 2 : 0;
 
             /* Bayer pixel indexes */
             int bPix[16] = {
-                ( pixm1-1 ), ( pixm1 ), ( pixm1+1 ), ( pixm1+2 ),
-                ( pix - 1 ), (  pix  ), ( pix + 1 ), ( pix + 2 ),
-                ( pixp1-1 ), ( pixp1 ), ( pixp1+1 ), ( pixp1+2 ),
-                ( pixp2-1 ), ( pixp2 ), ( pixp2+1 ), ( pixp2+2 ),
+                ( pixm1-1 ), ( pixm1 ), ( pixm1+1 ), ( pixm1+r2 ),
+                ( pix - 1 ), (  pix  ), ( pix + 1 ), ( pix + r2 ),
+                ( pixp1-1 ), ( pixp1 ), ( pixp1+1 ), ( pixp1+r2 ),
+                ( pixp2-1 ), ( pixp2 ), ( pixp2+1 ), ( pixp2+r2 ),
             };
 
             /* Indexes of our four pixels in RGB(not every colour) */
