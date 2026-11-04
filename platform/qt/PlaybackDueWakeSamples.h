@@ -169,10 +169,14 @@ private:
     //! an in-range sample's bin (the clamp only absorbs the floating-point rounding just below kMaxMs)
     static std::size_t binOf( double ms )
     {
-        const double bin = std::floor( ( ms - kMinMs ) / kBinMs );
-        if( !( bin > 0.0 ) ) return 0;
-        if( bin >= static_cast<double>( kBins - 1 ) ) return kBins - 1;
-        return static_cast<std::size_t>( bin );
+        const double estimate = std::floor( ( ms - kMinMs ) / kBinMs );
+        std::size_t bin = !( estimate > 0.0 ) ? 0
+            : ( estimate >= static_cast<double>( kBins - 1 ) ? kBins - 1 : static_cast<std::size_t>( estimate ) );
+        // r6 (adversary pass 12 A2): the division can round a sample across an edge; settle it against the very edges rank()
+        // reports, so binEdgeMs( bin ) <= ms < binEdgeMs( bin + 1 ) holds in double for every in-range sample
+        while( bin > 0 && ms < binEdgeMs( bin ) ) --bin;
+        while( bin < kBins - 1 && ms >= binEdgeMs( bin + 1 ) ) ++bin;
+        return bin;
     }
 
     std::vector<double> m_exact;
@@ -207,8 +211,13 @@ inline QString playbackDueWakePercentileBoundText( const PlaybackDueWakeSamples 
     const PlaybackDueWakeSamples::Rank r = samples.rank( p );
     if( r.censor != PlaybackDueWakeSamples::Censor::None ) return playbackDueWakePercentileText( samples, p );
     const bool lower = side == PlaybackDueWakeBoundSide::Lower;
-    const double scaled = ( lower ? r.loMs : r.hiMs ) * 1000.0;
-    const double rounded = ( lower ? std::floor( scaled ) : std::ceil( scaled ) ) / 1000.0;
+    const double bound = lower ? r.loMs : r.hiMs;
+    double steps = lower ? std::floor( bound * 1000.0 ) : std::ceil( bound * 1000.0 );
+    // r6 (adversary pass 12 A2): the product can round across a 0.001 step; the printed value (steps / 1000, the double its
+    // text parses back to) must not cross the bound, so step once more outward when it does
+    if( lower && steps / 1000.0 > bound ) steps -= 1.0;
+    if( !lower && steps / 1000.0 < bound ) steps += 1.0;
+    const double rounded = steps / 1000.0;
     return QStringLiteral( "%1" ).arg( rounded == 0.0 ? 0.0 : rounded, 0, 'f', 3 );   // never "-0.000"
 }
 

@@ -330,6 +330,8 @@ void PlaybackDueWake::arm( double dueMs )
 {
     if( d->stopped ) return;
     if( !( dueMs > 0.0 ) ) dueMs = 0.0;
+    // r6 adversary pass 12 A1 (and pass 10 A4, +infinity): bounded before the ns, 100 ns and int conversions below
+    if( dueMs > kMaxDueMs ) dueMs = kMaxDueMs;
     const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );
     d->lastArmQtTimer = d->delivery == Delivery::QtTimer;
 #ifdef Q_OS_WIN

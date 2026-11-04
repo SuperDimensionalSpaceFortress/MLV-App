@@ -1170,3 +1170,94 @@ TEST(PlaybackDueWakeSplit, ThePrintedBoundsEncloseTheTrueSplitPastTheExactStoreA
         ASSERT_TRUE( lower( spread, p ) <= truth && truth <= upper( spread, p ) );
     }
 }
+
+TEST(PlaybackDueWakeSplit, APrintedBoundNeverCrossesItsSampleAtDoublePrecision)
+{
+    // r6 adversary pass 12 A2 input: 44.029999999999994 x 16,385 (p50 Lower) printed 44.030, above its sample; 44.160000000000004
+    // x 16,385 (p50 Upper) printed 44.160, below it. The division in binOf rounded the sample into the next / previous bin.
+    const double lowSample = 44.029999999999994;
+    const double highSample = 44.160000000000004;
+    PlaybackDueWakeSamples low, high;
+    low.addRepeated( lowSample, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    high.addRepeated( highSample, PlaybackDueWakeSamples::kExactCapacity + 1 );
+    ASSERT_FALSE( low.exact() );
+    ASSERT_TRUE( low.rank( 0.50 ).loMs <= lowSample && lowSample < low.rank( 0.50 ).hiMs );
+    ASSERT_TRUE( high.rank( 0.50 ).loMs <= highSample && highSample < high.rank( 0.50 ).hiMs );
+    ASSERT_TRUE( playbackDueWakePercentileBoundText( low, 0.50, PlaybackDueWakeBoundSide::Lower ).toDouble() <= lowSample );
+    ASSERT_TRUE( playbackDueWakePercentileBoundText( high, 0.50, PlaybackDueWakeBoundSide::Upper ).toDouble() >= highSample );
+    // every sample sits inside its own bin's reported edges, across the range, at and next to an edge every 0.4 ms (250 edges,
+    // 4 values each: each one is a spilled set, so the count is kept small)
+    LatenessSource source;
+    for( int i = 0; i < 250; ++i )
+    {
+        const double edge = -20.0 + static_cast<double>( i * 40 ) * 0.01;
+        for( const double v : { edge, std::nextafter( edge, -100.0 ), std::nextafter( edge, 100.0 ), source.next( -20.0, 80.0 ) } )
+        {
+            if( !( v >= PlaybackDueWakeSamples::kMinMs ) || v >= PlaybackDueWakeSamples::kMaxMs ) continue;
+            PlaybackDueWakeSamples one;
+            one.addRepeated( v, PlaybackDueWakeSamples::kExactCapacity + 1 );
+            const PlaybackDueWakeSamples::Rank r = one.rank( 0.50 );
+            ASSERT_TRUE( r.loMs <= v && v < r.hiMs );
+            ASSERT_TRUE( playbackDueWakePercentileBoundText( one, 0.50, PlaybackDueWakeBoundSide::Lower ).toDouble() <= v );
+            ASSERT_TRUE( playbackDueWakePercentileBoundText( one, 0.50, PlaybackDueWakeBoundSide::Upper ).toDouble() >= v );
+        }
+    }
+    // the exact store: a value just below a printed step is not printed as that step when it is a lower bound
+    PlaybackDueWakeSamples exact;
+    const double justBelow = std::nextafter( 0.003, 0.0 );
+    exact.add( justBelow );
+    ASSERT_TRUE( playbackDueWakePercentileBoundText( exact, 0.50, PlaybackDueWakeBoundSide::Lower ).toDouble() <= justBelow );
+    ASSERT_TRUE( playbackDueWakePercentileBoundText( exact, 0.50, PlaybackDueWakeBoundSide::Upper ).toDouble() >= justBelow );
+}
+
+TEST(PlaybackDueWakeGate, AnAbsurdWaitSaturatesTheDueInsteadOfOverflowing)
+{
+    // r6 adversary pass 12 A1 gate sibling input: nowNs = 1,000,000,000,000 and dueInNs = 9,223,372,036,000,000,000. The sum
+    // overflowed qint64 (undefined; in practice a negative due, so any delivery was "on time").
+    PlaybackDueWakeGate gate;
+    const quint32 g = gate.arm( 1000000000000LL, 9223372036000000000LL );
+    ASSERT_TRUE( gate.armed() );
+    ASSERT_FALSE( gate.accept( g, 2000000000000LL ) );            // far before the (saturated) due: early, still armed
+    ASSERT_TRUE( gate.armed() );
+    ASSERT_TRUE( gate.accept( g, std::numeric_limits<qint64>::max() ) );
+    // a negative wait is "now"
+    PlaybackDueWakeGate now;
+    const quint32 n = now.arm( 5000000, -3000000 );
+    ASSERT_TRUE( now.accept( n, 5000000 ) );
+}
+
+TEST(PlaybackDueWakeNative, AnAbsurdDueIsClampedBeforeEveryConversion)
+{
+    // r6 adversary pass 12 A1 input: fpsOverride with frameRate 1e-12 makes msUntilCredit ~1e15 ms; 1e-7 gives ~1e10 ms on the
+    // QTimer path; +infinity is pass 10 A4. dueMs * 1e6 left qint64, the 100 ns units LONGLONG, and the QTimer delay int.
+    ASSERT_EQ( 2147483647.0, PlaybackDueWake::kMaxDueMs );
+    ASSERT_TRUE( PlaybackDueWake::kMaxDueMs * 1000000.0 < 9.2e18 );                        // the gate's ns
+    ASSERT_TRUE( std::ceil( PlaybackDueWake::kMaxDueMs * 10000.0 ) < 9.2e18 );             // SetWaitableTimer's 100 ns units
+    ASSERT_TRUE( std::ceil( PlaybackDueWake::kMaxDueMs ) <= 2147483647.0 );               // QTimer::start( int )
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_FALSE( source.isEmpty() );
+    const int clamp = source.indexOf( QStringLiteral( "if( dueMs > kMaxDueMs ) dueMs = kMaxDueMs;" ) );
+    const int convert = source.indexOf( QStringLiteral( "const quint32 generation = d->gate.arm( d->nowNs(), static_cast<qint64>( dueMs * 1000000.0 ) );" ) );
+    ASSERT_TRUE( clamp > 0 && convert > clamp );
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    for( const double due : { 1e15, std::numeric_limits<double>::infinity() } )
+    {
+        wake.arm( due );
+        ASSERT_TRUE( wake.armed() );
+        ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::NativeMessage );   // the set succeeded
+        ASSERT_EQ( 0, pumpDueWakeMessages( wake, 30 ) );                                     // and it is not "now"
+        ASSERT_EQ( 0, fired );
+    }
+    wake.setWaitableTimerFailsForTest( true );
+    wake.arm( 10000000000.25 );                                                              // the QTimer path
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
+    const ULONGLONG deadline = GetTickCount64() + 30;
+    while( GetTickCount64() < deadline ) { QCoreApplication::processEvents( QEventLoop::AllEvents, 5 ); Sleep( 1 ); }
+    ASSERT_EQ( 0, fired );
+    ASSERT_TRUE( wake.armed() );
+    wake.cancel();
+#endif
+}

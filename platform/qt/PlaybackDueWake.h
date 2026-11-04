@@ -35,6 +35,7 @@
 #include <QtGlobal>
 
 #include <functional>
+#include <limits>
 #include <memory>
 
 class QObject;
@@ -53,7 +54,9 @@ public:
     {
         nextGeneration();
         m_armed = true;
-        m_dueNs = nowNs + dueInNs;
+        // r6 (adversary pass 12 A1, sibling): the absolute due saturates instead of overflowing qint64 (a negative wait is now)
+        if( dueInNs < 0 ) dueInNs = 0;
+        m_dueNs = nowNs > std::numeric_limits<qint64>::max() - dueInNs ? std::numeric_limits<qint64>::max() : nowNs + dueInNs;
         return m_generation;
     }
     void cancel()
@@ -194,7 +197,12 @@ public:
     PlaybackDueWake( const PlaybackDueWake & ) = delete;
     PlaybackDueWake & operator=( const PlaybackDueWake & ) = delete;
 
-    /*! Fire once, \a dueMs from now (a previous arm is replaced). A no-op after stop(). */
+    /*! r6 (adversary pass 12 A1): the longest wait arm() schedules, INT_MAX ms (24.8 days, QTimer's int limit). A longer one
+     *  (an extreme fps override makes msUntilCredit huge; +infinity, pass 10 A4) is clamped to it, so the ns, 100 ns and int
+     *  conversions below never leave their types' ranges. */
+    static constexpr double kMaxDueMs = 2147483647.0;
+    /*! Fire once, \a dueMs from now (a previous arm is replaced). A no-op after stop(). \a dueMs is clamped to
+     *  [0, kMaxDueMs] (negative and NaN are now). */
     void arm( double dueMs );
     /*! Forget a pending wake; a delivery already queued for it is dropped. */
     void cancel();
