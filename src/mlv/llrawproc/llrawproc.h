@@ -569,8 +569,10 @@ void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing);
  *   run_wall_ms       host wall of igpu_recon_run / run_preuploaded
  *   run_gpu_ms        the backend's own event span of that run (upload ..
  *                     handoff, igpu_recon_last_timing total_ms)
- *   sync_ms           run_wall_ms - run_gpu_ms, floored at 0: host launch and
- *                     the wait for the stream beyond the run's own GPU span
+ *   sync_ms           run_wall_ms - run_gpu_ms, floored at 0: wall-clock
+ *                     remainder of the run not covered by the recorded event
+ *                     pairs; not a device sync time (host setup before the
+ *                     first event, bookkeeping after the last, any stream wait)
  *   post_run_ms       held, after the run: device output query, retain (D2D
  *                     copy + stream sync), allocated bytes, timing read
  * dual_iso_ms of the same run, minus prepare, preupload, mutex_wait, configure,
