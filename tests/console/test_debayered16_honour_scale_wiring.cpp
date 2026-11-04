@@ -91,12 +91,37 @@ TEST(Debayered16HonourScaleWiring, Processed8ReducedPlanAndRunBlockIsUnchanged)
     const int end = body.indexOf(QStringLiteral("        if( slot.reducedReconScale <= 1 )"), start);
     ASSERT_TRUE(end > start);
     const QString block = body.mid(start, end - start);
-    // SHA-256 of the same span at b77baaf0 (LF line endings).
+    // SHA-256 of the same span (LF line endings). b77baaf0 pinned
+    // 09cf3dcdd381823d0e61a10048881c1ca1beeda17ece3a882fd063fa32d367b7 / 2696; re-pinned by
+    // CPU-DUALISO-REDUCED-RECON-H2C-PORT-1, which sizes the reduced Bayer and the slot dims from
+    // the plan's bayer dims (x2 for the x4 plan) and records reducedReconBayerScale.
     const QByteArray digest =
         QCryptographicHash::hash(block.toUtf8(), QCryptographicHash::Sha256).toHex();
-    ASSERT_EQ(std::string("09cf3dcdd381823d0e61a10048881c1ca1beeda17ece3a882fd063fa32d367b7"),
+    ASSERT_EQ(std::string("67af678aceca38491f392f8490a98709ffb8f23d1df1bf6da9646b2ea78901aa"),
               std::string(digest.constData()));
-    ASSERT_EQ(2696, static_cast<int>(block.size()));
+    ASSERT_EQ(2894, static_cast<int>(block.size()));
+}
+
+// CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 adversary A1: the CPU plan at x4 shrinks into an x2
+// Bayer (4x reducedWidth*reducedHeight words), so the public capacity contract of ...Run and
+// ...Shrink must name the bayer dims; a caller sizing from the old reducedWidth*reducedHeight
+// text overflows. Every in-tree caller sizes from bayerWidth*bayerHeight.
+TEST(Debayered16HonourScaleWiring, ReducedReconCapacityContractNamesTheBayerDims)
+{
+    const QString header = readRepoFile(QStringLiteral("src/mlv/video_mlv.h"));
+    ASSERT_FALSE(header.contains(QStringLiteral("reducedWidth*reducedHeight words")));
+    const int runAt = header.indexOf(QStringLiteral("int mlvDualIsoPreviewScaleReconRun("));
+    const int shrinkAt = header.indexOf(QStringLiteral("int mlvDualIsoPreviewScaleReconShrink("));
+    ASSERT_TRUE(runAt > 0 && shrinkAt > runAt);
+    const int runDoc = header.lastIndexOf(QStringLiteral("/*"), runAt);
+    const int shrinkDoc = header.lastIndexOf(QStringLiteral("/*"), shrinkAt);
+    ASSERT_TRUE(header.mid(runDoc, runAt - runDoc).contains(QStringLiteral("plan->bayerWidth*plan->bayerHeight words")));
+    ASSERT_TRUE(header.mid(shrinkDoc, shrinkAt - shrinkDoc).contains(QStringLiteral("plan->bayerWidth *")));
+    // The render thread's two CPU sites size the reduced Bayer from the bayer dims.
+    const QString render = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_TRUE(render.contains(QStringLiteral("static_cast<size_t>( reducedPlan.bayerWidth )")));
+    const QString policy = readRepoFile(QStringLiteral("platform/qt/Debayered16ReconReusePolicy.h"));
+    ASSERT_TRUE(policy.contains(QStringLiteral("reducedBayer.resize( static_cast<size_t>( plan.bayerWidth )")));
 }
 
 TEST(Debayered16HonourScaleWiring, RenderConsumesAReducedSlotOnlyForAnAdmittedRequestAtItsScale)

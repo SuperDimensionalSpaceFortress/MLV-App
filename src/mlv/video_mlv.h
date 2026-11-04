@@ -331,7 +331,9 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
                                     mlvDualIsoPreviewScaleRecon_t * plan);
 /* Run the planned reduced recon: seed the ISO pattern from `fullRaw`, apply the
  * full-res fixes in place when planned, shrink into `reducedOut` (capacity
- * reducedWidth*reducedHeight words) and reconstruct it on `worker` without
+ * plan->bayerWidth*plan->bayerHeight words; CPU-DUALISO-REDUCED-RECON-H2C-PORT-1:
+ * the CPU plan at x4 writes an x2 Bayer, 4x reducedWidth*reducedHeight, so size
+ * the buffer from the bayer dims, never the display dims) and reconstruct it on `worker` without
  * publishing estimates to the shared llrawproc state, then apply the reduced
  * ISO-period notch to it (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH; a notch that cannot
  * get its scratch fails the run like a failed recon). Returns 1 on success,
@@ -346,7 +348,8 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
                                    double * fullResFixesMs,
                                    double * downsampleMs);
 /* The first half of ...Run: seed the ISO pattern, run the planned full-res
- * fixes in place and shrink into `reducedOut`. Returns 1 (fullRaw untouched)
+ * fixes in place and shrink into `reducedOut` (capacity plan->bayerWidth *
+ * plan->bayerHeight words, as ...Run). Returns 1 (fullRaw untouched)
  * or 2 (fixes changed fullRaw) on success, 0 / -1 on failure as ...Run. */
 int mlvDualIsoPreviewScaleReconShrink(mlvObject_t * video,
                                       const mlvDualIsoPreviewScaleRecon_t * plan,

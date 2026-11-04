@@ -1919,6 +1919,17 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4ReconstructsAtX2AndBothConsumersTakeIt)
         size_t nonzero = 0;
         for (const uint8_t v : out8) nonzero += v != 0;
         ASSERT_TRUE(nonzero > out8.size() / 2);
+
+        // Adversary A3: a Bayer under 4 rows reconstructs no row pair, so the filtered (scratch)
+        // branches would hand back a previous frame's scratch; the entry refuses it (out untouched).
+        std::vector<uint16_t> shortBayer(static_cast<size_t>(plan.bayerWidth) * 2u, 5000u);
+        std::vector<uint16_t> sentinel(rgb.size(), 0xBEEFu);
+        w = -1;
+        h = -1;
+        ASSERT_EQ(0, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, shortBayer.data(), plan.bayerWidth, 2,
+                                                                     scale, sentinel.data(), hq, &w, &h));
+        ASSERT_TRUE(std::all_of(sentinel.begin(), sentinel.end(), [](uint16_t v) { return v == 0xBEEFu; }));
+        ASSERT_EQ(-1, w);
     }
 }
 

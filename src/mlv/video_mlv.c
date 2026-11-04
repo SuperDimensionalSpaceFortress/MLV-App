@@ -6793,6 +6793,11 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
 {
     if (!out || !bayer || bw <= 0 || bh <= 0 || out_w <= 0 || out_h <= 0) return 0;
     const uint64_t bayer_rgb_words = (uint64_t)bw * (uint64_t)bh * 3u;
+    /* The filtered branches debayer into thread-local scratch: below 4 rows
+     * debayerBasicU16 reconstructs no row pair and would leave a previous frame's
+     * scratch in place (adversary A3), so they refuse such a Bayer. */
+    const int filtered_branch = (displayScale == 2 * bayerScale) || (displayScale == 2 && bayerScale == 2);
+    if (filtered_branch && bh < 4) return 0;
     int rows = 0;
     if (displayScale == 2 * bayerScale)
     {
