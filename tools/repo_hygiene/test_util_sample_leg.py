@@ -920,6 +920,23 @@ function Invoke-ZoneRegion3([string]$AtStart, [string]$AtStop) {
     @{ status = $utilSampleGpu.status; mean = $utilSampleGpu.mean; inWindow = $utilSampleGpu.rowsInWindow; total = $utilSampleGpu.rowsTotal; cpu = $utilSampleCpu.status }
 }
 $z2s = $z2ist.ToSerializedString()
+# ---- adversary c979b531 A1 (exact case, in-memory): both CSVs owned and both stops clean; while region 3's first publication copies them a reader
+# holds each with FileShare.None (a sharing violation), and releases them before the outer finally calls Publish-UtilSampleFiles again. At
+# c979b531 each flag was set before its copy, so the finally skipped both now-readable files: one copy attempt per file, nothing published
+$q1dir = Join-Path $t 'q1'; [void](New-Item -ItemType Directory -Force -Path $q1dir); $q1pub = Join-Path $t 'q1-pub'; [void](New-Item -ItemType Directory -Force -Path $q1pub)
+$Pub = $q1pub; $utilSampleGpuCsv = Join-Path $q1dir 'gpu-util.csv'; $utilSampleCpuCsv = Join-Path $q1dir 'cpu-util.csv'
+[IO.File]::WriteAllText($utilSampleGpuCsv, "2026/11/02 08:00:00.000, 40, 10, 1800, P2, 50.00`n"); [IO.File]::WriteAllText($utilSampleCpuCsv, $y2good)
+$utilSampleGpuStart = [ordered]@{ status = 'running'; reason = $null; owned = $true }; $utilSampleCpuStart = $run
+$script:utilSampleStopRecord = [ordered]@{ gpu = [ordered]@{ stopped = $true; killed = $true; exitCode = 1; exitedBeforeStop = $false; why = $null }; cpu = $okStop }
+$script:utilSamplePublished = $false; $script:utilSampleGpuPublished = $false; $script:utilSampleCpuPublished = $false; $script:y2pubs = [Collections.Generic.List[string]]::new()
+$q1holds = @([IO.File]::Open($utilSampleGpuCsv, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None), [IO.File]::Open($utilSampleCpuCsv, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None))
+Publish-UtilSampleFiles
+$q1first = @($script:y2pubs)
+foreach ($h in $q1holds) { $h.Dispose() }
+Publish-UtilSampleFiles
+$q1second = @($script:y2pubs)
+Publish-UtilSampleFiles
+$r['q1A1'] = @{ first = $q1first; second = $q1second; third = @($script:y2pubs); files = @(Get-ChildItem -LiteralPath $q1pub -Name | Sort-Object) }
 $r['z2A2'] = @{ hostIsIst = ([TimeZoneInfo]::Local.Id -ceq 'India Standard Time'); captured = (Invoke-ZoneRegion3 $z2s $z2s); changedInCapture = (Invoke-ZoneRegion3 $z2s $z2npt.ToSerializedString()); unknown = (Invoke-ZoneRegion3 $z2s '') }
 Write-Output (J $r)
 """
@@ -1246,6 +1263,14 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual((p3["firstOwned"], p3["region3Published"], p3["kills"]), (False, [], 2), f"the first stop's shape is not the finding's: {p3}")
         self.assertEqual((p3["stopped"], p3["retryOwned"], p3["retryEarly"]), (True, True, False), p3)
         self.assertEqual(p3["finallyPublished"], ["cpu-util.csv=utc,cpuTotal"], f"the finally did not publish the CSV the retried stop proved owned: {p3}")
+
+    def test_adv_c979b531_a1_a_failed_copy_is_published_by_the_next_call(self) -> None:
+        # exact case: at c979b531 both flags were set before their copies, so the finally's call skipped the two files the first copy failed on
+        q1 = self.r["q1A1"]
+        self.assertEqual(q1["first"], [], f"the probe's held handles did not fail the first copies: {q1}")
+        self.assertEqual(sorted(q1["second"]), ["cpu-util.csv=utc,cpuTotal", "gpu-util.csv=2026/11/02 0"], f"a copy that failed was never tried again: {q1}")
+        self.assertEqual(sorted(q1["third"]), sorted(q1["second"]), f"a published file was published again: {q1}")
+        self.assertEqual(q1["files"], ["cpu-util.csv", "gpu-util.csv"], q1)
 
     def test_adv_1697fe31_a2_gpu_rows_are_read_in_the_zone_they_were_stamped_in(self) -> None:
         # exact input: IST capture, a different zone at summary time; at 1697fe31 region 3 read [TimeZoneInfo]::Local and the rows shifted

@@ -7526,12 +7526,13 @@ $utilSampleZoneAtStart = $null
 $utilSampleZoneAtStop = $null
 # Both CSVs beside presentmon.csv, each once, at the first site (the success summary, else the outer finally) where it is the job's own; a failure
 # is a trace line. adversary 1697fe31 A3: each side keeps its own flag, so a CPU file not yet owned at the success summary (its stop failed) is
-# published by the outer finally once the retried stop proves the child's clean exit.
+# published by the outer finally once the retried stop proves the child's clean exit. adversary c979b531 A1: a flag is set only after its copy
+# succeeded, so a copy that failed (a sharing violation) is tried again by the finally's call.
 function Publish-UtilSampleFiles {
     # sol r4 B3: only a file this job created is published (the GPU side's CreateNew; the CPU side's child exit 0 after its CreateNew, adversary
     # f685c478 A2); an occupied name never is
-    try { if (-not $script:utilSampleGpuPublished -and $utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf)) { $script:utilSampleGpuPublished = $true; [void](Publish-AttrCudaFileCopy -Source $utilSampleGpuCsv -Destination (Join-Path $Pub 'gpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=gpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
-    try { if (-not $script:utilSampleCpuPublished -and (Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf)) { $script:utilSampleCpuPublished = $true; [void](Publish-AttrCudaFileCopy -Source $utilSampleCpuCsv -Destination (Join-Path $Pub 'cpu-util.csv')) } } catch { Write-JobTrace "step util-sample publish file=cpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try { if (-not $script:utilSampleGpuPublished -and $utilSampleGpuStart.owned -and (Test-Path -LiteralPath $utilSampleGpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $utilSampleGpuCsv -Destination (Join-Path $Pub 'gpu-util.csv')); $script:utilSampleGpuPublished = $true } } catch { Write-JobTrace "step util-sample publish file=gpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
+    try { if (-not $script:utilSampleCpuPublished -and (Test-UtilSampleCpuOwned $utilSampleCpuStart $utilSampleStopRecord) -and (Test-Path -LiteralPath $utilSampleCpuCsv -PathType Leaf)) { [void](Publish-AttrCudaFileCopy -Source $utilSampleCpuCsv -Destination (Join-Path $Pub 'cpu-util.csv')); $script:utilSampleCpuPublished = $true } } catch { Write-JobTrace "step util-sample publish file=cpu-util.csv error=$([string]$_.CategoryInfo.Reason)" }
 }
 # adversary 1697fe31 A2: the host zone nvidia-smi will stamp in, read before it starts (and again at the stop)
 try { $utilSampleZoneAtStart = Get-UtilSampleHostZone } catch { }
