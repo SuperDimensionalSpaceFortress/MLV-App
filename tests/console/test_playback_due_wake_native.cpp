@@ -1044,7 +1044,9 @@ TEST(PlaybackDueWakeNative, AQueuedNotifierActivationOfTheReplacedTimerNeverFire
 {
     // r6 adversary pass 10 A1 sibling (PlaybackDueWake.cpp:258): on the notifier path the replaced arm's timer signalled and
     // its activation was queued before arm(5) failed over to a QTimer. deliverCurrent took "whatever is armed now", so the
-    // queued activation fired the replacement on the notifier. Posted events only are sent first (no Qt timer runs there).
+    // queued activation fired the replacement on the notifier. Only the notifier's own posted event type (WinEventAct) is sent
+    // first: a bare sendPostedEvents() also ran the fallback QTimer's timeout on hosted CI (c625b77a, fired == 1 from the
+    // correct QTimer delivery), so it could not tell the two mechanisms apart.
 #ifdef Q_OS_WIN
     int fired = 0;
     PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, false );
@@ -1055,7 +1057,7 @@ TEST(PlaybackDueWakeNative, AQueuedNotifierActivationOfTheReplacedTimerNeverFire
     wake.arm( 5.0 );
     ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
     Sleep( 8 );                                                    // past the replacement's due
-    QCoreApplication::sendPostedEvents();                          // the queued activation, if it was queued
+    QCoreApplication::sendPostedEvents( nullptr, QEvent::WinEventAct );   // the queued activation only, if it was queued
     ASSERT_EQ( 0, fired );
     ASSERT_TRUE( wake.armed() );
     const ULONGLONG deadline = GetTickCount64() + 500;
