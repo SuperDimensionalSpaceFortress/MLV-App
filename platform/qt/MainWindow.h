@@ -1204,9 +1204,9 @@ private:
     quint64 m_playbackDueWakeBusyDeferred = 0;
     quint64 m_playbackDueWakeUnpresentedDeferred = 0;   // r2 A1: every-frame wake held until the requested frame presented
     quint64 m_playbackDueWakePostUnsplit = 0;           // r5 pass 9 A1: native deliveries taken before the post-return stamp
-    quint64 m_playbackDueWakePostRescued = 0;           // r7 passes 13/14 A1: lost posts the poll tick delivered
-    quint64 m_playbackDueWakePostRefusedBase = 0;       // r7: the wake's cumulative counters at this Play's reset
+    quint64 m_playbackDueWakePostRefusedBase = 0;       // r7 passes 13-15 A1: the wake's cumulative counters at this Play's reset
     quint64 m_playbackDueWakePostFailedBase = 0;
+    quint64 m_playbackDueWakePostRescuedBase = 0;
     long long m_playbackDueWakePresentedFrame = -1;     // r2 pass 4 A1: the frame whose present last ENDED (presentPlaybackPreparedFrame)
     QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
     bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism

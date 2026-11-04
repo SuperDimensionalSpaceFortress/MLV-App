@@ -256,6 +256,10 @@ public:
      *  budget (each one left a lost post for deliverLostPost()). */
     quint64 postRefusals() const;
     quint64 postFailures() const;
+    /*! GUI thread, cumulative: lost posts deliverLostPost() fired. r7 (adversary pass 15 A1): counted BEFORE the callback runs,
+     *  and a failure is counted before its lost post is published, so a summary line printed from inside the callback (a
+     *  rescued wake that stops Play) already shows both. */
+    quint64 postRescued() const;
     /*! Test hook: the wait thread's retry budget in ms (0: no retry). */
     void setPostRetryBudgetMsForTest( int ms );
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */

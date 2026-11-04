@@ -1369,12 +1369,74 @@ TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsDeliveredOnceByThePollTickAn
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
     const QString timer = functionBody( mainWindow, QStringLiteral( "void MainWindow::timerEvent(QTimerEvent *t)" ),
                                         QStringLiteral( "//1sec Timer" ) );
-    const int rescue = timer.indexOf( QStringLiteral(
-        "if( m_playbackDueWake && m_playbackDueWake->deliverLostPost() ) ++m_playbackDueWakePostRescued;" ) );
+    const int rescue = timer.indexOf( QStringLiteral( "if( m_playbackDueWake ) m_playbackDueWake->deliverLostPost();" ) );
     const int tick = timer.indexOf( QStringLiteral( "timerFrameEvent();" ) );
     ASSERT_TRUE( rescue > 0 && tick > rescue );
     ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "QStringLiteral( \" post_refused=%1 post_failed=%2 post_rescued=%3\" )" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostRescued = 0;" ) ) );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, ARescuedWakeThatStopsPlayPrintsItsOwnRescueAndFailure)
+{
+    // r7 adversary pass 15 A1 input (MainWindow.cpp:3095 on 4c5e8289): the current due wake is armed, cut-out moved to the
+    // next frame, the GUI queue filled with 10000 posted messages and held past the 100 ms retry budget; the worker publishes
+    // the lost generation, the queue drains and the poll tick rescues it. The rescue's callback (onPlaybackDueWake ->
+    // timerFrameEvent) stops Play at the cut-out, and the stop handler prints the summary line BEFORE deliverLostPost returns.
+    // On 4c5e8289 MainWindow counted the rescue after deliverLostPost returned (post_failed=1 post_rescued=0 on that line), and
+    // the worker published the generation before counting the failure. The callback below reads the counters exactly where
+    // the summary line does: from inside the fire.
+#ifdef Q_OS_WIN
+    quint64 failedSeen = 0;
+    quint64 rescuedSeen = 0;
+    int fired = 0;
+    PlaybackDueWake *self = nullptr;
+    PlaybackDueWake wake( nullptr, [&]() { ++fired; failedSeen = self->postFailures(); rescuedSeen = self->postRescued(); } );
+    self = &wake;
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    DueWakeQueueDrain drainOnExit { wake };
+    wake.setPostRetryBudgetMsForTest( 20 );
+    DWORD refusedWith = 0;
+    fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    if( refusedWith == 0 ) SKIP_TEST( "this host's posted-message limit is above 1000000: the queue cannot be filled" );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.arm( 5.0 );
+    // the GUI thread polls the rescue the way the poll tick does, as soon as a generation is published (no other wait)
+    const ULONGLONG deadline = GetTickCount64() + 3000;
+    bool rescued = false;
+    while( !rescued && GetTickCount64() < deadline )
+    {
+        rescued = wake.deliverLostPost();
+        if( !rescued ) Sleep( 0 );
+    }
+    ASSERT_TRUE( rescued );
+    ASSERT_EQ( 1, fired );
+    ASSERT_EQ( 1u, failedSeen );                                   // the failure was counted before it was published
+    ASSERT_EQ( 1u, rescuedSeen );                                  // the rescue was counted before the callback ran
+    ASSERT_EQ( 1u, wake.postRescued() );
+    ASSERT_FALSE( wake.deliverLostPost() );
+    ASSERT_EQ( 1u, wake.postRescued() );
+    // a native delivery is never counted as a rescue
+    drainDueWakeWindow( wake );
+    wake.arm( 1.0 );
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    ASSERT_EQ( 2, fired );
+    ASSERT_EQ( 1u, rescuedSeen );
+    // the wiring: the wake counts both ahead of their publication; MainWindow reads the wake's counter (no own increment)
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    const int count = source.indexOf( QStringLiteral( "args.postFailures->fetch_add( 1 );" ) );
+    const int publish = source.indexOf( QStringLiteral( "args.lostGeneration->store( generation, std::memory_order_release );" ) );
+    ASSERT_TRUE( count > 0 && publish > count );
+    const QString deliver = functionBody( source, QStringLiteral( "void deliverGeneration( quint32 generation" ),
+                                          QStringLiteral( "#ifdef Q_OS_WIN\nnamespace" ) );
+    const int rescue = deliver.indexOf( QStringLiteral( "++postRescued;" ) );
+    const int fire = deliver.indexOf( QStringLiteral( "onFire();" ) );
+    ASSERT_TRUE( rescue > 0 && fire > rescue );
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "++m_playbackDueWakePostRescued" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "m_playbackDueWake ? m_playbackDueWake->postRescued() - m_playbackDueWakePostRescuedBase : 0" ) ) );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif

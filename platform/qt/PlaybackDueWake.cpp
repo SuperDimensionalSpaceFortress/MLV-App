@@ -61,7 +61,10 @@ struct PlaybackDueWake::Impl
     std::atomic<quint64> postFailures { 0 };
     std::atomic<int> postRetryBudgetMs { PlaybackDueWake::kPostRetryBudgetMs };
 #endif
-    quint64 deliveries = 0;               // r7: native deliveries that fired (deliverLostPost reports whether it fired)
+    // r7 (adversary pass 15 A1): lost posts the poll tick fired, counted BEFORE the callback runs (it can stop Play and print
+    // the summary line before deliverLostPost returns); rescuingLostPost marks the delivery deliverLostPost is making
+    quint64 postRescued = 0;
+    bool rescuingLostPost = false;
 
     // r3 (adversary pass 7 A1): the gate's clock. On Windows it is QueryPerformanceCounter in ns, the clock the wait thread
     // stamps the post time on, so the gate can drop a delivery posted before the armed due time; elsewhere QElapsedTimer.
@@ -102,7 +105,11 @@ struct PlaybackDueWake::Impl
         firingPostMs = returnNs >= 0 ? static_cast<double>( returnNs ) / 1000000.0 : -1.0;
         firingFirstMs = returnNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;
         firingUnsplit = postNs >= 0 && returnNs < 0;
-        ++deliveries;
+        if( rescuingLostPost )
+        {
+            ++postRescued;
+            rescuingLostPost = false;   // a delivery nested inside the callback is not this rescue
+        }
         onFire();
         firingPostMs = -1.0;
         firingFirstMs = -1.0;
@@ -219,8 +226,10 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
             if( stopped ) break;
             if( !posted )
             {
-                args.lostGeneration->store( generation, std::memory_order_release );
+                // r7 (adversary pass 15 A1, sibling): counted BEFORE the generation is published, so a GUI thread that
+                // rescues it (and may print the summary line from inside the callback) always sees the failure
                 args.postFailures->fetch_add( 1 );
+                args.lostGeneration->store( generation, std::memory_order_release );
                 continue;   // nothing was posted: no return time to publish
             }
         }
@@ -511,9 +520,11 @@ bool PlaybackDueWake::deliverLostPost()
     // No post time: the gate judges it as a notifier / qtimer delivery (current generation, armed, not early).
     const quint32 generation = d->lostGeneration.exchange( 0, std::memory_order_acq_rel );
     if( generation == 0 ) return false;
-    const quint64 before = d->deliveries;
+    const quint64 before = d->postRescued;
+    d->rescuingLostPost = true;
     d->deliverGeneration( generation );
-    return d->deliveries != before;
+    d->rescuingLostPost = false;
+    return d->postRescued != before;
 #else
     return false;
 #endif
@@ -535,6 +546,11 @@ quint64 PlaybackDueWake::postFailures() const
 #else
     return 0;
 #endif
+}
+
+quint64 PlaybackDueWake::postRescued() const
+{
+    return d->postRescued;
 }
 
 void PlaybackDueWake::setPostRetryBudgetMsForTest( int ms )
