@@ -4127,7 +4127,9 @@ void MainWindow::recordClipOpenSourceStamp()
     m_clipOpenSourceStampGeneration = static_cast<quint64>( m_clipLifecycleBarrier.generation() );
     m_clipOpenSourceStampObject = static_cast<const void *>( m_pMlvObject );
     // r8 pass 1 A1: a visual-capture run holds the clip's files from here (no writer can open them) until the clip is freed
-    if( m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )
+    // r10 (adversary r9 pass 3 A1): only where the guard excludes writers (Windows); elsewhere no open guard, so no source id
+    if( visual_capture_source_difference::SourceWriteGuard::excludesExistingWriters()
+        && m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )
     {
         m_clipOpenSourceGuard = std::make_shared<visual_capture_source_difference::SourceWriteGuard>(
             m_pMlvObject->file, m_pMlvObject->filenum, m_clipOpenSourceStamp );
@@ -10793,7 +10795,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         const visual_capture_source_difference::BoundSourceIds visualSourceIds = visual_capture_source_difference::bindSourceIds(
             visualCaptureClips, visualCaptureClip, m_clipLifecycleBarrier, m_pMlvObject,
-            [&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },
+            // r10 (adversary r9 pass 3 A1): a build whose guard excludes no writer binds no source id (every frame unknown)
+            [&]( bool *unchanged ) { *unchanged = visual_capture_source_difference::SourceWriteGuard::excludesExistingWriters()
+                && visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },
             [&]( int displayFrame, quint64 *hash, bool *ok )
             {
                 uint64_t sourceHash = 0;

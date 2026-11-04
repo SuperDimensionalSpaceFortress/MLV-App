@@ -135,7 +135,11 @@ samples as the display stores them (uint16, channel 0..3, row-major); codestream
 comment OpenJPH skips, bytes outside the spans or where a span lies change nothing (`mlvJpeg2kFrameSourceHash64`; a frame that
 decode refuses, and every frame on a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no identity). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
 ends (r8: a `--visual-capture-dir` run opens every clip under a share-read `SourceWriteGuard`, so no writer can change its bytes,
-and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes. Two frames that
+and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes.
+Only the Windows guard can be held (r10): its share-read reopen fails while any writer has the file open. On every other
+platform the guard excludes no writer -- a `MAP_SHARED` writable mapping taken before the open can store into the clip without
+moving its size, mtime or ctime -- so it is never held (`SourceWriteGuard::excludesExistingWriters()` is false), no source id is
+attached, and `source_difference` is absent (unknown) on every non-Windows run. Mappings are not detected. Two frames that
 decode to the same picture always share an identity, and two that decode differently never do (up to a 64-bit collision):
 bytes the decoder never uses -- COM/APPn segments, ignored header fields, a table symbol the bitstream never selects, bytes
 after the scan -- cannot make a static clip read "known to differ", and no byte the decoder uses can make two pictures read

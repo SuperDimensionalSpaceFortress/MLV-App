@@ -56,13 +56,15 @@ void ojphStubReset(const OjphStubPlan & new_plan)
 }
 
 OjphRealCodecScope::OjphRealCodecScope()
+    : m_previous(plan())
 {
     OjphStubPlan real;
     real.real_codec = true;
     ojphStubReset(real);
 }
 
-OjphRealCodecScope::~OjphRealCodecScope() { ojphStubReset(OjphStubPlan()); }
+/* r10 (adversary r9 pass 3 A2): restore the plan this scope replaced (an outer scope's real plan, or the stub's) */
+OjphRealCodecScope::~OjphRealCodecScope() { ojphStubReset(m_previous); }
 
 int ojphStubDecoderNewCount() { return decoderNewCount().load(); }
 int ojphStubProbeCount() { return probeCount().load(); }

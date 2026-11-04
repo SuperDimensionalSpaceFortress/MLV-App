@@ -1284,3 +1284,58 @@ TEST(VisualCaptureSourceHash, Jpeg2kAFrameTheDecoderRefusesHasNoIdentity)
     ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &hash));
     ASSERT_TRUE(hash == 0x77);
 }
+
+// r10 (adversary r9 pass 3 A2 on 1c438b0c): the json's input -- OjphRealCodecScope outer; { OjphRealCodecScope inner; } and then a
+// decode -- got the STUB, because the inner scope's destructor installed the default plan while the outer scope was alive. Each
+// scope now restores the plan it replaced. The default stub plan probes 0 x 0, so a real codestream through the stub is refused.
+TEST(VisualCaptureSourceHash, Jpeg2kANestedRealCodecScopeLeavesTheOuterOnTheRealCodec)
+{
+    const std::vector<uint8_t> frame = j2kPayload(encodeJ2kQuarter(j2kQuarterPicture(2048, 12288)), 0, 0, {});
+    uint64_t real = 0;
+    {
+        OjphRealCodecScope outer;
+        ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &real));
+        {
+            OjphRealCodecScope inner;
+            uint64_t nested = 0;
+            ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &nested));
+            ASSERT_TRUE(nested == real);
+        }
+        uint64_t afterInner = 0;   // 1c438b0c: the stub again, so this frame was refused
+        ASSERT_EQ(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &afterInner));
+        ASSERT_TRUE(afterInner == real);
+    }
+    // the outermost scope restores the stub
+    uint64_t stub = 0x77;
+    ASSERT_NE(0, mlvJpeg2kFrameSourceHash64(frame.data(), frame.size(), kJ2kFrameSide, kJ2kFrameSide, &stub));
+    ASSERT_TRUE(stub == 0x77);
+}
+
+// r10 (Dot B3, lj92.c find()): the marker scan's bounds, through lj92_open (find() is static to lj92.c). Payloads of datalen 0..3
+// -- 0xFF as the last byte, FF D8 as the last two bytes, and no marker -- each followed IN MEMORY by a whole valid LJ92 stream, so
+// a scan that looked past datalen would find an SOI and open it. Every one is refused, as before r10. The datalen = INT_MAX case
+// (where `ix += 2` overflowed) needs a 2 GiB payload, so it is pinned by the white-box -ftrapv harness in the r10 run dir instead.
+TEST(VisualCaptureSourceHash, Lj92TheMarkerScanNeverLooksPastThePayloadEnd)
+{
+    const std::vector<uint8_t> valid = encodeLj92(1000, 9000);
+    ASSERT_TRUE(valid.size() > 4);
+    ASSERT_EQ(LJ92_ERROR_NONE, lj92OpenStatus(valid, 0));   // control: the stream alone opens
+    for (int len = 0; len <= 3; ++len)
+        for (int shape = 0; shape < 3; ++shape)
+        {
+            std::vector<uint8_t> buffer(static_cast<size_t>(len), 0x40);
+            if (shape == 0 && len >= 1) buffer[len - 1] = 0xFF;
+            if (shape == 1 && len >= 2) { buffer[len - 2] = 0xFF; buffer[len - 1] = 0xD8; }
+            buffer.insert(buffer.end(), valid.begin(), valid.end());
+            lj92 decoder = nullptr;
+            int width = 0, height = 0, bitdepth = 0, components = 0;
+            const int ret = lj92_open(&decoder, buffer.data(), len, &width, &height, &bitdepth, &components);
+            if (ret == LJ92_ERROR_NONE) lj92_close(decoder);
+            ASSERT_EQ(LJ92_ERROR_CORRUPT, ret);
+        }
+    // control: an in-payload decode is the encoded picture (lossless), as it was before r10
+    std::vector<uint16_t> decoded;
+    ASSERT_TRUE(decodeLj92(valid, &decoded));
+    ASSERT_EQ(static_cast<size_t>(64 * 64), decoded.size());
+    for (int i = 0; i < 64 * 64; ++i) ASSERT_EQ((i % 64) < 32 ? 1000 : 9000, static_cast<int>(decoded[i]));
+}

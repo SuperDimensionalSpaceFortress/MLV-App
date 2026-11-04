@@ -113,8 +113,10 @@ static int find(ljp* self) {
     while (data[ix] != 0xFF && ix<(self->datalen-1)) {
         ix += 1;
     }
+    /* r10 (Dot B3): the bound is decided before the step, so `ix += 2` never overflows (the loop can stop at
+     * ix = datalen - 1 = INT_MAX - 1); for every input that did not overflow, the result is the same as before. */
+    if (ix >= self->datalen - 2) return -1;
     ix += 2;
-    if (ix>=self->datalen) return -1;
     self->ix = ix;
     return data[ix-1];
 }
@@ -404,7 +406,8 @@ static int parseHuff(ljp* self) {
 static int parseSof3(ljp* self) {
     /* r6 A2 class: SOF3 reads bytes ix..ix+7 (the component count is ix+7, which the old ix+6 bound missed),
      * and its length must end inside the payload. */
-    if (self->ix < 0 || self->ix+7 >= self->datalen) return LJ92_ERROR_CORRUPT;
+    /* r10 (Dot B3 class): subtraction form, so ix + 7 never overflows near INT_MAX */
+    if (self->ix < 0 || 7 >= self->datalen - self->ix) return LJ92_ERROR_CORRUPT;
     const int length = lj92_segment_length(self, self->ix);
     if (!lj92_segment_fits(self, self->ix, length)) return LJ92_ERROR_CORRUPT;
     self->y = BEH(self->data[self->ix+3]);
@@ -992,7 +995,8 @@ static int parseScan(ljp* self) {
     //memset(self->sssshist,0,sizeof(self->sssshist));
     self->ix = self->scanstart;
     /* r6 A2 class: lj92_open checked these header bytes; a handle that skipped it is refused, never read past. */
-    if (self->scanstart < 0 || self->scanstart+2 >= self->datalen) return ret;
+    /* r10 (Dot B3 class): subtraction form, so scanstart + 2 never overflows near INT_MAX */
+    if (self->scanstart < 0 || 2 >= self->datalen - self->scanstart) return ret;
     int compcount = self->data[self->ix+2];
     if (3+2*compcount >= self->datalen - self->scanstart) return ret;
     int pred = self->data[self->ix+3+2*compcount];
@@ -1157,7 +1161,8 @@ static int parseImage(ljp* self) {
              * a 112-byte frame) is refused here, so lj92_open never reports a scan the bit reader would start
              * outside the buffer. The header bytes parseScan reads (component count, predictor) are inside it. */
             const int entropy = lj92_scan_entropy_start(self);
-            const int headerok = entropy >= 0 && self->scanstart+2 < self->datalen;
+            /* r10 (Dot B3 class): subtraction form (entropy >= 0 implies scanstart >= 0) */
+            const int headerok = entropy >= 0 && 2 < self->datalen - self->scanstart;
             const int compcount = headerok ? self->data[self->scanstart+2] : 0;
             if (!headerok || 3+2*compcount >= self->datalen - self->scanstart) {
                 ret = LJ92_ERROR_CORRUPT;

@@ -42,12 +42,15 @@ struct OjphStubPlan {
     bool real_codec = false;
 };
 
-/* r9: the real codec for the lifetime of the scope (installs a real_codec plan, restores the default stub plan). */
+/* r9: the real codec for the lifetime of the scope (installs a real_codec plan). r10 (adversary r9 pass 3 A2): on exit it
+ * restores the plan it replaced, not the default stub plan, so a nested scope leaves the outer one on the real codec. */
 struct OjphRealCodecScope {
     OjphRealCodecScope();
     ~OjphRealCodecScope();
     OjphRealCodecScope(const OjphRealCodecScope &) = delete;
     OjphRealCodecScope & operator=(const OjphRealCodecScope &) = delete;
+private:
+    OjphStubPlan m_previous;
 };
 
 /* Plan that decodes one quarter-resolution bayer channel successfully. */

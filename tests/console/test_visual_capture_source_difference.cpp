@@ -388,8 +388,10 @@ TEST(VisualCaptureSourceDifferenceWiring, TheCaptureRunBindsItsSourceIdsToTheCli
     ASSERT_TRUE(stampClip.contains(QStringLiteral("visualOpenStampClip.object = m_clipOpenSourceStampObject;")));
     ASSERT_TRUE(lf.indexOf(QStringLiteral("processEvents(")) > guardAt);
     // r8 pass 1 A1: the ids also need the guard that has held this clip since its open
-    ASSERT_TRUE(lf.mid(bindAt, 300).contains(QStringLiteral(
-        "[&]( bool *unchanged ) { *unchanged = visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },")));
+    // r10 (adversary r9 pass 3 A1): and only on a build whose guard excludes writers at all (Windows)
+    ASSERT_TRUE(lf.mid(bindAt, 600).contains(QStringLiteral(
+        "[&]( bool *unchanged ) { *unchanged = visual_capture_source_difference::SourceWriteGuard::excludesExistingWriters()\n"
+        "                && visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },")));
     ASSERT_TRUE(lf.contains(QStringLiteral(
         "visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip )\n"
         "                ? m_clipOpenSourceGuard : std::shared_ptr<visual_capture_source_difference::SourceWriteGuard>();")));
@@ -423,7 +425,10 @@ TEST(VisualCaptureSourceDifferenceWiring, EveryClipOpenStampsItsFilesBeforeAnyFr
         "m_clipOpenSourceStampGeneration = static_cast<quint64>( m_clipLifecycleBarrier.generation() );")));
     ASSERT_TRUE(def.contains(QStringLiteral("m_clipOpenSourceStampObject = static_cast<const void *>( m_pMlvObject );")));
     // r8 pass 1 A1: a visual-capture run HOLDS the clip from that point (share-read handles), released when the clip is freed
-    ASSERT_TRUE(def.contains(QStringLiteral("if( m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )")));
+    // r10 (adversary r9 pass 3 A1): and only where the guard excludes writers (Windows)
+    ASSERT_TRUE(def.contains(QStringLiteral(
+        "if( visual_capture_source_difference::SourceWriteGuard::excludesExistingWriters()\n"
+        "        && m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )")));
     ASSERT_TRUE(def.contains(QStringLiteral("m_clipOpenSourceGuard = std::make_shared<visual_capture_source_difference::SourceWriteGuard>(")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_holdClipSourceFromOpen = !options.visualCaptureDir.isEmpty();")));
     const int smokeAt = source.indexOf(QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"));
@@ -496,6 +501,12 @@ TEST(VisualCaptureSourceGuard, NoWriterChangesTheBytesWhileTheGuardHoldsThem)
     const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);   // r8: as MainWindow stamps a clip it opens
     {
         const vcsd::SourceWriteGuard guard(&clipFile, 1, opened);
+        if (!vcsd::SourceWriteGuard::excludesExistingWriters()) {   // r10: a guard that excludes no writer is never held
+            ASSERT_FALSE(guard.held());
+            ASSERT_FALSE(guard.unchanged());
+            std::fclose(clipFile);
+            return;
+        }
         ASSERT_TRUE(guard.held());
         ASSERT_TRUE(guard.unchanged());
         // the json's edit: byte 7167 FF -> FE, flushed
@@ -621,6 +632,12 @@ TEST(VisualCaptureSourceGuard, AClipUntouchedSinceItOpenedKeepsTheGuardAndItsSou
     ASSERT_EQ(size_t(7168), std::fread(cached.data(), 1, 7168, clipFile));   // a decode before the guard, nothing edited
     {
         const vcsd::SourceWriteGuard guard(&clipFile, 1, opened);
+        if (!vcsd::SourceWriteGuard::excludesExistingWriters()) {   // r10: a guard that excludes no writer is never held
+            ASSERT_FALSE(guard.held());
+            ASSERT_FALSE(guard.unchanged());
+            std::fclose(clipFile);
+            return;
+        }
         ASSERT_TRUE(guard.held());
         ASSERT_TRUE(guard.unchanged());
         ClipHarness clips;
@@ -648,6 +665,12 @@ TEST(VisualCaptureSourceGuard, AClipHeldFromItsOpenCannotBeEditedSoNoWriteTimeCa
     const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
     {
         const vcsd::SourceWriteGuard heldFromOpen(&clipFile, 1, opened);   // taken at the open, before any decode
+        if (!vcsd::SourceWriteGuard::excludesExistingWriters()) {   // r10: a guard that excludes no writer is never held
+            ASSERT_FALSE(heldFromOpen.held());
+            ASSERT_FALSE(heldFromOpen.unchanged());
+            std::fclose(clipFile);
+            return;
+        }
         ASSERT_TRUE(heldFromOpen.held());
         QFile writer(path);
         const bool writerOpened = writer.open(QIODevice::ReadWrite);
@@ -695,4 +718,84 @@ TEST(VisualCaptureSourceGuard, AnOpenStampThatIsEmptyOrAnotherFilesIsNeverHeld)
     }
     std::fclose(otherFile);
     std::fclose(clipFile);
+}
+
+// r10 (adversary r9 pass 3 A1 on 1c438b0c; hub ruling HUB-TICK 20261104T0536Z (a)). The json's input: a Linux uncompressed MLV
+// whose writer took a MAP_SHARED writable mapping BEFORE the open stamp, then stored into one captured frame after the captures
+// and before the deferred hash, with no flush, resize or remap. dup() excludes no writer, and that store can leave size, mtime
+// and ctime unchanged, so 1c438b0c's POSIX guard held, said unchanged(), and the hash of edited bytes was bound to the earlier
+// capture: identical captured frames got differing ids. A guard that cannot exclude an EXISTING writer now binds no source id
+// at all; only the Windows guard (share-read reopen, which fails while any writer holds the file) is ever held. This test takes
+// the non-Windows path on any build through the constructor's seam (platformExcludesWriters = false); the next test pins that
+// the real non-Windows compile takes it too.
+TEST(VisualCaptureSourceGuard, AGuardThatCannotExcludeAnExistingWriterBindsNoSourceId)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+    ASSERT_TRUE(clipFile != nullptr);
+    const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+    ASSERT_FALSE(opened.isEmpty());
+    {
+        // the non-Windows path: the open guard and the capture guard, both on files nothing has written (the mapped store is
+        // invisible to the stamp, so the stamp still matches: the guard must refuse on what it cannot exclude, not on the stamp)
+        const vcsd::SourceWriteGuard openGuard(&clipFile, 1, opened, false);
+        const vcsd::SourceWriteGuard captureGuard(&clipFile, 1, opened, false);
+        ASSERT_TRUE(vcsd::SourceWriteGuard::openStamp(&clipFile, 1) == opened);
+        ASSERT_FALSE(openGuard.held());
+        ASSERT_FALSE(openGuard.unchanged());
+        ASSERT_FALSE(captureGuard.held());
+        ASSERT_FALSE(captureGuard.unchanged());
+        // through the binding, as MainWindow asks it: no capture gets a source id, nothing is hashed, the verdict is unknown
+        ClipHarness clips;
+        const vcsd::ClipToken captureClip = clips.now();
+        QVector<vcsd::CaptureClip> captures;
+        for (int label : kA2Labels) captures.append(playCapture(label, clips.now()));
+        clips.sourceUnchanged = vcsd::SourceWriteGuard::excludesExistingWriters()
+            && captureGuard.unchanged() && openGuard.unchanged();
+        clips.editSourceDuringHashCall = 2;   // the json's store lands while hashing: no hash may be read at all
+        const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+        assertNoSourceId(bound);
+        ASSERT_EQ(0, clips.hashCalls);
+    }
+    if (vcsd::SourceWriteGuard::excludesExistingWriters())
+    {
+        // control (Windows): the same files, through the default constructor, are held and keep their ids
+        const vcsd::SourceWriteGuard guard(&clipFile, 1, opened);
+        ASSERT_TRUE(guard.held());
+        ASSERT_TRUE(guard.unchanged());
+    }
+    std::fclose(clipFile);
+}
+
+// r10: the seam above is the non-Windows path only if the real non-Windows compile takes it. Pinned on the header's text, because
+// this suite builds on Windows only: excludesExistingWriters() is false outside Q_OS_WIN, the constructor holds nothing then (even
+// when a caller passes true), and unchanged() asks it too. MainWindow's two sites ask it as well (wiring tests above).
+TEST(VisualCaptureSourceGuard, EveryNonWindowsBuildsGuardExcludesNoWriterSoItIsNeverHeld)
+{
+    const QString header = QString(readRepoFile(QStringLiteral("platform/qt/VisualCaptureSourceGuard.h")))
+        .replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "    static constexpr bool excludesExistingWriters()\n"
+        "    {\n"
+        "#ifdef Q_OS_WIN\n"
+        "        return true;\n"
+        "#else\n"
+        "        return false;\n"
+        "#endif\n"
+        "    }\n")));
+    ASSERT_EQ(1, header.count(QStringLiteral("bool excludesExistingWriters()")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "        bool held = excludesExistingWriters() && platformExcludesWriters && files != nullptr && count > 0;\n")));
+    ASSERT_TRUE(header.contains(QStringLiteral(
+        "    bool unchanged() const { return excludesExistingWriters() && m_held && stamp() == m_stamp; }\n")));
+    // m_held is assigned once, from `held`
+    ASSERT_EQ(1, header.count(QStringLiteral("        m_held = ")));
+    ASSERT_TRUE(header.contains(QStringLiteral("        m_held = held && ")));
+#ifdef Q_OS_WIN
+    ASSERT_TRUE(vcsd::SourceWriteGuard::excludesExistingWriters());
+#else
+    ASSERT_FALSE(vcsd::SourceWriteGuard::excludesExistingWriters());
+#endif
 }

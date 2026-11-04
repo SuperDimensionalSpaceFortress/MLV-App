@@ -18,7 +18,13 @@
  * old bytes, the deferred hash read the new ones. Now the guard must also MATCH the stamp taken when the clip was OPENED
  * (openStamp(), from the clip's own read handles, before any frame of it is decoded): any write to the files between the open
  * and the end of the hashing moves the stamp, the guard is not held, and no source id is attached. Every decode a cache can
- * serve happened after the open, so no cached picture can predate the bytes the identity is read from. */
+ * serve happened after the open, so no cached picture can predate the bytes the identity is read from.
+ *
+ * r10 (adversary r9 pass 3 A1 on 1c438b0c, hub ruling HUB-TICK 20261104T0536Z): only the Windows guard EXCLUDES writers. A POSIX
+ * dup() excludes none, and a writer that took a MAP_SHARED writable mapping before the open stamp can store into the clip without
+ * moving its size, mtime or ctime, so a stamp cannot see the edit. Every non-Windows build therefore never holds the guard
+ * (excludesExistingWriters() is false): no source id is bound and every frame stays unknown (fail closed). Mappings are not
+ * detected. */
 
 #include <QByteArray>
 #include <QVector>
@@ -62,11 +68,25 @@ public:
         return out;
     }
 
+    // r10 (adversary r9 pass 3 A1): whether this build's guard excludes every writer of the clip, including one that opened or
+    // mapped it before the guard. Windows: yes (the share-read reopen fails while any writer holds the file). Elsewhere: no.
+    static constexpr bool excludesExistingWriters()
+    {
+#ifdef Q_OS_WIN
+        return true;
+#else
+        return false;
+#endif
+    }
+
     // clipOpenStamp: openStamp() of these same files, taken when the clip was opened (r8). The guard is held only when the
     // files are still exactly what they were then; an empty clipOpenStamp (unknown open state) is never held.
-    SourceWriteGuard( FILE * const *files, int count, const QByteArray &clipOpenStamp )
+    // r10: never held where excludesExistingWriters() is false. platformExcludesWriters is the tests' compile-time seam for the
+    // non-Windows path on a Windows build: it can only withhold the guard, never grant one.
+    SourceWriteGuard( FILE * const *files, int count, const QByteArray &clipOpenStamp,
+                      bool platformExcludesWriters = excludesExistingWriters() )
     {
-        bool held = files != nullptr && count > 0;
+        bool held = excludesExistingWriters() && platformExcludesWriters && files != nullptr && count > 0;
 #ifdef Q_OS_WIN
         // looked up at run time: ReOpenFile is Vista+, and the toolchains' _WIN32_WINNT defaults differ
         typedef HANDLE ( WINAPI *ReOpenFileFn )( HANDLE, DWORD, DWORD, DWORD );
@@ -92,6 +112,7 @@ public:
         }
         if( held ) m_stamp = stamp();
         // r8: a write since the clip was opened (before this guard) is a write the cached pictures may predate
+        // (r10 adversary r9 pass 3 A1: `held` is already false on every build whose guard excludes no writer)
         m_held = held && !m_stamp.isEmpty() && !clipOpenStamp.isEmpty() && m_stamp == clipOpenStamp;
     }
 
@@ -110,7 +131,8 @@ public:
     bool held() const { return m_held; }
 
     // the guard holds AND no file it covers was replaced, resized or written since it was taken
-    bool unchanged() const { return m_held && stamp() == m_stamp; }
+    // (r10: and this build's guard excludes writers at all; a stamp alone cannot see a mapped store)
+    bool unchanged() const { return excludesExistingWriters() && m_held && stamp() == m_stamp; }
 
 private:
     // One file's identity, size and last write time (POSIX: and change time), the same text for any handle of that file.
