@@ -6843,6 +6843,8 @@ function Start-UtilSampleCpu([string]$PwshPath, [string]$Encoded, [string]$CsvPa
 # time since it, beyond both brackets' half-widths (ms). $UtcTicks returns DateTime ticks (the child passes UtcNow; a test passes a stepped clock).
 # adversary 01d6ad51 A1: a bracket wider than 2 ms is read again (up to three times), and the bracket half-widths are ADDED to the step (an upper
 # bound), never subtracted: a step that lands inside a bracket widens it and so is counted, it cannot hide there.
+# sol r8 key B1 (adversary f63d8a08 A1): a slew under the limit per poll accumulates, so every read is also judged against the session's FIRST read
+# (an offset the clock already had by then is no drift), and maxStep is whichever is larger: the witness's limit bounds the cumulative offset too.
 function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
     for ($try = 0; $try -lt 3; $try++) {
         $u1 = [int64](& $UtcTicks); $m = $Watch.Elapsed.TotalMilliseconds; $u2 = [int64](& $UtcTicks)
@@ -6852,7 +6854,9 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
     if ($null -ne $Ck.u) {
         $step = [math]::Abs((($u - $Ck.u) / 1e4) - ($m - $Ck.m)) + $e + $Ck.e
         if ($step -gt $Ck.maxStep) { $Ck.maxStep = $step }
-    }
+        $off = [math]::Abs((($u - $Ck.u0) / 1e4) - ($m - $Ck.m0)) + $e + $Ck.e0
+        if ($off -gt $Ck.maxStep) { $Ck.maxStep = $off }
+    } else { $Ck.u0 = $u; $Ck.m0 = $m; $Ck.e0 = $e }
     $Ck.u = $u; $Ck.m = $m; $Ck.e = $e
     [DateTime]::new($u, [DateTimeKind]::Utc)
 }
@@ -6863,7 +6867,8 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
 # sol r4 B1: the row's interval is stated, never inferred from when a row was written: fromUtc is the clock read taken just BEFORE the previous
 # row's counter read and snapshot (a lower bound of where this interval starts) and utc the read taken just AFTER this row's snapshot (an upper
 # bound of where it ends), so a delayed write cannot move an interval boundary. sol r4 B2: the clock is read on every poll (about 50 ms) and
-# clockStepMs is the largest wall-against-monotonic step seen since the previous row (the summaries' clock witness).
+# clockStepMs is the largest wall-against-monotonic step, or offset from the session's first read, seen since the previous row (the summaries' clock
+# witness).
 # It ends on the stop file, its monotonic deadline, or its parent's exit; on the last two it also ends the job's nvidia-smi, that pid only and
 # only while its start time matches. adversary 9d648094 A10: the parent is bound by pid AND start time ($ParentStartTicks, 0 = pid only).
 # The app's processes for one CPU row: "pid,startTicks" -> @(pid, cumulative CPU seconds). adversary 01d6ad51 A5: with $AppPath only a process
@@ -7308,10 +7313,12 @@ function Select-UtilSampleWindowRows($Rows, $Window, [bool]$IntervalRows = $fals
 
 # sol r4 B2: the clock witness for a window. An ordered excursion (the host clock stepped out and back) keeps every stamp in order, so stamp order
 # alone cannot verify that a sample stamped inside the window was taken there. The CPU child reads the wall clock against its monotonic clock on
-# every poll and states the largest step per row (clockStepMs). $null (verified) when the running child's rows cover the window with no gap, in
-# order, and no step passed 25 ms; sample-clock-unverified for a step or out-of-order stamps; sample-clock-unwitnessed for no running child, no
-# rows, a gap between rows or rows that do not cover the window. The job stores it on the window (clockWhy); both summaries refuse a window without
-# a $null clockWhy. Residual by design: an excursion that starts and ends between two polls (about 50 ms) is not seen.
+# every poll and states the largest step, or offset from its first read, per row (clockStepMs). $null (verified) when the running child's rows cover
+# the window with no gap, in order, and no value passed 25 ms; sample-clock-unverified for a step, a cumulative offset or out-of-order stamps;
+# sample-clock-unwitnessed for no running child, no rows, a gap between rows or rows that do not cover the window. The job stores it on the window
+# (clockWhy); both summaries refuse a window without a $null clockWhy. Residual by design: an excursion that starts and ends between two polls (about
+# 50 ms) is not seen, and an offset under the limit moves the window's edges by at most that much against the stamps (it can decide only a row within
+# 25 ms of an edge). sol r8 key B1: the 25 ms leaves a steady host its session: 340 ppm for the 73 s of a real leg, and this VM measured 22 ppm.
 function Get-UtilSampleClockWitness($Parsed, $Start, $Window) {
     try {
         if ($null -eq $Window) { return $null }

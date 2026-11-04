@@ -938,6 +938,80 @@ $q1second = @($script:y2pubs)
 Publish-UtilSampleFiles
 $r['q1A1'] = @{ first = $q1first; second = $q1second; third = @($script:y2pubs); files = @(Get-ChildItem -LiteralPath $q1pub -Name | Sort-Object) }
 $r['z2A2'] = @{ hostIsIst = ([TimeZoneInfo]::Local.Id -ceq 'India Standard Time'); captured = (Invoke-ZoneRegion3 $z2s $z2s); changedInCapture = (Invoke-ZoneRegion3 $z2s $z2npt.ToSerializedString()); unknown = (Invoke-ZoneRegion3 $z2s '') }
+# ---- sol r8 key B1 (= pass-17 A1 = Dot 0859466): a slew under the per-poll limit accumulates. The child's clock reads run through the real
+# Read-UtilSampleClock on a simulated clock: polls every 50 ms from Play-1000 ms to Play+21000 ms (the app exits after its summary), a CPU row at each
+# whole second, GPU rows every 250 ms from Play-300 ms, every stamp offset by $Offset(t). $HotGpu are the t of the 100 % GPU rows; the row closing at Play+20000 ms holds $HotCpu.
+function Invoke-DriftCase([scriptblock]$Offset, [double]$StartMs, [double]$SummaryMs, [double[]]$HotGpu, [double]$HotCpu) {
+    $script:dct = -1000.0; $script:dcOff = $Offset
+    $dw = @{ Elapsed = @{ TotalMilliseconds = 0.0 } }
+    $dclock = { $p0.Ticks + [int64][math]::Round(1e4 * ($script:dct + [double](& $script:dcOff $script:dct))) }
+    $ck = @{ u = $null; m = 0.0; e = 0.0; maxStep = 0.0 }
+    $csv = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n"; $from = $null; $inputStep = 0.0; $stated = 0.0
+    for ($ti = -1000.0; $ti -le 21000.0; $ti += 50.0) {
+        $script:dct = $ti; $dw.Elapsed.TotalMilliseconds = $ti + 1000.0
+        if ($ti -gt -1000.0) { $inputStep = [math]::Max($inputStep, [math]::Abs([double](& $Offset $ti) - [double](& $Offset ($ti - 50.0)))) }
+        $c = Read-UtilSampleClock $ck $dw $dclock
+        if ($null -eq $from) { $from = $c; continue }
+        if ($ti % 1000.0 -eq 0.0) {
+            $st = [double]$ck.maxStep; $stated = [math]::Max($stated, $st)
+            $csv += (CpuRow $c $(if ($ti -eq 20000.0) { $HotCpu } else { 0 }) 1234 0 $from $st.ToString('0.###', $inv) 1000 1000)
+            $from = $c; $ck.maxStep = 0.0
+        }
+    }
+    $gt = ''
+    for ($g = -300.0; $g -le 20200.0; $g += 250.0) {
+        $gu = [TimeZoneInfo]::ConvertTimeFromUtc($p0.AddMilliseconds($g + [double](& $Offset $g)), $cst)
+        $gt += "$($gu.ToString('yyyy/MM/dd HH:mm:ss.fff', $inv)), $(if ($HotGpu -contains $g) { 100 } else { 0 }), 0, 1800, P2, 50`n"
+    }
+    $lf = { param($ms) $p0.AddMilliseconds($ms).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", $inv) }
+    $dl = "[$(& $lf $StartMs)] [info] [smoke] playback_smoke.start session=1`n[$(& $lf $SummaryMs)] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+    $dw2 = Get-UtilSamplePlayWindow $dl
+    $dcp = ConvertFrom-UtilSampleCpuCsv $csv
+    if ($null -ne $dw2) { $dw2['clockWhy'] = Get-UtilSampleClockWitness $dcp $run $dw2 }
+    $dgp = ConvertFrom-UtilSampleGpuCsv $gt $cst
+    $dg = Get-UtilSampleGpuSummary $dgp $run $dw2 $okStop
+    $dc = Get-UtilSampleCpuSummary $dcp $run $dw2 $okStop
+    $ds = Get-UtilSampleScalars $dg $dc ($null -ne $dw2)
+    @{ inputStep = $inputStep; stated = $stated; window = ($null -ne $dw2); clockWhy = $(if ($null -ne $dw2) { $dw2.clockWhy } else { 'no-window' })
+        gpu = $dg.status; gpuMean = $dg.mean; gpuRows = $dg.rowsInWindow; cpu = $dc.status; cpuMean = $dc.totalMean; cpuRows = $dc.rowsInWindow; overall = $ds.utilSampleStatus; reason = $ds.utilSampleReason }
+}
+# sol's literal input: offset 0 through t=19500, then (t-19500)/5 through t=20000, then 100; the summary stamp 14:00:20.100Z passes the 1 s tolerance
+$d1Slew = { param($x) if ($x -le 19500) { 0.0 } elseif ($x -le 20000) { ($x - 19500) / 5.0 } else { 100.0 } }
+# the adversary's and key3's literal input: +10 ms per 50 ms poll for the 500 ms before Play, -10 ms per poll for the 500 ms after
+$d1Pre = { param($x) if ($x -le -500 -or $x -ge 500) { 0.0 } elseif ($x -le 0) { ($x + 500) / 5.0 } else { (500 - $x) / 5.0 } }
+function Get-RampOffset([double]$Peak) { { param($x) if ($x -le 19500) { 0.0 } elseif ($x -le 20000) { ($x - 19500) * $Peak / 500.0 } else { $Peak } }.GetNewClosure() }
+$r['d1B1'] = @{
+    steady = (Invoke-DriftCase { param($x) 0.0 } 0 20000 @(19950.0) 100)
+    slewed = (Invoke-DriftCase $d1Slew 0 20100 @(19950.0) 100)
+    # the log stamp as the adversary states it (true time, the Play-50 ms sample inside the window) and as key3 traces it (the same drifted clock)
+    preAdversary = (Invoke-DriftCase $d1Pre 0 20000 @(-300.0, -50.0) 0)
+    preKey3 = (Invoke-DriftCase $d1Pre 100 20000 @(-300.0, -50.0) 0)
+    # the mapping is judged against the first reading: an offset the clock already had is no drift, and an ordinary crystal's rate is not refused
+    fixedOffset = (Invoke-DriftCase { param($x) 1000.0 } 1000 21000 @(19950.0) 100)
+    crystal = (Invoke-DriftCase { param($x) ($x + 1000) * 0.0005 } 0 20000 @(19950.0) 100)
+    under = (Invoke-DriftCase (Get-RampOffset 24) 0 20000 @(19950.0) 100)
+    over = (Invoke-DriftCase (Get-RampOffset 26) 0 20000 @(19950.0) 100)
+}
+# ---- the same class through the real loop (scaled): the wall clock slews 100 ms over 500 ms (about 12 ms per real poll) and is never put back
+$script:d2t0 = $null
+$d2clock = { $n = [DateTime]::UtcNow.Ticks; if ($null -eq $script:d2t0) { $script:d2t0 = $n }; $el = ($n - $script:d2t0) / 1e4; $n + [int64](1e4 * [math]::Min(100.0, [math]::Max(0.0, ($el - 400) / 5.0))) }
+[void](Invoke-UtilSampleCpuLoop (Join-Path $t 'd2.csv') (Join-Path $t 'd2.stop') 'no-such-process-name-xyz' 200 1600 { 5 } 0 0 0 0 $d2clock '' { param($br, $sw) @{} })
+$d2p = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText((Join-Path $t 'd2.csv')))
+$d2rows = @($d2p.rows)
+$r['d2Loop'] = @{ rows = $d2rows.Count; maxStep = (@($d2rows | ForEach-Object { $_.step }) | Measure-Object -Maximum).Maximum
+    witness = (Get-UtilSampleClockWitness $d2p $run ([ordered]@{ startUtc = $d2rows[0].fromUtc; endUtc = $d2rows[$d2rows.Count - 1].utc })) }
+# ---- the tail (adversary 88e10edc A1's shape, a sub-limit step this time): row 1 sees +20 ms and row 2 is steady; after row 2's closing read the clock
+# moves 10 ms more and the stop file appears, so only the tail read sees the cumulative 30 ms, and its own step is 10 ms
+$script:d3sq = 0; $script:d3armAt = -1; $script:d3stepped = $false; $script:d3n = 0; $script:d3off = 0.0; $d3stop = Join-Path $t 'd3.stop'
+$d3clock = { $script:d3sq++
+    if ($script:d3armAt -gt 0 -and $script:d3sq -ge $script:d3armAt -and -not $script:d3stepped) { $script:d3stepped = $true; $script:d3off = 30.0; [IO.File]::WriteAllText($d3stop, 'stop') }
+    [DateTime]::UtcNow.Ticks + [int64](1e4 * $script:d3off) }
+$d3snap = { param($br, $sw) $script:d3n++; if ($script:d3n -eq 2) { $script:d3off = 20.0 }; if ($script:d3n -eq 3) { $script:d3armAt = $script:d3sq + 3 }; if ($null -ne $br -and $null -ne $sw) { $br['a'] = $sw.Elapsed.TotalMilliseconds; $br['b'] = $br['a'] }; @{} }
+$d3res = Invoke-UtilSampleCpuLoop (Join-Path $t 'd3.csv') $d3stop 'no-such-process-name-xyz' 200 5000 { 5 } 0 0 0 0 $d3clock '' $d3snap
+$d3p = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText((Join-Path $t 'd3.csv')))
+$d3rows = @($d3p.rows)
+$r['d3Tail'] = @{ endedBy = $d3res.endedBy; stepped = $script:d3stepped; realRows = @($d3rows | Where-Object { $null -ne $_.total }).Count
+    witness = $(if ($d3rows.Count -ge 2) { Get-UtilSampleClockWitness $d3p $run ([ordered]@{ startUtc = $d3rows[0].fromUtc; endUtc = $d3rows[1].utc }) } else { 'no-window' }) }
 Write-Output (J $r)
 """
 
@@ -1236,6 +1310,48 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertIsNone(torn["totalMean"], a1)
         # control: the same twenty rows, cleanly ended, still verify and summarize
         self.assertEqual((clean["torn"], clean["clockWhy"], clean["status"], clean["totalMean"]), (False, None, "ok", 50), a1)
+
+    def test_sol_r8_b1_a_slew_at_the_end_of_play_rejects_the_clock_mapping(self) -> None:
+        # sol's literal input: at 322e5672 max step 10, clockWhy None, GPU 0.0 over 79 rows, CPU 0.0 over 19 rows, both ok, overall ok
+        b1 = self.r["d1B1"]
+        steady, slewed = b1["steady"], b1["slewed"]
+        self.assertEqual((steady["clockWhy"], steady["gpu"], steady["gpuMean"], steady["gpuRows"], steady["cpu"], steady["cpuMean"], steady["cpuRows"], steady["overall"]),
+                         (None, "ok", 1.25, 80, "ok", 5.0, 20, "ok"), f"the steady control moved: {steady}")
+        self.assertEqual((slewed["inputStep"], slewed["window"]), (10.0, True), f"the probe did not build the finding's shape: {slewed}")
+        self.assertEqual(slewed["clockWhy"], "sample-clock-unverified", f"a 100 ms cumulative slew left the mapping verified: {slewed}")
+        self.assertEqual((slewed["gpu"], slewed["gpuMean"], slewed["cpu"], slewed["cpuMean"], slewed["overall"]),
+                         ("unavailable(sample-clock-unverified)", None, "unavailable(sample-clock-unverified)", None, "unavailable"),
+                         f"both summaries and the overall status must agree the mapping is refused: {slewed}")
+
+    def test_sol_r8_b1_a_slew_around_the_start_of_play_rejects_the_clock_mapping(self) -> None:
+        # pass-17 A1's literal input with the log stamp as stated (at f63d8a08 GPU ok, mean 1.235 over 81 rows) and as key3 traces it (ok, mean 0)
+        b1 = self.r["d1B1"]
+        for name in ("preAdversary", "preKey3"):
+            with self.subTest(case=name):
+                c = b1[name]
+                self.assertEqual((c["inputStep"], c["window"]), (10.0, True), f"the probe did not build the finding's shape: {c}")
+                self.assertEqual(c["clockWhy"], "sample-clock-unverified", f"a drift out and back left the mapping verified: {c}")
+                self.assertEqual((c["gpu"], c["gpuMean"], c["cpu"], c["overall"]),
+                                 ("unavailable(sample-clock-unverified)", None, "unavailable(sample-clock-unverified)", "unavailable"), c)
+
+    def test_r9_the_cumulative_limit_is_against_the_first_reading_and_keeps_a_steady_host(self) -> None:
+        b1 = self.r["d1B1"]
+        fixed = b1["fixedOffset"]
+        self.assertEqual((fixed["clockWhy"], fixed["gpuMean"], fixed["gpuRows"], fixed["cpuMean"], fixed["cpuRows"], fixed["overall"]), (None, 1.25, 80, 5.0, 20, "ok"),
+                         f"an offset the clock already had at the first reading is no drift: {fixed}")
+        crystal = b1["crystal"]
+        self.assertEqual((crystal["clockWhy"], crystal["overall"]), (None, "ok"), f"500 ppm over this session (10.5 ms) must not be refused: {crystal}")
+        self.assertEqual((b1["under"]["clockWhy"], b1["over"]["clockWhy"]), (None, "sample-clock-unverified"), f"the limit is 25 ms: {b1['under']} {b1['over']}")
+
+    def test_r9_the_real_loop_states_a_cumulative_slew_on_its_rows(self) -> None:
+        d2 = self.r["d2Loop"]
+        self.assertGreaterEqual(d2["maxStep"], 50, f"the rows did not state the cumulative offset: {d2}")
+        self.assertEqual(d2["witness"], "sample-clock-unverified", d2)
+
+    def test_r9_a_cumulative_offset_first_seen_after_the_last_row_writes_the_tail_row(self) -> None:
+        d3 = self.r["d3Tail"]
+        self.assertEqual((d3["endedBy"], d3["stepped"], d3["realRows"]), ("stop-file", True, 2), f"the probe did not build the shape: {d3}")
+        self.assertEqual(d3["witness"], "sample-clock-unverified", f"a cumulative 30 ms seen only by the tail read was dropped with the loop: {d3}")
 
     def test_adv_fa1197b4_a1_the_child_exits_0_only_after_its_last_write(self) -> None:
         # at fa1197b4 a row write that failed (the CSV locked under it) still returned created=true, and the child's exit line said 0 (owned)
