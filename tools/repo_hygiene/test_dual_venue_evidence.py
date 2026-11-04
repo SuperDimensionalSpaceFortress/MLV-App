@@ -5280,6 +5280,30 @@ class ConformArmIsHonouredTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.expect(native, "ADVISORY", "native")
         self.expect(conformed, "INVALID", "conformed", needle="CONFORM_ARM_NOT_HONOURED")
 
+    def test_r19_sol_b2_the_leg_verdict_judges_the_measured_conform_fields(self) -> None:
+        """r19 (sol r18 B2): Invoke-VenueLeg's own criteria verdict sees the run log's measured conform fields. A conform leg whose criteria are the
+        committed CONFORM_MEASURED_CRITERIA PASSES on the sound conformed run and FAILS on sol's fixture and on a line without the fields."""
+        spec_path = self.write_spec(generator_args={"playbackConform": "on"}, leg_id="r19-conform-measured")
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        for role in ("acceptance", "supplementary"):
+            spec["criteria"][role]["cpu"] = list(CONFORM_MEASURED_CRITERIA)
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        hfr24 = {"native_fps": "59.940", "pace_fps": "24.000"}
+        base = conform_line(clip="59.940", play="24.000", active=1, env_override=1)
+        for name, measured, outcome, needles in (
+                ("sound", " audio_sync_requests=0 source_fps=24.000 max_jump=1", "PASS", ()),
+                ("sol r18 B2", " audio_sync_requests=1 source_fps=33.600 max_jump=2", "FAIL", ("conformSourceFps le 24.72", "conformMaxJump eq 1", "conformAudioSyncRequests eq 0")),
+                ("no measured fields", "", "FAIL", ("does not carry the field",))):
+            with self.subTest(name):
+                self.write_artifacts(line=hfr24, extra_log_lines=[base + measured])
+                _, receipt, _ = self.run_leg("ultra-magnus", spec_path, extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], outcome, receipt["outcomeDetail"])
+                self.assertEqual((receipt["playback"]["valid"], receipt["playback"]["paceRule"]), (True, "conform"), receipt["playback"])
+                for needle in needles:
+                    self.assertIn(needle, receipt["outcomeDetail"])
+                # receipt.metrics stays the verbatim summary metrics: the conform fields live in the playback block only
+                self.assertNotIn("conformSourceFps", receipt["metrics"])
+
     def test_mutation_without_the_runner_gate_a_native_leg_that_ran_conformed_passes(self) -> None:
         dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "    if ($conformArm.blocks) {", "    if ($false) {")])
         self.write_artifacts(extra_log_lines=[conform_line(active=1, env_override=-1)])
@@ -7119,7 +7143,8 @@ class LegSpecSchemaTests(unittest.TestCase):
             cell = json.loads((DV / "legs" / f"m16-1243-display-{leg['displayMode']}-s1.json").read_text(encoding="utf-8"))
             self.assertEqual((leg["legId"], leg["card"], leg["clipId"], leg["backends"]),
                              (Path(rel).stem, "PLAYBACK-HFR-CONFORM-DEFAULT-1", "M16-" + Path(rel).stem[4:8], ["cuda"]), rel)
-            cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"]} for role, per in cell["criteria"].items()})
+            # r19 (sol r18 B2): plus the measured conform criteria (source_fps band, max_jump 1, no audio sync), appended in both roles
+            cell_cuda = dict(cell, criteria={role: {"cuda": per["cuda"] + CONFORM_MEASURED_CRITERIA} for role, per in cell["criteria"].items()})
             cell_cuda["generatorArgs"] = dict(cell["generatorArgs"], playbackConform="on")
             self.assertEqual(dict(leg, legId=cell["legId"], card=cell["card"], clipId=cell["clipId"], backends=cell["backends"]), cell_cuda, rel)
         for name, clip, legs in (("hfr-conform", "M16-1456", HFR_CONFORM_LEGS), ("hfr-conform-m16-1457", "M16-1457", HFR_CONFORM_LEGS_1457)):
@@ -12135,6 +12160,125 @@ class ConformStatusParenthesisSurvivesTheLogReaderTests(unittest.TestCase):
                     self.assertFalse(out["valid"], out)
                     if token is not None:
                         self.assertTrue(any(token in r for r in out["reasons"]), out)
+
+
+# HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2, catalogue row M-HFR-CONFORM-MEASURED-CRITERIA): the conform leg's acceptance inputs the app prints on its
+# playback_smoke.conform line (platform/qt/MainWindow.cpp: source_fps is the 24 +/- 3 % acceptance, max_jump == 1 means every source frame was shown,
+# audio_sync_requests must be 0 while conform_active=1). Every committed conform spec judges them, in both roles, as these exact criteria.
+CONFORM_MEASURED_CRITERIA = [
+    {"metric": "conformSourceFps", "op": "ge", "value": 23.28},
+    {"metric": "conformSourceFps", "op": "le", "value": 24.72},
+    {"metric": "conformMaxJump", "op": "eq", "value": 1},
+    {"metric": "conformAudioSyncRequests", "op": "eq", "value": 0},
+]
+
+
+@requires_windows_pwsh
+class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
+    """r19 (sol r18 B2): before r19 the extractor dropped source_fps / max_jump / audio_sync_requests and no conform spec named them, so sol's
+    same-session, hash-bound look-leg fixture (source_fps=33.600, max_jump=2, audio_sync_requests=1) was valid=true, honoured=true and criteriaPass=true.
+    The chain here is the shipped one, in Invoke-VenueLeg's order: Get-DvPlaybackEvidence -> Get-DvConformArmVerdict -> Get-DvCriteriaMetrics ->
+    Test-DvCriteria, against each COMMITTED conform spec's own criteria in both roles."""
+
+    CLIP = "M16-1457"
+    SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
+
+    def chain(self, measured: str) -> list[dict]:
+        log = "\n".join([
+            "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
+            "playback_smoke.measured_session id=3",
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1" + measured,
+            conformed_summary_line()]) + "\n"
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 1499; lookFlavorReported = 'cinematic' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+            "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+            "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
+            "  $spec = Get-Content -Raw -LiteralPath (Join-Path $env:DVE_DV $rel) | ConvertFrom-Json\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA"
+            " -ExpectedClipId $env:DVE_CLIP -RequestedConform ([string]$spec.generatorArgs.playbackConform)\n"
+            "  $arm = Get-DvConformArmVerdict -Spec $spec -Playback $pb\n"
+            "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
+            "  foreach ($role in 'acceptance', 'supplementary') {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cuda -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass; failures = @($v.failures);"
+            " sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
+            "  }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(self.SPECS))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2 * len(self.SPECS), out)
+        for row in out:
+            # the run itself is sound and honoured: only the criteria decide
+            self.assertEqual((row["valid"], row["honoured"], row["blocks"]), (True, True, False), row)
+        return out
+
+    def test_every_committed_conform_spec_judges_the_measured_fields_in_both_roles(self) -> None:
+        for rel in self.SPECS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            for role in ("acceptance", "supplementary"):
+                with self.subTest(spec=rel, role=role):
+                    self.assertEqual(spec["criteria"][role]["cuda"][-len(CONFORM_MEASURED_CRITERIA):], CONFORM_MEASURED_CRITERIA)
+
+    def test_sols_fixture_fails_every_conform_spec(self) -> None:
+        """sol r18 B2 literal: source_fps=33.600, max_jump=2, audio_sync_requests=1 on an otherwise sound, honoured, hash-bound conformed run."""
+        for row in self.chain(" audio_sync_requests=1 source_fps=33.600 max_jump=2"):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertEqual((row["sourceFps"], row["maxJump"], row["audioSync"]), (33.6, 2, 1), row)
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(sorted(f.split(" ")[0] for f in row["failures"]), ["conformAudioSyncRequests", "conformMaxJump", "conformSourceFps"], row)
+
+    def test_each_measured_field_alone_fails_and_the_sound_run_passes(self) -> None:
+        cases = {
+            "sound": (" audio_sync_requests=0 source_fps=24.010 max_jump=1", []),
+            "source fps above the band": (" audio_sync_requests=0 source_fps=24.800 max_jump=1", ["conformSourceFps"]),
+            "source fps below the band": (" audio_sync_requests=0 source_fps=23.200 max_jump=1", ["conformSourceFps"]),
+            "source fps NaN": (" audio_sync_requests=0 source_fps=NaN max_jump=1", ["conformSourceFps", "conformSourceFps"]),
+            "a skipped source frame": (" audio_sync_requests=0 source_fps=24.000 max_jump=2", ["conformMaxJump"]),
+            "no frame advanced": (" audio_sync_requests=0 source_fps=24.000 max_jump=0", ["conformMaxJump"]),
+            "audio synced while conformed": (" audio_sync_requests=1 source_fps=24.000 max_jump=1", ["conformAudioSyncRequests"]),
+        }
+        for name, (measured, failing) in cases.items():
+            for row in self.chain(measured):
+                with self.subTest(case=name, spec=row["spec"], role=row["role"]):
+                    self.assertEqual(row["pass"], not failing, row)
+                    self.assertEqual(sorted(f.split(" ")[0].rstrip(":") for f in row["failures"]), sorted(failing), row)
+
+    def test_a_conform_line_without_the_measured_fields_fails_closed(self) -> None:
+        """A build that does not print them (or a line that dropped them) is a missing number, never a passing one: each criterion fails with the typed reason."""
+        for row in self.chain(""):
+            with self.subTest(spec=row["spec"], role=row["role"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(len(row["failures"]), len(CONFORM_MEASURED_CRITERIA), row)
+                for f in row["failures"]:
+                    self.assertIn("does not carry the field", f, row)
+
+    def test_the_criteria_metrics_never_trust_a_summary_key_of_the_same_name(self) -> None:
+        """A summary.json that says conformSourceFps=24 cannot stand in for the run log's own source_fps (absent here, or 33.6)."""
+        proc, out = run_pwsh_json(
+            "$m = [pscustomobject]@{ conformSourceFps = 24.0; conformMaxJump = 1; conformAudioSyncRequests = 0; rows = 5 }\n"
+            "$absent = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false })\n"
+            "$bad = Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $true; conformSourceFps = 33.6; conformMaxJump = 2; conformAudioSyncRequests = 1 })\n"
+            "$none = Get-DvCriteriaMetrics -Metrics $m -Playback $null\n"
+            "[ordered]@{ absent = $absent; bad = $bad; none = $none } | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out["absent"]["conformSourceFps"], out["absent"]["rows"]), (None, 5), out)
+        self.assertIn("no playback_smoke.conform line", out["absent"]["conformSourceFpsCouldNotCheck"])
+        self.assertEqual((out["bad"]["conformSourceFps"], out["bad"]["conformMaxJump"], out["bad"]["conformAudioSyncRequests"]), (33.6, 2, 1), out)
+        self.assertNotIn("conformSourceFpsCouldNotCheck", out["bad"])
+        self.assertIsNone(out["none"]["conformMaxJump"], out)
+        self.assertIn("no playback block", out["none"]["conformMaxJumpCouldNotCheck"])
+
+    def test_both_criteria_call_sites_judge_the_criteria_metrics(self) -> None:
+        """Invoke-VenueLeg (the leg's own verdict) and Test-DvReceiptValid (the re-derived verdict) both hand Test-DvCriteria the criteria metrics."""
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
+        self.assertEqual(calls, ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)",
+                                 "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
 
 
 if __name__ == "__main__":

@@ -163,15 +163,18 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     ASSERT_EQ(1, static_cast<int>(p.tracker.advancedFrames()));
     ASSERT_EQ(0u, p.tracker.wraps());
     ASSERT_EQ(1u, p.tracker.backwardJumps());
-    // and a wrap followed by a FORWARD presentation is consumed there: a later backward seek is not the wrap
+    // and a wrap followed by a FORWARD presentation requested after it is taken there (r19, sol r18 B1: that frame is
+    // the wrap's forward landing, a full loop plus one, 101 + 720 - 100 = 721): a later backward seek is not the wrap
     PresentDriver q;
     q.startMeasuredPlay();
     q.present(0.0, 100, true, 0, 719);
     ++q.engineWraps;
     q.present(1 / 24.0, 101, true, 0, 719);
     q.present(2 / 24.0, 50, true, 0, 719);
-    ASSERT_EQ(0u, q.tracker.wraps());
+    ASSERT_EQ(1u, q.tracker.wraps());
     ASSERT_EQ(1u, q.tracker.backwardJumps());
+    ASSERT_EQ(721, static_cast<int>(q.tracker.advancedFrames()));
+    ASSERT_EQ(0, q.tracker.maxJump());
     // r16 re-pass A2 on 215bd10e: Loop + drop-frame, cut 1..8 (0..7), frame 5 then a backward seek to 4 with no
     // engine wrap. The inference accepts it (a jump of 1 >= 7 - 8), but the tracker takes no wrap and no credit.
     ASSERT_TRUE(playback_frame_range::isContactSheetLoopWrapTransition(true, 0, 7, 5, 4));
@@ -267,16 +270,18 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossT
     d.present(1.225, 0, true, 0, 719);
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(1u, d.tracker.backwardJumps());
-    // the wrap's FORWARD landing (a frame requested after it, still ahead of the last presented frame) consumes
-    // it, so a later seek is not credited as the wrap (r16 c9b4ca5e, with an explicit stamp)
+    // the wrap's FORWARD landing (a frame requested after it, still ahead of the last presented frame) takes it
+    // (r19, sol r18 B1: credited 5 + 8 - 3 = 10, no forward jump), so a later seek is not credited as the wrap
     PresentDriver f;
     f.startMeasuredPlay();
     f.present(0.0, 3, true, 0, 7);
     ++f.engineWraps;                          // narrow cut 1..8, drop-frame: 3 -> 7 -> wraps -> 5
     f.present(0.1, 5, true, 0, 7, f.engineWraps);
     f.present(0.2, 2, true, 0, 7, f.engineWraps);
-    ASSERT_EQ(0u, f.tracker.wraps());
+    ASSERT_EQ(1u, f.tracker.wraps());
     ASSERT_EQ(1u, f.tracker.backwardJumps());
+    ASSERT_EQ(10, static_cast<int>(f.tracker.advancedFrames()));
+    ASSERT_EQ(0, f.tracker.maxJump());
 }
 
 // r18 (adversary A1 on 26f235a4): Loop on, drop-frame off, cut 1..720 (0..719). The measured Play's FIRST presented
@@ -333,4 +338,77 @@ TEST(PlaybackSourceAdvanceTracker, R18AdversaryA1TheFirstFrameRequestedBeforeThe
     ASSERT_EQ(2, static_cast<int>(g.tracker.advancedFrames()));
     ASSERT_EQ(1u, g.tracker.wraps());
     ASSERT_EQ(0u, g.tracker.backwardJumps());
+}
+
+// r19 (sol r18 B1 / fable r18 OPEN 5196d4a6-A1, catalogue row M-HFR-FORWARD-WRAP): Loop + drop-frame, cut 1..8 (0..7).
+// 3 is presented at 1.000 s; the next tick advanceDropFrameTick(3, 9, 1, 8, true) wraps the engine and lands on 5,
+// requested after the wrap and presented at 1.160 s. 5196d4a6 consumed the wrap because 5 > 3 and returned no wrap:
+// advanced 2, wraps 0, maxJump 2, 12.5 source fps. A live engine wrap is the wrap whatever the landing's direction,
+// so the tracker's own wrapped-distance rule credits 5 + 8 - 3 = 10: advanced 10, wraps 1, maxJump 0, 62.5 fps.
+TEST(PlaybackSourceAdvanceTracker, R19SolB1AForwardWrapLandingCreditsTheLoopDistance)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(3.0, 9.0, 1, 8, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(5, static_cast<int>(tick.position));
+    PresentDriver d;
+    d.startMeasuredPlay();
+    d.present(1.000, 3, true, 0, 7);
+    ++d.engineWraps;                          // the drop-frame tick wraps (MainWindow notes it in playbackHandling)
+    d.present(1.160, static_cast<int>(tick.position), true, 0, 7, d.engineWraps);
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(10, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(0, d.tracker.maxJump());
+    ASSERT_EQ(0u, d.tracker.backwardJumps());
+    ASSERT_EQ(0u, d.tracker.repeatedFrames());
+    ASSERT_NEAR(10.0 / 0.160, d.tracker.sourceFps(), 1e-9);
+    // the wrap was taken once: the next forward frame is an ordinary step and a later seek back is not a wrap
+    d.present(1.200, 6, true, 0, 7);
+    d.present(1.240, 2, true, 0, 7);
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(11, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1, d.tracker.maxJump());
+    ASSERT_EQ(1u, d.tracker.backwardJumps());
+    // a landing on the frame it left (a full loop, requested after the wrap) is one cut width, never a repeat
+    PresentDriver r;
+    r.startMeasuredPlay();
+    r.present(1.000, 3, true, 0, 7);
+    ++r.engineWraps;
+    r.present(1.160, 3, true, 0, 7, r.engineWraps);
+    ASSERT_EQ(1u, r.tracker.wraps());
+    ASSERT_EQ(8, static_cast<int>(r.tracker.advancedFrames()));
+    ASSERT_EQ(0u, r.tracker.repeatedFrames());
+    // an in-flight forward frame requested BEFORE the wrap is still not its landing: the wrap stays pending for the
+    // first frame requested after it, here a forward one (6 -> wrap -> 7 over cut 0..7 is 7 + 8 - 6 = 9)
+    PresentDriver g;
+    g.startMeasuredPlay();
+    g.present(1.000, 4, true, 0, 7);
+    const int before = g.engineWraps;
+    ++g.engineWraps;
+    g.present(1.040, 6, true, 0, 7, before);
+    g.present(1.080, 7, true, 0, 7);
+    ASSERT_EQ(1u, g.tracker.wraps());
+    ASSERT_EQ(2 + 9, static_cast<int>(g.tracker.advancedFrames()));
+    ASSERT_EQ(2, g.tracker.maxJump());
+    // two wraps, each landed forward by a frame requested between them: each frame takes exactly its own wrap
+    PresentDriver two;
+    two.startMeasuredPlay();
+    two.present(1.000, 2, true, 0, 7);
+    ++two.engineWraps;
+    const int afterFirst = two.engineWraps;
+    ++two.engineWraps;                        // a second wrap before the first one's landing is presented
+    two.present(1.100, 4, true, 0, 7, afterFirst);
+    ASSERT_EQ(1u, two.tracker.wraps());
+    two.present(1.200, 6, true, 0, 7);
+    ASSERT_EQ(2u, two.tracker.wraps());
+    ASSERT_EQ((4 + 8 - 2) + (6 + 8 - 4), static_cast<int>(two.tracker.advancedFrames()));
+    ASSERT_EQ(0, two.tracker.maxJump());
+    // no engine wrap: a forward frame is an ordinary jump, never a wrap (the inference still decides nothing)
+    PresentDriver n;
+    n.startMeasuredPlay();
+    n.present(1.000, 3, true, 0, 7);
+    n.present(1.160, 5, true, 0, 7);
+    ASSERT_EQ(0u, n.tracker.wraps());
+    ASSERT_EQ(2, static_cast<int>(n.tracker.advancedFrames()));
+    ASSERT_EQ(2, n.tracker.maxJump());
 }

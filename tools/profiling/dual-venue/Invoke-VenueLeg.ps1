@@ -939,7 +939,8 @@ if ($visualRequest.applies -and $visualRequest.requested -and $artifactsShare -a
 $outcome = $resolved.outcome; $detail = $resolved.detail
 if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
-    $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $receipt.metrics
+    # r19 (sol r18 B2): the criteria also see the run log's measured conform fields (Get-DvCriteriaMetrics); receipt.metrics stays verbatim
+    $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
     # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
     if (-not $scale.honoured -and $null -ne $runLogText) {

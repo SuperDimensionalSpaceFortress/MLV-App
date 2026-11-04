@@ -16,14 +16,22 @@
       "cuda": [
         { "metric": "lookAssistForced", "op": "eq", "value": true },
         { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
-        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" },
+        { "metric": "conformSourceFps", "op": "ge", "value": 23.28 },
+        { "metric": "conformSourceFps", "op": "le", "value": 24.72 },
+        { "metric": "conformMaxJump", "op": "eq", "value": 1 },
+        { "metric": "conformAudioSyncRequests", "op": "eq", "value": 0 }
       ]
     },
     "supplementary": {
       "cuda": [
         { "metric": "lookAssistForced", "op": "eq", "value": true },
         { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
-        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" },
+        { "metric": "conformSourceFps", "op": "ge", "value": 23.28 },
+        { "metric": "conformSourceFps", "op": "le", "value": 24.72 },
+        { "metric": "conformMaxJump", "op": "eq", "value": 1 },
+        { "metric": "conformAudioSyncRequests", "op": "eq", "value": 0 }
       ]
     }
   }

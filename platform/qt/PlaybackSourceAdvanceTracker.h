@@ -99,10 +99,11 @@ private:
  *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
  *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
  *  wrap_count. An engine wrap belongs to ONE presented transition only (the rule is below). The measured
- *  Play's first presentation consumes the pending wraps (r16 re-pass A1 on c9b4ca5e: a wrap before the
- *  first presentation stayed pending, and a later backward seek took it and was credited 719 frames). The inference alone never makes a wrap here (r16 re-pass A2 on 215bd10e: over
- *  a cut range narrower than its 8-frame tolerance, cut 1..8, it calls any backward seek a wrap, and the
- *  seek 5 -> 4 was credited 7 frames).
+ *  Play's first presentation consumes only the pending wraps that came before its own request (r16 re-pass
+ *  A1 on c9b4ca5e: a wrap before the first presentation stayed pending, and a later backward seek took it
+ *  and was credited 719 frames; r18 below: a wrap after its request stays pending). The inference alone
+ *  never makes a wrap here (r16 re-pass A2 on 215bd10e: over a cut range narrower than its 8-frame
+ *  tolerance, cut 1..8, it calls any backward seek a wrap, and the seek 5 -> 4 was credited 7 frames).
  *  r17: neither count alone places the wrap.
  *  - The LIVE count (liveEngineWraps) is read after the draw's own early/tail advance. That advance can
  *    wrap the engine before an in-flight frame requested earlier is noted (718, 719, 0: adversary A1 on
@@ -110,14 +111,19 @@ private:
  *  - The REQUEST stamp (requestEngineWraps, RenderFrameThread::ReadyFrame::PresentationContext::
  *    engineWrapsAtRequest) misses a lookahead frame requested across the boundary before the wrap and
  *    reused after it (speculative 0 stamped 0: adversary A1 on eb5af034).
- *  So a wrap is PENDING while the live count is above consumedEngineWraps. A pending wrap is taken by the
- *  first presentation that goes backward: that one IS the wrap. A pending wrap is consumed without counting
- *  as a wrap by a frame requested after it: the measured Play's first presentation, or a forward frame,
- *  whose stamp counts the wrap, is the wrap's forward landing (r16 c9b4ca5e). A non-wrap presentation
- *  therefore raises consumedEngineWraps to min(stamp, live). A wrap stays pending across a forward or
- *  repeated frame requested before it (stamp below it): an in-flight frame from before the wrap. r18
- *  (adversary A1 on 26f235a4): that includes the measured Play's FIRST presentation. 719 requested with
- *  stamp 0 whose draw wraps the engine first used to consume the wrap, so 719 -> 0 counted backward.
+ *  So a wrap is PENDING while the live count is above consumedEngineWraps. With a previous presentation in
+ *  the measured Play, a pending wrap is TAKEN (returns true) by
+ *  - the first presentation that goes backward, whatever its stamp: that one IS the wrap; it consumes every
+ *    pending wrap; and
+ *  - r19 (sol r18 B1, catalogue M-HFR-FORWARD-WRAP): a forward or repeated presentation REQUESTED AFTER the
+ *    wrap (stamp above consumedEngineWraps). It is the wrap's forward landing: over cut 0..7, 3 -> wrap -> 5
+ *    travelled 5 + 8 - 3 = 10 frames, not a forward jump of 2. It consumes up to min(stamp, live), so a wrap
+ *    after its request stays pending for the next frame. 5196d4a6 consumed such a wrap without taking it.
+ *  A wrap stays pending across a forward or repeated frame requested before it (stamp not above
+ *  consumedEngineWraps): an in-flight frame from before the wrap. The measured Play's FIRST presentation
+ *  never takes a wrap (it has no transition); it consumes up to min(stamp, live), only the wraps before its
+ *  own request. r18 (adversary A1 on 26f235a4): 719 requested with stamp 0 whose draw wraps the engine first
+ *  used to consume the wrap, so 719 -> 0 counted backward.
  *  consumedEngineWraps is the caller's running count. It is set to the live count when the measured Play
  *  starts and only ever rises.
  *  \param havePrevious a frame was presented before this one in the measured Play */
@@ -125,19 +131,28 @@ inline bool presentationIsLoopWrap( int liveEngineWraps, int requestEngineWraps,
                                     bool havePrevious, int lastFrame, int frame )
 {
     if( liveEngineWraps <= consumedEngineWraps ) return false;   // no wrap pending
-    const bool wrap = havePrevious && frame < lastFrame;
-    const bool requestedBeforeTheWrap = requestEngineWraps < liveEngineWraps;
-    if( wrap || !requestedBeforeTheWrap )
+    // the wraps before this frame's request (never above the live count)
+    const int requestedAfter = requestEngineWraps < liveEngineWraps ? requestEngineWraps : liveEngineWraps;
+    const bool requestedAfterAPendingWrap = requestedAfter > consumedEngineWraps;
+    if( !havePrevious )
     {
-        consumedEngineWraps = liveEngineWraps;
+        // r18 (adversary A1 on 26f235a4): the first presentation has no transition; it consumes only the wraps
+        // that came before its own request. A later wrap stays pending for the frame that crosses it.
+        if( requestedAfterAPendingWrap ) consumedEngineWraps = requestedAfter;
+        return false;
     }
-    else if( requestEngineWraps > consumedEngineWraps )
+    if( frame < lastFrame )
     {
-        // r18 (adversary A1 on 26f235a4): a non-wrap presentation, the first one included, consumes only the
-        // wraps that came before its own request. A later wrap stays pending for the frame that crosses it.
-        consumedEngineWraps = requestEngineWraps;
+        consumedEngineWraps = liveEngineWraps;   // the backward landing IS the wrap (a lookahead stamped before it too)
+        return true;
     }
-    return wrap;
+    if( requestedAfterAPendingWrap )
+    {
+        // r19 (sol r18 B1): a forward or repeated frame requested after the wrap is its forward landing.
+        consumedEngineWraps = requestedAfter;
+        return true;
+    }
+    return false;   // an in-flight frame requested before the wrap: the wrap stays pending
 }
 
 #endif // PLAYBACKSOURCEADVANCETRACKER_H

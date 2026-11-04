@@ -1357,6 +1357,12 @@ function Get-DvPlaybackEvidence {
         conformSession = $(if ($conformFields.ContainsKey('session')) { [string]$conformFields['session'] } else { $null })
         conformActive = (ConvertTo-DvInt64 $conformFields['conform_active'])
         conformEnvOverride = (ConvertTo-DvInt64 $conformFields['conform_env_override'])
+        # HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2): the measured-session conform line's MEASURED acceptance inputs (the timeline's source frames per wall
+        # second, the largest jump between presented source frames, the audio sync requests while conformed); the conform leg specs' criteria judge them
+        # through Get-DvCriteriaMetrics. $null when the line or the field is absent; a non-finite rate stays non-finite (it then fails every bound).
+        conformSourceFps = (ConvertTo-DvDouble $conformFields['source_fps'])
+        conformMaxJump = (ConvertTo-DvInt64 $conformFields['max_jump'])
+        conformAudioSyncRequests = (ConvertTo-DvInt64 $conformFields['audio_sync_requests'])
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -3427,7 +3433,8 @@ function Test-DvReceiptValid {
                 $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
                 # the criteria are selected by the backend the HASHED run used (== the receipt's, or this receipt is already INVALID above)
                 $criteria = Get-DvProp (Get-DvProp (Get-DvProp $spec 'criteria') $role) $derivedBackend
-                $verdict = Test-DvCriteria -Criteria $criteria -Metrics $metrics
+                # r19 (sol r18 B2): the criteria also see the measured conform fields re-derived from the hashed run log; the receipt's metrics stay verbatim
+                $verdict = Test-DvCriteria -Criteria $criteria -Metrics (Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)
                 $sheetOk = $true
                 if ([string](Get-DvProp $spec 'legType') -ceq 'look') {
                     $sheet = Join-Path $ev.dir 'contact-sheet\sheet.png'
@@ -3877,6 +3884,37 @@ function Get-DvVerbatimMetrics {
     [pscustomobject]$m
 }
 
+# HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2): the measured conform fields a leg's criteria may name, and the re-derived playback block field each comes from.
+$script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests' }
+
+function Get-DvCriteriaMetrics {
+    <#
+    .SYNOPSIS
+    HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2). The metrics a leg's criteria are judged against: the verbatim summary.json / manifest metrics
+    (Get-DvVerbatimMetrics; the receipt's `metrics` stays exactly that) plus the measured session's conform line values from the playback block
+    Get-DvPlaybackEvidence re-derived from the run log: conformSourceFps (source_fps), conformMaxJump (max_jump), conformAudioSyncRequests
+    (audio_sync_requests). Before r19 the criteria saw only summary.json, so a conformed run at source_fps=33.6, max_jump=2, audio_sync_requests=1
+    passed its conform leg. A value the run log does not carry (no conform line for the measured session, or a build that does not print the field)
+    is left absent with a typed <metric>CouldNotCheck, so a criterion naming it FAILS (Test-DvCriteria). A summary.json key of the same name is never
+    overwritten by the playback value, and never trusted in its place: the playback value or the CouldNotCheck reason replaces it.
+    #>
+    param($Metrics, $Playback)
+    $m = [ordered]@{}
+    if ($null -ne $Metrics) { foreach ($p in $Metrics.PSObject.Properties) { $m[$p.Name] = $p.Value } }
+    foreach ($name in $script:ConformCriteriaMetrics.Keys) {
+        $value = $(if ($null -ne $Playback) { Get-DvProp $Playback $script:ConformCriteriaMetrics[$name] } else { $null })
+        $m[$name] = $value
+        if ($null -eq $value) {
+            $why = $(if ($null -eq $Playback) { 'no playback block was derived from the run log' }
+                     elseif ((Get-DvProp $Playback 'conformLinePresent') -ne $true) { 'no playback_smoke.conform line for the measured session in the run log' }
+                     else { 'the measured session''s playback_smoke.conform line does not carry the field' })
+            $m["${name}CouldNotCheck"] = $why
+        }
+        elseif ($m.Contains("${name}CouldNotCheck")) { $m.Remove("${name}CouldNotCheck") }
+    }
+    [pscustomobject]$m
+}
+
 # --- receipts (append-only) -----------------------------------------------------------------------
 function New-DvReceipt {
     <#
@@ -3989,4 +4027,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
