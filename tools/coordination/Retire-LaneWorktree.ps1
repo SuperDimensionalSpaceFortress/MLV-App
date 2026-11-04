@@ -281,6 +281,22 @@ $script:RunDirTieExt = @('.ps1', '.psm1', '.json', '.jsonl', '.txt', '.md', '.ar
 $script:RunDirTieBulkExt = @('.txt', '.jsonl')
 $script:RunDirTieMaxFiles = 200
 $script:RunDirTieMaxBytes = 1048576
+# RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: Windows reuses pids, so a dead lane's child.json / receipt can name a pid that now runs tailscaled.exe,
+# OfficeClickToRun.exe, remoting_host.exe or git.exe (fleet doctrine RECEIPTS.md:5103 "procStart defeats PID reuse"; TRAPS.md:11541).
+# r8 FAIL-CLOSED IDENTITY (HUB-TICK 20261103T1435Z step E; r1-r7 patched wall-clock and snapshot-age heuristics through nine adversary passes and each
+# pass found a new clock or stale-row boundary). The rule in Find-RunDirDriverHolders is now:
+#   A live pid named by a record in a run dir tied to the worktree is a HOLDER unless reuse is POSITIVELY PROVEN, and the ONLY proof is: the record
+#   carries a kernel process-creation stamp (createdUtc, containment.<x>CreatedUtc) AND the pid's CURRENT creation time, read by a per-pid query at
+#   decision time (Get-LivePidIdentity), differs from it by more than RunDirPidCreatedSlackSec. r9 (Dot B2): the stamp and the creation time must be
+#   ONE consistent pair (record read, live read, record re-read unchanged, all agreeing with the cached reads); otherwise the tie is uncertain = HOLDER.
+#   - No wall-clock or snapshot-age comparison (record write time, snapshot capture time) is part of the per-record decision, so a clock step,
+#     forward or backward, cannot turn a record into a reuse proof. (Pre-existing, not changed here: which run dirs and receipts are READ at all is
+#     bounded by RunDirMaxAgeDays / RunDirReceiptMaxAgeHours against the wall clock - advisory A4 of pass 10.)
+#   - A command line or image (the snapshot row may be the PREVIOUS holder of the pid) only ever ADDS a holder; it never rejects a record.
+#   - A pid absent from the snapshot but running now is judged by the same rule; a pid not running now is judged from its snapshot row, if any.
+#   - An UNSTAMPED record + a live pid = HOLDER, always; an unreadable current creation time proves nothing.
+#   False refusals are accepted on purpose: retirement is hygiene, and the next sweep asks again once the driver (or the pid's new owner) exits.
+$script:RunDirPidCreatedSlackSec = 5
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -385,6 +401,10 @@ function Get-LaneProcessSnapshot {
     # column. Measured 2026-10-03: the old per-ancestor `Get-CimInstance -Filter "ProcessId=N"` loop cost
     # ~31 s of a ~36 s gate call; the one full scan costs ~2.4 s. Throws when the scan fails (the caller
     # turns that into cannot-determine, never into "no live process").
+    # r6 (adversary A3, 6th pass): the capture time is taken BEFORE the scan, never after it. Every row is then at least this new, and a run-dir
+    # record written while the scan ran is NEWER than the snapshot (so its stamp / image are not contradicted by a row that may be the pid's
+    # previous holder); stamped after the scan returned, the same record would look older and a stale row would read as fresh evidence.
+    $capturedAt = (Get-Date).ToUniversalTime()
     $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
     $byPid = @{}
     foreach ($p in $all) { $byPid[[int]$p.ProcessId] = $p }
@@ -401,7 +421,7 @@ function Get-LaneProcessSnapshot {
         # TRAPS.md:15482-15492). Every live non-self process stays; the cmdline check simply cannot match it.
         Procs       = @($all | Where-Object { $self -notcontains $_.ProcessId })
         SelfPids    = $self
-        CapturedUtc = (Get-Date).ToUniversalTime()
+        CapturedUtc = $capturedAt
     }
 }
 
@@ -627,19 +647,243 @@ function Test-PathNamed {
     return [regex]::IsMatch((ConvertTo-PathMatchText $Text), $rx, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
 }
 
-function Get-PidsFromRecordText([string]$Text) {
-    # A pid record: a bare number (venue-cpu17v9-ab.pid), or JSON whose pid / childPid / driverPid / runnerPid / ownerPid fields carry one
-    # (opus-001.child.json, *.receipt.json). Pids 0-4 are kernel pseudo-processes and never a driver.
-    # Plain loops, no pipeline: this runs once per record (thousands per index).
+# r8 (pass-10 A5): Windows pids are DWORDs; up to ten digits are read, and ConvertTo-PidValue drops a value beyond the int range (no pid).
+$script:PidBareRx = [regex]::new('^\s*(\d{1,10})\s*$', 'Compiled')
+$script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,10})\b', 'Compiled')
+$script:PidLeadRx = [regex]::new('^(\d{1,10})\b', 'Compiled')
+$script:PidMemberKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')
+
+function Get-RecordPidMembers([string]$Text) {
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r7 (adversary pass 7 A3, A4; folds RETIRE-WORKTREE-PID-JSON-PARSE-1): THE ONE reader of the pids a
+    # run-dir record names. The pid rows (Get-RunDirPidIndex) and the root-stamp "exactly one pid" count (Get-RecordedCreatedUtcMap) both read ONLY
+    # this, so a record cannot name a pid to one and not to the other (r6 A2 and A3 were that split: an escape-blind regex beside a parser that
+    # decoded). Shapes:
+    #   empty / whitespace      no pids.
+    #   a bare number           (venue-cpu17v9-ab.pid) that pid.
+    #   anything else           PARSED as JSON (escapes decoded: "pid" is pid), and EVERY nesting level is walked (objects and arrays):
+    #                           each member whose decoded name is exactly pid / childPid / driverPid / runnerPid / ownerPid (ORDINAL compare) is a pid.
+    #   does not parse          AMBIGUOUS. It may name any pid, so the caller records an unreadable-record row (fails toward live: a live pid that
+    #                           could be tied through the run dir refuses the worktree). Pids a lenient scan can still see are returned too (more rows
+    #                           only moves a verdict toward live). Text with no JSON punctuation at all is not ambiguous, it is just not a record.
+    # Pids 0-4 are kernel pseudo-processes and never a driver. {Pids = distinct pids > 4 in first-seen order; Members = {Pid; Root} for every pid
+    # member (Pid 0 when its value is no pid; Root = a member of the ROOT object); Ambiguous; Why}. Plain loops, no pipeline: this runs once per
+    # record (thousands per index).
     $ids = New-Object System.Collections.Generic.List[int]
-    if ([string]::IsNullOrWhiteSpace($Text)) { return , $ids.ToArray() }
+    $members = New-Object System.Collections.Generic.List[object]
+    $res = [pscustomobject]@{ Pids = $null; Members = $members; Ambiguous = $false; Why = '' }
+    if ([string]::IsNullOrWhiteSpace($Text)) { $res.Pids = $ids.ToArray(); return $res }
     $m = $script:PidBareRx.Match($Text)
-    if ($m.Success) { $n = [int]$m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; return , $ids.ToArray() }
-    foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = [int]$m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
-    return , $ids.ToArray()
+    if ($m.Success) { $n = ConvertTo-PidValue $m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; $res.Pids = $ids.ToArray(); return $res }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($Text) }
+    catch {
+        foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = ConvertTo-PidValue $m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
+        if ($Text.IndexOfAny([char[]]@('{', '[', '"')) -ge 0) { $res.Ambiguous = $true; $res.Why = 'unparsable-pid-record: ' + ($_.Exception.Message -replace '\s+', ' ') }
+        $res.Pids = $ids.ToArray()
+        return $res
+    }
+    try {
+        # r9 (pass-11 A4): a depth-first walk in DOCUMENT order. Each frame is @(element, inRootObject, isPidMember); a container's children are pushed
+        # in reverse so the LIFO pops visit them first to last, and a pid member is recorded when its own frame is popped, i.e. in document order.
+        $stack = New-Object System.Collections.Generic.Stack[object]
+        $stack.Push(@($doc.RootElement, $false, $false, $true))
+        while ($stack.Count) {
+            $item = $stack.Pop()
+            $el = [System.Text.Json.JsonElement]$item[0]
+            if ([bool]$item[2]) {
+                $n = ConvertTo-RecordedPid $el
+                $members.Add([pscustomobject]@{ Pid = $n; Root = [bool]$item[1] })
+                if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) }
+            }
+            $kids = New-Object System.Collections.Generic.List[object]
+            if ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                foreach ($prop in $el.EnumerateObject()) {
+                    $isPid = Test-OrdinalMember $prop.Name $script:PidMemberKeys
+                    $k = $prop.Value.ValueKind
+                    if ($isPid -or $k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $kids.Add(@($prop.Value, [bool]$item[3], $isPid, $false)) }
+                }
+            }
+            elseif ($el.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                foreach ($e in $el.EnumerateArray()) {
+                    $k = $e.ValueKind
+                    if ($k -eq [System.Text.Json.JsonValueKind]::Object -or $k -eq [System.Text.Json.JsonValueKind]::Array) { $kids.Add(@($e, $false, $false, $false)) }
+                }
+            }
+            for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push($kids[$i]) }
+        }
+    } finally { $doc.Dispose() }
+    $res.Pids = $ids.ToArray()
+    return $res
 }
-$script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
-$script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
+
+function ConvertTo-PidValue([string]$Digits) {
+    # r8 (pass-10 A5): a run of up to ten digits as a pid, or 0 (no pid) when it is beyond the int range. Never throws.
+    $n = [long]0
+    if ([long]::TryParse($Digits, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$n) -and $n -le [int]::MaxValue) { return [int]$n }
+    return 0
+}
+
+# r8 (pass-10 A2): a creation stamp is a COMPLETE identity only: ISO 8601 date, time and an explicit zone (Z or +hh:mm). A time without a date (TryParse
+# supplies today's), a date without a time, or a time without a zone (local or UTC unknown) states no identity, so it can never prove reuse.
+$script:RecordedUtcRx = [regex]::new('^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,7})?(Z|[+-]\d{2}:\d{2})$', 'Compiled')
+
+function ConvertTo-RecordedUtc([object]$Value) {
+    # A complete ISO 8601 stamp string -> UTC [datetime], or $null (not a string, incomplete, or does not parse: no claim).
+    # r9 (pass-11 A5): parsed as a DateTimeOffset, which REJECTS an instant whose UTC value is outside the DateTime range ('0001-01-01T00:00:00+14:00');
+    # DateTime.TryParse clamped it to a wrong instant, which could then 'differ' from a live creation time. Rejected = no claim.
+    if ($Value -isnot [string] -or -not $script:RecordedUtcRx.IsMatch($Value)) { return $null }
+    $o = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse($Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$o)) { return $o.UtcDateTime }
+    return $null
+}
+
+function ConvertTo-RecordedPid([System.Text.Json.JsonElement]$El) {
+    # A pid field's value as an int: a JSON integer or an integer string, else the LEADING DIGITS of the number's or string's text (the shape the
+    # earlier regex accepted: 5000.0, "5000 "); anything else 0 (no pid). r7 (pass-8 A1): this is the ONE converter for every pid-valued member, both
+    # the pid rows / root count (Get-RecordPidMembers) and the containment pid/stamp pairing, so a value accepted as a pid for one is the same pid for the other.
+    $n = 0
+    if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number -and $El.TryGetInt32([ref]$n)) { return $n }
+    if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and [int]::TryParse($El.GetString(), [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $n }
+    $s = $null
+    if ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::Number) { $s = $El.GetRawText() }
+    elseif ($El.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $s = $El.GetString() }
+    if ($s) { $m = $script:PidLeadRx.Match($s); if ($m.Success) { return (ConvertTo-PidValue $m.Groups[1].Value) } }
+    return 0
+}
+
+function Test-OrdinalMember([string]$Name, [string[]]$Set) {
+    # True when $Name is exactly one of $Set, compared ORDINALLY. PowerShell's -ceq / -cin / -ccontains are culture-aware: a name containing an
+    # ignorable character (U+00AD ...) would equal a recognised key. Used for every identity-key test on a parsed JSON record.
+    foreach ($s in $Set) { if ([string]::Equals($Name, $s, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
+function Get-RecordedCreatedUtcMap([string]$Text, [object]$Members = $null) {
+    # $Members: the Get-RecordPidMembers result for this same text (the index passes the one it already has); read here when absent.
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 B1, B2): the process creation time(s) a record states, as @{ pid = UTC datetime }, read from
+    # the PARSED record and only from fields that belong to a pid, never from a document-wide pattern (a nested metadata.createdUtc is not the
+    # record's identity):
+    #   root         {"pid":N,"createdUtc":"..."} (opus-001.child.json, schema mlv-lane-child/v1): used only when the record names exactly one pid.
+    #   containment  a native lane receipt's block (Invoke-Lane.ps1): childPid/childCreatedUtc, ownerPid/ownerCreatedUtc, runnerPid/runnerCreatedUtc,
+    #                each stamp binding ITS pid (a null or unparsable stamp is no claim).
+    # Text that is not a JSON object makes no claim (the caller falls back to the image + record-write-time test).
+    $map = @{}
+    # No substring prefilter: a legal JSON escape (createdUtc) spells the same property, so only the parser can tell. A record is a JSON object
+    # only when its first character is '{' (a bare pid file is not parsed).
+    if ([string]::IsNullOrWhiteSpace($Text) -or $Text.TrimStart()[0] -ne '{') { return $map }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($Text) } catch { return $map }
+    try {
+        $root = $doc.RootElement
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $map }
+        $rootStamp = $null
+        $claims = @{}   # pid -> every creation time this record states for it (see the reconciliation below)
+        $rootPids =New-Object System.Collections.Generic.List[int]   # pids carried by ROOT-level fields: the only pids the root createdUtc can belong to (adversary A2)
+        # Property names compare ORDINALLY (a differently-cased key is another key, never the recognised one). r5 (adversary A1): a key that
+        # appears twice in one object is ambiguous, and an IDENTITY key (pid / childPid / driverPid / runnerPid / ownerPid, createdUtc, containment
+        # at the root; the three pid/stamp pairs inside containment) that appears twice makes the WHOLE record state no identity: the map is empty
+        # and the caller falls back to the image + record-write-time test exactly as for unparsable text. A duplicate must never leave one copy
+        # standing as the claim (a parser keeps the last, a reader the first): a stale stamp would then mark the genuine driver reused.
+        # r6 (adversary A1, 6th pass): PowerShell's -ceq / -cin / -ccontains are case-sensitive but LINGUISTIC (culture-aware), where U+00AD and other
+        # ignorable characters vanish, so a key spelled 'created<soft hyphen>Utc' (a JSON escape) matched createdUtc and an unrelated stale stamp could
+        # replace the genuine one. Every key test below is [string]::Equals(..., Ordinal) through Test-OrdinalMember.
+        $rootIdKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid', 'createdUtc', 'containment')
+        $rootPidKeys = @('pid', 'childPid', 'driverPid', 'runnerPid', 'ownerPid')
+        $seenRoot = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($prop in $root.EnumerateObject()) {
+            if (-not $seenRoot.Add($prop.Name) -and (Test-OrdinalMember $prop.Name $rootIdKeys)) { return @{} }
+        }
+        # r7: the pids the record names come from Get-RecordPidMembers ONLY (every nesting level, escapes decoded), the same function that makes the pid rows.
+        $pm = if ($null -ne $Members) { $Members } else { Get-RecordPidMembers $Text }
+        foreach ($mem in $pm.Members) { if ($mem.Root -and $mem.Pid -gt 0) { $rootPids.Add([int]$mem.Pid) } }
+        foreach ($prop in $root.EnumerateObject()) {
+            if ([string]::Equals($prop.Name, 'createdUtc', [StringComparison]::Ordinal)) { if ($null -eq $rootStamp -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $rootStamp = ConvertTo-RecordedUtc $prop.Value.GetString() } }
+            elseif (Test-OrdinalMember $prop.Name $rootPidKeys) { }   # a root pid member: counted by Get-RecordPidMembers above, nothing to read here
+            elseif ([string]::Equals($prop.Name, 'containment', [StringComparison]::Ordinal) -and $prop.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                $f = New-Object 'System.Collections.Generic.Dictionary[string,System.Text.Json.JsonElement]' ([StringComparer]::Ordinal)
+                $innerIdKeys = @('childPid', 'childCreatedUtc', 'ownerPid', 'ownerCreatedUtc', 'runnerPid', 'runnerCreatedUtc')
+                foreach ($c in $prop.Value.EnumerateObject()) {
+                    if ($f.ContainsKey($c.Name) -and (Test-OrdinalMember $c.Name $innerIdKeys)) { return @{} }
+                    $f[$c.Name] = $c.Value
+                }
+                foreach ($pair in @(@('childPid', 'childCreatedUtc'), @('ownerPid', 'ownerCreatedUtc'), @('runnerPid', 'runnerCreatedUtc'))) {
+                    if (-not $f.ContainsKey($pair[0]) -or -not $f.ContainsKey($pair[1])) { continue }
+                    $se = $f[$pair[1]]
+                    $pn = ConvertTo-RecordedPid $f[$pair[0]]
+                    if ($pn -le 4 -or $se.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { continue }
+                    $st = ConvertTo-RecordedUtc $se.GetString()
+                    if ($null -ne $st) { if (-not $claims.ContainsKey($pn)) { $claims[$pn] = New-Object 'System.Collections.Generic.List[datetime]' }; $claims[$pn].Add($st) }
+                }
+            }
+        }
+        # r6 (adversary A2, 6th pass) / r7 (A3): "names exactly one pid" is counted over EVERY pid member of the record at EVERY nesting level, escapes
+        # decoded: $pm.Pids from Get-RecordPidMembers, the same function that makes the pid rows (r6 counted a regex list and a shallow parser walk,
+        # and a second pid in metadata.pid or containment.driverPid escaped both). The root stamp stands only when that is one pid, and it is a root pid.
+        if ($null -ne $rootStamp -and @($pm.Pids).Count -eq 1 -and $rootPids.Contains([int]@($pm.Pids)[0])) {
+            $rp = [int]@($pm.Pids)[0]
+            if (-not $claims.ContainsKey($rp)) { $claims[$rp] = New-Object 'System.Collections.Generic.List[datetime]' }
+            $claims[$rp].Add($rootStamp)
+        }
+        # r5 (adversary A2, 2nd pass; A1, 3rd pass): several claims for ONE pid in one record (root + containment, or child / owner / runner naming
+        # the same pid) stand only when they are the SAME instant. Any difference is ambiguous and states nothing for that pid (the write-time rule
+        # decides): the last claim must never silently replace a matching one, a root claim must not be dropped because containment filled the
+        # map, and no representative may be picked from a set that spans more than the slack (a within-slack-of-the-first test lets it span twice).
+        foreach ($k in @($claims.Keys)) {
+            $l = $claims[$k]
+            $agree = $true
+            foreach ($t in $l) { if ($t.Ticks -ne $l[0].Ticks) { $agree = $false } }
+            if ($agree) { $map[[int]$k] = $l[0] }
+        }
+    } catch { return @{} } finally { $doc.Dispose() }
+    return $map
+}
+
+function Test-RecordedCreatedMismatch {
+    # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: does a record state an EXACT creation time for this pid that $Proc (r8: the pid's CURRENT identity,
+    # from Get-LivePidIdentity) does not have (beyond RunDirPidCreatedSlackSec)? r8: the ONLY proof of reuse, and it proves it for THIS record only.
+    # $false when the creation time is unreadable or the record states none (an unstamped record is never proof).
+    # r10 (pass-12 A2): $false too when the slack is not a number >= 0 (an override below 0 made equal times a 'mismatch'); equal times never are.
+    param([object]$Proc, [object]$Record)
+    $cdp = $Proc.PSObject.Properties['CreationDate']
+    if (-not $cdp -or $cdp.Value -isnot [datetime]) { return $false }
+    $rc = $Record.PSObject.Properties['RecordedCreatedUtc']
+    if (-not $rc -or $rc.Value -isnot [datetime]) { return $false }
+    $slack = [double]$script:RunDirPidCreatedSlackSec
+    if ([double]::IsNaN($slack) -or $slack -lt 0) { return $false }
+    $diff = [math]::Abs((([datetime]$cdp.Value).ToUniversalTime() - ([datetime]$rc.Value).ToUniversalTime()).TotalSeconds)
+    return ($diff -gt 0 -and $diff -gt $slack)
+}
+
+function Get-LivePidIdentity {
+    # r8 (ruling d): the pid's identity NOW, by a per-pid query at decision time, never the enumeration snapshot alone. $null = no process has this
+    # pid now. Otherwise {Name; CreationDate}: CreationDate is the kernel creation time (UTC) or $null when it cannot be read (an unreadable time
+    # proves nothing, so the caller holds). Process.StartTime first (GetProcessTimes); when this caller may not open the process, Win32_Process by pid
+    # (CreationDate is readable for every process). A query that fails for any other reason is "running, creation unknown" (fail toward holder).
+    # A seam: a test redefines it to play a process that runs now.
+    param([int]$ProcessId)
+    $p = $null
+    try { $p = [System.Diagnostics.Process]::GetProcessById($ProcessId) }
+    catch {
+        $e = $_.Exception
+        while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+        if ($e -is [ArgumentException]) { return $null }   # "Process with an Id of N is not running."
+        return [pscustomobject]@{ Name = ''; CreationDate = $null }
+    }
+    try {
+        $name = ''
+        try { $name = [string]$p.ProcessName; if ($name -and -not [IO.Path]::HasExtension($name)) { $name += '.exe' } } catch { }
+        $created = $null
+        try { $created = $p.StartTime.ToUniversalTime() } catch { $created = $null }
+        if ($null -eq $created) {
+            try {
+                $c = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -Property ProcessId, Name, CreationDate -ErrorAction Stop | Select-Object -First 1
+                if ($c -and $c.CreationDate -is [datetime]) { $created = ([datetime]$c.CreationDate).ToUniversalTime() }
+                if ($c -and -not $name) { $name = [string]$c.Name }
+            } catch { }
+        }
+        return [pscustomobject]@{ Name = $name; CreationDate = $created }
+    } finally { $p.Dispose() }
+}
 
 function Read-SharedText {
     # r3 (PR #654 key3 r2 B1): read a file another process may hold open for WRITING. [IO.File]::ReadAllText asks for FileShare.Read, so it
@@ -693,13 +937,27 @@ function Get-RunDirPidIndex {
             foreach ($f in $files) {
                 if ($f.Name.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and $f.LastWriteTimeUtc -lt $cut) { continue }
                 $text = $null
+                $cachedAt = $f.LastWriteTimeUtc   # the write time as ENUMERATED, before the read
                 try { $text = Read-RunDirRecordText -Path $f.FullName }
                 catch {
                     $why = Get-RunDirReadFailure $_
                     if ($why) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = 0; Error = "$($f.FullName) $why" }) }
                     continue
                 }
-                foreach ($id in (Get-PidsFromRecordText $text)) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null }) }
+                # RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: each row also carries when the record was written (RecordedAtUtc) and, when it states one for
+                # its only pid, the recorded process creation time (RecordedCreatedUtc), so Find-RunDirDriverHolders can prove reuse of the pid.
+                # r8: RecordedAtUtc is DIAGNOSTIC ONLY (a wall-clock reading); no holder decision reads it. It is the later of the enumerated and the
+                # post-read mtime, or $null when the post-read stat is unavailable (the cached value would describe an earlier version of the text).
+                $recordedAt = $null
+                try { $f.Refresh(); if ($f.Exists) { $recordedAt = $f.LastWriteTimeUtc; if ($cachedAt -gt $recordedAt) { $recordedAt = $cachedAt } } } catch { $recordedAt = $null }
+                # r7: ONE reader (Get-RecordPidMembers) for the pid rows and the stamp map's pid count. A record that does not parse is ambiguous:
+                # it also adds an unreadable-record row (Pid 0 + Error), which Find-RunDirDriverHolders reads as naming every live pid.
+                $pm = Get-RecordPidMembers $text
+                if ($pm.Ambiguous) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = 0; Error = "$($f.FullName) $($pm.Why)" }) }
+                $recIds = $pm.Pids
+                $recCreated = Get-RecordedCreatedUtcMap -Text $text -Members $pm
+                # r9 (pass-11 A1): RecordText is the text these rows were read from; a reuse proof stands only while the record still reads exactly so.
+                foreach ($id in $recIds) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null; RecordedAtUtc = $recordedAt; RecordedCreatedUtc = $(if ($recCreated.ContainsKey([int]$id)) { $recCreated[[int]$id] } else { $null }); RecordText = [string]$text }) }
             }
         }
     }
@@ -739,15 +997,23 @@ function Test-RunDirNamesPath {
 }
 
 function Find-RunDirDriverHolders {
-    # A live process recorded by a pid record in a run dir under -RunsRoot whose command line names the worktree, or names THAT run dir
-    # while the run dir names the worktree. A recorded live pid whose command line cannot be read holds it when its run dir names the
-    # worktree (unknown is never free). Rows {ProcessId; Name; Via = 'rundir-pid:<file>'; MatchedPath}. Throws when the run dirs cannot be listed.
+    # A live process recorded by a pid record in a run dir under -RunsRoot that names the worktree, or whose run dir names the worktree.
+    # Rows {ProcessId; Name; Via = 'rundir-pid:<file>'; MatchedPath}. Throws when the run dirs cannot be listed.
     # r2 (PR #654 sol r1 blocker): also THROWS, with the file and the error class, when the answer is unknown and no definite holder was found:
-    # a run dir whose tie cannot be settled (Test-RunDirNamesPath), or a pid record that exists but cannot be read. Such a record may name ANY
-    # pid, so it is read as naming every live non-self pid: it refuses exactly when one of them would hold the worktree through that run dir.
+    # a run dir whose tie cannot be settled (Test-RunDirNamesPath), or a pid record that exists but cannot be read.
+    # r8 FAIL-CLOSED IDENTITY (HUB-TICK 20261103T1435Z step E; see RunDirPidCreatedSlackSec at the top). Per record, independently of every other record:
+    #   1. identity = Get-LivePidIdentity (the pid NOW, per-pid query at decision time). Not running now: the snapshot row, if any (that process has
+    #      exited since the scan, or the table is a caller's fixture). Neither: not live, no holder.
+    #   2. HOLDER when the snapshot row's command line (raw or decoded -EncodedCommand) names the worktree: command-line evidence only ADDS.
+    #   3. else HOLDER when the record's run dir names the worktree, UNLESS the record carries a creation stamp and the identity's creation time is
+    #      readable and differs from it (Test-RecordedCreatedMismatch): the only proof of reuse, and it rejects only the record that states it.
+    #      The proof is re-read from the record at decision time ($reuseProven); a stamp must be complete ISO 8601 with a zone (ConvertTo-RecordedUtc).
+    #      r9 (Dot B2): the proof is one consistent pair (record, live identity, record unchanged); any disagreement is uncertain = HOLDER.
+    # No record write time, snapshot capture time, image or non-matching command line takes part, so a clock step or a stale row (the pid's previous
+    # holder) can never free a worktree. False refusals are accepted: the next sweep asks again (ruling f).
     param([string]$WorktreePath, [object]$Snapshot, [string]$RunsRoot)
     # LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1 B2: each command line is read with its -EncodedCommand arguments decoded (Get-EncodedCommandText), so a
-    # driver started as `pwsh -EncodedCommand <base64>` that names its run dir only inside the base64 still ties to it; such a row is via ...+cmdline-encoded.
+    # driver started as `pwsh -EncodedCommand <base64>` that names its run dir only inside the base64 is labelled via ...+cmdline-encoded.
     $rows = New-Object System.Collections.Generic.List[object]
     if (-not $RunsRoot) { return $rows.ToArray() }
     $wd = $WorktreePath.TrimEnd('\')
@@ -759,37 +1025,127 @@ function Find-RunDirDriverHolders {
     $seen = @{}
     $fail = $null
     $unreadable = New-Object System.Collections.Generic.List[object]
-    foreach ($rec in @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)) {
+    $index = @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)
+    # One identity query per pid and one tie answer per run dir in this call (a tie that cannot be settled is cached as its error and thrown again).
+    # r10 (pass-12 A1): only a FOUND identity is kept for the call. $null (no process now, no snapshot row) is asked again for the next record that
+    # names the pid, because the pid can start between two records; keeping "not running" would skip a live driver. (A read that fails is a found
+    # identity with no creation time: it never proves reuse, so keeping it only ever holds.)
+    $identity = @{}
+    $identityOf = {
+        param([int]$P)
+        if (-not $identity.ContainsKey($P)) {
+            $v = & $readIdentity $P
+            if ($null -eq $v) { return $null }
+            $identity[$P] = $v
+        }
+        return $identity[$P]
+    }
+    # The uncached read: the pair in $reuseProven calls it again after its first record read (r9, Dot B2).
+    $readIdentity = {
+        param([int]$P)
+        $id = $null
+        $f = Get-LivePidIdentity -ProcessId $P
+        if ($null -ne $f) {
+            $fc = $f.PSObject.Properties['CreationDate']
+            $nm = [string]$f.Name
+            if (-not $nm -and $byPid.ContainsKey($P)) { $nm = [string]$byPid[$P].Name }
+            $id = [pscustomobject]@{ Name = $nm; CreationDate = $(if ($fc -and $fc.Value -is [datetime]) { ([datetime]$fc.Value).ToUniversalTime() } else { $null }) }
+        } elseif ($byPid.ContainsKey($P)) {
+            $rc = $byPid[$P].PSObject.Properties['CreationDate']
+            $id = [pscustomobject]@{ Name = [string]$byPid[$P].Name; CreationDate = $(if ($rc -and $rc.Value -is [datetime]) { ([datetime]$rc.Value).ToUniversalTime() } else { $null }) }
+        }
+        return $id
+    }
+    # The complete stamp a record's text states for pid $P, or $null (gone, unreadable, ambiguous, no longer naming the pid, unstamped).
+    $stampIn = {
+        param([object]$Text, [int]$P)
+        if ($null -eq $Text) { return $null }
+        $pm = Get-RecordPidMembers ([string]$Text)
+        if ($pm.Ambiguous -or -not (@($pm.Pids) -contains $P)) { return $null }
+        $map = Get-RecordedCreatedUtcMap -Text ([string]$Text) -Members $pm
+        if (-not $map.ContainsKey($P) -or $map[$P] -isnot [datetime]) { return $null }
+        return [datetime]$map[$P]
+    }
+    # Two identity reads name the same process: same image name and the same readable creation time, exactly.
+    $sameIdentity = {
+        param($A, $B)
+        if ($null -eq $A -or $null -eq $B) { return $false }
+        if (-not [string]::Equals([string]$A.Name, [string]$B.Name, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if ($A.CreationDate -isnot [datetime] -or $B.CreationDate -isnot [datetime]) { return $false }
+        return ([datetime]$A.CreationDate -eq [datetime]$B.CreationDate)
+    }
+    # r8 (pass-10 A1): the index may be a cache from an earlier read (a sweep's shared snapshot, the gate's -ReuseRunIndex retry), and the record can
+    # have been rewritten since (a replacement driver's own stamp), so the proof is re-read from the record at decision time.
+    # r9 (Dot B2, hub B2 rule): and $id is itself a cache (the first query for this pid in this call). Comparing a re-read stamp to it compares two
+    # reads taken at different moments: an unrelated process P/T1 answered the query, exited, and a genuine driver reused P and re-stamped the record
+    # P/T2; T2 vs T1 'proved' reuse. Reuse is proven ONLY by ONE consistent pair, in this order:
+    #   1. read the record: its text is ordinal-equal to the text the index rows came from ($rec.RecordText; r9 pass-11 A1: a record that changed
+    #      since, even with the same stamp for this pid, may name a pid the cached rows do not have), and it names the pid with a complete stamp S;
+    #   2. read the live identity again (uncached): it is the same process as $id (name and creation time);
+    #   3. re-read the record: its text is ordinal-equal to read 1 (one deterministic decoder, so equal text = the same evidence);
+    #   4. S differs from that live creation time (Test-RecordedCreatedMismatch).
+    # Anything else (a changed stamp or record, a live read that disagrees with the cached one, a read that fails) is UNCERTAIN = HOLDER. A second
+    # identity query on its own is not atomic; it counts only inside this pair, bracketed by two equal record reads.
+    $reuseProven = {
+        param($rec, $id)
+        if (-not (Test-RecordedCreatedMismatch -Proc $id -Record $rec)) { return $false }
+        $path = Join-Path $rec.RunDir $rec.File
+        $P = [int]$rec.Pid
+        $t1 = $null
+        try { $t1 = Read-RunDirRecordText -Path $path } catch { return $false }
+        $rt = $rec.PSObject.Properties['RecordText']
+        if ($null -eq $t1 -or -not $rt -or $null -eq $rt.Value -or -not [string]::Equals([string]$rt.Value, [string]$t1, [StringComparison]::Ordinal)) { return $false }
+        $s = & $stampIn $t1 $P
+        if ($null -eq $s -or $s -ne [datetime]$rec.RecordedCreatedUtc) { return $false }
+        $live = & $readIdentity $P
+        if (-not (& $sameIdentity $id $live)) { return $false }
+        $t2 = $null
+        try { $t2 = Read-RunDirRecordText -Path $path } catch { return $false }
+        if ($null -eq $t2 -or -not [string]::Equals([string]$t1, [string]$t2, [StringComparison]::Ordinal)) { return $false }
+        return [bool](Test-RecordedCreatedMismatch -Proc $live -Record ([pscustomobject]@{ RecordedCreatedUtc = $s }))
+    }
+    # r9 (pass-11 A2): only a POSITIVE or UNKNOWN tie answer is kept for the call. A negative one is asked again for the next record, because a
+    # producer can publish the tie (a receipt's workDir) between two records; keeping "not tied" would suppress the later positive answer.
+    $ties = @{}
+    $tiedOf = {
+        param([string]$RunDir)
+        if (-not $ties.ContainsKey($RunDir)) {
+            $ans = $null
+            try { $ans = [pscustomobject]@{ Tied = [bool](Test-RunDirNamesPath -RunDir $RunDir -Path $wd); Error = $null } }
+            catch { $ans = [pscustomobject]@{ Tied = $false; Error = $_.Exception.Message } }
+            if (-not ($ans.Tied -or $ans.Error)) { return $false }
+            $ties[$RunDir] = $ans
+        }
+        if ($ties[$RunDir].Error) { throw $ties[$RunDir].Error }
+        return $ties[$RunDir].Tied
+    }
+    foreach ($rec in $index) {
         if ($rec.Error) { $unreadable.Add($rec); continue }
-        if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
-        $p = $byPid[$rec.Pid]
-        $cl = [string]$p.CommandLine
+        $P = [int]$rec.Pid
+        if ($seen.ContainsKey($P) -or $self -contains $P) { continue }
+        $id = & $identityOf $P
+        if ($null -eq $id) { continue }
+        $row = if ($byPid.ContainsKey($P)) { $byPid[$P] } else { $null }
+        $cl = if ($row) { [string]$row.CommandLine } else { '' }
+        $dt = if ($row) { [string](& $text $row) } else { '' }
         $matched = $null; $enc = ''
         try {
-            if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
-            elseif ((-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+            if ((Test-PathNamed -Text $cl -Path $wd) -or (Test-PathNamed -Text $dt -Path $wd)) { $matched = $wd }
+            elseif (-not (& $reuseProven $rec $id) -and (& $tiedOf $rec.RunDir)) {
                 $matched = $rec.RunDir
-                if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
+                if (-not (Test-PathNamed -Text $cl -Path $rec.RunDir) -and (Test-PathNamed -Text $dt -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
             }
-        } catch { if (-not $fail) { $fail = "$($_.Exception.Message) (live pid $($rec.Pid) recorded by $($rec.File))" }; continue }
+        } catch { if (-not $fail) { $fail = "$($_.Exception.Message) (live pid $P recorded by $($rec.File))" }; continue }
         if (-not $matched) { continue }
-        $seen[$rec.Pid] = $true
-        $rows.Add([pscustomobject]@{ ProcessId = [int]$rec.Pid; Name = [string]$p.Name; Via = "rundir-pid:$($rec.File)$enc"; MatchedPath = $matched })
+        $seen[$P] = $true
+        $rows.Add([pscustomobject]@{ ProcessId = $P; Name = [string]$id.Name; Via = "rundir-pid:$($rec.File)$enc"; MatchedPath = $matched })
     }
     if ($rows.Count) { return $rows.ToArray() }   # a definite holder outranks an unknown: both refuse, this one names the pid
     if ($fail) { throw $fail }
+    # A record that exists but cannot be read (or parsed) may name ANY pid, including one the snapshot does not list (r8 ruling d). r8 (ruling c): no
+    # command line can clear it, so it refuses whenever its run dir names the worktree (an unsettled tie throws too: fails closed).
     foreach ($rec in $unreadable) {
-        $tied = $null   # does the record's run dir name the worktree; asked once, and only when a live pid could be tied through it
-        foreach ($p in @($Snapshot.Procs)) {
-            if ($self -contains [int]$p.ProcessId) { continue }
-            $cl = [string]$p.CommandLine + "`n" + (& $text $p)
-            $hit = Test-PathNamed -Text $cl -Path $wd
-            if (-not $hit -and (-not $cl.Trim() -or (Test-PathNamed -Text $cl -Path $rec.RunDir))) {
-                if ($null -eq $tied) { $tied = [bool](Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd) }   # throws when unknown: fails closed too
-                $hit = $tied
-            }
-            if ($hit) { throw "rundir-record-unreadable path=$($rec.Error)" }
-        }
+        if (& $tiedOf $rec.RunDir) { throw "rundir-record-unreadable path=$($rec.Error)" }
     }
     return $rows.ToArray()
 }
