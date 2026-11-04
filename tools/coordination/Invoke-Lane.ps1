@@ -387,15 +387,15 @@ $CODEX_MCP_DISABLED_FEATURES = @('plugins', 'apps')
 $CODEX_MCP_LIST_STREAM_CAP_CHARS = 1048576
 function Get-CodexMcpDisableArgs {
     param(
-        [Parameter(Mandatory = $true)][string]$CodexExe,
+        # r12 (ADVISORY A3 on c4f381a7, CI run 41644166247): the RESOLVED launch (Resolve-CodexShimLaunch), never the raw shim, so an
+        # unsupported shim is refused before this probe and the probe never runs the shim through cmd.exe.
+        [Parameter(Mandatory = $true)]$CodexLaunch,
         [Parameter(Mandatory = $true)][string]$WorkDir,
         [Parameter(Mandatory = $true)][int]$TimeoutMs
     )
     $featureArgs = @()
     foreach ($f in $CODEX_MCP_DISABLED_FEATURES) { $featureArgs += @('-c', "features.$f=false") }
     $listPsi = [System.Diagnostics.ProcessStartInfo]::new()
-    $listPsi.FileName = $CodexExe
-    foreach ($a in @('mcp', 'list', '--json', '-c', 'features.plugins=false')) { [void]$listPsi.ArgumentList.Add($a) }
     $listPsi.WorkingDirectory = $WorkDir
     $listPsi.UseShellExecute = $false
     $listPsi.CreateNoWindow = $true
@@ -410,6 +410,7 @@ function Get-CodexMcpDisableArgs {
         # `.Result`, and each stream is capped as it arrives; overflow refuses, never truncates.
         $probeBudgetMs = [math]::Max(1, $TimeoutMs)
         $probeSw = [System.Diagnostics.Stopwatch]::StartNew()
+        Set-CodexLaunchStartInfo -Psi $listPsi -Launch $CodexLaunch -Argv @('mcp', 'list', '--json', '-c', 'features.plugins=false')
         $listProc = [System.Diagnostics.Process]::Start($listPsi)
         $listProc.StandardInput.Close()
         $pipes = @(
@@ -450,7 +451,7 @@ function Get-CodexMcpDisableArgs {
         $listText = $pipes[0].Text.ToString()
         $listErrText = $pipes[1].Text.ToString()
     } catch {
-        if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*') { throw }
+        if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*' -or $_.Exception.Message -like 'codex-shim-*' -or $_.Exception.Message -like 'codex-args-too-long:*') { throw }
         throw "codex-mcp-list-unreadable: could not run 'codex mcp list --json': $($_.Exception.Message)"
     }
     if ($listExit -ne 0) {
@@ -510,13 +511,15 @@ function Get-CodexCliVersion {
     try {
         if (-not (Test-Path -LiteralPath $CodexExe -PathType Leaf)) { return $null }
         $vPsi = [System.Diagnostics.ProcessStartInfo]::new()
-        $vPsi.FileName = $CodexExe
-        [void]$vPsi.ArgumentList.Add('--version')
+        # r12 (ADVISORY A3 on c4f381a7): the probe runs the RESOLVED launch, so an unsupported shim is never run (it answers $null here and
+        # the lane refuses it, typed, at its own resolution); the shim is re-hashed immediately before this Process.Start.
+        $vLaunch = Resolve-CodexShimLaunch -Exe $CodexExe
         $vPsi.UseShellExecute = $false
         $vPsi.CreateNoWindow = $true
         $vPsi.RedirectStandardInput = $true
         $vPsi.RedirectStandardOutput = $true
         $vPsi.RedirectStandardError = $true
+        Set-CodexLaunchStartInfo -Psi $vPsi -Launch $vLaunch -Argv @('--version')
         $vProc = [System.Diagnostics.Process]::Start($vPsi)
         $vProc.StandardInput.Close()
         $vOut = $vProc.StandardOutput.ReadToEndAsync()
@@ -1065,6 +1068,8 @@ if ($ImagePathsGiven.Count -gt 0) {
 #   "        quote state: toggles whether every character after it is special
 # '|', '<', '>' and '"' cannot occur in a Windows file name, so for them this is defence in depth. Every other file-name-legal character
 # (space # $ ' + , - . ; = @ [ ] _ ` { } ~) was measured to reach the child unchanged; ',' is refused separately (codex splits on it).
+# r12 (Dot item 4 on c4f381a7): since r11 the codex launch is a direct CreateProcess, never cmd.exe, so the launch path no longer applies this
+# pattern or the '!' rule (Copy-ImageSnapshot -RefuseCmdMeta/-RefuseBang $false); both stay here, fail closed by default, for a cmd.exe transport.
 $IMAGE_CMD_META_PATTERN = '[%^&|<>()"]'
 $IMAGE_CMD_META_TEXT = "a cmd.exe metacharacter (% ^ & | < > ( ) or a double quote; codex is launched through a .cmd shim, and cmd.exe rewrites them -- choose a run dir without them)"
 $IMAGE_CMD_BANG_TEXT = "'!' while cmd.exe delayed expansion can be on for the codex shim (Command Processor\DelayedExpansion, or the shim enables it), which rewrites it -- choose a run dir without '!'"
@@ -1168,7 +1173,9 @@ function Get-ImageIoException {
 }
 function Copy-ImageSnapshot {
     # -RefuseBang: refuse '!' in the resolved path (the launcher passes Test-CmdDelayedExpansion's answer; unset = refuse, fail closed).
-    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs, [bool]$RefuseBang = $true)
+    # -RefuseCmdMeta (r12): refuse the cmd.exe metacharacters only when cmd.exe would forward the path; unset = refuse (fail closed). The
+    # codex launch is a direct CreateProcess and passes $false.
+    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs, [bool]$RefuseBang = $true, [bool]$RefuseCmdMeta = $true)
     if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "image-path-snapshot-collision: the image snapshot path is the source file itself: $Source"
     }
@@ -1238,7 +1245,7 @@ function Copy-ImageSnapshot {
         }
         if ($null -ne $reparse) { throw [System.IO.IOException]::new("image-path-reparse-ancestor: the resolved image snapshot path has a reparse point in its ancestry ($reparse) ($finalPath)") }
         if ($finalPath.Contains(',')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ',' (codex splits an -i value on commas): $finalPath") }
-        if ($finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_META_TEXT}: $finalPath") }
+        if ($RefuseCmdMeta -and $finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_META_TEXT}: $finalPath") }
         if ($RefuseBang -and $finalPath.Contains('!')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_BANG_TEXT}: $finalPath") }
         $ok = $true
     } finally {
@@ -1541,6 +1548,8 @@ function Find-CodexProgramOnPath {
     # entry is skipped: the program is launched by the absolute path returned here, never searched for again by anyone else.
     # r11 fix iteration 2 (adversary A1 on 06b68082): PATHEXT '.EXE;\..\cmd.exe' made 'node' + '\..\cmd.exe' resolve to cmd.exe. A candidate
     # counts only when it is a plain leaf name (no separator, ':' or '..') whose full path is exactly <entry>\<Name><ext>.
+    # r12 (adversary A1 on c4f381a7): the check compares FULL candidate paths, never trimmed directory strings. GetDirectoryName('C:\node.exe')
+    # is 'C:\' while GetFullPath('C:\').TrimEnd('\') is 'C:', so a drive-root PATH entry was skipped and a later node selected.
     param([Parameter(Mandatory = $true)][string]$Name, [string[]]$Extensions = @(''))
     foreach ($raw in (([string]$env:PATH) -split ';')) {
         $d = $raw.Trim().Trim('"')
@@ -1551,11 +1560,11 @@ function Find-CodexProgramOnPath {
             $leaf = $Name + $e
             if ($leaf -match '[\\/:]' -or $leaf.Contains('..') -or $leaf.Trim() -ne $leaf -or $leaf.EndsWith('.')) { continue }
             try {
-                $c = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($d, $leaf))
-                $sameDir = [string]::Equals([System.IO.Path]::GetDirectoryName($c), [System.IO.Path]::GetFullPath($d).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)
-                $sameLeaf = [string]::Equals([System.IO.Path]::GetFileName($c), $leaf, [System.StringComparison]::OrdinalIgnoreCase)
+                $want = [System.IO.Path]::Combine([System.IO.Path]::GetFullPath($d), $leaf)
+                $c = [System.IO.Path]::GetFullPath($want)
+                $same = [string]::Equals($c, $want, [System.StringComparison]::OrdinalIgnoreCase)
             } catch { continue }
-            if (-not ($sameDir -and $sameLeaf)) { continue }
+            if (-not $same) { continue }
             if ([System.IO.File]::Exists($c)) { return $c }
         }
     }
@@ -1649,6 +1658,37 @@ function Resolve-CodexShimLaunch {
     }
     if (-not $file) { & $refuse "runs '$target', which does not exist (absolute PATH entries searched for a bare name)" }
     return [pscustomobject]@{ Kind = 'single-exe'; FileName = $file; PrefixArgs = $prefix; Shim = $Exe; ShimSha256 = $read.Sha256 }
+}
+# r12 (adversary A2 on c4f381a7, Dot B1 on c4f381a7; hub step E): ONE binding model. The shim is read once (Resolve-CodexShimLaunch), the launch
+# (program + full argv) is derived from that read, THAT command line is bounded for the transport that runs it, the shim is re-hashed
+# immediately before Process.Start, and only then is the process started. r11 bounded the ORIGINAL .cmd with the cmd.exe allowance (~7.6k)
+# before resolving, so a direct native launch that fits CreateProcess's 32767 was refused, and a shim replaced between that check and the
+# resolver's read was never bounded at all. A resolved launch is always a native program, so its transport is CreateProcess; a resolved
+# batch file is not a launch this model knows and is refused (fail closed). Every codex process (the --version and 'mcp list' probes and
+# the lane itself) is started through Set-CodexLaunchStartInfo, so none of them runs the raw shim through cmd.exe.
+function Assert-CodexLaunchFits {
+    param([Parameter(Mandatory = $true)]$Launch, [string[]]$Argv = @(), [int]$ImageCount = 0)
+    $file = [string]$Launch.FileName
+    $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
+    if ($ext -eq '.cmd' -or $ext -eq '.bat') {
+        throw "codex-shim-unsupported: the resolved codex launch '$file' is itself a batch file, which only cmd.exe runs; refused before launch"
+    }
+    return (Assert-CodexCommandLineFits -Exe $file -Argv (@($Launch.PrefixArgs) + @($Argv)) -ImageCount $ImageCount)
+}
+function Set-CodexLaunchStartInfo {
+    # Bounds the resolved command line, re-hashes the shim it was derived from, and only then sets FileName and ArgumentList. The caller
+    # calls Process.Start on $Psi next, with nothing in between.
+    param([Parameter(Mandatory = $true)]$Psi, [Parameter(Mandatory = $true)]$Launch, [string[]]$Argv = @(), [int]$ImageCount = 0)
+    $null = Assert-CodexLaunchFits -Launch $Launch -Argv $Argv -ImageCount $ImageCount
+    if ($Launch.Shim) {
+        $shimNow = (Read-CodexShimBytes -Path $Launch.Shim).Sha256
+        if ($shimNow -ne $Launch.ShimSha256) {
+            throw "codex-shim-changed: the codex shim '$($Launch.Shim)' changed between inspection (sha256 $($Launch.ShimSha256)) and launch (sha256 $shimNow); refused before launch"
+        }
+    }
+    $Psi.FileName = [string]$Launch.FileName
+    $Psi.ArgumentList.Clear()
+    foreach ($a in (@($Launch.PrefixArgs) + @($Argv))) { [void]$Psi.ArgumentList.Add([string]$a) }
 }
 # END Assert-CodexCommandLineFits
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
@@ -2298,10 +2338,17 @@ if ($cfg.engine -eq 'claude') {
     # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): a read-only lane gets NO MCP tool,
     # since every MCP server runs outside the sandbox (see Get-CodexMcpDisableArgs). Throws, so
     # the launch is refused, when the server list cannot be read. workspace-write is untouched.
+    # r11 (sol r10 B1/B2, fable r10 B1): the codex child is never a cmd.exe running the shim (see Resolve-CodexShimLaunch); an
+    # unsupported shim is refused here, typed, before launch, and the bytes read here are re-hashed immediately before Process.Start.
+    # r12 (CI run 41644166247, ADVISORY A3 on c4f381a7): resolved BEFORE the 'mcp list' probe, which runs this same launch. r11 ran the
+    # probe on the raw shim through cmd.exe first: on Windows Server 2025 'nul.exe' is no longer the NUL device, so the fixture shim
+    # '<inner><nul.exe %*' failed inside cmd.exe, the probe refused the lane as codex-mcp-list-unreadable (exit 127), and the resolver's
+    # typed refusal never ran. On Windows 10 'nul.exe' is still NUL, which is why the same test passed locally.
+    $codexLaunch = Resolve-CodexShimLaunch -Exe $exe
     $mcpServers = 'default'; $mcpDisabledServers = @(); $mcpArgs = @()
     if ($sandbox -eq 'read-only') {
         $mcpListTimeoutMs = [int][math]::Min(60000.0, [math]::Max(1.0, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
-        $mcpDisable = Get-CodexMcpDisableArgs -CodexExe $exe -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
+        $mcpDisable = Get-CodexMcpDisableArgs -CodexLaunch $codexLaunch -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
         $mcpServers = 'disabled'; $mcpDisabledServers = @($mcpDisable.Servers); $mcpArgs = @($mcpDisable.Args)
     }
     # VISUAL-JUDGE-TERRA-LANE-1: `-i, --image <FILE>...` is VARIADIC on codex 0.160.1 (codex-image-flag.txt), so
@@ -2311,19 +2358,15 @@ if ($cfg.engine -eq 'claude') {
     # describe the very bytes codex reads, whatever happens to the source afterwards (adversary A2). The copies stay
     # in the run dir as evidence of exactly what the judge saw.
     $imageSeq = 0
-    # r8 iteration 2: '!' is refused only when delayed expansion can be on for this shim (see $IMAGE_CMD_META_PATTERN); a native exe has no cmd.exe.
-    $imageRefuseBang = $false
-    if (@($ImageAttachments).Count -gt 0) {
-        $imageExeExt = [System.IO.Path]::GetExtension($exe).ToLowerInvariant()
-        $imageRefuseBang = ($imageExeExt -eq '.cmd' -or $imageExeExt -eq '.bat') -and (Test-CmdDelayedExpansion -Shim $exe -WorkingDirectory $WorkDir)
-    }
+    # r12 (Dot improvement on c4f381a7, item 4): the cmd.exe metacharacter ('%' '^' '&' '(' ')') and delayed-expansion ('!') refusals were
+    # for an argument cmd.exe forwards via %*. The codex launch is a direct CreateProcess (Assert-CodexLaunchFits refuses a batch file), which
+    # hands every -i path to codex unchanged, so those refusals are gone from this path. The genuine constraints stay: ',' (codex splits an
+    # -i value on commas), the snapshot/hold/reparse checks, and the native command-line bound.
     foreach ($attachment in $ImageAttachments) {
         $imageSeq++
         $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
         if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
-        if ($snapshot -match $IMAGE_CMD_META_PATTERN) { throw "image-path-bad-character: the image snapshot path contains ${IMAGE_CMD_META_TEXT}: $snapshot" }
-        if ($imageRefuseBang -and $snapshot.Contains('!')) { throw "image-path-bad-character: the image snapshot path contains ${IMAGE_CMD_BANG_TEXT}: $snapshot" }
-        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0) -RefuseBang $imageRefuseBang
+        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0) -RefuseBang $false -RefuseCmdMeta $false
         # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
         # r5 B1: that string is the RESOLVED path of the held object (Copy-ImageSnapshot's Path), not the name the copy went through.
         $snapshot = [string]$snapshotInfo.Path
@@ -2344,11 +2387,10 @@ if ($cfg.engine -eq 'claude') {
               '-o', $lastPath,
               '--skip-git-repo-check',
               '-')
-    # r8 (ADV-A2): refuse, typed, a command line cmd.exe would reject, before the child is started (see Assert-CodexCommandLineFits).
-    $null = Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount @($ImageAttachments).Count -WorkingDirectory $WorkDir
-    # r11 (sol r10 B1/B2, fable r10 B1): the codex child is never a cmd.exe running the shim (see Resolve-CodexShimLaunch); an
-    # unsupported shim is refused here, typed, before launch, and the bytes read here are re-hashed immediately before Process.Start.
-    $codexLaunch = Resolve-CodexShimLaunch -Exe $exe
+    # r12 (adversary A2, Dot B1 on c4f381a7): the command line bounded is the RESOLVED one (program + prefix + argv) derived from the single
+    # shim read above, held to the limit of the transport that runs it (CreateProcess). Set-CodexLaunchStartInfo bounds it again, re-hashes
+    # the shim, and sets the start info immediately before Process.Start.
+    $null = Assert-CodexLaunchFits -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count
     $launchFile = [string]$codexLaunch.FileName
     $launchArgv = @($codexLaunch.PrefixArgs) + $argv
     # post-shim-resolution-tick
@@ -2519,14 +2561,7 @@ $enc=[Text.UTF8Encoding]::new($false)
     $jobAssigned = $true
 } else {
     # r11 (sol r10 B2): the shim bytes Resolve-CodexShimLaunch read must still be the bytes on disk now; a change is refused, typed.
-    if ($codexLaunch.Shim) {
-        $shimNow = (Read-CodexShimBytes -Path $codexLaunch.Shim).Sha256
-        if ($shimNow -ne $codexLaunch.ShimSha256) {
-            throw "codex-shim-changed: the codex shim '$($codexLaunch.Shim)' changed between inspection (sha256 $($codexLaunch.ShimSha256)) and launch (sha256 $shimNow); refused before launch"
-        }
-    }
-    $psi.FileName = $launchFile
-    foreach ($a in $launchArgv) { [void]$psi.ArgumentList.Add($a) }
+    Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count
     $proc = [Diagnostics.Process]::Start($psi)
 }
 

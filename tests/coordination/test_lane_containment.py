@@ -1291,6 +1291,10 @@ try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGH
 def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded,delayed):
     # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
     # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
+    # r12 (Dot improvement on c4f381a7, item 4): since r11 the codex child is a direct CreateProcess, never cmd.exe, so a path cmd.exe would
+    # have rewritten reaches codex unchanged. The invariant is unchanged (never certify Q); what follows from it is now transport-exact:
+    # with the plain shim the launch proceeds and the child reads P at the literal path; a shim that enables delayed expansion (or forwards
+    # through a redirection) is not a launchable shape and is refused, typed, before launch. The %OS% row is the item-4 RED on c4f381a7.
     if delayed=="2>nul-inner":
         inner=fixture_tree["root"]/"inner"
         if " " in str(inner): pytest.skip("the unquoted extensionless target needs a space-free fixture path")
@@ -1299,7 +1303,7 @@ def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(f
     elif delayed:
         enable=delayed if isinstance(delayed,str) else "setlocal enabledelayedexpansion"
         fixture_tree["shim"].write_text(f'@echo off\r\n{enable}\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
-    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
     run_dir=root/dirname; run_dir.mkdir()
     if expanded:
         (root/expanded).mkdir(); (root/expanded/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
@@ -1314,8 +1318,15 @@ def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(f
         seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
         entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
         assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
-    assert r.returncode!=0 and "image-path-bad-character" in text,(r.returncode,text)
-    assert not (root/"args.json").exists(), "a path cmd.exe would rewrite must never reach the codex launch"
+    if delayed:
+        assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+        assert not (root/"args.json").exists(), "a shim cmd.exe would have to run must never reach the codex launch"
+        return
+    assert r.returncode==0,(r.returncode,text[-4000:])
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert dirname in seen[0]["path"] and seen[0]["path"]==entry["path"],(entry,seen)
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"]==sha,(entry,seen)
 
 
 # r8 (ADV-A1): the refused set is the class cmd.exe can rewrite in a %*-forwarded argument. '|', '<', '>' and '"' cannot be in a Windows file
@@ -1721,8 +1732,11 @@ def test_a_model_override_cmd_would_expand_past_the_limit_is_refused_before_the_
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_ADV_PAD"]="x"*8100
     r=run_lane(cmd+["-ModelOverride","%MLV_ADV_PAD%","-ImagePaths",str(png)],env)
     text=_failure_text(r,receipt)
-    assert r.returncode!=0 and "codex-arg-cmd-expansion" in text,(r.returncode,text[-4000:])
-    assert not (root/"args.json").exists(), "an argument cmd.exe would expand must be refused before the codex child starts"
+    # r12 (Dot improvement on c4f381a7, item 4): the codex child is a direct CreateProcess, so nothing expands '%MLV_ADV_PAD%': codex receives
+    # the literal 13 characters that were counted, never the 8100-character value. Refusing it (codex-arg-cmd-expansion) was a cmd.exe rule.
+    assert (root/"args.json").exists(),(r.returncode,text[-4000:])
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert "%MLV_ADV_PAD%" in argv and not any("x"*100 in a for a in argv),argv
 
 
 def test_a_run_dir_with_a_bang_is_refused_for_every_codex_argument_when_the_shim_runs_delayed_expansion(fixture_tree):
@@ -1735,7 +1749,9 @@ def test_a_run_dir_with_a_bang_is_refused_for_every_codex_argument_when_the_shim
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
     r=run_lane(cmd,env)
     text=_failure_text(r,run_dir/"terra-001.receipt.json")
-    assert r.returncode!=0 and "codex-arg-cmd-expansion" in text,(r.returncode,text[-4000:])
+    # r12: the delayed-expansion shim is not a launchable shape (it needs cmd.exe), so it is refused, typed, at resolution, which now runs
+    # before every probe and every argument bound.
+    assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
     assert not (root/"args.json").exists()
 
 
@@ -1976,6 +1992,128 @@ def test_r11_the_npm_template_needs_a_native_node_on_an_absolute_path_entry(tmp_
     else: assert "CAUGHT codex-shim-unsupported:" in out and "npm template" in out,out
 
 
+# r12 (adversary A1/A2, Dot B1, Dot item 4, CI run 41644166247 on c4f381a7; hub step E): read once, resolve, bound the resolved command for
+# its real transport, re-hash, launch. Each test below is RED on c4f381a7 (evidence under the r12 run dir) and GREEN on r12.
+def _free_drive_letter():
+    for letter in "QRSTUVWXYZPONMLK":
+        if not os.path.exists(f"{letter}:\\"): return letter
+    pytest.skip("no free drive letter for a subst root")
+
+
+def test_r12_a1_a_drive_root_path_entry_is_searched(tmp_path):
+    # adversary A1 on c4f381a7, literal shape: PATH=<root>:\;<later dir>, a node.exe in both, the npm template with no node.exe beside it.
+    # GetDirectoryName('Q:\node.exe')='Q:\' was compared with GetFullPath('Q:\').TrimEnd('\')='Q:', so the root entry was skipped and the
+    # later node selected; siblings: a bare program name in a one-line shim (refused 'does not exist' when the root is the only entry).
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    rootdir=tmp_path/"r"; rootdir.mkdir(); (rootdir/"node.exe").write_bytes(b"MZ"); (rootdir/"codex.exe").write_bytes(b"MZ")
+    later=tmp_path/"p2"; later.mkdir(); (later/"node.exe").write_bytes(b"MZ")
+    letter=_free_drive_letter()
+    made=subprocess.run(["subst",f"{letter}:",str(rootdir)],capture_output=True,text=True)
+    if made.returncode!=0: pytest.skip(f"subst unavailable: {made.stdout}{made.stderr}")
+    try:
+        out=_resolve(tmp_path,_NPM_SHIM,pre=f"$env:PATH = '{letter}:\\;{later}'\n$env:PATHEXT = '.EXE'\n")
+        assert "KIND npm-node" in out and f"FILE {letter}:\\node.exe".lower() in out.lower(),out
+        out=_resolve(tmp_path,"@echo off\r\ncodex.exe %*\r\n",pre=f"$env:PATH = '{letter}:\\'\n")
+        assert "KIND single-exe" in out and f"FILE {letter}:\\codex.exe".lower() in out.lower(),out
+    finally:
+        subprocess.run(["subst",f"{letter}:","/d"],capture_output=True,text=True)
+
+
+def test_r12_the_resolved_native_launch_is_bounded_by_createprocess_not_by_cmd(tmp_path):
+    # Dot B1 on c4f381a7 (unit): the npm template resolves to <node.exe> <script>; THAT command line is held to CreateProcess's 32767 characters
+    # (32766 plus the terminator). (a) 10,000 characters, above the old cmd.exe allowance of about 7.6k, fits; (b) exactly 32766 fits and 32767
+    # is refused, typed, with the image kind when images are attached.
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    (tmp_path/"node.exe").write_bytes(b"MZ")
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(_NPM_SHIM.encode("ascii"))
+    r=_cmdline_harness(tmp_path,f"""
+$x = Resolve-CodexShimLaunch -Exe '{shim}'
+'KIND ' + $x.Kind
+$l1 = Get-NativeCommandLineLength -Exe $x.FileName -Argv (@($x.PrefixArgs) + @('exec', 'x'))
+function Try-K($label, $k, $img) {{
+  try {{ $label + ' FITS ' + (Assert-CodexLaunchFits -Launch $x -Argv @('exec', ('x' * $k)) -ImageCount $img) }} catch {{ $label + ' REFUSED ' + $_.Exception.Message }}
+}}
+Try-K 'above-cmd' 10000 3
+Try-K 'edge' (32766 - $l1 + 1) 3
+Try-K 'past' (32766 - $l1 + 2) 3
+Try-K 'past-noimg' (32766 - $l1 + 2) 0
+""")
+    out=r.stdout
+    assert "KIND npm-node" in out,(out,r.stderr)
+    assert "above-cmd FITS " in out,(out,r.stderr)
+    assert "edge FITS 32766" in out,(out,r.stderr)
+    assert "past REFUSED image-args-too-long: the codex command line would be 32767 characters" in out,(out,r.stderr)
+    assert "past-noimg REFUSED codex-args-too-long:" in out,(out,r.stderr)
+
+
+def test_r12_dot_b1_a_native_launch_above_the_old_cmd_bound_is_accepted(fixture_tree):
+    # Dot B1 on c4f381a7 (end to end, native-valid-above-CMD-bound): 120 images put the codex command line well past the old cmd.exe allowance
+    # (r11 refused it image-args-too-long against the ORIGINAL .cmd) and well under 32767. The direct launch must proceed and attach them all.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths","|".join([str(png)]*120)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode==0 and (root/"args.json").exists(),(r.returncode,text[-4000:])
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv.count("-i")==120 and sum(len(a)+1 for a in argv)>8191,len(argv)
+
+
+def test_r12_a2_a_shim_replaced_before_the_one_read_is_bounded_as_resolved(fixture_tree):
+    # adversary A2 on c4f381a7: r11 bounded the short shim, then the resolver read a replacement (an allowlisted pwsh line with 5000 ' -NoLogo',
+    # ~40k bytes, under the 64 KiB read cap) and nothing bounded the resolved 40k native command. Now the bound is derived from the one read
+    # the launch comes from, so the replacement is refused, typed, before any process starts.
+    long_line='@echo off\r\n"'+PWSH+'"'+" -NoLogo"*5000+f' -File "{fixture_tree["child"]}" %*\r\n'
+    assert 40000<len(long_line)<65536
+    anchor="    $codexLaunch = Resolve-CodexShimLaunch -Exe $exe\n"
+    swap=(f"[System.IO.File]::WriteAllText('{str(fixture_tree['shim']).replace(chr(39),chr(39)*2)}', "
+          f"'{long_line.replace(chr(39),chr(39)*2)}'.Replace('\\r\\n', [string][char]13 + [char]10))\n")
+    def mutation(text):
+        assert text.count(anchor)==1, "resolution anchor moved; update this fixture mutation"
+        return text.replace(anchor, swap+anchor)
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "args-too-long: the codex command line would be" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+def test_r12_ci_41644166247_a_shim_the_raw_probe_cannot_run_is_refused_typed_by_resolution(fixture_tree):
+    # CI run 41644166247 (hosted job 125944985709, Windows Server 2025): the r11 fable B1 fixture shim '<inner><nul.exe %*' was run RAW by the
+    # --version and 'mcp list' probes through cmd.exe before the resolver. On Server 2025 'nul.exe' is not the NUL device, so cmd.exe failed
+    # the redirection, the probe refused the lane codex-mcp-list-unreadable (exit 127) and the typed codex-shim-unsupported never ran. This is
+    # the same shape with an input file that is absent on every host, so it is RED here too. Resolution now runs before any probe.
+    fixture_tree["shim"].write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %* <r12-absent-input.exe\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unsupported" in text and "codex-mcp-list-unreadable" not in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+def test_r12_a3_an_unsupported_shim_is_never_run_by_any_probe(fixture_tree):
+    # ADVISORY A3 on c4f381a7, literal shape: a shim whose first command line writes a marker. r11's --version and 'mcp list' probes ran it
+    # through cmd.exe before the resolver refused it, so the marker appeared. Every probe now runs the resolved launch: no process starts.
+    marker=fixture_tree["root"]/"probe-ran.txt"
+    fixture_tree["shim"].write_text(f'@echo off\r\necho probe-ran>"{marker}"\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+    assert not marker.exists(), "an unsupported shim was run by a probe before it was refused"
+    assert not (root/"args.json").exists()
+
+
 def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):
     # r8 (ADV-A2): every accepted -ImagePaths entry became one `-i <snapshot>` pair, and 120 of them pushed the command line past cmd.exe's
     # 8191 characters: the shim answered "The command line is too long." and codex never ran. The launcher must refuse it typed instead.
@@ -1983,9 +2121,13 @@ def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fi
     cache=_terra_env(fixture_tree)
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
     env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
-    r=run_lane(cmd+["-ImagePaths","|".join([str(png)]*120)],env)
+    # r12 (Dot B1 on c4f381a7): the bound is the native CreateProcess limit of the RESOLVED launch, so the count is the one that passes 32767
+    # characters on this host's run dir (120 now fits; see test_r12_dot_b1_a_native_launch_above_the_old_cmd_bound_is_accepted).
+    snap=len(str(Path(cmd[cmd.index("-RunDir")+1])/"terra-001.image-001.png"))
+    n=32767//(snap+4)+20
+    r=run_lane(cmd+["-ImagePaths","|".join([str(png)]*n)],env)
     text=_failure_text(r,receipt)
-    assert r.returncode!=0 and "image-args-too-long" in text,(r.returncode,text[-4000:])
+    assert r.returncode!=0 and "image-args-too-long" in text,(n,r.returncode,text[-4000:])
     assert not (root/"args.json").exists(), "an over-long command line must be refused before the codex child starts"
 
 
@@ -2066,13 +2208,12 @@ def test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable(fixtur
 def test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_recorded(fixture_tree):
     def mutation(text):
         # r11: the codex launch runs the resolved program (Resolve-CodexShimLaunch) with its literal prefix arguments.
-        old = ("    $psi.FileName = $launchFile\n"
-               "    foreach ($a in $launchArgv) { [void]$psi.ArgumentList.Add($a) }\n"
+        # r12: the start info is set by Set-CodexLaunchStartInfo (bound, re-hash, FileName/ArgumentList) right before Process.Start.
+        old = ("    Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count\n"
                "    $proc = [Diagnostics.Process]::Start($psi)\n"
                "}")
         assert old in text, "codex Process.Start block text has moved; update this fixture mutation"
-        new = ("    $psi.FileName = $launchFile\n"
-               "    foreach ($a in $launchArgv) { [void]$psi.ArgumentList.Add($a) }\n"
+        new = ("    Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count\n"
                "    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
                "}")
         return text.replace(old, new)
