@@ -227,9 +227,10 @@ class UtilSampleGeneratorTests(unittest.TestCase):
         child_path.write_text(child, encoding="utf-8")
         proc = run_pwsh(["-File", str(script), str(child_path)])
         self.assertIn("BAD=0", proc.stdout, proc.stdout + proc.stderr)
-        # adversary f685c478 A2: the child's exit 0 (its ownership signal) is emitted only once its CreateNew succeeded
+        # adversary f685c478 A2: the child's exit 0 (its ownership signal) is emitted only once its CreateNew succeeded; adversary fa1197b4 A1: and
+        # only once its last write and the close succeeded
         for name in ("function Read-UtilSampleClock", "function Invoke-UtilSampleCpuLoop", "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs",
-                     "if ($null -ne $us -and $us.created) { exit 0 }\nexit 6"):
+                     "if ($null -ne $us -and $us.created -and $us.written) { exit 0 }\nexit 6", "$res.written = $wrote"):
             self.assertIn(name, child)
 
 
@@ -810,6 +811,67 @@ $r['k2B2'] = @{
     reusedBeforeStart = (Invoke-GpuGuardian (New-GpuWorld 'repl' $false 0) $k2ticks 400)
     stopFile = (Invoke-GpuGuardian (New-GpuWorld 'orig' $false 0) $k2ticks 4000 (Join-Path $t 'k2.stop'))
 }
+# ---- adversary fa1197b4 A1 (exact input): log session 1 starts at P and summarizes at P+20s (elapsed_ms=20000); twenty complete steady rows at
+# total=50 cover the window, then a stepped row (step=100) is appended without its newline and with only six fields. At fa1197b4 the split dropped
+# it as tornTail, the witness checked only unparseable, and the window was verified: status=ok, totalMean=50
+$f1p = [DateTime]::new(2026, 11, 2, 14, 0, 0, 0, [DateTimeKind]::Utc)
+$f1log = "[2026-11-02T14:00:00.000Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$f1body = $H; for ($i = 1; $i -le 20; $i++) { $f1body += (CpuRow $f1p.AddSeconds($i) 50 1234 1 $f1p.AddSeconds($i - 1) '0' 1000 1000) }
+function F1Case([string]$Text) {
+    $p = ConvertFrom-UtilSampleCpuCsv $Text
+    $w = Get-UtilSamplePlayWindow $f1log
+    if ($null -ne $w) { $w['clockWhy'] = Get-UtilSampleClockWitness $p $run $w }
+    $s = Get-UtilSampleCpuSummary $p $run $w $okStop
+    @{ rows = $p.rows.Count; torn = [bool]$p.tornTail; unparseable = $p.unparseable; window = ($null -ne $w); clockWhy = $(if ($null -ne $w) { $w.clockWhy } else { 'no-window' }); status = $s.status; totalMean = $s.totalMean }
+}
+$r['f1A1'] = @{ torn = (F1Case ($f1body + '2026-11-02T14:00:20.1000000Z,,,,2026-11-02T14:00:19.0000000Z,100')); clean = (F1Case $f1body) }
+# ---- adversary fa1197b4 A1, second half (in-process, the child's own error semantics): once a row is written another handle locks the CSV, so the
+# next row's write fails. A .NET write failure inside the loop's try/finally is statement-terminating: the loop returned created=true and the child's
+# exit line (lifted from the generator) exited 0, its ownership signal, over a file whose last write never landed
+$f1child = @($genStrings | Where-Object { $_.Contains('$us = Invoke-UtilSampleCpuLoop') })[0]
+$f1after = $false; $f1exit = [Collections.Generic.List[string]]::new()
+foreach ($ln in @($f1child -split "\r?\n")) { if ($f1after -and $ln.Trim().Length -gt 0) { $f1exit.Add($ln) }; if ($ln.Contains('$us = Invoke-UtilSampleCpuLoop')) { $f1after = $true } }
+$f1decide = [scriptblock]::Create("param(`$us)`n" + (($f1exit -join "`n") -replace '\bexit (\d+)', 'return $1'))
+$f1csv = Join-Path $t 'f1w.csv'; $script:f1n = 0; $script:f1lock = $null
+$f1snap = { param($br, $sw)
+    $script:f1n++
+    if ($script:f1n -eq 3 -and $null -eq $script:f1lock) { $script:f1lock = [IO.File]::Open($f1csv, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite); $script:f1lock.Lock(0, 1099511627776) }
+    if ($null -ne $br -and $null -ne $sw) { $br['a'] = $sw.Elapsed.TotalMilliseconds; $br['b'] = $br['a'] }; @{} }
+$f1res = & { $ErrorActionPreference = 'Continue'; Invoke-UtilSampleCpuLoop $f1csv (Join-Path $t 'f1w.stop') 'no-such-process-name-xyz' 200 2000 { 5 } 0 0 0 0 $null '' $f1snap 2>$null }
+$f1res = @($f1res)[-1]
+$f1locked = ($null -ne $script:f1lock)
+if ($f1locked) { try { $script:f1lock.Unlock(0, 1099511627776) } catch { }; $script:f1lock.Dispose() }
+$f1okRes = & { $ErrorActionPreference = 'Continue'; Invoke-UtilSampleCpuLoop (Join-Path $t 'f1ok.csv') (Join-Path $t 'f1ok.stop') 'no-such-process-name-xyz' 200 700 { 5 } 0 0 0 0 $null '' { param($br, $sw) @{} } 2>$null }
+$f1okRes = @($f1okRes)[-1]
+$r['f1Write'] = @{ locked = $f1locked; created = [bool]$f1res.created; endedBy = $f1res.endedBy; fileRows = @([IO.File]::ReadAllLines($f1csv)).Count
+    exit = (& $f1decide $f1res); okEndedBy = $f1okRes.endedBy; okExit = (& $f1decide $f1okRes); exitLines = @($f1exit) }
+# ---- adversary fa1197b4 A3 (exact case, in-memory double): the CPU child is running and its CSV created; the first pre-stop HasExited=false; the
+# stop file is published; WaitForExit(5000)=false; both Kill attempts throw Win32Exception(5). The child then sees the original stop file and exits
+# 0 before the outer finally's retry, which passes the unsuccessful first record as Prev. At fa1197b4 the retry read HasExited=true as its own
+# pre-stop observation: exitedBeforeStop=true, the CSV unowned. Sibling (GPU): nvidia-smi's two Kills throw, then it is gone before the retry
+function New-StuckDouble {
+    $d = [pscustomobject]@{ exited = $false; code = $null; kills = 0 }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $this.exited }
+    $d | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { $this.code }
+    $d | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $this.exited }
+    $d | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.kills++; throw [ComponentModel.Win32Exception]::new(5) }
+    $d
+}
+$f3c = New-StuckDouble; $f3g = New-StuckDouble; $script:f3stops = 0
+$f3first = Stop-UtilSampleAll ([ordered]@{ proc = $f3g }) ([ordered]@{ proc = $f3c }) { $script:f3stops++ } 5000
+$f3c.exited = $true; $f3c.code = 0; $f3g.exited = $true; $f3g.code = 1
+$f3retry = Stop-UtilSampleAll ([ordered]@{ proc = $f3g }) ([ordered]@{ proc = $f3c }) { $script:f3stops++ } 5000 $f3first
+$r['f3A3'] = @{ firstStopped = [bool]$f3first.cpu.stopped; firstEarly = [bool]$f3first.cpu.exitedBeforeStop; firstKills = $f3c.kills; firstOwned = [bool](Test-UtilSampleCpuOwned $run $f3first)
+    retryStopped = [bool]$f3retry.cpu.stopped; retryExit = $f3retry.cpu.exitCode; retryEarly = [bool]$f3retry.cpu.exitedBeforeStop; retryKilled = [bool]$f3retry.cpu.killed
+    owned = [bool](Test-UtilSampleCpuOwned $run $f3retry); stopped = [bool](Test-UtilSampleStopped $f3retry)
+    gpuFirstStopped = [bool]$f3first.gpu.stopped; gpuRetryStopped = [bool]$f3retry.gpu.stopped; gpuRetryEarly = [bool]$f3retry.gpu.exitedBeforeStop }
+# control: a CPU child that had already ended before the first stop keeps exitedBeforeStop=true through a retry (the carried observation is the
+# first stop's, never a guess)
+$f3e = New-StuckDouble; $f3e.exited = $true; $f3e.code = 0; $f3eg = New-StuckDouble
+$f3efirst = Stop-UtilSampleAll ([ordered]@{ proc = $f3eg }) ([ordered]@{ proc = $f3e }) { } 5000
+$f3eg.exited = $true
+$f3eretry = Stop-UtilSampleAll ([ordered]@{ proc = $f3eg }) ([ordered]@{ proc = $f3e }) { } 5000 $f3efirst
+$r['f3A3Early'] = @{ early = [bool]$f3eretry.cpu.exitedBeforeStop; owned = [bool](Test-UtilSampleCpuOwned $run $f3eretry) }
 Write-Output (J $r)
 """
 
@@ -1097,6 +1159,37 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertFalse(a3["cpuEarly"], f"the retry overwrote the clean CPU stop with exitedBeforeStop=true: {a3}")
         self.assertTrue(a3["owned"], a3)
         self.assertEqual(a3["published"], ["cpu-util.csv=utc,cpuTotal"], f"the finally dropped the CPU CSV the child created: {a3}")
+
+    def test_adv_fa1197b4_a1_a_torn_stepped_tail_leaves_the_clock_unverified(self) -> None:
+        # exact input: at fa1197b4 the torn stepped row was dropped as tornTail and the witness verified the window (clockWhy None, status ok, 50)
+        a1 = self.r["f1A1"]
+        torn, clean = a1["torn"], a1["clean"]
+        self.assertEqual((torn["rows"], torn["torn"], torn["unparseable"], torn["window"]), (20, True, 0, True), f"the probe did not build the finding's shape: {a1}")
+        self.assertEqual(torn["clockWhy"], "sample-clock-unverified", f"a dropped torn tail (step=100) left the window verified: {a1}")
+        self.assertNotEqual(torn["status"], "ok", a1)
+        self.assertIsNone(torn["totalMean"], a1)
+        # control: the same twenty rows, cleanly ended, still verify and summarize
+        self.assertEqual((clean["torn"], clean["clockWhy"], clean["status"], clean["totalMean"]), (False, None, "ok", 50), a1)
+
+    def test_adv_fa1197b4_a1_the_child_exits_0_only_after_its_last_write(self) -> None:
+        # at fa1197b4 a row write that failed (the CSV locked under it) still returned created=true, and the child's exit line said 0 (owned)
+        w = self.r["f1Write"]
+        self.assertTrue(w["locked"], f"the probe never locked the CSV: {w}")
+        self.assertEqual((w["created"], w["endedBy"]), (True, None), f"the write failure did not end the loop: {w}")
+        self.assertEqual(w["exit"], 6, f"the child signalled ownership (exit 0) after a write that failed: {w}")
+        self.assertEqual((w["okEndedBy"], w["okExit"]), ("deadline", 0), f"a loop that wrote everything must still exit 0: {w}")
+
+    def test_adv_fa1197b4_a3_the_retry_keeps_the_first_stops_pre_stop_observation(self) -> None:
+        # exact case: at fa1197b4 the retry recorded exitedBeforeStop=true for a child that exited 0 on the first stop's file, and dropped its CSV
+        a3 = self.r["f3A3"]
+        self.assertEqual((a3["firstStopped"], a3["firstEarly"], a3["firstKills"], a3["firstOwned"]), (False, False, 2, False), f"the first stop's shape is not the finding's: {a3}")
+        self.assertEqual((a3["retryStopped"], a3["retryExit"], a3["retryKilled"], a3["stopped"]), (True, 0, False, True), a3)
+        self.assertFalse(a3["retryEarly"], f"the retry overwrote the first stop's pre-stop observation (exitedBeforeStop=true): {a3}")
+        self.assertTrue(a3["owned"], f"the CSV a child created and closed before exiting 0 on the stop file was dropped: {a3}")
+        # sibling (GPU): nvidia-smi was running at the first stop, so its end before the retry is not an early exit
+        self.assertEqual((a3["gpuFirstStopped"], a3["gpuRetryStopped"], a3["gpuRetryEarly"]), (False, True, False), a3)
+        # control: a child that had ended before the first stop is still exitedBeforeStop after the retry, and owns nothing
+        self.assertEqual(self.r["f3A3Early"], {"early": True, "owned": False})
 
     def test_r5_an_empty_system_root_does_not_end_the_nvidia_smi_search(self) -> None:
         self.assertEqual(self.r["r5EmptyRoot"]["found"], self.r["r5EmptyRoot"]["expected"])

@@ -6921,7 +6921,7 @@ function Get-UtilSampleAppSnapshot($Procs, [string]$AppPath, $Watch = $null, $Br
 # counterMs empty, and the summary refuses a window holding a cpuTotalPct without one (cpu-counter-interval-unbound). res.created is set only once
 # CreateNew succeeded (A2: the child's exit 0 is its positive ownership signal). $SnapSeam: a test seam for the app snapshot ($null = Get-Process).
 function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$AppName, [int]$IntervalMs, [int64]$DeadlineMs, $ReadTotal, [int]$ParentPid, [int64]$ParentStartTicks, [int]$GpuPid, [int64]$GpuStartTicks, $UtcTicks = $null, [string]$AppPath = '', $SnapSeam = $null) {
-    $res = [ordered]@{ endedBy = $null; rows = 0; counterErrors = 0; gpuKilled = $false; created = $false }
+    $res = [ordered]@{ endedBy = $null; rows = 0; counterErrors = 0; gpuKilled = $false; created = $false; written = $false }
     if ($null -eq $UtcTicks) { $UtcTicks = { [DateTime]::UtcNow.Ticks } }
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $u8 = [Text.UTF8Encoding]::new($false)
@@ -6932,7 +6932,7 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
     # sol r6 key B2 (adversary 25d5c970 A2): the deadline / parent-gone cleanup must never kill a process that reused nvidia-smi's pid. One handle
     # is opened at the start and held to the kill: Windows does not reuse a pid while a handle to its process is open, and the start time, the
     # exit check and Kill all go through that handle, so the identity checked once is the process killed (a mismatch holds nothing, kills nothing).
-    $gHeld = $null
+    $gHeld = $null; $wrote = $false
     if ($GpuPid -gt 0 -and $GpuStartTicks -ne 0) {
         try {
             $g0 = Get-Process -Id $GpuPid -ErrorAction Stop
@@ -7004,7 +7004,11 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             $ub = $u8.GetBytes("$($tl.ToString('o', $inv)),,,,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),,`n")
             $uf.Write($ub, 0, $ub.Length); $uf.Flush()
         }
-    } finally { $uf.Dispose() }
+        $wrote = $true
+    } finally { try { $uf.Dispose() } catch { $wrote = $false } }
+    # adversary fa1197b4 A1: a failed Write / Flush is a statement-terminating error, which leaves the try above but lets this function return, so
+    # created alone is no ownership signal: written is set only once the last write and the close both succeeded (the child exits 0 on it alone)
+    $res.written = $wrote
     if ($null -ne $gHeld) {
         try { if ($res.endedBy -cne 'stop-file' -and -not $gHeld.HasExited) { $gHeld.Kill(); $res.gpuKilled = $true } } catch { }
         try { $gHeld.Dispose() } catch { }
@@ -7017,13 +7021,16 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
 # adversary 9d648094: A7 exitedBeforeStop says the process had already ended when the stop came (a sampler that died early); A6 a Kill that throws
 # is retried once; A9 $WaitMs is clamped to 0..60000.
 function Stop-UtilSampleProcess($Proc, [int]$WaitMs, [bool]$Kill, $ExitedBefore = $null) {
-    $s = [ordered]@{ stopped = $false; killed = $false; exitCode = $null; exitedBeforeStop = $false; why = $null }
+    $s = [ordered]@{ stopped = $false; killed = $false; exitCode = $null; exitedBeforeStop = $false; why = $null; preStop = $null }
     if ($null -eq $Proc) { $s.why = 'not-started'; return $s }
     $WaitMs = [math]::Min(60000, [math]::Max(0, $WaitMs))
     try {
         # adversary e4bc0d80 B1: $ExitedBefore (the caller's HasExited read taken BEFORE it asked the process to stop) decides exitedBeforeStop when
         # given, so a child that exits on its own after seeing the stop file is a clean stop, not a sampler that died early
-        if ($Proc.HasExited) { $s.exitedBeforeStop = $(if ($null -ne $ExitedBefore) { [bool]$ExitedBefore } else { $true }) }
+        # adversary fa1197b4 A3: preStop records that pre-stop observation, so a retry of an unsuccessful stop is judged by it (Stop-UtilSampleAll)
+        $hx = [bool]$Proc.HasExited
+        $s.preStop = $(if ($null -ne $ExitedBefore) { [bool]$ExitedBefore } else { $hx })
+        if ($hx) { $s.exitedBeforeStop = $s.preStop }
         else {
             if ($Kill -or -not $Proc.WaitForExit($WaitMs)) {
                 try { $Proc.Kill() } catch { $s.why = 'kill-retried: ' + ([string]$_.Exception.Message -replace '\s+', ' '); $Proc.Kill() }
@@ -7054,12 +7061,17 @@ function Stop-UtilSampleAll($GpuStart, $CpuStart, $WriteStop, [int]$WaitMs, $Pre
     $pg = $null; $pc = $null
     try { if ($null -ne $Prev -and $null -ne $Prev.gpu -and $Prev.gpu.stopped) { $pg = $Prev.gpu } } catch { }
     try { if ($null -ne $Prev -and $null -ne $Prev.cpu -and $Prev.cpu.stopped) { $pc = $Prev.cpu; $r.stopFileWhy = $Prev.stopFileWhy } } catch { }
-    if ($null -ne $pg) { $r.gpu = $pg } else { $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true }
+    # adversary fa1197b4 A3: a side the earlier stop did NOT end is stopped again, but judged by that earlier stop's pre-stop observation (preStop):
+    # a process that ended between the two stops ended after the first request, which is not an early exit (a CPU child that exits 0 on the first
+    # stop file still owns its CSV). An unknown earlier observation ($null) leaves the retry's own read, as before.
+    $gpuExitedBefore = $null; $cpuExitedBefore = $null
+    try { if ($null -eq $pg -and $null -ne $Prev -and $null -ne $Prev.gpu -and $Prev.gpu.Contains('preStop') -and $null -ne $Prev.gpu.preStop) { $gpuExitedBefore = [bool]$Prev.gpu.preStop } } catch { }
+    try { if ($null -eq $pc -and $null -ne $Prev -and $null -ne $Prev.cpu -and $Prev.cpu.Contains('preStop') -and $null -ne $Prev.cpu.preStop) { $cpuExitedBefore = [bool]$Prev.cpu.preStop } } catch { }
+    if ($null -ne $pg) { $r.gpu = $pg } else { $r.gpu = Stop-UtilSampleProcess $(if ($null -ne $GpuStart) { $GpuStart.proc }) $WaitMs $true $gpuExitedBefore }
     $cp = $(if ($null -ne $CpuStart) { $CpuStart.proc })
     if ($null -ne $pc) { $cp = $null }
-    $cpuExitedBefore = $null
     if ($null -ne $cp) {
-        try { $cpuExitedBefore = [bool]$cp.HasExited } catch { }
+        if ($null -eq $cpuExitedBefore) { try { $cpuExitedBefore = [bool]$cp.HasExited } catch { } }
         try { & $WriteStop } catch { $r.stopFileWhy = 'stop-file: ' + ([string]$_.Exception.Message -replace '\s+', ' ') }
     }
     if ($null -ne $pc) { $r.cpu = $pc } else { $r.cpu = Stop-UtilSampleProcess $cp $WaitMs $false $cpuExitedBefore }
@@ -7307,6 +7319,9 @@ function Get-UtilSampleClockWitness($Parsed, $Start, $Window) {
         # adversary a00b7766 A2: a row the child wrote that does not parse (a stepped clock writes fromUtc after utc) may carry the very step the
         # witness looks for, so any unparseable row leaves the clock unverified; and a row's interval start never moves backwards on a steady clock
         if ($Parsed.Contains('unparseable') -and $Parsed.unparseable -gt 0) { return 'sample-clock-unverified' }
+        # adversary fa1197b4 A1: a torn last row is dropped by the split, and it too may be the row that carries the step (the child writes whole
+        # flushed lines and is read only after it exited 0, so a clean stop never leaves one)
+        if ($Parsed.Contains('tornTail') -and $Parsed.tornTail) { return 'sample-clock-unverified' }
         $rows = @($Parsed.rows)
         if (-not (Test-UtilSampleClockSteady $rows)) { return 'sample-clock-unverified' }
         for ($i = 0; $i -lt $rows.Count; $i++) {
@@ -7474,7 +7489,7 @@ $pc = $null
 try { $pc = [Diagnostics.PerformanceCounter]::new('Processor', '% Processor Time', '_Total') } catch { }
 $rt = { if ($null -eq $pc) { throw 'counter-unavailable' }; $pc.NextValue() }
 $us = Invoke-UtilSampleCpuLoop ([string]$env:MLV_US_CSV) ([string]$env:MLV_US_STOP) ([string]$env:MLV_US_APP) 1000 ([int64]$env:MLV_US_DEADLINE_MS) $rt ([int]$env:MLV_US_PARENT) ([int64]$env:MLV_US_PARENT_START) ([int]$env:MLV_US_GPU_PID) ([int64]$env:MLV_US_GPU_START) $null ([string]$env:MLV_US_APP_PATH)
-if ($null -ne $us -and $us.created) { exit 0 }
+if ($null -ne $us -and $us.created -and $us.written) { exit 0 }
 exit 6
 '@
     $usChild = (@($usChild -split "\r?\n" | ForEach-Object { $_.TrimStart() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }) -join "`n")
