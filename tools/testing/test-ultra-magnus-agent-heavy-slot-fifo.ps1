@@ -517,6 +517,43 @@ function Initialize-BoundedCaptureIo {
         public static Task<string> KillTree(Process process) {
             return Task.Run(() => { try { process.Kill(true); return ""; } catch (Exception e) { return e.GetType().Name + ": " + e.Message; } });
         }
+        // adversary r13 pass-2 A2 (Windows): Kill(true) walks CURRENT parent links, so a process whose parent already ended (a factory that ran
+        // an intermediate which started a sleeper and exited) is out of its reach. A job object holds the worker and every process started
+        // under it whatever its parent chain, and TerminateJobObject ends them all. The worker is placed in the job before it is handed a factory.
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+        public sealed class WorkerJob { public IntPtr Handle = IntPtr.Zero; public string Error = ""; }
+        public static WorkerJob JoinNewJob(Process process) {
+            var job = new WorkerJob();
+            try {
+                job.Handle = CreateJobObjectW(IntPtr.Zero, null);
+                if (job.Handle == IntPtr.Zero) { job.Error = "CreateJobObject failed with error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error(); return job; }
+                if (!AssignProcessToJobObject(job.Handle, process.Handle)) {
+                    job.Error = "AssignProcessToJobObject failed with error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    CloseHandle(job.Handle); job.Handle = IntPtr.Zero;
+                }
+            }
+            catch (Exception e) { job.Error = e.GetType().Name + ": " + e.Message; }
+            return job;
+        }
+        // '' when every process of the job was terminated (or there is no job); otherwise the error. The job handle is closed either way.
+        public static Task<string> KillJob(WorkerJob job) {
+            return Task.Run(() => {
+                try {
+                    if (job == null || job.Handle == IntPtr.Zero) { return ""; }
+                    string result = TerminateJobObject(job.Handle, 1) ? "" : "TerminateJobObject failed with error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    CloseHandle(job.Handle); job.Handle = IntPtr.Zero;
+                    return result;
+                }
+                catch (Exception e) { return e.GetType().Name + ": " + e.Message; }
+            });
+        }
         [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
         private static extern int kill(int pid, int sig);
         // POSIX only (a worker launched by setsid leads its own process group): SIGKILL to the whole group. '' when it was sent or the group is
@@ -631,7 +668,8 @@ try {
     if ($req[3] -ceq 'scalar' -and $count -eq 1) { $argument = ConvertFrom-CaptureWire $req[5] }
     elseif ($req[3] -ceq 'array') {
         $argument = [string[]]::new($count)
-        for ($i = 0; $i -lt $count; $i++) { $argument[$i] = ConvertFrom-CaptureWire $req[5 + $i] }
+        # SetValue, not an indexed assignment: PowerShell turns a $null assigned into a string[] into '' (adversary r13 pass-2 A1).
+        for ($i = 0; $i -lt $count; $i++) { $argument.SetValue((ConvertFrom-CaptureWire $req[5 + $i]), $i) }
     }
     else { throw 'malformed capture worker request' }
     . ([scriptblock]::Create("function Get-CaptureTaskResult {$(ConvertFrom-CaptureWire $req[2])}"))
@@ -659,6 +697,14 @@ function Stop-CaptureWorker($Worker) {
     if ($null -eq $Worker) { return '' }
     $notes = [Collections.Generic.List[string]]::new()
     $p = $Worker.Process
+    if ($null -ne $Worker.Job) {
+        try {
+            $job = [BoundedCaptureIo]::KillJob($Worker.Job)
+            if (-not $job.Wait($CaptureWorkerKillMs)) { $notes.Add("the termination of the capture worker job did not return within $CaptureWorkerKillMs ms") }
+            elseif ($job.Result) { $notes.Add("the termination of the capture worker job failed ($($job.Result))") }
+        }
+        catch { $notes.Add("the termination of the capture worker job failed ($($_.Exception.Message))") }
+    }
     if ($null -ne $p) {
         if ($null -ne $Worker.Group) {
             try {
@@ -695,7 +741,7 @@ function Close-CaptureWorker($Worker) {
 function Start-CaptureWorker {
     # Starts a capture worker and waits (bounded) until it is ready, BEFORE the step's clock starts. Throws a named failure when it cannot
     # start; any process it did start is killed first.
-    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null; Group = $null }
+    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null; Group = $null; Job = $null }
     try {
         $null = [IO.Directory]::CreateDirectory($worker.Dir)
         [IO.File]::WriteAllText((Join-Path $worker.Dir 'worker.ps1'), $CaptureWorkerScript)
@@ -710,6 +756,11 @@ function Start-CaptureWorker {
         $worker.Process = Start-Process -FilePath $exe -WorkingDirectory $worker.Dir -NoNewWindow -PassThru -ArgumentList $argv `
             -RedirectStandardOutput (Join-Path $worker.Dir 'stdout.txt') -RedirectStandardError (Join-Path $worker.Dir 'stderr.txt')
         $null = $worker.Process.Handle   # keeps ExitCode readable after the exit, and lets Kill(true) find what an ended worker left behind
+        if ($IsWindows) {
+            # Before 'go', so nothing the factory starts can be outside the job. No job means no tree guarantee: a named failure.
+            $worker.Job = [BoundedCaptureIo]::JoinNewJob($worker.Process)
+            if ($worker.Job.Error) { throw "the capture worker could not be placed in a job object ($($worker.Job.Error))" }
+        }
         $ready = Join-Path $worker.Dir 'ready'
         $clock = [Diagnostics.Stopwatch]::StartNew()
         while (-not [IO.File]::Exists($ready)) {

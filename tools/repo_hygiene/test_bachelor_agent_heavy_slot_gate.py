@@ -18,6 +18,7 @@ Windows-only test below runs that script's pure-function cases (-UnitOnly, no he
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import gc
 import json
@@ -307,6 +308,27 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
     if cleanup_note:
         warnings.warn(f"{case}: {cleanup_note}", RuntimeWarning, stacklevel=2)
     return proc.returncode, stdout, stderr
+
+
+@contextlib.contextmanager
+def _pwsh_script_argv(script: str):
+    """A pwsh argv that runs `script` from a temporary .ps1, dot-sourced by -Command (so the -Command exit-code rules still apply).
+
+    r13: the bounded capture region (with the worker's job object and wire transport) made an inline `-Command <script>` longer than the
+    32767-character Windows command line (WinError 206)."""
+    fd, path = tempfile.mkstemp(prefix="heavy-slot-gate-", suffix=".ps1")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        yield [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ". '" + path.replace("'", "''") + "'"]
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def _run_pwsh_script(script: str, timeout: float = 120) -> subprocess.CompletedProcess:
+    with _pwsh_script_argv(script) as argv:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
 
 
 def _fifo_capture_io_region(fifo: str) -> str:
@@ -677,7 +699,7 @@ class BoundedRunTests(unittest.TestCase):
         values = ["C:\\repo root\\", "C:\\repo root", "\\\\server\\share\\dir\\", "C:\\a\\\\", "C:\\plain\\agent.ps1", "a \"quoted\" word\\"]
         script = body + "\n$v = @(" + ",".join("'" + v.replace("'", "''") + "'" for v in values) + ")\n" \
                  "($v | ForEach-Object { ConvertTo-CommandLineArg $_ }) -join ' '"
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        proc = _run_pwsh_script(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         command_line = proc.stdout.strip()
         argv_w = ctypes.windll.shell32.CommandLineToArgvW
@@ -706,7 +728,7 @@ class BoundedRunTests(unittest.TestCase):
                   "function Start-Process { $script:launched++; throw 'LAUNCH-ATTEMPTED' }\n" + body + "\n"
                   "foreach ($t in " + ",".join(str(b) for b in bounds) + ",1) { try { Invoke-BoundedSuite 'case-x' 'C:\\s.ps1' $t } "
                   "catch { Write-Output ('RESULT|' + $t + '|' + $_.Exception.Message + '|' + $script:launched) } }\n")
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        proc = _run_pwsh_script(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         rows = [line.split("|", 3) for line in proc.stdout.splitlines() if line.startswith("RESULT|")]
         self.assertEqual([r[1] for r in rows], [str(b) for b in bounds] + ["1"], proc.stdout)
@@ -741,7 +763,7 @@ class BoundedRunTests(unittest.TestCase):
                       "Write-Output ('HUNG|' + (Read-CapturedText (Join-Path ([IO.Path]::GetTempPath()) 'stdout.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
                       "Write-Output ('GOOD|' + (Read-CapturedText '" + good.replace("'", "''") + "'))\n"
                       "Write-Output ('MISSING|' + (Read-CapturedText (Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'no-such-dir-r6') 'x.txt')))\n")
-            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            proc = _run_pwsh_script(script)
         finally:
             os.unlink(good)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -1477,7 +1499,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
 
     @staticmethod
     def _pwsh(script: str) -> subprocess.CompletedProcess:
-        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        return _run_pwsh_script(script)
 
     @unittest.skipUnless(os.name == "nt" and PWSH is not None, "named pipes and pwsh are Windows-only here")
     def test_a_stalled_capture_open_is_abandoned_inside_its_bound_and_named(self) -> None:
@@ -1708,8 +1730,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "Write-Output ('ELAPSED-OK|' + ($sw.ElapsedMilliseconds -lt 15000))\n")
         code_lines = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith(("#", "//")))
         self.assertNotRegex(code_lines, _FORCED_EXIT, "the proof must end its process the ordinary way")
-        code, out, err = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-                                     self._NEVER_ENDING_PROCESS_CEILING_SEC, case)
+        with _pwsh_script_argv(script) as argv:
+            code, out, err = run_bounded(argv, self._NEVER_ENDING_PROCESS_CEILING_SEC, case)
         self.assertEqual(code, 0, out + err)
         self.assertIn("ELAPSED-OK|True", out, out + err)
         return out
@@ -1776,6 +1798,48 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("TWO|capture cleanup incomplete: type=System.String[] n=2 items=C:\\x\\a.txt|C:\\x\\b.txt", proc.stdout)
         self.assertIn("EMPTY|capture cleanup incomplete: null=False type=System.String[]", proc.stdout)
         self.assertRegex(proc.stdout, r"SCALAR\|type=System\.String n=1 items=.*a\.txt")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_null_element_of_the_argument_reaches_the_factory_as_null(self) -> None:
+        # adversary r13 pass-2 A1: the wire kept the null ('-'), but the worker's indexed assignment into its string[] turned it into ''.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "$probe = { param($x) [Threading.Tasks.Task]::FromResult('null0=' + ($null -eq $x[0]) + ' empty1=' + ($x[1] -ceq '') + ' n=' + $x.Count) }\n"
+                  "$paths = [string[]]::new(2); $paths[1] = ''\n"
+                  "Write-Output ('NULLS|' + (Remove-CaptureFiles $paths 5000 $probe))\n")
+        proc = self._pwsh(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("NULLS|capture cleanup incomplete: null0=True empty1=True n=2", proc.stdout)
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_a_process_orphaned_by_an_ended_intermediate_still_ends_with_the_worker(self) -> None:
+        # adversary r13 pass-2 A2: the factory runs an intermediate pwsh that starts a 600 s sleeper and ends, then hands back a finished
+        # task. The sleeper's parent is gone, so Kill(true) (which walks current parent links) could not reach it. Windows: the worker's job
+        # object holds it; POSIX: the worker's process group does.
+        pid_dir = tempfile.mkdtemp(prefix="heavy-slot-gate-a2b-")
+        try:
+            pid_file = os.path.join(pid_dir, "orphan.pid")
+            inner = ("$c = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
+                     "-ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 600'); "
+                     "[IO.File]::WriteAllText('" + pid_file.replace("'", "''") + "', [string]$c.Id)")
+            encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
+            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                      "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                      "$orphaning = { param($p) $m = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru "
+                      "-ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', '" + encoded + "'); "
+                      "$null = $m.WaitForExit(30000); [Threading.Tasks.Task]::FromResult('orphaned') }\n"
+                      "$r = Read-CapturedResult $p 40000 $orphaning\n"
+                      "Write-Output ('ORPHAN-READ|' + $r.Ok + '|' + $r.Text)\n"
+                      "$id = [int][IO.File]::ReadAllText('" + pid_file.replace("'", "''") + "'); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                      "while ($null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue) -and $sw.ElapsedMilliseconds -lt 5000) { Start-Sleep -Milliseconds 100 }\n"
+                      "$alive = $null -ne (Get-Process -Id $id -ErrorAction SilentlyContinue)\n"
+                      "Write-Output (\"ALIVE|$alive\")\n"
+                      "if ($alive) { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue }\n")
+            proc = self._pwsh(script)
+        finally:
+            shutil.rmtree(pid_dir, ignore_errors=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ORPHAN-READ|True|orphaned", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("ALIVE|False", proc.stdout, proc.stdout + proc.stderr)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_process_the_factory_started_ends_with_the_worker_even_when_the_worker_ended_first(self) -> None:
