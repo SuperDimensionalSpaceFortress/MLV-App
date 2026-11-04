@@ -67,6 +67,20 @@ function Wait-Until([scriptblock]$Cond, [double]$TimeoutSec) {
     while ((Get-Date) -lt $dl) { if (& $Cond) { return $true }; Start-Sleep -Milliseconds 100 }
     return [bool](& $Cond)
 }
+# The agent's poll counter. A read can land in the instant the heartbeat is rewritten, so it retries.
+function Get-HeartbeatGeneration($c) {
+    $hb = Join-Path $c.root 'heartbeat.txt'
+    for ($i = 0; $i -lt 50; $i++) {
+        try {
+            $fs = [IO.File]::Open($hb, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+            try { $t = ([IO.StreamReader]::new($fs)).ReadToEnd() } finally { $fs.Dispose() }
+            $m = [regex]::Match($t, 'generation=(\d+)')
+            if ($m.Success) { return [int]$m.Groups[1].Value }
+        } catch { }
+        Start-Sleep -Milliseconds 50
+    }
+    throw "FAIL: no heartbeat generation could be read from $hb"
+}
 # The artifacts Wait-VenueQuiet counts as a running job.
 function Get-RunningCounted($c) { return @(Get-ChildItem -LiteralPath $c.running -ErrorAction Stop | Where-Object { $_.Name -notmatch $setAsideRecordPattern } | ForEach-Object Name) }
 function Get-LogLines($c, [string]$Text) {
@@ -150,18 +164,19 @@ try {
             $tmp = "$job.started.json.335c4d6c403943309f1e6486e293baab.tmp"
             Put-File (Join-Path $c.running "$job.started.json") (New-MarkerJson $job)
             Put-File (Join-Path $c.running $tmp) (New-MarkerJson $job 'launched' 'completed')
+            $genBefore = Get-HeartbeatGeneration $c
             Put-File (Join-Path $c.outbox "$job.result.json") (New-ResultJson $job)
-            $t0 = Get-Date
             $cleared = Wait-Until { (Get-RunningCounted $c).Count -eq 0 } 8
-            $sec = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+            $polls = (Get-HeartbeatGeneration $c) - $genBefore
             $left = Get-RunningCounted $c
             Assert-True $cleared "a Wait-VenueQuiet-style count of running\ reads 0 within 8 s at a 1 s poll: left [$($left -join ',')]"
-            Assert-True ($sec -le 3) "cleared within one poll (a 1 s poll plus a pass of the loop): ${sec}s"
+            # Counted in the agent's own polls, not seconds, so a loaded host cannot redden it: the next poll clears it, plus one for this read arriving late.
+            Assert-True ($polls -le 2) "cleared within one poll: the heartbeat generation moved $polls"
             Assert-True (Test-Path -LiteralPath (Join-Path $c.processed "$job.started.completed.json")) 'the marker went to processed\ by the start-up path (status completed)'
             Assert-True (@(Get-ChildItem -LiteralPath $c.running -Filter "$tmp.stale-*").Count -eq 1) 'the tmp is preserved as a set-aside record, never deleted'
             Assert-True (@(Get-LogLines $c "live marker reconcile job=$job").Count -eq 1) 'one agent log line for the job'
             Assert-True ((Get-Content -LiteralPath (Join-Path $c.outbox "$job.result.json") -Raw | ConvertFrom-Json).fixture -eq $true) 'the published result is untouched'
-            return [ordered]@{ clearedSec = $sec; runningCounted = 0 }
+            return [ordered]@{ agentPollsToClear = $polls; runningCounted = 0 }
         }
         finally { Stop-Agent $c }
     }
