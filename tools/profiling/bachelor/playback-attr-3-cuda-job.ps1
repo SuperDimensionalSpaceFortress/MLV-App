@@ -6857,26 +6857,38 @@ function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) {
 # adversary 793d5dee A1: the CPU times are read in one tight pass AFTER the processes are enumerated and bound (Get-Process and the path / start-time
 # reads take tens of ms on a busy host), and with $Watch and $Bracket that pass is bracketed by two monotonic reads ($Bracket.a / .b), so the loop
 # dates the snapshot by when it READ the CPU times, never by when it returned (a stall after the reads is not part of the interval they measured).
+# sol r6 key B1 (adversary 25d5c970 A1): a Process from Get-Process holds no handle, so each read reopens by pid and a pid reused between the
+# selection and the CPU read would put another process's CPU time under the original "pid,startTicks" key (a false delta). The start time is read
+# FIRST and read AGAIN after the CPU read (a third pass, outside the bracket): a pid is never reused back to an exited process, so equal start times
+# on both sides bind the path and the CPU time between them to that one process, and a mismatch (or an unreadable re-read) drops the sample.
 function Get-UtilSampleAppSnapshot($Procs, [string]$AppPath, $Watch = $null, $Bracket = $null) {
     $o = @{}
     $sel = [Collections.Generic.List[object]]::new()
     foreach ($q in @($Procs)) {
         try {
-            if ($AppPath -and -not [string]::Equals([string]$q.Path, $AppPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
             $st = $q.StartTime
             if ($null -eq $st) { continue }
+            if ($AppPath -and -not [string]::Equals([string]$q.Path, $AppPath, [StringComparison]::OrdinalIgnoreCase)) { continue }
             $sel.Add(@($q, $st.ToUniversalTime().Ticks))
         } catch { }
     }
+    $read = [Collections.Generic.List[object]]::new()
     if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['a'] = $Watch.Elapsed.TotalMilliseconds }
     foreach ($e in $sel) {
         try {
             $cs = $e[0].TotalProcessorTime.TotalSeconds
             if ($null -eq $cs) { continue }
-            $o["$($e[0].Id),$($e[1])"] = @($e[0].Id, [double]$cs)
+            $read.Add(@($e[0], $e[1], [double]$cs))
         } catch { }
     }
     if ($null -ne $Watch -and $null -ne $Bracket) { $Bracket['b'] = $Watch.Elapsed.TotalMilliseconds }
+    foreach ($e in $read) {
+        try {
+            $st2 = $e[0].StartTime
+            if ($null -eq $st2 -or $st2.ToUniversalTime().Ticks -ne $e[1]) { continue }
+            $o["$($e[0].Id),$($e[1])"] = @($e[0].Id, $e[2])
+        } catch { }
+    }
     $o
 }
 
@@ -6898,6 +6910,17 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
         $uf = [IO.File]::Open($CsvPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
     } catch { throw ('cpu-util-occupied: ' + ([string]$_.Exception.Message -replace '\s+', ' ')) }
     $res.created = $true
+    # sol r6 key B2 (adversary 25d5c970 A2): the deadline / parent-gone cleanup must never kill a process that reused nvidia-smi's pid. One handle
+    # is opened at the start and held to the kill: Windows does not reuse a pid while a handle to its process is open, and the start time, the
+    # exit check and Kill all go through that handle, so the identity checked once is the process killed (a mismatch holds nothing, kills nothing).
+    $gHeld = $null
+    if ($GpuPid -gt 0 -and $GpuStartTicks -ne 0) {
+        try {
+            $g0 = Get-Process -Id $GpuPid -ErrorAction Stop
+            [void]$g0.Handle
+            if ($g0.StartTime.ToUniversalTime().Ticks -eq $GpuStartTicks) { $gHeld = $g0 } else { $g0.Dispose() }
+        } catch { }
+    }
     try {
         $ub = $u8.GetBytes("utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n")
         $uf.Write($ub, 0, $ub.Length); $uf.Flush()
@@ -6955,8 +6978,9 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             $prev = $cur; $prevMs = $nowMs; $from = $lo; $ck.maxStep = 0.0
         }
     } finally { $uf.Dispose() }
-    if ($res.endedBy -cne 'stop-file' -and $GpuPid -gt 0) {
-        try { $g = Get-Process -Id $GpuPid -ErrorAction Stop; if ($g.StartTime.ToUniversalTime().Ticks -eq $GpuStartTicks) { $g.Kill(); $res.gpuKilled = $true } } catch { }
+    if ($null -ne $gHeld) {
+        try { if ($res.endedBy -cne 'stop-file' -and -not $gHeld.HasExited) { $gHeld.Kill(); $res.gpuKilled = $true } } catch { }
+        try { $gHeld.Dispose() } catch { }
     }
     $res
 }

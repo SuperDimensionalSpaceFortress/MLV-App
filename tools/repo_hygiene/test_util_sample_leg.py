@@ -697,6 +697,74 @@ $y2cleanRun = Invoke-Region3 $y2crec
 $r['r6A2'] = @{ exit = $y2rec.cpu.exitCode; stopped = $y2rec.cpu.stopped; early = $y2rec.cpu.exitedBeforeStop; foreignFileOwned = [bool]$y2own; region3 = $y2run; finallyPublished = @($y2fin)
     killed = @{ killed = $y2krec.cpu.killed; owned = [bool](Test-UtilSampleCpuOwned $run $y2krec); run = $y2killRun; summary = (Get-UtilSampleCpuSummary (ConvertFrom-UtilSampleCpuCsv $y2good) $run $x1w $y2krec.cpu).status }
     clean = @{ owned = [bool](Test-UtilSampleCpuOwned $run $y2crec); run = $y2cleanRun } }
+# ---- sol r6 key B1 (adversary 25d5c970 A1, exact case, in-memory double): the previous snapshot holds PID 1234, startTicks 639293111400000000, CPU
+# 1 s. This snapshot's selection sees C:\job\MLVApp.exe with that start time; the original exits and PID 1234 is reused by another executable before
+# TotalProcessorTime is read (the double flips on that read), whose CPU is 2 s. At 25d5c970 the 2 s landed under the old key: a false 1 s delta.
+$k1st = [DateTime]::new([int64]639293111400000000, [DateTimeKind]::Utc); $k1key = "1234,$([int64]639293111400000000)"
+function New-ReusedAppDouble {
+    $d = [pscustomobject]@{ Id = 1234; reused = $false; orig = $k1st; repl = $k1st.AddSeconds(500) }
+    $d | Add-Member -MemberType ScriptProperty -Name Path -Value { if ($this.reused) { 'C:\other\Other.exe' } else { 'C:\job\MLVApp.exe' } }
+    $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value { if ($this.reused) { $this.repl } else { $this.orig } }
+    $d | Add-Member -MemberType ScriptProperty -Name TotalProcessorTime -Value { $this.reused = $true; [TimeSpan]::FromSeconds(2) }
+    $d
+}
+$k1prev = @{ $k1key = @(1234, [double]1.0) }
+$k1cur = Get-UtilSampleAppSnapshot @(New-ReusedAppDouble) 'C:\job\MLVApp.exe'
+$k1false = 0.0; foreach ($k in @($k1cur.Keys)) { if ($k1prev.ContainsKey($k)) { $k1false += [math]::Max(0.0, $k1cur[$k][1] - $k1prev[$k][1]) } }
+# a stable original (no reuse) still binds: control
+$k1ctl = [pscustomobject]@{ Id = 1234; Path = 'C:\job\MLVApp.exe'; StartTime = $k1st; TotalProcessorTime = [TimeSpan]::FromSeconds(2) }
+$k1ok = Get-UtilSampleAppSnapshot @($k1ctl) 'C:\job\MLVApp.exe'
+# the same race through the loop's own delta (the :6944 site): snapshot 1 = the original at 1 s, snapshot 2 = the reuse race, later ones the replacement
+$script:k1n = 0
+$k1snap = { param($br, $sw)
+    $script:k1n++
+    if ($script:k1n -eq 1) { $p = [pscustomobject]@{ Id = 1234; Path = 'C:\job\MLVApp.exe'; StartTime = $k1st; TotalProcessorTime = [TimeSpan]::FromSeconds(1) } }
+    elseif ($script:k1n -eq 2) { $p = New-ReusedAppDouble }
+    else { $p = [pscustomobject]@{ Id = 1234; Path = 'C:\other\Other.exe'; StartTime = $k1st.AddSeconds(500); TotalProcessorTime = [TimeSpan]::FromSeconds(2) } }
+    Get-UtilSampleAppSnapshot @($p) 'C:\job\MLVApp.exe' $sw $br }
+[void](Invoke-UtilSampleCpuLoop (Join-Path $t 'k1.csv') (Join-Path $t 'k1.stop') 'no-such-process-name-xyz' 200 700 { 5 } 0 0 0 0 $null '' $k1snap)
+$k1rows = @([IO.File]::ReadAllLines((Join-Path $t 'k1.csv')) | Select-Object -Skip 1)
+$r['k1B1'] = @{ oldKeyPresent = $k1cur.ContainsKey($k1key); keys = @($k1cur.Keys).Count; falseCpuSeconds = $k1false; control = (@($k1ok.Keys) -join ';'); controlCpu = $(if ($k1ok.ContainsKey($k1key)) { $k1ok[$k1key][1] })
+    loopRows = $k1rows.Count; loopFirst = $(if ($k1rows.Count) { $f = $k1rows[0] -split ','; "pid=$($f[2]);cores=$($f[3])" }) }
+# ---- sol r6 key B2 (adversary 25d5c970 A2, exact case, in-memory double): endedBy=deadline, GpuPid=1234, GpuStartTicks=639293111400000000. A pid
+# table models Windows: a Process from Get-Process holds no handle, so each read and Kill resolve the pid's CURRENT owner, unless .Handle was read
+# (the object is then bound to that process, and the pid is not reused while it is held). Once the deadline has passed, the first StartTime or
+# HasExited read is followed by the original exiting, and (when no handle holds it) an unrelated process taking PID 1234 before Kill.
+# At 25d5c970 the guardian looked the pid up again at cleanup, read the original's start time, and Kill hit the replacement.
+function New-GpuWorld([string]$Owner, [bool]$Armed, [int]$ArmAtMs) {
+    [pscustomobject]@{ owner = $Owner; held = 0; origExited = $false; armed = $Armed; armAtMs = $ArmAtMs; sw = [Diagnostics.Stopwatch]::StartNew()
+        killed = [Collections.Generic.List[string]]::new(); lookups = 0; origSt = $k1st; replSt = $k1st.AddSeconds(900) }
+}
+function Step-GpuWorld($W) {
+    if ($W.armed -and -not $W.origExited -and $W.sw.ElapsedMilliseconds -ge $W.armAtMs) { $W.origExited = $true; if ($W.held -le 0 -and $W.owner -ceq 'orig') { $W.owner = 'repl' } }
+}
+function New-GpuProxy($W) {
+    $p = [pscustomobject]@{ w = $W; bound = $null }
+    $p | Add-Member -MemberType ScriptMethod -Name Who -Value { if ($null -ne $this.bound) { $this.bound } else { $this.w.owner } }
+    $p | Add-Member -MemberType ScriptProperty -Name Handle -Value { if ($null -eq $this.bound) { $this.bound = $this.w.owner; if ($this.bound -ceq 'orig') { $this.w.held++ } }; [IntPtr]1 }
+    $p | Add-Member -MemberType ScriptProperty -Name StartTime -Value { $v = $(if ($this.Who() -ceq 'orig') { $this.w.origSt } else { $this.w.replSt }); Step-GpuWorld $this.w; $v }
+    $p | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $v = ($this.Who() -ceq 'orig' -and $this.w.origExited); Step-GpuWorld $this.w; $v }
+    $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { $who = $this.Who(); if ($who -ceq 'orig' -and $this.w.origExited) { return }; $this.w.killed.Add($who) }
+    $p | Add-Member -MemberType ScriptMethod -Name Dispose -Value { if ($this.bound -ceq 'orig') { $this.w.held-- }; $this.bound = 'disposed' }
+    $p
+}
+function Invoke-GpuGuardian($W, [int64]$StartTicks, [int]$DeadlineMs, [string]$Stop = '') {
+    $script:gw = $W
+    $res = & {
+        function Get-Process { [CmdletBinding()] param([int]$Id, [string]$Name) $script:gw.lookups++; if ($Id -ne 1234) { return }; New-GpuProxy $script:gw }
+        if ($Stop) { [IO.File]::WriteAllText($Stop, 'stop') }
+        Invoke-UtilSampleCpuLoop (Join-Path $t "k2-$([guid]::NewGuid().ToString('N')).csv") $(if ($Stop) { $Stop } else { Join-Path $t 'k2-none.stop' }) 'no-such-process-name-xyz' 200 $DeadlineMs { 5 } 0 0 1234 $StartTicks $null '' { param($br, $sw) @{} }
+    }
+    $res = @($res)[-1]
+    @{ endedBy = $res.endedBy; gpuKilled = [bool]$res.gpuKilled; killed = @($W.killed); held = $W.held; replAlive = -not $W.killed.Contains('repl') }
+}
+$k2ticks = [int64]639293111400000000
+$r['k2B2'] = @{
+    reuse = (Invoke-GpuGuardian (New-GpuWorld 'orig' $true 400) $k2ticks 400)
+    sameProcess = (Invoke-GpuGuardian (New-GpuWorld 'orig' $false 0) $k2ticks 400)
+    reusedBeforeStart = (Invoke-GpuGuardian (New-GpuWorld 'repl' $false 0) $k2ticks 400)
+    stopFile = (Invoke-GpuGuardian (New-GpuWorld 'orig' $false 0) $k2ticks 4000 (Join-Path $t 'k2.stop'))
+}
 Write-Output (J $r)
 """
 
@@ -943,6 +1011,29 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         self.assertEqual(a2["clean"], {"owned": True, "run": {"published": ["cpu-util.csv=utc,cpuTotal"], "total": 50.0, "pubFile": True,
                                                               "reason": "gpu:unavailable(nvidia-smi-missing)"}},
                          "a child that exited 0 on the stop owns, summarises and publishes its file")
+
+    def test_sol_r6_b1_a_pid_reused_before_the_cpu_read_is_dropped_not_a_false_delta(self) -> None:
+        # sol r6 key B1 exact case: at 25d5c970 oldKeyPresent=True, the replacement's 2 s sat under the old key, falseCpuSeconds=1
+        b1 = self.r["k1B1"]
+        self.assertFalse(b1["oldKeyPresent"], f"the replacement's CPU time was stored under the original pid,startTicks key: {b1}")
+        self.assertEqual((b1["keys"], b1["falseCpuSeconds"]), (0, 0.0), f"a reused pid's sample must be omitted, never a delta: {b1}")
+        self.assertEqual((b1["control"], b1["controlCpu"]), ("1234,639293111400000000", 2.0), "a process whose start time held across the read still binds")
+        self.assertGreaterEqual(b1["loopRows"], 1, b1)
+        self.assertEqual(b1["loopFirst"], "pid=;cores=", f"the loop's row after the race carried the false delta (:6944): {b1}")
+
+    def test_sol_r6_b2_cleanup_never_kills_a_process_that_reused_the_sampler_pid(self) -> None:
+        # sol r6 key B2 exact case: at 25d5c970 the deadline cleanup re-looked-up pid 1234, saw the original's start time, and Kill hit the replacement
+        b2 = self.r["k2B2"]
+        reuse = b2["reuse"]
+        self.assertEqual(reuse["endedBy"], "deadline", reuse)
+        self.assertNotIn("repl", reuse["killed"], f"the deadline cleanup killed the process that reused nvidia-smi's pid: {reuse}")
+        self.assertEqual(reuse["killed"], [], reuse)
+        self.assertEqual(b2["sameProcess"], {"endedBy": "deadline", "gpuKilled": True, "killed": ["orig"], "held": 0, "replAlive": True},
+                         "the job's own nvidia-smi is still ended on the deadline, and the held handle is released")
+        self.assertEqual((b2["reusedBeforeStart"]["killed"], b2["reusedBeforeStart"]["gpuKilled"]), ([], False),
+                         "a pid whose start time is not the sampler's is never held or killed")
+        self.assertEqual((b2["stopFile"]["endedBy"], b2["stopFile"]["killed"], b2["stopFile"]["held"]), ("stop-file", [], 0),
+                         "a stop-file end kills nothing and releases the handle")
 
     def test_r5_an_empty_system_root_does_not_end_the_nvidia_smi_search(self) -> None:
         self.assertEqual(self.r["r5EmptyRoot"]["found"], self.r["r5EmptyRoot"]["expected"])
