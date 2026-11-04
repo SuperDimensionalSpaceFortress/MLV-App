@@ -207,6 +207,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_PACED_LEGS)
 # Each differs from its twin only in its legId (native- -> native-trace-) and generatorArgs.presentTrace true (still paced, LIGHT, Look Assist Cinematic).
 NATIVE_TRACE_LEGS = {rel.replace("/m16-1457-native-", "/m16-1457-native-trace-"): rel for rel in NATIVE_PACED_LEGS}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_LEGS)
+# CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
+CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -7112,6 +7115,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(paired-(fullscreen|windowed)|sameframe-fullscreen)-s[24]$", path.name)
                 self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
                 self.assertIs(spec["look"]["pairedSeek"], True, path.name)
+            elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
