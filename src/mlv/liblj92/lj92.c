@@ -147,9 +147,19 @@ static int lj92_scan_entropy_start(const ljp* self) {
  * entropy data ends before its last sample reads zero bytes from there on, so one payload decodes to one
  * picture whatever lies after it in memory (the caller's slack, or nothing at all). The load is the same
  * little-endian u16 the reader always used while both bytes are inside the payload. */
+/* r9 (adversary r9 pass 1 A1 on 76d8340b): overflow-free -- `ix + 1` overflowed when ix reached INT_MAX. */
 static LJ92_ALWAYS_INLINE int lj92_load_entropy_pair(const u8* data, int ix, int datalen) {
-    if (ix + 1 < datalen) return *(const u16*)&data[ix];
-    return ix < datalen ? data[ix] : 0;
+    if (ix >= 0 && ix < datalen - 1) return *(const u16*)&data[ix];
+    return (ix >= 0 && ix < datalen) ? data[ix] : 0;
+}
+
+/* r9 (adversary r9 pass 1 A1 on 76d8340b): the entropy index never passes datalen. Past the payload every load is zero, so
+ * an index at datalen reads exactly what one further on would; it now stops there. A picture with more samples than its
+ * payload can feed (65535 x 10000 at 31 bits a sample) used to keep advancing it past INT_MAX -- signed overflow, and a
+ * wrapped index that admitted a load outside the payload. Whether ix >= datalen is decided as before: the step that took
+ * it to or past datalen now takes it to datalen. Assumes 0 <= ix <= datalen (every scan starts inside the payload). */
+static LJ92_ALWAYS_INLINE int lj92_advance_entropy_ix(int ix, int step, int datalen) {
+    return datalen - ix > step ? ix + step : datalen;
 }
 
 #ifndef SLOW_HUFF
@@ -418,12 +428,10 @@ static int nextbit(ljp* self) {
     u32 b = self->b;
     if (self->cnt == 0) {
         /* r6 A2 class: past the payload the reader reads zero bytes, never memory after it. */
-        u32 next = self->ix < self->datalen ? self->data[self->ix] : 0;
+        u32 next = (self->ix >= 0 && self->ix < self->datalen) ? self->data[self->ix] : 0;
         b = next;
-        if (next == 0xff) {
-            self->ix++;
-        }
-        self->ix++;
+        /* r9 A1: the index stops at datalen (lj92_advance_entropy_ix), never past INT_MAX */
+        self->ix = lj92_advance_entropy_ix(self->ix, next == 0xff ? 2 : 1, self->datalen);
         self->cnt = 8;
     }
     int bit = b >> 7;
@@ -494,12 +502,12 @@ static LJ92_ALWAYS_INLINE int nextdiff_fast(ljp* self, u32* b_io, int* cnt_io, i
         int two = next>>8;
         b = (b<<16)|(one<<8)|two;
         cnt += 16;
-        ix += 2;
+        ix = lj92_advance_entropy_ix(ix, 2, datalen); /* r9 A1: never past datalen */
         if (one==0xFF) {
             //printf("%x %x %x %x %d\n",one,two,b,b>>8,cnt);
             b >>= 8;
             cnt -= 8;
-        } else if (two==0xFF) ix++;
+        } else if (two==0xFF) ix = lj92_advance_entropy_ix(ix, 1, datalen);
     }
     int index = b >> (cnt - huffbits);
     u32 huffentry = hufflut[index];
@@ -527,11 +535,11 @@ static LJ92_ALWAYS_INLINE int nextdiff_fast(ljp* self, u32* b_io, int* cnt_io, i
             int two = next>>8;
             b = (b<<16)|(one<<8)|two;
             cnt += 16;
-            ix += 2;
+            ix = lj92_advance_entropy_ix(ix, 2, datalen); /* r9 A1: never past datalen */
             if (one==0xFF) {
                 b >>= 8;
                 cnt -= 8;
-            } else if (two==0xFF) ix++;
+            } else if (two==0xFF) ix = lj92_advance_entropy_ix(ix, 1, datalen);
         }
         cnt -= t;
         diff = b >> cnt;
