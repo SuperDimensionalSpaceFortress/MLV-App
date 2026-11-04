@@ -138,7 +138,10 @@ identity is taken over the samples as the display stores them AFTER the clip's C
 table maps to one picture share an id; uncompressed RAW with a table hashes its unpacked samples, without one its packed bytes). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
 ends (r8: a `--visual-capture-dir` run opens every clip under a share-read `SourceWriteGuard`, so no writer can change its bytes,
 and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes.
-Only the Windows guard can be held (r10): its share-read reopen fails while any writer has the file open. On every other
+Only the Windows guard can be held (r10): its share-read reopen was measured (r11, on NTFS, locally and through loopback SMB) to
+fail with a sharing violation while a handle has the file open for write, while a writable view outlives its file handle, or while a
+writable section handle does, with or without a view. A store through such a view can leave the file's size and write time alone,
+so only that refusal keeps it from an id. Other file systems and a writer on another host were not measured. On every other
 platform the guard excludes no writer -- a `MAP_SHARED` writable mapping taken before the open can store into the clip without
 moving its size, mtime or ctime -- so it is never held (`SourceWriteGuard::excludesExistingWriters()` is false), no source id is
 attached, and `source_difference` is absent (unknown) on every non-Windows run. Mappings are not detected. Two frames that

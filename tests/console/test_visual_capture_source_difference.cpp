@@ -17,6 +17,7 @@
 #include "../../platform/qt/VisualCaptureSourceGuard.h"
 
 #include <QByteArray>
+#include <QDir>
 #include <QTemporaryDir>
 #include <QThread>
 #include <cstdio>
@@ -725,7 +726,7 @@ TEST(VisualCaptureSourceGuard, AnOpenStampThatIsEmptyOrAnotherFilesIsNeverHeld)
 // and before the deferred hash, with no flush, resize or remap. dup() excludes no writer, and that store can leave size, mtime
 // and ctime unchanged, so 1c438b0c's POSIX guard held, said unchanged(), and the hash of edited bytes was bound to the earlier
 // capture: identical captured frames got differing ids. A guard that cannot exclude an EXISTING writer now binds no source id
-// at all; only the Windows guard (share-read reopen, which fails while any writer holds the file) is ever held. This test takes
+// at all; only the Windows guard (share-read reopen; r11 below pins what refuses it) is ever held. This test takes
 // the non-Windows path on any build through the constructor's seam (platformExcludesWriters = false); the next test pins that
 // the real non-Windows compile takes it too.
 TEST(VisualCaptureSourceGuard, AGuardThatCannotExcludeAnExistingWriterBindsNoSourceId)
@@ -799,3 +800,273 @@ TEST(VisualCaptureSourceGuard, EveryNonWindowsBuildsGuardExcludesNoWriterSoItIsN
     ASSERT_FALSE(vcsd::SourceWriteGuard::excludesExistingWriters());
 #endif
 }
+
+#ifdef Q_OS_WIN
+// r11 (Dot B4, UUID 7dbb4d0c; hub ruling HUB-TICK 20261104T1301Z). A writable mapping can outlive its file handle, and a store
+// through it moved neither the size nor the last write time while a fresh ReadFile saw the new bytes (run dir b4-probe.txt, NTFS),
+// so the stamp cannot see such a store: the only thing between it and a source id is the guard's share-read reopen being refused.
+// That refusal is the operating system's behaviour, not this code's, so these tests pin it. They fail if a guard ever holds a clip
+// under a writable mapping. Measured on NTFS only; see VisualCaptureSourceGuard.h.
+namespace
+{
+
+const int kMappedStoreOffset = 53;
+
+// The reopen SourceWriteGuard makes, by hand, for its GetLastError (the guard does not expose it). 0 when the reopen succeeds.
+DWORD shareReadReopenError(FILE * clipFile)
+{
+    typedef HANDLE ( WINAPI *ReOpenFileFn )( HANDLE, DWORD, DWORD, DWORD );
+    const ReOpenFileFn reopen = reinterpret_cast<ReOpenFileFn>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ReOpenFile")));
+    ASSERT_TRUE(reopen != nullptr);
+    SetLastError(0);
+    const HANDLE reopened = reopen(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(clipFile))), GENERIC_READ, FILE_SHARE_READ, 0);
+    const DWORD error = GetLastError();
+    if (reopened == INVALID_HANDLE_VALUE) return error;
+    CloseHandle(reopened);
+    return 0;
+}
+
+std::wstring nativePath(const QString & path)
+{
+    return QDir::toNativeSeparators(path).toStdWString();
+}
+
+// A writer that maps the clip and closes its file handle: only the section and/or the view are left.
+class RetainedMapping
+{
+public:
+    RetainedMapping(const QString & path, DWORD fileAccess, DWORD sectionProtect, DWORD viewAccess, bool retainSection)
+    {
+        const HANDLE file = CreateFileW(nativePath(path).c_str(), fileAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        ASSERT_TRUE(file != INVALID_HANDLE_VALUE);
+        m_section = CreateFileMappingW(file, nullptr, sectionProtect, 0, 0, nullptr);
+        CloseHandle(file);
+        ASSERT_TRUE(m_section != nullptr);
+        if (viewAccess != 0) m_view = static_cast<unsigned char *>(MapViewOfFile(m_section, viewAccess, 0, 0, 0));
+        const bool viewAsAsked = viewAccess == 0 || m_view != nullptr;
+        if (!retainSection) { CloseHandle(m_section); m_section = nullptr; }
+        ASSERT_TRUE(viewAsAsked);
+    }
+    ~RetainedMapping() { release(); }
+    RetainedMapping(const RetainedMapping &) = delete;
+    RetainedMapping & operator=(const RetainedMapping &) = delete;
+
+    // a store with no change of size, through the view (a retained writable section can map one at any time, guard or no guard)
+    void store()
+    {
+        if (!m_view) m_view = static_cast<unsigned char *>(MapViewOfFile(m_section, FILE_MAP_WRITE, 0, 0, 0));
+        ASSERT_TRUE(m_view != nullptr);
+        m_view[kMappedStoreOffset] ^= 0x5a;
+    }
+    void release()
+    {
+        if (m_view) UnmapViewOfFile(m_view);
+        if (m_section) CloseHandle(m_section);
+        m_view = nullptr;
+        m_section = nullptr;
+    }
+
+private:
+    HANDLE m_section = nullptr;
+    unsigned char * m_view = nullptr;
+};
+
+char byteOnDisk(const QString & path)
+{
+    QFile disk(path);
+    ASSERT_TRUE(disk.open(QIODevice::ReadOnly));
+    ASSERT_TRUE(disk.seek(kMappedStoreOffset));
+    char byte = 0;
+    ASSERT_EQ(qint64(1), disk.read(&byte, 1));
+    return byte;
+}
+
+// MainWindow's two guards on this clip, asked as bindSourceIds' callback asks them, over six play captures
+vcsd::BoundSourceIds bindThroughGuards(ClipHarness & clips, const vcsd::SourceWriteGuard & captureGuard, const vcsd::SourceWriteGuard & openGuard)
+{
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    for (int label : kA2Labels) captures.append(playCapture(label, clips.now()));
+    clips.sourceUnchanged = vcsd::SourceWriteGuard::excludesExistingWriters() && captureGuard.unchanged() && openGuard.unchanged();
+    return clips.bind(captures, captureClip);
+}
+
+// While the writer exists: the reopen is refused with a sharing violation, neither guard is held, no id, nothing hashed.
+void assertRefusedWithNoSourceId(FILE * clipFile, const QByteArray & opened)
+{
+    ASSERT_EQ(DWORD(ERROR_SHARING_VIOLATION), shareReadReopenError(clipFile));
+    const vcsd::SourceWriteGuard openGuard(&clipFile, 1, opened);
+    const vcsd::SourceWriteGuard captureGuard(&clipFile, 1, opened);
+    ASSERT_FALSE(openGuard.held());
+    ASSERT_FALSE(openGuard.unchanged());
+    ASSERT_FALSE(captureGuard.held());
+    ASSERT_FALSE(captureGuard.unchanged());
+    ClipHarness clips;
+    const vcsd::BoundSourceIds bound = bindThroughGuards(clips, captureGuard, openGuard);
+    assertNoSourceId(bound);
+    ASSERT_EQ(0, clips.hashCalls);
+}
+
+// The refusal belongs to the writer, not to the file: with it gone, the same read handle is held and binds its ids.
+void assertHeldAndBindsSourceIds(FILE * clipFile)
+{
+    ASSERT_EQ(DWORD(0), shareReadReopenError(clipFile));
+    const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+    ASSERT_FALSE(opened.isEmpty());
+    const vcsd::SourceWriteGuard openGuard(&clipFile, 1, opened);
+    const vcsd::SourceWriteGuard captureGuard(&clipFile, 1, opened);
+    ASSERT_TRUE(openGuard.held());
+    ASSERT_TRUE(openGuard.unchanged());
+    ASSERT_TRUE(captureGuard.held());
+    ASSERT_TRUE(captureGuard.unchanged());
+    ClipHarness clips;
+    const vcsd::BoundSourceIds bound = bindThroughGuards(clips, captureGuard, openGuard);
+    for (bool valid : bound.valid) ASSERT_TRUE(valid);
+    ASSERT_TRUE(vcsd::decide(bound.playIdentities) == vcsd::Verdict::Identical);
+    ASSERT_EQ(6, clips.hashCalls);
+}
+
+} // namespace
+
+// Dot's trace: the view retained, the original file handle closed, the store made after the guard was asked for. With and without
+// the section handle: Dot's case is the view alone, the hub's keeps both.
+TEST(VisualCaptureSourceGuard, AWritableViewThatOutlivesItsFileHandleRefusesTheGuardAndBindsNoSourceId)
+{
+    for (const bool retainSection : { true, false }) {
+        QTemporaryDir dir;
+        ASSERT_TRUE(dir.isValid());
+        const QString path = writeSourceFile(dir);
+        RetainedMapping writer(path, GENERIC_READ | GENERIC_WRITE, PAGE_READWRITE, FILE_MAP_WRITE, retainSection);
+        FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");   // the reader's own handle shares writes: this opens
+        ASSERT_TRUE(clipFile != nullptr);
+        const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+        ASSERT_FALSE(opened.isEmpty());
+        assertRefusedWithNoSourceId(clipFile, opened);
+        {
+            const vcsd::SourceWriteGuard guard(&clipFile, 1, opened);
+            const char before = byteOnDisk(path);
+            writer.store();
+            ASSERT_TRUE(byteOnDisk(path) != before);   // the deferred hash's file read WOULD see this store
+            ASSERT_FALSE(guard.held());
+            ASSERT_FALSE(guard.unchanged());           // whatever the stamp says about it
+        }
+        assertRefusedWithNoSourceId(clipFile, opened);
+        writer.release();
+        assertHeldAndBindsSourceIds(clipFile);
+        std::fclose(clipFile);
+    }
+}
+
+// A guard that counted views alone would hold here, and the writer could map one under it. A writable section with no view, or with
+// only a read view, is refused too. The store below goes through a view mapped after the guard was asked for.
+TEST(VisualCaptureSourceGuard, AWritableSectionRefusesTheGuardEvenWithNoWritableViewYet)
+{
+    for (const DWORD viewAccess : { DWORD(0), DWORD(FILE_MAP_READ) }) {
+        QTemporaryDir dir;
+        ASSERT_TRUE(dir.isValid());
+        const QString path = writeSourceFile(dir);
+        RetainedMapping writer(path, GENERIC_READ | GENERIC_WRITE, PAGE_READWRITE, viewAccess, true);
+        FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+        ASSERT_TRUE(clipFile != nullptr);
+        const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+        ASSERT_FALSE(opened.isEmpty());
+        assertRefusedWithNoSourceId(clipFile, opened);
+        if (viewAccess == 0) {
+            const vcsd::SourceWriteGuard guard(&clipFile, 1, opened);
+            const char before = byteOnDisk(path);
+            writer.store();
+            ASSERT_TRUE(byteOnDisk(path) != before);
+            ASSERT_FALSE(guard.held());
+            ASSERT_FALSE(guard.unchanged());
+        }
+        writer.release();
+        assertHeldAndBindsSourceIds(clipFile);
+        std::fclose(clipFile);
+    }
+}
+
+// The order the stamp cannot catch: a view exists at the clip's open, stores, and is gone by the capture. Its store may leave the
+// stamp as it was (b4-probe.txt [H]), so the capture's guard alone cannot be relied on to refuse. The open guard was refused and
+// stays refused, and bindSourceIds' callback asks both (wiring test above), so no capture gets an id.
+TEST(VisualCaptureSourceGuard, AWritableViewAtTheOpenLeavesNoSourceIdEvenOnceItIsGoneByTheCapture)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    RetainedMapping writer(path, GENERIC_READ | GENERIC_WRITE, PAGE_READWRITE, FILE_MAP_WRITE, false);
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+    ASSERT_TRUE(clipFile != nullptr);
+    const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+    ASSERT_FALSE(opened.isEmpty());
+    {
+        const vcsd::SourceWriteGuard openGuard(&clipFile, 1, opened);   // MainWindow::recordClipOpenSourceStamp
+        ASSERT_FALSE(openGuard.held());
+        writer.store();
+        writer.release();
+        const vcsd::SourceWriteGuard captureGuard(&clipFile, 1, opened);
+        ASSERT_FALSE(openGuard.held());
+        ASSERT_FALSE(openGuard.unchanged());
+        ClipHarness clips;
+        const vcsd::BoundSourceIds bound = bindThroughGuards(clips, captureGuard, openGuard);
+        assertNoSourceId(bound);
+        ASSERT_EQ(0, clips.hashCalls);
+    }
+    std::fclose(clipFile);
+}
+
+// Hub ruling (c), control: an ordinary writer holding an open write handle, no mapping at all.
+TEST(VisualCaptureSourceGuard, AnOrdinaryWriterHoldingAWriteHandleIsRefusedAndBindsNoSourceId)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    const HANDLE writer = CreateFileW(nativePath(path).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    ASSERT_TRUE(writer != INVALID_HANDLE_VALUE);
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+    ASSERT_TRUE(clipFile != nullptr);
+    const QByteArray opened = vcsd::SourceWriteGuard::openStamp(&clipFile, 1);
+    ASSERT_FALSE(opened.isEmpty());
+    assertRefusedWithNoSourceId(clipFile, opened);
+    CloseHandle(writer);
+    assertHeldAndBindsSourceIds(clipFile);
+    std::fclose(clipFile);
+}
+
+// Hub ruling (c), control: an unchanged file with no writer still binds an id, so the refusals above are not a guard that never holds.
+TEST(VisualCaptureSourceGuard, AnUnchangedFileWithNoWriterIsHeldAndBindsASourceId)
+{
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QString path = writeSourceFile(dir);
+    FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+    ASSERT_TRUE(clipFile != nullptr);
+    assertHeldAndBindsSourceIds(clipFile);
+    std::fclose(clipFile);
+}
+
+// Narrowness: mappings that cannot store to the file do not refuse the guard (b4-probe.txt [D], [E]). A retained read-only view or a
+// copy-on-write view leaves the clip held, and a copy-on-write store stays private: the file's bytes do not move.
+TEST(VisualCaptureSourceGuard, AMappingThatCannotStoreToTheFileLeavesTheGuardHeld)
+{
+    const struct { DWORD protect; DWORD view; } cases[] = { { PAGE_READONLY, FILE_MAP_READ }, { PAGE_WRITECOPY, FILE_MAP_COPY } };
+    for (const auto & mapping : cases) {
+        QTemporaryDir dir;
+        ASSERT_TRUE(dir.isValid());
+        const QString path = writeSourceFile(dir);
+        RetainedMapping reader(path, GENERIC_READ, mapping.protect, mapping.view, true);
+        FILE * clipFile = std::fopen(QFile::encodeName(path).constData(), "rb");
+        ASSERT_TRUE(clipFile != nullptr);
+        assertHeldAndBindsSourceIds(clipFile);
+        if (mapping.view == FILE_MAP_COPY) {
+            const char before = byteOnDisk(path);
+            reader.store();
+            ASSERT_EQ(int(before), int(byteOnDisk(path)));
+            assertHeldAndBindsSourceIds(clipFile);
+        }
+        std::fclose(clipFile);
+    }
+}
+#endif // Q_OS_WIN

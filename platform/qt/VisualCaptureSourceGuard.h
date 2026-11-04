@@ -7,7 +7,8 @@
  * never showed, and a healthy static display read FROZEN_DISPLAY. The guard is taken when the capture run starts and held
  * until the hashing ends:
  *  - Windows: each chunk file is reopened (ReOpenFile) with share mode FILE_SHARE_READ only, so no writer can open it
- *    while the guard holds it, and the reopen itself fails when a writer already has it open (the guard is then not held);
+ *    while the guard holds it, and the reopen itself fails when a writer already has it open (the guard is then not held;
+ *    r11 below lists what was measured to refuse it);
  *  - every platform: a stamp of each file's identity, size and last write time, read from the guard's OWN handles (never
  *    from the clip object, which a FileOpen may have freed), must be what it was when the guard was taken.
  * unchanged() is false when the guard could not be taken or the stamp moved: then no source id is attached (fail closed).
@@ -16,15 +17,28 @@
  * Play has decoded frames that the caches (raw prefetch ring, raw RGB cache, processed caches) later serve with no file read,
  * so a byte edited after such a decode and before the guard was baked into the guard's own stamp: the cached picture was the
  * old bytes, the deferred hash read the new ones. Now the guard must also MATCH the stamp taken when the clip was OPENED
- * (openStamp(), from the clip's own read handles, before any frame of it is decoded): any write to the files between the open
- * and the end of the hashing moves the stamp, the guard is not held, and no source id is attached. Every decode a cache can
- * serve happened after the open, so no cached picture can predate the bytes the identity is read from.
+ * (openStamp(), from the clip's own read handles, before any frame of it is decoded): a write through a file handle between the
+ * open and the end of the hashing moves the stamp (a store through a mapped view need not: r11 below), the guard is not held, and
+ * no source id is attached. Every decode a cache can serve happened after the open, so no cached picture can predate the bytes the
+ * identity is read from.
  *
  * r10 (adversary r9 pass 3 A1 on 1c438b0c, hub ruling HUB-TICK 20261104T0536Z): only the Windows guard EXCLUDES writers. A POSIX
  * dup() excludes none, and a writer that took a MAP_SHARED writable mapping before the open stamp can store into the clip without
  * moving its size, mtime or ctime, so a stamp cannot see the edit. Every non-Windows build therefore never holds the guard
  * (excludesExistingWriters() is false): no source id is bound and every frame stays unknown (fail closed). Mappings are not
- * detected. */
+ * detected.
+ *
+ * r11 (Dot B4, hub ruling HUB-TICK 20261104T1301Z): what the Windows guard excludes is measured, not assumed. A writable mapping can
+ * outlive its file handle. On local NTFS a store through one moved neither the size nor the last write time, even after
+ * FlushViewOfFile, while a fresh ReadFile saw the new bytes, so the stamp cannot see that store and only the refused reopen stands
+ * between it and a source id. Measured (Windows 10 19045, tests/console VisualCaptureSourceGuard.*): the share-read reopen fails with
+ * ERROR_SHARING_VIOLATION while any of these exists, on NTFS read locally or through loopback SMB:
+ *  - a handle open with write access;
+ *  - a FILE_MAP_WRITE view whose file handle is closed, with or without its section handle;
+ *  - a PAGE_READWRITE section handle whose file handle is closed, with only a read view or no view (it could map a writable one).
+ * A PAGE_READONLY or PAGE_WRITECOPY mapping does not refuse it, and neither can store to the file. The refusal comes from the file
+ * system, which this code does not check: FAT, exFAT, ReFS, a non-Windows SMB server and a writer on another host were not measured,
+ * and nothing here detects a mapping by any other means. */
 
 #include <QByteArray>
 #include <QVector>
@@ -68,8 +82,10 @@ public:
         return out;
     }
 
-    // r10 (adversary r9 pass 3 A1): whether this build's guard excludes every writer of the clip, including one that opened or
-    // mapped it before the guard. Windows: yes (the share-read reopen fails while any writer holds the file). Elsewhere: no.
+    // r10 (adversary r9 pass 3 A1): whether this build's guard can be held at all, because it has a way to refuse a writer of the
+    // clip that opened or mapped it before the guard. Elsewhere: no.
+    // r11 (Dot B4): Windows: yes, through the share-read reopen. This is a build-level switch, not proof about every writer: the
+    // writers measured to refuse the reopen, and the file systems they were measured on, are listed at the top of this file.
     static constexpr bool excludesExistingWriters()
     {
 #ifdef Q_OS_WIN
