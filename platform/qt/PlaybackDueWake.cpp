@@ -229,8 +229,11 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
             for( ;; )
             {
                 args.postRefusals->fetch_add( 1 );
-                if( GetTickCount64() - start >= budget ) break;
-                if( WaitForSingleObject( args.stopEvent, 1 ) != WAIT_TIMEOUT )
+                // r8 (adversary pass 17 A2): the wait is recomputed from the clock in the same expression that feeds it and
+                // clamped to min(1 ms, the budget left); 0 = the budget is spent (see kPostRetryBudgetMs for the contract)
+                const DWORD retryWaitMs = playbackDueWakeSliceWaitMs( GetTickCount64(), start + budget, 1 );
+                if( retryWaitMs == 0 ) break;
+                if( WaitForSingleObject( args.stopEvent, retryWaitMs ) != WAIT_TIMEOUT )
                 {
                     stopped = true;
                     break;
@@ -596,9 +599,11 @@ bool PlaybackDueWake::settlePostCounters()
     for( ;; )
     {
         if( d->settleAck.load() >= request ) return true;
-        const ULONGLONG now = GetTickCount64();
-        if( now >= deadline ) return false;
-        WaitForSingleObject( d->settledEvent, static_cast<DWORD>( deadline - now ) );
+        // r8 (adversary pass 17 A2 sibling): recomputed immediately before each wait and clamped to one slice, never a stale
+        // relative wait taken before a preemption
+        const DWORD settleWaitMs = playbackDueWakeSliceWaitMs( GetTickCount64(), deadline, kSettleSliceMs );
+        if( settleWaitMs == 0 ) return d->settleAck.load() >= request;
+        WaitForSingleObject( d->settledEvent, settleWaitMs );
     }
 #else
     return true;

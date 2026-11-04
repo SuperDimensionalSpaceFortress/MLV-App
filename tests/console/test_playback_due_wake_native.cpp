@@ -1483,14 +1483,15 @@ TEST(PlaybackDueWakeNative, APreviousPlaysLateFailureIsSettledBeforeTheNextPlays
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "const HANDLE handles[3] = { args.stopEvent, args.timer, args.settleEvent };" ) ) );
     // r7 adversary pass 16 A2: the elapsed budget is checked again after every retry wait, before any further attempt
-    const int retryWait = source.indexOf( QStringLiteral( "if( WaitForSingleObject( args.stopEvent, 1 ) != WAIT_TIMEOUT )" ) );
+    const int retryWait = source.indexOf( QStringLiteral( "if( WaitForSingleObject( args.stopEvent, retryWaitMs ) != WAIT_TIMEOUT )" ) );
     const int recheck = source.indexOf( QStringLiteral( "if( GetTickCount64() - start >= budget ) break;" ), retryWait );
     const int retry = source.indexOf( QStringLiteral( "if( postDueWake( args, postQpc.QuadPart, generation ) )" ), retryWait );
     ASSERT_TRUE( retryWait > 0 && recheck > retryWait && retry > recheck );
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
     const QString reset = functionBody( mainWindow, QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
                                         QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ) );
-    const int settle = reset.indexOf( QStringLiteral( "if( m_playbackDueWake ) m_playbackDueWake->settlePostCounters();" ) );
+    const int settle = reset.indexOf( QStringLiteral(
+        "m_playbackDueWakePostBaselineSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;" ) );
     const int baseline = reset.indexOf( QStringLiteral( "m_playbackDueWakePostFailedBase =" ) );
     ASSERT_TRUE( settle > 0 && baseline > settle );
     const QString line = functionBody( mainWindow, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
@@ -1500,6 +1501,97 @@ TEST(PlaybackDueWakeNative, APreviousPlaysLateFailureIsSettledBeforeTheNextPlays
     ASSERT_TRUE( settled > 0 && read > settled );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, ABaselineTakenAfterAnUnansweredSettleMarksThePlaysLineUnsettled)
+{
+    // r8 (adversary pass 17 A1, MainWindow.cpp:19684 on b19a895a) input: native delivery, Play A's arm(5.0) against a full
+    // queue; the worker is still inside its retry when A stops and B starts, and stays there through B's settle timeout; it
+    // counts A's failure after B recorded its baseline, B has no failure of its own, and B's end-of-Play settle succeeds. On
+    // b19a895a the reset dropped the settle's false, so B printed post_failed=1 post_counts_settled=1. Here the worker keeps
+    // the 3000 ms budget it loaded when its retry began, and the settle's deadline uses the budget set after that (0 + slack),
+    // so the settle times out exactly as it does for a worker descheduled past it.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    DueWakeQueueDrain drainOnExit { wake };
+    wake.setPostRetryBudgetMsForTest( 3000 );
+    DWORD refusedWith = 0;
+    fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    if( refusedWith == 0 ) SKIP_TEST( "this host's posted-message limit is above 1000000: the queue cannot be filled" );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.arm( 5.0 );                                               // Play A's last arm
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postRefusals() >= 1; }, 3000 ) );   // the worker is retrying
+    wake.cancel();                                                 // A stops
+    wake.setPostRetryBudgetMsForTest( 0 );                         // the settle below waits 0 + kSettleSlackMs only
+    // B's reset: the settle is not answered in time, and the baseline is taken anyway
+    const bool baselineSettled = wake.settlePostCounters();
+    ASSERT_FALSE( baselineSettled );
+    const quint64 baseFailed = wake.postFailures();
+    ASSERT_EQ( 0u, baseFailed );                                   // A's failure is not in yet...
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postFailures() >= 1; }, 6000 ) );   // ...it lands inside B
+    drainDueWakeWindow( wake );
+    wake.arm( 1.0 );                                               // B's own arm: delivered, no failure
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    const bool endSettled = wake.settlePostCounters();
+    ASSERT_TRUE( endSettled );                                     // the end-of-Play settle alone says "settled"...
+    ASSERT_EQ( 1u, wake.postFailures() - baseFailed );             // ...yet B's difference holds A's failure
+    ASSERT_FALSE( endSettled && baselineSettled );                 // what B's line must print: post_counts_settled=0
+    ASSERT_FALSE( wake.deliverLostPost() );                        // A's lost post was cancelled: the gate drops it
+    ASSERT_EQ( 1, fired );
+    // the wiring: the reset keeps the settle's answer, and the line's post_counts_settled requires it as well as its own
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "if( m_playbackDueWake ) m_playbackDueWake->settlePostCounters();" ) ) );
+    const QString reset = functionBody( mainWindow, QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
+                                        QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ) );
+    const int kept = reset.indexOf( QStringLiteral(
+        "m_playbackDueWakePostBaselineSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;" ) );
+    const int baseline = reset.indexOf( QStringLiteral( "m_playbackDueWakePostRefusedBase =" ) );
+    ASSERT_TRUE( kept > 0 && baseline > kept );
+    const QString line = functionBody( mainWindow, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
+                                       QStringLiteral( "//Paint the Audio Track Wave to GUI" ) );
+    const int both = line.indexOf( QStringLiteral( "&& m_playbackDueWakePostBaselineSettled;" ) );
+    const int printed = line.indexOf( QStringLiteral( ".arg( postCountsSettled ? 1 : 0 )" ) );
+    ASSERT_TRUE( both > 0 && printed > both );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, EveryRetryAndSettleWaitIsRecomputedAndClampedImmediatelyBeforeIt)
+{
+    // r8 (adversary pass 17 A2, PlaybackDueWake.cpp:239 on b19a895a) input: 100 ms retry budget, native arm(5.0), full queue;
+    // the last check reads elapsed=90 ms, the worker is descheduled until 150 ms. Sibling (:601): the settle reads now=0 with
+    // deadline=1100, is descheduled until 1500, then starts a stale 1100 ms relative wait (blocking to about 2600 ms). Now
+    // every wait is computed from the clock in the expression that feeds it, clamped to one slice, and 0 past the deadline.
+    // retry: start=0, deadline = start + budget = 100, slice 1 ms
+    ASSERT_EQ( 1u, playbackDueWakeSliceWaitMs( 90, 100, 1 ) );
+    ASSERT_EQ( 1u, playbackDueWakeSliceWaitMs( 99, 100, 1 ) );
+    ASSERT_EQ( 0u, playbackDueWakeSliceWaitMs( 100, 100, 1 ) );    // spent: no wait and no attempt
+    ASSERT_EQ( 0u, playbackDueWakeSliceWaitMs( 150, 100, 1 ) );    // the resumed worker starts nothing
+    // settle: deadline 1100 (budget 100 + slack 1000), slice kSettleSliceMs
+    ASSERT_EQ( PlaybackDueWake::kSettleSliceMs, playbackDueWakeSliceWaitMs( 0, 1100, PlaybackDueWake::kSettleSliceMs ) );
+    ASSERT_EQ( 5u, playbackDueWakeSliceWaitMs( 1095, 1100, PlaybackDueWake::kSettleSliceMs ) );
+    ASSERT_EQ( 0u, playbackDueWakeSliceWaitMs( 1500, 1100, PlaybackDueWake::kSettleSliceMs ) );   // returns, no 1100 ms wait
+    ASSERT_TRUE( PlaybackDueWake::kSettleSliceMs <= 10u );
+#ifdef Q_OS_WIN
+    // the wiring: no wait takes a relative time computed before a separate check
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 0, source.count( QStringLiteral( "WaitForSingleObject( args.stopEvent, 1 )" ) ) );
+    ASSERT_EQ( 0, source.count( QStringLiteral( "static_cast<DWORD>( deadline - now )" ) ) );
+    const int retryWait = source.indexOf( QStringLiteral(
+        "const DWORD retryWaitMs = playbackDueWakeSliceWaitMs( GetTickCount64(), start + budget, 1 );" ) );
+    const int retrySpent = source.indexOf( QStringLiteral( "if( retryWaitMs == 0 ) break;" ), retryWait );
+    const int retryUse = source.indexOf( QStringLiteral( "WaitForSingleObject( args.stopEvent, retryWaitMs )" ), retryWait );
+    const int recheck = source.indexOf( QStringLiteral( "if( GetTickCount64() - start >= budget ) break;" ), retryUse );
+    const int attempt = source.indexOf( QStringLiteral( "if( postDueWake( args, postQpc.QuadPart, generation ) )" ), retryUse );
+    ASSERT_TRUE( retryWait > 0 && retrySpent > retryWait && retryUse > retrySpent && recheck > retryUse && attempt > recheck );
+    const int settleWait = source.indexOf( QStringLiteral(
+        "const DWORD settleWaitMs = playbackDueWakeSliceWaitMs( GetTickCount64(), deadline, kSettleSliceMs );" ) );
+    const int settleUse = source.indexOf( QStringLiteral( "WaitForSingleObject( d->settledEvent, settleWaitMs );" ), settleWait );
+    ASSERT_TRUE( settleWait > 0 && settleUse > settleWait );
 #endif
 }
 

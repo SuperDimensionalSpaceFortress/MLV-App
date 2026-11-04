@@ -19681,7 +19681,9 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakePostUnsplit = 0;
     // r7 (adversary passes 13/14 A1): the wake's post counters are cumulative; the line reports this Play's share.
     // r7 pass 16 A1: settled first, so a failure of the previous Play's last arm is never taken into this Play's share
-    if( m_playbackDueWake ) m_playbackDueWake->settlePostCounters();
+    // r8 (adversary pass 17 A1): a false (the wait thread did not answer in time) is carried, so a late failure of the previous
+    // Play that lands after this baseline is printed as post_counts_settled=0, never as a settled count of this Play
+    m_playbackDueWakePostBaselineSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;
     m_playbackDueWakePostRefusedBase = m_playbackDueWake ? m_playbackDueWake->postRefusals() : 0;
     m_playbackDueWakePostFailedBase = m_playbackDueWake ? m_playbackDueWake->postFailures() : 0;
     m_playbackDueWakePostRescuedBase = m_playbackDueWake ? m_playbackDueWake->postRescued() : 0;
@@ -19733,7 +19735,10 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         || !m_playbackDueWakePostToReceiveHiMs.exact() || !m_playbackDueWakePostCallMs.exact();
     // r7 (adversary pass 16 A1): every timer signal of this Play is counted before the post counters are read
     // (post_counts_settled=0: the wait thread did not answer within its retry budget plus slack, and they may still move)
-    const bool postCountsSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;
+    // r8 (adversary pass 17 A1): ...at this line, OR at this Play's baseline (resetPlaybackDueWakeCounters); either one leaves
+    // the differences below open to another Play's late count
+    const bool postCountsSettled = ( m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true )
+        && m_playbackDueWakePostBaselineSettled;
     const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 )
         + QStringLiteral( " post_unsplit=%1" ).arg( m_playbackDueWakePostUnsplit )   // r5 pass 9 A1
         // r7 (adversary passes 13/14 A1): refused PostMessageW calls, posts given up after the retry budget, and lost posts the

@@ -1207,6 +1207,7 @@ private:
     quint64 m_playbackDueWakePostRefusedBase = 0;       // r7 passes 13-15 A1: the wake's cumulative counters at this Play's reset
     quint64 m_playbackDueWakePostFailedBase = 0;
     quint64 m_playbackDueWakePostRescuedBase = 0;
+    bool m_playbackDueWakePostBaselineSettled = true;   // r8 pass 17 A1: the reset's settlePostCounters() answered in time
     long long m_playbackDueWakePresentedFrame = -1;     // r2 pass 4 A1: the frame whose present last ENDED (presentPlaybackPreparedFrame)
     QString m_playbackDueWakeDelivery = QStringLiteral( "none" );   // r2: native-msg | notifier | qtimer, "+"-joined if arms differed
     bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism

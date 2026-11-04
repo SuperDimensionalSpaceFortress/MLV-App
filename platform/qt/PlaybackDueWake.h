@@ -159,6 +159,17 @@ inline quint64 playbackDueWakePackWParam( quint32 generation, quint32 tag )
 inline quint32 playbackDueWakeWParamGeneration( quint64 wParam ) { return static_cast<quint32>( wParam & 0xFFFFFFFFull ); }
 inline quint32 playbackDueWakeWParamTag( quint64 wParam ) { return static_cast<quint32>( wParam >> 32 ); }
 
+/*! r8 (adversary pass 17 A2): the next bounded wait, in ms, computed from a clock read taken IMMEDIATELY before the wait it
+ *  feeds: the time left to \a deadlineMs, clamped to \a sliceMs; 0 once \a nowMs has reached the deadline (no wait, and no
+ *  further attempt). A thread preempted between that read and the wait still waits at most one slice past its resumption,
+ *  never a stale whole remainder (the pass 17 sibling: a 1100 ms relative wait started after its deadline). */
+inline quint32 playbackDueWakeSliceWaitMs( quint64 nowMs, quint64 deadlineMs, quint32 sliceMs )
+{
+    if( nowMs >= deadlineMs ) return 0;
+    const quint64 left = deadlineMs - nowMs;
+    return left < sliceMs ? static_cast<quint32>( left ) : sliceMs;
+}
+
 /*! r6 (adversary pass 10 A2): the lateness split as the BOUNDS the two wait-thread stamps support, never a point. The post
  *  happened somewhere in [first stamp, PostMessageW's return stamp]: the wait thread can be descheduled before PostMessageW
  *  (pass 9 A1) or after it returns and before the return stamp (pass 10 A2), and no single stamp tells the two apart. So
@@ -247,7 +258,13 @@ public:
     /*! r7 (adversary passes 13/14 A1): PostMessageW fails when the GUI thread's queue is full (ERROR_NOT_ENOUGH_QUOTA, 10000
      *  posted messages by default), and the waitable timer's auto-reset signal is already consumed by then. The wait thread
      *  retries for up to this long (the stop event still wins); a post that never goes through is handed to the GUI thread
-     *  as a LOST post, which deliverLostPost() delivers once, and is counted (postFailures()). */
+     *  as a LOST post, which deliverLostPost() delivers once, and is counted (postFailures()).
+     *  r8 (adversary pass 17 A2), the budget contract: the budget bounds the retry loop's OWN waiting and deciding. Each wait
+     *  is recomputed from the clock immediately before it and clamped to min(1 ms, the budget left)
+     *  (playbackDueWakeSliceWaitMs); once a clock read shows the budget spent, no wait and no further attempt starts. What no
+     *  check can bound is a preemption of the wait thread itself: it delays whatever step comes next by its own length, and
+     *  an attempt decided inside the budget then posts late. Such a post carries the generation it loads at that moment and
+     *  is judged by the gate as usual, so a wake is still delivered at most once. */
     static constexpr int kPostRetryBudgetMs = 100;
     /*! GUI thread (MainWindow's poll tick): fire the current arm if the wait thread gave up posting its wake. True when it
      *  fired; a lost post of a cancelled or replaced arm is dropped by the gate, exactly like a stale message. */
@@ -263,9 +280,14 @@ public:
     /*! GUI thread. r7 (adversary pass 16 A1): the wait thread counts asynchronously, so a Play's cumulative-counter difference
      *  could take a failure of the previous Play's last arm. This returns once the wait thread has handled every timer signal
      *  that came before the call (posted, or retried and counted), waiting at most the retry budget plus kSettleSlackMs.
-     *  False on that timeout (the counters may still move). True at once when there is no wait thread. */
+     *  False on that timeout (the counters may still move). True at once when there is no wait thread.
+     *  r8 (adversary pass 17 A2 sibling): it waits in slices of at most kSettleSliceMs, each recomputed from the deadline
+     *  immediately before it, so a GUI thread preempted near the deadline returns at most one slice after it resumes.
+     *  r8 (pass 17 A1): a caller that takes a baseline after a false return must carry it (MainWindow prints
+     *  post_counts_settled=0 for that Play), never treat the baseline as settled. */
     bool settlePostCounters();
     static constexpr int kSettleSlackMs = 1000;
+    static constexpr quint32 kSettleSliceMs = 10;
     /*! Test hook: the wait thread's retry budget in ms (0: no retry). */
     void setPostRetryBudgetMsForTest( int ms );
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
