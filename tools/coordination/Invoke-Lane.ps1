@@ -155,6 +155,24 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# LANE-CHILD-LOADER-DIALOG-ON-OWNER-DESKTOP-1: a child that cannot load a DLL (or crashes, or hits an empty drive) raises a modal Windows System Error
+# box on the owner's desktop, and the child waits on a click nobody makes. A child inherits this process's error mode, so set it before ANY child,
+# version probe or MCP enumeration below starts. Same flag set as tools/testing/run-windows-test.ps1: SEM_FAILCRITICALERRORS 0x0001 |
+# SEM_NOGPFAULTERRORBOX 0x0002 | SEM_NOOPENFILEERRORBOX 0x8000. 0x0002 stays: the crash box is the thing that hangs a headless lane, and the lane still
+# sees the crash as the child's exit code (e.g. 0xC0000005). OR-ed onto the current mode, never a replacement. Fail open with a warning.
+# test_coordination_guardrails.py extracts this block between the two markers and runs it.
+# LANE-CHILD-ERROR-MODE-BEGIN
+if ($env:OS -eq 'Windows_NT') {
+    try {
+        if (-not ('LaneChildErrorMode' -as [type])) {
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class LaneChildErrorMode { [DllImport("kernel32.dll")] public static extern uint GetErrorMode(); [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint uMode); }'
+        }
+        [void][LaneChildErrorMode]::SetErrorMode([LaneChildErrorMode]::GetErrorMode() -bor 0x8003)
+    }
+    catch { Write-Warning "LANE_CHILD_ERROR_MODE_NOT_SET: $($_.Exception.Message) -- a child that cannot load a DLL may raise a dialog on the desktop" }
+}
+# LANE-CHILD-ERROR-MODE-END
+
 # ---------------------------------------------------------------- prompt + hub-host local-playback gate
 if (-not $Prompt -and -not $PromptFile) { throw 'Supply -Prompt or -PromptFile.' }
 if ($PromptFile) {

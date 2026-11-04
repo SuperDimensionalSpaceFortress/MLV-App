@@ -714,6 +714,85 @@ def test_invoke_lane_maps_the_negative_sentinels_rather_than_passing_them_throug
     assert "-999    { 127 }" in body, "never-completed sentinel is not mapped"
 
 
+# --- LANE-CHILD-LOADER-DIALOG-ON-OWNER-DESKTOP-1: a lane child must never raise a modal dialog ----------
+# MEASURED 2026-11-04 ~21:09Z: lj92-find-old.exe (libwinpthread-1.dll, then libgomp-1.dll not found) put Windows System Error boxes on the owner's
+# desktop. A child inherits its parent's error mode, so Invoke-Lane sets SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+# before it starts anything. Covered here: a grandchild through cmd.exe and one through ProcessStartInfo (the way Invoke-Lane starts its lane child).
+# NOT covered: a child that resets its own mode, and a process started through WMI (its parent is WmiPrvSE, so it inherits nothing from the lane).
+LANE_ERROR_MODE_FLAGS = 0x8003
+_LANE_ERROR_MODE_PWSH = shutil.which("pwsh")
+lane_error_mode_only = pytest.mark.skipif(
+    sys.platform != "win32" or _LANE_ERROR_MODE_PWSH is None,
+    reason="the Windows error mode (SetErrorMode / GetErrorMode) exists only on the Windows venue",
+)
+
+
+def _lane_error_mode_block(runner):
+    body = runner.read_text(encoding="utf-8").replace("\r\n", "\n")
+    begin, end = "# LANE-CHILD-ERROR-MODE-BEGIN\n", "# LANE-CHILD-ERROR-MODE-END"
+    assert begin in body and end in body, "Invoke-Lane lacks the LANE-CHILD-ERROR-MODE block"
+    return body[body.index(begin) + len(begin):body.index(end)]
+
+
+def _lane_error_mode_chain(tmp_path, runner):
+    """Parent resets its mode to 0, runs Invoke-Lane's own block, then reads the mode in two grandchildren."""
+    probe = tmp_path / "get-mode.ps1"
+    probe.write_text(
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; "
+        "public static class ProbeErrMode { [DllImport(\"kernel32.dll\")] public static extern uint GetErrorMode(); }'\n"
+        "'mode={0}' -f [ProbeErrMode]::GetErrorMode()\n",
+        encoding="ascii",
+    )
+    parent = tmp_path / "parent.ps1"
+    parent.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; "
+        "public static class TestErrModeReset { [DllImport(\"kernel32.dll\")] public static extern uint SetErrorMode(uint m); }'\n"
+        "[void][TestErrModeReset]::SetErrorMode(0)   # a clean parent: the test must not pass on a mode it inherited\n"
+        + _lane_error_mode_block(runner)
+        + f"$pwsh = '{_LANE_ERROR_MODE_PWSH}'\n"
+        f"$probe = '{probe}'\n"
+        "$viaCmd = (& cmd.exe /c \"`\"$pwsh`\" -NoProfile -NonInteractive -File `\"$probe`\"\") -join ' '\n"
+        "$psi = [System.Diagnostics.ProcessStartInfo]::new()\n"
+        "$psi.FileName = $pwsh; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true\n"
+        "foreach ($a in '-NoProfile','-NonInteractive','-File',$probe) { $psi.ArgumentList.Add($a) }\n"
+        "$p = [System.Diagnostics.Process]::Start($psi); $viaPsi = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()\n"
+        "'cmd: ' + $viaCmd\n"
+        "'psi: ' + $viaPsi.Trim()\n",
+        encoding="ascii",
+    )
+    done = subprocess.run(
+        [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(parent)],
+        text=True, capture_output=True, timeout=120,
+    )
+    modes = {m.group(1): int(m.group(2)) for m in re.finditer(r"^(cmd|psi): mode=(\d+)", done.stdout, re.M)}
+    return done, modes
+
+
+@lane_error_mode_only
+def test_invoke_lane_error_mode_reaches_a_grandchild(tmp_path):
+    done, modes = _lane_error_mode_chain(tmp_path, LANE_RUNNER)
+    assert set(modes) == {"cmd", "psi"}, f"the probe chain did not report both grandchildren: {done.stdout!r} {done.stderr!r}"
+    for path, mode in modes.items():
+        assert mode & LANE_ERROR_MODE_FLAGS == LANE_ERROR_MODE_FLAGS, (
+            f"grandchild via {path} has error mode 0x{mode:04X}; SEM_FAILCRITICALERRORS (0x0001) is what keeps a missing-DLL "
+            "dialog off the desktop, and the grandchild must carry 0x8003"
+        )
+
+
+def test_invoke_lane_sets_the_error_mode_before_it_starts_any_child():
+    body = LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert "# LANE-CHILD-ERROR-MODE-END" in body, "Invoke-Lane lacks the LANE-CHILD-ERROR-MODE block"
+    block_end = body.index("# LANE-CHILD-ERROR-MODE-END")
+    first_child = re.search(r"ProcessStartInfo|Start-Process|Invoke-GitCaptureUtf8\s", body)
+    assert first_child is not None
+    assert block_end < first_child.start(), (
+        f"the error mode is set after the first child-start site ({first_child.group(0).strip()!r}); a child started "
+        "earlier keeps the default mode and can raise a dialog on the desktop"
+    )
+    assert "SetErrorMode" in _lane_error_mode_block(LANE_RUNNER)
+
+
 def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
     # KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1. The user-level Stop hook usage-guard.py skips
     # its rotation-checkpoint block when MLV_FLEET_LANE is set; without it a headless lane takes one more
