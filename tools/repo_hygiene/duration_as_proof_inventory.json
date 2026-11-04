@@ -2618,6 +2618,36 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( firstMs < 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): firstMs is a TIMESTAMP (the first stamp from lastDeliveryPostFirstMs), and a negative value is the 'unsplit, no post interval' sentinel. The assert checks the sentinel on an unsplit delivery; no duration is compared and nothing is proven to have run (handleNativeMessage returning true proves the delivery).",
+      "lines": [
+        958
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , late . dueToPostLoMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): a pure arithmetic check of playbackDueWakeSplitBounds on the finding's synthetic input (due 100, first stamp 100, return stamp 140, receive 150 ms): the lower due-to-post bound is exactly 0. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1071
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "ASSERT_TRUE ( late . dueToPostLoMs <= 0.0 && 0.0 <= late . dueToPostHiMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): checks that the true due-to-post (0 ms) of the finding's synthetic input lies inside the [lo, hi] bounds playbackDueWakeSplitBounds computed. Constant inputs, no clock read, never a run-proof.",
+      "lines": [
+        1076
+      ]
+    },
+    {
       "path": "tests/pipeline/test_dualiso_gpu_split_timing.cpp",
       "anchor": "ASSERT_TRUE ( s . mutex_wait_ms >= 0.0 ) ;",
       "class": "not_run_proof_structural",

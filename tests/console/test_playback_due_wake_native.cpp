@@ -425,11 +425,13 @@ TEST(PlaybackDueWakeNative, TheMessageCarriesItsPostTimeAndTheLatenessIsSplitAtT
     ASSERT_EQ( static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ), playbackDueWakeWParamTag( packed ) );
     ASSERT_EQ( 0u, playbackDueWakeWParamTag( 7u ) );   // a bare generation carries no tag
     const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    // r6 (adversary pass 10 A2): the split is the [lo, hi] bounds of the two stamps, never a point
     ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
-        "\" post_stamped=%1 due_to_post_p50_ms=%2 due_to_post_p95_ms=%3 \"" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "\"post_to_receive_p50_ms=%4 post_to_receive_p95_ms=%5\"" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakeDueToPostMs.add( postMs - m_playbackDueWakeDueAtMs );" ) ) );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostToReceiveMs.add( nowMs - postMs );" ) ) );
+        "\" post_stamped=%1 due_to_post_p50_lo_ms=%2 due_to_post_p50_hi_ms=%3 \"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "\"post_to_receive_p50_lo_ms=%6 post_to_receive_p50_hi_ms=%7 \"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "playbackDueWakeSplitBounds( m_playbackDueWakeDueAtMs, firstStampMs, postMs, nowMs );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakeDueToPostLoMs.add( bounds.dueToPostLoMs );" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostToReceiveHiMs.add( bounds.postToReceiveHiMs );" ) ) );
 #ifdef Q_OS_WIN
     LARGE_INTEGER frequency;
     ASSERT_TRUE( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 );
@@ -604,14 +606,16 @@ TEST(PlaybackDueWakeSamplesB1, MainWindowKeepsNoUnboundedDueWakeSampleVector)
     ASSERT_FALSE( header.isEmpty() );
     ASSERT_FALSE( source.isEmpty() );
     ASSERT_FALSE( header.contains( QRegularExpression( QStringLiteral( "std::vector<double>[ ]+m_playbackDueWake" ) ) ) );
-    ASSERT_EQ( 3, header.count( QRegularExpression( QStringLiteral( "PlaybackDueWakeSamples[ ]+m_playbackDueWake[A-Za-z]+Ms;" ) ) ) );
+    // r6 (pass 10 A2): the lateness, and the split's four bounds and its post-call span
+    ASSERT_EQ( 6, header.count( QRegularExpression( QStringLiteral( "PlaybackDueWakeSamples[ ]+m_playbackDueWake[A-Za-z]+Ms;" ) ) ) );
     ASSERT_FALSE( source.contains( QRegularExpression( QStringLiteral( "m_playbackDueWake[A-Za-z]*Ms[.](push_back|emplace_back|clear)[(]" ) ) ) );
     const QString reset = functionBody( source, QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
                                         QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ) );
     ASSERT_FALSE( reset.isEmpty() );
     ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWakeLatenessMs.reset();" ) ) );
-    ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWakeDueToPostMs.reset();" ) ) );
-    ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWakePostToReceiveMs.reset();" ) ) );
+    const char *const splitSets[] = { "DueToPostLo", "DueToPostHi", "PostToReceiveLo", "PostToReceiveHi", "PostCall" };
+    for( const char *set : splitSets )
+        ASSERT_EQ( 1, reset.count( QStringLiteral( "m_playbackDueWake" ) + QLatin1String( set ) + QStringLiteral( "Ms.reset();" ) ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "m_playbackDueWakeLatenessMs.add( nowMs - m_playbackDueWakeDueAtMs );" ) ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "QStringLiteral( \" samples_binned=%1\" )" ) ) );
 }
@@ -770,14 +774,20 @@ TEST(PlaybackDueWakeSamplesB2, TheLongPlaySummaryLineDisclosesEachSetsRangeAndCe
     const QString line = functionBody( source, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
                                        QStringLiteral( "//Paint the Audio Track Wave to GUI" ) );
     ASSERT_FALSE( line.isEmpty() );
-    ASSERT_EQ( 6, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
-    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "DueToPostMs, 0.50 )", "DueToPostMs, 0.95 )",
-                                  "PostToReceiveMs, 0.50 )", "PostToReceiveMs, 0.95 )" };
+    // r6 (pass 10 A2): lateness p50 / p95, the four split bounds at p50 / p95, and the post-call span at p50 / p95
+    ASSERT_EQ( 12, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) ) );
+    const char *const ranks[] = { "LatenessMs, 0.50 )", "LatenessMs, 0.95 )", "DueToPostLoMs, 0.50 )", "DueToPostLoMs, 0.95 )",
+                                  "DueToPostHiMs, 0.50 )", "DueToPostHiMs, 0.95 )", "PostToReceiveLoMs, 0.50 )",
+                                  "PostToReceiveLoMs, 0.95 )", "PostToReceiveHiMs, 0.50 )", "PostToReceiveHiMs, 0.95 )",
+                                  "PostCallMs, 0.50 )", "PostCallMs, 0.95 )" };
     for( const char *rank : ranks )
         ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakePercentileText( m_playbackDueWake" ) + QLatin1String( rank ) ) );
     ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, \"late\" )" ) ) );
-    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeDueToPostMs, \"due_to_post\" )" ) ) );
-    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveMs, \"post_to_receive\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeDueToPostLoMs, \"due_to_post_lo\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakeDueToPostHiMs, \"due_to_post_hi\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveLoMs, \"post_to_receive_lo\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveHiMs, \"post_to_receive_hi\" )" ) ) );
+    ASSERT_EQ( 1, line.count( QStringLiteral( "playbackDueWakeRangeFields( m_playbackDueWakePostCallMs, \"post_call\" )" ) ) );
     // no raw double percentile is formatted on the line any more (that was the clamped value's path)
     ASSERT_EQ( 0, line.count( QStringLiteral( ".percentile(" ) ) );
     ASSERT_EQ( 0, line.count( QStringLiteral( "0, 'f', 3 )" ) ) );
@@ -872,6 +882,7 @@ TEST(PlaybackDueWakeNative, AFailedReArmCancelsTheReplacedNativeTimer)
     const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
     ASSERT_EQ( 1, source.count( QStringLiteral( "        CancelWaitableTimer( d->handle );\n"
                                                 "        d->postGeneration.store( 0, std::memory_order_release );\n"
+                                                "        d->gate.renew();\n"
                                                 "        d->lastArmQtTimer = true;" ) ) );
 }
 
@@ -906,9 +917,11 @@ TEST(PlaybackDueWakeNative, TheLatenessSplitsAtThePostReturnNotTheFirstStamp)
 #ifdef Q_OS_WIN
     // a live delivery: the post time it reports is never before the first stamp the message carries
     double postMs = -2.0;
+    double firstMs = -2.0;
     bool unsplit = false;
     PlaybackDueWake *self = nullptr;
-    PlaybackDueWake wake( nullptr, [&]() { postMs = self->lastDeliveryPostMs(); unsplit = self->lastDeliveryUnsplit(); } );
+    PlaybackDueWake wake( nullptr, [&]() { postMs = self->lastDeliveryPostMs(); firstMs = self->lastDeliveryPostFirstMs();
+                                           unsplit = self->lastDeliveryUnsplit(); } );
     self = &wake;
     LARGE_INTEGER frequency;
     ASSERT_TRUE( QueryPerformanceFrequency( &frequency ) && frequency.QuadPart > 0 );
@@ -937,9 +950,158 @@ TEST(PlaybackDueWakeNative, TheLatenessSplitsAtThePostReturnNotTheFirstStamp)
         if( postMs >= 0.0 )
         {
             ASSERT_TRUE( postMs >= firstStampMs );
+            // r6 (pass 10 A2): the lower end of the post interval is the message's own first stamp
+            ASSERT_NEAR( firstStampMs, firstMs, 1e-3 );
             ++split;
         }
+        else
+            ASSERT_TRUE( firstMs < 0.0 );   // unsplit: no interval at all
     }
     ASSERT_EQ( 1, split );
 #endif
+}
+
+TEST(PlaybackDueWakeGate, ARenewKeepsTheArmAndItsDueAndStalesEveryEarlierGeneration)
+{
+    // r6 adversary pass 10 A1: the failed re-arm renews the generation; the due time and the armed state are the arm's own
+    const qint64 ms = 1000000;
+    PlaybackDueWakeGate gate;
+    const quint32 replaced = gate.arm( 0, 50 * ms );
+    const quint32 replacement = gate.arm( 60 * ms, 5 * ms );      // due t=65
+    const quint32 renewed = gate.renew();
+    ASSERT_TRUE( renewed != replacement && renewed != replaced && renewed != 0u );
+    ASSERT_TRUE( gate.armed() );
+    ASSERT_FALSE( gate.accept( replacement, 67 * ms, 65 * ms + 100000 ) );   // the old wait thread's late post: stale
+    ASSERT_FALSE( gate.accept( replaced, 67 * ms, 65 * ms + 100000 ) );
+    ASSERT_TRUE( gate.armed() );
+    ASSERT_FALSE( gate.accept( renewed, 64 * ms ) );              // the due is kept: an early QTimer is still early
+    ASSERT_TRUE( gate.accept( renewed, 67 * ms ) );               // the QTimer (no post time) fires it, once
+    ASSERT_FALSE( gate.armed() );
+    // the delivery paths: a notifier activation delivers only a waitable-timer arm, a QTimer only a QTimer arm
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_FALSE( source.isEmpty() );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "if( fromQtTimer != lastArmQtTimer ) return;" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "[impl]( HANDLE ) { impl->deliverCurrent( false ); } );" ) ) );
+    ASSERT_EQ( 2, source.count( QStringLiteral( "impl->deliverCurrent( true ); } );" ) ) );
+    ASSERT_EQ( 0, source.count( QStringLiteral( "deliverCurrent(); }" ) ) );
+}
+
+TEST(PlaybackDueWakeNative, TheReplacedTimersSignalPostedAfterAFailedReArmNeverFiresIt)
+{
+    // r6 adversary pass 10 A1 input: at t=0 arm(50) succeeds. At t=50 the wait thread consumes its signal and pauses before
+    // stamping. At t=60 arm(5) publishes generation 2 (due t=65) and SetWaitableTimer fails: cancel, generation 0 posted from
+    // then on. At t=65.1 the old wait thread resumes, stamps and posts generation 2. The GUI handles it at t=67, before the
+    // fallback QTimer. On 933b6558 it matched gate generation 2, passed both time checks, fired and disarmed the replacement
+    // while lastArmDelivery() said qtimer. The wait thread's late post is fed directly (its timing cannot be forced).
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    wake.arm( 50.0 );                                              // generation 1, on the waitable timer
+    wake.setWaitableTimerFailsForTest( true );
+    wake.arm( 5.0 );                                               // generation 2 stored for the wait thread; the set fails
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
+    Sleep( 8 );                                                    // past the replacement's due (t=65.1 .. 67)
+    LARGE_INTEGER stamp;
+    ASSERT_TRUE( QueryPerformanceCounter( &stamp ) );
+    MSG late = {};
+    late.hwnd = reinterpret_cast<HWND>( wake.nativeWindow() );
+    late.message = PlaybackDueWake::kNativeWakeMessage;
+    late.lParam = static_cast<LPARAM>( stamp.QuadPart );          // stamped after the due: the time checks pass
+    for( const quint32 generation : { 2u, 1u } )                   // the generation it loaded, and the replaced arm's
+    {
+        late.wParam = static_cast<WPARAM>(
+            playbackDueWakePackWParam( generation, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) );
+        ASSERT_TRUE( wake.handleNativeMessage( &late ) );          // this wake's message: consumed...
+        ASSERT_EQ( 0, fired );                                     // ...and stale
+        ASSERT_TRUE( wake.armed() );                               // the replacement is still armed for its QTimer
+    }
+    // the fallback QTimer is what delivers it, once
+    const ULONGLONG deadline = GetTickCount64() + 500;
+    while( fired < 1 && GetTickCount64() < deadline )
+    {
+        QCoreApplication::processEvents( QEventLoop::AllEvents, 5 );
+        Sleep( 1 );
+    }
+    ASSERT_EQ( 1, fired );
+    ASSERT_FALSE( wake.armed() );
+    ASSERT_EQ( 0, pumpDueWakeMessages( wake, 20 ) );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, AQueuedNotifierActivationOfTheReplacedTimerNeverFiresAFailedReArm)
+{
+    // r6 adversary pass 10 A1 sibling (PlaybackDueWake.cpp:258): on the notifier path the replaced arm's timer signalled and
+    // its activation was queued before arm(5) failed over to a QTimer. deliverCurrent took "whatever is armed now", so the
+    // queued activation fired the replacement on the notifier. Posted events only are sent first (no Qt timer runs there).
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; }, false );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::Notifier );
+    wake.arm( 1.0 );                                               // on the waitable timer
+    Sleep( 30 );                                                   // it signals; nobody processes events
+    wake.setWaitableTimerFailsForTest( true );
+    wake.arm( 5.0 );
+    ASSERT_TRUE( wake.lastArmDelivery() == PlaybackDueWake::Delivery::QtTimer );
+    Sleep( 8 );                                                    // past the replacement's due
+    QCoreApplication::sendPostedEvents();                          // the queued activation, if it was queued
+    ASSERT_EQ( 0, fired );
+    ASSERT_TRUE( wake.armed() );
+    const ULONGLONG deadline = GetTickCount64() + 500;
+    while( fired < 1 && GetTickCount64() < deadline )
+    {
+        QCoreApplication::processEvents( QEventLoop::AllEvents, 5 );
+        Sleep( 1 );
+    }
+    ASSERT_EQ( 1, fired );                                         // the QTimer delivers it, once
+    ASSERT_FALSE( wake.armed() );
+#else
+    SKIP_TEST( "the notifier delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeSplit, ADescheduleAfterPostMessageReturnsIsBoundedNotChargedToDueToPost)
+{
+    // r6 adversary pass 10 A2 input: due and first stamp at 100 ms, PostMessageW returns at 100 ms, the wait thread is
+    // descheduled before the return stamp until 140 ms and publishes 140, the GUI receives at 150 ms. 9c673870 reported
+    // due-to-post 40 / post-to-receive 10 against the true 0 / 50. Any single stamp has a window; the split is the bounds.
+    const PlaybackDueWakeSplitBounds late = playbackDueWakeSplitBounds( 100.0, 100.0, 140.0, 150.0 );
+    ASSERT_EQ( 0.0, late.dueToPostLoMs );
+    ASSERT_EQ( 40.0, late.dueToPostHiMs );
+    ASSERT_EQ( 10.0, late.postToReceiveLoMs );
+    ASSERT_EQ( 50.0, late.postToReceiveHiMs );
+    ASSERT_EQ( 40.0, late.postCallMs );                            // the attribution uncertainty, disclosed
+    ASSERT_TRUE( late.dueToPostLoMs <= 0.0 && 0.0 <= late.dueToPostHiMs );           // the true 0 / 50 is inside
+    ASSERT_TRUE( late.postToReceiveLoMs <= 50.0 && 50.0 <= late.postToReceiveHiMs );
+    // the pass 9 A1 mirror (deschedule BEFORE PostMessageW until 140, receive 140.1): the true 40 / 0.1 is inside too
+    const PlaybackDueWakeSplitBounds early = playbackDueWakeSplitBounds( 100.0, 100.0, 140.0, 140.1 );
+    ASSERT_TRUE( early.dueToPostLoMs <= 40.0 && 40.0 <= early.dueToPostHiMs );
+    ASSERT_TRUE( early.postToReceiveLoMs <= 0.1 + 1e-9 && 0.1 <= early.postToReceiveHiMs + 1e-9 );
+    // per-sample bounds bound every percentile: a true post anywhere in [first, return] stays inside the printed pair
+    PlaybackDueWakeSamples lo, hi, truth;
+    LatenessSource source;
+    for( int i = 0; i < 4000; ++i )
+    {
+        const double due = 1000.0 * i;
+        const double first = due + source.next( 0.0, 3.0 );
+        const double ret = first + source.next( 0.0, 40.0 );
+        const double post = first + ( ret - first ) * source.next( 0.0, 1.0 );
+        const PlaybackDueWakeSplitBounds b = playbackDueWakeSplitBounds( due, first, ret, ret + source.next( 0.0, 20.0 ) );
+        lo.add( b.dueToPostLoMs );
+        hi.add( b.dueToPostHiMs );
+        truth.add( post - due );
+    }
+    for( const double p : { 0.0, 0.50, 0.95, 1.0 } )
+        ASSERT_TRUE( lo.percentile( p ) <= truth.percentile( p ) && truth.percentile( p ) <= hi.percentile( p ) );
+    // the summary line claims no point split any more
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    ASSERT_FALSE( mainWindow.isEmpty() );
+    for( const char *point : { "due_to_post_p50_ms=", "due_to_post_p95_ms=", "post_to_receive_p50_ms=", "post_to_receive_p95_ms=" } )
+        ASSERT_EQ( 0, mainWindow.count( QLatin1String( point ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "\"post_call_p50_ms=%10 post_call_p95_ms=%11\"" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "const double firstStampMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostFirstMs() : -1.0;" ) ) );
+    const QString wake = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 1, wake.count( QStringLiteral( "firingFirstMs = returnNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;" ) ) );
 }

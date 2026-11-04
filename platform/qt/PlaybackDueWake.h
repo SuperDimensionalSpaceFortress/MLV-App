@@ -61,6 +61,14 @@ public:
         m_armed = false;
         nextGeneration();
     }
+    /*! r6 (adversary pass 10 A1): a new generation for the SAME arm (due time and armed state kept). A failed
+     *  SetWaitableTimer re-arm takes one after cancelling the replaced timer, so a message the old wait thread posted with
+     *  the generation stored before the attempt is stale; the fallback QTimer delivers the renewed generation. */
+    quint32 renew()
+    {
+        nextGeneration();
+        return m_generation;
+    }
     /*! True once, for the delivery that belongs to the current arm; the gate is disarmed before the caller fires.
      *  r3 (adversary pass 7 A1): \a postNs >= 0 is when the delivery was POSTED, on the gate's clock. A waitable timer never
      *  signals early, so a delivery posted before the armed due time is an EARLIER arm's signal whose wait thread read the
@@ -148,6 +156,27 @@ inline quint64 playbackDueWakePackWParam( quint32 generation, quint32 tag )
 inline quint32 playbackDueWakeWParamGeneration( quint64 wParam ) { return static_cast<quint32>( wParam & 0xFFFFFFFFull ); }
 inline quint32 playbackDueWakeWParamTag( quint64 wParam ) { return static_cast<quint32>( wParam >> 32 ); }
 
+/*! r6 (adversary pass 10 A2): the lateness split as the BOUNDS the two wait-thread stamps support, never a point. The post
+ *  happened somewhere in [first stamp, PostMessageW's return stamp]: the wait thread can be descheduled before PostMessageW
+ *  (pass 9 A1) or after it returns and before the return stamp (pass 10 A2), and no single stamp tells the two apart. So
+ *  due-to-post is in [first - due, return - due], post-to-receive is in [receive - return, receive - first], and the
+ *  post-call span (return - first) is the attribution uncertainty. Per-sample bounds bound the percentiles too: the k-th
+ *  smallest lower bound is <= the k-th smallest true value <= the k-th smallest upper bound. All times in ms, one clock. */
+struct PlaybackDueWakeSplitBounds
+{
+    double dueToPostLoMs;
+    double dueToPostHiMs;
+    double postToReceiveLoMs;
+    double postToReceiveHiMs;
+    double postCallMs;
+};
+inline PlaybackDueWakeSplitBounds playbackDueWakeSplitBounds( double dueAtMs, double firstStampMs, double returnStampMs,
+                                                              double receiveMs )
+{
+    return PlaybackDueWakeSplitBounds { firstStampMs - dueAtMs, returnStampMs - dueAtMs, receiveMs - returnStampMs,
+                                        receiveMs - firstStampMs, returnStampMs - firstStampMs };
+}
+
 class PlaybackDueWake
 {
 public:
@@ -202,6 +231,10 @@ public:
      *  delivery the GUI thread took before the wait thread published that stamp has no split: < 0 here, and
      *  lastDeliveryUnsplit() is true (the summary line counts it as post_unsplit, in neither split set). */
     double lastDeliveryPostMs() const;
+    /*! r6 (adversary pass 10 A2): the FIRST stamp of the delivery firing now (ms, the same clock), the earliest the post can
+     *  have been; >= 0 exactly when lastDeliveryPostMs() is. The post lies in [lastDeliveryPostFirstMs(), lastDeliveryPostMs()],
+     *  and the split is reported as those bounds (playbackDueWakeSplitBounds). */
+    double lastDeliveryPostFirstMs() const;
     bool lastDeliveryUnsplit() const;
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
     void stop();

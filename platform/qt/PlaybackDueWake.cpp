@@ -70,13 +70,18 @@ struct PlaybackDueWake::Impl
 #endif
         return clock.nsecsElapsed();
     }
-    // the notifier / Qt timer paths: the signal belongs to whatever is armed now (the gate drops an early one)
-    void deliverCurrent()
+    // the notifier / Qt timer paths: the signal belongs to whatever is armed now (the gate drops an early one).
+    // r6 (adversary pass 10 A1): ...but only on the mechanism the current arm runs on. A notifier activation queued from the
+    // waitable timer an arm that fell back to a QTimer replaced is not that arm's signal (only the QTimer is), and a QTimer
+    // timeout is not the signal of an arm that set the waitable timer.
+    void deliverCurrent( bool fromQtTimer )
     {
+        if( fromQtTimer != lastArmQtTimer ) return;
         if( gate.accept( gate.generation(), nowNs() ) && onFire ) onFire();
     }
     // r3: the post time of the delivery firing now (ms on the QPC clock), < 0 when the delivery carries none
     double firingPostMs = -1.0;
+    double firingFirstMs = -1.0;          // r6 pass 10 A2: its first stamp (>= 0 exactly when firingPostMs is)
     bool firingUnsplit = false;           // r5 pass 9 A1: a stamped native delivery whose post-return time was not published yet
     // the native-message path: the message names its generation and (r3) its first post stamp in QPC ticks (<= 0: none);
     // r5: returnTicks is PostMessageW's return time for that stamp (<= 0: not published when the GUI thread took it). The gate
@@ -87,9 +92,11 @@ struct PlaybackDueWake::Impl
         if( !gate.accept( generation, nowNs(), postNs ) || !onFire ) return;
         const qint64 returnNs = ( postNs >= 0 && returnTicks >= postTicks ) ? ticksToNs( returnTicks, qpcFrequency ) : -1;
         firingPostMs = returnNs >= 0 ? static_cast<double>( returnNs ) / 1000000.0 : -1.0;
+        firingFirstMs = returnNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;
         firingUnsplit = postNs >= 0 && returnNs < 0;
         onFire();
         firingPostMs = -1.0;
+        firingFirstMs = -1.0;
         firingUnsplit = false;
     }
 };
@@ -255,7 +262,7 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
         d->delivery = Delivery::Notifier;
         d->notifier = new QWinEventNotifier( d->handle, owner );
         Impl *impl = d.get();
-        QObject::connect( d->notifier, &QWinEventNotifier::activated, d->notifier, [impl]( HANDLE ) { impl->deliverCurrent(); } );
+        QObject::connect( d->notifier, &QWinEventNotifier::activated, d->notifier, [impl]( HANDLE ) { impl->deliverCurrent( false ); } );
         d->notifier->setEnabled( true );
         return;
     }
@@ -267,7 +274,7 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
     d->timer->setSingleShot( true );
     d->timer->setTimerType( Qt::PreciseTimer );
     Impl *impl = d.get();
-    QObject::connect( d->timer, &QTimer::timeout, owner, [impl]() { impl->deliverCurrent(); } );
+    QObject::connect( d->timer, &QTimer::timeout, owner, [impl]() { impl->deliverCurrent( true ); } );
 }
 
 PlaybackDueWake::~PlaybackDueWake()
@@ -343,8 +350,12 @@ void PlaybackDueWake::arm( double dueMs )
         // r5 adversary pass 9 A2: the failed SetWaitableTimer left the REPLACED arm's timer running, and its signal would
         // have posted (or, on the notifier path, delivered) this arm's generation. Cancel it, and post generation 0 (never
         // live) from now on, so only the QTimer delivers this arm.
+        // r6 adversary pass 10 A1: a wait thread that consumed the replaced timer's signal BEFORE the cancel can still load the
+        // generation stored above and post it after this arm's due time. Renew the generation (same due): that message, and
+        // any carrying an older one, is stale; the QTimer delivers the renewed one (deliverCurrent reads gate.generation()).
         CancelWaitableTimer( d->handle );
         d->postGeneration.store( 0, std::memory_order_release );
+        d->gate.renew();
         d->lastArmQtTimer = true;
         if( !d->timer )
         {
@@ -353,7 +364,7 @@ void PlaybackDueWake::arm( double dueMs )
             d->timer->setSingleShot( true );
             d->timer->setTimerType( Qt::PreciseTimer );
             Impl *impl = d.get();
-            QObject::connect( d->timer, &QTimer::timeout, [impl]() { impl->deliverCurrent(); } );
+            QObject::connect( d->timer, &QTimer::timeout, [impl]() { impl->deliverCurrent( true ); } );
         }
     }
 #else
@@ -424,6 +435,11 @@ bool PlaybackDueWake::waitThreadRunning() const
 double PlaybackDueWake::lastDeliveryPostMs() const
 {
     return d->firingPostMs;
+}
+
+double PlaybackDueWake::lastDeliveryPostFirstMs() const
+{
+    return d->firingFirstMs;
 }
 
 bool PlaybackDueWake::lastDeliveryUnsplit() const

@@ -19595,11 +19595,19 @@ void MainWindow::onPlaybackDueWake( void )
     m_playbackDueWakeLatenessMs.add( nowMs - m_playbackDueWakeDueAtMs );
     // r3: split the lateness at the post (native-message deliveries carry their post time): due-to-post is the timer and the
     // wait thread, post-to-receive is the GUI thread's queue (delivery vs GUI-thread occupancy)
+    // r6 adversary pass 10 A2: the post lies in [first stamp, return stamp] (a deschedule before PostMessageW or after it returns
+    // cannot be told apart), so the split is recorded as the bounds both stamps support, never a point
     const double postMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostMs() : -1.0;
+    const double firstStampMs = m_playbackDueWake ? m_playbackDueWake->lastDeliveryPostFirstMs() : -1.0;
     if( postMs >= 0.0 )
     {
-        m_playbackDueWakeDueToPostMs.add( postMs - m_playbackDueWakeDueAtMs );
-        m_playbackDueWakePostToReceiveMs.add( nowMs - postMs );
+        const PlaybackDueWakeSplitBounds bounds =
+            playbackDueWakeSplitBounds( m_playbackDueWakeDueAtMs, firstStampMs, postMs, nowMs );
+        m_playbackDueWakeDueToPostLoMs.add( bounds.dueToPostLoMs );
+        m_playbackDueWakeDueToPostHiMs.add( bounds.dueToPostHiMs );
+        m_playbackDueWakePostToReceiveLoMs.add( bounds.postToReceiveLoMs );
+        m_playbackDueWakePostToReceiveHiMs.add( bounds.postToReceiveHiMs );
+        m_playbackDueWakePostCallMs.add( bounds.postCallMs );
     }
     // r5 adversary pass 9 A1: postMs is PostMessageW's return time; a native delivery taken before the wait thread published
     // it is in neither split set (post_unsplit), never split at the first stamp
@@ -19673,8 +19681,11 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeMechanismSeen = false;
     // r4 (Dot B1): reset() releases the capacity (clear() kept it)
     m_playbackDueWakeLatenessMs.reset();
-    m_playbackDueWakeDueToPostMs.reset();
-    m_playbackDueWakePostToReceiveMs.reset();
+    m_playbackDueWakeDueToPostLoMs.reset();
+    m_playbackDueWakeDueToPostHiMs.reset();
+    m_playbackDueWakePostToReceiveLoMs.reset();
+    m_playbackDueWakePostToReceiveHiMs.reset();
+    m_playbackDueWakePostCallMs.reset();
 }
 
 // One line per measured Play, logged after the timed window has closed (finishPlaybackSmokeTelemetry).
@@ -19686,22 +19697,37 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
     const QString p50 = playbackDueWakePercentileText( m_playbackDueWakeLatenessMs, 0.50 );
     const QString p95 = playbackDueWakePercentileText( m_playbackDueWakeLatenessMs, 0.95 );
     // r3: the lateness split at the post (post_stamped = how many fired wakes carried a post time; the rest are 0.000)
-    const QString split = QStringLiteral( " post_stamped=%1 due_to_post_p50_ms=%2 due_to_post_p95_ms=%3 "
-                                          "post_to_receive_p50_ms=%4 post_to_receive_p95_ms=%5" )
-        .arg( static_cast<qulonglong>( m_playbackDueWakePostToReceiveMs.size() ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostMs, 0.50 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostMs, 0.95 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveMs, 0.50 ) )
-        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveMs, 0.95 ) );
+    // r6 (adversary pass 10 A2): each split percentile is printed as the [lo, hi] pair the two stamps support (the p-th lower
+    // bound <= the true p-th value <= the p-th upper bound), plus the post-call span that separates them; no point split
+    const QString split = QStringLiteral( " post_stamped=%1 due_to_post_p50_lo_ms=%2 due_to_post_p50_hi_ms=%3 "
+                                          "due_to_post_p95_lo_ms=%4 due_to_post_p95_hi_ms=%5 "
+                                          "post_to_receive_p50_lo_ms=%6 post_to_receive_p50_hi_ms=%7 "
+                                          "post_to_receive_p95_lo_ms=%8 post_to_receive_p95_hi_ms=%9 "
+                                          "post_call_p50_ms=%10 post_call_p95_ms=%11" )
+        .arg( static_cast<qulonglong>( m_playbackDueWakePostCallMs.size() ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostLoMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostHiMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostLoMs, 0.95 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakeDueToPostHiMs, 0.95 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveLoMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveHiMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveLoMs, 0.95 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostToReceiveHiMs, 0.95 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostCallMs, 0.50 ) )
+        .arg( playbackDueWakePercentileText( m_playbackDueWakePostCallMs, 0.95 ) );
     // r4 (Dot B1): binned=1 when a set outgrew its exact store this Play. r5 (Dot B2): a binned percentile is within 0.005 ms
     // (bin centre) for IN-RANGE ranks only; each set discloses its exactness, its underflow / overflow counts and the range
-    const bool binned = !m_playbackDueWakeLatenessMs.exact() || !m_playbackDueWakeDueToPostMs.exact()
-        || !m_playbackDueWakePostToReceiveMs.exact();
+    const bool binned = !m_playbackDueWakeLatenessMs.exact() || !m_playbackDueWakeDueToPostLoMs.exact()
+        || !m_playbackDueWakeDueToPostHiMs.exact() || !m_playbackDueWakePostToReceiveLoMs.exact()
+        || !m_playbackDueWakePostToReceiveHiMs.exact() || !m_playbackDueWakePostCallMs.exact();
     const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 )
         + QStringLiteral( " post_unsplit=%1" ).arg( m_playbackDueWakePostUnsplit )   // r5 pass 9 A1
         + playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, "late" )
-        + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostMs, "due_to_post" )
-        + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveMs, "post_to_receive" );
+        + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostLoMs, "due_to_post_lo" )
+        + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostHiMs, "due_to_post_hi" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveLoMs, "post_to_receive_lo" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostToReceiveHiMs, "post_to_receive_hi" )
+        + playbackDueWakeRangeFields( m_playbackDueWakePostCallMs, "post_call" );
     return QStringLiteral( "playback_due_wake armed=%1 fired=%2 advanced=%3 rearmed=%4 busy_deferred=%5 "
                            "late_p50_ms=%6 late_p95_ms=%7 hires=%8 disabled=%9 delivery=%10 unpresented_deferred=%11" )
         .arg( m_playbackDueWakeArmed )

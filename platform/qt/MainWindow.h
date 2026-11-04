@@ -1209,8 +1209,13 @@ private:
     bool m_playbackDueWakeMechanismSeen = false;                    // r2 pass 5 A1: an arm of this Play recorded its mechanism
     // r4 (Dot B1): bounded per Play (PlaybackDueWakeSamples.h), released at the Play-start reset
     PlaybackDueWakeSamples m_playbackDueWakeLatenessMs;
-    PlaybackDueWakeSamples m_playbackDueWakeDueToPostMs;       // r3: post time - due time (native-message deliveries)
-    PlaybackDueWakeSamples m_playbackDueWakePostToReceiveMs;   // r3: GUI-thread receive time - post time
+    // r6 (adversary pass 10 A2): the split at the post as BOUNDS (playbackDueWakeSplitBounds), native-message deliveries only:
+    // the post lies between the wait thread's first stamp and PostMessageW's return stamp, so no point split is claimed
+    PlaybackDueWakeSamples m_playbackDueWakeDueToPostLoMs;       // first stamp - due time
+    PlaybackDueWakeSamples m_playbackDueWakeDueToPostHiMs;       // return stamp - due time
+    PlaybackDueWakeSamples m_playbackDueWakePostToReceiveLoMs;   // GUI-thread receive time - return stamp
+    PlaybackDueWakeSamples m_playbackDueWakePostToReceiveHiMs;   // GUI-thread receive time - first stamp
+    PlaybackDueWakeSamples m_playbackDueWakePostCallMs;          // return stamp - first stamp (the attribution uncertainty)
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
