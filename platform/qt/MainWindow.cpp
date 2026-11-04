@@ -3090,6 +3090,9 @@ void MainWindow::timerEvent(QTimerEvent *t)
     //Main timer
     if( t->timerId() == m_timerId )
     {
+        // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r7 (adversary passes 13/14 A1): a due wake whose native post a full queue
+        // refused past the wait thread's retry budget is delivered here, once, and counted (post_rescued)
+        if( m_playbackDueWake && m_playbackDueWake->deliverLostPost() ) ++m_playbackDueWakePostRescued;
         timerFrameEvent();
         return;
     }
@@ -19675,6 +19678,10 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakeBusyDeferred = 0;
     m_playbackDueWakeUnpresentedDeferred = 0;
     m_playbackDueWakePostUnsplit = 0;
+    m_playbackDueWakePostRescued = 0;
+    // r7 (adversary passes 13/14 A1): the wake's post counters are cumulative; the line reports this Play's share
+    m_playbackDueWakePostRefusedBase = m_playbackDueWake ? m_playbackDueWake->postRefusals() : 0;
+    m_playbackDueWakePostFailedBase = m_playbackDueWake ? m_playbackDueWake->postFailures() : 0;
     m_playbackDueWakePresentedFrame = -1;   // nothing presented in this Play yet
     m_playbackDueWakeHiRes = false;
     m_playbackDueWakeDelivery = QStringLiteral( "none" );
@@ -19723,6 +19730,12 @@ QString MainWindow::playbackDueWakeSummaryLine( void ) const
         || !m_playbackDueWakePostToReceiveHiMs.exact() || !m_playbackDueWakePostCallMs.exact();
     const QString bound = QStringLiteral( " samples_binned=%1" ).arg( binned ? 1 : 0 )
         + QStringLiteral( " post_unsplit=%1" ).arg( m_playbackDueWakePostUnsplit )   // r5 pass 9 A1
+        // r7 (adversary passes 13/14 A1): refused PostMessageW calls, posts given up after the retry budget, and lost posts the
+        // poll tick delivered; post_failed > post_rescued means a lost post's arm was cancelled or replaced before a tick
+        + QStringLiteral( " post_refused=%1 post_failed=%2 post_rescued=%3" )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->postRefusals() - m_playbackDueWakePostRefusedBase : 0 ) )
+              .arg( static_cast<qulonglong>( m_playbackDueWake ? m_playbackDueWake->postFailures() - m_playbackDueWakePostFailedBase : 0 ) )
+              .arg( static_cast<qulonglong>( m_playbackDueWakePostRescued ) )
         + playbackDueWakeRangeFields( m_playbackDueWakeLatenessMs, "late" )
         + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostLoMs, "due_to_post_lo" )
         + playbackDueWakeRangeFields( m_playbackDueWakeDueToPostHiMs, "due_to_post_hi" )

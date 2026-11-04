@@ -244,6 +244,20 @@ public:
      *  and the split is reported as those bounds (playbackDueWakeSplitBounds). */
     double lastDeliveryPostFirstMs() const;
     bool lastDeliveryUnsplit() const;
+    /*! r7 (adversary passes 13/14 A1): PostMessageW fails when the GUI thread's queue is full (ERROR_NOT_ENOUGH_QUOTA, 10000
+     *  posted messages by default), and the waitable timer's auto-reset signal is already consumed by then. The wait thread
+     *  retries for up to this long (the stop event still wins); a post that never goes through is handed to the GUI thread
+     *  as a LOST post, which deliverLostPost() delivers once, and is counted (postFailures()). */
+    static constexpr int kPostRetryBudgetMs = 100;
+    /*! GUI thread (MainWindow's poll tick): fire the current arm if the wait thread gave up posting its wake. True when it
+     *  fired; a lost post of a cancelled or replaced arm is dropped by the gate, exactly like a stale message. */
+    bool deliverLostPost();
+    /*! Cumulative, any thread: PostMessageW calls the queue refused (retries included), and posts given up after the retry
+     *  budget (each one left a lost post for deliverLostPost()). */
+    quint64 postRefusals() const;
+    quint64 postFailures() const;
+    /*! Test hook: the wait thread's retry budget in ms (0: no retry). */
+    void setPostRetryBudgetMsForTest( int ms );
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
     void stop();
 

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -1261,5 +1262,149 @@ TEST(PlaybackDueWakeNative, AnAbsurdDueIsClampedBeforeEveryConversion)
     ASSERT_EQ( 0, fired );
     ASSERT_TRUE( wake.armed() );
     wake.cancel();
+#endif
+}
+
+#ifdef Q_OS_WIN
+namespace
+{
+// r7 (adversary passes 13/14 A1): fill this thread's posted-message queue with harmless WM_NULLs to the wake's window until
+// PostMessageW refuses one (10000 by default). Returns how many went in; refusedWith is GetLastError() of the refusal, 0 when
+// the cap was reached first (a raised USERPostMessageLimit).
+int fillQueueWithWmNull( HWND window, DWORD & refusedWith )
+{
+    refusedWith = 0;
+    int posted = 0;
+    for( ; posted < 1000000; ++posted )
+    {
+        if( !PostMessageW( window, WM_NULL, 0, 0 ) )
+        {
+            refusedWith = GetLastError();
+            break;
+        }
+    }
+    return posted;
+}
+
+// Take every message queued for the wake's window: WM_NULLs are dropped, the wake's own handed to it. Returns the wake's.
+int drainDueWakeWindow( PlaybackDueWake & wake )
+{
+    const HWND window = reinterpret_cast<HWND>( wake.nativeWindow() );
+    int taken = 0;
+    MSG msg;
+    while( PeekMessageW( &msg, window, 0, 0, PM_REMOVE ) )
+    {
+        if( msg.message == PlaybackDueWake::kNativeWakeMessage && wake.handleNativeMessage( &msg ) ) ++taken;
+    }
+    return taken;
+}
+
+// a failed assert throws: never leave the queue full for the next test
+struct DueWakeQueueDrain
+{
+    PlaybackDueWake & wake;
+    ~DueWakeQueueDrain()
+    {
+        drainDueWakeWindow( wake );
+        QCoreApplication::processEvents( QEventLoop::AllEvents, 5 );   // a Qt wake-up refused meanwhile is re-sent here
+    }
+};
+
+bool waitWithoutPumping( const std::function<bool()> & done, DWORD waitMs )
+{
+    const ULONGLONG deadline = GetTickCount64() + waitMs;
+    while( !done() && GetTickCount64() < deadline ) Sleep( 2 );
+    return done();
+}
+}
+#endif
+
+TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsDeliveredOnceByThePollTickAndCounted)
+{
+    // r7 (adversary pass 13 A1, confirmed by pass 14; PlaybackDueWake.cpp:168 on ecdc3aa7) input: default native-message
+    // delivery; the GUI queue holds 10000 harmless WM_NULL messages; arm(5.0); nothing is drained until after the expiry.
+    // PostMessageW returns FALSE with ERROR_NOT_ENOUGH_QUOTA. On ecdc3aa7 the result was discarded: the auto-reset signal was
+    // consumed, nothing was posted, the arm stayed armed and undelivered, and the line showed nothing. Now the wait thread
+    // retries for its budget, then hands the generation to the GUI thread; the poll tick delivers it once, and it is counted.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    DueWakeQueueDrain drainOnExit { wake };
+    wake.setPostRetryBudgetMsForTest( 20 );
+    DWORD refusedWith = 0;
+    const int filled = fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    if( refusedWith == 0 ) SKIP_TEST( "this host's posted-message limit is above 1000000: the queue cannot be filled" );
+    ASSERT_TRUE( filled > 0 );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.arm( 5.0 );
+    // not drained until the wait thread gave up: refused, retried for 20 ms, refused
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postFailures() >= 1; }, 3000 ) );
+    ASSERT_EQ( 1u, wake.postFailures() );
+    ASSERT_TRUE( wake.postRefusals() >= 1u );                      // the first post at least (the retries depend on scheduling)
+    ASSERT_EQ( 0, drainDueWakeWindow( wake ) );                    // the queue drains: no wake message was ever posted
+    ASSERT_EQ( 0, fired );
+    ASSERT_TRUE( wake.armed() );                                   // still the arm's, for the poll tick
+    ASSERT_TRUE( wake.deliverLostPost() );                         // the poll tick delivers it...
+    ASSERT_EQ( 1, fired );
+    ASSERT_FALSE( wake.armed() );
+    ASSERT_FALSE( wake.deliverLostPost() );                        // ...exactly once
+    ASSERT_EQ( 1, fired );
+    ASSERT_EQ( 0, pumpDueWakeMessages( wake, 20 ) );
+    // a lost post of an arm cancelled before the tick is dropped by the gate (counted as failed, never fired)
+    fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.arm( 1.0 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postFailures() >= 2; }, 3000 ) );
+    drainDueWakeWindow( wake );
+    wake.cancel();
+    ASSERT_FALSE( wake.deliverLostPost() );
+    ASSERT_EQ( 1, fired );
+    ASSERT_EQ( 2u, wake.postFailures() );
+    // the wiring: the post result is checked and retried, the poll tick rescues, and the line counts all three
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "static_cast<LPARAM>( postQpc ) ) != 0;" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "bool posted = postDueWake( args, postQpc.QuadPart, generation );" ) ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "args.lostGeneration->store( generation, std::memory_order_release );" ) ) );
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    const QString timer = functionBody( mainWindow, QStringLiteral( "void MainWindow::timerEvent(QTimerEvent *t)" ),
+                                        QStringLiteral( "//1sec Timer" ) );
+    const int rescue = timer.indexOf( QStringLiteral(
+        "if( m_playbackDueWake && m_playbackDueWake->deliverLostPost() ) ++m_playbackDueWakePostRescued;" ) );
+    const int tick = timer.indexOf( QStringLiteral( "timerFrameEvent();" ) );
+    ASSERT_TRUE( rescue > 0 && tick > rescue );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "QStringLiteral( \" post_refused=%1 post_failed=%2 post_rescued=%3\" )" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "m_playbackDueWakePostRescued = 0;" ) ) );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsRetriedAndDeliveredOnceWhenTheQueueDrains)
+{
+    // r7 (adversary pass 13 A1, the retry): the same full queue, drained while the wait thread is still inside its budget. The
+    // retry goes through: one message, one fire, nothing lost and nothing for the poll tick.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    DueWakeQueueDrain drainOnExit { wake };
+    wake.setPostRetryBudgetMsForTest( 10000 );
+    DWORD refusedWith = 0;
+    fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    if( refusedWith == 0 ) SKIP_TEST( "this host's posted-message limit is above 1000000: the queue cannot be filled" );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.arm( 5.0 );
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postRefusals() >= 1; }, 3000 ) );   // refused at least once
+    int taken = drainDueWakeWindow( wake );
+    taken += pumpDueWakeMessages( wake, 300 );
+    ASSERT_EQ( 1, taken );
+    ASSERT_EQ( 1, fired );
+    ASSERT_FALSE( wake.armed() );
+    ASSERT_EQ( 0u, wake.postFailures() );
+    ASSERT_FALSE( wake.deliverLostPost() );
+    ASSERT_EQ( 1, fired );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
 #endif
 }

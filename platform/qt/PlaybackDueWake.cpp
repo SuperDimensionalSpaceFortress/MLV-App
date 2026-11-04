@@ -12,6 +12,7 @@
 #include <QObject>
 #include <QTimer>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 
@@ -53,7 +54,14 @@ struct PlaybackDueWake::Impl
     std::atomic<qint64> postReturnFor { 0 };
     std::atomic<qint64> postReturnQpc { 0 };
     QAbstractNativeEventFilter *filter = nullptr;
+    // r7 (adversary passes 13/14 A1): a post the full queue refused past the retry budget leaves its generation here for the
+    // GUI thread (deliverLostPost, 0: none); the counters are the wait thread's, read for the summary line
+    std::atomic<quint32> lostGeneration { 0 };
+    std::atomic<quint64> postRefusals { 0 };
+    std::atomic<quint64> postFailures { 0 };
+    std::atomic<int> postRetryBudgetMs { PlaybackDueWake::kPostRetryBudgetMs };
 #endif
+    quint64 deliveries = 0;               // r7: native deliveries that fired (deliverLostPost reports whether it fired)
 
     // r3 (adversary pass 7 A1): the gate's clock. On Windows it is QueryPerformanceCounter in ns, the clock the wait thread
     // stamps the post time on, so the gate can drop a delivery posted before the armed due time; elsewhere QElapsedTimer.
@@ -94,6 +102,7 @@ struct PlaybackDueWake::Impl
         firingPostMs = returnNs >= 0 ? static_cast<double>( returnNs ) / 1000000.0 : -1.0;
         firingFirstMs = returnNs >= 0 ? static_cast<double>( postNs ) / 1000000.0 : -1.0;
         firingUnsplit = postNs >= 0 && returnNs < 0;
+        ++deliveries;
         onFire();
         firingPostMs = -1.0;
         firingFirstMs = -1.0;
@@ -150,7 +159,22 @@ struct WaitThreadArgs
     std::atomic<quint32> *postGeneration;
     std::atomic<qint64> *postReturnFor;
     std::atomic<qint64> *postReturnQpc;
+    std::atomic<quint32> *lostGeneration;
+    std::atomic<quint64> *postRefusals;
+    std::atomic<quint64> *postFailures;
+    std::atomic<int> *postRetryBudgetMs;
 };
+
+// One post of the wake message, carrying the generation stored now; false when the queue refused it. \a generation is the
+// generation it carried.
+bool postDueWake( const WaitThreadArgs & args, qint64 postQpc, quint32 & generation )
+{
+    generation = args.postGeneration->load( std::memory_order_acquire );
+    return PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
+                         static_cast<WPARAM>( playbackDueWakePackWParam(
+                             generation, static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
+                         static_cast<LPARAM>( postQpc ) ) != 0;
+}
 
 DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
 {
@@ -165,11 +189,41 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
         // r3: stamp the post time, so the GUI thread can split due-to-post from post-to-receive
         LARGE_INTEGER postQpc;
         if( !QueryPerformanceCounter( &postQpc ) ) postQpc.QuadPart = 0;
-        PostMessageW( args.window, PlaybackDueWake::kNativeWakeMessage,
-                      static_cast<WPARAM>( playbackDueWakePackWParam(
-                          args.postGeneration->load( std::memory_order_acquire ),
-                          static_cast<quint32>( PlaybackDueWake::kNativeWakeTag ) ) ),
-                      static_cast<LPARAM>( postQpc.QuadPart ) );
+        quint32 generation = 0;
+        bool posted = postDueWake( args, postQpc.QuadPart, generation );
+        // r7 (adversary passes 13/14 A1): a full queue refuses the post (ERROR_NOT_ENOUGH_QUOTA), and the auto-reset signal is
+        // already consumed, so a dropped post left the arm armed and undelivered. Retry for the bounded budget (each retry
+        // loads the generation again, so a re-arm or cancel meanwhile is judged by the gate as usual; the first stamp stays
+        // the earliest the post can have been). Past the budget the generation is handed to the GUI thread, whose poll tick
+        // delivers it once (deliverLostPost), and the failure is counted.
+        if( !posted )
+        {
+            const ULONGLONG start = GetTickCount64();
+            const ULONGLONG budget = static_cast<ULONGLONG>( ( std::max )( args.postRetryBudgetMs->load(), 0 ) );   // ms
+            bool stopped = false;
+            for( ;; )
+            {
+                args.postRefusals->fetch_add( 1 );
+                if( GetTickCount64() - start >= budget ) break;
+                if( WaitForSingleObject( args.stopEvent, 1 ) != WAIT_TIMEOUT )
+                {
+                    stopped = true;
+                    break;
+                }
+                if( postDueWake( args, postQpc.QuadPart, generation ) )
+                {
+                    posted = true;
+                    break;
+                }
+            }
+            if( stopped ) break;
+            if( !posted )
+            {
+                args.lostGeneration->store( generation, std::memory_order_release );
+                args.postFailures->fetch_add( 1 );
+                continue;   // nothing was posted: no return time to publish
+            }
+        }
         // r5 adversary pass 9 A1: the first stamp is taken BEFORE the post, so a pause of this thread between the two would
         // read as GUI-queue time. Publish when PostMessageW returned, keyed by the first stamp (seqlock writer: invalidate,
         // write, validate); the GUI thread splits at this time, or not at all
@@ -234,7 +288,8 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
         if( d->stopEvent )
         {
             WaitThreadArgs *args = new WaitThreadArgs { d->stopEvent, d->handle, d->window, &d->postGeneration,
-                                                        &d->postReturnFor, &d->postReturnQpc };
+                                                        &d->postReturnFor, &d->postReturnQpc, &d->lostGeneration,
+                                                        &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -447,6 +502,48 @@ double PlaybackDueWake::lastDeliveryPostFirstMs() const
 bool PlaybackDueWake::lastDeliveryUnsplit() const
 {
     return d->firingUnsplit;
+}
+
+bool PlaybackDueWake::deliverLostPost()
+{
+#ifdef Q_OS_WIN
+    // r7 (adversary passes 13/14 A1): the generation whose post the full queue refused past the retry budget, taken once.
+    // No post time: the gate judges it as a notifier / qtimer delivery (current generation, armed, not early).
+    const quint32 generation = d->lostGeneration.exchange( 0, std::memory_order_acq_rel );
+    if( generation == 0 ) return false;
+    const quint64 before = d->deliveries;
+    d->deliverGeneration( generation );
+    return d->deliveries != before;
+#else
+    return false;
+#endif
+}
+
+quint64 PlaybackDueWake::postRefusals() const
+{
+#ifdef Q_OS_WIN
+    return d->postRefusals.load();
+#else
+    return 0;
+#endif
+}
+
+quint64 PlaybackDueWake::postFailures() const
+{
+#ifdef Q_OS_WIN
+    return d->postFailures.load();
+#else
+    return 0;
+#endif
+}
+
+void PlaybackDueWake::setPostRetryBudgetMsForTest( int ms )
+{
+#ifdef Q_OS_WIN
+    d->postRetryBudgetMs.store( ms );
+#else
+    Q_UNUSED( ms );
+#endif
 }
 
 PlaybackDueWake::Delivery PlaybackDueWake::delivery() const
