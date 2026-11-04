@@ -531,6 +531,10 @@ double llrpGetLastPreDualIsoFixMilliseconds(void);
 int llrpGetLastPreDualIsoFixCompleted(void);
 void llrpResetLastPreDualIsoFixTelemetry(void);
 void llrpResetLastRunTimingForCurrentThread(void);
+/* Save / restore every record llrpResetLastRunTimingForCurrentThread clears
+ * (one saved copy per thread). */
+void llrpSaveLastRunTimingForCurrentThread(void);
+void llrpRestoreLastRunTimingForCurrentThread(void);
 double llrpGetLastDualIsoMilliseconds(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
 /* LLRAWPROC-RESIDUAL-SUBTIMERS-1: the steps inside the llrawproc wall that the
