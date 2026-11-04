@@ -295,6 +295,9 @@ if ([string]::IsNullOrWhiteSpace($script:AgentImagePath)) { $script:AgentImagePa
 # RecoveryQuarantine: jobId -> why its recovery is unresolved (the inbox loop never admits or launches it).
 $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:OwnPendingMarkerTmp = @{}
+# BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: set only while Invoke-LiveMarkerReconcile runs a recovery. LiveResultVanished: that recovery found the result gone and did nothing.
+$script:LiveReconcileOnly = $false
+$script:LiveResultVanished = $false
 $script:RecoveryQuarantine = @{}
 $script:LastRecoveryWhy = $null
 
@@ -1781,6 +1784,11 @@ function Resolve-StartedMarkerFile {
         return
     }
 
+    # sol pass-2 A1: the live reconcile saw this result a moment ago. A client reusing the job id deletes the old result before it publishes its new script (Submit-AgentJob),
+    # so it can be gone now. Adopt / orphan / re-queue below are for a job whose result never came, and are start-up only: against a job about to be submitted afresh they
+    # would publish an exit-127 receipt for it. Do nothing here; Resolve-JobRecovery returns without quarantining, because a quarantine retry would run them.
+    if ($script:LiveReconcileOnly) { $script:LiveResultVanished = $true; return }
+
     # GATE-2: a job the previous agent was HOLDING in the admission gate never launched (no child), so it is
     # neither adoptable nor orphaned. Its job file is still in inbox\, so it is re-queued: the main loop below
     # gates it again. r1c: a waiting job held no slot; its queued holder is stopped at start (Stop-StaleHeavySlotHolders).
@@ -1838,6 +1846,7 @@ function Resolve-JobRecovery {
         $fa = Read-MarkerArtifact -Path $final
         if ($fa.state -eq "ok") {
             $null = Resolve-StartedMarkerFile -Marker $fa.marker -MarkerPath $final
+            if ($script:LiveResultVanished) { return $true }
             $left = Get-JobRecoveryPending -JobId $JobId -IgnoreQuarantine
             # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: this agent's own unlaunched claim reads as admissible above, but with its result published the marker
             # should be gone by now. Still here means its retire failed, so it stays quarantined and is retried, not released with the marker left behind.
@@ -1893,7 +1902,14 @@ function Invoke-LiveMarkerReconcile {
         if (Test-Path -LiteralPath (Join-Path $inbox "$id.job.ps1") -PathType Leaf) { continue }
         if (-not (Test-Path -LiteralPath (Join-Path $outbox "$id.result.json") -PathType Leaf)) { continue }
         # The start-up path: settle the tmps (Resolve-JobMarkerTemps), then complete the marker (Complete-StartedMarker). A failure quarantines the job.
-        $settled = Resolve-JobRecovery -JobId $id
+        $script:LiveReconcileOnly = $true; $script:LiveResultVanished = $false
+        try { $settled = Resolve-JobRecovery -JobId $id } finally { $script:LiveReconcileOnly = $false }
+        if ($script:LiveResultVanished) {
+            # Its result was withdrawn mid-call (a resubmission): the job is no longer finished, so nothing is retired and nothing is recovered.
+            $script:LiveResultVanished = $false
+            Add-AgentLogLine "live marker reconcile job=${id}: its result was withdrawn before recovery ran; left alone"
+            continue
+        }
         Add-AgentLogLine "live marker reconcile job=${id}: result published, job not live; $(if ($settled) { 'marker artifacts retired' } else { "quarantined: $($script:RecoveryQuarantine[$id])" })"
     }
 }
