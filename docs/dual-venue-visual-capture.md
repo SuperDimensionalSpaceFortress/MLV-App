@@ -189,3 +189,33 @@ what they saw (`VISUAL <arm>: <strip> -- <what was seen>`). Reading the receipt'
 a strip is a finding. The rule is enforced, not merely proposed: the hub's key prompt composer (`hub-tools\new-review-keys.ps1`
 plus `key-prompt-visual.md`, installed 2026-10-14; board-only, untracked tooling) adds a `## VISUAL INSPECTION` block and a
 `visual_inspection` field to every key prompt for a PR touching `platform/qt/`, `src/` or `tools/profiling/`.
+
+## 2026-11-04: E-01 strips for PLAYBACK-SOURCE-FRAME-IDENTITY-1 (PR 477, r13)
+
+Build `7dc59c48b01cc186ab2b706f9d2ddbe378e32d8d`, manifest `21a2269e063c5311d5f831d8e742d85ffe6eb433f7de6c41597d87207f632433`,
+Bachelor, clip M16-1243. Each strip was opened and read. Paths are under `.claude-state\dual-venue\` on the hub host; those files
+are not tracked. This section changes no source, so the strips apply to the build named here and to any commit whose product
+source equals it.
+
+| Leg | Backend | Counted | Visual | `source_difference` | Play ids | Seen in the strip |
+|---|---|---|---|---|---|---|
+| fullscreen-s4 | cuda | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 602-668 advancing in order, no visible defect |
+| fullscreen-s4 | cpu | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 601-667 advancing in order, no visible defect |
+| windowed-s2 | cuda | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 602-668 advancing in order, no visible defect |
+| windowed-s2 | cpu | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 601-664 advancing in order, no visible defect |
+
+Every leg: `sourceDifference` `known-differ`, `sourceDifferenceCrossCheck` `agree`, `repeatedPlayFrames` 0, `look_assist_enabled=1`,
+verification `ADVISORY` (`VENUE_ANCHOR_ABSENT`). The windowed CPU leg's unforced stop capture differs from its bound stop by
+7.954, above the 6.0 threshold; its bound reading is 0.684, and CPU divergence is judged only on a bound capture.
+
+Not proved: the `identical` branch (no leg had a repeated frame), decode equality with base (no base arm ran), JPEG2K or
+uncompressed RAW at the venue, any speed claim, or the venue volume's file system (not recorded, so B4-UNMEASURED stays open).
+
+| Leg | Receipt (`receipts\PLAYBACK-BACHELOR-PRESENT-JITTER-1\<leg>\bachelor\`) | Strip (`sheets\`) |
+|---|---|---|
+| fullscreen-s4 cuda | `e22ef07b-85fb-4045-aa53-2395b87cf314.json` | `strip-m16-1243-pace-cinematic-fullscreen-s4-bachelor-cuda-7dc59c48-20261104201615.png` |
+| fullscreen-s4 cpu | `11645a15-4320-420d-9ce5-ba32db0af40f.json` | `strip-m16-1243-pace-cinematic-fullscreen-s4-bachelor-cpu-7dc59c48-20261104202152.png` |
+| windowed-s2 cuda | `f305fa1f-4673-4762-a612-ed5e5c72369b.json` | `strip-m16-1243-pace-cinematic-windowed-s2-bachelor-cuda-7dc59c48-20261104202552.png` |
+| windowed-s2 cpu | `78c6b219-ff1b-4d0a-9ef3-8657db593d38.json` | `strip-m16-1243-pace-cinematic-windowed-s2-bachelor-cpu-7dc59c48-20261104203116.png` |
+
+`<leg>` is `m16-1243-pace-cinematic-fullscreen-s4` or `m16-1243-pace-cinematic-windowed-s2`.
