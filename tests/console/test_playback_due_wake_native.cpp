@@ -22,10 +22,12 @@
 #include <QTextStream>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef Q_OS_WIN
@@ -1496,7 +1498,9 @@ TEST(PlaybackDueWakeNative, APreviousPlaysLateFailureIsSettledBeforeTheNextPlays
     ASSERT_TRUE( settle > 0 && baseline > settle );
     const QString line = functionBody( mainWindow, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
                                        QStringLiteral( "//Paint the Audio Track Wave to GUI" ) );
-    const int settled = line.indexOf( QStringLiteral( "const bool postCountsSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;" ) );
+    // r8 (adversary pass 18 A2): the expression now also requires the baseline's settle (pass 17 A1)
+    const int settled = line.indexOf( QStringLiteral(
+        "const bool postCountsSettled = ( m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true )" ) );
     const int read = line.indexOf( QStringLiteral( "m_playbackDueWake->postFailures() - m_playbackDueWakePostFailedBase" ) );
     ASSERT_TRUE( settled > 0 && read > settled );
 #else
@@ -1555,6 +1559,53 @@ TEST(PlaybackDueWakeNative, ABaselineTakenAfterAnUnansweredSettleMarksThePlaysLi
     const int both = line.indexOf( QStringLiteral( "&& m_playbackDueWakePostBaselineSettled;" ) );
     const int printed = line.indexOf( QStringLiteral( ".arg( postCountsSettled ? 1 : 0 )" ) );
     ASSERT_TRUE( both > 0 && printed > both );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, ASettleWakeThatLoadsANewerRequestHandlesThePendingTimerSignalFirst)
+{
+    // r8 (adversary pass 18 A1, PlaybackDueWake.cpp:209 on d2fda465) input: the worker is paused after WaitForMultipleObjects
+    // picked settle request 1 and before it loads the request number; meanwhile Play B's timer expires (its post will fail:
+    // the GUI queue is full) and a newer request (C's baseline) is issued. On d2fda465 the resumed worker loaded the newer
+    // number and answered it at once: C's settle returned true with B's failure not yet counted, and C later printed
+    // post_failed=1 post_counts_settled=1. Here the pause is the test hook; request 1 is issued from a helper thread.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    DueWakeQueueDrain drainOnExit { wake };
+    wake.setPostRetryBudgetMsForTest( 0 );                         // a refused post fails at once (settle deadline: slack)
+    DWORD refusedWith = 0;
+    fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    if( refusedWith == 0 ) SKIP_TEST( "this host's posted-message limit is above 1000000: the queue cannot be filled" );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.setSettleAnswerDelayMsForTest( 400 );
+    std::atomic<bool> firstSettled { false };
+    std::thread first( [&wake, &firstSettled]() { firstSettled = wake.settlePostCounters(); } );   // request 1: wakes the worker
+    Sleep( 60 );                                                   // the worker is inside its pause
+    wake.arm( 5.0 );                                               // B's timer expires while the worker is paused
+    Sleep( 60 );
+    const bool secondSettled = wake.settlePostCounters();          // C's baseline: request 2, newer than the wake
+    const quint64 failedAtBaseline = wake.postFailures();
+    first.join();
+    wake.setSettleAnswerDelayMsForTest( 0 );
+    ASSERT_TRUE( firstSettled.load() );
+    ASSERT_TRUE( secondSettled );
+    ASSERT_EQ( 1u, failedAtBaseline );                             // B's failure is counted before C's baseline is answered
+    ASSERT_TRUE( wake.settlePostCounters() );
+    ASSERT_EQ( 1u, wake.postFailures() );                          // nothing moves after it
+    drainDueWakeWindow( wake );
+    ASSERT_TRUE( wake.deliverLostPost() );                         // B's lost post is still delivered once
+    ASSERT_EQ( 1, fired );
+    // the wiring: the request is loaded BEFORE the timer probe, and a pending signal defers the answer
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 0, source.count( QStringLiteral( "args.settleAck->store( args.settleRequest->load() );" ) ) );
+    const int load = source.indexOf( QStringLiteral( "const quint64 request = args.settleRequest->load();" ) );
+    const int probe = source.indexOf( QStringLiteral( "if( WaitForSingleObject( args.timer, 0 ) != WAIT_OBJECT_0 )" ), load );
+    const int defer = source.indexOf( QStringLiteral( "pendingAck = request;" ), probe );
+    ASSERT_TRUE( load > 0 && probe > load && defer > probe );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif

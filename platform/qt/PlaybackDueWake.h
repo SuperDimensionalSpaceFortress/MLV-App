@@ -280,6 +280,8 @@ public:
     /*! GUI thread. r7 (adversary pass 16 A1): the wait thread counts asynchronously, so a Play's cumulative-counter difference
      *  could take a failure of the previous Play's last arm. This returns once the wait thread has handled every timer signal
      *  that came before the call (posted, or retried and counted), waiting at most the retry budget plus kSettleSlackMs.
+     *  r8 (adversary pass 18 A1): the wait thread probes the timer AFTER it loads the request number it answers, so a request
+     *  newer than the wake that carried it is never answered ahead of a timer signal still pending.
      *  False on that timeout (the counters may still move). True at once when there is no wait thread.
      *  r8 (adversary pass 17 A2 sibling): it waits in slices of at most kSettleSliceMs, each recomputed from the deadline
      *  immediately before it, so a GUI thread preempted near the deadline returns at most one slice after it resumes.
@@ -290,6 +292,9 @@ public:
     static constexpr quint32 kSettleSliceMs = 10;
     /*! Test hook: the wait thread's retry budget in ms (0: no retry). */
     void setPostRetryBudgetMsForTest( int ms );
+    /*! Test hook, r8 (adversary pass 18 A1): the wait thread pauses this long between waking for a settle request and loading
+     *  the request number (the window in which a newer request and a timer signal can both arrive). 0: no pause. */
+    void setSettleAnswerDelayMsForTest( int ms );
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
     void stop();
 

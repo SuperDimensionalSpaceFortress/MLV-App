@@ -65,6 +65,7 @@ struct PlaybackDueWake::Impl
     HANDLE settledEvent = nullptr;
     std::atomic<quint64> settleRequest { 0 };
     std::atomic<quint64> settleAck { 0 };
+    std::atomic<int> settleAnswerDelayMsForTest { 0 };
 #endif
     // r7 (adversary pass 15 A1): lost posts the poll tick fired, counted BEFORE the callback runs (it can stop Play and print
     // the summary line before deliverLostPost returns); rescuingLostPost marks the delivery deliverLostPost is making
@@ -179,6 +180,7 @@ struct WaitThreadArgs
     HANDLE settledEvent;                  // ...and the wait thread answers, with the request it answers in settleAck
     std::atomic<quint64> *settleRequest;
     std::atomic<quint64> *settleAck;
+    std::atomic<int> *settleAnswerDelayMsForTest;   // r8 pass 18 A1: a pause between the settle wake and its request load
 };
 
 // One post of the wake message, carrying the generation stored now; false when the queue refused it. \a generation is the
@@ -201,14 +203,32 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
     // counted) before it is answered: WaitForMultipleObjects reports the lowest signalled index, and this one thread does the
     // posting, the retrying and the counting in order
     const HANDLE handles[3] = { args.stopEvent, args.timer, args.settleEvent };
+    quint64 pendingAck = 0;   // r8 pass 18 A1: a request answered once the timer signal it found pending is handled
     for( ;; )
     {
-        const DWORD result = WaitForMultipleObjects( 3, handles, FALSE, INFINITE );
+        if( pendingAck )
+        {
+            args.settleAck->store( pendingAck );
+            SetEvent( args.settledEvent );
+            pendingAck = 0;
+        }
+        DWORD result = WaitForMultipleObjects( 3, handles, FALSE, INFINITE );
         if( result == WAIT_OBJECT_0 + 2 )
         {
-            args.settleAck->store( args.settleRequest->load() );
-            SetEvent( args.settledEvent );
-            continue;
+            const int answerDelayMs = args.settleAnswerDelayMsForTest->load();
+            if( answerDelayMs > 0 ) Sleep( static_cast<DWORD>( answerDelayMs ) );
+            const quint64 request = args.settleRequest->load();
+            // r8 (adversary pass 18 A1): this thread can be paused between the wake and the load above, so the request it
+            // loaded can be newer than a timer signal that arrived meanwhile. Probe the timer AFTER the load: a signal still
+            // pending is handled (posted, or retried and counted) below before this request is answered at the loop top
+            if( WaitForSingleObject( args.timer, 0 ) != WAIT_OBJECT_0 )
+            {
+                args.settleAck->store( request );
+                SetEvent( args.settledEvent );
+                continue;
+            }
+            pendingAck = request;
+            result = WAIT_OBJECT_0 + 1;
         }
         if( result != WAIT_OBJECT_0 + 1 ) break;   // stop, or a wait failure
         // r3: stamp the post time, so the GUI thread can split due-to-post from post-to-receive
@@ -324,7 +344,8 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
             WaitThreadArgs *args = new WaitThreadArgs { d->stopEvent, d->handle, d->window, &d->postGeneration,
                                                         &d->postReturnFor, &d->postReturnQpc, &d->lostGeneration,
                                                         &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs,
-                                                        d->settleEvent, d->settledEvent, &d->settleRequest, &d->settleAck };
+                                                        d->settleEvent, d->settledEvent, &d->settleRequest, &d->settleAck,
+                                                        &d->settleAnswerDelayMsForTest };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -614,6 +635,15 @@ void PlaybackDueWake::setPostRetryBudgetMsForTest( int ms )
 {
 #ifdef Q_OS_WIN
     d->postRetryBudgetMs.store( ms );
+#else
+    Q_UNUSED( ms );
+#endif
+}
+
+void PlaybackDueWake::setSettleAnswerDelayMsForTest( int ms )
+{
+#ifdef Q_OS_WIN
+    d->settleAnswerDelayMsForTest.store( ms );
 #else
     Q_UNUSED( ms );
 #endif
