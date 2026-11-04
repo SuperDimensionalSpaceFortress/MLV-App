@@ -2994,6 +2994,9 @@ ENCODED_LAUNCH_SITES = {
         ("'-ExecutionPolicy','Bypass','-EncodedCommand',$encoded",
          "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
          "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json"),
+        ("'-ExecutionPolicy','Bypass','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($codexHostSource))",
+         "the codex image job host (pwsh -EncodedCommand $codexHostSource) is not a driver: it runs with the lane's worktree as its cwd and waits on its codex child, "
+         "whose argv names <RunDir> through -o <RunDir>\\<lane>-NNN.last.txt and each -i snapshot under <RunDir>"),
     ],
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
         ("-EncodedCommand $CorePartitionHelperEncoded",
@@ -3254,14 +3257,17 @@ def test_launcher_census_the_lease_batch_probe_seams_are_classified_per_site_and
 
 
 def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
-    """The one Invoke-Lane -EncodedCommand site is safe only while its child names the run dir and is recorded in it."""
+    """The two Invoke-Lane -EncodedCommand sites are safe only while each child names the run dir (and, for the Claude host, is recorded in it)."""
     t = (REPO / "tools/coordination/Invoke-Lane.ps1").read_text(encoding="utf-8")
-    assert len(re.findall(r"'-EncodedCommand'", t)) == 1, "Invoke-Lane.ps1 gained another -EncodedCommand launch: classify it"
+    assert len(re.findall(r"'-EncodedCommand'", t)) == 2, "Invoke-Lane.ps1 gained another -EncodedCommand launch: classify it"
     assert re.search(r"\$candidate = Join-Path \$RunDir", t) and "$base = $candidate" in t, "lane slot base is no longer under $RunDir"
     assert '$settingsPath = "$base.settings.json"' in t and "$argv += @('--settings', $settingsPath)" in t, "child argv no longer names the run dir"
     assert '$controlPath = "$base.child.json"' in t and "pid=$child.Id" in t, "child pid is no longer recorded in the run dir"
     host = t.split("$hostSource = @'", 1)[1].split("'@", 1)[0]
     assert "-File" not in host and "Start-Process" not in host and "WaitForExit()" in host, "the encoded host must only wait on its child"
+    codex_host = t.split("$codexHostSource = @'", 1)[1].split("'@", 1)[0]
+    assert "-File" not in codex_host and "Start-Process" not in codex_host and "WaitForExit()" in codex_host, "the codex image host must only wait on its child"
+    assert "'-o', $lastPath," in t and '$lastPath' in t and "$imageArgs += @('-i', $attachment.path)" in t, "the codex child's argv no longer names the run dir"
 
 
 def test_launcher_census_build_guard_holder_is_its_one_encoded_launch_and_only_holds():
