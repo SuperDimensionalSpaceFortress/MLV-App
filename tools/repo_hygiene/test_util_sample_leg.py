@@ -1012,6 +1012,43 @@ $d3p = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText((Join-Path $t 'd3.cs
 $d3rows = @($d3p.rows)
 $r['d3Tail'] = @{ endedBy = $d3res.endedBy; stepped = $script:d3stepped; realRows = @($d3rows | Where-Object { $null -ne $_.total }).Count
     witness = $(if ($d3rows.Count -ge 2) { Get-UtilSampleClockWitness $d3p $run ([ordered]@{ startUtc = $d3rows[0].fromUtc; endUtc = $d3rows[1].utc }) } else { 'no-window' }) }
+# ---- adversary f8fbeab3 A1 (literal input): the app starts its Play clock, then stalls 500 ms before it logs the start line, so the start stamp is
+# P+0.5 s while the summary (stamp P+20 s, elapsed_ms=20000) still agrees within the 1 s tolerance. GPU 0 through P+20 s, 100 afterwards. At f8fbeab3 the
+# window ran P+0.5..P+20.5 s, past the end of Play: clockWhy null, GPU ok, mean 2.469 although Play's true mean is 0
+$g1log = "[2026-11-02T14:00:00.500Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.000Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$g1csv = "utc,cpuTotalPct,appPid,appCpuCores,fromUtc,clockStepMs,intervalMs,counterMs`n"; for ($i = 0; $i -le 22; $i++) { $g1csv += (CpuRow $p0.AddSeconds($i) 5 1234 0 $p0.AddSeconds($i - 1) '0' 1000 1000) }
+$g1gt = ''; for ($g = 0; $g -le 21500; $g += 250) { $g1gt += "$([TimeZoneInfo]::ConvertTimeFromUtc($p0.AddMilliseconds($g), $cst).ToString('yyyy/MM/dd HH:mm:ss.fff', $inv)), $(if ($g -le 20000) { 0 } else { 100 }), 0, 1800, P2, 50`n" }
+$g1w = Get-UtilSamplePlayWindow $g1log
+$g1c = ConvertFrom-UtilSampleCpuCsv $g1csv
+$g1w['clockWhy'] = Get-UtilSampleClockWitness $g1c $run $g1w
+$g1g = Get-UtilSampleGpuSummary (ConvertFrom-UtilSampleGpuCsv $g1gt $cst) $run $g1w $okStop
+$g1s = Get-UtilSampleCpuSummary $g1c $run $g1w $okStop
+# a summary stamp LATER than start + elapsed_ms keeps the computed end (the summary's own line was the late one)
+$g1late = Get-UtilSamplePlayWindow "[2026-11-02T14:00:00.000Z] [info] [smoke] playback_smoke.start session=1`n[2026-11-02T14:00:20.400Z] [info] [smoke] playback_smoke.summary session=1 elapsed_ms=20000`n"
+$r['g1A1'] = @{ start = $g1w.startUtc.ToString('o'); end = $g1w.endUtc.ToString('o'); clockWhy = $g1w.clockWhy; gpu = $g1g.status; gpuMean = $g1g.mean; cpu = $g1s.status; cpuRows = $g1s.rowsInWindow; lateEnd = $g1late.endUtc.ToString('o') }
+# ---- adversary f8fbeab3 A3 (literal input): first read P.Ticks at monotonic 0, then P.Ticks + i*10000000 + 250004 at i*1000 ms, so the true cumulative
+# offset is 25.0004 ms. At f8fbeab3 the row's 0.### format wrote 25, and the witness's "> 25" passed it. Both write sites run through the real loop:
+# a stubbed clock read states the raw value on every row (g3Row) or only on the read after the last row (g3Tail: the tail row alone carries it).
+$script:g3i = 0; $g3ck = @{ u = $null; m = 0.0; e = 0.0; maxStep = 0.0 }; $g3w = @{ Elapsed = @{ TotalMilliseconds = 0.0 } }
+$g3tick = { $p0.Ticks + $(if ($script:g3i -gt 0) { [int64]$script:g3i * 10000000 + 250004 } else { 0 }) }
+for ($script:g3i = 0; $script:g3i -le 11; $script:g3i++) { $g3w.Elapsed.TotalMilliseconds = $script:g3i * 1000.0; [void](Read-UtilSampleClock $g3ck $g3w $g3tick) }
+$script:g3raw = [double]$g3ck.maxStep
+$g3rowCsv = Join-Path $t 'g3row.csv'
+[void](& { function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) { $Ck.maxStep = $script:g3raw; [DateTime]::UtcNow }
+    Invoke-UtilSampleCpuLoop $g3rowCsv (Join-Path $t 'g3row.stop') 'no-such-process-name-xyz' 200 700 { 5 } 0 0 0 0 $null '' { param($br, $sw) @{} } })
+$g3rp = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText($g3rowCsv)); $g3rr = @($g3rp.rows)
+$script:g3c = 0; $script:g3arm = -1; $script:g3n = 0; $g3stop = Join-Path $t 'g3tail.stop'; $g3tailCsv = Join-Path $t 'g3tail.csv'
+$g3res = & { function Read-UtilSampleClock($Ck, $Watch, $UtcTicks) { $script:g3c++
+        if ($script:g3arm -gt 0 -and $script:g3c -eq $script:g3arm + 2) { [IO.File]::WriteAllText($g3stop, 'stop') }
+        if ($script:g3arm -gt 0 -and $script:g3c -ge $script:g3arm + 3) { $Ck.maxStep = $script:g3raw }
+        [DateTime]::UtcNow }
+    Invoke-UtilSampleCpuLoop $g3tailCsv $g3stop 'no-such-process-name-xyz' 200 5000 { 5 } 0 0 0 0 $null '' { param($br, $sw) $script:g3n++; if ($script:g3n -eq 3) { $script:g3arm = $script:g3c }; @{} } }
+$g3res = @($g3res)[-1]
+$g3tp = ConvertFrom-UtilSampleCpuCsv ([IO.File]::ReadAllText($g3tailCsv)); $g3tr = @($g3tp.rows)
+$r['g3A3'] = @{ raw = $script:g3raw
+    row = @{ rows = $g3rr.Count; witness = (Get-UtilSampleClockWitness $g3rp $run ([ordered]@{ startUtc = $g3rr[0].fromUtc; endUtc = $g3rr[$g3rr.Count - 1].utc })) }
+    tail = @{ endedBy = $g3res.endedBy; realRows = @($g3tr | Where-Object { $null -ne $_.total }).Count; rows = $g3tr.Count
+        witness = $(if ($g3tr.Count -ge 2) { Get-UtilSampleClockWitness $g3tp $run ([ordered]@{ startUtc = $g3tr[0].fromUtc; endUtc = $g3tr[1].utc }) } else { 'no-window' }) } }
 Write-Output (J $r)
 """
 
@@ -1352,6 +1389,22 @@ class UtilSamplePureHelperTests(unittest.TestCase):
         d3 = self.r["d3Tail"]
         self.assertEqual((d3["endedBy"], d3["stepped"], d3["realRows"]), ("stop-file", True, 2), f"the probe did not build the shape: {d3}")
         self.assertEqual(d3["witness"], "sample-clock-unverified", f"a cumulative 30 ms seen only by the tail read was dropped with the loop: {d3}")
+
+    def test_adv_f8fbeab3_a1_the_window_never_runs_past_the_summary_stamp(self) -> None:
+        # literal input: at f8fbeab3 the window ended P+20.5 s (the delayed start stamp + elapsed_ms): GPU ok, mean 2.469 although Play's true mean is 0
+        a1 = self.r["g1A1"]
+        self.assertEqual((a1["start"], a1["end"]), ("2026-11-02T14:00:00.5000000Z", "2026-11-02T14:00:20.0000000Z"), f"the window left the measured Play: {a1}")
+        self.assertEqual((a1["clockWhy"], a1["gpu"], a1["gpuMean"], a1["cpu"], a1["cpuRows"]), (None, "ok", 0.0, "ok", 19), a1)
+        self.assertEqual(a1["lateEnd"], "2026-11-02T14:00:20.0000000Z", f"a late summary line must not extend the window: {a1}")
+
+    def test_adv_f8fbeab3_a3_the_written_step_never_rounds_below_the_limit(self) -> None:
+        # literal input: at f8fbeab3 raw 25.0004 was written as 25, so clockWhy None and CPU ok; row site and tail site
+        a3 = self.r["g3A3"]
+        self.assertAlmostEqual(a3["raw"], 25.0004, places=6, msg=f"the probe did not build the finding's shape: {a3}")
+        self.assertGreaterEqual(a3["row"]["rows"], 1, a3)
+        self.assertEqual(a3["row"]["witness"], "sample-clock-unverified", f"the row site rounded the value under the limit: {a3}")
+        self.assertEqual((a3["tail"]["endedBy"], a3["tail"]["realRows"], a3["tail"]["rows"]), ("stop-file", 2, 3), f"the probe did not build the tail shape: {a3}")
+        self.assertEqual(a3["tail"]["witness"], "sample-clock-unverified", f"the tail site rounded the value under the limit: {a3}")
 
     def test_adv_fa1197b4_a1_the_child_exits_0_only_after_its_last_write(self) -> None:
         # at fa1197b4 a row write that failed (the CSV locked under it) still returned created=true, and the child's exit line said 0 (owned)

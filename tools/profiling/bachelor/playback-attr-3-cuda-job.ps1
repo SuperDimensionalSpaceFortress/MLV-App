@@ -6996,7 +6996,8 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
             $prevSm = $sm
             $cores = ''
             if ($both -gt 0 -and $dt -gt 0) { $cores = ($sec / $dt).ToString('0.####', $inv) }
-            $ub = $u8.GetBytes("$($hi.ToString('o', $inv)),$total,$pids,$cores,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),$ivMs,$counterMs`n")
+            # adversary f8fbeab3 A3: clockStepMs rounds UP, so 25.0004 ms is never written as the 25 the witness passes (the tail row below alike)
+            $ub = $u8.GetBytes("$($hi.ToString('o', $inv)),$total,$pids,$cores,$($from.ToString('o', $inv)),$(([math]::Ceiling([double]$ck.maxStep * 1000) / 1000).ToString('0.###', $inv)),$ivMs,$counterMs`n")
             $uf.Write($ub, 0, $ub.Length); $uf.Flush()
             $res.rows++
             $prev = $cur; $prevMs = $nowMs; $from = $lo; $ck.maxStep = 0.0
@@ -7006,7 +7007,7 @@ function Invoke-UtilSampleCpuLoop([string]$CsvPath, [string]$StopFile, [string]$
         # witness refuses the window instead of finding every written row steady.
         $tl = Read-UtilSampleClock $ck $w $UtcTicks
         if ([double]$ck.maxStep -gt 25) {
-            $ub = $u8.GetBytes("$($tl.ToString('o', $inv)),,,,$($from.ToString('o', $inv)),$(([double]$ck.maxStep).ToString('0.###', $inv)),,`n")
+            $ub = $u8.GetBytes("$($tl.ToString('o', $inv)),,,,$($from.ToString('o', $inv)),$(([math]::Ceiling([double]$ck.maxStep * 1000) / 1000).ToString('0.###', $inv)),,`n")
             $uf.Write($ub, 0, $ub.Length); $uf.Flush()
         }
         $wrote = $true
@@ -7228,7 +7229,8 @@ function ConvertFrom-UtilSampleCpuCsv($Text) {
 # offsets on PresentMon's frame clock and span the app's whole capture, startup included, so they are not a Play window). The session is
 # Get-CorePartitionPlaybackStart's rule (the playback_smoke.measured_session marker, else the first playback_smoke.summary session); the window
 # opens at that session's playback_smoke.start stamp (UTC, the log sink's) and closes elapsed_ms later (the same session's first summary line,
-# measured on the app's monotonic clock from the start line). $null when any part is missing or the window is empty.
+# measured on the app's monotonic clock from the start of Play), or at that summary line's own stamp when it is earlier. $null when any part is
+# missing or the window is empty.
 function Get-UtilSamplePlayWindow([string]$LogText) {
     try {
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
@@ -7256,6 +7258,10 @@ function Get-UtilSamplePlayWindow([string]$LogText) {
         if ([math]::Abs((($st.Ticks - $pt.Ticks) / 1e4) - $ms) -gt 1000) { return $null }
         $s = [DateTime]::SpecifyKind($pt, [DateTimeKind]::Utc)
         $e = $s.AddTicks([int64][math]::Round($ms * 10000))
+        # adversary f8fbeab3 A1: the app starts its Play clock before it logs the start line, so a stall between them moves the start stamp later and,
+        # with elapsed_ms measured from the clock, this end past the end of Play. The summary line is logged after Play ended: the window never runs past it.
+        $se = [DateTime]::SpecifyKind($st, [DateTimeKind]::Utc)
+        if ($se -lt $e) { $e = $se }
         if ($e -le $s) { return $null }
         return [ordered]@{ startUtc = $s; endUtc = $e; session = [int64]$sid }
     } catch { return $null }
