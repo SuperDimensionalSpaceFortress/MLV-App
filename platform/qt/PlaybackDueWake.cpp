@@ -60,6 +60,11 @@ struct PlaybackDueWake::Impl
     std::atomic<quint64> postRefusals { 0 };
     std::atomic<quint64> postFailures { 0 };
     std::atomic<int> postRetryBudgetMs { PlaybackDueWake::kPostRetryBudgetMs };
+    // r7 (adversary pass 16 A1): settlePostCounters' handshake with the wait thread (both auto-reset)
+    HANDLE settleEvent = nullptr;
+    HANDLE settledEvent = nullptr;
+    std::atomic<quint64> settleRequest { 0 };
+    std::atomic<quint64> settleAck { 0 };
 #endif
     // r7 (adversary pass 15 A1): lost posts the poll tick fired, counted BEFORE the callback runs (it can stop Play and print
     // the summary line before deliverLostPost returns); rescuingLostPost marks the delivery deliverLostPost is making
@@ -170,6 +175,10 @@ struct WaitThreadArgs
     std::atomic<quint64> *postRefusals;
     std::atomic<quint64> *postFailures;
     std::atomic<int> *postRetryBudgetMs;
+    HANDLE settleEvent;                   // r7 pass 16 A1: the GUI thread asks "every signal so far is counted?"
+    HANDLE settledEvent;                  // ...and the wait thread answers, with the request it answers in settleAck
+    std::atomic<quint64> *settleRequest;
+    std::atomic<quint64> *settleAck;
 };
 
 // One post of the wake message, carrying the generation stored now; false when the queue refused it. \a generation is the
@@ -187,11 +196,20 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
 {
     WaitThreadArgs args = *static_cast<WaitThreadArgs *>( parameter );
     delete static_cast<WaitThreadArgs *>( parameter );
-    // the stop event is first: it wins over a timer signalled at the same instant
-    const HANDLE handles[2] = { args.stopEvent, args.timer };
+    // the stop event is first: it wins over a timer signalled at the same instant.
+    // r7 (adversary pass 16 A1): the settle request is LAST, so a timer signal that came before it is posted (or retried and
+    // counted) before it is answered: WaitForMultipleObjects reports the lowest signalled index, and this one thread does the
+    // posting, the retrying and the counting in order
+    const HANDLE handles[3] = { args.stopEvent, args.timer, args.settleEvent };
     for( ;; )
     {
-        const DWORD result = WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
+        const DWORD result = WaitForMultipleObjects( 3, handles, FALSE, INFINITE );
+        if( result == WAIT_OBJECT_0 + 2 )
+        {
+            args.settleAck->store( args.settleRequest->load() );
+            SetEvent( args.settledEvent );
+            continue;
+        }
         if( result != WAIT_OBJECT_0 + 1 ) break;   // stop, or a wait failure
         // r3: stamp the post time, so the GUI thread can split due-to-post from post-to-receive
         LARGE_INTEGER postQpc;
@@ -217,6 +235,8 @@ DWORD WINAPI dueWakeWaitThread( LPVOID parameter )
                     stopped = true;
                     break;
                 }
+                // r7 (adversary pass 16 A2): the wait can overrun the budget; no attempt starts past it
+                if( GetTickCount64() - start >= budget ) break;
                 if( postDueWake( args, postQpc.QuadPart, generation ) )
                 {
                     posted = true;
@@ -293,12 +313,15 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
         {
             SetWindowLongPtrW( d->window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>( this ) );
             d->stopEvent = CreateEventW( nullptr, TRUE, FALSE, nullptr );   // manual reset: stays set once stopped
+            d->settleEvent = CreateEventW( nullptr, FALSE, FALSE, nullptr );
+            d->settledEvent = CreateEventW( nullptr, FALSE, FALSE, nullptr );
         }
-        if( d->stopEvent )
+        if( d->stopEvent && d->settleEvent && d->settledEvent )
         {
             WaitThreadArgs *args = new WaitThreadArgs { d->stopEvent, d->handle, d->window, &d->postGeneration,
                                                         &d->postReturnFor, &d->postReturnQpc, &d->lostGeneration,
-                                                        &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs };
+                                                        &d->postRefusals, &d->postFailures, &d->postRetryBudgetMs,
+                                                        d->settleEvent, d->settledEvent, &d->settleRequest, &d->settleAck };
             d->thread = CreateThread( nullptr, 0, dueWakeWaitThread, args, 0, nullptr );
             if( d->thread )
                 SetThreadPriority( d->thread, THREAD_PRIORITY_HIGHEST );
@@ -318,6 +341,10 @@ PlaybackDueWake::PlaybackDueWake( QObject *owner, std::function<void()> onFire, 
         // the thread could not start: undo the partial native path and fall back to the notifier
         if( d->stopEvent ) CloseHandle( d->stopEvent );
         d->stopEvent = nullptr;
+        if( d->settleEvent ) CloseHandle( d->settleEvent );
+        d->settleEvent = nullptr;
+        if( d->settledEvent ) CloseHandle( d->settledEvent );
+        d->settledEvent = nullptr;
         if( d->window ) DestroyWindow( d->window );
         d->window = nullptr;
     }
@@ -384,6 +411,10 @@ void PlaybackDueWake::stop()
     }
     if( d->stopEvent ) CloseHandle( d->stopEvent );
     d->stopEvent = nullptr;
+    if( d->settleEvent ) CloseHandle( d->settleEvent );
+    d->settleEvent = nullptr;
+    if( d->settledEvent ) CloseHandle( d->settledEvent );
+    d->settledEvent = nullptr;
     if( d->handle ) CancelWaitableTimer( d->handle );
 #endif
     if( d->timer ) d->timer->stop();
@@ -551,6 +582,27 @@ quint64 PlaybackDueWake::postFailures() const
 quint64 PlaybackDueWake::postRescued() const
 {
     return d->postRescued;
+}
+
+bool PlaybackDueWake::settlePostCounters()
+{
+#ifdef Q_OS_WIN
+    if( !d->thread || !d->settleEvent || !d->settledEvent ) return true;   // no wait thread: nothing counts asynchronously
+    // r7 (adversary pass 16 A1): a numbered request, so an answer to an earlier request that timed out never settles this one
+    const quint64 request = d->settleRequest.fetch_add( 1 ) + 1;
+    SetEvent( d->settleEvent );
+    const ULONGLONG deadline = GetTickCount64() + static_cast<ULONGLONG>( ( std::max )( d->postRetryBudgetMs.load(), 0 ) )
+        + kSettleSlackMs;
+    for( ;; )
+    {
+        if( d->settleAck.load() >= request ) return true;
+        const ULONGLONG now = GetTickCount64();
+        if( now >= deadline ) return false;
+        WaitForSingleObject( d->settledEvent, static_cast<DWORD>( deadline - now ) );
+    }
+#else
+    return true;
+#endif
 }
 
 void PlaybackDueWake::setPostRetryBudgetMsForTest( int ms )

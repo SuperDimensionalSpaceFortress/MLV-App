@@ -1340,6 +1340,8 @@ TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsDeliveredOnceByThePollTickAn
     wake.arm( 5.0 );
     // not drained until the wait thread gave up: refused, retried for 20 ms, refused
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postFailures() >= 1; }, 3000 ) );
+    // r7 pass 16 A3: the failure is counted just BEFORE the generation is published; settling waits for the publication
+    ASSERT_TRUE( wake.settlePostCounters() );
     ASSERT_EQ( 1u, wake.postFailures() );
     ASSERT_TRUE( wake.postRefusals() >= 1u );                      // the first post at least (the retries depend on scheduling)
     ASSERT_EQ( 0, drainDueWakeWindow( wake ) );                    // the queue drains: no wake message was ever posted
@@ -1356,6 +1358,7 @@ TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsDeliveredOnceByThePollTickAn
     ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
     wake.arm( 1.0 );
     ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postFailures() >= 2; }, 3000 ) );
+    ASSERT_TRUE( wake.settlePostCounters() );
     drainDueWakeWindow( wake );
     wake.cancel();
     ASSERT_FALSE( wake.deliverLostPost() );
@@ -1372,7 +1375,8 @@ TEST(PlaybackDueWakeNative, APostAFullQueueRefusesIsDeliveredOnceByThePollTickAn
     const int rescue = timer.indexOf( QStringLiteral( "if( m_playbackDueWake ) m_playbackDueWake->deliverLostPost();" ) );
     const int tick = timer.indexOf( QStringLiteral( "timerFrameEvent();" ) );
     ASSERT_TRUE( rescue > 0 && tick > rescue );
-    ASSERT_EQ( 1, mainWindow.count( QStringLiteral( "QStringLiteral( \" post_refused=%1 post_failed=%2 post_rescued=%3\" )" ) ) );
+    ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
+        "QStringLiteral( \" post_refused=%1 post_failed=%2 post_rescued=%3 post_counts_settled=%4\" )" ) ) );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif
@@ -1437,6 +1441,63 @@ TEST(PlaybackDueWakeNative, ARescuedWakeThatStopsPlayPrintsItsOwnRescueAndFailur
     ASSERT_EQ( 0, mainWindow.count( QStringLiteral( "++m_playbackDueWakePostRescued" ) ) );
     ASSERT_EQ( 1, mainWindow.count( QStringLiteral(
         "m_playbackDueWake ? m_playbackDueWake->postRescued() - m_playbackDueWakePostRescuedBase : 0" ) ) );
+#else
+    SKIP_TEST( "native-message delivery is Windows-only" );
+#endif
+}
+
+TEST(PlaybackDueWakeNative, APreviousPlaysLateFailureIsSettledBeforeTheNextPlaysBaseline)
+{
+    // r7 adversary pass 16 A1 input (MainWindow.cpp:19684 on c687f37c): native Play A, arm(5.0), the GUI queue full through
+    // the retry budget; the worker is still retrying (its failure not yet counted) when A stops and B starts, so B's baseline
+    // read postFailures() == 0; the worker then counted A's failure inside B, and B printed post_failed=1 with no failure of
+    // its own. Here the worker is held inside its retry by a long budget and a queue that stays full; B's reset settles first.
+#ifdef Q_OS_WIN
+    int fired = 0;
+    PlaybackDueWake wake( nullptr, [&fired]() { ++fired; } );
+    ASSERT_TRUE( wake.delivery() == PlaybackDueWake::Delivery::NativeMessage );
+    DueWakeQueueDrain drainOnExit { wake };
+    wake.setPostRetryBudgetMsForTest( 300 );
+    DWORD refusedWith = 0;
+    fillQueueWithWmNull( reinterpret_cast<HWND>( wake.nativeWindow() ), refusedWith );
+    if( refusedWith == 0 ) SKIP_TEST( "this host's posted-message limit is above 1000000: the queue cannot be filled" );
+    ASSERT_EQ( static_cast<DWORD>( ERROR_NOT_ENOUGH_QUOTA ), refusedWith );
+    wake.arm( 5.0 );                                               // Play A's last arm
+    ASSERT_TRUE( waitWithoutPumping( [&wake]() { return wake.postRefusals() >= 1; }, 3000 ) );   // the worker is retrying
+    wake.cancel();                                                 // A stops (the cancel does not reach the worker)
+    // B's reset (resetPlaybackDueWakeCounters): settle, then the baseline. The queue stays full, so the worker gives up.
+    ASSERT_TRUE( wake.settlePostCounters() );
+    ASSERT_EQ( 1u, wake.postFailures() );                          // A's failure is in before B's baseline...
+    const quint64 baseFailed = wake.postFailures();
+    const quint64 baseRefused = wake.postRefusals();
+    drainDueWakeWindow( wake );
+    // ...and B, with no failure of its own, reports none
+    wake.arm( 1.0 );
+    ASSERT_EQ( 1, pumpDueWakeMessages( wake, 200 ) );
+    ASSERT_TRUE( wake.settlePostCounters() );
+    ASSERT_EQ( 0u, wake.postFailures() - baseFailed );
+    ASSERT_EQ( 0u, wake.postRefusals() - baseRefused );
+    ASSERT_FALSE( wake.deliverLostPost() );                        // A's lost post was cancelled: the gate drops it
+    ASSERT_EQ( 1, fired );
+    // the wiring: the settle request is the LAST handle; the reset and the line both settle before reading the counters
+    const QString source = dueWakeRepoSource( QStringLiteral( "platform/qt/PlaybackDueWake.cpp" ) );
+    ASSERT_EQ( 1, source.count( QStringLiteral( "const HANDLE handles[3] = { args.stopEvent, args.timer, args.settleEvent };" ) ) );
+    // r7 adversary pass 16 A2: the elapsed budget is checked again after every retry wait, before any further attempt
+    const int retryWait = source.indexOf( QStringLiteral( "if( WaitForSingleObject( args.stopEvent, 1 ) != WAIT_TIMEOUT )" ) );
+    const int recheck = source.indexOf( QStringLiteral( "if( GetTickCount64() - start >= budget ) break;" ), retryWait );
+    const int retry = source.indexOf( QStringLiteral( "if( postDueWake( args, postQpc.QuadPart, generation ) )" ), retryWait );
+    ASSERT_TRUE( retryWait > 0 && recheck > retryWait && retry > recheck );
+    const QString mainWindow = dueWakeRepoSource( QStringLiteral( "platform/qt/MainWindow.cpp" ) );
+    const QString reset = functionBody( mainWindow, QStringLiteral( "void MainWindow::resetPlaybackDueWakeCounters( void )" ),
+                                        QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ) );
+    const int settle = reset.indexOf( QStringLiteral( "if( m_playbackDueWake ) m_playbackDueWake->settlePostCounters();" ) );
+    const int baseline = reset.indexOf( QStringLiteral( "m_playbackDueWakePostFailedBase =" ) );
+    ASSERT_TRUE( settle > 0 && baseline > settle );
+    const QString line = functionBody( mainWindow, QStringLiteral( "QString MainWindow::playbackDueWakeSummaryLine( void ) const" ),
+                                       QStringLiteral( "//Paint the Audio Track Wave to GUI" ) );
+    const int settled = line.indexOf( QStringLiteral( "const bool postCountsSettled = m_playbackDueWake ? m_playbackDueWake->settlePostCounters() : true;" ) );
+    const int read = line.indexOf( QStringLiteral( "m_playbackDueWake->postFailures() - m_playbackDueWakePostFailedBase" ) );
+    ASSERT_TRUE( settled > 0 && read > settled );
 #else
     SKIP_TEST( "native-message delivery is Windows-only" );
 #endif

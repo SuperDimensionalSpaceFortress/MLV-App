@@ -260,6 +260,12 @@ public:
      *  and a failure is counted before its lost post is published, so a summary line printed from inside the callback (a
      *  rescued wake that stops Play) already shows both. */
     quint64 postRescued() const;
+    /*! GUI thread. r7 (adversary pass 16 A1): the wait thread counts asynchronously, so a Play's cumulative-counter difference
+     *  could take a failure of the previous Play's last arm. This returns once the wait thread has handled every timer signal
+     *  that came before the call (posted, or retried and counted), waiting at most the retry budget plus kSettleSlackMs.
+     *  False on that timeout (the counters may still move). True at once when there is no wait thread. */
+    bool settlePostCounters();
+    static constexpr int kSettleSlackMs = 1000;
     /*! Test hook: the wait thread's retry budget in ms (0: no retry). */
     void setPostRetryBudgetMsForTest( int ms );
     /*! Stop and join the wait thread (idempotent). After it returns no message is posted and arm() is a no-op. */
