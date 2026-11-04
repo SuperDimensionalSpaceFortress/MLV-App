@@ -1005,6 +1005,15 @@ public static class MlvLaneJob {
   static extern bool Process32FirstW(IntPtr snapshot, ref PROCESSENTRY32 entry);
   [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
   static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetProcessTimes(IntPtr process, out Int64 creation, out Int64 exit, out Int64 kernel, out Int64 user);
+  // r14 fix iteration 1 (adversary A1 on 1d4adafb): creation FILETIMEs, which are UTC. Process.StartTime is local time and runs backward when daylight time ends, so a real child read as older than its parent.
+  static Int64 CreatedFileTime(Process p) {
+    Int64 creation,exit,kernel,user;
+    if(!GetProcessTimes(p.Handle,out creation,out exit,out kernel,out user)) throw new Win32Exception(Marshal.GetLastWin32Error(),"GetProcessTimes");
+    return creation;
+  }
+  public static bool StartedBeforeParent(Int64 kidCreated, Int64 parentCreated) { return kidCreated<parentCreated; }
   public static List<Process> SnapshotDescendants(Process root) {
     Dictionary<int,List<int>> kids=new Dictionary<int,List<int>>();
     IntPtr snap=CreateToolhelp32Snapshot(2,0);
@@ -1023,13 +1032,13 @@ public static class MlvLaneJob {
     while(walk.Count>0) {
       Process parent=walk.Dequeue();
       if(!kids.ContainsKey(parent.Id)) continue;
-      DateTime parentStart=parent.StartTime;
+      Int64 parentCreated=CreatedFileTime(parent);
       foreach(int id in kids[parent.Id]) {
         Process kid;
         try { kid=Process.GetProcessById(id); } catch(ArgumentException) { continue; }   // exited since the snapshot
         try {
-          IntPtr pin=kid.Handle;
-          if(kid.StartTime<parentStart) continue;   // older than this parent: the parent's pid was reused, and this is not its child
+          // Reading it opens the handle, which this object then keeps.
+          if(StartedBeforeParent(CreatedFileTime(kid),parentCreated)) continue;   // older than this parent: the parent's pid was reused, and this is not its child
         } catch(InvalidOperationException) { continue; }   // exited since the snapshot
         found.Add(kid); walk.Enqueue(kid);
       }
@@ -1118,6 +1127,10 @@ function Stop-CodexDirectChildTree {
     try { $members = @([MlvLaneJob]::SnapshotDescendants($Proc)) } catch { $members = $null }
     try { $Proc.Kill($true) } catch { return 'uncertain:kill-failed' }
     if ($null -eq $members) { return 'uncertain:tree-unreadable' }
+    # r14 fix iteration 1 (adversary A1 on 1d4adafb): Kill($true) walks the tree with local start times, so across the end of daylight time it can miss a real descendant. Everything the snapshot saw is killed here too.
+    foreach ($member in $members) {
+        try { if (-not $member.HasExited) { $member.Kill() } } catch { return 'uncertain:kill-failed' }
+    }
     foreach ($member in (@($Proc) + $members)) {
         $leftMs = [int][math]::Max(0.0, [math]::Floor($LimitMs - $clock.Elapsed.TotalMilliseconds))
         try { if (-not ($member.WaitForExit($leftMs))) { return 'uncertain:wait-timeout' } } catch { return 'uncertain:tree-unreadable' }

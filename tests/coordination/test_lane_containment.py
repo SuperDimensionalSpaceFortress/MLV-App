@@ -2528,6 +2528,34 @@ def test_r14_b3_the_snapshot_failing_still_kills_the_child(fixture_tree):
     wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
 
 
+def test_r14_iter1_a1_a_descendant_the_runtime_tree_kill_misses_is_killed_and_seen_gone(fixture_tree):
+    # adversary A1 on 1d4adafb: Kill($true) compares local start times, so across the end of daylight time it drops a real descendant. Standing in for that miss, the kill reaches
+    # only the root here. The descendant the snapshot saw must still be killed and seen to exit; 'killed' never rests on what the runtime's own walk found.
+    root=fixture_tree["root"]
+    muts=[_replacing(_DIRECT_KILL,"$Proc.Kill()"),_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    wait_absent(json.loads((root/"grand.json").read_text(encoding="utf-8-sig")),5)
+    assert r.returncode!=0 and q["codexDirectChildStop"]=="killed",(r.returncode,q)
+
+
+def test_r14_iter1_a1_the_parent_age_check_reads_utc_filetimes_never_local_start_times(tmp_path):
+    # adversary A1 on 1d4adafb, its input: under Central time the parent started 2026-11-01T06:59:59Z and the child 07:00:01Z, which read locally as 01:59:59 and 01:00:01, so the child
+    # looked older than its parent and was dropped. The check takes creation FILETIMEs; a child really older than the pid's current holder (a reused pid) is still refused.
+    text=CANDIDATE.read_text(encoding="utf-8")
+    block=re.search(r"(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@",text).group(1)
+    walk=block[block.index("public static List<Process> SnapshotDescendants"):]
+    assert ".StartTime" not in walk, "the tree walk compares Process.StartTime, which is local time and runs backward when daylight time ends"
+    import datetime as dt
+    parent=int(dt.datetime(2026,11,1,6,59,59,tzinfo=dt.timezone.utc).timestamp()*10_000_000)+116444736000000000
+    child=parent+2*10_000_000
+    script=tmp_path/"age.ps1"
+    script.write_text("param($P,$C)\nAdd-Type -TypeDefinition @'\n"+block+"\n'@\n'{0} {1}' -f [MlvLaneJob]::StartedBeforeParent([long]$C,[long]$P), [MlvLaneJob]::StartedBeforeParent([long]$P,[long]$C)\n",encoding="ascii")
+    r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-File",str(script),str(parent),str(child)],capture_output=True,text=True,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    assert r.stdout.strip().splitlines()[-1:]==["False True"],(r.stdout,r.stderr)
+
+
 def test_r14_b3_control_an_ordinary_no_image_lane_has_no_stop_to_report(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     r=run_lane(cmd,env)
