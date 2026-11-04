@@ -96,25 +96,38 @@ inline double channelMean(const std::vector<uint8_t> & rgb, int w, int h, int c)
 // The CPU reduced recon (mlvDualIsoPreviewScaleReconRun) without the reduced ISO
 // notch: the plan's shrink, then the with-dims recon with the route's flags minus
 // LLRP_WITH_DIMS_REDUCED_ISO_NOTCH. `raw` is a full-resolution decode (consumed).
-// Empty on any refusal.
+// Empty on any refusal. CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: at the plan's Bayer dims
+// (bayerWidth x bayerHeight; x2 for the CPU plan at x4).
 inline std::vector<uint16_t> unnotchedCpuReducedRecon(mlvObject_t * video,
                                                       const mlvDualIsoPreviewScaleRecon_t & plan,
                                                       std::vector<uint16_t> raw)
 {
-    std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth)
-                                  * static_cast<size_t>(plan.reducedHeight));
+    std::vector<uint16_t> reduced(static_cast<size_t>(plan.bayerWidth)
+                                  * static_cast<size_t>(plan.bayerHeight));
     llrawprocWorkerState_t worker;
     llrpInitWorkerState(&worker);
     const int shrunk = mlvDualIsoPreviewScaleReconShrink(video, &plan, raw.data(), reduced.data(),
                                                          &worker, 1, nullptr, nullptr);
     const int ok = shrunk > 0
         && applyLLRawProcObjectWorker_with_dims(video, reduced.data(), reduced.size() * sizeof(uint16_t),
-                                                plan.reducedWidth, plan.reducedHeight, &worker,
+                                                plan.bayerWidth, plan.bayerHeight, &worker,
                                                 LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED
                                                 | LLRP_WITH_DIMS_NO_PUBLISH);
     llrpFreeWorkerState(&worker);
     if (!ok) reduced.clear();
     return reduced;
+}
+
+// CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the CPU plan with its Bayer at the display scale,
+// the CUDA plan's shape (bayerScale == scale). Since that card the CPU plan at x4 shrinks
+// and reconstructs at x2; tests that compare the CPU recon with the CUDA route's, or grade
+// the reduced recon itself at the display scale, use this shape.
+inline mlvDualIsoPreviewScaleRecon_t atDisplayScaleBayer(mlvDualIsoPreviewScaleRecon_t plan)
+{
+    plan.bayerScale = plan.scale;
+    plan.bayerWidth = plan.reducedWidth;
+    plan.bayerHeight = plan.reducedHeight;
+    return plan;
 }
 
 } // namespace dualiso_mesh_metrics

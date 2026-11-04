@@ -131,7 +131,8 @@ bool reducedPathTaken(MlvPipelineFixture & fixture, uint64_t frame, int scale,
     }
     std::vector<uint16_t> raw = decodeRaw(fixture, frame);
     if (raw.empty()) return false;
-    std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight));
+    // H2C-PORT-1: the reduced Bayer is at the plan's Bayer dims (x2 for the x4 plan).
+    std::vector<uint16_t> reduced(static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight));
     WorkerState worker;
     const int rc = mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), reduced.data(),
                                                   &worker.state, 1, nullptr, nullptr);
@@ -143,7 +144,7 @@ bool reducedPathTaken(MlvPipelineFixture & fixture, uint64_t frame, int scale,
     std::vector<uint8_t> out(outputBytes(fixture, scale));
     PreviewEnvelope envelope(scale);
     if (getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(fixture.video(), frame, reduced.data(),
-                                                            plan.reducedWidth, plan.reducedHeight, plan.scale,
+                                                            plan.bayerWidth, plan.bayerHeight, plan.scale,
                                                             out.data(), 1, scale) != 1)
     {
         std::printf("[cpu-dualiso-preview-scale] frame %d x%d process stage declined\n",
@@ -470,6 +471,9 @@ TEST(CpuDualIsoPreviewScale, ReducedRouteNotchesTheIsoPeriod)
         ASSERT_EQ(notchFrames + 1, mlvDualIsoReducedIsoNotchFrames());
         const int rw = plan.reducedWidth;
         const int rh = plan.reducedHeight;
+        // H2C-PORT-1: the route's Bayer (x2 for the x4 plan); rw x rh are the display dims.
+        const int bw = plan.bayerWidth;
+        const int bh = plan.bayerHeight;
         int w = 0, h = 0;
         mlvFrameOutputDimensions(video, scale, &w, &h);
         ASSERT_EQ(rw, w);
@@ -478,13 +482,13 @@ TEST(CpuDualIsoPreviewScale, ReducedRouteNotchesTheIsoPeriod)
         ASSERT_EQ(routeBayer.size(), unnotched.size());
         ASSERT_EQ(notchFrames + 1, mlvDualIsoReducedIsoNotchFrames());
         std::vector<uint16_t> expected(unnotched.size());
-        dualiso_reduced_iso_period_notch16(expected.data(), unnotched.data(), rw, rh);
+        dualiso_reduced_iso_period_notch16(expected.data(), unnotched.data(), bw, bh);
         const bool b1 = routeBayer == expected;
 
         std::vector<uint8_t> off(outputBytes(fixture, scale));
         {
             PreviewEnvelope envelope(scale);
-            ASSERT_EQ(1, getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(video, 2, unnotched.data(), rw, rh,
+            ASSERT_EQ(1, getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(video, 2, unnotched.data(), bw, bh,
                                                                              plan.scale, off.data(), 1, scale));
         }
         std::vector<uint8_t> refBox;
@@ -780,7 +784,7 @@ TEST(CpuDualIsoPreviewScale, LutKeepIsByteIdenticalAtScale1And2And4)
             std::vector<uint16_t> raw = decodeRaw(fixture, frame);
             ASSERT_FALSE(raw.empty());
             std::vector<uint16_t> raw2 = raw;
-            const size_t n = static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight);
+            const size_t n = static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight);
             std::vector<uint16_t> a(n), b(n);
             ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), a.data(),
                                                         &kept.state, 1, nullptr, nullptr));

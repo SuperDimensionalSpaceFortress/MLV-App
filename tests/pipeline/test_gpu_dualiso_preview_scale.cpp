@@ -359,8 +359,8 @@ TEST(GpuDualIsoPreviewScale, CudaSuppressedSessionTakesTheCpuReducedReconPlan)
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), 4, &plan));
         std::vector<uint16_t> raw = decodeRaw(fixture, 0);
         ASSERT_FALSE(raw.empty());
-        std::vector<uint16_t> reduced(static_cast<size_t>(plan.reducedWidth)
-                                      * static_cast<size_t>(plan.reducedHeight), 0u);
+        std::vector<uint16_t> reduced(static_cast<size_t>(plan.bayerWidth)
+                                      * static_cast<size_t>(plan.bayerHeight), 0u);
         WorkerState worker;
         llrpSetGpuPlaybackReconLastUsedForTesting(1);
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), reduced.data(),
@@ -544,6 +544,7 @@ using dualiso_mesh_metrics::columnPeriod4Energy;
 using dualiso_mesh_metrics::lag4VerticalLumaDetail;
 using dualiso_mesh_metrics::channelMean;
 using dualiso_mesh_metrics::unnotchedCpuReducedRecon;
+using dualiso_mesh_metrics::atDisplayScaleBayer;
 
 // The full-res route's preview: its 8-bit frame box-downsampled by `scale`.
 std::vector<uint8_t> boxDownsample(const std::vector<uint8_t> & full, int fullW, int scale,
@@ -631,7 +632,8 @@ std::vector<uint8_t> emulateReducedPresent(MlvPipelineFixture & fixture,
                                            int reducedHeight,
                                            int outHeight,
                                            bool hnyquist,
-                                           bool amaze = false)
+                                           bool amaze = false,
+                                           bool chroma121 = false)
 {
     const size_t rowWords = static_cast<size_t>(reducedWidth) * 3u;
     std::vector<uint16_t> work(bayer);
@@ -644,6 +646,13 @@ std::vector<uint8_t> emulateReducedPresent(MlvPipelineFixture & fixture,
     else
     {
         debayerBasicU16(rgb.data(), work.data(), reducedWidth, reducedHeight, 1, 0);
+    }
+    if (chroma121)
+    {
+        // CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the CPU x2 consumer's chroma-only [1 2 1] ("H0c").
+        std::vector<uint16_t> filtered(rgb.size(), 0u);
+        debayer_reduced_hchroma121_rgb16(filtered.data(), rgb.data(), reducedWidth, reducedHeight, 1);
+        std::copy_n(filtered.data(), rowWords * static_cast<size_t>(reducedHeight), rgb.data());
     }
     for (int y = reducedHeight; y < outHeight; ++y)
         std::memcpy(rgb.data() + static_cast<size_t>(y) * rowWords,
@@ -862,6 +871,9 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         mlvDualIsoPreviewScaleRecon_t plan;
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
         ASSERT_EQ(1, plan.phaseTentShrink);
+        // CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: E emulates the CUDA route (c1), whose Bayer
+        // is at the display scale; the CPU plan at x4 now reconstructs at x2.
+        plan = atDisplayScaleBayer(plan);
         // The old decimator's route, for the report arm only.
         mlvDualIsoPreviewScaleRecon_t decimatorPlan = plan;
         decimatorPlan.phaseTentShrink = 0;
@@ -912,9 +924,10 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         processingSetPlaybackPreviewScaleFactor(scale);
         const int ok = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
             video, 2, bayer.data(), rw, rh, plan.scale, routed.data(), 1, scale);
-        // The emulation without the filter, through debayerBasicU16, is the routed frame.
+        // The emulation without the filter, through debayerBasicU16, is the routed frame
+        // (H2C-PORT-1: plus the chroma-only [1 2 1] the CPU consumer takes at x2).
         const std::vector<uint8_t> emulatedBasic =
-            emulateReducedPresent(fixture, 2, bayer, rw, rh, h, false);
+            emulateReducedPresent(fixture, 2, bayer, rw, rh, h, false, false, scale == 2);
         const std::vector<uint8_t> e = emulateReducedPresent(fixture, 2, bayer, rw, rh, h, hnyquist, true);
         const std::vector<uint8_t> refBin = emulateReducedPresent(fixture, 2, binned, rw, rh, h, false, true);
         const std::vector<uint8_t> unnotched =
@@ -1291,7 +1304,9 @@ TEST(GpuDualIsoPreviewScale, PhaseTentShrinkOnBothPlans)
             ASSERT_EQ(1, plan.phaseTentShrink);
             std::vector<uint16_t> raw = decodeRaw(fixture, 1);
             ASSERT_FALSE(raw.empty());
-            std::vector<uint16_t> viaPlan(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight, 0u);
+            // H2C-PORT-1: the shrink writes the plan's Bayer (x2 for the CPU plan at x4).
+            ASSERT_EQ((!gpu && scale == 4) ? 2 : scale, plan.bayerScale);
+            std::vector<uint16_t> viaPlan(static_cast<size_t>(plan.bayerWidth) * plan.bayerHeight, 0u);
             std::vector<uint16_t> direct(viaPlan.size(), 1u);
             const uint64_t framesBefore = mlvDualIsoPhaseTentShrinkFrames();
             WorkerState worker;
@@ -1299,7 +1314,7 @@ TEST(GpuDualIsoPreviewScale, PhaseTentShrinkOnBothPlans)
                                                            &worker.state, 1, nullptr, nullptr));
             int ow = 0, oh = 0;
             ASSERT_EQ(0, pl_downsample_bayer_to_bayer_phase_tent(raw.data(), fixture.width(), plan.sourceHeight,
-                                                                 direct.data(), scale, &ow, &oh, 1));
+                                                                 direct.data(), plan.bayerScale, &ow, &oh, 1));
             ASSERT_TRUE(viaPlan == direct);
             ASSERT_EQ(framesBefore + 1u, mlvDualIsoPhaseTentShrinkFrames());
         }
@@ -1343,8 +1358,10 @@ TEST(GpuDualIsoPreviewScale, CpuPlanShrinkPutsEveryOutputOnItsSite)
                 ramp[static_cast<size_t>(y) * fullW + x] = static_cast<uint16_t>(v);
             }
         ASSERT_TRUE(maxValue < 65536);
-        const int rw = plan.reducedWidth;
-        const int rh = plan.reducedHeight;
+        // H2C-PORT-1: the shrink's sites are at the plan's Bayer scale (x2 for the x4 plan).
+        const int bs = plan.bayerScale;
+        const int rw = plan.bayerWidth;
+        const int rh = plan.bayerHeight;
         std::vector<uint16_t> out(static_cast<size_t>(rw) * rh, 0u);
         WorkerState worker;
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconShrink(fixture.video(), &noFixes, ramp.data(), out.data(),
@@ -1353,13 +1370,13 @@ TEST(GpuDualIsoPreviewScale, CpuPlanShrinkPutsEveryOutputOnItsSite)
         for (int y = 1; y < rh - 1; ++y)
             for (int x = 1; x < rw - 1; ++x)
             {
-                const int want = base(x, y) + (2 * scale * x + scale - 1) + 2 * (2 * scale * y + scale - 1);
+                const int want = base(x, y) + (2 * bs * x + bs - 1) + 2 * (2 * bs * y + bs - 1);
                 const int got = out[static_cast<size_t>(y) * rw + x];
                 if (got != want && bad++ < 8)
                     std::printf("[cpu-shrink-site] x%d (%d,%d) got %d want %d\n", scale, x, y, got, want);
             }
-        std::printf("[cpu-shrink-site] x%d %dx%d -> %dx%d tent=%d: %d interior samples off their site\n", scale,
-                    fullW, plan.sourceHeight, rw, rh, plan.phaseTentShrink, bad);
+        std::printf("[cpu-shrink-site] x%d (bayer x%d) %dx%d -> %dx%d tent=%d: %d interior samples off their site\n",
+                    scale, bs, fullW, plan.sourceHeight, rw, rh, plan.phaseTentShrink, bad);
         ASSERT_EQ(0, bad);
     }
 }
@@ -1397,10 +1414,14 @@ TEST(GpuDualIsoPreviewScale, CpuReducedDebayerChannelsShareOneCentre)
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
         mlvDualIsoPreviewScaleRecon_t noFixes = plan; // as T-A: the fixes stay off the ramp
         noFixes.fullResFixes = 0;
+        // H2C-PORT-1: the shrink writes the Bayer (bw x bh, x2 for the x4 plan); the entry
+        // returns the display frame, reconstructed over rw x rh (display) pixels.
+        const int bw = plan.bayerWidth;
+        const int bh = plan.bayerHeight;
         const int rw = plan.reducedWidth;
         const int rh = plan.reducedHeight;
         std::vector<uint16_t> raw(ramp);
-        std::vector<uint16_t> reduced(static_cast<size_t>(rw) * rh, 0u);
+        std::vector<uint16_t> reduced(static_cast<size_t>(bw) * bh, 0u);
         WorkerState worker;
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconShrink(video, &noFixes, raw.data(), reduced.data(), &worker.state, 1,
                                                        nullptr, nullptr));
@@ -1408,9 +1429,10 @@ TEST(GpuDualIsoPreviewScale, CpuReducedDebayerChannelsShareOneCentre)
         const int outH = fullH / scale;
         std::vector<uint16_t> rgb(static_cast<size_t>(outW) * outH * 3u, 0u);
         int w = 0, h = 0;
-        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, reduced.data(), rw, rh, scale,
+        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, reduced.data(), bw, bh, scale,
                                                                      rgb.data(), hq, &w, &h));
         ASSERT_EQ(outW, w);
+        ASSERT_EQ(outW, rw);
         int bad = 0, maxOffCentre = 0, maxSpread = 0;
         for (int y = 2; y < rh - 2; ++y)
             for (int x = 2; x < rw - 2; ++x)
@@ -1485,9 +1507,15 @@ TEST(GpuDualIsoPreviewScale, AHeightNotAMultipleOf16CropsItsLastRowsAndPadsTheEd
         const int block = 4 * scale;
         ASSERT_EQ((fullH / block) * block, plan.sourceHeight);
         ASSERT_TRUE(plan.sourceHeight < fullH);
-        const int rw = plan.reducedWidth;
-        const int rh = plan.reducedHeight;
-        ASSERT_EQ(plan.sourceHeight / scale, rh);
+        // H2C-PORT-1: the shrink and its checks are at the Bayer dims (x2 for the x4 plan,
+        // which keeps the x4 crop); the debayered frame is at the display dims.
+        ASSERT_EQ(plan.sourceHeight / scale, plan.reducedHeight);
+        ASSERT_EQ(plan.sourceHeight / plan.bayerScale, plan.bayerHeight);
+        ASSERT_EQ(fullW / plan.bayerScale, plan.bayerWidth);
+        const int rw = plan.bayerWidth;
+        const int rh = plan.bayerHeight;
+        const int dw = plan.reducedWidth;
+        const int dh = plan.reducedHeight;
         mlvDualIsoPreviewScaleRecon_t noFixes = plan; // as T-A: the fixes stay off the synthetic frames
         noFixes.fullResFixes = 0;
         auto shrink = [&](std::vector<uint16_t> raw) {
@@ -1514,25 +1542,428 @@ TEST(GpuDualIsoPreviewScale, AHeightNotAMultipleOf16CropsItsLastRowsAndPadsTheEd
         for (int y = rh - 4; y < rh; ++y)
             for (int x = 0; x < rw; ++x) ASSERT_EQ(base(x, y), static_cast<int>(classes[static_cast<size_t>(y) * rw + x]));
 
-        // The debayered frame is full_h / S rows; the rows past rh repeat row rh - 1.
+        // The debayered frame is full_h / S rows; the rows past dh repeat row dh - 1.
         const int outH = fullH / scale;
-        ASSERT_TRUE(rh < outH);
+        ASSERT_TRUE(dh < outH);
         std::vector<uint16_t> work(reduced); // the entry shifts its input in place
-        std::vector<uint16_t> rgb(static_cast<size_t>(rw) * outH * 3u, 0u);
+        std::vector<uint16_t> rgb(static_cast<size_t>(dw) * outH * 3u, 0u);
         int w = 0, h = 0;
         ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, work.data(), rw, rh, scale, rgb.data(),
                                                                      hq, &w, &h));
-        ASSERT_EQ(rw, w);
+        ASSERT_EQ(dw, w);
         ASSERT_EQ(outH, h);
-        const size_t rowWords = static_cast<size_t>(rw) * 3u;
-        const uint16_t * last = rgb.data() + static_cast<size_t>(rh - 1) * rowWords;
+        const size_t rowWords = static_cast<size_t>(dw) * 3u;
+        const uint16_t * last = rgb.data() + static_cast<size_t>(dh - 1) * rowWords;
         // The ramp: the last row is not a mid-frame row (nor zeros), so a copy of it is told apart.
-        ASSERT_FALSE(std::equal(last, last + rowWords, rgb.data() + static_cast<size_t>(rh / 2) * rowWords));
-        for (int y = rh; y < outH; ++y)
+        ASSERT_FALSE(std::equal(last, last + rowWords, rgb.data() + static_cast<size_t>(dh / 2) * rowWords));
+        for (int y = dh; y < outH; ++y)
             ASSERT_TRUE(std::equal(last, last + rowWords, rgb.data() + static_cast<size_t>(y) * rowWords));
-        std::printf("[non-multiple-of-16] x%d %dx%d -> source %d rows (%d cropped) -> reduced %d -> shown %d\n", scale,
-                    fullW, fullH, plan.sourceHeight, fullH - plan.sourceHeight, rh, outH);
+        std::printf("[non-multiple-of-16] x%d %dx%d -> source %d rows (%d cropped) -> bayer %d (x%d) -> reduced %d "
+                    "-> shown %d\n", scale, fullW, fullH, plan.sourceHeight, fullH - plan.sourceHeight, rh,
+                    plan.bayerScale, dh, outH);
     }
+}
+
+// ---- CPU-DUALISO-REDUCED-RECON-H2C-PORT-1 ---------------------------------------------------
+// The playing CPU route at x4 fringed (venue H/C 2.4x at s4, 1.9x at s2): the x4 plan shrank
+// with the phase tent to x4 and debayered bilinear there ("H0"). The offline model
+// (EDGE-FRINGE-1 r2 sim_r2.py / sim_r2_alt.py) names H2c for x4: tent x2 + bilinear at x2 +
+// chroma-only horizontal [1 2 1]/4 (R' = G + h121(R - G), B' = G + h121(B - G)) + 2x2 box,
+// phase-mean F/ref 1.10-1.19 (H0 2.16-2.53), per-phase max 2.00-2.03 (H0 2.50-3.38); and, at
+// x2 (this card's P0b, sim_s2.py), H0c: H0 then the chroma-only [1 2 1], gained H0c/H0 phase
+// mean 0.739-0.858. These tests port sim_r2.py's scenes and metric_F onto the real entry.
+namespace {
+
+const double kH2cKr = 0.3977; // fixture_wb.exe on the GPU-eligible fixture's frame 1 (sim_r2.py KR, KB)
+const double kH2cKb = 0.6442;
+const int kH2cLo = 2000;
+const int kH2cHi = 12000;
+
+struct H2cScene
+{
+    std::vector<double> s; // per-column radiance (constant down the columns)
+    std::vector<int> edges;
+};
+
+H2cScene h2cStep(int w, int e)
+{
+    H2cScene sc;
+    sc.s.assign(static_cast<size_t>(w), kH2cLo);
+    for (int x = e; x < w; ++x) sc.s[static_cast<size_t>(x)] = kH2cHi;
+    sc.edges = { e };
+    return sc;
+}
+
+H2cScene h2cLine(int w, int e, int widthFull)
+{
+    H2cScene sc;
+    sc.s.assign(static_cast<size_t>(w), kH2cLo);
+    for (int x = e; x < e + widthFull && x < w; ++x) sc.s[static_cast<size_t>(x)] = kH2cHi;
+    sc.edges = { e, e + widthFull };
+    return sc;
+}
+
+// sim_r2.py scene_bars over its 1536 columns (the rest stays at the low level).
+H2cScene h2cBars(int w)
+{
+    H2cScene sc;
+    const int simW = std::min(w, 1536);
+    for (int k = 0;; ++k)
+    {
+        const int e = 40 * k + (k % 8) + 24;
+        if (e > simW - 24) break;
+        sc.edges.push_back(e);
+    }
+    sc.s.assign(static_cast<size_t>(w), kH2cLo);
+    double lvl = kH2cLo;
+    size_t next = 0;
+    for (int x = 0; x < simW; ++x)
+    {
+        if (next < sc.edges.size() && x == sc.edges[next])
+        {
+            lvl = lvl == kH2cLo ? kH2cHi : kH2cLo;
+            ++next;
+        }
+        sc.s[static_cast<size_t>(x)] = lvl;
+    }
+    return sc;
+}
+
+// RGGB: R at (even row, even col) = kR * s, B at (odd, odd) = kB * s, G = s; every row class alike.
+std::vector<uint16_t> h2cBayer(const H2cScene & sc, int w, int h, double kr, double kb)
+{
+    std::vector<uint16_t> b(static_cast<size_t>(w) * static_cast<size_t>(h));
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const double s = sc.s[static_cast<size_t>(x)];
+            const bool ye = (y % 2) == 0, xe = (x % 2) == 0;
+            const double v = (ye && xe) ? kr * s : (!ye && !xe) ? kb * s : s;
+            b[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] =
+                static_cast<uint16_t>(std::lround(v));
+        }
+    return b;
+}
+
+// sim_r2.py metric_F on white-balanced RGB16 (R / kR, B / kB): mean |R-G| + |B-G| over the
+// output pixels (rows 3 .. rows-4, columns 3 .. w-4) whose centre S*X + (S-1)/2 lies within
+// 1.0 S full px of an edge (e - 0.5). stride = the row stride in pixels.
+double h2cMetricF(const uint16_t * rgb, int stride, int w, int rows, int scale, const std::vector<int> & edges,
+                  double kr, double kb)
+{
+    std::vector<char> nearCols(static_cast<size_t>(w), 0);
+    for (int x = 3; x < w - 3; ++x)
+    {
+        const double centre = scale * static_cast<double>(x) + (scale - 1) / 2.0;
+        for (const int e : edges)
+            if (std::fabs(centre - (e - 0.5)) <= 1.0 * scale) nearCols[static_cast<size_t>(x)] = 1;
+    }
+    double sum = 0.0;
+    size_t n = 0;
+    for (int y = 3; y < rows - 3; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            if (!nearCols[static_cast<size_t>(x)]) continue;
+            const uint16_t * p = rgb + (static_cast<size_t>(y) * static_cast<size_t>(stride) + static_cast<size_t>(x)) * 3u;
+            const double r = p[0] / kr, g = p[1], b = p[2] / kb;
+            sum += std::fabs(r - g) + std::fabs(b - g);
+            ++n;
+        }
+    return n ? sum / static_cast<double>(n) : 0.0;
+}
+
+// One scene through the reference (debayerBasicU16 at full res + SxS box) and the CPU reduced
+// route at `scale` (the plan's shrink, then getMlvRawFrameDebayeredFromReducedReconnedRaw16).
+// h0: F of the bilinear debayer of the same shrunk Bayer when it is at the display scale.
+struct H2cPhase
+{
+    double ref = 0.0;
+    double route = 0.0;
+    double h0 = 0.0;
+};
+
+bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan, int scale, int hq, int shift,
+                 const H2cScene & sc, double kr, double kb, H2cPhase * out)
+{
+    const int fullW = static_cast<int>(getMlvWidth(video));
+    const int fullH = static_cast<int>(getMlvHeight(video));
+    const std::vector<uint16_t> bayer = h2cBayer(sc, fullW, fullH, kr, kb);
+    // Reference.
+    std::vector<uint16_t> work(bayer);
+    std::vector<uint16_t> full(static_cast<size_t>(fullW) * static_cast<size_t>(fullH) * 3u);
+    debayerBasicU16(full.data(), work.data(), fullW, fullH, 4, shift);
+    const int outW = fullW / scale;
+    const int outH = fullH / scale;
+    std::vector<uint16_t> ref(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3u);
+    if (!processingRgbU16BoxDownsample(full.data(), ref.data(), fullW, fullH, scale, 4)) return false;
+    // Route. 07962caf has no Bayer dims: its plan's Bayer is the reduced (display) one.
+    mlvDualIsoPreviewScaleRecon_t noFixes = plan;
+    noFixes.fullResFixes = 0;
+    const int bw = plan.bayerWidth > 0 ? plan.bayerWidth : plan.reducedWidth;
+    const int bh = plan.bayerHeight > 0 ? plan.bayerHeight : plan.reducedHeight;
+    std::vector<uint16_t> raw(bayer);
+    std::vector<uint16_t> reduced(static_cast<size_t>(bw) * static_cast<size_t>(bh), 0u);
+    WorkerState worker;
+    if (mlvDualIsoPreviewScaleReconShrink(video, &noFixes, raw.data(), reduced.data(), &worker.state, 1, nullptr,
+                                          nullptr) != 1)
+        return false;
+    std::vector<uint16_t> h0In(reduced);
+    std::vector<uint16_t> rgb(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3u, 0u);
+    int w = 0, h = 0;
+    if (getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, reduced.data(), bw, bh, scale, rgb.data(), hq, &w,
+                                                        &h) != 1)
+        return false;
+    const int rows = plan.reducedHeight;
+    out->ref = h2cMetricF(ref.data(), outW, outW, rows, scale, sc.edges, kr, kb);
+    out->route = h2cMetricF(rgb.data(), outW, outW, rows, scale, sc.edges, kr, kb);
+    if (bw == outW)
+    {
+        std::vector<uint16_t> h0(static_cast<size_t>(bw) * static_cast<size_t>(bh) * 3u);
+        debayerBasicU16(h0.data(), h0In.data(), bw, bh, 4, shift);
+        out->h0 = h2cMetricF(h0.data(), bw, bw, rows, scale, sc.edges, kr, kb);
+    }
+    return true;
+}
+
+struct H2cSceneSpec
+{
+    std::string name;
+    std::vector<H2cScene> phases;
+};
+
+std::vector<H2cSceneSpec> h2cGainedScenes(int fullW, int scale)
+{
+    const int base = 600;
+    std::vector<H2cSceneSpec> scenes;
+    scenes.push_back({ "bars-gained", { h2cBars(fullW) } });
+    H2cSceneSpec step{ "step-gained", {} };
+    for (int p = 0; p < 2 * scale; ++p) step.phases.push_back(h2cStep(fullW, base + p));
+    scenes.push_back(step);
+    for (const int lw : { 1, 2, 3 })
+    {
+        H2cSceneSpec line{ "line" + std::to_string(lw) + "-gained", {} };
+        for (int p = 0; p < 2 * scale; ++p) line.phases.push_back(h2cLine(fullW, base + p, lw * scale));
+        scenes.push_back(line);
+    }
+    return scenes;
+}
+} // namespace
+
+// H2C-PORT-1 RED 1: at x4 the playing CPU route's edge chroma stays near the full recon's.
+// Per scene (gained raw, kR 0.3977 kB 0.6442; bars, step and lines 1/2/3 reduced px wide at
+// each of the 8 sub-phases): max over phases F(route)/F(ref) <= 2.1 and phase mean <= 1.35.
+// Model: H0 (07962caf) max 3.25 / mean 2.31 fails; H2c max 2.00-2.03 / mean 1.10-1.19 passes.
+// Mutations: x4 plan back on an x4 Bayer (H0), chroma filter dropped, filter on G too (H2n).
+TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingFringeStaysNearFullRecon)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video); // the reduced entry is the bilinear route
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    const int shift = hq ? 0 : 16 - video->RAWI.raw_info.bits_per_pixel;
+    const int scale = 4;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+    ASSERT_EQ(scale, plan.scale);
+    bool pass = true;
+    for (const H2cSceneSpec & spec : h2cGainedScenes(fixture.width(), scale))
+    {
+        double maxRatio = 0.0, sumRatio = 0.0;
+        std::string perPhase;
+        for (const H2cScene & sc : spec.phases)
+        {
+            H2cPhase ph;
+            ASSERT_TRUE(h2cRunPhase(video, plan, scale, hq, shift, sc, kH2cKr, kH2cKb, &ph));
+            ASSERT_TRUE(ph.ref > 0.0);
+            const double ratio = ph.route / ph.ref;
+            maxRatio = std::max(maxRatio, ratio);
+            sumRatio += ratio;
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), " %.3f", ratio);
+            perPhase += buf;
+        }
+        const double mean = sumRatio / static_cast<double>(spec.phases.size());
+        const bool ok = maxRatio <= 2.1 && mean <= 1.35;
+        std::printf("[h2c-x4-fringe] %-12s bayer x%d: F(route)/F(ref) per phase%s | max %.3f (<= 2.1) mean %.3f "
+                    "(<= 1.35) %s\n",
+                    spec.name.c_str(), plan.bayerScale, perPhase.c_str(), maxRatio, mean, ok ? "ok" : "FAIL");
+        pass = pass && ok;
+    }
+    ASSERT_TRUE(pass);
+}
+
+// H2C-PORT-1 RED 2 (s2 IN SCOPE by P0b, p0-report.md): at x2 the route is H0c, the chroma-only
+// [1 2 1] on the x2 bilinear. Per gained scene, phase-mean F(H0c)/F(ref) over phase-mean
+// F(H0)/F(ref) <= sim_s2.py's ratio + 0.05 (bars/step 0.772, line1 0.858, line2 0.739, line3
+// 0.758). H0 is the bilinear debayer of the same shrunk Bayer, measured in the test.
+// Mutations: no filter at x2 (ratio 1.0), filter on G too.
+TEST(GpuDualIsoPreviewScale, CpuReducedX2PlayingFringeDropsWithChromaFilter)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video);
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    const int shift = hq ? 0 : 16 - video->RAWI.raw_info.bits_per_pixel;
+    const int scale = 2;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+    const struct { const char * name; double sim; } bounds[] = {
+        { "bars-gained", 0.772 }, { "step-gained", 0.772 }, { "line1-gained", 0.858 },
+        { "line2-gained", 0.739 }, { "line3-gained", 0.758 },
+    };
+    bool pass = true;
+    for (const H2cSceneSpec & spec : h2cGainedScenes(fixture.width(), scale))
+    {
+        double sumRoute = 0.0, sumH0 = 0.0;
+        std::string perPhase;
+        for (const H2cScene & sc : spec.phases)
+        {
+            H2cPhase ph;
+            ASSERT_TRUE(h2cRunPhase(video, plan, scale, hq, shift, sc, kH2cKr, kH2cKb, &ph));
+            ASSERT_TRUE(ph.ref > 0.0 && ph.h0 > 0.0);
+            sumRoute += ph.route / ph.ref;
+            sumH0 += ph.h0 / ph.ref;
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), " %.3f/%.3f", ph.route / ph.ref, ph.h0 / ph.ref);
+            perPhase += buf;
+        }
+        double bound = 0.0;
+        for (const auto & b : bounds)
+            if (spec.name == b.name) bound = b.sim + 0.05;
+        ASSERT_TRUE(bound > 0.0);
+        const double q = sumRoute / sumH0;
+        const bool ok = q <= bound;
+        std::printf("[h2c-x2-fringe] %-12s per phase route/ref h0/ref%s | H0c/H0 phase mean %.3f (<= %.3f) %s\n",
+                    spec.name.c_str(), perPhase.c_str(), q, bound, ok ? "ok" : "FAIL");
+        pass = pass && ok;
+    }
+    ASSERT_TRUE(pass);
+}
+
+// H2C-PORT-1 RED 3: the route. At x4 the CPU plan's Bayer is at x2 (fullWidth / 2 x
+// sourceHeight / 2, sourceHeight still the x4 crop) and BOTH reduced consumers take it (a
+// consumer that rejected the new dims would drop every playing frame to the slow full render).
+// At x2 the Bayer is the display one. The CUDA plan keeps its Bayer at the display dims.
+// Mutations: plan left at x4, either consumer keeps its old width check.
+TEST(GpuDualIsoPreviewScale, CpuReducedX4ReconstructsAtX2AndBothConsumersTakeIt)
+{
+    {
+        GpuReconEnv env(true);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        for (const int scale : { 2, 4 })
+        {
+            mlvDualIsoPreviewScaleRecon_t plan;
+            ASSERT_EQ(1, mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), scale, 1, &plan));
+            ASSERT_EQ(scale, plan.bayerScale);
+            ASSERT_EQ(plan.reducedWidth, plan.bayerWidth);
+            ASSERT_EQ(plan.reducedHeight, plan.bayerHeight);
+        }
+    }
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video);
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+        const int wantBayerScale = scale == 4 ? 2 : scale;
+        std::printf("[h2c-route] x%d: sourceHeight %d reduced %dx%d bayer x%d %dx%d\n", scale, plan.sourceHeight,
+                    plan.reducedWidth, plan.reducedHeight, plan.bayerScale, plan.bayerWidth, plan.bayerHeight);
+        ASSERT_EQ(wantBayerScale, plan.bayerScale);
+        ASSERT_EQ((fixture.height() / (4 * scale)) * (4 * scale), plan.sourceHeight);
+        ASSERT_EQ(fixture.width() / scale, plan.reducedWidth);
+        ASSERT_EQ(plan.sourceHeight / scale, plan.reducedHeight);
+        ASSERT_EQ(fixture.width() / wantBayerScale, plan.bayerWidth);
+        ASSERT_EQ(plan.sourceHeight / wantBayerScale, plan.bayerHeight);
+
+        std::vector<uint16_t> raw = decodeRaw(fixture, 1);
+        ASSERT_FALSE(raw.empty());
+        std::vector<uint16_t> bayer(static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight), 0u);
+        WorkerState worker;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), bayer.data(), &worker.state, 1, nullptr,
+                                                    nullptr));
+        const int outW = fixture.width() / scale;
+        const int outH = fixture.height() / scale;
+        std::vector<uint16_t> work(bayer);
+        std::vector<uint16_t> rgb(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3u, 0u);
+        int w = 0, h = 0;
+        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, work.data(), plan.bayerWidth,
+                                                                     plan.bayerHeight, scale, rgb.data(), hq, &w, &h));
+        ASSERT_EQ(outW, w);
+        ASSERT_EQ(outH, h);
+
+        int fw = 0, fh = 0;
+        mlvFrameOutputDimensions(video, scale, &fw, &fh);
+        std::vector<uint8_t> out8(static_cast<size_t>(fw) * static_cast<size_t>(fh) * 3u, 0u);
+        const int previousMode = processingPlaybackPreviewModeEnabled();
+        const int previousScale = processingPlaybackPreviewScaleFactor();
+        processingSetPlaybackPreviewMode(1);
+        processingSetPlaybackPreviewScaleFactor(scale);
+        const int ok8 = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
+            video, 1, bayer.data(), plan.bayerWidth, plan.bayerHeight, plan.scale, out8.data(), 1, scale);
+        processingSetPlaybackPreviewScaleFactor(previousScale);
+        processingSetPlaybackPreviewMode(previousMode);
+        ASSERT_EQ(1, ok8);
+        size_t nonzero = 0;
+        for (const uint8_t v : out8) nonzero += v != 0;
+        ASSERT_TRUE(nonzero > out8.size() / 2);
+    }
+}
+
+// H2C-PORT-1: debayer_reduced_hchroma121_rgb16 leaves G alone, lowpasses R-G and B-G with
+// [1 2 1]/4 along x (mirrored edges), and clamps to [0, 65535].
+// Mutations: filter on G, weights [1 0 1]/2, no mirroring, no clamp, unsigned difference.
+TEST(GpuDualIsoPreviewScale, HChroma121FiltersOnlyTheColourDifference)
+{
+    const int w = 6, h = 2;
+    std::vector<uint16_t> in(static_cast<size_t>(w) * h * 3u);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            uint16_t * p = in.data() + (static_cast<size_t>(y) * w + x) * 3u;
+            p[1] = static_cast<uint16_t>(10000 + 1000 * x);            // G ramp, must pass through
+            p[0] = static_cast<uint16_t>(p[1] + ((x % 2) ? -400 : 400)); // R - G alternates +-400
+            p[2] = static_cast<uint16_t>(p[1] + 100 * x);                // B - G ramps
+        }
+    std::vector<uint16_t> out(in.size(), 0u);
+    debayer_reduced_hchroma121_rgb16(out.data(), in.data(), w, h, 1);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const uint16_t * p = out.data() + (static_cast<size_t>(y) * w + x) * 3u;
+            const int g = 10000 + 1000 * x;
+            ASSERT_EQ(g, static_cast<int>(p[1]));
+            // Alternating +-400: the interior [1 2 1] gives 0; the mirrored edges (x-1 -> x+1) too.
+            ASSERT_EQ(g, static_cast<int>(p[0]));
+            const int xl = x > 0 ? x - 1 : x + 1, xr = x < w - 1 ? x + 1 : x - 1;
+            const int s = 100 * xl + 200 * x + 100 * xr;
+            ASSERT_EQ(g + ((s + 2) >> 2), static_cast<int>(p[2]));
+        }
+    // Clamp: the middle pixel's neighbours have R - G = B - G = -60000 (below 0) / +65535 (above).
+    const std::vector<uint16_t> low = { 0, 60000, 0, 1000, 1000, 1000, 0, 60000, 0 };
+    std::vector<uint16_t> lowOut(low.size(), 1u);
+    debayer_reduced_hchroma121_rgb16(lowOut.data(), low.data(), 3, 1, 1);
+    ASSERT_EQ(0, static_cast<int>(lowOut[3]));
+    ASSERT_EQ(1000, static_cast<int>(lowOut[4]));
+    ASSERT_EQ(0, static_cast<int>(lowOut[5]));
+    const std::vector<uint16_t> high = { 65535, 0, 65535, 64000, 64000, 64000, 65535, 0, 65535 };
+    std::vector<uint16_t> highOut(high.size(), 1u);
+    debayer_reduced_hchroma121_rgb16(highOut.data(), high.data(), 3, 1, 1);
+    ASSERT_EQ(65535, static_cast<int>(highOut[3]));
+    ASSERT_EQ(64000, static_cast<int>(highOut[4]));
+    ASSERT_EQ(65535, static_cast<int>(highOut[5]));
 }
 
 namespace {
@@ -1894,6 +2325,7 @@ TEST(GpuDualIsoPreviewScale, C1DumpDllParityVectors)
             GPU_DUALISO_TEST_UNSETENV("MLVAPP_GPU_PLAYBACK_RECON");
             mlvDualIsoPreviewScaleRecon_t plan;
             ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+            plan = atDisplayScaleBayer(plan); // H2C-PORT-1: the c1 vectors are the CUDA route's shape
             std::vector<uint16_t> raw = decodeRaw(fixture, 2);
             ASSERT_FALSE(raw.empty());
             std::vector<uint16_t> notched(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
@@ -2106,6 +2538,7 @@ TEST(GpuDualIsoPreviewScale, C1ReceiptConfigReconParity)
                     mlvDualIsoPreviewScaleRecon_t plan;
                     ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
                     plan.phaseTentShrink = 1;
+                    plan = atDisplayScaleBayer(plan); // H2C-PORT-1: the GPU plan's Bayer dims
                     const int w = plan.reducedWidth, h = plan.reducedHeight;
                     const size_t n = static_cast<size_t>(w) * h;
                     std::vector<uint16_t> cpuIn(n, 0u), gpuIn;
@@ -2261,7 +2694,7 @@ VStripesTentArm vstripesTentArm(int scale, bool tentShrink, bool solveQueued)
     plan.phaseTentShrink = tentShrink ? 1 : 0;
     arm.fullResFixes = plan.fullResFixes;
     std::vector<uint16_t> raw = vstripesFrame(fixture, true);
-    arm.reduced.assign(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight), 0u);
+    arm.reduced.assign(static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight), 0u);
     WorkerState worker;
     ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), arm.reduced.data(),
                                                 &worker.state, 1, nullptr, nullptr));
@@ -2383,7 +2816,7 @@ TEST(GpuDualIsoPreviewScale, M16VerticalStripesSolveLeavesTheReducedInputAlone)
             std::vector<uint16_t> raw = decodeRaw(fixture, frame);
             ASSERT_FALSE(raw.empty());
             std::vector<uint16_t> & out = reduced[solve ? 0 : 1];
-            out.assign(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight), 0u);
+            out.assign(static_cast<size_t>(plan.bayerWidth) * static_cast<size_t>(plan.bayerHeight), 0u);
             WorkerState worker;
             ASSERT_TRUE(mlvDualIsoPreviewScaleReconShrink(fixture.video(), &plan, raw.data(), out.data(),
                                                           &worker.state, 1, nullptr, nullptr) > 0);
@@ -2517,6 +2950,7 @@ TEST(CpuDualIsoPreviewScale, ReducedIsoNotchFlagOnlyOnTheCpuRoute)
         mlvDualIsoPreviewScaleRecon_t plan;
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
         ASSERT_EQ(0, plan.fullResFixes);
+        plan = atDisplayScaleBayer(plan); // H2C-PORT-1: the notch flag at the display-scale Bayer
         const std::vector<uint16_t> unnotched = unnotchedCpuReducedRecon(video, plan, decodeRaw(fixture, 2));
         ASSERT_FALSE(unnotched.empty());
 
