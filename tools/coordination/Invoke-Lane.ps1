@@ -542,6 +542,10 @@ function Get-CodexCliVersion {
         return $null
     } catch {
         return $null
+    } finally {
+        # r14 (Dot B4): the narrowing lasts as long as this probe. Left in place, the lane's own deadline (Get-CodexShimDeadline keeps the earlier of the two) inherited this
+        # probe's budget, and a later shim read inside a much longer lane budget ended in launch-budget-exhausted.
+        $script:CodexShimDeadline = $outerShimDeadline
     }
 }
 
@@ -985,6 +989,53 @@ public static class MlvLaneJob {
   // caller's scope nor a finalizer can close it earlier.
   static readonly List<object> keptToProcessExit=new List<object>();
   public static void KeepToProcessExit(object item) { lock(keptToProcessExit) { keptToProcessExit.Add(item); } }
+  // r14 (Dot B3): the descendants of a live process with no job, each already holding a handle, so a wait after the kill reads these exact processes and not a reused pid.
+  // A descendant whose parent has already exited has no path from the root, so it is not found. Throws when the snapshot, or a descendant it found, cannot be read.
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct PROCESSENTRY32 {
+    public UInt32 dwSize, cntUsage, th32ProcessID;
+    public IntPtr th32DefaultHeapID;
+    public UInt32 th32ModuleID, cntThreads, th32ParentProcessID;
+    public Int32 pcPriClassBase;
+    public UInt32 dwFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szExeFile;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr CreateToolhelp32Snapshot(UInt32 flags, UInt32 processId);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool Process32FirstW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+  public static List<Process> SnapshotDescendants(Process root) {
+    Dictionary<int,List<int>> kids=new Dictionary<int,List<int>>();
+    IntPtr snap=CreateToolhelp32Snapshot(2,0);
+    if(snap==new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateToolhelp32Snapshot");
+    try {
+      PROCESSENTRY32 e=new PROCESSENTRY32(); e.dwSize=(UInt32)Marshal.SizeOf(typeof(PROCESSENTRY32));
+      if(!Process32FirstW(snap,ref e)) throw new Win32Exception(Marshal.GetLastWin32Error(),"Process32First");
+      do {
+        int parent=(int)e.th32ParentProcessID;
+        if(!kids.ContainsKey(parent)) kids[parent]=new List<int>();
+        kids[parent].Add((int)e.th32ProcessID);
+      } while(Process32NextW(snap,ref e));
+    } finally { CloseHandle(snap); }
+    List<Process> found=new List<Process>();
+    Queue<Process> walk=new Queue<Process>(); walk.Enqueue(root);
+    while(walk.Count>0) {
+      Process parent=walk.Dequeue();
+      if(!kids.ContainsKey(parent.Id)) continue;
+      DateTime parentStart=parent.StartTime;
+      foreach(int id in kids[parent.Id]) {
+        Process kid;
+        try { kid=Process.GetProcessById(id); } catch(ArgumentException) { continue; }   // exited since the snapshot
+        try {
+          IntPtr pin=kid.Handle;
+          if(kid.StartTime<parentStart) continue;   // older than this parent: the parent's pid was reused, and this is not its child
+        } catch(InvalidOperationException) { continue; }   // exited since the snapshot
+        found.Add(kid); walk.Enqueue(kid);
+      }
+    }
+    return found;
+  }
 }
 '@
 }
@@ -1051,6 +1102,27 @@ function Complete-CodexImageHolds {
         if ($Outcome -eq 'released') { try { $hold.Dispose() } catch { } } else { [MlvLaneJob]::KeepToProcessExit($hold) }
     }
     $ImageHolds.Clear()
+}
+# r14 (Dot B3 on afdc228b): a Codex lane with no image has no job, so when its launch path throws only this can stop the child, and only the child's own tree can be reached.
+# The answer is what was observed, never what was attempted: 'killed' = the child and every descendant seen before the kill were each seen to exit within the bound.
+# 'uncertain:<already-exited|kill-failed|wait-timeout|tree-unreadable>' = they are not known to be gone. A child that has already exited leaves its descendants out of reach,
+# so that is uncertainty and not a clean stop. A descendant whose parent had already exited is not seen, so 'killed' makes no claim about it. Never throws.
+$codexDirectChildStop = $null
+$CODEX_DIRECT_KILL_WAIT_MS = 15000
+function Stop-CodexDirectChildTree {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Proc, [Parameter(Mandatory = $true)][double]$LimitMs)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    try { if ($Proc.HasExited) { return 'uncertain:already-exited' } } catch { return 'uncertain:tree-unreadable' }
+    # Before the kill: afterwards the parents are gone and the tree cannot be walked. A snapshot that fails still leaves the kill to do.
+    $members = $null
+    try { $members = @([MlvLaneJob]::SnapshotDescendants($Proc)) } catch { $members = $null }
+    try { $Proc.Kill($true) } catch { return 'uncertain:kill-failed' }
+    if ($null -eq $members) { return 'uncertain:tree-unreadable' }
+    foreach ($member in (@($Proc) + $members)) {
+        $leftMs = [int][math]::Max(0.0, [math]::Floor($LimitMs - $clock.Elapsed.TotalMilliseconds))
+        try { if (-not ($member.WaitForExit($leftMs))) { return 'uncertain:wait-timeout' } } catch { return 'uncertain:tree-unreadable' }
+    }
+    return 'killed'
 }
 # `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
 # -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
@@ -3012,6 +3084,13 @@ catch {
         }
         Complete-CodexImageHolds -Outcome $imageHoldRelease
     }
+    # r14 (Dot B3 on afdc228b): the direct path, which has no job and no hold. Its child can be alive here, and nothing after this point would stop it. The wait is on the lane's
+    # own stopwatch, restarted if the throw came after it stopped (adversary A2 on afdc228b), and what is left of the lane's budget bounds it, down to the floor a stop needs to be observed at all.
+    if ($cfg.engine -eq 'codex' -and $null -eq $codexImageHost -and $null -ne $proc) {
+        if (-not $sw.IsRunning) { $sw.Start() }
+        $directStopLimitMs = [math]::Min([double]$CODEX_DIRECT_KILL_WAIT_MS, [math]::Max([double]$IMAGE_VERIFY_FLOOR_MS, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
+        try { $codexDirectChildStop = Stop-CodexDirectChildTree -Proc $proc -LimitMs $directStopLimitMs } catch { $codexDirectChildStop = 'uncertain:tree-unreadable' }
+    }
     $noChildCause = $_.Exception.Message
     $noChildCauseType = $_.Exception.GetType().Name
     # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
@@ -3181,6 +3260,11 @@ if ([string]$imageHoldRelease -like 'uncertain:*') {
     $holdProblem = "image-hold-${imageHoldRelease}: the image readers are not known to be gone; the holds stay open until the lane process exits"
     $failure = if ($failure) { "$failure | $holdProblem" } else { $holdProblem }
     if ($exitCode -eq 0) { $exitCode = 1 }
+}
+# r14 (Dot B3): this lane is already failing or timing out; what it could not stop goes on the record beside the cause.
+if ([string]$codexDirectChildStop -like 'uncertain:*') {
+    $stopProblem = "codex-direct-child-${codexDirectChildStop}: the codex child or a descendant may have outlived this lane"
+    $failure = if ($failure) { "$failure | $stopProblem" } else { $stopProblem }
 }
 # Cleanup must precede all receipt construction and I/O, including exceptional
 # startup paths. Failure to write evidence cannot keep a provider running.
@@ -3519,6 +3603,8 @@ if ($ImageAttachments.Count -gt 0) { $receipt['imagePaths'] = @($ImageAttachment
 # r13 (Dot B2): 'released' = the holds were closed with no possible reader left (the job reported no live member, or no reader was ever started).
 # 'uncertain:<kill-failed|wait-timeout|tree-unreadable>' = they were kept until the lane process exits.
 if ($ImageAttachments.Count -gt 0) { $receipt['imageHoldRelease'] = if ($imageHoldRelease) { $imageHoldRelease } else { 'released' } }
+# r14 (Dot B3): present only when the launch path of a Codex lane with no image threw with a child started, so every other receipt keeps its exact shape. See Stop-CodexDirectChildTree.
+if ($null -ne $codexDirectChildStop) { $receipt['codexDirectChildStop'] = $codexDirectChildStop }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {

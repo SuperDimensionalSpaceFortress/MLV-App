@@ -277,6 +277,23 @@ Limit: a process created outside the job's inheritance, such as one started thro
 Secondary Logon service under another account, is not a job member, so `released` makes no
 claim about it. Whether Codex's elevated sandbox starts its tools that way is not measured here.
 
+**A Codex lane with no image has no job (VISUAL-JUDGE-TERRA-LANE-1 r14).** When its launch path
+throws with a child started, for example because the stdin write fails, the lane tree-kills
+the child and waits for each process it saw before the kill. The wait is on the lane's own
+stopwatch. It is bounded at 15 s, or by what is left of the lane's budget, with a 5 s floor. The
+receipt's `codexDirectChildStop` is present only in this case:
+
+- `killed`: the child and every descendant seen before the kill were each seen to exit in time.
+- `uncertain:already-exited`: the child had already exited, so its descendants cannot be
+  reached. They are not known to be gone, and this is never a clean stop.
+- `uncertain:kill-failed`, `uncertain:wait-timeout`, `uncertain:tree-unreadable`: the child or a
+  descendant may still be alive.
+
+Every `uncertain:` value also adds `codex-direct-child-uncertain:<cause>` to the receipt's
+`failure`. Non-promises: this path has no job, so `killed` makes no claim about a descendant
+whose parent had already exited, or one started outside the tree (the limit above). The lane's
+timeout path keeps its older tree kill, whose failure is not recorded.
+
 Run the real Windows fixture suite with:
 
 ```powershell

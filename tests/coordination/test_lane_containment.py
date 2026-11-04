@@ -161,6 +161,8 @@ if($args.Count -ge 2 -and $args[0] -eq 'mcp' -and $args[1] -eq 'list'){
 # CODEX-KEY-PRIVATE-PIN-1: answers the launcher's `codex --version` stamp the same way (version
 # from MLV_FIXTURE_CODEX_VERSION, unset = 0.0.0-fixture) and exits before any lane-side write.
 if($args.Count -ge 1 -and $args[0] -eq '--version'){
+  # VISUAL-JUDGE-TERRA-LANE-1 r14 (test-only, unset = no-op): a version probe that fails.
+  if($env:MLV_FIXTURE_CODEX_VERSION_EXIT){exit ([int]$env:MLV_FIXTURE_CODEX_VERSION_EXIT)}
   $v=if($env:MLV_FIXTURE_CODEX_VERSION){$env:MLV_FIXTURE_CODEX_VERSION}else{'0.0.0-fixture'}
   [Console]::Out.Write("codex-cli $v`n")
   exit 0
@@ -2435,6 +2437,177 @@ def test_r13_iter2_a1_sibling_the_mcp_probe_starts_no_process_after_its_deadline
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert not (root/"mcp-args.json").exists(), "the probe process started after its deadline"
     assert r.returncode==124 and "codex-mcp-list-unreadable" not in (q["failure"] or ""),(r.returncode,q)
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r14 (Dot B3 on afdc228b): a codex lane with no image has no job. When a later launch-path operation throws, only the catch can stop its child.
+# Injection seam: the fixture's stdin failure is a text mutation at the lane's real write line. The real pipe cannot be broken from a test, because the cmd.exe of the shim
+# inherits the read end and stays alive, so a child closing its own copy does not fail the lane's write. Everything after the throw is the real catch.
+_DIRECT_STDIN_WRITE = "    $proc.StandardInput.Write($stdinContent)\n"
+_DIRECT_KILL = "$Proc.Kill($true)"
+_DIRECT_WAIT = "$member.WaitForExit($leftMs)"
+_DIRECT_SNAPSHOT = "[MlvLaneJob]::SnapshotDescendants($Proc)"
+
+
+def _stdin_write_fails_while(wait_for):
+    wait=(f"$waitChild=[Diagnostics.Stopwatch]::StartNew(); while(-not (Test-Path -LiteralPath {wait_for}) -and $waitChild.ElapsedMilliseconds -lt 40000)"
+          "{Start-Sleep -Milliseconds 50}\nthrow [System.IO.IOException]::new('fixture-stdin-write-failed')\n")
+    def mutation(text):
+        assert text.count(_DIRECT_STDIN_WRITE)==1, "the direct path's stdin write moved; update this fixture mutation"
+        return text.replace(_DIRECT_STDIN_WRITE,wait+_DIRECT_STDIN_WRITE)
+    return mutation
+
+
+def _replacing(old,new):
+    def mutation(text):
+        assert text.count(old)==1, f"{old!r} moved; update this fixture mutation"
+        return text.replace(old,new)
+    return mutation
+
+
+def _run_lane_to_files(cmd,env,root):
+    # The child inherits the lane's stdout, so capture_output would not return until the child and its descendant ended on their own, and both would then read as gone: an
+    # unfixed lane passed that way (r14: both alive for 60 s, then "gone" at the moment run_lane returned). Files have no EOF to wait for, so this returns when the lane exits.
+    with open(root/"lane.stdout.txt","wb") as o, open(root/"lane.stderr.txt","wb") as e:
+        return subprocess.run(cmd,env=env,stdout=o,stderr=e,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+
+
+def test_r14_b3_a_a_live_child_and_its_descendant_are_gone_when_the_stdin_write_fails(fixture_tree):
+    # Case a. The receipt's word comes from the wait on each process seen before the kill.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND"))
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in (q["failure"] or ""),(r.returncode,q)
+    assert (root/"child.json").exists() and (root/"grand.json").exists(), "the injected failure must come after the child and its descendant started"
+    wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
+    wait_absent(json.loads((root/"grand.json").read_text(encoding="utf-8-sig")),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+def test_r14_b3_b_an_exited_child_with_a_live_descendant_is_explicit_uncertainty_never_a_clean_stop(fixture_tree):
+    # Case b. Without a job the descendant cannot be enumerated once its parent is gone: the descendant really is alive, and the receipt must not read as if it were not.
+    root=fixture_tree["root"]; hold=root/"hold.pid"
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=_throw_after_the_child_exits)
+    env=dict(env); env["MLV_FIXTURE_HOLD_PIPE_SECONDS"]="60"; env["MLV_FIXTURE_HOLD_PID"]=str(hold)
+    r=_run_lane_to_files(cmd,env,root)
+    pid=int(hold.read_text(encoding="utf-8-sig").strip())
+    try:
+        assert _pid_alive(pid), "this test needs a descendant alive after the lane ended"
+        q=json.loads(receipt.read_text(encoding="utf-8"))
+        assert r.returncode!=0 and "fixture-late-stream-failure" in (q["failure"] or ""),(r.returncode,q)
+        assert q["codexDirectChildStop"]=="uncertain:already-exited",q
+        assert "codex-direct-child-uncertain:already-exited" in q["failure"],q
+    finally:
+        _stop_pid(pid)
+
+
+@pytest.mark.parametrize("token,mutations",[
+    ("kill-failed",[(_DIRECT_KILL,"throw [ComponentModel.Win32Exception]::new(5, 'fixture-kill-failed')")]),
+    ("wait-timeout",[(_DIRECT_KILL,"$null = $Proc"),(_DIRECT_WAIT,"$false")]),
+    ("tree-unreadable",[(_DIRECT_SNAPSHOT,"$(throw [ComponentModel.Win32Exception]::new(5, 'fixture-snapshot-failed'))")]),
+],ids=["c-kill-failed","c-wait-timeout","snapshot-failed"])
+def test_r14_b3_c_a_stop_that_is_not_observed_is_typed_uncertainty_and_the_receipt_is_still_written(fixture_tree,token,mutations):
+    # Case c, and the snapshot failing: each answer is the observed result, never the attempt. A failed kill and an expired wait leave the child alive, so nothing may claim otherwise.
+    root=fixture_tree["root"]
+    muts=[_replacing(o,n) for o,n in mutations]+[_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in (q["failure"] or ""),(r.returncode,q)
+    assert q["codexDirectChildStop"]==f"uncertain:{token}",q
+    assert f"codex-direct-child-uncertain:{token}" in q["failure"],q
+
+
+def test_r14_b3_the_snapshot_failing_still_kills_the_child(fixture_tree):
+    # A tree that cannot be read is no reason to leave the child running: the kill still happens, and only the word about the tree changes.
+    root=fixture_tree["root"]
+    muts=[_replacing(_DIRECT_SNAPSHOT,"$(throw [ComponentModel.Win32Exception]::new(5, 'fixture-snapshot-failed'))"),_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,root)
+    assert r.returncode!=0,r.returncode
+    wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
+
+
+def test_r14_b3_control_an_ordinary_no_image_lane_has_no_stop_to_report(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+    assert "codexDirectChildStop" not in q,q
+
+
+_DIRECT_STOP_ENTRY = "function Stop-CodexDirectChildTree {\n    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Proc, [Parameter(Mandatory = $true)][double]$LimitMs)\n"
+_TIMEOUT_KILL = "try { $proc.Kill($true) } catch { }\n        try { [void]$proc.WaitForExit(15000) } catch { }\n"
+_AFTER_STOPWATCH = "$sw.Stop()\n$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }\n"
+
+
+def test_r14_b3_the_stop_wait_is_on_the_lanes_stopwatch_and_a_spent_budget_leaves_the_floor(fixture_tree):
+    # The trap of adversary A2 on afdc228b. The throw comes after the stopwatch stopped and with the child alive (the timeout's own kill is left out), so an uncharged wait
+    # would not appear in the lane's duration. The stop spends 4 s it would otherwise hide; the budget is gone, so it gets the floor and no more.
+    root=fixture_tree["root"]; out=root/"direct-stop.json"
+    spy=(f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',(@{{limitMs=$LimitMs;stopwatchRunning=$sw.IsRunning}}|ConvertTo-Json -Compress))\n"
+         "Start-Sleep -Seconds 4\n")
+    muts=[_replacing(_DIRECT_STOP_ENTRY,_DIRECT_STOP_ENTRY+spy),_replacing(_TIMEOUT_KILL,""),
+          _replacing(_AFTER_STOPWATCH,"$sw.Stop()\n$script:r14Before=$sw.Elapsed.TotalSeconds\nthrow [System.IO.IOException]::new('fixture-after-stopwatch')\n"+_AFTER_STOPWATCH)]
+    # The lane's final elapsed, read at the very end of the process, against the elapsed when the throw came.
+    probe=root/"elapsed.json"
+    muts.append(lambda text:(f"[System.IO.File]::WriteAllText('{str(probe).replace(chr(39),chr(39)*2)}',(@{{before=$script:r14Before;after=$sw.Elapsed.TotalSeconds}}|ConvertTo-Json -Compress))\n"+_HOLD_STATE_ANCHOR).join(text.rsplit(_HOLD_STATE_ANCHOR,1)))
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    cmd[cmd.index("-TimeoutSec")+1]="12"
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    seen=json.loads(out.read_text(encoding="utf-8"))
+    assert seen["stopwatchRunning"] is True and seen["limitMs"]==5000.0,seen
+    t=json.loads(probe.read_text(encoding="utf-8"))
+    assert t["after"]-t["before"]>=3.5,t
+    assert q["codexDirectChildStop"]=="killed" and "fixture-after-stopwatch" in (q["failure"] or ""),q
+    if (root/"child.json").exists(): wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
+
+
+def test_r14_b3_with_budget_left_the_stop_wait_is_capped_at_its_own_bound(fixture_tree):
+    root=fixture_tree["root"]; out=root/"direct-stop.txt"
+    spy=f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',[string]$LimitMs)\n"
+    muts=[_replacing(_DIRECT_STOP_ENTRY,_DIRECT_STOP_ENTRY+spy),_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    cmd[cmd.index("-TimeoutSec")+1]="600"
+    _run_lane_to_files(cmd,env,root)
+    assert float(out.read_text())==15000.0,out.read_text()
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r14 (Dot B4): the version probe narrowed the shim deadline for its own duration and never put it back, so the lane's budget inherited the probe's.
+# The probe's 15 s is shortened only so the test does not wait 15 s; the delay stands for any slow step between the probe and the lane's final shim rehash.
+_PROBE_BUDGET = "[int]$TimeoutMs = 15000"
+_PROBE_RESOLVE = "$vLaunch = Resolve-CodexShimLaunch -Exe $CodexExe"
+_LANE_REHASH = "Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count"
+
+
+def _slow_step_before_the_final_rehash(seconds):
+    return _replacing(_LANE_REHASH,f"Start-Sleep -Seconds {int(seconds)}\n{_LANE_REHASH}")
+
+
+@pytest.mark.parametrize("fault",["ok","non-zero-exit","throws"])
+def test_r14_b4_the_final_shim_rehash_spends_the_lanes_budget_not_the_budget_of_a_finished_probe(fixture_tree,fault):
+    # A successful probe and a failed one (it exits non-zero; its own body throws), each followed by a delayed valid shim read inside a much longer lane budget.
+    muts=[_replacing(_PROBE_BUDGET,"[int]$TimeoutMs = 3000"),_slow_step_before_the_final_rehash(5)]
+    if fault=="throws": muts.append(_replacing(_PROBE_RESOLVE,"throw 'fixture-probe-threw'"))
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=_chain(*muts))
+    env=dict(env)
+    if fault=="non-zero-exit": env["MLV_FIXTURE_CODEX_VERSION_EXIT"]="7"
+    r=run_lane(cmd,env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+
+
+def test_r14_b4_control_a_real_budget_exhausted_at_the_final_rehash_still_refuses_typed(fixture_tree):
+    # The restore gives back the caller's deadline; it does not remove it. A lane budget that really ran out stops at that rehash, as a timeout, and no child starts.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=_slow_step_before_the_final_rehash(6))
+    cmd[cmd.index("-TimeoutSec")+1]="3"
+    r=run_lane(cmd,env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==124,(r.returncode,q)
+    assert "codex-shim-unreadable" not in (q["failure"] or ""),q
+    assert not (root/"child.json").exists(), "a child started after the lane's budget ran out"
 
 
 class _OplockedFile:
