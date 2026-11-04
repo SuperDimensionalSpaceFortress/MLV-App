@@ -2355,6 +2355,42 @@ def test_r13_a_codex_image_host_outside_the_job_is_never_told_what_to_run(fixtur
     assert q["imageHoldRelease"]=="released",q
 
 
+def test_r13_iter1_a1_a_stale_host_failure_file_never_fails_a_clean_child(fixture_tree):
+    # adversary A1 on 993583ac, its input: the slot has no receipt, but its host-failure file exists from an earlier attempt, and the child exits 0.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    (root/"run"/"terra-001.codex-host-failure.txt").write_text("codex-start-failed: stale previous attempt",encoding="ascii")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete" and q["failure"] is None,(r.returncode,q)
+
+
+def test_r13_iter1_a1_sibling_a_stale_last_message_is_never_the_answer_of_this_run(fixture_tree):
+    # adversary A1 sibling: codex writes -o only on a clean exit, so a file left in the slot read as this run's answer. The fixture child writes no -o file.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    (root/"run"/"sol-001.last.txt").write_text("stale answer from an earlier attempt",encoding="ascii")
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0,(r.returncode,q)
+    assert "stale answer" not in json.dumps(q)
+    last=root/"run"/"sol-001.last.txt"
+    assert not last.exists() or "stale answer" not in last.read_text(encoding="utf-8")
+
+
+def test_r13_iter1_a1_sibling_a_stale_host_drain_marker_is_never_a_drain_timeout_of_this_run(fixture_tree):
+    # adversary A1 sibling: the Claude path reads the same kind of file.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    (root/"run"/"sonnet-001.host-drain.json").write_text('{"schema":"mlv-lane-drain/v1","stdoutOpen":true,"stderrOpen":true,"graceMs":1}',encoding="ascii")
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0,(r.returncode,q)
+    assert q["outputDrain"]["hostReportedTimeout"] is False,q["outputDrain"]
+
+
 class _OplockedFile:
     # A real stalled open: a level 1 oplock whose break is never acknowledged blocks every other open of the file that reads data, while metadata stays immediate.
     # Local stand-in for adversary A2's slow share.

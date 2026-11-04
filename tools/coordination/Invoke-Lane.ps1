@@ -2581,6 +2581,14 @@ if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) {
     throw [TimeoutException]::new('launch-budget-exhausted')
 }
 
+# r13 fix iteration 1 (adversary A1 on 993583ac): what this invocation reads back from a sidecar must have been written by this invocation. A file left in the slot
+# by an earlier attempt read as a start failure of a clean child, an output-drain timeout, or the child's answer. Removed before any process can write one; a file
+# that cannot be removed fails the launch.
+$hostDrainPath = "$base.host-drain.json"
+foreach ($sidecar in @($hostDrainPath, "$base.codex-host-failure.txt", $lastPath)) {
+    if ($sidecar -and (Test-Path -LiteralPath $sidecar)) { Remove-Item -LiteralPath $sidecar -Force -ErrorAction Stop }
+}
+
 if ($cfg.engine -eq 'claude') {
     # This trusted host is inert until it reads frame one. It is assigned to the job
     # before frame one is sent, so the provider and every descendant inherit the job. A Codex lane with images uses the same order below; one without has no job.
@@ -2692,7 +2700,6 @@ $outBuf = [System.IO.MemoryStream]::new()
 $errBuf = [System.IO.MemoryStream]::new()
 $outTask = $outStream.CopyToAsync($outBuf)
 $errTask = $errStream.CopyToAsync($errBuf)
-$hostDrainPath = "$base.host-drain.json"
 
 # The prompt reaches claude this way; codex gets an empty stdin that is CLOSED,
 # which is what stops it waiting on "Reading additional input from stdin...".
@@ -2829,11 +2836,12 @@ $drain = Complete-BoundedOutputDrain -OutTask $outTask -ErrTask $errTask -OutBuf
     -OutStream $outStream -ErrStream $errStream -GraceMs $OUTPUT_DRAIN_GRACE_MS
 $stdout = [string]$drain.stdout
 $stderrText = [string]$drain.stderr
-# r13: what the codex image host could not do (typed, like the same throw on the direct path). A start failure means no child ever ran.
-if ($null -ne $codexImageHost -and (Test-Path -LiteralPath $codexImageHost.FailurePath)) {
+# r13: what the codex image host could not do (typed, like the same throw on the direct path). A start failure means no child ever ran. The host exits 127
+# after writing this file, and only that exit makes the file evidence.
+if ($null -ne $codexImageHost -and $exitCode -eq 127 -and (Test-Path -LiteralPath $codexImageHost.FailurePath)) {
     $hostFailure = try { [System.IO.File]::ReadAllText($codexImageHost.FailurePath) } catch { "codex-host-failure-unreadable: $($_.Exception.Message)" }
     $failure = if ($failure) { "$hostFailure | $failure" } else { $hostFailure }
-    if ($hostFailure -like 'codex-start-failed:*' -and -not $timedOut) { $exitCode = -999 }
+    if ($hostFailure -like 'codex-start-failed:*') { $exitCode = -999 }
 }
 # The contained host runs the same bounded drain on the CHILD's pipes and leaves this marker when it had to give up on them.
 $hostDrain = $null
