@@ -6915,7 +6915,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         m_playbackStartupSplit.noteRequest( ( mlv_stage_timing_now() - m_playbackSmokeStartTime ) * 1000.0 );
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
-    requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;   // r17 adversary A1: see presentationIsLoopWrap
+    requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;   // r17 adversary A1: see presentationLoopWraps
     requestContext.sceneWidth = sceneWidth;
     requestContext.sceneHeight = sceneHeight;
     requestContext.devicePixelRatioMilli = devicePixelRatioMilli;
@@ -26261,21 +26261,23 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
     // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
     // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
-    // (presentationIsLoopWrap): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold,
+    // (presentationLoopWraps): a drop-frame wrap from 700 of 0..719 is under the inference's 711 threshold,
     // and over a cut range narrower than its tolerance the inference calls any backward seek a wrap.
     // r17 (adversary A1 on 6451a8d9 and on eb5af034): the live count AND the count stamped when THIS frame was
     // requested. The draw's early/tail advance (timerFrameEvent) runs before this call and can wrap the engine
     // first, so an in-flight frame requested before the wrap must not take it (718 -> 719), while a lookahead
     // frame requested across the boundary before the wrap still can (719 -> speculative 0).
-    const bool sourceAdvanceWrap = presentationIsLoopWrap( m_playbackWrapRecorder.engineWraps,
-                                                           requestContext.engineWrapsAtRequest,
-                                                           m_playbackSmokeTrackerEngineWraps,
-                                                           m_playbackSmokePresentedFrames > 0,
-                                                           m_playbackSmokeLastPresentedFrame,
-                                                           static_cast<int>( displayFrame ) );
+    // r19 (sol r18 B1; adversary A1 on 924d3d6f): a forward landing takes its wrap too, and each landing is
+    // credited one cut width per wrap it crossed.
+    const int sourceAdvanceWraps = presentationLoopWraps( m_playbackWrapRecorder.engineWraps,
+                                                          requestContext.engineWrapsAtRequest,
+                                                          m_playbackSmokeTrackerEngineWraps,
+                                                          m_playbackSmokePresentedFrames > 0,
+                                                          m_playbackSmokeLastPresentedFrame,
+                                                          static_cast<int>( displayFrame ) );
     m_playbackSmokeSourceAdvance.notePresented( now,
                                                 static_cast<int>( displayFrame ),
-                                                sourceAdvanceWrap,
+                                                sourceAdvanceWraps,
                                                 ui->spinBoxCutIn->value() - 1,
                                                 ui->spinBoxCutOut->value() - 1 );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.

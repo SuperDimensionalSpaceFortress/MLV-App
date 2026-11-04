@@ -89,7 +89,7 @@ TEST(PlaybackSourceAdvanceTracker, FewerThanTwoPresentsReportsNoRate)
 // with wrapped = true, and frame 0 is presented next. The inference (isContactSheetLoopWrapTransition) needs a
 // jump back of at least 711, so it misses this; MainWindow fed only the inference to the tracker, which then
 // counted a backward jump, no wrap and no source advance across it. The engine's wrap count now decides
-// (presentationIsLoopWrap), driven exactly as MainWindow::notePlaybackSmokePresentedFrame drives it.
+// (presentationLoopWraps), driven exactly as MainWindow::notePlaybackSmokePresentedFrame drives it.
 namespace
 {
 struct PresentDriver
@@ -107,8 +107,8 @@ struct PresentDriver
     {
         (void)loop;   // the inference (Loop, the jump size) no longer decides the tracker's wrap (re-pass A2)
         const int stamp = stampAtRequest < 0 ? engineWraps : stampAtRequest;
-        const bool wrap = presentationIsLoopWrap(engineWraps, stamp, consumed, presented > 0, last, frame);
-        tracker.notePresented(t, frame, wrap, cutIn0, cutOut0);
+        const int wraps = presentationLoopWraps(engineWraps, stamp, consumed, presented > 0, last, frame);
+        tracker.notePresented(t, frame, wraps, cutIn0, cutOut0);
         last = frame;
         ++presented;
     }
@@ -411,4 +411,68 @@ TEST(PlaybackSourceAdvanceTracker, R19SolB1AForwardWrapLandingCreditsTheLoopDist
     ASSERT_EQ(0u, n.tracker.wraps());
     ASSERT_EQ(2, static_cast<int>(n.tracker.advancedFrames()));
     ASSERT_EQ(2, n.tracker.maxJump());
+}
+
+// r19 fix iteration 1 (adversary A1 on 924d3d6f): two engine wraps between presentations. Cut 0..7. 5 is presented first;
+// the engine wraps, 1 is requested (stamp 1), the engine wraps again before 1 is presented (live 2), then 3 is requested
+// after the second wrap (stamp 2). 924d3d6f's backward landing consumed BOTH wraps and credited one cut width, so 3 found
+// no pending wrap: advanced 6, wraps 1. Each landing takes only the wraps before its own request, one cut width each:
+// 5 -> 1 is 1 + 8 - 5 = 4, 1 -> 3 is 3 + 8 - 1 = 10: advanced 14, wraps 2.
+TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1EachLandingTakesOnlyTheWrapsItCrossed)
+{
+    PresentDriver d;
+    d.startMeasuredPlay();
+    d.present(1.000, 5, true, 0, 7);
+    ++d.engineWraps;
+    const int stamp1 = d.engineWraps;         // 1 is requested after the first wrap ...
+    ++d.engineWraps;                          // ... and the second wrap lands before 1 is presented
+    d.present(1.100, 1, true, 0, 7, stamp1);
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
+    d.present(1.200, 3, true, 0, 7);          // requested after the second wrap
+    ASSERT_EQ(2u, d.tracker.wraps());
+    ASSERT_EQ(14, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(0, d.tracker.maxJump());
+    ASSERT_EQ(0u, d.tracker.backwardJumps());
+    ASSERT_NEAR(14.0 / 0.200, d.tracker.sourceFps(), 1e-9);
+    // the adversary's same-class case: a FORWARD landing over two wraps, 2 -> (two wraps) -> 4 = 4 + 2 x 8 - 2 = 18
+    PresentDriver f;
+    f.startMeasuredPlay();
+    f.present(1.000, 2, true, 0, 7);
+    f.engineWraps += 2;
+    f.present(1.100, 4, true, 0, 7);
+    ASSERT_EQ(2u, f.tracker.wraps());
+    ASSERT_EQ(18, static_cast<int>(f.tracker.advancedFrames()));
+    ASSERT_EQ(0, f.tracker.maxJump());
+    // a BACKWARD landing over two wraps (fable r18's live=2 row): 6 -> (two wraps) -> 2 = 2 + 2 x 8 - 6 = 12
+    PresentDriver b;
+    b.startMeasuredPlay();
+    b.present(1.000, 6, true, 0, 7);
+    b.engineWraps += 2;
+    b.present(1.100, 2, true, 0, 7);
+    ASSERT_EQ(2u, b.tracker.wraps());
+    ASSERT_EQ(12, static_cast<int>(b.tracker.advancedFrames()));
+    ASSERT_EQ(0u, b.tracker.backwardJumps());
+    // a backward lookahead stamped before BOTH wraps lands one of them (it went backward, so it is a wrap); the other stays
+    // pending for the first frame requested after it: 6 -> 2 is 4, 2 -> 3 is 3 + 8 - 2 = 9, total 13 = 3 + 2 x 8 - 6
+    PresentDriver l;
+    l.startMeasuredPlay();
+    const int both = l.engineWraps;
+    l.present(1.000, 6, true, 0, 7, both);
+    l.engineWraps += 2;
+    l.present(1.050, 2, true, 0, 7, both);
+    ASSERT_EQ(1u, l.tracker.wraps());
+    l.present(1.100, 3, true, 0, 7);
+    ASSERT_EQ(2u, l.tracker.wraps());
+    ASSERT_EQ(13, static_cast<int>(l.tracker.advancedFrames()));
+    // every wrap is taken once: a later seek back is a backward jump, never a third wrap
+    l.present(1.150, 0, true, 0, 7);
+    ASSERT_EQ(2u, l.tracker.wraps());
+    ASSERT_EQ(1u, l.tracker.backwardJumps());
+    // the tracker credits a wrap count directly: true / false still read as 1 / 0
+    PlaybackSourceAdvanceTracker t;
+    t.notePresented(0.0, 6, 0, 0, 7);
+    t.notePresented(1.0, 2, 3, 0, 7);         // three loops of 8 from 6 to 2 = 2 + 24 - 6
+    ASSERT_EQ(20, static_cast<int>(t.advancedFrames()));
+    ASSERT_EQ(3u, t.wraps());
 }

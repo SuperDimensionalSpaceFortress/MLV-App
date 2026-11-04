@@ -178,7 +178,7 @@ public:
             /* HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r17 (adversary A1 on 6451a8d9): the engine's loop-wrap
              * count (PlaybackWrapRecorder::engineWraps) when this frame was REQUESTED. A frame requested before a
              * wrap is presented after it whenever the draw's own early/tail advance wraps the engine first, so
-             * the source-advance tracker reads this beside the live count (presentationIsLoopWrap). A lookahead
+             * the source-advance tracker reads this beside the live count (presentationLoopWraps). A lookahead
              * request copies its base request's count. */
             int engineWrapsAtRequest = 0;
             bool playbackActive = false;
