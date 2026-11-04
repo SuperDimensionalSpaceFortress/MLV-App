@@ -4212,9 +4212,18 @@ static uint64_t mlv_source_hash_fnv1a64(uint64_t hash, const uint8_t * data, siz
  * refused unless the buffer is at least the display decode's (getMlvRawFrameUint16Direct: max(frame_size, packed
  * picture) + 4, mlvRawFrameInputCapacity). r6 (pass 3 A1/A2): liblj92 itself now refuses a scan header past `length`
  * and its bit reader reads zero bytes past `length`, never the slack; the display zeroes its slack too. */
+/* r10 (adversary r10 pass 1 A1 on 5f23fb9d): the display applies the clip's CURV linearisation table to every decoded sample
+ * (getMlvRawFrameUint16Direct: unpackedFrame[i] = video->linearise_lut[unpackedFrame[i]]), so two payloads that decode to
+ * different samples the table maps to one picture ARE one displayed picture. Every identity is therefore taken over the samples
+ * the display stores, after that table (`lut`, NULL when the clip has none): this is one sample through it. */
+static inline uint16_t mlv_source_sample_as_displayed(const uint16_t * lut, uint16_t sample)
+{
+    return lut ? lut[sample] : sample;
+}
+
 static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length, size_t capacity,
                                          int expectedWidth, int expectedHeight, int expectedBitdepth,
-                                         uint64_t * hashOut)
+                                         const uint16_t * lut, uint64_t * hashOut)
 {
     if (!payload || !hashOut || length < 4 || length > (size_t)INT_MAX || capacity < length) return 1;
     lj92 decoder;
@@ -4257,7 +4266,8 @@ static int mlv_lj92_decoded_picture_hash(uint8_t * payload, size_t length, size_
     uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
     for (size_t i = 0; i < samples; ++i)
     {
-        const uint8_t sample[2] = { (uint8_t)(picture[i] & 0xFFu), (uint8_t)(picture[i] >> 8) };
+        const uint16_t value = mlv_source_sample_as_displayed(lut, picture[i]);   /* r10 A1: after CURV */
+        const uint8_t sample[2] = { (uint8_t)(value & 0xFFu), (uint8_t)(value >> 8) };
         hash = mlv_source_hash_fnv1a64(hash, sample, 2);
     }
     free(picture);
@@ -4289,7 +4299,7 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
     uint8_t * copy = (uint8_t *)calloc(capacity, 1);
     if (!copy) return 1;
     memcpy(copy, data, length);
-    const int status = mlv_lj92_decoded_picture_hash(copy, length, capacity, 0, 0, 0, hashOut);
+    const int status = mlv_lj92_decoded_picture_hash(copy, length, capacity, 0, 0, 0, NULL, hashOut);
     free(copy);
     return status;
 }
@@ -4301,7 +4311,9 @@ int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * has
  * (mlv_jpeg2k_decode_bayer_quarters) into private quarter buffers, and FNV-1a 64 runs over every sample as the display stores
  * it (clamped to uint16, little-endian), channel 0..3, row-major. Codestream bytes are never the id; a frame the display
  * refuses has none. */
-int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, int height, uint64_t * hashOut)
+/* r10 (adversary r10 pass 1 A1): the samples after the clip's CURV table (`lut`, NULL for none), as the display stores them. */
+static int mlv_jpeg2k_decoded_picture_hash(const uint8_t * data, size_t length, int width, int height, const uint16_t * lut,
+                                           uint64_t * hashOut)
 {
 #ifdef ENABLE_JPEG2K
     if (!data || !hashOut || length < MLV_JPEG2K_BAYER_HEADER_BYTES) return 1;
@@ -4315,7 +4327,7 @@ int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, i
     {
         for (size_t i = 0; i < quarter_pixels; ++i)
         {
-            const uint16_t value = mlv_jpeg2k_display_sample(quarter_bufs[c][i]);
+            const uint16_t value = mlv_source_sample_as_displayed(lut, mlv_jpeg2k_display_sample(quarter_bufs[c][i]));
             const uint8_t sample[2] = { (uint8_t)(value & 0xFFu), (uint8_t)(value >> 8) };
             hash = mlv_source_hash_fnv1a64(hash, sample, 2);
         }
@@ -4325,9 +4337,14 @@ int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, i
     return 0;
 #else
     /* the display refuses every JPEG2K frame on this build, so none has an identity */
-    (void)data; (void)length; (void)width; (void)height; (void)hashOut;
+    (void)data; (void)length; (void)width; (void)height; (void)lut; (void)hashOut;
     return 1;
 #endif
+}
+
+int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, int height, uint64_t * hashOut)
+{
+    return mlv_jpeg2k_decoded_picture_hash(data, length, width, height, NULL, hashOut);
 }
 
 /* PLAYBACK-SOURCE-FRAME-IDENTITY-1: see video_mlv.h. Reads the same byte span
@@ -4393,7 +4410,7 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
          * expected size and bit depth are the display decode's (RAWI), so a frame it refuses has no identity. */
         const int lj92Failed = seekFailed || got != byte_count
             || mlv_lj92_decoded_picture_hash(payload, byte_count, lj92_capacity, video->RAWI.xRes, video->RAWI.yRes,
-                                             video->RAWI.raw_info.bits_per_pixel, hashOut) != 0;
+                                             video->RAWI.raw_info.bits_per_pixel, video->linearise_lut, hashOut) != 0;
         free(payload);
         return lj92Failed ? 1 : 0;
     }
@@ -4413,9 +4430,58 @@ int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t *
         const size_t got = seekFailed ? 0 : fread(payload, 1, byte_count, video->file[chunk]);
         pthread_mutex_unlock(video->main_file_mutex + chunk);
         const int jpeg2kFailed = seekFailed || got != byte_count
-            || mlvJpeg2kFrameSourceHash64(payload, byte_count, video->RAWI.xRes, video->RAWI.yRes, hashOut) != 0;
+            || mlv_jpeg2k_decoded_picture_hash(payload, byte_count, video->RAWI.xRes, video->RAWI.yRes, video->linearise_lut,
+                                               hashOut) != 0;
         free(payload);
         return jpeg2kFailed ? 1 : 0;
+    }
+
+    /* r10 (adversary r10 pass 1 A1, sibling): with a CURV table the display stores lut[unpacked sample], which two different
+     * packed frames can share, so the bytes are not the picture: the frame is read and unpacked as the display does
+     * (packed_frame_size bytes into a zero-filled raw_frame_capacity buffer, dng_unpack_image_bits in RAWI's geometry), and
+     * the samples after the table are hashed. Without a table the bytes are hashed as before (they unpack one-to-one). */
+    if (video->linearise_lut)
+    {
+        size_t packed_frame_size = 0;
+        size_t raw_frame_capacity = 0;
+        const int width = video->RAWI.xRes;
+        const int height = video->RAWI.yRes;
+        const int bitdepth = video->RAWI.raw_info.bits_per_pixel;
+        if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / sizeof(uint16_t) / (size_t)height
+            || !mlvRawFrameInputCapacity(video->RAWI.xRes, video->RAWI.yRes, video->RAWI.raw_info.bits_per_pixel, 0,
+                                         &packed_frame_size, &raw_frame_capacity)
+            || packed_frame_size > raw_frame_capacity - 4u)
+            return 1;
+        const size_t pixels = (size_t)width * (size_t)height;
+        uint8_t * raw = (uint8_t *)calloc(raw_frame_capacity, 1);
+        uint16_t * picture = (uint16_t *)calloc(pixels, sizeof(uint16_t));
+        if (!raw || !picture)
+        {
+            free(raw);
+            free(picture);
+            return 1;
+        }
+        pthread_mutex_lock(video->main_file_mutex + chunk);
+        const int seekFailed = file_set_pos(video->file[chunk], entry->frame_offset, SEEK_SET) != 0;
+        const size_t got = seekFailed ? 0 : fread(raw, 1, packed_frame_size, video->file[chunk]);
+        pthread_mutex_unlock(video->main_file_mutex + chunk);
+        const int readFailed = seekFailed || got != packed_frame_size;
+        uint64_t hash = 0xcbf29ce484222325ull; /* FNV-1a 64 offset basis */
+        if (!readFailed)
+        {
+            dng_unpack_image_bits(picture, (uint16_t *)raw, width, height, (uint32_t)bitdepth);
+            for (size_t i = 0; i < pixels; ++i)
+            {
+                const uint16_t value = mlv_source_sample_as_displayed(video->linearise_lut, picture[i]);
+                const uint8_t sample[2] = { (uint8_t)(value & 0xFFu), (uint8_t)(value >> 8) };
+                hash = mlv_source_hash_fnv1a64(hash, sample, 2);
+            }
+        }
+        free(raw);
+        free(picture);
+        if (readFailed) return 1;
+        *hashOut = hash;
+        return 0;
     }
 
     /* uncompressed RAW: exactly the packed_frame_size bytes the decoder unpacks (byte_count above) */

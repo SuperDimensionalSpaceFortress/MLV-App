@@ -133,7 +133,9 @@ payload with liblj92, as the display decodes it, and hashes the decoded picture 
 decodes the four declared channel spans through the display's own OpenJPH decode into private buffers and hashes the decoded
 samples as the display stores them (uint16, channel 0..3, row-major); codestream bytes are never the id, so an equal-length COM
 comment OpenJPH skips, bytes outside the spans or where a span lies change nothing (`mlvJpeg2kFrameSourceHash64`; a frame that
-decode refuses, and every frame on a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no identity). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
+decode refuses, and every frame on a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no identity). Every
+identity is taken over the samples as the display stores them AFTER the clip's CURV linearisation table (r10: two frames the
+table maps to one picture share an id; uncompressed RAW with a table hashes its unpacked samples, without one its packed bytes). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
 ends (r8: a `--visual-capture-dir` run opens every clip under a share-read `SourceWriteGuard`, so no writer can change its bytes,
 and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes.
 Only the Windows guard can be held (r10): its share-read reopen fails while any writer has the file open. On every other

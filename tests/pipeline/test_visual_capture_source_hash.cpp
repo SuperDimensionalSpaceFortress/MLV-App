@@ -1311,6 +1311,136 @@ TEST(VisualCaptureSourceHash, Jpeg2kANestedRealCodecScopeLeavesTheOuterOnTheReal
     ASSERT_TRUE(stub == 0x77);
 }
 
+// r10 (adversary r10 pass 1 A1 on 5f23fb9d): the display applies the clip's CURV linearisation table to every decoded sample
+// (getMlvRawFrameUint16Direct: unpackedFrame[i] = video->linearise_lut[unpackedFrame[i]]), but the identity hashed the samples
+// BEFORE it. The json's input: RAWI 64x64 at 14 bits, a CURV table LUT[i] = floor(i / 2), and LJ92 frames encodeLj92(1000, 9000)
+// and encodeLj92(1001, 9000): the display shows 500 | 4500 for both, yet 5f23fb9d gave them two ids ("differ" over a static
+// picture, FROZEN_DISPLAY counted=false). The identity is now taken after the table, on every frame class.
+namespace
+{
+
+// `payload` as frame 0 of the open clip, with videoClass `videoClass`, RAWI 64x64 at `bitsPerPixel` and the CURV table `lut`
+// (nullptr: none), for one getMlvFrameSourceHash64 call; everything is restored after it.
+int hashAsClipFrameWithCurve(MlvPipelineFixture & fixture, const std::vector<uint8_t> & payload, uint32_t videoClass,
+                             int bitsPerPixel, uint16_t * lut, uint64_t * hash)
+{
+    mlvObject_t * video = fixture.video();
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    const QByteArray path = QFile::encodeName(dir.filePath(QStringLiteral("frame.bin")));
+    FILE * file = std::fopen(path.constData(), "w+b");
+    ASSERT_TRUE(file != nullptr);
+    const std::vector<uint8_t> lead(17, 0x5A);
+    ASSERT_EQ(lead.size(), std::fwrite(lead.data(), 1, lead.size(), file));
+    ASSERT_EQ(payload.size(), std::fwrite(payload.data(), 1, payload.size(), file));
+    ASSERT_EQ(0, std::fflush(file));
+    frame_index_t * entry = &video->video_index[0];
+    const int chunk = static_cast<int>(entry->chunk_num);
+    FILE * const savedFile = video->file[chunk];
+    const frame_index_t savedEntry = *entry;
+    const uint32_t savedClass = video->MLVI.videoClass;
+    const auto savedXRes = video->RAWI.xRes;
+    const auto savedYRes = video->RAWI.yRes;
+    const auto savedBits = video->RAWI.raw_info.bits_per_pixel;
+    uint16_t * const savedLut = video->linearise_lut;
+    video->file[chunk] = file;
+    entry->frame_offset = lead.size();
+    entry->frame_size = static_cast<uint32_t>(payload.size());
+    video->MLVI.videoClass = videoClass;
+    video->RAWI.xRes = kJ2kFrameSide;
+    video->RAWI.yRes = kJ2kFrameSide;
+    video->RAWI.raw_info.bits_per_pixel = bitsPerPixel;
+    video->linearise_lut = lut;
+    const int status = getMlvFrameSourceHash64(video, 0, hash);
+    video->linearise_lut = savedLut;
+    video->RAWI.raw_info.bits_per_pixel = savedBits;
+    video->RAWI.xRes = savedXRes;
+    video->RAWI.yRes = savedYRes;
+    video->MLVI.videoClass = savedClass;
+    *entry = savedEntry;
+    video->file[chunk] = savedFile;
+    std::fclose(file);
+    return status;
+}
+
+std::vector<uint16_t> halvingCurve()
+{
+    std::vector<uint16_t> lut(MLV_LINEARISE_LUT_ENTRIES);
+    for (size_t i = 0; i < lut.size(); ++i) lut[i] = static_cast<uint16_t>(i / 2);
+    return lut;
+}
+
+uint32_t rawVideoClass(const MlvPipelineFixture & fixture)
+{
+    return const_cast<MlvPipelineFixture &>(fixture).video()->MLVI.videoClass
+        & ~static_cast<uint32_t>(MLV_VIDEO_CLASS_FLAG_LJ92 | MLV_VIDEO_CLASS_FLAG_JPEG2K);
+}
+
+} // namespace
+
+TEST(VisualCaptureSourceHash, Lj92TwoFramesTheCurveShowsAsOnePictureShareTheIdentity)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    std::vector<uint16_t> curve = halvingCurve();
+    const uint32_t lj92Class = rawVideoClass(fixture) | MLV_VIDEO_CLASS_FLAG_LJ92;
+    const std::vector<uint8_t> a = encodeLj92(1000, 9000);
+    const std::vector<uint8_t> b = encodeLj92(1001, 9000);
+    const std::vector<uint8_t> c = encodeLj92(1000, 9002);   // 500 | 4501 on display: a different picture
+    ASSERT_FALSE(a.empty() || b.empty() || c.empty());
+    uint64_t ha = 0, hb = 0, hc = 0;
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, lj92Class, 14, curve.data(), &ha));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, lj92Class, 14, curve.data(), &hb));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, c, lj92Class, 14, curve.data(), &hc));
+    ASSERT_TRUE(ha == hb);   // 5f23fb9d: b47aad9ecdade325 vs 2caa1a2fe210c325
+    ASSERT_TRUE(ha != hc);
+    // control: without a CURV table the display shows 1000 vs 1001, two pictures
+    uint64_t na = 0, nb = 0;
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, lj92Class, 14, nullptr, &na));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, lj92Class, 14, nullptr, &nb));
+    ASSERT_TRUE(na != nb);
+    ASSERT_TRUE(na != ha);
+}
+
+TEST(VisualCaptureSourceHash, Jpeg2kTwoFramesTheCurveShowsAsOnePictureShareTheIdentity)
+{
+    OjphRealCodecScope realCodec;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    std::vector<uint16_t> curve = halvingCurve();
+    const uint32_t j2kClass = rawVideoClass(fixture) | MLV_VIDEO_CLASS_FLAG_JPEG2K;
+    const std::vector<uint8_t> a = j2kPayload(encodeJ2kQuarter(j2kQuarterPicture(2048, 12288)), 0, 0, {});
+    const std::vector<uint8_t> b = j2kPayload(encodeJ2kQuarter(j2kQuarterPicture(2049, 12288)), 0, 0, {});
+    uint64_t ha = 0, hb = 0, na = 0, nb = 0;
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, j2kClass, 14, curve.data(), &ha));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, j2kClass, 14, curve.data(), &hb));
+    ASSERT_TRUE(ha == hb);   // both display 1024 | 6144
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, j2kClass, 14, nullptr, &na));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, j2kClass, 14, nullptr, &nb));
+    ASSERT_TRUE(na != nb);
+}
+
+// Uncompressed RAW: a CURV table that maps every sample to one value shows any two frames as one picture; without it, two
+// different packed frames are two pictures.
+TEST(VisualCaptureSourceHash, RawTwoFramesTheCurveShowsAsOnePictureShareTheIdentity)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeDualIso(fixture));
+    std::vector<uint16_t> flat(MLV_LINEARISE_LUT_ENTRIES, 777);
+    const uint32_t rawClass = rawVideoClass(fixture);
+    const size_t packed = static_cast<size_t>(kJ2kFrameSide) * kJ2kFrameSide * 14 / 8;
+    const std::vector<uint8_t> a(packed, 0x00);
+    std::vector<uint8_t> b(packed, 0x00);
+    for (size_t i = 0; i < packed; i += 7) b[i] = 0x5A;
+    uint64_t ha = 0, hb = 0, na = 0, nb = 0;
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, rawClass, 14, flat.data(), &ha));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, rawClass, 14, flat.data(), &hb));
+    ASSERT_TRUE(ha == hb);
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, a, rawClass, 14, nullptr, &na));
+    ASSERT_EQ(0, hashAsClipFrameWithCurve(fixture, b, rawClass, 14, nullptr, &nb));
+    ASSERT_TRUE(na != nb);
+}
+
 // r10 (Dot B3, lj92.c find()): the marker scan's bounds, through lj92_open (find() is static to lj92.c). Payloads of datalen 0..3
 // -- 0xFF as the last byte, FF D8 as the last two bytes, and no marker -- each followed IN MEMORY by a whole valid LJ92 stream, so
 // a scan that looked past datalen would find an SOI and open it. Every one is refused, as before r10. The datalen = INT_MAX case
