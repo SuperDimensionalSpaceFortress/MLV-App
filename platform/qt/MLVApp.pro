@@ -202,6 +202,7 @@ SOURCES += \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
+    GpuScopeTap.cpp \
     GpuFieldTelemetry.cpp \
     GpuDeviceLossBreaker.cpp \
         main.cpp \
@@ -418,6 +419,7 @@ HEADERS += MainWindow.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
+    GpuScopeTap.h \
     GpuFieldTelemetry.h \
     GpuFieldTelemetryCore.h \
     GpuDeviceLossBreaker.h \

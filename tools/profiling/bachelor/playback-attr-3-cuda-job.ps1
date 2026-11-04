@@ -1003,6 +1003,11 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# VENUE-SESSION-LOCKED-REFUSAL-1 
 $embeddedFunctions = $embeddedFunctions + "`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaConformAwareSourceFramesVerdict'
 )) +"`r`n# HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured session's eligibility line (the verdict above calls it), spliced inside its own
+# sentinel brackets for the same byte-identity reason as the splices above.
+$embeddedFunctions = $embeddedFunctions + "`r`n# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaEligibilityLineForSession'
+)) +"`r`n# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -2206,6 +2211,23 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     afterwards is chronologically LATER, and the FIRST playback_smoke.summary line's session id
     is still the measured one.
     #>
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    # r5 (adversary r4 A1 on e927e38a): a record marker must OPEN its record (Get-AttrCudaEligibilityLineForSession's rule, 9570ccf8).
+    # A marker is read only from a record BODY (the text before the first ' (', where the Qt location suffix starts), right after the
+    # writer's optional "[<utc>] [<level>] [<thread>] " prefix. So marker text in another record's quoted value (a cuda_backend_resolved
+    # DLL path, say) or in a location suffix never selects a warmup session. Without that rule the gate admitted (exit 0) a measured
+    # session that refuses (exit 15). The id must end at a space or the body's end. The baseline loops below are kept verbatim and
+    # are no longer reached.
+    $recordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
+    $recordBodies = @(($RawLog -split "`r?`n") | ForEach-Object { $_ -replace ' \(.*$', '' })
+    foreach ($body in $recordBodies) {
+        if ($body -match ($recordStart + 'playback_smoke\.measured_session id=(?<session>\d+)(\s|$)')) { return $Matches['session'] }
+    }
+    foreach ($body in $recordBodies) {
+        if ($body -match ($recordStart + 'playback_smoke\.summary session=(?<session>\d+)(\s|$)')) { return $Matches['session'] }
+    }
+    throw 'no playback_smoke.summary line found in the MLVApp log'
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -match 'playback_smoke\.measured_session id=(?<session>\d+)') {
             return $Matches['session']
@@ -3705,6 +3727,11 @@ if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
 # alone would happily describe some other path. Both fields and r16_reason are recorded
 # either way, so a refusal says WHY.
 $verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+# r2: the line in force for the MEASURED session (the last one at or before its playback_smoke.summary), not the
+# post-measurement window-capture tail's; the tail is reported, never read. The line above is the baseline call, kept verbatim.
+$verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog -MeasuredSessionId $measuredSmokeSessionId
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 $diagnostics = [ordered]@{
     source = $verdict.source
     linePresent = $verdict.linePresent
@@ -3715,6 +3742,12 @@ $diagnostics = [ordered]@{
     cudaBackendResolved = $verdict.cudaBackendResolved
     r16ProbeRan = $verdict.r16ProbeRan
     admitted = $verdict.admitted
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    verdictScope = $verdict.verdictScope
+    measuredWindowRefusingLines = $verdict.measuredWindowRefusingLines
+    tailLinesIgnored = $verdict.tailLinesIgnored
+    tailRefused = $verdict.tailRefused
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     # Which bytes the verdict was read from, and the binding that proves they are this run's.
     log = [ordered]@{ path = $runLog.path; sha256 = $runLog.sha256; bytes = $runLog.bytes; runNonce = $runLog.runNonce; source = $runLog.source; aggregateSourcePath = $runLog.aggregateSourcePath }
 }
@@ -4254,6 +4287,34 @@ $manifest = [ordered]@{
     capturedUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+# r2 (CoS #447): where the MEASURED session's scope updates came from (cpu | gpu_tap | mixed | none) and how many GL read-backs
+# completed, from that session's own playback_smoke.cpu_summary_ext line (the last one wins), so a leg spec can assert the read-back
+# served. Absent from a build that predates the fields: both stay $null, and a criterion on them fails (an absent metric never passes).
+$scopeSource = $null
+$scopeTapCompleted = $null
+# r6 (Dot I1 on 44cebb07): 'valid' | 'invalid' (the presenter at the finish was not the one at the start) | $null (a build before
+# the field). An invalid interval has no count: scopeTapCompleted stays $null, so a criterion on it fails (ineligible).
+$scopeTapInterval = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    # r3 (adversary A2 on ddceb595): the record BODY only, the text before the first ' (' (the Qt location suffix starts there and a
+    # record body never holds ' ('), so a build path cannot supply the marker or either field.
+    # r3 (CI run 41449047424, scanner rule R4): an operator, not a .NET member -- the publish-write scan allowlists neither .IndexOf() nor
+    # [StringComparison]::Ordinal. -replace drops everything from the FIRST ' (' on (leftmost match; a line holds no newline), which is
+    # exactly the text before the first ' (' that IndexOf + Substring returned, and the whole line when it holds none.
+    $body = $candidateLine -replace ' \(.*$', ''
+    # r5 (adversary r4 A1 on 6b564afc): the marker must OPEN the record (after the "[<utc>] [<level>] [<thread>] " prefix), so a
+    # quoted value inside another record that spells it (an eligibility line's DLL path) is never read as this record.
+    if ($body -match ('^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.cpu_summary_ext session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $scopeSource = if ($body -match '\sscope_source=(?<v>\S+)') { $Matches['v'] } else { $null }
+        # r5 (adversary r4 A4): a whole decimal count only (1.5, 1garbage or an overflow stay $null: fail closed, never a guess).
+        # r6 (adversary r6 A2 on 44cebb07): ASCII digits only -- \d also matches other scripts' digits, which the cast throws on.
+        $scopeTapCompleted = if ($body -match '\sscope_tap_completed=(?<v>[0-9]{1,18})(\s|$)') { [int64]$Matches['v'] } else { $null }
+        $scopeTapInterval = if ($body -match '\sscope_tap_interval=(?<v>valid|invalid)(\s|$)') { $Matches['v'] } else { $null }
+        if ($scopeTapInterval -eq 'invalid') { $scopeTapCompleted = $null }
+    }
+}
+# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
 # A SUCCESS summary.json, which the failure paths above all write but the success path did not:
 # summary.json is the first file a reader opens, and its absence on the one path that produces
 # numbers is exactly where a rehearsal could be mistaken for a measurement (sol, PR #137 r1).
@@ -4268,6 +4329,11 @@ Save-Json ([ordered]@{
     sourceFrames = $sourceFramesBlock
     gpuFramesTotal = $gpuFramesTotal
     cpuFrames = $gpuSummary.cpuFrames
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    scopeSource = $scopeSource
+    scopeTapCompleted = $scopeTapCompleted
+    scopeTapInterval = $scopeTapInterval
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     presentMonSamples = $pmRows.Count
     presentMonSelectedChain = $displayReport.selectedChain
     presentMonStatus = $presentMonStatus
@@ -4934,8 +5000,12 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
         $lines = @($LogText -split "`r?`n")
         $sid = $null
-        foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
-        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 siblings): Get-MeasuredSmokeSessionId's rule, a marker must OPEN its record. Each
+        # marker is read from the record body (before the first ' (') right after the optional "[<utc>] [<level>] [<thread>] " prefix, so
+        # another record's quoted value or Qt location never names the session.
+        $bodies = @($lines | ForEach-Object { $_ -replace ' \(.*$', '' })
+        foreach ($ln in $bodies) { $mm = [regex]::Match($ln, '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.measured_session id=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $bodies) { $mm = [regex]::Match($ln, '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?playback_smoke\.summary session=(\d+)(\s|$)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
         if ($null -eq $sid) { return $r }
         $r.session = [int64]$sid
         $stamp = $null

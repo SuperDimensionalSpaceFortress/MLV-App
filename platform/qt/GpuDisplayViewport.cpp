@@ -505,6 +505,62 @@ bool GpuDisplayViewport::isTexturePresentationActive(const QGraphicsView *view)
     return viewport && viewport->m_texturePresentationActive;
 }
 
+// The answer paintGL cached for this widget's context (GpuScopeTap::supported evaluates only with it current).
+bool GpuDisplayViewport::scopeTapSupported(const QGraphicsView *view)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    return viewport && viewport->m_scopeTap.supportedCached(viewport->context());
+}
+
+bool GpuDisplayViewport::scopeTapRectCapturable(const QGraphicsView *view)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    return viewport && viewport->m_scopeTap.drawnRectCapturable();
+}
+
+void GpuDisplayViewport::requestScopeTap(QGraphicsView *view, int maxWidth)
+{
+    GpuDisplayViewport *viewport = from(view);
+    if ( !viewport ) return;
+    viewport->m_scopeTap.request(maxWidth);
+}
+
+void GpuDisplayViewport::invalidateScopeTap(QGraphicsView *view)
+{
+    GpuDisplayViewport *viewport = from(view);
+    if ( viewport ) viewport->m_scopeTap.invalidate();
+}
+
+bool GpuDisplayViewport::takeScopeTap(QGraphicsView *view,
+                                      std::vector<uint8_t> *rgb8,
+                                      int *width,
+                                      int *height,
+                                      bool *under,
+                                      bool *over,
+                                      quint64 *serial)
+{
+    GpuDisplayViewport *viewport = from(view);
+    if ( !viewport || !rgb8 ) return false;
+    if ( under ) *under = false;
+    if ( over ) *over = false;
+    QOpenGLContext *glContext = viewport->context();
+    if ( viewport->m_scopeTap.pending() && glContext && glContext->isValid() )
+    {
+        // Poll the fence with a zero timeout; makeCurrent only if this context is not already current.
+        const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
+        if ( needsCurrent ) viewport->makeCurrent();
+        viewport->m_scopeTap.poll(glContext);
+        if ( needsCurrent ) viewport->doneCurrent();
+    }
+    return viewport->m_scopeTap.take(rgb8, width, height, serial);
+}
+
+GpuDisplayViewport::ScopeTapCounters GpuDisplayViewport::scopeTapCountersFor(const QGraphicsView *view)
+{
+    const GpuDisplayViewport *viewport = from(view);
+    return viewport ? viewport->m_scopeTap.counters() : ScopeTapCounters();
+}
+
 bool GpuDisplayViewport::paintedSerialFor(const QGraphicsView *view, quint64 *serial)
 {
     const GpuDisplayViewport *viewport = from(view);
@@ -1033,6 +1089,11 @@ void GpuDisplayViewport::paintGL()
     const QColor clearColor = m_view
         ? m_view->backgroundBrush().color()
         : palette().color(QPalette::Window);
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: collect a scope read-back whose fence has signalled (zero timeout), and
+    // answer (once per context, cached) whether this context can do the read-back at all.
+    m_scopeTap.supported(context(), format());
+    m_scopeTap.poll(context());
+
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -1141,6 +1202,18 @@ void GpuDisplayViewport::paintGL()
     m_paintedSerial = m_presentationOptions.presentationSerial;
     m_paintedSerialValid = m_paintedSerial != 0;
 
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1: the Throttled scope's read-back of the picture just drawn. Every drawn
+    // picture records whether its rectangle can be read back (zoomed past fit it cannot: the scope then stays
+    // on the CPU feed rather than freezing).
+    const int fbWidthPx = static_cast<int>(std::lround(fbWidth));
+    const int fbHeightPx = static_cast<int>(std::lround(fbHeight));
+    m_scopeTap.noteDrawnRect(leftPx, topPx, rightPx, bottomPx, fbWidthPx, fbHeightPx);
+    if ( m_scopeTap.requested() )
+    {
+        m_scopeTap.clearRequest();
+        m_scopeTap.issue(context(), defaultFramebufferObject(), leftPx, topPx, rightPx, bottomPx, fbWidthPx, fbHeightPx);
+    }
+
     // Bug A on-screen present A/B (V4): force the dGPU to flush/complete this frame
     // before Qt blits the FBO and presents it, in case the Optimus cross-adapter
     // copy is racing an incomplete frame. Inert unless MLVAPP_VIEWPORT_AB_FLUSH set.
@@ -1181,6 +1254,8 @@ void GpuDisplayViewport::cleanupGLResources()
     QOpenGLContext *glContext = context();
     if ( !glContext )
     {
+        // No context: the scope read-back's GL names died with it; forget them, never call GL.
+        m_scopeTap.destroy(false);
         destroyTexture();
         destroyProcessingTextures();
         if ( m_program )
@@ -1194,6 +1269,7 @@ void GpuDisplayViewport::cleanupGLResources()
     const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
 
+    m_scopeTap.destroy(QOpenGLContext::currentContext() == glContext);
     destroyTexture();
     destroyProcessingTextures();
     if ( m_program )

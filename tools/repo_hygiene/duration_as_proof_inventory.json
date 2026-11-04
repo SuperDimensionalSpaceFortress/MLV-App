@@ -215,9 +215,10 @@
       "anchor": "intervalMs <= 0",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "Part of the 'should I refresh the scopes now' throttle predicate (also true when never updated, or enough wall time elapsed); intervalMs is a UI cadence, not a stage-completion signal.",
+      "justification": "Part of the 'should I refresh the scopes now' throttle predicate (also true when never updated, or enough wall time elapsed); intervalMs is a UI cadence, not a stage-completion signal. Two copies: the CPU scope feed's updateScopesNow and PLAYBACK-GPU-SCOPES-NO-VETO-1's tapDue (the same throttle deciding when the GL read-back is requested for the Throttled scope); neither proves a stage ran.",
       "lines": [
-        27353
+        30881,
+        30932
       ]
     },
     {

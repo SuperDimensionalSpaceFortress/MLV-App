@@ -3484,13 +3484,18 @@ function Get-AttrCudaSelfHealMetrics {
     $sessionLine = {
         param([string]$LogText, [string]$Session, [string]$Marker)
         if ([string]::IsNullOrEmpty($LogText)) { return $null }
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 sibling): a record marker must OPEN its record (Get-AttrCudaEligibilityLineForSession's
+        # rule). The session marker and the <marker> line are read from each record BODY (the text before the first ' (', where the Qt
+        # location suffix starts), right after the optional "[<utc>] [<level>] [<thread>] " prefix. So another record's quoted value or a
+        # location suffix never names the session or supplies the line or its fields.
+        $recordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
+        $bodies = @(($LogText -split "`r?`n") | ForEach-Object { $_ -replace ' \(.*$', '' })
         if ([string]::IsNullOrEmpty($Session)) {
-            $sm = [regex]::Match($LogText, 'playback_smoke\.measured_session id=(\d+)')
-            if (-not $sm.Success) { return $null }
-            $Session = $sm.Groups[1].Value
+            foreach ($body in $bodies) { if ($body -match ($recordStart + 'playback_smoke\.measured_session id=(?<s>\d+)(\s|$)')) { $Session = $Matches['s']; break } }
+            if ([string]::IsNullOrEmpty($Session)) { return $null }
         }
         $found = $null
-        foreach ($lm in [regex]::Matches($LogText, '(?m)' + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>[^\r\n]*)')) { $found = $lm.Groups['rest'].Value }
+        foreach ($body in $bodies) { if ($body -match ($recordStart + [regex]::Escape($Marker) + ' session=' + [regex]::Escape($Session) + ' (?<rest>.*)$')) { $found = $Matches['rest'] } }
         if ($null -eq $found) { return $null }
         $fields = @{}
         foreach ($kv in [regex]::Matches($found, '([A-Za-z0-9_]+)=(\S*)')) { $fields[$kv.Groups[1].Value] = $kv.Groups[2].Value }
@@ -4084,6 +4089,12 @@ function Get-AttrCudaLastEligibilityLine {
     (key="some text") values, so the value alternation has to handle quotes -- r16_reason is
     quoted and routinely contains spaces. The LAST line wins: the probe re-runs per render
     policy evaluation and the final one describes the state the run ended in.
+    PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    r2: since the post-measurement window-capture tail (#428) the state the run ended in is not
+    the measured session's. The verdict (Get-AttrCudaEligibilityVerdict) therefore reads the line
+    in force for the measured session (Get-AttrCudaEligibilityLineForSession) and uses this last
+    line only as the fallback when the log has no summary line for that session.
+    PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     Returns $null when the log carries no such line.
     #>
     [CmdletBinding()]
@@ -4107,6 +4118,85 @@ function Get-AttrCudaLastEligibilityLine {
     $last
 }
 
+function Get-AttrCudaEligibilityLineForSession {
+    <#
+    .SYNOPSIS
+    The gpu_playback_recon.eligibility line in force for the MEASURED playback_smoke session.
+    .DESCRIPTION
+    PLAYBACK-GPU-SCOPES-NO-VETO-1 r2 (row B): anchors on the first line matching
+    "playback_smoke.summary session=<MeasuredSessionId>" and returns, as .values, the LAST
+    eligibility line at or before it (key/value hashtable, parsed like
+    Get-AttrCudaLastEligibilityLine), or $null when there is none (absence is not evidence).
+    Lines after the summary -- the post-measurement window-capture tail's paused re-render, for
+    one -- are counted (tailLinesIgnored) and reported (tailRefused), never read for the verdict.
+    measuredWindowRefusingLines counts refusing lines strictly between
+    "playback_smoke.start session=<id>" and the summary ($null without a start line); it is
+    reported, not gating: the app logs the line only on change, and the paused pre-play line in
+    force at session start reads r16_available=0 while a scope is visible. A refusing line is one
+    without both cuda_backend_available=1 and r16_available=1. summaryFound is false when the log
+    has no such summary line; the caller then falls back to the last line.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText,
+        [Parameter(Mandatory = $true)]
+        [string]$MeasuredSessionId
+    )
+
+    $idPattern = [regex]::Escape($MeasuredSessionId) + '(\s|$)'
+    # r3 (adversary A1 on ddceb595): record MARKERS are matched on the line's BODY, the text before its first ' (' -- the Qt
+    # location suffix CrashForensics::writeLogLine appends ( (<file>:<line>)) is written last and starts at or after it
+    # (DualVenueRunner's Get-DvLogRecordBody, the same rule) -- so a build path holding "playback_smoke.summary session=<id>"
+    # or "gpu_playback_recon.eligibility " can neither anchor the session, hide the real eligibility line in the tail, nor add
+    # one. The eligibility FIELDS are read from the whole line, first occurrence of a key winning: its free-text values
+    # (r16_reason, r16_renderer, cuda_backend_description; sanitizeLogValue keeps spaces) may hold ' (' before
+    # cuda_backend_available, and every key a later location suffix could spell is one the app already wrote earlier.
+    # r5 (adversary r4 A1 on 6b564afc): and the marker must OPEN the record -- right after the writer's
+    # "[<utc>] [<level>] [<thread>] " prefix (optional, for a bare record) -- so a quoted value inside another record (a
+    # cuda_backend_resolved DLL path, say) that spells "playback_smoke.summary session=<id>" is never read as one.
+    $recordStart = '^(?:\[[^\]]*\] \[[^\]]*\] \[[^\]]*\] )?'
+    $rawLines = @($LogText -split "`r?`n")
+    $lines = @($rawLines | ForEach-Object { $open = $_.IndexOf(' (', [StringComparison]::Ordinal); if ($open -ge 0) { $_.Substring(0, $open) } else { $_ } })
+    $startIndex = -1
+    $summaryIndex = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($startIndex -lt 0 -and $lines[$i] -match ($recordStart + 'playback_smoke\.start session=' + $idPattern)) { $startIndex = $i }
+        if ($lines[$i] -match ($recordStart + 'playback_smoke\.summary session=' + $idPattern)) { $summaryIndex = $i; break }
+    }
+    $sessionValues = $null
+    $tailLinesIgnored = 0
+    $tailRefused = $false
+    $windowRefusing = 0
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch ($recordStart + 'gpu_playback_recon\.eligibility ')) { continue }
+        $values = @{}
+        foreach ($match in [regex]::Matches($rawLines[$i], '(?<key>[A-Za-z0-9_]+)=(?:"(?<quoted>[^"]*)"|(?<bare>[^\s]+))')) {
+            $key = $match.Groups['key'].Value
+            if ($values.ContainsKey($key)) { continue }
+            if ($match.Groups['quoted'].Success) { $values[$key] = $match.Groups['quoted'].Value }
+            else { $values[$key] = $match.Groups['bare'].Value }
+        }
+        $refusing = -not ([string]$values['cuda_backend_available'] -eq '1' -and [string]$values['r16_available'] -eq '1')
+        if ($summaryIndex -lt 0) { continue }
+        if ($i -lt $summaryIndex) {
+            $sessionValues = $values
+            if ($startIndex -ge 0 -and $i -gt $startIndex -and $refusing) { $windowRefusing++ }
+        } else {
+            $tailLinesIgnored++
+            if ($refusing) { $tailRefused = $true }
+        }
+    }
+    [pscustomobject]@{
+        summaryFound = [bool]($summaryIndex -ge 0)
+        values = $sessionValues
+        tailLinesIgnored = $tailLinesIgnored
+        tailRefused = $tailRefused
+        measuredWindowRefusingLines = $(if ($summaryIndex -ge 0 -and $startIndex -ge 0 -and $startIndex -lt $summaryIndex) { $windowRefusing } else { $null })
+    }
+}
+
 function Get-AttrCudaEligibilityVerdict {
     <#
     .SYNOPSIS
@@ -4118,15 +4208,44 @@ function Get-AttrCudaEligibilityVerdict {
     absence of the diagnostic is not evidence of eligibility. exitCode is 15
     (BACKEND_NOT_AVAILABLE) whenever the run is not admitted, and every field is carried either
     way so a refusal says WHY.
+    PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    r2: with -MeasuredSessionId and that session's playback_smoke.summary line in the log, the
+    verdict reads the eligibility line in force for the MEASURED session -- the last one at or
+    before that summary (Get-AttrCudaEligibilityLineForSession; verdictScope=measured_session) --
+    not a later line from the post-measurement window-capture tail (tailLinesIgnored /
+    tailRefused report it). No line at or before the summary refuses. Without the id or without
+    its summary line, the LAST line in the log is read as before (last_line_fallback).
+    PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyString()]
         [string]$LogText
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+        , [AllowEmptyString()]
+        [string]$MeasuredSessionId = ''
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     )
 
     $values = Get-AttrCudaLastEligibilityLine -LogText $LogText
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+    # r2: the measured session's line replaces the last line whenever that session's summary is in the log.
+    $verdictScope = 'last_line_fallback'
+    $tailLinesIgnored = 0
+    $tailRefused = $false
+    $measuredWindowRefusingLines = $null
+    if (-not [string]::IsNullOrWhiteSpace($MeasuredSessionId)) {
+        $session = Get-AttrCudaEligibilityLineForSession -LogText $LogText -MeasuredSessionId $MeasuredSessionId
+        if ($session.summaryFound) {
+            $verdictScope = 'measured_session'
+            $values = $session.values
+            $tailLinesIgnored = $session.tailLinesIgnored
+            $tailRefused = $session.tailRefused
+            $measuredWindowRefusingLines = $session.measuredWindowRefusingLines
+        }
+    }
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     $read = {
         param([string]$Key)
         if ($null -eq $values -or -not $values.ContainsKey($Key)) { return $null }
@@ -4153,6 +4272,12 @@ function Get-AttrCudaEligibilityVerdict {
         r16ProbeRan = & $read 'r16_probe_ran'
         admitted = $admitted
         exitCode = $(if ($admitted) { 0 } else { 15 })
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>
+        verdictScope = $verdictScope
+        measuredWindowRefusingLines = $measuredWindowRefusingLines
+        tailLinesIgnored = $tailLinesIgnored
+        tailRefused = $tailRefused
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<
     }
 }
 
@@ -7435,6 +7560,7 @@ Export-ModuleMember -Function `
     Remove-AttrCudaFileById, `
     Resolve-AttrCudaSmokeRunLog, `
     Get-AttrCudaLastEligibilityLine, `
+    Get-AttrCudaEligibilityLineForSession, `
     Get-AttrCudaEligibilityVerdict, `
     ConvertTo-AttrCudaQuotedProcessArgument, `
     Publish-AttrCudaContactSheetRawCaptures, `

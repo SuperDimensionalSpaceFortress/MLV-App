@@ -885,6 +885,363 @@ class SmokeRunLogSelectorTests(_PwshCase):
         self.assertTrue(self.log_root.name.startswith("logs-result-"))
 
 
+@requires_pwsh
+class MeasuredSessionEligibilityVerdictTests(_PwshCase):
+    """PLAYBACK-GPU-SCOPES-NO-VETO-1 r2 (row B): the verdict reads the eligibility line in force for the MEASURED
+    session -- the last one at or before its playback_smoke.summary -- not the post-measurement visual-capture tail's
+    paused re-render line (#428), which reads r16_available=0 whenever a scope is visible. The tail is reported
+    (tailLinesIgnored / tailRefused), never read; absence stays refusal; without the session's summary line the old
+    last-line rule applies unchanged (last_line_fallback)."""
+
+    PRE_EXISTING = (
+        "source", "linePresent", "cudaBackendAvailable", "r16Available", "r16Reason", "cudaBackendAttempted",
+        "cudaBackendResolved", "cudaBackendDescription", "scale", "r16ProbeRan", "admitted", "exitCode",
+    )
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._second = 0
+
+    def _ts(self) -> str:
+        self._second += 1
+        return f"[2026-10-15T09:00:{self._second:02d}.100Z] [I] [0x1] "
+
+    def elig(self, cuda: int, r16: int, reason: str = "ok") -> str:
+        return ELIGIBILITY.format(second=0, resolved=1, cuda=cuda, r16=r16, reason=reason).replace(
+            "[2026-09-16T23:00:00.100Z] [I] [0x1] ", self._ts())
+
+    def start(self, session: int) -> str:
+        return self._ts() + f"playback_smoke.start session={session} position=0 cut_in=0 cut_out=599"
+
+    def summary(self, session: int) -> str:
+        return self._ts() + f"playback_smoke.summary session={session} frames_presented=599 source_frames=480"
+
+    def verdicts(self, lines: list[str], session: str) -> tuple[dict, dict]:
+        log = self.tmp / "run.log"
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        proc = self.run_with_module(
+            f"$text = [IO.File]::ReadAllText('{log}')\n"
+            f"$new = Get-AttrCudaEligibilityVerdict -LogText $text -MeasuredSessionId '{session}'\n"
+            "Write-Output ('NEW=' + ($new | ConvertTo-Json -Compress))\n"
+            "$old = Get-AttrCudaEligibilityVerdict -LogText $text\n"
+            "Write-Output ('OLD=' + ($old | ConvertTo-Json -Compress))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        found = {}
+        for line in proc.stdout.splitlines():
+            for tag in ("NEW=", "OLD="):
+                if line.startswith(tag):
+                    found[tag] = json.loads(line[len(tag):])
+        self.assertIn("NEW=", found, proc.stdout + proc.stderr)
+        self.assertIn("OLD=", found, proc.stdout + proc.stderr)
+        return found["NEW="], found["OLD="]
+
+    def test_t1_the_measured_session_line_admits_whatever_the_tail_says(self) -> None:
+        new, old = self.verdicts([
+            self.elig(1, 0, "paused, scope visible"),   # in force when the session opens: before start, not counted
+            self.start(7),
+            self.elig(1, 0, "paused, scope visible"),   # inside the window: reported, not gating
+            self.elig(1, 1),
+            self.summary(7),
+            self.elig(1, 0, "visual-capture tail re-render"),
+        ], "7")
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["exitCode"], 0)
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertTrue(new["tailRefused"])
+        self.assertEqual(new["tailLinesIgnored"], 1)
+        self.assertEqual(new["measuredWindowRefusingLines"], 1)
+        # Today's last-line rule refuses this clean session (the r1 leg-01 failure).
+        self.assertFalse(old["admitted"])
+        self.assertEqual(old["verdictScope"], "last_line_fallback")
+
+    def test_t2_a_cpu_fallback_session_stays_refused_when_the_tail_admits(self) -> None:
+        for cuda, r16 in ((0, 1), (1, 0)):
+            with self.subTest(cuda=cuda, r16=r16):
+                new, old = self.verdicts([
+                    self.start(7),
+                    self.elig(cuda, r16, "fallback"),
+                    self.summary(7),
+                    self.elig(1, 1, "tail"),
+                ], "7")
+                self.assertFalse(new["admitted"])
+                self.assertEqual(new["exitCode"], 15)
+                self.assertEqual(new["verdictScope"], "measured_session")
+                self.assertEqual(new["r16Reason"], "fallback")
+                self.assertFalse(new["tailRefused"])
+                # Today the admitting tail line wrongly admits it.
+                self.assertTrue(old["admitted"])
+
+    def test_t3_no_line_at_or_before_the_summary_refuses_even_if_the_tail_admits(self) -> None:
+        new, _old = self.verdicts([self.start(7), self.summary(7), self.elig(1, 1, "tail")], "7")
+        self.assertFalse(new["admitted"])
+        self.assertEqual(new["exitCode"], 15)
+        self.assertFalse(new["linePresent"])
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertEqual(new["tailLinesIgnored"], 1)
+
+    def test_t4_no_measured_summary_falls_back_to_the_last_line_unchanged(self) -> None:
+        for tail_r16 in (1, 0):
+            with self.subTest(tail_r16=tail_r16):
+                new, old = self.verdicts([
+                    self.start(3), self.elig(1, 1), self.summary(3), self.elig(1, tail_r16, "last"),
+                ], "7")
+                self.assertEqual(new["verdictScope"], "last_line_fallback")
+                for field in self.PRE_EXISTING:
+                    self.assertEqual(new[field], old[field], field)
+                self.assertEqual(new["admitted"], bool(tail_r16))
+                self.assertEqual(new["tailLinesIgnored"], 0)
+                self.assertFalse(new["tailRefused"])
+                self.assertIsNone(new["measuredWindowRefusingLines"])
+        # An empty id is the same fallback.
+        new, old = self.verdicts([self.start(7), self.elig(1, 1), self.summary(7), self.elig(1, 0)], "")
+        self.assertEqual(new["verdictScope"], "last_line_fallback")
+        self.assertFalse(new["admitted"])
+
+    def test_t5_the_anchor_is_the_measured_session_not_the_first_summary(self) -> None:
+        warmup_admits = [
+            self.start(3), self.elig(1, 1), self.summary(3),
+            self.start(7), self.elig(0, 1, "measured fallback"), self.summary(7),
+            self.elig(1, 1, "tail"),
+        ]
+        new, _old = self.verdicts(warmup_admits, "7")
+        self.assertFalse(new["admitted"])
+        self.assertEqual(new["r16Reason"], "measured fallback")
+        self._second = 0
+        warmup_refuses = [
+            self.start(3), self.elig(1, 0, "warmup paused"), self.summary(3),
+            self.start(7), self.elig(1, 1, "measured"), self.summary(7),
+            self.elig(1, 0, "tail"),
+        ]
+        new, _old = self.verdicts(warmup_refuses, "7")
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["r16Reason"], "measured")
+        self.assertTrue(new["tailRefused"])
+        # The session id must match exactly: session 70 is not session 7.
+        self._second = 0
+        new, _old = self.verdicts([self.start(70), self.elig(1, 1), self.summary(70)], "7")
+        self.assertEqual(new["verdictScope"], "last_line_fallback")
+
+    def test_t6_a_log_with_no_tail_keeps_every_pre_existing_field(self) -> None:
+        for cuda, r16 in ((1, 1), (1, 0), (0, 1)):
+            with self.subTest(cuda=cuda, r16=r16):
+                self._second = 0
+                new, old = self.verdicts([self.start(7), self.elig(cuda, r16, "only"), self.summary(7)], "7")
+                self.assertEqual(new["verdictScope"], "measured_session")
+                for field in self.PRE_EXISTING:
+                    self.assertEqual(new[field], old[field], field)
+                self.assertEqual(new["tailLinesIgnored"], 0)
+                self.assertFalse(new["tailRefused"])
+
+    def test_the_job_passes_the_measured_session_and_records_the_new_fields(self) -> None:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        self.assertEqual(
+            1, text.count("$verdict = Get-AttrCudaEligibilityVerdict -LogText $rawLog -MeasuredSessionId $measuredSmokeSessionId"))
+        self.assertLess(text.index("$measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog"),
+                        text.index("$verdict = Get-AttrCudaEligibilityVerdict"))
+        for field in ("verdictScope", "measuredWindowRefusingLines", "tailLinesIgnored", "tailRefused"):
+            self.assertIn(f"    {field} = $verdict.{field}\n", text)
+        # The new function is spliced inside its own sentinel brackets (the default job is pinned byte for byte outside them).
+        self.assertIn("# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name @(\n"
+                      "    'Get-AttrCudaEligibilityLineForSession'\n", text)
+
+    def test_t7_a_qt_location_suffix_neither_anchors_hides_nor_rewrites_the_measured_line(self) -> None:
+        """r3 (adversary A1 on ddceb595): CrashForensics::writeLogLine appends ` (<file>:<line>)` after the message; a build
+        path holding record text must not be read as a record. Markers are matched on the body (before the first ` (`); the
+        eligibility fields are read from the whole line, first key wins, because its free-text values may hold ` (`."""
+        loc = " (C:/build/playback_smoke.summary session=7 x/platform/qt/MainWindow.cpp:100)"
+        # The adversary's exact shape: a spoofed summary BEFORE the session would make the real eligibility line "tail".
+        new, _old = self.verdicts([
+            self._ts() + "app.ready" + loc,
+            self.start(7),
+            self.elig(1, 1),
+            self.summary(7),
+        ], "7")
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertTrue(new["linePresent"])
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["exitCode"], 0)
+        self.assertEqual(new["tailLinesIgnored"], 0)
+        # A suffix spelling an admitting key cannot rewrite a refusing line; nor can one spelling the marker add a line.
+        self._second = 0
+        new, _old = self.verdicts([
+            self.start(7),
+            self.elig(1, 0, "paused") + " (C:/b r16_available=1 cuda_backend_available=1/x.cpp:5)",
+            self._ts() + "app.ready (C:/b gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=1/x.cpp:6)",
+            self.summary(7),
+        ], "7")
+        self.assertFalse(new["admitted"])
+        self.assertEqual(new["exitCode"], 15)
+        self.assertEqual(new["r16Reason"], "paused")
+        # A free-text value holding ` (` keeps every later field: the line still admits.
+        self._second = 0
+        new, _old = self.verdicts([
+            self.start(7), self.elig(1, 1, "ok (texture probe passed)") + " (C:/b/x.cpp:7)", self.summary(7),
+        ], "7")
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["r16Reason"], "ok (texture probe passed)")
+        # r5 (adversary r4 A1 on 6b564afc): a QUOTED value inside another record that spells a marker (a DLL path) is never
+        # that record -- the marker must open the record, right after its "[utc] [level] [thread] " prefix.
+        self._second = 0
+        path = ' cuda_backend_description="C:\\gpu playback_smoke.summary session=7 x\\backend.dll"'
+        new, _old = self.verdicts([
+            self.elig(1, 0, "before") + path,
+            self.start(7),
+            self.elig(1, 1) + path,
+            self.summary(7),
+        ], "7")
+        self.assertEqual(new["verdictScope"], "measured_session")
+        self.assertTrue(new["linePresent"])
+        self.assertTrue(new["admitted"])
+        self.assertEqual(new["tailLinesIgnored"], 0)
+        self.assertEqual(new["measuredWindowRefusingLines"], 0)
+
+    def _job_function(self, name: str, end_marker: str) -> str:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index(f"function {name}(")
+        return text[start:text.index(end_marker, start)]
+
+    def test_t8_the_job_measured_session_id_is_read_only_from_a_record_that_opens_with_its_marker(self) -> None:
+        """r5 (adversary r4 A1 on e927e38a, introduced/major): the id the gate is handed comes from the job's
+        Get-MeasuredSmokeSessionId, whose marker match was unanchored, so marker text in a quoted DLL path or in a Qt
+        location suffix of ANOTHER record picked the warmup session and the gate admitted (exit 0) a measured session that
+        refuses (exit 15). The adversary's exact log; then the Qt-location shape; then the summary fallback (:2220)."""
+        def ts(second: int) -> str:
+            return f"[2026-11-03T06:00:{second:02d}.100Z] [I] [0x1] "
+        quoted = [
+            ts(1) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=0 '
+                    'cuda_backend_resolved="C:\\gpu playback_smoke.measured_session id=3 x\\backend.dll"',
+            ts(2) + "playback_smoke.start session=3",
+            ts(3) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=1 r16_reason="warmup"',
+            ts(4) + "playback_smoke.summary session=3",
+            ts(5) + "playback_smoke.start session=7",
+            ts(6) + "playback_smoke.measured_session id=7",
+            ts(7) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=0 r16_reason="measured fallback"',
+            ts(8) + "playback_smoke.summary session=7",
+        ]
+        located = [ts(1) + "app.ready (C:/b playback_smoke.measured_session id=3 x/MainWindow.cpp:1)"] + quoted[1:]
+        # No marker at all (a build before it): the first summary that OPENS its record is the measured one, not a path's.
+        fallback = [ts(1) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=1 '
+                            'cuda_backend_resolved="C:\\gpu playback_smoke.summary session=3 x\\backend.dll"',
+                    ts(2) + "playback_smoke.start session=7",
+                    ts(3) + 'gpu_playback_recon.eligibility cuda_backend_available=1 r16_available=0 r16_reason="measured fallback"',
+                    ts(4) + "playback_smoke.summary session=7",
+                    ts(5) + "app.ready (C:/b playback_smoke.summary session=3 x/MainWindow.cpp:2)"]
+        fn = self._job_function("Get-MeasuredSmokeSessionId", "\nfunction Get-FrameRows(")
+        for name, lines in (("quoted DLL path", quoted), ("Qt location suffix", located), ("summary fallback", fallback)):
+            with self.subTest(case=name):
+                log = self.tmp / f"{name.replace(' ', '-')}.log"
+                log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                proc = self.run_with_module(
+                    fn + "\n"
+                    f"$text = [IO.File]::ReadAllText('{log}')\n"
+                    "$id = Get-MeasuredSmokeSessionId $text\n"
+                    "$v = Get-AttrCudaEligibilityVerdict -LogText $text -MeasuredSessionId $id\n"
+                    "Write-Output ('OUT=' + (@{ id = [string]$id; admitted = $v.admitted; exitCode = $v.exitCode; reason = $v.r16Reason } | ConvertTo-Json -Compress))\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                out = json.loads(next(x for x in proc.stdout.splitlines() if x.startswith("OUT="))[4:])
+                self.assertEqual(out["id"], "7", out)
+                self.assertFalse(out["admitted"], out)
+                self.assertEqual(out["exitCode"], 15, out)
+                self.assertEqual(out["reason"], "measured fallback", out)
+
+    def test_t9_the_core_partition_start_and_self_heal_reads_bind_the_marker_to_its_record(self) -> None:
+        """r5 (adversary r4 A1 siblings job.ps1:4979/4980 and AttrCudaArtifacts.psm1:3488): the core-partition playback start
+        and the self-heal pre-launch read choose the session by the same marker, and must not take it from another record's
+        quoted value or Qt location; the self-heal line read (:3493) must not take a record from a location suffix either."""
+        def ts(second: int) -> str:
+            return f"[2026-11-03T06:00:{second:02d}.100Z] [I] [0x1] "
+        spoof = ts(1) + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.measured_session id=3 x\\backend.dll"'
+        loc_spoof = ts(1) + "app.ready (C:/b playback_smoke.measured_session id=3 x/MainWindow.cpp:1)"
+        summary_spoof = ts(1) + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.summary session=3 x\\backend.dll"'
+        real = [ts(2) + "playback_smoke.summary session=3 presented_fps=10",
+                ts(3) + "playback_smoke.measured_session id=7",
+                ts(4) + "playback_smoke.summary session=7 presented_fps=24"]
+        cp = self._job_function("Get-CorePartitionPlaybackStart", "\n}\n") + "\n}\n"
+        for name, lines in (("quoted marker", [spoof, *real]), ("located marker", [loc_spoof, *real]),
+                            ("quoted summary, no marker", [summary_spoof, real[0].replace("session=3", "session=7"), real[2]])):
+            with self.subTest(reader="core partition", case=name):
+                log = self.tmp / "cp.log"
+                log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                proc = self.run_with_module(cp + f"\nWrite-Output ('SID=' + (Get-CorePartitionPlaybackStart ([IO.File]::ReadAllText('{log}')) 1 1 1 0).session)\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("SID=7", proc.stdout.splitlines(), proc.stdout + proc.stderr)
+        heal = self.tmp / "self-heal"
+        (heal / "pre-1").mkdir(parents=True)
+        (heal / "pre-1" / "pre-launch.json").write_text('{"rc": 0, "error": null}', encoding="utf-8")
+        for name, lines in (("quoted marker", [spoof, *real]), ("located marker", [loc_spoof, *real]),
+                            ("located summary after the real one", [*real, ts(5) + "app.ready (C:/b playback_smoke.summary session=7 presented_fps=99 x/x.cpp:1)"])):
+            with self.subTest(reader="self-heal", case=name):
+                (heal / "pre-1" / "result.json.run.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                proc = self.run_with_module(
+                    f"$m = Get-AttrCudaSelfHealMetrics -SelfHealDir '{heal}' -PreLaunches @('cuda') -MeasuredLogText '' -MeasuredSessionId ''\n"
+                    "Write-Output ('FPS=' + [string]$m['selfHealL1PresentedFps'])\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("FPS=24", proc.stdout.splitlines(), proc.stdout + proc.stderr)
+
+
+@requires_pwsh
+class MeasuredSessionScopeFieldsTests(_PwshCase):
+    """PLAYBACK-GPU-SCOPES-NO-VETO-1 r3 (adversary A2 on ddceb595): the job's read of scope_source / scope_tap_completed from
+    the measured session's playback_smoke.cpu_summary_ext line, run as the job runs it (the bracketed splice, verbatim), so a
+    build path in the Qt location suffix can supply neither the marker nor either field."""
+
+    def scope_fields(self, raw_log: str, session: str = "7", with_interval: bool = False) -> dict:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index("# PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>\n# r2 (CoS #447): where the MEASURED session's scope updates")
+        end = text.index("# PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<", start)
+        log = self.tmp / "run.log"
+        log.write_text(raw_log, encoding="utf-8")
+        fields = "s = $scopeSource; c = $scopeTapCompleted" + ("; i = $scopeTapInterval" if with_interval else "")
+        proc = self.run_with_module(
+            f"$rawLog = [IO.File]::ReadAllText('{log}')\n$measuredSmokeSessionId = '{session}'\n"
+            + text[start:end]
+            + "\nWrite-Output ('OUT=' + (@{ " + fields + " } | ConvertTo-Json -Compress))\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        line = next(x for x in proc.stdout.splitlines() if x.startswith("OUT="))
+        return json.loads(line[4:])
+
+    def test_a_count_over_another_presenter_or_in_non_ascii_digits_is_no_count(self) -> None:
+        """r6 (Dot I1 on 44cebb07): scope_tap_interval=invalid (the presenter at the finish was not the one at the start) leaves
+        no count, so the leg is ineligible -- and a wrapped count beside it is never read. r6 (adversary r6 A2): a count in
+        non-ASCII digits (U+0661) is no count, not a thrown cast."""
+        ts = "[2026-11-03T23:00:04.000Z] [I] [0x1] "
+        head = ts + "playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap "
+        invalid = head + "scope_tap_requests=na scope_tap_completed=na scope_tap_w=256 scope_tap_h=144 scope_tap_interval=invalid\n"
+        self.assertEqual(self.scope_fields(invalid, with_interval=True), {"s": "gpu_tap", "c": None, "i": "invalid"})
+        wrapped = head + "scope_tap_completed=18446744073709551606 scope_tap_interval=invalid\n"
+        self.assertEqual(self.scope_fields(wrapped, with_interval=True), {"s": "gpu_tap", "c": None, "i": "invalid"})
+        stale_count = head + "scope_tap_completed=5 scope_tap_interval=invalid\n"
+        self.assertEqual(self.scope_fields(stale_count, with_interval=True), {"s": "gpu_tap", "c": None, "i": "invalid"})
+        valid = head + "scope_tap_completed=5 scope_tap_w=256 scope_tap_h=144 scope_tap_interval=valid\n"
+        self.assertEqual(self.scope_fields(valid, with_interval=True), {"s": "gpu_tap", "c": 5, "i": "valid"})
+        before_the_field = head + "scope_tap_completed=5 scope_tap_w=256 scope_tap_h=144\n"
+        self.assertEqual(self.scope_fields(before_the_field, with_interval=True), {"s": "gpu_tap", "c": 5, "i": None})
+        arabic_indic = head + "scope_tap_completed=١ scope_tap_interval=valid\n"
+        self.assertEqual(self.scope_fields(arabic_indic, with_interval=True), {"s": "gpu_tap", "c": None, "i": "valid"})
+
+    def test_the_fields_come_from_the_record_body_only(self) -> None:
+        ts = "[2026-11-02T09:00:04.000Z] [I] [0x1] "
+        spoof = (ts + "playback_smoke.cpu_summary_ext session=7 avg_processed8_setup_ms=0 "
+                 "(C:/build/x scope_source=gpu_tap scope_tap_completed=1 x/platform/qt/MainWindow.cpp:30090)\n")
+        self.assertEqual(self.scope_fields(spoof), {"s": None, "c": None})
+        marker_in_path = ts + "app.ready (C:/b playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap scope_tap_completed=9/x.cpp:1)\n"
+        self.assertEqual(self.scope_fields(marker_in_path), {"s": None, "c": None})
+        real = (ts + "playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap scope_tap_requests=4 scope_tap_completed=3 "
+                "scope_tap_w=256 (C:/b scope_source=cpu scope_tap_completed=0/x.cpp:2)\n")
+        self.assertEqual(self.scope_fields(real), {"s": "gpu_tap", "c": 3})
+        self.assertEqual(self.scope_fields(real, session="70"), {"s": None, "c": None})
+        # r5 (adversary r4 A1): a quoted value in a LATER record spelling the marker never replaces the real record's fields.
+        quoted = (ts + "playback_smoke.cpu_summary_ext session=7 scope_source=none scope_tap_completed=0\n"
+                  + ts + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.cpu_summary_ext session=7 '
+                  'scope_source=gpu_tap scope_tap_completed=1 x\\backend.dll"\n')
+        self.assertEqual(self.scope_fields(quoted), {"s": "none", "c": 0})
+        # r5 (adversary r4 A4): a count that is not a whole decimal number fails closed.
+        for bad in ("1.5", "1garbage", "9223372036854775808"):
+            line = ts + f"playback_smoke.cpu_summary_ext session=7 scope_source=gpu_tap scope_tap_completed={bad}\n"
+            self.assertEqual(self.scope_fields(line), {"s": "gpu_tap", "c": None}, bad)
+
+
 # --------------------------------------------------------------------------------------------
 # (e) an interrupted stage never publishes build.json
 # --------------------------------------------------------------------------------------------
@@ -4973,6 +5330,8 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Assert-AttrCudaBuildManifest",
             "Resolve-AttrCudaSmokeRunLog",
             "Get-AttrCudaLastEligibilityLine",
+            # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the verdict's measured-session line.
+            "Get-AttrCudaEligibilityLineForSession",
             "Get-AttrCudaEligibilityVerdict",
             "Assert-AttrCudaWritableFileSlot",
             "Test-AttrCudaPathIsReparsePoint",

@@ -650,6 +650,13 @@ private slots:
     void mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOneRequiresLibraryReadyFirst();
     void mainWindowGpuPreviewPolicyClassifiesPlaybackPipelineStatus();
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
+    void playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhenItServes();
+    void gpuScopeTapCountsOnlyDroppedRequestsAndInvalidateDropsStaleReadBacks();
+    void gpuScopeTapNeverPublishesAReadBackWhoseGlSequenceRaisedAnError();
+    void gpuScopeTapRefusedOrFailingTapFallsBackToTheCpuScopeFeed();
+    void gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedFramebuffer();
+    void gpuScopeTapWhoseFenceIsNullNeverPublishesAndFallsBackToTheCpuScopeFeed();
+    void gpuScopeTapIntervalIsInvalidAcrossAPresenterSwitchOrRecreation();
     void dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate();
     void dualIsoPatternMappingKeepsUiAndCoreConventionsAligned();
     void gpuViewportRgb888ZebraProcessingMatchesCpuReference();
@@ -1491,6 +1498,499 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback()
               QStringLiteral( "GPU Tex NR" ) );
     QVERIFY( QString::fromLatin1( mainWindowScopePerformanceHintText() )
                  .contains( QStringLiteral( "Hide the edit area with E" ) ) );
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 (PGT-02 composition row): the policy state MainWindow builds fills its scope flags through the
+// scope funnel. With the read-back serving a Throttled play the flags are off, so the GPU recon texture route stays allowed;
+// the same state in Live keeps the CPU scope, the flags on, and the route refused (today's veto).
+void GuiSmokeTest::playbackScopeGpuTapKeepsTheReconTexturePolicyEligibleOnlyWhenItServes()
+{
+    for (const PlaybackScopesMode mode : { PlaybackScopesMode::Throttled, PlaybackScopesMode::Live })
+    {
+        PlaybackScopeGpuTapInputs tap;
+        tap.mode = mode;
+        tap.playbackActive = true;
+        tap.editAreaVisible = true;
+        tap.anyScopeChecked = true;
+        tap.gpuWidgetViewportInstalled = true;
+        tap.tapSupported = true;
+        tap.tapRectCapturable = true;
+        tap.textureRouteEligibleIgnoringScopes = true;
+        const bool scopeDisplayVisible = playbackScopeDisplayConsumesPresentedPixels(
+            /*editAreaVisible*/ true, /*playbackActive*/ true, mode, playbackScopeGpuTapServes(tap));
+
+        MainWindowGpuPreviewPolicyState state;
+        state.gpuViewportInstalled = true;
+        state.gpuWidgetViewportInstalled = true;
+        state.gpuPlaybackReconEnvironmentRequested = true;
+        state.gpuPlaybackReconTexturePresentationEnvironmentRequested = true;
+        state.gpuPlaybackReconTexturePresentationCompatible = true;
+        state.gpuPreviewProcessingDisplayShaderCompatible = true;
+        state.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, /*histogram checked*/ true);
+        state.waveformEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, false);
+        state.paradeEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, false);
+        state.vectorScopeEnabled = mainWindowScopeActionConsumesPresentedPixels(scopeDisplayVisible, false);
+
+        const bool throttled = mode == PlaybackScopesMode::Throttled;
+        QCOMPARE(mainWindowAllowsGpuPlaybackReconTexturePresentation(state), throttled);
+        QCOMPARE(mainWindowAllowsGpu16PreviewRender(state), throttled);
+        QCOMPARE(mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOne(
+                     true, true, mainWindowHasScopeVisualization(state), true, true, true, false, true, false),
+                 throttled);
+    }
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r4: a headless GL behind GpuScopeTap's GpuScopeTapGl seam. Each PBO keeps its store
+// across reads (like a driver's), a read that "fails" raises its error and leaves the store as it was, the fence is
+// always signalled and the map returns the store -- exactly the adversary r3 A1/A2 inputs.
+namespace {
+class FakeScopeTapGl final : public GpuScopeTapGl
+{
+public:
+    std::vector<GLenum> errors;                     // pending GL errors, oldest first
+    GLenum framebufferStatus = GL_FRAMEBUFFER_COMPLETE;
+    GLenum renderbufferError = GL_NO_ERROR;         // raised by glRenderbufferStorage
+    GLenum blitError = GL_NO_ERROR;                 // raised by glBlitFramebuffer
+    GLenum bufferDataError = GL_NO_ERROR;           // raised by glBufferData (the store is then left as it was)
+    GLenum readPixelsError = GL_NO_ERROR;           // raised by glReadPixels (the store is then left as it was)
+    GLenum genFramebuffersError = GL_NO_ERROR;      // r5: raised by glGenFramebuffers, which then leaves the name 0
+    bool fenceFails = false;                        // r6 (Dot I3): glFenceSync returns a null fence...
+    GLenum fenceError = GL_NO_ERROR;                // ...raising this error first (GL_NO_ERROR: null with no error)
+    uint8_t picture[4] = { 255, 0, 0, 255 };        // RGBA of the picture a successful read copies
+    int readPixelsCalls = 0;
+    std::vector<GLuint> blitDrawTargets;            // r5: the draw framebuffer bound at each blit (0 = the displayed one)
+
+    GLenum glGetError() override
+    {
+        if ( errors.empty() ) return GL_NO_ERROR;
+        const GLenum e = errors.front();
+        errors.erase(errors.begin());
+        return e;
+    }
+    void glGenRenderbuffers(GLsizei n, GLuint *names) override { gen(n, names); }
+    void glDeleteRenderbuffers(GLsizei, const GLuint *) override {}
+    void glBindRenderbuffer(GLenum, GLuint) override {}
+    void glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei) override { raise(renderbufferError); }
+    void glGenFramebuffers(GLsizei n, GLuint *names) override
+    {
+        if ( genFramebuffersError != GL_NO_ERROR ) { raise(genFramebuffersError); return; }
+        gen(n, names);
+    }
+    void glDeleteFramebuffers(GLsizei, const GLuint *) override {}
+    void glBindFramebuffer(GLenum target, GLuint name) override
+    {
+        if ( target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER ) m_drawFramebuffer = name;
+    }
+    void glFramebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint) override {}
+    // The default framebuffer (0) is complete, as a driver reports it: completeness alone cannot prove the tap's own FBO.
+    GLenum glCheckFramebufferStatus(GLenum) override { return m_drawFramebuffer == 0 ? GLenum(GL_FRAMEBUFFER_COMPLETE) : framebufferStatus; }
+    void glBlitFramebuffer(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) override
+    {
+        blitDrawTargets.push_back(m_drawFramebuffer);
+        raise(blitError);
+    }
+    void glGenBuffers(GLsizei n, GLuint *names) override { gen(n, names); }
+    void glBindBuffer(GLenum, GLuint name) override { m_bound = name; }
+    void glBufferData(GLenum, GLsizeiptr size, const void *, GLenum) override
+    {
+        if ( bufferDataError != GL_NO_ERROR ) { raise(bufferDataError); return; }
+        m_stores[m_bound].assign(static_cast<size_t>(size), 0);
+    }
+    void glPixelStorei(GLenum, GLint) override {}
+    void glReadPixels(GLint, GLint, GLsizei width, GLsizei height, GLenum, GLenum, void *) override
+    {
+        ++readPixelsCalls;
+        if ( readPixelsError != GL_NO_ERROR ) { raise(readPixelsError); return; }
+        std::vector<uint8_t> &store = m_stores[m_bound];
+        const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+        if ( store.size() < bytes ) { raise(GL_INVALID_OPERATION); return; }
+        for ( size_t i = 0; i < bytes; i += 4 ) std::memcpy(&store[i], picture, 4);
+    }
+    GLsync glFenceSync(GLenum, GLbitfield) override
+    {
+        if ( fenceFails ) { raise(fenceError); return nullptr; }
+        return reinterpret_cast<GLsync>(&m_fenceToken);
+    }
+    GLenum glClientWaitSync(GLsync, GLbitfield, GLuint64) override { return GL_ALREADY_SIGNALED; }
+    void glDeleteSync(GLsync) override {}
+    void *glMapBufferRange(GLenum, GLintptr, GLsizeiptr length, GLbitfield) override
+    {
+        std::vector<uint8_t> &store = m_stores[m_bound];
+        return store.size() >= static_cast<size_t>(length) ? store.data() : nullptr;
+    }
+    GLboolean glUnmapBuffer(GLenum) override { return GL_TRUE; }
+
+private:
+    void gen(GLsizei n, GLuint *names) { for ( GLsizei i = 0; i < n; ++i ) names[i] = ++m_nextName; }
+    void raise(GLenum e) { if ( e != GL_NO_ERROR ) errors.push_back(e); }
+    GLuint m_nextName = 0;
+    GLuint m_bound = 0;
+    GLuint m_drawFramebuffer = 0;
+    int m_fenceToken = 0;
+    QMap<GLuint, std::vector<uint8_t>> m_stores;
+};
+
+// One full request/issue/poll/take round through the seam; returns whether a read-back was published.
+bool fakeScopeTapRound(GpuScopeTap &tap, FakeScopeTapGl &gl, void (GpuScopeTap::*issueWith)(GpuScopeTapGl *, GLuint, const QRect &),
+                       void (GpuScopeTap::*pollWith)(GpuScopeTapGl *), std::vector<uint8_t> *rgb8)
+{
+    tap.request(512);
+    tap.clearRequest();
+    (tap.*issueWith)(&gl, 0, QRect(0, 0, 1920, 1080));
+    (tap.*pollWith)(&gl);
+    int width = 0;
+    int height = 0;
+    quint64 serial = 0;
+    return tap.take(rgb8, &width, &height, &serial);
+}
+} // namespace
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r4 (adversary r3 A1 on b99325e7, GpuScopeTap.cpp:160 and its blit sibling :137): a read
+// whose glReadPixels -- or the blit/bind/allocate before it -- raised a GL error is discarded, never published, and
+// counted in glErrors. Input: reusable 512x288 PBO (589824 bytes) holding red, picture now blue, glReadPixels raises
+// GL_OUT_OF_MEMORY and leaves the old store; the fence signals, map returns the old bytes, unmap returns GL_TRUE.
+void GuiSmokeTest::gpuScopeTapNeverPublishesAReadBackWhoseGlSequenceRaisedAnError()
+{
+    GpuScopeTap tap("widget");
+    FakeScopeTapGl gl;
+    std::vector<uint8_t> rgb8;
+    // Two clean red reads fill both PBOs (slot 0, then slot 1) with red.
+    QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QCOMPARE(tap.m_slots[0].capacityBytes, 589824);
+    QCOMPARE(tap.counters().completed, quint64(2));
+    QCOMPARE(int(rgb8[0]), 255);
+
+    // The picture is now blue, but the read into the reused red PBO fails: nothing is published.
+    gl.picture[0] = 0;
+    gl.picture[2] = 255;
+    gl.readPixelsError = GL_OUT_OF_MEMORY;
+    QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QCOMPARE(tap.counters().completed, quint64(2));
+    QCOMPARE(tap.counters().glErrors, quint64(1));
+    QVERIFY(!tap.pending());
+
+    // The blit before the read fails (sibling :137): nothing is published either.
+    gl.readPixelsError = GL_NO_ERROR;
+    gl.blitError = GL_INVALID_OPERATION;
+    QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QCOMPARE(tap.counters().completed, quint64(2));
+    QCOMPARE(tap.counters().glErrors, quint64(2));
+
+    // An error some other code left pending before the tap's sequence is not blamed on this read: it is drained, and a
+    // clean read publishes the new blue picture (and resets the failure run, so the tap stays usable).
+    gl.blitError = GL_NO_ERROR;
+    gl.errors.push_back(GL_INVALID_ENUM);
+    QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QCOMPARE(tap.counters().completed, quint64(3));
+    QCOMPARE(int(rgb8[0]), 0);
+    QCOMPARE(int(rgb8[2]), 255);
+    QVERIFY(tap.usable());
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r4 (adversary r3 A2 on b99325e7, MainWindow.cpp:23313): a tap whose renderbuffer is
+// refused (FBO incomplete) is unusable for the context, so supportedCached() -- what MainWindow's tapSupported reads --
+// answers false and the scope keeps the CPU feed instead of waiting forever on a read-back that only skips. A tap whose
+// read-backs fail in GL kGlFailureLimit times in a row (a refused PBO, a failing read) falls back the same way.
+// destroy() (a new context) evaluates afresh.
+void GuiSmokeTest::gpuScopeTapRefusedOrFailingTapFallsBackToTheCpuScopeFeed()
+{
+    int contextToken = 0;
+    const QOpenGLContext *context = reinterpret_cast<const QOpenGLContext *>(&contextToken);
+    // The finding's input: throttled, playing, visible histogram, zebras off, kill switch unset, eligible texture
+    // route, supported single-sample GL 4.6, rectangle (0,0,1920,1080) in a 1920x1080 framebuffer.
+    auto servesWith = [](const GpuScopeTap &tap, const QOpenGLContext *ctx) {
+        PlaybackScopeGpuTapInputs in;
+        in.mode = PlaybackScopesMode::Throttled;
+        in.playbackActive = true;
+        in.editAreaVisible = true;
+        in.anyScopeChecked = true;
+        in.gpuWidgetViewportInstalled = true;
+        in.zebrasEnabled = false;
+        in.killSwitch = false;
+        in.tapSupported = tap.supportedCached(ctx);
+        in.tapRectCapturable = in.tapSupported && playbackScopeTapFramebufferRect(0.0, 0.0, 1920.0, 1080.0, 1920, 1080, nullptr);
+        in.textureRouteEligibleIgnoringScopes = in.tapRectCapturable;
+        return playbackScopeGpuTapServes(in);
+    };
+
+    {
+        GpuScopeTap tap("widget");
+        tap.m_supportContext = context;
+        tap.m_supportCached = true;
+        QVERIFY(servesWith(tap, context));
+        FakeScopeTapGl gl;
+        gl.renderbufferError = GL_OUT_OF_MEMORY;
+        gl.framebufferStatus = GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        std::vector<uint8_t> rgb8;
+        QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+        QVERIFY(!tap.usable());
+        QVERIFY(!tap.supportedCached(context));
+        QVERIFY(!servesWith(tap, context));     // the CPU scope feed takes over at once
+        QCOMPARE(gl.readPixelsCalls, 0);
+
+        // A new context is evaluated afresh.
+        tap.destroy(false);
+        QVERIFY(tap.usable());
+    }
+    {
+        // Every PBO allocation is refused (the GpuScopeTap.cpp:153 sibling): after kGlFailureLimit in a row, CPU feed.
+        GpuScopeTap tap("window");
+        tap.m_supportContext = context;
+        tap.m_supportCached = true;
+        FakeScopeTapGl gl;
+        gl.bufferDataError = GL_OUT_OF_MEMORY;
+        std::vector<uint8_t> rgb8;
+        for ( int i = 0; i < GpuScopeTap::kGlFailureLimit - 1; ++i )
+        {
+            QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+            QVERIFY(servesWith(tap, context)); // one refusal is not yet a fallback
+        }
+        QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+        QVERIFY(!tap.usable());
+        QVERIFY(!servesWith(tap, context));
+    }
+    {
+        // Failing reads (the A1 discard) also fall back after kGlFailureLimit in a row; a clean read in between resets.
+        GpuScopeTap tap("widget");
+        tap.m_supportContext = context;
+        tap.m_supportCached = true;
+        FakeScopeTapGl gl;
+        std::vector<uint8_t> rgb8;
+        gl.readPixelsError = GL_OUT_OF_MEMORY;
+        for ( int i = 0; i < GpuScopeTap::kGlFailureLimit - 1; ++i )
+            QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+        gl.readPixelsError = GL_NO_ERROR;
+        QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+        gl.readPixelsError = GL_OUT_OF_MEMORY;
+        for ( int i = 0; i < GpuScopeTap::kGlFailureLimit - 1; ++i )
+            QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+        QVERIFY(tap.usable());
+        QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+        QVERIFY(!tap.usable());
+        QVERIFY(!servesWith(tap, context));
+    }
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 on 1d3ea3f5, GpuScopeTap.cpp:193): glGenFramebuffers raises
+// GL_OUT_OF_MEMORY and leaves the name 0, then every later call succeeds. Completeness was checked on framebuffer 0 (the
+// displayed one, which is complete) and the setup error was drained before the blit. So the tap blitted the frame into
+// the displayed framebuffer and published it. A tap setup that raised an error, or produced no name, is a failed
+// request: no blit, no read, nothing published. It counts as a GL failure (kGlFailureLimit in a row: CPU scope feed).
+// The next request sets up afresh, and a clean one publishes.
+void GuiSmokeTest::gpuScopeTapWhoseSetupRaisedAnErrorNeverBlitsIntoTheDisplayedFramebuffer()
+{
+    int contextToken = 0;
+    const QOpenGLContext *context = reinterpret_cast<const QOpenGLContext *>(&contextToken);
+    GpuScopeTap tap("window");
+    tap.m_supportContext = context;
+    tap.m_supportCached = true;
+    FakeScopeTapGl gl;
+    gl.genFramebuffersError = GL_OUT_OF_MEMORY;
+    std::vector<uint8_t> rgb8;
+    QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(gl.blitDrawTargets.empty());        // never into framebuffer 0, nor anywhere
+    QCOMPARE(gl.readPixelsCalls, 0);
+    QCOMPARE(tap.counters().completed, quint64(0));
+    QCOMPARE(tap.counters().glErrors, quint64(1));
+    QVERIFY(tap.usable());                      // one failure is not yet a fallback
+    for ( int i = 1; i < GpuScopeTap::kGlFailureLimit; ++i )
+        QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(gl.blitDrawTargets.empty());
+    QVERIFY(!tap.usable());
+    QVERIFY(!tap.supportedCached(context));    // the CPU scope feed takes over
+
+    // A new context sets up afresh: with glGenFramebuffers working the tap blits into its own FBO and publishes.
+    tap.destroy(false);
+    tap.m_supportContext = context;
+    tap.m_supportCached = true;
+    gl.genFramebuffersError = GL_NO_ERROR;
+    QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QCOMPARE(int(gl.blitDrawTargets.size()), 1);
+    QVERIFY(gl.blitDrawTargets[0] != 0);
+    QCOMPARE(tap.counters().completed, quint64(1));
+
+    // r5b (adversary r5 A1 on c8393c8f): a setup error that comes with an incomplete status is still counted in glErrors.
+    GpuScopeTap refused("widget");
+    FakeScopeTapGl refusedGl;
+    refusedGl.renderbufferError = GL_OUT_OF_MEMORY;
+    refusedGl.framebufferStatus = GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+    QVERIFY(!fakeScopeTapRound(refused, refusedGl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    QVERIFY(!refused.usable());
+    QCOMPARE(refused.counters().glErrors, quint64(1));
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r6 (Dot I3 on 44cebb07, GpuScopeTap.cpp:287): every earlier fake fence was non-null, so the
+// null-fence branch had no row. glFenceSync returns null -- after raising GL_INVALID_OPERATION, and (a driver that does
+// not say why) with no error at all. Each such read-back is not published and never left pending, and counts once in
+// issued=0, skipped and glErrors; kGlFailureLimit in a row make the tap unusable, so the scope takes the CPU feed. The
+// RED binary (the 1d3ea3f5 tap) counts none of them in glErrors.
+void GuiSmokeTest::gpuScopeTapWhoseFenceIsNullNeverPublishesAndFallsBackToTheCpuScopeFeed()
+{
+    int contextToken = 0;
+    const QOpenGLContext *context = reinterpret_cast<const QOpenGLContext *>(&contextToken);
+    for ( const GLenum fenceError : { GLenum(GL_INVALID_OPERATION), GLenum(GL_NO_ERROR) } )
+    {
+        GpuScopeTap tap("window");
+        tap.m_supportContext = context;
+        tap.m_supportCached = true;
+        FakeScopeTapGl gl;
+        gl.fenceFails = true;
+        gl.fenceError = fenceError;
+        std::vector<uint8_t> rgb8;
+        for ( int i = 1; i <= GpuScopeTap::kGlFailureLimit; ++i )
+        {
+            QVERIFY(!fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+            QVERIFY(!tap.pending());
+            QCOMPARE(tap.counters().issued, quint64(0));
+            QCOMPARE(tap.counters().completed, quint64(0));
+            QCOMPARE(tap.counters().skipped, quint64(i));
+            QCOMPARE(tap.counters().glErrors, quint64(i));
+            QCOMPARE(tap.usable(), i < GpuScopeTap::kGlFailureLimit);
+            QCOMPARE(tap.supportedCached(context), i < GpuScopeTap::kGlFailureLimit);   // false: CPU scope feed
+        }
+        QCOMPARE(gl.readPixelsCalls, GpuScopeTap::kGlFailureLimit);
+        QVERIFY(rgb8.empty());
+    }
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r6 (Dot I1 on 44cebb07, MainWindow.cpp:25744/30075): the measured session's scope_tap_*
+// counts were a subtraction of a start snapshot from whichever presenter was active at the finish, with no identity
+// binding. Started on presenter A with completed=10 and finished on a replacement B with completed=0, it wrapped to
+// 18446744073709551606. Now the interval is bound to the presenter: another presenter at the finish (a switch to the
+// other surface, the presenter re-created, its context re-created, or a presenter at only one end) makes it invalid,
+// with every delta 0 -- never a wrapped value. The same presenter at both ends still yields the right deltas. The RED
+// binary carries the 44cebb07 arithmetic (subtract regardless) behind GpuScopeTap::interval.
+void GuiSmokeTest::gpuScopeTapIntervalIsInvalidAcrossAPresenterSwitchOrRecreation()
+{
+    std::vector<uint8_t> rgb8;
+    auto completedRounds = [&rgb8](GpuScopeTap &tap, FakeScopeTapGl &gl, int rounds) {
+        for ( int i = 0; i < rounds; ++i )
+            QVERIFY(fakeScopeTapRound(tap, gl, &GpuScopeTap::issueWith, &GpuScopeTap::pollWith, &rgb8));
+    };
+    auto expectInvalid = [](const GpuScopeTap::Interval &in) {
+        QVERIFY(!in.valid);
+        QCOMPARE(in.requests, quint64(0));
+        QCOMPARE(in.completed, quint64(0));
+        QCOMPARE(in.notReady, quint64(0));
+        QCOMPARE(in.skipped, quint64(0));
+        QCOMPARE(in.mapMsTotal, 0.0);
+    };
+
+    // Switch: started on presenter A (completed=10), finished on presenter B (completed=0).
+    GpuScopeTap presenterA("widget");
+    FakeScopeTapGl glA;
+    completedRounds(presenterA, glA, 10);
+    const GpuScopeTap::Counters start = presenterA.counters();
+    QCOMPARE(start.completed, quint64(10));
+    {
+        GpuScopeTap presenterB("window");
+        QCOMPARE(presenterB.counters().completed, quint64(0));
+        QVERIFY(presenterB.counters().presenterId != start.presenterId);
+        expectInvalid(GpuScopeTap::interval(start, presenterB.counters()));
+    }
+    // Recreation: the replacement presenter has the same surface name and may sit at the same address; still another one.
+    {
+        GpuScopeTap replacement("widget");
+        FakeScopeTapGl glR;
+        completedRounds(replacement, glR, 12);   // even counts ABOVE the start's never pass as this interval's
+        expectInvalid(GpuScopeTap::interval(start, replacement.counters()));
+    }
+    // A presenter at only one end (no surface active at the start, or none at the finish).
+    expectInvalid(GpuScopeTap::interval(GpuScopeTap::Counters(), start));
+    expectInvalid(GpuScopeTap::interval(start, GpuScopeTap::Counters()));
+
+    // Same-presenter control: 3 more read-backs on A give completed=3, requests=3 and a valid interval.
+    completedRounds(presenterA, glA, 3);
+    const GpuScopeTap::Interval same = GpuScopeTap::interval(start, presenterA.counters());
+    QVERIFY(same.valid);
+    QCOMPARE(same.completed, quint64(3));
+    QCOMPARE(same.requests, quint64(3));
+    QCOMPARE(same.notReady, quint64(0));
+    QCOMPARE(same.skipped, quint64(0));
+    // No presenter at either end: valid and empty (nothing was measured, nothing wraps).
+    const GpuScopeTap::Interval none = GpuScopeTap::interval(GpuScopeTap::Counters(), GpuScopeTap::Counters());
+    QVERIFY(none.valid);
+    QCOMPARE(none.completed, quint64(0));
+
+    // The same object with its context re-created (destroy) is another presenter from then on: its counters carry on,
+    // but an interval that spans the recreation is invalid.
+    const GpuScopeTap::Counters beforeRecreate = presenterA.counters();
+    presenterA.destroy(false);
+    completedRounds(presenterA, glA, 1);
+    QCOMPARE(presenterA.counters().completed, beforeRecreate.completed + 1);
+    expectInvalid(GpuScopeTap::interval(beforeRecreate, presenterA.counters()));
+}
+
+// PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: GpuScopeTap's no-GL state, shared by the viewport and GpuDisplayWindow.
+// C4 (CoS #447): only a request DROPPED because both read-backs are in flight counts as not ready.
+// D3 (CoS #447): invalidate() (stop, seek, clip or mode change) drops the pending request and a finished result,
+// and marks in-flight read-backs stale so poll() frees them unread. No context is needed or used.
+void GuiSmokeTest::gpuScopeTapCountsOnlyDroppedRequestsAndInvalidateDropsStaleReadBacks()
+{
+    GpuScopeTap tap("widget");
+    QVERIFY(!tap.supportedCached(nullptr));
+    QVERIFY(!tap.drawnRectCapturable());
+
+    // Nothing in flight: accepted, not "not ready".
+    tap.request(512);
+    QVERIFY(tap.requested());
+    QCOMPARE(tap.counters().requests, quint64(1));
+    QCOMPARE(tap.counters().notReady, quint64(0));
+
+    // One read-back in flight, one slot free: still accepted, still not "not ready" (r1 counted this one).
+    int fenceToken = 0;
+    tap.clearRequest();
+    tap.m_slots[0].fence = reinterpret_cast<GLsync>(&fenceToken);
+    tap.request(512);
+    QVERIFY(tap.requested());
+    QCOMPARE(tap.counters().notReady, quint64(0));
+
+    // Both in flight: dropped and counted.
+    tap.clearRequest();
+    tap.m_slots[1].fence = reinterpret_cast<GLsync>(&fenceToken);
+    tap.request(512);
+    QVERIFY(!tap.requested());
+    QCOMPARE(tap.counters().requests, quint64(3));
+    QCOMPARE(tap.counters().notReady, quint64(1));
+
+    // A finished result is taken exactly once.
+    tap.m_result = { 1, 2, 3 };
+    tap.m_resultWidth = 1;
+    tap.m_resultHeight = 1;
+    tap.m_resultSerial = 7;
+    tap.m_resultReady = true;
+    std::vector<uint8_t> rgb8;
+    int width = 0;
+    int height = 0;
+    quint64 serial = 0;
+    QVERIFY(tap.take(&rgb8, &width, &height, &serial));
+    QCOMPARE(width, 1);
+    QCOMPARE(serial, quint64(7));
+    QVERIFY(!tap.take(&rgb8, &width, &height, &serial));
+
+    // invalidate(): the request and the finished result are gone, and the in-flight read-backs are stale.
+    tap.m_slots[0].generation = tap.m_generation;
+    tap.m_slots[1].generation = tap.m_generation;
+    tap.m_result = { 4, 5, 6 };
+    tap.m_resultReady = true;
+    tap.m_requested = true;
+    tap.invalidate();
+    QVERIFY(!tap.requested());
+    QVERIFY(!tap.take(&rgb8, &width, &height, &serial));
+    QVERIFY(tap.m_slots[0].generation != tap.m_generation);
+    QVERIFY(tap.m_slots[1].generation != tap.m_generation);
+
+    // destroy(false) never calls GL (no context is current here): the names are only forgotten.
+    tap.destroy(false);
+    QVERIFY(!tap.pending());
+    QVERIFY(!tap.drawnRectCapturable());
+
+    // D2: a drawn picture inside the framebuffer is capturable; zoomed past fit it is not.
+    tap.noteDrawnRect(10.0, 20.0, 2148.0, 1353.0, 2158, 1373);
+    QVERIFY(tap.drawnRectCapturable());
+    tap.noteDrawnRect(-50.0, -30.0, 2400.0, 1500.0, 2158, 1373);
+    QVERIFY(!tap.drawnRectCapturable());
 }
 
 void GuiSmokeTest::dualIsoPlaybackPolicyKeepsExplicitPreviewAndPlaybackOverrideSeparate()
@@ -2759,7 +3259,9 @@ QByteArray read_rgba16_texture(QOpenGLFunctions *gl, GLuint textureId, int width
     gl->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureId, 0);
     QByteArray bytes;
-    if (gl->glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+    // PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 sibling): a framebuffer that was never generated (0) is the
+    // displayed one, whose status reads complete; reading it would return the window, not the texture.
+    if (fbo != 0 && gl->glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
         bytes.resize(width * height * 4 * static_cast<int>(sizeof(uint16_t)));
         gl->glPixelStorei(GL_PACK_ALIGNMENT, 1);
         gl->glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT, bytes.data());

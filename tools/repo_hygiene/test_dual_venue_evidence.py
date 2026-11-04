@@ -141,6 +141,20 @@ SCOPE_LEGS["legs/m16-1243-scopes-cuda-windowed-s1-waveform-i0.json"] = (
 # PLAYBACK-SCOPES-OPTION-1 r3: the Look-Assist-ON twins of the N and T arms (the shipping default is Look Assist on): the no-look twin with
 # generatorArgs.forceLookAssist true (a capture-free pace leg at the default Classic flavor) in place of disableLookAssist true.
 SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json" for backend in ("cpu", "cuda") for arm in ("none", "histogram"))
+# PLAYBACK-GPU-SCOPES-NO-VETO-1: the GL viewport scope read-back's cuda LA-on legs. CONTROL is the HEAD histogram-la leg at scopesDuringPlayback hide
+# (same scope, same window layout); the D4 matrix cells and the waveform / vectorscope supplements are throttled. Each adds cpuFrames eq 0.
+GPU_TAP_SCOPE_LEGS = ("legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-hide.json",
+                      *(f"legs/m16-1243-scopes-cuda-{mode}-s{scale}-histogram-la.json"
+                        for mode, scale in (("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4))),
+                      *(f"legs/m16-1243-scopes-cuda-windowed-s1-{scope}-la.json" for scope in ("waveform", "vectorscope")),
+                      # r2: the A/B HEAD arm's own leg (the HEAD histogram-la leg exists on master and is never mutated), which proves the read-back served.
+                      "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-gputap.json")
+# r2 (CoS #447): a throttled WINDOWED read-back leg asserts the read-back served (scopeSource eq gpu_tap, scopeTapCompleted gt 0); the CONTROL (hide) and the
+# fullscreen cells (the edit area, so the scope, is hidden) do not.
+GPU_TAP_SERVED_GATES = [{"metric": "scopeSource", "op": "eq", "value": "gpu_tap"}, {"metric": "scopeTapCompleted", "op": "gt", "value": 0}]
+# r2: the D4 matrix's cpu cells (the read-back never serves the CPU route; a no-regression check): the cpu histogram-la leg with only its cell changed.
+GPU_TAP_CPU_SCOPE_LEGS = tuple(f"legs/m16-1243-scopes-cpu-{mode}-s{scale}-histogram-la.json"
+                               for mode, scale in (("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4)))
 # CUDA-HEADROOM-1: the unpaced throughput legs (both clips, the D4 cells) and the stage-attribution legs (HEAVY telemetry + CUDA launch timing).
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
@@ -158,7 +172,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
                 *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
-                *IDENTITY_LEGS, *MISSDUMP_LEGS)
+                *IDENTITY_LEGS, *MISSDUMP_LEGS, *GPU_TAP_SCOPE_LEGS, *GPU_TAP_CPU_SCOPE_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -429,6 +443,14 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_CONFORM_OPEN = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 >>>"
     HFR_CONFORM_CLOSE = "HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 <<<"
     HFR_CONFORM_REGIONS = 3
+    # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the measured-session eligibility verdict (row B) and the summary's scope-feed fields (CoS #447). Ten regions: in the spliced
+    # module functions, Get-AttrCudaLastEligibilityLine's help (1) and Get-AttrCudaEligibilityVerdict's help, parameter, measured-session override and result
+    # fields (4), plus the Get-AttrCudaEligibilityLineForSession splice (1); in the job template the measured-session verdict call, the diagnostics fields, the
+    # cpu_summary_ext scope read and the two summary fields (4). r5 (adversary r4 A1 on e927e38a) adds one: Get-MeasuredSmokeSessionId's anchored read,
+    # ahead of its baseline loops (1). Every baseline line stays verbatim outside them. Absent from the baseline.
+    GPU_SCOPES_NO_VETO_OPEN = "PLAYBACK-GPU-SCOPES-NO-VETO-1 >>>"
+    GPU_SCOPES_NO_VETO_CLOSE = "PLAYBACK-GPU-SCOPES-NO-VETO-1 <<<"
+    GPU_SCOPES_NO_VETO_REGIONS = 11
     # PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): the HFR (>= 50 fps native) 10 s floor branch the embedded source-frame
     # oracle (Get-AttrCudaSourceFramesVerdict) gains ahead of the unchanged 20 s branch, plus the HFR-only 10 s wording of the
     # "under N s of real footage" message. Two regions; the baseline's 20 s lines stay verbatim outside them.
@@ -459,7 +481,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
                     "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
                     "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE),
-                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE)}
+                    "cpu-gl-env-clear": (cls.CPU_GL_ENV_CLEAR_OPEN, cls.CPU_GL_ENV_CLEAR_CLOSE),
+                    "gpu-scopes-no-veto": (cls.GPU_SCOPES_NO_VETO_OPEN, cls.GPU_SCOPES_NO_VETO_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -508,6 +531,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["playback-vsync"], self.PLAYBACK_VSYNC_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the default job carries exactly the pinned number of bracketed HFR-CONFORM-AWARE-RECEIPT-ORACLES-1 regions")
         self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
+        self.assertEqual(new_counts["gpu-scopes-no-veto"], self.GPU_SCOPES_NO_VETO_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-GPU-SCOPES-NO-VETO-1 regions")
+        self.assertEqual(old_counts["gpu-scopes-no-veto"], 0, "the baseline predates PLAYBACK-GPU-SCOPES-NO-VETO-1 r2")
         self.assertEqual(new_counts["hfr-10s-floor"], self.HFR_10S_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-CLIP-LENGTH-HFR-10S-1 regions")
         self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
         self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
@@ -4450,7 +4475,11 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
         self.assertIn("$legSpecSha256 = Get-DvLegSpecSha256 $specBytes", runner)
         self.assertNotIn("Get-DvSha256OfBytes $specBytes", runner)
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertIn("(Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256", module)
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2b, re-pinned at the master merge (2026-11-02): master's repo-and-blob-keyed LegBlobCache replaced this
+        # card's per-blob cache (same purpose: n lookups over n blobs stay linear in git processes); the comparison is still that function's hash.
+        self.assertIn("$blob = $script:LegBlobCache[$cacheKey]", module)
+        self.assertIn("if ($blob.ok -and (Get-DvLegSpecSha256 $blob.bytes) -ceq $LegSpecSha256) {", module)
+        self.assertNotIn("LegSpecBlobCache", module)
 
     def test_mutation_without_the_line_ending_normalisation_the_committed_spec_is_not_found_on_a_crlf_checkout(self) -> None:
         mutated = self.mutated_module([("Get-DvSha256OfBytes (ConvertTo-DvLfBytes $Bytes)", "Get-DvSha256OfBytes $Bytes")])
@@ -6973,6 +7002,50 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(spec["criteria"], {"acceptance": {backend: [gate]}, "supplementary": {backend: [gate]}}, rel)
             self.assertEqual(dict(spec, legId=twin["legId"], generatorArgs=twin["generatorArgs"], criteria=twin["criteria"]), twin, rel)
 
+    def test_the_gpu_tap_scope_legs_are_the_head_histogram_la_leg_with_only_their_cell_changed(self) -> None:
+        """PLAYBACK-GPU-SCOPES-NO-VETO-1: every leg is m16-1243-scopes-cuda-windowed-s1-histogram-la (the HEAD arm) except its legId, card, cell
+        (scaleFactor, displayMode, scope, scopesDuringPlayback) and criteria, which keep lookAssistForced eq true and add gpuFramesTotal gt 0 and
+        cpuFrames eq 0. The CONTROL changes only scopesDuringPlayback to hide: same scope, same window layout and viewport as the HEAD arm.
+        r2 (CoS #447): every throttled WINDOWED leg also asserts the read-back served (GPU_TAP_SERVED_GATES); hide and fullscreen do not."""
+        head = json.loads((DV / "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la.json").read_text(encoding="utf-8"))
+        gates = [{"metric": "lookAssistForced", "op": "eq", "value": True}, {"metric": "gpuFramesTotal", "op": "gt", "value": 0},
+                 {"metric": "cpuFrames", "op": "eq", "value": 0}]
+        served = 0
+        for rel in GPU_TAP_SCOPE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "PLAYBACK-GPU-SCOPES-NO-VETO-1", rel)
+            expected_mode = "hide" if rel.endswith("-la-hide.json") else "throttled"
+            expected_gates = gates + GPU_TAP_SERVED_GATES if expected_mode == "throttled" and spec["displayMode"] == "windowed" else gates
+            served += expected_gates is not gates
+            self.assertEqual(spec["criteria"], {"acceptance": {"cuda": expected_gates}, "supplementary": {"cuda": expected_gates}}, rel)
+            self.assertEqual(spec["generatorArgs"], dict(head["generatorArgs"], scope=spec["generatorArgs"]["scope"], scopesDuringPlayback=expected_mode), rel)
+            self.assertEqual(dict(spec, legId=head["legId"], card=head["card"], scaleFactor=head["scaleFactor"], displayMode=head["displayMode"],
+                                  generatorArgs=head["generatorArgs"], criteria=head["criteria"]), head, rel)
+        control = json.loads((DV / GPU_TAP_SCOPE_LEGS[0]).read_text(encoding="utf-8"))
+        self.assertEqual((control["scaleFactor"], control["displayMode"], control["generatorArgs"]["scope"]), (1, "windowed", "histogram"))
+        self.assertEqual(served, 5, "windowed s2, s4, waveform, vectorscope and the s1 gputap HEAD leg assert the read-back served")
+        gputap = json.loads((DV / "legs/m16-1243-scopes-cuda-windowed-s1-histogram-la-gputap.json").read_text(encoding="utf-8"))
+        self.assertEqual((gputap["scaleFactor"], gputap["displayMode"], gputap["generatorArgs"]), (1, "windowed", head["generatorArgs"]))
+
+    def test_the_gpu_tap_cpu_matrix_legs_are_the_cpu_histogram_la_leg_with_only_their_cell_changed(self) -> None:
+        """PLAYBACK-GPU-SCOPES-NO-VETO-1 r2: the D4 matrix's cpu cells are m16-1243-scopes-cpu-windowed-s1-histogram-la (unchanged, on master) except their
+        legId, card, scaleFactor and displayMode; the acceptance stays lookAssistForced eq true (a no-regression check, no fps threshold)."""
+        base = json.loads((DV / "legs/m16-1243-scopes-cpu-windowed-s1-histogram-la.json").read_text(encoding="utf-8"))
+        gate = [{"metric": "lookAssistForced", "op": "eq", "value": True}]
+        self.assertEqual(base["criteria"], {"acceptance": {"cpu": gate}, "supplementary": {"cpu": gate}})
+        cells = set()
+        for rel in GPU_TAP_CPU_SCOPE_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(spec, self.schema)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertEqual(spec["card"], "PLAYBACK-GPU-SCOPES-NO-VETO-1", rel)
+            self.assertEqual(spec["backends"], ["cpu"], rel)
+            cells.add((spec["displayMode"], spec["scaleFactor"]))
+            self.assertEqual(dict(spec, legId=base["legId"], card=base["card"], scaleFactor=base["scaleFactor"], displayMode=base["displayMode"]), base, rel)
+        self.assertEqual(cells, {("windowed", 2), ("windowed", 4), ("fullscreen", 1), ("fullscreen", 2), ("fullscreen", 4)})
+
     def test_only_an_unpaced_swap_interval_0_leg_may_declare_its_tearing_expected(self) -> None:
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
@@ -7866,6 +7939,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1's regions: present in both too, at their pinned count.
                 self.assertEqual((new_counts.pop("hfr-conform-oracles"), old_counts.pop("hfr-conform-oracles")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS, GeneratorByteIdentityAndVariantTests.HFR_CONFORM_REGIONS), name)
+                # PLAYBACK-GPU-SCOPES-NO-VETO-1 r2's regions: in the new job at their pinned count, absent from the base generator.
+                self.assertEqual((new_counts.pop("gpu-scopes-no-veto"), old_counts.pop("gpu-scopes-no-veto")),
+                                 (GeneratorByteIdentityAndVariantTests.GPU_SCOPES_NO_VETO_REGIONS, 0), name)
                 # PLAYBACK-CLIP-LENGTH-HFR-10S-1's region: in the new job only (the base predates the owner's 2026-10-15 amendment).
                 self.assertEqual((new_counts.pop("hfr-10s-floor"), old_counts.pop("hfr-10s-floor")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_10S_REGIONS, 0), name)
@@ -11518,6 +11594,31 @@ class PrepConflatedMoveEvidenceTests(unittest.TestCase):
             with self.subTest(case=name):
                 v = self.verdict(self.ON, self.log(record))
                 self.assertEqual((v["observed"], v["verdict"], v["blocks"]), (None, "NOT_HONOURED", True), v)
+
+    def test_a_marker_inside_another_records_quoted_value_never_selects_the_session_or_a_line(self) -> None:
+        # PLAYBACK-GPU-SCOPES-NO-VETO-1 r5 (adversary r4 A1 siblings DualVenueRunner.psm1:1111/1112 on #447): the body is cut at the first ` (`, but a
+        # quoted value inside ANOTHER record (an eligibility line's DLL path) holds no ` (` and spelled the marker, so Get-DvSmokeSummaryFields took the
+        # warmup session. A marker must OPEN its record (after the optional `[utc] [level] [thread] ` prefix) -- the session, the summary, conform and
+        # pacing_isolated lines, and Get-DvSmokeSessionLineRead's line all.
+        spoof = self.PREFIX + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.measured_session id=3 x\\backend.dll"'
+        real = [self.PREFIX + "playback_smoke.start session=3 worker_threads=2", self.PREFIX + "playback_smoke.summary session=3 presented_fps=10",
+                self.PREFIX + "playback_smoke.measured_session id=7", self.PREFIX + "playback_smoke.start session=7 worker_threads=8",
+                self.PREFIX + "interaction_trace event=automation.pacing_isolated settings_store=run_scoped",
+                self.PREFIX + "playback_smoke.summary session=7 presented_fps=24"]
+        later = [self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x playback_smoke.summary session=7 presented_fps=99"',
+                 self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x playback_smoke.start session=7 worker_threads=1"',
+                 self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x playback_smoke.conform session=7 conform_active=1"',
+                 self.PREFIX + 'gpu_playback_recon.eligibility r16_reason="x interaction_trace event=automation.pacing_isolated settings_store=venue"']
+        # without a marker the FIRST summary that OPENS its record is the measured one, never a DLL path's
+        no_marker = [self.PREFIX + 'gpu_playback_recon.eligibility cuda_backend_resolved="C:\\gpu playback_smoke.summary session=3 x\\backend.dll"', *real[3:]]
+        for name, lines in (("quoted marker", [spoof, *real, *later]), ("quoted summary, no marker", no_marker)):
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json("$f = Get-DvSmokeSummaryFields -LogText $env:DVE_LOG\n$s = Get-DvSmokeSessionLineRead -LogText $env:DVE_LOG -Marker 'start'\n"
+                                          "[ordered]@{ session = $f.session; fps = $f.fields['presented_fps']; conform = $f.conformLine; isolated = $f.settingsIsolated;"
+                                          " workers = $s.fields['worker_threads'] } | ConvertTo-Json -Compress",
+                                          DVE_LOG="\n".join(lines) + "\n")
+                self.assertIsNotNone(out, proc.stdout + proc.stderr)
+                self.assertEqual(out, {"session": "7", "fps": "24", "conform": None, "isolated": True, "workers": "8"})
 
     def test_record_markers_inside_a_qt_location_never_count_or_select_a_record(self) -> None:
         # r4 (r3 adversary A2 on #726): markers were matched on the RAW line, before the location suffix was stripped, so a build path holding
