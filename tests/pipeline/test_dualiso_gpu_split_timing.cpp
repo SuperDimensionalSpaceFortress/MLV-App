@@ -174,7 +174,13 @@ enum class HoldStart
     AtArrival,           // fork/master before A2: hold from the arrival count, bound holdMs / 2
     AtBlockedInTheWait   // A2: hold from the run seen blocked in the mutex wait, bound the measured hold
 };
+// The RED build of A2 (qmake "DEFINES+=DUALISO_SPLIT_TIMING_A2_RED") restores the fork/master rendezvous and
+// bound, so the deterministic timeline test below fails on it; every other build uses the A2 rendezvous.
+#if defined(DUALISO_SPLIT_TIMING_A2_RED)
+constexpr HoldStart kHoldStart = HoldStart::AtArrival;
+#else
 constexpr HoldStart kHoldStart = HoldStart::AtBlockedInTheWait;
+#endif
 
 // Both stamps below and the split use QueryPerformanceCounter (mlv_stage_timing_now, StageTiming.h), so the
 // slack covers only the double rounding of the ms conversions, not a second clock.
