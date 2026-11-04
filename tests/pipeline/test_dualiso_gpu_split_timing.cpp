@@ -245,19 +245,30 @@ typedef LONG(WINAPI * NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
 // True when thread `tid` of this process is blocked in a user-mode wait right now. The only wait the queued run
 // can enter after its arrival count is the backend mutex's (mlv_stage_timing_now never blocks), so after the
 // arrival this is "the run is in pthread_mutex_lock, its wait timer already started".
-bool threadBlockedInAUserWait(DWORD tid, ULONG * waitReasonOut)
+// noexcept, and the snapshot buffer is sized by a first call made before the parent takes the mutex (adversary A2
+// r1 pass 2 A2): an allocation failure is "not seen blocked", never a throw past the held mutex and the thread.
+bool threadBlockedInAUserWait(DWORD tid, ULONG * waitReasonOut) noexcept
 {
 #if defined(_WIN64)
     static const NtQuerySystemInformationFn query = reinterpret_cast<NtQuerySystemInformationFn>(
         reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
     if (!query) return false;
-    static std::vector<unsigned char> buffer(size_t(4) << 20);
+    static std::vector<unsigned char> buffer;
     ULONG needed = 0;
-    LONG status = query(5 /* SystemProcessInformation */, buffer.data(), ULONG(buffer.size()), &needed);
-    while (status == LONG(0xC0000004) /* STATUS_INFO_LENGTH_MISMATCH */)
+    LONG status = LONG(0xC0000004);
+    try
     {
-        buffer.resize(size_t(needed) + (size_t(1) << 20));
-        status = query(5, buffer.data(), ULONG(buffer.size()), &needed);
+        if (buffer.empty()) buffer.resize(size_t(4) << 20);
+        status = query(5 /* SystemProcessInformation */, buffer.data(), ULONG(buffer.size()), &needed);
+        while (status == LONG(0xC0000004) /* STATUS_INFO_LENGTH_MISMATCH */)
+        {
+            buffer.resize(size_t(needed) + (size_t(1) << 20));
+            status = query(5, buffer.data(), ULONG(buffer.size()), &needed);
+        }
+    }
+    catch (...)
+    {
+        return false;
     }
     if (status != 0) return false;
     const DWORD pid = GetCurrentProcessId();
@@ -314,6 +325,8 @@ QueuedRun runQueuedOnTheBackendMutex(uint64_t frameId, int holdMs, bool suppress
     QueuedRun out;
     std::atomic<bool> done{false};
     std::atomic<DWORD> runTid{0};
+    if (kHoldStart == HoldStart::AtBlockedInTheWait)
+        (void)threadBlockedInAUserWait(GetCurrentThreadId(), NULL); // sizes the snapshot buffer before the hold
     const long arrivalsBefore = llrpGpuReconBackendLockArrivalsForTesting();
     llrpHoldGpuReconBackendMutexForTesting(1);
     std::thread queued([&]() {
@@ -365,6 +378,21 @@ bool heldIntervalsFitTheCall(const QueuedRun & q)
            && q.split.mutex_wait_ms + afterAcquire <= q.callWallMs + kQpcSlackMs;
 }
 
+// The A2 rendezvous needs one attempt. fork/master's three attempts are kept only for the AtArrival fallback
+// (adversary A2 r1 pass 2 A1), where a deschedule between the arrival and the timer can fail one attempt.
+QueuedRun runQueuedUntilBoundMet(uint64_t firstFrameId, int holdMs, bool suppressWhileQueued)
+{
+    const int attempts = kHoldStart == HoldStart::AtArrival ? 3 : 1;
+    QueuedRun q;
+    for (int attempt = 0; attempt < attempts; ++attempt)
+    {
+        q = runQueuedOnTheBackendMutex(firstFrameId + uint64_t(attempt), holdMs, suppressWhileQueued);
+        if (queuedWaitBoundMet(kHoldStart, q.split.mutex_wait_ms, q.measuredHoldMs, holdMs) && heldIntervalsFitTheCall(q))
+            break;
+    }
+    return q;
+}
+
 } // namespace
 
 // Adversary r1 A2, deterministic: the schedule the adversary named (holdMs 60; the run descheduled for 70 ms
@@ -399,7 +427,7 @@ TEST(DualIsoGpuSplitTiming, AWaitOnTheBackendMutexIsReportedAsMutexWait)
     FakeBackendScope scope;
     const int holdMs = 60;
     // One attempt: the bound is the hold measured after the run was seen in the wait, sound under any schedule.
-    const QueuedRun q = runQueuedOnTheBackendMutex(10, holdMs, false);
+    const QueuedRun q = runQueuedUntilBoundMet(10, holdMs, false);
     ASSERT_TRUE(q.arrived);
     if (!q.seenBlocked) fprintf(stderr, "    run never seen in a user wait (last KWAIT_REASON %lu)\n", q.lastWaitReason);
     ASSERT_TRUE(q.seenBlocked || kHoldStart == HoldStart::AtArrival);
@@ -422,7 +450,7 @@ TEST(DualIsoGpuSplitTiming, ARunRefusedUnderTheLockStillReportsItsWait)
 {
     FakeBackendScope scope;
     const int holdMs = 60;
-    const QueuedRun q = runQueuedOnTheBackendMutex(20, holdMs, true);
+    const QueuedRun q = runQueuedUntilBoundMet(20, holdMs, true);
     ASSERT_TRUE(q.arrived);
     if (!q.seenBlocked) fprintf(stderr, "    run never seen in a user wait (last KWAIT_REASON %lu)\n", q.lastWaitReason);
     ASSERT_TRUE(q.seenBlocked || kHoldStart == HoldStart::AtArrival);
