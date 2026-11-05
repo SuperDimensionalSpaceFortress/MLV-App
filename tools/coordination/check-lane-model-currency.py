@@ -51,8 +51,12 @@ T and Z, no comma, no padding; LIVE_START_RE), and timeoutSec must be a JSON int
 most 15 significant digits (exact_timeout: json.load rounds a longer token before the script could see it, so the
 digits are counted on the token itself; padding zeros do not count). Anything else is not a candidate and stays
 unproven, as before this PR; no exotic spelling is read, so none can be mis-read. The arithmetic on an accepted
-receipt stays exact. A startedUtc whose UTC offset carries seconds ('+01:00:00.0000001') cannot be placed to the
-microsecond, so it is not even readable: counted in `unreadableReceipts` like any malformed timestamp (pass 6, A2).
+receipt stays exact. ONE OFFSET ALLOWLIST (r4, pass 8 A1): every site that reads a startedUtc goes through
+split_designator, and a stamp must end in 'Z' or '+-HH:MM' (DESIGNATOR_RE). Any other ending ('+01', '+0100',
+'+01:00:00', '+01:00.0000001', a lower-case 'z', no designator at all) cannot be placed to the microsecond, so the
+receipt is not even readable: counted in `unreadableReceipts` like any malformed timestamp, and left out of the
+verdict, not read as a failure or a success. That is the same treatment the hub ruled for an offset with seconds
+(pass 6, A2); it can make a hand-written receipt that the base read disappear, and never makes a real one do so.
 Measured on the real writer: every receipt under fleet-runs that has a startedUtc matches. That
 is an AGE WINDOW derived
 from the receipt's own start time and timeout, not a process probe: this script reads receipts only, it
@@ -119,10 +123,10 @@ MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a rea
 # DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
 # digits only and matched against the raw, unstripped string with fullmatch, so a trailing newline or space is out.
 LIVE_START_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
-# A UTC offset that carries seconds, extended ('+01:00:00.5') or compact ('-010000.5'): not placeable to the microsecond.
-OFFSET_WITH_SECONDS_RE = re.compile(r"[+-][0-9]{2}:?[0-9]{2}:?[0-9]{2}(?:\.[0-9]+)?$")
-# Any trailing UTC designator or offset, with or without minutes or seconds; removed before the seconds fraction is read.
-OFFSET_TAIL_RE = re.compile(r"(?:[Zz]|[+-][0-9]{2}(?::?[0-9]{2}(?::?[0-9]{2}(?:\.[0-9]+)?)?)?)$")
+# THE ONE OFFSET ALLOWLIST (r4, adversary pass 8 A1): a stamp ends in 'Z' or '+-HH:MM' and in nothing else. Every site
+# that reads a startedUtc goes through split_designator, so no site can read an offset one way and another site another
+# way. A stamp that ends otherwise (naive, 'z', '+01', '+0100', '+01:00:00', '+01:00.5', ...) is unreadable.
+DESIGNATOR_RE = re.compile(r"(?:Z|[+-][0-9]{2}:[0-9]{2})$")
 SECONDS_FRACTION_RE = re.compile(r"\.[0-9]{6}([0-9]+)$")
 MAX_TIMEOUT_SIGNIFICANT_DIGITS = 15  # a decimal this short survives the trip through a binary float unchanged
 MAX_TIMEOUT_EXPONENT = 30            # |decimal exponent of the leading digit|; keeps Fraction() cheap on a hostile token
@@ -159,32 +163,40 @@ def normalize_fraction(text):
     return re.sub(r"(?<=[0-9]),(?=[0-9])", ".", text)
 
 
-def sub_microsecond_digits(text):
-    """The digits of the SECONDS fraction past the sixth, trailing zeros removed ('' when there are none).
-
-    Read from the END of the string after the UTC designator or offset is removed, so it holds for every date and
-    time spelling fromisoformat accepts (extended, basic, week date, any separator) and a fraction inside an offset
-    can never be mistaken for a fraction of a second (adversary passes 6 and 7: '...+01:00:00.0000001' and
-    '20261012T195900.0000009Z' each put the wrong digits, or none, into the sort key)."""
+def split_designator(text):
+    """(body, designator) for a stamp that ends in 'Z' or '+-HH:MM' (surrounding whitespace trimmed, a comma fraction
+    normalized to a dot); None for every other ending. The single reader of the offset for parse_utc and
+    sub_microsecond_digits (adversary passes 6, 7 and 8 each found a spelling the previous pattern read as something
+    it was not: '+01:00:00.0000001', '+0100', '+01:00.0000001')."""
     if not isinstance(text, str):
+        return None
+    cleaned = normalize_fraction(text.strip())
+    match = DESIGNATOR_RE.search(cleaned)
+    if match is None:
+        return None
+    return cleaned[:match.start()], match.group(0)
+
+
+def sub_microsecond_digits(text):
+    """The digits of the SECONDS fraction past the sixth, trailing zeros removed ('' when there are none, and for a
+    stamp outside the designator allowlist, which parse_utc cannot read either).
+
+    Read from the END of the body once the designator is split off, so it holds for every date and time spelling
+    fromisoformat accepts (extended, basic, week date, any separator) and a fraction inside an offset can never be
+    mistaken for a fraction of a second (adversary passes 6 and 7)."""
+    split = split_designator(text)
+    if split is None:
         return ""
-    body = OFFSET_TAIL_RE.sub("", normalize_fraction(text.strip()), count=1)
-    match = SECONDS_FRACTION_RE.search(body)
+    match = SECONDS_FRACTION_RE.search(split[0])
     return match.group(1).rstrip("0") if match else ""
 
 
 def parse_utc(text):
-    if not isinstance(text, str):
+    split = split_designator(text)
+    if split is None:
         return None
-    cleaned = normalize_fraction(text.strip())
-    # An offset with seconds ('+01:00:00', '-00:00:00.0000001') cannot be ordered exactly: fromisoformat keeps at most
-    # microseconds of it and the rest is lost. No lane writer emits one, so the receipt is unreadable, like any
-    # other timestamp this script cannot place exactly (adversary pass 6, A2).
-    if OFFSET_WITH_SECONDS_RE.search(cleaned):
-        return None
-    if cleaned.endswith(("Z", "z")):
-        cleaned = cleaned[:-1] + "+00:00"
-    cleaned = re.sub(r"(\.[0-9]{6})[0-9]+", r"\1", cleaned)
+    body, designator = split
+    cleaned = re.sub(r"(\.[0-9]{6})[0-9]+$", r"\1", body) + ("+00:00" if designator == "Z" else designator)
     try:
         moment = datetime.datetime.fromisoformat(cleaned)
     except ValueError:

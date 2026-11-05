@@ -1,5 +1,6 @@
 import datetime
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -828,15 +829,15 @@ class LiveShapeTests(CurrencyFixture):
 
     def test_r3p6_a2_offsets_with_seconds_do_not_parse_and_plain_offsets_still_do(self):
         for text in ("2026-10-12T20:59:00+01:00:00.0000001", "2026-10-12T20:59:00+01:00:00",
-                     "2026-10-12T19:59:00-00:00:00.5", "2026-10-12T19:59:00,5-05:00:00"):
+                     "2026-10-12T19:59:00-00:00:00.5", "2026-10-12T19:59:00,5-05:00:00",
+                     "2026-10-12T19:59:00.5"):      # r4: no designator at all is unreadable too (was readable as UTC)
             with self.subTest(text):
                 self.assertIsNone(check.parse_utc(text))
         minute_ago = NOW - datetime.timedelta(seconds=60)
         for text, expected in (("2026-10-12T19:59:00Z", minute_ago),
                                ("2026-10-12T20:59:00+01:00", minute_ago),
                                ("2026-10-12T14:59:00-05:00", minute_ago),
-                               ("2026-10-12T19:59:00.1234567+00:00", minute_ago + datetime.timedelta(microseconds=123456)),
-                               ("2026-10-12T19:59:00.5", minute_ago + datetime.timedelta(microseconds=500000))):
+                               ("2026-10-12T19:59:00.1234567+00:00", minute_ago + datetime.timedelta(microseconds=123456))):
             with self.subTest(text):
                 self.assertEqual(check.parse_utc(text), expected)
 
@@ -846,7 +847,8 @@ class LiveShapeTests(CurrencyFixture):
                                ("2026-10-12T19:59:00.123456+01:00", ""),
                                ("2026-10-12T20:59:00+01:00:00.0000001", ""),     # an offset fraction is not seconds
                                ("2026-10-12T19:59:00-00:00:00.0000001", ""),
-                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", "9"), (None, ""), (12, "")):
+                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", ""),   # r4: unreadable, not a '9'
+                               (None, ""), (12, "")):
             with self.subTest(text=text):
                 self.assertEqual(check.sub_microsecond_digits(text), expected)
 
@@ -858,8 +860,8 @@ class LiveShapeTests(CurrencyFixture):
         for label, failed in (("basic", "20261012T195900.0000009Z"),
                               ("week date", "2026-W42-1T19:59:00.0000009Z"),
                               ("newline separator", "2026-10-12\n19:59:00.0000009Z"),
-                              ("basic with compact offset", "20261012T205900.0000009+0100"),
-                              ("hour-only offset", "2026-10-12T20:59:00.0000009+01"),
+                              # r4: 'basic with compact offset' (+0100) and 'hour-only offset' (+01) moved out of this
+                              # list: they are no longer designators, so they are unreadable (see the r4 tests)
                               ("extended, the control", "2026-10-12T19:59:00.0000009Z")):
             for order in (("a-fin", "b-fail"), ("a-fail", "b-fin")):
                 with self.subTest(label=label, order=order):
@@ -896,13 +898,67 @@ class LiveShapeTests(CurrencyFixture):
 
     def test_r3p7_the_sub_microsecond_digits_are_the_seconds_fraction_in_every_spelling(self):
         for text, expected in (("20261012T195900.0000009Z", "9"), ("2026-W42-1T19:59:00.0000009Z", "9"),
-                               ("2026-10-12\n19:59:00.0000009Z", "9"), ("20261012T195900.1234567-0500", "7"),
-                               ("2026-10-12T19:59:00.1234567-05", "7"), ("2026-10-12T19:59:00.1234567-05:30", "7"),
-                               ("  2026-10-12T19:59:00,1234567Z\n", "7"), ("2026-10-12T19:59:00.1234567", "7"),
-                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", "9"),
+                               ("2026-10-12\n19:59:00.0000009Z", "9"), ("20261012T195900.1234567-05:00", "7"),
+                               ("2026-10-12T19:59:00.1234567-05:30", "7"),
+                               ("  2026-10-12T19:59:00,1234567Z\n", "7"),
+                               # r4: outside the designator allowlist, so unreadable and no digits at all
+                               ("20261012T195900.1234567-0500", ""), ("2026-10-12T19:59:00.1234567-05", ""),
+                               ("2026-10-12T19:59:00.1234567", ""),
+                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", ""),
                                ("2026-10-12T19:59:00+01:00", ""), ("2026-10-12T19:59:00Z", ""), ("2026-10-12", "")):
             with self.subTest(text=text):
                 self.assertEqual(check.sub_microsecond_digits(text), expected)
+
+    # --- adversary pass 8 (sol, head 38502f66): A1, an introduced major in the pass-7 fold -------------------------
+    def test_r4_a1_the_adversary_input_a_fractional_minutes_offset_is_unreadable(self):
+        # Exact input of pass 8 A1 (now=2026-10-12T20:00:00Z, main(['--runs-dir', R, '--json'])). The failed run sorted
+        # 'newer' only because offset digit 1 was read as the seconds digit. Python 3.14 rejects the stamp by itself
+        # and masks the defect; run this file under 3.13 to see it fail on 38502f66.
+        specs = {"complete": dict(state="complete", startedUtc="2026-10-12T19:59:00.0000005Z",
+                                  resolvedModel="gpt-6.1-sol", effort="high"),
+                 "failed": dict(state="failed", startedUtc="2026-10-12T20:59:00.0000009+01:00.0000001",
+                                resolvedModel=None, effort="high"),
+                 "running": dict(state="running", startedUtc="2026-10-12T19:59:30Z", timeoutSec=3600)}
+        for name, fields in specs.items():
+            run = self.runs / name
+            run.mkdir()
+            (run / "sol-001.receipt.json").write_text(json.dumps(dict(lane="sol", **fields)), encoding="utf-8")
+        real_evaluate = check.evaluate
+        out = io.StringIO()
+        with mock.patch.object(check, "evaluate", lambda *a, **k: real_evaluate(*a, now=NOW, **k)), \
+                mock.patch("sys.stdout", out):
+            code = check.main(["--runs-dir", str(self.runs), "--json"])
+        result = json.loads(out.getvalue())
+        # the failed stamp cannot be placed, so it is unreadable (counted) and the lane is judged on the complete
+        # run with the running one in flight
+        self.assertEqual(result["unreadableReceipts"], 1)
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(result["lanes"]["sol"]["judgedOn"]["startedUtc"], "2026-10-12T19:59:00+00:00")
+        self.assertEqual(code, 0)
+        self.assertIsNone(check.parse_utc("2026-10-12T20:59:00.0000009+01:00.0000001"))
+        self.assertEqual(check.sub_microsecond_digits("2026-10-12T20:59:00.0000009+01:00.0000001"), "")
+
+    def test_r4_a1_only_z_and_hh_mm_are_designators_everywhere_a_stamp_is_read(self):
+        # ONE allowlist (DESIGNATOR_RE): 'Z' or '+-HH:MM' ends the stamp, anything else is unreadable, at every site
+        # that reads one: parse_utc and the sub-microsecond digits (so the sort key). Each spelling below was readable
+        # before r4 (the pass 3..7 tests pinned some of them).
+        base = "2026-10-12T19:59:00.1234569"
+        for tail in ("+01", "+0100", "-0500", "z", "", "+01:00.5", "+01:00.0000001", "+01:00:00", "-010000",
+                     "+01:0", "+1:00", "+01:000", "ZZ", "+01:00Z", "UTC", "+01:00:", "Z\x00"):
+            with self.subTest(tail=tail):
+                self.assertIsNone(check.parse_utc(base + tail))
+                self.assertEqual(check.sub_microsecond_digits(base + tail), "")
+        for tail in ("Z", "+00:00", "+01:00", "-05:30", "+23:59"):
+            with self.subTest(tail=tail):
+                self.assertIsNotNone(check.parse_utc(base + tail))
+                self.assertEqual(check.sub_microsecond_digits(base + tail), "9")
+        # surrounding whitespace was always trimmed before reading; that is unchanged
+        self.assertIsNotNone(check.parse_utc("  " + base + "Z\n"))
+
+    def test_r4_the_two_offset_denylists_are_gone(self):
+        self.assertFalse(hasattr(check, "OFFSET_WITH_SECONDS_RE"))
+        self.assertFalse(hasattr(check, "OFFSET_TAIL_RE"))
+        self.assertTrue(hasattr(check, "DESIGNATOR_RE"))
 
     def test_r3_a5_the_docstring_says_past_the_skew_bound(self):
         doc = check.__doc__
