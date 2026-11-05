@@ -22,6 +22,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
+#include "VisualCaptureSourceDifference.h"
 #include "ClipOpenAbortPolicy.h"
 #include "debug/StageTiming.h"
 extern "C" {
@@ -1666,6 +1667,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include <windows.h>
 #endif
 #include "OutputDirIdentity.h"
+#include "VisualCaptureSourceGuard.h"
 
 static uint8_t scanZebrasRgb8(const uint8_t *rgbData, int width, int height);
 static uint8_t applyZebrasToImage( QImage *image, bool enableZebras );
@@ -4112,6 +4114,28 @@ bool MainWindow::waitForRenderThreadIdleBeforeCoreMutation( const char *reason )
     return prepMutationAllowed;
 }
 
+// PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 (fable r7 key A1): called right after a newly opened clip becomes m_pMlvObject and before
+// anything can decode a frame of it (setMlvProcessing, the first render and every cache fill come later). The --visual-capture-dir
+// SourceWriteGuard is held only while the clip's files still match this stamp, so a byte written after a frame was decoded into a
+// cache, but before the guard, leaves every capture without a source id instead of an id read from bytes the picture never had.
+void MainWindow::recordClipOpenSourceStamp()
+{
+    m_clipOpenSourceGuard.reset();
+    m_clipOpenSourceStamp = m_pMlvObject
+        ? visual_capture_source_difference::SourceWriteGuard::openStamp( m_pMlvObject->file, m_pMlvObject->filenum )
+        : QByteArray();
+    m_clipOpenSourceStampGeneration = static_cast<quint64>( m_clipLifecycleBarrier.generation() );
+    m_clipOpenSourceStampObject = static_cast<const void *>( m_pMlvObject );
+    // r8 pass 1 A1: a visual-capture run holds the clip's files from here (no writer can open them) until the clip is freed
+    // r10 (adversary r9 pass 3 A1): only where the guard excludes writers (Windows); elsewhere no open guard, so no source id
+    if( visual_capture_source_difference::SourceWriteGuard::excludesExistingWriters()
+        && m_holdClipSourceFromOpen && m_pMlvObject && !m_clipOpenSourceStamp.isEmpty() )
+    {
+        m_clipOpenSourceGuard = std::make_shared<visual_capture_source_difference::SourceWriteGuard>(
+            m_pMlvObject->file, m_pMlvObject->filenum, m_clipOpenSourceStamp );
+    }
+}
+
 // r2 (CoS B1): returns whether the prep drain inside allows a borrow-freeing mutation.
 // The mlv object itself is always freed (no prep task borrows it), so delete-clip,
 // rename-clip and the smoke close, which only load an empty object next, proceed. The
@@ -4142,6 +4166,7 @@ bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
             .arg( reasonText )
             .arg( static_cast<qulonglong>( generation ) ),
         true );
+    m_clipOpenSourceGuard.reset();   // r8 pass 1 A1: the clip's files are released with the clip
     freeMlvObject( m_pMlvObject );
     return prepMutationAllowed;
 }
@@ -9079,6 +9104,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     QTextStream out(stdout);
     QTextStream err(stderr);
     m_lookAssistAutoWarmupDeferralCount = 0;
+    // PLAYBACK-SOURCE-FRAME-IDENTITY-1 r8 pass 1 A1: a visual-capture run holds every clip it opens from the open (see recordClipOpenSourceStamp)
+    m_holdClipSourceFromOpen = !options.visualCaptureDir.isEmpty();
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2: Loop is forced OFF at every automation entry, before anything else.
     forceLoopOffForAutomation( "gui-smoke-entry" );
     isolateAutomationPacing( "gui-smoke-entry" );
@@ -10602,8 +10629,30 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             bool playActive = false;
             bool settled = false;
             double captureMs = 0.0;
+            visual_capture_source_difference::ClipToken clip;   // r7 (adversary r6 pass 3 A2): the clip open when it was taken
         };
         QVector<VisualGrab> visualGrabs;
+        // r7 (adversary r6 pass 3 A2): every processEvents below can handle a QFileOpenEvent that replaces the open clip. The clip this
+        // capture run belongs to is named HERE, before any event is pumped; per-clip data (source ids, the paused settle) is attached only
+        // while that clip is still the open one, else it is left out (fail closed), never taken from the newly opened clip.
+        const visual_capture_source_difference::ClipToken visualCaptureClip =
+            visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
+        // r7 (adversary r7 pass 1 A1): the clip's BYTES are held too, from here until the source hashing ends: no writer may
+        // open its files meanwhile, and a file replaced, resized or written since leaves every capture without a source id.
+        // r8 (fable r7 key A1): "since" is since the clip was OPENED, not since this guard: the measured Play already decoded
+        // frames the caches serve with no file read, so the guard must match the stamp taken at the open (before any decode);
+        // a stamp of another clip, or none, is never matched.
+        visual_capture_source_difference::ClipToken visualOpenStampClip;
+        visualOpenStampClip.generation = m_clipOpenSourceStampGeneration;
+        visualOpenStampClip.object = m_clipOpenSourceStampObject;
+        const visual_capture_source_difference::SourceWriteGuard visualSourceGuard(
+            m_pMlvObject ? m_pMlvObject->file : nullptr, m_pMlvObject ? m_pMlvObject->filenum : 0,
+            visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip ) ? m_clipOpenSourceStamp : QByteArray() );
+        // r8 pass 1 A1: and the clip must have been HELD since its open (a forged last-write time cannot fake that): the open guard
+        // of this same clip, still held and unchanged, else no source id
+        const std::shared_ptr<visual_capture_source_difference::SourceWriteGuard> visualOpenGuard =
+            visual_capture_source_difference::sameClip( visualOpenStampClip, visualCaptureClip )
+                ? m_clipOpenSourceGuard : std::shared_ptr<visual_capture_source_difference::SourceWriteGuard>();
         QWidget *visualGlContainer = findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
         const bool visualUseGlContainer =
             GpuDisplayWindow::isActive() && visualGlContainer && visualGlContainer->isVisible();
@@ -10638,6 +10687,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
             grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
             grab.playActive = ui->actionPlay->isChecked();
+            grab.clip = visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
             QElapsedTimer captureClock;
             captureClock.start();
             grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
@@ -10702,7 +10752,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         // (3) the SAME timeline position through the paused full-quality path.
         int visualSettledFrame = visualStopFrame;
+        // r7 (A2 sweep): the stop frame is a position in the capture's clip; it is never sought in a clip opened since.
         const bool visualSettled = visualStopFrame >= 0
+            && visual_capture_source_difference::sameClip( visualGrabs.last().clip, visualCaptureClip )
+            && visual_capture_source_difference::sameClip(
+                   visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject ), visualCaptureClip )
             && seekAndSettleLoadedClip( visualStopFrame, "gui-smoke-visual-capture-paused", &visualSettledFrame, 20000 );
         for( int i = 0; i < 10; ++i )
         {
@@ -10722,8 +10776,48 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             visualError = QStringLiteral( "visual capture directory could not be created" );
         }
         const QDir visualDir( options.visualCaptureDir );
+        // PLAYBACK-SOURCE-FRAME-IDENTITY-1: each play frame's SOURCE identity (the bytes the decoder
+        // reads for its display_frame), read here because Play has stopped, once per distinct frame.
+        // The verdict across them is visual.json's source_difference (VisualCaptureSourceDifference.h).
+        // Both play kinds carry a source_id: the forced "play" captures and the unforced "play_unbound"
+        // ones (the runner judges the frozen check on the unforced ones whenever they exist).
+        // r7 (adversary r6 pass 3 A2): bound to the clip each capture was taken from (visualCaptureClip): a capture from another clip, or
+        // any capture once the open clip has changed, gets no source_id, so a FileOpen during the waits above never lends B's ids to A.
+        QVector<visual_capture_source_difference::CaptureClip> visualCaptureClips;
         for( const VisualGrab &grab : visualGrabs )
         {
+            if( !visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ) continue;
+            visual_capture_source_difference::CaptureClip capture;
+            capture.kind = grab.kind;
+            capture.displayFrame = grab.displayFrame;
+            capture.clip = grab.clip;
+            visualCaptureClips.append( capture );
+        }
+        const visual_capture_source_difference::BoundSourceIds visualSourceIds = visual_capture_source_difference::bindSourceIds(
+            visualCaptureClips, visualCaptureClip, m_clipLifecycleBarrier, m_pMlvObject,
+            // r10 (adversary r9 pass 3 A1): a build whose guard excludes no writer binds no source id (every frame unknown)
+            [&]( bool *unchanged ) { *unchanged = visual_capture_source_difference::SourceWriteGuard::excludesExistingWriters()
+                && visualSourceGuard.unchanged() && visualOpenGuard && visualOpenGuard->unchanged(); },
+            [&]( int displayFrame, quint64 *hash, bool *ok )
+            {
+                uint64_t sourceHash = 0;
+                *ok = m_pMlvObject
+                    && getMlvFrameSourceHash64( m_pMlvObject, static_cast<uint64_t>( displayFrame ), &sourceHash ) == 0;
+                *hash = static_cast<quint64>( sourceHash );
+            } );
+        if( visualSourceIds.clipChangedCaptures > 0 )
+        {
+            logInteractionEvent(
+                QStringLiteral("gui_smoke.visual_capture.clip_changed"),
+                QStringLiteral("refused_play_captures=%1 capture_generation=%2")
+                    .arg( visualSourceIds.clipChangedCaptures ).arg( visualCaptureClip.generation ) );
+        }
+        const visual_capture_source_difference::Verdict visualSourceVerdict =
+            visual_capture_source_difference::decide( visualSourceIds.playIdentities );
+        int visualPlayAt = 0;   // the play capture's position in visualCaptureClips / visualSourceIds
+        for( const VisualGrab &grab : visualGrabs )
+        {
+            const int playAt = visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ? visualPlayAt++ : -1;
             const QString fileStem = QString( grab.kind ).replace( QLatin1Char('_'), QLatin1Char('-') );
             const QString fileName = grab.kind.startsWith( QStringLiteral("play") )
                 ? QStringLiteral("%1-%2.png").arg( fileStem ).arg( grab.index )
@@ -10743,9 +10837,17 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
+            if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )
+            {
+                if( playAt >= 0 && playAt < visualSourceIds.valid.size() && visualSourceIds.valid.at( playAt ) )
+                    frameJson.insert( QStringLiteral("source_id"),
+                                      visual_capture_source_difference::sourceIdHex( visualSourceIds.hash.at( playAt ) ) );
+            }
             if( grab.kind == QStringLiteral("paused") )
             {
-                frameJson.insert( QStringLiteral("settled"), grab.settled );
+                // r7 (A2 sweep): a re-render taken from another clip than the capture's is not this run's settled frame
+                frameJson.insert( QStringLiteral("settled"),
+                                  grab.settled && visual_capture_source_difference::sameClip( grab.clip, visualCaptureClip ) );
                 frameJson.insert( QStringLiteral("settled_frame"), visualSettledFrame );
             }
             bool saved = false;
@@ -10795,6 +10897,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         visualJson.insert( QStringLiteral("frames"), visualFramesJson );
         visualJson.insert( QStringLiteral("frames_written"), visualFramesWritten );
         visualJson.insert( QStringLiteral("error"), visualError );
+        visual_capture_source_difference::apply( visualJson, visualSourceVerdict );
         if( QDir( options.visualCaptureDir ).exists() )
         {
             QFile visualJsonFile( visualDir.absoluteFilePath( QStringLiteral("visual.json") ) );
@@ -10806,7 +10909,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         logInteractionEvent(
             QStringLiteral("gui_smoke.visual_capture"),
-            QStringLiteral("measured_session=%1 requested=%2 written=%3 stop_frame=%4 paused_settled=%5 tail_begin_utc=%6 tail_end_utc=%7 error=\"%8\"")
+            QStringLiteral("measured_session=%1 requested=%2 written=%3 stop_frame=%4 paused_settled=%5 tail_begin_utc=%6 tail_end_utc=%7 error=\"%8\" source_difference=%9")
                 .arg( visualMeasuredSession )
                 .arg( visualGrabs.size() )
                 .arg( visualFramesWritten )
@@ -10814,7 +10917,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( bool01( visualSettled ) )
                 .arg( visualTailBeginUtc )
                 .arg( visualTailEndUtc )
-                .arg( visualError ) );
+                .arg( visualError )
+                .arg( visualSourceVerdict == visual_capture_source_difference::Verdict::Differ
+                          ? QStringLiteral("differ")
+                          : visualSourceVerdict == visual_capture_source_difference::Verdict::Identical
+                              ? QStringLiteral("identical") : QStringLiteral("omitted") ) );
     }
 
     if( ui->actionPlay->isChecked() )
@@ -11411,6 +11518,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     /* Set to NEW object with a NEW MLV clip! */
     m_pMlvObject = new_MlvObject;
     m_clipLifecycleBarrier.reopen();
+    recordClipOpenSourceStamp();
 
     if( isMcraw )
     {
@@ -11660,6 +11768,7 @@ int MainWindow::openMlv( QString fileName )
     /* Set to NEW object with a NEW MLV clip! */
     m_pMlvObject = new_MlvObject;
     m_clipLifecycleBarrier.reopen();
+    recordClipOpenSourceStamp();
 
     /* If use has terminal this is useful */
 #ifndef STDOUT_SILENT
