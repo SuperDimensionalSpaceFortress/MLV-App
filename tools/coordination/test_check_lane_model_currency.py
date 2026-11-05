@@ -330,6 +330,71 @@ class InFlightTests(CurrencyFixture):
         self.assertIn("IN-FLIGHT", line)
         self.assertIn("judged-on=claude-opus-5-5", line)
 
+    # --- adversary pass 1 (sol, head 70403d1c): A1-A4 -------------------------------------------------
+    def _write_raw(self, name, **fields):
+        run = self.runs / name
+        run.mkdir()
+        (run / ("%s-001.receipt.json" % fields["lane"])).write_text(json.dumps(fields), encoding="utf-8")
+
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, str(SCRIPT), "--runs-dir", str(self.runs), *args],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_a1_an_absurd_timeout_cannot_crash_the_check_it_is_simply_not_provably_live(self):
+        for index, bad in enumerate((1e20, float("inf"), float("nan"), 2147483647, -5, True)):
+            self._write_raw("bad-%d" % index, lane="opus", state="running",
+                            startedUtc="2026-11-04T11:00:00Z", timeoutSec=bad)
+        result = self._cli("--json", "--since-hours", "0")
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["lanes"]["opus"]["verdict"], "NO-DATA")
+        self.assertEqual(payload["lanes"]["opus"]["inFlightRuns"], 0)
+
+    def test_a1_the_liveness_bound_is_capped_so_a_huge_but_finite_timeout_is_dead(self):
+        self.receipt("opus", "claude-opus-5-5", 100)
+        self.running("opus", 90, timeout=check.MAX_LIVE_TIMEOUT_SEC + 1)
+        self.assertEqual(self.evaluate(since_hours=0)["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a2_a_live_running_receipt_does_not_raise_the_family_newest_either(self):
+        self.receipt("sol", "gpt-6-sol", 30)
+        self.receipt("sol", "gpt-6-sol", 20)
+        # a running receipt that already carries a newer id: not evidence, so it cannot make the two
+        # finished runs STALE
+        self.receipt("sol", "gpt-6.1-sol", 1, effort="high", state="running", timeout=7200)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(result["familyNewest"]["sol"], "gpt-6-sol")
+        self.assertEqual(result["verdict"], "CURRENT")
+
+    def test_a2_the_adversary_input_exits_zero_through_the_cli(self):
+        self._write_raw("a", lane="sol", state="complete", startedUtc="2026-11-03T06:00:00Z",
+                        resolvedModel="gpt-6-sol", effort="high")
+        self._write_raw("b", lane="sol", state="complete", startedUtc="2026-11-03T16:00:00Z",
+                        resolvedModel="gpt-6-sol", effort="high")
+        self._write_raw("c", lane="sol", state="running", startedUtc="2026-11-04T11:00:00Z",
+                        timeoutSec=2147483647, resolvedModel="gpt-6.1-sol", effort="high")
+        result = self._cli("--json", "--since-hours", "0")
+        self.assertNotEqual(result.returncode, 1, result.stdout)     # never STALE on the strength of a running receipt
+        self.assertNotEqual(json.loads(result.stdout)["lanes"]["sol"]["verdict"], "STALE")
+
+    def test_a3_equal_started_timestamps_after_microsecond_truncation_still_read_in_flight(self):
+        for name, state, extra in (("fin", "complete", {"resolvedModel": "claude-opus-5-5", "effort": "high"}),
+                                   ("run", "running", {"timeoutSec": 7200})):
+            self._write_raw(name, lane="opus", state=state,
+                            startedUtc=("2026-10-12T19:00:00.1234561Z" if name == "fin" else "2026-10-12T19:00:00.1234569Z"),
+                            **extra)
+        entry = self.evaluate()["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "IN-FLIGHT")
+
+    def test_a4_a_huge_or_infinite_window_means_every_receipt_not_a_crash(self):
+        self.receipt("fable", "claude-fable-5-1", 5)
+        for value in ("1e20", "inf", "nan"):
+            result = self._cli("--json", "--since-hours", value)
+            self.assertNotIn("Traceback", result.stderr, value)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"], value)
+            self.assertEqual(payload["receiptsInWindow"], 1, value)
+
     def test_cli_exit_zero_when_the_only_non_current_lane_is_in_flight(self):
         # The CLI judges against the real clock, so these receipts are stamped relative to it.
         real_now = datetime.datetime.now(datetime.timezone.utc)

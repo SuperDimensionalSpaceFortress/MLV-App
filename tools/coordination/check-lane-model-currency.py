@@ -36,9 +36,10 @@ Missing evidence is never CURRENT (r3 blocker B1). A lane's verdict is, in order
 IN-FLIGHT (CURRENCY-CHECK-WIRED-INTO-HUB-TICK-1). A running receipt records no resolvedModel and no
 effort yet (Invoke-Lane.ps1 writes both at the end), so before this verdict a lane that was merely busy
 read NO-DATA and pulled the overall verdict to INCOMPLETE. A receipt counts as LIVE when it says
-state=running, has no endedUtc, has a positive timeoutSec, and now is no later than
-startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the wrapper's post-run cleanup and the hub clock's
-measured skew of up to ~20 s). That is an AGE BOUND derived from the receipt's own timeout, not a process
+state=running, has no endedUtc, has a finite timeoutSec between 0 (exclusive) and
+MAX_LIVE_TIMEOUT_SEC (48 h; nan, inf, a non-positive or an absurd value is no bound, never a crash), and
+now is no later than startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the wrapper's post-run cleanup and
+the hub clock's measured skew of up to ~20 s). That is an AGE BOUND derived from the receipt's own timeout, not a process
 probe: this script reads receipts only, and the board's authoritative liveness rule (hub-queue-lib.ps1
 Get-LaneRunState: child pid alive, command line names the run dir, start time matches within 10 s) needs
 the process table. The cost of the weaker rule is bounded and one-sided: a dead lane inside its own
@@ -47,7 +48,8 @@ nothing worse than a lane that is current anyway. A receipt left at state=runnin
 it stays an unproven run (counted in `deadRunning`), so the lane reads NO-DATA, never IN-FLIGHT. A running
 receipt with no timeoutSec cannot be bounded and is treated as dead for the same reason.
 Live running receipts are not evidence in either direction: they are left out of the model rule, the
-effort rule and `unrecordedEffort`, and the lane is judged on its finished runs alone, with the run it was
+effort rule, `unrecordedEffort` and the family's newest id (a running receipt that already names a newer
+id cannot make finished runs STALE), and the lane is judged on its finished runs alone, with the run it was
 judged on named in `judgedOn` and in the table. IN-FLIGHT is given only when the newest FINISHED run is
 proven too: a failed run in between is not papered over (the lane stays NO-DATA), and a lane with no
 proven finished run in the window stays NO-DATA, because missing evidence is never CURRENT.
@@ -80,6 +82,7 @@ import argparse
 import datetime
 import glob
 import json
+import math
 import os
 import re
 import subprocess
@@ -91,6 +94,7 @@ REQUIRED_EFFORT = "high"
 CONSECUTIVE_STALE_RUNS = 2
 DEFAULT_SINCE_HOURS = 72.0
 LIVE_GRACE_SEC = 300.0
+MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a real lane is 12600 s
 RECEIPT_GLOB = "*/*-001.receipt.json"
 TIERING_REL = "agents/orchestration-tiering.md"
 INVOKE_LANE_REL = "tools/coordination/Invoke-Lane.ps1"
@@ -207,28 +211,36 @@ def is_live_running(receipt, now):
     if receipt["state"] != "running" or receipt["ended"]:
         return False
     timeout = receipt["timeoutSec"]
-    if not timeout or timeout <= 0:
+    try:
+        # nan, inf, a non-positive value, a huge int or anything past the cap is not a bound at all
+        if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= MAX_LIVE_TIMEOUT_SEC:
+            return False
+        return now <= receipt["started"] + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC)
+    except (OverflowError, ValueError, TypeError):
         return False
-    return now <= receipt["started"] + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC)
 
 
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     # The family's newest id is judged over every receipt, the window only decides what is reported.
-    newest = newest_per_family(receipts, overrides or {})
-    if since_hours and since_hours > 0:
-        cutoff = now - datetime.timedelta(hours=since_hours)
-        window = [r for r in receipts if r["started"] >= cutoff]
-    else:
-        window = list(receipts)
+    # A live running receipt is not evidence in either direction, so it cannot raise the newest id either.
+    live_ids = {id(r) for r in receipts if is_live_running(r, now)}
+    newest = newest_per_family([r for r in receipts if id(r) not in live_ids], overrides or {})
+    window = list(receipts)
+    if since_hours and since_hours > 0 and math.isfinite(since_hours):
+        try:
+            cutoff = now - datetime.timedelta(hours=since_hours)
+            window = [r for r in receipts if r["started"] >= cutoff]
+        except OverflowError:
+            pass            # a window wider than any representable date reaches every receipt
     lanes = {}
     for receipt in window:
         lanes.setdefault(receipt["lane"], []).append(receipt)
     report = {}
     for lane in sorted(lanes):
         # A live running receipt has no model or effort yet: it is neither evidence nor a gap.
-        live = [r for r in lanes[lane] if is_live_running(r, now)]
-        runs = [r for r in lanes[lane] if r not in live]
+        live = [r for r in lanes[lane] if id(r) in live_ids]
+        runs = [r for r in lanes[lane] if id(r) not in live_ids]
         dead_running = [r for r in runs if r["state"] == "running"]
         proven = [r for r in runs if r["parsed"]]
         reasons = []
@@ -254,7 +266,7 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
             verdict = "NO-DATA"
         elif unrecorded:
             verdict = "INCOMPLETE"
-        elif live and live[-1]["started"] > runs[-1]["started"]:
+        elif live and live[-1]["started"] >= runs[-1]["started"]:     # >=: equal after microsecond truncation
             verdict = "IN-FLIGHT"       # newest receipt is running; the newest finished run is proven and CURRENT
         else:
             verdict = "CURRENT"
