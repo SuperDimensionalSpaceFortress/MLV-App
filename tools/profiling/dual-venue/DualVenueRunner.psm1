@@ -1537,8 +1537,9 @@ function Get-DvWorkerThreadsEvidence {
         # compare CLEAN. src/batch/WorkerThreadCount.h reads four: MLVAPP_PLAYBACK_MAX_THREADS (a cap), MLVAPP_FORCE_THREADS and MLVAPP_FORCE_SINGLETHREAD (both
         # force the count and bypass the cap) and MLVAPP_DISABLE_PLAYBACK_THREAD_CAP (lifts the default cap of 16). The app writes what it saw of each on the same
         # start line (`env_<name lower case>=`, "unset" when unset or empty, log_line_field::envFieldValue). On a leg that names no cap, a value that is neither
-        # "unset" nor all zeros (a zero is inert in the app) is INHERITED_WORKER_OVERRIDE and blocks: the venue, not the spec, set the worker count, so it is not
-        # the automatic-default arm the spec describes. A duplicated field is unreadable and blocks too. A start line without the field (a build before it
+        # "unset" nor exactly "0" is INHERITED_WORKER_OVERRIDE and blocks: the venue, not the spec, set the worker count, so it is not the automatic-default arm
+        # the spec describes. Only the literal 0 is inert under all four parsers (the int reads, mlvappEnvFlagEnabled and ForceSingleThread.cpp's envTruthy); "00",
+        # "+0", "-0" are ACTIVE for MLVAPP_FORCE_SINGLETHREAD (adversary A1 on 165d4a30), so no wider zero pattern is trusted, and "false" or "off" is refused too. A duplicated field is unreadable and blocks too. A start line without the field (a build before it
         # existed) or no start line at all stays NOT_REQUESTED, so a leg that legitimately runs uncapped is unchanged. No tool in tools/ or .github sets any of
         # the four for a dual-venue leg.
         $startRead = Get-DvSmokeSessionLineRead -LogText $LogText -Marker 'start'
@@ -1555,7 +1556,7 @@ function Get-DvWorkerThreadsEvidence {
                 $name = $workerEnv[$key]
                 if ($startRead.duplicates -contains $key) { $unreadable.Add($name); continue }
                 $value = $startRead.fields[$key]
-                if ($null -ne $value -and $value -cne 'unset' -and $value -cnotmatch '^[+-]?0+$') { $overrides.Add("$name=$value") }
+                if ($null -ne $value -and $value -cne 'unset' -and $value -cne '0') { $overrides.Add("$name=$value") }
             }
             if ($overrides.Count -gt 0 -or $unreadable.Count -gt 0) {
                 $verdict = 'INHERITED_WORKER_OVERRIDE'

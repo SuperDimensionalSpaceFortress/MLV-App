@@ -3738,6 +3738,15 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         v = self.verdict(self.UNCAPPED, self.log(self.start_with("12", playback_max_threads="12", force_threads="12")), self.DONE)
         self.assertEqual(v["inheritedOverrides"], "MLVAPP_PLAYBACK_MAX_THREADS=12 MLVAPP_FORCE_THREADS=12", "every override is named, not the first")
 
+    def test_a_zero_like_value_is_not_trusted_as_inert(self) -> None:
+        # adversary A1 on 165d4a30: ForceSingleThread.cpp's envTruthy treats "00", "+0" and "-0" as ON (only 0, false, off, no and empty are off), so a numeric-zero
+        # pattern exempted an active override. Only the exact token 0 is inert, for every variable; anything else is named and refused.
+        for key, name in self.WORKER_ENV:
+            for value in ("00", "+0", "-0", "false", "off", "no", "000"):
+                with self.subTest(variable=name, inherited=value):
+                    v = self.verdict(self.UNCAPPED, self.log(self.start_with("16", **{key: value})), self.DONE)
+                    self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, f"{name}={value}"), v)
+
     def test_the_control_and_the_capped_arm_at_the_same_inherited_count_do_not_both_pass(self) -> None:
         # sol's literal cases: unchanged C and T12 specs; venue MLVAPP_PLAYBACK_MAX_THREADS=12 (A2) or MLVAPP_FORCE_THREADS=12 (adversary A1). T12 honours its own
         # cap at 12; the control must not read as the uncapped arm it is meant to be.
@@ -3756,8 +3765,9 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"]), ("HONOURED", False, 12), arm)
 
     def test_a_leg_that_requested_no_cap_and_saw_none_is_unchanged(self) -> None:
-        # no start line, a start line from a build without the fields, every field unset, and every field a zero (inert in the app): none of them blocks
-        zeros = [self.start_with("16", **{key: zero}) for key, _ in self.WORKER_ENV for zero in ("0", "00", "+0", "-0")]
+        # no start line, a start line from a build without the fields, every field unset, and every field the exact token 0 (inert under all four of the app's
+        # parsers): none of them blocks
+        zeros = [self.start_with("16", **{key: "0"}) for key, _ in self.WORKER_ENV]
         for name, log in (("fields unset", self.log(self.start_with("16"))), ("build without the fields", self.log(self.start("16"))),
                           ("no start line", self.log()), ("no log", ""), *((f"zero {i}", self.log(line)) for i, line in enumerate(zeros))):
             with self.subTest(case=name):
