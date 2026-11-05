@@ -19,7 +19,7 @@ import unittest
 import zlib
 from pathlib import Path
 
-from tools.repo_hygiene.test_dual_venue_evidence import DV, STUB_GENERATOR, RunnerHarness, requires_windows_pwsh
+from tools.repo_hygiene.test_dual_venue_evidence import DV, STUB_GENERATOR, RunnerHarness, requires_windows_pwsh, run_pwsh
 from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import ATTRIBUTION_GENERATOR, MODULE, _run_pwsh_file, requires_pwsh
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
@@ -395,6 +395,61 @@ class ControlContainerShapeTests(RunnerHarness, unittest.TestCase):
         self.assertIn("ContactSheetPairedSeek=True", call)
         self.assertIn("QualityMode=hq", call)
         self.assertIn("ContactSheetFrames=2", call)
+
+
+BOOL_SWITCHES = ("forceLookAssist", "corePartitionTelemetry", "disableLookAssist", "presentTrace", "firstPresentCapture", "warmReuseMissDump", "unpaced",
+                 "disablePrepPointwiseFast", "prepConflatedMove")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
+
+
+@requires_windows_pwsh
+class GeneratorArgsBooleanStrictnessTests(RunnerHarness, unittest.TestCase):
+    """DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1: a generatorArgs switch is a JSON boolean or the leg spec is refused (DVE_LEG_SPEC_INVALID), before anything
+    is generated or submitted. Invoke-VenueLeg read seven of the nine with a plain [bool] cast, so any non-empty string was true: "disableLookAssist": "false"
+    turned Look Assist OFF (the owner's 2026-10-20 objection, hub rule D4b). Fixed once, in the shape predicate the leg and the lease batch's preflight share."""
+
+    def predicate(self, name: str, raw_json: str) -> str:
+        script = ("$spec = $env:DVE_SPEC_JSON | ConvertFrom-Json -NoEnumerate\n"
+                  "$r = Get-DvLegSpecShapeRefusal -Spec $spec\n"
+                  "Write-Output ('REFUSAL=' + $r)")
+        spec = '{"schema":"mlv-app/dual-venue-leg/v1","legType":"speed","generatorArgs":{"%s":%s}}' % (name, raw_json)
+        proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], env_extra={"DVE_SPEC_JSON": spec})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return next(l for l in proc.stdout.splitlines() if l.startswith("REFUSAL="))[len("REFUSAL="):]
+
+    def test_a_non_boolean_switch_is_refused_naming_the_field_for_every_boolean_switch(self) -> None:
+        for name in BOOL_SWITCHES:
+            for raw in ('"false"', '"true"', '"yes"', '0', '1', 'null', '[]', '{}'):
+                with self.subTest(name=name, value=raw):
+                    refusal = self.predicate(name, raw)
+                    self.assertIn(f"generatorArgs.{name} must be JSON true or false", refusal)
+
+    def test_json_true_and_false_are_not_refused(self) -> None:
+        for name in BOOL_SWITCHES:
+            for raw in ("true", "false"):
+                with self.subTest(name=name, value=raw):
+                    self.assertEqual(self.predicate(name, raw), "")
+
+    def test_the_shape_check_covers_every_boolean_the_schema_declares(self) -> None:
+        props = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))["properties"]["generatorArgs"]["properties"]
+        declared = sorted(k for k, v in props.items() if v.get("type") == "boolean" or isinstance(v.get("const"), bool))
+        self.assertEqual(declared, sorted(BOOL_SWITCHES), "a new boolean generatorArgs member must be added to BOOL_SWITCHES and to the shape predicate")
+
+    def test_the_leg_refuses_a_string_switch_before_generating_or_submitting(self) -> None:
+        self.make_harness()
+        for name, value in (("disableLookAssist", "false"), ("unpaced", "true"), ("forceLookAssist", "false")):
+            with self.subTest(name=name):
+                self.gen_log.write_text("", encoding="utf-8")
+                path = self.write_spec(leg_type="speed", leg_id=f"str-{name}")
+                spec = json.loads(path.read_text(encoding="utf-8"))
+                spec["generatorArgs"] = {name: value}
+                path.write_text(json.dumps(spec), encoding="utf-8")
+                proc, receipt, submitted = self.run_leg("ultra-magnus", path, extra=["-Backend", "cpu"])
+                out = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, out)
+                self.assertIn(f"DVE_LEG_SPEC_INVALID generatorArgs.{name} must be JSON true or false", out)
+                self.assertIsNone(receipt)
+                self.assertEqual(submitted, [])
+                self.assertEqual(self.generator_calls(), [])
 
 
 FINAL_COMPLETE_ANCHOR = "\nComplete-Receipt $outcome $detail\n"

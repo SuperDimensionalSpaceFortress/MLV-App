@@ -2132,6 +2132,8 @@ function Read-DvContactFrames {
 # look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg (r14: and, as the generator's
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
+# the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove')
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
@@ -2140,6 +2142,19 @@ function Get-DvLegSpecShapeRefusal {
         if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
             $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
             return "$container must be a single JSON object (it is $shape)"
+        }
+    }
+    # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1: every generatorArgs switch is a JSON boolean (leg-spec.schema.json types each one boolean), refused here otherwise.
+    # Invoke-VenueLeg reads most of them with a plain [bool] cast, which is true for ANY non-empty string: "disableLookAssist": "false" ran a Look-Assist-OFF leg,
+    # the failure of the owner's 2026-10-20 objection (hub rule D4b). One check here covers the leg and the lease batch's preflight, so no cast is patched
+    # one by one. A present-but-null, number, array or object value is refused too (a cast read null and 0 as false and 1 as true). Absent stays "not asked for".
+    $genArgsProp = $Spec.PSObject.Properties['generatorArgs']
+    if ($null -ne $genArgsProp) {
+        foreach ($switchName in $script:GeneratorArgsBooleanSwitches) {
+            $switchProp = $genArgsProp.Value.PSObject.Properties[$switchName]
+            if ($null -ne $switchProp -and $switchProp.Value -isnot [bool]) {
+                return "generatorArgs.$switchName must be JSON true or false (it is $(ConvertTo-Json -InputObject $switchProp.Value -Compress -Depth 3))"
+            }
         }
     }
     # r9 (adversary r8 cc8061a2 A1, Dot pr-721, hub ACK 6564543250): legType is ONE string of the schema's enum, compared case-sensitively as the validator
