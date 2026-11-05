@@ -694,6 +694,22 @@ function Get-CaptureWorkerExitText($Worker) {
     try { if ($Worker.Process.HasExited) { return "exit code $($Worker.Process.ExitCode)" } } catch { }
     return 'exit code unknown'
 }
+function Get-CaptureGroupIdentityProblem($Worker, [string]$ProcRoot = '/proc') {
+    # adversary r15 A3: the recorded group number is the worker's pid, confirmed once at start-up. After the worker has ended and been reaped its
+    # number is free, and a NEW process leading a group of the same number would be killed by a blind kill(-group). The worker's start time
+    # (field 22 of the process stat file) is recorded with the group: while that file still shows the same start time the group is the worker's;
+    # when the file is gone the worker has been reaped and no other leader has taken the number, so only its orphans can be in the group;
+    # a different start time means the number was reused, and the group is not killed. '' when the group may be killed, else a note.
+    try {
+        $statPath = Join-Path (Join-Path $ProcRoot ([string]$Worker.Group)) 'stat'
+        if (-not [IO.File]::Exists($statPath)) { return '' }
+        $stat = [IO.File]::ReadAllText($statPath)
+        $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
+        if ([string]$fields[19] -ceq [string]$Worker.GroupStart) { return '' }
+        return "capture worker group $($Worker.Group) is no longer the worker's (its leader's start time changed, so the number was reused): the group was not killed"
+    }
+    catch { return "the identity of capture worker group $($Worker.Group) could not be confirmed ($($_.Exception.Message)): the group was not killed" }
+}
 function Stop-CaptureWorker($Worker) {
     # Kills the worker's process tree, reaps it, and removes its scratch directory, each under its own bound.
     # adversary r13 A3: the tree is killed EVEN WHEN the worker has already ended. Its root ending proves nothing about what it started (a
@@ -713,7 +729,9 @@ function Stop-CaptureWorker($Worker) {
         catch { $notes.Add("the termination of the capture worker job failed ($($_.Exception.Message))") }
     }
     if ($null -ne $p) {
-        if ($null -ne $Worker.Group) {
+        $identity = if ($null -ne $Worker.Group) { Get-CaptureGroupIdentityProblem $Worker } else { '' }
+        if ($identity) { $notes.Add($identity) }
+        elseif ($null -ne $Worker.Group) {
             try {
                 $group = [BoundedCaptureIo]::KillGroup([int]$Worker.Group)
                 if (-not $group.Wait($CaptureWorkerKillMs)) { $notes.Add("the kill of capture worker group $($Worker.Group) did not return within $CaptureWorkerKillMs ms") }
@@ -756,7 +774,7 @@ function Resolve-CaptureWorkerSetsid([bool]$Windows = $IsWindows, [string[]]$Can
 function Start-CaptureWorker {
     # Starts a capture worker and waits (bounded) until it is ready, BEFORE the step's clock starts. Throws a named failure when it cannot
     # start; any process it did start is killed first.
-    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null; Group = $null; Job = $null }
+    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null; Group = $null; GroupStart = $null; Job = $null }
     try {
         $null = [IO.Directory]::CreateDirectory($worker.Dir)
         [IO.File]::WriteAllText((Join-Path $worker.Dir 'worker.ps1'), $CaptureWorkerScript)
@@ -788,7 +806,7 @@ function Start-CaptureWorker {
             # The group is recorded only when /proc confirms the worker leads it (field 5 of /proc/<pid>/stat), so no other group is ever killed.
             $stat = [IO.File]::ReadAllText("/proc/$($worker.Process.Id)/stat")
             $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
-            if ([int]$fields[2] -eq $worker.Process.Id) { $worker.Group = $worker.Process.Id }
+            if ([int]$fields[2] -eq $worker.Process.Id) { $worker.Group = $worker.Process.Id; $worker.GroupStart = [string]$fields[19] }
             else { throw "the capture worker does not lead its own process group (pgrp $($fields[2]), pid $($worker.Process.Id)), so its tree cannot be ended" }
         }
         return $worker

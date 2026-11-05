@@ -97,27 +97,44 @@ def max_run_bounded_sec(timeout: float) -> float:
     return max_wait_and_kill_sec(timeout) + CAPTURE_CLOSE_BOUND_SEC + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
 
 
-# sol r14 B1 / adversary r14 A1: no cleanup-critical path renders an exception it did not create with repr() / str() / !r / an f-string.
-# A class that overrides __repr__ or __str__ can raise, or block, and a raise there replaced the case-named verdict and skipped the root
-# kill; a block cannot be bounded at all. So the message is rendered ONLY for the interpreter's own exception classes (and subprocess's)
-# carrying plain-data arguments; every other exception is named by its type, read past a metaclass that overrides __name__.
-_TRUSTED_EXC_CLASSES = frozenset(
-    [c for c in vars(__import__("builtins")).values() if isinstance(c, type) and issubclass(c, BaseException)]
-    + [subprocess.SubprocessError, subprocess.TimeoutExpired, subprocess.CalledProcessError])
+# sol r14 B1 / adversary r14 A1 / adversary r15 A1, A2: no cleanup-critical path runs code that a caller's exception controls. repr(), str(),
+# !r and f-strings call the exception's own methods and the fields they read; isinstance() consults a __class__ property; `in` a frozenset or
+# tuple of classes calls a metaclass __hash__ / __eq__. Any of those can raise (replacing the case-named verdict) or block (no bound exists).
+# So an exception is rendered ONLY when its class IS (identity, `is`) one of the interpreter's own exception classes listed below AND every
+# field its str() / repr() read holds plain data of an exact built-in type; every other exception is named by its type, read straight from
+# the type's descriptor.
+_TRUSTED_PLAIN = (Exception, RuntimeError, ValueError, TypeError, MemoryError, OverflowError, AssertionError, EOFError, BufferError, subprocess.SubprocessError)
+_TRUSTED_OS = (OSError, PermissionError, FileNotFoundError, FileExistsError, NotADirectoryError, IsADirectoryError, TimeoutError, BrokenPipeError,
+               ProcessLookupError, InterruptedError, ChildProcessError)
+_TRUSTED_SUBPROCESS = (subprocess.TimeoutExpired, subprocess.CalledProcessError)
 _PLAIN_DATA = (str, int, float, bytes, bool, type(None))
-_TYPE_DICT = type.__dict__  # descriptors read directly: a metaclass cannot reroute __name__ / __mro__ / __dict__ through its own code
+_TYPE_DICT = type.__dict__  # descriptors read directly: a metaclass cannot reroute __name__ through its own code
+
+
+def _is_one_of(kind: object, group: tuple) -> bool:
+    for known in group:
+        if kind is known:  # identity only: no __eq__ / __hash__ of a caller's metaclass runs
+            return True
+    return False
 
 
 def _plain(value: object, depth: int = 3) -> bool:
-    if type(value) in _PLAIN_DATA:
+    kind = type(value)
+    if _is_one_of(kind, _PLAIN_DATA):
         return True
-    return depth > 0 and type(value) in (list, tuple) and all(_plain(item, depth - 1) for item in value)  # type: ignore[attr-defined]
+    if depth > 0 and (kind is list or kind is tuple):
+        for item in value:  # type: ignore[attr-defined] - iterating an exact list / tuple runs no caller code
+            if not _plain(item, depth - 1):
+                return False
+        return True
+    return False
 
 
 def _exc_type_name(exc: object) -> str:
-    """The exception's type name, read so that a hostile metaclass cannot raise out of it."""
+    """The exception's type name, read from the type's descriptor so that a hostile metaclass cannot run code or raise out of it."""
     try:
-        return str(_TYPE_DICT["__name__"].__get__(type(exc)))
+        name = _TYPE_DICT["__name__"].__get__(type(exc))
+        return name if type(name) is str else "<exception>"
     except Exception:  # noqa: BLE001 - a diagnostic never replaces a verdict
         return "<exception>"
 
@@ -125,15 +142,28 @@ def _exc_type_name(exc: object) -> str:
 def _exc_trusted(exc: object) -> bool:
     """True when repr(exc) / str(exc) run only interpreter-owned code over plain data (never a class defined by a test or a caller)."""
     try:
-        for method in ("__repr__", "__str__"):
-            for klass in _TYPE_DICT["__mro__"].__get__(type(exc)):
-                if method in _TYPE_DICT["__dict__"].__get__(klass):
-                    if klass not in _TRUSTED_EXC_CLASSES:
-                        return False
-                    break
+        kind = type(exc)
+        os_class, sub_class = _is_one_of(kind, _TRUSTED_OS), _is_one_of(kind, _TRUSTED_SUBPROCESS)
+        if not (os_class or sub_class or _is_one_of(kind, _TRUSTED_PLAIN)):
+            return False
         if not _plain(BaseException.args.__get__(exc)):  # type: ignore[attr-defined]
             return False
-        return not isinstance(exc, OSError) or (_plain(OSError.filename.__get__(exc)) and _plain(OSError.filename2.__get__(exc)))  # type: ignore[attr-defined]
+        if os_class:  # adversary r15 A1: str(OSError) reads these slots, and an instance can have them reassigned to anything
+            slots = [OSError.errno, OSError.strerror, OSError.filename, OSError.filename2]  # type: ignore[attr-defined]
+            if "winerror" in OSError.__dict__:
+                slots.append(OSError.__dict__["winerror"])
+            for slot in slots:
+                if not _plain(slot.__get__(exc)):
+                    return False
+        if sub_class:  # the subprocess exceptions keep their command, output and timeout as plain instance attributes
+            for name in ("cmd", "timeout", "returncode", "output", "stdout", "stderr"):
+                try:
+                    value = object.__getattribute__(exc, name)
+                except AttributeError:
+                    continue
+                if not _plain(value):
+                    return False
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -264,10 +294,10 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
     if error is not None:
         # adversary r7 A2: after a failed wait ANY Exception from the read (MemoryError on a huge stream, ValueError, RuntimeError) is recorded
         # in the text; only a BaseException that is not an Exception (an interrupt) still propagates.
-        if tolerate_oserror and isinstance(error, OSError) and _exc_trusted(error):
+        if tolerate_oserror and _exc_trusted(error) and _is_one_of(type(error), _TRUSTED_OS):
             # errno / strerror are read from the OSError slots, past a subclass that overrides them with a property
             return f"<read failed: errno {OSError.errno.__get__(error)} {OSError.strerror.__get__(error)}>"  # type: ignore[attr-defined]
-        if tolerate_oserror and isinstance(error, Exception):
+        if tolerate_oserror and issubclass(type(error), Exception):  # not isinstance(): a caller's __class__ property would run
             return f"<read failed: {_safe_text(error)}>"
         raise error  # type: ignore[misc]
     return str(box["text"])
@@ -368,7 +398,7 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
                 # sol r5 B1: any other failure of the wait (OverflowError, ValueError, OSError, an interrupt) happens with the child
                 # already running. The tree is killed first; an interrupt is then re-raised, anything else keeps the case-named verdict.
                 kill_note = _kill_tree(proc)
-                if not isinstance(exc, Exception):
+                if not issubclass(type(exc), Exception):  # not isinstance(): a caller's __class__ property would run
                     raise
                 failed = True
                 verdict = f"could not be waited on ({_safe_repr(exc)})"
@@ -1394,7 +1424,70 @@ class HostileExceptionRenderingTests(unittest.TestCase):
                 raise ValueError("hostile metaclass name")
 
         hostile_class = Meta("Whatever", (RuntimeError,), {})
-        self.assertEqual(_safe_text(hostile_class("x")), "Whatever: x", "the name is read past a metaclass that overrides __name__")
+        self.assertEqual(_safe_text(hostile_class("x")), "Whatever", "the name is read past a metaclass that overrides __name__; a subclass is never rendered")
+
+    def test_adversary_r15_a1_an_exact_builtin_exception_with_a_reassigned_field_is_not_rendered(self) -> None:
+        # adversary r15 A1: the trust check looked at args and filename only, so an exact OSError whose strerror was reassigned to an object
+        # with a hostile __str__ was "trusted" and str() ran that object (it raised and replaced the case-named verdict; it could block).
+        calls: list[str] = []
+
+        class Payload:
+            def __str__(self) -> str:
+                calls.append("payload-str")
+                raise RuntimeError("REPLACED-CASE-VERDICT")
+            __repr__ = __str__
+
+        fields = OSError(5, "original")
+        fields.strerror = Payload()  # type: ignore[assignment]
+        expired = subprocess.TimeoutExpired(["child"], 3)
+        expired.cmd = Payload()
+        called = subprocess.CalledProcessError(1, ["child"])
+        called.output = Payload()
+        for exc in (fields, expired, called):
+            self.assertEqual(_safe_text(exc), type(exc).__name__)
+            self.assertEqual(_safe_repr(exc), f"<{type(exc).__name__}>")
+        target = Path(tempfile.gettempdir()) / "hostile-field-read.txt"
+        with mock.patch.object(Path, "read_text", side_effect=fields):
+            self.assertEqual(_read_captured(target, tolerate_oserror=True), "<read failed: OSError>")
+        self.assertEqual(calls, [])
+
+    def test_adversary_r15_a2_a_metaclass_or_class_property_of_the_exception_never_runs(self) -> None:
+        # adversary r15 A2: _exc_trusted did `klass not in frozenset` (the metaclass __hash__ / __eq__ ran, and a blocking one held the
+        # cleanup before the root kill), and the read path used isinstance(error, OSError) (a __class__ property ran). Identity checks only.
+        calls: list[str] = []
+
+        class Meta(type):
+            def __hash__(cls) -> int:
+                calls.append("meta-hash")
+                return type.__hash__(cls)
+
+            def __eq__(cls, other: object) -> bool:
+                calls.append("meta-eq")
+                return type.__eq__(cls, other)
+
+        class AuditError(RuntimeError, metaclass=Meta):
+            def __repr__(self) -> str:
+                calls.append("repr")
+                raise ValueError("exception repr failed")
+
+            @property  # type: ignore[misc]
+            def __class__(self):  # noqa: ANN204
+                calls.append("class-property")
+                return type(self)
+
+        exc = AuditError("denied")
+        calls.clear()
+        self.assertEqual(_safe_text(exc), "AuditError")
+        self.assertEqual(_safe_repr(exc), "<AuditError>")
+        target = Path(tempfile.gettempdir()) / "hostile-meta-read.txt"
+        with mock.patch.object(Path, "read_text", side_effect=exc):
+            self.assertEqual(_read_captured(target, tolerate_oserror=True), "<read failed: AuditError>")
+        root = self._Root()
+        caught = self._run(root, None, taskkill_launch_error=exc)
+        self.assertIsInstance(caught, AssertionError, repr(caught))
+        self.assertIn("hostile-case exceeded its 3 s wall-clock bound", str(caught))
+        self.assertTrue(root.killed_and_reaped, f"the root was not killed and reaped: {root.events}")
+        self.assertEqual(calls, [], "a cleanup path ran the exception class's metaclass or __class__ property")
 
 
 class BoundedCaptureIoTests(unittest.TestCase):
@@ -2469,7 +2562,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
         begin = fifo.index("function Start-CaptureWorker")
         worker = fifo[begin:fifo.index("function Get-CaptureTaskResult", begin)]
         self.assertIn("$setsid = Resolve-CaptureWorkerSetsid", worker)
-        self.assertRegex(worker, r"if \(\[int\]\$fields\[2\] -eq \$worker\.Process\.Id\) \{ \$worker\.Group = \$worker\.Process\.Id \}\s*\n\s*else \{ throw", "an unconfirmed group is a named failure too")
+        self.assertRegex(worker, r"if \(\[int\]\$fields\[2\] -eq \$worker\.Process\.Id\) \{ \$worker\.Group = \$worker\.Process\.Id(?:; \$worker\.GroupStart = \[string\]\$fields\[19\])? \}\s*\n\s*else \{ throw", "an unconfirmed group is a named failure too")
 
     @staticmethod
     def _link_or_copy(src: str, dst: str) -> str:
@@ -2571,6 +2664,41 @@ class BoundedCaptureIoTests(unittest.TestCase):
         for function in ("function Stop-CaptureWorker", "public static Task<string> KillTree"):
             at = fifo.index(function)
             self.assertIn("visible", fifo[max(0, at - 600):at + 1500], f"{function} is documented without the visible-descendants limit")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_adversary_r15_a3_a_group_number_reused_by_another_leader_is_not_killed(self) -> None:
+        # adversary r15 A3: Stop-CaptureWorker sent SIGKILL to -<recorded group> even after the worker had been reaped, so a number reused by an
+        # unrelated group leader was killed and reported as success. The worker's start time is recorded with the group and checked against the
+        # process stat file first. The check takes the stat root, so it runs here against a fake one on any OS.
+        root = tempfile.mkdtemp(prefix="heavy-slot-gate-a3-proc-")
+        try:
+            def stat(pid: int, start: str) -> str:
+                return f"{pid} (pwsh) S 1 {pid} {pid} 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 {start} 1000 2000"
+
+            for name, text in (("same", stat(4242, "777")), ("reused", stat(4242, "999")), ("comm", "4242 (a) b) c) S 1 4242 4242 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 777 1 2")):
+                os.makedirs(os.path.join(root, name, "4242"))
+                Path(root, name, "4242", "stat").write_text(text, encoding="ascii")
+            os.makedirs(os.path.join(root, "gone"))
+            os.makedirs(os.path.join(root, "unreadable", "4242"))
+            Path(root, "unreadable", "4242", "stat").write_text("", encoding="ascii")  # nothing to parse: the identity cannot be confirmed
+            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                      "$w = [pscustomobject]@{ Group = 4242; GroupStart = '777' }\n"
+                      "foreach ($n in 'same', 'reused', 'comm', 'gone', 'unreadable') {\n"
+                      "  Write-Output ($n + '|[' + (Get-CaptureGroupIdentityProblem $w (Join-Path '" + root.replace("'", "''") + "' $n)) + ']')\n"
+                      "}\n")
+            proc = self._pwsh(script)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for name in ("same", "comm", "gone"):
+            self.assertIn(f"{name}|[]", proc.stdout, f"{name}: the group is the worker's (or only its orphans remain) and may be killed")
+        self.assertRegex(proc.stdout, r"reused\|\[capture worker group 4242 is no longer the worker's .*the group was not killed\]")
+        self.assertRegex(proc.stdout, r"unreadable\|\[the identity of capture worker group 4242 could not be confirmed .*the group was not killed\]")
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        stop = fifo[fifo.index("function Stop-CaptureWorker"):fifo.index("function Close-CaptureWorker")]
+        self.assertLess(stop.index("Get-CaptureGroupIdentityProblem"), stop.index("KillGroup"), "the identity is checked before any group kill")
+        start = fifo[fifo.index("function Start-CaptureWorker"):fifo.index("function Get-CaptureTaskResult", fifo.index("function Start-CaptureWorker"))]
+        self.assertIn("$worker.GroupStart = [string]$fields[19]", start, "the start time (stat field 22) is recorded with the group")
 
     def test_r15_b2_a_session_escaping_factory_child_is_outside_the_teardown_contract_and_is_killed_by_its_pid(self) -> None:
         # The stated limit, executed: a factory launches a readiness-confirmed child in its OWN session (setsid). The read succeeds and the child
