@@ -15,17 +15,27 @@ def git(wd, *args):
     return subprocess.run(["git", "-C", str(wd), *args], capture_output=True, check=True).stdout
 
 
-@pytest.fixture
-def repo(tmp_path):
-    wd = tmp_path / "wt"
+@pytest.fixture(scope="session")
+def repo_template(tmp_path_factory):
+    """CI-SHARD8-GUARDRAILS-COST-2: the base repository is built once per session (the same seven git calls the per-test fixture
+    used to make, about 280 times) and every test gets a file copy of it, so each test still starts from its own private,
+    identical, committed repository."""
+    wd = tmp_path_factory.mktemp("lane-dirty-save-template") / "wt"
     wd.mkdir()
-    (tmp_path / "run").mkdir()
     for a in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["config", "core.autocrlf", "false"]):
         git(wd, *a)
     (wd / "a.txt").write_bytes(b"one\r\ntwo\nthree\n")
     (wd / "b.bin").write_bytes(BINARY)
     git(wd, "add", ".")
     git(wd, "commit", "-q", "-m", "base")
+    return wd
+
+
+@pytest.fixture
+def repo(tmp_path, repo_template):
+    wd = tmp_path / "wt"
+    shutil.copytree(repo_template, wd)
+    (tmp_path / "run").mkdir()
     return wd
 
 
