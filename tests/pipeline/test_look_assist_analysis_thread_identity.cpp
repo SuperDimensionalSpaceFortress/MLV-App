@@ -11,6 +11,7 @@
 #include "../../src/batch/ReceiptApplier.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -280,6 +281,15 @@ TEST(LookAssistAnalysisThreadIdentity, TheWorkerTakesTheCallersOpenMpSettings)
     const int restoreDynamic = omp_get_dynamic();
     AnalysisWorker thread;
     AnalysisPump pump;
+
+    // The hazard is real: a job posted straight to the worker, past AnalysisPump::call, does not see the caller's setting.
+    omp_set_num_threads( 7 );
+    std::atomic<int> bareThreads{ 0 };
+    thread.post( [&bareThreads]() { bareThreads = omp_get_max_threads(); } );
+    while( bareThreads.load() == 0 ) std::this_thread::yield();
+    std::printf( "[identity] caller asks for 7 threads, a bare worker thread reads %d\n", bareThreads.load() );
+    ASSERT_TRUE( bareThreads.load() != 7 );
+
     pump.beginSession( &thread );
     for( const int threads : { 3, 1, 2 } )
     {

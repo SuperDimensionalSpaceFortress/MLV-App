@@ -17128,7 +17128,7 @@ MainWindow::LookAssistApplyTimingScope::~LookAssistApplyTimingScope()
         // Nothing pumps on the inline route: the whole apply is one block of the GUI thread.
         timing.guiBlockMaxMs = timing.totalMs;
     }
-    m_window->logInteractionEvent( QStringLiteral("look_assist.apply.timing"), timing.logFields() );
+    logInteractionEvent( QStringLiteral("look_assist.apply.timing"), timing.logFields() );
 }
 
 void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
