@@ -34,6 +34,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_frame_compare.cpp \
     $$REPO_ROOT/tests/console/test_phase3_quality_policy.cpp \
     $$REPO_ROOT/tests/console/test_clip_lifecycle_barrier.cpp \
+    $$REPO_ROOT/tests/console/test_look_assist_analysis_pump.cpp \
     $$REPO_ROOT/tests/console/test_playback_stop_lifetime.cpp \
     $$REPO_ROOT/tests/console/test_playback_prep_inflight_gate.cpp \
     $$REPO_ROOT/tests/console/test_clip_open_abort_callers.cpp \
