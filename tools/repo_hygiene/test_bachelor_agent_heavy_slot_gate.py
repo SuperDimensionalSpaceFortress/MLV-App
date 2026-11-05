@@ -66,6 +66,27 @@ CAPTURE_CLEANUP_BOUND_SEC = 10
 CAPTURE_CLOSE_BOUND_SEC = 10  # closing the two capture files (adversary r8 A1): a close that stalls or fails is named, never awaited
 
 
+# sol r14 B3: a regression that measures a whole Read-CapturedResult / Remove-CaptureFiles call (a -Start seam starts a worker pwsh BEFORE the
+# step's clock, and tears it down after the verdict) must allow what the implementation itself allows. The ceilings are derived from the
+# script's own constants (read from its source, so a change there moves them), never typed as a number of seconds.
+def _fifo_constant_ms(name: str) -> int:
+    match = re.search(r"(?m)^\$" + name + r" = (\d+)\s*$", FIFO_TEST.read_text(encoding="ascii"))
+    if match is None:
+        raise AssertionError(f"{FIFO_TEST.name} no longer defines ${name} as a plain millisecond number")
+    return int(match.group(1))
+
+
+CAPTURE_WORKER_START_MS = _fifo_constant_ms("CaptureWorkerStartMs")  # a worker may take this long to be ready, before the step's clock
+CAPTURE_WORKER_KILL_MS = _fifo_constant_ms("CaptureWorkerKillMs")  # teardown: each of the job, group and tree kills
+CAPTURE_WORKER_REAP_MS = _fifo_constant_ms("CaptureWorkerReapMs")  # teardown: the reap, and the scratch directory removal
+CAPTURE_CEILING_SLACK_MS = CLEANUP_MARGIN_SEC * 1000  # scheduling slack on a loaded runner (the same named margin the cleanup ceilings use)
+
+
+def capture_call_ceiling_ms(bound_ms: int) -> int:
+    """The longest a whole Read-CapturedResult / Remove-CaptureFiles call may take: worker start, the operation budget, the teardown, slack."""
+    return CAPTURE_WORKER_START_MS + bound_ms + 3 * CAPTURE_WORKER_KILL_MS + 2 * CAPTURE_WORKER_REAP_MS + CAPTURE_CEILING_SLACK_MS
+
+
 def max_wait_and_kill_sec(timeout: float) -> float:
     """The longest the wait plus the tree-kill cleanup of run_bounded(timeout=...) may take (what a virtual clock counts)."""
     return timeout + CLEANUP_BOUND_SEC
@@ -823,7 +844,7 @@ class BoundedRunTests(unittest.TestCase):
             script = ("$ReadBoundMs = 10000\n" + body + "\n"
                       "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
                       "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
-                      "Write-Output ('HUNG|' + (Read-CapturedText (Join-Path ([IO.Path]::GetTempPath()) 'stdout.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                      f"Write-Output ('HUNG|' + (Read-CapturedText (Join-Path ([IO.Path]::GetTempPath()) 'stdout.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt {capture_call_ceiling_ms(300)}))\n"
                       "Write-Output ('GOOD|' + (Read-CapturedText '" + good.replace("'", "''") + "'))\n"
                       "Write-Output ('MISSING|' + (Read-CapturedText (Join-Path (Join-Path ([IO.Path]::GetTempPath()) 'no-such-dir-r6') 'x.txt')))\n")
             proc = _run_pwsh_script(script)
@@ -1764,7 +1785,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "$srv = [IO.Pipes.NamedPipeServerStream]::new('mlv-r7-stall-" + str(os.getpid()) + "', [IO.Pipes.PipeDirection]::Out, 1)\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "$r = Read-CapturedText '\\\\.\\pipe\\mlv-r7-stall-" + str(os.getpid()) + "' 400\n"
-                  "Write-Output ('STALLED|' + $r + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                  f"Write-Output ('STALLED|' + $r + '|' + ($sw.ElapsedMilliseconds -lt {capture_call_ceiling_ms(400)}))\n"
                   "$srv.Dispose()\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -1796,12 +1817,16 @@ class BoundedCaptureIoTests(unittest.TestCase):
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$two = { param($p) [Threading.Tasks.TaskCompletionSource[string]]::new().Task; [Threading.Tasks.TaskCompletionSource[string]]::new().Task }\n"
                   "$none = { param($p) }\n"
-                  # r13 (sol r12 B1): each seam call starts its own worker process (~1 s), so the 5 s ceiling is per call, not for all four.
+                  # r15 (sol r14 B3): each seam call starts its own worker process BEFORE its clock, and the factory is dispatched AFTER it, so a
+                  # 300 ms operation budget let a correct scheduling delay turn the shape error into a timeout. The budget is the worker's own
+                  # start bound (long enough that dispatch cannot outlast it), the error still returns at once, and the ceiling per call is the
+                  # derived whole-call ceiling (worker start, the budget, the teardown, slack).
+                  f"$budget = $CaptureWorkerStartMs; $limit = {capture_call_ceiling_ms(CAPTURE_WORKER_START_MS)}\n"
                   "$fast = $true; $sw = [Diagnostics.Stopwatch]::StartNew()\n"
-                  "Write-Output ('READ-TWO|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $two)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000; $sw.Restart()\n"
-                  "Write-Output ('READ-NONE|' + (Read-CapturedText 'C:\\x\\a.txt' 300 $none)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000; $sw.Restart()\n"
-                  "Write-Output ('DEL-TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $two)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000; $sw.Restart()\n"
-                  "Write-Output ('DEL-NONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') 300 $none)); $fast = $fast -and $sw.ElapsedMilliseconds -lt 5000\n"
+                  "Write-Output ('READ-TWO|' + (Read-CapturedText 'C:\\x\\a.txt' $budget $two)); $fast = $fast -and $sw.ElapsedMilliseconds -lt $limit; $sw.Restart()\n"
+                  "Write-Output ('READ-NONE|' + (Read-CapturedText 'C:\\x\\a.txt' $budget $none)); $fast = $fast -and $sw.ElapsedMilliseconds -lt $limit; $sw.Restart()\n"
+                  "Write-Output ('DEL-TWO|' + (Remove-CaptureFiles @('C:\\x\\a.txt') $budget $two)); $fast = $fast -and $sw.ElapsedMilliseconds -lt $limit; $sw.Restart()\n"
+                  "Write-Output ('DEL-NONE|' + (Remove-CaptureFiles @('C:\\x\\a.txt') $budget $none)); $fast = $fast -and $sw.ElapsedMilliseconds -lt $limit\n"
                   "Write-Output ('FAST|' + $fast)\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -1817,13 +1842,37 @@ class BoundedCaptureIoTests(unittest.TestCase):
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$hang = { param($p) [Threading.Tasks.TaskCompletionSource[bool]]::new().Task }\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
-                  "Write-Output ('STALLED|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt 5000))\n"
+                  f"Write-Output ('STALLED|' + (Remove-CaptureFiles @('C:\\x\\a.txt', 'C:\\x\\b.txt') 300 $hang) + '|' + ($sw.ElapsedMilliseconds -lt {capture_call_ceiling_ms(300)}))\n"
                   "$real = [IO.Path]::GetTempFileName()\n"
                   "Write-Output ('CLEAN|[' + (Remove-CaptureFiles @($real)) + ']|' + (Test-Path -LiteralPath $real))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("STALLED|capture cleanup abandoned after 0.3 s: C:\\x\\a.txt, C:\\x\\b.txt|True", proc.stdout)
         self.assertIn("CLEAN|[]|False", proc.stdout)
+
+    def test_r15_b3_every_ceiling_that_spans_a_worker_start_is_derived_from_the_implementations_own_bounds(self) -> None:
+        # sol r14 B3: Start-CaptureWorker permits a CaptureWorkerStartMs start before the step's clock, yet several regressions required the whole
+        # call inside a typed 5 s / 10 s / 15 s / 30 s. Source pin (every OS): the derivation reads the script's constants, the start bound is the
+        # one Start-CaptureWorker enforces, and no test keeps a typed elapsed ceiling around a Read-Captured* / Remove-CaptureFiles call.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("function Start-CaptureWorker")
+        self.assertIn("-ge $CaptureWorkerStartMs", fifo[begin:fifo.index("function Get-CaptureTaskResult", begin)])
+        self.assertEqual(capture_call_ceiling_ms(300), CAPTURE_WORKER_START_MS + 300 + 3 * CAPTURE_WORKER_KILL_MS + 2 * CAPTURE_WORKER_REAP_MS + CLEANUP_MARGIN_SEC * 1000)
+        self.assertGreater(capture_call_ceiling_ms(1), CAPTURE_WORKER_START_MS, "the ceiling must allow a worker start that takes its full bound")
+        self.assertGreater(BoundedCaptureIoTests._NEVER_ENDING_PROCESS_CEILING_SEC * 1000, CAPTURE_WORKER_START_MS)
+        self.assertGreater(BoundedCaptureIoTests._SLOW_OPERATION_MS, BoundedCaptureIoTests._SLOW_CEILING_MS,
+                           "the slow operation must outlast the ceiling, or a call that waited for it would still pass")
+        source = Path(__file__).read_text(encoding="utf-8")
+        offenders = []
+        for chunk in re.split(r"\n    (?:@unittest[^\n]*\n    )?def ", source):
+            name = chunk.split("(", 1)[0]
+            if name.startswith("test_r15_b3_every_ceiling"):
+                continue
+            for line in chunk.splitlines():
+                # the sleeper-death polls and the readiness poll run after (or apart from) a worker start; they are not call ceilings
+                if re.search(r"ElapsedMilliseconds -lt \d+", line) and "Get-Process" not in line and "Exists(" not in line:
+                    offenders.append(f"{name}: {line.strip()[:100]}")
+        self.assertEqual(offenders, [], "a typed elapsed ceiling spans a worker start; derive it with capture_call_ceiling_ms")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_factory_that_consumes_the_bound_before_returning_a_completed_task_is_a_timeout_not_a_late_success(self) -> None:
@@ -1936,29 +1985,34 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertIn("PLAIN-DEL|capture cleanup incomplete: still present: a.txt", proc.stdout, "control: the ordinary Task<string>")
 
     # sol r11 B2: a synchronous factory, and the synchronous conversion of the result, used to run on the caller's thread, so the elapsed
-    # check classified an expiry only AFTER they returned (a 1 ms bound returned after 386 ms; Thread.Sleep(Infinite) never returned). The
-    # ceilings below are generous on purpose: the operation takes 20 s, the bound is 50 ms and the call must be back inside 10 s.
-    # r13 (sol r12 B1): each call now also starts a worker process (~1 s) before its clock, so the operation and the ceiling were scaled
-    # together (4 s / 2.5 s -> 20 s / 10 s): the call is still back long before the operation could have finished. The slow type is a
-    # PowerShell class defined inside the factory, because the factory runs in the worker process.
-    _SLOW_TEXT_TYPE = "class Slow20sText { [string] ToString() { [Threading.Thread]::Sleep(20000); return 'payload' } }; "
+    # check classified an expiry only AFTER they returned (a 1 ms bound returned after 386 ms; Thread.Sleep(Infinite) never returned).
+    # r13 (sol r12 B1): each call now also starts a worker process before its clock, and tears it down after the verdict.
+    # r15 (sol r14 B3): the ceiling is the DERIVED whole-call ceiling (worker start bound + the 50 ms budget + teardown bounds + slack), not
+    # a fixed 10 s that the implementation's own 30 s start bound contradicts; the operation outlasts that ceiling by a full margin, so a
+    # call that waited for the factory or the conversion instead of its bound still fails. The slow type is a PowerShell class defined
+    # inside the factory, because the factory runs in the worker process.
+    _SLOW_BOUND_MS = 50
+    _SLOW_CEILING_MS = capture_call_ceiling_ms(_SLOW_BOUND_MS)
+    _SLOW_OPERATION_MS = _SLOW_CEILING_MS + CAPTURE_CEILING_SLACK_MS
+    _SLOW_TEXT_TYPE = ("class SlowText { [string] ToString() { [Threading.Thread]::Sleep(" + str(_SLOW_OPERATION_MS) + "); return 'payload' } }; ")
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_synchronous_factory_or_result_conversion_that_outlasts_the_bound_returns_the_named_timeout_inside_a_generous_ceiling(self) -> None:
         script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                   "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                  "$slowFactory = { param($p) [Threading.Thread]::Sleep(20000); [Threading.Tasks.Task]::FromResult('payload') }\n"
-                  "$slowFactoryDel = { param($p) [Threading.Thread]::Sleep(20000); [Threading.Tasks.Task]::FromResult('') }\n"
-                  "$slowConv = { param($p) " + self._SLOW_TEXT_TYPE + "[Threading.Tasks.Task]::FromResult([object][Slow20sText]::new()) }\n"
+                  f"$slowFactory = {{ param($p) [Threading.Thread]::Sleep({self._SLOW_OPERATION_MS}); [Threading.Tasks.Task]::FromResult('payload') }}\n"
+                  f"$slowFactoryDel = {{ param($p) [Threading.Thread]::Sleep({self._SLOW_OPERATION_MS}); [Threading.Tasks.Task]::FromResult('') }}\n"
+                  "$slowConv = { param($p) " + self._SLOW_TEXT_TYPE + "[Threading.Tasks.Task]::FromResult([object][SlowText]::new()) }\n"
+                  f"$ceiling = {self._SLOW_CEILING_MS}\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "$r = Read-CapturedResult $p 50 $slowFactory\n"
-                  "Write-Output ('FACTORY-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n"
+                  "Write-Output ('FACTORY-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt $ceiling))\n"
                   "$sw.Restart(); $n = Remove-CaptureFiles @($p) 50 $slowFactoryDel\n"
-                  "Write-Output ('FACTORY-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n"
+                  "Write-Output ('FACTORY-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt $ceiling))\n"
                   "$sw.Restart(); $r = Read-CapturedResult $p 50 $slowConv\n"
-                  "Write-Output ('CONV-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n"
+                  "Write-Output ('CONV-READ|' + $r.Ok + '|' + $r.Text + '|' + ($sw.ElapsedMilliseconds -lt $ceiling))\n"
                   "$sw.Restart(); $n = Remove-CaptureFiles @($p) 50 $slowConv\n"
-                  "Write-Output ('CONV-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt 10000))\n")
+                  "Write-Output ('CONV-DEL|' + $n + '|' + ($sw.ElapsedMilliseconds -lt $ceiling))\n")
         proc = self._pwsh(script)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("FACTORY-READ|False|<read timed out: a.txt not readable within 50 ms>|True", proc.stdout)
@@ -1971,7 +2025,11 @@ class BoundedCaptureIoTests(unittest.TestCase):
     # runspace and stops its pipeline) blocked forever; the r12 test hid that with [Environment]::Exit(0). Each case is now a child pwsh that
     # runs ONE caller and then simply reaches the end of its script. It must print the named timeout AND end on its own inside the ceiling;
     # run_bounded kills it and fails the case by name if it does not. No forced exit of any kind is in the script.
-    _NEVER_ENDING_PROCESS_CEILING_SEC = 30
+    # r15 (sol r14 B3): the whole child pwsh (its own start, the compile of the capture type, ONE call, its end) is bounded by the derived
+    # whole-call ceiling for the 200 ms budget plus the named cleanup margin, not by a fixed 30 s that the 30 s worker start bound contradicts.
+    _NEVER_ENDING_BOUND_MS = 200
+    _NEVER_ENDING_CALL_CEILING_MS = capture_call_ceiling_ms(_NEVER_ENDING_BOUND_MS)
+    _NEVER_ENDING_PROCESS_CEILING_SEC = math.ceil(_NEVER_ENDING_CALL_CEILING_MS / 1000) + CLEANUP_MARGIN_SEC
     _FOREVER_FACTORY = "{ param($p) [Threading.Thread]::Sleep([Threading.Timeout]::Infinite); [Threading.Tasks.Task]::FromResult('x') }"
     _FOREVER_CONVERSION = ("{ param($p) class ForeverText { [string] ToString() { [Threading.Thread]::Sleep([Threading.Timeout]::Infinite); return 'x' } }; "
                            "[Threading.Tasks.Task]::FromResult([object][ForeverText]::new()) }")
@@ -1982,7 +2040,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   f"$forever = {factory}\n"
                   "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   f"{call}\n"
-                  "Write-Output ('ELAPSED-OK|' + ($sw.ElapsedMilliseconds -lt 15000))\n")
+                  f"Write-Output ('ELAPSED-OK|' + ($sw.ElapsedMilliseconds -lt {self._NEVER_ENDING_CALL_CEILING_MS}))\n")
         code_lines = "\n".join(line for line in script.splitlines() if not line.lstrip().startswith(("#", "//")))
         self.assertNotRegex(code_lines, _FORCED_EXIT, "the proof must end its process the ordinary way")
         with _pwsh_script_argv(script) as argv:
