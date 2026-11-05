@@ -98,18 +98,16 @@ struct PresentDriver
     int engineWraps = 0;
     int consumed = 0;
     int presented = 0;
-    int last = -1;
-    void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; last = -1; }
+    void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; }
     // r17 (adversary A1 on 6451a8d9 / eb5af034): MainWindow passes the live count and the count stamped when the
-    // frame was REQUESTED (PresentationContext::engineWrapsAtRequest). stampAtRequest < 0 = requested after
-    // every wrap so far.
+    // frame was REQUESTED (PresentationContext::engineWrapsAtRequest; r20: a presented lookahead's accepted stamp).
+    // stampAtRequest < 0 = requested after every wrap so far.
     void present(double t, int frame, bool loop, int cutIn0, int cutOut0, int stampAtRequest = -1)
     {
         (void)loop;   // the inference (Loop, the jump size) no longer decides the tracker's wrap (re-pass A2)
         const int stamp = stampAtRequest < 0 ? engineWraps : stampAtRequest;
-        const int wraps = presentationLoopWraps(engineWraps, stamp, consumed, presented > 0, last, frame);
+        const int wraps = presentationLoopWraps(engineWraps, stamp, consumed, presented > 0);
         tracker.notePresented(t, frame, wraps, cutIn0, cutOut0);
-        last = frame;
         ++presented;
     }
 };
@@ -247,8 +245,8 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1AFrameRequestedBeforeTheWrapNev
 // r17 (adversary A1 on eb5af034): lookahead 3, Loop on, drop-frame off, cut 1..720. 718 and the speculative 719, 0
 // and 1 are all requested while the count is 0 (a lookahead copies its base request's stamp). The engine wraps, and
 // the reused speculative 0 is presented with stamp 0. eb5af034 judged by the stamp alone (0 > 0 is false): 719 -> 0
-// was backward, advanced 1, wraps 0, 11.111 fps. The live count says a wrap is pending, and 0 goes backward: it IS
-// the wrap.
+// was backward, advanced 1, wraps 0, 11.111 fps. r20: drawFrameReady accepts the reused 0 only because it is the engine's
+// active target, and the live count at that check stamps it (presentationAcceptedLookaheadStamp): it IS the wrap's landing.
 TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossTheWrapStillTakesIt)
 {
     PresentDriver d;
@@ -257,12 +255,12 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossT
     d.present(1.000, 718, true, 0, 719, stamp);
     ++d.engineWraps;                          // the engine wraps to the cut-in
     d.present(1.045, 719, true, 0, 719, stamp);
-    d.present(1.090, 0, true, 0, 719, stamp); // the reused speculative frame
+    d.present(1.090, 0, true, 0, 719, presentationAcceptedLookaheadStamp(stamp, d.engineWraps)); // the reused speculative frame
     ASSERT_EQ(2, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(0u, d.tracker.backwardJumps());
     ASSERT_NEAR(2.0 / 0.090, d.tracker.sourceFps(), 1e-9);
-    d.present(1.135, 1, true, 0, 719, stamp);
+    d.present(1.135, 1, true, 0, 719, presentationAcceptedLookaheadStamp(stamp, d.engineWraps));
     d.present(1.180, 2, true, 0, 719);        // the first frame requested after the wrap
     ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(1u, d.tracker.wraps());
@@ -453,14 +451,17 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1EachLandingTakesOnlyTheWrapsItC
     ASSERT_EQ(2u, b.tracker.wraps());
     ASSERT_EQ(12, static_cast<int>(b.tracker.advancedFrames()));
     ASSERT_EQ(0u, b.tracker.backwardJumps());
-    // a backward lookahead stamped before BOTH wraps lands one of them (it went backward, so it is a wrap); the other stays
-    // pending for the first frame requested after it: 6 -> 2 is 4, 2 -> 3 is 3 + 8 - 2 = 9, total 13 = 3 + 2 x 8 - 6
+    // r20: a lookahead spawned before BOTH wraps, accepted as the target after the first, and whose own draw makes the second,
+    // lands the first; the other stays pending for the first frame requested after it: 6 -> 2 is 4, 2 -> 3 is 3 + 8 - 2 = 9,
+    // total 13 = 3 + 2 x 8 - 6
     PresentDriver l;
     l.startMeasuredPlay();
     const int both = l.engineWraps;
     l.present(1.000, 6, true, 0, 7, both);
-    l.engineWraps += 2;
-    l.present(1.050, 2, true, 0, 7, both);
+    l.engineWraps += 1;
+    const int acceptedOnce = presentationAcceptedLookaheadStamp(both, l.engineWraps);
+    l.engineWraps += 1;
+    l.present(1.050, 2, true, 0, 7, acceptedOnce);
     ASSERT_EQ(1u, l.tracker.wraps());
     l.present(1.100, 3, true, 0, 7);
     ASSERT_EQ(2u, l.tracker.wraps());
@@ -481,8 +482,8 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1EachLandingTakesOnlyTheWrapsItC
 // (stamp 0); the cached lookahead 1 was spawned with stamp 0; the engine wraps, advanceDropFrameTick(0, 3, 1, 3, true)
 // lands on 1, and drawFrame's request for 1 (at count 1) reuses the cached 1. 1df419eb read the cached frame's own stamp
 // 0, so the forward landing looked like an in-flight frame: advanced 1, wraps 0, 20 source fps. The engine's own request
-// for the frame stamps a reused lookahead (presentationRequestStamp, as MainWindow::notePlaybackSmokePresentedFrame
-// calls it): 1 + 3 - 0 = 4, wraps 1, 80 source fps.
+// for the frame stamped a reused lookahead here; r20 replaced that record with the count at drawFrameReady's target check
+// (presentationAcceptedLookaheadStamp, as MainWindow::drawFrameReady calls it): 1 + 3 - 0 = 4, wraps 1, 80 source fps.
 TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEnginesOwnRequest)
 {
     const playback_frame_range::DropFrameTickResult tick =
@@ -493,33 +494,142 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEn
     d.startMeasuredPlay();
     d.present(1.000, 0, true, 0, 2);
     const int lookaheadStamp = d.engineWraps;                 // the cached 1 was spawned before the wrap
-    ++d.engineWraps;                                          // the engine wraps ...
-    const int engineRequestFrame = static_cast<int>(tick.position);
-    const int engineRequestStamp = d.engineWraps;             // ... and drawFrame requests 1 after it
-    const int stamp = presentationRequestStamp(true, lookaheadStamp, 1, engineRequestFrame, engineRequestStamp);
+    ++d.engineWraps;                                          // the engine wraps, and 1 is its active target
+    const int stamp = presentationAcceptedLookaheadStamp(lookaheadStamp, d.engineWraps);
     ASSERT_EQ(1, stamp);
     d.present(1.050, 1, true, 0, 2, stamp);
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(0, d.tracker.maxJump());
     ASSERT_NEAR(4.0 / 0.050, d.tracker.sourceFps(), 1e-9);
-    // the stamp rule keeps every earlier case: a frame that is not a lookahead keeps its own stamp (an in-flight 719
-    // requested before the wrap, while the engine already asked for 0), and so does a lookahead the engine did not
-    // last request, or one whose own stamp is already the later count
-    ASSERT_EQ(0, presentationRequestStamp(false, 0, 1, 1, 1));
-    ASSERT_EQ(0, presentationRequestStamp(true, 0, 719, 0, 1));
-    ASSERT_EQ(2, presentationRequestStamp(true, 2, 5, 5, 1));
-    ASSERT_EQ(0, presentationRequestStamp(true, 0, 5, -1, 0));
-    // the reused speculative 0 of eb5af034 (lookahead stamped 0, the engine's request for 0 after the wrap) still lands
-    // the wrap backward, once
+    // the reused speculative 0 of eb5af034 (lookahead stamped 0, accepted as the target after the wrap) still lands the
+    // wrap backward, once
     PresentDriver e;
     e.startMeasuredPlay();
     e.present(1.000, 718, true, 0, 719);
     e.present(1.045, 719, true, 0, 719);
     const int spec0 = e.engineWraps;
     ++e.engineWraps;
-    e.present(1.090, 0, true, 0, 719, presentationRequestStamp(true, spec0, 0, 0, e.engineWraps));
+    e.present(1.090, 0, true, 0, 719, presentationAcceptedLookaheadStamp(spec0, e.engineWraps));
     ASSERT_EQ(1u, e.tracker.wraps());
     ASSERT_EQ(2, static_cast<int>(e.tracker.advancedFrames()));
     ASSERT_EQ(0u, e.tracker.backwardJumps());
+}
+
+// r20 (adversary A1 on dbeb9424 and on 5d820339): Loop + drop-frame, a reused lookahead frame. drawFrameReady accepts it because
+// it IS the engine's active target, stamps it with the live count there, and only then runs that draw's early/tail advance. That
+// advance's request for the next frame overwrote dbeb9424's record of the engine's last request (the pair became (2,1), then (6,1)),
+// so the landing read as an in-flight frame: advanced 1, wraps 0, maxJump 1, and advanced 2, wraps 0, maxJump 2.
+TEST(PlaybackSourceAdvanceTracker, R20AdversaryA1ALookaheadIsStampedWhenItIsAcceptedAsTheTarget)
+{
+    // cut 0..3, depth 2: 0 presented, cached 1 stamped 0, advanceDropFrameTick(0, 4, 1, 4, true) wraps and lands on 1
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, 4.0, 1, 4, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(1, static_cast<int>(tick.position));
+    PresentDriver d;
+    d.startMeasuredPlay();
+    d.present(1.000, 0, true, 0, 3);
+    const int context = d.engineWraps;
+    ++d.engineWraps;
+    const int accepted = presentationAcceptedLookaheadStamp(context, d.engineWraps);
+    ASSERT_EQ(1, accepted);
+    d.present(1.050, static_cast<int>(tick.position), true, 0, 3, accepted);
+    ASSERT_EQ(5, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(0, d.tracker.maxJump());
+    // cut 0..7: 3 presented, cached 5 stamped 0, the engine wraps and requests 5, and 5's own advance then requests 6
+    PresentDriver f;
+    f.startMeasuredPlay();
+    f.present(1.000, 3, true, 0, 7);
+    const int contextFive = f.engineWraps;
+    ++f.engineWraps;
+    f.present(1.050, 5, true, 0, 7, presentationAcceptedLookaheadStamp(contextFive, f.engineWraps));
+    ASSERT_EQ(10, static_cast<int>(f.tracker.advancedFrames()));
+    ASSERT_EQ(1u, f.tracker.wraps());
+    ASSERT_EQ(0, f.tracker.maxJump());
+    // the count is read BEFORE that draw's own advance: a wrap the advance makes is not this frame's. 6, then cached 7 accepted at
+    // count 0 whose early advance wraps (live 1), then cached 0 accepted at count 1 lands it: 7 is one step, 0 is one more
+    PresentDriver g;
+    g.startMeasuredPlay();
+    g.present(1.000, 6, true, 0, 7);
+    const int seven = presentationAcceptedLookaheadStamp(g.engineWraps, g.engineWraps);
+    ++g.engineWraps;
+    g.present(1.050, 7, true, 0, 7, seven);
+    ASSERT_EQ(0u, g.tracker.wraps());
+    g.present(1.100, 0, true, 0, 7, presentationAcceptedLookaheadStamp(0, g.engineWraps));
+    ASSERT_EQ(1u, g.tracker.wraps());
+    ASSERT_EQ(2, static_cast<int>(g.tracker.advancedFrames()));
+    ASSERT_EQ(1, g.tracker.maxJump());
+    ASSERT_EQ(0u, g.tracker.backwardJumps());
+    // the rule itself: the later of the two counts, so a frame requested after the check's count keeps its own
+    ASSERT_EQ(1, presentationAcceptedLookaheadStamp(0, 1));
+    ASSERT_EQ(2, presentationAcceptedLookaheadStamp(2, 1));
+    ASSERT_EQ(3, presentationAcceptedLookaheadStamp(3, 3));
+}
+
+// r20 (adversary A2 on dbeb9424 and on 5d820339): cut 0..7, 5 presented, an ordinary non-lookahead seek to 4 stamped 0, and its draw's
+// early advance wraps the engine (live 1) before it is noted. dbeb9424's backward branch took the wrap: the seek was credited
+// 4 + 8 - 5 = 7, wraps 1, backward 0, and the real landing then had no wrap left and counted backward.
+TEST(PlaybackSourceAdvanceTracker, R20AdversaryA2ABackwardFrameStampedBeforeAWrapIsNotItsLanding)
+{
+    // advanceDropFrameTick(4, 5, 1, 8, true) lands on 2
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(4.0, 5.0, 1, 8, true);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(2, static_cast<int>(tick.position));
+    PresentDriver d;
+    d.startMeasuredPlay();
+    d.present(1.000, 5, true, 0, 7);
+    const int seekStamp = d.engineWraps;
+    ++d.engineWraps;
+    d.present(1.050, 4, true, 0, 7, seekStamp);
+    ASSERT_EQ(0, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(0u, d.tracker.wraps());
+    ASSERT_EQ(1u, d.tracker.backwardJumps());
+    d.present(1.100, static_cast<int>(tick.position), true, 0, 7);
+    ASSERT_EQ(6, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(1u, d.tracker.wraps());
+    ASSERT_EQ(1u, d.tracker.backwardJumps());
+    ASSERT_EQ(0, d.tracker.maxJump());
+    // the same seek when the early advance lands on 0: 0 + 8 - 4 = 4, and the wrap is taken once
+    PresentDriver z;
+    z.startMeasuredPlay();
+    z.present(1.000, 5, true, 0, 7);
+    const int seekZero = z.engineWraps;
+    ++z.engineWraps;
+    z.present(1.050, 4, true, 0, 7, seekZero);
+    z.present(1.100, 0, true, 0, 7);
+    ASSERT_EQ(4, static_cast<int>(z.tracker.advancedFrames()));
+    ASSERT_EQ(1u, z.tracker.wraps());
+    ASSERT_EQ(1u, z.tracker.backwardJumps());
+    z.present(1.150, 0, true, 0, 7);
+    ASSERT_EQ(1u, z.tracker.wraps());
+    ASSERT_EQ(1u, z.tracker.repeatedFrames());
+    // two backward frames stamped before the wrap: neither is its landing, and the landing is measured from the last of them
+    PresentDriver t;
+    t.startMeasuredPlay();
+    t.present(1.000, 5, true, 0, 7);
+    const int twoStamp = t.engineWraps;
+    ++t.engineWraps;
+    t.present(1.050, 4, true, 0, 7, twoStamp);
+    t.present(1.100, 3, true, 0, 7, twoStamp);
+    ASSERT_EQ(2u, t.tracker.backwardJumps());
+    ASSERT_EQ(0u, t.tracker.wraps());
+    t.present(1.150, 0, true, 0, 7);
+    ASSERT_EQ(5, static_cast<int>(t.tracker.advancedFrames()));
+    ASSERT_EQ(1u, t.tracker.wraps());
+    // a forward seek stamped before the wrap is an ordinary forward jump and leaves it pending too
+    PresentDriver s;
+    s.startMeasuredPlay();
+    s.present(1.000, 1, true, 0, 7);
+    const int forwardStamp = s.engineWraps;
+    ++s.engineWraps;
+    s.present(1.050, 4, true, 0, 7, forwardStamp);
+    ASSERT_EQ(3, static_cast<int>(s.tracker.advancedFrames()));
+    ASSERT_EQ(3, s.tracker.maxJump());
+    ASSERT_EQ(0u, s.tracker.wraps());
+    s.present(1.100, 0, true, 0, 7);
+    ASSERT_EQ(1u, s.tracker.wraps());
+    ASSERT_EQ(3 + 4, static_cast<int>(s.tracker.advancedFrames()));
 }

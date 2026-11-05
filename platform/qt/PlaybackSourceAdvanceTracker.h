@@ -93,91 +93,60 @@ private:
     double m_lastTime = 0.0;
 };
 
-/*! HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r16 (adversary A1 on ff41b4fa): whether a presentation is a
- *  loop wrap's landing, and (r19) over how many wraps, for notePresented's `wrapsCrossed`. The presented-frame inference
- *  (playback_frame_range::isContactSheetLoopWrapTransition) misses a genuine wrap whenever dropped frames
- *  leave the last presented frame more than 8 frames short of the cut-out: Loop + drop-frame, cut 1..720,
- *  700 -> 0 jumps back by 700, under its 711. The tracker then counted the wrap as a backward jump and lost
- *  the source advance across it. The ENGINE's wrap count (PlaybackWrapRecorder::engineWraps, noted by the
- *  wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
- *  wrap_count. An engine wrap belongs to ONE presented transition only (the rule is below). The measured
- *  Play's first presentation consumes only the pending wraps that came before its own request (r16 re-pass
- *  A1 on c9b4ca5e: a wrap before the first presentation stayed pending, and a later backward seek took it
- *  and was credited 719 frames; r18 below: a wrap after its request stays pending). The inference alone
- *  never makes a wrap here (r16 re-pass A2 on 215bd10e: over a cut range narrower than its 8-frame
- *  tolerance, cut 1..8, it calls any backward seek a wrap, and the seek 5 -> 4 was credited 7 frames).
- *  r17: neither count alone places the wrap.
- *  - The LIVE count (liveEngineWraps) is read after the draw's own early/tail advance. That advance can
- *    wrap the engine before an in-flight frame requested earlier is noted (718, 719, 0: adversary A1 on
- *    6451a8d9). With the live count alone, 719 took the wrap and 719 -> 0 counted backward.
- *  - The REQUEST stamp (requestEngineWraps, RenderFrameThread::ReadyFrame::PresentationContext::
- *    engineWrapsAtRequest) misses a lookahead frame requested across the boundary before the wrap and
- *    reused after it (speculative 0 stamped 0: adversary A1 on eb5af034).
- *  So a wrap is PENDING while the live count is above consumedEngineWraps. The function returns HOW MANY
- *  pending wraps this presentation lands (0 = it is no wrap), for notePresented's wrapsCrossed. The wraps a
- *  presented frame crossed are the pending ones before its own request: min(stamp, live) - consumed. With a
- *  previous presentation in the measured Play, pending wraps are TAKEN by
- *  - a presentation that goes backward, whatever its stamp: it IS a wrap's landing, so it takes the wraps
- *    before its request and at least one (a lookahead stamped before the wrap, eb5af034, takes that one); and
- *  - r19 (sol r18 B1, catalogue M-HFR-FORWARD-WRAP): a forward or repeated presentation REQUESTED AFTER a
- *    pending wrap (stamp above consumedEngineWraps). It is the wrap's forward landing: over cut 0..7,
- *    3 -> wrap -> 5 travelled 5 + 8 - 3 = 10 frames, not a forward jump of 2. 5196d4a6 consumed such a wrap
- *    without taking it.
- *  r19 (adversary A1 on 924d3d6f): each landing takes only the wraps it crossed, and is credited one cut
- *  width per wrap. Two wraps before the first landing's presentation, the second after its request: 5 ->
- *  wrap -> 1 (stamp 1) -> wrap -> 3 (stamp 2) is 4 + 10 = 14 frames and 2 wraps, never 6 and 1; and 2 -> two
- *  wraps -> 4 (stamp 2) is 4 + 2 x 8 - 2 = 18 frames. A wrap after a landing's request stays pending for the
- *  next frame that crosses it. A wrap stays pending across a forward or repeated frame requested before it
- *  (stamp not above consumedEngineWraps): an in-flight frame from before the wrap. The measured Play's FIRST
- *  presentation never takes a wrap (it has no transition); it consumes up to min(stamp, live), only the
- *  wraps before its own request. r18 (adversary A1 on 26f235a4): 719 requested with stamp 0 whose draw wraps
- *  the engine first used to consume the wrap, so 719 -> 0 counted backward.
- *  consumedEngineWraps is the caller's running count. It is set to the live count when the measured Play
- *  starts and only ever rises, never above the live count.
+/*! HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r16 (adversary A1 on ff41b4fa), rule rewritten in r20: how many loop wraps a
+ *  presentation lands, for notePresented's `wrapsCrossed`. The presented-frame inference
+ *  (playback_frame_range::isContactSheetLoopWrapTransition) misses a genuine wrap whenever dropped frames leave the last
+ *  presented frame more than 8 frames short of the cut-out (Loop + drop-frame, cut 1..720, 700 -> 0 jumps back by 700,
+ *  under its 711), and over a cut range narrower than its tolerance it calls any backward seek a wrap (r16 re-pass A2 on
+ *  215bd10e: cut 1..8, the seek 5 -> 4 credited 7 frames). So the ENGINE's wrap count (PlaybackWrapRecorder::engineWraps,
+ *  noted by the wrap branches in MainWindow::playbackHandling) is the authority, as it already is for the summary's
+ *  wrap_count, and an engine wrap belongs to ONE presented transition only.
+ *
+ *  The rule: a presentation lands the pending wraps that came before the request that made it the timeline's position,
+ *  min(requestEngineWraps, liveEngineWraps) - consumedEngineWraps, one cut width per wrap. Direction decides nothing,
+ *  because the engine notes a wrap BEFORE it requests the frame the wrap lands on, so a stamp below a wrap proves the
+ *  frame is not that wrap's landing:
+ *  - in flight: 718, 719 (stamp 0, its draw's own early/tail advance wraps the engine first, live 1), 0 (stamp 1). The
+ *    wrap stays pending across 719 and 0 lands it (r17, adversary A1 on 6451a8d9). The measured Play's FIRST presentation
+ *    behaves the same but has no transition: it consumes the wraps before its request and is credited none (r18,
+ *    adversary A1 on 26f235a4; r16 re-pass A1 on c9b4ca5e).
+ *  - a backward seek: cut 0..7, 5, then 4 (stamp 0) whose draw wraps the engine (live 1), then the landing 2 (stamp 1). 4
+ *    is an ordinary backward jump and leaves the wrap pending: 2 is credited 2 + 8 - 4 = 6 (r20, adversary A2 on dbeb9424:
+ *    a "backward means landing" branch took the wrap and credited 4 + 8 - 5 = 7).
+ *  - a forward landing: cut 0..7, 3 -> wrap -> 5 (stamp 1) travelled 5 + 8 - 3 = 10 frames, never a forward jump of 2 (r19,
+ *    sol r18 B1, catalogue M-HFR-FORWARD-WRAP).
+ *  - several wraps: 5 -> wrap -> 1 (stamp 1) -> wrap -> 3 (stamp 2) is 4 + 10 = 14 frames and 2 wraps; 2 -> two wraps -> 4
+ *    (stamp 2) is 4 + 2 x 8 - 2 = 18 (r19, adversary A1 on 924d3d6f). A wrap after a landing's request stays pending for
+ *    the next frame that crosses it.
+ *  A request after a pending wrap whose landing was never presented, a seek included, lands that wrap: the timeline did
+ *  cross it, and the frame is the first presented from beyond it.
+ *  consumedEngineWraps is the caller's running count: set to the live count when the measured Play starts, it only ever
+ *  rises, never above the live count.
+ *  \param requestEngineWraps a non-lookahead frame's PresentationContext::engineWrapsAtRequest, or a presented lookahead's
+ *         presentationAcceptedLookaheadStamp, which MainWindow::drawFrameReady writes there
  *  \param havePrevious a frame was presented before this one in the measured Play */
-/*! r19 fix iteration 2 (adversary A1 on 1df419eb): the request stamp presentationLoopWraps reads. A playback
- *  LOOKAHEAD frame is requested by the render thread ahead of the timeline, stamped with the wrap count of the
- *  request that spawned it, and the engine REUSES it when the timeline reaches that frame (MainWindow::drawFrame:
- *  hasPlaybackLookaheadRequest). That stamp can predate a wrap the timeline crossed before reaching the frame:
- *  Loop + drop-frame, cut 0..2, 0 presented, lookahead 1 stamped 0, the engine wraps and lands on 1, and the cached
- *  1 is presented stamped 0, so the forward landing read as an in-flight frame (advanced 1, wraps 0, not 4 and 1).
- *  The engine's OWN request for the frame is the authority: when a lookahead frame is the frame the engine last
- *  requested, its stamp is the later of the two counts. A frame that is not a lookahead, or not the engine's last
- *  request (an in-flight frame from before a wrap whose draw already requested the next frame, 718 -> 719), keeps
- *  its own stamp. \param engineRequestFrame the frame drawFrame last requested (-1 = none yet)
- *  \param engineRequestStamp the live wrap count when it did */
-inline int presentationRequestStamp( bool lookaheadFrame, int contextStamp, int frame,
-                                     int engineRequestFrame, int engineRequestStamp )
-{
-    if( lookaheadFrame && frame == engineRequestFrame && engineRequestStamp > contextStamp ) return engineRequestStamp;
-    return contextStamp;
-}
-
 inline int presentationLoopWraps( int liveEngineWraps, int requestEngineWraps, int &consumedEngineWraps,
-                                  bool havePrevious, int lastFrame, int frame )
+                                  bool havePrevious )
 {
-    if( liveEngineWraps <= consumedEngineWraps ) return 0;   // no wrap pending
-    // the wraps before this frame's request (never above the live count), and how many of them are pending
     const int beforeRequest = requestEngineWraps < liveEngineWraps ? requestEngineWraps : liveEngineWraps;
     const int crossed = beforeRequest > consumedEngineWraps ? beforeRequest - consumedEngineWraps : 0;
-    if( !havePrevious )
-    {
-        // r18 (adversary A1 on 26f235a4): the first presentation has no transition; it consumes only the wraps
-        // that came before its own request. A later wrap stays pending for the frame that crosses it.
-        consumedEngineWraps += crossed;
-        return 0;
-    }
-    if( frame < lastFrame )
-    {
-        // the backward landing IS a wrap: the ones before its request, and at least one (a lookahead stamped before it)
-        const int taken = crossed > 0 ? crossed : 1;
-        consumedEngineWraps += taken;
-        return taken;
-    }
-    // r19 (sol r18 B1): a forward or repeated frame requested after a pending wrap is its forward landing; one
-    // requested before every pending wrap (crossed 0) is an in-flight frame, and the wraps stay pending
     consumedEngineWraps += crossed;
-    return crossed;
+    return havePrevious ? crossed : 0;
+}
+
+/*! r20 (adversary A1 on dbeb9424, closing A1 on eb5af034 and on 1df419eb): the request stamp of a presented playback
+ *  LOOKAHEAD frame. It is rendered ahead of the timeline and stamped with the wrap count of the request that spawned it,
+ *  which can predate a wrap the timeline crossed before reaching it (cut 0..3, 0 presented, cached 1 stamped 0, the engine
+ *  wraps and lands on 1). MainWindow::drawFrameReady drops a lookahead frame unless it IS the engine's active target, so a
+ *  presented lookahead is the timeline's position at that check, and the live count there, read before that draw's own
+ *  early/tail advance can move the target or the count, is the wraps before its landing. A record of the engine's last
+ *  request (dbeb9424) lost this when that advance requested the next frame first, and read advanced 1, wraps 0 where
+ *  1 + 4 - 0 = 5 and 1 are right.
+ *  \param contextStamp the frame's own PresentationContext::engineWrapsAtRequest
+ *  \param engineWrapsAtAcceptance the live count at drawFrameReady's target check */
+inline int presentationAcceptedLookaheadStamp( int contextStamp, int engineWrapsAtAcceptance )
+{
+    return engineWrapsAtAcceptance > contextStamp ? engineWrapsAtAcceptance : contextStamp;
 }
 
 #endif // PLAYBACKSOURCEADVANCETRACKER_H

@@ -7230,10 +7230,6 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             }
         }
     }
-    // r19 (adversary A1 on 1df419eb): the engine's own request for this frame, with the wrap count then; a lookahead
-    // frame reused for it is stamped by this request, not by the one that spawned it (presentationRequestStamp)
-    m_playbackEngineRequestFrame = requestedFrame;
-    m_playbackEngineRequestWraps = requestContext.engineWrapsAtRequest;
     const bool playbackLookaheadCoversCurrent =
         ui->actionPlay->isChecked()
         && m_pRenderThread
@@ -26382,18 +26378,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // frame requested across the boundary before the wrap still can (719 -> speculative 0).
     // r19 (sol r18 B1; adversary A1 on 924d3d6f): a forward landing takes its wrap too, and each landing is
     // credited one cut width per wrap it crossed.
-    // r19 (adversary A1 on 1df419eb): a reused lookahead frame takes the stamp of the engine's own request for it.
-    const int sourceAdvanceRequestStamp = presentationRequestStamp( requestContext.playbackLookaheadRequest,
-                                                                    requestContext.engineWrapsAtRequest,
-                                                                    static_cast<int>( displayFrame ),
-                                                                    m_playbackEngineRequestFrame,
-                                                                    m_playbackEngineRequestWraps );
+    // r20 (adversary A1 and A2 on dbeb9424): direction decides nothing, and a presented lookahead carries the stamp
+    // drawFrameReady gave it at its target check (presentationAcceptedLookaheadStamp).
     const int sourceAdvanceWraps = presentationLoopWraps( m_playbackWrapRecorder.engineWraps,
-                                                          sourceAdvanceRequestStamp,
+                                                          requestContext.engineWrapsAtRequest,
                                                           m_playbackSmokeTrackerEngineWraps,
-                                                          m_playbackSmokePresentedFrames > 0,
-                                                          m_playbackSmokeLastPresentedFrame,
-                                                          static_cast<int>( displayFrame ) );
+                                                          m_playbackSmokePresentedFrames > 0 );
     m_playbackSmokeSourceAdvance.notePresented( now,
                                                 static_cast<int>( displayFrame ),
                                                 sourceAdvanceWraps,
@@ -33664,6 +33654,12 @@ void MainWindow::drawFrameReady()
             }
             return;
         }
+        // r20 (adversary A1 on dbeb9424): this frame IS the engine's active target, so the wraps before its landing are
+        // the live count here, before this draw's own early/tail advance moves the target or the count.
+        requestContext.engineWrapsAtRequest =
+            presentationAcceptedLookaheadStamp( requestContext.engineWrapsAtRequest,
+                                                m_playbackWrapRecorder.engineWraps );
+        readyFrame.presentationContext.engineWrapsAtRequest = requestContext.engineWrapsAtRequest;
     }
 
     // Forward-only present guard: during forward playback never present a frame older

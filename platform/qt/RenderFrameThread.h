@@ -179,7 +179,8 @@ public:
              * count (PlaybackWrapRecorder::engineWraps) when this frame was REQUESTED. A frame requested before a
              * wrap is presented after it whenever the draw's own early/tail advance wraps the engine first, so
              * the source-advance tracker reads this beside the live count (presentationLoopWraps). A lookahead
-             * request copies its base request's count. */
+             * request copies its base request's count, and r20: MainWindow::drawFrameReady raises it to the live count
+             * when it accepts the frame as the engine's target (presentationAcceptedLookaheadStamp). */
             int engineWrapsAtRequest = 0;
             bool playbackActive = false;
             bool dropFramePlaybackActive = false;

@@ -80,6 +80,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_conform_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_conform_env_override.cpp \
     $$REPO_ROOT/tests/console/test_playback_source_advance_tracker.cpp \
+    $$REPO_ROOT/tests/console/test_playback_source_advance_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
