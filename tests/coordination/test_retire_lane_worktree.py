@@ -5575,3 +5575,113 @@ def test_full_gate_an_exited_process_with_a_locked_script_is_no_candidate(repo):
     arms = sd / "arms.ps1"
     d = _gate_with_snapshot(wt, _fake_row("999992", cmd=f"pwsh -File {arms}", name="pwsh.exe", cwd=str(tmp)), prelude=_locked(arms))
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), json.dumps(d)
+
+
+# --- RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 r3 (sol A1 on #759; carries RETIRE-NOREAD-ROW-PROPERTY-SAFE-1) ---
+# A caller-built holder row (a -ProcessSnapshot's or a -SnapshotProvider's HolderIndex) predates File/FileError/CreatedUtc. Under
+# Set-StrictMode Latest a row missing one threw inside Get-CwdUnknownRefusal, and every caller turned the throw into an anonymous failure
+# (census-failed with no pid; cannot-determine; holder-probe-failed). The holder IS known, so the refusal must still name it. Every case
+# uses a real, proven-live holder pid and asserts the exact refusal and that nothing was removed; a holder that died is a fixture error.
+
+_NOREAD_FILE = "C:\\locked\\arms.ps1"
+_NOREAD_VARIANTS = [
+    pytest.param((), id="complete-row-control"),
+    pytest.param(("FileError",), id="missing-FileError"),
+    pytest.param(("File",), id="missing-File"),
+    pytest.param(("File", "FileError"), id="missing-File-and-FileError"),
+    pytest.param(("CreatedUtc",), id="missing-CreatedUtc"),
+    pytest.param(("CreatedUtc", "File", "FileError"), id="missing-all-optional"),
+]
+
+
+def _noread_snapshot(pid, drop=()):
+    """A snapshot with a cached HolderIndex: probe ok, one unknown row Why=script-unreadable for `pid`, optional properties in `drop` omitted."""
+    props = [("ProcessId", str(pid)), ("Name", "'pwsh.exe'"), ("Why", "'script-unreadable'"), ("CreatedUtc", "$null"),
+             ("File", f"'{_NOREAD_FILE}'"), ("FileError", "'IOException win32=32'")]
+    row = "; ".join(f"{k} = {v}" for k, v in props if k not in drop)
+    return ("[pscustomobject]@{ Procs = @(); SelfPids = @($PID); CapturedUtc = (Get-Date).ToUniversalTime(); "
+            "HolderIndex = [pscustomobject]@{ Cwd = @{}; Scripts = @(); ScriptsByPid = @{}; CwdProbe = 'ok'; "
+            f"CwdUnknown = @([pscustomobject]@{{ {row} }}) }} }}")
+
+
+def _noread_holder(repo, leaf):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / leaf)
+    return wt, _spawn_proven_alive(tmp, leaf + "-holder", cwd=tmp)
+
+
+def _noread_alive(p):
+    if p.poll() is not None:
+        raise AssertionError(f"FIXTURE ERROR: holder {p.pid} exited before the gate returned, so this says nothing about the refusal")
+
+
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_still_gets_the_identifying_reason(repo, drop):
+    """Get-CwdUnknownRefusal itself, under StrictMode: Reason, Rows and Unknown name the pid (and the file when the row has one)."""
+    wt, p = _noread_holder(repo, "wt-noread-helper")
+    try:
+        script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+                  f"$r = Get-CwdUnknownRefusal -Snapshot ({_noread_snapshot(p.pid, drop)}) -WorktreePath '{wt}'; "
+                  "[pscustomobject]@{ Reason = $r.Reason; Rows = @($r.Rows); Unknown = @($r.Unknown) } | ConvertTo-Json -Depth 4 -Compress")
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r.returncode == 0, r.stdout + r.stderr
+    d = json.loads(r.stdout)
+    assert d["Reason"].startswith("cwd-unknown") and str(p.pid) in d["Reason"] and "script-unreadable" in d["Reason"], d
+    assert len(d["Rows"]) == 1 and d["Rows"][0]["ProcessId"] == p.pid and d["Rows"][0]["Via"] == "script-unreadable", d
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u for u in d["Unknown"]), d
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["Reason"] and d["Rows"][0]["MatchedPath"] == _NOREAD_FILE, d
+        assert any(f"file={_NOREAD_FILE}" in u for u in d["Unknown"]), d
+    if "FileError" in drop:
+        assert "[]" not in d["Reason"], f"an absent FileError must not print an empty bracket pair: {d['Reason']}"
+
+
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_live_refusal_names_the_holder(repo, drop):
+    """Get-WorktreeLiveRefusal: the typed refusal keeps the known pid; it is never census-failed with processId null."""
+    wt, p = _noread_holder(repo, "wt-noread-guard")
+    try:
+        r, err = _live_refusal(wt, snapshot_expr=_noread_snapshot(p.pid, drop))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r is not None, "a known unreadable-script holder was read as FREE"
+    assert r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"] == (_NOREAD_FILE if "File" not in drop else ""), r
+    assert f"pid={p.pid}" in err and "reason=cwd-unknown" in err, err
+
+
+def _gate_snapshot_run(workdir, snapshot_expr, whatif):
+    quarantine = Path(workdir).parent / "q"
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; $snap = {snapshot_expr}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
+        f"{' -WhatIf' if whatif else ''} -ProcessSnapshot $snap | ConvertTo-Json -Depth 4"
+    )
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True)
+    return json.loads(r.stdout), r.stderr
+
+
+@pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_retire_keeps_the_worktree_and_names_the_holder(repo, drop, whatif):
+    """Invoke-RetireLaneWorktree: kept with reason cwd-unknown naming the pid, never cannot-determine; nothing renamed, nothing removed."""
+    wt, p = _noread_holder(repo, "wt-noread-retire")
+    try:
+        d, err = _gate_snapshot_run(wt, _noread_snapshot(p.pid, drop), whatif)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"], json.dumps(d)
+    assert "cannot-determine" not in d["reason"], json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u for u in d["cwdUnknown"]), json.dumps(d)
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["reason"], json.dumps(d)
+    assert f"pid={p.pid}" in err and "via=script-unreadable" in err, err
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists()

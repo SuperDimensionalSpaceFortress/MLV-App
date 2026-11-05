@@ -49,7 +49,7 @@ def world(tmp_path):
     return w
 
 
-def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None, extra="", timeout=120, real_snapshot=False):
+def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None, extra="", timeout=120, real_snapshot=False, strict=False):
     """Dot-source the helper in a fresh pwsh and return its disposition as a dict.
 
     pr=None leaves the PR probe at its default (real `gh`, or the -GhPath seam in `extra`).
@@ -61,9 +61,9 @@ def call_helper(w, paths, pr="none", keep=False, work=None, workdir_in=None, ext
     driver = w["tmp"] / "driver.ps1"
     probe = "-PrProbe { '%s' } " % pr if pr is not None else ""
     driver.write_text(
-        ". '%s'\n$d = Invoke-RemoveLaneBulkScratch -RunDir '%s' -WorkDir '%s' -Root '%s' -LaneScratchRoot '%s' "
+        "%s. '%s'\n$d = Invoke-RemoveLaneBulkScratch -RunDir '%s' -WorkDir '%s' -Root '%s' -LaneScratchRoot '%s' "
         "%s%s %s\n$d | ConvertTo-Json -Depth 6\n"
-        % (HELPER, w["run"], work or w["work"], w["bulk"], w["scratch"], probe, "-Keep" if keep else "", extra),
+        % ("Set-StrictMode -Version Latest\n" if strict else "", HELPER, w["run"], work or w["work"], w["bulk"], w["scratch"], probe, "-Keep" if keep else "", extra),
         encoding="ascii")
     r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver)],
                        capture_output=True, text=True, timeout=timeout)
@@ -498,3 +498,36 @@ def test_two_case_spellings_of_one_path_are_one_entry(world):
     d = call_helper(world, [asm, str(asm).upper(), str(asm).lower() + "\\"])
     assert len(d["entries"]) == 1 and entry(d)["action"] == "removed", d["entries"]
     assert d["truncated"] == 0
+
+
+# ---- RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 r3 (sol A1; RETIRE-NOREAD-ROW-PROPERTY-SAFE-1): a caller-built row may omit File / FileError / CreatedUtc ----
+
+@pytest.mark.parametrize("drop", [(), ("FileError",), ("File",), ("File", "FileError"), ("CreatedUtc",), ("CreatedUtc", "File", "FileError")],
+                         ids=["complete-row-control", "missing-FileError", "missing-File", "missing-File-and-FileError", "missing-CreatedUtc", "missing-all-optional"])
+def test_an_unreadable_script_row_missing_an_optional_property_still_keeps_the_dir_and_names_the_holder(world, drop):
+    """Under StrictMode (as the lane launcher runs it) the guard must refuse as holder-cwd-unknown with the known pid, never holder-probe-failed.
+    The pid is a real, proven-live process; a holder that exited is a fixture error, not a gate result."""
+    ready = world["tmp"] / "noread-holder.ready"
+    holder = subprocess.Popen([PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                               "[IO.File]::WriteAllText('%s', 'up'); Start-Sleep -Seconds 300" % ready],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 60
+        while holder.poll() is None and not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert holder.poll() is None and ready.exists(), "FIXTURE ERROR: the holder never became ready"
+        asm = make_asm(world)
+        props = [("ProcessId", str(holder.pid)), ("Name", "'pwsh.exe'"), ("Why", "'script-unreadable'"), ("CreatedUtc", "$null"),
+                 ("File", "'C:\\locked\\arms.ps1'"), ("FileError", "'IOException win32=32'")]
+        row = "[pscustomobject]@{ %s }" % "; ".join("%s = %s" % kv for kv in props if kv[0] not in drop)
+        d = call_helper(world, [asm], extra=provider(unknown="@(%s)" % row), strict=True)
+        assert holder.poll() is None, "FIXTURE ERROR: the holder exited before the guard returned"
+    finally:
+        holder.kill(); holder.wait(timeout=30)
+    e = entry(d)
+    assert e["action"] == "kept" and e["reason"] == "holder-cwd-unknown", e
+    assert str(holder.pid) in e["error"] and "script-unreadable" in e["error"], e
+    if "File" not in drop:
+        assert "C:\\locked\\arms.ps1" in e["error"], e
+    assert any(str(holder.pid) in h and "via=script-unreadable" in h for h in e["holders"]), e
+    assert (asm / "a.txt").exists() and not (world["run"] / "scratch-receipts").exists()

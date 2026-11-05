@@ -1301,6 +1301,19 @@ function Get-ServiceAccountByPid {
     return $map
 }
 
+function ConvertTo-CwdUnknownRow {
+    # RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 r3 (sol A1 on #759, RETIRE-NOREAD-ROW-PROPERTY-SAFE-1): a holder-index row built by a caller (a -ProcessSnapshot or
+    # -SnapshotProvider index) predates the optional properties. Get-LaneHolderIndex always writes CreatedUtc, and File/FileError only on a script-unreadable
+    # row, so a caller's row may omit any of the three, and under Set-StrictMode Latest a bare read of a missing property throws. The throw reached
+    # Get-WorktreeLiveRefusal (census-failed, no pid), Test-CwdRefusal (cannot-determine) and Remove-LaneBulkScratch (holder-probe-failed): the holder
+    # was known and the refusal lost it. Every optional read goes through this copy (never the shared index row), so a missing one is '' / $null and the
+    # row still names its pid. ProcessId, Name and Why are not optional: a row without them is malformed and still fails closed through the callers' catch.
+    param([object]$Row)
+    $opt = { param([string]$n) $p = $Row.PSObject.Properties[$n]; if ($p) { $p.Value } else { $null } }
+    [pscustomobject]@{ ProcessId = $Row.ProcessId; Name = $Row.Name; Why = $Row.Why; CreatedUtc = (& $opt 'CreatedUtc')
+                       File = [string](& $opt 'File'); FileError = [string](& $opt 'FileError') }
+}
+
 function Get-CwdUnknownRefusal {
     # r2: the cwd probe's own verdict for this snapshot and worktree. Unknown is empty when every candidate holder's cwd was
     # read or exempted; otherwise Reason/Rows/Unknown describe a kept / cwd-probe-unavailable | cwd-unknown result. Never a
@@ -1322,7 +1335,8 @@ function Get-CwdUnknownRefusal {
     $idx = Get-LaneHolderIndex -Snapshot $Snapshot
     $wtCreated = try { (Get-Item -LiteralPath $WorktreePath -ErrorAction Stop).CreationTimeUtc } catch { $null }
     $unk = @(); $exempt = 0; $owner = @(); $ownerProbe = $null; $ownerSkipped = @()
-    foreach ($u in @($idx.CwdUnknown)) {
+    foreach ($raw in @($idx.CwdUnknown)) {
+        $u = ConvertTo-CwdUnknownRow $raw
         if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable' -and $null -ne $wtCreated -and $null -ne $u.CreatedUtc -and $u.CreatedUtc -lt $wtCreated) { $exempt++; continue }
         if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable') {
             # One SCM query per snapshot, cached on the index; a failed query exempts nothing.
@@ -1346,14 +1360,14 @@ function Get-CwdUnknownRefusal {
                 }
                 if (-not $unbound) { $owner += "$($u.ProcessId) $($u.Name) exempt=service-sid:$($o.Sid) via=scm:$($o.Services) bound=config-older-than-process"; continue }
                 # A copy: the index row is shared by every worktree of a sweep and must keep Why=cwd-unreadable.
-                $u = [pscustomobject]@{ ProcessId = $u.ProcessId; Name = $u.Name; Why = $unbound; CreatedUtc = $u.CreatedUtc }
+                $u = [pscustomobject]@{ ProcessId = $u.ProcessId; Name = $u.Name; Why = $unbound; CreatedUtc = $u.CreatedUtc; File = $u.File; FileError = $u.FileError }
             }
         }
         $unk += $u
     }
     $made = if ($null -ne $wtCreated) { ([datetime]$wtCreated).ToString('o') } else { $null }
-    # A row built by a caller (a -SnapshotProvider's index) predates File: read it only when present (StrictMode throws on a missing property).
-    $fileOf = { param($u) if ($u.PSObject.Properties['File']) { [string]$u.File } else { '' } }
+    # Every row in $unk went through ConvertTo-CwdUnknownRow, so File / FileError / CreatedUtc always exist (as '' / $null when the caller's row lacked them).
+    $fileOf = { param($u) [string]$u.File }
     $describe = { param($u) $t = if ($u.CreatedUtc) { ([datetime]$u.CreatedUtc).ToString('o') } else { 'unreadable' }; $f = & $fileOf $u; "$($u.ProcessId) $($u.Name) $($u.Why) created=$t$(if ($f) { " file=$f" })" }
     $deferred = @()
     if ($DeferUnreadableCwd -and $idx.CwdProbe -eq 'ok') {
@@ -1375,7 +1389,7 @@ function Get-CwdUnknownRefusal {
     if ($noRead.Count) {
         # The refusal names each pid and file; the sentence above is about a cwd, which is not this row's problem when every row is this kind.
         if ($noRead.Count -eq $unk.Count -and $idx.CwdProbe -eq 'ok') { $res.Reason = "cwd-unknown: $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
-        $res.Reason += ' (script-unreadable: a script the process can load exists and could not be read, so it may name this worktree: ' + (($noRead | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.File) [$($_.FileError)]" }) -join ', ') + ')'
+        $res.Reason += ' (script-unreadable: a script the process can load exists and could not be read, so it may name this worktree: ' + (($noRead | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId)$(if ($_.File) { " $($_.File)" })$(if ($_.FileError) { " [$($_.FileError)]" })" }) -join ', ') + ')'
     }
     $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object {
         $row = [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $(if ($_.Why -in @('encoded-command-undecodable', 'script-unreadable')) { $_.Why } else { $via }) }
