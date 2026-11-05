@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-11-05T13:52:19Z
+generated_from: 2026-11-05T16:16:10Z
 
 ## Open product and playback cards
 
@@ -20,6 +20,7 @@ generated_from: 2026-11-05T13:52:19Z
 
 | P | card | kind | state | queued since | order_chain |
 |---|---|---|---|---|---|
+| 1 | LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1 | product | pr-open | 2026-10-14 | - |
 | 1 | CORE-PARTITION-HELPER-PID-REUSE-1 | product | queued | 2026-10-28 | ORDER-20261028T134438Z #2 after BACHELOR-CORE-PARTITION-AB-1 |
 | 1 | CORE-PARTITION-TERMINAL-TEST-REAL-PUBLISHER-1 | product | queued | 2026-10-28 | - |
 | 1 | QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 | product | queued | 2026-10-31 | - |
@@ -49,7 +50,7 @@ generated_from: 2026-11-05T13:52:19Z
 
 ## Drain
 
-product+playback open: 26
+product+playback open: 27
 
 Window: the 7 UTC days ending 2026-11-05 (the last day is partial).
 Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
