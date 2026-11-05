@@ -32,6 +32,17 @@ own output, or the resolver, proved actually ran), never a copy of one for the o
 | recon | Luna (`luna` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-luna` slug at launch) | high, and only high (LANE-MODEL-CURRENCY-1 round 2 retired the earlier low-recon carve-out) | read-only shards, doctrine folds, evidence audits | editing |
 | status | Haiku (Desktop chat session from `.claude-state/continuity/HAIKU-STATUS-PASTE.md`) | n/a | read heartbeat, receipts, PR list; report | adjudicate, mutate, dispatch, answer "what next" |
 
+Visual judge (VISUAL-JUDGE-TERRA-LANE-1, owner directive 2026-10-31): the `terra` tier row in
+`tools/coordination/Invoke-Lane.ps1` (engine codex, role `visual-judge`, high effort, read-only like every
+codex row) is the seat that looks at images. The tier resolves at launch to the highest listed
+`gpt-<ver>-terra` slug, and `-ImagePaths` attaches PNG/JPG files through `codex exec -i` (codex lanes only;
+the receipt carries each file's sha256). The hub tool `Invoke-StripReview.ps1` builds reference-versus-candidate
+side-by-side strips from a head-bound `sheets.json`, asks terra for one JSON verdict (`PASS`/`FAIL`/`UNSURE`;
+`UNSURE` or an unparseable answer counts as `FAIL`) and sets `review/visual-terra` on the exact PR head. The
+seat is a hold condition for a PR that names it by hub ruling, never a merge-bar key, and it is absent from
+`Invoke-Workstream.ps1` and `Invoke-WorkstreamLoop.ps1`, so nothing on a timer can reach it. It is used only after
+its calibration (a known-worse candidate must FAIL, an identical pair must PASS) has passed.
+
 ## Precedence against error-remediation.md
 
 [error-remediation.md](error-remediation.md) governs a recoverable FAILURE inside an already

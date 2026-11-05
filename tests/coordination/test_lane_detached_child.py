@@ -27,6 +27,9 @@ LANE-DETACHED-CHILD-TEST-HARDENING-2 closes the rows #545's keys left open:
      one created after the records were written, cannot escape.
   3. The live job's LimitFlags is read back with QueryInformationJobObject(job, 9) and must equal 0x2000, so an
      indirect write of a breakaway flag goes red even though the static one-write guard sees nothing.
+
+VISUAL-JUDGE-TERRA-LANE-1 r14: Invoke-Lane.ps1 creates the job at TWO named sites, the Claude host and the Codex image host (a Codex lane that carries
+-ImagePaths). The census is exact, each control below runs against each site's own statement, and a third site or a missing one fails.
 """
 
 import ctypes
@@ -108,7 +111,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Dir,
     [Parameter(Mandatory = $true)][int]$SurvivalSec,
     [Parameter(Mandatory = $true)][int]$HostWaitSec,
-    [switch]$ProbeOnly   # read the live job's limit flags back and stop: no host, no children
+    [switch]$ProbeOnly,  # read the live job's limit flags back and stop: no host, no children
+    [string]$ProbeSite   # which named job call site's own statement to run (job-sites.json, written by this module)
 )
 $ErrorActionPreference = 'Stop'
 $src = [IO.File]::ReadAllText($LaneScript)
@@ -151,8 +155,13 @@ function Test-Alive($Rec) {
 if ($ProbeOnly) {
     # Read back the handle the way the lane holds it: run Invoke-Lane.ps1's own `$jobHandle = ...CreateKillOnClose()`
     # statement (the whole line, whatever it now does to the handle) and probe $jobHandle, not a fresh job from the class.
-    $site = [regex]::Matches($src, '(?m)^[ \t]*(\$jobHandle[ \t]*=[ \t]*\[MlvLaneJob\]::CreateKillOnClose\(\)[^\r\n]*)\r?$')
-    if ($site.Count -ne 1) { throw ('job-call-site-not-unique-' + $site.Count) }
+    # The census is exact: every statement that creates the job must be one of the named sites, so a third one stops the probe before anything runs.
+    $sites = [IO.File]::ReadAllText((Join-Path $Dir 'job-sites.json')) | ConvertFrom-Json -AsHashtable
+    $census = [regex]::Matches($src, '(?m)^[ \t]*(\$jobHandle[ \t]*=[ \t]*\[MlvLaneJob\]::CreateKillOnClose\(\)[^\r\n]*)\r?$')
+    if ($census.Count -ne $sites.Count) { throw ('job-call-site-census-' + $census.Count + '-expected-' + $sites.Count) }
+    if (-not $sites.ContainsKey($ProbeSite)) { throw ('job-call-site-unknown-' + $ProbeSite) }
+    $site = [regex]::Matches($src, [string]$sites[$ProbeSite])
+    if ($site.Count -ne 1) { throw ('job-call-site-not-unique-' + $ProbeSite + '-' + $site.Count) }
     Invoke-Expression $site[0].Groups[1].Value
     try { '{"limitFlags":' + [MlvTestJobProbe]::LimitFlags($jobHandle) + '}' } finally { [void][MlvLaneJob]::CloseHandle($jobHandle) }
     return
@@ -292,12 +301,12 @@ def sweep_tagged(token, not_before, *, kill=True):
     return swept
 
 
-def probe_job_flags(d, lane_script=INVOKE_LANE):
-    """LimitFlags of the job object the lane script's own MlvLaneJob class creates, read back with
+def probe_job_flags(d, site, lane_script=INVOKE_LANE):
+    """LimitFlags of the job object the named call site's own statement creates in the lane script, read back with
     QueryInformationJobObject(job, JobObjectExtendedLimitInformation = 9)."""
     cp = subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(d / "control.ps1"),
-         "-LaneScript", str(lane_script), "-Dir", str(d), "-SurvivalSec", "0", "-HostWaitSec", "0", "-ProbeOnly"],
+         "-LaneScript", str(lane_script), "-Dir", str(d), "-SurvivalSec", "0", "-HostWaitSec", "0", "-ProbeOnly", "-ProbeSite", site],
         capture_output=True, text=True, timeout=90)
     assert cp.returncode == 0, f"job probe failed rc={cp.returncode}\nstdout={cp.stdout}\nstderr={cp.stderr}"
     return json.loads(cp.stdout.strip().splitlines()[-1])["limitFlags"]
@@ -319,6 +328,7 @@ def stage(d):
     (d / "host.ps1").write_text(HOST_PS1, encoding="ascii")
     (d / "control.ps1").write_text(CONTROL_PS1, encoding="ascii")
     (d / "token.txt").write_text("MLVTAG" + uuid.uuid4().hex, encoding="ascii")
+    (d / "job-sites.json").write_text(json.dumps({name: rx.pattern for name, rx in JOB_CALL_SITES.items()}), encoding="ascii")
     return d
 
 
@@ -465,17 +475,30 @@ def limit_flag_decls(src):
     return len(LIMIT_FLAGS_DECL_RE.findall(job_block(src)))
 
 
+# Every statement that creates the lane's job, by name; only what surrounds it tells them apart. A name that stops matching, or a third statement, fails the census.
+_JOB_STATEMENT = r"(?m)^[ \t]*(\$jobHandle = \[MlvLaneJob\]::CreateKillOnClose\(\)[^\r\n]*)\r?\n"
+_THEN_START = r"[ \t]*\$proc = \[Diagnostics\.Process\]::Start\(\$psi\)\r?\n"
+JOB_CALL_SITES = {
+    # the Claude host: Start follows at once, and records that a host exists
+    "claude-host": re.compile(_JOB_STATEMENT + _THEN_START + r"[ \t]*\$hostStarted = \$true"),
+    # the Codex image host: the last statement of the branch that only a lane with image holds enters; the Start after it is shared with a no-image lane
+    "codex-image-host": re.compile(_JOB_STATEMENT + r"[ \t]*\}\r?\n" + _THEN_START + r"\}"),
+}
+SITE_NAMES = sorted(JOB_CALL_SITES)
+
+
 # Every way Invoke-Lane.ps1 may mention the lane's job handle. The runtime read-back runs the call-site line and probes
 # $jobHandle, so a later second write to the handle (a copy, a re-assignment, a flag change on the live job) has to be
 # a deliberate edit to this list. Matching is case-insensitive in PowerShell, so the leftover scan is too; `${jobHandle}`
 # and `$script:jobHandle` are mentions, and they match none of these shapes.
 JOB_HANDLE_CALL_SITE_RE = re.compile(r"(?m)^[ \t]*\$jobHandle = \[MlvLaneJob\]::CreateKillOnClose\(\)[ \t]*\r?$")
 JOB_HANDLE_KNOWN_SHAPES = (
-    JOB_HANDLE_CALL_SITE_RE,                                                 # the one place the job is created
+    JOB_HANDLE_CALL_SITE_RE,                                                 # the named sites that create the job (JOB_CALL_SITES)
     re.compile(r"\$jobHandle = \[IntPtr\]::Zero\b"),                         # initial value and every post-close reset
     re.compile(r"\[MlvLaneJob\]::AssignOrThrow\(\$jobHandle, \$proc\.Handle\)"),
     re.compile(r"if \(\$jobHandle -ne \[IntPtr\]::Zero\)"),
     re.compile(r"\[void\]\[MlvLaneJob\]::CloseHandle\(\$jobHandle\)"),
+    re.compile(r"Stop-CodexImageReaderTree -Job \$jobHandle\b"),             # r13: the image readers are stopped through the job, by this function only
 )
 JOB_HANDLE_MENTION_RE = re.compile(r"jobHandle", re.I)
 
@@ -489,9 +512,13 @@ def job_handle_unknown_mentions(src):
 
 
 def assert_job_handle_shapes(src):
-    assert len(JOB_HANDLE_CALL_SITE_RE.findall(src)) == 1, "the job-handle call site must be exactly one whole line"
+    found = len(JOB_HANDLE_CALL_SITE_RE.findall(src))
+    assert found == len(JOB_CALL_SITES), (
+        f"each job-handle call site must be exactly one whole line; the census found {found}, expected {SITE_NAMES}")
     unknown = job_handle_unknown_mentions(src)
     assert not unknown, f"jobHandle appears in a shape the guard does not know (a second write to the handle?): {unknown}"
+    for name, rx in JOB_CALL_SITES.items():
+        assert len(rx.findall(src)) == 1, f"the job-handle call site named {name} must be exactly one whole line in its own place"
 
 
 def assert_kill_on_close_only(src):
@@ -622,6 +649,16 @@ def test_the_only_limitflags_write_must_be_0x2000():
 JOB_CALL_SITE = "$jobHandle = [MlvLaneJob]::CreateKillOnClose()"
 
 
+def after_site(src, site, text):
+    """`src` with `text` right after the named site's own statement, and no other site touched."""
+    assert src.count(JOB_CALL_SITE) == len(JOB_CALL_SITES), "Invoke-Lane.ps1 no longer has the expected job call sites"
+    matches = list(JOB_CALL_SITES[site].finditer(src))
+    assert len(matches) == 1, f"the call site named {site} moved; update JOB_CALL_SITES"
+    end = matches[0].end(1)
+    return src[:end] + text + src[end:]
+
+
+@pytest.mark.parametrize("site", SITE_NAMES)
 @pytest.mark.parametrize("extra", [
     "$h2 = $jobHandle",                                              # a copy that a later statement could change the job through
     "${jobHandle}",                                                  # braced spelling of the same variable
@@ -631,25 +668,66 @@ JOB_CALL_SITE = "$jobHandle = [MlvLaneJob]::CreateKillOnClose()"
     "Set-Variable -Name jobHandle -Value 5",                         # indirect write, no `$` at all
     "[MlvLaneJob]::CloseHandle($jobHandle, 1)",                      # a known name in an unknown call shape
 ])
-def test_a_job_handle_mention_in_an_unknown_shape_is_caught(extra):
+def test_a_job_handle_mention_in_an_unknown_shape_is_caught(extra, site):
     src = INVOKE_LANE.read_text(encoding="utf-8")
-    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
+    assert src.count(JOB_CALL_SITE) == len(JOB_CALL_SITES), "Invoke-Lane.ps1 no longer has the expected job call sites"
     with pytest.raises(AssertionError, match="jobHandle appears in a shape"):
-        assert_kill_on_close_only(src.replace(JOB_CALL_SITE, JOB_CALL_SITE + "\n" + extra))
+        assert_kill_on_close_only(after_site(src, site, "\n" + extra))
 
 
-def test_a_second_statement_on_the_job_call_site_line_is_caught():
+@pytest.mark.parametrize("site", SITE_NAMES)
+def test_a_second_statement_on_the_job_call_site_line_is_caught(site):
     src = INVOKE_LANE.read_text(encoding="utf-8")
-    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
+    assert src.count(JOB_CALL_SITE) == len(JOB_CALL_SITES), "Invoke-Lane.ps1 no longer has the expected job call sites"
     with pytest.raises(AssertionError, match="call site must be exactly one whole line"):
-        assert_kill_on_close_only(src.replace(JOB_CALL_SITE, JOB_CALL_SITE + "; [void]$jobHandle"))
+        assert_kill_on_close_only(after_site(src, site, "; [void]$jobHandle"))
 
 
-def test_a_whole_line_comment_naming_the_job_handle_is_not_a_mention():
+def test_the_census_names_exactly_the_sites_the_lane_has():
+    # Each name matches exactly one statement, and no statement goes unnamed.
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert_job_handle_shapes(src)
+    spans = {name: rx.search(src).span(1) for name, rx in JOB_CALL_SITES.items()}
+    assert len(set(spans.values())) == len(JOB_CALL_SITES), f"two names matched one statement: {spans}"
+
+
+@pytest.mark.parametrize("site", SITE_NAMES)
+def test_a_third_job_call_site_fails_the_census(site, tmp_path):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    third = after_site(src, site, "\n" + JOB_CALL_SITE)
+    with pytest.raises(AssertionError, match="the census found 3"):
+        assert_kill_on_close_only(third)
+    lane_copy = tmp_path / "Invoke-Lane.mutated.ps1"
+    lane_copy.write_text(third, encoding="utf-8")
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    with pytest.raises(AssertionError, match="job-call-site-census-3-expected-2"):
+        probe_job_flags(stage(probe_dir), site, lane_copy)
+
+
+@pytest.mark.parametrize("site", SITE_NAMES)
+def test_a_missing_job_call_site_fails_the_census(site):
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    start, end = JOB_CALL_SITES[site].search(src).span(1)
+    with pytest.raises(AssertionError, match="the census found 1"):
+        assert_kill_on_close_only(src[:start] + "$null = 0" + src[end:])
+
+
+@pytest.mark.parametrize("site", SITE_NAMES)
+def test_a_call_site_moved_out_of_its_place_fails_by_name(site):
+    # The statement is still a whole line and the count is still two, but it no longer stands where its name says: nothing else would notice.
+    src = INVOKE_LANE.read_text(encoding="utf-8")
+    assert_job_handle_shapes(src)
+    with pytest.raises(AssertionError, match=f"call site named {site}"):
+        assert_kill_on_close_only(after_site(src, site, "\n$null = 0"))
+
+
+@pytest.mark.parametrize("site", SITE_NAMES)
+def test_a_whole_line_comment_naming_the_job_handle_is_not_a_mention(site):
     # Invoke-Lane.ps1 already has one (`# job, so $jobHandle is zero ...`); the shape guard must not trip on comments.
     src = INVOKE_LANE.read_text(encoding="utf-8")
-    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
-    assert job_handle_unknown_mentions(src.replace(JOB_CALL_SITE, JOB_CALL_SITE + "\n# $jobHandle is only read below")) == []
+    assert src.count(JOB_CALL_SITE) == len(JOB_CALL_SITES), "Invoke-Lane.ps1 no longer has the expected job call sites"
+    assert job_handle_unknown_mentions(after_site(src, site, "\n# $jobHandle is only read below")) == []
 
 
 # ---- the lifecycle ----------------------------------------------------------------------------------------
@@ -884,9 +962,9 @@ def test_run_control_does_not_report_a_reap_it_could_not_confirm(tmp_path, monke
 JOB_FLAGS_KILL_ON_CLOSE_ONLY = 0x2000
 
 
-@pytest.fixture(scope="module")
-def job_flags(tmp_path_factory):
-    return probe_job_flags(stage(tmp_path_factory.mktemp("job-probe")))
+@pytest.fixture(scope="module", params=SITE_NAMES)
+def job_flags(request, tmp_path_factory):
+    return probe_job_flags(stage(tmp_path_factory.mktemp("job-probe")), request.param)
 
 
 def test_the_live_lane_job_reads_back_kill_on_close_and_nothing_else(job_flags):
@@ -915,8 +993,9 @@ INDIRECT_BREAKAWAY_WRITES = {
 }
 
 
+@pytest.mark.parametrize("site", SITE_NAMES)
 @pytest.mark.parametrize("name", sorted(INDIRECT_BREAKAWAY_WRITES))
-def test_an_indirect_breakaway_write_is_invisible_to_the_text_guard_but_goes_red_at_runtime(name, tmp_path):
+def test_an_indirect_breakaway_write_is_invisible_to_the_text_guard_but_goes_red_at_runtime(name, site, tmp_path):
     src = INVOKE_LANE.read_text(encoding="utf-8")
     assert src.count(STRUCT_TO_PTR) == 1, "Invoke-Lane.ps1 no longer marshals the job struct the expected way"
     assert "LimitFlags" not in INDIRECT_BREAKAWAY_WRITES[name], f"{name}: the case spells LimitFlags, so it is not indirect"
@@ -926,8 +1005,8 @@ def test_an_indirect_breakaway_write_is_invisible_to_the_text_guard_but_goes_red
     lane_copy.write_text(mutated, encoding="utf-8")
     probe_dir = tmp_path / "probe"
     probe_dir.mkdir()
-    flags = probe_job_flags(stage(probe_dir), lane_copy)
-    assert flags == 0x2800, f"{name}: the runtime read-back saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
+    flags = probe_job_flags(stage(probe_dir), site, lane_copy)
+    assert flags == 0x2800, f"{name}: the runtime read-back at {site} saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
     assert flags != JOB_FLAGS_KILL_ON_CLOSE_ONLY
 
 
@@ -942,18 +1021,24 @@ JOB_CALL_SITE_ORS_0x800 = (
     ".Invoke($null, @($jobHandle, 9, $m, [uint32]144))")
 
 
-def test_a_call_site_that_changes_the_job_it_just_created_is_caught_statically_and_at_runtime(tmp_path):
+@pytest.mark.parametrize("site", SITE_NAMES)
+def test_a_call_site_that_changes_the_job_it_just_created_is_caught_statically_and_at_runtime(site, tmp_path):
     src = INVOKE_LANE.read_text(encoding="utf-8")
-    assert src.count(JOB_CALL_SITE) == 1, "Invoke-Lane.ps1 no longer has the expected single job call site"
-    mutated = src.replace(JOB_CALL_SITE, JOB_CALL_SITE + JOB_CALL_SITE_ORS_0x800)
+    assert src.count(JOB_CALL_SITE) == len(JOB_CALL_SITES), "Invoke-Lane.ps1 no longer has the expected job call sites"
+    mutated = after_site(src, site, JOB_CALL_SITE_ORS_0x800)
     with pytest.raises(AssertionError, match="call site must be exactly one whole line"):
         assert_kill_on_close_only(mutated)
     lane_copy = tmp_path / "Invoke-Lane.mutated.ps1"
     lane_copy.write_text(mutated, encoding="utf-8")
     probe_dir = tmp_path / "probe"
     probe_dir.mkdir()
-    flags = probe_job_flags(stage(probe_dir), lane_copy)
-    assert flags == 0x2800, f"the call-site read-back saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
+    flags = probe_job_flags(stage(probe_dir), site, lane_copy)
+    assert flags == 0x2800, f"the call-site read-back at {site} saw {flags:#x}, expected KILL_ON_JOB_CLOSE|BREAKAWAY_OK 0x2800"
+    # The read-back is of that site's own statement: the other site's statement, in the same file, still reads clean.
+    other = next(name for name in SITE_NAMES if name != site)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    assert probe_job_flags(stage(other_dir), other, lane_copy) == JOB_FLAGS_KILL_ON_CLOSE_ONLY
 
 
 def test_the_finalizer_leaves_a_recycled_pid_alone():
