@@ -24412,25 +24412,19 @@ bool MainWindow::loadedClipIsRow( int row ) const
 {
     if( row < 0 || row >= SESSION_CLIP_COUNT || !m_fileLoaded || m_pMlvObject == nullptr || m_loadedClipFileName.isEmpty() )
         return false;
-    return ( m_loadedClipFileName == GET_CLIP( row )->getPath() || m_loadedClipFileName == GET_RECEIPT( row )->fileName() )
-        && !loadedClipRecordedOnAnotherRow( row );
-}
-
-// LOOK-FULLSCREEN-PARITY-1 r12 (adversary r12 A1): two rows can hold one path; the row the open recorded is the one loaded.
-bool MainWindow::loadedClipRecordedOnAnotherRow( int row ) const
-{
-    return ::loadedClipRecordedOnAnotherRow( row, SESSION_CLIP_COUNT,
-        [this]( int other ) { return m_loadedClipFileName == GET_CLIP( other )->getPath() || m_loadedClipFileName == GET_RECEIPT( other )->fileName(); },
-        [this]( int other ) { return GET_RECEIPT( other ) == m_loadedClipReceipt; } );
+    // LOOK-FULLSCREEN-PARITY-1 r12 (adversary r12 A1): two rows can hold one path; the row the open recorded is the one loaded.
+    const bool rowHoldsPath = m_loadedClipFileName == GET_CLIP( row )->getPath() || m_loadedClipFileName == GET_RECEIPT( row )->fileName();
+    return loadedClipHeldByRow( rowHoldsPath, m_loadedClipReceipt != nullptr, GET_RECEIPT( row ) == m_loadedClipReceipt );
 }
 
 // Called where an open names the file it loaded: the active row when it holds that file, else the first row that does.
-// The pointer is only ever compared, so a row removed later leaves nothing to read.
+// Both pointers are only ever compared, so a row removed later leaves nothing to read.
 void MainWindow::recordLoadedClipReceipt( const QString &fileName )
 {
     const int openedRow = look_label::loadedClipOwnerRow( SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT,
         [this, &fileName]( int row ) { return fileName == GET_CLIP( row )->getPath() || fileName == GET_RECEIPT( row )->fileName(); } );
     m_loadedClipReceipt = openedRow >= 0 ? GET_RECEIPT( openedRow ) : nullptr;
+    m_lookLabelAppliedReceipt = m_loadedClipReceipt;
 }
 
 bool MainWindow::receiptOwnedByLoadedClip( const char *site )
@@ -24438,8 +24432,7 @@ bool MainWindow::receiptOwnedByLoadedClip( const char *site )
     const bool hasActiveReceipt = SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0
                                && SESSION_ACTIVE_CLIP_ROW < SESSION_CLIP_COUNT && ACTIVE_RECEIPT;
     const bool loadedIsActiveClip = hasActiveReceipt && !m_loadedClipFileName.isEmpty()
-        && ( m_loadedClipFileName == ACTIVE_CLIP->getPath() || m_loadedClipFileName == ACTIVE_RECEIPT->fileName() )
-        && !loadedClipRecordedOnAnotherRow( SESSION_ACTIVE_CLIP_ROW );
+        && loadedClipHeldByRow( m_loadedClipFileName == ACTIVE_CLIP->getPath() || m_loadedClipFileName == ACTIVE_RECEIPT->fileName(), m_loadedClipReceipt != nullptr, ACTIVE_RECEIPT == m_loadedClipReceipt );
     if( activeReceiptOwnsLoadedClip( m_slidersDetachedFromReceipt, m_fileLoaded && m_pMlvObject != nullptr,
                                      hasActiveReceipt, loadedIsActiveClip ) )
         return true;
@@ -25101,6 +25094,9 @@ void MainWindow::exportHandler( void )
             return;
         }
         m_exportOpenAbortRetries = 0;
+        // r12b (adversary r12 A1): the job grades this clone, not the row's receipt, so its outcome is read under the clone
+        // until the next open records a row. A failed final reopen keeps this clip and grade loaded.
+        m_lookLabelAppliedReceipt = m_exportQueue.first();
         //Set sliders to receipt
         setSliders( m_exportQueue.first(), false );
         //Fill label in StatusDialog
@@ -31719,7 +31715,9 @@ void MainWindow::updateLookLabel( void )
     // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
     // r10: a receipt setSliders put back to its baseline reads "Look: Baseline" until an analysis LANDS on it; the mark lives
     // in the outcome (baselineRestored / showsBaseline), so every landed() forgets it in the same step (shownText reads it).
-    const void *lookReceipt = lookOn ? owner : nullptr;
+    // r12b (adversary r12 A1): the outcome is read under the receipt applied to this clip. An export job grades a clone of
+    // the row's receipt, and a failed final reopen leaves that job's clip and grade loaded.
+    const void *lookReceipt = lookOn ? look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ) : nullptr;
     const QString text = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText : look_label::shownText(
         lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
     const bool fullscreenShown =

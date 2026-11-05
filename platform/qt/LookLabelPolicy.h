@@ -88,7 +88,8 @@ inline QString shownText( bool lookAssistEnabled, const lookassist::LookAssistFl
 /*! \brief r12 (adversary r11 A1): the session row whose receipt owns the loaded clip, or -1. The active row is not it
  *  while another row's open is pumping events (addFileToSession activates B before B's loader runs, and A is still what
  *  is on screen). `isLoadedRow(row)` answers for one row in [0, rowCount); MainWindow::loadedClipIsRow already separates two
- *  rows of one path by the receipt the open recorded, so the active row winning only breaks a tie nothing recorded. */
+ *  rows of one path by the receipt the open recorded, so the active row winning only breaks a tie nothing recorded.
+ *  recordLoadedClipReceipt also uses this to pick the row an open loaded for. */
 template <typename IsLoadedRow>
 inline int loadedClipOwnerRow( int activeRow, int rowCount, IsLoadedRow isLoadedRow )
 {
@@ -106,7 +107,15 @@ inline bool lookOnForOwner( bool hasOwner, bool ownerLookAssistEnabled, bool own
     return hasOwner && ownerLookAssistEnabled && ( !ownerIsActiveRow || selectorChecked );
 }
 
-/*! \brief A clip stays loaded but no session row holds it (its row was removed and the next open has not replaced it):
+/*! \brief r12b (adversary r12 A1): which receipt the outcome is read under. The switch comes from the row's receipt, but an
+ *  analysis lands on the receipt applied to the clip, and an export job applies a clone of the row's receipt. Identity only:
+ *  a finished job's clone is gone, so it is never read. Without one (an open that found no row of its file), the owner. */
+inline const void *outcomeKey( const void *appliedReceipt, const void *ownerReceipt )
+{
+    return appliedReceipt ? appliedReceipt : ownerReceipt;
+}
+
+/*! \brief A clip stays loaded but no session row holds it(its row was removed and the next open has not replaced it):
  *  no receipt can say what is on screen, so the label keeps the text it had. Nothing loaded is not this case: it reads Off. */
 inline bool keepsTextWithoutOwner( bool clipLoaded, int ownerRow )
 {

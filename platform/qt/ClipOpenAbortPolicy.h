@@ -66,15 +66,13 @@ inline bool activeReceiptOwnsLoadedClip( bool slidersDetached, bool clipLoaded, 
 }
 
 // LOOK-FULLSCREEN-PARITY-1 r12 (adversary r12 A1): Open Session's Search can give a second row the path of the clip that
-// is already loaded, and the name alone then matches both rows. The open recorded which row's receipt it loaded for, so
-// another row holding the same path does not own the clip. `holdsLoadedPath` and `isRecordedRow` answer for one row in
-// [0, rowCount). Without a recorded row in the session (none recorded, or that row is gone) the name decides, as it did.
-template <typename HoldsLoadedPath, typename IsRecordedRow>
-inline bool loadedClipRecordedOnAnotherRow( int row, int rowCount, HoldsLoadedPath holdsLoadedPath, IsRecordedRow isRecordedRow )
+// is already loaded, and the name alone then matches both rows. The open records which row's receipt it loaded for, and
+// that record decides: only that row holds the clip. If that row has left the session, no row holds it until another open
+// succeeds, even a row of the same path (r12b, adversary A2). Only an open that found no row of its file leaves nothing
+// recorded; then the name decides, as it did.
+inline bool loadedClipHeldByRow( bool rowHoldsLoadedPath, bool anyRowRecorded, bool rowIsRecorded )
 {
-    for( int other = 0; other < rowCount; ++other )
-        if( other != row && isRecordedRow( other ) && holdsLoadedPath( other ) ) return true;
-    return false;
+    return rowHoldsLoadedPath && ( !anyRowRecorded || rowIsRecorded );
 }
 
 // Play's cut-range repair clamps the range it plays (the cut spin boxes) on any loaded clip; it saves that

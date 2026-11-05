@@ -915,6 +915,8 @@ private:
     QString m_loadedClipFileName;
     // LOOK-FULLSCREEN-PARITY-1 r12: the receipt of the row that open loaded for (two rows can hold one path). Compared, never read.
     const ReceiptSettings *m_loadedClipReceipt = nullptr;
+    // r12b: the key the look outcome is read under: the recorded row's receipt, or the running export job's clone. Compared, never read.
+    const void *m_lookLabelAppliedReceipt = nullptr;
     unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
     bool m_exportInProgress = false;
     // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
@@ -1956,7 +1958,6 @@ private:
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
     bool loadedClipIsRow( int row ) const;
-    bool loadedClipRecordedOnAnotherRow( int row ) const;
     void recordLoadedClipReceipt( const QString &fileName );
     bool receiptOwnedByLoadedClip( const char *site );
     void retryClipReopenAfterPrepAbort( int row );
