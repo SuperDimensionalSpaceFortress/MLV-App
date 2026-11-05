@@ -5506,22 +5506,65 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # what each read took; '+' marks the one still running when the guard gave up on it
     GUARD_READS_RE = r"guardReads\(sec\): start=[0-9.]+ (\S+=[0-9.]+ )*{}=[0-9.]+\+"
 
-    def _claim_wait_cmd(self, *extra: str, manifest_probe: Path | None = None) -> tuple[list[str], dict]:
+    def _claim_wait_cmd(self, *extra: str, manifest_probe: Path | None = None, **env: str) -> tuple[list[str], dict]:
         self._fresh_run_dir()
         self._foreign_live_claim()
         probes = ("-StagedBuildProbeScript", str(manifest_probe)) if manifest_probe else ()
-        return self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), *probes, *extra)
+        return self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), *probes, *extra, **env)
 
-    def _assert_read_again_and_the_plan_ran(self, code: int, so: str, se: str) -> None:
+    def _assert_read_again_and_the_plan_ran(self, code: int, so: str, se: str, line: str = "CLAIM_WAIT_GUARD_NO_ANSWER", no_answers: int = 1) -> None:
         self.assertEqual(code, 0, so + se)
         self.assertNotIn("LEG_PLAN_REFUSED", se)
-        self.assertIn("CLAIM_WAIT_GUARD_NO_ANSWER batch=1 noAnswers=1/3 ", se)
-        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertIn(f"{line} batch=1 unfinished=1/3 noAnswers={no_answers} ", se)
+        self.assertEqual(se.count(line), 1, se)
         self.assertIn("claimWaitBefore=yes deniedPolls=1 ", se)
         self.assertEqual(len(self.leg_calls()), 1, so + se)
         log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
-        self.assertLess(log.index("CLAIM_WAIT_GUARD_ANSWERED batch=1 noAnswers=1 "), log.index("CLAIM_HELD"), "a line was written before a read vouched for the input's location")
+        self.assertLess(log.index(f"CLAIM_WAIT_GUARD_ANSWERED batch=1 unfinished=1 noAnswers={no_answers} "), log.index("CLAIM_HELD"), "a line was written before a read vouched for the input's location")
         self.assertEqual(self.batches()[0]["endReason"], "ALL_LEGS_DONE")
+
+    def _run_acting_on_stderr(self, args: list[str], e: dict, marker: str, act, timeout_s: float = 240) -> tuple[int, str, str, float]:
+        # the run's stderr is read as it comes, and act() runs once on the first line carrying marker: a no-answer poll writes nothing into -RunDir, so stderr is all a case can wait on
+        t0 = time.monotonic()
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        lines: list[str] = []
+        acted = threading.Event()
+
+        def drain() -> None:
+            for line in p.stderr:
+                lines.append(line)
+                if marker in line and not acted.is_set():
+                    acted.set()
+                    act()
+        t = threading.Thread(target=drain, daemon=True)
+        t.start()
+        try:
+            so = p.stdout.read()
+            p.wait(timeout=timeout_s)
+            t.join(timeout=30)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        return p.returncode, so, "".join(lines), time.monotonic() - t0
+
+    def _claim_loop_snippet(self, setup: str) -> dict:
+        # the runner's own no-answer branch and helpers, run in memory: only the sleep is replaced, so a wakeup that comes late is a fact of the case and not of the host
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                  "$branch = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.IfStatementAst] -and $x.Extent.Text.StartsWith('if ($hit -and $hit.noAnswer -and -not $req.granted)') }, $true)\n"
+                  "$script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitNoAnswerMax = 3; $script:ClaimWaitGuardSec = 1; $ClaimPollSec = 1; $batchNo = 1; $unfinished = 0; $noAnswers = 0; $Venue = 'bachelor'\n"
+                  "$req = [pscustomobject]@{ granted = $false; broken = @() }\n"
+                  "$hit = [pscustomobject]@{ item = 1; why = 'WHY'; noAnswer = $true; readAbandoned = $true }\n"
+                  "$script:slept = 0\n"
+                  "function Start-Sleep { param([int]$Seconds) $script:slept++; [Threading.Thread]::Sleep(($Seconds + $overshootSec) * 1000) }\n"
+                  f"{setup}\n"
+                  "$outcome = 'READ_AGAIN'\n"
+                  "foreach ($i in 1) { . ([scriptblock]::Create($branch.Extent.Text)); $outcome = 'REFUSAL' }\n"
+                  "[pscustomobject]@{ outcome = $outcome; slept = $script:slept; why = $hit.why } | ConvertTo-Json -Compress\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
 
     def test_artifact_preflight_claim_wait_one_location_read_with_no_answer_costs_no_leg(self) -> None:
         args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40x1")
@@ -5540,12 +5583,23 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         code, so, se = self._during_claim_wait(args, e, lambda: None)
         self._assert_read_again_and_the_plan_ran(code, so, se)
         self.assertIn("could not be read after the claim wait", se)
+        self.assertRegex(se, self.GUARD_READS_RE.format("content:build1"), "a read really given up on keeps its '+'")
 
     def test_artifact_preflight_claim_wait_one_slow_read_that_left_no_room_costs_no_leg(self) -> None:
-        # the read answered, but the guard's 30 s went on it: the next read has no room to start (or, on a slow host, the guard gave up on this one). Neither is a refusal yet.
+        # the read answered, but the guard's 30 s went on it: the next read has no room to start (or, on a host so slow that the worker took over 2.5 s to reach it, the guard gave up on
+        # this one). Neither is a refusal yet. Sol and fable r2: the pass with no read given up on carries no '+' and says no read went unanswered; the other keeps both.
         args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x1")
         code, so, se = self._during_claim_wait(args, e, lambda: None)
-        self._assert_read_again_and_the_plan_ran(code, so, se)
+        if "CLAIM_WAIT_GUARD_NO_ANSWER" in se:
+            self._assert_read_again_and_the_plan_ran(code, so, se)
+            self.assertRegex(se, self.GUARD_READS_RE.format("content:spec1"))
+            return
+        self._assert_read_again_and_the_plan_ran(code, so, se, line="CLAIM_WAIT_GUARD_NO_ROOM", no_answers=0)
+        [line] = [l for l in se.splitlines() if "CLAIM_WAIT_GUARD_NO_ROOM" in l]
+        self.assertRegex(line, r"guardReads\(sec\): start=[0-9.]+ (\S+=[0-9.]+ )*content:spec1=[0-9.]+ claimWaitBefore=yes")
+        self.assertNotRegex(line, r"guardReads\(sec\): [^\]]*\+", "every read that started had answered")
+        self.assertNotIn("no answer", line.lower())
+        self.assertIn("no time is left in the claim wait", line)
 
     def test_artifact_preflight_claim_wait_a_share_that_never_answers_still_refuses_typed_and_writes_nothing(self) -> None:
         # the control: every read stalls past the guard's 30 s, the foreign claim never lets go. The same typed reason, after three reads in a row and never at the deadline.
@@ -5586,6 +5640,150 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("could not be read after the claim wait", se)
         self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", se)
         self.assertEqual(self.leg_calls(), [])
+
+    def test_artifact_preflight_claim_wait_r3_no_retry_when_a_whole_guard_does_not_fit_before_the_deadline(self) -> None:
+        # sol r2 B-01: 40 s left and a poll of 1 s. The first read gives up at about 31 s, and a second would be granted a fresh 30 s past the deadline (62 s on 38d61585). It is refused
+        # typed, at the first read, and nothing else is read.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=40)))
+        t0 = time.monotonic()
+        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("(no answer on 1 read in a row while no claim was held)", r.stderr)
+        self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", r.stderr)
+        self.assertNotIn("BATCH_END", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+        self.assertLess(took, 40, f"the run took {took:.1f} s: a second guard ran past the 40 s deadline")
+
+    def test_artifact_preflight_claim_wait_r3_the_room_is_asked_again_after_the_sleep(self) -> None:
+        # sol r2 B-01's second repro: the room was there before the sleep (1 s poll + 1 s guard + 0.5 s against 5 s), and a wakeup 4 s late spent it. No request starts after that.
+        late = self._claim_loop_snippet("$overshootSec = 4; $deadline = [DateTime]::UtcNow.AddSeconds(5)")
+        self.assertEqual((late["outcome"], late["slept"]), ("REFUSAL", 1), late)
+        self.assertIn("(no answer on 1 read in a row while no claim was held)", late["why"])
+        # the control: the same sleep on time, with room left
+        on_time = self._claim_loop_snippet("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(20)")
+        self.assertEqual((on_time["outcome"], on_time["slept"]), ("READ_AGAIN", 1), on_time)
+        # and no room at all: no sleep, no read again
+        none_left = self._claim_loop_snippet("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(2)")
+        self.assertEqual((none_left["outcome"], none_left["slept"]), ("REFUSAL", 0), none_left)
+
+    def test_artifact_preflight_claim_wait_r3_an_answered_poll_starts_no_request_after_the_deadline(self) -> None:
+        # the class sweep of B-01: the poll check before a sleep is only a plan. The runner's own claim loop, in memory: every pass answers, the foreign claim stays, and a wakeup 4 s late
+        # lands past the deadline. On 38d61585 that started another request; here the loop ends (DEADLINE, as ever), and with an on-time sleep it still polls.
+        def requests(setup: str) -> int:
+            script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                      "$loop = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Statements[0].Extent.Text.StartsWith('$req = Request-VenueClaim') }, $true)\n"
+                      "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                      "$script:requests = 0; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitNoAnswerMax = 3; $script:ClaimWaitGuardSec = 30; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
+                      "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1\n"
+                      "function Request-VenueClaim { $script:requests++; [pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' } }\n"
+                      "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
+                      "function Invoke-InputGuard { $null }\n"
+                      "function Test-AliasHit { param($h) $false }\n"
+                      "function LogBest { param($m) }\n"
+                      "function Start-Sleep { param([int]$Seconds) [Threading.Thread]::Sleep(($Seconds + $overshootSec) * 1000) }\n"
+                      f"{setup}\n"
+                      ". ([scriptblock]::Create($loop.Extent.Text))\n"
+                      "\"requests=$script:requests\"\n")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return int(re.search(r"requests=([0-9]+)", r.stdout).group(1))
+        self.assertEqual(requests("$overshootSec = 4; $deadline = [DateTime]::UtcNow.AddSeconds(3)"), 1)
+        self.assertGreaterEqual(requests("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(4)"), 2)
+
+    def test_artifact_preflight_claim_wait_r3_the_refusal_says_no_answer_only_for_reads_given_up_on(self) -> None:
+        # fable r2: three passes that ran out of room while every read answered are not "no answer on 3 reads", and a run of both says how many of each
+        cases = [(3, 3, "(no answer on 3 reads in a row while no claim was held)"),
+                 (3, 0, "(3 guard passes in a row ran out of time while no claim was held; every read that started answered)"),
+                 (3, 2, "(3 guard passes in a row did not finish while no claim was held: no answer on 2 reads, and the others ran out of time)"),
+                 (1, 0, "(1 guard pass in a row ran out of time while no claim was held; every read that started answered)")]
+        for strikes, given_up, want in cases:
+            ran = self._claim_loop_snippet(f"$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(600); $unfinished = {strikes - 1}; $noAnswers = {given_up - 1 if given_up else 0}; $hit.readAbandoned = {'$true' if given_up else '$false'}"
+                                           if strikes == 3 else "$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(1); $hit.readAbandoned = $false")
+            self.assertEqual(ran["outcome"], "REFUSAL", ran)
+            self.assertEqual(ran["why"], f"WHY {want}")
+
+    def test_artifact_preflight_claim_wait_r3_a_hit_with_no_room_is_not_a_read_given_up_on(self) -> None:
+        # in memory, so no host is too slow for it: the spec read answers at 1.5 s of a 3 s budget, the build read has no room to start. noAnswer keeps the retry; the '+' is only for
+        # a read given up on, and the seconds each read took are the same either way.
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal', 'Set-GuardProgress', 'Get-GuardTimingText') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                  "$script:GuardReadMinSec = 2; $legPlanMode = $true; $script:claimWait = $null\n"
+                  "function Wait-GuardReadSeam { param($r) }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) [Threading.Thread]::Sleep(1500); @($null, $null) }\n"
+                  "$script:guardedInputs = @([pscustomobject]@{ kind = 'spec'; item = 1; path = 's'; backend = 'cuda' }, [pscustomobject]@{ kind = 'build'; item = 1; path = 'm'; commit = ('a' * 40); sha256 = ('a' * 64) })\n"
+                  "$prog = [hashtable]::Synchronized(@{ locationsDone = $true; item = 0; at = 'x'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) })\n"
+                  "$script:guardProgress = $prog\n"
+                  "$script:guardBudget = New-GuardBudget 3 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "$h = Get-InputContentRefusal\n"
+                  "[pscustomobject]@{ noAnswer = [bool]$h.noAnswer; hasFlag = ($null -ne $h.PSObject.Properties['readAbandoned']); readAbandoned = [bool]$h.readAbandoned; answered = (Get-GuardTimingText $prog $script:guardBudget ([bool]$h.readAbandoned)); givenUp = (Get-GuardTimingText $prog $script:guardBudget $true) } | ConvertTo-Json -Compress\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertTrue(d["noAnswer"], "it still reads again next poll")
+        self.assertTrue(d["hasFlag"], d)
+        self.assertFalse(d["readAbandoned"], d)
+        self.assertRegex(d["answered"], r"content:spec1=[0-9.]+ claimWaitBefore=no$")
+        self.assertRegex(d["givenUp"], r"content:spec1=[0-9.]+\+ claimWaitBefore=no$")
+
+    def test_artifact_preflight_claim_wait_r3_good_polls_between_no_answers_never_add_up_to_the_refusal(self) -> None:
+        # dot I2: "three in a row" is three in a row. Manifest reads 2, 4 and 6 are given up on, 3, 5 and 7 answer, then the foreign claim lets go: the plan runs.
+        calls = self.case / "manifest-calls.txt"
+        manifest_probe, _ = self._timed_probes(0, 0)
+        manifest_probe.write_text(manifest_probe.read_text(encoding="utf-8").replace(
+            "param($p)\n", f"param($p)\n[IO.File]::AppendAllText('{calls}', 'm' + [Environment]::NewLine)\nif (@(2, 4, 6) -contains [IO.File]::ReadAllLines('{calls}').Count) {{ [Threading.Thread]::Sleep(40000) }}\n", 1), encoding="utf-8")
+        args, e = self._claim_wait_cmd(manifest_probe=manifest_probe)
+
+        def until_three_were_given_up_on() -> None:
+            end = time.monotonic() + 180
+            while time.monotonic() < end and (not calls.exists() or len(calls.read_text(encoding="utf-8").splitlines()) < 7):
+                time.sleep(0.2)
+        code, so, se = self._during_claim_wait(args, e, until_three_were_given_up_on)
+        self.assertEqual(code, 0, so + se)
+        self.assertNotIn("LEG_PLAN_REFUSED", se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER batch=1 unfinished=1/3 noAnswers=1 "), 3, se)
+        self.assertNotIn("unfinished=2/3", se)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertEqual(log.count("CLAIM_WAIT_GUARD_ANSWERED batch=1 unfinished=1 noAnswers=1 "), 3, log)
+        self.assertEqual(len(self.leg_calls()), 1, so + se)
+
+    def test_artifact_preflight_claim_wait_r3_a_hung_share_reacquired_after_no_answer_stops_at_the_deadline(self) -> None:
+        # fable r2 hardening 3: the foreign claim lets go between no-answers and the input is still bad. The granted attempt keeps first-failure behaviour (no second chance, the claim
+        # released, no lease), and its guard ends at the run's deadline, not on the claim's 10199 s budget. Fixture only: the 90 s read stands in for a share that does not answer.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=90", "-ClaimPollSec", "3", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=75)))
+        code, so, se, took = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", self.claim_path.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 the guard's reads did not finish within the claim guard", se)
+        self.assertIn("cut to the run's deadline after an unfinished read", se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertNotIn("no answer on", se, "a granted attempt refuses on its first failure, not as a strike")
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        self.assertLess(took, 85, f"the run took {took:.1f} s: the 90 s read was waited for")
+
+    def test_artifact_preflight_claim_wait_r3_waited_sec_ends_at_the_grant(self) -> None:
+        # opus r2 B2: 30 s in the open, then the open guard gives up. waitedSec said the time since the first denied poll, open included; it is the claim wait only.
+        args, e = self._claim_wait_cmd("-LeaseCapSec", "75", "-GuardReadDelay", "open:identity=25", FAKE_OPEN_SLEEP="30")
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("the guard's reads did not finish within the lease's room", se)
+        m = re.search(r"claimWaitBefore=yes deniedPolls=[0-9]+ waitedSec=([0-9]+)", se)
+        self.assertIsNotNone(m, se)
+        self.assertLess(int(m.group(1)), 25, f"waitedSec={m.group(1)} counts the 30 s open: {se}")
+
+    def test_artifact_preflight_claim_wait_r3_a_usage_stop_does_not_wait_on_a_read_given_up_on(self) -> None:
+        # fable r2 hardening 5: the scalar form ends a hit through Stop-Usage. One read is given up on and stays stuck, the spec then goes, and exit 2 comes without waiting out that read.
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        args, e = self.batch_cmd([spec], "-GuardReadDelay", "claim:identity=120x1")
+        code, so, se, took = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", spec.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("BATCH_USAGE ", se)
+        self.assertLess(took, 100, f"the run took {took:.1f} s: exit 2 waited on the stuck read")
 
     # r5 ITEM 1 (key3 r4 B1, catalogue row L-05; Dot 6457724432): an attempt the claim was NOT granted for ran the guard inline with no budget, and the guard hashed every cached
     # artifact (-VerifyArtifacts) on the venue's share on every -ClaimPollSec poll while a foreign chain held the venue (and measured). Master's wait read the manifests only.
