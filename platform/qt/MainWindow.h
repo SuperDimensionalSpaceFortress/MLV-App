@@ -994,6 +994,10 @@ private:
     };
     look_assist_pump::ApplyTiming m_lookAssistApplyTiming;
     int m_lookAssistApplyTimingDepth = 0;
+    // A session is open while a first-frame analysis runs with the GUI thread pumping.
+    look_assist_pump::AnalysisPump m_lookAssistPump;
+    bool m_lookAssistResizeHeld = false;
+    void applyLookAssistFromFrameReady( ReceiptSettings *receipt, int analysisFrame );
     bool m_lastLookAssistDiagnosticsValid = false;
     QString m_lastWarnedLookAssistFlavorValue;
     lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
