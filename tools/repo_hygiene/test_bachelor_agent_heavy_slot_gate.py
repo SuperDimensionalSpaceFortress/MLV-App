@@ -76,6 +76,67 @@ def max_run_bounded_sec(timeout: float) -> float:
     return max_wait_and_kill_sec(timeout) + CAPTURE_CLOSE_BOUND_SEC + MAX_READ_SEC + CAPTURE_CLEANUP_BOUND_SEC
 
 
+# sol r14 B1 / adversary r14 A1: no cleanup-critical path renders an exception it did not create with repr() / str() / !r / an f-string.
+# A class that overrides __repr__ or __str__ can raise, or block, and a raise there replaced the case-named verdict and skipped the root
+# kill; a block cannot be bounded at all. So the message is rendered ONLY for the interpreter's own exception classes (and subprocess's)
+# carrying plain-data arguments; every other exception is named by its type, read past a metaclass that overrides __name__.
+_TRUSTED_EXC_CLASSES = frozenset(
+    [c for c in vars(__import__("builtins")).values() if isinstance(c, type) and issubclass(c, BaseException)]
+    + [subprocess.SubprocessError, subprocess.TimeoutExpired, subprocess.CalledProcessError])
+_PLAIN_DATA = (str, int, float, bytes, bool, type(None))
+_TYPE_DICT = type.__dict__  # descriptors read directly: a metaclass cannot reroute __name__ / __mro__ / __dict__ through its own code
+
+
+def _plain(value: object, depth: int = 3) -> bool:
+    if type(value) in _PLAIN_DATA:
+        return True
+    return depth > 0 and type(value) in (list, tuple) and all(_plain(item, depth - 1) for item in value)  # type: ignore[attr-defined]
+
+
+def _exc_type_name(exc: object) -> str:
+    """The exception's type name, read so that a hostile metaclass cannot raise out of it."""
+    try:
+        return str(_TYPE_DICT["__name__"].__get__(type(exc)))
+    except Exception:  # noqa: BLE001 - a diagnostic never replaces a verdict
+        return "<exception>"
+
+
+def _exc_trusted(exc: object) -> bool:
+    """True when repr(exc) / str(exc) run only interpreter-owned code over plain data (never a class defined by a test or a caller)."""
+    try:
+        for method in ("__repr__", "__str__"):
+            for klass in _TYPE_DICT["__mro__"].__get__(type(exc)):
+                if method in _TYPE_DICT["__dict__"].__get__(klass):
+                    if klass not in _TRUSTED_EXC_CLASSES:
+                        return False
+                    break
+        if not _plain(BaseException.args.__get__(exc)):  # type: ignore[attr-defined]
+            return False
+        return not isinstance(exc, OSError) or (_plain(OSError.filename.__get__(exc)) and _plain(OSError.filename2.__get__(exc)))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _safe_repr(exc: object) -> str:
+    """repr(exc) for a trusted exception, else `<TypeName>`; never calls an overridden __repr__."""
+    if _exc_trusted(exc):
+        try:
+            return repr(exc)
+        except Exception:  # noqa: BLE001
+            pass
+    return f"<{_exc_type_name(exc)}>"
+
+
+def _safe_text(exc: object) -> str:
+    """`TypeName: message` for a trusted exception, else `TypeName`; never calls an overridden __str__."""
+    if _exc_trusted(exc):
+        try:
+            return f"{_exc_type_name(exc)}: {exc}"
+        except Exception:  # noqa: BLE001
+            pass
+    return _exc_type_name(exc)
+
+
 _PARKED_CAPTURES: list = []  # capture handles whose close could not be started; kept alive so no finalizer closes them on the caller's thread
 
 
@@ -92,7 +153,7 @@ def _close_captures(files: list) -> str:
             try:
                 handle.close()
             except Exception as exc:  # noqa: BLE001 - recorded in the note below
-                problems.append(f"{type(exc).__name__}: {exc}")
+                problems.append(_safe_text(exc))
 
     try:
         closer = threading.Thread(target=close, name="close-capture", daemon=True)
@@ -101,7 +162,7 @@ def _close_captures(files: list) -> str:
         # adversary r8 pass-12 A1: dropping the handles here would let the garbage collector close them synchronously on the caller's
         # thread (traceback-frame clearing), unbounded. They are parked for the life of the process instead.
         _PARKED_CAPTURES.extend(files)
-        return f"capture close not started ({type(exc).__name__}: {exc})"
+        return f"capture close not started ({_safe_text(exc)})"
     closer.join(CAPTURE_CLOSE_BOUND_SEC)
     if closer.is_alive():
         return f"capture close abandoned after {CAPTURE_CLOSE_BOUND_SEC:g} s"
@@ -128,15 +189,15 @@ def _remove_capture_dir(path: str) -> str:
             except FileNotFoundError:
                 left["present"] = False
             except (OSError, ValueError) as exc:
-                left["unconfirmed"] = f"{type(exc).__name__}: {exc}"
+                left["unconfirmed"] = _safe_text(exc)
         except Exception as exc:  # noqa: BLE001 - adversary r8 A2: a worker that dies must not read as a finished removal
-            left["error"] = f"{type(exc).__name__}: {exc}"
+            left["error"] = _safe_text(exc)
 
     try:
         remover = threading.Thread(target=remove, name="rmtree-capture", daemon=True)
         remover.start()
     except Exception as exc:  # noqa: BLE001 - adversary r7 A1: a worker that cannot start must not replace the case-named verdict
-        return f"capture cleanup not started ({type(exc).__name__}: {exc}): {path}"
+        return f"capture cleanup not started ({_safe_text(exc)}): {path}"
     remover.join(CAPTURE_CLEANUP_BOUND_SEC)
     if remover.is_alive():
         return f"capture cleanup abandoned after {CAPTURE_CLEANUP_BOUND_SEC:g} s: {path}"
@@ -168,7 +229,7 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
         reader = threading.Thread(target=read, name=f"read-{path.name}", daemon=True)
         reader.start()
     except Exception as exc:  # noqa: BLE001 - adversary r7 A1: "can't start new thread" must not replace the case-named verdict
-        note = f"<read failed: could not start the reader thread ({type(exc).__name__}: {exc})>"
+        note = f"<read failed: could not start the reader thread ({_safe_text(exc)})>"
         if tolerate_oserror:
             return note
         raise
@@ -182,10 +243,11 @@ def _read_captured(path: Path, *, tolerate_oserror: bool) -> str:
     if error is not None:
         # adversary r7 A2: after a failed wait ANY Exception from the read (MemoryError on a huge stream, ValueError, RuntimeError) is recorded
         # in the text; only a BaseException that is not an Exception (an interrupt) still propagates.
-        if tolerate_oserror and isinstance(error, OSError):
-            return f"<read failed: errno {error.errno} {error.strerror}>"
+        if tolerate_oserror and isinstance(error, OSError) and _exc_trusted(error):
+            # errno / strerror are read from the OSError slots, past a subclass that overrides them with a property
+            return f"<read failed: errno {OSError.errno.__get__(error)} {OSError.strerror.__get__(error)}>"  # type: ignore[attr-defined]
         if tolerate_oserror and isinstance(error, Exception):
-            return f"<read failed: {type(error).__name__}: {error}>"
+            return f"<read failed: {_safe_text(error)}>"
         raise error  # type: ignore[misc]
     return str(box["text"])
 
@@ -195,13 +257,13 @@ def _kill_taskkill_child(taskkill: subprocess.Popen, problems: list[str]) -> Non
     try:
         taskkill.kill()
     except Exception as exc:
-        problems.append(f"taskkill kill failed: {exc!r}")
+        problems.append(f"taskkill kill failed: {_safe_repr(exc)}")
     try:
         taskkill.wait(timeout=TASKKILL_REAP_SEC)
     except subprocess.TimeoutExpired:
         problems.append(f"taskkill was still running {TASKKILL_REAP_SEC} s after its kill")
     except Exception as exc:
-        problems.append(f"waiting for taskkill failed: {exc!r}")
+        problems.append(f"waiting for taskkill failed: {_safe_repr(exc)}")
 
 
 def _kill_tree(proc: subprocess.Popen) -> str:
@@ -218,7 +280,7 @@ def _kill_tree(proc: subprocess.Popen) -> str:
         taskkill = subprocess.Popen(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
-        problems.append(f"taskkill failed: {exc!r}")
+        problems.append(f"taskkill failed: {_safe_repr(exc)}")
     else:
         try:
             returncode = taskkill.wait(timeout=TASKKILL_BOUND_SEC)
@@ -228,17 +290,17 @@ def _kill_tree(proc: subprocess.Popen) -> str:
             problems.append(f"taskkill failed: it did not exit within {TASKKILL_BOUND_SEC} s")
             _kill_taskkill_child(taskkill, problems)
         except Exception as exc:
-            problems.append(f"taskkill failed: {exc!r}")
+            problems.append(f"taskkill failed: {_safe_repr(exc)}")
     try:
         proc.kill()
     except Exception as exc:
-        problems.append(f"kill failed: {exc!r}")
+        problems.append(f"kill failed: {_safe_repr(exc)}")
     try:
         proc.wait(timeout=ROOT_REAP_SEC)
     except subprocess.TimeoutExpired:
         problems.append(f"the root process was still running {ROOT_REAP_SEC} s after the kill")
     except Exception as exc:
-        problems.append(f"waiting for the root process failed: {exc!r}")
+        problems.append(f"waiting for the root process failed: {_safe_repr(exc)}")
     return "its process tree was killed" if not problems else f"its process tree kill is NOT confirmed ({'; '.join(problems)})"
 
 
@@ -288,7 +350,7 @@ def run_bounded(argv: list[str], timeout: float, case: str) -> tuple[int, str, s
                 if not isinstance(exc, Exception):
                     raise
                 failed = True
-                verdict = f"could not be waited on ({exc!r})"
+                verdict = f"could not be waited on ({_safe_repr(exc)})"
         finally:
             close_note = _close_captures(captures)
         elapsed = time.monotonic() - started
@@ -1120,6 +1182,198 @@ class BoundedRunInputRangeTests(unittest.TestCase):
                 run_bounded(["child"], 3, "interrupt-case")
         self.assertEqual(taskkill.wait_timeouts, [TASKKILL_BOUND_SEC])
         self.assertGreaterEqual(proc.kills, 1)
+
+
+def _hostile_exception(kind: str, calls: list[str]) -> BaseException:
+    """An exception whose rendering is hostile (sol r14 B1 / adversary r14 A1). kind: repr_throws, str_throws, repr_blocks, str_blocks.
+
+    Every call of a hostile method is recorded in `calls` and then raises (a real blocking call cannot be bounded, so the contract is that
+    a cleanup-critical path never calls it at all: the tests assert `calls` stays empty)."""
+    release = threading.Event()
+
+    def hostile(label: str, blocks: bool):
+        def method(self: object) -> str:
+            calls.append(label)
+            if blocks:
+                release.wait(0.2)  # a short stand-in for a call that would never return
+            raise ValueError("exception " + label + " failed")
+        return method
+
+    attrs = {"__repr__": hostile("repr", kind == "repr_blocks")} if kind.startswith("repr") else {"__str__": hostile("str", kind == "str_blocks")}
+    return type("Hostile" + kind.title().replace("_", ""), (RuntimeError,), attrs)("hostile detail")
+
+
+HOSTILE_KINDS = ("repr_throws", "str_throws", "repr_blocks", "str_blocks")
+
+
+class HostileExceptionRenderingTests(unittest.TestCase):
+    """sol r14 B1 / adversary r14 A1: no cleanup-critical path of run_bounded renders an arbitrary exception with repr() / str() / !r.
+
+    Sol reproduced it with a real subprocess.Popen audit event: an exception with a throwing __repr__ escaped the taskkill launch handler
+    and the root process was neither killed nor reaped. The class is every place the helper formats an exception it did not create.
+    """
+
+    class _Root:
+        """The root process: records its kill and its reaping (a wait after the kill)."""
+        pid = 4242
+
+        def __init__(self, *, first_wait: BaseException | None = None, kill_error: BaseException | None = None,
+                     reap_error: BaseException | None = None) -> None:
+            self.first_wait, self.kill_error, self.reap_error = first_wait, kill_error, reap_error
+            self.events: list[str] = []
+
+        def wait(self, timeout: float | None = None) -> int:
+            first = "wait" not in self.events
+            self.events.append("wait")
+            if first:
+                raise self.first_wait if self.first_wait is not None else subprocess.TimeoutExpired(["child"], timeout)
+            if self.reap_error is not None:
+                raise self.reap_error
+            return 1
+
+        def kill(self) -> None:
+            self.events.append("kill")
+            if self.kill_error is not None:
+                raise self.kill_error
+
+        @property
+        def killed_and_reaped(self) -> bool:
+            return "kill" in self.events and "wait" in self.events[self.events.index("kill"):]
+
+    def _run(self, root: object, taskkill: object, **popen_kwargs: object) -> BaseException:
+        popen = BoundedRunOutputReadFailureTests._popen_for(root, taskkill, **popen_kwargs)
+        with mock.patch.object(subprocess, "Popen", side_effect=popen):
+            try:
+                run_bounded(["child"], 3, "hostile-case")
+            except BaseException as caught:  # noqa: BLE001 - the verdict type is the assertion
+                return caught
+        self.fail("run_bounded returned instead of failing")
+
+    def test_a_hostile_exception_in_any_cleanup_phase_keeps_the_case_named_verdict_and_the_root_kill_and_reap(self) -> None:
+        fake = BoundedRunOutputReadFailureTests._FakeTaskkill
+        for kind in HOSTILE_KINDS:
+            calls: list[str] = []
+            exc = _hostile_exception(kind, calls)
+
+            def boom(*args: object, **kwargs: object) -> None:
+                raise exc
+
+            tk_wait = fake(0)
+            tk_wait.wait = boom  # type: ignore[method-assign]
+            tk_kill = fake(None, never_exits=True)
+            tk_kill.kill = boom  # type: ignore[method-assign]
+            tk_reap = fake(None, never_exits=True)
+            reaps: list[int] = []
+
+            def reap_wait(timeout: float | None = None, _reaps: list[int] = reaps) -> int:
+                _reaps.append(1)
+                if len(_reaps) == 1:
+                    raise subprocess.TimeoutExpired(["taskkill"], timeout)
+                raise exc
+            tk_reap.wait = reap_wait  # type: ignore[method-assign]
+            phases = (
+                ("taskkill launch", self._Root(), None, {"taskkill_launch_error": exc}, "taskkill failed", "exceeded its 3 s wall-clock bound"),
+                ("taskkill wait", self._Root(), tk_wait, {}, "taskkill failed", "exceeded its 3 s wall-clock bound"),
+                ("taskkill kill", self._Root(), tk_kill, {}, "taskkill kill failed", "exceeded its 3 s wall-clock bound"),
+                ("taskkill reap", self._Root(), tk_reap, {}, "waiting for taskkill failed", "exceeded its 3 s wall-clock bound"),
+                ("root kill", self._Root(kill_error=exc), fake(0), {}, "kill failed", "exceeded its 3 s wall-clock bound"),
+                ("root reap", self._Root(reap_error=exc), fake(0), {}, "waiting for the root process failed", "exceeded its 3 s wall-clock bound"),
+                ("main wait", self._Root(first_wait=exc), fake(0), {}, "its process tree was killed", "could not be waited on"),
+            )
+            for label, root, taskkill, popen_kwargs, expect, verdict in phases:
+                with self.subTest(kind=kind, phase=label):
+                    caught = self._run(root, taskkill, **popen_kwargs)
+                    self.assertIsInstance(caught, AssertionError, repr(caught))
+                    self.assertIn("hostile-case " + verdict, str(caught))
+                    self.assertIn(expect, str(caught))
+                    self.assertTrue(root.killed_and_reaped, f"the root was not killed and reaped: {root.events}")
+                    self.assertEqual(calls, [], f"{kind}: the hostile {calls} was called by a cleanup path")
+                    calls.clear()
+
+    def test_a_hostile_exception_in_a_capture_io_helper_is_named_by_its_type_and_never_rendered(self) -> None:
+        for kind in HOSTILE_KINDS:
+            calls: list[str] = []
+            exc = _hostile_exception(kind, calls)
+            name = type(exc).__name__
+
+            class Handle:
+                def __init__(self, error: BaseException | None) -> None:
+                    self.error, self.closed = error, False
+
+                def close(self) -> None:
+                    self.closed = True
+                    if self.error is not None:
+                        raise self.error
+
+            with self.subTest(kind=kind, helper="close: a failing close does not leave the next handle open"):
+                first, second = Handle(exc), Handle(None)
+                note = _close_captures([first, second])
+                self.assertTrue(second.closed, "the close worker died on the hostile exception before closing the next handle")
+                self.assertIn("capture close failed", note)
+                self.assertIn(name, note)
+            with self.subTest(kind=kind, helper="close: thread start"), mock.patch.object(threading.Thread, "start", side_effect=exc):
+                note = _close_captures([Handle(None)])
+                self.assertIn("capture close not started", note)
+                self.assertIn(name, note)
+            tmp = tempfile.mkdtemp(prefix="hostile-rm-")
+            try:
+                with self.subTest(kind=kind, helper="remove: rmtree"), mock.patch.object(shutil, "rmtree", side_effect=exc):
+                    note = _remove_capture_dir(tmp)
+                    self.assertIn("capture cleanup failed", note)
+                    self.assertIn(name, note)
+                with self.subTest(kind=kind, helper="remove: probe"), mock.patch.object(os, "lstat", side_effect=exc):
+                    note = _remove_capture_dir(tmp)
+                    self.assertIn("capture cleanup", note)
+                    self.assertNotIn("was not fully removed", note, "the probe's failure was lost as a worker death")
+                    self.assertIn(name, note)
+                with self.subTest(kind=kind, helper="remove: thread start"), mock.patch.object(threading.Thread, "start", side_effect=exc):
+                    note = _remove_capture_dir(tmp)
+                    self.assertIn("capture cleanup not started", note)
+                    self.assertIn(name, note)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            target = Path(tempfile.gettempdir()) / "hostile-read.txt"
+            with self.subTest(kind=kind, helper="read: read_text"), mock.patch.object(Path, "read_text", side_effect=exc):
+                text = _read_captured(target, tolerate_oserror=True)
+                self.assertIn("<read failed: ", text)
+                self.assertIn(name, text)
+            with self.subTest(kind=kind, helper="read: thread start"), mock.patch.object(threading.Thread, "start", side_effect=exc):
+                text = _read_captured(target, tolerate_oserror=True)
+                self.assertIn("<read failed: could not start the reader thread", text)
+                self.assertIn(name, text)
+            self.assertEqual(calls, [], f"{kind}: a capture io helper rendered the hostile exception")
+
+    def test_the_rendering_helpers_keep_the_builtin_detail_and_drop_everything_else(self) -> None:
+        # The ordinary exceptions keep their repr / str detail (the existing tests assert it); a class that overrides either method, or a
+        # builtin carrying a non-primitive argument, is named by its type only.
+        self.assertEqual(_safe_repr(OSError(6, "invalid handle")), repr(OSError(6, "invalid handle")))
+        self.assertEqual(_safe_text(PermissionError(13, "denied")), "PermissionError: [Errno 13] denied")
+        self.assertEqual(_safe_text(subprocess.TimeoutExpired(["child"], 3)), "TimeoutExpired: " + str(subprocess.TimeoutExpired(["child"], 3)))
+        calls: list[str] = []
+
+        class Quiet(RuntimeError):
+            def __str__(self) -> str:
+                calls.append("str")
+                return "never"
+
+        class Arg:
+            def __repr__(self) -> str:
+                calls.append("arg-repr")
+                return "never"
+            __str__ = __repr__
+
+        for exc in (Quiet("x"), RuntimeError(Arg()), OSError(2, "no", Arg()), _hostile_exception("repr_throws", calls)):
+            self.assertEqual(_safe_text(exc), type(exc).__name__)
+            self.assertEqual(_safe_repr(exc), f"<{type(exc).__name__}>")
+        self.assertEqual(calls, [])
+
+        class Meta(type):
+            @property
+            def __name__(cls) -> str:  # type: ignore[override]
+                raise ValueError("hostile metaclass name")
+
+        hostile_class = Meta("Whatever", (RuntimeError,), {})
+        self.assertEqual(_safe_text(hostile_class("x")), "Whatever: x", "the name is read past a metaclass that overrides __name__")
 
 
 class BoundedCaptureIoTests(unittest.TestCase):
