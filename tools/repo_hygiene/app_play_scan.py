@@ -247,8 +247,14 @@ _SET_PLAYING = re.compile(r"\bsetPlaying\s*\(")
 _INVOKE_METHOD = re.compile(r"\binvokeMethod\s*\([^;]*?\w*[Aa]ctionPlay\w*")
 _KEY_SYNTH = re.compile(r"\bQKeyEvent\s*(?:\w+\s*)?\(|\bKey_Space\b|\bQTest\s*::\s*key\w*|\bkeyClick\s*\(")
 _EVENT_POST = re.compile(r"\b(?:postEvent|sendEvent|sendSpontaneousEvent)\s*\(")
-# The one event dispatch that exists today (MyApplication's event filter forwarding to the main window).
-PINNED_EVENT_SITES = {("platform/qt/MyApplication.h", "sendEvent"): 1}
+# The event dispatches that exist today: MyApplication's event filter forwarding to the main window, and the two
+# Look Assist analysis holds, which re-post at landing a clone of an event the user or the OS already delivered
+# (LookAssistAnalysisPump.h: held input; MainWindow.cpp: a held FileOpen). Neither makes up an event.
+PINNED_EVENT_SITES = {
+    ("platform/qt/MyApplication.h", "sendEvent"): 1,
+    ("platform/qt/LookAssistAnalysisPump.h", "postEvent"): 1,
+    ("platform/qt/MainWindow.cpp", "postEvent"): 1,
+}
 _ACTION_PLAY = re.compile(r"\bactionPlay\b")
 _ACTION_LOOP = re.compile(r"\bactionLoop\b")
 _GATED_CALL = re.compile(r'\bprogrammaticPlay\s*\(\s*"([^"]+)"\s*,')

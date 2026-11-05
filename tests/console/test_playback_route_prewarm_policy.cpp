@@ -587,8 +587,14 @@ TEST(PlaybackReconWarmRunWiring, TheGuiReleasesTheTokenOnEveryPath)
     const QString done = bodyBetween(source, QStringLiteral("void MainWindow::onPlaybackReconWarmDone("),
                                      QStringLiteral("void MainWindow::armPlaybackRoutePrewarm()"));
     ASSERT_FALSE(done.isEmpty());
-    // no early exit: every warm-done reaches the release
-    ASSERT_FALSE(done.contains(QStringLiteral("return")));
+    // no early exit: every warm-done reaches the release. The one return is the Look Assist hold, which re-enters this
+    // slot with the same result at landing, so a held warm-done still reaches the release.
+    const int held = done.indexOf(QStringLiteral("m_lookAssistPump.hold( [this, heldDone]() { onPlaybackReconWarmDone( heldDone ); } );"));
+    const int work = done.indexOf(QStringLiteral("const playback_recon_warm_run::Outcome &outcome = done.outcome;"));
+    ASSERT_TRUE(held >= 0);
+    ASSERT_TRUE(work > held);
+    ASSERT_EQ(done.left(work).count(QStringLiteral("return")), 1);
+    ASSERT_FALSE(done.mid(work).contains(QStringLiteral("return")));
     const int gate = done.indexOf(QStringLiteral("if( playback_recon_warm_run::guiAmazeAllowed( hasOutput, playing, clipMatches ) )"));
     const int amaze = done.indexOf(QStringLiteral("GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive("));
     const int release = done.indexOf(QStringLiteral(
