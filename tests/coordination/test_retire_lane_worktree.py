@@ -4220,6 +4220,10 @@ ENCODED_LAUNCH_SITES = {
          "BACHELOR-CORE-PARTITION-AB-1: the venue-side core-partition telemetry helper (a bounded pwsh the playback job spawns, killed by pid "
          "on a stop timeout and ended by its own deadline); read-only counters plus its ready / record files in the job's $Work, never a lane "
          "driver and never run against a hub lane worktree"),
+        ("-EncodedCommand $Encoded\")",
+         "CUDA-HEADROOM-UTIL-SAMPLER-1: the venue-side CPU utilisation sampler (Start-UtilSampleCpu: a bounded BelowNormal pwsh the playback job "
+         "spawns around the measured smoke launch, ended by its stop file, its own deadline or the parent pid going away); it only reads CPU "
+         "counters into a cpu-util.csv in the job's $Work, never a lane driver and never run against a hub lane worktree"),
     ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("'-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String",
