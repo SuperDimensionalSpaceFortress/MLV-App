@@ -8,7 +8,7 @@ law4: attested
 
 **Before:** the 2026-10-12 R16 receipt (bus `4555cb5`) says "The currency check over the last 72 hours of receipts reads CURRENT for every lane that ran." The shipped rule does not say that. Both review keys on the card's PR (#418, round 4) flagged that a lane whose newest run has a null `resolvedModel`, or whose runs recorded no effort, does not read CURRENT. Nothing ran the check on a schedule, so the sentence was never tested against a busy day.
 
-**What the check returns for a lane with missing evidence** (measured on `check-lane-model-currency.py` at MLV-App commit `72d4d9d0`, three throwaway receipt sets, real clock, `--since-hours 72 --json`): the verdict vocabulary is STALE, NO-DATA, INCOMPLETE, IN-FLIGHT and CURRENT, and missing evidence is never CURRENT.
+**What the check returns for a lane with missing evidence** (measured on `check-lane-model-currency.py` at MLV-App commit `5e5e6c9f`, three throwaway receipt sets, real clock, `--since-hours 72 --json`): the verdict vocabulary is STALE, NO-DATA, INCOMPLETE, IN-FLIGHT and CURRENT, and missing evidence is never CURRENT.
 - A lane whose newest finished run failed with `resolvedModel` null reads NO-DATA. With a CURRENT fable lane beside it the overall verdict is INCOMPLETE and the exit code is 3.
 - A lane with a proven model and a run that recorded no effort reads INCOMPLETE, exit 3.
 - A lane whose only receipt is a run still in progress reads NO-DATA (a running receipt holds no model or effort yet), exit 3.
