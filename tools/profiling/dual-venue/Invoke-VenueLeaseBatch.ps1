@@ -99,6 +99,12 @@
 #         room cannot start the re-read is refused reason=LEG_BUDGET_EXCEEDS_LEASE at once, before any probe). r4: each check is ONE deadline over all of its reads (existence,
 #         physical path and identity, spec bytes, manifest, artifact hash): the hash gets what the manifest read left, and a read still running at the deadline is abandoned
 #         and the check refused SHARE_UNREACHABLE (one whose input locations were not all verified also writes nothing more into -RunDir).
+#         While NO claim is held (a foreign chain holds the venue) each poll runs that check too, for locations, specs and manifests inside 30 s. No lease, leg or write hangs on it, as the
+#         attempt that gets the claim checks again on its own budget, so a read with NO ANSWER there is read again next poll, with nothing written meanwhile (CLAIM_WAIT_GUARD_NO_ANSWER on
+#         stderr; CLAIM_WAIT_GUARD_ANSWERED in batch.log once one answers). Three in a row, or one with no poll left before the deadline, are the same SHARE_UNREACHABLE refusal. A read that
+#         ANSWERED with a failure is refused on that poll. No bound changed: each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before.
+#         A SHARE_UNREACHABLE from any of these checks says guardReads(sec): what each read took ('+' = still running when given up on; start = the worker's own start, nothing read yet) and
+#         claimWaitBefore=yes|no.
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
@@ -251,8 +257,9 @@ if ($umRunIsReal -and $GuardReadDelay) { Stop-Usage '-GuardReadDelay is an offli
 $script:guardDelaySeam = $null; $script:lastGuardSeam = $null
 if ($GuardReadDelay) {
     # r4 adversary A3: [0-9], not \d, which also matches non-ASCII decimal digits that [int] then throws on. r5: rundir delays every read of -RunDir itself, in that guard and after it
-    if ($GuardReadDelay -cnotmatch '^(claim|open):(existence|identity|spec|rundir)=([0-9]{1,4})\z') { Stop-Usage "-GuardReadDelay '$GuardReadDelay' is not <claim|open>:<existence|identity|spec|rundir>=<sec>" }
-    $script:guardDelaySeam = [pscustomobject]@{ guard = $Matches[1]; read = $Matches[2]; ms = [int]$Matches[3] * 1000 }
+    # x<n>: only the first n reads of that kind stall (a read that was slow once, then answered); $null left means every one
+    if ($GuardReadDelay -cnotmatch '^(claim|open):(existence|identity|spec|rundir)=([0-9]{1,4})(?:x([0-9]{1,2}))?\z') { Stop-Usage "-GuardReadDelay '$GuardReadDelay' is not <claim|open>:<existence|identity|spec|rundir>=<sec>[x<n>]" }
+    $script:guardDelaySeam = [pscustomobject]@{ guard = $Matches[1]; read = $Matches[2]; ms = [int]$Matches[3] * 1000; left = $(if ($Matches[4]) { [hashtable]::Synchronized(@{ n = [int]$Matches[4] }) } else { $null }) }
 }
 $cooldownExplicit = $PSBoundParameters.ContainsKey('LeaseCooldownSec'); $budgetExplicit = $PSBoundParameters.ContainsKey('LeaseBudgetSec')
 if ($ClaimRenewSec -eq 0) { $ClaimRenewSec = [int][Math]::Max(1, [Math]::Min(600, [Math]::Floor($ClaimTtlSec / 4))) }
@@ -644,11 +651,13 @@ function Get-InputOutputRefusal {
     # outranks an unresolved input and a content hit (an output zone nobody inspected is never hidden behind them: the receipt guard asks file by file when it sees one)
     $unresolved = $null; $outputUnresolved = $null
     foreach ($g in $script:guardedInputs) {
-        if ($script:guardProgress) { $script:guardProgress.item = $g.item; $script:guardProgress.at = "the location of the $($g.kind) input $($g.path)" }
+        Set-GuardProgress $g "the location of the $($g.kind) input $($g.path)" 'location'
         # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED). r5b (adversary r5b A1): a folder at its name is not gone.
         # r6 (adversary r6 A1 sibling): gone means not found; a manifest whose lookup is denied is still there (Test-Path said gone)
         if ($g.kind -ceq 'build') { Wait-GuardReadSeam 'existence' }
         if ($g.kind -ceq 'build' -and (Test-NothingAtName $g.path)) { continue }
+        # the step above is this input's own share alone; the one below also walks -RunDir and -ClaimDir on this host, so guardReads tells a stalled share from a slow host
+        if ($g.kind -ceq 'build') { Set-GuardProgress $g "the location of the $($g.kind) input $($g.path)" 'location' ':path' }
         Wait-GuardReadSeam 'identity'
         # r5b (adversary r5b A2): only a refusal reached with the input itself open is an alias. An input that did not open while the guard ran got no answer from it (a save-as-rename's
         # moment): the guard is asked again, at most three times, and an input that never stays open is unresolved, never a runner output.
@@ -686,7 +695,26 @@ function Get-InputOutputRefusal {
 function Wait-GuardReadSeam([string]$Read) {
     # r4: the -GuardReadDelay offline seam (refused with the real um-run.ps1); production passes none and this returns at once
     $d = $script:guardDelaySeam
-    if ($null -ne $d -and $null -ne $script:guardBudget -and $d.guard -ceq $script:guardBudget.seam -and $d.read -ceq $Read) { [Threading.Thread]::Sleep($d.ms) }
+    if ($null -ne $d -and $null -ne $script:guardBudget -and $d.guard -ceq $script:guardBudget.seam -and $d.read -ceq $Read) {
+        if ($null -ne $d.left) { if ($d.left.n -le 0) { return }; $d.left.n-- }
+        [Threading.Thread]::Sleep($d.ms)
+    }
+}
+
+function Set-GuardProgress($Input_, [string]$At, [string]$Phase, [string]$Sub = '') {
+    # the read the worker starts now: which one Invoke-InputGuard names if it gives up, and when it started, on the guard's own clock (Get-GuardTimingText)
+    $p = $script:guardProgress; if (-not $p) { return }
+    $p.item = $Input_.item; $p.at = $At
+    [void]$p.steps.Add(@("${Phase}:$($Input_.kind)$(if ($Input_.item -gt 0) { $Input_.item })$Sub", $script:guardBudget.clock.Elapsed.TotalSeconds))
+}
+
+function Get-GuardTimingText($Prog, $Budget, [bool]$GaveUp) {
+    # what each read of this guard took: the 'still reading' sentence names only where the worker had got to, and its seconds are the whole guard's, all reads before that one included
+    $parts = [System.Collections.Generic.List[string]]::new(); $name = 'start'; $from = 0.0
+    foreach ($s in $Prog.steps.ToArray()) { $parts.Add("$name=$([Math]::Round($s[1] - $from, 2))"); $name = $s[0]; $from = $s[1] }
+    $parts.Add("$name=$([Math]::Round($Budget.clock.Elapsed.TotalSeconds - $from, 2))$(if ($GaveUp) { '+' })")
+    $w = $script:claimWait
+    "guardReads(sec): $($parts -join ' ') $(if ($null -ne $w -and $w.denied -gt 0) { "claimWaitBefore=yes deniedPolls=$($w.denied) waitedSec=$([int]([DateTime]::UtcNow - $w.startUtc).TotalSeconds)" } else { 'claimWaitBefore=no' })"
 }
 
 function Wait-RunDirReadSeam {
@@ -703,7 +731,10 @@ function Wait-RunDirReadSeam {
 # r7 (sol r6 B1): ONE rule for the least room a content read may START with -- the guard's own check before each spec and build read, its no-room typing, and the -ArtifactMinSec
 # Get-VenueStagedBuildManifest holds the artifact hash to -- so a room the guard admits is never refused by the module for a rounding the guard did not make.
 $script:GuardReadMinSec = 2
-$script:GuardWorkerFunctions = @('Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-RunDirOutputRefusal', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Get-LegSpecRefusal',
+# LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1: reads in a row with no answer, while no claim is held, that make the typed refusal (the claim loop). Each keeps its whole bound, so a
+# share that never answers is refused about 2.5 minutes after its first such read at the default -ClaimPollSec (3 x 30 s reads and 2 x 30 s polls).
+$script:ClaimWaitNoAnswerMax = 3
+$script:GuardWorkerFunctions = @('Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Set-GuardProgress', 'Get-RunDirOutputRefusal', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Get-LegSpecRefusal',
     'Test-NothingAtName', 'Get-InputUnresolvedCode')   # r12 (#704 merge): Get-InputOutputRefusal now calls these two (r5b, r6)
 $script:GuardWorker = {
     param($A)
@@ -729,7 +760,7 @@ function Invoke-InputGuard {
     # far past such a room); the content check then refuses with $gb.code before any content read. A location check still running then fails closed, typed $gb.code.
     $noRoom = $left -lt $script:GuardReadMinSec
     $bound = $(if ($noRoom) { 2 } else { $left + 0.5 })
-    $prog = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'the start of the guard' })
+    $prog = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'the start of the guard'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) })
     $vars = @{ guardedInputs = $script:guardedInputs; guardBudget = $gb; guardProgress = $prog; GuardReadMinSec = $script:GuardReadMinSec; guardDelaySeam = $script:guardDelaySeam; legPlanMode = $legPlanMode; AgentShare = $AgentShare
         stagedBuildProbe = $stagedBuildProbe; artifactProbe = $artifactProbe; RunDir = $RunDir; Venue = $Venue; ClaimDir = $ClaimDir; here = $here; ClaimDirPath = $script:ClaimDirPath
         RunDirOutputLeafPatterns = $script:RunDirOutputLeafPatterns; RunDirOutputDirs = $script:RunDirOutputDirs; ClaimDirOutputLeafPatterns = $script:ClaimDirOutputLeafPatterns; ClaimDirOutputDirs = $script:ClaimDirOutputDirs }
@@ -749,13 +780,17 @@ function Invoke-InputGuard {
             # that input is cannot be read again on this thread inside the room either, even when its location was verified first: every location is left unknown, and nothing more is
             # written into -RunDir (Get-WriteDestinationHit, behind each L and receipt write, would re-read every input's path unbounded)
             $unknown = $true
-            return [pscustomobject]@{ kind = 'content'; item = [int]$prog.item; code = $(if ($noRoom -and $gb.code) { $gb.code } else { 'SHARE_UNREACHABLE' }); locationUnknown = $unknown
-                why = "the guard's reads did not finish within $($gb.what) (still reading $($prog.at) after $([Math]::Round($gb.clock.Elapsed.TotalSeconds, 1)) s)$(if ($unknown) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' }); no leg runs on it" }
+            return [pscustomobject]@{ kind = 'content'; item = [int]$prog.item; code = $(if ($noRoom -and $gb.code) { $gb.code } else { 'SHARE_UNREACHABLE' }); locationUnknown = $unknown; noAnswer = $true
+                why = "the guard's reads did not finish within $($gb.what) (still reading $($prog.at) after $([Math]::Round($gb.clock.Elapsed.TotalSeconds, 1)) s)$(if ($unknown) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' }); no leg runs on it [$(Get-GuardTimingText $prog $gb $true)]" }
         }
         $out = @($ps.EndInvoke($async))
         $n = $(if ($out.Count -gt 0) { [int]$out[-1].abandoned } else { 0 })
         if ($n -gt 0) { & (Get-Module VenueChain) { param($k) $script:VenueAbandonedReads += $k } $n }
-        if ($out.Count -gt 0) { return $out[-1].hit }
+        if ($out.Count -gt 0) {
+            $h = $out[-1].hit
+            if ($h -and $h.kind -ceq 'content' -and $h.code -ceq 'SHARE_UNREACHABLE') { $h.why = "$($h.why) [$(Get-GuardTimingText $prog $gb ([bool]$h.noAnswer))]" }
+            return $h
+        }
         $null
     } catch {
         $unknown = -not $prog.locationsDone
@@ -1007,9 +1042,9 @@ function Get-InputContentRefusal {
         # r4 adversary A1 (pass 1), A2 (pass 2): under 2 s left of the budget no content read STARTS, checked before EACH spec and build read (a spec read comes before the builds,
         # and an earlier read can use up the room): the typed refusal is at once, never after a read that spends the leg reserve
         if (($g.kind -ceq 'spec' -or $g.kind -ceq 'build') -and $null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt $script:GuardReadMinSec) {
-            return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
+            return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
         }
-        if ($script:guardProgress) { $script:guardProgress.item = $g.item; $script:guardProgress.at = "the $($g.kind) input $($g.path)" }
+        Set-GuardProgress $g "the $($g.kind) input $($g.path)" 'content'
         if ($g.kind -ceq 'spec') {
             Wait-GuardReadSeam 'spec'
             $sr = @(Get-LegSpecRefusal $g.path $g.backend)
@@ -1032,7 +1067,7 @@ function Get-InputContentRefusal {
             $share = 300
             # r10 (sol r9 B1): 330.0, never 330 -- an integer first operand selects [Math]::Min's Int32 overload and rounds the double room (2.3 s -> 2, under the hash's 2 s minimum)
             if ($null -ne $script:guardBudget) { $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
-            if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
+            if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
@@ -1043,7 +1078,7 @@ function Get-InputContentRefusal {
             # #705 r14 (adversary r14 A1 sibling): a bounded manifest read or hash given up on under a guard budget is a read still held on the manifest's share, so its location is
             # left unknown as Invoke-InputGuard leaves it for a worker given up on (a "no time left" refusal gave up on no read, and keeps the location it verified)
             $gaveUp = ($null -ne $script:guardBudget) -and ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
-            if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; locationUnknown = $gaveUp; why = "the staged build manifest for $short could not be read after the claim wait (or the open) within $within at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no leg runs on it$(if ($gaveUp) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' })" } }
+            if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; locationUnknown = $gaveUp; noAnswer = $gaveUp; why = "the staged build manifest for $short could not be read after the claim wait (or the open) within $within at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no leg runs on it$(if ($gaveUp) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' })" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
             if ($st.state -ceq 'STAGED' -and $st.sha256 -cne $g.sha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short changed while the batch waited: sha256 $($st.sha256), not $($g.sha256)" } }
@@ -1636,10 +1671,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         Start-Sleep -Seconds $bw.waitSec
     }
     # (1) the claim, once per batch. A LIVE claim of another chain is waited out; stale claims are broken once each.
-    $claim = $null; $lastHolder = ''
+    $claim = $null; $lastHolder = ''; $noAnswers = 0; $script:claimWait = @{ denied = 0; startUtc = $null }
     while ($true) {
         $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
         $grantReadUtc = [DateTime]::UtcNow
+        if (-not $req.granted) { if ($script:claimWait.denied -eq 0) { $script:claimWait.startUtc = $grantReadUtc }; $script:claimWait.denied++ }
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
         # r5 (key3 r4 B1, Dot 6457724432): an attempt NOT granted (a foreign chain holds the venue, and may be measuring) runs the guard bounded too, 30 s as the gate guard, and
@@ -1659,6 +1695,22 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $script:guardBudget = $null
         # adversary r4 A2: an alias seen while a receipt was written stays seen, whatever the link is by now. r5: it outranks a live hit that is no alias; an unresolved one is kept too
         if ((Test-AliasHit $script:receiptGuardHit) -and -not (Test-AliasHit $hit)) { $hit = $script:receiptGuardHit } elseif (-not $hit -and $script:receiptGuardHit) { $hit = $script:receiptGuardHit }
+        # LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1: no lease, leg or write hangs on a read while no claim is held (the attempt that gets the claim guards again, on its own budget), so one
+        # with no answer is read again next poll instead of ending the plan. An input's location may be unknown until then, so nothing goes into -RunDir (the lines below are skipped, and
+        # no write guard re-reads every input unbounded on this thread). Three in a row, or no poll left before the deadline (DEADLINE's line and receipt would write), are the refusal.
+        if ($hit -and $hit.noAnswer -and -not $req.granted) {
+            $noAnswers++
+            if ($noAnswers -lt $script:ClaimWaitNoAnswerMax -and [DateTime]::UtcNow.AddSeconds($ClaimPollSec) -lt $deadline) {
+                [Console]::Error.WriteLine("CLAIM_WAIT_GUARD_NO_ANSWER batch=$batchNo noAnswers=$noAnswers/$($script:ClaimWaitNoAnswerMax) item=$($hit.item) $($hit.why) (read again in $ClaimPollSec s: no claim is held, and nothing runs or is written before a read answers)")
+                foreach ($bk in $req.broken) { [Console]::Error.WriteLine("CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)") }
+                Start-Sleep -Seconds $ClaimPollSec
+                continue
+            }
+            $hit.why = "$($hit.why) (no answer on $noAnswers read$(if ($noAnswers -ne 1) { 's' }) in a row while no claim was held)"
+        } elseif (-not $hit -and $noAnswers -gt 0) {
+            LogBest "CLAIM_WAIT_GUARD_ANSWERED batch=$batchNo noAnswers=$noAnswers (a read answered after that many with none; no leg was lost to them)"
+            $noAnswers = 0
+        }
         if ($hit) {
             if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed

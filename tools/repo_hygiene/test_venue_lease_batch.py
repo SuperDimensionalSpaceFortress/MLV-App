@@ -4733,12 +4733,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
 
     # r12 pass 2 (adversary r12 A2'): what the preflight validated must still hold when the claim is taken, or the leg throws / refuses after the lease opened.
-    def _during_claim_wait(self, args: list[str], e: dict, change) -> tuple[int, str, str]:
+    def _during_claim_wait(self, args: list[str], e: dict, change, release: bool = True) -> tuple[int, str, str]:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("CLAIM_HELD")
             change()
-            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            if release:
+                self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
@@ -5248,6 +5249,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ {body} }}\n", encoding="utf-8")
         r = self.run_plan(self.write_plan(items or [self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", cap, "-LegBudgetSec", leg, "-LeaseMarginSec", margin,
                           "-ArtifactProbeScript", str(probe), *extra, **env)
+        exited = datetime.now(timezone.utc)   # subprocess.run returned: the process is gone and its pipes closed (Dot I1 on #750)
         ticks = {}
         for line in self.events_raw():
             t, kind, rest = line.split(" ", 2)
@@ -5255,14 +5257,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 ticks.setdefault("open" if rest.startswith("lease-batch-open-") else "close", int(t))
         self.assertIn("open", ticks, r.stdout + r.stderr)
         # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 3: the second number returned is a CLOSE-submitted measurement ONLY when close_substituted is False. When no close was submitted
-        # (NO_CLOSE_EXPECTED) the runner's finishedUtc stands in for it, and the number is then how long the RUN took after the open: it proves termination (and, with the claim file
+        # (NO_CLOSE_EXPECTED) the observed process exit stands in for it, and the number is then how long the RUN took after the open: it proves termination (and, with the claim file
         # check beside it, claim cleanup), never a successful close and never a physical release of the lease.
+        # Dot I1 on #750: this was the runner's finishedUtc, which is stamped when the summary is built, before Write-RunSummary, Complete-VenueProcess and exit, so a stall after it passed.
+        def ticks_of(t: datetime) -> int:
+            return (t - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
         self.close_substituted = False
         if "close" not in ticks and env.get("NO_CLOSE_EXPECTED"):
             # r6: a close redirect that failed closed submits no close job (JOB_WRITE_FAILED); the run's end then stands in for the close
             self.close_substituted = True
-            done = datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))
-            ticks["close"] = (done - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
+            self.summary_after_open = (ticks_of(datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))) - ticks["open"]) / 1e7
+            ticks["close"] = ticks_of(exited)
         self.assertIn("close", ticks, r.stdout + r.stderr)
         return r, (ticks["close"] - ticks["open"]) / 1e7
 
@@ -5491,6 +5496,96 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.kinds(), [], "no lease was opened")
         self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
         self.assertLess(took, 40, f"the run took {took:.1f} s: the 40 s read was waited for")
+        # LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1: the refusal says what each read took and that no claim wait came before it
+        self.assertRegex(r.stderr, self.GUARD_READS_RE.format("location:plan"))
+        self.assertIn("claimWaitBefore=no", r.stderr)
+
+    # LEASE-BATCH-CLAIM-WAIT-GUARD-READ-REFUSAL-1: #748's matrix and retry plans each stopped on one no-claim read that did not answer in its 30 s, while another chain held the venue, and
+    # every remaining leg went NOT_RUN. No lease, leg or write hangs on that read: the attempt that gets the claim guards again on its own budget before anything runs. So a read with
+    # no answer while no claim is held is read again next poll, writing nothing meanwhile, and only three in a row are the typed refusal, which then still says SHARE_UNREACHABLE.
+    # what each read took; '+' marks the one still running when the guard gave up on it
+    GUARD_READS_RE = r"guardReads\(sec\): start=[0-9.]+ (\S+=[0-9.]+ )*{}=[0-9.]+\+"
+
+    def _claim_wait_cmd(self, *extra: str, manifest_probe: Path | None = None) -> tuple[list[str], dict]:
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        probes = ("-StagedBuildProbeScript", str(manifest_probe)) if manifest_probe else ()
+        return self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), *probes, *extra)
+
+    def _assert_read_again_and_the_plan_ran(self, code: int, so: str, se: str) -> None:
+        self.assertEqual(code, 0, so + se)
+        self.assertNotIn("LEG_PLAN_REFUSED", se)
+        self.assertIn("CLAIM_WAIT_GUARD_NO_ANSWER batch=1 noAnswers=1/3 ", se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertIn("claimWaitBefore=yes deniedPolls=1 ", se)
+        self.assertEqual(len(self.leg_calls()), 1, so + se)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertLess(log.index("CLAIM_WAIT_GUARD_ANSWERED batch=1 noAnswers=1 "), log.index("CLAIM_HELD"), "a line was written before a read vouched for the input's location")
+        self.assertEqual(self.batches()[0]["endReason"], "ALL_LEGS_DONE")
+
+    def test_artifact_preflight_claim_wait_one_location_read_with_no_answer_costs_no_leg(self) -> None:
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40x1")
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self._assert_read_again_and_the_plan_ran(code, so, se)
+        self.assertRegex(se, self.GUARD_READS_RE.format("location:build1"))
+        self.assertIn("still reading the location of the build input", se)
+
+    def test_artifact_preflight_claim_wait_one_manifest_read_given_up_on_costs_no_leg(self) -> None:
+        calls = self.case / "manifest-calls.txt"
+        manifest_probe, _ = self._timed_probes(0, 0)
+        # the preflight is the first read; the first denied poll's is the second, and it does not answer inside the guard's 30 s
+        manifest_probe.write_text(manifest_probe.read_text(encoding="utf-8").replace(
+            "param($p)\n", f"param($p)\n[IO.File]::AppendAllText('{calls}', 'm' + [Environment]::NewLine)\nif ([IO.File]::ReadAllLines('{calls}').Count -eq 2) {{ [Threading.Thread]::Sleep(40000) }}\n", 1), encoding="utf-8")
+        args, e = self._claim_wait_cmd(manifest_probe=manifest_probe)
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self._assert_read_again_and_the_plan_ran(code, so, se)
+        self.assertIn("could not be read after the claim wait", se)
+
+    def test_artifact_preflight_claim_wait_one_slow_read_that_left_no_room_costs_no_leg(self) -> None:
+        # the read answered, but the guard's 30 s went on it: the next read has no room to start (or, on a slow host, the guard gave up on this one). Neither is a refusal yet.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x1")
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self._assert_read_again_and_the_plan_ran(code, so, se)
+
+    def test_artifact_preflight_claim_wait_a_share_that_never_answers_still_refuses_typed_and_writes_nothing(self) -> None:
+        # the control: every read stalls past the guard's 30 s, the foreign claim never lets go. The same typed reason, after three reads in a row and never at the deadline.
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40")
+        t0 = time.monotonic()
+        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 the guard's reads did not finish within the claim wait", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertIn("(no answer on 3 reads in a row while no claim was held)", r.stderr)
+        self.assertRegex(r.stderr, self.GUARD_READS_RE.format("location:build1"))
+        self.assertIn("claimWaitBefore=yes deniedPolls=3 ", r.stderr)
+        self.assertEqual(r.stderr.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 2, r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertGreater(took, 3 * 30, f"the run took {took:.1f} s: each read keeps its whole 30 s")
+        self.assertLess(took, 3 * 30.5 + 2 * 1 + 30, f"the run took {took:.1f} s: three reads and two polls, then the refusal")
+        self.assertNotIn("CLAIM_HELD", (self.run_dir / "batch.log").read_text(encoding="utf-8"), "a line was written while no read had vouched for the input's location")
+
+    def test_artifact_preflight_claim_wait_a_read_with_no_answer_at_the_deadline_refuses_typed_not_deadline(self) -> None:
+        # no poll is left to read again in: the run ends in the refusal, because DEADLINE's own log line and receipt would write into a -RunDir nobody vouched for
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:existence=40", "-ClaimPollSec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=200, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("(no answer on 1 read in a row while no claim was held)", r.stderr)
+        self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", r.stderr)
+        self.assertNotIn("BATCH_END", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_artifact_preflight_claim_wait_a_read_the_share_refused_at_once_is_still_the_refusal(self) -> None:
+        # the sibling control: a read that ANSWERED with a failure (the manifest write-locked) is an answer, so it is refused on that poll, as #705 r13 made it
+        manifest = self._staged_manifest(self.commit_a)
+        args, e = self._claim_wait_cmd()
+        code, so, se = self._during_claim_wait(args, e, lambda: self._lock_exclusive(manifest), release=False)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", se)
+        self.assertIn("could not be read after the claim wait", se)
+        self.assertNotIn("CLAIM_WAIT_GUARD_NO_ANSWER", se)
+        self.assertEqual(self.leg_calls(), [])
 
     # r5 ITEM 1 (key3 r4 B1, catalogue row L-05; Dot 6457724432): an attempt the claim was NOT granted for ran the guard inline with no budget, and the guard hashed every cached
     # artifact (-VerifyArtifacts) on the venue's share on every -ClaimPollSec poll while a foreign chain held the venue (and measured). Master's wait read the manifests only.
@@ -5565,7 +5660,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # held the run before the typed refusal and the lease close. '<guard>:rundir=<sec>' stalls every read of -RunDir in that guard and after it; GUARD_READ_DELAY_SEAM on stderr names
     # each main-thread read that reached the stall.
     # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 3: renamed from ..._reaches_the_typed_refusal_and_the_close_inside_the_room. No close job is submitted here (JOB_WRITE_FAILED), so
-    # the measurement is the run's own end (finishedUtc), which proves termination and the claim release, not a close.
+    # the measurement is the run's own end (the observed process exit), which proves termination and the claim release, not a close.
     def test_artifact_preflight_r5_item2_a_stalled_rundir_after_the_open_reaches_the_typed_refusal_and_the_run_ends_with_the_claim_released_inside_the_room(self) -> None:
         # sol's repro: cap 75, leg budget 60, margin 0 (the post-open guard has 14 s); -RunDir's metadata reads stall 40 s once the open is answered
         r, ended_after_open = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", NO_CLOSE_EXPECTED="1")
@@ -5576,7 +5671,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.leg_calls(), [])
         self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
         # the 14 s room and the documented 2 s bounded re-read of -RunDir (adversary r5 A1), never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
-        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): the stalled -RunDir was waited for")
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (the observed process exit stands in for a close that was never submitted): the stalled -RunDir was waited for")
         self.assertFalse(self.claim_path.exists(), "the claim file was removed (claim cleanup; says nothing of the lease's physical release)")
         self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
@@ -5729,7 +5824,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("an input whose location is unknown is refused", r.stderr)
         self.assertEqual(self.leg_calls(), [])
         # the 14 s room and the 2 s bound on the -RunDir re-read and the TEMP walk (raced, one bound), never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
-        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): a TEMP read that reached the stalled -RunDir was waited for")
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (the observed process exit stands in for a close that was never submitted): a TEMP read that reached the stalled -RunDir was waited for")
         self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the redirect fails closed")
         self.assertIn(expect, r.stderr)
         self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
@@ -5775,10 +5870,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     TEMP_WALK_REFUSAL_TAIL = "once the guard gave up on a location: it is not known to be outside -RunDir"
     RUNDIR_REREAD_REFUSAL_TAIL = "once the guard gave up on a location: where it is now is unknown, so TEMP is not known to be outside it"
 
-    def _responsive_rundir_temp_run(self, resolve_ms: int, identity_ms: int, stalled: bool) -> tuple[subprocess.CompletedProcess, float, Path]:
+    def _responsive_rundir_temp_run(self, resolve_ms: int, identity_ms: int, stalled: bool, extra_patches: tuple[tuple[str, str], ...] = ()) -> tuple[subprocess.CompletedProcess, float, Path]:
         temp = self.case / "iso-temp-elsewhere"
         temp.mkdir(parents=True, exist_ok=True)
-        self._mirror_with_bad_sidecar(runner_patches=((self.TEMP_SEAM_ANCHOR, f"$tempSeam = @({resolve_ms}, {identity_ms})"),))
+        self._mirror_with_bad_sidecar(runner_patches=((self.TEMP_SEAM_ANCHOR, f"$tempSeam = @({resolve_ms}, {identity_ms})"), *extra_patches))
         self.plan_runner = self.runner
         env = {"NO_CLOSE_EXPECTED": "1"} if stalled else {}
         r, measured = self._post_open_hash_run(0, "-GuardReadDelay", "open:identity=25", cap="75", TEMP=str(temp), TMP=str(temp), **env)
@@ -5803,7 +5898,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(list(temp.glob("venue-lease-batch-close-*")), [], "a close redirect was made in a TEMP that did not answer")
         self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
         # the 14 s room and TEMP's 2 s bound, never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
-        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): TEMP's stalled walk was waited for")
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (the observed process exit stands in for a close that was never submitted): TEMP's stalled walk was waited for")
+
+    def test_artifact_preflight_claim_wait_dot_i1_the_measured_end_is_the_process_exit_not_the_summary_stamp(self) -> None:
+        # Dot I1 on #750: finishedUtc is stamped when the summary is built, before Write-RunSummary, Complete-VenueProcess and exit, so a stall after it passed the bound. A mirror stalls
+        # 8 s between the summary and the exit: the measured end must lie past the stamp by that much.
+        exit_line = "Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned"
+        r, ended_after_open, _ = self._responsive_rundir_temp_run(40000, 0, stalled=True, extra_patches=((exit_line, "Start-Sleep -Seconds 8; " + exit_line),))
+        self.assertTrue(self.close_substituted, r.stdout + r.stderr)
+        self.assertGreaterEqual(ended_after_open - self.summary_after_open, 8, f"the process exit {ended_after_open:.1f} s after the open is not past the summary stamp {self.summary_after_open:.1f} s by the 8 s stall")
 
     def test_artifact_preflight_iso1_item1_control_a_responsive_rundir_and_an_unstalled_temp_walk_on_the_patched_mirror_still_gets_the_redirect(self) -> None:
         r, held, temp = self._responsive_rundir_temp_run(0, 0, stalled=False)
