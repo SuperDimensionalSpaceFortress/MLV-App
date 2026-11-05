@@ -1898,7 +1898,7 @@ function Resolve-JobRecovery {
         $fa = Read-MarkerArtifact -Path $final
         if ($fa.state -eq "ok") {
             $null = Resolve-StartedMarkerFile -Marker $fa.marker -MarkerPath $final
-            $left =Get-JobRecoveryPending -JobId $JobId -IgnoreQuarantine
+            $left = Get-JobRecoveryPending -JobId $JobId -IgnoreQuarantine
             # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: this agent's own unlaunched claim reads as admissible above, but with its result published the marker
             # should be gone by now. Still here means its retire failed, so it stays quarantined and is retried, not released with the marker left behind.
             if (-not $left -and (Test-Path -LiteralPath (Join-Path $outbox "$JobId.result.json") -PathType Leaf) -and (Test-Path -LiteralPath $final -PathType Leaf)) { $left = "its result is published but its marker could not be retired" }
