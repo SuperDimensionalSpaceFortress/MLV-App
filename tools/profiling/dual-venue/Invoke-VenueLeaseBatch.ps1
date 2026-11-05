@@ -104,7 +104,7 @@
 #         run again next poll, with nothing written into -RunDir or any output meanwhile (each poll's claim request still writes the claim directory, as every poll always has;
 #         CLAIM_WAIT_GUARD_NO_ANSWER or CLAIM_WAIT_GUARD_NO_ROOM on stderr; CLAIM_WAIT_GUARD_ANSWERED in batch.log once a pass finishes). Three in a row, or one with too little time left for
 #         the poll and a whole 30 s pass before the deadline (asked again after the sleep), are the same SHARE_UNREACHABLE refusal. A read that ANSWERED with a failure is refused on that
-#         poll. Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
+#         poll, even when the same pass then runs out of room or a later read is given up on (the refusal names that failure). Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
 #         A SHARE_UNREACHABLE from any of these checks says guardReads(sec): what each read took ('+' = still running when given up on; start = the worker's own start, nothing read yet) and
 #         claimWaitBefore=yes|no (waitedSec: first denied poll to the grant, or to now while still denied).
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
@@ -659,7 +659,7 @@ function Get-InputOutputRefusal {
         # r6 (adversary r6 A1 sibling): gone means not found; a manifest whose lookup is denied is still there (Test-Path said gone)
         if ($g.kind -ceq 'build') { Wait-GuardReadSeam 'existence' }
         if ($g.kind -ceq 'build' -and (Test-NothingAtName $g.path)) {
-            if ($script:guardProgress) { $script:guardProgress.answeredFailure = "BUILD_NOT_STAGED $($g.path)" }   # r3 adversary pass 2 A1: read by Invoke-InputGuard if a later read stalls
+            if ($script:guardProgress) { $script:guardProgress.answeredFailure = "BUILD_NOT_STAGED $($g.path)" }   # r3 adversary pass 2 A1, r4: read by Invoke-InputGuard if a later read stalls or the pass ends with no room
             continue
         }
         # the step above is this input's own share alone; the one below also walks -RunDir and -ClaimDir on this host, so guardReads tells a stalled share from a slow host
@@ -813,6 +813,9 @@ function Invoke-InputGuard {
         if ($n -gt 0) { & (Get-Module VenueChain) { param($k) $script:VenueAbandonedReads += $k } $n }
         if ($out.Count -gt 0) {
             $h = $out[-1].hit
+            # r4 (sol, fable, opus r3): the same answer as the abandon branch above, for a worker that returned: a pass already answered with a failure that then ended on no room or a read given up on
+            # is that failure, refused on this poll, not a read to try again. Every exit that sets noAnswer returns through here or that branch.
+            if ($h -and $h.noAnswer -and $prog.answeredFailure) { $h.noAnswer = $false; $h.why = "$($h.why); an input had already answered with a failure: $($prog.answeredFailure)" }
             # r3 (sol, fable, opus r2): the '+' is for a read really given up on (readAbandoned), never for noAnswer, which also covers a pass whose reads answered and left no room for the next
             if ($h -and $h.kind -ceq 'content' -and $h.code -ceq 'SHARE_UNREACHABLE') { $h.why = "$($h.why) [$(Get-GuardTimingText $prog $gb ([bool]$h.readAbandoned))]" }
             return $h

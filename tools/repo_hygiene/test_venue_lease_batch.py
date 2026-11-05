@@ -5614,8 +5614,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_artifact_preflight_claim_wait_one_slow_read_that_left_no_room_costs_no_leg(self) -> None:
         # the read answered, but the guard's 30 s went on it: the next read has no room to start (or, on a host so slow that the worker took over 2.5 s to reach it, the guard gave up on
         # this one). Neither is a refusal yet. Sol and fable r2: the pass with no read given up on carries no '+' and says no read went unanswered; the other keeps both.
-        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x1")
-        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        # r4 (the keys' control, INV-1): the manifest goes and comes back before the next pass, which no pass saw, so this is still a read again: the row below is the one that saw it gone.
+        manifest = self._staged_manifest(self.commit_a)
+        staged = manifest.read_bytes()
+
+        def gone_and_back_then_the_foreign_owner_lets_go() -> None:
+            manifest.unlink()
+            manifest.write_bytes(staged)
+            self._wait_for_log("CLAIM_HELD")
+            self.claim_path.unlink()
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x1", "-ClaimPollSec", "3")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_", gone_and_back_then_the_foreign_owner_lets_go)
         if "CLAIM_WAIT_GUARD_NO_ANSWER" in se:
             self._assert_read_again_and_the_plan_ran(code, so, se)
             self.assertRegex(se, self.GUARD_READS_RE.format("content:spec1"))
@@ -5767,6 +5776,89 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
         self.assertIn("already answered with a failure: BUILD_NOT_STAGED", se)
         self.assertEqual(self.kinds(), [], "no lease was opened")
+
+    def test_artifact_preflight_claim_wait_r4_a_manifest_found_gone_then_no_room_is_refused_on_that_poll(self) -> None:
+        # r4 (sol, fable, opus r3 blocker; sol ran it at 28.01, 29 and 29.99 s): the row above with a pass that COMPLETES. The spec read answers at 28 s of the 30, so the next read has no
+        # room, and the worker returns its no-room hit instead of being given up on. The manifest was still found gone first: refused on that poll, never read again.
+        # (On a host so slow that the guard gives up on the spec read instead, the row above is what runs, and this says the same.)
+        manifest = self._staged_manifest(self.commit_a)
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=28x2")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_", manifest.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_"), 1, se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", se)
+        self.assertIn("already answered with a failure: BUILD_NOT_STAGED", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+
+    def _guard_passes_in_memory(self, passes: str, stall_commit: str) -> list[dict]:
+        # one no-claim pass per row, in one process, through the runner's own Invoke-InputGuard, worker runspace, location and content steps, and VenueChain's bounded read. Only the
+        # alias and spec checks are stubbed, and a pass's room is cut at the named read's progress line (no read has to be slow, so no host is too slow or too fast for it).
+        flag = self.case / "stall-on"
+        manifest_probe, _ = self._timed_probes(8000, 0, when=f"$p -like '*{stall_commit[:12]}*' -and [IO.File]::Exists('{psq(flag)}')")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Test-NothingAtName') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  "foreach ($v in '$script:GuardReadMinSec', '$script:GuardWorkerFunctions', '$script:GuardWorker') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq $v }, $true).Extent.Text)) }\n"
+                  "$t = Get-Def 'Set-GuardProgress'\n"
+                  "$cut = 'if ($Phase -ceq ''content'') { $b = $script:guardBudget; if ($b.cutKind -ceq $Input_.kind -and $b.cutItem -eq $Input_.item) { $b.sec = $b.clock.Elapsed.TotalSeconds + $b.room } }'\n"
+                  ". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}')) + \"`n$cut`n}\"))\n"
+                  "function Get-RunDirOutputRefusal { param($p) '' }\n"
+                  "function Get-InputUnresolvedCode { param($p, [switch]$SkipRead) '' }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) @('', '') }\n"
+                  f"$here = '{psq(RUNNER.parent)}'; Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking\n"
+                  f"$legPlanMode = $true; $AgentShare = '{psq(self.share)}'; $RunDir = 'r'; $Venue = 'bachelor'; $ClaimDir = 'c'; $artifactProbe = $null; $script:guardDelaySeam = $null; $script:claimWait = $null\n"
+                  f"$stagedBuildProbe = [scriptblock]::Create([IO.File]::ReadAllText('{psq(manifest_probe)}'))\n"
+                  "function Build-Input([int]$item, [string]$commit, [string]$sha) { [pscustomobject]@{ kind = 'build'; item = $item; commit = $commit; sha256 = $sha; path = ($AgentShare.TrimEnd('\\') + '\\cache\\playback-attr-3-cuda-' + $commit.Substring(0, 12) + '-build.json') } }\n"
+                  f"$a = Build-Input 2 '{self.commit_a}' '{self.manifests[self.commit_a]}'; $b1 = Build-Input 1 '{self.commit_b}' '{self.manifests[self.commit_b]}'\n"
+                  "$spec = [pscustomobject]@{ kind = 'spec'; item = 1; path = 's'; backend = 'cpu' }\n"
+                  f"$rows = @(\n{passes}\n)\n"
+                  "$out = foreach ($row in $rows) {\n"
+                  "    $gone = $row.gone\n"
+                  f"    if ($row.stall) {{ [IO.File]::WriteAllText('{psq(flag)}', '') }} else {{ [IO.File]::Delete('{psq(flag)}') }}\n"
+                  "    if ($gone) { [IO.File]::Move($a.path, \"$($a.path).away\") }\n"
+                  "    $script:guardedInputs = @($row.inputs)\n"
+                  "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "    $script:guardBudget | Add-Member cutKind $row.kind; $script:guardBudget | Add-Member cutItem $row.item; $script:guardBudget | Add-Member room $row.room\n"
+                  "    $h = Invoke-InputGuard\n"
+                  "    $script:guardBudget = $null\n"
+                  "    if ($gone) { [IO.File]::Move(\"$($a.path).away\", $a.path) }\n"
+                  "    [pscustomobject]@{ site = $row.site; gone = $gone; code = $h.code; item = $h.item; noAnswer = [bool]$h.noAnswer; readAbandoned = [bool]$h.readAbandoned; locationUnknown = [bool]$h.locationUnknown; why = $h.why }\n"
+                  "}\n"
+                  # a read given up on is a live thread the host would wait for
+                  "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out))); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_artifact_preflight_claim_wait_r4_a_manifest_found_gone_is_refused_at_each_exit_that_completes_the_pass(self) -> None:
+        # r4 catalogue row (sol, fable, opus r3): manifest found gone, then the pass ends on a no-room hit or a bounded manifest read given up on: the failure is named and noAnswer is off, so
+        # the claim loop refuses on that poll. Each exit has a row, its control next to it: the same exit with the manifest back answers nothing, stays noAnswer and is read again (INV-1).
+        # The no-room exit before a read also has the real-process row above. The build read's own room check has no read before it to delay, so only a cut room reaches it, and the A/B read
+        # given up on (sol's two-build form) is here because a real run of it costs two whole 30 s passes.
+        rows = {"no_room_next_read": ("@($spec, $a)", "'spec'", 1, 1, 0), "no_room_build_read": ("@($b1, $a)", "'build'", 2, 1, 0), "manifest_read_given_up": ("@($b1, $a)", "'build'", 1, 2.5, 1)}
+        passes = ",\n".join(f"[pscustomobject]@{{ site = '{site}'; gone = ${'true' if gone else 'false'}; inputs = {inputs}; kind = {kind}; item = {item}; room = {room}; stall = {'$true' if stall else '$false'} }}"
+                            for site, (inputs, kind, item, room, stall) in rows.items() for gone in (True, False))
+        got = {(d["site"], d["gone"]): d for d in self._guard_passes_in_memory(passes, self.commit_b)}
+        self.assertEqual(len(got), 6, got)
+        says = {"no_room_next_read": "to re-read the build input", "no_room_build_read": "to read and hash the staged build for", "manifest_read_given_up": "could not be read after the claim wait"}
+        for site, text in says.items():
+            given_up = site == "manifest_read_given_up"
+            with self.subTest(site=site, gone=True):
+                d = got[(site, True)]
+                self.assertEqual(d["code"], "SHARE_UNREACHABLE", d)
+                self.assertIn(text, d["why"])
+                self.assertFalse(d["noAnswer"], f"read again, not refused: {d}")
+                self.assertRegex(d["why"], r"already answered with a failure: BUILD_NOT_STAGED \S+ \[guardReads\(sec\): ", "named, before the timing, as the worker-given-up branch says it")
+                self.assertEqual((d["readAbandoned"], d["locationUnknown"]), (given_up, given_up), d)
+                self.assertEqual("+ claimWaitBefore" in d["why"], given_up, "'+' is only for a read really given up on")
+            with self.subTest(site=site, gone=False):
+                d = got[(site, False)]
+                self.assertEqual(d["code"], "SHARE_UNREACHABLE", d)
+                self.assertIn(text, d["why"])
+                self.assertTrue(d["noAnswer"], f"a pass that really did not finish is read again: {d}")
+                self.assertNotIn("already answered", d["why"])
+                self.assertEqual(d["readAbandoned"], given_up, d)
 
     def test_artifact_preflight_claim_wait_r3_a_claim_request_that_throws_on_a_retry_is_the_typed_refusal(self) -> None:
         # adversary r3 pass 2 A2: the retry goes into a claim request nothing guarded, and a throw there ended the script with a read given up on still stuck on a live thread, which the host
