@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-11-05T16:16:10Z
+generated_from: 2026-11-05T18:20:44Z
 
 ## Open product and playback cards
 
@@ -21,6 +21,7 @@ generated_from: 2026-11-05T16:16:10Z
 | P | card | kind | state | queued since | order_chain |
 |---|---|---|---|---|---|
 | 1 | LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1 | product | pr-open | 2026-10-14 | - |
+| 1 | LOOK-FULLSCREEN-PARITY-1 | product | pr-open | 2026-10-16 | - |
 | 1 | CORE-PARTITION-HELPER-PID-REUSE-1 | product | queued | 2026-10-28 | ORDER-20261028T134438Z #2 after BACHELOR-CORE-PARTITION-AB-1 |
 | 1 | CORE-PARTITION-TERMINAL-TEST-REAL-PUBLISHER-1 | product | queued | 2026-10-28 | - |
 | 1 | QUIET-LEASE-RENEW-HOOK-WRITE-RETRY-1 | product | queued | 2026-10-31 | - |
@@ -28,11 +29,10 @@ generated_from: 2026-11-05T16:16:10Z
 | 1 | HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 | product | pr-open | 2026-11-04 | - |
 | 1 | CPU-SCOPE-LIVE-CRASH-FIX-1 | product | declared | 2026-11-05 | - |
 | 2 | PLAYBACK-GL-PRESENT-BACKLOG-1 | product | declared | 2026-10-09 | ORDER-20261008T151800Z #2 after PLAYBACK-GL-PRESENT-SETUP-STALL-1 |
+| 2 | HFR-NATIVE-60FPS-FULLRES-1 | product | pr-open | 2026-10-12 | ORDER-20261014T015628Z #3 after HFR-NATIVE-M16-1457-TIMEBUDGET-1 |
 | 2 | PLAYBACK-GPU-SCOPES-NO-VETO-1 | product | pr-open | 2026-10-15 | - |
-| 2 | LOOK-FULLSCREEN-PARITY-1 | product | pr-open | 2026-10-16 | - |
 | 2 | CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 | product | queued | 2026-10-28 | ORDER-20261028T134438Z #3 after CORE-PARTITION-HELPER-PID-REUSE-1 |
 | 2 | CPU-S1-RECON-CHAIN-ATTRIBUTION-1 | product | pr-open | 2026-11-04 | - |
-| 3 | HFR-NATIVE-60FPS-FULLRES-1 | product | pr-open | 2026-10-12 | ORDER-20261014T015628Z #3 after HFR-NATIVE-M16-1457-TIMEBUDGET-1 |
 | 3 | PLAYBACK-HFR-CONFORM-DEFAULT-1 | product | declared | 2026-10-15 | - |
 | 3 | WARM-RUN-CHROMA-SMOOTH-PARITY-1 | product | pr-open | 2026-10-18 | - |
 | 6 | PREP-WORKER-HL-RECON-REFUSAL-FIXTURE-1 | product | queued | 2026-10-07 | - |
