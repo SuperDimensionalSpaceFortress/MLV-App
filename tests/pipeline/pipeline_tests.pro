@@ -9,10 +9,42 @@ DEFINES += STDOUT_SILENT
 
 # Compile video_mlv.c's real JPEG2000 frame-read branch into the test binary so
 # the upstream-sync hardening regressions run the production lines rather than
-# the "codec not enabled" stub. OpenJPH itself is not linked: the codec entry
-# points come from tests/pipeline/ojph_decoder_test_stub.cpp, which is the only
-# thing replaced. See that file for why.
+# the "codec not enabled" stub. The ojph_* codec entry points video_mlv.c calls
+# come from tests/pipeline/ojph_decoder_test_stub.cpp, which is the only thing
+# replaced. See that file for why (and r9 below for the real codec beside it).
 DEFINES += ENABLE_JPEG2K
+
+# PLAYBACK-SOURCE-FRAME-IDENTITY-1 r9: the JPEG2K source identity is the DECODED picture, so a real codestream must go
+# through the real decoder. OpenJPH is linked as MLVApp.pro links it (same source list, same AVX/AVX2/AVX512 and WASM
+# exclusions), plus SSSE3 excluded because this build's C++ flags have no -mssse3 (OpenJPH then selects its generic block
+# decoder, as it does at run time on a CPU without SSSE3). The product wrapper is compiled only through
+# tests/pipeline/ojph_real_codec.cpp, under ojph_real_* names, so the stub keeps the ojph_* names (OjphRealCodecScope).
+DEFINES += OJPH_DISABLE_AVX512 OJPH_DISABLE_AVX2 OJPH_DISABLE_AVX OJPH_DISABLE_SSSE3
+OPENJPH = $$REPO_ROOT/src/mlv/OpenJPH
+INCLUDEPATH += $$OPENJPH $$OPENJPH/openjph $$OPENJPH/codestream $$OPENJPH/coding $$OPENJPH/transform $$OPENJPH/others
+SOURCES += \
+    $$files($$OPENJPH/codestream/*.cpp) \
+    $$files($$OPENJPH/coding/*.cpp) \
+    $$files($$OPENJPH/transform/*.cpp) \
+    $$files($$OPENJPH/others/*.cpp) \
+    $$OPENJPH/others/ojph_mem_c.c \
+    $$REPO_ROOT/tests/pipeline/ojph_real_codec.cpp
+SOURCES -= \
+    $$OPENJPH/codestream/ojph_codestream_wasm.cpp \
+    $$OPENJPH/coding/ojph_block_decoder_wasm.cpp \
+    $$OPENJPH/coding/ojph_block_decoder_avx2.cpp \
+    $$OPENJPH/coding/ojph_block_decoder_ssse3.cpp \
+    $$OPENJPH/coding/ojph_block_encoder_avx2.cpp \
+    $$OPENJPH/coding/ojph_block_encoder_avx512.cpp \
+    $$OPENJPH/transform/ojph_colour_wasm.cpp \
+    $$OPENJPH/transform/ojph_colour_avx.cpp \
+    $$OPENJPH/transform/ojph_colour_avx2.cpp \
+    $$OPENJPH/transform/ojph_transform_wasm.cpp \
+    $$OPENJPH/transform/ojph_transform_avx.cpp \
+    $$OPENJPH/transform/ojph_transform_avx2.cpp \
+    $$OPENJPH/transform/ojph_transform_avx512.cpp \
+    $$OPENJPH/codestream/ojph_codestream_avx.cpp \
+    $$OPENJPH/codestream/ojph_codestream_avx2.cpp
 
 SOURCES += \
     $$REPO_ROOT/tests/common/test_artifacts.cpp \
@@ -136,6 +168,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_gpu_field_telemetry_capture.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_playback_recon_preload.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_device_loss_selfheal.cpp \
+    $$REPO_ROOT/tests/pipeline/test_visual_capture_source_hash.cpp \
     $$REPO_ROOT/tests/pipeline/test_dualiso_gpu_split_timing.cpp
 
 HEADERS += \
@@ -166,6 +199,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRunPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackReconWarmRun.h \
     $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.h \
+    $$REPO_ROOT/tests/pipeline/ojph_real_codec.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
     $$REPO_ROOT/tests/pipeline/dualiso_mesh_metrics.h \
     $$REPO_ROOT/tests/pipeline/backend_parametric_fixture.h \

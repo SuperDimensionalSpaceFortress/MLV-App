@@ -4789,9 +4789,41 @@ def _pwsh_identity(remaining: "float | None" = None) -> str:
 _PWSH_IDENTITY_REAL = _pwsh_identity  # the tests replace the module name; this keeps the real function reachable
 
 
+# CI-FLAKE-LINT-CACHE-PROBE-START-CRASH-WITH-OUTPUT-1: PR #745 e78a9ab8, run 41585926746, job 125751263016 (Repo Hygiene Python ubuntu shard 3/4), fresh12:
+# rc=-6 after 0.9 s with stdout = the banner below and stderr ending "...Exception: The given assembly name was invalid.\nFile name: 'System.Collections.
+# Specialized, Version=10.0.0.0, Culture=neutral, PublicKey<garbage>'\n   at System.Reflection.AssemblyNameParser.Parse(ReadOnlySpan`1 name)\n   at System.
+# Reflection.AssemblyName.ParseAsAssemblySpec(Char* pAssemblyName, Void* pAssemblySpec)". The same start crash, but it said something. Only these literals
+# count as "something"; a probe row (`"op"`, the JSON _cache_probe parses) or any other text makes it a real failure.
+LINT_PROBE_CRASH_BANNER = "An error has occurred that was not properly handled. Additional information is shown below. The PowerShell process will exit."
+LINT_PROBE_ASSEMBLY_LOAD = "The given assembly name was invalid."
+# Every accepted stderr line is matched WHOLE (adversary r1 A1): the message line may only carry an exception-type prefix, the File name line ends in the
+# public key (its token may be garbled into non-ASCII, as in the real log), and a frame's parameters are `Type name` pairs. Nothing else may follow.
+_LINT_PROBE_ASSEMBLY_MESSAGE = re.compile(r"^(?:Unhandled exception\.\s+)?(?:--->\s+)?(?:System\.[A-Za-z0-9_.]*Exception:\s+)?" + re.escape(LINT_PROBE_ASSEMBLY_LOAD) + "$")
+_LINT_PROBE_ASSEMBLY_FILE = re.compile(r"^File name: 'System\.[A-Za-z0-9_.]+, Version=\d+(?:\.\d+){3}, Culture=[A-Za-z0-9-]+, PublicKey(?:Token=(?:[0-9a-f]{16}|null))?[^\x00-\x7f]*'$")
+_LINT_PROBE_FRAME_PARAM = r"[A-Za-z0-9_.`<>\[\]]+[*&]? [A-Za-z0-9_]+"
+_LINT_PROBE_DOTNET_FRAME = re.compile(rf"^at System\.[A-Za-z0-9_.`]+\((?:{_LINT_PROBE_FRAME_PARAM}(?:, {_LINT_PROBE_FRAME_PARAM})*)?\)$")
+
+
+def _only_start_crash_text(stdout: "str | bytes | None", stderr: "str | bytes | None") -> bool:
+    """True when the output is empty, or is made ONLY of the pwsh crash banner (stdout) and/or the .NET assembly-load failure (stderr: its message line, its
+    `File name:` line and its System.* stack frames) with at least one of the two present. Any other line, and any probe row, is False."""
+    streams = [text.decode("utf-8", errors="replace") if isinstance(text, bytes) else (text or "") for text in (stdout, stderr)]
+    if not any(text.strip() for text in streams):
+        return True  # the original SIGSEGV shape: it said nothing
+    out_lines, err_lines = ([line.strip() for line in text.splitlines() if line.strip()] for text in streams)
+    if any('"op"' in line for line in out_lines + err_lines):
+        return False  # a probe row: the probe ran, so this is not a start-up abort
+    if any(line != LINT_PROBE_CRASH_BANNER for line in out_lines):
+        return False
+    if not all(_LINT_PROBE_ASSEMBLY_MESSAGE.match(line) or _LINT_PROBE_ASSEMBLY_FILE.match(line) or _LINT_PROBE_DOTNET_FRAME.match(line) for line in err_lines):
+        return False
+    return bool(out_lines) or any(_LINT_PROBE_ASSEMBLY_MESSAGE.match(line) for line in err_lines)
+
+
 def _is_start_crash(done: "subprocess.CompletedProcess", elapsed: float) -> bool:
-    """An interpreter start crash: died of a fault signal, said nothing, and did it inside the start-up window."""
-    return -done.returncode in LINT_PROBE_CRASH_SIGNALS and not done.stdout and not done.stderr and elapsed < LINT_PROBE_START_WINDOW_SEC
+    """An interpreter start crash: died of a fault signal inside the start-up window, and either said nothing or said only the pwsh crash banner /
+    a .NET assembly-load failure (see _only_start_crash_text). A non-signal exit, a kill, a late death or any other output is a real failure."""
+    return -done.returncode in LINT_PROBE_CRASH_SIGNALS and elapsed < LINT_PROBE_START_WINDOW_SEC and _only_start_crash_text(done.stdout, done.stderr)
 
 
 def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: "float | None" = None) -> list[dict]:
@@ -4859,7 +4891,8 @@ def _cache_probe(lint: Path, steps: list[dict], work: Path, tag: str, deadline: 
             break
         crash = attempt == 1 and _is_start_crash(done, lasted)
         if crash and limit - finished > 0:
-            print(f"[{tag}] interpreter start crash (rc={done.returncode}{signal}, no output, {lasted:.1f} s): running the probe once more", file=sys.stderr)
+            said = "no output" if not (done.stdout or done.stderr) else "only the crash banner / assembly-load text"
+            print(f"[{tag}] interpreter start crash (rc={done.returncode}{signal}, {said}, {lasted:.1f} s): running the probe once more", file=sys.stderr)
             continue
         identity = _pwsh_identity(limit - time.monotonic())
         why = ("finished after the deadline" if finished > limit and done.returncode == 0 else
@@ -5164,6 +5197,115 @@ class LintCacheProbeBoundTests(unittest.TestCase):
             self.assertEqual(1, len(started))
             self.assertIn("rc=-11", message)
             self.assertNotIn("retry", err.lower())
+
+    # CI-FLAKE-LINT-CACHE-PROBE-START-CRASH-WITH-OUTPUT-1: PR #745 e78a9ab8, Tests run 41585926746, job 125751263016 (Repo Hygiene Python ubuntu shard 3/4),
+    # fresh12: rc=-6 (signal 6) after 0.9 s; stdout the pwsh unhandled-exception banner, stderr a .NET assembly-load failure (the PublicKey in the file name
+    # is garbage, so the runtime was already corrupt). It printed no probe row, so it is the same start crash as the silent ones, and it is retried once.
+    BANNER = "An error has occurred that was not properly handled. Additional information is shown below. The PowerShell process will exit."
+    ASSEMBLY_LOAD = ("Unhandled exception. System.ArgumentException: The given assembly name was invalid.\n"
+                     "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKeyﾰ'\n"
+                     "   at System.Reflection.AssemblyNameParser.Parse(ReadOnlySpan`1 name)\n"
+                     "   at System.Reflection.AssemblyName.ParseAsAssemblySpec(Char* pAssemblyName, Void* pAssemblySpec)")
+    BANNER_CRASH = subprocess.CompletedProcess([], -6, stdout=BANNER, stderr=ASSEMBLY_LOAD)
+
+    def test_a_start_up_abort_that_printed_only_the_crash_banner_is_a_start_crash(self):
+        """RED rows: each is a fault-signal death inside the start-up window whose whole output is the banner and/or the assembly-load failure."""
+        for name, crash in (("banner and assembly text", self.BANNER_CRASH),
+                            ("banner only", subprocess.CompletedProcess([], -6, stdout=self.BANNER + "\n", stderr="")),
+                            ("assembly text only", subprocess.CompletedProcess([], -6, stdout="", stderr=self.ASSEMBLY_LOAD + "\n")),
+                            ("windows line ends", subprocess.CompletedProcess([], -6, stdout=self.BANNER + "\r\n", stderr=self.ASSEMBLY_LOAD.replace("\n", "\r\n"))),
+                            ("segv", subprocess.CompletedProcess([], -11, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD))):
+            for elapsed in (0.9, 4.99):
+                self.assertTrue(_is_start_crash(crash, elapsed), f"{name} at {elapsed} s must be a start crash")
+
+    def test_a_banner_crash_then_a_good_retry_stands_with_exactly_one_retry(self):
+        rows, message, started, err = self._scripted([self.BANNER_CRASH, self.GOOD], elapsed=0.9)
+        self.assertIsNone(message)
+        self.assertEqual([{"op": "state"}], rows)
+        self.assertEqual(["fresh9-probe.ps1"] * 2, started, "exactly one retry")
+        self.assertIn("rc=-6", err)
+        self.assertIn("running the probe once more", err)
+
+    def test_two_banner_crashes_fail_after_one_retry_and_the_message_keeps_the_text(self):
+        rows, message, started, _ = self._scripted([self.BANNER_CRASH, self.BANNER_CRASH], elapsed=0.9)
+        self.assertIsNone(rows)
+        self.assertEqual(2, len(started), "one retry, never two")
+        for needle in ("fresh9", "rc=-6", "signal 6", "attempt 1", "attempt 2", "assembly name was invalid", "not properly handled"):
+            self.assertIn(needle, message)
+
+    def test_a_banner_crash_retry_stays_inside_the_shared_deadline(self):
+        _, message, started, _ = self._scripted([self.BANNER_CRASH, self.GOOD], elapsed=0.9, deadline=1000.5)
+        self.assertEqual(1, len(started), "the crash used up the shared deadline: no retry")
+        self.assertIn("rc=-6", message)
+        rows, _, started, _ = self._scripted([self.BANNER_CRASH, self.GOOD], elapsed=1.0, deadline=1010.0)
+        self.assertEqual(2, len(started))
+        self.assertAlmostEqual(9.0, self.timeouts[1], msg="the retry may use only what is left of the shared deadline")
+
+    def test_output_that_is_not_only_the_crash_banner_is_a_real_failure(self):
+        """Guard rows (must stay non-crash): (a) a probe row, (b) a non-signal exit, (c) at or past the window, (d) a timeout, (e) any other text."""
+        row = '[{"op":"lint","findings":[],"built":true,"grammars":true,"cache":3}]'
+        guards = (
+            ("(a) probe row after the banner", subprocess.CompletedProcess([], -6, stdout=self.BANNER + "\n" + row, stderr=self.ASSEMBLY_LOAD), 0.9),
+            ("(a) probe row alone", subprocess.CompletedProcess([], -6, stdout=row, stderr=""), 0.9),
+            ("(a) probe row inside the assembly text", subprocess.CompletedProcess([], -6, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD + ' {"op":"state"}'), 0.9),
+            ("(a) probe row on the banner line", subprocess.CompletedProcess([], -6, stdout=self.BANNER + ' {"op":"state"}', stderr=""), 0.9),
+            ("(b) exit 1 with the banner", subprocess.CompletedProcess([], 1, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD), 0.9),
+            ("(b) exit 134 (a shell's view of SIGABRT)", subprocess.CompletedProcess([], 134, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD), 0.9),
+            ("(b) exit 0 with the banner", subprocess.CompletedProcess([], 0, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD), 0.9),
+            ("(c) at the window", self.BANNER_CRASH, 5.0),
+            ("(c) past the window", self.BANNER_CRASH, 6.0),
+            ("(e) other stderr text", subprocess.CompletedProcess([], -6, stdout=self.BANNER, stderr="Segmentation fault"), 0.9),
+            ("(e) other stderr line beside the assembly text", subprocess.CompletedProcess([], -6, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD + "\nsomething else broke"), 0.9),
+            ("(e) other stdout text beside the banner", subprocess.CompletedProcess([], -6, stdout=self.BANNER + "\nWARNING: disk full", stderr=self.ASSEMBLY_LOAD), 0.9),
+            ("(e) a different banner", subprocess.CompletedProcess([], -6, stdout="An error has occurred.", stderr=""), 0.9),
+            ("(e) stack frames with no assembly-load line", subprocess.CompletedProcess([], -6, stdout="", stderr="   at System.Reflection.AssemblyName.ParseAsAssemblySpec(Char* a, Void* b)"), 0.9),
+            ("(e) a bare word 'error'", subprocess.CompletedProcess([], -6, stdout="", stderr="error"), 0.9),
+            ("(e) external kill with the banner", subprocess.CompletedProcess([], -9, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD), 0.9),
+            ("(e) SIGTERM with the banner", subprocess.CompletedProcess([], -15, stdout=self.BANNER, stderr=self.ASSEMBLY_LOAD), 0.9),
+        )
+        for name, done, elapsed in guards:
+            self.assertFalse(_is_start_crash(done, elapsed), name)
+        _, message, started, err = self._scripted([subprocess.CompletedProcess([], -6, stdout=self.BANNER, stderr="Segmentation fault")], elapsed=0.9)
+        self.assertEqual(1, len(started), "other stderr text is not retried")
+        self.assertNotIn("running the probe once more", err)
+        self.assertIn("rc=-6", message)
+        _, message, started, _ = self._scripted([subprocess.TimeoutExpired(["pwsh"], 600)], elapsed=600)
+        self.assertEqual(1, len(started), "(d) a timeout is not retried")
+        self.assertIn("timed out", message)
+
+    def test_unrelated_text_that_merely_contains_the_assembly_literal_is_a_real_failure(self):
+        """Adversary r1 A1 (sol): every accepted line is matched whole, not by substring. The literal inside other text, a File name line with a suffix,
+        and a frame whose parameters are prose all stay real failures, and the retry is not taken for them."""
+        a = "The given assembly name was invalid."
+        file_ok = "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKeyﾰ'"
+        frame = "   at System.Reflection.AssemblyName.ParseAsAssemblySpec(Char* pAssemblyName, Void* pAssemblySpec)"
+        bad = (
+            f"FAIL: lint cache state corrupt; {a} (quoted input)",
+            f"{a} and then the lint printed FAIL",
+            f"prefix text {a}",
+            f"{a} (quoted input)",
+            "Unhandled exception. System.ArgumentException: FAIL " + a,
+            "Unhandled exception. System.ArgumentException: " + a + " trailing",
+            file_ok[:-1] + " rest of the line 'x",
+            file_ok + " and more",
+            "File name: 'System.Collections.Specialized, Version=10.0.0.0, Culture=neutral, PublicKey FAIL lint cache state corrupt'",
+            "   at System.Foo.Bar(FAIL lint cache state corrupt)",
+            "   at System.Foo.Bar(x) FAIL later",
+        )
+        for text in bad:
+            for stdout in ("", self.BANNER):
+                done = subprocess.CompletedProcess([], -6, stdout=stdout, stderr=text)
+                self.assertFalse(_is_start_crash(done, 0.9), f"{text!r} (stdout {stdout[:8]!r}) must stay a real failure")
+            self.assertFalse(_is_start_crash(subprocess.CompletedProcess([], -6, stdout=self.BANNER, stderr=f"{a}\n{text}"), 0.9), f"{text!r} beside the real message")
+        _, message, started, err = self._scripted([subprocess.CompletedProcess([], -6, stdout="", stderr=f"FAIL: lint cache state corrupt; {a} (quoted input)"), self.GOOD], elapsed=0.9)
+        self.assertEqual(1, len(started), "unrelated text is not retried")
+        self.assertNotIn("running the probe once more", err)
+        self.assertIn("rc=-6", message)
+        # the real shapes still stand (message with every allowed prefix, a PublicKeyToken file name, a frame with parameters)
+        for text in (a, "System.ArgumentException: " + a, "Unhandled exception. System.IO.FileLoadException: " + a, "---> System.ArgumentException: " + a,
+                     file_ok, "File name: 'System.Runtime, Version=10.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a'", frame):
+            stderr = text if a in text else f"{a}\n{text}"
+            self.assertTrue(_is_start_crash(subprocess.CompletedProcess([], -6, stdout="", stderr=stderr), 0.9), text)
 
     def test_a_non_signal_failure_is_not_retried(self):
         for rc in (1, 7):

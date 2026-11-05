@@ -85,13 +85,16 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   first (or none: an r2 build); `stopUnboundObserverClean`: whether `stop-unbound.png` also follows them with no forced paint;
 * `repeatedPlayFrames`: judged unforced captures that show the same picture as the one before them while the app's label
   advanced (`null` over source frames the app records as identical); `repeatedPlayFramesNote` says so in words, and is set
-  whatever note `reason` already holds (`reason` keeps the first note).
+  whatever note `reason` already holds (`reason` keeps the first note). Each repeat is judged by its own pair's `source_id`s:
+  a pair whose ids are equal is the source repeating its picture and is no repeat; a pair with a missing or malformed id is
+  counted but proves nothing;
+* `repeatedPlayFramesSourceDiffer`: the repeats whose own pair's source ids differ, the only ones that can make `PARTIAL_FREEZE`.
 
 | verdict | when | counted |
 |---|---|---|
 | `FROZEN_DISPLAY` | the play frames show ONE picture while the app presented more than one frame across them AND the source frames are known to differ (`sourceDifference` `known-differ`) | **no**: the receipt is `INVALID` |
 | `FROZEN_DISPLAY_SUSPECTED` | the same one picture, but nothing records whether the source frames differ (`sourceDifference` `unknown`): a static clip shows one picture legitimately | yes, and the detail says so |
-| `PARTIAL_FREEZE` | more than one picture, but `repeatedPlayFrames` is 2 or more AND the source frames are known to differ: the display's own paint stopped landing for part of the tail. One repeat is `OK`; over an `unknown` source the repeats stay a note (`repeatedPlayFramesNote`) on an `OK` block | yes, and the detail says so; a self-heal pre-launch with it is `INVALID` |
+| `PARTIAL_FREEZE` | more than one picture, but `repeatedPlayFramesSourceDiffer` is 2 or more AND the source frames are known to differ: the display's own paint stopped landing for part of the tail. One repeat is `OK`; over an `unknown` source the repeats stay a note (`repeatedPlayFramesNote`) on an `OK` block | yes, and the detail says so; a self-heal pre-launch with it is `INVALID` |
 | `VISUAL_ASSESSMENT_UNAVAILABLE` | play frames have no usable viewport rectangle in `visual.json` (absent, empty or outside the image) AND fewer than two play frames with one remain: the whole window, with its timecode and chrome, is never judged in its place. With two or more usable frames those are judged as above (a known-differ leg with one frame lacking a rectangle is still `FROZEN_DISPLAY`) | yes, and the detail says so |
 | `CAPTURE_UNBOUND` | a capture the divergence compares is not shown bound to its label: on a binding build (either side carries `label_bound`), the stop OR the paused capture's `label_bound` is false or missing; the stop-vs-paused difference then compares two moments | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
@@ -99,18 +102,70 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
 | `OK` | none of the above | yes |
 
-`sourceDifference` is read from the app's own `visual.json` field `source_difference` (`differ` -> `known-differ`, `identical` ->
-`known-identical`); absent or anything else (the wrong case included: `IDENTICAL`) is `unknown`, never a guess. One picture over
+`sourceDifference` is derived from the app's own per-frame records over the SAME frames the picture is judged over (the play
+frames with a content hash): `Get-DvVisualSourceDifference` applies the app's rule (next section) to those frames' `source_id`, so
+`known-differ` means the judged frames themselves show differing source ids. The app's top-level `source_difference` covers EVERY
+play capture, a usable picture or not, so it is kept as written (`appSourceDifference`) and only cross-checks the decision
+(`sourceDifferenceCrossCheck`: `agree` or `disagree`; a disagreement also adds a note to the reason, and never decides).
+PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1 on PR #477): five frozen frames over one source beside an unusable sixth over
+another read `differ` in the app's record, but the judged frames are a static clip. The app's words map `differ` -> `known-differ`,
+`identical` -> `known-identical`; absent or anything else (the wrong case included: `IDENTICAL`) is `unknown`, never a guess. One picture over
 `known-identical` source frames is a static clip, not frozen (`OK`, with the reason "one picture; the app records the source frames as
 identical: a static clip", so a wrong `identical` from a future build shows in the receipt). `playFrames` counts the judged play
 frames (those with a viewport); `savedPlayFrames` the play PNGs saved; `captured` is true when any was saved. The app side is
-tracked as `PLAYBACK-SOURCE-FRAME-IDENTITY-1`. No app build writes the field yet, so until one does a single picture reads
-`FROZEN_DISPLAY_SUSPECTED`. A self-heal pre-launch still needs `OK`, so either new verdict there makes the leg `INVALID`.
+tracked as `PLAYBACK-SOURCE-FRAME-IDENTITY-1`; a build that carries it writes `source_id` per capture and `source_difference`
+(next section). A build without it writes neither, and there a single picture reads `FROZEN_DISPLAY_SUSPECTED`. Missing or invalid
+frame evidence (a frame with no id, a display frame that is not a whole number from 0 to 2147483647) is `unknown`, never `known-identical`. A self-heal pre-launch still needs `OK`, so either new verdict there makes the leg `INVALID`.
 
 The divergence threshold (`$script:VisualDivergenceThreshold`, DualVenueRunner.psm1) is calibrated on a known-good leg: 6.0. The
 known-good Bachelor leg (M16-1243 windowed-s2, CPU, build `adf6185a`, receipt `a5d3ffbe`) measured 1.099 on its worst channel;
 three times that (3.3) is under the 6.0 floor, so the floor is the threshold.
 
+## Source-frame identity: `source_id` and `source_difference` (PLAYBACK-SOURCE-FRAME-IDENTITY-1)
+
+One picture across the play frames is FROZEN only if the SOURCE frames behind them differ; a static clip shows one picture
+too. Display-side hashes cannot tell the two apart (a frozen display freezes them), so the app records the source itself. After
+Play has stopped (step (4) of the capture block, never in the timed window or the tail), for each distinct `display_frame` of
+the play captures it reads the bytes the decoder reads for that frame -- the encoded VIDF payload at
+`video_index[frame].frame_offset`: `frame_size` bytes for LJ92 and JPEG2K, the packed RAW size otherwise -- under the file's
+own mutex, and hashes them with FNV-1a 64 (`getMlvFrameSourceHash64`, `src/mlv/video_mlv.c`). A frame whose VIDF header at
+`video_index[frame].block_offset` cannot be read has no id, because the display refuses it (r11). For LJ92 (r5) it decodes the
+payload with liblj92, as the display decodes it, and hashes the decoded picture (`mlvLj92FrameSourceHash64`). For JPEG2K (r9) it
+decodes the four declared channel spans through the display's own OpenJPH decode into private buffers and hashes the decoded
+samples as the display stores them (uint16, channel 0..3, row-major); codestream bytes are never the id, so an equal-length COM
+comment OpenJPH skips, bytes outside the spans or where a span lies change nothing (`mlvJpeg2kFrameSourceHash64`; a frame that
+decode refuses, and every frame on a build without `ENABLE_JPEG2K`, whose display refuses JPEG2K, gives no identity). Every
+identity is taken over the samples as the display stores them AFTER the clip's CURV linearisation table (r10: two frames the
+table maps to one picture share an id; uncompressed RAW with a table hashes its unpacked samples, without one its packed bytes). The ids are attached only when the clip was HELD from its open, before any frame of it was decoded, until the hashing
+ends (r8: a `--visual-capture-dir` run opens every clip under a share-read `SourceWriteGuard`, so no writer can change its bytes,
+and the capture's guard must match the open-time stamp), so a frame a cache decoded never gets an id read from other bytes.
+Only the Windows guard can be held (r10): its share-read reopen was measured (r11, on NTFS, locally and through loopback SMB) to
+fail with a sharing violation while a handle has the file open for write, while a writable view outlives its file handle, or while a
+writable section handle does, with or without a view. A store through such a view can leave the file's size and write time alone,
+so only that refusal keeps it from an id. Other file systems and a writer on another host were not measured. On every other
+platform the guard excludes no writer -- a `MAP_SHARED` writable mapping taken before the open can store into the clip without
+moving its size, mtime or ctime -- so it is never held (`SourceWriteGuard::excludesExistingWriters()` is false), no source id is
+attached, and `source_difference` is absent (unknown) on every non-Windows run. Mappings are not detected. Two frames that
+decode to the same picture always share an identity, and two that decode differently never do (up to a 64-bit collision):
+bytes the decoder never uses -- COM/APPn segments, ignored header fields, a table symbol the bitstream never selects, bytes
+after the scan -- cannot make a static clip read "known to differ", and no byte the decoder uses can make two pictures read
+"known identical". (Rounds r6-r9 replayed the decoder's marker walk instead, and each replay missed a byte it reads
+differently: the DHT class/id byte liblj92 zeroes in place, and a table symbol the bitstream never selects.)
+
+* `frames[].source_id` (play entries only, both the forced `play` and the unforced `play_unbound` captures -- the frozen check is
+  judged on the unforced ones whenever they exist): that hash as 16 lowercase hex digits. Absent when it could not be read.
+* `source_difference` (top level), a JSON string, exactly one of:
+  * `"differ"`: at least two play frames' source ids differ;
+  * `"identical"`: every play frame has a source id, they span at least two distinct `display_frame` values, and all are equal;
+  * absent otherwise: fewer than two play frames, any frame without a source id (an unreadable frame, a frame index of -1),
+    or one repeated `display_frame` (a stuck playback clock is not evidence of a static clip).
+
+The runner decides from `frames[].source_id` of the judged play frames (exactly 16 lowercase hex digits; anything else is no id)
+by the same rule, and reads the top-level field case-sensitively, accepting only those two strings, as a cross-check; anything
+else is unknown. `"identical"` waives the
+frozen gate, which is why it is written only on that positive evidence. Scope: MLV containers only; an MCRAW or CinemaDNG-folder
+clip has no source id and the field is omitted. The policy is `platform/qt/VisualCaptureSourceDifference.h`; the
+`gui_smoke.visual_capture` log line ends with `source_difference=<differ|identical|omitted>`.
 **A CPU `VISUAL_DIVERGENCE` from a build without the binding (`labelBound` null) is not a reliable verdict**: its stop capture
 may show an older frame than its label, and the measured CPU stop-vs-paused difference swung 0.969-8.266 run to run on such
 builds (CUDA, which paints before labelling, read 0.65-1.69). Judge CPU divergence only on a bound capture (`labelBound` true).
@@ -134,3 +189,33 @@ what they saw (`VISUAL <arm>: <strip> -- <what was seen>`). Reading the receipt'
 a strip is a finding. The rule is enforced, not merely proposed: the hub's key prompt composer (`hub-tools\new-review-keys.ps1`
 plus `key-prompt-visual.md`, installed 2026-10-14; board-only, untracked tooling) adds a `## VISUAL INSPECTION` block and a
 `visual_inspection` field to every key prompt for a PR touching `platform/qt/`, `src/` or `tools/profiling/`.
+
+## 2026-11-04: E-01 strips for PLAYBACK-SOURCE-FRAME-IDENTITY-1 (PR 477, r13)
+
+Build `7dc59c48b01cc186ab2b706f9d2ddbe378e32d8d`, manifest `21a2269e063c5311d5f831d8e742d85ffe6eb433f7de6c41597d87207f632433`,
+Bachelor, clip M16-1243. Each strip was opened and read. Paths are under `.claude-state\dual-venue\` on the hub host; those files
+are not tracked. This section changes no source, so the strips apply to the build named here and to any commit whose product
+source equals it.
+
+| Leg | Backend | Counted | Visual | `source_difference` | Play ids | Seen in the strip |
+|---|---|---|---|---|---|---|
+| fullscreen-s4 | cuda | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 602-668 advancing in order, no visible defect |
+| fullscreen-s4 | cpu | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 601-667 advancing in order, no visible defect |
+| windowed-s2 | cuda | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 602-668 advancing in order, no visible defect |
+| windowed-s2 | cpu | yes | OK | `"differ"` | 12 of 12 distinct | real footage, frames 601-664 advancing in order, no visible defect |
+
+Every leg: `sourceDifference` `known-differ`, `sourceDifferenceCrossCheck` `agree`, `repeatedPlayFrames` 0, `look_assist_enabled=1`,
+verification `ADVISORY` (`VENUE_ANCHOR_ABSENT`). The windowed CPU leg's unforced stop capture differs from its bound stop by
+7.954, above the 6.0 threshold; its bound reading is 0.684, and CPU divergence is judged only on a bound capture.
+
+Not proved: the `identical` branch (no leg had a repeated frame), decode equality with base (no base arm ran), JPEG2K or
+uncompressed RAW at the venue, any speed claim, or the venue volume's file system (not recorded, so B4-UNMEASURED stays open).
+
+| Leg | Receipt (`receipts\PLAYBACK-BACHELOR-PRESENT-JITTER-1\<leg>\bachelor\`) | Strip (`sheets\`) |
+|---|---|---|
+| fullscreen-s4 cuda | `e22ef07b-85fb-4045-aa53-2395b87cf314.json` | `strip-m16-1243-pace-cinematic-fullscreen-s4-bachelor-cuda-7dc59c48-20261104201615.png` |
+| fullscreen-s4 cpu | `11645a15-4320-420d-9ce5-ba32db0af40f.json` | `strip-m16-1243-pace-cinematic-fullscreen-s4-bachelor-cpu-7dc59c48-20261104202152.png` |
+| windowed-s2 cuda | `f305fa1f-4673-4762-a612-ed5e5c72369b.json` | `strip-m16-1243-pace-cinematic-windowed-s2-bachelor-cuda-7dc59c48-20261104202552.png` |
+| windowed-s2 cpu | `78c6b219-ff1b-4d0a-9ef3-8657db593d38.json` | `strip-m16-1243-pace-cinematic-windowed-s2-bachelor-cpu-7dc59c48-20261104203116.png` |
+
+`<leg>` is `m16-1243-pace-cinematic-fullscreen-s4` or `m16-1243-pace-cinematic-windowed-s2`.

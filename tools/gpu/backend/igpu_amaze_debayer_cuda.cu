@@ -1816,6 +1816,9 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
             }
         }
 
+        /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: the stream-0 GL handoff (map, copy, unmap) on
+         * the device clock (env-gated). */
+        igpu_lt::SpanScope handoff("gl_rgba16_direct:handoff", 0);
         cudaError_t rc = IGPU_LT_SYNC_CALL("gl_rgba16_direct:map", cudaGraphicsMapResources(1, &resource, 0));
         if (rc != cudaSuccess)
         {
@@ -1859,6 +1862,7 @@ int copy_rgba16_to_gl_rgba16_texture(const uint16_t * dRgba16,
 
         const cudaError_t unmapRc =
             IGPU_LT_SYNC_CALL("gl_rgba16_direct:unmap", cudaGraphicsUnmapResources(1, &resource, 0));
+        handoff.end();
         const cudaError_t unregisterRc =
             cached ? cudaSuccess : cudaGraphicsUnregisterResource(resource);
         if (arrayRc != cudaSuccess || rc != cudaSuccess || unmapRc != cudaSuccess || unregisterRc != cudaSuccess)
