@@ -11677,6 +11677,23 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
         repo, receipt = self.production(None, self.BLOCK)
         self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
 
+    def uncapped_under(self, env: str):
+        # an uncapped leg (its spec names no playbackMaxThreads) whose measured session's start line says what the app saw of the venue's MLVAPP_PLAYBACK_MAX_THREADS
+        repo = self.prod_repo(spec=self.write_spec())
+        ev = self.evidence("wt-env-" + hashlib.sha1(env.encode()).hexdigest()[:8], backend="cuda",
+                           extra_log_lines=[f"{self.START} env_playback_max_threads={env}"], summary=None)
+        return repo, self.receipt_for(repo, ev, backend="cuda")
+
+    def test_an_uncapped_leg_that_ran_under_an_inherited_cap_is_not_a_valid_receipt(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754): the validator re-derives the same INHERITED_WORKER_CAP the runner gates on, so a receipt cannot
+        # carry a PASS for a control that ran at the venue's cap.
+        for env in ("12", "8"):
+            with self.subTest(inherited=env):
+                repo, receipt = self.uncapped_under(env)
+                self.assertNotValid(receipt, repo, "INHERITED_WORKER_CAP", status="INVALID")
+        repo, receipt = self.uncapped_under("unset")
+        self.assertAdvisory(receipt, repo)
+
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
     """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it

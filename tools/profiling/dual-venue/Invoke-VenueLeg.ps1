@@ -971,7 +971,7 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
 $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary
 if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
-    $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement under the cap this leg names"
+    $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement of the worker count this leg specifies"
     $outcome = 'INVALID'
 }
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1, FAIL CLOSED: a leg that asks for the #397 prep-conflated-move switch counts only when the measured session's own

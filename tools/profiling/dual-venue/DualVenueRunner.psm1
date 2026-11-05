@@ -1495,6 +1495,7 @@ function Get-DvWorkerThreadsEvidence {
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
     $requested = ConvertTo-DvInt64 $raw
     $observed = $null
+    $inheritedCap = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($null -ne $raw) {
@@ -1529,7 +1530,29 @@ function Get-DvWorkerThreadsEvidence {
         }
         else { $verdict = 'HONOURED' }
     }
-    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+    else {
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754): a leg that names NO cap still runs under one when the venue's own MLVAPP_PLAYBACK_MAX_THREADS is
+        # inherited (the smoke runner sets the variable only for -Threads and never removes an inherited one), so a control meant to differ from a capped arm
+        # in worker count can run at the arm's count and compare CLEAN. The app writes the variable it saw on the same start line as `env_playback_max_threads=`
+        # ("unset" when unset or empty, log_line_field::envFieldValue). Any other value on such a leg is INHERITED_WORKER_CAP and blocks: the leg did not run
+        # the worker count it was specified for (the auto default). A duplicated field is unreadable and blocks too. A start line without the field (a build
+        # before it existed) or no start line at all stays NOT_REQUESTED, so a leg that legitimately runs uncapped is unchanged.
+        $startRead = Get-DvSmokeSessionLineRead -LogText $LogText -Marker 'start'
+        if ($startRead.found) {
+            $inheritedCap = $startRead.fields['env_playback_max_threads']
+            if ($startRead.duplicates -contains 'env_playback_max_threads') {
+                $verdict = 'INHERITED_WORKER_CAP'
+                $observed = ConvertTo-DvInt64 $startRead.fields['worker_threads']
+                $reason = 'INHERITED_WORKER_CAP: the measured session''s playback_smoke.start line carries env_playback_max_threads= more than once, so whether the leg ran under an inherited MLVAPP_PLAYBACK_MAX_THREADS is unreadable'
+            }
+            elseif ($null -ne $inheritedCap -and $inheritedCap -cne 'unset') {
+                $verdict = 'INHERITED_WORKER_CAP'
+                $observed = ConvertTo-DvInt64 $startRead.fields['worker_threads']
+                $reason = "INHERITED_WORKER_CAP: the leg names no playbackMaxThreads yet the app saw MLVAPP_PLAYBACK_MAX_THREADS=$inheritedCap in its environment (worker_threads=$($startRead.fields['worker_threads'])); the venue's variable, not the leg, set its worker count, so it is not the uncapped arm its spec describes"
+            }
+        }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; inheritedCap = $inheritedCap; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('NOT_HONOURED', 'INHERITED_WORKER_CAP')) }
 }
 
 function Get-DvPrepConflatedMoveEvidence {
@@ -3345,7 +3368,7 @@ function Test-DvReceiptValid {
             if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED: $($unpacedVerdict.reason); a paced run is no throughput measurement") }
             # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg the app did not run at the cap (or whose count is unreadable) is no measurement under it.
             $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary
-            if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement under the cap its leg names") }
+            if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement of the worker count its leg specifies") }
             # adversary r2b A1: the receipt's own workerThreads block is re-derived like the display block, so a receipt cannot state a count (or a verdict) the
             # hashed evidence does not; the writer emits the block exactly when the spec asks for a cap (Invoke-VenueLeg.ps1), so the same condition decides here.
             $storedWorkerThreads = Get-DvProp $Receipt 'workerThreads'
