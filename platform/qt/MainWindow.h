@@ -30,6 +30,7 @@
 #include <QItemSelectionModel>
 #include <QToolButton>
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
+#include "LookAssistAnalysisPump.h"
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
@@ -978,6 +979,21 @@ private:
     uint64_t m_playbackQualityFrameCounter = 0;
     double m_playbackQualityLastPresentedTime = 0.0;
     PlaybackQualityAutoSampler m_playbackQualitySampler;
+    // LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1: writes look_assist.apply.timing when the outermost apply returns.
+    class LookAssistApplyTimingScope
+    {
+    public:
+        explicit LookAssistApplyTimingScope( MainWindow *window );
+        ~LookAssistApplyTimingScope();
+        LookAssistApplyTimingScope( const LookAssistApplyTimingScope & ) = delete;
+        LookAssistApplyTimingScope &operator=( const LookAssistApplyTimingScope & ) = delete;
+
+    private:
+        MainWindow *m_window;
+        QElapsedTimer m_clock;
+    };
+    look_assist_pump::ApplyTiming m_lookAssistApplyTiming;
+    int m_lookAssistApplyTimingDepth = 0;
     bool m_lastLookAssistDiagnosticsValid = false;
     QString m_lastWarnedLookAssistFlavorValue;
     lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it

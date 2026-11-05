@@ -16975,6 +16975,24 @@ void MainWindow::drainLookAssistWorkers( const char *reason )
             .arg( ( mlv_stage_timing_now() - drain_start ) * 1000.0, 0, 'f', 1 ) );
 }
 
+MainWindow::LookAssistApplyTimingScope::LookAssistApplyTimingScope( MainWindow *window )
+    : m_window( window )
+{
+    if( m_window->m_lookAssistApplyTimingDepth++ > 0 ) return;
+    m_window->m_lookAssistApplyTiming = look_assist_pump::ApplyTiming();
+    m_clock.start();
+}
+
+MainWindow::LookAssistApplyTimingScope::~LookAssistApplyTimingScope()
+{
+    if( --m_window->m_lookAssistApplyTimingDepth > 0 ) return;
+    look_assist_pump::ApplyTiming &timing = m_window->m_lookAssistApplyTiming;
+    timing.totalMs = m_clock.nsecsElapsed() / 1000000.0;
+    // Nothing pumps on the inline route: the whole apply is one block of the GUI thread.
+    timing.guiBlockMaxMs = timing.totalMs;
+    m_window->logInteractionEvent( QStringLiteral("look_assist.apply.timing"), timing.logFields() );
+}
+
 void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                            int analysisFrame )
 {
@@ -17093,6 +17111,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         return;
     }
 
+    // One look_assist.apply.timing line per analysis: master's pass below re-enters here and adds to the same line.
+    const LookAssistApplyTimingScope timingScope( this );
+
     if( analysisFrame < 0 )
     {
         analysisFrame = ui->horizontalSliderPosition->value();
@@ -17194,10 +17215,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     QByteArray thumbnail;
     thumbnail.resize( width * height * 3 );
-    get_area_average_downscale_raw_thumnail( m_pMlvObject,
-                                             analysisFrame,
-                                             downscaleFactor,
-                                             reinterpret_cast<unsigned char *>( thumbnail.data() ) );
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.rawThumbMs );
+        get_area_average_downscale_raw_thumnail( m_pMlvObject,
+                                                 analysisFrame,
+                                                 downscaleFactor,
+                                                 reinterpret_cast<unsigned char *>( thumbnail.data() ) );
+    }
 
     LookAssistStats stats = analyzeLookAssistThumbnail(
                 reinterpret_cast<const unsigned char *>( thumbnail.constData() ),
@@ -17269,8 +17293,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the one master classified (daylight needs the evidence).
     // Not const: a night verdict that the aperture-bounded exposure rules out and a verified surface backs becomes the
     // daylight class after the white balance (resolveLookAssistWindowLitInterior below).
-    LookAssistScene scene = resolveLookAssistScene(
-        &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    LookAssistScene scene = LookAssistScene::Night;
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.sceneMs );
+        scene = resolveLookAssistScene(
+            &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    }
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
@@ -17294,6 +17322,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     bool useProcessedColorStats = false;
     if( canAnalyzeProcessedColor )
     {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.processedMs );
         processedThumbnail.resize( colorWidth * colorHeight * 3 );
         bool renderedAtPresetExposure = false;
         if( scene != LookAssistScene::Night )
@@ -17336,13 +17365,17 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // exposure Look Assist chooses (the headless applier asks the very same function).
     LookAssistStats displayStatsUi;
     int displayMeterSamples = 0;
-    const bool displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(
-        m_pMlvObject,
-        analysisFrame,
-        downscaleFactor,
-        qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-        &displayStatsUi,
-        &displayMeterSamples );
+    bool displayStatsValidUi = false;
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.meterMs );
+        displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(
+            m_pMlvObject,
+            analysisFrame,
+            downscaleFactor,
+            qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+            &displayStatsUi,
+            &displayMeterSamples );
+    }
     if( displayStatsValidUi )
     {
         decisionTrace.displayMeterRan = true;
@@ -18126,7 +18159,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     wbRequest.renderBalance = ReceiptApplier::lookAssistBalanceRenderer(
         m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
         qMax( 1, mlvappEffectiveWorkerThreadCount() ), false );
-    const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
+    LookAssistWhiteBalanceResolution wb;
+    {
+    const look_assist_pump::SegmentClock solveSegment( &m_lookAssistApplyTiming.solveMs );
+    wb = resolveLookAssistWhiteBalance(
         wbRequest,
         [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
         {
@@ -18149,6 +18185,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             }
         },
         &preset );
+    }
     logLookAssistDaylightRefine( wb, QStringLiteral("sync"), analysisFrame );
     if( wb.legacyBalance && !s_lookAssistMasterScenePass )
     {
@@ -18195,10 +18232,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     windowLitRequest.renderDisplayBalance = ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer(
         m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
         qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
-    const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
-        windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
-        useProcessedColorStats ? &processedColorStats : nullptr,
-        displayStatsValidUi ? &displayStatsUi : nullptr );
+    LookAssistWindowLitCheck windowLit;
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.windowLitMs );
+        windowLit = resolveLookAssistWindowLitInterior(
+            windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
+            useProcessedColorStats ? &processedColorStats : nullptr,
+            displayStatsValidUi ? &displayStatsUi : nullptr );
+    }
     const bool windowLitApplied = windowLit.applies && !s_lookAssistMasterScenePass;
     if( windowLitApplied )
     {
@@ -18309,6 +18350,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     int postTintDelta = 0;
     if( canAnalyzeProcessedColor )
     {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.walkMs );
         const int minColorBalanceSamples = qMax( 32, ( colorWidth * colorHeight ) / 100 );
         const int postTintCap = lookAssistAutoTintCap( scene, useProcessedColorStats );
         auto analyzePostAppliedLook = [&]() -> bool
