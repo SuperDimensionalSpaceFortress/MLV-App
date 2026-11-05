@@ -734,7 +734,7 @@ def _lane_error_mode_block(runner):
     return body[body.index(begin) + len(begin):body.index(end)]
 
 
-def _lane_error_mode_chain(tmp_path, runner):
+def _lane_error_mode_chain(tmp_path, runner, env=None):
     """Parent resets its mode to 0, runs Invoke-Lane's own block, then reads the mode in two grandchildren."""
     probe = tmp_path / "get-mode.ps1"
     probe.write_text(
@@ -763,7 +763,7 @@ def _lane_error_mode_chain(tmp_path, runner):
     )
     done = subprocess.run(
         [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(parent)],
-        text=True, capture_output=True, timeout=120,
+        text=True, capture_output=True, timeout=120, env=env,
     )
     modes = {m.group(1): int(m.group(2)) for m in re.finditer(r"^(cmd|psi): mode=(\d+)", done.stdout, re.M)}
     return done, modes
@@ -778,6 +778,16 @@ def test_invoke_lane_error_mode_reaches_a_grandchild(tmp_path):
             f"grandchild via {path} has error mode 0x{mode:04X}; SEM_FAILCRITICALERRORS (0x0001) is what keeps a missing-DLL "
             "dialog off the desktop, and the grandchild must carry 0x8003"
         )
+
+
+@lane_error_mode_only
+def test_invoke_lane_error_mode_is_set_when_the_environment_has_no_os_variable(tmp_path):
+    # Adversary A1 on 74a5d6e7: a Windows process started with OS unset skipped the whole block, warning included, so its children kept the default mode.
+    env = {name: value for name, value in os.environ.items() if name.upper() != "OS"}
+    done, modes = _lane_error_mode_chain(tmp_path, LANE_RUNNER, env=env)
+    assert set(modes) == {"cmd", "psi"}, f"the probe chain did not report both grandchildren: {done.stdout!r} {done.stderr!r}"
+    for path, mode in modes.items():
+        assert mode & LANE_ERROR_MODE_FLAGS == LANE_ERROR_MODE_FLAGS, f"with OS unset, the grandchild via {path} has error mode 0x{mode:04X}"
 
 
 # The ordering pin: HUB-VM gate, then the error-mode block, then the first launch. r1 searched the text for three spellings, so a native `&` or a helper
@@ -796,6 +806,8 @@ LANE_PRE_BLOCK_COMMANDS = (
 LANE_LINT_COMMANDS = (
     "ConvertFrom-Json", "ForEach-Object", "Get-Content", "Join-Path", "New-Object", "Sort-Object", "Test-Path", "Where-Object",
 )
+# $env:OS alone is not enough: a process started with a scrubbed environment has no OS variable (adversary A1), so the platform check sits beside it.
+LANE_ERROR_MODE_GUARD = "if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq 'Win32NT') {"
 _LANE_LAUNCH_SCANNER = r"""
 using namespace System.Management.Automation.Language
 param([Parameter(Mandatory = $true)][string]$CaseRoot, [Parameter(Mandatory = $true)][string]$AllowFile, [Parameter(Mandatory = $true)][string]$LintAllowFile)
@@ -880,12 +892,28 @@ foreach ($case in @(Get-ChildItem -LiteralPath $CaseRoot -Directory)) {
     $launches = New-Object System.Collections.Generic.List[object]
     # Only the param block and the top-level statements that start ahead of BEGIN can hold a launch ahead of it, which skips the thousands of lines below.
     # With no usable BEGIN marker nothing is scanned here; the marker check reports that case.
-    $roots = @($ast.ParamBlock) + @($top | Where-Object { $_ -isnot [FunctionDefinitionAst] -and $_.Extent.StartOffset -lt $beginAt })
-    foreach ($root in @($roots | Where-Object { $null -ne $_ })) {
+    $roots = @($top | Where-Object { $_ -isnot [FunctionDefinitionAst] -and $_.Extent.StartOffset -lt $beginAt })
+    foreach ($root in $roots) {
         foreach ($n in $root.FindAll({ param($x) $true }, $true)) {
             if ($n.Extent.StartOffset -ge $beginAt -or (Test-InsideFunction $n)) { continue }
             $kind = Get-LaunchKind $n $allow @('. $localPlaybackLint')
             if ($kind) { $launches.Add((ConvertTo-Row $n $kind)) }
+        }
+    }
+    # These run ahead of the block wherever they sit in the text: the param defaults, a begin or process block, and a trap, which fires from anywhere in its scope.
+    $early = @($ast.ParamBlock, $ast.DynamicParamBlock, $ast.BeginBlock, $ast.ProcessBlock) + @($ast.EndBlock.Traps)
+    foreach ($root in @($early | Where-Object { $null -ne $_ })) {
+        foreach ($n in $root.FindAll({ param($x) $true }, $true)) {
+            if (Test-InsideFunction $n) { continue }
+            $kind = Get-LaunchKind $n $allow @()
+            if ($kind) { $launches.Add((ConvertTo-Row $n $kind)) }
+        }
+    }
+    # Inside the block only its own Add-Type and its warning may run: anything else could start ahead of SetErrorMode, and the inheritance probes would not see it.
+    foreach ($statement in @($top | Where-Object { $beginAt -ge 0 -and $endAt -ge 0 -and $_.Extent.StartOffset -gt $beginAt -and $_.Extent.EndOffset -lt $endAt })) {
+        foreach ($n in $statement.FindAll({ param($x) $true }, $true)) {
+            $kind = Get-LaunchKind $n @('Add-Type', 'Write-Warning') @()
+            if ($kind) { $launches.Add((ConvertTo-Row $n "in-the-block:$kind")) }
         }
     }
     # Most cases share one lint text, so it is read once per distinct text.
@@ -956,8 +984,8 @@ def _lane_order_problems(scan):
         problems.append("block below the lane table")
     statements = scan["blockStatements"]
     # Exactly one top-level statement, so a block wrapped in `if ($false) { ... }` (no top-level statement left between the markers) cannot pass.
-    if len(statements) != 1 or not statements[0].startswith("if ($env:OS -eq 'Windows_NT')") or "SetErrorMode" not in statements[0]:
-        problems.append("the markers must hold one top-level `if ($env:OS -eq 'Windows_NT')` statement that calls SetErrorMode")
+    if len(statements) != 1 or not statements[0].startswith(LANE_ERROR_MODE_GUARD) or "SetErrorMode" not in statements[0]:
+        problems.append(f"the markers must hold one top-level `{LANE_ERROR_MODE_GUARD}` statement that calls SetErrorMode")
     problems += [f"launch ahead of the block ({r['kind']}) at line {r['line']}: {r['text']}" for r in scan["launches"]]
     problems += [f"launch in the dot-sourced lint ({r['kind']}) at line {r['line']}: {r['text']}" for r in scan["lintLaunches"]]
     problems += [f"the lint runs a statement when dot-sourced, at line {r['line']}: {r['text']}" for r in scan["lintTop"]]
@@ -1006,7 +1034,12 @@ def _lane_order_mutants(script, lint, helpers):
         "block-at-the-r1-position": (without_block.replace(strict, strict + block, 1), lint),
         "block-below-the-lane-table": (without_block.replace("# Absolute launcher paths.", block + "# Absolute launcher paths.", 1), lint),
         "block-disabled": (script.replace(begin_marker, "if ($false) {\n" + begin_marker, 1).replace(end_marker, end_marker + "}\n", 1), lint),
-        "block-without-the-guard": (script.replace("if ($env:OS -eq 'Windows_NT') {", "if ($true) {", 1), lint),
+        "block-without-the-guard": (script.replace(LANE_ERROR_MODE_GUARD, "if ($true) {", 1), lint),
+        "block-guard-reads-only-the-environment": (script.replace(LANE_ERROR_MODE_GUARD, "if ($env:OS -eq 'Windows_NT') {", 1), lint),
+        "native-inside-the-block": (script.replace("    try {\n        if (-not ('LaneChildErrorMode'", "    try {\n        & git --version\n        if (-not ('LaneChildErrorMode'", 1), lint),
+        "native-in-a-begin-block": (script.replace("\n)\n\n$ErrorActionPreference = 'Stop'\n", "\n)\n\nbegin { & git --version }\nend {\n$ErrorActionPreference = 'Stop'\n", 1) + "\n}\n", lint),
+        "native-in-a-trap": (script.replace(strict, strict + "trap { & git --version; break }\n", 1), lint),
+        "native-in-a-trap-below-the-block": (script.replace("# Absolute launcher paths.", "trap { & git --version; break }\n# Absolute launcher paths.", 1), lint),
         "marker-duplicated": ahead(end_marker.strip()),
         "lint-launch-in-test-hubhost": (script, lint.replace("    $cfg = if ($HostsFile)", "    & git --version\n    $cfg = if ($HostsFile)", 1)),
         "lint-runs-when-dot-sourced": (script, lint + "\nWrite-Output 'dot-source time'\n"),

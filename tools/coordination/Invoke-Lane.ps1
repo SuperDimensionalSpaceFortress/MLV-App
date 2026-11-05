@@ -189,10 +189,11 @@ if (Test-HubHost) {
 # 5.1 this block's Add-Type can start csc.exe. Same flag set as tools/testing/run-windows-test.ps1: SEM_FAILCRITICALERRORS 0x0001 |
 # SEM_NOGPFAULTERRORBOX 0x0002 | SEM_NOOPENFILEERRORBOX 0x8000. 0x0002 stays: the crash box is the thing that hangs a headless lane, and the lane still
 # sees the crash as the child's exit code (e.g. 0xC0000005). 0x0002 also suppresses Windows Error Reporting, not only the box, so a crash under a lane
-# leaves no WER report and no LocalDumps dump. OR-ed onto the current mode, never a replacement. Fail open with a warning.
+# leaves no WER report and no LocalDumps dump. OR-ed onto the current mode, never a replacement. Fail open with a warning. The platform check sits beside
+# $env:OS because a process started with a scrubbed environment has no OS variable, and it would skip this block without a warning.
 # test_coordination_guardrails.py extracts this block between the two markers and runs it, and pins gate, then block, then first launch.
 # LANE-CHILD-ERROR-MODE-BEGIN
-if ($env:OS -eq 'Windows_NT') {
+if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq 'Win32NT') {
     try {
         if (-not ('LaneChildErrorMode' -as [type])) {
             Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class LaneChildErrorMode { [DllImport("kernel32.dll")] public static extern uint GetErrorMode(); [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint uMode); }'
