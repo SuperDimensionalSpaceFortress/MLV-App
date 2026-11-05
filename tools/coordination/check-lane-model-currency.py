@@ -25,29 +25,36 @@ Missing evidence is never CURRENT (r3 blocker B1). A lane's verdict is, in order
 
   STALE       a STALE-MODEL or BAD-EFFORT reason above.
   NO-DATA     the lane has no proven model, or its NEWEST finished run in the window has none (a
-              failed run, or a running receipt that is not provably alive; resolvedModel null/'unknown'):
-              what the lane runs now is unproven.
+              failed run, or a running receipt that is not a live candidate -- an expired-unproven one; resolvedModel
+              null/'unknown'): what the lane runs now is unproven.
   INCOMPLETE  the model is proven but at least one finished run in the window recorded no effort, so
-              'high' is unproven; counted in `unrecordedEffort` and shown in the table.
-  IN-FLIGHT   the lane's newest receipt is a run that is provably still running, AND the lane's newest
-              finished run is proven and would itself read CURRENT. See the next paragraph.
-  CURRENT     a proven model, every effort recorded and 'high'.
+              'high' is unproven; counted in `unrecordedEffort` and shown in the table. The one
+              intentional exemption is a live-candidate running receipt (see below), which has no effort
+              yet by design and is not counted.
+  IN-FLIGHT   the lane's newest receipt is a LIVE CANDIDATE running run (an age window, not a process
+              probe), AND the lane's newest finished run is proven and would itself read CURRENT. See the
+              next paragraph.
+  CURRENT     a proven model, every effort recorded and 'high'. CURRENT describes HISTORICAL model and
+              effort evidence in the receipts; it is not a statement that any process is running.
 
 IN-FLIGHT (CURRENCY-CHECK-WIRED-INTO-HUB-TICK-1). A running receipt records no resolvedModel and no
 effort yet (Invoke-Lane.ps1 writes both at the end), so before this verdict a lane that was merely busy
-read NO-DATA and pulled the overall verdict to INCOMPLETE. A receipt counts as LIVE when it says
-state=running, has no endedUtc, has a finite timeoutSec between 0 (exclusive) and
-MAX_LIVE_TIMEOUT_SEC (48 h; nan, inf, a non-positive or an absurd value is no bound, never a crash), and
-now is no later than startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the wrapper's post-run cleanup and
-the hub clock's measured skew of up to ~20 s). That is an AGE BOUND derived from the receipt's own timeout, not a process
-probe: this script reads receipts only, and the board's authoritative liveness rule (hub-queue-lib.ps1
+read NO-DATA and pulled the overall verdict to INCOMPLETE. A receipt counts as a LIVE CANDIDATE when it
+says state=running, has no endedUtc, has a finite timeoutSec between 0 (exclusive) and
+MAX_LIVE_TIMEOUT_SEC (48 h; nan, inf, a non-positive or an absurd value is no bound, never a crash), is not
+dated more than MAX_FUTURE_START_SKEW_SEC (300 s) past now (a receipt dated in the future has no age, so it
+is never a candidate), and now is no later than startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the
+wrapper's post-run cleanup and the hub clock's measured skew of up to ~20 s). That is an AGE WINDOW derived
+from the receipt's own start time and timeout, not a process probe: this script reads receipts only, it
+never proves that a process exists, and the board's authoritative liveness rule (hub-queue-lib.ps1
 Get-LaneRunState: child pid alive, command line names the run dir, start time matches within 10 s) needs
-the process table. The cost of the weaker rule is bounded and one-sided: a dead lane inside its own
-timeout reads IN-FLIGHT, and only ever when the finished run before it is CURRENT, so it can hide
-nothing worse than a lane that is current anyway. A receipt left at state=running past the bound is DEAD:
-it stays an unproven run (counted in `deadRunning`), so the lane reads NO-DATA, never IN-FLIGHT. A running
-receipt with no timeoutSec cannot be bounded and is treated as dead for the same reason.
-Live running receipts are not evidence in either direction: they are left out of the model rule, the
+the process table. The cost of the weaker rule is bounded and one-sided: a lane that died inside its own
+timeout window still reads IN-FLIGHT, and only ever when the finished run before it is CURRENT, so it can hide
+nothing worse than a lane that is current anyway. A receipt left at state=running outside the window
+(expired-unproven, or dated too far ahead) is not a candidate: it stays an unproven run (counted in
+`deadRunning`, a name kept for the JSON contract), so the lane reads NO-DATA, never IN-FLIGHT. A running
+receipt with no timeoutSec cannot be bounded and is treated the same way.
+Running receipts that are live candidates are not evidence in either direction: they are left out of the model rule, the
 effort rule, `unrecordedEffort` and the family's newest id (a running receipt that already names a newer
 id cannot make finished runs STALE), and the lane is judged on its finished runs alone, with the run it was
 judged on named in `judgedOn` and in the table. IN-FLIGHT is given only when the newest FINISHED run is
@@ -94,6 +101,7 @@ REQUIRED_EFFORT = "high"
 CONSECUTIVE_STALE_RUNS = 2
 DEFAULT_SINCE_HOURS = 72.0
 LIVE_GRACE_SEC = 300.0
+MAX_FUTURE_START_SKEW_SEC = 300     # a running receipt may be dated at most this far past now (clock skew)
 MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a real lane is 12600 s
 RECEIPT_GLOB = "*/*-001.receipt.json"
 TIERING_REL = "agents/orchestration-tiering.md"
@@ -211,7 +219,8 @@ def newest_per_family(receipts, overrides):
 
 
 def is_live_running(receipt, now):
-    """True only for a receipt that is provably still running by its own timeout (see the docstring)."""
+    """True only for a receipt that is a live CANDIDATE: its own start time and timeout allow a run in progress.
+    This is an age window, not a process probe; it does not prove anything is running (see the docstring)."""
     if receipt["state"] != "running" or receipt["ended"]:
         return False
     timeout = receipt["timeoutSec"]
@@ -219,7 +228,11 @@ def is_live_running(receipt, now):
         # nan, inf, a non-positive value, a huge int or anything past the cap is not a bound at all
         if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= MAX_LIVE_TIMEOUT_SEC:
             return False
-        return now <= receipt["started"] + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC)
+        started = receipt["started"]
+        # Bounded at both ends: not older than timeout + grace, and not dated past the future-skew bound. A
+        # receipt dated in the future has no age at all, so it is no evidence that a run is in progress.
+        return (started <= now + datetime.timedelta(seconds=MAX_FUTURE_START_SKEW_SEC)
+                and now <= started + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC))
     except (OverflowError, ValueError, TypeError):
         return False
 

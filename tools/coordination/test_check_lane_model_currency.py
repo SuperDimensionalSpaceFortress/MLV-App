@@ -280,10 +280,114 @@ class InFlightTests(CurrencyFixture):
         self.assertEqual(entry["deadRunning"], 1)
         self.assertEqual(result["verdict"], "INCOMPLETE")
 
-    def test_the_liveness_bound_is_timeout_plus_grace(self):
-        self.receipt("opus", "claude-opus-5-5", 10)
-        self.running("opus", 1.0, timeout=3600)               # exactly at timeout: still live
-        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+    # --- r2 (PR 753 fix round): the grace and the cap are pinned at their edges ---------------------------
+    def _running_at(self, started, timeout, **extra):
+        """A running receipt written as a real file with an exact startedUtc (a datetime)."""
+        self.count += 1
+        run = self.runs / ("raw-run-%03d" % self.count)
+        run.mkdir()
+        body = {"lane": "opus", "state": "running", "card": "TEST", "timeoutSec": timeout,
+                "startedUtc": started.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"}
+        body.update(extra)
+        (run / "opus-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+
+    def _opus_verdict_with_running_started(self, started, timeout, since_hours=72):
+        self.receipt("opus", "claude-opus-5-5", 40)           # a CURRENT finished run well before any case
+        self._running_at(started, timeout)
+        return self.evaluate(since_hours=since_hours)["lanes"]["opus"]
+
+    def test_the_liveness_bound_is_timeout_plus_grace_before_at_and_after(self):
+        grace = datetime.timedelta(seconds=300)               # literal on purpose: not read back from the script
+        timeout = 3600
+        edge = NOW - datetime.timedelta(seconds=timeout) - grace    # the instant the bound is exactly reached
+        for label, started, expected in (
+                ("at the timeout, no grace used", NOW - datetime.timedelta(seconds=timeout), "IN-FLIGHT"),
+                ("1 s inside the grace", edge + datetime.timedelta(seconds=1), "IN-FLIGHT"),
+                ("exactly at timeout + grace", edge, "IN-FLIGHT"),
+                ("1 s past timeout + grace", edge - datetime.timedelta(seconds=1), "NO-DATA"),
+                ("1 microsecond past timeout + grace", edge - datetime.timedelta(microseconds=1), "NO-DATA")):
+            with self.subTest(label):
+                self.setUp()
+                entry = self._opus_verdict_with_running_started(started, timeout)
+                self.assertEqual(entry["verdict"], expected)
+                self.assertEqual(entry["inFlightRuns"], 1 if expected == "IN-FLIGHT" else 0)
+                self.assertEqual(entry["deadRunning"], 0 if expected == "IN-FLIGHT" else 1)
+
+    def test_the_grace_is_three_hundred_seconds_and_removing_it_is_caught(self):
+        self.assertEqual(check.LIVE_GRACE_SEC, 300.0)
+        # between the timeout and timeout + grace the receipt is live only because of the grace
+        started = NOW - datetime.timedelta(seconds=3600 + 100)
+        self.assertEqual(self._opus_verdict_with_running_started(started, 3600)["verdict"], "IN-FLIGHT")
+
+    def test_the_timeout_cap_is_pinned_at_its_edge_independent_of_the_age_bound(self):
+        started = NOW - datetime.timedelta(hours=1)           # young: only the cap can make it dead
+        for label, timeout, expected in (
+                ("cap itself", check.MAX_LIVE_TIMEOUT_SEC, "IN-FLIGHT"),
+                ("cap - 1", check.MAX_LIVE_TIMEOUT_SEC - 1, "IN-FLIGHT"),
+                ("cap + 1", check.MAX_LIVE_TIMEOUT_SEC + 1, "NO-DATA"),
+                ("zero", 0, "NO-DATA"),
+                ("one second", 1, "NO-DATA")):                # 1 s timeout, 1 h old: past timeout + grace
+            with self.subTest(label):
+                self.setUp()
+                self.assertEqual(self._opus_verdict_with_running_started(started, timeout)["verdict"], expected)
+
+    # --- r2 B1: a receipt dated in the future is not live ---------------------------------------------
+    def test_b1_the_hub_counterexample_through_real_receipt_files(self):
+        # hub repro-753-b1.py: completed sol run 19:00Z on gpt-6.1-sol/high, then a running receipt that
+        # starts 31 days later with timeout 3600. now = 2026-10-12T20:00Z.
+        for since in (72, 0):
+            with self.subTest(since_hours=since):
+                self.setUp()
+                self.receipt("sol", "gpt-6.1-sol", 1)
+                self.count += 1
+                run = self.runs / "future"
+                run.mkdir()
+                started = NOW + datetime.timedelta(days=31)
+                (run / "sol-001.receipt.json").write_text(json.dumps({
+                    "lane": "sol", "state": "running", "card": "TEST", "timeoutSec": 3600,
+                    "startedUtc": started.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"}), encoding="utf-8")
+                receipts, _ = check.load_receipts(str(self.runs))
+                future = next(r for r in receipts if r["state"] == "running")
+                self.assertFalse(check.is_live_running(future, NOW))
+                result = check.evaluate(receipts, since_hours=since, now=NOW)
+                entry = result["lanes"]["sol"]
+                if since == 72:       # the window reaches back from now, so the future receipt is in it
+                    self.assertEqual(entry["runsInWindow"], 2)
+                self.assertEqual(entry["verdict"], "NO-DATA")      # unproven, as before this PR
+                self.assertEqual(entry["inFlightRuns"], 0)
+                self.assertEqual(entry["deadRunning"], 1)
+                self.assertEqual(result["inFlightLanes"], [])
+                self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_b1_the_future_start_skew_bound_is_pinned_inside_at_and_past(self):
+        self.assertEqual(check.MAX_FUTURE_START_SKEW_SEC, 300)
+        skew = datetime.timedelta(seconds=check.MAX_FUTURE_START_SKEW_SEC)
+        for since in (72, 0):
+            for label, started, expected in (
+                    ("1 s inside the bound", NOW + skew - datetime.timedelta(seconds=1), "IN-FLIGHT"),
+                    ("exactly at the bound", NOW + skew, "IN-FLIGHT"),
+                    ("1 microsecond past the bound", NOW + skew + datetime.timedelta(microseconds=1), "NO-DATA"),
+                    ("1 s past the bound", NOW + skew + datetime.timedelta(seconds=1), "NO-DATA"),
+                    ("an hour ahead", NOW + datetime.timedelta(hours=1), "NO-DATA")):
+                with self.subTest(label=label, since_hours=since):
+                    self.setUp()
+                    entry = self._opus_verdict_with_running_started(started, 3600, since_hours=since)
+                    self.assertEqual(entry["verdict"], expected)
+                    self.assertEqual(entry["inFlightRuns"], 1 if expected == "IN-FLIGHT" else 0)
+
+    def test_b1_a_future_dated_receipt_is_not_live_through_the_cli_with_the_real_clock(self):
+        real_now = datetime.datetime.now(datetime.timezone.utc)
+        self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol", effort="high",
+                        startedUtc=(real_now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z")
+        self._write_raw("fut", lane="sol", state="running", timeoutSec=3600,
+                        startedUtc=(real_now + datetime.timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z")
+        for flags in ((), ("--since-hours", "0")):
+            with self.subTest(flags=flags):
+                result = self._cli("--json", *flags)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["lanes"]["sol"]["verdict"], "NO-DATA")
+                self.assertEqual(payload["inFlightLanes"], [])
 
     def test_a_running_receipt_with_no_timeout_cannot_be_proven_live(self):
         self.receipt("opus", "claude-opus-5-5", 10)
@@ -366,16 +470,38 @@ class InFlightTests(CurrencyFixture):
         self.assertEqual(result["familyNewest"]["sol"], "gpt-6-sol")
         self.assertEqual(result["verdict"], "CURRENT")
 
-    def test_a2_the_adversary_input_exits_zero_through_the_cli(self):
-        self._write_raw("a", lane="sol", state="complete", startedUtc="2026-11-03T06:00:00Z",
-                        resolvedModel="gpt-6-sol", effort="high")
-        self._write_raw("b", lane="sol", state="complete", startedUtc="2026-11-03T16:00:00Z",
-                        resolvedModel="gpt-6-sol", effort="high")
-        self._write_raw("c", lane="sol", state="running", startedUtc="2026-11-04T11:00:00Z",
-                        timeoutSec=2147483647, resolvedModel="gpt-6.1-sol", effort="high")
+    def test_a2_the_adversary_input_with_an_eligible_timeout_exits_zero_in_flight_through_the_cli(self):
+        # The adversary's shape (two finished gpt-6-sol runs, then a running receipt that already names the
+        # newer gpt-6.1-sol), with a timeout the liveness rule accepts, stamped against the real clock the
+        # CLI uses. The over-cap timeout 2147483647 is the separate case in test_a1_an_absurd_timeout....
+        real_now = datetime.datetime.now(datetime.timezone.utc)
+
+        def stamp(hours_ago):
+            return (real_now - datetime.timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+        self._write_raw("a", lane="sol", state="complete", startedUtc=stamp(30), resolvedModel="gpt-6-sol", effort="high")
+        self._write_raw("b", lane="sol", state="complete", startedUtc=stamp(20), resolvedModel="gpt-6-sol", effort="high")
+        self._write_raw("c", lane="sol", state="running", startedUtc=stamp(1), timeoutSec=7200,
+                        resolvedModel="gpt-6.1-sol", effort="high")
         result = self._cli("--json", "--since-hours", "0")
-        self.assertNotEqual(result.returncode, 1, result.stdout)     # never STALE on the strength of a running receipt
-        self.assertNotEqual(json.loads(result.stdout)["lanes"]["sol"]["verdict"], "STALE")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["lanes"]["sol"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(payload["familyNewest"]["sol"], "gpt-6-sol")     # the running receipt raised nothing
+        self.assertEqual(payload["verdict"], "CURRENT")
+        self.assertEqual(payload["inFlightLanes"], ["sol"])
+
+    def test_n1_an_exact_tie_in_started_reads_the_running_receipt_as_the_newer_in_both_creation_orders(self):
+        stamp = "2026-10-12T19:00:00.1234567Z"      # the same seven digits on both receipts: a true tie
+        specs = {"fin": dict(state="complete", resolvedModel="claude-opus-5-5", effort="high"),
+                 "run": dict(state="running", timeoutSec=7200)}
+        for order in (("fin", "run"), ("run", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                for name in order:
+                    self._write_raw(name, lane="opus", startedUtc=stamp, **specs[name])
+                receipts, _ = check.load_receipts(str(self.runs))
+                self.assertEqual(receipts[0]["order"], receipts[1]["order"])     # truly equal sort keys
+                self.assertEqual(check.evaluate(receipts, now=NOW)["lanes"]["opus"]["verdict"], "IN-FLIGHT")
 
     def test_a3_equal_started_timestamps_after_microsecond_truncation_still_read_in_flight(self):
         for name, state, extra in (("fin", "complete", {"resolvedModel": "claude-opus-5-5", "effort": "high"}),
