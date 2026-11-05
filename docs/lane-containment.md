@@ -255,8 +255,80 @@ launch. When `high` is what runs, Codex receives its normal reasoning configurat
 and Claude receives `CLAUDE_CODE_EFFORT_LEVEL=high` in the child environment -- the same
 pre-existing, out-of-scope-for-this-PR assignment tracked under
 NA3-CHILD-ENV-SCOPE-1 above. The receipt records the effective effort; user settings
-and the parent environment are unchanged. Codex continues through its existing direct
-process path; the new Windows job containment applies to Claude.
+and the parent environment are unchanged. A Codex lane with no image continues through its
+existing direct process path; the Windows job containment applies to Claude and to a Codex
+lane that carries `-ImagePaths`.
+
+**Image holds are released by job membership (VISUAL-JUDGE-TERRA-LANE-1 r13).** A Codex lane
+with images starts an inert host, assigns it to a kill-on-close job, and only then tells it
+what to run, so the child and every descendant are in the job. The child inherits the host's
+stdout and stderr, so the lane's pipes stream as on the direct path. Before any hold is
+released, on the completion, timeout and throwing paths alike, the lane terminates the job
+whether or not the direct process has exited, and waits for the job to report no live member.
+The receipt's `imageHoldRelease` records the outcome:
+
+- `released`: the holds were closed with no possible reader left. Either the job reported no
+  live member, or no reader was ever started.
+- `uncertain:kill-failed`, `uncertain:wait-timeout`, `uncertain:tree-unreadable`: the readers
+  are not known to be gone. The holds stay open until the lane process exits, the lane fails
+  with `image-hold-uncertain:<cause>`, and every image reports `consumedVerified=false`.
+
+Limit: a process created outside the job's inheritance, such as one started through the
+Secondary Logon service under another account, is not a job member, so `released` makes no
+claim about it. Whether Codex's elevated sandbox starts its tools that way is not measured here.
+
+**A Codex lane with no image has no job (VISUAL-JUDGE-TERRA-LANE-1 r14).** When its launch path
+throws with a child started, for example because the stdin write fails, the lane tree-kills
+the child and waits for each process it saw before the kill. The wait is on the lane's own
+stopwatch. It is bounded at 15 s, or by what is left of the lane's budget, with a 5 s floor.
+
+A process snapshot only names pids, and a pid can change hands before it is opened. So a
+candidate is killed only after the parent read from its own kept handle matches the parent being
+walked, and it does not read older than that parent (r15). A process whose parent does not match
+is left alone. The receipt's `codexDirectChildStop` is present only in this case:
+
+- `killed`: the child and every descendant shown to be in the tree before the kill were each seen
+  to exit in time.
+- `uncertain:already-exited`: the child had already exited, so its descendants cannot be
+  reached. They are not known to be gone, and this is never a clean stop.
+- `uncertain:kill-failed`, `uncertain:wait-timeout`, `uncertain:tree-unreadable`: the child or a
+  descendant may still be alive.
+- `uncertain:ancestry-unreadable`: a candidate or a parent could not be read, so it was not
+  killed by the lane's own loop.
+- `uncertain:older-than-parent`: the parent matches and the child reads older. A backward clock
+  step and a reused parent pid look the same, so it was not killed by the lane's own loop, and
+  it may still be alive.
+- `uncertain:descendant-unreachable`: the snapshot saw a process under a pid whose holder has
+  since gone, so that process cannot be shown to be in the tree, or to be gone.
+
+Every `uncertain:` value also adds `codex-direct-child-uncertain:<cause>` to the receipt's
+`failure`. Non-promises: this path has no job, so `killed` makes no claim about a descendant
+whose parent had already exited before the snapshot, or one started outside the tree (the limit
+above), or one started after the snapshot. The root's own `Kill($true)` is the runtime's walk, not
+this check: the runtime requires the child's local start time to be later than the parent's, so
+it can miss a child, and what it kills is not checked here. A candidate that reads younger than a
+parent whose pid was reused, because the clock stepped back between the two, cannot be told from a
+real child and would be killed. The lane's timeout path keeps its older tree kill, whose failure
+is not recorded.
+
+**An argument carrying a NUL is refused before launch (`argv-nul-refused`, r15).** CreateProcess
+reads its command line up to the first NUL, so one would drop every argument after it, including
+the sandbox flag, the MCP disables and the deny list, while the receipt recorded them. This holds
+for both engines. `pwsh -File` cannot carry a NUL; a caller using the call operator can.
+
+**A lone surrogate is refused before launch (`lone-surrogate-refused`, r16).** The image host's
+frame encodes with a replacement fallback, so a lone surrogate became U+FFFD, which names a
+different path: the child read the other directory's file while the held snapshot verified. The
+lane refuses one in `-RunDir`, `-WorkDir` and `-ImagePaths` before it does any run-dir work, and in
+the program and argv at the codex launch bound. Limits: this guards a caller using the call
+operator. `pwsh -File` replaces a lone surrogate with U+FFFD before the script runs (measured), so
+that caller's lane runs on the U+FFFD path, which is well formed and cannot be told from one named
+on purpose. The refusal is at these entry points only; the other encoders are not changed.
+
+**Sidecar cleanup trusts the run dir (limit, not defended).** Before launch the lane deletes stale
+sidecars from its own slot by path, with no directory identity check. A process running as the same
+user that retargets the run dir during the cleanup can redirect the delete at another directory's
+sidecars. The hub rules this a same-trust-domain limit.
 
 Run the real Windows fixture suite with:
 
@@ -382,7 +454,9 @@ absolute and strictly inside `-BulkScratchRoot` (default `C:\mlvtmp`), is, conta
 reparse point (never followed), is held by a live process (`kept` / `live-process`: the path or one under it
 is a cwd, is on a command line, or is named by a script that process runs; a live process that names the
 run's own dir holds everything the run registered, `kept` / `run-dir-active`; a live process whose cwd
-cannot be read and is not exempted by the worktree-retirement rule is `kept` / `holder-cwd-unknown`; a probe
+cannot be read and is not exempted by the worktree-retirement rule, or with a script it can load that exists
+and cannot be read, is `kept` / `holder-cwd-unknown` (the refusal names the pid even when the holder row
+omits its file, file error or creation time); a probe
 that cannot answer is `holder-probe-failed`, and it is not retried: every remaining entry gets the same
 refusal), or whose lane branch has an open PR (or whose PR state cannot be read, including a failed branch
 lookup; `gh` gets 60 s and is killed past it). The PR state is asked before the process snapshot is taken, so

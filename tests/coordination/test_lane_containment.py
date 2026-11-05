@@ -1,4 +1,4 @@
-import hashlib, importlib.util, json, os, re, subprocess, sys, threading, time
+import hashlib, importlib.util, json, os, re, shutil, subprocess, sys, threading, time
 from datetime import datetime
 from pathlib import Path
 
@@ -161,6 +161,8 @@ if($args.Count -ge 2 -and $args[0] -eq 'mcp' -and $args[1] -eq 'list'){
 # CODEX-KEY-PRIVATE-PIN-1: answers the launcher's `codex --version` stamp the same way (version
 # from MLV_FIXTURE_CODEX_VERSION, unset = 0.0.0-fixture) and exits before any lane-side write.
 if($args.Count -ge 1 -and $args[0] -eq '--version'){
+  # VISUAL-JUDGE-TERRA-LANE-1 r14 (test-only, unset = no-op): a version probe that fails.
+  if($env:MLV_FIXTURE_CODEX_VERSION_EXIT){exit ([int]$env:MLV_FIXTURE_CODEX_VERSION_EXIT)}
   $v=if($env:MLV_FIXTURE_CODEX_VERSION){$env:MLV_FIXTURE_CODEX_VERSION}else{'0.0.0-fixture'}
   [Console]::Out.Write("codex-cli $v`n")
   exit 0
@@ -168,6 +170,12 @@ if($args.Count -ge 1 -and $args[0] -eq '--version'){
 $me=Get-Process -Id $PID
 $t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_CHILD
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
+# VISUAL-JUDGE-TERRA-LANE-1 r3 (env-gated, unset = no-op): record the sha256 + length of every file passed as `-i <file>` AT LAUNCH, i.e. the
+# bytes codex would consume, so a test can compare them with the receipt and with a source mutated after the snapshot.
+if($env:MLV_FIXTURE_IMAGE_BYTES){
+  $seen=@(); for($i=0;$i -lt $args.Count-1;$i++){ if($args[$i] -eq '-i'){ $f=[string]$args[$i+1]; $seen+=[ordered]@{path=$f;sha256=(Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $f -Force).Length} } }
+  ConvertTo-Json -InputObject @($seen) -Depth 4|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_IMAGE_BYTES
+}
 $env:CLAUDE_CODE_EFFORT_LEVEL|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_EFFORT
 $env:CLAUDE_CODE_DISABLE_BACKGROUND_TASKS|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_BGTASKS
 # LANE-PROMPT-ENV-DIRECT-DISPATCH-1: records the MLV_LANE_PROMPT the hook's NA-4 would read in this child (env-gated; no other test reads it).
@@ -246,6 +254,14 @@ if($env:MLV_FIXTURE_HOLD_PIPE_SECONDS){
   foreach($x in @('-NoProfile','-NonInteractive','-Command',"Set-Content -LiteralPath '$env:MLV_FIXTURE_HOLD_PID' -Value `$PID; Start-Sleep -Seconds $env:MLV_FIXTURE_HOLD_PIPE_SECONDS")){[void]$hp.ArgumentList.Add($x)}
   [void][System.Diagnostics.Process]::Start($hp)
   $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_HOLD_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
+}
+# VISUAL-JUDGE-TERRA-LANE-1 r13 (Dot B2; test-only, unset = no-op): MLV_FIXTURE_READER_SCRIPT leaves a descendant, handed the -i snapshot path, alive AFTER this process exits.
+if($env:MLV_FIXTURE_READER_SCRIPT){
+  $snap=$null; for($i=0;$i -lt $args.Count-1;$i++){ if($args[$i] -eq '-i'){ $snap=[string]$args[$i+1] } }
+  $hp=[System.Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath); $hp.UseShellExecute=$false
+  foreach($x in @('-NoProfile','-NonInteractive','-File',$env:MLV_FIXTURE_READER_SCRIPT,$snap)){[void]$hp.ArgumentList.Add($x)}
+  [void][System.Diagnostics.Process]::Start($hp)
+  $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_READER_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
 }
 # LANE-MODEL-CURRENCY-1: lets a test substitute the child's own JSON result (e.g. to add a
 # modelUsage block) without touching the fixed default every other test still relies on.
@@ -638,6 +654,2396 @@ def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixtu
     assert q["codexModelsClientVersion"]==CODEX_MODELS_CACHE_CLIENT_VERSION
 
 
+def _write_png(path, payload):
+    # Not a decodable picture: the fixture shim never opens it. Distinct payloads give distinct sha256 values.
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + payload)
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_terra_lane_resolves_its_tier_and_attaches_each_image_with_i_before_the_model_flag(fixture_tree):
+    # VISUAL-JUDGE-TERRA-LANE-1: terra is a codex-engine tier row. The tier resolves to the highest listed
+    # gpt-<ver>-terra slug (a sol slug with a higher version must not win), every -ImagePaths entry reaches
+    # `codex exec` as its own `-i <path>` pair BEFORE `-m` (the flag is variadic: a flag token ends the list),
+    # the prompt still arrives on stdin ('-' last), and the receipt hashes the exact bytes handed over.
+    root=fixture_tree["root"]
+    cache=root/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-5.6-terra","gpt-6.1-terra","gpt-6-terra","gpt-7-sol")),encoding="utf-8")
+    first=root/"strip one.png"; second=root/"strip-two.jpg"
+    sha_first=_write_png(first,b"one"); second.write_bytes(b"\xff\xd8\xff-two"); sha_second=hashlib.sha256(second.read_bytes()).hexdigest()
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    # `pwsh -File` hands -ImagePaths ONE string; '|' (illegal in a Windows file name) separates the paths.
+    r=run_lane(cmd+["-ImagePaths",str(first)+"|"+str(second)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-m")+1]=="gpt-6.1-terra"
+    image_flags=[i for i,a in enumerate(argv) if a=="-i"]
+    # The lane is handed a SNAPSHOT of each image in the run dir (adversary A2), never the caller's file.
+    snap_first=receipt.parent/"terra-001.image-01.png"; snap_second=receipt.parent/"terra-001.image-02.jpg"
+    assert [argv[i+1] for i in image_flags]==[str(snap_first),str(snap_second)]
+    assert snap_first.read_bytes()==first.read_bytes() and snap_second.read_bytes()==second.read_bytes()
+    assert max(image_flags)+1<argv.index("-m"), argv
+    assert argv[-1]=="-" and argv[0]=="exec", argv
+    assert argv[argv.index("-s")+1]=="read-only", argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert (q["lane"],q["engine"],q["role"],q["requestedModel"],q["effort"])==("terra","codex","visual-judge","terra","low")
+    assert q["resolvedModel"]=="gpt-6.1-terra"
+    assert [(e["source"],e["path"],e["sha256"],e["bytes"]) for e in q["imagePaths"]]==[
+        (str(first),str(snap_first),sha_first,first.stat().st_size),(str(second),str(snap_second),sha_second,second.stat().st_size)]
+
+
+def test_the_receipt_hash_describes_the_snapshot_even_if_the_source_changes_afterwards(fixture_tree):
+    # adversary A2: hashing the SOURCE at validation and attaching it later lets a replaced file be judged under the old hash.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    png.write_bytes(b"replaced after the run")
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    entry=q["imagePaths"][0]
+    assert entry["sha256"]==sha and hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest()==sha
+    assert entry["path"]!=str(png) and entry["source"]==str(png)
+
+
+def test_a_provider_qualified_image_path_resolves_to_the_native_path(fixture_tree):
+    # adversary A3: Test-Path accepts `Microsoft.PowerShell.Core\FileSystem::C:\x.png`, native File.Exists does not.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"native")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths","Microsoft.PowerShell.Core\\FileSystem::"+str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert entry["source"]==str(png) and "::" not in entry["source"] and entry["sha256"]==sha
+
+
+def test_an_image_path_with_a_comma_is_refused_because_codex_splits_i_values_on_commas(fixture_tree):
+    # adversary A1: codex 0.160.1 declares a comma value delimiter for -i, so `strip,one.png` would attach two other files.
+    root=fixture_tree["root"]; png=root/"strip,one.png"; _write_png(png,b"comma")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode!=0 and "image-path-bad-character" in r.stderr,(r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"args.json").exists()
+
+
+@pytest.mark.parametrize("lane,value,token",[
+    ("terra"," ","image-path-empty"), ("terra","||","image-path-empty"), ("terra","|a.png","image-path-empty"),
+    ("sonnet"," ","image-paths-codex-only"), ("sonnet","||","image-paths-codex-only")])
+def test_a_blank_image_path_entry_is_refused_not_dropped(fixture_tree,lane,value,token):
+    # r2 adversary A1: blank elements used to vanish before validation, so a claude lane given `-ImagePaths '||'` silently
+    # judged nothing and a codex lane ran with no image flag. A supplied value is validated as supplied.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    r=run_lane(cmd+["-ImagePaths",value],env)
+    assert r.returncode!=0 and token in r.stderr,(r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"args.json").exists()
+
+
+def test_a_hidden_image_is_snapshotted_hashed_and_attached(fixture_tree):
+    # r2 adversary A2: Get-Item without -Force throws on a Hidden snapshot, so a Hidden source failed after the run dir existed.
+    root=fixture_tree["root"]; png=root/"hidden strip.png"; sha=_write_png(png,b"hidden")
+    assert subprocess.run(["attrib","+h",str(png)],capture_output=True).returncode==0
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert entry["sha256"]==sha and entry["bytes"]==png.stat().st_size
+    assert hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest()==sha
+
+
+def test_a_slow_image_copy_spends_the_lane_timeout_budget_and_leaves_no_partial_snapshot(fixture_tree):
+    # r2 adversary A3: the snapshot copy ran outside -TimeoutSec, so a slow share could hold the lane for any length of time.
+    # The fixture stalls every 256 KiB chunk by 1.5 s (a 1 MiB image = 4 chunks = 6 s) under a 4 s budget.
+    root=fixture_tree["root"]; png=root/"slow strip.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n"+os.urandom(1024*1024))
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",
+        mutation=lambda text: text.replace("# copy-loop-tick","Start-Sleep -Milliseconds 1500"))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    cmd[cmd.index("-TimeoutSec")+1]="4"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    # pass-2b A3: an exhausted budget is a TIMEOUT (timedOut=true, exit 124), the same booking launch-budget-exhausted gets,
+    # not a generic launch failure (exit 127).
+    assert r.returncode==124,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["timedOut"] is True,(r.stdout,r.stderr)
+    assert not (root/"args.json").exists()
+    assert not list(receipt.parent.glob("terra-001.image-*")), list(receipt.parent.iterdir())
+
+
+def test_an_image_that_is_already_the_snapshot_path_is_never_deleted_by_the_failed_copy_cleanup(fixture_tree):
+    # pass-2b A1: a caller file named like the generated snapshot (terra-001.image-01.png inside the run dir) used to be
+    # opened as the source, collide on CreateNew, and then be deleted by the cleanup of the "partial" destination.
+    root=fixture_tree["root"]
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    receipt.parent.mkdir(parents=True,exist_ok=True)
+    victim=receipt.parent/"terra-001.image-01.png"; sha=_write_png(victim,b"callers own file")
+    r=run_lane(cmd+["-ImagePaths",str(victim)],env)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert victim.exists() and hashlib.sha256(victim.read_bytes()).hexdigest()==sha, "the caller's image was deleted"
+    # r4 hardening (sol/opus/Grok G4): the collision refusal carries the same `image-path-` prefix as every other image refusal.
+    assert "image-path-snapshot-collision" in _failure_text(r,receipt), _failure_text(r,receipt)
+
+
+def test_a_source_read_that_never_returns_is_cut_at_the_deadline(tmp_path):
+    # pass-2b A2: Copy-ImageSnapshot is exercised alone against a named pipe that accepts the reader and never writes a byte,
+    # the stand-in for a share whose read stalls. A synchronous Read would hang here; the cancellable read ends at the budget.
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Copy-ImageSnapshot"); b=text.index("# END Copy-ImageSnapshot")
+    harness=tmp_path/"stall.ps1"; dest=tmp_path/"snap.png"
+    harness.write_text(text[a:b]+f'''
+$ErrorActionPreference = 'Stop'
+$name = 'mlv-stall-' + $PID
+$srv = [System.IO.Pipes.NamedPipeServerStream]::new($name, [System.IO.Pipes.PipeDirection]::Out, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::Asynchronous)
+$null = $srv.WaitForConnectionAsync()
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source "\\\\.\\pipe\\$name" -Dest '{dest}' -Clock $clock -LimitMs 1500; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+'ELAPSED ' + [int]$clock.ElapsedMilliseconds
+'DEST ' + [System.IO.File]::Exists('{dest}')
+$srv.Dispose()
+''',encoding="utf-8")
+    r=subprocess.run(["pwsh","-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=60)
+    out=r.stdout
+    assert "CAUGHT TimeoutException image-copy-timeout" in out,(out,r.stderr)
+    elapsed=int(re.search(r"ELAPSED (\d+)",out).group(1))
+    assert 1400<=elapsed<8000,(elapsed,out)
+    assert "DEST False" in out,out
+
+
+_AFTER_SNAPSHOT_ANCHOR = "    $imageArgs = @()\n"
+_BEFORE_COPY_ANCHOR = "        $snapshotInfo = Copy-ImageSnapshot "
+
+
+def _terra_env(fixture_tree):
+    cache=fixture_tree["root"]/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    return cache
+
+
+def _failure_text(r, receipt):
+    # The typed error is booked into the receipt's `failure`; the process stderr may carry it too. Either is greppable.
+    text=(r.stdout or "")+(r.stderr or "")
+    if receipt.exists(): text+=receipt.read_text(encoding="utf-8")
+    return text
+
+
+def test_a_source_deleted_between_validation_and_launch_fails_with_a_typed_image_path_missing(fixture_tree):
+    # Grok G2: the validation (Test-Path/Resolve-Path) passes, then the source vanishes before the snapshot opens it. The failure used to be
+    # a raw .NET FileNotFoundException; it must carry the same `image-path-` prefix as the other refusals.
+    root=fixture_tree["root"]; png=root/"vanishing strip.png"; _write_png(png,b"soon gone")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _BEFORE_COPY_ANCHOR in text, "snapshot call site moved; update this fixture mutation"
+        return text.replace(_BEFORE_COPY_ANCHOR,"        Remove-Item -LiteralPath $attachment.source -Force\n"+_BEFORE_COPY_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert "image-path-missing: source vanished before snapshot" in text and png.name in text, text
+    assert not (root/"args.json").exists(), "a vanished image must never reach the codex launch"
+    assert not list(receipt.parent.glob("terra-001.image-*")), "no partial snapshot may remain"
+
+
+def test_a_source_locked_between_validation_and_launch_fails_with_a_typed_image_path_unreadable(fixture_tree):
+    # Grok G2: a source held open exclusively (sharing violation) is an IOException, not a missing file.
+    root=fixture_tree["root"]; png=root/"locked strip.png"; _write_png(png,b"locked")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _BEFORE_COPY_ANCHOR in text, "snapshot call site moved; update this fixture mutation"
+        lock="        $script:fixtureLock = [System.IO.File]::Open($attachment.source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)\n"
+        return text.replace(_BEFORE_COPY_ANCHOR,lock+_BEFORE_COPY_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert "image-path-unreadable:" in text and png.name in text, text
+    assert not (root/"args.json").exists()
+    assert not list(receipt.parent.glob("terra-001.image-*")), "no partial snapshot may remain"
+
+
+def test_a_preexisting_snapshot_destination_is_refused_and_left_byte_identical(fixture_tree):
+    # Grok G3 + Dot eb383f73: the snapshot target already exists (a file this call did not create) and the source is a DIFFERENT file.
+    # CreateNew fails; the cleanup must not delete what it never created, and the refusal is typed `image-path-`.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"the source")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    receipt.parent.mkdir(parents=True,exist_ok=True)
+    victim=receipt.parent/"terra-001.image-01.png"; victim.write_bytes(b"someone elses bytes, not made by this call")
+    before=victim.read_bytes()
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert "image-path-snapshot-exists" in text, text
+    assert victim.exists() and victim.read_bytes()==before, "the pre-existing destination was deleted or rewritten"
+    assert not (root/"args.json").exists()
+
+
+def test_pre_consumption_mutation_of_the_source_never_reaches_codex(fixture_tree):
+    # Dot e64efdb1: the source is rewritten AFTER the snapshot is taken and BEFORE codex consumes it. What the launched process reads
+    # (hashed by the fixture shim at launch) must be the snapshot bytes the receipt describes, never the mutated source.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text, "post-snapshot call site moved; update this fixture mutation"
+        hit="    [System.IO.File]::WriteAllBytes($ImageAttachments[0].source, [byte[]](1..64))\n"
+        return text.replace(_AFTER_SNAPSHOT_ANCHOR,hit+_AFTER_SNAPSHOT_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert hashlib.sha256(png.read_bytes()).hexdigest()!=sha, "the mutation hook did not run"
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert len(seen)==1 and seen[0]["path"]==entry["path"]!=str(png)
+    assert (seen[0]["sha256"],seen[0]["bytes"])==(sha,len(b"\x89PNG\r\n\x1a\n"+b"original bytes")), seen
+    assert (entry["sha256"],entry["bytes"])==(seen[0]["sha256"],seen[0]["bytes"])
+
+
+def _copy_harness(tmp_path, body, mutation=None):
+    """Runs Copy-ImageSnapshot (the text between its BEGIN/END markers) alone in a fresh pwsh; `body` is the PowerShell that drives it."""
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Copy-ImageSnapshot"); b=text.index("# END Copy-ImageSnapshot")
+    block=text[a:b]
+    if mutation is not None: block=mutation(block)
+    harness=tmp_path/"copy-harness.ps1"
+    harness.write_text(block+"\n$ErrorActionPreference = 'Stop'\n"+body,encoding="utf-8")
+    return subprocess.run(["pwsh","-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=90)
+
+
+_AFTER_INPUT_RELEASE = "        if ($null -ne $in) { try { $in.Dispose() } catch { } }\n"
+
+
+def test_a_failed_copy_never_deletes_a_replacement_moved_into_the_snapshot_name_after_its_handle_is_released(tmp_path):
+    # r4 B1 (sol): the cleanup used to delete BY PATH after the destination handle was gone, so a file moved into the snapshot
+    # name in that window was deleted instead of the partial. The replacement is injected right after the handles are released
+    # (the old code's window); the failed copy (LimitMs 0 -> TimeoutException after CreateNew) must leave it untouched.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); victim=tmp_path/"victim.png"; victim.write_bytes(b"victim bytes")
+    dest=tmp_path/"snap.png"
+    def mutation(block):
+        assert _AFTER_INPUT_RELEASE in block, "handle-release site moved; update this fixture mutation"
+        hit=("        if ([System.IO.File]::Exists($Dest)) { [System.IO.File]::Move($Dest, $Dest + '.aside') }\n"
+             "        [System.IO.File]::Move($script:victimPath, $Dest)\n")
+        return block.replace(_AFTER_INPUT_RELEASE,_AFTER_INPUT_RELEASE+hit,1)
+    r=_copy_harness(tmp_path,f"""
+$script:victimPath = '{victim}'
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 0; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name }}
+'DEST-EXISTS ' + [System.IO.File]::Exists('{dest}')
+if ([System.IO.File]::Exists('{dest}')) {{ 'DEST-BYTES ' + [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes('{dest}')) }}
+""",mutation)
+    assert "CAUGHT TimeoutException" in r.stdout,(r.stdout,r.stderr)
+    assert "DEST-EXISTS True" in r.stdout and "DEST-BYTES victim bytes" in r.stdout, ("the replacement was deleted by the failed-copy cleanup",r.stdout,r.stderr)
+
+
+def test_the_held_snapshot_refuses_a_write_through_a_hard_link_and_a_delete(tmp_path):
+    # r4 B2 (sol): after the copy the snapshot was writable, so a hard link to it could change the bytes between the hash and codex's read.
+    # The copy now returns a HELD read handle (FileShare.Read: no writer, no delete) that stays open until the child exits.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"; link=tmp_path/"snap-link.png"
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$info = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 60000
+$null = New-Item -ItemType HardLink -Path '{link}' -Target '{dest}'
+try {{ $w = [System.IO.File]::Open('{link}', 'Open', 'Write', 'ReadWrite'); $w.Write([byte[]](1..64), 0, 64); $w.Dispose(); 'LINK-WRITE accepted' }} catch {{ 'LINK-WRITE refused' }}
+try {{ [System.IO.File]::Delete('{dest}'); 'DELETE accepted' }} catch {{ 'DELETE refused' }}
+try {{ $rd = [System.IO.File]::ReadAllBytes('{dest}'); 'READ ok ' + $rd.Length }} catch {{ 'READ refused' }}
+'HOLD ' + ($null -ne $info.Hold)
+if ($null -ne $info.Hold) {{ $info.Hold.Dispose() }}
+""")
+    assert "HOLD True" in r.stdout,(r.stdout,r.stderr)
+    assert "LINK-WRITE refused" in r.stdout and "DELETE refused" in r.stdout and "READ ok" in r.stdout,(r.stdout,r.stderr)
+    assert dest.read_bytes()==src.read_bytes(),"the snapshot bytes changed while held"
+
+
+_AFTER_CHILD_EXIT_ANCHOR = "$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }\n"
+
+
+def test_a_post_copy_write_through_a_hard_link_is_refused_and_the_receipt_describes_the_consumed_bytes(fixture_tree):
+    # r4 B2 end to end: between the snapshot and the launch a hostile writer hard-links the snapshot and tries to overwrite it. The held
+    # handle refuses, so what the fixture's codex hashes at launch equals the receipt's sha256/bytes, and the post-exit re-hash passes.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text, "post-snapshot call site moved; update this fixture mutation"
+        hit=("    $lnk = $ImageAttachments[0].path + '.lnk'\n"
+             "    $null = New-Item -ItemType HardLink -Path $lnk -Target $ImageAttachments[0].path\n"
+             "    try { $w = [System.IO.File]::Open($lnk, 'Open', 'Write', 'ReadWrite'); $w.Write([byte[]](1..64), 0, 64); $w.Dispose(); $hookResult = 'accepted' } catch { $hookResult = 'refused' }\n"
+             "    Set-Content -LiteralPath (Join-Path (Split-Path $ImageAttachments[0].path) 'hook-result.txt') -Value $hookResult\n")
+        return text.replace(_AFTER_SNAPSHOT_ANCHOR,hit+_AFTER_SNAPSHOT_ANCHOR,1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert (receipt.parent/"hook-result.txt").read_text(encoding="utf-8").strip()=="refused","the write through the hard link was accepted"
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert (seen[0]["sha256"],seen[0]["bytes"])==(entry["sha256"],entry["bytes"])==(sha,len(b"\x89PNG\r\n\x1a\n"+b"original bytes"))
+    assert entry["consumedVerified"] is True, entry
+
+
+def test_a_snapshot_whose_bytes_differ_after_the_child_exits_is_a_typed_failure_never_a_silent_pass(fixture_tree):
+    # r4 B2: the held handle is re-read after the child exits and compared with the hash the receipt carries. A mismatch (here simulated
+    # by corrupting the recorded digest right after the exit, since a real writer is refused) must be `image-snapshot-mutated`.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_CHILD_EXIT_ANCHOR in text, "child-exit site moved; update this fixture mutation"
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+"if ($ImageAttachments.Count -gt 0) { $ImageAttachments[0].sha256 = ('0' * 64) }\n",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    assert q["state"]=="failed" and "image-snapshot-mutated" in (q["failure"] or ""),q
+    assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
+
+
+def _mk_junction(link, target):
+    r=subprocess.run(["cmd","/c","mklink","/J",str(link),str(target)],capture_output=True,text=True)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+_DIGEST_TICK = "# hold-digest-read-tick"
+
+
+def _digest_counter():
+    # Counts digest chunk reads across the whole lane process (strict mode: the variable must be created before it is read).
+    return "$global:hdc = 1 + $(if (Test-Path variable:global:hdc) { $global:hdc } else { 0 });"
+
+
+def test_a_run_dir_junction_retargeted_during_the_child_read_never_certifies_a_file_the_child_did_not_read(fixture_tree):
+    # r5 B1 (sol A1 / ADV-A1): -RunDir is a junction to `good`. After the hold is registered the junction is retargeted to `bad`, which holds
+    # DIFFERENT bytes under the same snapshot name, and restored once the child has exited. The old lane handed codex the junction PATHNAME
+    # (so codex read bad's bytes) while hashing the HELD OBJECT (good's bytes) and reported consumedVerified=true. Invariant: consumedVerified
+    # may be true only when the bytes the child read are the bytes the receipt hashes.
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    good=root/"good"; bad=root/"bad"; good.mkdir(); bad.mkdir(); link=root/"run-link"
+    _mk_junction(link,good)
+    (bad/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q, same snapshot name")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_SNAPSHOT_ANCHOR in text and _AFTER_CHILD_EXIT_ANCHOR in text, "fixture anchors moved"
+        def swap(target):
+            return (f"    $rl = $RunDir; [System.IO.Directory]::Delete($rl); $null = New-Item -ItemType Junction -Path $rl -Target '{target}'\n")
+        text=text.replace(_AFTER_SNAPSHOT_ANCHOR,swap(bad)+_AFTER_SNAPSHOT_ANCHOR,1)
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+swap(good),1)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    cmd[cmd.index("-RunDir")+1]=str(link)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    receipt=good/"terra-001.receipt.json"
+    assert receipt.exists(),(r.stdout,r.stderr,list(good.iterdir()))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    entry=q["imagePaths"][0]
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    assert not (entry.get("consumedVerified") is True and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+    # The mechanism: codex is handed the RESOLVED path of the held object, so the retarget cannot redirect its open.
+    assert Path(seen[0]["path"]).parent.resolve()==good.resolve() and seen[0]["sha256"]==sha, seen
+    assert "run-link" not in entry["path"], entry
+
+
+def test_get_image_reparse_ancestor_names_a_junction_in_the_path_and_is_null_for_a_plain_path(tmp_path):
+    real=tmp_path/"real"; real.mkdir(); (real/"x.png").write_bytes(b"x"); link=tmp_path/"jn"; _mk_junction(link,real)
+    r=_copy_harness(tmp_path,f"""
+'VIA-JUNCTION ' + (Get-ImageReparseAncestor -Path '{link}\\x.png')
+'PLAIN [' + (Get-ImageReparseAncestor -Path '{real}\\x.png') + ']'
+""")
+    assert f"VIA-JUNCTION {link}" in r.stdout and "PLAIN []" in r.stdout,(r.stdout,r.stderr)
+
+
+def _digest_fault_run(fixture_tree, on_call, fault="throw [System.IO.IOException]::new('ERROR_NETNAME_DELETED')"):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _DIGEST_TICK in text, "digest seam moved; update this fixture mutation"
+        return text.replace(_DIGEST_TICK,_digest_counter()+f" if ($global:hdc -eq {on_call}) {{ {fault} }}",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    return r,receipt,root
+
+
+def test_a_digest_io_error_before_launch_is_a_typed_unreadable_image_path_error_with_no_child(fixture_tree):
+    # r5 B2 (sol / ADV-A3): the digest taken when the hold is acquired used to let a raw IOException escape (untyped, no image-path- prefix).
+    r,receipt,root=_digest_fault_run(fixture_tree,1)
+    text=_failure_text(r,receipt)
+    assert r.returncode==127,(r.returncode,text)
+    assert "image-path-snapshot-unreadable" in text and "ERROR_NETNAME_DELETED" in text,text
+    assert "image-snapshot-mutated" not in text,text
+    assert not (root/"args.json").exists(), "a child was launched"
+
+
+def test_a_digest_io_error_after_the_child_exits_is_unverifiable_never_a_false_mutation_claim(fixture_tree):
+    # r5 B2: the same IOException on the post-exit re-read of an UNCHANGED snapshot used to be booked as `image-snapshot-mutated`.
+    r,receipt,root=_digest_fault_run(fixture_tree,2)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and q["state"]=="failed",(r.returncode,text)
+    assert "image-snapshot-unverifiable" in (q["failure"] or ""),q["failure"]
+    assert "image-snapshot-mutated" not in (q["failure"] or ""),q["failure"]
+    entry=q["imagePaths"][0]
+    assert entry["consumedVerified"] is False and "ERROR_NETNAME_DELETED" in entry["consumedVerifyReason"],entry
+
+
+def test_a_stalled_digest_read_before_launch_ends_as_a_timeout_inside_the_deadline(tmp_path):
+    # r5 H1 (ADV-A2): the digest taken at hold time spends the lane budget. The seam sleeps past a 3 s limit after the first chunk is read.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+try {{ $null = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 3000; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+""",lambda block: block.replace(_DIGEST_TICK,"Start-Sleep -Milliseconds 3500",1))
+    assert "CAUGHT TimeoutException image-digest-timeout" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_a_stalled_digest_read_after_the_child_exits_is_unverifiable_with_a_timeout_reason(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    limit_anchor="    $verifyClock = [System.Diagnostics.Stopwatch]::StartNew()\n"
+    def mutation(text):
+        assert _DIGEST_TICK in text and limit_anchor in text, "fixture anchors moved"
+        text=text.replace(limit_anchor,limit_anchor+"    $verifyLimitMs = 500\n",1)
+        return text.replace(_DIGEST_TICK,_digest_counter()+" if ($global:hdc -eq 2) { Start-Sleep -Milliseconds 1500 }",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "image-snapshot-unverifiable" in (q["failure"] or ""),(r.returncode,q["failure"])
+    entry=q["imagePaths"][0]
+    assert entry["consumedVerified"] is False and entry["consumedVerifyReason"].startswith("timeout:"),entry
+
+
+def test_a_held_snapshot_that_moved_from_the_path_codex_was_given_is_a_typed_failure(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes")
+    cache=_terra_env(fixture_tree)
+    def mutation(text):
+        assert _AFTER_CHILD_EXIT_ANCHOR in text, "child-exit site moved"
+        return text.replace(_AFTER_CHILD_EXIT_ANCHOR,_AFTER_CHILD_EXIT_ANCHOR+"if ($ImageAttachments.Count -gt 0) { $ImageAttachments[0].path = $ImageAttachments[0].path + '.elsewhere' }\n",1)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "image-snapshot-path-changed" in (q["failure"] or ""),(r.returncode,q["failure"])
+    assert q["imagePaths"][0]["consumedVerified"] is False,q["imagePaths"]
+
+
+_GAP_TICK = "# writer-closed-pre-hold-tick"
+_COMPARE_LINE = "        if ($held.sha256 -ne $copySha -or $held.bytes -ne $total) {\n"
+
+
+def _gap_run(tmp_path, neutralize_compare):
+    # r5 H2 (Grok G5): a writer changes Dest AFTER the copy's writer handle is disposed and BEFORE the hold is acquired.
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); dest=tmp_path/"snap.png"
+    def mutation(block):
+        assert _GAP_TICK in block and _COMPARE_LINE in block, "gap seam or comparison moved; update this fixture mutation"
+        block=block.replace(_GAP_TICK,"[System.IO.File]::WriteAllBytes($Dest, [byte[]](1..40))",1)
+        if neutralize_compare: block=block.replace(_COMPARE_LINE,"        if ($false) {\n",1)
+        return block
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+$info = $null
+try {{ $info = Copy-ImageSnapshot -Source '{src}' -Dest '{dest}' -Clock $clock -LimitMs 60000; 'NO-ERROR' }}
+catch {{ 'CAUGHT ' + $_.Exception.GetType().Name + ' ' + $_.Exception.Message }}
+'HOLD-RETURNED ' + ($null -ne $info -and $null -ne $info.Hold)
+'DEST-EXISTS ' + [System.IO.File]::Exists('{dest}')
+if ($null -ne $info -and $null -ne $info.Hold) {{ $info.Hold.Dispose() }}
+""",mutation)
+    return r
+
+
+def test_a_write_between_the_writer_close_and_the_hold_open_is_image_snapshot_mutated_with_no_hold(tmp_path):
+    r=_gap_run(tmp_path,False)
+    assert "CAUGHT IOException image-snapshot-mutated" in r.stdout,(r.stdout,r.stderr)
+    assert "HOLD-RETURNED False" in r.stdout and "DEST-EXISTS True" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_the_writer_close_gap_test_is_red_when_the_hold_comparison_is_deleted(tmp_path):
+    # Proof that the test above bites: with the comparison neutralised the changed snapshot is returned as good.
+    r=_gap_run(tmp_path,True)
+    assert "NO-ERROR" in r.stdout and "HOLD-RETURNED True" in r.stdout,(r.stdout,r.stderr)
+
+
+def test_the_largest_accepted_timeout_sec_does_not_overflow_the_child_wait(fixture_tree):
+    # r5 A4: WaitForExit([int]$remainingMs) overflowed Int32 for -TimeoutSec above 2147483. r7: 2147483 is now the largest accepted
+    # budget, and its full millisecond value fits one Int32 wait, so no native wait is ever clamped below the real deadline.
+    assert 2147483*1000<=2**31-1<2147484*1000
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    cmd[cmd.index("-TimeoutSec")+1]="2147483"
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("lane",["terra","sonnet"])
+@pytest.mark.parametrize("value",["2147484","3000000"])
+def test_a_timeout_sec_above_the_int32_millisecond_budget_is_refused_typed_before_any_receipt(fixture_tree,lane,value):
+    # r7 (sol B3 / ADV-A3): -TimeoutSec 3000000 used to be accepted, then every native wait (WaitForExit and both image-read CancelAfter
+    # sites) was clamped to Int32.MaxValue ms and the lane was booked timedOut/124 with ~852515 s of its budget unspent. The cap refuses it.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    cmd[cmd.index("-TimeoutSec")+1]=value
+    r=run_lane(cmd,env)
+    assert r.returncode!=0 and "timeout-sec-too-large" in r.stderr,(r.returncode,r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"child.json").exists() and not (root/"args.json").exists()
+
+
+_RAW_JUNCTION_PS = r'''
+param([string]$Link, [string]$NtTarget)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System; using System.Text; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles;
+public static class RawJunction {
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern SafeFileHandle CreateFileW(string n, uint access, uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool DeviceIoControl(SafeFileHandle h, uint code, byte[] inBuf, int inSize, IntPtr outBuf, int outSize, out int ret, IntPtr ov);
+  public static void Make(string link, string ntTarget) {
+    System.IO.Directory.CreateDirectory(link);
+    byte[] sub = Encoding.Unicode.GetBytes(ntTarget);
+    int dataLen = 8 + sub.Length + 2 + 2;
+    byte[] buf = new byte[8 + dataLen];
+    BitConverter.GetBytes(0xA0000003u).CopyTo(buf, 0);
+    BitConverter.GetBytes((ushort)dataLen).CopyTo(buf, 4);
+    BitConverter.GetBytes((ushort)0).CopyTo(buf, 8);
+    BitConverter.GetBytes((ushort)sub.Length).CopyTo(buf, 10);
+    BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(buf, 12);
+    BitConverter.GetBytes((ushort)0).CopyTo(buf, 14);
+    sub.CopyTo(buf, 16);
+    using (var h = CreateFileW(link, 0x40000000, 0, IntPtr.Zero, 3, 0x02000000 | 0x00200000, IntPtr.Zero)) {
+      if (h.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      int ret;
+      if (!DeviceIoControl(h, 0x000900A4, buf, buf.Length, IntPtr.Zero, 0, out ret, IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+  }
+}
+"@
+[RawJunction]::Make($Link, $NtTarget)
+'''
+
+
+def _mk_raw_junction(tmp_path, link, nt_target):
+    # mklink /J and New-Item -ItemType Junction both normalize the target (a trailing '.' is dropped), so the keys' repro shape -- a junction
+    # whose stored target is the NATIVE directory `judge.` -- is written directly with FSCTL_SET_REPARSE_POINT (no elevation needed).
+    script=tmp_path/"raw-junction.ps1"; script.write_text(_RAW_JUNCTION_PS,encoding="ascii")
+    r=subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-File",str(script),"-Link",str(link),"-NtTarget",nt_target],capture_output=True,text=True,timeout=90)
+    assert r.returncode==0,(r.stdout,r.stderr)
+
+
+def test_a_run_dir_junction_to_a_native_trailing_dot_directory_never_certifies_the_ordinary_sibling_codex_reads(fixture_tree):
+    # r7 (opus B1 = sol B2, r6 ADV-A1): -RunDir is a junction whose stored target is \??\<root>\judge. (a real directory named `judge.`),
+    # and the ordinary sibling <root>\judge holds DIFFERENT bytes Q under the snapshot name. The snapshot P is written into `judge.`;
+    # FinalPath stripped \\?\ and handed codex <root>\judge.\terra-001.image-01.png, which Win32 normalizes to <root>\judge\..., so codex
+    # read Q while the held-digest compare certified P (consumedVerified=true). The stripped path must be canonical or the run is refused.
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"original bytes P")
+    judge_dot="\\\\?\\"+str(root/"judge")+"."; os.mkdir(judge_dot)
+    plain=root/"judge"; plain.mkdir()
+    (plain/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q in the ordinary sibling")
+    link=root/"judge-link"
+    try:
+        _mk_raw_junction(root,link,"\\??\\"+str(root/"judge")+".")
+        cache=_terra_env(fixture_tree)
+        cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+        cmd[cmd.index("-RunDir")+1]=str(link)
+        env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+        r=run_lane(cmd+["-ImagePaths",str(png)],env)
+        receipt=link/"terra-001.receipt.json"
+        text=_failure_text(r,receipt)
+        if (root/"image-bytes.json").exists():
+            seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+            entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+            assert not (entry.get("consumedVerified") is True and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+        assert r.returncode!=0 and "image-path-noncanonical" in text,(r.returncode,text)
+        assert not (root/"args.json").exists(), "a non-canonical snapshot path must never reach the codex launch"
+    finally:
+        if link.exists(): os.rmdir(link)
+        shutil.rmtree(judge_dot,ignore_errors=True)
+
+
+@pytest.mark.parametrize("raw,expected",[
+    ("\\\\?\\C:\\x\\judge\\terra-001.image-01.png","C:\\x\\judge\\terra-001.image-01.png"),
+    ("\\\\?\\UNC\\srv\\share\\run\\terra-001.image-01.png","\\\\srv\\share\\run\\terra-001.image-01.png"),
+    ("C:\\x\\run dir\\terra-001.image-01.png","C:\\x\\run dir\\terra-001.image-01.png"),
+    ("\\\\?\\C:\\x\\judge.\\terra-001.image-01.png",None),
+    ("\\\\?\\UNC\\srv\\share\\judge.\\terra-001.image-01.png",None),
+    ("\\\\?\\C:\\x\\judge\\terra-001.image-01.png.",None),
+])
+def test_strip_verbatim_returns_only_a_path_win32_will_not_renormalize(tmp_path,raw,expected):
+    # r7: the extracted check, DOS and UNC prefix-removal branches, with the keys' exact trailing-dot strings (no filesystem access).
+    r=_copy_harness(tmp_path,f"""
+try {{ 'OUT [' + [MlvImageSnap]::StripVerbatim('{raw}') + ']' }} catch {{ 'CAUGHT ' + $_.Exception.GetBaseException().GetType().Name + ' ' + $_.Exception.GetBaseException().Message }}
+""")
+    if expected is None:
+        assert "CAUGHT IOException image-path-noncanonical" in r.stdout,(r.stdout,r.stderr)
+    else:
+        assert f"OUT [{expected}]" in r.stdout,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("dirname,expanded,delayed",[
+    ("%OS%","Windows_NT",False),("a^b","ab",False),("a&b",None,False),
+    # r8 (ADV-A1): '!' is expanded by delayed expansion, which HKCU/HKLM Command Processor\DelayedExpansion=1 turns on for every batch file.
+    # The fixture shim enables it itself (setlocal enabledelayedexpansion) so the registry is never touched; '(' / ')' are refused as a class.
+    ("!OS!","Windows_NT",True),("a!b",None,True),("a(b",None,False),("a)b",None,False),
+    # r9 (sol r8 B2): the shim enables it with an escaped spelling cmd.exe still obeys; r8 read it as off and certified bytes Q never read.
+    ("!OS!","Windows_NT","setlocal enable^delayedexpansion"),
+    # r10 (sol r9 B1, fable r9 B1): the shim forwards through '2>nul <extensionless inner>' and inner.cmd enables it before forwarding %*.
+    ("!OS!","Windows_NT","2>nul-inner"),
+])
+def test_a_run_dir_cmd_would_rewrite_never_certifies_a_file_codex_did_not_read(fixture_tree,dirname,expanded,delayed):
+    # r7 (sol B1): codex is launched through a .cmd shim that forwards %*, and ProcessStartInfo quotes an argument only when it has a space,
+    # so cmd.exe expanded %OS% and dropped '^' in the -i path: codex read the sibling's bytes Q while the held snapshot P verified.
+    # r12 (Dot improvement on c4f381a7, item 4): since r11 the codex child is a direct CreateProcess, never cmd.exe, so a path cmd.exe would
+    # have rewritten reaches codex unchanged. The invariant is unchanged (never certify Q); what follows from it is now transport-exact:
+    # with the plain shim the launch proceeds and the child reads P at the literal path; a shim that enables delayed expansion (or forwards
+    # through a redirection) is not a launchable shape and is refused, typed, before launch. The %OS% row is the item-4 RED on c4f381a7.
+    if delayed=="2>nul-inner":
+        inner=fixture_tree["root"]/"inner"
+        if " " in str(inner): pytest.skip("the unquoted extensionless target needs a space-free fixture path")
+        (fixture_tree["root"]/"inner.cmd").write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+        fixture_tree["shim"].write_text(f'@echo off\r\n2>nul {inner} %*\r\n',encoding="ascii")
+    elif delayed:
+        enable=delayed if isinstance(delayed,str) else "setlocal enabledelayedexpansion"
+        fixture_tree["shim"].write_text(f'@echo off\r\n{enable}\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    run_dir=root/dirname; run_dir.mkdir()
+    if expanded:
+        (root/expanded).mkdir(); (root/expanded/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    receipt=run_dir/"terra-001.receipt.json"
+    text=_failure_text(r,receipt)
+    if (root/"image-bytes.json").exists() and receipt.exists():
+        seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+        entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+        assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+    if delayed:
+        assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+        assert not (root/"args.json").exists(), "a shim cmd.exe would have to run must never reach the codex launch"
+        return
+    assert r.returncode==0,(r.returncode,text[-4000:])
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert dirname in seen[0]["path"] and seen[0]["path"]==entry["path"],(entry,seen)
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"]==sha,(entry,seen)
+
+
+# r8 (ADV-A1): the refused set is the class cmd.exe can rewrite in a %*-forwarded argument. '|', '<', '>' and '"' cannot be in a Windows file
+# name, so they are proved on the extracted pattern; every file-name-legal character measured to survive the shim must still be accepted.
+# '!' is in neither list: it is refused only when delayed expansion can be on (-RefuseBang / Test-CmdDelayedExpansion; tests below).
+_CMD_REFUSED = ['%','^','&','|','<','>','(',')','"']
+_CMD_SURVIVES = [' ','#','$',"'",'+','-','.',';','=','@','[',']','_','`','{','}','~','!']
+
+
+@pytest.mark.parametrize("ch",_CMD_REFUSED+_CMD_SURVIVES)
+def test_the_cmd_metacharacter_pattern_refuses_exactly_the_class_cmd_rewrites(tmp_path,ch):
+    r=_copy_harness(tmp_path,f"""
+$p = 'C:\\x\\a' + [string][char]{ord(ch)} + 'b\\terra-001.image-01.png'
+'MATCH ' + ($p -match $IMAGE_CMD_META_PATTERN)
+""")
+    assert ("MATCH True" if ch in _CMD_REFUSED else "MATCH False") in r.stdout,(ch,r.stdout,r.stderr)
+
+
+def _registry_delayed_expansion_on():
+    # read-only. r9 (adversary A3 on 0da1f4ef): the EFFECTIVE setting, HKCU over HKLM, as cmd.exe /? states; the first hive holding the
+    # value decides, so HKCU=0/HKLM=1 is off and the default-run-dir regression below runs instead of skipping.
+    import winreg
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, r"Software\Microsoft\Command Processor") as k:
+                v=winreg.QueryValueEx(k, "DelayedExpansion")[0]
+        except OSError: continue
+        try: return int(v)!=0
+        except (TypeError,ValueError): return True
+    return False
+
+
+def test_a_default_style_run_dir_with_a_bang_attaches_and_verifies_when_delayed_expansion_is_off(fixture_tree):
+    # r8 iteration-2 adversary A1 (0f0450d7): the default -RunDir is under C:\!Layi Wkspc\MLV-App, and the unconditional '!' refusal made
+    # every default image launch refuse its own snapshot. With delayed expansion off, cmd.exe passes '!' unchanged (probe-cmd-meta.txt), so
+    # the launch must proceed and the child must read exactly the bytes the receipt certifies.
+    if _registry_delayed_expansion_on(): pytest.skip("this host turns cmd.exe delayed expansion on; the refusal case is covered by the delayed-shim tests")
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    run_dir=root/"!Layi Wkspc"/"run"; run_dir.mkdir(parents=True)
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads((run_dir/"terra-001.receipt.json").read_text(encoding="utf-8"))["imagePaths"][0]
+    assert "!" in entry["path"] and seen[0]["path"]==entry["path"],(entry,seen)
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"]==sha,(entry,seen)
+
+
+def test_copy_image_snapshot_refuses_a_bang_only_when_told_to(tmp_path):
+    src=tmp_path/"src.png"; src.write_bytes(b"\x89PNG\r\n\x1a\nsource"); d=tmp_path/"a!b"; d.mkdir()
+    r=_copy_harness(tmp_path,f"""
+$clock = [System.Diagnostics.Stopwatch]::StartNew()
+foreach ($refuse in $true, $false) {{
+  try {{ $s = Copy-ImageSnapshot -Source '{src}' -Dest ('{d}\\snap-' + $refuse + '.png') -Clock $clock -LimitMs 60000 -RefuseBang $refuse; 'OK ' + $refuse; $s.Hold.Dispose() }}
+  catch {{ 'CAUGHT ' + $refuse + ' ' + $_.Exception.GetBaseException().Message }}
+}}
+""")
+    assert "CAUGHT True image-path-bad-character:" in r.stdout and "OK False" in r.stdout,(r.stdout,r.stderr)
+
+
+def _cmdline_harness(tmp_path, body):
+    """Runs the Assert-CodexCommandLineFits block (between its BEGIN/END markers) alone in a fresh pwsh."""
+    text=CANDIDATE.read_text(encoding="utf-8")
+    a=text.index("# BEGIN Assert-CodexCommandLineFits"); b=text.index("# END Assert-CodexCommandLineFits")
+    harness=tmp_path/"cmdline-harness.ps1"
+    harness.write_text(text[a:b]+"\n$ErrorActionPreference = 'Stop'\n"+body,encoding="utf-8")
+    return subprocess.run([PWSH,"-NoLogo","-NoProfile","-NonInteractive","-File",str(harness)],capture_output=True,text=True,timeout=90)
+
+
+def test_the_command_line_length_is_exactly_what_dotnet_hands_createprocess(tmp_path):
+    # r8 (ADV-A2): the bound is only sound if the computed length equals the real one. A child started through ProcessStartInfo.ArgumentList
+    # reports its own GetCommandLineW() length; arguments cover empty, spaces, embedded quotes, trailing and quote-adjacent backslashes.
+    probe=tmp_path/"cmdlen.py"
+    probe.write_text("import ctypes\nf=ctypes.windll.kernel32.GetCommandLineW\nf.restype=ctypes.c_wchar_p\nprint('LEN',len(f()))\n",encoding="ascii")
+    r=_cmdline_harness(tmp_path,f"""
+$exe = '{sys.executable}'
+$argv = @('-I', '{probe}', 'exec', '', 'a b', 'q"uote', 'C:\\dir with space\\', 'C:\\x\\\\"y', 'tail\\\\', 'plain\\path', ([string][char]0x3000 + 'ideographic'))
+$psi = [Diagnostics.ProcessStartInfo]::new($exe); foreach ($a in $argv) {{ [void]$psi.ArgumentList.Add($a) }}
+$psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true
+$p = [Diagnostics.Process]::Start($psi); $o = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()
+$o.Trim()
+'CALC ' + (Get-NativeCommandLineLength -Exe $exe -Argv $argv)
+""")
+    real=re.search(r"LEN (\d+)",r.stdout); calc=re.search(r"CALC (\d+)",r.stdout)
+    assert real and calc,(r.stdout,r.stderr)
+    assert int(real.group(1))==int(calc.group(1)),(r.stdout,r.stderr)
+
+
+def test_the_codex_command_line_bound_refuses_one_character_past_the_shim_limit(tmp_path):
+    # r8 (ADV-A2) boundary: through 'C:\\x\\codex.cmd' (14 chars) the limit is 8191-(14+512)=7665. "<exe>" + ' exec' + ' ' + k x's = 22+k.
+    r=_cmdline_harness(tmp_path,"""
+$exe = 'C:\\x\\codex.cmd'
+foreach ($k in 7643, 7644) {
+  try { 'FITS ' + $k + ' ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * $k)) -ImageCount 3) }
+  catch { 'REFUSED ' + $k + ' ' + $_.Exception.Message }
+}
+try { 'FITS-NOIMG ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * 7644))) } catch { 'REFUSED-NOIMG ' + $_.Exception.Message }
+try { 'FITS-NATIVE ' + (Assert-CodexCommandLineFits -Exe 'C:\\x\\codex.exe' -Argv @('exec', ('x' * 7644)) -ImageCount 3) } catch { 'REFUSED-NATIVE ' + $_.Exception.Message }
+""")
+    out=r.stdout
+    assert "FITS 7643 7665" in out,(out,r.stderr)
+    assert "REFUSED 7644 image-args-too-long: the codex command line would be 7666 characters with 3 image(s)" in out,(out,r.stderr)
+    assert "REFUSED-NOIMG codex-args-too-long:" in out,(out,r.stderr)
+    assert "FITS-NATIVE 7666" in out,(out,r.stderr)
+
+
+def test_the_shim_reserve_covers_the_shims_own_literal_text(tmp_path):
+    # r10 fix iteration 1 (adversary A2 on b04222df): a shim with 1001 literal spaces before %* forwards a line ~1000 characters longer than
+    # the fixed 512 reserve allowed for, so cmd.exe refused after launch. The reserve is now at least the shim's own text.
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(('@echo off\r\nC:\\pins\\codex.exe'+' '*1001+'%*\r\n').encode("ascii"))
+    r=_cmdline_harness(tmp_path,f"""
+$exe = '{shim}'
+$text = [IO.File]::ReadAllText($exe)
+$l1 = Get-NativeCommandLineLength -Exe $exe -Argv @('exec', 'x')
+function Try-K($label, $k) {{
+  try {{ $label + ' FITS ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * $k)) -DelayedExpansion $false) }} catch {{ $label + ' REFUSED ' + $_.Exception.Message }}
+}}
+Try-K 'old-edge' (8191 - ($exe.Length + 512) - $l1 + 1)
+Try-K 'new-edge' (8191 - ($exe.Length + $text.Length) - $l1 + 1)
+Try-K 'new-past' (8191 - ($exe.Length + $text.Length) - $l1 + 2)
+""")
+    out=r.stdout
+    assert "old-edge REFUSED codex-args-too-long:" in out,(out,r.stderr)
+    assert "new-edge FITS " in out,(out,r.stderr)
+    assert "new-past REFUSED codex-args-too-long:" in out,(out,r.stderr)
+
+
+def test_the_shim_bound_charges_every_forwarding_of_the_arguments(tmp_path):
+    # r10 fix iteration 2 (adversary A2 on b0a71c84): 'codex.exe %* %*' puts the arguments on its line twice, so a line counted at 4939 became
+    # 9851 after launch. The counted length is charged once per %* / %1-%9 reference in the shim text.
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(b'@echo off\r\nC:\\pins\\codex.exe %* %*\r\n')
+    r=_cmdline_harness(tmp_path,f"""
+$exe = '{shim}'
+$limit = 8191 - ($exe.Length + 512)
+$l1 = Get-NativeCommandLineLength -Exe $exe -Argv @('exec', 'x')
+function Try-K($label, $k) {{
+  try {{ $label + ' FITS ' + (Assert-CodexCommandLineFits -Exe $exe -Argv @('exec', ('x' * $k)) -ImageCount 1 -DelayedExpansion $false) }} catch {{ $label + ' REFUSED ' + $_.Exception.Message }}
+}}
+$kHalf = [int][Math]::Floor($limit / 2) - $l1 + 1
+Try-K 'half' $kHalf
+Try-K 'past-half' ($kHalf + 1)
+Try-K 'once-edge' ($limit - $l1 + 1)
+""")
+    out=r.stdout
+    assert "half FITS " in out,(out,r.stderr)
+    assert "past-half REFUSED image-args-too-long:" in out,(out,r.stderr)
+    assert "once-edge REFUSED image-args-too-long:" in out,(out,r.stderr)
+
+
+def test_the_codex_command_line_bound_refuses_an_argument_cmd_would_expand(tmp_path):
+    # r8 iteration 2 (adversary A1 on 7ba1883b): the length was counted BEFORE cmd.exe expanded %NAME% (and, with delayed expansion, !NAME!),
+    # so `-ModelOverride '%PAD%'` measured 332 characters and became 8419. Through a shim such an argument is refused; a native exe is not.
+    r=_cmdline_harness(tmp_path,"""
+$shim = 'C:\\x\\codex.cmd'
+function Try-Fits($label, $exe, $argv, $delayed) {
+  try { $label + ' FITS ' + (Assert-CodexCommandLineFits -Exe $exe -Argv $argv -ImageCount 1 -DelayedExpansion $delayed) } catch { $label + ' REFUSED ' + $_.Exception.Message }
+}
+Try-Fits 'pct' $shim @('exec', '-m', '%MLV_ADV_PAD%') $false
+Try-Fits 'pct-delayed' $shim @('exec', '-o', 'C:\\run\\a%b\\terra-001.last.txt') $true
+Try-Fits 'bang-delayed' $shim @('exec', '-o', 'C:\\!Layi Wkspc\\run\\terra-001.last.txt') $true
+Try-Fits 'bang-plain' $shim @('exec', '-o', 'C:\\!Layi Wkspc\\run\\terra-001.last.txt') $false
+Try-Fits 'native' 'C:\\x\\codex.exe' @('exec', '-m', '%MLV_ADV_PAD%') $true
+""")
+    out=r.stdout
+    assert "pct REFUSED codex-arg-cmd-expansion: the codex argument '%MLV_ADV_PAD%'" in out,(out,r.stderr)
+    assert "pct-delayed REFUSED codex-arg-cmd-expansion:" in out,(out,r.stderr)
+    assert "bang-delayed REFUSED codex-arg-cmd-expansion:" in out,(out,r.stderr)
+    assert "bang-plain FITS " in out,(out,r.stderr)
+    assert "native FITS " in out,(out,r.stderr)
+
+
+def test_delayed_expansion_is_detected_from_the_shim_itself(tmp_path):
+    on=tmp_path/"on.cmd"; on.write_text('@echo off\r\nsetlocal EnableDelayedExpansion\r\n"x.exe" %*\r\n',encoding="ascii")
+    plain=tmp_path/"plain.cmd"; plain.write_text('@echo off\r\n"x.exe" %*\r\n',encoding="ascii")
+    r=_cmdline_harness(tmp_path,f"""
+'ON ' + (Test-CmdDelayedExpansion -Shim '{on}')
+'PLAIN ' + (Test-CmdDelayedExpansion -Shim '{plain}')
+'MISSING ' + (Test-CmdDelayedExpansion -Shim '{tmp_path / "absent.cmd"}')
+""")
+    assert "ON True" in r.stdout and "MISSING True" in r.stdout,(r.stdout,r.stderr)
+    assert re.search(r"PLAIN (True|False)",r.stdout),(r.stdout,r.stderr)
+
+
+# r9: the registry is never read or written by these tests. Get-ItemProperty is shadowed by a script function (a PowerShell function wins over
+# the cmdlet of the same name) that answers from $MockReg; 'absent' means the key exists without a DelayedExpansion value. The mock answers
+# both the r8 call shape (-Name DelayedExpansion, throws when absent) and the r9 one (whole key, value missing), so the RED is behavioural.
+_REG_MOCK = """
+$MockReg = @{{ 'HKCU:' = {hkcu}; 'HKLM:' = {hklm} }}
+function Get-ItemProperty {{
+  [CmdletBinding()] param([string]$LiteralPath, [string[]]$Name)
+  $v = $MockReg[$LiteralPath.Substring(0, 5)]
+  if ($Name) {{
+    if ($null -eq $v) {{ throw [System.Management.Automation.PSArgumentException]::new('Property DelayedExpansion does not exist') }}
+    return [pscustomobject]@{{ DelayedExpansion = $v }}
+  }}
+  if ($null -eq $v) {{ return [pscustomobject]@{{ EnableExtensions = 1 }} }}
+  return [pscustomobject]@{{ EnableExtensions = 1; DelayedExpansion = $v }}
+}}
+"""
+_PLAIN_SHIM = '@echo off\r\n"x.exe" %*\r\n'
+
+
+def _detect(tmp_path, shim_text, hkcu="$null", hklm="$null", pre="", wd=""):
+    shim=tmp_path/"shim.cmd"; shim.write_bytes(shim_text.encode("ascii"))
+    call=f"Test-CmdDelayedExpansion -Shim '{shim}'"+(f" -WorkingDirectory '{wd}'" if wd else "")
+    r=_cmdline_harness(tmp_path,_REG_MOCK.format(hkcu=hkcu,hklm=hklm)+pre+f"\n'DETECTED ' + ({call})\n")
+    m=re.search(r"DETECTED (True|False)",r.stdout)
+    assert m,(r.stdout,r.stderr)
+    return m.group(1)=="True"
+
+
+@pytest.mark.parametrize("hkcu,hklm,expected",[
+    # sol r8 B1 / fable r8 hardening 2: cmd.exe /? "The user specific setting takes precedence over the machine setting."
+    ("[int]0","[int]1",False),("[int]1","[int]0",True),("[int]0","[int]0",False),
+    ("$null","[int]1",True),("[int]1","$null",True),("$null","$null",False),
+    # a value cmd.exe would not read as a DWORD is unknowable: fail closed.
+    ("'0'","[int]0",True),
+])
+def test_registry_delayed_expansion_is_the_effective_setting_hkcu_over_hklm(tmp_path,hkcu,hklm,expected):
+    assert _detect(tmp_path,_PLAIN_SHIM,hkcu,hklm) is expected
+
+
+@pytest.mark.parametrize("shim_text",[
+    '@echo off\r\nrem EnableDelayedExpansion is disabled\r\n"x.exe" %*\r\n',
+    '@echo off\r\n@REM setlocal EnableDelayedExpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\n:: cmd /v:on was removed\r\n"x.exe" %*\r\n',
+    # measured on this host: rem and :: swallow a '&' on their own line, so this never runs.
+    '@echo off\r\nrem x & setlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\nsetlocal DisableDelayedExpansion\r\ncmd.exe /v:off /c "x.exe" %*\r\n',
+    # measured: '/v:offx' and '/V:OFF' leave it off (cmd.exe reads the '/v:off' prefix)
+    '@echo off\r\ncmd.exe /V:OFF /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd.exe /v:offx /c "x.exe" %*\r\n',
+    # forwarded positional references are static: %*, %1, %~dp0
+    '@echo off\r\n"%~dp0x.exe" %1 %*\r\n',
+    # r10: a redirection before or after a native target is still off (the target is what runs); '2>&1' is not a command separator
+    '@echo off\r\n2>nul "x.exe" %*\r\n',
+    '@echo off\r\n>nul 2>&1 C:\\x.exe %*\r\n',
+    '@echo off\r\n"x.exe" %* 2>&1\r\n',
+    # r10 fix iteration 1: a nested cmd.exe whose /c command line is a native target is still off
+    '@echo off\r\nC:\\Windows\\System32\\cmd.exe /d /c C:\\x.exe %*\r\n',
+    '@echo off\r\ncmd.exe /d /s /c "x.exe" %*\r\n',
+])
+def test_comment_lines_and_disabling_spellings_do_not_turn_delayed_expansion_on(tmp_path,shim_text):
+    # sol r8 B1: both hives 0 plus a harmless comment refused every default C:\!Layi Wkspc run dir.
+    assert _detect(tmp_path,shim_text,"[int]0","[int]0") is False
+
+
+_NPM_SHIM=('@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n'
+           'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n'
+           'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n')
+
+
+def test_the_real_npm_codex_shim_shape_reads_as_delayed_expansion_off(tmp_path):
+    # the template is recognised by its exact text; node.exe beside the shim is what it runs.
+    (tmp_path/"node.exe").write_bytes(b"MZ")
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0") is False
+
+
+@pytest.mark.parametrize("first,expected",[("node.exe",False),("node.com",False),("node.cmd",True),("node.bat",True),(None,True)])
+def test_the_npm_shim_is_off_only_when_the_node_it_runs_is_native(tmp_path,first,expected):
+    # r9 fix iteration 1: without node.exe beside the shim the template runs the first 'node' cmd.exe finds (working directory, then PATH).
+    # A node.cmd/.bat would re-parse the forwarded arguments under its own settings; no node at all is unknowable. Both fail closed.
+    wd=tmp_path/"wd"; wd.mkdir(); p1=tmp_path/"p1"; p1.mkdir(); p2=tmp_path/"p2"; p2.mkdir()
+    if first: (p1/first).write_bytes(b"x")
+    (p2/"node.exe").write_bytes(b"MZ") if first else None
+    pre=f"\n$env:PATH = '{p1};{p2}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.JS'\n"
+    if first is None: pre=f"\n$env:PATH = '{p1}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.JS'\n"
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is expected
+
+
+def test_the_npm_shim_searches_the_working_directory_first(tmp_path):
+    wd=tmp_path/"wd"; wd.mkdir(); (wd/"node.cmd").write_bytes(b"x"); p1=tmp_path/"p1"; p1.mkdir(); (p1/"node.exe").write_bytes(b"MZ")
+    pre=f"\n$env:PATH = '{p1}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'\n"
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is True
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre) is False
+
+
+def test_the_npm_shim_is_on_when_only_the_working_directory_holds_a_native_node(tmp_path):
+    # r9 adversary A2 on 353df92c: with NoDefaultCurrentDirectoryInExePath set, cmd.exe skips the working directory and runs PATH's
+    # node.cmd. Both searches (with and without the working directory) must find a native node.
+    wd=tmp_path/"wd"; wd.mkdir(); (wd/"node.exe").write_bytes(b"MZ"); adv=tmp_path/"adv"; adv.mkdir(); (adv/"node.cmd").write_bytes(b"x")
+    pre=f"\n$env:PATH = '{adv}'; $env:PATHEXT = '.COM;.EXE;.BAT;.CMD'; $env:NoDefaultCurrentDirectoryInExePath = '1'\n"
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(wd)) is True
+
+
+@pytest.mark.parametrize("entry,parent_rel,child_rel",[
+    # sol r9 B2: the launcher process (parent) sits in 'producer' and holds node.exe at the entry; the codex child runs in WorkDir 'child'
+    # and holds node.cmd there. r9 resolved the relative entry with File.Exists, i.e. against the PARENT's directory, and read OFF.
+    ("rel","rel","rel"),
+    (".\\bin","bin","bin"),
+    ("..\\bin","..\\bin","..\\bin"),
+    # '.' is the child's working directory, which the with-working-directory search already reaches first; kept as a class row
+    (".","",""),
+    # an empty entry is unknowable too: refused, not dropped
+    ("","",None),
+])
+def test_the_npm_shim_native_node_exemption_refuses_a_relative_path_entry(tmp_path,entry,parent_rel,child_rel):
+    # r10 (sol r9 B2): only ABSOLUTE PATH entries may grant the exemption; a relative or empty entry reached before the hit makes it
+    # unavailable (ON) with a typed warning, resolved against neither directory. The filesystem boundary is the process directory:
+    # [IO.Directory]::SetCurrentDirectory moves the parent to 'producer' while -WorkingDirectory names the child's 'child'.
+    producer=tmp_path/"p"/"producer"; child=tmp_path/"child"; ok=tmp_path/"ok"
+    for d in (producer,child,ok): d.mkdir(parents=True)
+    (producer/parent_rel).mkdir(parents=True,exist_ok=True); (producer/parent_rel/"node.exe").write_bytes(b"MZ")
+    if child_rel is not None:
+        (child/child_rel).mkdir(parents=True,exist_ok=True); (child/child_rel/"node.cmd").write_bytes(b"@setlocal enabledelayedexpansion\r\n")
+    (ok/"node.exe").write_bytes(b"MZ")
+    path=f"{entry};{ok}"
+    pre=(f"\n[System.IO.Directory]::SetCurrentDirectory('{producer}'); $env:PATH = '{path}'; $env:PATHEXT = '.EXE;.CMD'\n"
+         "Remove-Item Env:NoDefaultCurrentDirectoryInExePath -ErrorAction SilentlyContinue\n")
+    assert not (tmp_path/"node.exe").exists()
+    assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre,wd=str(child)) is True
+    # the same layout with only absolute entries is still off (the real shims on this host have only absolute PATH entries); for '.' the
+    # child's node.cmd sits in the working directory itself, which the with-working-directory search reaches first, so it stays on
+    if child_rel!="": assert _detect(tmp_path,_NPM_SHIM,"[int]0","[int]0",pre=pre.replace(f"'{path}'",f"'{ok}'"),wd=str(child)) is False
+
+
+def test_the_npm_shim_relative_path_refusal_is_typed(tmp_path):
+    ok=tmp_path/"ok"; ok.mkdir(); (ok/"node.exe").write_bytes(b"MZ")
+    shim=tmp_path/"shim.cmd"; shim.write_bytes(_NPM_SHIM.encode("ascii"))
+    r=_cmdline_harness(tmp_path,_REG_MOCK.format(hkcu="[int]0",hklm="[int]0")+
+        f"\n$env:PATH = 'rel;{ok}'; $env:PATHEXT = '.EXE;.CMD'\n'DETECTED ' + (Test-CmdDelayedExpansion -Shim '{shim}' -WorkingDirectory '{tmp_path}' 3>&1 | Out-String)\n")
+    assert "npm-shim-node-path-relative:" in r.stdout and "'rel'" in r.stdout and "True" in r.stdout,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("shim_text",[
+    # sol r8 B2 (measured: cmd.exe removed the caret and expanded !OS! to Windows_NT)
+    '@echo off\r\nsetlocal enable^delayedexpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\ncmd /v:o^n /c "x.exe" %*\r\n',
+    # fable r8 hardening 2: a bare /V, and the other spellings of the switch
+    '@echo off\r\ncmd /V /c "x.exe" %*\r\n',
+    '@echo off\r\n%COMSPEC% /V:ON /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd/v /c "x.exe" %*\r\n',
+    '@echo off\r\nsetlocal ^^^\r\nenabledelayedexpansion\r\n"x.exe" %*\r\n',
+    # a comment line continued onto a live line is not a comment (measured: 'rem x ^' did not swallow the setlocal)
+    '@echo off\r\nrem x ^\r\nsetlocal enabledelayedexpansion\r\n"x.exe" %*\r\n',
+    # arguments built at run time cannot be read statically (measured: 'setlocal %E%' turned it on)
+    '@echo off\r\nset E=enabledelayed\r\nsetlocal %E%expansion\r\n"x.exe" %*\r\n',
+    # r9 adversary A1 on 0da1f4ef: every /v switch but '/v:off...' turns it on (measured /von /v1 /voff /v:of on)
+    '@echo off\r\ncmd /von /c node C:\\pins\\codex.js %*\r\n',
+    '@echo off\r\ncmd /v1 /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /vfoo /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /voff /c "x.exe" %*\r\n',
+    '@echo off\r\ncmd /v:of /c "x.exe" %*\r\n',
+    # r9 adversary A2 on 0da1f4ef: a command built at run time, and its siblings (for variables, call, start, a nested batch file)
+    '@echo off\r\nset E=enabledelayed\r\nset L=set\r\n%L%local %E%expansion\r\nnode C:\\pins\\codex.js %*\r\n',
+    '@echo off\r\nfor %%s in (setlocal) do %%s enabledelayed%%xpansion\r\n"x.exe" %*\r\n',
+    '@echo off\r\ncall :go %*\r\nexit /b\r\n:go\r\n"x.exe" %*\r\n',
+    '@echo off\r\nstart /b /wait "" "x.exe" %*\r\n',
+    '@echo off\r\n"C:\\tools\\inner.bat" %*\r\n',
+    '@echo off\r\n%COMSPEC% /c "x.exe" %*\r\n',
+    # the npm template is OFF only by its exact text: one changed character makes it an ordinary shim, read with the dynamic rule
+    _NPM_SHIM.replace('title %COMSPEC%','title %X%'),
+    # r9 adversary A1 on 353df92c: an extensionless target resolves to inner.cmd, which enables it before forwarding; and its siblings
+    # (a bare program name, an if/else whose inner command is not at the segment start)
+    '@echo off\r\nC:\\pins\\inner %*\r\n',
+    '@echo off\r\nnode C:\\pins\\codex.js %*\r\n',
+    '@echo off\r\nif exist "C:\\x.exe" C:\\pins\\inner %*\r\n',
+    # r10 (sol r9 B1, fable r9 B1): cmd.exe runs the command after a leading redirection, so the r9 skip of a redirection-led segment read
+    # these as off. Each is red on 7a695393. The class: every redirection spelling and '@' before an extensionless, bare or batch target.
+    '@echo off\r\n>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n2>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n>>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n1>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n>nul 2>&1 C:\\pins\\inner %*\r\n',
+    '@echo off\r\n@2>nul node %*\r\n',
+    '@echo off\r\n> nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\n2>"C:\\log dir\\x.txt" C:\\pins\\inner %*\r\n',
+    '@echo off\r\n<nul C:\\pins\\inner %*\r\n',
+    # r10 fail-closed default: a redirection target or command token this reading cannot parse is ON, not skipped
+    '@echo off\r\n>nul,C:\\pins\\inner C:\\a.exe %*\r\n',
+    '@echo off\r\nC:\\pins\\inner,C:\\a.exe %*\r\n',
+    '@echo off\r\n"C:\\a.exe"C:\\pins\\inner %*\r\n',
+    '@echo off\r\n>\r\nC:\\a.exe %*\r\n',
+    # r10: a shim that runs no native program is not positively recognised (fable r9 note: a 0-byte shim read as off)
+    '',
+    '@echo off\r\n',
+    # r10 fix iteration 1 (adversary A1 on b04222df): a native cmd.exe runs ANOTHER command line; its /c or /k text is classified too
+    '@echo off\r\nC:\\Windows\\System32\\cmd.exe /d /c C:\\pins\\inner %*\r\n',
+    '@echo off\r\ncmd.exe /k C:\\pins\\inner %*\r\n',
+    '@echo off\r\ncmd.exe /c "C:\\pins\\inner" %*\r\n',
+    '@echo off\r\ncmd.exe /c 2>nul C:\\pins\\inner %*\r\n',
+    '@echo off\r\ncmd.exe /c "x.exe & C:\\pins\\inner" %*\r\n',
+    '@echo off\r\ncmd.exe /c ""C:\\a b\\x.exe" %*"\r\n',
+    '@echo off\r\ncmd.exe /d %*\r\n',
+    '@echo off\r\ncmd.exe /c cmd.exe /c cmd.exe /c x.exe %*\r\n',
+    # r10 fix iteration 2 (adversary A1 on b0a71c84): a quoted internal name is looked up on PATH ('"setlocal" %*' runs setlocal.cmd)
+    '@echo off\r\n"setlocal" %*\r\nC:\\pins\\codex.exe %*\r\n',
+    '@echo off\r\n"echo" x\r\nC:\\pins\\codex.exe %*\r\n',
+    '@echo off\r\n2>nul "cd" x\r\nC:\\pins\\codex.exe %*\r\n',
+])
+def test_every_spelling_cmd_parses_as_enabling_delayed_expansion_is_detected(tmp_path,shim_text):
+    assert _detect(tmp_path,shim_text,"[int]0","[int]0") is True
+
+
+def test_a_model_override_cmd_would_expand_past_the_limit_is_refused_before_the_codex_child_starts(fixture_tree):
+    # r8 iteration 2 (adversary A1 on 7ba1883b), the adversary's own input: an 8100-character variable named in -ModelOverride.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_ADV_PAD"]="x"*8100
+    r=run_lane(cmd+["-ModelOverride","%MLV_ADV_PAD%","-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    # r12 (Dot improvement on c4f381a7, item 4): the codex child is a direct CreateProcess, so nothing expands '%MLV_ADV_PAD%': codex receives
+    # the literal 13 characters that were counted, never the 8100-character value. Refusing it (codex-arg-cmd-expansion) was a cmd.exe rule.
+    assert (root/"args.json").exists(),(r.returncode,text[-4000:])
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert "%MLV_ADV_PAD%" in argv and not any("x"*100 in a for a in argv),argv
+
+
+def test_a_run_dir_with_a_bang_is_refused_for_every_codex_argument_when_the_shim_runs_delayed_expansion(fixture_tree):
+    # r8 iteration 2, sibling class (-o <RunDir>\...last.txt): no image at all, a RunDir 'run!x' and a shim with delayed expansion on.
+    fixture_tree["shim"].write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; run_dir=root/"run!x"; run_dir.mkdir()
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd,env)
+    text=_failure_text(r,run_dir/"terra-001.receipt.json")
+    # r12: the delayed-expansion shim is not a launchable shape (it needs cmd.exe), so it is refused, typed, at resolution, which now runs
+    # before every probe and every argument bound.
+    assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+# r11 (sol r10 B1, sol r10 B2, fable r10 B1; hub step E): the codex child is never a cmd.exe running the shim. The npm template launches
+# its native node + script, a strict one-line shim launches the program it names, and every other shim is refused, typed, before launch.
+def _bang_run_dir_case(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; sha=_write_png(png,b"original bytes P")
+    run_dir=root/"!OS!"; run_dir.mkdir()
+    (root/"Windows_NT").mkdir(); (root/"Windows_NT"/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+    return root,png,sha,run_dir
+
+
+def _assert_never_q_read_p_certified(root, run_dir):
+    receipt=run_dir/"terra-001.receipt.json"
+    if (root/"image-bytes.json").exists() and receipt.exists():
+        seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+        entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+        assert not (entry.get("consumedVerified") is True and seen and seen[0]["sha256"]!=entry["sha256"]), ("consumedVerified certified bytes the child did not read",entry,seen)
+
+
+def test_r11_sol_b1_a_shim_side_expansion_is_refused_typed_before_launch(fixture_tree):
+    # sol r10 B1: 'C:\pins\codex.exe %PAD% %*' with PAD = 7800 spaces measured 1,109 characters before launch and 8,903 after cmd.exe expanded
+    # the shim line, so cmd.exe refused AFTER launch. Here the fixture shim carries the same %PAD% reference in front of %*.
+    fixture_tree["shim"].write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %PAD% %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["PAD"]=" "*7800
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unsupported" in text and "%PAD%" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists(), "a shim whose own text expands must be refused before the codex child starts"
+
+
+def test_r11_fable_b1_a_redirection_glued_to_the_command_token_never_certifies_a_file_codex_did_not_read(fixture_tree):
+    # fable r10 B1: 'C:\pins\inner>nul.exe %*' read as the native 'inner>nul.exe'; cmd.exe runs inner.cmd, which enables delayed expansion, and
+    # codex opened the Windows_NT sibling Q while held P certified. The shim must be refused, typed, before launch. End to end this uses
+    # fable's '<nul.exe' sibling: '>nul.exe' also swallows the pre-launch 'codex mcp list' answer, which refuses the lane earlier for
+    # another reason; the literal '>nul.exe' row is in test_r11_every_shim_outside_the_two_launchable_shapes_is_refused_typed.
+    if _registry_delayed_expansion_on(): pytest.skip("this host turns cmd.exe delayed expansion on, so every '!' path is refused before this shape matters")
+    inner=fixture_tree["root"]/"inner"
+    if " " in str(inner): pytest.skip("the unquoted glued target needs a space-free fixture path")
+    (fixture_tree["root"]/"inner.cmd").write_text(f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    fixture_tree["shim"].write_text(f'@echo off\r\n{inner}<nul.exe %*\r\n',encoding="ascii")
+    root,png,sha,run_dir=_bang_run_dir_case(fixture_tree)
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    _assert_never_q_read_p_certified(root,run_dir)
+    text=_failure_text(r,run_dir/"terra-001.receipt.json")
+    assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+_PROC_START_CODEX = "    $proc = [Diagnostics.Process]::Start($psi)\n}\n"
+
+
+def _swap_shim_mutation(fixture_tree, anchor, before):
+    swapped=f'@echo off\r\nsetlocal enabledelayedexpansion\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n'
+    swap=(f"[System.IO.File]::WriteAllText('{str(fixture_tree['shim']).replace(chr(39),chr(39)*2)}', "
+          f"'{swapped.replace(chr(39),chr(39)*2)}'.Replace('\\r\\n', [string][char]13 + [char]10))\n")
+    def mutation(text):
+        assert text.count(anchor)==1, "launch anchor moved; update this fixture mutation"
+        return text.replace(anchor, (swap+anchor) if before else (anchor+swap))
+    return mutation
+
+
+def test_r11_sol_b2_a_shim_replaced_after_inspection_never_certifies_a_file_codex_did_not_read(fixture_tree):
+    # sol r10 B2: a safe shim is inspected (delayed expansion off, so '!' is permitted in the snapshot path), then replaced by one that enables
+    # delayed expansion just before Process.Start. cmd.exe expanded !OS! and codex opened Q while held P certified. The child must read P.
+    if _registry_delayed_expansion_on(): pytest.skip("this host turns cmd.exe delayed expansion on, so every '!' path is refused before this shape matters")
+    root,png,sha,run_dir=_bang_run_dir_case(fixture_tree)
+    cache=_terra_env(fixture_tree)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="terra",mutation=_swap_shim_mutation(fixture_tree,_PROC_START_CODEX,before=True))
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json"); env["OS"]="Windows_NT"
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    _assert_never_q_read_p_certified(root,run_dir)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads((run_dir/"terra-001.receipt.json").read_text(encoding="utf-8"))["imagePaths"][0]
+    assert seen[0]["path"]==entry["path"] and "!OS!" in seen[0]["path"],(entry,seen)
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"]==sha,(entry,seen)
+
+
+def test_r11_a_shim_changed_between_inspection_and_launch_is_refused_typed(fixture_tree):
+    # hub step E (2): the shim is bound by its content hash where it is inspected and re-hashed immediately before launch.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=_swap_shim_mutation(fixture_tree,"    # post-shim-resolution-tick\n",before=False))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-changed" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+def _resolve(tmp_path, shim_text, pre=""):
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(shim_text.encode("ascii"))
+    r=_cmdline_harness(tmp_path,pre+f"""
+try {{ $x = Resolve-CodexShimLaunch -Exe '{shim}'; 'KIND ' + $x.Kind; 'FILE ' + $x.FileName; 'ARGS [' + ($x.PrefixArgs -join '|') + ']' }}
+catch {{ 'CAUGHT ' + $_.Exception.Message }}
+""")
+    assert ("KIND " in r.stdout) or ("CAUGHT " in r.stdout),(r.stdout,r.stderr)
+    return r.stdout
+
+
+# One row per refusal class of hub step E (1), with the three literal reviewer inputs first.
+@pytest.mark.parametrize("shim_text,why",[
+    ("@echo off\r\nC:\\pins\\codex.exe %PAD% %*\r\n","'%' expansion"),                    # sol r10 B1, literal
+    ("@echo off\r\nC:\\pins\\codex.exe %PAD:~0,7800% %*\r\n","'%' expansion"),
+    ("@echo off\r\nC:\\pins\\codex.exe %PAD% %PAD% %*\r\n","'%' expansion"),
+    ("@echo off\r\nC:\\pins\\inner>nul.exe %*\r\n","cmd.exe operator"),                     # fable r10 B1, literal
+    ("@echo off\r\nC:\\pins\\inner<nul.exe %*\r\n","cmd.exe operator"),
+    ("@echo off\r\ncmd>nul.exe /c C:\\pins\\inner %*\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\codex.exe %* | more\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\codex.exe %* & C:\\pins\\inner\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\co^dex.exe %*\r\n","cmd.exe operator"),
+    ("@echo off\r\n(C:\\pins\\codex.exe %*)\r\n","cmd.exe operator"),
+    ("@echo off\r\nC:\\pins\\codex.exe !X! %*\r\n","'!'"),
+    ("@echo off\r\nsetlocal enabledelayedexpansion\r\nC:\\pins\\codex.exe %*\r\n","command lines"),  # sol r10 B2's replacement shim
+    ("@echo off\r\nC:\\pins\\codex.exe %*\r\nC:\\pins\\codex.exe %*\r\n","command lines"),
+    ("","command lines"),
+    ("@echo off\r\nC:\\pins\\codex.exe %* %*\r\n","'%' expansion"),
+    ("@echo off\r\nC:\\pins\\codex.exe %1\r\n","exactly one unquoted '%*'"),
+    ("@echo off\r\nC:\\pins\\codex.exe \"%*\"\r\n","exactly one unquoted '%*'"),
+    ("@echo off\r\nC:\\pins\\inner %*\r\n","not named as a native"),
+    ("@echo off\r\nC:\\pins\\node.cmd C:\\pins\\codex.js %*\r\n","not named as a native"),
+    ("@echo off\r\nbin\\codex.exe %*\r\n","relative path"),
+    ("@echo off\r\nC:\\pins\\codex.exe a,b %*\r\n","separator"),
+    ("@echo off\r\n\"C:\\pins\\codex.exe\"x %*\r\n","not a plain or fully quoted word"),
+    ("@echo off\r\nC:\\pins\\definitely-absent-r11\\codex.exe %*\r\n","does not exist"),
+    # r11 fix iteration 1 (adversary A1 on 9de900bd): a program that parses its own command line again (cmd.exe /c, a PowerShell -Command,
+    # forfiles /c, node -e) would re-read the forwarded arguments; only codex.exe, node.exe <script> and a PowerShell host running -File are
+    # launched (an allowlist, so an interpreter nobody listed is refused too).
+    ("@echo off\r\nC:\\Windows\\System32\\cmd.exe /d /c C:\\pin\\codex.exe %*\r\n","launchable program"),
+    ("@echo off\r\ncmd.exe /c C:\\pin\\codex.exe %*\r\n","launchable program"),
+    ("@echo off\r\nC:\\Windows\\System32\\forfiles.exe /c C:\\pin\\codex.exe %*\r\n","launchable program"),
+    ("@echo off\r\nC:\\Windows\\System32\\wscript.exe C:\\pin\\codex.js %*\r\n","launchable program"),
+    ("@echo off\r\npowershell.exe -NoProfile -Command C:\\pin\\codex.ps1 %*\r\n","launchable program"),
+    ("@echo off\r\npwsh.exe -c C:\\pin\\codex.ps1 %*\r\n","launchable program"),
+    ("@echo off\r\npwsh.exe -File C:\\pin\\codex.ps1 -Extra %*\r\n","launchable program"),
+    ("@echo off\r\npwsh.exe %*\r\n","launchable program"),
+    ("@echo off\r\nnode.exe -e x %*\r\n","launchable program"),
+    ("@echo off\r\nnode.exe %*\r\n","launchable program"),
+    ("@echo off\r\nC:\\pin\\tool.exe %*\r\n","launchable program"),
+])
+def test_r11_every_shim_outside_the_two_launchable_shapes_is_refused_typed(tmp_path,shim_text,why):
+    out=_resolve(tmp_path,shim_text)
+    assert "CAUGHT codex-shim-unsupported:" in out and why in out,(shim_text,out)
+
+
+def test_r11_a_strict_one_line_shim_launches_the_program_it_names_with_its_literal_args(tmp_path):
+    exe=tmp_path/"codex.exe"; exe.write_bytes(b"MZ")
+    out=_resolve(tmp_path,f'@echo off\r\n"{exe}" -x "a b" %*\r\n')
+    assert "KIND single-exe" in out and f"FILE {exe}" in out and "ARGS [-x|a b]" in out,out
+    out=_resolve(tmp_path,'@ECHO OFF\r\n\r\n%~dp0codex.exe %*\r\n')
+    assert "KIND single-exe" in out and f"FILE {exe}" in out and "ARGS []" in out,out
+    js=tmp_path/"codex.js"; js.write_text("//",encoding="ascii"); node=tmp_path/"node.exe"; node.write_bytes(b"MZ")
+    out=_resolve(tmp_path,f'@echo off\r\n"{node}" "{js}" %*\r\n')
+    assert "KIND single-exe" in out and f"FILE {node}" in out and f"ARGS [{js}]" in out,out
+    out=_resolve(tmp_path,f'@echo off\r\npwsh.exe -NoProfile -NonInteractive -File "{js}" %*\r\n')
+    assert "KIND single-exe" in out and f"ARGS [-NoProfile|-NonInteractive|-File|{js}]" in out,out
+
+
+def test_r11_a_bare_program_name_is_resolved_on_absolute_path_entries_only(tmp_path):
+    rel=tmp_path/"rel"; rel.mkdir(); (rel/"codex.exe").write_bytes(b"MZ")
+    good=tmp_path/"good"; good.mkdir(); (good/"codex.exe").write_bytes(b"MZ")
+    pre=f"Set-Location -LiteralPath '{tmp_path}'\n$env:PATH = 'rel;' + '{good}'\n"
+    out=_resolve(tmp_path,"@echo off\r\ncodex.exe %*\r\n",pre=pre)
+    assert "KIND single-exe" in out and f"FILE {good / 'codex.exe'}" in out,out
+
+
+@pytest.mark.parametrize("raw",[
+    "@echo off\r\nC:\\pin\\codex.exe -p café %*\r\n".encode("utf-8"),        # adversary A2 on 9de900bd, literal: UTF-8 'caf\xc3\xa9'
+    b"\xef\xbb\xbf@echo off\r\nC:\\pin\\codex.exe %*\r\n",                          # a UTF-8 BOM
+    "@echo off\r\nC:\\pin\\codex.exe -p café %*\r\n".encode("cp1252"),       # a single high byte
+    b"@echo off\r\nC:\\pin\\codex.exe -p a\x00b %*\r\n",                            # a NUL
+    b"@echo off\r\nC:\\pin\\codex.exe -p a\x1ab %*\r\n",                            # a control character (Ctrl-Z ends a cmd.exe read)
+])
+def test_r11_a_shim_byte_outside_printable_ascii_is_refused_typed(tmp_path,raw):
+    # r11 fix iteration 1 (adversary A2 on 9de900bd): the shim bytes were decoded as ASCII, so 'caf\xc3\xa9' became 'caf??' and was launched
+    # as a different literal argument. What a byte means to cmd.exe depends on the code page, so any byte outside printable ASCII
+    # (plus TAB, CR, LF) is refused, typed, instead of decoded.
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(raw)
+    r=_cmdline_harness(tmp_path,f"""
+try {{ $x = Resolve-CodexShimLaunch -Exe '{shim}'; 'KIND ' + $x.Kind + ' ARGS [' + ($x.PrefixArgs -join '|') + ']' }}
+catch {{ 'CAUGHT ' + $_.Exception.Message }}
+""")
+    assert "CAUGHT codex-shim-unsupported:" in r.stdout and "printable ASCII" in r.stdout,(raw,r.stdout,r.stderr)
+
+
+def test_r11_the_npm_template_launches_its_native_node_and_script_directly(tmp_path):
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    (tmp_path/"node.exe").write_bytes(b"MZ")
+    text=_NPM_SHIM
+    assert "GOTO start" in text, "the real npm template fixture text is required"
+    out=_resolve(tmp_path,text)
+    assert "KIND npm-node" in out and f"FILE {tmp_path / 'node.exe'}" in out and f"ARGS [{script}]" in out,out
+
+
+@pytest.mark.parametrize("pathext",[".EXE;\\..\\cmd.exe", "\\..\\cmd.exe", ".EXE;/../cmd.exe", ".EXE;:x"])
+def test_r11_a_pathext_entry_can_never_turn_the_node_search_into_another_program(tmp_path,pathext):
+    # r11 fix iteration 2 (adversary A1 on 06b68082, literal first row): with no node.exe beside the shim, 'node' + '\..\cmd.exe' resolved
+    # to <PATH entry>\cmd.exe and the npm template was launched as cmd.exe. A candidate must be the plain leaf <entry>\node<ext>.
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    p1=tmp_path/"p1"; p1.mkdir(); (p1/"cmd.exe").write_bytes(b"MZ")
+    out=_resolve(tmp_path,_NPM_SHIM,pre=f"$env:PATH = '{p1}'\n$env:PATHEXT = '{pathext}'\n")
+    assert "CAUGHT codex-shim-unsupported:" in out and "npm template" in out,(pathext,out)
+    assert "KIND npm-node" not in out,(pathext,out)
+
+
+def test_r11_the_npm_template_script_is_joined_to_the_shim_directory_as_cmd_builds_it(tmp_path):
+    # r11 fix iteration 2 (adversary A2 on 06b68082, literal): '"%dp0%\\codex.js"' names <shim dir>\codex.js, but Path.Combine(dir, '\codex.js')
+    # dropped the directory and selected <drive>:\codex.js. The script is the template text joined exactly as cmd.exe expands %dp0%.
+    (tmp_path/"codex.js").write_text("// A",encoding="ascii"); (tmp_path/"node.exe").write_bytes(b"MZ")
+    text=_NPM_SHIM.replace('"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js"','"%dp0%\\\\codex.js"')
+    assert '"%dp0%\\\\codex.js" %*' in text
+    out=_resolve(tmp_path,text)
+    assert "KIND npm-node" in out and f"ARGS [{tmp_path / 'codex.js'}]" in out,out
+    bin_dir=tmp_path/"a"/".bin"; bin_dir.mkdir(parents=True); (bin_dir/"node.exe").write_bytes(b"MZ")
+    (tmp_path/"a"/"pkg").mkdir(); (tmp_path/"a"/"pkg"/"codex.js").write_text("// B",encoding="ascii")
+    shim=bin_dir/"codex.cmd"; shim.write_bytes(_NPM_SHIM.replace('"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js"','"%dp0%\\..\\pkg\\codex.js"').encode("ascii"))
+    r=_cmdline_harness(tmp_path,f"$x = Resolve-CodexShimLaunch -Exe '{shim}'; 'ARGS [' + ($x.PrefixArgs -join '|') + ']'\n")
+    assert f"ARGS [{tmp_path / 'a' / 'pkg' / 'codex.js'}]" in r.stdout,(r.stdout,r.stderr)
+
+
+@pytest.mark.parametrize("first,ok",[("node.exe",True),("node.cmd",False),(None,False)])
+def test_r11_the_npm_template_needs_a_native_node_on_an_absolute_path_entry(tmp_path,first,ok):
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    p1=tmp_path/"p1"; p1.mkdir(); p2=tmp_path/"p2"; p2.mkdir(); (p2/"node.exe").write_bytes(b"MZ")
+    if first: (p1/first).write_bytes(b"MZ")
+    path=f"{p1};{p2}" if first else f"{p1}"
+    out=_resolve(tmp_path,_NPM_SHIM,pre=f"$env:PATH = '{path}'\n$env:PATHEXT = '.COM;.EXE;.BAT;.CMD'\n")
+    if ok: assert "KIND npm-node" in out and f"FILE {p1 / 'node.exe'}".lower() in out.lower(),out  # the PATHEXT spelling ('.EXE') is kept
+    else: assert "CAUGHT codex-shim-unsupported:" in out and "npm template" in out,out
+
+
+# r12 (adversary A1/A2, Dot B1, Dot item 4, CI run 41644166247 on c4f381a7; hub step E): read once, resolve, bound the resolved command for
+# its real transport, re-hash, launch. Each test below is RED on c4f381a7 (evidence under the r12 run dir) and GREEN on r12.
+def _free_drive_letter():
+    for letter in "QRSTUVWXYZPONMLK":
+        if not os.path.exists(f"{letter}:\\"): return letter
+    pytest.skip("no free drive letter for a subst root")
+
+
+def test_r12_a1_a_drive_root_path_entry_is_searched(tmp_path):
+    # adversary A1 on c4f381a7, literal shape: PATH=<root>:\;<later dir>, a node.exe in both, the npm template with no node.exe beside it.
+    # GetDirectoryName('Q:\node.exe')='Q:\' was compared with GetFullPath('Q:\').TrimEnd('\')='Q:', so the root entry was skipped and the
+    # later node selected; siblings: a bare program name in a one-line shim (refused 'does not exist' when the root is the only entry).
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    rootdir=tmp_path/"r"; rootdir.mkdir(); (rootdir/"node.exe").write_bytes(b"MZ"); (rootdir/"codex.exe").write_bytes(b"MZ")
+    later=tmp_path/"p2"; later.mkdir(); (later/"node.exe").write_bytes(b"MZ")
+    letter=_free_drive_letter()
+    made=subprocess.run(["subst",f"{letter}:",str(rootdir)],capture_output=True,text=True)
+    if made.returncode!=0: pytest.skip(f"subst unavailable: {made.stdout}{made.stderr}")
+    try:
+        out=_resolve(tmp_path,_NPM_SHIM,pre=f"$env:PATH = '{letter}:\\;{later}'\n$env:PATHEXT = '.EXE'\n")
+        assert "KIND npm-node" in out and f"FILE {letter}:\\node.exe".lower() in out.lower(),out
+        out=_resolve(tmp_path,"@echo off\r\ncodex.exe %*\r\n",pre=f"$env:PATH = '{letter}:\\'\n")
+        assert "KIND single-exe" in out and f"FILE {letter}:\\codex.exe".lower() in out.lower(),out
+    finally:
+        subprocess.run(["subst",f"{letter}:","/d"],capture_output=True,text=True)
+
+
+def test_r12_the_resolved_native_launch_is_bounded_by_createprocess_not_by_cmd(tmp_path):
+    # Dot B1 on c4f381a7 (unit): the npm template resolves to <node.exe> <script>; THAT command line is held to CreateProcess's 32767 characters
+    # (32766 plus the terminator). (a) 10,000 characters, above the old cmd.exe allowance of about 7.6k, fits; (b) exactly 32766 fits and 32767
+    # is refused, typed, with the image kind when images are attached.
+    script=tmp_path/"node_modules"/"@openai"/"codex"/"bin"/"codex.js"; script.parent.mkdir(parents=True); script.write_text("//",encoding="ascii")
+    (tmp_path/"node.exe").write_bytes(b"MZ")
+    shim=tmp_path/"codex.cmd"; shim.write_bytes(_NPM_SHIM.encode("ascii"))
+    r=_cmdline_harness(tmp_path,f"""
+$x = Resolve-CodexShimLaunch -Exe '{shim}'
+'KIND ' + $x.Kind
+$l1 = Get-NativeCommandLineLength -Exe $x.FileName -Argv (@($x.PrefixArgs) + @('exec', 'x'))
+function Try-K($label, $k, $img) {{
+  try {{ $label + ' FITS ' + (Assert-CodexLaunchFits -Launch $x -Argv @('exec', ('x' * $k)) -ImageCount $img) }} catch {{ $label + ' REFUSED ' + $_.Exception.Message }}
+}}
+Try-K 'above-cmd' 10000 3
+Try-K 'edge' (32766 - $l1 + 1) 3
+Try-K 'past' (32766 - $l1 + 2) 3
+Try-K 'past-noimg' (32766 - $l1 + 2) 0
+""")
+    out=r.stdout
+    assert "KIND npm-node" in out,(out,r.stderr)
+    assert "above-cmd FITS " in out,(out,r.stderr)
+    assert "edge FITS 32766" in out,(out,r.stderr)
+    assert "past REFUSED image-args-too-long: the codex command line would be 32767 characters" in out,(out,r.stderr)
+    assert "past-noimg REFUSED codex-args-too-long:" in out,(out,r.stderr)
+
+
+def test_r12_dot_b1_a_native_launch_above_the_old_cmd_bound_is_accepted(fixture_tree):
+    # Dot B1 on c4f381a7 (end to end, native-valid-above-CMD-bound): 120 images put the codex command line well past the old cmd.exe allowance
+    # (r11 refused it image-args-too-long against the ORIGINAL .cmd) and well under 32767. The direct launch must proceed and attach them all.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths","|".join([str(png)]*120)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode==0 and (root/"args.json").exists(),(r.returncode,text[-4000:])
+    argv=json.loads((root/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv.count("-i")==120 and sum(len(a)+1 for a in argv)>8191,len(argv)
+
+
+def test_r12_a2_a_shim_replaced_before_the_one_read_is_bounded_as_resolved(fixture_tree):
+    # adversary A2 on c4f381a7: r11 bounded the short shim, then the resolver read a replacement (an allowlisted pwsh line with 5000 ' -NoLogo',
+    # ~40k bytes, under the 64 KiB read cap) and nothing bounded the resolved 40k native command. Now the bound is derived from the one read
+    # the launch comes from, so the replacement is refused, typed, before any process starts.
+    long_line='@echo off\r\n"'+PWSH+'"'+" -NoLogo"*5000+f' -File "{fixture_tree["child"]}" %*\r\n'
+    assert 40000<len(long_line)<65536
+    anchor="    $codexLaunch = Resolve-CodexShimLaunch -Exe $exe\n"
+    swap=(f"[System.IO.File]::WriteAllText('{str(fixture_tree['shim']).replace(chr(39),chr(39)*2)}', "
+          f"'{long_line.replace(chr(39),chr(39)*2)}'.Replace('\\r\\n', [string][char]13 + [char]10))\n")
+    def mutation(text):
+        assert text.count(anchor)==1, "resolution anchor moved; update this fixture mutation"
+        return text.replace(anchor, swap+anchor)
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "args-too-long: the codex command line would be" in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+def test_r12_ci_41644166247_a_shim_the_raw_probe_cannot_run_is_refused_typed_by_resolution(fixture_tree):
+    # CI run 41644166247 (hosted job 125944985709, Windows Server 2025): the r11 fable B1 fixture shim '<inner><nul.exe %*' was run RAW by the
+    # --version and 'mcp list' probes through cmd.exe before the resolver. On Server 2025 'nul.exe' is not the NUL device, so cmd.exe failed
+    # the redirection, the probe refused the lane codex-mcp-list-unreadable (exit 127) and the typed codex-shim-unsupported never ran. This is
+    # the same shape with an input file that is absent on every host, so it is RED here too. Resolution now runs before any probe.
+    fixture_tree["shim"].write_text(f'@echo off\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %* <r12-absent-input.exe\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unsupported" in text and "codex-mcp-list-unreadable" not in text,(r.returncode,text[-4000:])
+    assert not (root/"args.json").exists()
+
+
+def test_r12_a3_an_unsupported_shim_is_never_run_by_any_probe(fixture_tree):
+    # ADVISORY A3 on c4f381a7, literal shape: a shim whose first command line writes a marker. r11's --version and 'mcp list' probes ran it
+    # through cmd.exe before the resolver refused it, so the marker appeared. Every probe now runs the resolved launch: no process starts.
+    marker=fixture_tree["root"]/"probe-ran.txt"
+    fixture_tree["shim"].write_text(f'@echo off\r\necho probe-ran>"{marker}"\r\n"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n',encoding="ascii")
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unsupported" in text,(r.returncode,text[-4000:])
+    assert not marker.exists(), "an unsupported shim was run by a probe before it was refused"
+    assert not (root/"args.json").exists()
+
+
+_AFTER_STDIN_ANCHOR = "$timedOut = $false\n$remainingMs = "
+_HOLD_STATE_ANCHOR = "exit $propagated"
+
+
+def _throw_while_alive(wait_for):
+    # adversary A1 on 2d55c467 / Dot B2: a later launch-path operation throws. Injected after stdin is closed, once the named state file exists.
+    wait=(f"$waitChild=[Diagnostics.Stopwatch]::StartNew(); while(-not (Test-Path -LiteralPath {wait_for}) -and $waitChild.ElapsedMilliseconds -lt 40000)"
+          "{Start-Sleep -Milliseconds 50}\nthrow [System.IO.IOException]::new('fixture-late-stream-failure')\n")
+    def mutation(text):
+        assert text.count(_AFTER_STDIN_ANCHOR)==1, "the post-stdin anchor moved; update this fixture mutation"
+        return text.replace(_AFTER_STDIN_ANCHOR,wait+_AFTER_STDIN_ANCHOR)
+    return mutation
+
+
+def _throw_after_the_child_exits(text):
+    # Dot B2 (a): the direct process has already exited when the later stream operation throws.
+    assert text.count(_AFTER_STDIN_ANCHOR)==1, "the post-stdin anchor moved; update this fixture mutation"
+    return text.replace(_AFTER_STDIN_ANCHOR,"[void]$proc.WaitForExit(40000)\nthrow [System.IO.IOException]::new('fixture-late-stream-failure')\n"+_AFTER_STDIN_ANCHOR)
+
+
+def _record_hold_state(out):
+    # At the very end of the lane process: can the snapshot be opened exclusively? A kept hold refuses that; a released one does not (the snapshot is read-only, so a write open would fail either way).
+    probe=(f"try {{ $h=[System.IO.File]::Open([string]$ImageAttachments[0].path,'Open','Read','None'); $h.Dispose(); $hs='released' }} catch {{ $hs=if($_.Exception.GetBaseException().HResult -eq -2147024864){{'held'}}else{{'probe-error: '+$_.Exception.GetBaseException().Message}} }}\n"
+           f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',$hs)\n")
+    def mutation(text):
+        assert text.count(_HOLD_STATE_ANCHOR)>=1, "the final exit moved; update this fixture mutation"
+        return (probe+_HOLD_STATE_ANCHOR).join(text.rsplit(_HOLD_STATE_ANCHOR,1))
+    return mutation
+
+
+def _chain(*mutations):
+    def mutation(text):
+        for m in mutations: text=m(text)
+        return text
+    return mutation
+
+
+def _reader_env(fixture_tree, env):
+    # A descendant handed the snapshot path: it tries to open the snapshot exclusively, standing for any change to it, until it can; only an open hold prevents that.
+    root=fixture_tree["root"]; script=root/"reader.ps1"
+    script.write_text("param($Snap)\n$t=$env:MLV_FIXTURE_READER_PID+'.tmp'; Set-Content -LiteralPath $t -Value $PID; Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_READER_PID\n"
+                      "$end=(Get-Date).AddSeconds(90); while((Get-Date) -lt $end){ try { $h=[IO.File]::Open($Snap,'Open','Read','None'); $h.Dispose(); Set-Content -LiteralPath $env:MLV_FIXTURE_READER_WROTE -Value 'wrote'; break } catch { Start-Sleep -Milliseconds 100 } }\nStart-Sleep -Seconds 90\n",encoding="ascii")
+    env=dict(env); env["MLV_FIXTURE_READER_SCRIPT"]=str(script); env["MLV_FIXTURE_READER_PID"]=str(root/"reader.pid"); env["MLV_FIXTURE_READER_WROTE"]=str(root/"reader.wrote")
+    return env
+
+
+def _reader_pid(root):
+    return int((root/"reader.pid").read_text(encoding="utf-8-sig").strip())
+
+
+def _pid_alive(pid):
+    r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"if(Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue){{exit 0}};exit 3"],capture_output=True,timeout=PWSH_PROBE_TIMEOUT_SEC)
+    return r.returncode==0
+
+
+def _stop_pid(pid):
+    subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"Stop-Process -Id {int(pid)} -Force -ErrorAction SilentlyContinue"],capture_output=True,timeout=PWSH_PROBE_TIMEOUT_SEC,check=False)
+
+
+def _assert_the_reader_was_gone_before_release(root, q):
+    pid=_reader_pid(root)
+    try:
+        time.sleep(1.5)
+        assert not (root/"reader.wrote").exists(), "the hold was released while a descendant holding the snapshot path was alive: it took the snapshot"
+        assert not _pid_alive(pid), "a descendant holding the snapshot path outlived the lane"
+        assert q.get("imageHoldRelease")=="released",q
+    finally:
+        _stop_pid(pid)
+
+
+def test_r12_iter1_a1_a_codex_child_alive_when_the_launch_path_throws_is_killed_before_its_holds_are_released(fixture_tree):
+    # adversary A1 on 2d55c467: the live-direct-child control of Dot B2. A child alive when a later launch-path operation throws is killed, tree and all, before the holds go.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="terra",mutation=_throw_while_alive("$env:MLV_FIXTURE_GRAND"))
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,90))
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "fixture-late-stream-failure" in text,(r.returncode,text[-4000:])
+    assert (root/"child.json").exists() and (root/"grand.json").exists(), "the injected failure must come after the codex child and its descendant started"
+    wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),30)
+    wait_absent(json.loads((root/"grand.json").read_text(encoding="utf-8-sig")),30)
+
+
+def test_r13_b2_a_an_exited_parent_with_a_live_descendant_is_killed_before_release_on_the_completion_path(fixture_tree):
+    # Dot B2 (a) on 01fa433d: the direct process exits 0 and leaves a descendant holding the snapshot path. The holds must not go until that descendant is gone.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=_reader_env(fixture_tree,env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    _assert_the_reader_was_gone_before_release(root,q)
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+    assert q["imagePaths"][0]["consumedVerified"] is True,q["imagePaths"]
+
+
+def test_r13_b2_a_an_exited_parent_with_a_live_descendant_is_killed_before_release_on_the_throwing_path(fixture_tree):
+    # Dot B2 (a), its literal shape: the parent spawned the descendant and exited, and a later stream operation throws. The catch used to skip the tree kill because HasExited was true.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=_throw_after_the_child_exits)
+    env=_reader_env(fixture_tree,env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    _assert_the_reader_was_gone_before_release(root,q)
+    assert r.returncode!=0 and "fixture-late-stream-failure" in (q["failure"] or ""),(r.returncode,q)
+
+
+def test_r13_b2_a_a_lane_timeout_kills_the_whole_tree_before_release(fixture_tree):
+    # The timeout sibling of Dot B2: a child and a descendant alive at the deadline.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"timeout",lane="terra",mutation=_record_hold_state(root/"hold-state.txt"))
+    cmd[cmd.index("-TimeoutSec")+1]="12"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==124,(r.returncode,q)
+    assert q.get("imageHoldRelease")=="released",q
+    assert (root/"hold-state.txt").read_text()=="released"
+    for name in ("child.json","grand.json"):
+        if (root/name).exists(): wait_absent(json.loads((root/name).read_text(encoding="utf-8-sig")),30)
+
+
+_KILL_NEW = "[MlvLaneJob]::TerminateOrThrow($Job)"
+_WAIT_NEW = "[MlvLaneJob]::WaitJobEmpty($Job, $IMAGE_READER_KILL_WAIT_MS)"
+_KILL_OLD_CATCH = "$proc.Kill($true); [void]$proc.WaitForExit(15000)"
+_KILL_OLD_TIMEOUT = "try { $proc.Kill($true) } catch { }\n    try { [void]$proc.WaitForExit(15000) } catch { }\n}\n$sw.Stop()"
+
+
+def _fault_kill(text):
+    # (b): the kill throws. On the pre-r13 shapes the same fault is the swallowed Kill.
+    text=text.replace(_KILL_NEW,"throw [ComponentModel.Win32Exception]::new(5, 'fixture-kill-failed')")
+    text=text.replace(_KILL_OLD_CATCH,"throw [ComponentModel.Win32Exception]::new(5, 'fixture-kill-failed')")
+    return text.replace(_KILL_OLD_TIMEOUT,"}\n$sw.Stop()")
+
+
+def _fault_wait(text):
+    # (c): the kill "worked" and the wait for the tree expires with a member still alive. The real kill is left out so that the member really is alive.
+    text=text.replace(_KILL_NEW,"$null = $Job")
+    text=text.replace(_WAIT_NEW,"$false")
+    text=text.replace(_KILL_OLD_CATCH,"$null = $false")
+    return text.replace(_KILL_OLD_TIMEOUT,"}\n$sw.Stop()")
+
+
+def _fault_tree(text):
+    # The job cannot be asked.
+    text=text.replace(_KILL_NEW,"$null = $Job")
+    text=text.replace(_WAIT_NEW,"$(throw [ComponentModel.Win32Exception]::new(6, 'fixture-query-failed'))")
+    return text.replace(_KILL_OLD_CATCH,"throw [ComponentModel.Win32Exception]::new(6, 'fixture-query-failed')")
+
+
+@pytest.mark.parametrize("path",["throwing","completion","timeout"])
+@pytest.mark.parametrize("fault,token",[(_fault_kill,"kill-failed"),(_fault_wait,"wait-timeout"),(_fault_tree,"tree-unreadable")],ids=["b-kill-failed","c-wait-timeout","tree-unreadable"])
+def test_r13_b2_an_uncertain_tree_keeps_the_holds_to_process_exit_and_never_claims_a_clean_release(fixture_tree,fault,token,path):
+    # Dot B2 (b), (c), and the unreadable tree, on each path that releases holds. The holds are still open at the very end of the lane process, the receipt says why,
+    # and nothing is reported as consumed-and-verified.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    mode={"throwing":"hold","completion":"normal","timeout":"timeout"}[path]
+    muts=[fault,_record_hold_state(root/"hold-state.txt")]
+    if path=="throwing": muts.append(_throw_while_alive("$env:MLV_FIXTURE_CHILD"))
+    cmd,env,receipt=prepare(fixture_tree,mode,lane="terra",mutation=_chain(*muts))
+    if path=="timeout": cmd[cmd.index("-TimeoutSec")+1]="12"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert (root/"hold-state.txt").read_text()=="held", "the holds were released before the readers were known gone"
+    assert q.get("imageHoldRelease")==f"uncertain:{token}",q
+    assert q["state"]=="failed" and f"image-hold-uncertain:{token}" in (q["failure"] or ""),q
+    assert r.returncode!=0,(r.returncode,q)
+    assert q["imagePaths"][0]["consumedVerified"] is False and token in q["imagePaths"][0]["consumedVerifyReason"],q["imagePaths"]
+
+
+def test_r13_a_clean_codex_image_lane_releases_its_holds_and_passes_the_child_through_the_host_unchanged(fixture_tree):
+    # The control for the host launch: exit code, stdout, stderr, the prompt on stdin (non-ASCII included) and a non-ASCII snapshot path reach and leave the child as on the direct path.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=root/"models_cache.json"; cache.write_text(codex_models_cache_text(("gpt-6.1-terra","gpt-6-sol")),encoding="utf-8")
+    run_dir=root/"run dir caf\u00e9"
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=_record_hold_state(root/"hold-state.txt"))
+    cmd[cmd.index("-RunDir")+1]=str(run_dir); receipt=run_dir/"terra-001.receipt.json"
+    prompt="judge caf\u00e9 \u03b1 2026-11-04T10:00:00Z"
+    cmd[cmd.index("-Prompt")+1]=prompt
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+    assert q["imageHoldRelease"]=="released" and q["imagePaths"][0]["consumedVerified"] is True,q
+    assert (root/"hold-state.txt").read_text()=="released", "the probe cannot tell a released hold from a kept one"
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    assert seen[0]["path"]==q["imagePaths"][0]["path"] and seen[0]["sha256"]==q["imagePaths"][0]["sha256"],(seen,q["imagePaths"])
+    assert "fixture-err" in (run_dir/"terra-001.err.txt").read_text(encoding="utf-8"),"the child's stderr must reach the lane"
+    # The direct path, same prompt: the child reads the same text on either route.
+    via_host=(root/"prompt.txt").read_bytes()
+    (root/"prompt.txt").unlink(); (root/"child.json").unlink()
+    direct=[*cmd[:cmd.index("-Lane")+1],"sol",*cmd[cmd.index("-Lane")+2:]]
+    r2=run_lane(direct,env)
+    assert r2.returncode==0,(r2.returncode,r2.stdout,r2.stderr)
+    assert (root/"prompt.txt").read_bytes()==via_host, "the host changed the stdin bytes"
+
+
+def test_r13_a_codex_image_host_that_cannot_start_the_child_is_a_typed_no_child_failure(fixture_tree):
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    missing=str(root/"no-such-codex.exe").replace("'","''")
+    def mutation(text):
+        old="(& $hostText $codexImageHost.Program)"
+        assert text.count(old)==1, "the host frame moved; update this fixture mutation"
+        return text.replace(old,f"(& $hostText '{missing}')")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==127 and q["state"]=="failed" and "codex-start-failed" in (q["failure"] or ""),(r.returncode,q)
+    assert not (root/"child.json").exists()
+    assert q["imageHoldRelease"]=="released",q
+
+
+def test_r13_a_codex_image_host_outside_the_job_is_never_told_what_to_run(fixture_tree):
+    # The order the job guarantee rests on: no assignment, no frame, so no reader can exist outside the job.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",assignment_failure=True)
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-assignment-failure" in (q["failure"] or ""),(r.returncode,q)
+    time.sleep(2)
+    assert not (root/"child.json").exists(), "the codex child ran although its host was never in the job"
+    assert q["imageHoldRelease"]=="released",q
+
+
+def test_r13_iter1_a1_a_stale_host_failure_file_never_fails_a_clean_child(fixture_tree):
+    # adversary A1 on 993583ac, its input: the slot has no receipt, but its host-failure file exists from an earlier attempt, and the child exits 0.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    (root/"run"/"terra-001.codex-host-failure.txt").write_text("codex-start-failed: stale previous attempt",encoding="ascii")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete" and q["failure"] is None,(r.returncode,q)
+
+
+def test_r13_iter1_a1_sibling_a_stale_last_message_is_never_the_answer_of_this_run(fixture_tree):
+    # adversary A1 sibling: codex writes -o only on a clean exit, so a file left in the slot read as this run's answer. The fixture child writes no -o file.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    (root/"run"/"sol-001.last.txt").write_text("stale answer from an earlier attempt",encoding="ascii")
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0,(r.returncode,q)
+    assert "stale answer" not in json.dumps(q)
+    last=root/"run"/"sol-001.last.txt"
+    assert not last.exists() or "stale answer" not in last.read_text(encoding="utf-8")
+
+
+def test_r13_iter1_a1_sibling_a_stale_host_drain_marker_is_never_a_drain_timeout_of_this_run(fixture_tree):
+    # adversary A1 sibling: the Claude path reads the same kind of file.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    (root/"run"/"sonnet-001.host-drain.json").write_text('{"schema":"mlv-lane-drain/v1","stdoutOpen":true,"stderrOpen":true,"graceMs":1}',encoding="ascii")
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0,(r.returncode,q)
+    assert q["outputDrain"]["hostReportedTimeout"] is False,q["outputDrain"]
+
+
+def test_r13_iter2_a2_the_reader_tree_wait_is_charged_to_the_budget_verification_is_given(fixture_tree):
+    # adversary A2 on afdc228b: the stopwatch stopped before the cleanup wait, so verification got the budget back that the wait had spent. A wait that spends the whole budget leaves the floor.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    out=root/"verify-limit.txt"
+    verify_anchor="$verifyClock = [System.Diagnostics.Stopwatch]::StartNew()\n"
+    def mutation(text):
+        assert text.count(_WAIT_NEW)==1 and text.count(verify_anchor)==1, "the tree wait or the verify clock moved; update this fixture mutation"
+        text=text.replace(_WAIT_NEW,"$(Start-Sleep -Seconds 12; $true)")
+        return text.replace(verify_anchor,f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',[string]$verifyLimitMs)\n"+verify_anchor)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra",mutation=mutation)
+    cmd[cmd.index("-TimeoutSec")+1]="12"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    assert float(out.read_text())==5000.0, (out.read_text(),r.returncode,r.stdout[-1500:])
+
+
+def test_r13_iter2_a1_a_stalled_shim_read_spends_the_lane_budget_and_is_a_lane_timeout(fixture_tree):
+    # adversary A1 on afdc228b: a read got a fresh 5000 ms past a shorter lane budget, and its expiry read as an unreadable shim (127). It is the lane's own timeout (124).
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    cmd[cmd.index("-TimeoutSec")+1]="3"
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    with _OplockedFile(fixture_tree["shim"]) as lock:
+        r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,90))
+        assert lock.broken(), "the launcher never asked for the shim's data, so this test exercised nothing"
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==124,(r.returncode,q)
+    assert "codex-shim-unreadable" not in (q["failure"] or ""),q
+
+
+def test_r13_iter2_a1_sibling_the_mcp_probe_starts_no_process_after_its_deadline_and_stays_a_timeout(fixture_tree):
+    # adversary A1 sibling: a shim re-hash that used up the probe's budget still started the probe's process, and the expiry read as codex-mcp-list-unreadable.
+    root=fixture_tree["root"]
+    old="$probeBudgetMs = [math]::Max(1, $TimeoutMs)"
+    def mutation(text):
+        assert text.count(old)==1, "the probe budget moved; update this fixture mutation"
+        return text.replace(old,"$probeBudgetMs = 1")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert not (root/"mcp-args.json").exists(), "the probe process started after its deadline"
+    assert r.returncode==124 and "codex-mcp-list-unreadable" not in (q["failure"] or ""),(r.returncode,q)
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r14 (Dot B3 on afdc228b): a codex lane with no image has no job. When a later launch-path operation throws, only the catch can stop its child.
+# Injection seam: the fixture's stdin failure is a text mutation at the lane's real write line. The real pipe cannot be broken from a test, because the cmd.exe of the shim
+# inherits the read end and stays alive, so a child closing its own copy does not fail the lane's write. Everything after the throw is the real catch.
+_DIRECT_STDIN_WRITE = "    $proc.StandardInput.Write($stdinContent)\n"
+_DIRECT_KILL = "$Proc.Kill($true)"
+_DIRECT_WAIT = "$member.WaitForExit($leftMs)"
+_DIRECT_SNAPSHOT = "[MlvLaneJob]::SnapshotDescendants($Proc)"
+
+
+def _stdin_write_fails_while(wait_for):
+    wait=(f"$waitChild=[Diagnostics.Stopwatch]::StartNew(); while(-not (Test-Path -LiteralPath {wait_for}) -and $waitChild.ElapsedMilliseconds -lt 40000)"
+          "{Start-Sleep -Milliseconds 50}\nthrow [System.IO.IOException]::new('fixture-stdin-write-failed')\n")
+    def mutation(text):
+        assert text.count(_DIRECT_STDIN_WRITE)==1, "the direct path's stdin write moved; update this fixture mutation"
+        return text.replace(_DIRECT_STDIN_WRITE,wait+_DIRECT_STDIN_WRITE)
+    return mutation
+
+
+def _replacing(old,new):
+    def mutation(text):
+        assert text.count(old)==1, f"{old!r} moved; update this fixture mutation"
+        return text.replace(old,new)
+    return mutation
+
+
+def _run_lane_to_files(cmd,env,root):
+    # The child inherits the lane's stdout, so capture_output would not return until the child and its descendant ended on their own, and both would then read as gone: an
+    # unfixed lane passed that way (r14: both alive for 60 s, then "gone" at the moment run_lane returned). Files have no EOF to wait for, so this returns when the lane exits.
+    with open(root/"lane.stdout.txt","wb") as o, open(root/"lane.stderr.txt","wb") as e:
+        return subprocess.run(cmd,env=env,stdout=o,stderr=e,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+
+
+def test_r14_b3_a_a_live_child_and_its_descendant_are_gone_when_the_stdin_write_fails(fixture_tree):
+    # Case a. The receipt's word comes from the wait on each process seen before the kill.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND"))
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in (q["failure"] or ""),(r.returncode,q)
+    assert (root/"child.json").exists() and (root/"grand.json").exists(), "the injected failure must come after the child and its descendant started"
+    wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
+    wait_absent(json.loads((root/"grand.json").read_text(encoding="utf-8-sig")),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+def test_r14_b3_b_an_exited_child_with_a_live_descendant_is_explicit_uncertainty_never_a_clean_stop(fixture_tree):
+    # Case b. Without a job the descendant cannot be enumerated once its parent is gone: the descendant really is alive, and the receipt must not read as if it were not.
+    root=fixture_tree["root"]; hold=root/"hold.pid"
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=_throw_after_the_child_exits)
+    env=dict(env); env["MLV_FIXTURE_HOLD_PIPE_SECONDS"]="60"; env["MLV_FIXTURE_HOLD_PID"]=str(hold)
+    r=_run_lane_to_files(cmd,env,root)
+    pid=int(hold.read_text(encoding="utf-8-sig").strip())
+    try:
+        assert _pid_alive(pid), "this test needs a descendant alive after the lane ended"
+        q=json.loads(receipt.read_text(encoding="utf-8"))
+        assert r.returncode!=0 and "fixture-late-stream-failure" in (q["failure"] or ""),(r.returncode,q)
+        assert q["codexDirectChildStop"]=="uncertain:already-exited",q
+        assert "codex-direct-child-uncertain:already-exited" in q["failure"],q
+    finally:
+        _stop_pid(pid)
+
+
+@pytest.mark.parametrize("token,mutations",[
+    ("kill-failed",[(_DIRECT_KILL,"throw [ComponentModel.Win32Exception]::new(5, 'fixture-kill-failed')")]),
+    ("wait-timeout",[(_DIRECT_KILL,"$null = $Proc"),(_DIRECT_WAIT,"$false")]),
+    ("tree-unreadable",[(_DIRECT_SNAPSHOT,"$(throw [ComponentModel.Win32Exception]::new(5, 'fixture-snapshot-failed'))")]),
+],ids=["c-kill-failed","c-wait-timeout","snapshot-failed"])
+def test_r14_b3_c_a_stop_that_is_not_observed_is_typed_uncertainty_and_the_receipt_is_still_written(fixture_tree,token,mutations):
+    # Case c, and the snapshot failing: each answer is the observed result, never the attempt. A failed kill and an expired wait leave the child alive, so nothing may claim otherwise.
+    root=fixture_tree["root"]
+    muts=[_replacing(o,n) for o,n in mutations]+[_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in (q["failure"] or ""),(r.returncode,q)
+    assert q["codexDirectChildStop"]==f"uncertain:{token}",q
+    assert f"codex-direct-child-uncertain:{token}" in q["failure"],q
+
+
+def test_r14_b3_the_snapshot_failing_still_kills_the_child(fixture_tree):
+    # A tree that cannot be read is no reason to leave the child running: the kill still happens, and only the word about the tree changes.
+    root=fixture_tree["root"]
+    muts=[_replacing(_DIRECT_SNAPSHOT,"$(throw [ComponentModel.Win32Exception]::new(5, 'fixture-snapshot-failed'))"),_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,root)
+    assert r.returncode!=0,r.returncode
+    wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
+
+
+def test_r14_iter1_a1_a_descendant_the_runtime_tree_kill_misses_is_killed_and_seen_gone(fixture_tree):
+    # adversary A1 on 1d4adafb: Kill($true) compares local start times, so across the end of daylight time it drops a real descendant. Standing in for that miss, the kill reaches
+    # only the root here. The descendant the snapshot saw must still be killed and seen to exit; 'killed' never rests on what the runtime's own walk found.
+    root=fixture_tree["root"]
+    muts=[_replacing(_DIRECT_KILL,"$Proc.Kill()"),_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    wait_absent(json.loads((root/"grand.json").read_text(encoding="utf-8-sig")),5)
+    assert r.returncode!=0 and q["codexDirectChildStop"]=="killed",(r.returncode,q)
+
+
+def test_r14_iter1_a1_the_parent_age_check_reads_utc_filetimes_never_local_start_times(tmp_path):
+    # adversary A1 on 1d4adafb, its input: under Central time the parent started 2026-11-01T06:59:59Z and the child 07:00:01Z, which read locally as 01:59:59 and 01:00:01, so the child
+    # looked older than its parent and was dropped. The check takes creation FILETIMEs; a child really older than the pid's current holder (a reused pid) is still refused.
+    text=CANDIDATE.read_text(encoding="utf-8")
+    block=re.search(r"(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@",text).group(1)
+    walk=block[block.index("public static DescendantWalk SnapshotDescendants"):]
+    assert ".StartTime" not in walk, "the tree walk compares Process.StartTime, which is local time and runs backward when daylight time ends"
+    import datetime as dt
+    parent=int(dt.datetime(2026,11,1,6,59,59,tzinfo=dt.timezone.utc).timestamp()*10_000_000)+116444736000000000
+    child=parent+2*10_000_000
+    script=tmp_path/"age.ps1"
+    script.write_text("param($P,$C)\nAdd-Type -TypeDefinition @'\n"+block+"\n'@\n'{0} {1}' -f [MlvLaneJob]::StartedBeforeParent([long]$C,[long]$P), [MlvLaneJob]::StartedBeforeParent([long]$P,[long]$C)\n",encoding="ascii")
+    r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-File",str(script),str(parent),str(child)],capture_output=True,text=True,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    assert r.stdout.strip().splitlines()[-1:]==["False True"],(r.stdout,r.stderr)
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r15 (Dot B5 = adversary A1 on 05e95288; adversary A2 = Dot B6). Everything below runs the real MlvLaneJob type and the real Stop-CodexDirectChildTree, in a lane.
+# Injection seams, each a text mutation and none in the shipped script:
+#   _stale_row: pid reuse cannot be forced, so the snapshot's table gains the row a stale enumeration would hold (R -> x) just after it closes, with x really held by another process.
+#   _parent_reads_newer: a clock cannot be stepped on a shared host, so the parent's creation time is read one hour late, which leaves a real child reading older than its parent.
+#   $Proc.Kill(): stands for the runtime's tree kill missing a process, which its IsParentOf does when a child reads older (runtime-il.txt, r15 run dir: pwsh 7.6.9, .NET 10.0.14).
+# Mutations that must go red, each executed below by test_r15_mutation_*:
+#   parent check removed; parent check on a separately opened handle (seen by a spy at the one NtQueryInformationProcess call, because two opens cannot be raced here);
+#   mismatch treated as uncertain but still killed; older-than-parent treated as killed; older-than-parent accepted as a member.
+_DIRECT_STDIN_THROW = "throw [System.IO.IOException]::new('fixture-stdin-write-failed')\n"
+_SNAPSHOT_CLOSED = "} finally { CloseHandle(snap); }\n"
+_PARENT_CREATED = "parentCreated=CreatedFileTime(parent)"
+_PARENT_READ = "parentPid=ParentPidOf(kid)"
+_MISMATCH_BRANCH = 'if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }'
+_OLDER_BRANCH = 'if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }'
+_ACCEPT = "seen.Members.Add(kid); walk.Enqueue(kid);"
+_READ_CALL = "int status=NtQueryInformationProcess(p.Handle,"
+
+
+def _ps_path(path):
+    return str(path).replace(chr(39),chr(39)*2)
+
+
+def _stale_row(rows_below=False):
+    # R -> x, as the snapshot would have recorded it before x changed hands. The replacement did not exist then, so its own children (ping.exe has a conhost) are taken back out of the table.
+    # With rows_below, the snapshot also saw a descendant under x's old holder.
+    below='kids[int.Parse(stale)]=new List<int>(new int[]{Process.GetCurrentProcess().Id});\n' if rows_below else ""
+    return _replacing(_SNAPSHOT_CLOSED,_SNAPSHOT_CLOSED+'string stale=Environment.GetEnvironmentVariable("MLV_FIXTURE_STALE_KID");\nkids.Remove(int.Parse(stale));\nif(!kids.ContainsKey(root.Id)) kids[root.Id]=new List<int>();\nkids[root.Id].Add(int.Parse(stale));\n'+below)
+
+
+def _parent_reads_newer():
+    return _replacing(_PARENT_CREATED,_PARENT_CREATED+"+36000000000L")
+
+
+def _start_replacement(out):
+    # The replacement U: started after the root, so it is younger and passes the age check, with the lane as its parent Q, so it is no descendant of the root.
+    return (f"$uPsi=[Diagnostics.ProcessStartInfo]::new('ping.exe','-n 150 127.0.0.1'); $uPsi.UseShellExecute=$false; $uPsi.CreateNoWindow=$true; $uProc=[Diagnostics.Process]::Start($uPsi)\n"
+            f"[IO.File]::WriteAllText('{_ps_path(out)}',(@{{pid=$uProc.Id;createdUtc=$uProc.StartTime.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress))\n"
+            "$env:MLV_FIXTURE_STALE_KID=[string]$uProc.Id\n")
+
+
+def _stopped_lane(tree,*extra,before_throw=""):
+    muts=[_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    if before_throw: muts.append(_replacing(_DIRECT_STDIN_THROW,before_throw+_DIRECT_STDIN_THROW))
+    muts.extend(extra)
+    cmd,env,receipt=prepare(tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,tree["root"])
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in (q["failure"] or ""),(r.returncode,q)
+    return q
+
+
+def _state(root,name):
+    return json.loads((root/name).read_text(encoding="utf-8-sig"))
+
+
+def _lives(item):
+    return identity(item["pid"])==item["createdUtc"]
+
+
+@pytest.fixture
+def stale_tree(fixture_tree):
+    yield fixture_tree
+    p=fixture_tree["root"]/"replacement.json"
+    if p.exists():
+        try: stop_exact(json.loads(p.read_text(encoding="utf-8")))
+        except Exception: pass
+
+
+def _stale_lane(tree,*extra,rows_below=False):
+    root=tree["root"]
+    q=_stopped_lane(tree,_stale_row(rows_below),*extra,before_throw=_start_replacement(root/"replacement.json"))
+    u=json.loads((root/"replacement.json").read_text(encoding="utf-8"))
+    assert u["createdUtc"]>_state(root,"child.json")["createdUtc"], "the schedule needs the replacement younger than the root, or the age check alone would refuse it"
+    return q,u
+
+
+def test_r15_b5_a_snapshot_pid_now_held_by_a_younger_unrelated_process_is_never_killed(stale_tree):
+    # Dot B5's schedule: the snapshot saw R -> x; x now belongs to U, younger than R, with another parent. The root tree kill succeeds and leaves U alone; the explicit loop must too.
+    root=stale_tree["root"]
+    q,u=_stale_lane(stale_tree)
+    assert _lives(u), f"the lane killed a process that was never in the tree: {q.get('codexDirectChildStop')}"
+    wait_absent(_state(root,"child.json"),5)
+    wait_absent(_state(root,"grand.json"),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+def test_r15_b5_a_replaced_pid_with_a_descendant_row_below_it_is_uncertainty_and_the_replacement_lives(stale_tree):
+    # The snapshot also saw a process under x. With x's old holder gone, nothing can show that process is gone, so 'killed' would claim more than was seen.
+    q,u=_stale_lane(stale_tree,rows_below=True)
+    assert _lives(u),q
+    assert q["codexDirectChildStop"]=="uncertain:descendant-unreachable",q
+    assert "codex-direct-child-uncertain:descendant-unreachable" in q["failure"],q
+
+
+def test_r15_a2_a_real_child_reading_older_with_the_runtime_kill_missing_it_is_uncertain_and_not_killed_by_the_loop(fixture_tree):
+    # A2 and Dot B6 together: the parent matches and the child reads older, so a clock step and a reused parent pid cannot be told apart. The runtime's tree kill misses it too.
+    # The lane must not kill it on that evidence and must not say 'killed'.
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    wait_absent(_state(root,"child.json"),5)
+    assert _lives(_state(root,"grand.json")), "the explicit loop killed a process whose ancestry it could not establish"
+    assert q["codexDirectChildStop"]=="uncertain:older-than-parent",f"the child is alive and the receipt says {q['codexDirectChildStop']}"
+    assert "codex-direct-child-uncertain:older-than-parent" in q["failure"],q
+
+
+def test_r15_a2_a_child_reading_older_is_uncertain_even_when_the_runtime_kill_took_it(fixture_tree):
+    # The runtime read its own clock and took the child. The walk still refused it and never saw it exit, so the answer stays what was observed.
+    q=_stopped_lane(fixture_tree,_parent_reads_newer())
+    assert q["codexDirectChildStop"]=="uncertain:older-than-parent",q
+
+
+def test_r15_control_a_snapshot_pid_held_by_an_older_unrelated_process_is_never_killed(fixture_tree):
+    # The older-pid control. Green on 05e95288 through the age check, and after the fix through the parent check.
+    root=fixture_tree["root"]
+    older=subprocess.Popen(["ping.exe","-n","150","127.0.0.1"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        q=_stopped_lane(fixture_tree,_stale_row(),before_throw=f"$env:MLV_FIXTURE_STALE_KID='{older.pid}'\n")
+        assert older.poll() is None, "the lane killed an older process that was never in the tree"
+        wait_absent(_state(root,"grand.json"),5)
+        assert q["codexDirectChildStop"]=="killed",q
+    finally:
+        older.kill(); older.wait(10)
+
+
+def test_r15_control_a_candidate_that_cannot_be_read_is_uncertain_and_never_killed_by_the_loop(fixture_tree):
+    # The unreadable control, green on 05e95288 too: every creation-time read except the root's is refused, as for a process this account may not open.
+    root=fixture_tree["root"]
+    refuse=_replacing("static Int64 CreatedFileTime(Process p) {\n",'static Int64 CreatedFileTime(Process p) {\n    if(p.Id.ToString()!=Environment.GetEnvironmentVariable("MLV_FIXTURE_READABLE")) throw new Win32Exception(5,"fixture-unreadable");\n')
+    q=_stopped_lane(fixture_tree,refuse,_replacing(_DIRECT_KILL,"$Proc.Kill()"),before_throw="$env:MLV_FIXTURE_READABLE=[string]$proc.Id\n")
+    assert q["codexDirectChildStop"].startswith("uncertain:"),q
+    assert _lives(_state(root,"grand.json")),q
+
+
+def test_r15_ancestry_that_cannot_be_read_is_typed_and_the_candidate_is_not_killed(fixture_tree):
+    # The parent read itself is refused. The token names it, the candidate is left alone, and the root is still stopped.
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_replacing(_PARENT_READ,_PARENT_READ+';\n          if(kid.Id!=0) throw new Win32Exception(5,"fixture-ancestry-refused")'),_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    assert q["codexDirectChildStop"]=="uncertain:ancestry-unreadable",q
+    assert "codex-direct-child-uncertain:ancestry-unreadable" in q["failure"],q
+    wait_absent(_state(root,"child.json"),5)
+    assert _lives(_state(root,"grand.json")),q
+
+
+def test_r15_a_valid_child_is_accepted_on_the_handle_the_kill_then_uses(fixture_tree):
+    # A spy, not a race: two opens of one pid cannot be raced here. The one NtQueryInformationProcess call records its handle, and acceptance requires it to be the handle the lane keeps,
+    # so a parent read through any other open fails here. The runtime kill misses the child, so its death also shows the walk accepted it on that read.
+    root=fixture_tree["root"]
+    spy=_chain(_replacing(_READ_CALL,"fixtureRead=p.Handle;\n    "+_READ_CALL),
+               _replacing("  static int ParentPidOf(Process p) {\n","  static IntPtr fixtureRead;\n  static int ParentPidOf(Process p) {\n"),
+               _replacing(_ACCEPT,'if(fixtureRead!=kid.Handle) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n        '+_ACCEPT))
+    q=_stopped_lane(fixture_tree,spy,_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    wait_absent(_state(root,"grand.json"),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+def test_r15_mutation_parent_check_removed_kills_the_replacement(stale_tree):
+    q,u=_stale_lane(stale_tree,_replacing("parentPid!=parent.Id","parentPid==int.MinValue"))
+    assert not _lives(u),q
+
+
+def test_r15_mutation_mismatch_marked_uncertain_but_still_killed_kills_the_replacement(stale_tree):
+    q,u=_stale_lane(stale_tree,_replacing(_MISMATCH_BRANCH,'if(parentPid!=parent.Id) { seen.Note("ancestry-unreadable"); seen.Members.Add(kid); continue; }'))
+    assert not _lives(u) and q["codexDirectChildStop"]=="uncertain:ancestry-unreadable",q
+
+
+def test_r15_mutation_parent_read_on_a_separately_opened_handle_is_seen_by_the_spy(fixture_tree):
+    spy=_chain(_replacing(_READ_CALL,"fixtureRead=p.Handle;\n    "+_READ_CALL),
+               _replacing("  static int ParentPidOf(Process p) {\n","  static IntPtr fixtureRead;\n  static int ParentPidOf(Process p) {\n"),
+               _replacing(_ACCEPT,'if(fixtureRead!=kid.Handle) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n        '+_ACCEPT),
+               _replacing(_PARENT_READ,"parentPid=ParentPidOf(Process.GetProcessById(kid.Id))"))
+    q=_stopped_lane(fixture_tree,spy)
+    assert q["codexDirectChildStop"]=="uncertain:tree-unreadable",q
+
+
+def test_r15_mutation_older_than_parent_treated_as_killed_answers_killed_with_the_child_alive(fixture_tree):
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"),_replacing(_OLDER_BRANCH,"if(StartedBeforeParent(created,parentCreated)) { kid.Dispose(); continue; }"))
+    assert q["codexDirectChildStop"]=="killed" and _lives(_state(root,"grand.json")),q
+
+
+def test_r15_mutation_older_than_parent_accepted_as_a_member_kills_the_child(fixture_tree):
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"),_replacing(_OLDER_BRANCH,"if(StartedBeforeParent(created,parentCreated)) { }"))
+    wait_absent(_state(root,"grand.json"),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r15 fix iteration 1 (adversary A1 on 82faecd9): CreateProcess reads its command line up to the first NUL, so a NUL in one argument drops every argument after it,
+# the explicit read-only sandbox and the MCP disables among them, while the receipt records the intended authority. `pwsh -File` cannot carry a NUL, so this is the finding's own route, the call operator.
+def _lane_with_model_ending_in_nul(cmd,root):
+    at=cmd.index("-File")
+    parts=[]
+    for token in cmd[at+2:]:
+        parts.append(token if token.startswith("-") else "'"+token.replace("'","''")+"'")
+    call=root/"call-lane.ps1"
+    call.write_text("& '"+cmd[at+1].replace("'","''")+"' "+" ".join(parts)+" -ModelOverride ('gpt-6.1-terra'+[char]0)\nexit $LASTEXITCODE\n",encoding="utf-8")
+    return cmd[:at+1]+[str(call)]
+
+
+@pytest.mark.parametrize("lane,images",[("sol",False),("terra",True),("sonnet",False)],ids=["direct-codex","codex-image-host","claude-host"])
+def test_r15_iter1_a1_a_nul_in_an_argument_is_refused_before_any_provider_runs(fixture_tree,lane,images):
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    if images:
+        png=root/"strip.png"; _write_png(png,b"r15-nul")
+        cmd=cmd+["-ImagePaths",str(png)]
+    r=_run_lane_to_files(_lane_with_model_ending_in_nul(cmd,root),env,root)
+    seen=json.loads((root/"args.json").read_text(encoding="utf-8-sig")) if (root/"args.json").exists() else None
+    assert seen is None, f"a provider ran with a command line cut at the NUL: {seen}"
+    assert r.returncode!=0, r.returncode
+    assert "argv-nul-refused" in (root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(receipt.read_text(encoding="utf-8") if receipt.exists() else "")
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r16 (OPEN A1 on feeea1f9): the image host's frame encodes each field with Encoding.Unicode's replacement fallback, so a lone surrogate arrives as U+FFFD: a path to a DIFFERENT
+# directory, whose file the child reads while the held snapshot verifies. Refused where the path enters, so no frame, sibling site or provider ever sees one. The run-dir rows are the adversary's own schedule.
+# `pwsh -File` replaces a lone surrogate with U+FFFD before the script sees it (measured on this suite's first RED run: the receipt landed in the FFFD directory), so these go through the call operator, written as ASCII.
+def _ps_text(s):
+    units=[int.from_bytes(s.encode("utf-16-le","surrogatepass")[i:i+2],"little") for i in range(0,len(s.encode("utf-16-le","surrogatepass")),2)]
+    return "("+"+".join("[string][char]"+hex(u) for u in units)+")"
+
+
+def _through_the_call_operator(cmd,root,cwd=None):
+    at=cmd.index("-File")
+    params=[t if t.startswith("-") else _ps_text(t) for t in cmd[at+2:]]
+    call=root/"call-lane.ps1"
+    enter="Set-Location -LiteralPath "+_ps_text(str(cwd))+"\n" if cwd else ""
+    call.write_text(enter+"& "+_ps_text(cmd[at+1])+" "+" ".join(params)+"\nexit $LASTEXITCODE\n",encoding="ascii")
+    return cmd[:at+1]+[str(call)]
+
+
+def _lane_with_lone_surrogate(fixture_tree,route,lone):
+    root=fixture_tree["root"]
+    png=root/"strip.png"; _write_png(png,b"original bytes P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    replaced="�"*len(lone)
+    if route=="run-dir":
+        run_dir=root/("judge"+lone); run_dir.mkdir()
+        other=root/("judge"+replaced); other.mkdir(); (other/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+        cmd[cmd.index("-RunDir")+1]=str(run_dir); receipt=run_dir/"terra-001.receipt.json"
+    elif route=="work-dir":
+        work=root/("work"+lone); work.mkdir(); (root/("work"+replaced)).mkdir()
+        cmd[cmd.index("-WorkDir")+1]=str(work)
+    elif route=="relative-run-dir":
+        (root/("cwd"+lone)).mkdir(); (root/("cwd"+replaced)/"judge").mkdir(parents=True)
+        cmd[cmd.index("-RunDir")+1]="judge"; receipt=root/("cwd"+lone)/"judge"/"terra-001.receipt.json"
+    elif route=="image-path":
+        renamed=root/("strip"+lone+".png"); png.rename(renamed); png=renamed
+    elif route=="argv":
+        cmd=cmd+["-ModelOverride","gpt-6.1-terra"+lone]
+    return cmd+["-ImagePaths",str(png)],env,receipt
+
+
+@pytest.mark.parametrize("route,lone",[("run-dir","\ud800"),("run-dir","\udc00"),("run-dir","\udc00\ud800"),("relative-run-dir","\ud800"),("work-dir","\ud800"),("image-path","\ud800"),("argv","\ud800")],
+                         ids=["run-dir-lone-high","run-dir-lone-low","run-dir-reversed-pair","relative-run-dir","work-dir","image-path","argv"])
+def test_r16_a1_a_lone_surrogate_is_refused_before_any_provider_runs(fixture_tree,route,lone):
+    root=fixture_tree["root"]
+    cmd,env,receipt=_lane_with_lone_surrogate(fixture_tree,route,lone)
+    r=_run_lane_to_files(_through_the_call_operator(cmd,root,cwd=root/("cwd"+lone) if route=="relative-run-dir" else None),env,root)
+    text=(root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(receipt.read_text(encoding="utf-8") if receipt.exists() else "")
+    seen=(root/"image-bytes.json").read_text(encoding="utf-8-sig") if (root/"image-bytes.json").exists() else None
+    entry=json.loads(receipt.read_text(encoding="utf-8")).get("imagePaths") if receipt.exists() else None
+    assert not (root/"args.json").exists(), ascii(("a provider ran on a path holding a lone surrogate",(root/"args.json").read_text(encoding="utf-8-sig"),seen,entry))
+    assert r.returncode!=0, r.returncode
+    assert "lone-surrogate-refused" in text, ascii(text[-2000:])
+
+
+# A codex lane meets the launch bound as well (the run-dir row above). A claude lane has only the check after Resolve-Path when the surrogate comes from a relative -RunDir's current directory.
+def _claude_lane_with_relative_run_dir_in_lone_surrogate_cwd(fixture_tree,mutation=None):
+    root=fixture_tree["root"]; lone="\ud800"
+    (root/("cwd"+lone)).mkdir(); (root/"cwd�"/"judge").mkdir(parents=True)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="sonnet",mutation=mutation)
+    cmd[cmd.index("-RunDir")+1]="judge"
+    r=_run_lane_to_files(_through_the_call_operator(cmd,root,cwd=root/("cwd"+lone)),env,root)
+    return r,(root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(root/"lane.stdout.txt").read_text(encoding="utf-8",errors="replace")
+
+
+def test_r16_a1_a_claude_lane_is_refused_on_a_relative_run_dir_under_a_lone_surrogate(fixture_tree):
+    r,text=_claude_lane_with_relative_run_dir_in_lone_surrogate_cwd(fixture_tree)
+    assert r.returncode!=0 and "lone-surrogate-refused" in text and not (fixture_tree["root"]/"args.json").exists(), ascii(text[-2000:])
+
+
+def test_r16_mutation_no_check_after_resolving_leaves_the_claude_lane_unrefused(fixture_tree):
+    _,text=_claude_lane_with_relative_run_dir_in_lone_surrogate_cwd(fixture_tree,mutation=_replacing("Assert-NoLoneSurrogate -Text @($RunDir)\n",""))
+    assert "lone-surrogate-refused" not in text, ascii(text[-2000:])
+
+
+@pytest.mark.parametrize("name",["judge\U0001F600","judge�"],ids=["whole-pair","literal-replacement-character"])
+def test_r16_control_a_well_formed_run_dir_reaches_the_child_unchanged_and_verifies(fixture_tree,name):
+    root=fixture_tree["root"]
+    cmd,env,_=_lane_with_lone_surrogate(fixture_tree,"none","")
+    run_dir=root/name; run_dir.mkdir()
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    r=_run_lane_to_files(_through_the_call_operator(cmd,root),env,root)
+    receipt=run_dir/"terra-001.receipt.json"
+    assert r.returncode==0, ascii((root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")[-2000:])
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert name in seen[0]["path"] and seen[0]["path"]==entry["path"], ascii((entry,seen))
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"], ascii((entry,seen))
+
+
+def test_r14_b3_control_an_ordinary_no_image_lane_has_no_stop_to_report(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    r=run_lane(cmd,env)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+    assert "codexDirectChildStop" not in q,q
+
+
+_DIRECT_STOP_ENTRY = "function Stop-CodexDirectChildTree {\n    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Proc, [Parameter(Mandatory = $true)][double]$LimitMs)\n"
+_TIMEOUT_KILL = "try { $proc.Kill($true) } catch { }\n        try { [void]$proc.WaitForExit(15000) } catch { }\n"
+_AFTER_STOPWATCH = "$sw.Stop()\n$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }\n"
+
+
+def test_r14_b3_the_stop_wait_is_on_the_lanes_stopwatch_and_a_spent_budget_leaves_the_floor(fixture_tree):
+    # The trap of adversary A2 on afdc228b. The throw comes after the stopwatch stopped and with the child alive (the timeout's own kill is left out), so an uncharged wait
+    # would not appear in the lane's duration. The stop spends 4 s it would otherwise hide; the budget is gone, so it gets the floor and no more.
+    root=fixture_tree["root"]; out=root/"direct-stop.json"
+    spy=(f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',(@{{limitMs=$LimitMs;stopwatchRunning=$sw.IsRunning}}|ConvertTo-Json -Compress))\n"
+         "Start-Sleep -Seconds 4\n")
+    muts=[_replacing(_DIRECT_STOP_ENTRY,_DIRECT_STOP_ENTRY+spy),_replacing(_TIMEOUT_KILL,""),
+          _replacing(_AFTER_STOPWATCH,"$sw.Stop()\n$script:r14Before=$sw.Elapsed.TotalSeconds\nthrow [System.IO.IOException]::new('fixture-after-stopwatch')\n"+_AFTER_STOPWATCH)]
+    # The lane's final elapsed, read at the very end of the process, against the elapsed when the throw came.
+    probe=root/"elapsed.json"
+    muts.append(lambda text:(f"[System.IO.File]::WriteAllText('{str(probe).replace(chr(39),chr(39)*2)}',(@{{before=$script:r14Before;after=$sw.Elapsed.TotalSeconds}}|ConvertTo-Json -Compress))\n"+_HOLD_STATE_ANCHOR).join(text.rsplit(_HOLD_STATE_ANCHOR,1)))
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    cmd[cmd.index("-TimeoutSec")+1]="12"
+    r=_run_lane_to_files(cmd,env,root)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    seen=json.loads(out.read_text(encoding="utf-8"))
+    assert seen["stopwatchRunning"] is True and seen["limitMs"]==5000.0,seen
+    t=json.loads(probe.read_text(encoding="utf-8"))
+    assert t["after"]-t["before"]>=3.5,t
+    assert q["codexDirectChildStop"]=="killed" and "fixture-after-stopwatch" in (q["failure"] or ""),q
+    if (root/"child.json").exists(): wait_absent(json.loads((root/"child.json").read_text(encoding="utf-8-sig")),5)
+
+
+def test_r14_b3_with_budget_left_the_stop_wait_is_capped_at_its_own_bound(fixture_tree):
+    root=fixture_tree["root"]; out=root/"direct-stop.txt"
+    spy=f"[System.IO.File]::WriteAllText('{str(out).replace(chr(39),chr(39)*2)}',[string]$LimitMs)\n"
+    muts=[_replacing(_DIRECT_STOP_ENTRY,_DIRECT_STOP_ENTRY+spy),_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    cmd,env,receipt=prepare(fixture_tree,"hold",lane="sol",mutation=_chain(*muts))
+    cmd[cmd.index("-TimeoutSec")+1]="600"
+    _run_lane_to_files(cmd,env,root)
+    assert float(out.read_text())==15000.0,out.read_text()
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r14 (Dot B4): the version probe narrowed the shim deadline for its own duration and never put it back, so the lane's budget inherited the probe's.
+# The probe's 15 s is shortened only so the test does not wait 15 s; the delay stands for any slow step between the probe and the lane's final shim rehash.
+_PROBE_BUDGET = "[int]$TimeoutMs = 15000"
+_PROBE_RESOLVE = "$vLaunch = Resolve-CodexShimLaunch -Exe $CodexExe"
+_LANE_REHASH = "Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count"
+
+
+def _slow_step_before_the_final_rehash(seconds):
+    return _replacing(_LANE_REHASH,f"Start-Sleep -Seconds {int(seconds)}\n{_LANE_REHASH}")
+
+
+@pytest.mark.parametrize("fault",["ok","non-zero-exit","throws"])
+def test_r14_b4_the_final_shim_rehash_spends_the_lanes_budget_not_the_budget_of_a_finished_probe(fixture_tree,fault):
+    # A successful probe and a failed one (it exits non-zero; its own body throws), each followed by a delayed valid shim read inside a much longer lane budget.
+    muts=[_replacing(_PROBE_BUDGET,"[int]$TimeoutMs = 3000"),_slow_step_before_the_final_rehash(5)]
+    if fault=="throws": muts.append(_replacing(_PROBE_RESOLVE,"throw 'fixture-probe-threw'"))
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=_chain(*muts))
+    env=dict(env)
+    if fault=="non-zero-exit": env["MLV_FIXTURE_CODEX_VERSION_EXIT"]="7"
+    r=run_lane(cmd,env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==0 and q["state"]=="complete",(r.returncode,q)
+
+
+def test_r14_b4_control_a_real_budget_exhausted_at_the_final_rehash_still_refuses_typed(fixture_tree):
+    # The restore gives back the caller's deadline; it does not remove it. A lane budget that really ran out stops at that rehash, as a timeout, and no child starts.
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=_slow_step_before_the_final_rehash(6))
+    cmd[cmd.index("-TimeoutSec")+1]="3"
+    r=run_lane(cmd,env,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode==124,(r.returncode,q)
+    assert "codex-shim-unreadable" not in (q["failure"] or ""),q
+    assert not (root/"child.json").exists(), "a child started after the lane's budget ran out"
+
+
+class _OplockedFile:
+    # A real stalled open: a level 1 oplock whose break is never acknowledged blocks every other open of the file that reads data, while metadata stays immediate.
+    # Local stand-in for adversary A2's slow share.
+    def __init__(self, path):
+        import ctypes
+        from ctypes import wintypes
+        class OVERLAPPED(ctypes.Structure):
+            _fields_=[("Internal",ctypes.c_void_p),("InternalHigh",ctypes.c_void_p),("Offset",wintypes.DWORD),("OffsetHigh",wintypes.DWORD),("hEvent",wintypes.HANDLE)]
+        self.k=ctypes.WinDLL("kernel32",use_last_error=True)
+        self.k.CreateFileW.restype=wintypes.HANDLE
+        self.k.CreateFileW.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,wintypes.DWORD,wintypes.HANDLE]
+        self.k.CreateEventW.restype=wintypes.HANDLE
+        self.k.CreateEventW.argtypes=[ctypes.c_void_p,wintypes.BOOL,wintypes.BOOL,wintypes.LPCWSTR]
+        self.k.DeviceIoControl.argtypes=[wintypes.HANDLE,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.c_void_p,wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),ctypes.POINTER(OVERLAPPED)]
+        self.k.WaitForSingleObject.argtypes=[wintypes.HANDLE,wintypes.DWORD]
+        self.k.CloseHandle.argtypes=[wintypes.HANDLE]
+        self.h=None; self.ov=OVERLAPPED(); self.path=path; self.ctypes=ctypes; self.wintypes=wintypes
+    def __enter__(self):
+        end=time.monotonic()+20
+        while True:
+            h=self.k.CreateFileW(str(self.path),0x80000000,7,None,3,0x40000000,None)
+            assert h not in (None,self.ctypes.c_void_p(-1).value), self.ctypes.get_last_error()
+            self.ov.hEvent=self.k.CreateEventW(None,True,False,None)
+            ret=self.wintypes.DWORD(0)
+            ok=self.k.DeviceIoControl(h,0x00090000,None,0,None,0,self.ctypes.byref(ret),self.ctypes.byref(self.ov))
+            err=self.ctypes.get_last_error()
+            if not ok and err==997:
+                self.h=h
+                return self
+            # A scanner still has the fresh file open, so the oplock was not granted yet.
+            self.k.CloseHandle(h); self.k.CloseHandle(self.ov.hEvent)
+            assert time.monotonic()<end, f"the oplock was never granted (last error {err})"
+            time.sleep(.25)
+    def broken(self):
+        # True once some other open of the file asked for its data, i.e. that open is now stalled on this oplock.
+        return self.k.WaitForSingleObject(self.ov.hEvent,0)==0
+    def __exit__(self,*a):
+        self.k.CloseHandle(self.h); self.k.CloseHandle(self.ov.hEvent)
+
+
+def test_r13_adversary_a2_a_shim_whose_open_stalls_is_refused_typed_within_the_read_bound(fixture_tree):
+    # adversary A2 on 2d55c467 (fixed in 01fa433d with no RED test, and its asynchronous read left the OPEN unbounded): a shim read that stalls must not hold the lane. An unbounded
+    # read parks the launcher past this test's budget with no receipt; the bound answers codex-shim-unreadable.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    with _OplockedFile(fixture_tree["shim"]) as lock:
+        r=run_lane(cmd+["-ImagePaths",str(png)],env,timeout=max(LANE_RUN_TIMEOUT_SEC,90))
+        assert lock.broken(), "the launcher never asked for the shim's data, so this test exercised nothing"
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "codex-shim-unreadable" in text,(r.returncode,text[-4000:])
+    assert not (root/"child.json").exists()
+
+
+def test_too_many_image_paths_are_refused_typed_before_the_codex_child_starts(fixture_tree):
+    # r8 (ADV-A2): every accepted -ImagePaths entry became one `-i <snapshot>` pair, and 120 of them pushed the command line past cmd.exe's
+    # 8191 characters: the shim answered "The command line is too long." and codex never ran. The launcher must refuse it typed instead.
+    root=fixture_tree["root"]; png=root/"s.png"; _write_png(png,b"P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    # r12 (Dot B1 on c4f381a7): the bound is the native CreateProcess limit of the RESOLVED launch, so the count is the one that passes 32767
+    # characters on this host's run dir (120 now fits; see test_r12_dot_b1_a_native_launch_above_the_old_cmd_bound_is_accepted).
+    snap=len(str(Path(cmd[cmd.index("-RunDir")+1])/"terra-001.image-001.png"))
+    n=32767//(snap+4)+20
+    r=run_lane(cmd+["-ImagePaths","|".join([str(png)]*n)],env)
+    text=_failure_text(r,receipt)
+    assert r.returncode!=0 and "image-args-too-long" in text,(n,r.returncode,text[-4000:])
+    assert not (root/"args.json").exists(), "an over-long command line must be refused before the codex child starts"
+
+
+def test_a_codex_lane_without_image_paths_has_no_image_flag_and_no_receipt_key(fixture_tree):
+    cache=fixture_tree["root"]/"models_cache.json"
+    cache.write_text(codex_models_cache_text(("gpt-6.1-terra",)),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=run_lane(cmd,env)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert "-i" not in argv and "--image" not in argv
+    assert "imagePaths" not in json.loads(receipt.read_text(encoding="utf-8"))
+
+
+def test_a_claude_lane_with_image_paths_fails_closed_before_any_receipt(fixture_tree):
+    root=fixture_tree["root"]; png=root/"strip.png"; _write_png(png,b"x")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet")
+    r=run_lane(cmd+["-ImagePaths",str(png)],env)
+    assert r.returncode!=0 and "image-paths-codex-only" in r.stderr, (r.stdout,r.stderr)
+    assert not receipt.exists() and not (root/"child.json").exists()
+
+
+def test_image_paths_must_exist_and_be_png_or_jpg(fixture_tree):
+    root=fixture_tree["root"]
+    gif=root/"strip.gif"; gif.write_bytes(b"GIF89a")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")   # every refusal precedes the receipt slot, so one fixture serves all cases
+    for bad,token in ((str(root/"absent.png"),"image-path-missing"),(str(gif),"image-path-bad-extension"),(str(root),"image-path-missing")):
+        r=run_lane(cmd+["-ImagePaths",bad],env)
+        assert r.returncode!=0 and token in r.stderr, (bad,r.stdout,r.stderr)
+        assert not receipt.exists() and not (root/"child.json").exists(), bad
+        assert not (root/"args.json").exists(), "a refused image path must never reach the codex launch"
+
+
 def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="luna")
     cmd=cmd+["-ModelOverride","gpt-9-luna-pinned-for-test"]
@@ -683,16 +3089,12 @@ def test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable(fixtur
 # repro sol gave: "CODEX_EXE is missing or unstartable ... Process.Start then throws".
 def test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_recorded(fixture_tree):
     def mutation(text):
-        old = ("} else {\n"
-               "    $psi.FileName = $exe\n"
-               "    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }\n"
-               "    $proc = [Diagnostics.Process]::Start($psi)\n"
+        # r11: the codex launch runs the resolved program (Resolve-CodexShimLaunch) with its literal prefix arguments.
+        # r12: the start info is set by Set-CodexLaunchStartInfo (bound, re-hash, FileName/ArgumentList) right before Process.Start.
+        old = ("    $proc = [Diagnostics.Process]::Start($psi)\n"
                "}")
-        assert old in text, "codex Process.Start block text has moved; update this fixture mutation"
-        new = ("} else {\n"
-               "    $psi.FileName = $exe\n"
-               "    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }\n"
-               "    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
+        assert text.count(old)==1, "codex Process.Start block text has moved; update this fixture mutation"
+        new = ("    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
                "}")
         return text.replace(old, new)
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)
@@ -1783,10 +4185,15 @@ def _pin_case(fixture_tree, pin=None, exe_version=PIN_VERSION, create_exe=True, 
     pinned = pin_root / PIN_VERSION / "node_modules" / ".bin" / "codex.cmd"
     if create_exe:
         pinned.parent.mkdir(parents=True)
+        # r11: the launcher runs only a one-line shim (or the npm template) and never through cmd.exe, so the pinned fixture's
+        # --version answer and its 'pinned' marker live in a PowerShell copy of the child instead of in batch lines.
+        pinned_child = root / "pinned-child.ps1"
+        pinned_child.write_text(
+            f"if($args.Count -ge 1 -and $args[0] -eq '--version'){{[Console]::Out.Write(\"codex-cli {exe_version}`n\"); exit 0}}\n"
+            "'pinned'|Set-Content -Encoding ascii -LiteralPath $env:MLV_FIXTURE_VIA\n"
+            + fixture_tree["child"].read_text(encoding="ascii"), encoding="ascii")
         pinned.write_text("@echo off\r\n"
-                          f'if "%~1"=="--version" (echo codex-cli {exe_version}& exit /b 0)\r\n'
-                          'echo pinned> "%MLV_FIXTURE_VIA%"\r\n'
-                          f'"{PWSH}" -NoProfile -NonInteractive -File "{fixture_tree["child"]}" %*\r\n', encoding="ascii")
+                          f'"{PWSH}" -NoProfile -NonInteractive -File "{pinned_child}" %*\r\n', encoding="ascii")
     if pin is None:
         # probedModels: the fixture cache's highest sol (gpt-6-sol) is what a sol lane resolves to
         # (MODEL-POSTURE-R16-1: a pin only covers the models its promotion exec-probed).
@@ -2493,8 +4900,11 @@ def _fail_final_receipt_write(text):
 # the copy of the launcher waits (bounded) for the grandchild's own state file, then lets a 1.5 s deadline run
 # out through the unchanged WaitForExit -> $timedOut -> job-close -> final-write path.
 def _deadline_after_descendants_ready(text):
-    old='$remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
-    assert text.count(old)==1
+    # Anchored on the bounded-wait budget line that feeds `$proc.WaitForExit([int][math]::Min(2147483647.0, $remainingMs))`
+    # (VISUAL-JUDGE-TERRA-LANE-1 r5 made it Max(0.0, ...) so the budget is a double). It must be found exactly once:
+    # a drift here fails the fixture build loudly instead of silently running the real wall-clock budget.
+    old='$remainingMs = [math]::Max(0.0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
+    assert text.count(old)==1, "bounded-wait budget anchor not found exactly once in Invoke-Lane.ps1"
     ready=("$readyWatch = [Diagnostics.Stopwatch]::StartNew(); "
            "while (-not (Test-Path -LiteralPath $env:MLV_FIXTURE_GRAND) -and $readyWatch.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 20 }\n"
            "$remainingMs = 1500")
