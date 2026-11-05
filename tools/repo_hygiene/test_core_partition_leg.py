@@ -2508,10 +2508,27 @@ R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
 # it; goneAt, the enumeration count from which it has exited; startSec, its start relative to the launch; pathFail/startFail, the enumerations up to
 # which that read fails (-1: always); pathFailFrom/startFailFrom, the enumeration from which it fails; pathMode, how a failed Path read looks (empty
 # is what MainModule gives a real process before its loader has run; throw is an access-denied read); exe 'other', readable at another path;
-# recycleAt, the enumeration from which the pid belongs to a process started just now. The measured pid and the stop file arrive at enumeration 8.
+# recycleAt, the enumeration from which the pid belongs to a process whose start is stamped 3 s after that read, well past any gap the helper's own
+# clock sampling can record on a loaded host. The measured pid and the stop file arrive at enumeration 8.
 # Every enumeration stamps the wall clock, so a test can place the record's first sight among the helper's polls.
+# r2 additions. Two doubles may share an id: the pid passes from one to the other, and which one is listed is decided by from/to alone. stepMs: every wall
+# clock read the helper makes is that much earlier from enumeration 1 on (a backward step, which its own clock sampling then sees); startBeforeFirstPollMs:
+# the start is that long before enumeration 1 on the unstepped clock, so the process really did start before the first listing that stamps a later time.
+# exitedNullAt: from that enumeration count HasExited gives nothing, which is what PowerShell makes of the getter's access-denied throw once the pid belongs to a
+# process this user cannot open (measured on csrss, wininit and smss from an unelevated pwsh 7.6: Path '', StartTime null, HasExited null, no throw).
 _APP = {"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
 _Q = {"from": 1, "to": 99, "goneAt": 999}
+# Opus key3's pid 300: P1 is tracked and read at once. P2 takes the pid in the pass that sees P1 gone (enumeration 4), Path empty, its start readable and new.
+_P1_TRACKED = {"id": 300, "from": 1, "to": 3, "goneAt": 3, "startSec": 1}
+_P2_PATH_UNREAD = {"id": 300, "from": 4, "goneAt": 999, "startSec": 2, "pathMode": "empty"}
+# P1 unread on enumerations 1-2, its pid then held by P2.
+_P1_UNREAD = {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty"}
+# Sol's input: the process started 50 ms before enumeration 1, whose stamp is stepMs earlier. One failed read at first sight, then every read succeeds.
+_CLOCK_APP = {**_APP, "startBeforeFirstPollMs": 50}
+CLOCK_STEPS_MS = (100, 500, 1000)
+# With the start unread at first sight only the listing's stamp is left to compare, so the gap the helper sampled decides it. These steps keep that gap
+# well above what a stall between the helper's two clock zeros can take off it.
+CLOCK_START_UNREAD_STEPS_MS = (400, 700, 1000)
 LATE_READ_SCENARIOS = {
     "control": {"procs": [_APP]},
     "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
@@ -2532,21 +2549,33 @@ LATE_READ_SCENARIOS = {
     "other-path-once-readable": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "pathFail": 3, "pathMode": "empty"}]},
     "recycled-start-unread": {"procs": [_APP, {**_Q, "id": 300, "startSec": 1, "startFail": 2, "recycleAt": 3}]},
     "recycled-path-unread": {"procs": [_APP, {**_Q, "id": 300, "startSec": 1, "pathFail": 2, "pathMode": "empty", "recycleAt": 3}]},
+    "recycled-over-tracked-gone-next-pass": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 4, "pathFail": -1}]},
+    "recycled-over-tracked-read-later": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 6, "pathFail": 5}]},
+    "recycled-over-tracked-never-seen-gone": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 999}, {**_P2_PATH_UNREAD, "to": 5, "pathFail": -1}]},
+    "recycled-over-tracked-unopenable": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 999, "exitedNullAt": 3}, {**_P2_PATH_UNREAD, "to": 6, "pathFail": -1, "pathMode": "throw", "startFail": -1}]},
+    "recycled-other-path-start-unread": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startSec": 2, "exe": "other", "startFail": -1}]},
+    "recycled-start-not-later": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startSec": 2}]},
+    "other-path-start-unread-from-the-first": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "startFail": -1}]},
+    **{f"clock-back-path-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "pathFail": 1, "pathMode": "empty"}]} for ms in CLOCK_STEPS_MS},
+    **{f"clock-back-start-{ms}": {"stepMs": ms, "procs": [{**_CLOCK_APP, "startFail": 1}]} for ms in CLOCK_START_UNREAD_STEPS_MS},
 }
 _LATE_READ_DRIVER_BODY = HELPER_SOURCE + r"""
 $cat = "[Diagnostics.PerformanceCounterCategory]::new('Processor Information')"
 if (-not $hb.Contains($cat)) { throw 'the helper no longer reads the Processor Information category (the stub anchor)' }
 $hb = $hb.Replace($cat, '$cpFakeCat')
+# Every wall clock read of the helper's goes through the double. A helper whose reads this no longer finds fails the skew assertion, so the step cannot go missing unnoticed.
+$hb = $hb -replace '\[DateTime\]::UtcNow|\$dt::UtcNow', '(Get-CpNow)'
 $prelude = @'
 $cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
 $global:cpPoll = 0
 $global:cpSpec = $env:CP_SPEC | ConvertFrom-Json
 $global:cpLaunch = [DateTime]::new([int64]$env:CP_LAUNCH_TICKS, [DateTimeKind]::Utc)
+function Get-CpNow { $n = [DateTime]::UtcNow; if ($global:cpPoll -ge 1 -and $global:cpSpec.stepMs) { $n.AddMilliseconds(-$global:cpSpec.stepMs) } else { $n } }
 function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global:cpPoll -le $Up) -or ($null -ne $From -and $global:cpPoll -ge $From) }
 $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
         if (Test-CpFails $s.pathFail $s.pathFailFrom) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
@@ -2554,11 +2583,13 @@ $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
         $s = $this.cpS
         if (Test-CpFails $s.startFail $s.startFailFrom) { throw [ComponentModel.Win32Exception]::new(5) }
-        if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow }; return $global:cpNew }
+        if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow.AddSeconds(3) }; return $global:cpNew }
+        if ($null -ne $s.startBeforeFirstPollMs) { return $global:cpT1.AddMilliseconds(-$s.startBeforeFirstPollMs) }
         $global:cpLaunch.AddSeconds($s.startSec) }
     $d })
 function Get-Process { [CmdletBinding()] param([string]$Name)
     $global:cpPoll++
+    if ($global:cpPoll -eq 1) { $global:cpT1 = [DateTime]::UtcNow }
     [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
     if ($global:cpPoll -eq 8) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
     $global:cpDoubles | Where-Object { $global:cpPoll -ge $_.cpS.from -and $global:cpPoll -le $_.cpS.to } }
@@ -2602,7 +2633,7 @@ for ($b = 0; $b -lt $names.Count; $b += 4) {
             instances = @(@($rec.instances) | Where-Object { $null -ne $_ } | ForEach-Object { $_.pid })
             others = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified } | ForEach-Object { $_.pid })
             unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid })
-            by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons
+            by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons; skew = $rec.clockSkewMaxMs
             polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ }) }
     }
 }
@@ -2868,6 +2899,64 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
                 self.assertEqual(case["instances"], [5000, 300], case)
                 self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], f"the recycled pid inherited the earlier first sight: {case}")
+
+    def test_handover_a_process_on_a_recycled_tracked_pid_is_never_dropped(self) -> None:
+        """Opus key3 on e048ccc6: P1 on pid 300 is tracked, and P2 is listed on that pid with Path empty and a readable new start. A readable start that no
+        process has held is not P1 exiting, so a pid-only guard must not swallow it. P2 unread for its whole life is recorded and refuses the run: when it is gone by
+        the next pass, and when P1 is never seen gone because HasExited, which opens by pid, reads P2 (master refuses in both). When this user cannot open P2 at all
+        both reads fail and HasExited gives nothing: that is not P1 alive, so P1 is seen gone and P2 is on the record from the next pass."""
+        for mode in ("recycled-over-tracked-gone-next-pass", "recycled-over-tracked-never-seen-gone", "recycled-over-tracked-unopenable"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a process on a recycled pid that was never identified left no record: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        p1 = self.late_read("recycled-over-tracked-unopenable")["by"]["300"]
+        self.assertIsNotNone(p1["goneMs"], f"a HasExited that gave nothing was read as alive: {p1}")
+
+    def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
+        """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""
+        case = self.late_read("recycled-over-tracked-read-later")
+        self.assertEqual(case["unidentified"], [], case)
+        self.assertEqual(case["instances"], [5000, 300, 300], f"P1 and P2 are two instances: {case}")
+        rec, polls = case["by"]["300"], case["polls"]
+        self.assertGreaterEqual(rec["first"], polls[3], case)
+        self.assertLess(rec["first"], polls[4], f"the first sight of a process on a recycled tracked pid is a pass late: {case}")
+
+    def test_handover_an_unread_process_is_not_dropped_on_a_read_that_cannot_tell_it_from_its_successor(self) -> None:
+        """Sibling at the pending removal: P1 is unread, and the pid then reads at another path with its start unread. The recycle check cannot run without a start, so
+        that read cannot say P1 was identified and its entry stays: refused when nothing ever tells them apart. Control: with no unread process on that
+        pid, another-path with a failed start read refuses nothing, as on master."""
+        case = self.late_read("recycled-other-path-start-unread")
+        self.assertEqual(case["unidentified"], [300], f"an unread process was removed by a read that could not identify it: {case}")
+        self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        control = self.late_read("other-path-start-unread-from-the-first")
+        self.assertEqual([control["unidentified"], control["others"], control["instances"]], [[], [], [5000]], control)
+        self.assertIn(control["vwhy"], self.ACCEPTED, control)
+
+    def test_handover_a_start_read_at_first_sight_is_the_identity_the_later_read_is_held_to(self) -> None:
+        """P1's start was read at first sight, so a different start on that pid is another process even when it is no later than the listing's stamp (a clock
+        stepped back between them makes that possible). P1 refuses, and P2 gets its own first sight, never P1's."""
+        case = self.late_read("recycled-start-not-later")
+        self.assertEqual(case["unidentified"], [300], f"P2 inherited an unread P1 and P1 left no record: {case}")
+        self.assertEqual(case["instances"], [5000, 300], case)
+        self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], case)
+
+    def test_handover_a_backward_clock_step_within_tolerance_is_not_a_recycled_pid(self) -> None:
+        """Sol on e048ccc6, catalogue row CP-CLOCK-REUSE: the process started before its first listing, but a backward step within the supported 1000 ms makes the
+        listing's stamp the earlier one. Its reads recover, so it is the measured app and no predecessor is invented, whichever read failed. A step of
+        1000 ms plus the sampling noise can be past the job's tolerance, which is its own refusal and is not under test at that size."""
+        for read, steps in (("path", CLOCK_STEPS_MS), ("start", CLOCK_START_UNREAD_STEPS_MS)):
+            for ms in steps:
+                with self.subTest(step=ms, read=read):
+                    case = self.late_read(f"clock-back-{read}-{ms}")
+                    # The gap reads short by the time between the helper's two clock zeros, which a loaded host can stretch, so only the larger steps are held to it.
+                    if ms >= 400:
+                        self.assertGreaterEqual(case["skew"], ms * 0.5, f"the clock double did not reach the helper: {case}")
+                    self.assertGreater(case["by"]["5000"]["start"], case["polls"][0] - ms * 10000, f"the input no longer has the listing's stamp before the start: {case}")
+                    self.assertEqual(case["unidentified"], [], f"a backward step within tolerance invented an unidentified predecessor: {case}")
+                    self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
+                    self.assertIn(case["vwhy"], self.ACCEPTED + (("clock-discontinuity",) if ms == 1000 else ()), case)
 
     def test_handover_a_real_process_caught_before_its_loader_ran_is_classed_after_it_resumes(self) -> None:
         """Nothing doubled but the counter category: a real stand-in process held suspended through two whole enumerations. Its Path really is unreadable
