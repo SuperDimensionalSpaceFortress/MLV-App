@@ -195,6 +195,11 @@ FRAME:
   On both grids, every run whose count really reaches 1499 by the budget is Reached, at the first poll after it. Every
   run that cannot is refused `PLAY_PACE_TOO_SLOW` before the budget. Off the grid, a run whose true finish lies
   less than one poll past the budget can still end in the typed `PLAY_SAFETY_TIMEOUT` instead, never a pass.
+  r20 (adversary A2 on 657fcd3d) narrows the first sentence: `Reached` needs a poll at or before the budget. A
+  requirement first seen past the budget is `PLAY_SAFETY_TIMEOUT`, because the poll cannot tell a finish in the last poll
+  gap before the budget from one just past it. So a run on the grid that finishes in that gap and is first seen after
+  it ends typed, not Reached, and the committed test (a) pins exactly that. The full-sweep receipt (b) predates this
+  rule and has not been rerun.
   Example: 24 fps, first present 1084 ms, reaching at 65000.7 ms (r16 re-pass A3). There are two pinned exceptions, both refused typed within 200 ms of the
   probe:
   (1) the stall share cap below: a burst whose stalls exceed a third of the time to the probe looks, at 8 s, exactly

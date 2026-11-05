@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "why": "CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest measured windows classes run in the job repo-hygiene-python-windows-unittest-heavy, split into `parts` legs; the windows 7-way partition excludes exactly these. CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the windows suite weighs 12047 s, more than the 9666 s that 7 shards and 2 parts hold at the 85 % limit, so parts went 2 -> 6 (5 cannot hold the open #705 and #709 additions) and the set was re-balanced so every shard and part is expected under that limit. LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: #705's 69 test_artifact_preflight_* cases (545.9 s hosted, run 40861273862) left VenueLeaseBatchLegPlanTests at 1131 s, past one part, so they run in their own class VenueLeaseBatchArtifactPreflightTests, which joins this set. CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1 r16: BoundedCaptureIoTests (67 s hosted windows) joins, because the card's own growth took every shard to 1225.7 s against the 1224 s limit; it now sits at 1216.1 s and the heaviest part at 1206.7 s. test_ci_unittest_shard.HeavySetTests and ShardDurationBudgetTests pin both sides.",
+  "why": "CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest measured windows classes run in the job repo-hygiene-python-windows-unittest-heavy, split into `parts` legs; the windows 7-way partition excludes exactly these. CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the windows suite weighs 12047 s, more than the 9666 s that 7 shards and 2 parts hold at the 85 % limit, so parts went 2 -> 6 (5 cannot hold the open #705 and #709 additions) and the set was re-balanced so every shard and part is expected under that limit. LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: #705's 69 test_artifact_preflight_* cases (545.9 s hosted, run 40861273862) left VenueLeaseBatchLegPlanTests at 1131 s, past one part, so they run in their own class VenueLeaseBatchArtifactPreflightTests, which joins this set. CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1 r16: BoundedCaptureIoTests (67 s hosted windows) joins, because the card's own growth took every shard to 1225.7 s against the 1224 s limit; it now sits at 1216.1 s and the heaviest part at 1206.7 s. HFR-NATIVE-60FPS-FULLRES-1 r20: this PR's three conform classes (59.8 s hosted windows) join, because they took the heaviest shard to 1229.8 s against the 1224 s limit; it now sits at 1221.2 s and the heaviest part is still 1206.7 s. test_ci_unittest_shard.HeavySetTests and ShardDurationBudgetTests pin both sides.",
   "profiles": {
     "windows": {
       "parts": 6,
@@ -11,6 +11,9 @@
         "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests",
         "tools.repo_hygiene.test_core_partition_leg.CorePartitionGeneratorTests",
         "tools.repo_hygiene.test_core_partition_leg.PlaybackMaxThreadsGeneratorTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.ConformArmIsHonouredTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.ConformMeasuredFieldsAreJudgedTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.ConformStatusParenthesisSurvivesTheLogReaderTests",
         "tools.repo_hygiene.test_dual_venue_evidence.EvidenceBoundReceiptTests",
         "tools.repo_hygiene.test_dual_venue_evidence.ProductFailureTerminalsAreReceiptableTests",
         "tools.repo_hygiene.test_dual_venue_evidence.VenueProbeIdentityNoArgumentTextR5Tests",

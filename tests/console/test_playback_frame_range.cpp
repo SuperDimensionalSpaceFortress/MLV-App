@@ -2404,7 +2404,7 @@ TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeas
 {
     const int64_t budget = playSafetyMs( 25.0 );
     int64_t feasibleReached = 0, infeasibleAtProbe = 0, infeasibleLater = 0, shareCapRefused = 0, twoPollRefused = 0;
-    int64_t pinnedReached = 0, pinnedLatestMs = 0;
+    int64_t pinnedReached = 0, pinnedLatestMs = 0, seenPastTheBudget = 0;
     std::vector<int64_t> infeasiblePerFps( 3, 0 );
     for( const bool burst : { true, false } )
     for( size_t fi = 0; fi < 3; ++fi )
@@ -2436,6 +2436,15 @@ TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeas
                 ASSERT_TRUE( r.elapsedMs >= reach && r.elapsedMs < reach + 50 );
                 ++( overShareCap || twoPoll ? pinnedReached : feasibleReached );
             }
+            else if( r.state == PlayStopState::SafetyTimeout )
+            {
+                // r20 (adversary A2 on 657fcd3d): a finish in the last poll gap before the budget, first seen after it. The
+                // poll cannot tell it from one just past the budget, so it ends typed, never a pass, and only at that poll.
+                ASSERT_TRUE( reach <= budget );
+                ASSERT_TRUE( r.elapsedMs > budget );
+                ASSERT_TRUE( r.elapsedMs >= reach && r.elapsedMs < reach + 50 );
+                ++seenPastTheBudget;
+            }
             else
             {
                 // only the two pinned classes, and only typed, within 200 ms of the probe
@@ -2453,9 +2462,10 @@ TEST( PlayPaceRecovery, R16GeneratedSweepEveryFeasibleRunCompletesAndEveryInfeas
         }
     }
     std::printf( "  r16 sweep: feasible Reached=%lld (+%lld in a pinned class), infeasible refused at the probe=%lld, later=%lld; "
-                 "pinned refusals: share cap=%lld, two-poll=%lld, the latest at %lld ms\n", (long long)feasibleReached,
+                 "pinned refusals: share cap=%lld, two-poll=%lld, the latest at %lld ms; first seen past the budget=%lld\n",
+                 (long long)feasibleReached,
                  (long long)pinnedReached, (long long)infeasibleAtProbe, (long long)infeasibleLater, (long long)shareCapRefused,
-                 (long long)twoPollRefused, (long long)pinnedLatestMs );
+                 (long long)twoPollRefused, (long long)pinnedLatestMs, (long long)seenPastTheBudget );
     ASSERT_TRUE( feasibleReached > 0 && infeasibleAtProbe > 0 && infeasibleLater > 0 );
     for( const int64_t n : infeasiblePerFps ) ASSERT_TRUE( n > 0 );   // the spacing reaches truly infeasible at every fps
 }
@@ -2946,4 +2956,91 @@ TEST( ContactSheetSeekFrameList, TheFirstFramePastTheClipIsNamedBeforeAnyPlay )
     ASSERT_EQ( 0, firstContactSheetSeekFrameOutOfRange( { 0 }, 1 ) );
     ASSERT_EQ( 3, firstContactSheetSeekFrameOutOfRange( { 3, 4 }, 0 ) );
     ASSERT_EQ( -1, firstContactSheetSeekFrameOutOfRange( {}, 0 ) );
+}
+
+// r20 (adversary A1 on 657fcd3d): native 60 fps, conform off, 2000 frames, requested 25 s, required 1500, budget 65000, Gated,
+// polled every 50 ms from 0 (note, then decide). The count sits at 2 until 4000 ms, runs at 60 fps to 5000 ms, holds at 62 until
+// 7000 ms, and runs at 60 fps from there. The stretch 4000..8000 ms proves 120 steps in 4000 ms, 30 fps, projecting 53933.333 ms.
+// The window kept only the newest anchor at least 3 s back (the count 61 last seen at 4950 ms, 20.66 fps), so the probe projected
+// past the budget and refused a run that reaches 1500 at 30966.667 ms. The pace is over ANY stretch of at least 3 s.
+namespace
+{
+int64_t r20A1Count( int64_t t )
+{
+    if( t < 17 ) return 1;
+    if( t < 4000 ) return 2;
+    if( t < 5000 ) return 2 + ( t - 4000 ) * 60 / 1000;
+    if( t < 7000 ) return 62;
+    return 62 + ( t - 7000 ) * 60 / 1000;
+}
+}
+
+TEST( PlayPaceRecovery, R20AdversaryA1ThePaceProbeReadsAnyStretchOfAtLeastThreeSeconds )
+{
+    PlayPaceHistory h;
+    PlayStopState state = PlayStopState::Continue;
+    int64_t t = 0;
+    for( ; t <= 900000; t += 50 )
+    {
+        h.note( r20A1Count( t ), t );
+        state = evaluatePlayStop( r20A1Count( t ), 1500, true, t, 65000, playback_frame_range::PlayPaceMode::Gated, h );
+        if( t == 8000 )
+        {
+            ASSERT_EQ( int64_t( 122 ), r20A1Count( t ) );
+            ASSERT_NEAR( 0.03, h.bestWindowPace, 1e-9 );
+            ASSERT_TRUE( state == PlayStopState::Continue );
+        }
+        if( state != PlayStopState::Continue ) break;
+    }
+    ASSERT_TRUE( state == PlayStopState::Reached );
+    ASSERT_EQ( int64_t( 31000 ), t );
+    // the stretch is anchored at a LAST sighting, so the stall inside it still counts against it: a steady 20 fps run is not lifted
+    PlayPaceHistory slow;
+    PlayStopState slowState = PlayStopState::Continue;
+    for( t = 0; t <= 900000; t += 50 )
+    {
+        const int64_t c = 1 + t * 20 / 1000;
+        slow.note( c, t );
+        slowState = evaluatePlayStop( c, 1500, true, t, 65000, playback_frame_range::PlayPaceMode::Gated, slow );
+        if( slowState != PlayStopState::Continue ) break;
+    }
+    ASSERT_TRUE( slowState == PlayStopState::PaceTooSlow );
+    ASSERT_EQ( int64_t( 8000 ), t );
+}
+
+// r20 (adversary A2 on 657fcd3d): native 59.94 fps, conform 24 fps, 1667 frames, requested 25 s, required 1499, budget 65000, Gated,
+// polled at 49 + 50k ms. A 2626 ms first-frame wait, then 24 fps: the count is 1498 at 64999 ms and first reaches 1499 at 65001 ms,
+// after the deadline. Reached was checked before the clock, so the next poll (65049 ms, count 1500) passed, and autoplay maps Reached
+// to exit 0. A requirement first SEEN past the deadline cannot be proved inside it, so it ends in the typed timeout, never a pass.
+TEST( PlayStopDecision, R20AdversaryA2ARequirementFirstSeenPastTheDeadlineIsNeverAPass )
+{
+    const auto count = []( int64_t t ) -> int64_t
+    {
+        if( t < 17 ) return 1;
+        if( t < 2626 ) return 2;
+        return 2 + ( t - 2626 ) * 24 / 1000;
+    };
+    PlayPaceHistory h;
+    PlayStopState state = PlayStopState::Continue;
+    int64_t t = 49;
+    for( ; t <= 900000; t += 50 )
+    {
+        h.note( count( t ), t );
+        state = evaluatePlayStop( count( t ), 1499, true, t, 65000, playback_frame_range::PlayPaceMode::Gated, h );
+        if( state != PlayStopState::Continue ) break;
+    }
+    ASSERT_EQ( int64_t( 1498 ), count( 64999 ) );
+    ASSERT_EQ( int64_t( 1500 ), count( 65049 ) );
+    ASSERT_EQ( int64_t( 65049 ), t );
+    ASSERT_TRUE( state == PlayStopState::SafetyTimeout );
+    ASSERT_EQ( std::string( "PLAY_SAFETY_TIMEOUT" ), std::string( playback_frame_range::playStopFailureReason( state ) ) );
+    // the same for a run that ended on that frame (it is late, not short) and for an informational run, whose ceiling this is
+    ASSERT_TRUE( evaluatePlayStop( 1500, 1499, false, 65049, 65000 ) == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( evaluatePlayStop( 1500, 1499, true, 65049, 65000, playback_frame_range::PlayPaceMode::MeasuredInformational ) == PlayStopState::SafetyTimeout );
+    // seen at or before the deadline it is inside it, whichever poll sees it, and a Play ending on that frame is still Reached
+    ASSERT_TRUE( evaluatePlayStop( 1499, 1499, true, 65000, 65000 ) == PlayStopState::Reached );
+    ASSERT_TRUE( evaluatePlayStop( 1499, 1499, false, 65000, 65000 ) == PlayStopState::Reached );
+    ASSERT_TRUE( evaluatePlayStop( 1499, 1499, true, 64999, 65000 ) == PlayStopState::Reached );
+    // required <= 0 still never reaches, past the deadline or not
+    ASSERT_TRUE( evaluatePlayStop( 99999, 0, true, 65049, 65000 ) == PlayStopState::SafetyTimeout );
 }

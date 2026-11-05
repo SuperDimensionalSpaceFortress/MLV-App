@@ -584,7 +584,10 @@ struct PlayPaceHistory
     };
     bool haveFirstStep = false;
     Sample firstStep;                   // the first observation with consumed >= 2 (the first forward step)
-    std::deque<Sample> window;          // front = newest value last seen at or before now - kPaceRecentWindowMs
+    std::deque<Sample> window;          // the values last seen less than kPaceRecentWindowMs ago, too recent to anchor a stretch
+    // r20 (adversary A1 on 657fcd3d): the older values, thinned to their lower convex hull (x = lastSeenMs, y = consumed).
+    // From any later observation the fastest stretch starts on the hull, so the rest can never be the best.
+    std::vector<Sample> stretchAnchors;
     double bestWindowPace = 0.0;        // steps per ms: the fastest kPaceRecentWindowMs-or-longer stretch seen so far
     int64_t lastElapsedMs = -1;
     int64_t lastConsumed = 0;
@@ -857,13 +860,27 @@ struct PlayPaceHistory
         {
             window.back().lastSeenMs = elapsedMs;
         }
-        while( window.size() >= 2 && window[1].lastSeenMs <= elapsedMs - kPaceRecentWindowMs ) window.pop_front();
-        const Sample &anchor = window.front();
-        const int64_t span = elapsedMs - anchor.lastSeenMs;
-        if( span >= kPaceRecentWindowMs )
+        // r20 (adversary A1 on 657fcd3d): ANY stretch of at least kPaceRecentWindowMs ending now, not only the shortest. With a
+        // hold inside the last 3 s the shortest can start just before it (a count at 61 last seen at 4950 ms, 20.66 fps at
+        // 8000 ms) while a longer one proves more (2 last seen at 4000 ms, 120 steps in 4000 ms, 30 fps).
+        while( !window.empty() && window.front().lastSeenMs <= elapsedMs - kPaceRecentWindowMs )
         {
-            bestWindowPace = std::max( bestWindowPace,
-                static_cast<double>( consumed - anchor.consumed ) / static_cast<double>( span ) );
+            const Sample &next = window.front();   // not the newest value: that one's lastSeenMs is elapsedMs
+            while( stretchAnchors.size() >= 2 )
+            {
+                const Sample &a = stretchAnchors[stretchAnchors.size() - 2];
+                const Sample &b = stretchAnchors.back();
+                if( ( b.lastSeenMs - a.lastSeenMs ) * ( next.consumed - a.consumed )
+                    > ( b.consumed - a.consumed ) * ( next.lastSeenMs - a.lastSeenMs ) ) break;
+                stretchAnchors.pop_back();
+            }
+            stretchAnchors.push_back( next );
+            window.pop_front();
+        }
+        for( const Sample &anchor : stretchAnchors )
+        {
+            bestWindowPace = std::max( bestWindowPace, static_cast<double>( consumed - anchor.consumed )
+                                                       / static_cast<double>( elapsedMs - anchor.lastSeenMs ) );
         }
     }
 
@@ -967,16 +984,20 @@ inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int6
 enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout, PaceTooSlow };
 
 // The ONE decision every automation Play wait makes. Reached (the source frames were consumed) wins over
-// everything, including a Play that ended on that very frame; a Play that ended first is EndedEarly; a wall
-// clock that ran out first is SafetyTimeout; a pace that cannot make it in time is PaceTooSlow. required <= 0 can
-// never be reached. r11 (ADV-A1b): `history` is the Play's PlayPaceHistory, noted with this same observation; the
+// everything, including a Play that ended on that very frame, while it is seen at or before the deadline; a Play that
+// ended first is EndedEarly; a wall clock that ran out first is SafetyTimeout; a pace that cannot make it in time is
+// PaceTooSlow. required <= 0 can never be reached. r20 (adversary A2 on 657fcd3d): a requirement first SEEN past the
+// deadline is SafetyTimeout, never a pass. The poll cannot tell a crossing just before the deadline from one just after
+// it (1498 at 64999 ms, first 1499 at 65001 ms, 1500 at 65049 ms), so it fails closed, typed.
+// r11 (ADV-A1b): `history` is the Play's PlayPaceHistory, noted with this same observation; the
 // app's one caller (MainWindow::programmaticPlayState) always passes it. Without one the pace probe is master's.
 inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool playStillRunning,
                                        int64_t elapsedMs, int64_t safetyMs,
                                        PlayPaceMode mode = PlayPaceMode::Gated,
                                        const PlayPaceHistory &history = PlayPaceHistory() )
 {
-    if( required > 0 && consumed >= required ) return PlayStopState::Reached;
+    if( required > 0 && consumed >= required )
+        return elapsedMs <= safetyMs ? PlayStopState::Reached : PlayStopState::SafetyTimeout;
     if( !playStillRunning ) return PlayStopState::EndedEarly;
     if( elapsedMs >= safetyMs ) return PlayStopState::SafetyTimeout;
     // CPU-LOOK-LEG-PACE-ABORT-1: the pace probe is the Gated mode's only; an informational run measures its pace and
