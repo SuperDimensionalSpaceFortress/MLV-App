@@ -616,6 +616,9 @@ function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
 # object, which holds the worker and the processes started under it; on POSIX the recorded process group (the worker leads its own, via
 # setsid) plus the descendants still visible in the worker's tree. A factory child that starts its own session or group (setsid) is
 # OUTSIDE this contract and may survive teardown, and the reader does not detect that.
+# PID OWNERSHIP IS A STATED LIMITATION, NOT A GUARANTEE (r16): on POSIX the group is signalled by number, after a separate identity check. The
+# identity check and the group signal are two steps, so a number reused by an unrelated leader between them can still be signalled. That
+# window has not been measured, and nothing here closes it (no pidfd, no group handle).
 # Every accepted -Start input therefore ends one of five ways, each of which lets this process end on its own:
 #   the task completes inside the bound         -> the worker writes its answer and ends; the step succeeds
 #   the factory or the conversion throws       -> the worker writes the innermost message and ends; the step fails by that name
@@ -698,16 +701,21 @@ function Get-CaptureGroupIdentityProblem($Worker, [string]$ProcRoot = '/proc') {
     # adversary r15 A3: the recorded group number is the worker's pid, confirmed once at start-up. After the worker has ended and been reaped its
     # number is free, and a NEW process leading a group of the same number would be killed by a blind kill(-group). The worker's start time
     # (field 22 of the process stat file) is recorded with the group: while that file still shows the same start time the group is the worker's;
-    # when the file is gone the worker has been reaped and no other leader has taken the number, so only its orphans can be in the group;
-    # a different start time means the number was reused, and the group is not killed. '' when the group may be killed, else a note.
+    # when the file is NOT FOUND (the read below raises FileNotFound / DirectoryNotFound) the worker has been reaped, so only its orphans can be in
+    # the group; a different start time means the number was reused, and the group is not killed. '' when the group may be killed, else a note.
+    # r16, stated limitation: this check and the group signal (KillGroup, queued afterwards by Stop-CaptureWorker) are SEPARATE steps. A number
+    # that is freed and reused by an unrelated leader between them can still be signalled; the window has not been measured and nothing here
+    # closes it (no pidfd, no group handle). Any other failure to read the file (a permission or I/O error, a directory in its place, an
+    # unparsable line) is NOT read as "gone": the identity is unconfirmed and the group is not killed (orphans of that group may survive).
     try {
         $statPath = Join-Path (Join-Path $ProcRoot ([string]$Worker.Group)) 'stat'
-        if (-not [IO.File]::Exists($statPath)) { return '' }
         $stat = [IO.File]::ReadAllText($statPath)
         $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
         if ([string]$fields[19] -ceq [string]$Worker.GroupStart) { return '' }
         return "capture worker group $($Worker.Group) is no longer the worker's (its leader's start time changed, so the number was reused): the group was not killed"
     }
+    catch [IO.FileNotFoundException] { return '' }
+    catch [IO.DirectoryNotFoundException] { return '' }
     catch { return "the identity of capture worker group $($Worker.Group) could not be confirmed ($($_.Exception.Message)): the group was not killed" }
 }
 function Stop-CaptureWorker($Worker) {
@@ -716,7 +724,8 @@ function Stop-CaptureWorker($Worker) {
     # factory that launched a process and then threw left that process running). POSIX: the worker leads its own process group (setsid), so the
     # group is killed too, which reaches orphans of that group that were reparented away from the worker. It does not reach a descendant that left the
     # group or session (setsid): only the descendants still visible in the worker's tree and the recorded group are covered.
-    # Returns '' or a note naming what could not be confirmed. Never throws.
+    # The group is signalled by number after a separate identity check, so a number reused between the two can still be hit (r16, stated
+    # limitation; see Get-CaptureGroupIdentityProblem). Returns '' or a note naming what could not be confirmed. Never throws.
     if ($null -eq $Worker) { return '' }
     $notes = [Collections.Generic.List[string]]::new()
     $p = $Worker.Process

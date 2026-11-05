@@ -2780,6 +2780,27 @@ class BoundedCaptureIoTests(unittest.TestCase):
             at = fifo.index(function)
             self.assertIn("visible", fifo[max(0, at - 600):at + 1500], f"{function} is documented without the visible-descendants limit")
 
+    def test_r16_a5_pid_ownership_is_a_stated_limitation_and_an_unreadable_identity_refuses_the_kill(self) -> None:
+        # Source pin (every OS), r16 re-pass A2 / Dot's hardening note: the contract no longer implies the identity check and the group signal
+        # are one step, no time window is claimed that was never measured, and "File.Exists = false" is not read as "gone".
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("# PID OWNERSHIP IS A STATED LIMITATION")
+        statement = re.sub(r"\s*\n#\s*", " ", fifo[begin:fifo.index("$CaptureWorkerStartMs = ", begin)])
+        for needle in ("on POSIX the group is signalled by number", "separate identity check", "The identity check and the group signal are two steps",
+                       "can still be signalled", "has not been measured", "no pidfd, no group handle"):
+            self.assertIn(needle, statement, f"the pid-ownership limitation no longer says: {needle}")
+        self.assertNotRegex(fifo, r"(?i)microsecond|no other leader has taken the number|cannot be reused|atomic(?:ally)? (?:check|kill)",
+                            "a comment claims a pid-reuse window that was never measured, or an atomicity the code does not have")
+        problem = fifo[fifo.index("function Get-CaptureGroupIdentityProblem"):fifo.index("function Stop-CaptureWorker")]
+        code = "\n".join(_code_lines(problem))
+        self.assertNotIn("[IO.File]::Exists(", code, "File.Exists answers false for a denied or failed lookup as well as for a gone file")
+        self.assertIn("catch [IO.FileNotFoundException] { return '' }", code)
+        self.assertIn("catch [IO.DirectoryNotFoundException] { return '' }", code)
+        self.assertRegex(code, r"catch \{ return \"the identity of capture worker group", "any other failure refuses the kill")
+        self.assertIn("SEPARATE steps", problem, "the check's own comment states that the signal is a separate step")
+        stop = fifo[fifo.index("function Stop-CaptureWorker"):fifo.index("function Close-CaptureWorker")]
+        self.assertIn("separate identity check", stop, "Stop-CaptureWorker repeats the limitation")
+
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_adversary_r15_a3_a_group_number_reused_by_another_leader_is_not_killed(self) -> None:
         # adversary r15 A3: Stop-CaptureWorker sent SIGKILL to -<recorded group> even after the worker had been reaped, so a number reused by an
@@ -2796,9 +2817,10 @@ class BoundedCaptureIoTests(unittest.TestCase):
             os.makedirs(os.path.join(root, "gone"))
             os.makedirs(os.path.join(root, "unreadable", "4242"))
             Path(root, "unreadable", "4242", "stat").write_text("", encoding="ascii")  # nothing to parse: the identity cannot be confirmed
+            os.makedirs(os.path.join(root, "denied", "4242", "stat"))  # r16: a directory where the file belongs: the read is denied, which is NOT "gone"
             script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                       "$w = [pscustomobject]@{ Group = 4242; GroupStart = '777' }\n"
-                      "foreach ($n in 'same', 'reused', 'comm', 'gone', 'unreadable') {\n"
+                      "foreach ($n in 'same', 'reused', 'comm', 'gone', 'unreadable', 'denied') {\n"
                       "  Write-Output ($n + '|[' + (Get-CaptureGroupIdentityProblem $w (Join-Path '" + root.replace("'", "''") + "' $n)) + ']')\n"
                       "}\n")
             proc = self._pwsh(script)
@@ -2809,6 +2831,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
             self.assertIn(f"{name}|[]", proc.stdout, f"{name}: the group is the worker's (or only its orphans remain) and may be killed")
         self.assertRegex(proc.stdout, r"reused\|\[capture worker group 4242 is no longer the worker's .*the group was not killed\]")
         self.assertRegex(proc.stdout, r"unreadable\|\[the identity of capture worker group 4242 could not be confirmed .*the group was not killed\]")
+        self.assertRegex(proc.stdout, r"denied\|\[the identity of capture worker group 4242 could not be confirmed .*the group was not killed\]",
+                         "a lookup that is denied (not NotFound) must refuse the kill, not read as a gone worker")
         fifo = FIFO_TEST.read_text(encoding="ascii")
         stop = fifo[fifo.index("function Stop-CaptureWorker"):fifo.index("function Close-CaptureWorker")]
         self.assertLess(stop.index("Get-CaptureGroupIdentityProblem"), stop.index("KillGroup"), "the identity is checked before any group kill")
