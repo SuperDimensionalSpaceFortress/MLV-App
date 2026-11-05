@@ -26,7 +26,7 @@ SCANNED_DIRECTORIES = ("platform", "src")
 SUFFIXES = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".mm", ".inl", ".tcc"}
 TOKEN = re.compile(r"\bthread_local\b")
 SPLICE = re.compile(r"\\\r?\n")
-RAW_STRING_OPEN = re.compile(r'R"([^ ()\\\t\v\f\n]{0,16})\(')
+RAW_STRING_OPEN = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n]{0,16})\(')
 
 ALLOW_LIST = {
     (
@@ -49,15 +49,8 @@ def strip_comments(text):
         c = text[i]
         two = text[i : i + 2]
         if two == "//":
-            # A backslash-newline continues a line comment.
-            i += 2
-            while i < n and text[i] != "\n":
-                if text[i] == "\\" and text[i + 1 : i + 2] == "\n":
-                    i += 2
-                elif text[i] == "\\" and text[i + 1 : i + 3] == "\r\n":
-                    i += 3
-                else:
-                    i += 1
+            end = text.find("\n", i)
+            i = n if end < 0 else end
             continue
         if two == "/*":
             end = text.find("*/", i + 2)
@@ -65,7 +58,7 @@ def strip_comments(text):
             out.append(" " + "\n" * text.count("\n", i, stop))
             i = stop
             continue
-        raw = RAW_STRING_OPEN.match(text, i) if c == "R" else None
+        raw = RAW_STRING_OPEN.match(text, i) if c in "uULR" else None
         if raw and not (i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")):
             closing = ")" + raw.group(1) + '"'
             end = text.find(closing, raw.end())
@@ -92,9 +85,9 @@ def strip_comments(text):
 
 
 def thread_local_lines(text):
-    """The stripped logical lines that hold the token, comments removed and backslash-newlines spliced."""
-    spliced = SPLICE.sub("", strip_comments(text))
-    return [line.strip() for line in spliced.splitlines() if TOKEN.search(line)]
+    """The stripped logical lines that hold the token. Splicing comes first, as it does in translation."""
+    stripped = strip_comments(SPLICE.sub("", text))
+    return [line.strip() for line in stripped.splitlines() if TOKEN.search(line)]
 
 
 def scan(root):
@@ -143,6 +136,19 @@ class ThreadLocalGrammarTests(unittest.TestCase):
         self.assertEqual(
             ['const char * s = R"x(/*)x"; thread_local Foo g;'],
             thread_local_lines('const char * s = R"x(/*)x"; thread_local Foo g;\n'),
+        )
+
+    def test_comment_markers_inside_a_prefixed_raw_string_do_not_hide_the_token(self):
+        # Adversary A2.
+        for prefix in ("u8R", "uR", "UR", "LR"):
+            source = 'const char * s = %s"x("/*)x";\nthread_local Foo g;\n' % prefix
+            self.assertEqual(["thread_local Foo g;"], thread_local_lines(source), prefix)
+
+    def test_a_comment_terminator_split_by_a_continuation_does_not_hide_the_token(self):
+        # Adversary A3: splicing comes before comments in translation.
+        self.assertEqual(
+            ["thread_local Foo g;"],
+            thread_local_lines("/* ignored *\\\n/ thread_local Foo g;\n"),
         )
 
     def test_a_digit_separator_does_not_open_a_literal(self):

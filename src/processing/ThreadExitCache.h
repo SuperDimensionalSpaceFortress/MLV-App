@@ -20,7 +20,12 @@ T & mlvThreadExitCache()
         return k;
     }();
     void * p = pthread_getspecific(key);
-    if (!p) { p = new T(); pthread_setspecific(key, p); }
+    if (!p)
+    {
+        p = new T();
+        // An unregistered object would be rebuilt on the next call and never released: the caller's state would vanish.
+        if (pthread_setspecific(key, p) != 0) std::abort();
+    }
     return *static_cast<T *>(p);
 }
 #else

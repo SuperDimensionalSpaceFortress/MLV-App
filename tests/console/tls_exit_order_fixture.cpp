@@ -16,6 +16,7 @@
 //   bench          ns per access, old thread_local against the helper.
 //   churn          100 std::threads each run the real recursive_bf_wrap on 256x256x3. Expected: PagefileUsage growth under 64 MB.
 //   churn_control  The same with a filter nothing frees. Expected: over the bound, or the bound proves nothing.
+//   setspecific_fail  The helper with pthread_setspecific failing. Expected: it stops with abort, GREEN; returning is RED.
 //   kind is stdthread | qthread | omp, and also main for helper.
 //
 // Output: one "RESULT mode=... kind=... verdict=... ..." line on stdout. Exit 0 when a verdict was reached, 3 when INVALID,
@@ -35,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +45,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+int tlsExitOrderInjectedAccess(); // tls_exit_order_inject.cpp
 
 namespace
 {
@@ -165,6 +169,16 @@ __attribute__((noinline)) Probe::~Probe()
     // Members are destroyed after this. In crash mode that is the free() the dump shows failing.
 }
 
+// K that was never set never fires, which would read as a result. A failure here is the fixture's own: stop.
+void setKeyK()
+{
+    if (pthread_setspecific(g_key_k, reinterpret_cast<void *>(1)) != 0)
+    {
+        std::fprintf(stderr, "pthread_setspecific(K) failed\n");
+        std::_Exit(3);
+    }
+}
+
 __attribute__((noinline)) void touchProbe()
 {
     static thread_local Probe probe;
@@ -180,7 +194,7 @@ void workerBody()
     g_pos_block = std::malloc(kBlockSize);
     g_pos_target = g_pos_block;
     g_neg_block = std::malloc(kBlockSize);
-    pthread_setspecific(g_key_k, reinterpret_cast<void *>(1));
+    setKeyK();
 }
 
 // Runs workerBody on a thread of the given kind and waits for that thread's handle: a handle is signalled only after the
@@ -305,7 +319,7 @@ __attribute__((noinline)) void helperBody()
     g_pos_block = std::malloc(kBlockSize);
     g_pos_target = g_pos_block;
     g_neg_block = std::malloc(kBlockSize);
-    pthread_setspecific(g_key_k, reinterpret_cast<void *>(1));
+    setKeyK();
 }
 
 int runHelper(const std::string & kind)
@@ -431,6 +445,18 @@ int runChurn(const bool leakControl)
     return printResult("churn", "stdthread", underBound ? "GREEN" : "RED", detail);
 }
 
+// Adversary A1 (tls_exit_order_inject.cpp): the helper must stop rather than return an object no key will ever release.
+int runSetspecificFail()
+{
+    std::signal(SIGABRT, [](int) {
+        std::printf("RESULT mode=setspecific_fail kind=main verdict=GREEN stopped_with_abort=1\n");
+        std::fflush(stdout);
+        std::_Exit(0);
+    });
+    const int value = tlsExitOrderInjectedAccess();
+    return printResult("setspecific_fail", "main", "RED", "returned_unregistered_object=1 value=" + std::to_string(value));
+}
+
 // mingw-w64 v11's werapi.h does not compile, and kernel32 exports this, so it is resolved rather than declared.
 void disableWerUi()
 {
@@ -457,6 +483,12 @@ int main(int argc, char ** argv)
     }
     const std::string mode = argv[1];
     const std::string kind = argc > 2 ? argv[2] : "stdthread";
+    const bool knownKind = kind == "stdthread" || kind == "qthread" || kind == "omp" || (kind == "main" && mode == "helper");
+    if (!knownKind)
+    {
+        std::fprintf(stderr, "unknown kind %s for mode %s\n", kind.c_str(), mode.c_str());
+        return 4;
+    }
 
     g_emutls_touch = 1;
     if (g_emutls_touch != 1) return 4;
@@ -485,6 +517,7 @@ int main(int argc, char ** argv)
                            "finished=" + std::to_string(finished) + " base_found=" + std::to_string(g_search.base_found)
                                + " pos_found=" + std::to_string(g_search.pos_found) + " attempts=" + std::to_string(g_search.attempts));
     }
+    if (mode == "setspecific_fail") return runSetspecificFail();
     if (mode == "helper") return runHelper(kind);
     if (mode == "identity") return runIdentity();
     if (mode == "bench") return runBench();

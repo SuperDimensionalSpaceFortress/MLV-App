@@ -16,6 +16,7 @@ QMAKE_CXXFLAGS += -fopenmp -std=c++17
 LIBS += -llibgomp-1 -lpsapi
 
 SOURCES += $$REPO_ROOT/tests/console/tls_exit_order_fixture.cpp \
+           $$REPO_ROOT/tests/console/tls_exit_order_inject.cpp \
            $$REPO_ROOT/src/processing/rbfilter/rbf_wrapper.cpp \
            $$REPO_ROOT/src/processing/rbfilter/RBFilterPlain.cpp
 HEADERS += $$REPO_ROOT/src/processing/ThreadExitCache.h
