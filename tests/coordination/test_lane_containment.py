@@ -2545,7 +2545,7 @@ def test_r14_iter1_a1_the_parent_age_check_reads_utc_filetimes_never_local_start
     # looked older than its parent and was dropped. The check takes creation FILETIMEs; a child really older than the pid's current holder (a reused pid) is still refused.
     text=CANDIDATE.read_text(encoding="utf-8")
     block=re.search(r"(?s)if \(-not \('MlvLaneJob' -as \[type\]\)\) \{\s*Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@",text).group(1)
-    walk=block[block.index("public static List<Process> SnapshotDescendants"):]
+    walk=block[block.index("public static DescendantWalk SnapshotDescendants"):]
     assert ".StartTime" not in walk, "the tree walk compares Process.StartTime, which is local time and runs backward when daylight time ends"
     import datetime as dt
     parent=int(dt.datetime(2026,11,1,6,59,59,tzinfo=dt.timezone.utc).timestamp()*10_000_000)+116444736000000000
@@ -2554,6 +2554,193 @@ def test_r14_iter1_a1_the_parent_age_check_reads_utc_filetimes_never_local_start
     script.write_text("param($P,$C)\nAdd-Type -TypeDefinition @'\n"+block+"\n'@\n'{0} {1}' -f [MlvLaneJob]::StartedBeforeParent([long]$C,[long]$P), [MlvLaneJob]::StartedBeforeParent([long]$P,[long]$C)\n",encoding="ascii")
     r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-File",str(script),str(parent),str(child)],capture_output=True,text=True,timeout=max(LANE_RUN_TIMEOUT_SEC,120))
     assert r.stdout.strip().splitlines()[-1:]==["False True"],(r.stdout,r.stderr)
+
+
+# VISUAL-JUDGE-TERRA-LANE-1 r15 (Dot B5 = adversary A1 on 05e95288; adversary A2 = Dot B6). Everything below runs the real MlvLaneJob type and the real Stop-CodexDirectChildTree, in a lane.
+# Injection seams, each a text mutation and none in the shipped script:
+#   _stale_row: pid reuse cannot be forced, so the snapshot's table gains the row a stale enumeration would hold (R -> x) just after it closes, with x really held by another process.
+#   _parent_reads_newer: a clock cannot be stepped on a shared host, so the parent's creation time is read one hour late, which leaves a real child reading older than its parent.
+#   $Proc.Kill(): stands for the runtime's tree kill missing a process, which its IsParentOf does when a child reads older (runtime-il.txt, r15 run dir: pwsh 7.6.9, .NET 10.0.14).
+# Mutations that must go red, each executed below by test_r15_mutation_*:
+#   parent check removed; parent check on a separately opened handle (seen by a spy at the one NtQueryInformationProcess call, because two opens cannot be raced here);
+#   mismatch treated as uncertain but still killed; older-than-parent treated as killed; older-than-parent accepted as a member.
+_DIRECT_STDIN_THROW = "throw [System.IO.IOException]::new('fixture-stdin-write-failed')\n"
+_SNAPSHOT_CLOSED = "} finally { CloseHandle(snap); }\n"
+_PARENT_CREATED = "parentCreated=CreatedFileTime(parent)"
+_PARENT_READ = "parentPid=ParentPidOf(kid)"
+_MISMATCH_BRANCH = 'if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }'
+_OLDER_BRANCH = 'if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }'
+_ACCEPT = "seen.Members.Add(kid); walk.Enqueue(kid);"
+_READ_CALL = "int status=NtQueryInformationProcess(p.Handle,"
+
+
+def _ps_path(path):
+    return str(path).replace(chr(39),chr(39)*2)
+
+
+def _stale_row(rows_below=False):
+    # R -> x, as the snapshot would have recorded it before x changed hands. The replacement did not exist then, so its own children (ping.exe has a conhost) are taken back out of the table.
+    # With rows_below, the snapshot also saw a descendant under x's old holder.
+    below='kids[int.Parse(stale)]=new List<int>(new int[]{Process.GetCurrentProcess().Id});\n' if rows_below else ""
+    return _replacing(_SNAPSHOT_CLOSED,_SNAPSHOT_CLOSED+'string stale=Environment.GetEnvironmentVariable("MLV_FIXTURE_STALE_KID");\nkids.Remove(int.Parse(stale));\nif(!kids.ContainsKey(root.Id)) kids[root.Id]=new List<int>();\nkids[root.Id].Add(int.Parse(stale));\n'+below)
+
+
+def _parent_reads_newer():
+    return _replacing(_PARENT_CREATED,_PARENT_CREATED+"+36000000000L")
+
+
+def _start_replacement(out):
+    # The replacement U: started after the root, so it is younger and passes the age check, with the lane as its parent Q, so it is no descendant of the root.
+    return (f"$uPsi=[Diagnostics.ProcessStartInfo]::new('ping.exe','-n 150 127.0.0.1'); $uPsi.UseShellExecute=$false; $uPsi.CreateNoWindow=$true; $uProc=[Diagnostics.Process]::Start($uPsi)\n"
+            f"[IO.File]::WriteAllText('{_ps_path(out)}',(@{{pid=$uProc.Id;createdUtc=$uProc.StartTime.ToUniversalTime().ToString('o')}}|ConvertTo-Json -Compress))\n"
+            "$env:MLV_FIXTURE_STALE_KID=[string]$uProc.Id\n")
+
+
+def _stopped_lane(tree,*extra,before_throw=""):
+    muts=[_stdin_write_fails_while("$env:MLV_FIXTURE_GRAND")]
+    if before_throw: muts.append(_replacing(_DIRECT_STDIN_THROW,before_throw+_DIRECT_STDIN_THROW))
+    muts.extend(extra)
+    cmd,env,receipt=prepare(tree,"hold",lane="sol",mutation=_chain(*muts))
+    r=_run_lane_to_files(cmd,env,tree["root"])
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert r.returncode!=0 and "fixture-stdin-write-failed" in (q["failure"] or ""),(r.returncode,q)
+    return q
+
+
+def _state(root,name):
+    return json.loads((root/name).read_text(encoding="utf-8-sig"))
+
+
+def _lives(item):
+    return identity(item["pid"])==item["createdUtc"]
+
+
+@pytest.fixture
+def stale_tree(fixture_tree):
+    yield fixture_tree
+    p=fixture_tree["root"]/"replacement.json"
+    if p.exists():
+        try: stop_exact(json.loads(p.read_text(encoding="utf-8")))
+        except Exception: pass
+
+
+def _stale_lane(tree,*extra,rows_below=False):
+    root=tree["root"]
+    q=_stopped_lane(tree,_stale_row(rows_below),*extra,before_throw=_start_replacement(root/"replacement.json"))
+    u=json.loads((root/"replacement.json").read_text(encoding="utf-8"))
+    assert u["createdUtc"]>_state(root,"child.json")["createdUtc"], "the schedule needs the replacement younger than the root, or the age check alone would refuse it"
+    return q,u
+
+
+def test_r15_b5_a_snapshot_pid_now_held_by_a_younger_unrelated_process_is_never_killed(stale_tree):
+    # Dot B5's schedule: the snapshot saw R -> x; x now belongs to U, younger than R, with another parent. The root tree kill succeeds and leaves U alone; the explicit loop must too.
+    root=stale_tree["root"]
+    q,u=_stale_lane(stale_tree)
+    assert _lives(u), f"the lane killed a process that was never in the tree: {q.get('codexDirectChildStop')}"
+    wait_absent(_state(root,"child.json"),5)
+    wait_absent(_state(root,"grand.json"),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+def test_r15_b5_a_replaced_pid_with_a_descendant_row_below_it_is_uncertainty_and_the_replacement_lives(stale_tree):
+    # The snapshot also saw a process under x. With x's old holder gone, nothing can show that process is gone, so 'killed' would claim more than was seen.
+    q,u=_stale_lane(stale_tree,rows_below=True)
+    assert _lives(u),q
+    assert q["codexDirectChildStop"]=="uncertain:descendant-unreachable",q
+    assert "codex-direct-child-uncertain:descendant-unreachable" in q["failure"],q
+
+
+def test_r15_a2_a_real_child_reading_older_with_the_runtime_kill_missing_it_is_uncertain_and_not_killed_by_the_loop(fixture_tree):
+    # A2 and Dot B6 together: the parent matches and the child reads older, so a clock step and a reused parent pid cannot be told apart. The runtime's tree kill misses it too.
+    # The lane must not kill it on that evidence and must not say 'killed'.
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    wait_absent(_state(root,"child.json"),5)
+    assert _lives(_state(root,"grand.json")), "the explicit loop killed a process whose ancestry it could not establish"
+    assert q["codexDirectChildStop"]=="uncertain:older-than-parent",f"the child is alive and the receipt says {q['codexDirectChildStop']}"
+    assert "codex-direct-child-uncertain:older-than-parent" in q["failure"],q
+
+
+def test_r15_a2_a_child_reading_older_is_uncertain_even_when_the_runtime_kill_took_it(fixture_tree):
+    # The runtime read its own clock and took the child. The walk still refused it and never saw it exit, so the answer stays what was observed.
+    q=_stopped_lane(fixture_tree,_parent_reads_newer())
+    assert q["codexDirectChildStop"]=="uncertain:older-than-parent",q
+
+
+def test_r15_control_a_snapshot_pid_held_by_an_older_unrelated_process_is_never_killed(fixture_tree):
+    # The older-pid control. Green on 05e95288 through the age check, and after the fix through the parent check.
+    root=fixture_tree["root"]
+    older=subprocess.Popen(["ping.exe","-n","150","127.0.0.1"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        q=_stopped_lane(fixture_tree,_stale_row(),before_throw=f"$env:MLV_FIXTURE_STALE_KID='{older.pid}'\n")
+        assert older.poll() is None, "the lane killed an older process that was never in the tree"
+        wait_absent(_state(root,"grand.json"),5)
+        assert q["codexDirectChildStop"]=="killed",q
+    finally:
+        older.kill(); older.wait(10)
+
+
+def test_r15_control_a_candidate_that_cannot_be_read_is_uncertain_and_never_killed_by_the_loop(fixture_tree):
+    # The unreadable control, green on 05e95288 too: every creation-time read except the root's is refused, as for a process this account may not open.
+    root=fixture_tree["root"]
+    refuse=_replacing("static Int64 CreatedFileTime(Process p) {\n",'static Int64 CreatedFileTime(Process p) {\n    if(p.Id.ToString()!=Environment.GetEnvironmentVariable("MLV_FIXTURE_READABLE")) throw new Win32Exception(5,"fixture-unreadable");\n')
+    q=_stopped_lane(fixture_tree,refuse,_replacing(_DIRECT_KILL,"$Proc.Kill()"),before_throw="$env:MLV_FIXTURE_READABLE=[string]$proc.Id\n")
+    assert q["codexDirectChildStop"].startswith("uncertain:"),q
+    assert _lives(_state(root,"grand.json")),q
+
+
+def test_r15_ancestry_that_cannot_be_read_is_typed_and_the_candidate_is_not_killed(fixture_tree):
+    # The parent read itself is refused. The token names it, the candidate is left alone, and the root is still stopped.
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_replacing(_PARENT_READ,_PARENT_READ+';\n          if(kid.Id!=0) throw new Win32Exception(5,"fixture-ancestry-refused")'),_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    assert q["codexDirectChildStop"]=="uncertain:ancestry-unreadable",q
+    assert "codex-direct-child-uncertain:ancestry-unreadable" in q["failure"],q
+    wait_absent(_state(root,"child.json"),5)
+    assert _lives(_state(root,"grand.json")),q
+
+
+def test_r15_a_valid_child_is_accepted_on_the_handle_the_kill_then_uses(fixture_tree):
+    # A spy, not a race: two opens of one pid cannot be raced here. The one NtQueryInformationProcess call records its handle, and acceptance requires it to be the handle the lane keeps,
+    # so a parent read through any other open fails here. The runtime kill misses the child, so its death also shows the walk accepted it on that read.
+    root=fixture_tree["root"]
+    spy=_chain(_replacing(_READ_CALL,"fixtureRead=p.Handle;\n    "+_READ_CALL),
+               _replacing("  static int ParentPidOf(Process p) {\n","  static IntPtr fixtureRead;\n  static int ParentPidOf(Process p) {\n"),
+               _replacing(_ACCEPT,'if(fixtureRead!=kid.Handle) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n        '+_ACCEPT))
+    q=_stopped_lane(fixture_tree,spy,_replacing(_DIRECT_KILL,"$Proc.Kill()"))
+    wait_absent(_state(root,"grand.json"),5)
+    assert q["codexDirectChildStop"]=="killed",q
+
+
+def test_r15_mutation_parent_check_removed_kills_the_replacement(stale_tree):
+    q,u=_stale_lane(stale_tree,_replacing("parentPid!=parent.Id","parentPid==int.MinValue"))
+    assert not _lives(u),q
+
+
+def test_r15_mutation_mismatch_marked_uncertain_but_still_killed_kills_the_replacement(stale_tree):
+    q,u=_stale_lane(stale_tree,_replacing(_MISMATCH_BRANCH,'if(parentPid!=parent.Id) { seen.Note("ancestry-unreadable"); seen.Members.Add(kid); continue; }'))
+    assert not _lives(u) and q["codexDirectChildStop"]=="uncertain:ancestry-unreadable",q
+
+
+def test_r15_mutation_parent_read_on_a_separately_opened_handle_is_seen_by_the_spy(fixture_tree):
+    spy=_chain(_replacing(_READ_CALL,"fixtureRead=p.Handle;\n    "+_READ_CALL),
+               _replacing("  static int ParentPidOf(Process p) {\n","  static IntPtr fixtureRead;\n  static int ParentPidOf(Process p) {\n"),
+               _replacing(_ACCEPT,'if(fixtureRead!=kid.Handle) throw new Win32Exception(5,"fixture-parent-read-on-another-handle");\n        '+_ACCEPT),
+               _replacing(_PARENT_READ,"parentPid=ParentPidOf(Process.GetProcessById(kid.Id))"))
+    q=_stopped_lane(fixture_tree,spy)
+    assert q["codexDirectChildStop"]=="uncertain:tree-unreadable",q
+
+
+def test_r15_mutation_older_than_parent_treated_as_killed_answers_killed_with_the_child_alive(fixture_tree):
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"),_replacing(_OLDER_BRANCH,"if(StartedBeforeParent(created,parentCreated)) { kid.Dispose(); continue; }"))
+    assert q["codexDirectChildStop"]=="killed" and _lives(_state(root,"grand.json")),q
+
+
+def test_r15_mutation_older_than_parent_accepted_as_a_member_kills_the_child(fixture_tree):
+    root=fixture_tree["root"]
+    q=_stopped_lane(fixture_tree,_parent_reads_newer(),_replacing(_DIRECT_KILL,"$Proc.Kill()"),_replacing(_OLDER_BRANCH,"if(StartedBeforeParent(created,parentCreated)) { }"))
+    wait_absent(_state(root,"grand.json"),5)
+    assert q["codexDirectChildStop"]=="killed",q
 
 
 def test_r14_b3_control_an_ordinary_no_image_lane_has_no_stop_to_report(fixture_tree):

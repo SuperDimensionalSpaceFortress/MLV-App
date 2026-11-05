@@ -1014,7 +1014,30 @@ public static class MlvLaneJob {
     return creation;
   }
   public static bool StartedBeforeParent(Int64 kidCreated, Int64 parentCreated) { return kidCreated<parentCreated; }
-  public static List<Process> SnapshotDescendants(Process root) {
+  // r15 (Dot B5 = adversary A1 on 05e95288): the snapshot only names pids, and a pid can change hands before it is opened. The parent is read from the handle this object keeps,
+  // the same one a later Kill or wait uses, so what was checked is what gets killed.
+  [StructLayout(LayoutKind.Sequential)] struct PROCESS_BASIC_INFORMATION {
+    public IntPtr ExitStatus, PebBaseAddress, AffinityMask, BasePriority, UniqueProcessId, InheritedFromUniqueProcessId;
+  }
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out PROCESS_BASIC_INFORMATION info, int length, out int returned);
+  static int ParentPidOf(Process p) {
+    PROCESS_BASIC_INFORMATION info; int returned;
+    int status=NtQueryInformationProcess(p.Handle,0,out info,Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),out returned);
+    if(status<0) throw new Win32Exception(status,"NtQueryInformationProcess");
+    return (int)info.InheritedFromUniqueProcessId.ToInt64();
+  }
+  // r15 (Dot B5; adversary A2 = Dot B6): Members are the processes shown to be in the tree. Uncertain says why 'killed' would claim too much; the first reason found stands.
+  //   ancestry-unreadable: a candidate, or a parent, could not be read.
+  //   older-than-parent: the parent matches and the child reads older. A backward clock step and a reused parent pid look the same, so it is neither killed nor called gone.
+  //   descendant-unreachable: the snapshot saw a process under a pid whose holder has since gone, so that process cannot be shown to be in the tree, or to be gone.
+  public sealed class DescendantWalk {
+    public readonly List<Process> Members=new List<Process>();
+    public string Uncertain;
+    internal void Note(string why) { if(Uncertain==null) Uncertain=why; }
+    internal void NoteIfAnyBelow(Dictionary<int,List<int>> kids, int id) { if(kids.ContainsKey(id)) Note("descendant-unreachable"); }
+  }
+  public static DescendantWalk SnapshotDescendants(Process root) {
     Dictionary<int,List<int>> kids=new Dictionary<int,List<int>>();
     IntPtr snap=CreateToolhelp32Snapshot(2,0);
     if(snap==new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateToolhelp32Snapshot");
@@ -1027,23 +1050,32 @@ public static class MlvLaneJob {
         kids[parent].Add((int)e.th32ProcessID);
       } while(Process32NextW(snap,ref e));
     } finally { CloseHandle(snap); }
-    List<Process> found=new List<Process>();
+    DescendantWalk seen=new DescendantWalk();
     Queue<Process> walk=new Queue<Process>(); walk.Enqueue(root);
     while(walk.Count>0) {
       Process parent=walk.Dequeue();
       if(!kids.ContainsKey(parent.Id)) continue;
-      Int64 parentCreated=CreatedFileTime(parent);
+      Int64 parentCreated;
+      try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
       foreach(int id in kids[parent.Id]) {
         Process kid;
-        try { kid=Process.GetProcessById(id); } catch(ArgumentException) { continue; }   // exited since the snapshot
+        try { kid=Process.GetProcessById(id); }
+        catch(ArgumentException) { seen.NoteIfAnyBelow(kids,id); continue; }   // exited since the snapshot
+        catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
+        int parentPid; Int64 created;
         try {
-          // Reading it opens the handle, which this object then keeps.
-          if(StartedBeforeParent(CreatedFileTime(kid),parentCreated)) continue;   // older than this parent: the parent's pid was reused, and this is not its child
-        } catch(InvalidOperationException) { continue; }   // exited since the snapshot
-        found.Add(kid); walk.Enqueue(kid);
+          // The first read opens the handle, which this object then keeps, so both reads and any later Kill or wait are about one process.
+          parentPid=ParentPidOf(kid);
+          created=CreatedFileTime(kid);
+        }
+        catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the snapshot
+        catch(Win32Exception) { seen.Note("ancestry-unreadable"); kid.Dispose(); continue; }
+        if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
+        if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
+        seen.Members.Add(kid); walk.Enqueue(kid);
       }
     }
-    return found;
+    return seen;
   }
 }
 '@
@@ -1114,8 +1146,9 @@ function Complete-CodexImageHolds {
 }
 # r14 (Dot B3 on afdc228b): a Codex lane with no image has no job, so when its launch path throws only this can stop the child, and only the child's own tree can be reached.
 # The answer is what was observed, never what was attempted: 'killed' = the child and every descendant seen before the kill were each seen to exit within the bound.
-# 'uncertain:<already-exited|kill-failed|wait-timeout|tree-unreadable>' = they are not known to be gone. A child that has already exited leaves its descendants out of reach,
-# so that is uncertainty and not a clean stop. A descendant whose parent had already exited is not seen, so 'killed' makes no claim about it. Never throws.
+# 'uncertain:<already-exited|kill-failed|wait-timeout|tree-unreadable|ancestry-unreadable|older-than-parent|descendant-unreachable>' = they are not known to be gone. A child that has already
+# exited leaves its descendants out of reach, so that is uncertainty and not a clean stop. A descendant whose parent had already exited is not seen, so 'killed' makes no claim about it.
+# r15 (Dot B5): only a process the walk showed to be in the tree is killed here; the root's Kill($true) is the runtime's own walk. Never throws.
 $codexDirectChildStop = $null
 $CODEX_DIRECT_KILL_WAIT_MS = 15000
 function Stop-CodexDirectChildTree {
@@ -1123,11 +1156,12 @@ function Stop-CodexDirectChildTree {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     try { if ($Proc.HasExited) { return 'uncertain:already-exited' } } catch { return 'uncertain:tree-unreadable' }
     # Before the kill: afterwards the parents are gone and the tree cannot be walked. A snapshot that fails still leaves the kill to do.
-    $members = $null
-    try { $members = @([MlvLaneJob]::SnapshotDescendants($Proc)) } catch { $members = $null }
+    $treeWalk = $null
+    try { $treeWalk = [MlvLaneJob]::SnapshotDescendants($Proc) } catch { $treeWalk = $null }
     try { $Proc.Kill($true) } catch { return 'uncertain:kill-failed' }
-    if ($null -eq $members) { return 'uncertain:tree-unreadable' }
-    # r14 fix iteration 1 (adversary A1 on 1d4adafb): Kill($true) walks the tree with local start times, so across the end of daylight time it can miss a real descendant. Everything the snapshot saw is killed here too.
+    if ($null -eq $treeWalk) { return 'uncertain:tree-unreadable' }
+    $members = @($treeWalk.Members)
+    # r14 fix iteration 1 (adversary A1 on 1d4adafb): Kill($true) walks the tree with local start times, so across the end of daylight time it can miss a real descendant. Everything the walk showed to be in the tree is killed here too.
     foreach ($member in $members) {
         try { if (-not $member.HasExited) { $member.Kill() } } catch { return 'uncertain:kill-failed' }
     }
@@ -1135,6 +1169,7 @@ function Stop-CodexDirectChildTree {
         $leftMs = [int][math]::Max(0.0, [math]::Floor($LimitMs - $clock.Elapsed.TotalMilliseconds))
         try { if (-not ($member.WaitForExit($leftMs))) { return 'uncertain:wait-timeout' } } catch { return 'uncertain:tree-unreadable' }
     }
+    if ($treeWalk.Uncertain) { return "uncertain:$($treeWalk.Uncertain)" }
     return 'killed'
 }
 # `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to

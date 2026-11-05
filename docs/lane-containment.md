@@ -280,19 +280,36 @@ claim about it. Whether Codex's elevated sandbox starts its tools that way is no
 **A Codex lane with no image has no job (VISUAL-JUDGE-TERRA-LANE-1 r14).** When its launch path
 throws with a child started, for example because the stdin write fails, the lane tree-kills
 the child and waits for each process it saw before the kill. The wait is on the lane's own
-stopwatch. It is bounded at 15 s, or by what is left of the lane's budget, with a 5 s floor. The
-receipt's `codexDirectChildStop` is present only in this case:
+stopwatch. It is bounded at 15 s, or by what is left of the lane's budget, with a 5 s floor.
 
-- `killed`: the child and every descendant seen before the kill were each seen to exit in time.
+A process snapshot only names pids, and a pid can change hands before it is opened. So a
+candidate is killed only after the parent read from its own kept handle matches the parent being
+walked, and it does not read older than that parent (r15). A process whose parent does not match
+is left alone. The receipt's `codexDirectChildStop` is present only in this case:
+
+- `killed`: the child and every descendant shown to be in the tree before the kill were each seen
+  to exit in time.
 - `uncertain:already-exited`: the child had already exited, so its descendants cannot be
   reached. They are not known to be gone, and this is never a clean stop.
 - `uncertain:kill-failed`, `uncertain:wait-timeout`, `uncertain:tree-unreadable`: the child or a
   descendant may still be alive.
+- `uncertain:ancestry-unreadable`: a candidate or a parent could not be read, so it was not
+  killed by the lane's own loop.
+- `uncertain:older-than-parent`: the parent matches and the child reads older. A backward clock
+  step and a reused parent pid look the same, so it was not killed by the lane's own loop, and
+  it may still be alive.
+- `uncertain:descendant-unreachable`: the snapshot saw a process under a pid whose holder has
+  since gone, so that process cannot be shown to be in the tree, or to be gone.
 
 Every `uncertain:` value also adds `codex-direct-child-uncertain:<cause>` to the receipt's
 `failure`. Non-promises: this path has no job, so `killed` makes no claim about a descendant
-whose parent had already exited, or one started outside the tree (the limit above). The lane's
-timeout path keeps its older tree kill, whose failure is not recorded.
+whose parent had already exited before the snapshot, or one started outside the tree (the limit
+above), or one started after the snapshot. The root's own `Kill($true)` is the runtime's walk, not
+this check: the runtime requires the child's local start time to be later than the parent's, so
+it can miss a child, and what it kills is not checked here. A candidate that reads younger than a
+parent whose pid was reused, because the clock stepped back between the two, cannot be told from a
+real child and would be killed. The lane's timeout path keeps its older tree kill, whose failure
+is not recorded.
 
 Run the real Windows fixture suite with:
 
