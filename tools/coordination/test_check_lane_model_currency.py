@@ -1082,6 +1082,15 @@ class RunningIsNeverEvidenceTests(CurrencyFixture):
                 self.assertEqual((entry["verdict"], result["verdict"], code), ("STALE", "STALE", 1), result)
                 self.assertEqual(entry["reasons"][0]["ranModels"], ["gpt-6-sol", "gpt-6-sol"])
 
+    def test_r6_a_stale_reason_outranks_the_expired_running_no_data_and_reads_stale_exit_1(self):
+        # The outbox sentence (doctrine-outbox/20261104-...): NO-DATA for an expired newest running receipt, "unless a
+        # STALE-MODEL or BAD-EFFORT reason outranks it: that reads STALE, exit 1". The model case is pinned above; this
+        # is the effort case: an expired running receipt alone, with effort low, is a BAD-EFFORT reason.
+        code, result = self.run_main(("dead",), {"dead": dict(self.DEAD, effort="low")})
+        entry = result["lanes"]["sol"]
+        self.assertEqual((entry["verdict"], result["verdict"], code), ("STALE", "STALE", 1), result)
+        self.assertEqual(entry["reasons"][0]["kind"], "BAD-EFFORT")
+
     def test_b1_an_older_expired_receipt_with_no_effort_before_a_finished_run_stays_incomplete(self):
         # unchanged by r5: the expired receipt is an unproven run that recorded no effort, so the lane cannot be
         # CURRENT; it is INCOMPLETE (its newest run is the finished one, which is proven)
