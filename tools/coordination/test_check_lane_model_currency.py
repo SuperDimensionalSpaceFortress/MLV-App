@@ -966,6 +966,111 @@ class LiveShapeTests(CurrencyFixture):
         self.assertNotIn("a receipt dated in the future has no age, so it is never a candidate", doc)
 
 
+class RunningIsNeverEvidenceTests(CurrencyFixture):
+    """r5 (PR 753, B1): a receipt whose state is `running` is never evidence, live or expired. It enters neither
+    the proven runs, nor `latestModel`, nor the family's newest id; a lane whose newest run in the window is
+    such a receipt, or that has no proven FINISHED run, reads NO-DATA, never CURRENT. Clock: 2026-10-12T20:00:00Z.
+    Every case runs through main() with --json, in both enumeration orders."""
+
+    FIN = dict(state="complete", startedUtc="2026-10-12T19:00:00Z", resolvedModel="gpt-6.1-sol", effort="high")
+    LIVE = dict(state="running", startedUtc="2026-10-12T19:00:00Z", timeoutSec=7200)               # live, older
+    DEAD = dict(state="running", startedUtc="2026-10-12T19:50:00Z", timeoutSec=1,                  # expired, models
+                resolvedModel="gpt-6.1-sol", effort="high")
+
+    def run_main(self, names, specs):
+        """-> (exit code, parsed --json output) for the receipts in `specs`, written in the order of `names`."""
+        for name in names:
+            run = self.runs / name
+            run.mkdir()
+            (run / "sol-001.receipt.json").write_text(json.dumps(dict(lane="sol", **specs[name])), encoding="utf-8")
+        real_evaluate = check.evaluate
+        out = io.StringIO()
+        with mock.patch.object(check, "evaluate", lambda *a, **k: real_evaluate(*a, now=NOW, **k)), \
+                mock.patch("sys.stdout", out):
+            code = check.main(["--runs-dir", str(self.runs), "--json"])
+        return code, json.loads(out.getvalue())
+
+    def assert_no_data(self, names, specs):
+        code, result = self.run_main(names, specs)
+        entry = result["lanes"]["sol"]
+        self.assertEqual((entry["verdict"], result["verdict"], code), ("NO-DATA", "INCOMPLETE", 3), result)
+        self.assertIsNone(entry["judgedOn"])
+        self.assertEqual(result["inFlightLanes"], [])
+        return entry, result
+
+    def test_b1_an_older_live_and_a_newer_expired_modelled_running_receipt_read_no_data_in_both_orders(self):
+        for order in (("live", "dead"), ("dead", "live")):
+            with self.subTest(order=order):
+                self.setUp()
+                entry, _ = self.assert_no_data(order, {"live": self.LIVE, "dead": self.DEAD})
+                self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (1, 1))
+                self.assertEqual(entry["provenModelRuns"], 0)
+                self.assertIsNone(entry["latestModel"])
+
+    def test_b1_an_expired_modelled_running_receipt_alone_reads_no_data(self):
+        entry, result = self.assert_no_data(("dead",), {"dead": self.DEAD})
+        self.assertEqual((entry["provenModelRuns"], entry["deadRunning"]), (0, 1))
+        self.assertIsNone(entry["latestModel"])
+        self.assertEqual(result["familyNewest"], {})
+
+    def test_b1_a_finished_run_then_a_newer_expired_modelled_running_receipt_reads_no_data(self):
+        for order in (("fin", "dead"), ("dead", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                entry, _ = self.assert_no_data(order, {"fin": self.FIN, "dead": self.DEAD})
+                # the finished run stays the only proven one; the expired receipt is not a model of its own
+                self.assertEqual((entry["provenModelRuns"], entry["latestModel"]), (1, "gpt-6.1-sol"))
+
+    def test_b1_the_complete_expired_and_live_case_still_reads_no_data(self):
+        live = dict(self.LIVE, startedUtc="2026-10-12T19:55:00Z")
+        self.assert_no_data(("fin", "dead", "live"), {"fin": self.FIN, "dead": self.DEAD, "live": live})
+
+    def test_b1_an_older_expired_receipt_then_a_newer_live_one_still_reads_no_data(self):
+        dead = dict(self.DEAD, startedUtc="2026-10-12T18:00:00Z")
+        for order in (("dead", "live"), ("live", "dead")):
+            with self.subTest(order=order):
+                self.setUp()
+                self.assert_no_data(order, {"dead": dead, "live": dict(self.LIVE, startedUtc="2026-10-12T19:30:00Z")})
+
+    def test_b1_an_expired_receipt_naming_a_newer_id_raises_no_family_newest_and_hides_no_stale(self):
+        old = dict(self.FIN, resolvedModel="gpt-6-sol")
+        specs = {"a": dict(old, startedUtc="2026-10-12T17:00:00Z"), "b": dict(old, startedUtc="2026-10-12T18:00:00Z"),
+                 "dead": self.DEAD}
+        # the expired gpt-6.1-sol receipt is not evidence: the pair is current as far as finished runs know, and the
+        # lane is unproven because its newest receipt is the expired one
+        entry, result = self.assert_no_data(("a", "b", "dead"), specs)
+        self.assertEqual(result["familyNewest"], {"sol": "gpt-6-sol"})
+        self.assertEqual((entry["latestModel"], entry["familyNewest"]), ("gpt-6-sol", "gpt-6-sol"))
+        # a FINISHED newer id earlier in the window still makes the pair STALE; the expired receipt must not hide it
+        for order in (("n", "a", "b", "dead"), ("dead", "b", "a", "n")):
+            with self.subTest(order=order):
+                self.setUp()
+                newer = dict(self.FIN, startedUtc="2026-10-12T16:00:00Z")
+                code, result = self.run_main(order, dict(specs, n=newer))
+                entry = result["lanes"]["sol"]
+                self.assertEqual((entry["verdict"], result["verdict"], code), ("STALE", "STALE", 1), result)
+                self.assertEqual(entry["reasons"][0]["ranModels"], ["gpt-6-sol", "gpt-6-sol"])
+
+    def test_b1_an_older_expired_receipt_with_no_effort_before_a_finished_run_stays_incomplete(self):
+        # unchanged by r5: the expired receipt is an unproven run that recorded no effort, so the lane cannot be
+        # CURRENT; it is INCOMPLETE (its newest run is the finished one, which is proven)
+        dead = dict(state="running", startedUtc="2026-10-12T18:00:00Z", timeoutSec=1)
+        for order in (("dead", "fin"), ("fin", "dead")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, {"dead": dead, "fin": self.FIN})
+                entry = result["lanes"]["sol"]
+                self.assertEqual((entry["verdict"], result["verdict"], code), ("INCOMPLETE", "INCOMPLETE", 3), result)
+                self.assertEqual(entry["unrecordedEffort"], 1)
+
+    def test_b1_a_live_receipt_over_a_finished_run_is_still_in_flight(self):
+        live = dict(self.LIVE, startedUtc="2026-10-12T19:30:00Z")
+        code, result = self.run_main(("fin", "live"), {"fin": self.FIN, "live": live})
+        entry = result["lanes"]["sol"]
+        self.assertEqual((entry["verdict"], result["verdict"], code), ("IN-FLIGHT", "CURRENT", 0), result)
+        self.assertEqual(entry["judgedOn"]["model"], "gpt-6.1-sol")
+
+
 class WindowTests(CurrencyFixture):
     def test_old_receipts_outside_the_window_are_not_reported(self):
         self.receipt("astra", "gpt-6-astra", 500, effort="xhigh")

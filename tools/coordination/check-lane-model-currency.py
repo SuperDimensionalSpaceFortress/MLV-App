@@ -21,12 +21,13 @@ The newest id per family is the highest version among the receipts read, raised 
 any lane has run it). Only receipts that proved a model (a parseable resolvedModel; 'unknown' and
 null never count) take part in the model rule.
 
-Missing evidence is never CURRENT (r3 blocker B1). A lane's verdict is, in order:
+Missing evidence is never CURRENT (r3 blocker B1; one hub-ruled exception, named after IN-FLIGHT below). A lane's verdict is, in order:
 
   STALE       a STALE-MODEL or BAD-EFFORT reason above.
-  NO-DATA     the lane has no proven model, or its NEWEST finished run in the window has none (a
-              failed run, or a running receipt that is not a live candidate -- an expired-unproven one; resolvedModel
-              null/'unknown'): what the lane runs now is unproven.
+  NO-DATA     the lane has no proven FINISHED run, or its newest run in the window that is not a live
+              candidate is unproven (a failed run with resolvedModel null/'unknown', or a running receipt that is
+              not a live candidate, i.e. an expired one, whatever model it carries): what the lane runs now is
+              unproven. A receipt whose state is `running` is never a proven run (r5, B1).
   INCOMPLETE  the model is proven but at least one finished run in the window recorded no effort, so
               'high' is unproven; counted in `unrecordedEffort` and shown in the table. The one
               intentional exemption is a live-candidate running receipt (see below), which has no effort
@@ -66,14 +67,22 @@ the process table. The cost of the weaker rule is bounded and one-sided: a lane 
 timeout window still reads IN-FLIGHT, and only ever when the finished run before it is CURRENT, so it can hide
 nothing worse than a lane that is current anyway. A receipt left at state=running outside the window
 (expired-unproven, or dated too far ahead) is not a candidate: it stays an unproven run (counted in
-`deadRunning`, a name kept for the JSON contract), so the lane reads NO-DATA, never IN-FLIGHT. A running
-receipt with no timeoutSec cannot be bounded and is treated the same way.
-Running receipts that are live candidates are not evidence in either direction: they are left out of the model rule, the
-effort rule, `unrecordedEffort` and the family's newest id (a running receipt that already names a newer
-id cannot make finished runs STALE), and the lane is judged on its finished runs alone, with the run it was
-judged on named in `judgedOn` and in the table. IN-FLIGHT is given only when the newest FINISHED run is
-proven too: a failed run in between is not papered over (the lane stays NO-DATA), and a lane with no
-proven finished run in the window stays NO-DATA, because missing evidence is never CURRENT.
+`deadRunning`, a name kept for the JSON contract), never IN-FLIGHT. A running receipt with no timeoutSec
+cannot be bounded and is treated the same way.
+A running receipt is never a proven run, live or expired (r5, B1): whatever resolvedModel and effort it carries,
+it is left out of the proven runs, `latestModel`, `provenModelRuns`, `judgedOn` and the family's newest id (a
+running receipt that already names a newer id cannot make finished runs STALE, and an expired one cannot hide a
+STALE pair either), and the lane is judged on its finished runs alone, with the run it was judged on named in
+`judgedOn` and in the table. A LIVE candidate is also left out of the effort rule and `unrecordedEffort`; an
+EXPIRED running receipt is not (it is an unproven run that may have recorded no effort, so a lane whose
+expired receipt is older than a proven finished run and recorded no effort reads INCOMPLETE, not CURRENT).
+Two consequences, both NO-DATA: a lane whose newest non-live run is an expired running receipt (the expired
+receipt alone, a finished run followed by one, or an older live receipt beside one) and a lane with no proven
+finished run in the window. IN-FLIGHT is given only when the newest FINISHED run is proven too: a failed run in
+between is not papered over (the lane stays NO-DATA), because missing evidence is never CURRENT.
+ONE EXCEPTION to "missing evidence is never CURRENT" (hub-ruled trade, r4): a newest FAILED run whose startedUtc
+is unreadable is dropped from the lane (counted in `unreadableReceipts`), so the lane is judged on the runs
+that could be read and can read CURRENT where the base read NO-DATA.
 
 The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
 else NO-DATA when no lane ran in the window, else CURRENT. IN-FLIGHT lanes count as CURRENT here and are
@@ -377,9 +386,9 @@ def is_live_running(receipt, now):
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     # The family's newest id is judged over every receipt, the window only decides what is reported.
-    # A live running receipt is not evidence in either direction, so it cannot raise the newest id either.
+    # A receipt whose state is `running` is never evidence, live or expired (r5, B1), so it cannot raise the newest id.
     live_ids = {id(r) for r in receipts if is_live_running(r, now)}
-    newest = newest_per_family([r for r in receipts if id(r) not in live_ids], overrides or {})
+    newest = newest_per_family([r for r in receipts if r["state"] != "running"], overrides or {})
     window = list(receipts)
     if since_hours and since_hours > 0 and math.isfinite(since_hours):
         try:
@@ -396,7 +405,9 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
         live = [r for r in lanes[lane] if id(r) in live_ids]
         runs = [r for r in lanes[lane] if id(r) not in live_ids]
         dead_running = [r for r in runs if r["state"] == "running"]
-        proven = [r for r in runs if r["parsed"]]
+        # Proven = a FINISHED run that named a parseable model. An expired running receipt is not finished, so
+        # whatever model and effort it carries prove nothing (r5, B1); it stays in `runs` as an unproven run.
+        proven = [r for r in runs if r["parsed"] and r["state"] != "running"]
         reasons = []
         # STALE-MODEL: the two most recent proven runs are both older than their family's newest.
         tail = proven[-CONSECUTIVE_STALE_RUNS:]
@@ -416,14 +427,13 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
         latest = proven[-1] if proven else None
         if reasons:
             verdict = "STALE"
-        elif not proven or not runs[-1]["parsed"]:
+        elif not proven or not runs[-1]["parsed"] or runs[-1]["state"] == "running":
+            # No proven finished run, or the newest non-live run is unproven: a failed run, or an expired running
+            # receipt (which never finished, so what it carries is no evidence and IN-FLIGHT has no foundation:
+            # adversary pass 4 A3, and r5 B1 for the case with no live receipt on top).
             verdict = "NO-DATA"
         elif unrecorded:
             verdict = "INCOMPLETE"
-        elif live and live[-1]["order"] >= runs[-1]["order"] and runs[-1]["state"] == "running":
-            # The run before the live one is an expired running receipt: it never finished, so whatever model it
-            # carries is not finished evidence and IN-FLIGHT has no foundation (adversary pass 4, A3).
-            verdict = "NO-DATA"
         elif live and live[-1]["order"] >= runs[-1]["order"]:     # >=: an exact tie reads the running run as newer
             verdict = "IN-FLIGHT"      # newest receipt is running; the newest finished run is proven and CURRENT
         else:
