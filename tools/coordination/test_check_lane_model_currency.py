@@ -390,15 +390,18 @@ class InFlightTests(CurrencyFixture):
                 ("100 ns past, 7 digits", "2026-10-12T20:05:00.0000001Z", "NO-DATA"),
                 ("1 ns past, 9 digits", "2026-10-12T20:05:00.000000001Z", "NO-DATA"),
                 ("1 unit at the 10th digit", "2026-10-12T20:05:00.0000000001Z", "NO-DATA"),
+                # r3: a comma fraction is no longer read at all, so it is not live even exactly at the bound
                 ("comma fraction past", "2026-10-12T20:05:00,0000001Z", "NO-DATA"),
-                ("comma fraction at the bound", "2026-10-12T20:05:00,0000000Z", "IN-FLIGHT"),
+                ("comma fraction at the bound", "2026-10-12T20:05:00,0000000Z", "NO-DATA"),
                 ("100 ns inside", "2026-10-12T20:04:59.9999999Z", "IN-FLIGHT")):
             with self.subTest(label):
                 self.setUp()
                 self.assertEqual(self._verdict_for_running_stamp(stamp), expected)
 
     def test_a2_comma_fraction_timestamps_keep_their_sub_microsecond_order(self):
-        # The finished run is 800 ns NEWER than the running one: the lane is CURRENT, in both creation orders.
+        # Since r3 a comma-spelled running receipt is not a live candidate (LIVE_START_RE), so the lane reads
+        # INCOMPLETE (an unproven run with no effort) instead of CURRENT; what stays pinned is the ORDER: the
+        # comma form still parses and sorts exactly like the dot form, and the receipt is never IN-FLIGHT.
         specs = {"fin": dict(state="complete", resolvedModel="gpt-6.1-sol", effort="high",
                              startedUtc="2026-10-12T19:00:00,1234569Z"),
                  "run": dict(state="running", timeoutSec=7200, startedUtc="2026-10-12T19:00:00,1234561Z")}
@@ -407,30 +410,52 @@ class InFlightTests(CurrencyFixture):
                 self.setUp()
                 for name in order:
                     self._write_raw(name, lane="sol", **specs[name])
-                self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], "CURRENT")
+                entry = self.evaluate()["lanes"]["sol"]
+                self.assertEqual(entry["verdict"], "INCOMPLETE")
+                self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (0, 1))
         # and the comma form orders exactly like the dot form
         self.assertEqual(check.parse_utc("2026-10-12T19:00:00,1234569Z"), check.parse_utc("2026-10-12T19:00:00.1234569Z"))
 
     # --- adversary pass 4 (sol, head 421f4a82): A1-A3, introduced majors --------------------------------
+    def _fin_and_run(self, fin, run, order):
+        for name in order:
+            if name == "fin":
+                self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol",
+                                effort="high", startedUtc=fin)
+            else:
+                self._write_raw("run", lane="sol", state="running", timeoutSec=7200, startedUtc=run)
+
     def test_p4a1_every_fractional_digit_orders_receipts_only_an_exact_tie_favours_the_running_one(self):
-        # the finished run is newer at the 10th digit (…0009 vs …0001): CURRENT, not IN-FLIGHT
+        # Spellings a live candidate may have (1-9 fraction digits, dot): the finished run is newer at the 9th
+        # digit (...009 vs ...001): CURRENT, not IN-FLIGHT.
         for fin, run, expected in (
-                ("2026-10-12T19:00:00.1234560009Z", "2026-10-12T19:00:00.1234560001Z", "CURRENT"),
-                ("2026-10-12T19:00:00,1234560009Z", "2026-10-12T19:00:00,1234560001Z", "CURRENT"),
-                ("2026-10-12T19:00:00.1234560001Z", "2026-10-12T19:00:00.1234560009Z", "IN-FLIGHT"),
-                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.1234560000000Z", "IN-FLIGHT"),  # equal
-                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.12345600001Z", "IN-FLIGHT"),
-                ("2026-10-12T19:00:00.12345600001Z", "2026-10-12T19:00:00.123456Z", "CURRENT")):
+                ("2026-10-12T19:00:00.123456009Z", "2026-10-12T19:00:00.123456001Z", "CURRENT"),
+                ("2026-10-12T19:00:00.123456001Z", "2026-10-12T19:00:00.123456009Z", "IN-FLIGHT"),
+                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.123456000Z", "IN-FLIGHT"),  # equal
+                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.123456001Z", "IN-FLIGHT"),
+                ("2026-10-12T19:00:00.123456001Z", "2026-10-12T19:00:00.123456Z", "CURRENT")):
             for order in (("fin", "run"), ("run", "fin")):
                 with self.subTest(fin=fin, run=run, order=order):
                     self.setUp()
-                    for name in order:
-                        if name == "fin":
-                            self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol",
-                                            effort="high", startedUtc=fin)
-                        else:
-                            self._write_raw("run", lane="sol", state="running", timeoutSec=7200, startedUtc=run)
+                    self._fin_and_run(fin, run, order)
                     self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], expected)
+
+    def test_r3_a_running_receipt_spelled_past_nine_digits_or_with_a_comma_is_never_in_flight(self):
+        # pass 4 pinned these as live; r3 stops reading them (LIVE_START_RE), so the order of the digits no
+        # longer decides IN-FLIGHT vs CURRENT: the running receipt is an unproven one in every case.
+        for fin, run in (
+                ("2026-10-12T19:00:00.1234560009Z", "2026-10-12T19:00:00.1234560001Z"),
+                ("2026-10-12T19:00:00,1234560009Z", "2026-10-12T19:00:00,1234560001Z"),
+                ("2026-10-12T19:00:00.1234560001Z", "2026-10-12T19:00:00.1234560009Z"),
+                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.1234560000000Z"),
+                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.12345600001Z")):
+            for order in (("fin", "run"), ("run", "fin")):
+                with self.subTest(fin=fin, run=run, order=order):
+                    self.setUp()
+                    self._fin_and_run(fin, run, order)
+                    entry = self.evaluate()["lanes"]["sol"]
+                    self.assertNotEqual(entry["verdict"], "IN-FLIGHT")
+                    self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (0, 1))
 
     def test_p4a2_liveness_is_exact_at_sub_microsecond_timeouts_and_starts(self):
         # now = 20:00:00. Bound: now <= started + timeout + 300 s, read exactly.
@@ -647,6 +672,128 @@ class InFlightTests(CurrencyFixture):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["lanes"]["opus"]["verdict"], "IN-FLIGHT")
         self.assertEqual(payload["verdict"], "CURRENT")
+
+
+class LiveShapeTests(CurrencyFixture):
+    """r3 (hub ruling 20261105T0250Z): a receipt is a live candidate only in the shape Invoke-Lane.ps1 writes.
+
+    startedUtc must be YYYY-MM-DDTHH:MM:SS(.d{1,9})?(Z|+-HH:MM) and timeoutSec an int, or a number of at most 15
+    significant digits judged on its RAW token (json.load rounds a longer one before the script sees it). Any other
+    shape is not live: it stays unproven (NO-DATA), as before this PR. Closes adversary pass 5 A1 and A2 as a class."""
+
+    def _lane_verdict(self, started, timeout_token):
+        """A completed sol/gpt-6.1-sol/high run at 19:00Z plus a running receipt written as RAW JSON text, so the
+        timeout token reaches the script exactly as spelled. `started` is any string. -> (lane entry, running)."""
+        fin = self.runs / "fin"
+        fin.mkdir()
+        (fin / "sol-001.receipt.json").write_text(json.dumps({
+            "lane": "sol", "state": "complete", "card": "TEST", "startedUtc": "2026-10-12T19:00:00.0000000Z",
+            "resolvedModel": "gpt-6.1-sol", "effort": "high"}), encoding="utf-8")
+        run = self.runs / "run"
+        run.mkdir()
+        (run / "sol-001.receipt.json").write_text(
+            '{"lane":"sol","state":"running","card":"TEST","startedUtc":%s,"timeoutSec":%s}' % (
+                json.dumps(started), timeout_token), encoding="utf-8")
+        receipts, _ = check.load_receipts(str(self.runs))
+        running = [r for r in receipts if r["state"] == "running"]
+        return check.evaluate(receipts, now=NOW)["lanes"]["sol"], running
+
+    def _not_live(self, started, timeout_token, label=""):
+        self.setUp()
+        entry, running = self._lane_verdict(started, timeout_token)
+        message = "%s %r %s" % (label, started, timeout_token)
+        self.assertNotEqual(entry["verdict"], "IN-FLIGHT", message)
+        self.assertEqual(entry["inFlightRuns"], 0, message)
+        for receipt in running:
+            self.assertFalse(check.is_live_running(receipt, NOW), message)
+        return entry
+
+    def _live(self, started, timeout_token, label=""):
+        self.setUp()
+        entry, running = self._lane_verdict(started, timeout_token)
+        message = "%s %r %s" % (label, started, timeout_token)
+        self.assertEqual(entry["verdict"], "IN-FLIGHT", message)
+        self.assertEqual(entry["inFlightRuns"], 1, message)
+        self.assertTrue(running and all(check.is_live_running(r, NOW) for r in running), message)
+
+    def test_r3_a1_the_hub_timeout_inputs_read_unproven_not_in_flight(self):
+        # json.load rounds both to a value the exact arithmetic then trusted (adversary pass 5, A1).
+        for started, token in (("2026-10-12T19:54:59.9999999Z", "0.000000099999999999999999"),
+                               ("2026-10-12T19:30:00Z", "172800.000000000001")):
+            with self.subTest(token=token):
+                self.assertEqual(self._not_live(started, token)["verdict"], "NO-DATA")
+
+    def test_r3_a1_the_fifteen_digit_edge_of_the_raw_timeout_token(self):
+        young = "2026-10-12T19:59:00Z"
+        for token, live in (("7200.12345678901", True),          # 15 significant digits
+                            ("7200.123456789012", False),         # 16
+                            ("7200", True), ("7200.0", True), ("7.2e3", True), ("72E2", True), ("1e-7", True),
+                            ("172800.000000000000", True),        # zero padding is exact, not a longer digit string
+                            ("0.100000000000000000", True),
+                            ("0.1000000000000001", False),        # 16 significant digits
+                            ("1e400", False), ("1e-400", False), ("1E+31", False),
+                            ("9" * 400 + ".5", False), ("0." + "0" * 400 + "1", False), ("-3600", False),
+                            ("0", False), ("0.0", False)):
+            with self.subTest(token=token):
+                if live:
+                    self._live(young if token != "1e-7" else "2026-10-12T19:54:59.9999999Z", token)
+                else:
+                    self._not_live(young, token)
+
+    def test_r3_a1_each_sibling_site_sees_the_raw_digits(self):
+        # :241 (the 0 < timeout <= cap test), :253 (the exact liveness sum) and :256 (the expiry compare) all
+        # read one value now, and a 17-digit token never becomes a float on the way.
+        started = "2026-10-12T19:30:00Z"                           # 30 min old
+        self._not_live(started, "172800.00000000000001", "cap edge, 19 digits")      # a cap sibling
+        self._not_live("2026-10-12T14:54:59Z", "18000.000000000001", "expiry edge")   # an expiry sibling
+        self._not_live("2026-10-12T19:54:59.9999999Z", "0.0000001000000000000001", "tiny + a trailing digit")
+        self._live("2026-10-12T19:54:59.9999999Z", "0.0000001", "the same value, short")
+
+    def test_r3_a2_offset_fractions_are_not_live(self):
+        # Hub inputs (adversary pass 5, A2): the offset fraction was dropped by parse_utc.
+        for started, token in (("2026-10-12T20:05:00.0000000-00:00:00.0000001", "3600"),
+                               ("2026-10-12T20:54:59.0000000+01:00:00.0000001", "1"),
+                               ("2026-10-12T19:59:00+00:00:00.0000001", "3600"),
+                               ("2026-10-12T19:59:00+00:00:00", "3600"),
+                               ("2026-10-12T19:59:00.0000000-00:00:00.0000001", "3600")):
+            with self.subTest(started=started):
+                self._not_live(started, token)
+
+    def test_r3_a2_only_the_writers_start_shapes_can_be_live(self):
+        # every spelling below names 19:59:00Z (60 s before now) or is a near miss of that
+        for label, stamp in (("lowercase z", "2026-10-12T19:59:00z"), ("lowercase t", "2026-10-12t19:59:00Z"),
+                             ("space separator", "2026-10-12 19:59:00Z"), ("comma fraction", "2026-10-12T19:59:00,5Z"),
+                             ("no zone", "2026-10-12T19:59:00"), ("compact offset", "2026-10-12T19:59:00+0000"),
+                             ("hour-only offset", "2026-10-12T19:59:00+00"),
+                             ("ten fraction digits", "2026-10-12T19:59:00.0000000000Z"),
+                             ("empty fraction", "2026-10-12T19:59:00.Z"),
+                             ("leading space", " 2026-10-12T19:59:00Z"), ("trailing space", "2026-10-12T19:59:00Z "),
+                             ("trailing newline", "2026-10-12T19:59:00Z\n"),
+                             ("basic format", "20261012T195900Z"), ("week date", "2026-W42-1T19:59:00Z"),
+                             ("ordinal date", "2026-285T19:59:00Z"), ("date only", "2026-10-12"),
+                             ("arabic-indic digits", "٢٠٢٦-10-12T19:59:00Z"),
+                             ("minus sign U+2212 offset", "2026-10-12T19:59:00−00:00"),
+                             ("hour 24", "2026-10-12T24:00:00Z")):
+            with self.subTest(label):
+                self._not_live(stamp, "3600", label)
+
+    def test_r3_a2_the_writers_shapes_stay_live(self):
+        # 60 s before now in every spelling the writer or a normal ISO 8601 producer emits
+        for stamp in ("2026-10-12T19:59:00Z", "2026-10-12T19:59:00.0000000Z", "2026-10-12T19:59:00.1Z",
+                      "2026-10-12T19:59:00.123456789Z", "2026-10-12T19:59:00+00:00", "2026-10-12T19:59:00.5+00:00",
+                      "2026-10-12T14:59:00-05:00", "2026-10-12T21:59:00+02:00", "2026-10-12T19:59:00.0000000Z"):
+            with self.subTest(stamp):
+                self._live(stamp, "3600")
+
+    def test_r3_non_numeric_and_boolean_timeouts_stay_unproven(self):
+        for token in ('"3600"', "true", "null", "[3600]", '{"a":1}', "NaN", "Infinity", "-Infinity"):
+            with self.subTest(token=token):
+                self._not_live("2026-10-12T19:59:00Z", token)
+
+    def test_r3_a5_the_docstring_says_past_the_skew_bound(self):
+        doc = check.__doc__
+        self.assertIn("past the skew bound", doc)
+        self.assertNotIn("a receipt dated in the future has no age, so it is never a candidate", doc)
 
 
 class WindowTests(CurrencyFixture):

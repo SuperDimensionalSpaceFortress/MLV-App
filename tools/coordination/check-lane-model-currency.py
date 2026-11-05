@@ -42,9 +42,17 @@ effort yet (Invoke-Lane.ps1 writes both at the end), so before this verdict a la
 read NO-DATA and pulled the overall verdict to INCOMPLETE. A receipt counts as a LIVE CANDIDATE when it
 says state=running, has no endedUtc, has a finite timeoutSec between 0 (exclusive) and
 MAX_LIVE_TIMEOUT_SEC (48 h; nan, inf, a non-positive or an absurd value is no bound, never a crash), is not
-dated more than MAX_FUTURE_START_SKEW_SEC (300 s) past now (a receipt dated in the future has no age, so it
+dated more than MAX_FUTURE_START_SKEW_SEC (300 s) past now (a receipt dated past the skew bound has no age, so it
 is never a candidate), and now is no later than startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the
-wrapper's post-run cleanup and the hub clock's measured skew of up to ~20 s). That is an AGE WINDOW derived
+wrapper's post-run cleanup and the hub clock's measured skew of up to ~20 s).
+SHAPES (r3, hub ruling 20261105T0250Z). The receipt is a candidate only if its two fields are spelled the way the
+writer spells them: startedUtc must fullmatch YYYY-MM-DDTHH:MM:SS(.d{1,9})?(Z|+-HH:MM) (ASCII digits, upper-case
+T and Z, no comma, no padding; LIVE_START_RE), and timeoutSec must be a JSON int or a number whose RAW token has at
+most 15 significant digits (exact_timeout: json.load rounds a longer token before the script could see it, so the
+digits are counted on the token itself; padding zeros do not count). Anything else is not a candidate and stays
+unproven, as before this PR; no exotic spelling is read, so none can be mis-read. The arithmetic on an accepted
+receipt stays exact. Measured on the real writer: every receipt under fleet-runs that has a startedUtc matches. That
+is an AGE WINDOW derived
 from the receipt's own start time and timeout, not a process probe: this script reads receipts only, it
 never proves that a process exists, and the board's authoritative liveness rule (hub-queue-lib.ps1
 Get-LaneRunState: child pid alive, command line names the run dir, start time matches within 10 s) needs
@@ -87,6 +95,7 @@ Usage: python check-lane-model-currency.py [--runs-dir DIR] [--since-hours N] [-
 """
 import argparse
 import datetime
+import decimal
 import fractions
 import glob
 import json
@@ -104,6 +113,12 @@ DEFAULT_SINCE_HOURS = 72.0
 LIVE_GRACE_SEC = 300.0
 MAX_FUTURE_START_SKEW_SEC = 300     # a running receipt may be dated at most this far past now (clock skew)
 MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a real lane is 12600 s
+# The ONLY startedUtc spelling a live candidate may have: what Invoke-Lane.ps1 writes (ToString('o') of a UTC
+# DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
+# digits only and matched against the raw, unstripped string with fullmatch, so a trailing newline or space is out.
+LIVE_START_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
+MAX_TIMEOUT_SIGNIFICANT_DIGITS = 15  # a decimal this short survives the trip through a binary float unchanged
+MAX_TIMEOUT_EXPONENT = 30            # |decimal exponent of the leading digit|; keeps Fraction() cheap on a hostile token
 RECEIPT_GLOB = "*/*-001.receipt.json"
 TIERING_REL = "agents/orchestration-tiering.md"
 INVOKE_LANE_REL = "tools/coordination/Invoke-Lane.ps1"
@@ -153,6 +168,58 @@ def parse_utc(text):
     return moment
 
 
+class RawFloat(float):
+    """A float that remembers the JSON token it was read from (json.load alone would round a long one)."""
+    raw = None
+
+
+class RawInt(int):
+    raw = None
+
+
+def _raw_float(token):
+    value = RawFloat(token)
+    value.raw = token
+    return value
+
+
+def _raw_int(token):
+    value = RawInt(token)
+    value.raw = token
+    return value
+
+
+def exact_timeout(value):
+    """The exact value of a timeoutSec that may take part in the liveness test, as a Fraction; else None.
+
+    Judged on the RAW JSON token (r3, adversary pass 5 A1): json.load turns 172800.000000000001 into 172800.0 and
+    0.000000099999999999999999 into 1e-07, so the digits must be counted before any float exists. Live only when the
+    token is a JSON int or float with at most MAX_TIMEOUT_SIGNIFICANT_DIGITS significant digits (padding zeros do
+    not count: 172800.000000000000 is exactly 172800) and a decimal exponent within MAX_TIMEOUT_EXPONENT. A value
+    that did not come from a number token (nan, inf, a string, a bool, a list) is None."""
+    raw = getattr(value, "raw", None)
+    if not isinstance(raw, str):
+        return None
+    try:
+        parts = decimal.Decimal(raw).as_tuple()
+    except decimal.InvalidOperation:
+        return None
+    if not isinstance(parts.exponent, int):         # 'NaN' / 'Infinity' never come through parse_int/parse_float
+        return None
+    digits, exponent = list(parts.digits), parts.exponent
+    while digits and digits[0] == 0:
+        digits.pop(0)
+    while digits and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    if len(digits) > MAX_TIMEOUT_SIGNIFICANT_DIGITS:
+        return None
+    if digits and abs(exponent + len(digits) - 1) > MAX_TIMEOUT_EXPONENT:
+        return None
+    number = fractions.Fraction(int("".join(map(str, digits)) or "0")) * fractions.Fraction(10) ** exponent
+    return -number if parts.sign else number
+
+
 def default_runs_dir():
     """<repo>/.claude-state/fleet-runs of the MAIN checkout: .claude-state is untracked, so a
     linked worktree has none; git's common dir leads back to the checkout that does."""
@@ -183,7 +250,7 @@ def load_receipts(runs_dir):
     for path in glob.glob(os.path.join(runs_dir, RECEIPT_GLOB)):
         try:
             with open(path, "r", encoding="utf-8-sig") as handle:
-                data = json.load(handle)
+                data = json.load(handle, parse_float=_raw_float, parse_int=_raw_int)
         except (OSError, ValueError):
             unreadable += 1
             continue
@@ -208,6 +275,11 @@ def load_receipts(runs_dir):
             "state": data.get("state"),
             "ended": data.get("endedUtc"),
             "timeoutSec": timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else None,
+            # the two facts a live candidate needs, decided once here on the RAW text (r3): the exact timeout, and
+            # whether startedUtc is spelled in the one shape the writer produces
+            "timeoutExact": exact_timeout(timeout),
+            "strictStart": (isinstance(data.get("startedUtc"), str)
+                            and LIVE_START_RE.fullmatch(data["startedUtc"]) is not None),
             "card": data.get("card"), "effort": data.get("effort"),
             "resolvedModel": resolved if isinstance(resolved, str) else None,
             "parsed": parse_model_id(resolved),
@@ -235,25 +307,30 @@ def is_live_running(receipt, now):
     This is an age window, not a process probe; it does not prove anything is running (see the docstring)."""
     if receipt["state"] != "running" or receipt["ended"]:
         return False
-    timeout = receipt["timeoutSec"]
+    # Only the writer's own spellings are read at all (r3): startedUtc in LIVE_START_RE and a timeoutSec whose RAW
+    # token has at most 15 significant digits (exact_timeout). Any other shape (a comma fraction, a fractional or
+    # compact offset, a lowercase z, a 16-digit timeout that json.load would have rounded) is not provably inside
+    # the window, so it is not a candidate: it stays unproven, exactly as before this PR.
+    if not receipt.get("strictStart"):
+        return False
+    timeout = receipt.get("timeoutExact")
     try:
-        # nan, inf, a non-positive value, a huge int or anything past the cap is not a bound at all
-        if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= MAX_LIVE_TIMEOUT_SEC:
+        # a missing, non-positive or over-cap value is not a bound at all (nan, inf and non-numbers are None here)
+        if timeout is None or not 0 < timeout <= int(MAX_LIVE_TIMEOUT_SEC):
             return False
         # Bounded at both ends: not older than timeout + grace, and not dated past the future-skew bound. A
-        # receipt dated in the future has no age at all, so it is no evidence that a run is in progress.
+        # receipt dated past that bound has no age at all, so it is no evidence that a run is in progress.
         # The arithmetic is EXACT (fractions, no timedelta rounding), so the bounds hold to the last digit the
-        # receipt wrote: the microsecond-truncated `started`, the digits it dropped (`subus`) and a fractional
-        # timeoutSec (read as its decimal text, not as a binary float) all enter unrounded.
+        # receipt wrote: the microsecond-truncated `started`, the digits it dropped (`subus`) and the timeout
+        # (its exact decimal value, `timeoutExact`) all enter unrounded.
         micro = (receipt["started"] - now) // datetime.timedelta(microseconds=1)
         digits = receipt.get("subus") or ""
         start_minus_now = fractions.Fraction(micro, 10 ** 6)
         if digits:
             start_minus_now += fractions.Fraction(int(digits), 10 ** len(digits)) / 10 ** 6
-        timeout_exact = fractions.Fraction(timeout if isinstance(timeout, int) else repr(timeout))
         if start_minus_now > MAX_FUTURE_START_SKEW_SEC:
             return False
-        return start_minus_now + timeout_exact + int(LIVE_GRACE_SEC) >= 0
+        return start_minus_now + timeout + int(LIVE_GRACE_SEC) >= 0
     except (OverflowError, ValueError, TypeError):
         return False        # includes an unreadably long digit string: not provably inside the window
 
