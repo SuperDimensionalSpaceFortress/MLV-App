@@ -295,9 +295,9 @@ if ([string]::IsNullOrWhiteSpace($script:AgentImagePath)) { $script:AgentImagePa
 # RecoveryQuarantine: jobId -> why its recovery is unresolved (the inbox loop never admits or launches it).
 $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:OwnPendingMarkerTmp = @{}
-# BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: set only while Invoke-LiveMarkerReconcile runs a recovery. LiveResultVanished: that recovery found the result gone and did nothing.
-$script:LiveReconcileOnly = $false
-$script:LiveResultVanished = $false
+# BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: LiveRetireQuarantine: jobId -> why a finished job's marker could not be retired. Retried only by Invoke-LiveMarkerReconcile, never by
+# start-up recovery: by the retry the result may have been withdrawn, and adopt, orphan or re-queue against that id would answer a resubmitting client with a false receipt.
+$script:LiveRetireQuarantine = @{}
 $script:RecoveryQuarantine = @{}
 $script:LastRecoveryWhy = $null
 
@@ -1115,12 +1115,12 @@ function Complete-StartedMarker {
 }
 
 function Set-MarkerRetireQuarantine {
-    # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: a marker that could not be retired stays in running\ and goes to the retry Invoke-QuarantineReconcile
-    # runs every poll. One log line when it enters quarantine, not one per retry; Resolve-JobRecovery logs any change of reason from there on.
+    # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: a marker that could not be retired stays in running\ and goes to the retry Invoke-LiveMarkerReconcile runs every poll, which
+    # retires it only while its result is there. One log line when it enters quarantine, not one per retry. Resolve-JobRecovery, when it was the caller, also holds the job in RecoveryQuarantine itself.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Why)
-    if ($script:RecoveryQuarantine.ContainsKey($JobId)) { return }
-    Add-AgentLogLine "marker kept job=${JobId}: $Why; quarantined until recovery retires it"
-    $script:RecoveryQuarantine[$JobId] = $Why
+    if ($script:LiveRetireQuarantine.ContainsKey($JobId)) { return }
+    Add-AgentLogLine "marker kept job=${JobId}: $Why; quarantined until the live reconcile retires it"
+    $script:LiveRetireQuarantine[$JobId] = $Why
 }
 
 function Set-OwnPendingMarkerTmp {
@@ -1784,11 +1784,6 @@ function Resolve-StartedMarkerFile {
         return
     }
 
-    # sol pass-2 A1: the live reconcile saw this result a moment ago. A client reusing the job id deletes the old result before it publishes its new script (Submit-AgentJob),
-    # so it can be gone now. Adopt / orphan / re-queue below are for a job whose result never came, and are start-up only: against a job about to be submitted afresh they
-    # would publish an exit-127 receipt for it. Do nothing here; Resolve-JobRecovery returns without quarantining, because a quarantine retry would run them.
-    if ($script:LiveReconcileOnly) { $script:LiveResultVanished = $true; return }
-
     # GATE-2: a job the previous agent was HOLDING in the admission gate never launched (no child), so it is
     # neither adoptable nor orphaned. Its job file is still in inbox\, so it is re-queued: the main loop below
     # gates it again. r1c: a waiting job held no slot; its queued holder is stopped at start (Stop-StaleHeavySlotHolders).
@@ -1846,8 +1841,7 @@ function Resolve-JobRecovery {
         $fa = Read-MarkerArtifact -Path $final
         if ($fa.state -eq "ok") {
             $null = Resolve-StartedMarkerFile -Marker $fa.marker -MarkerPath $final
-            if ($script:LiveResultVanished) { return $true }
-            $left = Get-JobRecoveryPending -JobId $JobId -IgnoreQuarantine
+            $left =Get-JobRecoveryPending -JobId $JobId -IgnoreQuarantine
             # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: this agent's own unlaunched claim reads as admissible above, but with its result published the marker
             # should be gone by now. Still here means its retire failed, so it stays quarantined and is retried, not released with the marker left behind.
             if (-not $left -and (Test-Path -LiteralPath (Join-Path $outbox "$JobId.result.json") -PathType Leaf) -and (Test-Path -LiteralPath $final -PathType Leaf)) { $left = "its result is published but its marker could not be retired" }
@@ -1889,28 +1883,83 @@ function Resolve-StartedMarkers {
     foreach ($id in @(Get-RunningMarkerJobIds)) { $null = Resolve-JobRecovery -JobId $id }
 }
 
+function Invoke-LiveMarkerRetire {
+    # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: retire ONE finished job's marker artifacts from the live loop. It settles the job's marker tmps, re-checks the published result, and
+    # completes the marker only with the result there. It is deliberately not Resolve-JobRecovery: every branch behind that (stranded-result promotion, adopt, orphan, re-queue) is for a
+    # job found at start-up, and a client reusing the id deletes the old result before it publishes its new script (Submit-AgentJob), so the result can be gone at any step here. THREE OUTCOMES:
+    #   retired    no marker artifact of the job is left
+    #   withdrawn  the result went: the job is no longer finished, so its marker and any result tmp stay as they are
+    #   kept       the retire is still owed; why says why
+    param([Parameter(Mandatory = $true)][string]$JobId)
+    $script:LastRecoveryWhy = $null
+    if (-not (Resolve-JobMarkerTemps -JobId $JobId)) { return [pscustomobject]@{ state = "kept"; why = $script:LastRecoveryWhy } }
+    $final = Join-Path $running "$JobId.started.json"
+    $resultPath = Join-Path $outbox "$JobId.result.json"
+    $fa = Read-MarkerArtifact -Path $final
+    if ($fa.state -eq "missing") { return [pscustomobject]@{ state = "retired"; why = $null } }
+    if ($fa.state -ne "ok") { return [pscustomobject]@{ state = "kept"; why = "final marker $($fa.state): $($fa.why)" } }
+    # Complete-StartedMarker files everything under the marker's own jobId, so a marker naming another job would quarantine and retire under the wrong id.
+    if ([string]$fa.marker.jobId -ne $JobId) { return [pscustomobject]@{ state = "kept"; why = "the marker names job $($fa.marker.jobId)" } }
+    if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { return [pscustomobject]@{ state = "withdrawn"; why = $null } }
+    Complete-StartedMarker -MarkerPath $final -Status "completed" -ResultPath $resultPath
+    # The result went inside that call, before its own check. That check quarantines for start-up recovery, right for a result that never landed; here the next poll's retry would
+    # orphan the reused id. The caller only comes here for an id with no such entry, so this entry is that call's. A result that goes AFTER its check retires the marker of a job that did finish.
+    if ($script:RecoveryQuarantine.ContainsKey($JobId)) {
+        $script:RecoveryQuarantine.Remove($JobId)
+        return [pscustomobject]@{ state = "withdrawn"; why = $null }
+    }
+    $list = Get-MarkerTempFiles -JobId $JobId
+    if (-not $list.ok) { return [pscustomobject]@{ state = "kept"; why = "running\ cannot be listed: $($list.error)" } }
+    if ((Test-Path -LiteralPath $final -PathType Leaf) -or @($list.items).Count -gt 0) { return [pscustomobject]@{ state = "kept"; why = "its marker artifacts are still in running\" } }
+    return [pscustomobject]@{ state = "retired"; why = $null }
+}
+
 function Invoke-LiveMarkerReconcile {
     # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1: defence in depth, every poll of the live loop. A marker artifact whose job has a published result and is
     # not live is a leak: Wait-VenueQuiet counts it, so every quiet probe reads GATE_BUSY until the agent restarts. Complete-StartedMarker now catches
-    # its own failures; this catches a leak from any other route, including an agent that deployed before that fix.
-    #   live    a job whose script is still in inbox\ is this agent's live set: queued, held at the gate, running (Move-JobArtifacts is its last step), or
+    # its own failures; this retries those and catches a leak from any other route, including an agent that deployed before that fix.
+    #   start-up quarantine  left to Invoke-QuarantineReconcile: start-up recovery already holds that job.
+    #   live    a job whose script is in inbox\ is this agent's live set: queued, held at the gate, running (Move-JobArtifacts is its last step), or
     #           left queued after a refused launch. Never touched here; the inbox loop owns it. The loop is single-threaded and this runs between jobs.
-    #   no result  NOT touched: an unfinished job's recovery (adopt, orphan, re-queue) stays start-up only.
-    #   quarantined  left to Invoke-QuarantineReconcile, which already retries it every poll.
-    foreach ($id in @(Get-RunningMarkerJobIds)) {
+    #   no result  NOT touched: an unfinished job's recovery (adopt, orphan, re-queue) stays with start-up and the inbox loop.
+    # LiveRetireQuarantine is the job's retry state, not a gate: this scan finds the job again anyway. It keeps one retry per poll down to one log line,
+    # and an entry lasts only while a retire is owed.
+    $ids = @(Get-RunningMarkerJobIds)
+    foreach ($gone in @($script:LiveRetireQuarantine.Keys | Where-Object { $ids -notcontains $_ })) { $script:LiveRetireQuarantine.Remove($gone) }
+    foreach ($id in $ids) {
         if ($script:RecoveryQuarantine.ContainsKey($id)) { continue }
-        if (Test-Path -LiteralPath (Join-Path $inbox "$id.job.ps1") -PathType Leaf) { continue }
-        if (-not (Test-Path -LiteralPath (Join-Path $outbox "$id.result.json") -PathType Leaf)) { continue }
-        # The start-up path: settle the tmps (Resolve-JobMarkerTemps), then complete the marker (Complete-StartedMarker). A failure quarantines the job.
-        $script:LiveReconcileOnly = $true; $script:LiveResultVanished = $false
-        try { $settled = Resolve-JobRecovery -JobId $id } finally { $script:LiveReconcileOnly = $false }
-        if ($script:LiveResultVanished) {
-            # Its result was withdrawn mid-call (a resubmission): the job is no longer finished, so nothing is retired and nothing is recovered.
-            $script:LiveResultVanished = $false
-            Add-AgentLogLine "live marker reconcile job=${id}: its result was withdrawn before recovery ran; left alone"
+        $owed = $script:LiveRetireQuarantine.ContainsKey($id)
+        if (Test-Path -LiteralPath (Join-Path $inbox "$id.job.ps1") -PathType Leaf) {
+            if ($owed) {
+                $script:LiveRetireQuarantine.Remove($id)
+                Add-AgentLogLine "live marker reconcile job=${id}: its script is in inbox\; left to the inbox loop"
+            }
             continue
         }
-        Add-AgentLogLine "live marker reconcile job=${id}: result published, job not live; $(if ($settled) { 'marker artifacts retired' } else { "quarantined: $($script:RecoveryQuarantine[$id])" })"
+        if (-not (Test-Path -LiteralPath (Join-Path $outbox "$id.result.json") -PathType Leaf)) {
+            if ($owed) {
+                $script:LiveRetireQuarantine.Remove($id)
+                Add-AgentLogLine "live marker reconcile job=${id}: its result was withdrawn; left alone"
+            }
+            continue
+        }
+        $r = Invoke-LiveMarkerRetire -JobId $id
+        if ($r.state -eq "retired") {
+            $script:LiveRetireQuarantine.Remove($id)
+            Add-AgentLogLine $(if ($owed) { "live retire reconciled job=$id; quarantine released" } else { "live marker reconcile job=${id}: result published, job not live; marker artifacts retired" })
+        }
+        elseif ($r.state -eq "withdrawn") {
+            $script:LiveRetireQuarantine.Remove($id)
+            Add-AgentLogLine "live marker reconcile job=${id}: its result was withdrawn; left alone"
+        }
+        elseif (-not $owed) {
+            # Complete-StartedMarker may already have filed this job with the reason it knows best.
+            if (-not $script:LiveRetireQuarantine.ContainsKey($id)) {
+                $script:LiveRetireQuarantine[$id] = $r.why
+                Add-AgentLogLine "QUARANTINED job=$id (the live reconcile retries its retire every poll): $($r.why)"
+            }
+            Add-AgentLogLine "live marker reconcile job=${id}: result published, job not live; quarantined: $($script:LiveRetireQuarantine[$id])"
+        }
     }
 }
 

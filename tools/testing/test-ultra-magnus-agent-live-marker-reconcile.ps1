@@ -16,18 +16,25 @@ param(
 #         live-job-left-alone        a running job's marker is untouched although a result for its id already exists
 #         no-result-left-alone       a marker with no published result is untouched
 #         locked-marker-quarantined  a marker nobody can read is quarantined with one log line, then retired once the reader lets go
+#         live-locked-then-withdrawn  sol pass-3 A1: locked through a live pass, then the result withdrawn: no exit-127 receipt, the marker is not orphaned
+#         live-locked-stale-tmp-then-withdrawn  the same with an old result tmp on disk: the tmp is not promoted
+#         completion-denied-then-withdrawn  the same class by the ordinary completion route: a retire denied as the job finished, then the result withdrawn
 #   unit  the agent's real functions, lifted from its AST:
 #         inbox-job-left-alone       a job whose script is in inbox\ is the live set: no recovery runs, even with marker + result
 #         own-claim-retire-retried   this agent's own unlaunched claim whose retire failed stays quarantined, then clears
 #         live-reconcile-result-withdrawn  a result deleted by a resubmitting client after the live check: no adopt/orphan recovery, no quarantine
-#         completed-tmp-kept-on-failed-move  the marker moved but the completed tmp could not: the tmp is KEPT, the job quarantined, then recovery completes it
+#         completed-tmp-kept-on-failed-move  the marker moved but the completed tmp could not: the tmp is KEPT, the job quarantined, then the live retry completes it
+#         live-withdrawn-stale-result-tmp  sol pass-3 A2: result deleted after the live check with an old tmp present (both tmp forms): not promoted, marker not retired
+#         live-withdrawn-inside-complete  the result deleted inside Complete-StartedMarker, after the live re-check: nothing lands in the start-up quarantine
+#         live-quarantine-lifecycle  a live-origin entry is dropped when the marker went, the result went, or a script came back; retried and released otherwise
+#         live-path-no-startup-recovery  the live functions call no start-up recovery, and the flags that used to guard it are gone
 # Prints one JSON object. Exit 0 = every row passed. Exit 1 = a row failed; the object says which (a RED run needs the rows, not the first throw).
 
 $ErrorActionPreference = 'Stop'
 # PowerShell variables are case-insensitive: assigning $agentScript below also assigns $AgentScript, so the override is captured first.
 $agentScriptOverridden = [bool]$AgentScript
 $agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
-$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move', 'live-reconcile-result-withdrawn')
+$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move', 'live-reconcile-result-withdrawn', 'live-locked-then-withdrawn', 'live-locked-stale-tmp-then-withdrawn', 'completion-denied-then-withdrawn', 'live-withdrawn-stale-result-tmp', 'live-withdrawn-inside-complete', 'live-quarantine-lifecycle', 'live-path-no-startup-recovery')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Want([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -117,6 +124,20 @@ function Wait-Launched($c, [string]$JobId, [double]$TimeoutSec) {
                 return (($t | ConvertFrom-Json).phase -eq 'launched')
             } catch { return $false }
         } $TimeoutSec)
+}
+# Waits out $Polls of the agent's own polls, so "nothing happened" means the agent looked and left it alone.
+function Wait-Polls($c, [int]$Polls) {
+    $from = Get-HeartbeatGeneration $c
+    Assert-True (Wait-Until { ((Get-HeartbeatGeneration $c) - $from) -ge $Polls } 30) "$($c.name): the agent polled $Polls more times"
+}
+# What a withdrawn job must look like after those polls: no receipt and no recovery, and the fresh submission is free to arrive.
+function Assert-WithdrawnLeftAlone($c, [string]$JobId) {
+    $res = Join-Path $c.outbox "$JobId.result.json"
+    $got = if (Test-Path -LiteralPath $res) { Get-Content -LiteralPath $res -Raw } else { '' }
+    Assert-True (-not (Test-Path -LiteralPath $res)) "nothing republished a result for the withdrawn id: $got"
+    Assert-True (Test-Path -LiteralPath (Join-Path $c.running "$JobId.started.json")) 'the marker is still in running\'
+    Assert-True (@(Get-ChildItem -LiteralPath $c.processed -Filter "$JobId.started.*").Count -eq 0) 'the marker was not retired against nothing'
+    Assert-True (@(Get-LogLines $c "orphaned job=$JobId").Count -eq 0) "no orphan recovery ran: $((Get-LogLines $c "orphaned job=$JobId") -join ' | ')"
 }
 function Invoke-Row([string]$Name, [scriptblock]$Body) {
     if (-not (Want $Name)) { return }
@@ -272,6 +293,78 @@ try {
         finally { Stop-Agent $c }
     }
 
+    # sol pass-3 A1: locked through one live pass, so it is held for a retry; then a resubmitting client deletes the result. The retry must not run the
+    # start-up recovery, which publishes exit 127 for the reused id before its fresh script arrives. The result goes first and the reader second: the same state at the next poll, with no window for an honest retire.
+    Invoke-Row 'live-locked-then-withdrawn' {
+        $c = New-Case 'live-locked-then-withdrawn'
+        try {
+            Start-Agent $c
+            $job = 'resubmitted'
+            $markerPath = Join-Path $c.running "$job.started.json"
+            Put-File $markerPath (New-MarkerJson $job)
+            $before = (Get-FileHash -LiteralPath $markerPath).Hash
+            $reader = [IO.File]::Open($markerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            try {
+                Put-File (Join-Path $c.outbox "$job.result.json") (New-ResultJson $job)
+                Assert-True (Wait-Until { @(Get-LogLines $c "QUARANTINED job=$job").Count -ge 1 } 8) 'the locked marker is held for a retry'
+                Remove-Item -LiteralPath (Join-Path $c.outbox "$job.result.json") -Force
+            }
+            finally { $reader.Dispose() }
+            Wait-Polls $c 4
+            Assert-WithdrawnLeftAlone $c $job
+            Assert-True ((Get-FileHash -LiteralPath $markerPath).Hash -eq $before) 'the marker is byte-identical'
+            return 'left alone'
+        }
+        finally { Stop-Agent $c }
+    }
+
+    # The same, with an old result tmp on disk: the retry must not restore it as the job's receipt either.
+    Invoke-Row 'live-locked-stale-tmp-then-withdrawn' {
+        $c = New-Case 'live-locked-stale-tmp-then-withdrawn'
+        try {
+            Start-Agent $c
+            $job = 'resubmitted-tmp'
+            $markerPath = Join-Path $c.running "$job.started.json"
+            $staleTmp = Join-Path $c.outbox "$job.result.0123456789abcdef0123456789abcdef.tmp"
+            Put-File $staleTmp (([ordered]@{ jobId = $job; exitCode = 0; stdout = 'OLD RESULT' }) | ConvertTo-Json -Compress)
+            Put-File $markerPath (New-MarkerJson $job)
+            $reader = [IO.File]::Open($markerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            try {
+                Put-File (Join-Path $c.outbox "$job.result.json") (New-ResultJson $job)
+                Assert-True (Wait-Until { @(Get-LogLines $c "QUARANTINED job=$job").Count -ge 1 } 8) 'the locked marker is held for a retry'
+                Remove-Item -LiteralPath (Join-Path $c.outbox "$job.result.json") -Force
+            }
+            finally { $reader.Dispose() }
+            Wait-Polls $c 4
+            Assert-WithdrawnLeftAlone $c $job
+            Assert-True (Test-Path -LiteralPath $staleTmp) 'the old result tmp was not promoted'
+            return 'left alone'
+        }
+        finally { Stop-Agent $c }
+    }
+
+    # The class, by the route that does not start in the live pass: a job finishes under a reader that denies its retire, then its result is withdrawn.
+    Invoke-Row 'completion-denied-then-withdrawn' {
+        $c = New-Case 'completion-denied-then-withdrawn'
+        try {
+            Start-Agent $c
+            $job = 'venue-quiet-probe-withdrawn'
+            Submit-Job $c $job 'Start-Sleep -Seconds 4; "ran"'
+            Assert-True (Wait-Launched $c $job 30) 'the job launched'
+            $markerPath = Join-Path $c.running "$job.started.json"
+            $reader = [IO.File]::Open($markerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                Assert-True (Wait-Until { @(Get-LogLines $c "marker kept job=$job").Count -ge 1 } 30) 'the denied retire is held for a retry'
+                Remove-Item -LiteralPath (Join-Path $c.outbox "$job.result.json") -Force
+            }
+            finally { $reader.Dispose() }
+            Wait-Polls $c 4
+            Assert-WithdrawnLeftAlone $c $job
+            return 'left alone'
+        }
+        finally { Stop-Agent $c }
+    }
+
     # ------------------------------------------------------------ unit: the agent's real functions, lifted from its AST
     $tokens = $null; $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($agentScript, [ref]$tokens, [ref]$parseErrors)
@@ -292,10 +385,10 @@ try {
         Invoke-Row 'inbox-job-left-alone' {
             $c = New-Case 'inbox-job-left-alone'
             $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox')
-            $script:RecoveryQuarantine = @{}
+            $script:RecoveryQuarantine = @{}; $script:LiveRetireQuarantine = @{}
             $script:Recovered = [System.Collections.Generic.List[string]]::new()
             foreach ($name in @('Get-MarkerTempFiles', 'Get-RunningMarkerJobIds', 'Invoke-LiveMarkerReconcile')) { . ([scriptblock]::Create((Get-AgentFunction $name).Extent.Text)) }
-            function Resolve-JobRecovery { param([string]$JobId) $script:Recovered.Add($JobId); return $true }
+            function Invoke-LiveMarkerRetire { param([string]$JobId) $script:Recovered.Add($JobId); return [pscustomobject]@{ state = 'retired'; why = $null } }
             function Add-AgentLogLine { param([string]$Message) }
             foreach ($job in @('in-inbox', 'not-in-inbox')) {
                 Put-File (Join-Path $c.running "$job.started.json") (New-MarkerJson $job)
@@ -312,7 +405,7 @@ try {
         Invoke-Row 'own-claim-retire-retried' {
             $c = New-Case 'own-claim-retire-retried'
             $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed
-            $script:RecoveryQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+            $script:RecoveryQuarantine = @{}; $script:LiveRetireQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
             $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             $script:Logged = [System.Collections.Generic.List[string]]::new()
             foreach ($name in @('Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Complete-StartedMarker', 'Set-MarkerRetireQuarantine', 'Set-OwnPendingMarkerTmp', 'Clear-OwnPendingMarkerTmp',
@@ -353,11 +446,11 @@ try {
         Invoke-Row 'completed-tmp-kept-on-failed-move' {
             $c = New-Case 'completed-tmp-kept-on-failed-move'
             $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed
-            $script:RecoveryQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+            $script:RecoveryQuarantine = @{}; $script:LiveRetireQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
             $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             $script:Logged = [System.Collections.Generic.List[string]]::new()
             $lift = @('Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Complete-StartedMarker', 'Set-MarkerRetireQuarantine', 'Set-OwnPendingMarkerTmp', 'Clear-OwnPendingMarkerTmp',
-                'Get-MarkerTempFiles', 'Read-MarkerArtifact', 'Move-MarkerTmpAside', 'Resolve-JobMarkerTemps', 'Resolve-StrandedResult', 'Resolve-StartedMarkerFile', 'Get-JobRecoveryPending', 'Resolve-JobRecovery')
+                'Get-MarkerTempFiles', 'Get-RunningMarkerJobIds', 'Read-MarkerArtifact', 'Move-MarkerTmpAside', 'Resolve-JobMarkerTemps', 'Invoke-LiveMarkerRetire', 'Invoke-LiveMarkerReconcile')
             foreach ($name in $lift) { . ([scriptblock]::Create((Get-AgentFunction $name).Extent.Text)) }
             function Add-AgentLogLine { param([string]$Message) $script:Logged.Add($Message) }
             $job = 'tmp-kept'
@@ -383,12 +476,13 @@ try {
             $tmps = @(Get-ChildItem -LiteralPath $c.running | Where-Object { $_.Name -match '\.tmp$' })
             Assert-True ($tmps.Count -eq 1) "the completed tmp is kept while its move is denied: [$((Get-ChildItem -LiteralPath $c.running).Name -join ',')]"
             Assert-True ((Get-Content -LiteralPath $tmps[0].FullName -Raw | ConvertFrom-Json).status -eq 'completed') 'the kept tmp is the completed record'
-            Assert-True ($script:RecoveryQuarantine.ContainsKey($job)) "the job is quarantined so recovery retries it: $($script:Logged -join ' | ')"
+            Assert-True ($script:LiveRetireQuarantine.ContainsKey($job)) "the job is quarantined so the live reconcile retries it: $($script:Logged -join ' | ')"
+            Assert-True (-not $script:RecoveryQuarantine.ContainsKey($job)) 'start-up recovery does not retry it'
             # The sharing violation ends: the REAL move and write functions are back, and the per-poll retry finishes the job.
             foreach ($name in @('Move-FileChecked', 'Write-JsonFileAtomic')) { . ([scriptblock]::Create((Get-AgentFunction $name).Extent.Text)) }
             $ErrorActionPreference = 'Continue'
-            try { $ok = Resolve-JobRecovery -JobId $job } finally { $ErrorActionPreference = 'Stop' }
-            Assert-True $ok "recovery reconciles it once the reader lets go: $($script:Logged -join ' | ')"
+            try { Invoke-LiveMarkerReconcile } finally { $ErrorActionPreference = 'Stop' }
+            Assert-True (-not $script:LiveRetireQuarantine.ContainsKey($job)) "the live reconcile finishes it once the reader lets go: $($script:Logged -join ' | ')"
             Assert-True (@(Get-ChildItem -LiteralPath $c.running | Where-Object { $_.Name -notmatch $setAsideRecordPattern }).Count -eq 0) 'running\ is empty'
             $rec = Get-Content -LiteralPath (Join-Path $c.processed "$job.started.completed.json") -Raw | ConvertFrom-Json
             Assert-True ($rec.status -eq 'completed') "processed\ holds the completed record: $($rec | ConvertTo-Json -Compress)"
@@ -402,20 +496,20 @@ try {
         Invoke-Row 'live-reconcile-result-withdrawn' {
             $c = New-Case 'live-reconcile-result-withdrawn'
             $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed; $script:orphaned = (Join-Path $c.root 'orphaned')
-            $script:RecoveryQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+            $script:RecoveryQuarantine = @{}; $script:LiveRetireQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
             $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
             $script:Logged = [System.Collections.Generic.List[string]]::new(); $script:Orphaned = [System.Collections.Generic.List[string]]::new()
             $lift = @('Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Complete-StartedMarker', 'Set-MarkerRetireQuarantine', 'Set-OwnPendingMarkerTmp', 'Clear-OwnPendingMarkerTmp',
-                'Get-MarkerTempFiles', 'Get-RunningMarkerJobIds', 'Read-MarkerArtifact', 'Move-MarkerTmpAside', 'Resolve-JobMarkerTemps', 'Resolve-StartedMarkerFile', 'Get-JobRecoveryPending', 'Resolve-JobRecovery', 'Invoke-LiveMarkerReconcile')
-            foreach ($name in $lift) { . ([scriptblock]::Create((Get-AgentFunction $name).Extent.Text)) }
+                'Get-MarkerTempFiles', 'Get-RunningMarkerJobIds', 'Read-MarkerArtifact', 'Move-MarkerTmpAside', 'Resolve-StrandedResult', 'Resolve-StartedMarkerFile', 'Get-JobRecoveryPending', 'Resolve-JobRecovery', 'Invoke-LiveMarkerRetire', 'Invoke-LiveMarkerReconcile')
+            foreach ($name in $lift) { $f = Get-AgentFunction $name; if ($null -ne $f) { . ([scriptblock]::Create($f.Extent.Text)) } }
             function Add-AgentLogLine { param([string]$Message) $script:Logged.Add($Message) }
             $job = 'resubmitted'
             $markerPath = Join-Path $c.running "$job.started.json"
             $resultPath = Join-Path $c.outbox "$job.result.json"
             Put-File $markerPath (New-MarkerJson $job)
             Put-File $resultPath (New-ResultJson $job)
-            # The race, simulated at its first step after the live check: the submitter deletes the result. The no-result branches are recorded, not run.
-            function Resolve-StrandedResult { param([string]$JobId) Remove-Item -LiteralPath $resultPath -Force; return $true }
+            # The race, simulated at its first step after the live check (settling the tmps): the submitter deletes the result. The no-result branches are recorded, not run.
+            function Resolve-JobMarkerTemps { param([string]$JobId) Remove-Item -LiteralPath $resultPath -Force; return $true }
             function Test-ProcessIdentityMatch { param($ProcessId, $ExpectedStartUtc, $ExpectedStartEpochMs, $ExpectedImagePath) return [pscustomobject]@{ matches = $false; reason = 'fixture'; startMatches = $false; imageMatches = $false; identity = [pscustomobject]@{ startUtc = $null; startEpochMs = $null; imagePath = $null } } }
             function Invoke-OrphanResult { param($Marker, [string]$MarkerPath, [string]$Reason) $script:Orphaned.Add([string]$Marker.jobId) }
             function Invoke-AdoptStartedJob { param($Marker, [string]$MarkerPath, $Match) $script:Orphaned.Add("adopt:$($Marker.jobId)") }
@@ -426,6 +520,127 @@ try {
             Assert-True (Test-Path -LiteralPath $markerPath) 'the marker is left as found'
             Assert-True (-not (Test-Path -LiteralPath $resultPath)) 'nothing republished a result'
             return 'left alone'
+        }
+    }
+
+    # Every function a live-reconcile row needs. A name this agent does not define is skipped: the RED run lifts the same list from an older agent.
+    $liveLift = @('Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Complete-StartedMarker', 'Set-MarkerRetireQuarantine', 'Set-OwnPendingMarkerTmp', 'Clear-OwnPendingMarkerTmp',
+        'Get-MarkerTempFiles', 'Get-RunningMarkerJobIds', 'Read-MarkerArtifact', 'Move-MarkerTmpAside', 'Resolve-JobMarkerTemps', 'Resolve-StrandedResult', 'Resolve-StartedMarkerFile', 'Get-JobRecoveryPending', 'Resolve-JobRecovery', 'Invoke-LiveMarkerRetire', 'Invoke-LiveMarkerReconcile')
+
+    # sol pass-3 A2: the result is deleted after the live check, with an old result tmp on disk. Promoting that tmp and retiring the marker against it hands the
+    # resubmitting client the OLD RESULT. Both tmp forms; the deletion is simulated at the first step after the live check.
+    if (-not (Skip-OnBase 'live-withdrawn-stale-result-tmp')) {
+        Invoke-Row 'live-withdrawn-stale-result-tmp' {
+            foreach ($form in @('0123456789abcdef0123456789abcdef.tmp', 'tmp')) {
+                $c = New-Case "live-withdrawn-stale-result-tmp-$($form.Length)"
+                $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed; $script:orphaned = (Join-Path $c.root 'orphaned')
+                $script:RecoveryQuarantine = @{}; $script:LiveRetireQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+                $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                $script:Logged = [System.Collections.Generic.List[string]]::new()
+                foreach ($name in $liveLift) { $f = Get-AgentFunction $name; if ($null -ne $f) { . ([scriptblock]::Create($f.Extent.Text)) } }
+                function Add-AgentLogLine { param([string]$Message) $script:Logged.Add($Message) }
+                $job = 'resubmitted'
+                $markerPath = Join-Path $c.running "$job.started.json"
+                $resultPath = Join-Path $c.outbox "$job.result.json"
+                $staleTmp = Join-Path $c.outbox "$job.result.$form"
+                Put-File $markerPath (New-MarkerJson $job)
+                Put-File $resultPath (([ordered]@{ jobId = $job; exitCode = 0; stdout = 'CURRENT' }) | ConvertTo-Json -Compress)
+                Put-File $staleTmp (([ordered]@{ jobId = $job; exitCode = 0; stdout = 'OLD RESULT' }) | ConvertTo-Json -Compress)
+                function Resolve-JobMarkerTemps { param([string]$JobId) Remove-Item -LiteralPath $resultPath -Force; return $true }
+                $ErrorActionPreference = 'Continue'   # the agent's own policy
+                try { Invoke-LiveMarkerReconcile } finally { $ErrorActionPreference = 'Stop' }
+                $got = if (Test-Path -LiteralPath $resultPath) { Get-Content -LiteralPath $resultPath -Raw } else { '' }
+                Assert-True (-not (Test-Path -LiteralPath $resultPath)) "form ${form}: the old tmp was not promoted to the job's result: $got"
+                Assert-True (Test-Path -LiteralPath $staleTmp) "form ${form}: the old tmp stays where it was"
+                Assert-True (Test-Path -LiteralPath $markerPath) "form ${form}: the marker was not retired against the old tmp"
+                Assert-True (@(Get-ChildItem -LiteralPath $c.processed).Count -eq 0) "form ${form}: nothing reached processed\"
+                Assert-True (-not $script:RecoveryQuarantine.ContainsKey($job)) "form ${form}: nothing is left for the start-up retry"
+            }
+            return 'left alone, both forms'
+        }
+    }
+
+    # The result goes after the live re-check, inside Complete-StartedMarker but before its own check (the first thing it does is read the marker). That check
+    # quarantines for start-up recovery, which is right for a result that never landed and wrong here: the next poll's retry would orphan the id.
+    if (-not (Skip-OnBase 'live-withdrawn-inside-complete')) {
+        Invoke-Row 'live-withdrawn-inside-complete' {
+            $c = New-Case 'live-withdrawn-inside-complete'
+            $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed; $script:orphaned = (Join-Path $c.root 'orphaned')
+            $script:RecoveryQuarantine = @{}; $script:LiveRetireQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+            $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $script:Logged = [System.Collections.Generic.List[string]]::new(); $script:Orphaned = [System.Collections.Generic.List[string]]::new()
+            foreach ($name in $liveLift) { $f = Get-AgentFunction $name; if ($null -ne $f) { . ([scriptblock]::Create($f.Extent.Text)) } }
+            function Add-AgentLogLine { param([string]$Message) $script:Logged.Add($Message) }
+            function Invoke-OrphanResult { param($Marker, [string]$MarkerPath, [string]$Reason) $script:Orphaned.Add([string]$Marker.jobId) }
+            function Test-ProcessIdentityMatch { param($ProcessId, $ExpectedStartUtc, $ExpectedStartEpochMs, $ExpectedImagePath) return [pscustomobject]@{ matches = $false; reason = 'fixture'; startMatches = $false; imageMatches = $false; identity = [pscustomobject]@{ startUtc = $null; startEpochMs = $null; imagePath = $null } } }
+            $job = 'resubmitted'
+            $markerPath = Join-Path $c.running "$job.started.json"
+            $resultPath = Join-Path $c.outbox "$job.result.json"
+            Put-File $markerPath (New-MarkerJson $job)
+            Put-File $resultPath (New-ResultJson $job)
+            function Read-JsonFile { param([string]$Path) if (Test-Path -LiteralPath $resultPath) { Remove-Item -LiteralPath $resultPath -Force }; return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json) }
+            $ErrorActionPreference = 'Continue'   # the agent's own policy
+            try { Invoke-LiveMarkerReconcile } finally { $ErrorActionPreference = 'Stop' }
+            Assert-True (-not $script:RecoveryQuarantine.ContainsKey($job)) "nothing is left for the start-up retry: $($script:RecoveryQuarantine[$job])"
+            Assert-True ($script:Orphaned.Count -eq 0) 'no orphan recovery ran'
+            Assert-True (Test-Path -LiteralPath $markerPath) 'the marker is left as found'
+            Assert-True (-not (Test-Path -LiteralPath $resultPath)) 'nothing republished a result'
+            return 'left alone'
+        }
+    }
+
+    # A live-origin entry lasts only while a retire is still owed.
+    if (-not (Skip-OnBase 'live-quarantine-lifecycle')) {
+        Invoke-Row 'live-quarantine-lifecycle' {
+            $c = New-Case 'live-quarantine-lifecycle'
+            $script:running = $c.running; $script:outbox = $c.outbox; $script:inbox = (Join-Path $c.root 'inbox'); $script:processed = $c.processed; $script:orphaned = (Join-Path $c.root 'orphaned')
+            $script:RecoveryQuarantine = @{}; $script:OwnPendingMarkerTmp = @{}; $script:LastRecoveryWhy = $null
+            $script:OwnMarkerWriteIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $script:Logged = [System.Collections.Generic.List[string]]::new(); $script:Recovered = [System.Collections.Generic.List[string]]::new()
+            foreach ($name in $liveLift) { $f = Get-AgentFunction $name; if ($null -ne $f) { . ([scriptblock]::Create($f.Extent.Text)) } }
+            function Add-AgentLogLine { param([string]$Message) $script:Logged.Add($Message) }
+            function Resolve-JobRecovery { param([string]$JobId) $script:Recovered.Add($JobId); return $true }
+            $script:LiveRetireQuarantine = @{ 'marker-gone' = 'fixture'; 'result-gone' = 'fixture'; 'script-back' = 'fixture'; 'retry-ok' = 'fixture' }
+            Put-File (Join-Path $c.running 'result-gone.started.json') (New-MarkerJson 'result-gone')
+            Put-File (Join-Path $c.running 'script-back.started.json') (New-MarkerJson 'script-back')
+            Put-File (Join-Path $c.outbox 'script-back.result.json') (New-ResultJson 'script-back')
+            Put-File (Join-Path $script:inbox 'script-back.job.ps1') '"fresh"'
+            Put-File (Join-Path $c.running 'retry-ok.started.json') (New-MarkerJson 'retry-ok')
+            Put-File (Join-Path $c.outbox 'retry-ok.result.json') (New-ResultJson 'retry-ok')
+            $ErrorActionPreference = 'Continue'   # the agent's own policy
+            try { Invoke-LiveMarkerReconcile; $linesAfterFirst = $script:Logged.Count; Invoke-LiveMarkerReconcile } finally { $ErrorActionPreference = 'Stop' }
+            Assert-True ($script:LiveRetireQuarantine.Count -eq 0) "every entry is dropped: [$($script:LiveRetireQuarantine.Keys -join ',')]"
+            Assert-True ($script:Recovered.Count -eq 0) "no start-up recovery ran: [$($script:Recovered -join ',')]"
+            Assert-True (Test-Path -LiteralPath (Join-Path $c.running 'result-gone.started.json')) 'a marker whose result went stays'
+            Assert-True (Test-Path -LiteralPath (Join-Path $c.running 'script-back.started.json')) 'a marker whose script came back stays: the inbox loop owns it'
+            Assert-True (Test-Path -LiteralPath (Join-Path $c.processed 'retry-ok.started.completed.json')) 'a marker with its result retires'
+            Assert-True (@($script:Logged | Where-Object { $_ -like '*job=retry-ok*released*' }).Count -eq 1) "the release is logged once: $($script:Logged -join ' | ')"
+            Assert-True ($script:Logged.Count -eq $linesAfterFirst) "the second pass logs nothing new: $($script:Logged -join ' | ')"
+            # A marker naming another job is held here, never filed or retired under that other id.
+            Put-File (Join-Path $c.running 'file-id.started.json') (New-MarkerJson 'other-id')
+            Put-File (Join-Path $c.outbox 'file-id.result.json') (New-ResultJson 'file-id')
+            $ErrorActionPreference = 'Continue'
+            try { Invoke-LiveMarkerReconcile } finally { $ErrorActionPreference = 'Stop' }
+            Assert-True ($script:LiveRetireQuarantine.ContainsKey('file-id')) 'a marker naming another job is held for a retry'
+            Assert-True ($script:RecoveryQuarantine.Count -eq 0) 'nothing reached the start-up quarantine'
+            Assert-True (@(Get-ChildItem -LiteralPath $c.processed -Filter 'other-id.*').Count -eq 0) 'nothing was retired under the other id'
+            return 'dropped when owed nothing'
+        }
+    }
+
+    # The common cause of pass 3: a flag guards only the branches it was placed in front of. The live functions must not be able to reach a start-up branch at all.
+    if (-not (Skip-OnBase 'live-path-no-startup-recovery')) {
+        Invoke-Row 'live-path-no-startup-recovery' {
+            $forbidden = @('Resolve-JobRecovery', 'Resolve-StartedMarkerFile', 'Resolve-StrandedResult', 'Invoke-OrphanResult', 'Invoke-AdoptStartedJob', 'Invoke-RequeueAdmissionWait', 'Resolve-LaunchingMarker', 'Invoke-QuarantineReconcile')
+            foreach ($fn in @('Invoke-LiveMarkerReconcile', 'Invoke-LiveMarkerRetire')) {
+                $def = Get-AgentFunction $fn
+                Assert-True ($null -ne $def) "the agent defines $fn"
+                $calls = @($def.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { $_.GetCommandName() } | Where-Object { $_ -in $forbidden })
+                Assert-True ($calls.Count -eq 0) "$fn calls no start-up recovery: [$($calls -join ',')]"
+            }
+            $text = $ast.Extent.Text
+            Assert-True ($text -notmatch 'LiveReconcileOnly|LiveResultVanished') 'the flags are gone'
+            return 'none reachable'
         }
     }
 }
