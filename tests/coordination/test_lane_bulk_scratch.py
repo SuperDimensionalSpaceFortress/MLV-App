@@ -429,6 +429,20 @@ def test_a_live_process_with_an_unreadable_cwd_keeps_the_dir(world):
     assert (asm / "a.txt").exists() and not (world["run"] / "scratch-receipts").exists()
 
 
+def test_a_live_process_with_an_unreadable_script_keeps_the_dir_and_names_the_file(world):
+    """RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: created long before the dir, which exempts an unreadable cwd and must not exempt this."""
+    asm = make_asm(world)
+    earlier = "(Get-Date).ToUniversalTime().AddHours(-1)"
+    row = ("[pscustomobject]@{ ProcessId = 999004; Name = 'pwsh.exe'; Why = 'script-unreadable'; CreatedUtc = %s; "
+           "File = 'C:\\locked\\arms.ps1'; FileError = 'IOException win32=32' }" % earlier)
+    d = call_helper(world, [asm], extra=provider(unknown="@(%s)" % row))
+    e = entry(d)
+    assert e["action"] == "kept" and e["reason"] == "holder-cwd-unknown", e
+    assert "999004" in e["error"] and "C:\\locked\\arms.ps1" in e["error"], e
+    assert any("999004" in h and "via=script-unreadable" in h for h in e["holders"]), e
+    assert (asm / "a.txt").exists()
+
+
 def test_an_unreadable_cwd_of_a_process_older_than_the_dir_is_exempt_as_in_worktree_retirement(world):
     asm = make_asm(world)
     earlier = "(Get-Date).ToUniversalTime().AddDays(-1)"

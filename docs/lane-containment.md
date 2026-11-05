@@ -382,7 +382,8 @@ absolute and strictly inside `-BulkScratchRoot` (default `C:\mlvtmp`), is, conta
 reparse point (never followed), is held by a live process (`kept` / `live-process`: the path or one under it
 is a cwd, is on a command line, or is named by a script that process runs; a live process that names the
 run's own dir holds everything the run registered, `kept` / `run-dir-active`; a live process whose cwd
-cannot be read and is not exempted by the worktree-retirement rule is `kept` / `holder-cwd-unknown`; a probe
+cannot be read and is not exempted by the worktree-retirement rule, or with a script it can load that exists
+and cannot be read, is `kept` / `holder-cwd-unknown`; a probe
 that cannot answer is `holder-probe-failed`, and it is not retried: every remaining entry gets the same
 refusal), or whose lane branch has an open PR (or whose PR state cannot be read, including a failed branch
 lookup; `gh` gets 60 s and is killed past it). The PR state is asked before the process snapshot is taken, so
