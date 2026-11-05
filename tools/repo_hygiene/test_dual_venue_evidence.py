@@ -7641,12 +7641,15 @@ class LookReceiptLegSpecTests(unittest.TestCase):
         intended = {"p": ({"disablePrepPointwiseFast": True}, ()), "t12": ({"playbackMaxThreads": 12}, ()), "l": ({"disableLookAssist": True}, ("forceLookAssist", "lookFlavor"))}
         switches = ("disablePrepPointwiseFast", "playbackMaxThreads", "disableLookAssist")
         no_criteria = {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}
+        profile = {"card": "CPU-S1-RECON-CHAIN-ATTRIBUTION-1", "legType": "speed", "clipId": "M16-1243", "backends": ["cpu"], "scaleFactor": 1, "displayMode": "fullscreen"}
 
         def problems(specs: dict) -> list[str]:
             control = specs["c"]
             found = [f"c sets {key}" for key in switches if key in control["generatorArgs"]]
             if control["generatorArgs"].get("forceLookAssist") is not True or control["generatorArgs"].get("lookFlavor") != "cinematic":
                 found.append("c is not forced cinematic")
+            found += [f"c {key} is {control.get(key)!r}" for key, value in profile.items() if control.get(key) != value]
+            found += [f"{arm} legId is {spec.get('legId')!r}" for arm, spec in specs.items() if spec.get("legId") != f"m16-1243-chainattr-{arm}-fullscreen-s1"]
             for arm, (added, removed) in intended.items():
                 spec = specs[arm]
                 want = {k: v for k, v in control["generatorArgs"].items() if k not in removed} | added
@@ -7675,7 +7678,17 @@ class LookReceiptLegSpecTests(unittest.TestCase):
             specs[arm].update(fields)
             return specs
 
-        for name, bad in (("the control carries the prep kill switch", with_args("c", disablePrepPointwiseFast=True)),
+        def with_every_arm(**fields) -> dict:
+            specs = json.loads(json.dumps(arms))
+            for spec in specs.values():
+                spec.update(fields)
+            return specs
+
+        for name, bad in (("every arm runs another backend", with_every_arm(backends=["cuda"])),
+                          ("every arm runs another scale", with_every_arm(scaleFactor=3)),
+                          ("every arm runs another clip", with_every_arm(clipId="M16-1457")),
+                          ("L takes the control's identity", with_field("l", legId="m16-1243-chainattr-c-fullscreen-s1")),
+                          ("the control carries the prep kill switch", with_args("c", disablePrepPointwiseFast=True)),
                           ("T12 carries the prep kill switch", with_args("t12", disablePrepPointwiseFast=True)),
                           ("L carries the prep kill switch", with_args("l", disablePrepPointwiseFast=True)),
                           ("P loses the prep kill switch", with_args("p", drop=("disablePrepPointwiseFast",))),
