@@ -3709,45 +3709,71 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
     UNCAPPED = {"generatorArgs": {"telemetryArm": "LIGHT"}}
     DONE = {"result": "MEASUREMENT_CAPTURED"}
 
-    def test_an_inherited_cap_on_a_leg_that_names_none_blocks(self) -> None:
-        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754): the venue's MLVAPP_PLAYBACK_MAX_THREADS=12 caps the control exactly as the T12 arm's own cap does.
-        # Before r3 this read NOT_REQUESTED / blocks=false, so the C-versus-T12 pair compared two arms at 12 workers and could stay CLEAN.
-        for inherited in ("12", "8", "1", "16", "0", "abc"):
-            with self.subTest(inherited=inherited):
-                v = self.verdict(self.UNCAPPED, self.log(self.start("12" if inherited == "12" else "8", env=inherited)), self.DONE)
-                self.assertEqual((v["verdict"], v["blocks"], v["requested"], v["inheritedCap"]), ("INHERITED_WORKER_CAP", True, None, inherited), v)
-                self.assertIn(f"MLVAPP_PLAYBACK_MAX_THREADS={inherited}", v["reason"])
+    @classmethod
+    def start_with(cls, workers: str, **env: str) -> str:
+        # a start line whose env_<name>= fields say what the app saw of the venue's worker-count variables (every one not named is "unset")
+        line = cls.start(workers, env="unset").replace(" env_force_threads=0", " env_force_threads=unset")
+        line += " env_force_singlethread=unset env_disable_playback_thread_cap=unset"
+        for key, value in env.items():
+            marker = f" env_{key}=unset"
+            assert marker in line, key
+            line = line.replace(marker, f" env_{key}={value}")
+        return line
+
+    WORKER_ENV = (("playback_max_threads", "MLVAPP_PLAYBACK_MAX_THREADS"), ("force_threads", "MLVAPP_FORCE_THREADS"),
+                  ("force_singlethread", "MLVAPP_FORCE_SINGLETHREAD"), ("disable_playback_thread_cap", "MLVAPP_DISABLE_PLAYBACK_THREAD_CAP"))
+
+    def test_an_inherited_worker_override_on_a_leg_that_names_no_cap_blocks(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754; adversary A1 on 6ffe18f8): a venue MLVAPP_PLAYBACK_MAX_THREADS=12 caps the control exactly as the T12
+        # arm's own cap does, and MLVAPP_FORCE_THREADS=12 forces it (bypassing the cap). Before r3 both read NOT_REQUESTED / blocks=false, so the C-versus-T12 pair
+        # compared two arms at 12 workers and could stay CLEAN. Every variable src/batch/WorkerThreadCount.h reads for the count is covered, one at a time.
+        for key, name in self.WORKER_ENV:
+            for value in ("12", "8", "1", "16", "abc"):
+                with self.subTest(variable=name, inherited=value):
+                    v = self.verdict(self.UNCAPPED, self.log(self.start_with("12" if value == "12" else "8", **{key: value})), self.DONE)
+                    self.assertEqual((v["verdict"], v["blocks"], v["requested"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, None, f"{name}={value}"), v)
+                    self.assertIn(f"{name}={value}", v["reason"])
+        v = self.verdict(self.UNCAPPED, self.log(self.start_with("1", force_singlethread="1")), self.DONE)
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("INHERITED_WORKER_OVERRIDE", True, 1), "a forced single thread is no automatic-default arm either")
+        v = self.verdict(self.UNCAPPED, self.log(self.start_with("12", playback_max_threads="12", force_threads="12")), self.DONE)
+        self.assertEqual(v["inheritedOverrides"], "MLVAPP_PLAYBACK_MAX_THREADS=12 MLVAPP_FORCE_THREADS=12", "every override is named, not the first")
 
     def test_the_control_and_the_capped_arm_at_the_same_inherited_count_do_not_both_pass(self) -> None:
-        # sol's literal case: unchanged C and T12 specs, venue MLVAPP_PLAYBACK_MAX_THREADS=12. T12 honours its own cap; the control must not read as an uncapped arm.
-        control = self.verdict(self.UNCAPPED, self.log(self.start("12", env="12")), self.DONE)
-        arm = self.verdict(self.CAPPED, self.log(self.start("12", env="12")), self.PROOF)
-        self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"]), ("HONOURED", False, 12), arm)
-        self.assertEqual((control["verdict"], control["blocks"], control["observed"]), ("INHERITED_WORKER_CAP", True, 12), control)
+        # sol's literal cases: unchanged C and T12 specs; venue MLVAPP_PLAYBACK_MAX_THREADS=12 (A2) or MLVAPP_FORCE_THREADS=12 (adversary A1). T12 honours its own
+        # cap at 12; the control must not read as the uncapped arm it is meant to be.
+        for key in ("playback_max_threads", "force_threads"):
+            with self.subTest(variable=key):
+                control = self.verdict(self.UNCAPPED, self.log(self.start_with("12", **{key: "12"})), self.DONE)
+                arm = self.verdict(self.CAPPED, self.log(self.start_with("12", **{"playback_max_threads": "12", key: "12"})), self.PROOF)
+                self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"]), ("HONOURED", False, 12), arm)
+                self.assertEqual((control["verdict"], control["blocks"], control["observed"]), ("INHERITED_WORKER_OVERRIDE", True, 12), control)
 
     def test_the_recorded_pair_shape_stays_clean(self) -> None:
-        # the recorded r1/r2 arms (read from the receipts' smoke-run.log): C and L auto at worker_threads=16 with the variable unset, T12 at 12 with 12 (its own -Threads 12)
+        # the recorded r1/r2 arms (read from the receipts' smoke-run.log): C, P and L auto at worker_threads=16 with the variable unset, T12 at 12 with 12 (its own -Threads 12)
         control = self.verdict(self.UNCAPPED, self.log(self.start("16", env="unset")), self.DONE)
         arm = self.verdict(self.CAPPED, self.log(self.start("12", env="12")), self.PROOF)
-        self.assertEqual((control["verdict"], control["blocks"], control["observed"], control["inheritedCap"]), ("NOT_REQUESTED", False, None, "unset"), control)
+        self.assertEqual((control["verdict"], control["blocks"], control["observed"], control["inheritedOverrides"]), ("NOT_REQUESTED", False, None, None), control)
         self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"]), ("HONOURED", False, 12), arm)
 
     def test_a_leg_that_requested_no_cap_and_saw_none_is_unchanged(self) -> None:
-        # no start line, a start line from a build without the field, and the field present and unset: none of them blocks
-        for name, log in (("field unset", self.log(self.start("16", env="unset"))), ("build without the field", self.log(self.start("16"))),
-                          ("no start line", self.log()), ("no log", "")):
+        # no start line, a start line from a build without the fields, every field unset, and every field a zero (inert in the app): none of them blocks
+        zeros = [self.start_with("16", **{key: zero}) for key, _ in self.WORKER_ENV for zero in ("0", "00", "+0", "-0")]
+        for name, log in (("fields unset", self.log(self.start_with("16"))), ("build without the fields", self.log(self.start("16"))),
+                          ("no start line", self.log()), ("no log", ""), *((f"zero {i}", self.log(line)) for i, line in enumerate(zeros))):
             with self.subTest(case=name):
                 v = self.verdict(self.UNCAPPED, log, self.DONE)
-                self.assertEqual((v["verdict"], v["blocks"], v["observed"]), ("NOT_REQUESTED", False, None), v)
-        v = self.verdict(self.UNCAPPED, self.log(self.start("16", session=2, env="12")), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"], v["inheritedOverrides"]), ("NOT_REQUESTED", False, None, None), v)
+        v = self.verdict(self.UNCAPPED, self.log(self.start_with("16", playback_max_threads="12").replace("session=3", "session=2")), self.DONE)
         self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), "another session's start line is not the measured session's")
 
-    def test_a_duplicated_inherited_cap_field_on_an_uncapped_leg_is_refused(self) -> None:
-        for name, tail in (("same value twice", " env_playback_max_threads=unset"), ("forged after", " env_playback_max_threads=12"), ("empty after", " env_playback_max_threads=")):
-            with self.subTest(case=name):
-                v = self.verdict(self.UNCAPPED, self.log(self.start("16", env="unset") + tail), self.DONE)
-                self.assertEqual((v["verdict"], v["blocks"]), ("INHERITED_WORKER_CAP", True), v)
-                self.assertIn("more than once", v["reason"])
+    def test_a_duplicated_worker_env_field_on_an_uncapped_leg_is_refused(self) -> None:
+        for key, name in self.WORKER_ENV:
+            for case, tail in (("same value twice", f" env_{key}=unset"), ("forged after", f" env_{key}=12"), ("empty after", f" env_{key}=")):
+                with self.subTest(variable=name, case=case):
+                    v = self.verdict(self.UNCAPPED, self.log(self.start_with("16") + tail), self.DONE)
+                    self.assertEqual((v["verdict"], v["blocks"]), ("INHERITED_WORKER_OVERRIDE", True), v)
+                    self.assertIn("more than once", v["reason"])
+                    self.assertIn(name, v["reason"])
 
     def test_the_runner_and_the_validator_both_gate_on_it(self) -> None:
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
@@ -3823,7 +3849,7 @@ class PlaybackMaxThreadsRunnerTests(RunnerHarness, unittest.TestCase):
             with self.subTest(inherited=env):
                 receipt = self.leg(None, f"mt-inherited-{env}", env, None, env=env)
                 self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
-                self.assertIn("INHERITED_WORKER_CAP", receipt["outcomeDetail"])
+                self.assertIn("INHERITED_WORKER_OVERRIDE", receipt["outcomeDetail"])
                 self.assertIn(f"MLVAPP_PLAYBACK_MAX_THREADS={env}", receipt["outcomeDetail"])
                 self.assertNotIn("workerThreads", receipt, "the block exists only for a leg whose spec names a cap")
         receipt = self.leg({"playbackMaxThreads": 12}, "mt-capped-with-env", "12", self.PROOF, env="12")

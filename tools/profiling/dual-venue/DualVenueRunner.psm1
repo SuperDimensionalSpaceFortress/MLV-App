@@ -1495,7 +1495,7 @@ function Get-DvWorkerThreadsEvidence {
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
     $requested = ConvertTo-DvInt64 $raw
     $observed = $null
-    $inheritedCap = $null
+    $inheritedOverrides = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($null -ne $raw) {
@@ -1531,28 +1531,44 @@ function Get-DvWorkerThreadsEvidence {
         else { $verdict = 'HONOURED' }
     }
     else {
-        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754): a leg that names NO cap still runs under one when the venue's own MLVAPP_PLAYBACK_MAX_THREADS is
-        # inherited (the smoke runner sets the variable only for -Threads and never removes an inherited one), so a control meant to differ from a capped arm
-        # in worker count can run at the arm's count and compare CLEAN. The app writes the variable it saw on the same start line as `env_playback_max_threads=`
-        # ("unset" when unset or empty, log_line_field::envFieldValue). Any other value on such a leg is INHERITED_WORKER_CAP and blocks: the leg did not run
-        # the worker count it was specified for (the auto default). A duplicated field is unreadable and blocks too. A start line without the field (a build
-        # before it existed) or no start line at all stays NOT_REQUESTED, so a leg that legitimately runs uncapped is unchanged.
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754, adversary A1 on 6ffe18f8): a leg that names NO cap still runs at a count its venue chose when the
+        # venue's environment holds a variable the app reads for its worker count (the smoke runner sets MLVAPP_PLAYBACK_MAX_THREADS only for -Threads and never
+        # removes an inherited one; nothing removes the others), so a control meant to differ from a capped arm in worker count can run at the arm's count and
+        # compare CLEAN. src/batch/WorkerThreadCount.h reads four: MLVAPP_PLAYBACK_MAX_THREADS (a cap), MLVAPP_FORCE_THREADS and MLVAPP_FORCE_SINGLETHREAD (both
+        # force the count and bypass the cap) and MLVAPP_DISABLE_PLAYBACK_THREAD_CAP (lifts the default cap of 16). The app writes what it saw of each on the same
+        # start line (`env_<name lower case>=`, "unset" when unset or empty, log_line_field::envFieldValue). On a leg that names no cap, a value that is neither
+        # "unset" nor all zeros (a zero is inert in the app) is INHERITED_WORKER_OVERRIDE and blocks: the venue, not the spec, set the worker count, so it is not
+        # the automatic-default arm the spec describes. A duplicated field is unreadable and blocks too. A start line without the field (a build before it
+        # existed) or no start line at all stays NOT_REQUESTED, so a leg that legitimately runs uncapped is unchanged. No tool in tools/ or .github sets any of
+        # the four for a dual-venue leg.
         $startRead = Get-DvSmokeSessionLineRead -LogText $LogText -Marker 'start'
         if ($startRead.found) {
-            $inheritedCap = $startRead.fields['env_playback_max_threads']
-            if ($startRead.duplicates -contains 'env_playback_max_threads') {
-                $verdict = 'INHERITED_WORKER_CAP'
-                $observed = ConvertTo-DvInt64 $startRead.fields['worker_threads']
-                $reason = 'INHERITED_WORKER_CAP: the measured session''s playback_smoke.start line carries env_playback_max_threads= more than once, so whether the leg ran under an inherited MLVAPP_PLAYBACK_MAX_THREADS is unreadable'
+            $overrides = [System.Collections.Generic.List[string]]::new()
+            $unreadable = [System.Collections.Generic.List[string]]::new()
+            $workerEnv = [ordered]@{
+                env_playback_max_threads = 'MLVAPP_PLAYBACK_MAX_THREADS'
+                env_force_threads = 'MLVAPP_FORCE_THREADS'
+                env_force_singlethread = 'MLVAPP_FORCE_SINGLETHREAD'
+                env_disable_playback_thread_cap = 'MLVAPP_DISABLE_PLAYBACK_THREAD_CAP'
             }
-            elseif ($null -ne $inheritedCap -and $inheritedCap -cne 'unset') {
-                $verdict = 'INHERITED_WORKER_CAP'
+            foreach ($key in $workerEnv.Keys) {
+                $name = $workerEnv[$key]
+                if ($startRead.duplicates -contains $key) { $unreadable.Add($name); continue }
+                $value = $startRead.fields[$key]
+                if ($null -ne $value -and $value -cne 'unset' -and $value -cnotmatch '^[+-]?0+$') { $overrides.Add("$name=$value") }
+            }
+            if ($overrides.Count -gt 0 -or $unreadable.Count -gt 0) {
+                $verdict = 'INHERITED_WORKER_OVERRIDE'
                 $observed = ConvertTo-DvInt64 $startRead.fields['worker_threads']
-                $reason = "INHERITED_WORKER_CAP: the leg names no playbackMaxThreads yet the app saw MLVAPP_PLAYBACK_MAX_THREADS=$inheritedCap in its environment (worker_threads=$($startRead.fields['worker_threads'])); the venue's variable, not the leg, set its worker count, so it is not the uncapped arm its spec describes"
+                $inheritedOverrides = ($overrides -join ' ')
+                $parts = [System.Collections.Generic.List[string]]::new()
+                if ($overrides.Count -gt 0) { $parts.Add("the leg names no playbackMaxThreads yet the app saw $($overrides -join ', ') in its environment (worker_threads=$($startRead.fields['worker_threads'])); the venue's variable, not the leg, set its worker count, so it is not the automatic-default arm its spec describes") }
+                if ($unreadable.Count -gt 0) { $parts.Add("the measured session's playback_smoke.start line carries the field for $($unreadable -join ', ') more than once, so whether the leg ran under an inherited worker-count variable is unreadable") }
+                $reason = 'INHERITED_WORKER_OVERRIDE: ' + ($parts -join '; ')
             }
         }
     }
-    [ordered]@{ requested = $requested; observed = $observed; inheritedCap = $inheritedCap; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('NOT_HONOURED', 'INHERITED_WORKER_CAP')) }
+    [ordered]@{ requested = $requested; observed = $observed; inheritedOverrides = $inheritedOverrides; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('NOT_HONOURED', 'INHERITED_WORKER_OVERRIDE')) }
 }
 
 function Get-DvPrepConflatedMoveEvidence {
