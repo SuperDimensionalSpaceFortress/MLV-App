@@ -221,7 +221,6 @@ jobs:
         shell: pwsh
         run: |
           python -m pytest `
-            tools\coordination\test_coordination_guardrails.py `
             tools\coordination\stuck_queue_checks\test_stuck_queue_checks.py `
             tests\coordination `
             tests\docs `
@@ -230,6 +229,7 @@ jobs:
             --ignore=tests\coordination\test_doctrine_outbox_concerns.py `
             --ignore=tests\coordination\test_doctrine_outbox_hooks.py `
             --ignore=tests\coordination\test_retire_lane_worktree.py `
+            --ignore=tests\coordination\test_build_guard.py `
             -q
 
       - name: Run demote-factory-bridge refusal-path tests
@@ -321,6 +321,46 @@ jobs:
             tests\coordination\test_retire_lane_worktree.py `
             -q
 
+  repo-hygiene-python-windows-guardrails-heavy:
+    # CI-SHARD8-GUARDRAILS-COST-2 r2. Shard 8's "Run coordination and self-healing guardrails" step
+    # was 38-48 min of a 42-51 min job with a 50 min cap (merge_group run 41756920548 was cancelled
+    # at the cap). Hosted per-file attribution (runs 41636891010 to 41756994882): test_coordination_
+    # guardrails.py about 740-920 s and test_build_guard.py about 400-480 s, together about 21-23 min.
+    # They run here, in parallel with the shard matrix, and shard 8 stops naming the first and
+    # ignores the second, so each file is collected in exactly one job. The aggregate
+    # `Repo Hygiene Python (windows-latest)` below requires this job, so a failed, cancelled or
+    # skipped run still fails the required check.
+    name: Repo Hygiene Python windows guardrails heavy
+    runs-on: windows-latest
+    # About 24-27 min expected (21-23 min of tests plus setup); 45 leaves more than 1.6x for runner
+    # variance, the same cap as the other two split-out coordination jobs.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install repo hygiene test dependencies
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
+          python -m pip check
+
+      - name: Run heavy guardrail tests
+        shell: pwsh
+        run: |
+          python -m pytest `
+            tools\coordination\test_coordination_guardrails.py `
+            tests\coordination\test_build_guard.py `
+            -q
+
   repo-hygiene-python-windows-unittest-heavy:
     # The 7-way windows unittest partition was expected at 1439 of its 1440 s budget (48 % of
     # 50 min), so any PR that added tests failed the merge group (run 40233119003, 1445 s). The
@@ -375,7 +415,7 @@ jobs:
     # (not `!cancelled()`) keeps it running when the whole run is cancelled, so a cancel
     # leaves the required check failed rather than condition-skipped, which GitHub accepts.
     name: Repo Hygiene Python (windows-latest)
-    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment, repo-hygiene-python-windows-coordination-heavy, repo-hygiene-python-windows-unittest-heavy]
+    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment, repo-hygiene-python-windows-coordination-heavy, repo-hygiene-python-windows-guardrails-heavy, repo-hygiene-python-windows-unittest-heavy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -400,6 +440,13 @@ jobs:
         run: |
           echo "windows coordination heavy result: $HEAVY_RESULT"
           test "$HEAVY_RESULT" = "success"
+
+      - name: Require the heavy guardrails job to have passed
+        env:
+          GUARDRAILS_HEAVY_RESULT: ${{ needs.repo-hygiene-python-windows-guardrails-heavy.result }}
+        run: |
+          echo "windows guardrails heavy result: $GUARDRAILS_HEAVY_RESULT"
+          test "$GUARDRAILS_HEAVY_RESULT" = "success"
 
       - name: Require the heavy unittest job to have passed
         env:
