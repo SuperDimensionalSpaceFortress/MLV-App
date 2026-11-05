@@ -311,6 +311,11 @@ parent whose pid was reused, because the clock stepped back between the two, can
 real child and would be killed. The lane's timeout path keeps its older tree kill, whose failure
 is not recorded.
 
+**An argument carrying a NUL is refused before launch (`argv-nul-refused`, r15).** CreateProcess
+reads its command line up to the first NUL, so one would drop every argument after it, including
+the sandbox flag, the MCP disables and the deny list, while the receipt recorded them. This holds
+for both engines. `pwsh -File` cannot carry a NUL; a caller using the call operator can.
+
 Run the real Windows fixture suite with:
 
 ```powershell

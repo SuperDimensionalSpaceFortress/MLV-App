@@ -2743,6 +2743,32 @@ def test_r15_mutation_older_than_parent_accepted_as_a_member_kills_the_child(fix
     assert q["codexDirectChildStop"]=="killed",q
 
 
+# VISUAL-JUDGE-TERRA-LANE-1 r15 fix iteration 1 (adversary A1 on 82faecd9): CreateProcess reads its command line up to the first NUL, so a NUL in one argument drops every argument after it,
+# the explicit read-only sandbox and the MCP disables among them, while the receipt records the intended authority. `pwsh -File` cannot carry a NUL, so this is the finding's own route, the call operator.
+def _lane_with_model_ending_in_nul(cmd,root):
+    at=cmd.index("-File")
+    parts=[]
+    for token in cmd[at+2:]:
+        parts.append(token if token.startswith("-") else "'"+token.replace("'","''")+"'")
+    call=root/"call-lane.ps1"
+    call.write_text("& '"+cmd[at+1].replace("'","''")+"' "+" ".join(parts)+" -ModelOverride ('gpt-6.1-terra'+[char]0)\nexit $LASTEXITCODE\n",encoding="utf-8")
+    return cmd[:at+1]+[str(call)]
+
+
+@pytest.mark.parametrize("lane,images",[("sol",False),("terra",True),("sonnet",False)],ids=["direct-codex","codex-image-host","claude-host"])
+def test_r15_iter1_a1_a_nul_in_an_argument_is_refused_before_any_provider_runs(fixture_tree,lane,images):
+    root=fixture_tree["root"]
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane=lane)
+    if images:
+        png=root/"strip.png"; _write_png(png,b"r15-nul")
+        cmd=cmd+["-ImagePaths",str(png)]
+    r=_run_lane_to_files(_lane_with_model_ending_in_nul(cmd,root),env,root)
+    seen=json.loads((root/"args.json").read_text(encoding="utf-8-sig")) if (root/"args.json").exists() else None
+    assert seen is None, f"a provider ran with a command line cut at the NUL: {seen}"
+    assert r.returncode!=0, r.returncode
+    assert "argv-nul-refused" in (root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(receipt.read_text(encoding="utf-8") if receipt.exists() else "")
+
+
 def test_r14_b3_control_an_ordinary_no_image_lane_has_no_stop_to_report(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     r=run_lane(cmd,env)

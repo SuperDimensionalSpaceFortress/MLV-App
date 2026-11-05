@@ -1886,6 +1886,16 @@ function Resolve-CodexShimLaunch {
 # resolver's read was never bounded at all. A resolved launch is always a native program, so its transport is CreateProcess; a resolved
 # batch file is not a launch this model knows and is refused (fail closed). Every codex process (the --version and 'mcp list' probes and
 # the lane itself) is started through Set-CodexLaunchStartInfo, so none of them runs the raw shim through cmd.exe.
+# r15 fix iteration 1 (adversary A1 on 82faecd9): CreateProcess reads its command line up to the first NUL, so a NUL in one argument drops every argument after it (a sandbox, the MCP disables, a
+# deny list) while the receipt records them. `pwsh -File` cannot carry one, the call operator can. Both engines' argv pass through here before anything is told what to run.
+function Assert-ArgvHasNoNul {
+    param([string[]]$Argv = @())
+    foreach ($a in @($Argv)) {
+        if (([string]$a).IndexOf([char]0) -ge 0) {
+            throw "argv-nul-refused: the argument '$(([string]$a).Replace([string][char]0, '\0'))' carries a NUL, which would cut the command line there and drop every argument after it; refused before launch"
+        }
+    }
+}
 function Assert-CodexLaunchFits {
     param([Parameter(Mandatory = $true)]$Launch, [string[]]$Argv = @(), [int]$ImageCount = 0)
     $file = [string]$Launch.FileName
@@ -1893,6 +1903,7 @@ function Assert-CodexLaunchFits {
     if ($ext -eq '.cmd' -or $ext -eq '.bat') {
         throw "codex-shim-unsupported: the resolved codex launch '$file' is itself a batch file, which only cmd.exe runs; refused before launch"
     }
+    Assert-ArgvHasNoNul -Argv (@($Launch.PrefixArgs) + @($Argv))
     return (Assert-CodexCommandLineFits -Exe $file -Argv (@($Launch.PrefixArgs) + @($Argv)) -ImageCount $ImageCount)
 }
 function Set-CodexLaunchStartInfo {
@@ -2847,6 +2858,7 @@ $errTask = $errStream.CopyToAsync($errBuf)
 if ($cfg.engine -eq 'claude') {
     $controlPath = "$base.child.json"
     if (Test-Path -LiteralPath $controlPath) { throw "control-path-exists: $controlPath" }
+    Assert-ArgvHasNoNul -Argv $argv
     $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath; drainPath=$hostDrainPath; drainGraceMs=$OUTPUT_DRAIN_GRACE_MS } | ConvertTo-Json -Compress -Depth 5
     $awaitingChild = $true
     $proc.StandardInput.WriteLine($launchFrame); $proc.StandardInput.Flush()
