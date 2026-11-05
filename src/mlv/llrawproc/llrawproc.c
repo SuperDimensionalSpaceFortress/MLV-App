@@ -81,6 +81,8 @@ static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
 static MLV_THREAD_LOCAL llrpResidualSubstageTiming_t g_llrawproc_last_residual = {0};
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside the dual_iso timer (llrawproc.h). */
+static MLV_THREAD_LOCAL llrpDualIsoGpuSplitTiming_t g_llrawproc_last_dual_iso_gpu_split = {0};
 static double g_llrawproc_last_preview_histogram_ms = 0.0;
 static double g_llrawproc_last_preview_regression_ms = 0.0;
 static double g_llrawproc_last_preview_rowscale_ms = 0.0;
@@ -1481,10 +1483,25 @@ static int llrawproc_fake_gpu_backend_last_preupload_status(
     return 0;
 }
 
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1 r2 test-only: the fake's timing getter
+ * sleeps this many ms (0, the default, sleeps not at all), so a test can pin
+ * where a slow timing read is booked in the dual_iso split. */
+static volatile LONG g_llrawproc_fake_gpu_backend_last_timing_delay_ms = 0;
+
+void llrpSetFakeGpuBackendLastTimingDelayMsForTesting(int delay_ms);
+void llrpSetFakeGpuBackendLastTimingDelayMsForTesting(int delay_ms)
+{
+    InterlockedExchange(&g_llrawproc_fake_gpu_backend_last_timing_delay_ms,
+                        (LONG)(delay_ms > 0 ? delay_ms : 0));
+}
+
 static int llrawproc_fake_gpu_backend_last_timing(igpu_recon_backend * b,
                                                    igpu_recon_timing_t * t)
 {
+    const LONG delay_ms =
+        InterlockedCompareExchange(&g_llrawproc_fake_gpu_backend_last_timing_delay_ms, 0, 0);
     (void)b;
+    if(delay_ms > 0) Sleep((DWORD)delay_ms);
     if(!t) return -1;
     memset(t, 0, sizeof(*t));
     t->upload_ms = 1.0;
@@ -2490,6 +2507,24 @@ static void llrawproc_gpu_recon_luts_key_from_state(
     key->dark_noise = state->dark_noise;
 }
 
+/* CUDA-RECON-DUALISO-TIMER-SPLIT-1 (adversary r1 A1): a run_backend call refused
+ * after it took the backend mutex still books what it spent there. Refused by the
+ * suppression re-check (before the acquire stamp): the whole wait, as one call. */
+static void llrawproc_gpu_split_book_suppressed_wait(double lock_start_s)
+{
+    g_llrawproc_last_dual_iso_gpu_split.mutex_wait_ms +=
+        (mlv_stage_timing_now() - lock_start_s) * 1000.0;
+    g_llrawproc_last_dual_iso_gpu_split.backend_calls++;
+}
+
+/* ...refused by a later check (after the acquire stamp, which booked the wait):
+ * the held time so far, as configure_ms. */
+static void llrawproc_gpu_split_book_held_refusal(double lock_acquired_s)
+{
+    g_llrawproc_last_dual_iso_gpu_split.configure_ms +=
+        (mlv_stage_timing_now() - lock_acquired_s) * 1000.0;
+}
+
 static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * state,
                                            const uint16_t * gpu_input,
                                            uint16_t * gpu_output,
@@ -2530,6 +2565,10 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int telemetry_event_count = 0;
     int run_called = 0;
     int run_rc = 0;
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1 (llrpDualIsoGpuSplitTiming_t). */
+    double split_lock_acquired_s = 0.0;
+    double split_run_start_s = 0.0;
+    double split_run_end_s = 0.0;
     if(rc_out) *rc_out = -1;
     if(allocated_bytes_out) *allocated_bytes_out = 0;
     if(allocated_bytes_valid_out) *allocated_bytes_valid_out = 0;
@@ -2587,22 +2626,33 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     frame.apply_dither = state->apply_dither;
 
     InterlockedIncrement(&g_llrawproc_gpu_recon_lock_arrivals);
+    const double split_lock_start_s = mlv_stage_timing_now();
     pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
     /* r6 (CoS #437, guard under the serializing lock): a caller that passed the
      * check above and then waited here through a loss must not reach CUDA. */
     if(llrpGpuCudaSuppressed())
     {
+        llrawproc_gpu_split_book_suppressed_wait(split_lock_start_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CUDA_SUPPRESSED;
         return 0;
     }
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: the wait for the backend mutex (the
+     * suppression read above is a single volatile flag load). Every later
+     * refusal books its held time (llrawproc_gpu_split_book_held_refusal). */
+    split_lock_acquired_s = mlv_stage_timing_now();
+    g_llrawproc_last_dual_iso_gpu_split.mutex_wait_ms +=
+        (split_lock_acquired_s - split_lock_start_s) * 1000.0;
+    g_llrawproc_last_dual_iso_gpu_split.backend_calls++;
     if(!llrawproc_gpu_export_backend_available(prefer_playback_dll))
     {
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         return 0;
     }
     if(out_kind == IGPU_OUT_DEVICE_BAYER16 && !g->last_device_output)
     {
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = -3;
         return 0;
@@ -2623,6 +2673,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
       || g->configured_clip.height != clip.height))
     {
         ++g->clip_dims_change_refusals;
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CLIP_DIMS_BUSY;
         return 0;
@@ -2630,6 +2681,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(reduced_iso_notch && !g->set_reduced_iso_notch)
     {
         /* An older DLL: a reduced recon without the notch shows the ISO mesh. */
+        llrawproc_gpu_split_book_held_refusal(split_lock_acquired_s);
         pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH;
         return 0;
@@ -2723,6 +2775,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
          && g->last_preupload_status)
         {
             used_run_preuploaded = 1;
+            split_run_start_s = mlv_stage_timing_now();
             rc = g->run_preuploaded(g->backend,
                                     frame_token,
                                     &frame,
@@ -2733,6 +2786,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         }
         else
         {
+            split_run_start_s = mlv_stage_timing_now();
             rc = g->run(g->backend,
                         &frame,
                         gpu_input,
@@ -2740,6 +2794,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                         gpu_output,
                         gl_texture_id);
         }
+        split_run_end_s = mlv_stage_timing_now();
         InterlockedExchange(&g_llrawproc_gpu_recon_run_active, 0);
         run_called = 1;
         run_rc = rc;
@@ -2888,6 +2943,52 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         llrawproc_gpu_stage_telemetry_capture(g, run_event,
                                               "recon:run",
                                               IGPU_CUDA_ERROR_CHANNEL_RENDER, run_rc, run_ms);
+    }
+    {
+        /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: held time before and after the run.
+         * The GPU span is the backend's own event total for a successful run
+         * (from timing_out, or read here when the caller passed none); when the
+         * backend has no timing the run's wall stays unsplit (run_gpu_ms and sync_ms 0).
+         * Taken before the device-loss scan, whose cost is not counted. */
+        llrpDualIsoGpuSplitTiming_t * split = &g_llrawproc_last_dual_iso_gpu_split;
+        /* Adversary r1 pass 3 A1: a caller that asks for no timing (the export
+         * paths pass NULL timing_out) still gets the span split, read from the
+         * backend as the recon:run stage event above reads it.
+         * Adversary r1 passes 4-5 A1 (folded in r2): that fallback read is held
+         * work after the run, so it runs BEFORE the held-end stamp and a slow
+         * timing getter is booked to post_run_ms, not to the enclosing other_ms. */
+        double split_span_ms = -1.0;
+        if(run_called && run_rc == 0 && timing_out && timing_out->available)
+        {
+            split_span_ms = timing_out->total_ms;
+        }
+        else if(run_called && run_rc == 0 && g->last_timing)
+        {
+            igpu_recon_timing_t split_timing;
+            memset(&split_timing, 0, sizeof(split_timing));
+            if(g->last_timing(g->backend, &split_timing) == 0) split_span_ms = split_timing.total_ms;
+        }
+        const double split_held_end_s = mlv_stage_timing_now();
+        if(run_called)
+        {
+            const double run_wall_ms = (split_run_end_s - split_run_start_s) * 1000.0;
+            split->configure_ms += (split_run_start_s - split_lock_acquired_s) * 1000.0;
+            split->run_wall_ms += run_wall_ms;
+            split->post_run_ms += (split_held_end_s - split_run_end_s) * 1000.0;
+            if(split_span_ms >= 0.0)
+            {
+                split->run_gpu_ms += split_span_ms;
+                /* sync_ms (CoS #745 I1a): wall-clock remainder of the run not
+                 * covered by the recorded event pairs; not a device sync time.
+                 * Host setup before the first event and bookkeeping after the
+                 * last one land here as well as any wait for the stream. */
+                split->sync_ms += MAX(0.0, run_wall_ms - split_span_ms);
+            }
+        }
+        else
+        {
+            split->configure_ms += (split_held_end_s - split_lock_acquired_s) * 1000.0;
+        }
     }
     llrawproc_gpu_suppress_on_device_loss_locked(telemetry_events, telemetry_event_count);
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
@@ -4739,6 +4840,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
+    memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6225,7 +6327,8 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
      * scale here left the 4-row ISO mesh in flat areas on the first venue leg. */
     const int playback_hint = processingPlaybackPreviewModeEnabled() ? 1 : 0;
     memset(&gpu_playback_state, 0, sizeof(gpu_playback_state));
-    if (!diso_prepare_gpu_recon_state(raw_info,
+    const double prepare_start = mlv_stage_timing_now();
+    const int prepared = diso_prepare_gpu_recon_state(raw_info,
                                       raw_image_buff,
                                       dark_frame_mode,
                                       diso1,
@@ -6241,7 +6344,11 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
                                       playback_hint,
                                       llrawproc_threads,
                                       &worker->diso_full20bit_scratch,
-                                      &gpu_playback_state))
+                                      &gpu_playback_state);
+    /* CUDA-RECON-DUALISO-TIMER-SPLIT-1: inside the caller's dual_iso timer. */
+    g_llrawproc_last_dual_iso_gpu_split.prepare_ms +=
+        (mlv_stage_timing_now() - prepare_start) * 1000.0;
+    if (!prepared)
     {
         return 0;
     }
@@ -6253,7 +6360,10 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
         return 0;
     }
 
+    const double preupload_start = mlv_stage_timing_now();
     (void)llrpGpuPlaybackReconPreuploadFrame(frame_index, raw_image_buff, raw_image_size);
+    g_llrawproc_last_dual_iso_gpu_split.preupload_ms +=
+        (mlv_stage_timing_now() - preupload_start) * 1000.0;
     memset(&public_gpu_playback_state, 0, sizeof(public_gpu_playback_state));
     memset(&retained_device, 0, sizeof(retained_device));
     memset(&retained_timing, 0, sizeof(retained_timing));
@@ -6315,6 +6425,7 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
+    memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
     g_llrawproc_last_preview_histogram_ms = 0.0;
     g_llrawproc_last_preview_regression_ms = 0.0;
@@ -6858,8 +6969,53 @@ void llrpResetLastRunTimingForCurrentThread(void)
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     memset(&g_llrawproc_last_residual, 0, sizeof(g_llrawproc_last_residual));
+    memset(&g_llrawproc_last_dual_iso_gpu_split, 0, sizeof(g_llrawproc_last_dual_iso_gpu_split));
     llrawproc_reset_dual_iso_full20bit_timing();
     llrpResetLastPreDualIsoFixTelemetry();
+}
+
+/* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: every record the reset above clears.
+ * A thread that ran the llrawproc it then consumes saves them before the
+ * consuming debayer's reset and restores them after (video_mlv.c,
+ * mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread). */
+#define LLRP_LAST_RUN_TIMING(X) \
+    X(double, g_llrawproc_last_shared_lock_ms) \
+    X(double, g_llrawproc_last_dualiso_refine_lock_ms) \
+    X(double, g_llrawproc_last_publish_lock_ms) \
+    X(double, g_llrawproc_last_total_ms) \
+    X(double, g_llrawproc_last_dark_frame_ms) \
+    X(double, g_llrawproc_last_vertical_stripes_ms) \
+    X(double, g_llrawproc_last_focus_pixels_ms) \
+    X(double, g_llrawproc_last_bad_pixels_ms) \
+    X(double, g_llrawproc_last_pattern_noise_ms) \
+    X(double, g_llrawproc_last_dual_iso_ms) \
+    X(double, g_llrawproc_last_chroma_smooth_ms) \
+    X(llrpResidualSubstageTiming_t, g_llrawproc_last_residual) \
+    X(llrpDualIsoGpuSplitTiming_t, g_llrawproc_last_dual_iso_gpu_split) \
+    X(dualiso_full20bit_timing_t, g_llrawproc_last_dual_iso_full20bit_timing) \
+    X(double, g_llrawproc_last_pre_dualiso_fix_ms) \
+    X(int, g_llrawproc_last_pre_dualiso_fix_completed)
+
+typedef struct
+{
+#define LLRP_SAVED_LAST_RUN_RECORD(type, name) type name;
+    LLRP_LAST_RUN_TIMING(LLRP_SAVED_LAST_RUN_RECORD)
+#undef LLRP_SAVED_LAST_RUN_RECORD
+} llrawproc_saved_last_run_timing_t;
+static MLV_THREAD_LOCAL llrawproc_saved_last_run_timing_t g_llrawproc_saved_last_run_timing;
+
+void llrpSaveLastRunTimingForCurrentThread(void)
+{
+#define LLRP_SAVE_LAST_RUN_RECORD(type, name) g_llrawproc_saved_last_run_timing.name = name;
+    LLRP_LAST_RUN_TIMING(LLRP_SAVE_LAST_RUN_RECORD)
+#undef LLRP_SAVE_LAST_RUN_RECORD
+}
+
+void llrpRestoreLastRunTimingForCurrentThread(void)
+{
+#define LLRP_RESTORE_LAST_RUN_RECORD(type, name) name = g_llrawproc_saved_last_run_timing.name;
+    LLRP_LAST_RUN_TIMING(LLRP_RESTORE_LAST_RUN_RECORD)
+#undef LLRP_RESTORE_LAST_RUN_RECORD
 }
 
 double llrpGetLastDualIsoMilliseconds(void)
@@ -6876,6 +7032,12 @@ void llrpGetLastResidualSubstageTiming(llrpResidualSubstageTiming_t * timing)
 {
     if (!timing) return;
     *timing = g_llrawproc_last_residual;
+}
+
+void llrpGetLastDualIsoGpuSplitTiming(llrpDualIsoGpuSplitTiming_t * timing)
+{
+    if (!timing) return;
+    *timing = g_llrawproc_last_dual_iso_gpu_split;
 }
 
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing)

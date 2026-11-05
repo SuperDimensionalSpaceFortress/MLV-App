@@ -2125,6 +2125,380 @@ function Read-DvContactFrames {
     & $done
 }
 
+# --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the leg-spec SHAPE refusals, ONE predicate for the leg and the lease batch's preflight --------------
+# (adversary r5 A1) Invoke-VenueLeg refuses these before its terminal try; the batch preflight (Get-LegSpecRefusal) calls this same function, so a spec the
+# leg would refuse is refused before a lease opens, never after it (LEG_FAILED, no receipt). A control container the runner reads members of must be ONE
+# JSON object when present (r5, sol r4 B1: an array reads through member enumeration but has no PSObject property, so its controls were dropped), and
+# look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg (r14: and, as the generator's
+# -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
+$script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
+function Get-DvLegSpecShapeRefusal {
+    param($Spec)
+    if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
+    foreach ($container in 'look', 'generatorArgs', 'acceptedEffectiveScale', 'timeouts', 'criteria') {
+        $present = $Spec.PSObject.Properties[$container]
+        if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
+            $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
+            return "$container must be a single JSON object (it is $shape)"
+        }
+    }
+    # r9 (adversary r8 cc8061a2 A1, Dot pr-721, hub ACK 6564543250): legType is ONE string of the schema's enum, compared case-sensitively as the validator
+    # compares it. [string] of the array ["look","speed"] is 'look speed', so that spec with no look passed this predicate, the batch opened its lease, and the
+    # leg's -eq against the array was truthy and indexed the absent look before any receipt. An array, object, number, null, empty or other-case value is
+    # refused here, for the leg and every batch preflight alike. An ABSENT legType stays a speed leg, as the runner has always read it.
+    $legTypeProp = $Spec.PSObject.Properties['legType']
+    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
+        return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
+    }
+    $isLookLeg = ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'look')
+    # r7 (adversary r6 A2): a look leg reads look.* before its receipt exists, so a look leg with NO look is refused here too (it threw
+    # "Cannot index into a null array" after the batch had opened its lease).
+    if ($isLookLeg -and $null -eq $Spec.PSObject.Properties['look']) { return 'a look leg needs look (one JSON object); it is absent' }
+    $look = Get-DvProp $Spec 'look'
+    # r9 fix 1 (adversary r9 a0936637 A2): a look leg's look.contactSheetFrames is a whole number from 1 to 60 -- the schema's range and the generator's
+    # ValidateRange(1,60) -- refused here, before a lease opens. 61 (with a 61-frame list) and 0 (with []) passed this predicate and the generator refused
+    # them after the lease; 1.4 was generated as [int] 1 and then refused as no whole number after collection; 6.0 likewise. (A JSON number with a
+    # fraction parses to a double, never an int or long.)
+    if ($isLookLeg -and $null -ne $look) {
+        $countValue = Get-DvProp $look 'contactSheetFrames'
+        if (-not (($countValue -is [int] -or $countValue -is [long]) -and $countValue -ge 1 -and $countValue -le 60)) {
+            return "look.contactSheetFrames must be a whole number from 1 to 60 (it is $(if ($null -eq $look.PSObject.Properties['contactSheetFrames']) { 'absent' } else { ConvertTo-Json -InputObject $countValue -Compress -Depth 3 }))"
+        }
+    }
+    if (-not $isLookLeg -or $null -eq $look -or $null -eq $look.PSObject.Properties['pairedSeekFrames']) { return $null }
+    $listed = $look.pairedSeekFrames
+    $items = @($listed)
+    $bad = $(if ($listed -isnot [array]) { 'is not an array' }
+        elseif (-not ($look.PSObject.Properties['pairedSeek'] -and $look.pairedSeek -is [bool] -and $look.pairedSeek)) { 'needs look.pairedSeek true' }
+        elseif (@($items | Where-Object { -not ($_ -is [int] -or $_ -is [long]) -or $_ -lt 0 }).Count -gt 0) { 'must hold non-negative integers' }
+        elseif (@($items | Sort-Object -Unique).Count -ne $items.Count) { 'must not repeat a frame' }
+        elseif ($items.Count -ne [int]$look.contactSheetFrames) { "names $($items.Count) frame(s) but look.contactSheetFrames is $($look.contactSheetFrames)" }
+        # r14: Invoke-VenueLeg hands the list to the generator's -ContactSheetSeekFrames, whose contract (and the app's) is strictly ascending, each
+        # 0..999999999 (CONTACT_SHEET_SEEK_FRAMES_INVALID, untyped to the leg and after the batch's lease). A list it would refuse is refused here instead.
+        elseif (@($items | Where-Object { $_ -gt 999999999 }).Count -gt 0) { 'must hold frames 0..999999999 (the generator''s -ContactSheetSeekFrames range)' }
+        elseif (@(for ($i = 1; $i -lt $items.Count; $i++) { if ($items[$i] -le $items[$i - 1]) { $i } }).Count -gt 0) { 'must be strictly ascending (the generator''s -ContactSheetSeekFrames order)' }
+        else { $null })
+    if ($null -ne $bad) { return "look.pairedSeekFrames $bad" }
+    $null
+}
+
+# --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r10: is a paired-comparison image a PNG at all? ONE check for both members of every pair ------------
+# (sol r9 key B1, r9 adversary successor ADV-A1 DualVenueRunner.psm1:2048) A paused still or an in-pass partner whose file hash-matches its listing
+# was honoured whatever its bytes were: a zero-byte frame-00.png (sha256 e3b0c442...b855), a truncated file, a non-PNG renamed .png. A hash binds the
+# bytes to the listing; it says nothing about whether they are an image. This checks the PNG container and its image data with the .NET base library
+# only (no image-decoder dependency): the 8-byte signature; a first chunk IHDR of length 13 with width and height 1..2^31-1, a valid bit depth / colour
+# type pair, compression 0, filter 0 and interlace 0 or 1; every chunk length inside the file, every chunk type four ASCII letters and every chunk's
+# CRC-32 (IDAT included since r12); a PLTE before the image data of a palette image; at least one IDAT; an IEND that ends the chunk sequence (a file cut short has none);
+# and -- r10 fix 1, adversary r10 77fc99fa A1: a well-formed container whose IDAT inflated to 0 bytes passed -- the concatenated IDAT data must be ONE
+# valid zlib stream (its Adler-32 checked by the inflater) that inflates to exactly the scanline bytes IHDR implies (Adam7 passes included), each
+# scanline led by a filter type 0..4. Returns $null for a decodable PNG, otherwise the reason. Get-DvPairedSeekVerdict calls it for every paused still
+# and every in-pass partner image, so collection (Invoke-VenueLeg) and final validation (Test-DvReceiptValid) refuse the same files.
+$script:PngSignature = [byte[]](0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+$script:PngMinBytes = 8 + 25 + 12 + 12   # signature + IHDR chunk (12 + 13) + an IDAT chunk header + IEND chunk
+$script:PngBitDepths = @{ 0 = @(1, 2, 4, 8, 16); 2 = @(8, 16); 3 = @(1, 2, 4, 8); 4 = @(8, 16); 6 = @(8, 16) }   # colour type -> allowed bit depths
+$script:PngChannels = @{ 0 = 1; 2 = 3; 3 = 1; 4 = 2; 6 = 4 }                                                     # colour type -> samples per pixel
+$script:PngAdam7 = @(@(0, 0, 8, 8), @(4, 0, 8, 8), @(0, 4, 4, 8), @(2, 0, 4, 4), @(0, 2, 2, 4), @(1, 0, 2, 2), @(0, 1, 1, 2))   # xStart, yStart, xStep, yStep
+# r12 (adversary r12 e68b3f74 A1): EVERY chunk's CRC-32 is checked, IDAT included (an IDAT with a wrong CRC passed: only the zlib Adler-32 covered its
+# bytes, and Adler-32 does not cover the chunk's own CRC field). A PowerShell byte loop runs about 2 s per MB, too slow for a full-size still's IDAT, so
+# the CRC-32 (ISO 3309, the PNG polynomial) is a small C# type compiled once per process on first use (C# 5 syntax, so Windows PowerShell 5.1 builds it too).
+$script:PngCrc32TypeName = 'DvPngCrc32R12'
+$script:PngCrc32Source = @'
+public static class DvPngCrc32R12 {
+    private static readonly uint[] Table = MakeTable();
+    private static uint[] MakeTable() {
+        uint[] t = new uint[256];
+        for (uint k = 0; k < 256; k++) { uint c = k; for (int j = 0; j < 8; j++) { c = ((c & 1u) != 0u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); } t[k] = c; }
+        return t;
+    }
+    public static uint Compute(byte[] bytes, int offset, int count) {
+        uint c = 0xFFFFFFFFu;
+        int end = offset + count;
+        for (int i = offset; i < end; i++) { c = Table[(c ^ bytes[i]) & 0xFFu] ^ (c >> 8); }
+        return c ^ 0xFFFFFFFFu;
+    }
+}
+'@
+function Get-DvPngCrc32 {
+    param([byte[]]$Bytes, [int]$Offset, [int]$Count)
+    $t = $script:PngCrc32TypeName -as [type]
+    if ($null -eq $t) { Add-Type -TypeDefinition $script:PngCrc32Source -Language CSharp -ErrorAction Stop; $t = $script:PngCrc32TypeName -as [type] }
+    [long]$t::Compute($Bytes, $Offset, $Count)
+}
+# r13 (sol r12 key B1, r12 adversary successor ADV-A1): the chunk ALLOWLIST. Through r12 a chunk this check did not know was SKIPPED, so a PNG with
+# valid CRCs and image data but a malformed ancillary payload (a zTXt with compression method 1, an empty iCCP; Pillow refuses both) passed, and a
+# hash-matching pair of them was honoured. The check now fails CLOSED: a chunk type not on this list is refused, critical or ancillary, and every
+# ancillary on it has its length AND its fields checked to the PNG spec. The list is what the leg's stills and sheets actually carry (survey of the 8853
+# evidence PNGs under .claude-state\dual-venue\evidence and the r1 sheets, r13 run dir png-chunk-survey.txt: IHDR, pHYs, sRGB, gAMA, IDAT, IEND and
+# nothing else). No text, compressed or colour-profile chunk (tEXt, zTXt, iTXt, iCCP) and no private chunk is on it: the leg writes none.
+# r13 fix 1 (adversary r13 ebd1da64 A1 / A2): nor PLTE or tRNS -- the leg writes neither, and both opened a class this check does not decode (a palette
+# index past the palette's end in the pixel data; a tRNS before a suggested palette). So a palette image (colour type 3, which needs a PLTE) is refused
+# at its IHDR, and a PLTE or tRNS anywhere is refused as off the allowlist.
+$script:PngAllowedChunks = @('IHDR', 'IDAT', 'IEND', 'sRGB', 'gAMA', 'pHYs')
+# r11 fix 2: the allowlisted ancillary chunks' length, place and count (PNG 1.2 / ISO 15948 section 11.3). $null when the chunk keeps them, else why not.
+$script:PngAncillaryLength = @{ gAMA = 4; sRGB = 1; pHYs = 9 }   # (the same for every colour type)
+function Get-DvPngAncillaryProblem {
+    param([string]$Name, [int]$Length, [bool]$SawIdat, [System.Collections.Generic.HashSet[string]]$Seen, [byte[]]$Bytes, [int]$DataAt)
+    if ($Name -cin @('IHDR', 'IEND')) { return $null }   # (checked by the caller: IHDR first and 13 bytes, IEND last and empty)
+    if ($Name -cnotin @($script:PngAncillaryLength.Keys)) { return "is not on the PNG chunk allowlist ($($script:PngAllowedChunks -join ', '))" }   # (the caller refuses it first)
+    if ($Seen.Contains($Name)) { return 'repeats (PNG allows one)' }
+    if ($SawIdat) { return 'comes after the image data (PNG requires it before IDAT)' }
+    if ($Length -ne $script:PngAncillaryLength[$Name]) { return "is $Length bytes (PNG fixes it at $($script:PngAncillaryLength[$Name]))" }
+    # r13: the enumerated and ranged fields (PNG 1.2 sections 4.2.x; a PNG four-byte unsigned integer is at most 2^31-1)
+    $u32 = { param([int]$o) ([long]$Bytes[$DataAt + $o] -shl 24) -bor ([long]$Bytes[$DataAt + $o + 1] -shl 16) -bor ([long]$Bytes[$DataAt + $o + 2] -shl 8) -bor [long]$Bytes[$DataAt + $o + 3] }
+    if ($Name -ceq 'sRGB' -and $Bytes[$DataAt] -gt 3) { return "has rendering intent $($Bytes[$DataAt]) (PNG defines 0 .. 3)" }
+    if ($Name -ceq 'gAMA') { $g = & $u32 0; if ($g -lt 1 -or $g -gt 0x7FFFFFFF) { return "has gamma $g (PNG requires 1 .. 2^31-1; zero is meaningless)" } }
+    if ($Name -ceq 'pHYs') {
+        $px = & $u32 0; $py = & $u32 4
+        if ($px -gt 0x7FFFFFFF -or $py -gt 0x7FFFFFFF) { return "has pixels per unit $px x $py (PNG allows at most 2^31-1)" }
+        if ($Bytes[$DataAt + 8] -gt 1) { return "has unit specifier $($Bytes[$DataAt + 8]) (PNG defines 0 unknown and 1 metre)" }
+    }
+    $null
+}
+function Get-DvPngImageProblem {
+    param([AllowNull()][byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return 'it is empty (0 bytes)' }
+    $n = $Bytes.Length
+    for ($i = 0; $i -lt [Math]::Min(8, $n); $i++) { if ($Bytes[$i] -ne $script:PngSignature[$i]) { return "it does not start with the 8-byte PNG signature ($n bytes)" } }
+    if ($n -lt $script:PngMinBytes) { return "it is $n bytes, shorter than the smallest PNG ($($script:PngMinBytes) bytes: signature, IHDR, IDAT and IEND), so it is truncated" }
+    $u32 = { param([int]$at) ([long]$Bytes[$at] -shl 24) -bor ([long]$Bytes[$at + 1] -shl 16) -bor ([long]$Bytes[$at + 2] -shl 8) -bor [long]$Bytes[$at + 3] }
+    $type = { param([int]$at) [Text.Encoding]::ASCII.GetString($Bytes, $at, 4) }   # (a byte over 0x7F decodes to '?', which no chunk type matches)
+    if ((& $u32 8) -ne 13 -or (& $type 12) -cne 'IHDR') { return 'its first chunk is not a 13-byte IHDR' }
+    $width = & $u32 16; $height = & $u32 20
+    if ($width -lt 1 -or $width -gt 0x7FFFFFFF -or $height -lt 1 -or $height -gt 0x7FFFFFFF) { return "its IHDR says $width x $height (width and height must be 1 .. 2^31-1)" }
+    $depth = [int]$Bytes[24]; $colour = [int]$Bytes[25]
+    if (-not ($script:PngBitDepths.ContainsKey($colour) -and $depth -in $script:PngBitDepths[$colour])) { return "its IHDR bit depth $depth with colour type $colour is not a PNG pixel format" }
+    if ($Bytes[26] -ne 0 -or $Bytes[27] -ne 0 -or $Bytes[28] -gt 1) { return 'its IHDR compression, filter or interlace method is not one PNG defines' }
+    # r13 fix 1 (adversary r13 ebd1da64 A1): a palette image needs a PLTE, which is off the allowlist (the leg writes no palette image)
+    if ($colour -eq 3) { return "its IHDR colour type 3 is a palette image, which needs a PLTE chunk, and PLTE is not on the PNG chunk allowlist ($($script:PngAllowedChunks -join ', '))" }
+    $interlaced = ($Bytes[28] -eq 1)
+    $at = 8; $sawIdat = $false; $idatEnded = $false
+    $seenChunks = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $idat = [IO.MemoryStream]::new()
+    while ($true) {
+        if ($at + 12 -gt $n) { return 'its chunks end without an IEND chunk, so it is truncated' }
+        $length = & $u32 $at; $name = & $type ($at + 4)
+        if ($name -cnotmatch '^[A-Za-z]{4}$') { return "the chunk at byte $at has no PNG chunk type" }
+        if ($length -gt 0x7FFFFFFF -or $at + 12 + $length -gt $n) { return "its $name chunk at byte $at runs past the end of the file ($n bytes), so it is truncated" }
+        # r11 fix 1 (adversary r11 b4a4147f A1 and its class): the chunk sequence a decoder accepts. IHDR only first (a second, contradicting IHDR was
+        # ignored); no critical chunk (upper-case first letter) other than IHDR, PLTE, IDAT and IEND; at most one PLTE, and never after the image data;
+        # the IDAT chunks consecutive.
+        if ($name -ceq 'IHDR' -and $at -ne 8) { return "it has a second IHDR chunk at byte $at" }
+        # r13 (sol r12 B1): fail CLOSED on the chunk type. A chunk not on the allowlist is refused, critical or ancillary (it was skipped through r12).
+        # (r13 fix 1: PLTE is off the list too, so a second PLTE or a PLTE after the image data is refused here, as is any PLTE)
+        if ($name -cnotin $script:PngAllowedChunks) {
+            $why = $(if ($name -ceq 'PLTE') { ': the leg writes no palette' } elseif ($name -cmatch '^[A-Z]') { ': a critical chunk PNG does not define' } else { '' })
+            return "its $name chunk at byte $at is not on the PNG chunk allowlist ($($script:PngAllowedChunks -join ', '))$why"
+        }
+        if ($name -cne 'IDAT' -and $sawIdat) { $idatEnded = $true }
+        # r12 A1: the CRC-32 of EVERY chunk (type + data), IDAT included. r12 A2 (advisory): IEND carries no data.
+        if ((Get-DvPngCrc32 -Bytes $Bytes -Offset ($at + 4) -Count (4 + [int]$length)) -ne (& $u32 ($at + 8 + [int]$length))) { return "its $name chunk at byte $at fails its CRC-32" }
+        if ($name -ceq 'IEND' -and $length -ne 0) { return "its IEND chunk at byte $at holds $length bytes (PNG fixes IEND at 0)" }
+        if ($name -ceq 'IDAT') {
+            if ($idatEnded) { return "its IDAT chunk at byte $at is not consecutive with the earlier IDAT chunks" }
+            $sawIdat = $true; $idat.Write($Bytes, $at + 8, [int]$length)
+        }
+        else {
+            # r11 fix 2 (adversary r11 5a79915c A1 and its class): a chunk PNG defines with a size, a place or a count fixed by the image is refused when
+            # it breaks them (a decoder rejects it: a 1-byte tRNS on an RGB image, an empty gAMA, sRGB or pHYs passed): its length, before IDAT, and
+            # not repeated. r13: and every allowlisted chunk's fields (sRGB intent, gAMA value, pHYs units), from its bytes.
+            $problem = Get-DvPngAncillaryProblem -Name $name -Length ([int]$length) -SawIdat $sawIdat -Seen $seenChunks -Bytes $Bytes -DataAt ($at + 8)
+            if ($null -ne $problem) { return "its $name chunk at byte $at $problem" }
+            [void]$seenChunks.Add($name)
+        }
+        if ($name -ceq 'IEND') { break }
+        $at += 12 + [int]$length
+    }
+    if (-not $sawIdat) { return 'it has no IDAT chunk, so it holds no image data' }
+    # The scanlines IHDR implies: one segment per non-empty pass (one pass when not interlaced), each row a filter byte plus ceil(w * bits / 8) bytes
+    $bits = $depth * $script:PngChannels[$colour]
+    $passes = $script:PngAdam7
+    if (-not $interlaced) { $passes = @(, @(0, 0, 1, 1)) }   # (a direct assignment: a $(...) or if-expression would unroll the one pass into four numbers)
+    # r11 fix 1 (adversary r11 b4a4147f A3): the byte count IHDR implies, bounded in floating point BEFORE any [long] arithmetic. A 2^31-1 square 16-bit
+    # RGBA header implied ~3.7e19 bytes and threw an Int64 overflow out of this function (collection UNRESOLVED) instead of a refusal. No still this
+    # check reads is near 1 GiB inflated (an 8K 16-bit RGBA frame is ~265 MB), so a larger header is refused as no image this check reads.
+    $impliedBytes = [double]$height * (1.0 + [Math]::Ceiling([double]$width * [double]$bits / 8.0))
+    if ($impliedBytes -gt 1GB) { return "its IHDR says $width x $height at $bits bits per pixel, about $([Math]::Round($impliedBytes / 1GB, 1)) GiB of image data, larger than any still this check reads (1 GiB)" }
+    $segments = [System.Collections.Generic.List[long[]]]::new()
+    foreach ($p in $passes) {
+        $pw = $(if ($width -gt $p[0]) { [Math]::Floor(($width - $p[0] + $p[2] - 1) / $p[2]) } else { 0 })
+        $ph = $(if ($height -gt $p[1]) { [Math]::Floor(($height - $p[1] + $p[3] - 1) / $p[3]) } else { 0 })
+        if ($pw -gt 0 -and $ph -gt 0) { $segments.Add([long[]]@([long]$ph, [long](1 + [Math]::Floor(($pw * $bits + 7) / 8)))) }
+    }
+    [long]$expected = 0; foreach ($s in $segments) { $expected += $s[0] * $s[1] }
+    # r13 fix 2 (adversary r13 8db7736e A2): the 1 GiB cap applies to the EXACT byte count too. The estimate above counts one pass; Adam7 adds a filter
+    # byte per row of every pass and rounds each pass's rows up, so a 2 x 2^29 1-bit interlaced header estimated 1 GiB (admitted) but implies 1.5 GiB,
+    # which was then inflated, twice. (The estimate bounds $expected well inside [long], so this sum cannot overflow.)
+    if ($expected -gt 1GB) { return "its IHDR says $width x $height at $bits bits per pixel$(if ($interlaced) { ', interlaced' }), $expected bytes of image data, larger than any still this check reads (1 GiB)" }
+    # r11 fix 1 (adversary r11 b4a4147f A2): the IDAT data must be ONE complete zlib stream whose Adler-32 is checked. The inflater stops without an
+    # error when its input runs out, so a stream with no Adler-32 trailer, or whose deflate data never reaches a final block, inflated to the right byte
+    # count and passed. The inflater now reads the IDAT data followed by a 64-byte 0xFF tail. A deflate stream that never reaches its final block is fed
+    # the tail as more deflate data (0xFF codes literals, or a reserved block type), so it errors or inflates past the image's byte count. One that does
+    # end is followed by the 4 bytes ZLibStream (.NET 6+) checks as its Adler-32: the real trailer passes, while a missing one (the tail is read instead)
+    # or a misplaced one (whatever follows the deflate data is read instead) fails with InvalidDataException.
+    # r13 fix 2 (adversary r13 8db7736e A1 / A3): the .NET-before-6 fallback (a raw DeflateStream after the 2-byte header, its Adler-32 compared with the
+    # LAST four bytes of the IDAT data) is gone. A raw DeflateStream does not say where the deflate data ends, so junk between the deflate data and a
+    # trailer at the end passed (A3), and the header's window size was never checked (A1). Without ZLibStream (PowerShell 7 / .NET 6+, which the leg runs
+    # on) the image cannot be verified, so it is refused, fail closed. The header check now also requires CINFO <= 7 (a window of at most 32 KiB, RFC 1950).
+    $zType = 'System.IO.Compression.ZLibStream' -as [type]
+    if ($null -eq $zType) { return 'its IDAT data cannot be verified here: this runtime has no System.IO.Compression.ZLibStream (.NET 6+, PowerShell 7), which the image check needs to find the zlib trailer' }
+    $idatLength = $idat.Length
+    if ($idatLength -lt 6) { return "its IDAT data is $idatLength bytes, too short for a zlib stream (2-byte header, deflate data, 4-byte Adler-32)" }
+    $idatBytes = $idat.ToArray(); $idat.Dispose()
+    $cmf = [int]$idatBytes[0]; $flg = [int]$idatBytes[1]
+    if (($cmf -band 0x0F) -ne 8 -or ($cmf -shr 4) -gt 7 -or (($cmf * 256 + $flg) % 31) -ne 0 -or ($flg -band 0x20) -ne 0) { return 'its IDAT data does not start with a zlib header (deflate, a window of at most 32 KiB, no preset dictionary)' }
+    # r12 fix 2 (adversary r12 0f6daf3a A1): a stream whose Adler-32 trailer was cut short by ONE byte passed, because the 0xFF tail supplied the
+    # missing byte (the real trailer ended in 0xFF). So the stream is inflated TWICE, once with a 0xFF tail and once with a 0x00 tail, and must pass
+    # both: a trailer byte (or deflate data) borrowed from the tail matches at most one of the two fills, so the verdict cannot depend on bytes that are
+    # not in the file. (A 0x00 tail read as deflate data opens a stored block whose LEN / NLEN do not complement, so a stream that never ends errors.)
+    foreach ($tailByte in @(0xFF, 0x00)) {
+    $fed = [IO.MemoryStream]::new()
+    $fed.Write($idatBytes, 0, $idatLength)
+    $fed.Write([byte[]](@($tailByte) * 64), 0, 64)
+    $fed.Position = 0
+    $z = $null
+    try {
+        $z = $zType::new($fed, [IO.Compression.CompressionMode]::Decompress)
+        $buf = [byte[]]::new(65536); [long]$total = 0
+        $seg = 0; [long]$rowsLeft = $segments[0][0]; [long]$nextFilter = 0
+        while (($got = $z.Read($buf, 0, $buf.Length)) -gt 0) {
+            if ($total + $got -gt $expected) { return "its IDAT data inflates to more than the $expected bytes a $width x $height image holds (or its deflate data never ends)" }
+            while ($seg -lt $segments.Count -and $nextFilter -lt $total + $got) {
+                $f = $buf[$nextFilter - $total]
+                if ($f -gt 4) { return "a scanline of its image data has filter type $f (PNG defines 0 .. 4), so it is not image data" }
+                $nextFilter += $segments[$seg][1]; $rowsLeft--
+                if ($rowsLeft -eq 0) { $seg++; if ($seg -lt $segments.Count) { $rowsLeft = $segments[$seg][0] } }
+            }
+            $total += $got
+        }
+    }
+    catch { return "its IDAT data is not a valid zlib stream ($($_.Exception.GetType().Name))" }
+    finally { if ($null -ne $z) { $z.Dispose() }; $fed.Dispose() }
+    if ($total -ne $expected) { return "its IDAT data inflates to $total bytes but a $width x $height image needs $expected, so it is truncated" }
+    }   # (foreach tail byte)
+    $null
+}
+
+# --- CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6: the paused stills of a look.pairedSeekFrames leg, ONE reader for the runner and the validator ---------
+# (adversary r5 A2 / A3, Dot 5c6bcd98, sol r5 key B1 / B2) Still i (frame-<ii>) counts only when (1) its png AND its sidecar are in the hash listing;
+# (2) EACH is read back now and its bytes hash to the listed sha256 -- a file missing, replaced or truncated after the listing is a mismatch naming it
+# (r5 took the png's presence from the listing alone); (3) the sidecar, parsed from those same bytes, says the still was captured PAUSED through the full
+# reconstruction path, as the app writes a seek capture (capture_mode "seek", playback_path false; a field that is missing or of another type is a
+# mismatch); and (4) its display_frame is the requested frame. The runner records this at collection; Test-DvReceiptValid re-derives it with this function.
+# r7 (adversary r6 A1, Dot 6558329764, sol r6 key B1): it runs for EVERY look.pairedSeek leg. With no RequestedFrames (a leg that names no
+# look.pairedSeekFrames -- all four shipped paired legs) the stills are the ones the listing holds (each png/json stem), (1)-(3) bind each of them, a
+# png or a sidecar without its partner is a mismatch naming the absent file, and a leg that collected no still at all is not honoured; only (4) is skipped.
+# r8 (adversary r7 A2 / A1 / A3, Dot on #721 16:25:15Z): the stills a leg must hold come from the COMMITTED spec, never from what was collected or what a
+# receipt claims. -StillCount is the committed look.contactSheetFrames: the stills are frame-00 .. frame-<StillCount-1> (the app's own numbering, which
+# -RequestedFrames, when listed, also follows), so one valid still no longer satisfies a six-frame leg. Every expected still must be present and paused;
+# every hash-listed file must belong to one of them (an extra still -- a playing one included -- is a mismatch naming it, never ignored); a StillCount
+# that is not a positive integer, or a frame list of another length, is a mismatch. A sidecar whose top level is not ONE JSON object (a one-element
+# array, which ConvertFrom-Json would unwrap) is no sidecar.
+# r8 fix iteration 1 (adversary r8 A1 / A2): every entry ON DISK in -SeekDir must be a plain file the listing names (an extra still a receipt leaves out of
+# its listing is a mismatch, not invisible); and with no frame list, still i must show the display_frame of its IN-PASS partner frame-<ii>.json
+# (-InPassFiles: the hash-verified contact-sheet\raw files, Read-DvContactFrames' .files) -- the app seeks to exactly those frames (MainWindow.cpp
+# contactSheetTargetFrames = inPassDisplayFrames), so a paused still of another frame is no same-frame comparison.
+function Get-DvPairedSeekVerdict {
+    param([string]$SeekDir, $Files, [long[]]$RequestedFrames, $StillCount, $InPassFiles)
+    $listedSha = @{}
+    foreach ($f in @($Files)) { if ($null -ne $f) { $listedSha[[string](Get-DvProp $f 'name')] = [string](Get-DvProp $f 'sha256') } }
+    $reported = [System.Collections.Generic.List[object]]::new()
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    $show = { param($v) $(if ($null -eq $v) { 'absent' } else { ConvertTo-Json -InputObject $v -Compress }) }
+    # r9 (adversary r8 cc8061a2 A2 / A3): the in-pass partner sidecar is read whole -- its display_frame AND its provenance -- not only the frame number
+    $readSidecar = { param([byte[]]$b) $o = $null
+        try { $o = ([Text.Encoding]::UTF8.GetString($b).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $o = $null }
+        $(if ($o -is [System.Management.Automation.PSCustomObject]) { $o } else { $null }) }
+    $inPassBytes = @{}
+    foreach ($f in @($InPassFiles)) { if ($null -ne $f) { $inPassBytes[[string](Get-DvProp $f 'name')] = (Get-DvProp $f 'bytes') } }
+    if (-not [string]::IsNullOrEmpty($SeekDir) -and (Test-Path -LiteralPath $SeekDir -PathType Container)) {
+        foreach ($actual in @(Get-ChildItem -LiteralPath $SeekDir -Force | Sort-Object Name)) {
+            $isReparse = (($actual.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($actual.PSIsContainer -or $isReparse -or -not $listedSha.ContainsKey($actual.Name)) { $mismatches.Add("'$($actual.Name)' is in paired-seek\contact-sheet\raw but the paired-still listing does not name it as a plain file (every collected still is listed and checked)") }
+        }
+    }
+    $frameList = $null -ne $RequestedFrames
+    $count = $(if (($StillCount -is [int] -or $StillCount -is [long]) -and $StillCount -ge 1 -and $StillCount -le 999) { [int]$StillCount } else { 0 })
+    if ($count -eq 0) { $mismatches.Add("the committed look.contactSheetFrames ($(& $show $StillCount)) is not a positive whole number, so the paired stills this leg must hold are unknown") }
+    elseif ($frameList -and $RequestedFrames.Count -ne $count) { $mismatches.Add("look.pairedSeekFrames names $($RequestedFrames.Count) frame(s) but the committed look.contactSheetFrames is $count") }
+    $expectedCount = $(if ($frameList) { $RequestedFrames.Count } else { $count })
+    # (@(...) around the whole loop: $(...) would unroll a one-still list into a bare string, and [0] of a string is its first character)
+    [string[]]$stills = @(for ($i = 0; $i -lt $expectedCount; $i++) { 'frame-{0:D2}' -f $i })
+    if (-not $frameList -and $listedSha.Count -eq 0) { $mismatches.Add('no paused still was collected (look.pairedSeek asks for paused stills, each a png with its sidecar)') }
+    for ($i = 0; $i -lt $stills.Count; $i++) {
+        $stillName = $stills[$i]
+        $requested = $(if ($frameList) { $RequestedFrames[$i] } else { $null })
+        $tail = $(if ($frameList) { ", requested $requested" } else { '' })
+        $shown = $null; $problem = $null; $sidecarBytes = $null
+        if (-not ($listedSha.ContainsKey("$stillName.json") -and $listedSha.ContainsKey("$stillName.png"))) {
+            $problem = $(if ($frameList) { "$stillName reported no display_frame$tail" }
+                elseif (-not ($listedSha.ContainsKey("$stillName.json") -or $listedSha.ContainsKey("$stillName.png"))) { "$stillName was not collected (the committed spec asks for $expectedCount paired stills, frame-00 .. $($stills[-1]), each a png with its sidecar)" }
+                else { "$stillName.$(if ($listedSha.ContainsKey("$stillName.png")) { 'json' } else { 'png' }) is not hash-listed (a paired still needs its png and its sidecar)" })
+        }
+        else {
+            foreach ($ext in 'png', 'json') {
+                $file = $(if ([string]::IsNullOrEmpty($SeekDir)) { $null } else { Join-Path $SeekDir "$stillName.$ext" })
+                if ($null -eq $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { $problem = "$stillName.$ext is missing after it was hash-listed$tail"; break }
+                [byte[]]$bytes = [IO.File]::ReadAllBytes($file)
+                if ((Get-DvSha256OfBytes $bytes) -cne $listedSha["$stillName.$ext"]) { $problem = "$stillName.$ext changed after it was hash-listed (its bytes no longer hash to the listed sha256)$tail"; break }
+                # r10 (sol r9 key B1, adversary successor ADV-A1): a hash-matching png is still no paused image unless it IS a PNG (Get-DvPngImageProblem)
+                if ($ext -eq 'png') {
+                    $imageProblem = Get-DvPngImageProblem $bytes
+                    if ($null -ne $imageProblem) { $problem = "$stillName.png is not a decodable PNG image: $imageProblem (a paired still is a paused image, not a file that merely hash-matches its listing)$tail"; break }
+                }
+                if ($ext -eq 'json') { $sidecarBytes = $bytes }
+            }
+        }
+        if ($null -eq $problem) {
+            $parsed = $null
+            # (-NoEnumerate keeps a top-level array an array, so a one-element array sidecar is refused below instead of read as its element)
+            try { $parsed = ([Text.Encoding]::UTF8.GetString($sidecarBytes).TrimStart([char]0xFEFF)) | ConvertFrom-Json -NoEnumerate } catch { $parsed = $null }
+            if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { $parsed = $null }
+            $value = Get-DvProp $parsed 'display_frame'
+            # r9 fix 2 (adversary r9 7240a133 A1): a display_frame is a frame NUMBER, so a negative one identifies no frame -- -1 on a still and on its in-pass
+            # partner used to compare equal and stay honoured. Both readers accept only a non-negative integer (the frame list's own domain).
+            if (($value -is [int] -or $value -is [long]) -and $value -ge 0) { $shown = [long]$value }
+            $mode = Get-DvProp $parsed 'capture_mode'; $playbackPath = Get-DvProp $parsed 'playback_path'
+            if ($null -eq $shown) { $problem = "$stillName reported no display_frame (its sidecar $stillName.json is not a JSON object carrying a non-negative integer display_frame)$tail" }
+            elseif (-not ($mode -is [string] -and $mode -ceq 'seek' -and $playbackPath -is [bool] -and -not $playbackPath)) {
+                $problem = "$stillName was not captured paused through the full reconstruction path (its sidecar $stillName.json says capture_mode $(& $show $mode), playback_path $(& $show $playbackPath); a paired still needs capture_mode ""seek"" and playback_path false)$tail"
+            }
+            elseif ($frameList -and $shown -ne $requested) { $problem = "$stillName reported display_frame $shown$tail" }
+            # fix 2 (adversary r8 fix-1 A2): the in-pass partner binds a listed-frame leg too -- the list adds the requested frame, it never removes the pairing
+            # r9 (adversary r8 cc8061a2 A2 / A3, Dot pr-721 21:52:55Z, hub ACK 6564543250): the partner must be a frame the measured pass PRESENTED -- its
+            # sidecar says capture_mode "in_pass" and playback_path Boolean true, exactly as the app writes an in-pass grab (MainWindow.cpp in-pass sidecar
+            # writer; not the string "true", not 1) -- and its own image contact-sheet\raw\<still>.png must be among the hash-verified in-pass files. cc8061a2
+            # read only the partner's display_frame, so paused-versus-paused pairs, and six partner sidecars beside a single png, stayed honoured.
+            else {
+                $partnerSide = $(if ($inPassBytes.ContainsKey("$stillName.json")) { & $readSidecar ([byte[]]$inPassBytes["$stillName.json"]) } else { $null })
+                $partnerValue = Get-DvProp $partnerSide 'display_frame'
+                $partner = $(if (($partnerValue -is [int] -or $partnerValue -is [long]) -and $partnerValue -ge 0) { [long]$partnerValue } else { $null })
+                $partnerMode = Get-DvProp $partnerSide 'capture_mode'; $partnerPath = Get-DvProp $partnerSide 'playback_path'
+                if ($null -eq $partner) { $problem = "$stillName has no in-pass partner to pair with (contact-sheet\raw\$stillName.json is not a hash-listed JSON object carrying a non-negative integer display_frame), so its paused still cannot be shown to be the same frame" }
+                elseif (-not ($partnerMode -is [string] -and $partnerMode -ceq 'in_pass' -and $partnerPath -is [bool] -and $partnerPath)) {
+                    $problem = "$stillName's in-pass partner $stillName.json was not grabbed while playing (it says capture_mode $(& $show $partnerMode), playback_path $(& $show $partnerPath); an in-pass partner needs capture_mode ""in_pass"" and playback_path true), so its paused still is no playing-versus-paused comparison"
+                }
+                elseif (-not $inPassBytes.ContainsKey("$stillName.png")) { $problem = "$stillName's in-pass partner has no image: contact-sheet\raw\$stillName.png is not among the hash-verified in-pass files, so there is no playing frame to compare its paused still with" }
+                # r10 (sol r9 key B1): the partner's hash-verified bytes must be a PNG too -- both members of a pair are images, or neither is compared
+                elseif ($null -ne ($partnerImageProblem = Get-DvPngImageProblem ([byte[]]$inPassBytes["$stillName.png"]))) {
+                    $problem = "$stillName's in-pass partner image contact-sheet\raw\$stillName.png is not a decodable PNG image: $partnerImageProblem, so there is no playing frame to compare its paused still with"
+                }
+                # r14 (SAMEFRAME r1, sol r13 B3): only a LISTLESS still must show its partner's frame -- the app replays the in-pass frames there. A listed leg
+                # hands the list to the app (--contact-sheet-seek-frames), which seeks to it, so its still is bound to the requested frame above and its partner
+                # is the frame THIS arm's measured pass grabbed (r1: H 249 for 250, C 44 for 50); the partner's provenance and image checks above still bind it.
+                elseif (-not $frameList -and $shown -ne $partner) { $problem = "$stillName reported display_frame $shown but its in-pass partner $stillName.json shows $partner (a paired still is the paused rendition of the SAME frame)" }
+            }
+        }
+        $reported.Add($shown)
+        if ($null -ne $problem) { $mismatches.Add($problem) }
+    }
+    $expectedNames = @{}
+    foreach ($s in $stills) { $expectedNames["$s.png"] = $true; $expectedNames["$s.json"] = $true }
+    foreach ($name in @($listedSha.Keys | Sort-Object)) {
+        if (-not $expectedNames.ContainsKey($name)) { $mismatches.Add("'$name' is hash-listed among the paired stills but is not one of the $expectedCount the committed spec asks for (frame-00 .. frame-$('{0:D2}' -f [Math]::Max(0, $expectedCount - 1)) png and json); every listed still is checked, none is ignored") }
+    }
+    [pscustomobject]@{ reportedFrames = $reported.ToArray(); framesHonoured = ($mismatches.Count -eq 0); frameMismatches = $mismatches.ToArray() }
+}
+
 # --- PLAYBACK-VISUAL-INSPECTION-1: the window captures every speed leg keeps --------------------------------------------------------------
 # The app (--visual-capture-dir) captures the WINDOW with PrintWindow AFTER the measured session has closed: 6 frames across ~3 s of untimed
 # play, the frame on screen the instant Play is paused ('stop'), and that frame re-rendered by the paused full-quality path ('paused'). The
@@ -2295,6 +2669,51 @@ function Get-DvVisualVerdict {
     [pscustomobject]@{ verdict = 'OK'; counted = $true; reason = $waivedReason }
 }
 
+function Get-DvFrameNumber {
+    <#
+    .SYNOPSIS
+    A display frame number as the app writes it (a JSON integer, 0..Int32.MaxValue) -> [int]; anything else -> $null (pure, never throws).
+    PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key): [int] on -0.4 is 0 and on 1.5 is 2, on 2147483648 or an object it throws; none is a frame.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $integral = $Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [sbyte] -or
+                $Value -is [uint16] -or $Value -is [uint32] -or $Value -is [uint64] -or $Value -is [System.Numerics.BigInteger]
+    if (-not $integral) { return $null }
+    if ($Value -lt 0 -or $Value -gt [int]::MaxValue) { return $null }
+    [int]$Value
+}
+
+function Get-DvVisualSourceDifference {
+    <#
+    .SYNOPSIS
+    Whether the source frames behind the JUDGED play frames differ (pure): known-differ | known-identical | unknown, from each frame's own `sourceId`
+    (the app's per-frame source_id: exactly 16 lowercase hex digits; anything else is no id) and `displayFrame`. The app's rule
+    (visual_capture_source_difference::decide, platform/qt/VisualCaptureSourceDifference.h), over the frames passed: unknown with fewer than two frames,
+    any frame without an id or with a display frame below 0, or fewer than two distinct display frames; else known-differ when two ids differ, and
+    known-identical when all are equal. PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1): the caller passes the frames the picture is judged
+    over, so the two numbers the frozen gate compares come from ONE population.
+    #>
+    param([object[]]$Frames = @())
+    # PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key on 27da457e): missing or invalid evidence is unknown, never known-identical and never a
+    # throw. A $null frame is a judged frame with no evidence (it is not filtered away), and a display frame that is not a whole number in
+    # 0..Int32.MaxValue (-0.4, 1.5, 2147483648, an object) is no display frame (Get-DvFrameNumber).
+    $judged = @($Frames)
+    if ($judged.Count -lt 2) { return 'unknown' }
+    $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $displayFrames = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($f in $judged) {
+        if ($null -eq $f) { return 'unknown' }
+        $id = Get-DvProp $f 'sourceId'; $displayFrame = Get-DvFrameNumber (Get-DvProp $f 'displayFrame')
+        if (-not ($id -is [string] -and $id -cmatch '^[0-9a-f]{16}\z')) { return 'unknown' }   # \z: a trailing newline is not the app's form either
+        if ($null -eq $displayFrame) { return 'unknown' }
+        [void]$ids.Add($id); [void]$displayFrames.Add($displayFrame)
+    }
+    if ($displayFrames.Count -lt 2) { return 'unknown' }
+    if ($ids.Count -gt 1) { return 'known-differ' }
+    'known-identical'
+}
+
 function New-DvVisualStrip {
     <#
     .SYNOPSIS
@@ -2370,6 +2789,8 @@ function Read-DvVisualCaptures {
     them while the app's label advanced (a display whose paint stopped part-way when the source frames are known to differ, a possible one when
     nothing records them; $null over source frames the app records as identical). r5: repeatedPlayFramesNote carries the repeat note whatever
     reason was set first (reason keeps its first-wins rule), and two or more repeats over known-differ source frames are PARTIAL_FREEZE.
+    r7 (adversary r6 pass 3 A1): each repeat is judged by its own pair's source ids; repeatedPlayFramesSourceDiffer counts those whose ids differ,
+    and only it reaches the gate's -RepeatedPlayFrames. A pair with equal ids is not a repeat; one with a missing id is counted, never decisive.
     Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
     #>
     param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
@@ -2378,17 +2799,19 @@ function Read-DvVisualCaptures {
         method = $null; forwarded = $null; probe = $null; probeReason = $null; captured = $false
         frames = @(); playFrames = 0; savedPlayFrames = 0; distinctContentHashes = 0; appDistinctDisplayFrames = 0; flatPlayFrames = 0
         sourceDifference = 'unknown'; viewportUnavailablePlayFrames = 0
+        appSourceDifference = $null; sourceDifferenceCrossCheck = $null
         stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
         playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
         labelBound = $null; stopUnboundVsPausedMeanAbsDiff = $null; stopUnboundVsStopMeanAbsDiff = $null
         pausedLabelBound = $null; labelBoundBasis = $null; pausedLabelBoundBasis = $null; pausedUnboundVsPausedMeanAbsDiff = $null
         frozenJudgedOn = 'play'; forcedPlayDistinctContentHashes = $null
-        observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesNote = $null
+        observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesSourceDiffer = $null; repeatedPlayFramesNote = $null
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
     $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
+    $crossCheckNote = $null  # set when the app's source_difference is not what the judged frames' source ids show; kept the same way
     $maskNote = $null        # set when the forced play captures moved over unforced ones that did not; kept the same way
     $observerNote = $null    # set when some unforced play captures followed a forced paint and were not judged; kept the same way
     $repeatNote = $null      # set when judged unforced captures repeat their predecessor's picture while the label advanced; kept the same way
@@ -2398,14 +2821,16 @@ function Read-DvVisualCaptures {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
-            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
         # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
         # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
-        $notes = (@($notJudgedNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $stripNote) | Where-Object { $_ }) -join '; '
+        # PLAYBACK-SOURCE-FRAME-IDENTITY-1: the source-difference cross-check note follows the not-judged note.
+        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $stripNote) | Where-Object { $_ }) -join '; '
         # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
         if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
         elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
+        elseif ($null -eq $v.reason -and $crossCheckNote -and (-not $block.reason -or $block.reason -ceq $notJudgedNote)) { $block.reason = (@($notJudgedNote, $crossCheckNote) | Where-Object { $_ }) -join '; ' }   # no gate reason: the cross-check note stands beside the not-judged note
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -2431,9 +2856,12 @@ function Read-DvVisualCaptures {
     Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
     try { $app = [IO.File]::ReadAllText((Join-Path $dir 'app-visual.json')) | ConvertFrom-Json -ErrorAction Stop } catch { $block.reason = 'the app''s visual.json is not valid JSON'; return (& $finish) }
     $block.method = [string](Get-DvProp $app 'method'); $block.appError = [string](Get-DvProp $app 'error')
-    # Whether the source frames differ: only the app's own record says so (differ | identical, exactly that case: `identical` waives the gate, so `IDENTICAL`
-    # is not the app's word); anything else, or nothing, is unknown -- never a guess.
-    $block.sourceDifference = $(switch -CaseSensitive ([string](Get-DvProp $app 'source_difference')) { 'differ' { 'known-differ' } 'identical' { 'known-identical' } default { 'unknown' } })
+    # Whether the source frames differ: only the app's own records say so -- never a guess. Its top-level source_difference (differ | identical, exactly that
+    # case: `identical` waives the gate, so `IDENTICAL` is not the app's word; anything else, or nothing, is unknown) covers EVERY play capture, a usable
+    # picture or not, so it is kept as written and only CROSS-CHECKS the decision (PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4, acting-cos Dot B1). The decision
+    # is taken below from the judged frames' own source_id (Get-DvVisualSourceDifference).
+    $block.appSourceDifference = Get-DvProp $app 'source_difference'
+    $appSourceDifference = $(switch -CaseSensitive ([string]$block.appSourceDifference) { 'differ' { 'known-differ' } 'identical' { 'known-identical' } default { 'unknown' } })
     $block.tailBeginUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_begin_utc'); $block.tailEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $app 'tail_end_utc')
     $frames = [System.Collections.Generic.List[object]]::new()
     $pixels = @{}
@@ -2448,7 +2876,8 @@ function Read-DvVisualCaptures {
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
                              captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason'
                              serial = Get-DvProp $f 'serial'; paintedSerial = Get-DvProp $f 'painted_serial'; paintedSerialValid = Get-DvProp $f 'painted_serial_valid'
-                             labelBound = Get-DvProp $f 'label_bound'; labelBoundBasis = Get-DvProp $f 'label_bound_basis'; forcedPaintsBefore = Get-DvProp $f 'forced_paints_before' }
+                             labelBound = Get-DvProp $f 'label_bound'; labelBoundBasis = Get-DvProp $f 'label_bound_basis'; forcedPaintsBefore = Get-DvProp $f 'forced_paints_before'
+                             sourceId = Get-DvProp $f 'source_id' }
         $src = Join-Path $share $file
         if ($entry.saved -and (Test-Path -LiteralPath $src -PathType Leaf)) {
             $local = Join-Path $dir $legName
@@ -2517,8 +2946,18 @@ function Read-DvVisualCaptures {
         $notJudgedNote = "$($block.viewportUnavailablePlayFrames) saved play frame(s) have no usable viewport rectangle and were not judged; the other $($play.Count) were"
         if (-not $block.reason) { $block.reason = $notJudgedNote }
     }
+    # The source difference is judged over the SAME frames as the picture ($play: the play frames with a content hash), so FROZEN_DISPLAY fires only
+    # when the judged frames themselves show differing source ids under one picture (acting-cos Dot B1 on PR #477). A disagreement with the app's
+    # all-captures scalar is recorded (sourceDifferenceCrossCheck, and a note in the reason); it never decides.
+    $block.sourceDifference = Get-DvVisualSourceDifference -Frames $play
+    $block.sourceDifferenceCrossCheck = $(if ($appSourceDifference -ceq $block.sourceDifference) { 'agree' } else { 'disagree' })
+    if ($block.sourceDifferenceCrossCheck -ceq 'disagree') {
+        $appWord = $(if ($null -eq $block.appSourceDifference) { 'no source_difference' } else { "source_difference '$($block.appSourceDifference)'" })
+        $crossCheckNote = "the app's $appWord (over every play capture) is not the $($block.sourceDifference) the $($play.Count) judged frames' source ids show; the judged frames decide"
+    }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
-    $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
+    # r5 (sol r3 key class sweep): the same display frames reach here; a value that is not a frame number (Get-DvFrameNumber) is not counted, never a throw
+    $block.appDistinctDisplayFrames = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
     if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
@@ -2527,14 +2966,28 @@ function Read-DvVisualCaptures {
     if ($judgeKind -ceq 'play_unbound' -and $block.sourceDifference -cne 'known-identical') {
         # a display whose own paint stopped part-way: a judged unforced picture equal to the one before it while the app's label advanced
         $ordered = @($play | Sort-Object index)
+        # r7 (adversary r6 pass 3 A1): each repeat is judged by ITS OWN pair's source ids (Get-DvVisualSourceDifference over the two frames), never by
+        # the set-wide result: ids [aa,bb,bb,bb,bb,bb] under pictures [X,Y,Y,Y,Y,Y] are four repeats of the source's own picture, not a stopped paint.
+        # A pair whose ids are equal is no repeat; a pair whose ids differ is a display repeat (repeatedPlayFramesSourceDiffer, the only count that can
+        # make PARTIAL_FREEZE); a pair with a missing or malformed id is UNKNOWN: it stays in repeatedPlayFrames and its note, never in the verdict.
+        $sourceDifferRepeats = 0
         $block.repeatedPlayFrames = @(for ($i = 1; $i -lt $ordered.Count; $i++) {
             $a = $ordered[$i - 1]; $b = $ordered[$i]
-            if ($b.contentHash -ceq $a.contentHash -and $null -ne $a.displayFrame -and $null -ne $b.displayFrame -and [int]$b.displayFrame -ne [int]$a.displayFrame) { $b.index }
+            $aFrame = Get-DvFrameNumber $a.displayFrame; $bFrame = Get-DvFrameNumber $b.displayFrame   # r5: no frame number, no advance (never a throw)
+            if ($b.contentHash -ceq $a.contentHash -and $null -ne $aFrame -and $null -ne $bFrame -and $bFrame -ne $aFrame) {
+                $pairSource = Get-DvVisualSourceDifference -Frames @($a, $b)
+                if ($pairSource -cne 'known-identical') {
+                    if ($pairSource -ceq 'known-differ') { $sourceDifferRepeats++ }
+                    $b.index
+                }
+            }
         }).Count
+        $block.repeatedPlayFramesSourceDiffer = $sourceDifferRepeats
         if ($block.repeatedPlayFrames -gt 0 -and $block.distinctContentHashes -gt 1) {
-            # the cause is named only over source frames known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
+            # the cause is named only when every repeat's own pair is known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
             $repeatNote = "$($block.repeatedPlayFrames) of the $($play.Count) unforced play captures repeat the picture before them while the app's label advanced: " + $(
-                if ($block.sourceDifference -ceq 'known-differ') { "the display's own paint stopped landing for part of the tail" }
+                if ($block.sourceDifference -ceq 'known-differ' -and $sourceDifferRepeats -eq $block.repeatedPlayFrames) { "the display's own paint stopped landing for part of the tail" }
+                elseif ($sourceDifferRepeats -gt 0) { "$sourceDifferRepeats of them over pairs whose own source ids differ, but a judged frame has no usable source id, so this is a possible partial freeze or repeated source pictures, not a proven cause" }
                 else { "nothing records whether the source frames differ, so this is a possible partial freeze or repeated source pictures, not a proven cause" })
             $block.repeatedPlayFramesNote = $repeatNote   # its own field: an earlier note in reason never hides it (r5, Grok G4)
             if (-not $block.reason) { $block.reason = $repeatNote }
@@ -2565,7 +3018,7 @@ function Read-DvVisualCaptures {
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
             -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
-            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFramesSourceDiffer)
         $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
@@ -2604,7 +3057,9 @@ function Test-DvReceiptValid {
     A receipt written in offline test mode is never evidence (OFFLINE_TEST_RECEIPT) unless -AllowOfflineTestMode, which only the
     writer's own offline test path and the test harness pass; that mode still re-derives the evidence but has no committed consent to read.
     #>
-    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode)
+    # -OfflineLegSpecBytes (r8): offline test mode only -- the leg spec bytes the runner ran, so a paired-seek block is checked against a spec contract there
+    # too (bound to subject.legSpecSha256); production ignores it and reads the committed spec.
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
     $incomplete = [System.Collections.Generic.List[string]]::new()
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
@@ -2730,6 +3185,68 @@ function Test-DvReceiptValid {
     $ev = Read-DvEvidenceSet -Receipt $Receipt -EvidenceDir $EvidenceDir
     foreach ($m in $ev.incomplete) { $incomplete.Add($m) }
     foreach ($m in $ev.invalid) { $invalid.Add($m) }
+    # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r6 (adversary r5 A2, Dot 5c6bcd98, sol r5 key B1): the look.pairedSeek block is RE-DERIVED from its files.
+    # Every file it lists must still be in <evidence>\paired-seek\contact-sheet\raw with its listed bytes, and a look.pairedSeekFrames verdict must be what
+    # Get-DvPairedSeekVerdict -- the runner's own reader -- derives from them now, so a paired still deleted or replaced after collection cannot leave a
+    # PASS/FAIL. (Production: the requested frames are the committed spec's, and a committed paired leg whose receipt has no block is incomplete.)
+    $pairedSeek = Get-DvProp (Get-DvProp $Receipt 'look') 'pairedSeek'
+    # r8 (adversary r7 A1 / A2, Dot on #721 16:25:15Z): the paired-still CONTRACT -- how many stills, and which frames when listed -- is read from the
+    # committed leg spec only, never from the receipt (r7 took receipt requestedFrames when the spec listed none, so a receipt naming one frame narrowed
+    # validation to frame-00). Production: the spec committed at admission.headCommit. Offline test mode: the spec bytes the runner ran
+    # (-OfflineLegSpecBytes), bound to subject.legSpecSha256. No contract and a paired block = a typed mismatch, never a fallback to the receipt.
+    $contractSpec = $(if ($production) { $spec } else { $null })
+    $offlineSpecRefused = $null
+    if (-not $production -and $AllowOfflineTestMode -and $null -ne $OfflineLegSpecBytes) {
+        if ((Get-DvLegSpecSha256 $OfflineLegSpecBytes) -cne [string](Get-DvProp $subject 'legSpecSha256')) { $offlineSpecRefused = 'the leg spec the runner ran does not hash to subject.legSpecSha256' }
+        else { try { $contractSpec = [Text.Encoding]::UTF8.GetString($OfflineLegSpecBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json -ErrorAction Stop } catch { $offlineSpecRefused = 'the leg spec the runner ran does not parse' } }
+    }
+    $specLook = Get-DvProp $contractSpec 'look'
+    $specFrames = Get-DvProp $specLook 'pairedSeekFrames'
+    # r9 fix 1 (adversary r9 a0936637 A1): the spec asks for paired stills exactly when the RUNNER asks the generator for them (Invoke-VenueLeg: a look leg,
+    # look.pairedSeek Boolean true). This used `-eq $true`, which a speed leg carrying look.pairedSeek true and a look leg whose pairedSeek is the string
+    # "true" both satisfy; the runner asks neither, so an otherwise good run ended INVALID (RECEIPT_FIELD_ABSENT). A paired block on a receipt whose spec
+    # asks for none is no runner's record either.
+    $specLegType = Get-DvProp $contractSpec 'legType'
+    $specPairedSeek = Get-DvProp $specLook 'pairedSeek'
+    $specAsksPaired = ($specLegType -is [string] -and $specLegType -ceq 'look' -and $specPairedSeek -is [bool] -and $specPairedSeek)
+    if ($null -eq $pairedSeek) {
+        if ($specAsksPaired) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the committed leg spec asks for look.pairedSeek but the receipt carries no look.pairedSeek block') }
+    } elseif ($null -eq $specLook) {
+        $invalid.Add("PAIRED_SEEK_NOT_FROM_EVIDENCE: the receipt carries a look.pairedSeek block but no committed leg spec look names the paired stills it must hold$(if ($offlineSpecRefused) { " ($offlineSpecRefused)" })")
+    } elseif (-not $specAsksPaired) {
+        $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: the receipt carries a look.pairedSeek block but the committed leg spec asks for no paired stills (a look leg with look.pairedSeek true)')
+    } elseif (-not [string]::IsNullOrWhiteSpace($ev.dir) -and (Test-Path -LiteralPath $ev.dir -PathType Container)) {
+        $seekDir = Join-Path $ev.dir 'paired-seek\contact-sheet\raw'
+        $listedSeek = Get-DvProp $pairedSeek 'files'   # (assigned, then @()-wrapped: see Read-DvContactFrames)
+        $seekEntries = @(@($listedSeek) | Where-Object { $null -ne $_ })
+        if ((ConvertTo-DvInt64 (Get-DvProp $pairedSeek 'count')) -ne $seekEntries.Count) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.count is not the number of files it lists') }
+        foreach ($entry in $seekEntries) {
+            $name = [string](Get-DvProp $entry 'name'); $sha = [string](Get-DvProp $entry 'sha256')
+            if ($name -cnotmatch '^[^\\/:*?"<>|]+$' -or $name -cin @('.', '..') -or $sha -cnotmatch '^[0-9a-f]{64}$') { $invalid.Add('PAIRED_SEEK_UNLISTED: a look.pairedSeek entry is not a plain file name with a 64-hex sha256'); continue }
+            $file = Join-Path $seekDir $name
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $invalid.Add("PAIRED_SEEK_FILE_ABSENT: look.pairedSeek lists '$name' but paired-seek\contact-sheet\raw does not hold it"); continue }
+            if ((Get-DvSha256OfBytes ([IO.File]::ReadAllBytes($file))) -cne $sha) { $invalid.Add("PAIRED_SEEK_HASH_MISMATCH: '$name' does not hash to the sha256 look.pairedSeek lists") }
+        }
+        $requestedSeek = Get-DvProp $pairedSeek 'requestedFrames'
+        if ($null -ne $specFrames -and -not (Test-DvJsonEquivalent $requestedSeek $specFrames)) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.requestedFrames is not the committed leg spec''s look.pairedSeekFrames') }
+        elseif ($null -eq $specFrames -and $null -ne $requestedSeek) { $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.requestedFrames is present but the committed leg spec names no look.pairedSeekFrames (a receipt cannot narrow or add to the committed stills)') }
+        # r7 (adversary r6 A1, Dot 6558329764): the verdict is re-derived for EVERY paired block. r8 (adversary r7 A1 / A2): over the committed spec's
+        # stills only -- look.contactSheetFrames of them, at look.pairedSeekFrames when listed -- so every expected still and every listed file is checked.
+        # (fix iteration 1, adversary r8 A2: the in-pass partners are the hash-verified contact-sheet\raw frames, read the way every reader reads them)
+        $inPass = Read-DvContactFrames -Receipt $Receipt -EvidenceDir $ev.dir
+        $verdictArgs = @{ SeekDir = $seekDir; Files = $seekEntries; StillCount = (Get-DvProp $specLook 'contactSheetFrames'); InPassFiles = @($inPass.files) }
+        $framesUsable = $true
+        if ($null -ne $specFrames) {
+            try { $verdictArgs['RequestedFrames'] = [long[]]@($specFrames) } catch { $framesUsable = $false; $invalid.Add('PAIRED_SEEK_NOT_FROM_EVIDENCE: the committed look.pairedSeekFrames is not a list of frame numbers') }
+        }
+        if ($framesUsable) {
+            $seekVerdict = Get-DvPairedSeekVerdict @verdictArgs
+            foreach ($f in 'reportedFrames', 'framesHonoured', 'frameMismatches') {
+                if (-not (Test-DvJsonEquivalent (Get-DvProp $pairedSeek $f) $seekVerdict.$f)) { $invalid.Add("PAIRED_SEEK_NOT_FROM_EVIDENCE: look.pairedSeek.$f is not what the paired stills re-derive") }
+            }
+            if (-not $seekVerdict.framesHonoured) { $invalid.Add("PAIRED_SEEK_FRAMES_NOT_HONOURED: $($seekVerdict.frameMismatches -join '; ')") }
+        }
+    }
     if ($ev.complete) {
         $derived = Get-DvPlaybackEvidence -Summary $ev.summary -EvidenceManifest $ev.manifest -ResultJson $ev.result -LogText $ev.logText -LogSha256 $ev.logSha -ExpectedClipId $clipId
         $stored = Get-DvProp $Receipt 'playback'
@@ -3398,12 +3915,21 @@ function Write-DvReceipt {
     the file with CreateNew -- an existing receipt is NEVER overwritten (append-only; a repeat receiptId throws).
     Returns the path written.
     #>
-    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode)
+    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode, [byte[]]$LegSpecBytes = $null)
     if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
     if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
         # The writer never records a signal without its proof, whatever the caller believed: the SAME evidence-bearing validator a
         # reader calls re-derives the admission from the committed blobs and the run from the hashed evidence files.
-        $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B4): the validator RE-READS the hashed evidence. A throw there (a file held with FileShare.None
+        # after collection, one that vanished or turned unreadable) is an evidence-validation failure, never a receipt-destination write failure: it is
+        # re-thrown tagged DVE_EVIDENCE_VALIDATION_IO|<path>|<reason> (the path the .NET message quotes), and the runner writes the leg as a typed UNRESOLVED.
+        # (r8: -LegSpecBytes, the spec the runner ran, is the paired-still contract in offline test mode only; production reads the committed spec)
+        try { $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode -OfflineLegSpecBytes $(if ($OfflineTestMode) { $LegSpecBytes } else { $null }) }
+        catch {
+            $reason = ([string]$_.Exception.Message) -replace '\s+', ' '
+            $where = $(if ($reason -match "'((?:[A-Za-z]:\\|\\\\)[^']+)'") { $Matches[1] } else { '(validator)' })
+            throw [System.Management.Automation.RuntimeException]::new("DVE_EVIDENCE_VALIDATION_IO|$where|$reason")
+        }
         # A production receipt that re-derives is ADVISORY (valid=false, VENUE_ANCHOR_ABSENT): it is written as the local diagnostic record, stamped as such,
         # and no reader treats it as a PASS. Anything that does not re-derive (INVALID / INCOMPLETE) is refused outright.
         if (-not ($validity.valid -or $validity.status -ceq 'ADVISORY')) { throw "DVE_RECEIPT_INVALID a $($Receipt['outcome']) receipt that does not re-derive from committed consent and hashed run evidence is refused ($($validity.status)): $($validity.reasons -join '; ')" }
@@ -3422,8 +3948,8 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,

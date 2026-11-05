@@ -30,11 +30,19 @@
  * playback prep would have box-reduced the full frame to. A reduced slot whose
  * request was not admitted keeps the ReducedScale refusal: its rawImage16 is not
  * a recon, so today's getMlvRawFrameDebayered renders it at full size.
+ *
+ * CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: with Phase 3 Disabled (quality modes 0-2) no
+ * recon worker runs, so an admitted request reached the render unreconned and
+ * rendered the full frame. debayered16InlineReducedReconWanted admits such a frame
+ * and debayered16RunInlineReducedRecon reconstructs it on the render thread with
+ * the #271/#405 pieces; renderDebayered16FromSlot then consumes it unchanged.
  */
 
 #ifndef DEBAYERED16RECONREUSEPOLICY_H
 #define DEBAYERED16RECONREUSEPOLICY_H
 
+#include "../../src/debug/StageTiming.h"
+#include "../../src/mlv/pipeline_stage_capture.h"
 #include "../../src/mlv_include.h"
 
 #include <algorithm>
@@ -280,6 +288,10 @@ struct Debayered16ReconReuseInputs
     bool reconHqDualIso = false;
     /*! rawImage16 holds at least Width * Height words. */
     bool reconBufferComplete = false;
+    /*! CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the calling thread decoded and
+     *  reconstructed this frame itself (the inline reduced recon), so its last
+     *  decode and llrawproc records describe this frame and survive the debayer. */
+    bool reconOnCallingThread = false;
 };
 
 /*! What the recon worker records when a recon finishes, on the recon thread. */
@@ -458,11 +470,17 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
         if( afterAdmissionForTesting ) afterAdmissionForTesting( video, afterAdmissionContext );
         int reducedWidth = 0;
         int reducedHeight = 0;
-        if( getMlvRawFrameDebayeredFromReducedReconnedRaw16( video, frameNumber, reuse.reducedReconBayer,
+        /* r3 (ADV-A1): the reduced debayer clears the thread's decode and llrawproc
+         * records, which after an inline recon are this frame's own. */
+        if( reuse.reconOnCallingThread ) mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread();
+        const int reducedDebayered =
+            getMlvRawFrameDebayeredFromReducedReconnedRaw16( video, frameNumber, reuse.reducedReconBayer,
                                                              reuse.reducedReconWidth, reuse.reducedReconHeight,
                                                              reuse.reducedReconScale, slotRawImage16,
                                                              reuse.reconHqDualIso ? 1 : 0,
-                                                             &reducedWidth, &reducedHeight ) )
+                                                             &reducedWidth, &reducedHeight );
+        if( reuse.reconOnCallingThread ) mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread();
+        if( reducedDebayered )
         {
             dims.width = reducedWidth;
             dims.height = reducedHeight;
@@ -505,6 +523,142 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
     if( counters ) counters->note( outcome );
     if( renderedDims ) *renderedDims = dims;
     return outcome;
+}
+
+/*! What the render knows when it decides to reconstruct a frame itself. */
+struct Debayered16InlineReducedReconInputs
+{
+    /*! The slot reached the render through the recon worker (consumeReconnedRaw). */
+    bool slotReconned = false;
+    /*! No recon worker runs in this quality mode. A Phase 3 frame that missed the
+     *  worker keeps today's full render. */
+    bool phase3Disabled = false;
+    /*! PresentationContext::cpuDebayered16HonourScaleAdmitted. */
+    bool honourScaleAdmitted = false;
+    bool playbackActive = false;
+    /*! PresentationContext::playbackScaleFactor. */
+    int scale = 1;
+    /*! mlvRawDebayerCacheMayServeFrame != 0, read before any decode. */
+    bool frameCacheMayServe = true;
+};
+
+/*! \return true when the render should reconstruct this frame at the reduced scale. */
+inline bool debayered16InlineReducedReconWanted( const Debayered16InlineReducedReconInputs & in )
+{
+    if( Debayered16ReconReusePolicy::killSwitchSet() ) return false;
+    if( in.slotReconned ) return false;
+    if( !in.phase3Disabled ) return false;
+    if( !in.honourScaleAdmitted ) return false;
+    if( !in.playbackActive ) return false;
+    if( in.scale != 2 && in.scale != 4 ) return false;
+    return !in.frameCacheMayServe;
+}
+
+/*! One inline reduced recon. Reconstructed false leaves the frame to today's
+ *  getMlvRawFrameDebayered, which decodes for itself; fallbackReason says why. */
+struct Debayered16InlineReducedRecon
+{
+    bool reconstructed = false;
+    int scale = 1;
+    int reducedWidth = 0;
+    int reducedHeight = 0;
+    Debayered16ReconProvenance provenance;
+    /*! The decode ran, so its thread-local telemetry describes this frame. */
+    bool decoded = false;
+    double decodeMs = 0.0;
+    double fullResFixesMs = 0.0;
+    double downsampleMs = 0.0;
+    /*! llrpGetLastTotalMilliseconds of the recon: the reduced debayer clears it. */
+    double llrawprocMs = 0.0;
+    /*! The full-resolution fix pass's llrpGetLastPreDualIsoFix*, cleared the same way. */
+    bool preDualIsoFixCompleted = false;
+    double preDualIsoFixMs = 0.0;
+    const char * fallbackReason = "";
+};
+
+/*! The recon worker's reduced recon on the calling thread. rawBuffer (rawWords
+ *  words) receives the decode. The plan reads no pixels, so a frame it refuses
+ *  costs no decode. A null worker state is the calling thread's own pool slot,
+ *  which reseeds from the shared object on every call, like the recon worker's. */
+inline Debayered16InlineReducedRecon debayered16RunInlineReducedRecon( mlvObject_t * video,
+                                                                       uint32_t frameNumber,
+                                                                       int scale,
+                                                                       int threads,
+                                                                       uint16_t * rawBuffer,
+                                                                       size_t rawWords,
+                                                                       std::vector<uint16_t> & reducedBayer )
+{
+    Debayered16InlineReducedRecon recon;
+    recon.provenance.settingsAtDecode = video ? getMlvLlrawprocSettingsFingerprint( video ) : 0;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    if( !mlvDualIsoPreviewScaleReconPlan( video, scale, &plan ) )
+    {
+        recon.fallbackReason = plan.reason;
+        return recon;
+    }
+    if( plan.scale != scale )
+    {
+        recon.fallbackReason = "reduced recon plan is not at the requested scale";
+        return recon;
+    }
+    if( !rawBuffer
+     || rawWords < static_cast<size_t>( plan.fullWidth ) * static_cast<size_t>( plan.fullHeight ) )
+    {
+        recon.fallbackReason = "raw buffer is smaller than the frame";
+        return recon;
+    }
+    try
+    {
+        reducedBayer.resize( static_cast<size_t>( plan.reducedWidth )
+                             * static_cast<size_t>( plan.reducedHeight ) );
+    }
+    catch( const std::bad_alloc & )
+    {
+        recon.fallbackReason = "reduced recon buffer allocation failed";
+        return recon;
+    }
+    const double decodeStart = mlv_stage_timing_now();
+    recon.provenance.acquisitionSucceeded =
+        getMlvRawFrameUint16( video, frameNumber, rawBuffer ) == 0;
+    recon.decoded = true;
+    recon.decodeMs = ( mlv_stage_timing_now() - decodeStart ) * 1000.0;
+    if( !recon.provenance.acquisitionSucceeded )
+    {
+        recon.fallbackReason = "the render's decode of this frame failed";
+        return recon;
+    }
+    mlv_pipeline_capture_set_current_frame( frameNumber );
+    if( mlvDualIsoPreviewScaleReconRun( video, &plan, rawBuffer, reducedBayer.data(), nullptr, threads,
+                                        &recon.fullResFixesMs, &recon.downsampleMs ) != 1 )
+    {
+        recon.fallbackReason = "reduced recon rejected by the scaled llrawproc subset";
+        return recon;
+    }
+    recon.llrawprocMs = llrpGetLastTotalMilliseconds();
+    recon.preDualIsoFixCompleted = llrpGetLastPreDualIsoFixCompleted() != 0;
+    recon.preDualIsoFixMs = llrpGetLastPreDualIsoFixMilliseconds();
+    recon.provenance.done = debayered16ReconDoneStamp( video );
+    recon.scale = plan.scale;
+    recon.reducedWidth = plan.reducedWidth;
+    recon.reducedHeight = plan.reducedHeight;
+    recon.reconstructed = true;
+    return recon;
+}
+
+/*! The policy inputs of a frame the render reconstructed itself: its own recon,
+ *  so frame and serial are the render's. */
+inline void applyDebayered16InlineReducedRecon( const Debayered16InlineReducedRecon & recon,
+                                                uint32_t frameNumber,
+                                                uint64_t requestSerial,
+                                                Debayered16ReconReuseInputs & in )
+{
+    in.consumeReconnedRaw = recon.reconstructed;
+    in.reconOnCallingThread = recon.reconstructed;
+    applyDebayered16ReconProvenance( recon.provenance, in );
+    in.reconFrameNumber = frameNumber;
+    in.renderFrameNumber = frameNumber;
+    in.reconRequestSerial = requestSerial;
+    in.renderRequestSerial = requestSerial;
 }
 
 #endif // DEBAYERED16RECONREUSEPOLICY_H
