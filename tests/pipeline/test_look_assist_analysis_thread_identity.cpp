@@ -283,12 +283,19 @@ TEST(LookAssistAnalysisThreadIdentity, TheWorkerTakesTheCallersOpenMpSettings)
     AnalysisPump pump;
 
     // The hazard is real: a job posted straight to the worker, past AnalysisPump::call, does not see the caller's setting.
-    omp_set_num_threads( 7 );
-    std::atomic<int> bareThreads{ 0 };
-    thread.post( [&bareThreads]() { bareThreads = omp_get_max_threads(); } );
-    while( bareThreads.load() == 0 ) std::this_thread::yield();
-    std::printf( "[identity] caller asks for 7 threads, a bare worker thread reads %d\n", bareThreads.load() );
-    ASSERT_TRUE( bareThreads.load() != 7 );
+    const auto bareWorkerThreads = [&thread]()
+    {
+        std::atomic<int> seen{ 0 };
+        thread.post( [&seen]() { seen = omp_get_max_threads(); } );
+        while( seen.load() == 0 ) std::this_thread::yield();
+        return seen.load();
+    };
+    const int workerStartsAt = bareWorkerThreads();
+    const int callerAsksFor = workerStartsAt + 1;
+    omp_set_num_threads( callerAsksFor );
+    const int bareAfterCallerSet = bareWorkerThreads();
+    std::printf( "[identity] caller asks for %d threads, a bare worker thread still reads %d\n", callerAsksFor, bareAfterCallerSet );
+    ASSERT_EQ( workerStartsAt, bareAfterCallerSet );
 
     pump.beginSession( &thread );
     for( const int threads : { 3, 1, 2 } )

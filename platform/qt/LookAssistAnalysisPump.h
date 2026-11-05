@@ -134,11 +134,14 @@ private:
     std::thread m_thread;
 };
 
-// The event types that are the user's hand on the app.
+// The event types that are the user's hand on the app. Focus counts: a spin box commits typed text to the clip when focus
+// leaves it, and the window losing activation is not input to ExcludeUserInputEvents.
 inline bool isUserInputEvent( QEvent::Type type )
 {
     switch( type )
     {
+    case QEvent::FocusIn:
+    case QEvent::FocusOut:
     case QEvent::MouseButtonPress:
     case QEvent::MouseButtonRelease:
     case QEvent::MouseButtonDblClick:
@@ -163,6 +166,14 @@ inline bool isUserInputEvent( QEvent::Type type )
     default:
         return false;
     }
+}
+
+// What a session holds. A press from just before the analysis has armed its widget's auto-repeat timer, and that timer
+// would keep stepping a spin box or slider, so the clip's live settings, while the release waits behind the pump. So a
+// widget's timer waits too. QTimer and single-shot timers are not widgets: MainWindow's guarded sites answer those.
+inline bool heldDuringSession( QEvent::Type type, bool targetIsWidget )
+{
+    return isUserInputEvent( type ) || ( type == QEvent::Timer && targetIsWidget );
 }
 
 // The GUI thread's side of one analysis. With no session open every call runs inline on the caller, which is the route
@@ -294,7 +305,9 @@ private:
     protected:
         bool eventFilter( QObject *watched, QEvent *event ) override
         {
-            if( !isUserInputEvent( event->type() ) || ( mayTakeInput && mayTakeInput() ) ) return false;
+            if( !heldDuringSession( event->type(), watched->isWidgetType() ) || ( mayTakeInput && mayTakeInput() ) ) return false;
+            // A running timer fires again by itself after landing; only one shot of it is skipped.
+            if( event->type() == QEvent::Timer ) return true;
             const QPointer<QObject> target( watched );
             QEvent *const held = event->clone();
             m_pump->hold( [target, held]()

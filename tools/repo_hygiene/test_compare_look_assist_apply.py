@@ -137,7 +137,33 @@ class CompareLookAssistApply(unittest.TestCase):
     def test_play_before_the_analysis_landed_fails(self):
         report = compare.run(arm(), arm(play_first=True))
         self.assertEqual(report["verdict"], "differs")
-        self.assertTrue(any("comes before look_assist.toggle.end" in f for f in report["failures"]), report)
+        self.assertTrue(any("comes before the analysis landed" in f for f in report["failures"]), report)
+
+    def test_adversary_a3_the_clip_load_route_has_no_toggle_end(self):
+        log = arm().replace("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply")
+        log = log.replace("look_assist.toggle.end", "look_assist.setSliders.end")
+        self.assertEqual(compare.run(log, log)["verdict"], "identical")
+        self.assertEqual(compare.measures(compare.parse_log(log))["result_gap_ms"], 6000.0)
+
+    def test_adversary_a4_empty_values_and_an_earlier_empty_result_fail_closed(self):
+        empty_state = (
+            "look_assist_enabled=1 look_assist_diagnostics_valid=1 look_assist_scene= exposure= contrast= pivot= shadows= "
+            "highlights= vibrance= temperature= tint= raw_black= raw_white= chroma_smooth= look_assist_flavor="
+        )
+        log = arm(visual_line=empty_state)
+        report = compare.run(log, log)
+        self.assertEqual(report["verdict"], "differs")
+        self.assertTrue(any("has no temperature" in f for f in report["failures"]), report)
+        early = line("00.000", "0x1", "look_assist.apply.result", "") + "\n" + arm()
+        self.assertEqual(compare.run(early, early)["verdict"], "differs")
+
+    def test_adversary_a5_an_unreadable_measure_does_not_stop_the_report(self):
+        log = arm().replace("wait_ms=3333", "wait_ms=1.5")
+        report = compare.run(log, log)
+        self.assertEqual(report["verdict"], "identical")
+        self.assertIsNone(report["control"]["wait_ms"])
+        bad_stamp = arm().replace("2026-11-05T10:39:08", "not-a-stamp")
+        self.assertIsNone(compare.measures(compare.parse_log(bad_stamp)).get("toggle_gap_ms"))
 
     def test_measures_read_wait_and_the_control_block(self):
         got = compare.measures(compare.parse_log(arm()))

@@ -251,6 +251,44 @@ TEST(LookAssistAnalysisPump, AnUnrestrictedLoopInATurnCannotDeliverInputUntilLan
     ASSERT_EQ( 3, target.inputEvents );
 }
 
+// Adversary A1 on 9a8868b2: a press just before the analysis armed a spin box's auto-repeat timer, the release waited behind
+// the pump, and the timer kept stepping the clip's settings under the worker. A widget's timer waits; a focus change, which
+// commits typed text, waits. QTimer and single-shot timers are not widgets, or the pump itself could not turn.
+TEST(LookAssistAnalysisPump, AWidgetTimerAndAFocusChangeWaitAndOtherTimersRun)
+{
+    using look_assist_pump::heldDuringSession;
+    ASSERT_TRUE( heldDuringSession( QEvent::Timer, true ) );
+    ASSERT_TRUE( !heldDuringSession( QEvent::Timer, false ) );
+    ASSERT_TRUE( heldDuringSession( QEvent::FocusOut, true ) );
+    ASSERT_TRUE( heldDuringSession( QEvent::FocusIn, true ) );
+    ASSERT_TRUE( heldDuringSession( QEvent::MouseButtonRelease, true ) );
+    ASSERT_TRUE( heldDuringSession( QEvent::KeyPress, false ) );
+    ASSERT_TRUE( !heldDuringSession( QEvent::Paint, true ) );
+    ASSERT_TRUE( !heldDuringSession( QEvent::MetaCall, true ) );
+    ASSERT_TRUE( !heldDuringSession( QEvent::Close, true ) );   // MainWindow::closeEvent holds it
+
+    // The filter asks about the real target. Console tests have no QWidget, so this is pinned.
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/LookAssistAnalysisPump.h" ) );
+    QFile file( path );
+    ASSERT_TRUE( !path.isEmpty() && file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+    QTextStream in( &file );
+    ASSERT_TRUE( in.readAll().contains( QStringLiteral( "heldDuringSession( event->type(), watched->isWidgetType() )" ) ) );
+
+    // A plain object's timer still runs during a session.
+    AnalysisWorker worker;
+    AnalysisPump pump;
+    pump.beginSession( &worker );
+    int fired = 0;
+    QTimer timer;
+    QObject::connect( &timer, &QTimer::timeout, [&fired]() { ++fired; } );
+    timer.start( 5 );
+    pump.call( []() { sleepMs( 100 ); } );
+    timer.stop();
+    pump.endSession();
+    ASSERT_TRUE( fired > 0 );
+}
+
+// Adversary A2 on ff4e96ed: the request survives the analysis. The filter does not touch it: MainWindow::event holds it.
 TEST(LookAssistAnalysisPump, ADialogThatIsUpKeepsItsInputAndOtherEventsPass)
 {
     EventCounter target;

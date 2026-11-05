@@ -117,9 +117,9 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
     result = _last_result(rows)
     if result is None:
         failures.append("%s: no look_assist.apply.result line" % arm)
-    else:
+    for fields in (fields for _n, _s, event, fields in rows if event == "look_assist.apply.result"):
         for key in REQUIRED_RESULT_FIELDS:
-            if not result.get(key):
+            if not fields.get(key):
                 failures.append("%s: look_assist.apply.result has no %s" % (arm, key))
     states = [fields for _n, _s, event, fields in rows if event == VISUAL_STATE_EVENT]
     if not states:
@@ -130,7 +130,7 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
         if fields.get("look_assist_diagnostics_valid") != "1":
             failures.append("%s: look_assist_diagnostics_valid=%s, the analysis did not land" % (arm, fields.get("look_assist_diagnostics_valid")))
         for key in LOOK_STATE_FIELDS:
-            if fields.get(key) is None:
+            if not fields.get(key):
                 failures.append("%s: %s has no %s" % (arm, VISUAL_STATE_EVENT, key))
     if result is not None and require_walk and result.get("post_walk_ran") != "1":
         failures.append("%s: post_walk_ran=%s, this arm cannot catch a skipped refinement" % (arm, result.get("post_walk_ran")))
@@ -140,14 +140,18 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
 
 
 def play_after_landing_failure(rows, arm):
-    """The first Play in a log must come after the analysis landed, or a played frame showed the baseline look."""
-    landed = None
+    """The first Play in a log must come after the analysis landed, or a played frame showed the baseline look.
+
+    The toggle route ends with look_assist.toggle.end. The clip-load route has no such line, and its result line is the
+    last thing the analysis writes.
+    """
+    landed = False
     for number, _stamp, event, fields in rows:
-        if event == "look_assist.toggle.end" and fields.get("checked") == "1" and landed is None:
-            landed = number
+        if event == "look_assist.apply.result" or (event == "look_assist.toggle.end" and fields.get("checked") == "1"):
+            landed = True
         if event == "play.toggled.begin" and fields.get("checked") == "1":
-            if landed is None:
-                return "%s: first play.toggled at line %d comes before look_assist.toggle.end" % (arm, number)
+            if not landed:
+                return "%s: first play.toggled at line %d comes before the analysis landed" % (arm, number)
             return None
     return None
 
@@ -156,19 +160,35 @@ def _stamp_ms(stamp):
     return datetime.strptime(stamp.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S.%f%z").timestamp() * 1000.0
 
 
+def _int_or_none(text):
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gap_ms(start, end):
+    try:
+        return round(_stamp_ms(end) - _stamp_ms(start), 1)
+    except ValueError:
+        return None
+
+
 def measures(rows):
-    """The numbers a table needs: wait_ms, the apply.timing fields, and the control block gap."""
+    """The numbers a table needs: wait_ms, the apply.timing fields, and the control block gap (None when unreadable)."""
     out = {}
     apply_stamp = None
     for _number, stamp, event, fields in rows:
         if event == "gui_smoke.look_assist_settle" and "wait_ms" not in out:
-            out["wait_ms"] = int(fields.get("wait_ms", "-1"))
+            out["wait_ms"] = _int_or_none(fields.get("wait_ms"))
         elif event == "look_assist.apply.timing" and "timing" not in out:
             out["timing"] = dict(fields)
-        elif event == "look_assist.toggle.frame_ready_apply" and apply_stamp is None:
+        elif event in ("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply") and apply_stamp is None:
             apply_stamp = stamp
+        elif event == "look_assist.apply.result" and apply_stamp is not None and "result_gap_ms" not in out:
+            out["result_gap_ms"] = _gap_ms(apply_stamp, stamp)
         elif event == "look_assist.toggle.end" and apply_stamp is not None and "toggle_gap_ms" not in out:
-            out["toggle_gap_ms"] = round(_stamp_ms(stamp) - _stamp_ms(apply_stamp), 1)
+            out["toggle_gap_ms"] = _gap_ms(apply_stamp, stamp)
     return out
 
 
