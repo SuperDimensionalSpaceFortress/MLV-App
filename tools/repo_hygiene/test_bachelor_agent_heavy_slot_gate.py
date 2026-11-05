@@ -2815,35 +2815,57 @@ class BoundedCaptureIoTests(unittest.TestCase):
         start = fifo[fifo.index("function Start-CaptureWorker"):fifo.index("function Get-CaptureTaskResult", fifo.index("function Start-CaptureWorker"))]
         self.assertIn("$worker.GroupStart = [string]$fields[19]", start, "the start time (stat field 22) is recorded with the group")
 
+    # The fixture's own sleeper, exactly as the escaper script execs it. r16 (Dot's hardening note, re-pass A2): the cleanup kills an exact pid
+    # only while /proc/<pid>/cmdline IS this full command line, not merely contains "sleep" (any unrelated process whose argv mentions sleep).
+    _ESCAPER_CMDLINE = b"/bin/sleep\x00600\x00"
+
     def test_r15_b2_a_session_escaping_factory_child_is_outside_the_teardown_contract_and_is_killed_by_its_pid(self) -> None:
         # The stated limit, executed: a factory launches a readiness-confirmed child in its OWN session (setsid). The read succeeds and the child
         # survives teardown, which the narrowed contract names as out of scope. This test never relies on teardown for it: it ends the child itself
         # by exact pid in a finally (never a group or a name kill). If teardown ever reaches it this assertion fails: update the contract wording.
+        self._run_session_escape_case(spaced=False)
+
+    def test_r16_a4_a_session_escaping_factory_child_under_a_tmpdir_with_a_space(self) -> None:
+        # r16 (re-pass A4): the fixture builds its script and pid-file paths under TMPDIR, and Start-Process joins its ArgumentList with spaces
+        # and quotes nothing, so a space in either path split the argument. The driver now quotes the final argv with the fifo script's own
+        # ConvertTo-CommandLineArg. Same assertions, a TMPDIR and fixture paths that contain a space.
+        self._run_session_escape_case(spaced=True)
+
+    def _run_session_escape_case(self, *, spaced: bool) -> None:
         self._skip_unless_setsid_branch()
         if not os.path.isdir("/proc"):
             self.skipTest("SKIPPED: no /proc, so the escaped sleeper's identity cannot be confirmed before it is killed by pid")
         setsid = next(p for p in ("/usr/bin/setsid", "/bin/setsid") if os.path.exists(p))
         work = tempfile.mkdtemp(prefix="heavy-slot-gate-r15-b2-")
-        pid_file = os.path.join(work, "escaper.pid")
+        base = os.path.join(work, "tmp dir with space") if spaced else work
+        pid_file = os.path.join(base, "escaper.pid")
         escaped_pid: int | None = None
         try:
-            tmp = os.path.join(work, "tmp")
+            tmp = os.path.join(base, "tmp")
             os.makedirs(tmp)
-            script_file = os.path.join(work, "escaper.sh")
+            if spaced:
+                self.assertIn(" ", tmp)
+            script_file = os.path.join(base, "escaper.sh")
             Path(script_file).write_text('#!/bin/sh\necho $$ > "$1.tmp" && mv "$1.tmp" "$1"\nexec /bin/sleep 600\n', encoding="ascii")
             quoted_pid_file = pid_file.replace("'", "''")
-            factory = ("{ param($p) $null = Start-Process -FilePath '" + setsid + "' -NoNewWindow -PassThru "
-                       "-ArgumentList @('/bin/sh', '" + script_file.replace("'", "''") + "', '" + quoted_pid_file + "'); "
-                       "$sw = [Diagnostics.Stopwatch]::StartNew(); "
-                       "while (-not [IO.File]::Exists('" + quoted_pid_file + "') -and $sw.ElapsedMilliseconds -lt 20000) { [Threading.Thread]::Sleep(20) }; "
-                       "if (-not [IO.File]::Exists('" + quoted_pid_file + "')) { throw 'the session-escaping sleeper never became ready' }; "
-                       "[Threading.Tasks.Task]::FromResult('escaped sleeper ready') }")
+            # The factory text runs in the worker process, where the driver's functions do not exist, so the driver quotes the argv (with the
+            # real ConvertTo-CommandLineArg) and splices the quoted literals into the factory text before the factory is handed over.
+            template = ("param($p) $null = Start-Process -FilePath '" + setsid + "' -NoNewWindow -PassThru -ArgumentList @ARGV@; "
+                        "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+                        "while (-not [IO.File]::Exists('" + quoted_pid_file + "') -and $sw.ElapsedMilliseconds -lt 20000) { [Threading.Thread]::Sleep(20) }; "
+                        "if (-not [IO.File]::Exists('" + quoted_pid_file + "')) { throw 'the session-escaping sleeper never became ready' }; "
+                        "[Threading.Tasks.Task]::FromResult('escaped sleeper ready')")
+            self.assertNotIn("\n'@", template)
             script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
                       "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
-                      f"$factory = {factory}\n"
+                      "$argv = @((ConvertTo-CommandLineArg '/bin/sh'), (ConvertTo-CommandLineArg '" + script_file.replace("'", "''") + "'), "
+                      "(ConvertTo-CommandLineArg '" + quoted_pid_file + "'))\n"
+                      "$argvLiteral = '(' + (($argv | ForEach-Object { \"'\" + $_.Replace(\"'\", \"''\") + \"'\" }) -join ', ') + ')'\n"
+                      "$template = @'\n" + template + "\n'@\n"
+                      "$factory = [scriptblock]::Create($template.Replace('@ARGV@', $argvLiteral))\n"
                       "$r = Read-CapturedResult $p 60000 $factory\n"
                       "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n")
-            script_path = os.path.join(work, "driver.ps1")
+            script_path = os.path.join(base, "driver.ps1")
             Path(script_path).write_text(script, encoding="utf-8")
             proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], capture_output=True, text=True,
                                   timeout=240, env=dict(os.environ, TMPDIR=tmp))
@@ -2863,9 +2885,21 @@ class BoundedCaptureIoTests(unittest.TestCase):
                     escaped_pid = int(Path(pid_file).read_text(encoding="ascii").strip())
             if escaped_pid is not None:
                 with contextlib.suppress(OSError):
-                    if b"sleep" in Path(f"/proc/{escaped_pid}/cmdline").read_bytes():  # the exact pid, and only while it is still our sleeper
+                    # the exact pid, and only while it is still the fixture's own sleeper: its FULL command line, not a substring
+                    if Path(f"/proc/{escaped_pid}/cmdline").read_bytes() == self._ESCAPER_CMDLINE:
                         os.kill(escaped_pid, 9)
             shutil.rmtree(work, ignore_errors=True)
+
+    def test_r16_a4_the_escaper_cleanup_matches_the_fixtures_full_command_line_not_a_substring(self) -> None:
+        # Source pin (every OS): the cleanup compares /proc/<pid>/cmdline for equality with the fixture's own command line.
+        source = Path(__file__).read_text(encoding="utf-8")
+        case = source[source.index("    def _run_session_escape_case("):source.index("    def test_r16_a4_the_escaper_cleanup_matches")]
+        self.assertIn("read_bytes() == self._ESCAPER_CMDLINE", case)
+        self.assertNotIn('b"sleep" in', case)
+        self.assertIn("exec /bin/sleep 600", case)
+        self.assertEqual(self._ESCAPER_CMDLINE, b"/bin/sleep\x00600\x00", "the pinned command line is the one the escaper script execs")
+        self.assertIn("ConvertTo-CommandLineArg", case, "the fixture's argv is quoted with the fifo script's own function")
+        self.assertNotRegex(case, r"-ArgumentList @\('/bin/sh'", "the argv must not be handed to Start-Process unquoted")
 
 
 class BoundedCleanupTests(unittest.TestCase):
