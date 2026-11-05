@@ -58,6 +58,16 @@
     },
     {
       "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( ! renderIdle || renderWaitMs > 0 )",
+      "class": "display_or_format",
+      "clock": "other",
+      "justification": "Decides only whether the look_assist.apply.render_wait log line is written: the wait for a running render took time or hit its bound. The analysis goes on either way; renderIdle, not the duration, says whether the render finished, and nothing reads this as proof a stage ran.",
+      "lines": [
+        17086
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
       "anchor": "if ( autoplaySeconds > 0 )",
       "class": "value_fallback_select",
       "clock": "other",
