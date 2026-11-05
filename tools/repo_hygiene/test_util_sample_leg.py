@@ -1658,7 +1658,7 @@ class UtilSampleRunnerMappingTests(RunnerHarness, unittest.TestCase):
         return path
 
     def test_t6_only_a_json_true_passes_util_sample(self) -> None:
-        for name, args, want in (("true", {"utilSample": True}, "True"), ("string", {"utilSample": "true"}, None), ("false", {"utilSample": False}, None),
+        for name, args, want in (("true", {"utilSample": True}, "True"), ("false", {"utilSample": False}, None),
                                  ("absent", {}, None), ("none", None, None)):
             with self.subTest(case=name):
                 if self.gen_log.exists():
@@ -1668,6 +1668,16 @@ class UtilSampleRunnerMappingTests(RunnerHarness, unittest.TestCase):
                 self.assertTrue(calls, proc.stdout[-2000:] + proc.stderr[-2000:])
                 fields = dict(kv.split("=", 1) for kv in calls[-1].split(";") if "=" in kv)
                 self.assertEqual(fields.get("UtilSample"), want, calls[-1])
+
+    def test_t6_a_string_util_sample_is_refused_before_the_generator_runs(self) -> None:
+        # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r3: utilSample joined the shared generatorArgs boolean guard in r2, so {"utilSample": "true"} is no longer
+        # ignored (sampler off, leg proceeds): the leg refuses it with DVE_LEG_SPEC_INVALID naming utilSample and never reaches the generator.
+        self.gen_log.write_text("", encoding="utf-8")
+        proc, receipt, submitted = self.run_leg("bachelor", self.spec_with({"utilSample": "true"}, "us-string"))
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("DVE_LEG_SPEC_INVALID generatorArgs.utilSample must be JSON true or false", out)
+        self.assertEqual(self.generator_calls(), [])
 
 
 class UtilSampleSpecTests(unittest.TestCase):
