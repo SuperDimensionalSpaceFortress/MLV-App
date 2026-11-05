@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-11-05T18:20:44Z
+generated_from: 2026-11-05T21:15:39Z
 
 ## Open product and playback cards
 
@@ -33,6 +33,7 @@ generated_from: 2026-11-05T18:20:44Z
 | 2 | PLAYBACK-GPU-SCOPES-NO-VETO-1 | product | pr-open | 2026-10-15 | - |
 | 2 | CORE-PARTITION-PREDECESSOR-CLOCK-STEP-1 | product | queued | 2026-10-28 | ORDER-20261028T134438Z #3 after CORE-PARTITION-HELPER-PID-REUSE-1 |
 | 2 | CPU-S1-RECON-CHAIN-ATTRIBUTION-1 | product | pr-open | 2026-11-04 | - |
+| 2 | LEASE-BATCH-IDLE-END-UNSEEN-1 | product | queued | 2026-11-05 | - |
 | 3 | PLAYBACK-HFR-CONFORM-DEFAULT-1 | product | declared | 2026-10-15 | - |
 | 3 | WARM-RUN-CHROMA-SMOOTH-PARITY-1 | product | pr-open | 2026-10-18 | - |
 | 6 | PREP-WORKER-HL-RECON-REFUSAL-FIXTURE-1 | product | queued | 2026-10-07 | - |
@@ -50,7 +51,7 @@ generated_from: 2026-11-05T18:20:44Z
 
 ## Drain
 
-product+playback open: 27
+product+playback open: 28
 
 Window: the 7 UTC days ending 2026-11-05 (the last day is partial).
 Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
@@ -63,8 +64,8 @@ Landed = merged rows by `merged_utc` when the row has one, else by the newest st
 | 2026-11-02 | 3 | 5 |
 | 2026-11-03 | 1 | 1 |
 | 2026-11-04 | 2 | 3 |
-| 2026-11-05 | 0 | 1 |
-| total | 12 | 25 |
+| 2026-11-05 | 0 | 2 |
+| total | 12 | 26 |
 
 does not drain (queued >= landed)
 
