@@ -24,6 +24,7 @@ param(
 #         identity-startup-kept      the same at start-up: no exit-127 receipt, no launch, no promotion, no replacement; a valid marker still retires or orphans
 #         completion-tmp-denied-live  sol LM-02, native ACL deny: the completed record cannot be written, so the marker stays and nothing reads retired; the retry succeeds once it lifts
 #         completion-tmp-denied-ordinary  the same by the ordinary completion route, with the job's script already gone from inbox\
+#         completion-tmp-denied-startup  the same at start-up, by the completed and orphaned callers, which start-up recovery holds and retries
 #   unit  the agent's real functions, lifted from its AST:
 #         inbox-job-left-alone       a job whose script is in inbox\ is the live set: no recovery runs, even with marker + result
 #         own-claim-retire-retried   this agent's own unlaunched claim whose retire failed stays quarantined, then clears
@@ -47,7 +48,7 @@ $ErrorActionPreference = 'Stop'
 # PowerShell variables are case-insensitive: assigning $agentScript below also assigns $AgentScript, so the override is captured first.
 $agentScriptOverridden = [bool]$AgentScript
 $agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
-$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move', 'live-reconcile-result-withdrawn', 'live-locked-then-withdrawn', 'live-locked-stale-tmp-then-withdrawn', 'completion-denied-then-withdrawn', 'live-withdrawn-stale-result-tmp', 'live-withdrawn-inside-complete', 'live-quarantine-lifecycle', 'live-path-no-direct-startup-call', 'live-path-no-transitive-startup-call', 'retire-over-readonly-record', 'move-checked-readonly-destination', 'move-checked-failed-overwrite-contract', 'identity-markers-kept', 'identity-startup-kept', 'identity-reader-states', 'identity-complete-direct', 'identity-reread-differs', 'completion-tmp-denied-live', 'completion-tmp-denied-ordinary', 'completion-tmp-denied-retry', 'requeue-retire-denied')
+$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move', 'live-reconcile-result-withdrawn', 'live-locked-then-withdrawn', 'live-locked-stale-tmp-then-withdrawn', 'completion-denied-then-withdrawn', 'live-withdrawn-stale-result-tmp', 'live-withdrawn-inside-complete', 'live-quarantine-lifecycle', 'live-path-no-direct-startup-call', 'live-path-no-transitive-startup-call', 'retire-over-readonly-record', 'move-checked-readonly-destination', 'move-checked-failed-overwrite-contract', 'identity-markers-kept', 'identity-startup-kept', 'identity-reader-states', 'identity-complete-direct', 'identity-reread-differs', 'completion-tmp-denied-live', 'completion-tmp-denied-ordinary', 'completion-tmp-denied-startup', 'completion-tmp-denied-retry', 'requeue-retire-denied')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Want([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -588,6 +589,39 @@ try {
             Assert-True (Wait-Until { (Get-RunningCounted $c).Count -eq 0 } 12) "the retry retires it once the denial lifts: left [$((Get-RunningCounted $c) -join ',')]"
             $rec = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
             Assert-True ($rec.status -eq 'completed' -and $rec.resultPath -eq $resultPath -and $null -ne $rec.completedUtc -and $null -ne $rec.childPid) "a truthful completed record: $($rec | ConvertTo-Json -Compress)"
+            return 'kept, then completed'
+        }
+        finally { Remove-CreateFilesDeny $c.running $rule; Stop-Agent $c }
+    }
+
+    # The start-up callers under the same denial: a marker with its result (completed) and one with none (orphaned, which publishes exit 127 first). Neither files a record, start-up recovery holds
+    # both, and its retry retires both once the denial lifts. The orphan's retry reads its published result and files as completed, the name BACHELOR-AGENT-RETIRE-RETRY-KEEPS-ORIGINAL-STATUS-1 carries.
+    Invoke-Row 'completion-tmp-denied-startup' {
+        $c = New-Case 'completion-tmp-denied-startup'
+        $rule = $null
+        try {
+            Put-File (Join-Path $c.running 'done.started.json') (New-MarkerJson 'done')
+            Put-File (Join-Path $c.outbox 'done.result.json') (New-ResultJson 'done')
+            Put-File (Join-Path $c.running 'orph.started.json') (New-MarkerJson 'orph')
+            $rule = Add-CreateFilesDeny $c.running
+            Start-Agent $c
+            Wait-Polls $c 3
+            foreach ($id in @('done', 'orph')) {
+                Assert-True (Test-Path -LiteralPath (Join-Path $c.running "$id.started.json")) "${id}: the marker stays in running\: $((Get-LogLines $c "job=$id") -join ' | ')"
+                Assert-True (@(Get-ChildItem -LiteralPath $c.processed -Filter "$id.*").Count -eq 0) "${id}: no record was filed"
+                Assert-True (@(Get-LogLines $c "marker kept job=$id").Count -eq 1) "${id}: logged once: $((Get-LogLines $c "marker kept job=$id") -join ' | ')"
+                Assert-True (@(Get-LogLines $c "QUARANTINED job=$id ").Count -eq 1) "${id}: start-up recovery holds it: $((Get-LogLines $c "QUARANTINED job=$id ") -join ' | ')"
+            }
+            $orphanReceipt = Join-Path $c.outbox 'orph.result.json'
+            Assert-True ((Get-Content -LiteralPath $orphanReceipt -Raw | ConvertFrom-Json).exitCode -eq 127) 'orph: the orphan receipt is published before the failed retire'
+            $receiptBytes = Get-Bytes $orphanReceipt
+            Remove-CreateFilesDeny $c.running $rule; $rule = $null
+            Assert-True (Wait-Until { (Get-RunningCounted $c).Count -eq 0 } 12) "the retry retires both once the denial lifts: left [$((Get-RunningCounted $c) -join ',')]"
+            foreach ($id in @('done', 'orph')) {
+                $rec = Get-Content -LiteralPath (Join-Path $c.processed "$id.started.completed.json") -Raw | ConvertFrom-Json
+                Assert-True ($rec.status -eq 'completed' -and $rec.resultPath -eq (Join-Path $c.outbox "$id.result.json") -and $null -ne $rec.completedUtc) "${id}: a truthful completed record: $($rec | ConvertTo-Json -Compress)"
+            }
+            Assert-True ((Get-Bytes $orphanReceipt) -eq $receiptBytes) 'orph: the retry did not publish a second receipt'
             return 'kept, then completed'
         }
         finally { Remove-CreateFilesDeny $c.running $rule; Stop-Agent $c }
