@@ -5168,8 +5168,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         text = RUNNER.read_text(encoding="utf-8")
         # r3: the budget is New-GuardBudget's (a Stopwatch started at the grant read), so the claim guard and the post-open guard count on one monotonic clock each
         # r7: less 1 s for the guard's own end, now that its reads get the exact remainder
-        grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget ($ClaimTtlSec - $ClaimRenewSec - 1) ")
-        self.assertLess(text.index("$grantReadUtc = [DateTime]::UtcNow", grant - 2000), grant)
+        grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget $claimGuardSec ")
+        self.assertIn("$claimGuardSec = [double]($ClaimTtlSec - $ClaimRenewSec - 1);", text)
+        self.assertLess(text.rindex("$grantReadUtc = [DateTime]::UtcNow", 0, grant), grant)
         # r4 (sol r3 B1): the whole guard runs under that budget (Invoke-InputGuard), not only its manifest and artifact reads
         call, clear = text.index("try { $hit = Invoke-InputGuard }", grant), text.index("$script:guardBudget = $null", grant)
         self.assertLess(grant, call)
@@ -5528,6 +5529,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         t0 = time.monotonic()
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         lines: list[str] = []
+        out: list[str] = []
         acted = threading.Event()
 
         def drain() -> None:
@@ -5536,17 +5538,18 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 if marker in line and not acted.is_set():
                     acted.set()
                     act()
-        t = threading.Thread(target=drain, daemon=True)
-        t.start()
+        readers = [threading.Thread(target=drain, daemon=True), threading.Thread(target=lambda: out.append(p.stdout.read()), daemon=True)]
+        for t in readers:
+            t.start()
         try:
-            so = p.stdout.read()
             p.wait(timeout=timeout_s)
-            t.join(timeout=30)
         finally:
             if p.poll() is None:
                 subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
                 p.wait(timeout=60)
-        return p.returncode, so, "".join(lines), time.monotonic() - t0
+        for t in readers:
+            t.join(timeout=30)
+        return p.returncode, "".join(out), "".join(lines), time.monotonic() - t0
 
     def _claim_loop_snippet(self, setup: str) -> dict:
         # the runner's own no-answer branch and helpers, run in memory: only the sleep is replaced, so a wakeup that comes late is a fact of the case and not of the host
@@ -5690,6 +5693,46 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             return int(re.search(r"requests=([0-9]+)", r.stdout).group(1))
         self.assertEqual(requests("$overshootSec = 4; $deadline = [DateTime]::UtcNow.AddSeconds(3)"), 1)
         self.assertGreaterEqual(requests("$overshootSec = 0; $deadline = [DateTime]::UtcNow.AddSeconds(4)"), 2)
+
+    def test_artifact_preflight_claim_wait_r3_a_slow_claim_request_spends_the_retrys_room(self) -> None:
+        # adversary r3 A1: the room is there after the sleep, and the claim request itself then spends it (BUSY retries on a locked claim file). The runner's own claim loop, in memory: the
+        # second request takes 3.5 s of the 5 s left, so no second guard starts, and the first pass's hit is the refusal, its strikes counted once.
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "$loop = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Statements[0].Extent.Text.StartsWith('$req = Request-VenueClaim') }, $true)\n"
+                  "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
+                  "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 1; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
+                  "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
+                  "function Request-VenueClaim { $script:requests++; if ($script:requests -eq 2) { [Threading.Thread]::Sleep(3500) }; [pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' } }\n"
+                  "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
+                  "function Invoke-InputGuard { $script:guards++; [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }\n"
+                  "function Test-AliasHit { param($h) $false }\n"
+                  "function LogBest { param($m) }\n"
+                  "function Stop-InputIsOutput { param($h) $script:refused = $h.why; throw 'REFUSED' }\n"
+                  "$deadline = [DateTime]::UtcNow.AddSeconds(5)\n"
+                  "try { . ([scriptblock]::Create($loop.Extent.Text)) } catch { if ($_.Exception.Message -cne 'REFUSED') { throw } }\n"
+                  "[pscustomobject]@{ requests = $script:requests; guards = $script:guards; refused = $script:refused } | ConvertTo-Json -Compress\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual((d["requests"], d["guards"]), (2, 1), d)
+        self.assertEqual(d["refused"], "WHY (no answer on 1 read in a row while no claim was held)", d)
+
+    def test_artifact_preflight_claim_wait_r3_an_answered_failure_before_a_stalled_read_still_refuses_on_that_poll(self) -> None:
+        # adversary r3 A2: the second pass finds the spec gone (an ANSWERED failure, kept in the worker) and then stalls on the build's existence read. That is the refusal on that poll, not a
+        # read to try again, however healthy the next one would look; the first pass, which only stalled, is still read again.
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), "-GuardReadDelay", "claim:existence=40x2")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", spec.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", se)
+        self.assertIn("already answered with a failure: INPUT_VANISHED", se)
+        self.assertRegex(se, self.GUARD_READS_RE.format("location:build1"))
+        self.assertEqual(self.kinds(), [], "no lease was opened")
 
     def test_artifact_preflight_claim_wait_r3_the_refusal_says_no_answer_only_for_reads_given_up_on(self) -> None:
         # fable r2: three passes that ran out of room while every read answered are not "no answer on 3 reads", and a run of both says how many of each
@@ -6369,7 +6412,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("BATCH_USAGE -GuardReadDelay is an offline test seam", r.stderr)
         # r4 adversary A3: a non-ASCII decimal digit (U+0661) is refused typed, not accepted by \d and thrown on by [int]
-        for bad in ("open:hash=5", "open:spec=١"):
+        for bad in ("open:hash=5", "open:spec=١", "open:rundir=40x1"):
             r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", bad)
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("is not <claim|open>:<existence|identity|spec|rundir>=<sec>", r.stderr)
