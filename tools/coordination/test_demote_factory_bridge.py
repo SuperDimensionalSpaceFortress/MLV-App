@@ -140,17 +140,39 @@ DELIBERATE_BOARD_ROOT_CONTROLS = {
 }
 
 
-def _arg_after(args, flag):
-    return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+ACTOR_PARAMETERS = ("BoardRoot", "ReceiptsDir", "RepoRoot", "Apply")
+
+
+def _bound_parameters(args):
+    """Maps the actor parameters PowerShell would bind from `args` to their value (None for a
+    switch given bare). PowerShell matches parameter names case-insensitively, by unique prefix
+    among the actor's parameters, and accepts `-Name:value`; an ambiguous prefix binds nothing."""
+    bound = {}
+    for index, token in enumerate(args):
+        if not token.startswith("-") or len(token) < 2:
+            continue
+        name, colon, inline = token[1:].partition(":")
+        matches = [p for p in ACTOR_PARAMETERS if name and p.lower().startswith(name.lower())]
+        if len(matches) != 1:
+            continue
+        if colon:
+            bound[matches[0]] = inline
+        elif matches[0] == "Apply":
+            bound["Apply"] = None
+        elif index + 1 < len(args):
+            bound[matches[0]] = args[index + 1]
+    return bound
 
 
 def apply_call_violation(args):
     """Returns a reason string if `args` is an apply-mode actor call that is not hermetic,
     else None. Calls that are not apply-mode actor calls are never violations."""
-    if str(SCRIPT) not in args or "-Apply" not in args:
+    bound = _bound_parameters(args)
+    apply_on = "Apply" in bound and (bound["Apply"] or "").lower() not in ("$false", "false", "0")
+    if str(SCRIPT) not in args or not apply_on:
         return None
-    board_root = _arg_after(args, "-BoardRoot")
-    repo_root = _arg_after(args, "-RepoRoot")
+    board_root = bound.get("BoardRoot")
+    repo_root = bound.get("RepoRoot")
     if board_root is None:
         return "apply-mode call has no -BoardRoot (the actor would fall back to the owner path)"
     if not os.path.isdir(board_root):
@@ -209,6 +231,18 @@ def test_apply_calls_carry_an_isolated_existing_board_root(tmp_path, monkeypatch
     assert apply_call_violation(call(tmp_path / "absent")) is not None  # does not exist
     assert apply_call_violation(call(repo)) is not None  # equals -RepoRoot
     assert apply_call_violation(call(None, apply=False)) is None  # preview is not apply-mode
+
+    # PowerShell binds parameter names case-insensitively, by unique prefix, and as -Name:value
+    # (adversary pass on 8e131986, A1): each spelling below enables -Apply, so each must be seen.
+    for apply_spelling in ("-apply", "-APPLY", "-Ap", "-Apply:$true"):
+        bare = [str(SCRIPT), "-RepoRoot", str(repo), apply_spelling]
+        assert apply_call_violation(bare) is not None, apply_spelling
+    assert apply_call_violation([str(SCRIPT), "-RepoRoot", str(repo), "-Apply:$false"]) is None
+    assert apply_call_violation([str(SCRIPT), "-repo", str(repo), "-board", str(repo), "-apply"]) is not None  # equal
+    assert apply_call_violation([str(SCRIPT), "-repo", str(repo), "-boardroot:" + str(tmp_path), "-apply"]) is None
+    # -Re is ambiguous between -ReceiptsDir and -RepoRoot, so it names neither and PowerShell
+    # would refuse the call before running anything.
+    assert apply_call_violation([str(SCRIPT), "-Re", str(repo), "-BoardRoot", str(tmp_path), "-Apply"]) is None
 
 
 def assert_refused(result, expected_substring):
