@@ -35,6 +35,10 @@ KEY_PREFIX = "tools.repo_hygiene.test_"
 # ``<first docstring line> ... ok`` on the next, so TEST_LINE alone never sees it.
 DOC_HEAD = re.compile(r"^(\S+) \(([A-Za-z0-9_.]+)\)$")
 DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
+# The shard tool's own per-class figure, printed after every job's `SHARD_SLOWEST profile=... total=...s`
+# header (its TOP_CLASSES slowest classes, setUpClass included): `  316.2s tools.repo_hygiene.test_x.Cls`.
+SLOWEST_HEAD = re.compile(r"^SHARD_SLOWEST profile=\S+ shard=\S+ total=[0-9.]+s$")
+SLOWEST_ROW = re.compile(r"^\s+([0-9.]+)s ([A-Za-z0-9_.]+)$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -72,7 +76,15 @@ def class_seconds(log_text: str) -> dict[str, float]:
             # its result, so it keeps head -> this line and the plain test is not charged.
             name, pending = (pending or test.group(1)), None
         elif doc_head:
+            # unittest -v prints a docstring test's id line when the test STARTS, so the gap from the
+            # previous stamped line to it is the class's setUpClass (and the previous test's teardown),
+            # which a plain one-line test is charged too. The clock therefore stays on the previous
+            # line and the result line is charged previous -> result. An id line that replaces a
+            # still-pending one abandons it (its interval is not separable) and restarts the clock.
+            if pending is not None:
+                previous = now
             name, pending = None, doc_head
+            continue
         elif pending is not None and DOC_RESULT.match(text):
             name, pending = pending, None
         elif pending is not None:
@@ -84,6 +96,24 @@ def class_seconds(log_text: str) -> dict[str, float]:
         if name and previous is not None and name.startswith(KEY_PREFIX):
             totals[name.rsplit(".", 1)[0]] += max(0.0, now - previous)
         previous = now
+    # The tool's own figure for a class it names outranks the gap estimate where the estimate is lower:
+    # lines a class logs without a result (git warnings) hide its time from the gaps, e.g.
+    # CandidateAcceptanceTests read 8.8 s here against 62.7 s in its own job's SHARD_SLOWEST.
+    in_slowest = False
+    for raw in log_text.splitlines():
+        stamp = STAMP.match(raw)
+        if not stamp:
+            continue
+        text = stamp.group(3)
+        if SLOWEST_HEAD.match(text):
+            in_slowest = True
+            continue
+        row = SLOWEST_ROW.match(text) if in_slowest else None
+        if row is None:
+            in_slowest = False
+            continue
+        if row.group(2).startswith(KEY_PREFIX):
+            totals[row.group(2)] = max(totals.get(row.group(2), 0.0), float(row.group(1)))
     return dict(totals)
 
 

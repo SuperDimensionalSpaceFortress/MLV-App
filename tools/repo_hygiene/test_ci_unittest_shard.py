@@ -964,13 +964,50 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.AlphaTests": 3.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
+            {"tools.repo_hygiene.test_x.AlphaTests": 4.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
+        )
+
+    def test_the_time_before_a_classs_first_docstring_test_is_its_own(self) -> None:
+        # adversary r2 A1 on CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: unittest -v prints a docstring
+        # test's id line when the test STARTS, so the gap from the previous stamped line to it is
+        # the class's setUpClass (187.5 s for CorePartitionGeneratorTests, run 42021571373: the
+        # class weighed 128.2 s here and 316.2 s in the job's own SHARD_SLOWEST). That gap is
+        # charged to the class, as for a plain one-line test.
+        log = (
+            "2026-10-04T00:00:00.0000000Z test_z (tools.repo_hygiene.test_x.PriorTests.test_z) ... ok\n"
+            "2026-10-04T00:03:08.0000000Z test_a (tools.repo_hygiene.test_x.FixtureTests.test_a)\n"
+            "2026-10-04T00:03:29.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:03:30.0000000Z test_b (tools.repo_hygiene.test_x.FixtureTests.test_b)\n"
+            "2026-10-04T00:03:31.0000000Z another docstring ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.FixtureTests": 211.0})
+
+    def test_the_tools_own_slowest_figure_outranks_a_lower_gap_estimate(self) -> None:
+        # adversary r2 A1 sibling: lines a class logs without a result hide its time from the gaps
+        # (CandidateAcceptanceTests: 8.8 s here, 62.7 s in its job's SHARD_SLOWEST). The tool's own
+        # per-class figure wins where it is higher; a lower one never lowers the estimate.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:09.0000000Z test_a (tools.repo_hygiene.test_x.Quiet.test_a) ... ok\n"
+            "2026-10-04T00:00:10.0000000Z test_b (tools.repo_hygiene.test_x.Loud.test_b) ... ok\n"
+            "2026-10-04T00:00:11.0000000Z OK\n"
+            "2026-10-04T00:00:11.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=70.0s\n"
+            "2026-10-04T00:00:11.0000000Z   62.7s tools.repo_hygiene.test_x.Loud\n"
+            "2026-10-04T00:00:11.0000000Z   3.0s tools.repo_hygiene.test_x.Quiet\n"
+            "2026-10-04T00:00:11.0000000Z   2.0s somewhere.else.Tests\n"
+            "2026-10-04T00:00:12.0000000Z the block ended\n"
+            "2026-10-04T00:00:12.0000000Z   99.0s tools.repo_hygiene.test_x.NotInTheBlock\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.Quiet": 9.0, "tools.repo_hygiene.test_x.Loud": 62.7},
         )
 
     def test_a_docstring_test_that_logs_a_line_keeps_its_whole_runtime(self) -> None:
         # CoS on #449: a stamped line between the id line and "<docstring> ... ok" (a logged
         # warning) cleared the pending test, so its result line was never counted. The test
-        # keeps head -> result, the warning's line included; only a new id line replaces it.
+        # keeps previous line -> result, the warning's line included; only a new id line replaces it
+        # (and that replacement restarts the clock at the new id line).
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
             "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.AlphaTests.test_a)\n"
@@ -983,7 +1020,7 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.AlphaTests": 5.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
+            {"tools.repo_hygiene.test_x.AlphaTests": 6.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
         )
 
     def test_an_unexpected_success_docstring_test_clears_pending(self) -> None:
@@ -998,7 +1035,7 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.A": 2.0, "tools.repo_hygiene.test_x.B": 1.0},
+            {"tools.repo_hygiene.test_x.A": 3.0, "tools.repo_hygiene.test_x.B": 2.0},
         )
 
     def test_a_one_line_unexpected_success_is_counted_to_its_class(self) -> None:
@@ -1015,7 +1052,7 @@ class TimingsTests(unittest.TestCase):
     def test_a_pending_test_that_never_printed_a_result_keeps_its_interval(self) -> None:
         # fable on #629: a docstring id line, then a plain "... ok" line with no result line
         # for the first test (crash, interleaved output). The plain line closes the pending
-        # test: head -> plain line is charged to the PENDING class, as for a result line, and
+        # test: previous line -> plain line is charged to the PENDING class, as for a result line, and
         # the plain test is not charged (its own time is not separable from the pending one's).
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
@@ -1025,7 +1062,7 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.C": 1.0},
+            {"tools.repo_hygiene.test_x.A": 5.0, "tools.repo_hygiene.test_x.C": 1.0},
         )
 
     def test_a_logged_line_shaped_like_an_id_head_is_not_a_pending_test(self) -> None:
@@ -1051,7 +1088,7 @@ class TimingsTests(unittest.TestCase):
             "2026-10-04T00:00:03.0000000Z Running (1.2)\n"
             "2026-10-04T00:00:06.0000000Z the docstring first line ... ok\n"
         )
-        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 6.0})
 
     def test_a_docstring_head_outside_the_key_prefix_is_still_pending(self) -> None:
         # The displayed name equals the id's last component, so this is a real test whose
