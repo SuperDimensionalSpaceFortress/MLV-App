@@ -513,9 +513,9 @@ function Initialize-BoundedCaptureIo {
         public static Task WriteAtomic(string path, string text) {
             return Task.Run(() => { File.WriteAllText(path + ".tmp", text); File.Move(path + ".tmp", path); });
         }
-        // sol r12 B1: ends a capture worker and every process it started. '' when the kill call returned; otherwise what it raised.
+        // sol r12 B1: ends a capture worker and the descendants still visible in its process tree. '' when the kill call returned; otherwise what it raised.
         // adversary r13 A3: called even when the worker itself has ended. On Windows the held process handle still lets Kill(true) find the
-        // processes it left behind (by parent id and start time); on POSIX an ended worker's orphans are reparented, so KillGroup below ends them.
+        // processes it left behind (by parent id and start time); on POSIX an ended worker's orphans are reparented, so KillGroup below ends those that stayed in the worker's group (one that left it is out of reach).
         public static Task<string> KillTree(Process process) {
             return Task.Run(() => { try { process.Kill(true); return ""; } catch (Exception e) { return e.GetType().Name + ": " + e.Message; } });
         }
@@ -611,7 +611,11 @@ function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
 # sol r12 B1: they run in a CHILD pwsh process (the capture worker), never in this process. A thread cannot be killed on .NET, and an
 # in-process runspace stuck in Thread.Sleep(Infinite) or an endless ToString blocked ordinary pwsh shutdown forever (shutdown disposes every
 # open runspace and stops its pipeline). A process can be killed: on expiry the worker's whole process tree is killed and reaped under
-# their own bounds BEFORE the helper returns, so nothing of the step is left in this process or after it.
+# their own bounds BEFORE the helper returns, so no part of the step keeps running in this process.
+# WHAT TEARDOWN REACHES (r15, the narrowed contract; the earlier promise that no descendant outlives a step was false): on Windows the worker's job
+# object, which holds the worker and the processes started under it; on POSIX the recorded process group (the worker leads its own, via
+# setsid) plus the descendants still visible in the worker's tree. A factory child that starts its own session or group (setsid) is
+# OUTSIDE this contract and may survive teardown, and the reader does not detect that.
 # Every accepted -Start input therefore ends one of five ways, each of which lets this process end on its own:
 #   the task completes inside the bound         -> the worker writes its answer and ends; the step succeeds
 #   the factory or the conversion throws       -> the worker writes the innermost message and ends; the step fails by that name
@@ -694,7 +698,8 @@ function Stop-CaptureWorker($Worker) {
     # Kills the worker's process tree, reaps it, and removes its scratch directory, each under its own bound.
     # adversary r13 A3: the tree is killed EVEN WHEN the worker has already ended. Its root ending proves nothing about what it started (a
     # factory that launched a process and then threw left that process running). POSIX: the worker leads its own process group (setsid), so the
-    # group is killed too, which reaches orphans that were reparented away from it.
+    # group is killed too, which reaches orphans of that group that were reparented away from the worker. It does not reach a descendant that left the
+    # group or session (setsid): only the descendants still visible in the worker's tree and the recorded group are covered.
     # Returns '' or a note naming what could not be confirmed. Never throws.
     if ($null -eq $Worker) { return '' }
     $notes = [Collections.Generic.List[string]]::new()
@@ -742,7 +747,7 @@ function Close-CaptureWorker($Worker) {
 }
 function Resolve-CaptureWorkerSetsid([bool]$Windows = $IsWindows, [string[]]$Candidates = @('/usr/bin/setsid', '/bin/setsid')) {
     # adversary r14 A2: $null on Windows (the worker is tracked by a job object instead). On POSIX the worker is launched through setsid so it
-    # leads its own process group, which is the only way its teardown reaches a process the factory orphaned; a host without setsid is a named
+    # leads its own process group, which is how its teardown reaches a same-group process the factory orphaned; a host without setsid is a named
     # failure, exactly as a missing job object is on Windows (no tracking means no tree guarantee).
     if ($Windows) { return $null }
     foreach ($candidate in $Candidates) { if ([IO.File]::Exists($candidate)) { return $candidate } }

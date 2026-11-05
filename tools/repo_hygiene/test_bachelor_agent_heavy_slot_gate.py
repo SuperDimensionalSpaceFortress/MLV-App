@@ -2496,6 +2496,76 @@ class BoundedCaptureIoTests(unittest.TestCase):
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    # ---- r15 B2 (sol r14 blocker 2, adversary r14 A2; hub ruling: NARROW THE CONTRACT) ----
+    def test_r15_b2_the_teardown_contract_is_stated_as_the_group_and_the_visible_descendants_only(self) -> None:
+        # Source pin (runs on every OS): the promise that a factory "leaves nothing behind" was false for a factory child that starts its own
+        # session (setsid): the recorded-group kill misses it and the ended worker's tree no longer lists it. The wording must keep saying so.
+        fifo = FIFO_TEST.read_text(encoding="ascii")
+        begin = fifo.index("# sol r11 B2: ONE deadline")
+        contract = fifo[begin:fifo.index("$CaptureWorkerStartMs = ", begin)]
+        flat = re.sub(r"\s*\n#\s*", " ", contract)
+        for needle in ("recorded process group", "still visible in the worker's tree", "starts its own session or group (setsid)", "OUTSIDE this contract",
+                       "may survive", "the reader does not detect that"):
+            self.assertIn(needle, flat, f"the narrowed teardown contract no longer says: {needle}")
+        self.assertRegex(flat, r"(?i)POSIX.{0,200}recorded process group")
+        self.assertNotRegex(fifo, r"(?i)nothing of the step is left|leaves? nothing behind|nothing is left behind|left in this process or after it|ends a capture worker and every process it started",
+                            "a comment or message repeats the dropped 'leaves nothing behind' promise")
+        for function in ("function Stop-CaptureWorker", "public static Task<string> KillTree"):
+            at = fifo.index(function)
+            self.assertIn("visible", fifo[max(0, at - 600):at + 1500], f"{function} is documented without the visible-descendants limit")
+
+    def test_r15_b2_a_session_escaping_factory_child_is_outside_the_teardown_contract_and_is_killed_by_its_pid(self) -> None:
+        # The stated limit, executed: a factory launches a readiness-confirmed child in its OWN session (setsid). The read succeeds and the child
+        # survives teardown, which the narrowed contract names as out of scope. This test never relies on teardown for it: it ends the child itself
+        # by exact pid in a finally (never a group or a name kill). If teardown ever reaches it this assertion fails: update the contract wording.
+        self._skip_unless_setsid_branch()
+        if not os.path.isdir("/proc"):
+            self.skipTest("SKIPPED: no /proc, so the escaped sleeper's identity cannot be confirmed before it is killed by pid")
+        setsid = next(p for p in ("/usr/bin/setsid", "/bin/setsid") if os.path.exists(p))
+        work = tempfile.mkdtemp(prefix="heavy-slot-gate-r15-b2-")
+        pid_file = os.path.join(work, "escaper.pid")
+        escaped_pid: int | None = None
+        try:
+            tmp = os.path.join(work, "tmp")
+            os.makedirs(tmp)
+            script_file = os.path.join(work, "escaper.sh")
+            Path(script_file).write_text('#!/bin/sh\necho $$ > "$1.tmp" && mv "$1.tmp" "$1"\nexec /bin/sleep 600\n', encoding="ascii")
+            quoted_pid_file = pid_file.replace("'", "''")
+            factory = ("{ param($p) $null = Start-Process -FilePath '" + setsid + "' -NoNewWindow -PassThru "
+                       "-ArgumentList @('/bin/sh', '" + script_file.replace("'", "''") + "', '" + quoted_pid_file + "'); "
+                       "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+                       "while (-not [IO.File]::Exists('" + quoted_pid_file + "') -and $sw.ElapsedMilliseconds -lt 20000) { [Threading.Thread]::Sleep(20) }; "
+                       "if (-not [IO.File]::Exists('" + quoted_pid_file + "')) { throw 'the session-escaping sleeper never became ready' }; "
+                       "[Threading.Tasks.Task]::FromResult('escaped sleeper ready') }")
+            script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                      "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                      f"$factory = {factory}\n"
+                      "$r = Read-CapturedResult $p 60000 $factory\n"
+                      "Write-Output ('READ|' + $r.Ok + '|' + $r.Text)\n")
+            script_path = os.path.join(work, "driver.ps1")
+            Path(script_path).write_text(script, encoding="utf-8")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path], capture_output=True, text=True,
+                                  timeout=240, env=dict(os.environ, TMPDIR=tmp))
+            if os.path.exists(pid_file):
+                escaped_pid = int(Path(pid_file).read_text(encoding="ascii").strip())
+            out = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, out)
+            self.assertIn("READ|True|escaped sleeper ready", proc.stdout, out)
+            self.assertIsNotNone(escaped_pid, "the session-escaping sleeper never recorded its pid\n" + out)
+            try:
+                os.kill(escaped_pid, 0)  # type: ignore[arg-type]
+            except ProcessLookupError:
+                self.fail("the session-escaping sleeper did not survive teardown: teardown now reaches it, so the narrowed contract wording is out of date")
+        finally:
+            if escaped_pid is None and os.path.exists(pid_file):
+                with contextlib.suppress(OSError, ValueError):
+                    escaped_pid = int(Path(pid_file).read_text(encoding="ascii").strip())
+            if escaped_pid is not None:
+                with contextlib.suppress(OSError):
+                    if b"sleep" in Path(f"/proc/{escaped_pid}/cmdline").read_bytes():  # the exact pid, and only while it is still our sleeper
+                        os.kill(escaped_pid, 9)
+            shutil.rmtree(work, ignore_errors=True)
+
 
 class BoundedCleanupTests(unittest.TestCase):
     """sol r4b B1 / B2: the cleanup after a timeout is bounded end to end, and the regression's ceiling is derived from that bound.
