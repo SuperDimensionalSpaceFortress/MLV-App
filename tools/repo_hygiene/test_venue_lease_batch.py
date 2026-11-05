@@ -5675,7 +5675,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # lands past the deadline. On 38d61585 that started another request; here the loop ends (DEADLINE, as ever), and with an on-time sleep it still polls.
         def requests(setup: str) -> int:
             script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-                      "$loop = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Statements[0].Extent.Text.StartsWith('$req = Request-VenueClaim') }, $true)\n"
+                      "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
                       "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
                       "$script:requests = 0; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitNoAnswerMax = 3; $script:ClaimWaitGuardSec = 30; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
                       "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1\n"
@@ -5698,7 +5698,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # adversary r3 A1: the room is there after the sleep, and the claim request itself then spends it (BUSY retries on a locked claim file). The runner's own claim loop, in memory: the
         # second request takes 3.5 s of the 5 s left, so no second guard starts, and the first pass's hit is the refusal, its strikes counted once.
         script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-                  "$loop = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Statements[0].Extent.Text.StartsWith('$req = Request-VenueClaim') }, $true)\n"
+                  "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
                   "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true); if ($f) { . ([scriptblock]::Create($f.Extent.Text)) } }\n"
                   "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 1; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
                   "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
@@ -5733,6 +5733,46 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("already answered with a failure: INPUT_VANISHED", se)
         self.assertRegex(se, self.GUARD_READS_RE.format("location:build1"))
         self.assertEqual(self.kinds(), [], "no lease was opened")
+
+    def test_artifact_preflight_claim_wait_r3_a_manifest_found_gone_before_a_stalled_read_still_refuses_on_that_poll(self) -> None:
+        # adversary r3 pass 2 A1: the sibling of the answered failure above. The location step confirms the manifest is gone, and leaves its typing to the content step, which a stalled spec
+        # read then never reaches. That is an answer too: the poll refuses, whatever the next read would find.
+        manifest = self._staged_manifest(self.commit_a)
+        args, e = self._claim_wait_cmd("-GuardReadDelay", "claim:spec=40x2")
+        code, so, se, _ = self._run_acting_on_stderr(args, e, "CLAIM_WAIT_GUARD_NO_ANSWER", manifest.unlink)
+        self.assertEqual(code, 2, so + se)
+        self.assertEqual(se.count("CLAIM_WAIT_GUARD_NO_ANSWER"), 1, se)
+        self.assertIn("already answered with a failure: BUILD_NOT_STAGED", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+
+    def test_artifact_preflight_claim_wait_r3_a_claim_request_that_throws_on_a_retry_is_the_typed_refusal(self) -> None:
+        # adversary r3 pass 2 A2: the retry goes into a claim request nothing guarded, and a throw there ended the script with a read given up on still stuck on a live thread, which the host
+        # then waits for. The runner's own claim loop, in memory, with a request that really throws (a file at the claim folder reads BUSY): the first pass's hit is the refusal, the
+        # request's error named in it, and no second guard runs. With nothing unfinished the throw stays the throw it always was.
+        def run(setup: str) -> dict:
+            script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                      "$loop = $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.WhileStatementAst] -and $x.Body.Extent.Text.Contains('Request-VenueClaim') }, $true) | Select-Object -Last 1\n"
+                      "foreach ($n in 'Test-ClaimWaitRetryRoom', 'Get-ClaimWaitUnfinishedText') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                      "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
+                      "$script:requests = 0; $script:guards = 0; $script:refused = ''; $script:thrown = ''; $script:ClaimWaitUnfinishedMax = 3; $script:ClaimWaitGuardSec = 1; $script:receiptGuardHit = $null; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }\n"
+                      "$claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $batchNo = 1; $Venue = 'bachelor'; $RunDir = 'r'; $Purpose = 'p'; $ClaimDir = 'c'; $ClaimTtlSec = 60; $ClaimRenewSec = 15; $ClaimPollSec = 1; $batches = @()\n"
+                      "function New-GuardBudget { param($a, $b, $c, $d, $e, $f) [pscustomobject]@{} }\n"
+                      "function Invoke-InputGuard { $script:guards++; [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }\n"
+                      "function Test-AliasHit { param($h) $false }\n"
+                      "function LogBest { param($m) }\n"
+                      "function Stop-InputIsOutput { param($h) $script:refused = $h.why; throw 'REFUSED' }\n"
+                      "$deadline = [DateTime]::UtcNow.AddSeconds(60)\n"
+                      f"{setup}\n"
+                      "try { . ([scriptblock]::Create($loop.Extent.Text)) } catch { if ($_.Exception.Message -cne 'REFUSED') { $script:thrown = $_.Exception.Message } }\n"
+                      "[pscustomobject]@{ requests = $script:requests; guards = $script:guards; refused = $script:refused; thrown = $script:thrown } | ConvertTo-Json -Compress\n")
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        retry = run("function Request-VenueClaim { $script:requests++; if ($script:requests -eq 2) { throw 'claim folder went' }; [pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'held' } }")
+        self.assertEqual((retry["requests"], retry["guards"], retry["thrown"]), (2, 1, ""), retry)
+        self.assertEqual(retry["refused"], "WHY (the claim request then threw: claim folder went) (no answer on 1 read in a row while no claim was held)", retry)
+        first = run("function Request-VenueClaim { $script:requests++; throw 'claim folder went' }")
+        self.assertEqual((first["requests"], first["guards"], first["refused"], first["thrown"]), (1, 0, "", "claim folder went"), first)
 
     def test_artifact_preflight_claim_wait_r3_the_refusal_says_no_answer_only_for_reads_given_up_on(self) -> None:
         # fable r2: three passes that ran out of room while every read answered are not "no answer on 3 reads", and a run of both says how many of each

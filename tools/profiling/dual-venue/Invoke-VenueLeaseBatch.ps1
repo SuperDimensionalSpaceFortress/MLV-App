@@ -658,7 +658,10 @@ function Get-InputOutputRefusal {
         # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED). r5b (adversary r5b A1): a folder at its name is not gone.
         # r6 (adversary r6 A1 sibling): gone means not found; a manifest whose lookup is denied is still there (Test-Path said gone)
         if ($g.kind -ceq 'build') { Wait-GuardReadSeam 'existence' }
-        if ($g.kind -ceq 'build' -and (Test-NothingAtName $g.path)) { continue }
+        if ($g.kind -ceq 'build' -and (Test-NothingAtName $g.path)) {
+            if ($script:guardProgress) { $script:guardProgress.answeredFailure = "BUILD_NOT_STAGED $($g.path)" }   # r3 adversary pass 2 A1: read by Invoke-InputGuard if a later read stalls
+            continue
+        }
         # the step above is this input's own share alone; the one below also walks -RunDir and -ClaimDir on this host, so guardReads tells a stalled share from a slow host
         if ($g.kind -ceq 'build') { Set-GuardProgress $g "the location of the $($g.kind) input $($g.path)" 'location' ':path' }
         Wait-GuardReadSeam 'identity'
@@ -1696,13 +1699,24 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # (1) the claim, once per batch. A LIVE claim of another chain is waited out; stale claims are broken once each.
     $claim = $null; $lastHolder = ''; $unfinished = 0; $noAnswers = 0; $script:claimWait = @{ denied = 0; startUtc = $null; endUtc = $null }
     while ($true) {
-        $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
+        # r3 (adversary r3 pass 2 A2): a read given up on is a live thread the host would wait for, so a throw here must not end the script as it stands: on a retry it is the refusal of the
+        # pass that did not finish; otherwise it stays the throw it always was, once the process cannot wait on such a read.
+        $requestThrew = ''
+        try { $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir }
+        catch {
+            if ($unfinished -eq 0) {
+                if ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt 0) { [Console]::Error.WriteLine("the claim request threw: $($_.Exception.Message -replace '\s+', ' ')"); try { Complete-VenueProcess -ExitCode 1 } catch { } }
+                throw
+            }
+            $requestThrew = $_.Exception.Message -replace '\s+', ' '
+            $req = [pscustomobject]@{ granted = $false; broken = @(); claim = $null; state = 'REQUEST_THREW' }
+        }
         $grantReadUtc = [DateTime]::UtcNow
         if (-not $req.granted) { if ($script:claimWait.denied -eq 0) { $script:claimWait.startUtc = $grantReadUtc }; $script:claimWait.denied++; $script:claimWait.endUtc = $null }
         elseif ($script:claimWait.denied -gt 0) { $script:claimWait.endUtc = $grantReadUtc }
         # r3 (adversary r3 A1): the request can take time of its own (BUSY retries on a locked claim file), so a retry's room is asked once more now: gone, no pass starts, and the
         # pass that did not finish, still unvouched, is the refusal below
-        $retryRoomGone = (-not $req.granted) -and $unfinished -gt 0 -and -not (Test-ClaimWaitRetryRoom ([DateTime]::UtcNow) 0 $deadline)
+        $retryRoomGone = $requestThrew -or ((-not $req.granted) -and $unfinished -gt 0 -and -not (Test-ClaimWaitRetryRoom ([DateTime]::UtcNow) 0 $deadline))
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
         # r5 (key3 r4 B1, Dot 6457724432): an attempt NOT granted (a foreign chain holds the venue, and may be measuring) runs the guard bounded too, 30 s as the gate guard, and
@@ -1715,7 +1729,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # refused on its first failure as ever. A claim with no such pass before it keeps its whole budget, as a healthy slow hash needs it.
         $claimGuardSec = [double]($ClaimTtlSec - $ClaimRenewSec - 1); $claimGuardWhat = "the claim guard (-ClaimTtlSec $ClaimTtlSec less -ClaimRenewSec $ClaimRenewSec and 1 s)"
         if ($req.granted -and $unfinished -gt 0 -and ($deadline - [DateTime]::UtcNow).TotalSeconds -lt $claimGuardSec) { $claimGuardSec = ($deadline - [DateTime]::UtcNow).TotalSeconds; $claimGuardWhat += ", cut to the run's deadline after an unfinished read" }
-        if ($retryRoomGone) { $hit = $unfinishedHit } else {
+        if ($retryRoomGone) { $hit = $unfinishedHit; if ($requestThrew) { $hit.why = "$($hit.why) (the claim request then threw: $requestThrew)" } } else {
             $script:guardBudget = $(if ($req.granted) { New-GuardBudget $claimGuardSec $claimGuardWhat 'SHARE_UNREACHABLE' $false 'claim' }
                 else { New-GuardBudget $script:ClaimWaitGuardSec "the claim wait (no claim held: locations, specs and manifests only, $($script:ClaimWaitGuardSec) s)" 'SHARE_UNREACHABLE' $false 'claim' $true })
             # r4 (key3 H3): this runs before the batch try below, so a throw here once the claim is granted releases the claim and ends typed (exit 2), never an exit 1 with the claim held to its TTL
