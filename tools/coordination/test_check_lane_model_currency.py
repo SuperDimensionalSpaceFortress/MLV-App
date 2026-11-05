@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "check-lane-model-currency.py"
@@ -789,6 +790,65 @@ class LiveShapeTests(CurrencyFixture):
         for token in ('"3600"', "true", "null", "[3600]", '{"a":1}', "NaN", "Infinity", "-Infinity"):
             with self.subTest(token=token):
                 self._not_live("2026-10-12T19:59:00Z", token)
+
+    # --- adversary pass 6 (sol, head e6828cb2): A1 and A2, both introduced majors in the r3 code ---------------
+    def test_r3p6_a1_a_zero_or_hostile_exponent_is_decided_without_computing_a_power(self):
+        # A zero token skipped the exponent guard and reached Fraction(10) ** exponent: for 0e-999999999999999999 that
+        # asks for a 10**(10**18) integer. The power is patched to fail loudly so the test never allocates it.
+        import fractions
+        with mock.patch.object(fractions.Fraction, "__pow__", side_effect=AssertionError("a power was computed")):
+            for token in ("0e-999999999999999999", "0E+999999999999999999", "0.0e-9999999999999", "-0e-999999999999999999",
+                          "0e0", "0", "0.000", "1e-999999999999999999", "1e999999999999999999",
+                          "1e999999999999999999999999", "9e-31", "1e31"):
+                with self.subTest(token=token):
+                    self._not_live("2026-10-12T19:59:00Z", token)
+            self.assertEqual(check.exact_timeout(check._raw_float("0e-999999999999999999")), 0)
+            self.assertIsNone(check.exact_timeout(check._raw_float("1e-999999999999999999")))
+            self.assertIsNone(check.exact_timeout(check._raw_float("1e999999999999999999999999")))
+
+    def test_r3p6_a2_an_offset_with_seconds_is_unreadable_not_a_fraction_of_a_second(self):
+        # The failure really started 100 ns BEFORE the complete run (offset +01:00:00.0000001). The offset fraction
+        # used to be read as a seconds fraction, sorting the OLDER failure last and turning the lane NO-DATA.
+        for order in (("a-fail", "b-fin"), ("a-fin", "b-fail")):
+            with self.subTest(order=order):
+                self.setUp()
+                for name in order:
+                    run = self.runs / name
+                    run.mkdir()
+                    body = ({"lane": "sol", "state": "failed", "startedUtc": "2026-10-12T20:59:00+01:00:00.0000001",
+                             "resolvedModel": None, "effort": "high"} if name.endswith("fail") else
+                            {"lane": "sol", "state": "complete", "startedUtc": "2026-10-12T19:59:00Z",
+                             "resolvedModel": "gpt-6.1-sol", "effort": "high"})
+                    (run / "sol-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+                receipts, unreadable = check.load_receipts(str(self.runs))
+                self.assertEqual((len(receipts), unreadable), (1, 1))
+                result = check.evaluate(receipts, now=NOW)
+                self.assertEqual(result["lanes"]["sol"]["verdict"], "CURRENT")
+                self.assertEqual(result["verdict"], "CURRENT")
+
+    def test_r3p6_a2_offsets_with_seconds_do_not_parse_and_plain_offsets_still_do(self):
+        for text in ("2026-10-12T20:59:00+01:00:00.0000001", "2026-10-12T20:59:00+01:00:00",
+                     "2026-10-12T19:59:00-00:00:00.5", "2026-10-12T19:59:00,5-05:00:00"):
+            with self.subTest(text):
+                self.assertIsNone(check.parse_utc(text))
+        minute_ago = NOW - datetime.timedelta(seconds=60)
+        for text, expected in (("2026-10-12T19:59:00Z", minute_ago),
+                               ("2026-10-12T20:59:00+01:00", minute_ago),
+                               ("2026-10-12T14:59:00-05:00", minute_ago),
+                               ("2026-10-12T19:59:00.1234567+00:00", minute_ago + datetime.timedelta(microseconds=123456)),
+                               ("2026-10-12T19:59:00.5", minute_ago + datetime.timedelta(microseconds=500000))):
+            with self.subTest(text):
+                self.assertEqual(check.parse_utc(text), expected)
+
+    def test_r3p6_a2_the_sub_microsecond_digits_come_from_the_seconds_fraction_only(self):
+        for text, expected in (("2026-10-12T19:59:00.1234567Z", "7"), ("2026-10-12T19:59:00.1234560Z", ""),
+                               ("2026-10-12T19:59:00,12345678Z", "78"), ("2026-10-12T19:59:00.123456Z", ""),
+                               ("2026-10-12T19:59:00.123456+01:00", ""),
+                               ("2026-10-12T20:59:00+01:00:00.0000001", ""),     # an offset fraction is not seconds
+                               ("2026-10-12T19:59:00-00:00:00.0000001", ""),
+                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", "9"), (None, ""), (12, "")):
+            with self.subTest(text=text):
+                self.assertEqual(check.sub_microsecond_digits(text), expected)
 
     def test_r3_a5_the_docstring_says_past_the_skew_bound(self):
         doc = check.__doc__

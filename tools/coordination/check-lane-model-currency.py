@@ -51,7 +51,9 @@ T and Z, no comma, no padding; LIVE_START_RE), and timeoutSec must be a JSON int
 most 15 significant digits (exact_timeout: json.load rounds a longer token before the script could see it, so the
 digits are counted on the token itself; padding zeros do not count). Anything else is not a candidate and stays
 unproven, as before this PR; no exotic spelling is read, so none can be mis-read. The arithmetic on an accepted
-receipt stays exact. Measured on the real writer: every receipt under fleet-runs that has a startedUtc matches. That
+receipt stays exact. A startedUtc whose UTC offset carries seconds ('+01:00:00.0000001') cannot be placed to the
+microsecond, so it is not even readable: counted in `unreadableReceipts` like any malformed timestamp (pass 6, A2).
+Measured on the real writer: every receipt under fleet-runs that has a startedUtc matches. That
 is an AGE WINDOW derived
 from the receipt's own start time and timeout, not a process probe: this script reads receipts only, it
 never proves that a process exists, and the board's authoritative liveness rule (hub-queue-lib.ps1
@@ -117,6 +119,8 @@ MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a rea
 # DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
 # digits only and matched against the raw, unstripped string with fullmatch, so a trailing newline or space is out.
 LIVE_START_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
+OFFSET_WITH_SECONDS_RE = re.compile(r"[+-][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
+SECONDS_FRACTION_RE = re.compile(r"\s*[0-9]{4}-[0-9]{2}-[0-9]{2}.[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}([0-9]+)")
 MAX_TIMEOUT_SIGNIFICANT_DIGITS = 15  # a decimal this short survives the trip through a binary float unchanged
 MAX_TIMEOUT_EXPONENT = 30            # |decimal exponent of the leading digit|; keeps Fraction() cheap on a hostile token
 RECEIPT_GLOB = "*/*-001.receipt.json"
@@ -152,10 +156,24 @@ def normalize_fraction(text):
     return re.sub(r"(?<=[0-9]),(?=[0-9])", ".", text)
 
 
+def sub_microsecond_digits(text):
+    """The digits of the SECONDS fraction past the sixth, trailing zeros removed ('' when there are none).
+
+    Anchored to the date and time of day, so a fraction inside a UTC offset can never be read as a fraction of a
+    second (adversary pass 6, A2: '...+01:00:00.0000001' used to put '0000001' into the sort key)."""
+    match = SECONDS_FRACTION_RE.match(normalize_fraction(str(text)))
+    return match.group(1).rstrip("0") if match else ""
+
+
 def parse_utc(text):
     if not isinstance(text, str):
         return None
     cleaned = normalize_fraction(text.strip())
+    # An offset with seconds ('+01:00:00', '-00:00:00.0000001') cannot be ordered exactly: fromisoformat keeps at most
+    # microseconds of it and the rest is lost. No lane writer emits one, so the receipt is unreadable, like any
+    # other timestamp this script cannot place exactly (adversary pass 6, A2).
+    if OFFSET_WITH_SECONDS_RE.search(cleaned):
+        return None
     if cleaned.endswith(("Z", "z")):
         cleaned = cleaned[:-1] + "+00:00"
     cleaned = re.sub(r"(\.[0-9]{6})[0-9]+", r"\1", cleaned)
@@ -212,9 +230,11 @@ def exact_timeout(value):
     while digits and digits[-1] == 0:
         digits.pop()
         exponent += 1
+    if not digits:
+        return fractions.Fraction(0)    # any zero ('0', '0.0', '0e-999999999999999999'): never reaches a power below
     if len(digits) > MAX_TIMEOUT_SIGNIFICANT_DIGITS:
         return None
-    if digits and abs(exponent + len(digits) - 1) > MAX_TIMEOUT_EXPONENT:
+    if abs(exponent + len(digits) - 1) > MAX_TIMEOUT_EXPONENT:
         return None
     number = fractions.Fraction(int("".join(map(str, digits)) or "0")) * fractions.Fraction(10) ** exponent
     return -number if parts.sign else number
@@ -265,8 +285,7 @@ def load_receipts(runs_dir):
         # drops, as a string with trailing zeros removed: digit strings compare in numeric order of the fraction
         # ('09' < '1', '12' < '123', equal fractions equal), so no digit is ever lost and there is no int() size
         # limit to trip over. `order` ties only on a true tie; `subus` also feeds the exact liveness test.
-        extra = re.search(r"\.[0-9]{6}([0-9]+)", normalize_fraction(str(data.get("startedUtc"))))
-        subus = extra.group(1).rstrip("0") if extra else ""
+        subus = sub_microsecond_digits(data.get("startedUtc"))
         order = (started, subus)
         resolved = data.get("resolvedModel")
         timeout = data.get("timeoutSec")
