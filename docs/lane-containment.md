@@ -316,6 +316,20 @@ reads its command line up to the first NUL, so one would drop every argument aft
 the sandbox flag, the MCP disables and the deny list, while the receipt recorded them. This holds
 for both engines. `pwsh -File` cannot carry a NUL; a caller using the call operator can.
 
+**A lone surrogate is refused before launch (`lone-surrogate-refused`, r16).** The image host's
+frame encodes with a replacement fallback, so a lone surrogate became U+FFFD, which names a
+different path: the child read the other directory's file while the held snapshot verified. The
+lane refuses one in `-RunDir`, `-WorkDir` and `-ImagePaths` before it does any run-dir work, and in
+the program and argv at the codex launch bound. Limits: this guards a caller using the call
+operator. `pwsh -File` replaces a lone surrogate with U+FFFD before the script runs (measured), so
+that caller's lane runs on the U+FFFD path, which is well formed and cannot be told from one named
+on purpose. The refusal is at these entry points only; the other encoders are not changed.
+
+**Sidecar cleanup trusts the run dir (limit, not defended).** Before launch the lane deletes stale
+sidecars from its own slot by path, with no directory identity check. A process running as the same
+user that retargets the run dir during the cleanup can redirect the delete at another directory's
+sidecars. The hub rules this a same-trust-domain limit.
+
 Run the real Windows fixture suite with:
 
 ```powershell

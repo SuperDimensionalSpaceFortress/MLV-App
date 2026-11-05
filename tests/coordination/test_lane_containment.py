@@ -2769,6 +2769,96 @@ def test_r15_iter1_a1_a_nul_in_an_argument_is_refused_before_any_provider_runs(f
     assert "argv-nul-refused" in (root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(receipt.read_text(encoding="utf-8") if receipt.exists() else "")
 
 
+# VISUAL-JUDGE-TERRA-LANE-1 r16 (OPEN A1 on feeea1f9): the image host's frame encodes each field with Encoding.Unicode's replacement fallback, so a lone surrogate arrives as U+FFFD: a path to a DIFFERENT
+# directory, whose file the child reads while the held snapshot verifies. Refused where the path enters, so no frame, sibling site or provider ever sees one. The run-dir rows are the adversary's own schedule.
+# `pwsh -File` replaces a lone surrogate with U+FFFD before the script sees it (measured on this suite's first RED run: the receipt landed in the FFFD directory), so these go through the call operator, written as ASCII.
+def _ps_text(s):
+    units=[int.from_bytes(s.encode("utf-16-le","surrogatepass")[i:i+2],"little") for i in range(0,len(s.encode("utf-16-le","surrogatepass")),2)]
+    return "("+"+".join("[string][char]"+hex(u) for u in units)+")"
+
+
+def _through_the_call_operator(cmd,root,cwd=None):
+    at=cmd.index("-File")
+    params=[t if t.startswith("-") else _ps_text(t) for t in cmd[at+2:]]
+    call=root/"call-lane.ps1"
+    enter="Set-Location -LiteralPath "+_ps_text(str(cwd))+"\n" if cwd else ""
+    call.write_text(enter+"& "+_ps_text(cmd[at+1])+" "+" ".join(params)+"\nexit $LASTEXITCODE\n",encoding="ascii")
+    return cmd[:at+1]+[str(call)]
+
+
+def _lane_with_lone_surrogate(fixture_tree,route,lone):
+    root=fixture_tree["root"]
+    png=root/"strip.png"; _write_png(png,b"original bytes P")
+    cache=_terra_env(fixture_tree)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="terra")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache); env["MLV_FIXTURE_IMAGE_BYTES"]=str(root/"image-bytes.json")
+    replaced="�"*len(lone)
+    if route=="run-dir":
+        run_dir=root/("judge"+lone); run_dir.mkdir()
+        other=root/("judge"+replaced); other.mkdir(); (other/"terra-001.image-01.png").write_bytes(b"\x89PNG\r\n\x1a\n"+b"DIFFERENT bytes Q")
+        cmd[cmd.index("-RunDir")+1]=str(run_dir); receipt=run_dir/"terra-001.receipt.json"
+    elif route=="work-dir":
+        work=root/("work"+lone); work.mkdir(); (root/("work"+replaced)).mkdir()
+        cmd[cmd.index("-WorkDir")+1]=str(work)
+    elif route=="relative-run-dir":
+        (root/("cwd"+lone)).mkdir(); (root/("cwd"+replaced)/"judge").mkdir(parents=True)
+        cmd[cmd.index("-RunDir")+1]="judge"; receipt=root/("cwd"+lone)/"judge"/"terra-001.receipt.json"
+    elif route=="image-path":
+        renamed=root/("strip"+lone+".png"); png.rename(renamed); png=renamed
+    elif route=="argv":
+        cmd=cmd+["-ModelOverride","gpt-6.1-terra"+lone]
+    return cmd+["-ImagePaths",str(png)],env,receipt
+
+
+@pytest.mark.parametrize("route,lone",[("run-dir","\ud800"),("run-dir","\udc00"),("run-dir","\udc00\ud800"),("relative-run-dir","\ud800"),("work-dir","\ud800"),("image-path","\ud800"),("argv","\ud800")],
+                         ids=["run-dir-lone-high","run-dir-lone-low","run-dir-reversed-pair","relative-run-dir","work-dir","image-path","argv"])
+def test_r16_a1_a_lone_surrogate_is_refused_before_any_provider_runs(fixture_tree,route,lone):
+    root=fixture_tree["root"]
+    cmd,env,receipt=_lane_with_lone_surrogate(fixture_tree,route,lone)
+    r=_run_lane_to_files(_through_the_call_operator(cmd,root,cwd=root/("cwd"+lone) if route=="relative-run-dir" else None),env,root)
+    text=(root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(receipt.read_text(encoding="utf-8") if receipt.exists() else "")
+    seen=(root/"image-bytes.json").read_text(encoding="utf-8-sig") if (root/"image-bytes.json").exists() else None
+    entry=json.loads(receipt.read_text(encoding="utf-8")).get("imagePaths") if receipt.exists() else None
+    assert not (root/"args.json").exists(), ascii(("a provider ran on a path holding a lone surrogate",(root/"args.json").read_text(encoding="utf-8-sig"),seen,entry))
+    assert r.returncode!=0, r.returncode
+    assert "lone-surrogate-refused" in text, ascii(text[-2000:])
+
+
+# A codex lane meets the launch bound as well (the run-dir row above). A claude lane has only the check after Resolve-Path when the surrogate comes from a relative -RunDir's current directory.
+def _claude_lane_with_relative_run_dir_in_lone_surrogate_cwd(fixture_tree,mutation=None):
+    root=fixture_tree["root"]; lone="\ud800"
+    (root/("cwd"+lone)).mkdir(); (root/"cwd�"/"judge").mkdir(parents=True)
+    cmd,env,_=prepare(fixture_tree,"normal",lane="sonnet",mutation=mutation)
+    cmd[cmd.index("-RunDir")+1]="judge"
+    r=_run_lane_to_files(_through_the_call_operator(cmd,root,cwd=root/("cwd"+lone)),env,root)
+    return r,(root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")+(root/"lane.stdout.txt").read_text(encoding="utf-8",errors="replace")
+
+
+def test_r16_a1_a_claude_lane_is_refused_on_a_relative_run_dir_under_a_lone_surrogate(fixture_tree):
+    r,text=_claude_lane_with_relative_run_dir_in_lone_surrogate_cwd(fixture_tree)
+    assert r.returncode!=0 and "lone-surrogate-refused" in text and not (fixture_tree["root"]/"args.json").exists(), ascii(text[-2000:])
+
+
+def test_r16_mutation_no_check_after_resolving_leaves_the_claude_lane_unrefused(fixture_tree):
+    _,text=_claude_lane_with_relative_run_dir_in_lone_surrogate_cwd(fixture_tree,mutation=_replacing("Assert-NoLoneSurrogate -Text @($RunDir)\n",""))
+    assert "lone-surrogate-refused" not in text, ascii(text[-2000:])
+
+
+@pytest.mark.parametrize("name",["judge\U0001F600","judge�"],ids=["whole-pair","literal-replacement-character"])
+def test_r16_control_a_well_formed_run_dir_reaches_the_child_unchanged_and_verifies(fixture_tree,name):
+    root=fixture_tree["root"]
+    cmd,env,_=_lane_with_lone_surrogate(fixture_tree,"none","")
+    run_dir=root/name; run_dir.mkdir()
+    cmd[cmd.index("-RunDir")+1]=str(run_dir)
+    r=_run_lane_to_files(_through_the_call_operator(cmd,root),env,root)
+    receipt=run_dir/"terra-001.receipt.json"
+    assert r.returncode==0, ascii((root/"lane.stderr.txt").read_text(encoding="utf-8",errors="replace")[-2000:])
+    seen=json.loads((root/"image-bytes.json").read_text(encoding="utf-8-sig"))
+    entry=json.loads(receipt.read_text(encoding="utf-8"))["imagePaths"][0]
+    assert name in seen[0]["path"] and seen[0]["path"]==entry["path"], ascii((entry,seen))
+    assert entry["consumedVerified"] is True and seen[0]["sha256"]==entry["sha256"], ascii((entry,seen))
+
+
 def test_r14_b3_control_an_ordinary_no_image_lane_has_no_stop_to_report(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     r=run_lane(cmd,env)

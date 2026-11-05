@@ -1917,6 +1917,17 @@ function Assert-ArgvHasNoNul {
         }
     }
 }
+# r16 (OPEN A1 on feeea1f9): UTF-8 and the image host's Encoding.Unicode frame turn a lone surrogate into U+FFFD, which names a DIFFERENT path, so the child could read another directory's file while the held
+# snapshot verifies. Refused where a path enters and at the codex launch bound, so no frame or sibling encoder sees one. `pwsh -File` has already replaced it before this script runs; see docs/lane-containment.md.
+function Assert-NoLoneSurrogate {
+    param([string[]]$Text = @())
+    $lone = '[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
+    foreach ($t in @($Text)) {
+        if ([regex]::IsMatch([string]$t, $lone)) {
+            throw "lone-surrogate-refused: '$([regex]::Replace([string]$t, $lone, { param($m) '\u{0:X4}' -f [int]$m.Value[0] }))' holds a lone surrogate, which would reach the provider as a different path; refused before launch"
+        }
+    }
+}
 function Assert-CodexLaunchFits {
     param([Parameter(Mandatory = $true)]$Launch, [string[]]$Argv = @(), [int]$ImageCount = 0)
     $file = [string]$Launch.FileName
@@ -1925,6 +1936,7 @@ function Assert-CodexLaunchFits {
         throw "codex-shim-unsupported: the resolved codex launch '$file' is itself a batch file, which only cmd.exe runs; refused before launch"
     }
     Assert-ArgvHasNoNul -Argv (@($Launch.PrefixArgs) + @($Argv))
+    Assert-NoLoneSurrogate -Text (@($file) + @($Launch.PrefixArgs) + @($Argv))
     return (Assert-CodexCommandLineFits -Exe $file -Argv (@($Launch.PrefixArgs) + @($Argv)) -ImageCount $ImageCount)
 }
 function Set-CodexLaunchStartInfo {
@@ -2045,8 +2057,10 @@ if (-not $RunDir) {
     # product-ratio guard's coverage check reads the board tree first.
     $RunDir = Join-Path $RepoRoot ".claude-state\fleet-runs\$stamp"
 }
+Assert-NoLoneSurrogate -Text (@($RunDir, $WorkDir) + @($ImagePathsGiven))
 if (-not (Test-Path -LiteralPath $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
+Assert-NoLoneSurrogate -Text @($RunDir)
 
 $cfg = $LANES[$Lane].Clone()
 if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
