@@ -51,6 +51,7 @@ LOOK_STATE_FIELDS = (
     "look_assist_flavor",
 )
 EXCLUDED_FIELDS = frozenset(("last_serial", "next_serial"))
+REQUIRED_RESULT_FIELDS = ("analysis", "scene", "final_temp", "final_tint")
 
 _LINE_RX = re.compile(
     r"^\[(?P<stamp>[^\]]+)\]\s+\[[^\]]+\]\s+\[[^\]]+\]\s+interaction_trace\s+event=(?P<event>\S+)\s*(?P<body>.*)$"
@@ -80,11 +81,19 @@ def _compared_rows(rows):
     return out
 
 
+def _event_order(rows):
+    return [event for _number, _stamp, event, _fields in rows if event in COMPARED_EVENTS or event == VISUAL_STATE_EVENT]
+
+
 def compare_rows(control_rows, treatment_rows):
     """Returns the list of differences, one string each."""
     control = _compared_rows(control_rows)
     treatment = _compared_rows(treatment_rows)
     differences = []
+    control_order = _event_order(control_rows)
+    treatment_order = _event_order(treatment_rows)
+    if control_order != treatment_order:
+        differences.append("event order: control=%s treatment=%s" % (",".join(control_order), ",".join(treatment_order)))
     for event in COMPARED_EVENTS + (VISUAL_STATE_EVENT,):
         left = control.get(event, [])
         right = treatment.get(event, [])
@@ -108,12 +117,21 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
     result = _last_result(rows)
     if result is None:
         failures.append("%s: no look_assist.apply.result line" % arm)
+    else:
+        for key in REQUIRED_RESULT_FIELDS:
+            if not result.get(key):
+                failures.append("%s: look_assist.apply.result has no %s" % (arm, key))
     states = [fields for _n, _s, event, fields in rows if event == VISUAL_STATE_EVENT]
     if not states:
         failures.append("%s: no %s line" % (arm, VISUAL_STATE_EVENT))
     for fields in states:
         if fields.get("look_assist_enabled") != "1":
             failures.append("%s: look_assist_enabled=%s (Look Assist must be on in every leg)" % (arm, fields.get("look_assist_enabled")))
+        if fields.get("look_assist_diagnostics_valid") != "1":
+            failures.append("%s: look_assist_diagnostics_valid=%s, the analysis did not land" % (arm, fields.get("look_assist_diagnostics_valid")))
+        for key in LOOK_STATE_FIELDS:
+            if fields.get(key) is None:
+                failures.append("%s: %s has no %s" % (arm, VISUAL_STATE_EVENT, key))
     if result is not None and require_walk and result.get("post_walk_ran") != "1":
         failures.append("%s: post_walk_ran=%s, this arm cannot catch a skipped refinement" % (arm, result.get("post_walk_ran")))
     if result is not None and require_surface_search and result.get("surface_search") != "converged":

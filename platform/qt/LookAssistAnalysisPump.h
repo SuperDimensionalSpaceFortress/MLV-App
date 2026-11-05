@@ -8,7 +8,10 @@
 
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QEventLoop>
+#include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QStringLiteral>
 #include <QVector>
@@ -131,6 +134,37 @@ private:
     std::thread m_thread;
 };
 
+// The event types that are the user's hand on the app.
+inline bool isUserInputEvent( QEvent::Type type )
+{
+    switch( type )
+    {
+    case QEvent::MouseButtonPress:
+    case QEvent::MouseButtonRelease:
+    case QEvent::MouseButtonDblClick:
+    case QEvent::MouseMove:
+    case QEvent::NonClientAreaMouseButtonPress:
+    case QEvent::NonClientAreaMouseButtonRelease:
+    case QEvent::NonClientAreaMouseButtonDblClick:
+    case QEvent::Wheel:
+    case QEvent::KeyPress:
+    case QEvent::KeyRelease:
+    case QEvent::Shortcut:
+    case QEvent::ShortcutOverride:
+    case QEvent::ContextMenu:
+    case QEvent::TouchBegin:
+    case QEvent::TouchUpdate:
+    case QEvent::TouchEnd:
+    case QEvent::TouchCancel:
+    case QEvent::TabletPress:
+    case QEvent::TabletMove:
+    case QEvent::TabletRelease:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The GUI thread's side of one analysis. With no session open every call runs inline on the caller, which is the route
 // the MLVAPP_LOOK_ASSIST_ANALYSIS_INLINE=1 rollback and every other caller of the apply take.
 class AnalysisPump
@@ -139,18 +173,24 @@ public:
     // How long one pump turn waits for the worker before it looks at the event queue again.
     static constexpr int kTurnWaitMs = 4;
 
-    void beginSession( AnalysisWorker *worker )
+    // mayTakeInput: true while the user may act anyway. A modal dialog that a held-off path could not stop has to work,
+    // and the window behind it takes no input.
+    void beginSession( AnalysisWorker *worker, std::function<bool()> mayTakeInput = nullptr )
     {
         m_worker = worker;
         m_lastTurn.start();
         m_guiBlockMaxMs = 0.0;
         m_ticks = 0;
+        m_inputHold.mayTakeInput = std::move( mayTakeInput );
+        if( QCoreApplication::instance() ) QCoreApplication::instance()->installEventFilter( &m_inputHold );
     }
 
     // Returns the work to run once the analysis has landed, in the order it was held.
     QVector<std::function<void()>> endSession()
     {
         noteTurn();
+        if( QCoreApplication::instance() ) QCoreApplication::instance()->removeEventFilter( &m_inputHold );
+        m_inputHold.mayTakeInput = nullptr;
         m_worker = nullptr;
         QVector<std::function<void()>> held;
         held.swap( m_held );
@@ -241,6 +281,34 @@ public:
     }
 
 private:
+    // ExcludeUserInputEvents only binds this pump's own turn. A slot in the turn can run an unrestricted loop of its own
+    // (Updater::getReleaseList does), and that loop delivers a click into whatever it reaches: Next Clip would wait on the
+    // clip barrier that the suspended analysis holds, forever. So input stops here for the whole session, whichever loop
+    // carries it, and each event is posted again at landing, as ExcludeUserInputEvents would have kept it.
+    class InputHold : public QObject
+    {
+    public:
+        explicit InputHold( AnalysisPump *pump ) : m_pump( pump ) {}
+        std::function<bool()> mayTakeInput;
+
+    protected:
+        bool eventFilter( QObject *watched, QEvent *event ) override
+        {
+            if( !isUserInputEvent( event->type() ) || ( mayTakeInput && mayTakeInput() ) ) return false;
+            const QPointer<QObject> target( watched );
+            QEvent *const held = event->clone();
+            m_pump->hold( [target, held]()
+            {
+                if( target ) QCoreApplication::postEvent( target.data(), held );
+                else delete held;
+            } );
+            return true;
+        }
+
+    private:
+        AnalysisPump *m_pump;
+    };
+
     template <typename WaitForFinish>
     void pumpUntil( WaitForFinish waitForFinish )
     {
@@ -268,6 +336,7 @@ private:
     int m_pumpDepth = 0;
     bool m_drainingRender = false;
     QVector<std::function<void()>> m_held;
+    InputHold m_inputHold{ this };
 };
 
 } // namespace look_assist_pump

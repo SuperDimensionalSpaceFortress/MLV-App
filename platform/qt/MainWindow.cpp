@@ -3219,10 +3219,12 @@ bool MainWindow::event(QEvent *event)
             logInteractionEvent( QStringLiteral("playback_prep.file_open_skipped"), QStringLiteral("reason=export-in-progress") );
             return true;
         }
-        // Importing can replace the clip under the analysis (the barrier wait would never return from a pump turn).
+        // Importing can replace the clip under the analysis (the barrier wait would never return from a pump turn). The
+        // request runs at landing.
         if( m_lookAssistPump.sessionOpen() )
         {
-            logInteractionEvent( QStringLiteral("playback_prep.file_open_skipped"), QStringLiteral("reason=look-assist-analysis") );
+            QEvent *const heldOpen = event->clone();
+            m_lookAssistPump.hold( [this, heldOpen]() { QCoreApplication::postEvent( this, heldOpen ); } );
             return true;
         }
         if( QFile(fileName).exists() && fileName.endsWith( ".mlv", Qt::CaseInsensitive ) )
@@ -17064,7 +17066,7 @@ void MainWindow::applyLookAssistFromFrameReady( ReceiptSettings *receipt, int an
     // One thread for the life of the process, never ended (AnalysisWorker says why). It holds nothing of the clip
     // between calls, and process exit ends it.
     static look_assist_pump::AnalysisWorker *const s_analysisWorker = new look_assist_pump::AnalysisWorker();
-    m_lookAssistPump.beginSession( s_analysisWorker );
+    m_lookAssistPump.beginSession( s_analysisWorker, []() { return QApplication::activeModalWidget() != nullptr; } );
 
     const QString analyzingMessage = tr( "Analyzing Look Assist" );
     statusBar()->showMessage( analyzingMessage, 0 );
@@ -35086,6 +35088,13 @@ void MainWindow::on_actionCheckForUpdates_triggered( void )
 //Autocheck for updates told there is an update
 void MainWindow::updateCheck(void)
 {
+    // The startup timer can fire during a Look Assist analysis, and the check runs an event loop of its own.
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this]() { updateCheck(); } );
+        return;
+    }
+
     Updater *pUpdater = new Updater(this, mlvAppUpdateReleasesUrl(), GITVERSION);
     if( pUpdater->isUpdateAvailable() ) on_actionCheckForUpdates_triggered();
     else checkFocusPixelUpdate();

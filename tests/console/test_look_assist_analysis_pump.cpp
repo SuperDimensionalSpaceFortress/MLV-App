@@ -7,6 +7,7 @@
 #include "../../platform/qt/LookAssistAnalysisPump.h"
 
 #include <QCoreApplication>
+#include <QEvent>
 #include <QFile>
 #include <QString>
 #include <QTextStream>
@@ -194,6 +195,80 @@ TEST(LookAssistAnalysisPump, TheRenderDrainPresentsAndIsBounded)
     pump.endSession();
 }
 
+namespace
+{
+
+class EventCounter : public QObject
+{
+public:
+    int inputEvents = 0;
+
+protected:
+    bool event( QEvent *e ) override
+    {
+        if( look_assist_pump::isUserInputEvent( e->type() ) ) ++inputEvents;
+        return QObject::event( e );
+    }
+};
+
+} // namespace
+
+// Adversary A1: a slot in a pump turn ran an unrestricted loop (Updater::getReleaseList), a click reached Next Clip, and
+// the clip replacement waited forever on the barrier the suspended analysis holds.
+TEST(LookAssistAnalysisPump, AnUnrestrictedLoopInATurnCannotDeliverInputUntilLanding)
+{
+    EventCounter target;
+
+    // Control: with no session the same loop delivers the event, so what the session does below is the session's doing.
+    QCoreApplication::postEvent( &target, new QEvent( QEvent::MouseButtonPress ) );
+    QCoreApplication::processEvents();
+    ASSERT_EQ( 1, target.inputEvents );
+    target.inputEvents = 0;
+
+    AnalysisWorker worker;
+    AnalysisPump pump;
+    pump.beginSession( &worker );
+    int deliveredInsideTheLoop = -1;
+    QTimer::singleShot( 0, [&]()
+    {
+        QCoreApplication::postEvent( &target, new QEvent( QEvent::MouseButtonPress ) );
+        QCoreApplication::postEvent( &target, new QEvent( QEvent::KeyPress ) );
+        QCoreApplication::processEvents();   // what the update check does
+        deliveredInsideTheLoop = target.inputEvents;
+    } );
+    pump.call( []() { sleepMs( 100 ); } );
+    const auto held = pump.endSession();
+    ASSERT_EQ( 0, deliveredInsideTheLoop );
+    ASSERT_EQ( 0, target.inputEvents );
+    ASSERT_EQ( 2, static_cast<int>( held.size() ) );
+
+    // Landing: the click takes effect, and later input is untouched.
+    for( const auto &work : held ) work();
+    QCoreApplication::processEvents();
+    ASSERT_EQ( 2, target.inputEvents );
+    QCoreApplication::postEvent( &target, new QEvent( QEvent::MouseButtonPress ) );
+    QCoreApplication::processEvents();
+    ASSERT_EQ( 3, target.inputEvents );
+}
+
+TEST(LookAssistAnalysisPump, ADialogThatIsUpKeepsItsInputAndOtherEventsPass)
+{
+    EventCounter target;
+    AnalysisWorker worker;
+    AnalysisPump pump;
+    bool dialogUp = true;
+    pump.beginSession( &worker, [&dialogUp]() { return dialogUp; } );
+    QCoreApplication::postEvent( &target, new QEvent( QEvent::MouseButtonPress ) );
+    QCoreApplication::processEvents();
+    ASSERT_EQ( 1, target.inputEvents );
+    dialogUp = false;
+    bool userEventDelivered = false;
+    QTimer::singleShot( 0, [&userEventDelivered]() { userEventDelivered = true; } );
+    QCoreApplication::processEvents();
+    ASSERT_TRUE( userEventDelivered );
+    ASSERT_TRUE( pump.endSession().isEmpty() );
+}
+
 #ifdef Q_OS_WIN
 namespace
 {
@@ -293,6 +368,7 @@ TEST(LookAssistAnalysisPumpWiring, TheFrameReadyCallersPumpAndTheRouteHasItsRoll
     ASSERT_TRUE( route.contains( QStringLiteral( "statusBar()->clearMessage()" ) ) );
     ASSERT_TRUE( route.contains( QStringLiteral( "kRenderDrainBoundMs = 2000" ) ) );
     ASSERT_TRUE( route.contains( QStringLiteral( "isIdle()" ) ) );
+    ASSERT_TRUE( route.contains( QStringLiteral( "QApplication::activeModalWidget() != nullptr" ) ) );
     ASSERT_TRUE( route.contains( QStringLiteral( "look_assist.apply.render_wait" ) ) );
     // The worker is never deleted: process exit ends it.
     ASSERT_TRUE( route.contains( QStringLiteral( "static look_assist_pump::AnalysisWorker *const s_analysisWorker = new" ) ) );
@@ -312,7 +388,9 @@ TEST(LookAssistAnalysisPumpWiring, EverySiteAPumpTurnCanReachHoldsItself)
         { "void MainWindow::timerFrameEvent(", "if( m_lookAssistPump.sessionOpen() ) return;" },
         { "void MainWindow::timerEvent(", "m_fileLoaded && !m_lookAssistPump.sessionOpen()" },
         { "void MainWindow::resizeEvent(", "m_lookAssistPump.sessionOpen()" },
-        { "bool MainWindow::event(", "m_lookAssistPump.sessionOpen()" },
+        { "void MainWindow::updateCheck(", "m_lookAssistPump.pumping()" },
+        // Adversary A2: the request comes back at landing, it is not dropped.
+        { "bool MainWindow::event(", "QEvent *const heldOpen = event->clone();" },
         { "void MainWindow::dropEvent(", "m_lookAssistPump.pumping()" },
         { "void MainWindow::openMlvSet(", "m_lookAssistPump.pumping()" },
         { "void MainWindow::onPlaybackPrepResultReady(", "m_lookAssistPump.holdsPresentation()" },

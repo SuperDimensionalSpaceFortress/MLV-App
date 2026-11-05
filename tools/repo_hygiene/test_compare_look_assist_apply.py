@@ -113,6 +113,27 @@ class CompareLookAssistApply(unittest.TestCase):
     def test_an_arm_with_no_analysis_fails_closed(self):
         self.assertEqual(compare.run("", "")["verdict"], "differs")
 
+    def test_adversary_a3_an_empty_result_and_an_invalid_state_fail_closed(self):
+        log = (
+            "[2026-11-05T10:39:01.000Z] [INFO] [0x1] interaction_trace event=look_assist.apply.result\n"
+            "[2026-11-05T10:39:02.000Z] [INFO] [0x1] interaction_trace event=gui_smoke.visual_state "
+            "look_assist_enabled=1 look_assist_diagnostics_valid=0\n"
+        )
+        report = compare.run(log, log)
+        self.assertEqual(report["verdict"], "differs")
+        self.assertTrue(any("has no final_temp" in f for f in report["failures"]), report)
+        self.assertTrue(any("look_assist_diagnostics_valid=0" in f for f in report["failures"]), report)
+        self.assertTrue(any("has no temperature" in f for f in report["failures"]), report)
+
+    def test_adversary_a4_events_of_different_types_exchanged_differ(self):
+        lines = arm().splitlines()
+        post = next(i for i, l in enumerate(lines) if "look_assist.apply.post_balance" in l)
+        res = next(i for i, l in enumerate(lines) if "look_assist.apply.result" in l)
+        lines[post], lines[res] = lines[res], lines[post]
+        report = compare.run(arm(), "\n".join(lines) + "\n", require_walk=True)
+        self.assertEqual(report["verdict"], "differs")
+        self.assertTrue(any(d.startswith("event order:") for d in report["differences"]), report)
+
     def test_play_before_the_analysis_landed_fails(self):
         report = compare.run(arm(), arm(play_first=True))
         self.assertEqual(report["verdict"], "differs")
