@@ -364,9 +364,66 @@ def _pwsh_script_argv(script: str):
             os.unlink(path)
 
 
-def _run_pwsh_script(script: str, timeout: float = 120) -> subprocess.CompletedProcess:
+PWSH_SCRIPT_BASE_SEC = 120  # a bare pwsh start, the compile of the capture type and the script's own end: what a script with NO worker call needs
+_CAPTURE_CALL = re.compile(r"\b(Read-CapturedResult|Read-CapturedText|Remove-CaptureFiles)\b([^\n]*)")
+_LOOP_BLOCK_HEAD = re.compile(r"(?i)(?:\b(?:foreach|for|while)\s*\([^{}]*\)|\bdo|ForEach-Object)\s*$")
+
+
+def _call_is_inside_a_loop(body: str, position: int) -> bool:
+    """True when `position` sits inside a `foreach (...) {`, `for`, `while`, `do {` or `ForEach-Object {` block of the pwsh `body`."""
+    stack: list[bool] = []
+    for index in range(position):
+        char = body[index]
+        if char == "{":
+            stack.append(bool(_LOOP_BLOCK_HEAD.search(body[max(0, index - 200):index])))
+        elif char == "}" and stack:
+            stack.pop()
+    return any(stack)
+MAX_DECLARED_BOUND_MS = 120000  # an integer on a call line above this is a pid or a count, not an operation bound
+
+
+def pwsh_script_budget_sec(script: str, repeat: int = 1) -> float:
+    """The whole-script wall-clock budget of a pwsh case, derived from the capture calls the script makes (r16, Dot C1 / adversary r15 A3).
+
+    r13 started a worker pwsh for every Read-Captured* / Remove-CaptureFiles call, and each call may legitimately take
+    capture_call_ceiling_ms(its bound) (the worker start bound, the operation, the teardown bounds, slack). A fixed 120 s therefore failed a
+    valid script after four permitted slow starts (the transport case makes 18 calls). The budget is the base allowance plus, for every call
+    site in the script body (the helpers' own definitions, before the END marker, are not calls), that call's ceiling; a call line whose bound
+    is a variable is charged the worker start bound. A script that wraps calls in a loop must say how often with `repeat`, so a loop can never
+    hide calls from the derivation. A genuine hang still ends at the budget: run_bounded kills the whole tree and fails by case name.
+    """
+    marker = "# END bounded capture io"
+    body = script[script.index(marker):] if marker in script else script
+    if repeat < 1:
+        raise ValueError("repeat must be at least 1")
+    straight_ms, looped_ms = 0, 0
+    for match in _CAPTURE_CALL.finditer(body):
+        if re.search(r"(?i)\bfunction\s+$", body[:match.start()]):
+            continue
+        bounds = [int(n) for n in re.findall(r"(?<![\w$.])\d+(?![\w.])", match.group(2)) if 0 < int(n) <= MAX_DECLARED_BOUND_MS]
+        ceiling = capture_call_ceiling_ms(max(bounds) if bounds else CAPTURE_WORKER_START_MS)
+        if _call_is_inside_a_loop(body, match.start()):
+            looped_ms += ceiling
+        else:
+            straight_ms += ceiling
+    if looped_ms and repeat < 2:
+        raise AssertionError("this pwsh script makes capture calls inside a loop: pass repeat=<iterations> so the budget counts them")
+    return PWSH_SCRIPT_BASE_SEC + (straight_ms + repeat * looped_ms) / 1000
+
+
+def _case_name() -> str:
+    frame = sys._getframe(1)
+    while frame is not None and not frame.f_code.co_name.startswith("test_"):
+        frame = frame.f_back  # type: ignore[assignment]
+    return frame.f_code.co_name if frame is not None else "pwsh script"
+
+
+def _run_pwsh_script(script: str, repeat: int = 1) -> subprocess.CompletedProcess:
+    """Run `script` in a bare pwsh under its derived budget; a hang kills the tree and fails by case name (run_bounded)."""
+    budget = pwsh_script_budget_sec(script, repeat)
     with _pwsh_script_argv(script) as argv:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        code, out, err = run_bounded(argv, budget, _case_name())
+    return subprocess.CompletedProcess(argv, code, out, err)
 
 
 def _fifo_capture_io_region(fifo: str) -> str:
@@ -1864,8 +1921,8 @@ class BoundedCaptureIoTests(unittest.TestCase):
         self.assertNotIn("capture cleanup", str(caught))
 
     @staticmethod
-    def _pwsh(script: str) -> subprocess.CompletedProcess:
-        return _run_pwsh_script(script)
+    def _pwsh(script: str, repeat: int = 1) -> subprocess.CompletedProcess:
+        return _run_pwsh_script(script, repeat)
 
     @unittest.skipUnless(os.name == "nt" and PWSH is not None, "named pipes and pwsh are Windows-only here")
     def test_a_stalled_capture_open_is_abandoned_inside_its_bound_and_named(self) -> None:
@@ -1892,7 +1949,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "  try { $null = Remove-CaptureFiles @('C:\\x\\a.txt') $b $seam; Write-Output \"DEL|$b|NOT-REFUSED\" } catch { Write-Output \"DEL|$b|$($_.Exception.Message)\" }\n"
                   "}\n"
                   "Write-Output \"STARTED|$($script:started)\"\n")
-        proc = self._pwsh(script)
+        proc = self._pwsh(script, repeat=4)  # the loop runs the four refused bounds
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         rows = [line.split("|", 2) for line in proc.stdout.splitlines() if line.startswith(("READ|", "DEL|"))]
         self.assertEqual(len(rows), 8, proc.stdout)
@@ -1963,6 +2020,67 @@ class BoundedCaptureIoTests(unittest.TestCase):
                 if re.search(r"ElapsedMilliseconds -lt \d+", line) and "Get-Process" not in line and "Exists(" not in line:
                     offenders.append(f"{name}: {line.strip()[:100]}")
         self.assertEqual(offenders, [], "a typed elapsed ceiling spans a worker start; derive it with capture_call_ceiling_ms")
+
+    # r16 (Dot C1, adversary r15 A3): the WHOLE-script budget. _run_pwsh_script capped every script at a typed 120 s, but the transport case
+    # makes 18 worker calls and each may spend CaptureWorkerStartMs (30 s) before its step's clock, so permitted starts alone exceed it.
+    def test_r16_c1_the_whole_script_budget_is_derived_from_the_calls_the_script_makes(self) -> None:
+        region = "function Read-CapturedResult { }\n# END bounded capture io\n"
+        self.assertEqual(pwsh_script_budget_sec("Write-Output 'no worker call'"), PWSH_SCRIPT_BASE_SEC)
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedResult $p 300 $f\n"),
+                         PWSH_SCRIPT_BASE_SEC + capture_call_ceiling_ms(300) / 1000, "the definition is not a call; the call is charged its own ceiling")
+        self.assertEqual(pwsh_script_budget_sec(region + "$r = Read-CapturedText $p $b $f\n"),
+                         PWSH_SCRIPT_BASE_SEC + capture_call_ceiling_ms(CAPTURE_WORKER_START_MS) / 1000, "a variable bound is charged the worker start bound")
+        looped = region + "foreach ($t in $texts) {\n  $r = Read-CapturedResult $p 10000 $ok\n  $n = Remove-CaptureFiles @($p) 10000 $ok\n}\n$z = Read-CapturedResult $p 50 $f\n"
+        with self.assertRaises(AssertionError, msg="calls inside a loop must declare how often the loop runs"):
+            pwsh_script_budget_sec(looped)
+        self.assertEqual(pwsh_script_budget_sec(looped, repeat=6),
+                         PWSH_SCRIPT_BASE_SEC + (6 * 2 * capture_call_ceiling_ms(10000) + capture_call_ceiling_ms(50)) / 1000)
+        outside = region + "$a = Read-CapturedResult $p 50 $f\nforeach ($f in $files) { Stop-Process -Id $f }\n"
+        self.assertEqual(pwsh_script_budget_sec(outside), PWSH_SCRIPT_BASE_SEC + capture_call_ceiling_ms(50) / 1000, "a loop with no call in it needs no repeat")
+        # The failing shape: 18 calls that each take a PERMITTED worker start. The old typed 120 s could not hold even four of them.
+        permitted_starts_sec = 18 * CAPTURE_WORKER_START_MS / 1000
+        self.assertGreater(permitted_starts_sec, 120, "the old fixed cap could not hold the permitted starts of the transport case")
+        self.assertGreater(pwsh_script_budget_sec(looped, repeat=6), PWSH_SCRIPT_BASE_SEC + 6 * 2 * CAPTURE_WORKER_START_MS / 1000)
+        # No call site may bring its own typed timeout back.
+        source = Path(__file__).read_text(encoding="utf-8")
+        runner = source[source.index("def _run_pwsh_script("):source.index("def _fifo_capture_io_region(")]
+        self.assertNotIn("timeout", runner.split('"""')[0], "the runner takes no typed whole-script timeout")
+        self.assertIn("run_bounded(argv, budget, _case_name())", runner, "a whole script runs under run_bounded: a hang kills the tree and fails by case")
+        self.assertNotIn("subprocess.run(", runner)
+        self.assertEqual(re.findall(r"_run_pwsh_script\([^)\n]*timeout", source), [], "a case passes a typed whole-script timeout")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_r16_c1_a_script_whose_permitted_slow_worker_starts_outlast_the_old_fixed_cap_still_passes(self) -> None:
+        # Real pwsh, scaled: the typed base is patched down to 4 s (standing in for the old fixed cap), and every worker start is delayed
+        # 2 s (a PERMITTED delay: far under CaptureWorkerStartMs). Three calls then run longer than that base, so a fixed cap of that size
+        # fails this script; the derived budget adds the three calls' own ceilings and passes it.
+        script = (_fifo_capture_io_region(FIFO_TEST.read_text(encoding="ascii")) + "\n"
+                  "# END bounded capture io\n"
+                  "$real = (Get-Command Start-CaptureWorker -CommandType Function).ScriptBlock\n"
+                  "function Start-CaptureWorker { Start-Sleep -Milliseconds 2000; & $real }\n"
+                  "$p = Join-Path ([IO.Path]::GetTempPath()) 'a.txt'\n"
+                  "$f = { param($p) [Threading.Tasks.Task]::FromResult('ok') }\n"
+                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('ONE|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('TWO|' + $r.Ok + '|' + $r.Text)\n"
+                  "$r = Read-CapturedResult $p 5000 $f; Write-Output ('THREE|' + $r.Ok + '|' + $r.Text)\n")
+        base = 4
+        started = time.monotonic()
+        with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", base):
+            proc = _run_pwsh_script(script)
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for label in ("ONE", "TWO", "THREE"):
+            self.assertIn(f"{label}|True|ok", proc.stdout, proc.stdout + proc.stderr)
+        self.assertGreater(elapsed, base, "the script must outlast the typed base, or this case no longer shows what a fixed cap does")
+
+    @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
+    def test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget(self) -> None:
+        with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", 3):
+            with self.assertRaises(AssertionError) as caught:
+                _run_pwsh_script("Start-Sleep -Seconds 600\n")
+        message = str(caught.exception)
+        self.assertIn("test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget exceeded its 3 s wall-clock bound", message)
+        self.assertIn("its process tree was killed", message)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_factory_that_consumes_the_bound_before_returning_a_completed_task_is_a_timeout_not_a_late_success(self) -> None:
@@ -2178,7 +2296,7 @@ class BoundedCaptureIoTests(unittest.TestCase):
                   "  Write-Output (\"NOTE|$i|\" + ((Remove-CaptureFiles @($p) 10000 $ok) -ceq \"capture cleanup incomplete: $t\"))\n"
                   "  $i++\n"
                   "}\n")
-        proc = self._pwsh(script)
+        proc = self._pwsh(script, repeat=6)  # the loop runs the six texts: 18 worker calls in all
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         for kind in ("TEXT", "ERROR", "NOTE"):
             for i in range(6):
