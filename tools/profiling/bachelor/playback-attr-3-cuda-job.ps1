@@ -4543,38 +4543,38 @@ function Get-CorePartitionTopology {
         $len = [uint32]0
         [void][MlvCorePartition.Cpu]::GetLogicalProcessorInformationEx(0xFFFF, [IntPtr]::Zero, [ref]$len)
         if ($len -lt 40) { return @{ map = $map; reason = "GetLogicalProcessorInformationEx reported $len bytes" } }
-        $buf = [Runtime.InteropServices.Marshal]::AllocHGlobal([int]$len)
+        $m = [Runtime.InteropServices.Marshal]
+        $buf = $m::AllocHGlobal([int]$len)
         try {
             if (-not [MlvCorePartition.Cpu]::GetLogicalProcessorInformationEx(0xFFFF, $buf, [ref]$len)) { return @{ map = $map; reason = 'GetLogicalProcessorInformationEx failed' } }
-            $m = [Runtime.InteropServices.Marshal]
-            $byGroupBit = @{}; $nodes = @{}; $groupsSeen = @{}
+            $bg = @{}; $nd = @{}; $gs = @{}
             $o = 0
             while ($o + 8 -le $len) {
                 $size = $m::ReadInt32($buf, $o + 4)
                 if ($size -lt 8) { break }
                 $rel = $m::ReadInt32($buf, $o)
                 if (($rel -eq 0 -or $rel -eq 1) -and $size -ge 48) {
-                    $groupCount = [int]$m::ReadInt16($buf, $o + 30); if ($groupCount -lt 1) { $groupCount = 1 }
-                    for ($g = 0; $g -lt $groupCount; $g++) {
+                    $gc = [int]$m::ReadInt16($buf, $o + 30); if ($gc -lt 1) { $gc = 1 }
+                    for ($g = 0; $g -lt $gc; $g++) {
                         $at = $o + 32 + 16 * $g
                         $mask = $m::ReadInt64($buf, $at); $grp = [int]$m::ReadInt16($buf, $at + 8)
                         for ($bit = 0; $bit -lt 64; $bit++) {
                             if (-not (($mask -shr $bit) -band 1)) { continue }
-                            if ($rel -eq 0) { $byGroupBit["$grp,$bit"] = [int]$m::ReadByte($buf, $o + 9); $groupsSeen[$grp] = $true }
-                            else { $node = [int]$m::ReadInt32($buf, $o + 8); if (-not $nodes.ContainsKey($node)) { $nodes[$node] = @() }; $nodes[$node] += ,@($grp, $bit) }
+                            if ($rel -eq 0) { $bg["$grp,$bit"] = [int]$m::ReadByte($buf, $o + 9); $gs[$grp] = $true }
+                            else { $node = [int]$m::ReadInt32($buf, $o + 8); if (-not $nd.ContainsKey($node)) { $nd[$node] = @() }; $nd[$node] += ,@($grp, $bit) }
                         }
                     }
                 }
                 $o += $size
             }
-            if ($byGroupBit.Count -eq 0) { return @{ map = $map; reason = 'GetLogicalProcessorInformationEx returned no cores' } }
-            if ($nodes.Count -gt 1 -and $groupsSeen.Count -eq 1) {
-                foreach ($n in $nodes.Keys) {
+            if ($bg.Count -eq 0) { return @{ map = $map; reason = 'GetLogicalProcessorInformationEx returned no cores' } }
+            if ($nd.Count -gt 1 -and $gs.Count -eq 1) {
+                foreach ($n in $nd.Keys) {
                     $ord = 0
-                    foreach ($gb in @($nodes[$n] | Sort-Object { $_[0] * 1000 + $_[1] })) { $map["$n,$ord"] = $byGroupBit["$($gb[0]),$($gb[1])"]; $ord++ }
+                    foreach ($gb in @($nd[$n] | Sort-Object { $_[0] * 1000 + $_[1] })) { $map["$n,$ord"] = $bg["$($gb[0]),$($gb[1])"]; $ord++ }
                 }
-            } else { $map = $byGroupBit }
-        } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buf) }
+            } else { $map = $bg }
+        } finally { $m::FreeHGlobal($buf) }
         return @{ map = $map; reason = $null }
     } catch { return @{ map = @{}; reason = [string]$_.Exception.Message } }
 }
@@ -5198,7 +5198,7 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # sol r6 CP-07: every record number below went through the one guarded parse first
     $shapeWhy = Test-CorePartitionHelperRecordShape $Helper
     if ($shapeWhy) { return @{ why = $shapeWhy } }
-    # adversary r14b (c05dc76b) A1: the helper records a same-name process whose path (or, on the app's path, start time) it could not read as
+    # adversary r14b (c05dc76b) A1: the helper records a same-name process whose path (or, on the app's path, start time) it never could read as
     # unidentified; it cannot be ruled out as a competing instance, so no overlap verdict holds
     if (@(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified }).Count -gt 0) { return @{ why = 'same-path-instance-unidentified' } }
     # adversary r8 (e1ce216c) A1: under the tolerance a gap still moves each wall-clock stamp by up to that gap, so two stamps by up to twice it;
@@ -5464,8 +5464,8 @@ function Write-CorePartitionNewFile([string]$Path, [string]$Text) {
         $nf.Write($nb, 0, $nb.Length)
     } finally { $nf.Dispose() }
 }
-$exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $outPath = [string]$env:MLV_CP_OUT; $ready = [string]$env:MLV_CP_READY
-$bench = [int64]$env:MLV_CP_BENCH; $loadMask = [int64]$env:MLV_CP_LOAD; $helperMask = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
+$exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $op = [string]$env:MLV_CP_OUT; $ready = [string]$env:MLV_CP_READY
+$bench = [int64]$env:MLV_CP_BENCH; $lm = [int64]$env:MLV_CP_LOAD; $hm = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
 # r9 (Dot 3 = adversary r8 aeacec83 A3): the self-deadline is a monotonic budget in ms from the helper's own start ($cw below), so no wall-clock
 # step, backward or forward, moves it.
 $deadline = [int64]$env:MLV_CP_DEADLINE_MS
@@ -5477,21 +5477,21 @@ $u8 = [Text.Encoding]::UTF8; $hk = [Security.Cryptography.HMACSHA256]::new($u8.G
 $c0 = [DateTime]::UtcNow.Ticks; $rec.monoBaseMs = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000; $cw = [Diagnostics.Stopwatch]::StartNew()
 $clk = { $t = [DateTime]::UtcNow.Ticks; $g = [math]::Abs(($t - $c0) / 1e4 - $cw.Elapsed.TotalMilliseconds); if ($g -gt $rec.clockSkewMaxMs) { $rec.clockSkewMaxMs = $g }; $t }
 $errs = [Collections.Generic.List[string]]::new()
-$samples = [Collections.Generic.List[object]]::new()
-$instances = [Collections.Generic.List[object]]::new()
-$loadOn = $false; $loadStartMs = 0; $lb = 0
+$sm = [Collections.Generic.List[object]]::new()
+$ins = [Collections.Generic.List[object]]::new()
+$loadOn = $false; $ls0 = 0; $lb = 0
 # r9 (Dot 4 = adversary r8 aeacec83 A4): the owner's load seconds and bytes are clipped to its last poll that saw it alive (aliveMs, and the byte
 # count read at that poll, $lb), so load that ran after it exited, before the next poll saw it gone, is not its own.
 # r10 B4: each load session is its own object ($ld) with its own stop flag and byte count, so its bytes start at 0.
-$lc = { param($o) $o.loadSec += [math]::Max(0, $o.aliveMs - $loadStartMs) / 1e3; $o.loadBytes += $lb }
+$lc = { param($o) $o.loadSec += [math]::Max(0, $o.aliveMs - $ls0) / 1e3; $o.loadBytes += $lb }
 try {
     # Dot improvement + adversary r2 A2: the measured app starts after the job's measured-launch instant, which the job hands over in MLV_CP_LAUNCH once the
     # helper is ready; a same-path process that started earlier (or while no launch instant is known yet) is never bound.
-    $launchFile = [string]$env:MLV_CP_LAUNCH; $launchUtc = $null
+    $lf = [string]$env:MLV_CP_LAUNCH; $lu = $null
     $topo = Get-CorePartitionTopology
-    $tm = [ordered]@{}; foreach ($k in @($topo.map.Keys | Sort-Object)) { $tm[$k] = $topo.map[$k] }
+    $tm = [ordered]@{}; foreach ($k in @($topo.map.Keys | sort)) { $tm[$k] = $topo.map[$k] }
     $rec.topology = $tm; $rec.topologyReason = $topo.reason
-    $rec.topologyCheck = Test-CorePartitionMaskClass $topo.map $bench @($loadMask, $helperMask)
+    $rec.topologyCheck = Test-CorePartitionMaskClass $topo.map $bench @($lm, $hm)
     # r10 B4 (sol r9 B4 = adversary r9 5592421d A3): one object per load session. A worker reads only its own session's stop flag and adds only to
     # its own session's bytes, so a worker that outlives Join (descheduled) can never enter a later session; Halt() (pwsh binds no instance method named End) returns false when any worker
     # did not join, and the owning instance records it (loadJoined), which the job refuses for that session (load-worker-not-joined).
@@ -5523,8 +5523,12 @@ public sealed class MlvCorePartitionLoad {
     # (goneUtcTicks): started after the launch in instances, before it in others (adversary r5 A1), so a second process alive beside the measured app
     # across a poll is on the record. One whose whole lifetime falls between two polls is not (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1).
     # The load runs for the instance that owns it ($own), the first found while none does.
-    $live = @{}; $seen = @{}; $own = $null; $others = [Collections.Generic.List[object]]::new()
-    $nextSample = [DateTime]::UtcNow.AddSeconds(1)
+    # CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1: a failed read at first sight settles nothing. $pn holds, by pid, each same-name process not readable
+    # yet (Path goes through MainModule, which cannot read a process whose loader has not run; StartTime can fail on its own) with its real first sight,
+    # and every later poll reads it again. Only one still unread when it leaves the enumeration or when the helper stops is recorded unidentified ($un).
+    $live = @{}; $seen = @{}; $own = $null; $others = [Collections.Generic.List[object]]::new(); $pn = @{}
+    $un = { param($i) $others.Add(@{ pid = $i; unidentified = 1 }); $pn.Remove($i) }
+    $ns = [DateTime]::UtcNow.AddSeconds(1)
     $t0 = [DateTime]::UtcNow
     # r9 (Dot 1 = adversary r8 aeacec83 A1): each pass polls every tracked process BEFORE it looks for the stop file, so the job's stop (written
     # after the runner saw the app exit) finds the exit observed (goneUtcTicks + monotonic goneMs, the coverage end); a stop that arrives while the
@@ -5534,8 +5538,9 @@ public sealed class MlvCorePartitionLoad {
     while ($true) {
         [void](& $clk)
         if ($cw.ElapsedMilliseconds -ge $deadline) { $rec.endedBy = 'deadline'; break }
+        $held = @{}
         foreach ($k in @($live.Keys)) {
-            $q = $live[$k]
+            $q = $live[$k]; $held[$q.r.pid] = 1
             # r10 B1 (sol r9 B1 = adversary r9 8cf7e883 A1): the alive stamp and the load byte count are read BEFORE the liveness query, so a helper
             # descheduled after the query can only make aliveMs earlier (the gap to goneMs, the endpoint bound, longer), never charge post-exit work
             $mo = $cw.ElapsedMilliseconds; if ($k -eq $own -and $loadOn) { $bn = $ld.Bytes }
@@ -5548,40 +5553,50 @@ public sealed class MlvCorePartitionLoad {
                 $q.r.goneUtcTicks = & $clk; $q.r.goneMs = $cw.ElapsedMilliseconds; $live.Remove($k)
             }
         }
-        if ($null -eq $launchUtc -and $launchFile -and (Test-Path -LiteralPath $launchFile)) {
-            try { $launchUtc = [DateTime]::new([int64]([IO.File]::ReadAllText($launchFile).Trim()), [DateTimeKind]::Utc) } catch { }
+        if ($null -eq $lu -and $lf -and (Test-Path -LP $lf)) {
+            try { $lu = [DateTime]::new([int64]([IO.File]::ReadAllText($lf).Trim()), [DateTimeKind]::Utc) } catch { }
         }
-        if ($null -ne $launchUtc) {
+        if ($null -ne $lu) {
             # r10 B1 (class): a newly found process's alive stamp is the time before the enumeration that saw it. r10 B3 (sol r9 B3 = adversary r9
             # 8cf7e883 A3): firstMs, the monotonic time after that enumeration, and the wall first-seen stamp through $clk (which samples the clock
             # gap), so the job can order each process's start, first sight and exit and prove concurrency on the monotonic clock alone.
             $me = $cw.ElapsedMilliseconds
-            foreach ($p in @(Get-Process -Name $appName -ea 0)) {
+            $ps = @(Get-Process -Name $appName -ea 0); $lt = [DateTime]::UtcNow.Ticks
+            foreach ($p in $ps) {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
                 $k = "$($p.Id),$($pst.Ticks)"
-                # adversary r14b (c05dc76b) A1: a same-name process whose path (or, on the app's path, start time) cannot be read cannot be ruled out
-                # as a competing instance, so it is recorded unidentified (the job refuses same-path-instance-unidentified), never dropped
-                if ((!$pp -or ($pp -ieq $exe -and !$pst)) -and !$seen.ContainsKey($k)) { $seen[$k] = 1; $others.Add(@{ pid = $p.Id; unidentified = 1 }) }
-                if ($pp -and $pp -ieq $exe -and $pst -and -not $seen.ContainsKey($k)) {
-                    $seen[$k] = 1; $fs = & $clk
-                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $fs; lastSeenUtcTicks = $fs; firstMs = $cw.ElapsedMilliseconds; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
+                if ($seen[$k]) { continue }
+                $pe = $pn[$p.Id]
+                # Only one process holds a pid at a time, so a start no later than the enumeration that first listed it is that process. A later start
+                # is a process on a recycled pid, and the one first listed ended unread.
+                if ($pe -and $pst -and $pst.Ticks -gt $pe.t) { & $un $p.Id; $pe = $null }
+                # A read that fails for a pid this pass is already tracking (or just saw gone) is that process exiting, not a new one.
+                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if (!$pe -and !$held[$p.Id]) { $pn[$p.Id] = @{ t = $lt; f = & $clk; m = $cw.ElapsedMilliseconds } } }
+                else { $pn.Remove($p.Id) }
+                if ($pp -ieq $exe -and $pst) {
+                    # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
+                    $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = $cw.ElapsedMilliseconds } }
+                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
                     try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
                     $live[$k] = @{ p = $p; r = $r }
-                    if ($pst -lt $launchUtc) { $others.Add($r) }
+                    if ($pst -lt $lu) { $others.Add($r) }
                     else {
-                        $instances.Add($r)
-                        if ($null -eq $own) { $own = $k; if ($threads -gt 0) { $ld = [MlvCorePartitionLoad]::new($threads, 32); $loadOn = $true; $loadStartMs = $cw.ElapsedMilliseconds; $lb = 0; $rec.load.sessions++ } }
+                        $ins.Add($r)
+                        if ($null -eq $own) { $own = $k; if ($threads -gt 0) { $ld = [MlvCorePartitionLoad]::new($threads, 32); $loadOn = $true; $ls0 = $cw.ElapsedMilliseconds; $lb = 0; $rec.load.sessions++ } }
                     }
                 }
             }
+            # adversary r14b (c05dc76b) A1: a same-name process whose path (or, on the app's path, start time) was never read cannot be ruled out as a
+            # competing instance, so it is recorded unidentified (the job refuses same-path-instance-unidentified), never dropped
+            foreach ($i in @($pn.Keys)) { if ($ps.Id -notcontains $i) { & $un $i } }
         }
         if (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }
-        if ([DateTime]::UtcNow -ge $nextSample) {
-            $nextSample = $nextSample.AddSeconds(1)
+        if ([DateTime]::UtcNow -ge $ns) {
+            $ns = $ns.AddSeconds(1)
             try {
                 $now = $cat.ReadCategory()
-                $names = @($now['% Processor Time'].Keys | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\d+,\d+$' } | Sort-Object { $g = $_.Split(','); [int]$g[0] * 1000 + [int]$g[1] })
+                $names = @($now['% Processor Time'].Keys | % { [string]$_ } | ? { $_ -match '^\d+,\d+$' } | sort { $g = $_.Split(','); [int]$g[0] * 1000 + [int]$g[1] })
                 $vals = @{}
                 foreach ($cn in @('% Processor Time', 'Processor Frequency', '% Processor Performance', 'Parking Status')) {
                     $arr = New-Object object[] $names.Count
@@ -5590,34 +5605,36 @@ public sealed class MlvCorePartitionLoad {
                     }
                     $vals[$cn] = $arr
                 }
-                $samples.Add([ordered]@{ tMs = [int](([DateTime]::UtcNow - $t0).TotalMilliseconds); m = $cw.ElapsedMilliseconds; app = $false; appPid = $(if ($null -ne $own) { $live[$own].r.pid }); inst = $names; time = $vals['% Processor Time']; freq = $vals['Processor Frequency']; perf = $vals['% Processor Performance']; park = $vals['Parking Status'] })
+                $sm.Add([ordered]@{ tMs = [int](([DateTime]::UtcNow - $t0).TotalMilliseconds); m = $cw.ElapsedMilliseconds; app = $false; appPid = $(if ($null -ne $own) { $live[$own].r.pid }); inst = $names; time = $vals['% Processor Time']; freq = $vals['Processor Frequency']; perf = $vals['% Processor Performance']; park = $vals['Parking Status'] })
                 $prev = $now
             } catch { if ($errs.Count -lt 20) { $errs.Add("sample: $($_.Exception.Message)") } }
         }
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -m 200
     }
 } catch { $errs.Add("helper: $($_.Exception.Message)") }
 finally {
     try { if ($loadOn) { $o = $live[$own].r; $o.loadJoined = $ld.Halt(); & $lc $o } } catch { $errs.Add("load-end: $($_.Exception.Message)") }
     try { $self = [Diagnostics.Process]::GetCurrentProcess(); $self.Refresh(); $rec.helperAffinityObserved = [int64]$self.ProcessorAffinity; $rec.helperPriorityObserved = [string]$self.PriorityClass } catch { }
-    $rec.instances = $instances.ToArray(); $rec.others = $others.ToArray()
+    # still unread as the helper stops: the same refusal as one that left unread
+    foreach ($i in @($pn.Keys)) { & $un $i }
+    $rec.instances = $ins.ToArray(); $rec.others = $others.ToArray()
     # sol r4 CP-02 (was the longest instance): the app is the instance whose pid the job hands over after the smoke run (the runner's launched
     # process); none, or two with that pid, binds nothing. Only its samples are app samples and the load totals are its own (sol r4 A2).
     $mp = [int64]0; try { $mp = [int64]([IO.File]::ReadAllText([string]$env:MLV_CP_MEASURED).Trim()) } catch { }
-    $m = @($instances | Where-Object { $_.pid -eq $mp })
+    $m = @($ins | Where-Object { $_.pid -eq $mp })
     $app = $(if ($m.Count -eq 1) { $m[0] })
     $rec.measuredPid = $mp; $rec.app = $app
     # r9 (Dot 4): a sample stamped after the app's last observed-alive poll is not its own
-    foreach ($smp in $samples) { $smp.app = ($null -ne $app -and $smp.appPid -eq $app.pid -and $smp.m -le $app.aliveMs) }
+    foreach ($smp in $sm) { $smp.app = ($null -ne $app -and $smp.appPid -eq $app.pid -and $smp.m -le $app.aliveMs) }
     if ($null -ne $app) { $rec.load.seconds = $app.loadSec; $rec.load.bytes = $app.loadBytes; $rec.load.joined = $app.loadJoined }
-    $rec.samples = $samples.ToArray(); $rec.errors = $errs.ToArray(); $rec.endedUtc = [DateTime]::UtcNow.ToString('o')
+    $rec.samples = $sm.ToArray(); $rec.errors = $errs.ToArray(); $rec.endedUtc = [DateTime]::UtcNow.ToString('o')
     if (-not $rec.endedBy) { $rec.endedBy = 'error' }
     # sol r6 CP-06: the record, then its HMAC-SHA256 under the per-job key (MLV_CP_NONCE, which is never written anywhere) beside it. A refused
     # CreateNew throws out of this finally, so the helper exits non-zero; the job accepts the record only after an exit code of 0.
     [void](& $clk)
     $j = $rec | ConvertTo-Json -Depth 8 -Compress
-    Write-CorePartitionNewFile $outPath $j
-    Write-CorePartitionNewFile "$outPath.mac" ([Convert]::ToHexString($hk.ComputeHash($u8.GetBytes($j))))
+    Write-CorePartitionNewFile $op $j
+    Write-CorePartitionNewFile "$op.mac" ([Convert]::ToHexString($hk.ComputeHash($u8.GetBytes($j))))
 }
 exit 0
 '@

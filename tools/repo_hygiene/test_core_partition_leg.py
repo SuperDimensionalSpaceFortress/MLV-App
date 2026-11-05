@@ -812,7 +812,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertEqual(len({got["prePid"], got["midPid"], got["postPid"]}), 3)
-        self.assertEqual(got["seen"], got["postPid"], f"the helper bound a same-path process that started before the measured launch: {got}")
+        why = "the helper never classed the measured launch as an instance" if got["seen"] is None else "the helper bound a same-path process that started before the measured launch"
+        self.assertEqual(got["seen"], got["postPid"], f"{why}: {got}")
         self.assertEqual(got["instances"], [got["postPid"]], got)
 
     def test_a_short_same_exe_probe_after_the_launch_is_not_the_measured_apps_evidence(self) -> None:
@@ -846,7 +847,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1), "CP_GEN": str(GENERATOR)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
-        self.assertEqual(got["app"], got["measuredPid"], f"the helper bound another same-path instance as the measured app: {got}")
+        why = "the helper never classed the measured launch as an instance" if got["app"] is None else "the helper bound another same-path instance as the measured app"
+        self.assertEqual(got["app"], got["measuredPid"], f"{why}: {got}")
         self.assertEqual(got["recordedMeasuredPid"], got["measuredPid"], got)
         self.assertEqual(sorted(got["instances"]), sorted([got["otherPid"], got["measuredPid"]]), f"the concurrent instance is not on the record: {got}")
         self.assertEqual(got["others"], [got["prePid"]], f"adversary r5 A1: a same-path process alive from before the launch is not on the record: {got}")
@@ -2501,6 +2503,200 @@ def _r14b_unidentified_driver() -> str:
 
 R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
 
+# CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1: the real helper body against process doubles whose reads fail on a schedule counted in the helper's own
+# enumerations, never in time, so a failed first-sight read is forced with no timing dependence. Each double: id; from/to, the enumerations that list
+# it; goneAt, the enumeration count from which it has exited; startSec, its start relative to the launch; pathFail/startFail, the enumerations up to
+# which that read fails (-1: always); pathFailFrom/startFailFrom, the enumeration from which it fails; pathMode, how a failed Path read looks (empty
+# is what MainModule gives a real process before its loader has run; throw is an access-denied read); exe 'other', readable at another path;
+# recycleAt, the enumeration from which the pid belongs to a process started just now. The measured pid and the stop file arrive at enumeration 8.
+# Every enumeration stamps the wall clock, so a test can place the record's first sight among the helper's polls.
+_APP = {"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
+_Q = {"from": 1, "to": 99, "goneAt": 999}
+LATE_READ_SCENARIOS = {
+    "control": {"procs": [_APP]},
+    "path-empty-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
+    "path-throw-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "throw"}]},
+    "start-late": {"procs": [{**_APP, "startFail": 3}]},
+    "both-late": {"procs": [{**_APP, "pathFail": 3, "pathMode": "empty", "startFail": 3}]},
+    "lifelong-path-exits": {"procs": [_APP, {**_Q, "id": 200, "to": 3, "startSec": 1, "pathFail": -1, "pathMode": "empty"}]},
+    "lifelong-start-exits": {"procs": [_APP, {**_Q, "id": 200, "to": 3, "startSec": 1, "startFail": -1}]},
+    "lifelong-both-exits": {"procs": [_APP, {**_Q, "id": 200, "to": 3, "startSec": 1, "pathFail": -1, "pathMode": "throw", "startFail": -1}]},
+    "lifelong-path-to-stop": {"procs": [_APP, {**_Q, "id": 200, "startSec": 1, "pathFail": -1, "pathMode": "empty"}]},
+    "lifelong-start-to-stop": {"procs": [_APP, {**_Q, "id": 200, "startSec": 1, "startFail": -1}]},
+    "prelaunch-late": {"threads": 1, "procs": [_APP, {**_Q, "id": 200, "startSec": -5, "pathFail": 3, "pathMode": "empty"}]},
+    "prelaunch-start-late": {"procs": [_APP, {**_Q, "id": 200, "startSec": -5, "startFail": 3}]},
+    "owner-keeps-its-load": {"threads": 1, "procs": [_APP, {**_Q, "id": 300, "startSec": 1, "pathFail": 3, "pathMode": "empty"}]},
+    "late-app-owns-from-its-classing": {"threads": 1, "procs": [{**_APP, "pathFail": 3, "pathMode": "empty"}]},
+    "reads-fail-while-tracked": {"procs": [{**_APP, "to": 7, "goneAt": 7, "pathFailFrom": 5, "pathMode": "empty", "startFailFrom": 5}]},
+    "reads-fail-as-seen-gone": {"procs": [{**_APP, "to": 7, "goneAt": 6, "pathFailFrom": 6, "pathMode": "empty", "startFailFrom": 6}]},
+    "other-path-once-readable": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "pathFail": 3, "pathMode": "empty"}]},
+    "recycled-start-unread": {"procs": [_APP, {**_Q, "id": 300, "startSec": 1, "startFail": 2, "recycleAt": 3}]},
+    "recycled-path-unread": {"procs": [_APP, {**_Q, "id": 300, "startSec": 1, "pathFail": 2, "pathMode": "empty", "recycleAt": 3}]},
+}
+_LATE_READ_DRIVER_BODY = HELPER_SOURCE + r"""
+$cat = "[Diagnostics.PerformanceCounterCategory]::new('Processor Information')"
+if (-not $hb.Contains($cat)) { throw 'the helper no longer reads the Processor Information category (the stub anchor)' }
+$hb = $hb.Replace($cat, '$cpFakeCat')
+$prelude = @'
+$cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
+$global:cpPoll = 0
+$global:cpSpec = $env:CP_SPEC | ConvertFrom-Json
+$global:cpLaunch = [DateTime]::new([int64]$env:CP_LAUNCH_TICKS, [DateTimeKind]::Utc)
+function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global:cpPoll -le $Up) -or ($null -ne $From -and $global:cpPoll -ge $From) }
+$global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
+    $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
+    $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
+        $s = $this.cpS
+        if (Test-CpFails $s.pathFail $s.pathFailFrom) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
+        if ($s.exe -eq 'other') { 'C:\elsewhere\mlvfake.exe' } else { $env:MLV_CP_EXE } }
+    $d | Add-Member -MemberType ScriptProperty -Name StartTime -Value {
+        $s = $this.cpS
+        if (Test-CpFails $s.startFail $s.startFailFrom) { throw [ComponentModel.Win32Exception]::new(5) }
+        if ($null -ne $s.recycleAt -and $global:cpPoll -ge $s.recycleAt) { if ($null -eq $global:cpNew) { $global:cpNew = [DateTime]::UtcNow }; return $global:cpNew }
+        $global:cpLaunch.AddSeconds($s.startSec) }
+    $d })
+function Get-Process { [CmdletBinding()] param([string]$Name)
+    $global:cpPoll++
+    [IO.File]::AppendAllText($env:CP_POLLS, "$([DateTime]::UtcNow.Ticks)`n")
+    if ($global:cpPoll -eq 8) { [IO.File]::WriteAllText($env:MLV_CP_MEASURED, '5000'); [IO.File]::WriteAllText($env:MLV_CP_STOP, 'stop') }
+    $global:cpDoubles | Where-Object { $global:cpPoll -ge $_.cpS.from -and $global:cpPoll -le $_.cpS.to } }
+function Start-Sleep { param([int]$Milliseconds) [Threading.Thread]::Sleep(20) }
+'@
+$src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
+$out = [ordered]@{}
+$names = @($scenarios.PSObject.Properties.Name)
+for ($b = 0; $b -lt $names.Count; $b += 4) {
+    $runs = @(foreach ($mode in @($names[$b..([math]::Min($b + 3, $names.Count - 1))])) {
+        $spec = $scenarios.$mode
+        $dir = Join-Path $env:CP_DIR $mode
+        [void](New-Item -ItemType Directory -Path $dir)
+        $hp = Join-Path $dir 'helper.ps1'; [IO.File]::WriteAllText($hp, $src)
+        $launch = [DateTime]::UtcNow.AddSeconds(-30).Ticks
+        [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string]$launch)
+        $threads = $(if ($null -ne $spec.threads) { [int]$spec.threads } else { 0 })
+        $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.Environment['CP_SPEC'] = ($spec | ConvertTo-Json -Compress -Depth 6); $psi.Environment['CP_LAUNCH_TICKS'] = [string]$launch; $psi.Environment['CP_POLLS'] = Join-Path $dir 'polls'
+        $psi.Environment['MLV_CP_EXE'] = Join-Path $dir 'mlvfake.exe'
+        $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+        $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+        $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+        $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+        $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+        $psi.Environment['MLV_CP_BENCH'] = '4095'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = [string]$threads
+        $psi.Environment['MLV_CP_NONCE'] = 'late-read'; $psi.Environment['MLV_CP_DEADLINE_MS'] = '60000'
+        @{ mode = $mode; dir = $dir; launch = $launch; threads = $threads; h = [Diagnostics.Process]::Start($psi) } })
+    foreach ($run in $runs) {
+        if (-not $run.h.WaitForExit(120000)) { $run.h.Kill(); throw "the $($run.mode) helper did not end" }
+        $end = [DateTime]::UtcNow.Ticks
+        $rec = [IO.File]::ReadAllText((Join-Path $run.dir 'helper.json')) | ConvertFrom-Json
+        $start = ([DateTime]::new($run.launch, [DateTimeKind]::Utc)).AddSeconds(1).Ticks
+        $v = Test-CorePartitionMeasuredApp $rec 5000 ($start - 5000000) $end 0
+        $s = Get-CorePartitionScalars $rec ([ordered]@{ reasons = [ordered]@{} }) 4095 ([int64]$rec.helperAffinityObserved) $run.threads @{ value = 1; why = $null } $null $false -MeasuredPid 5000 -MeasuredStartTicks ($start - 5000000) -MeasuredEndTicks $end
+        $named = @(@($rec.instances) + @($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified })
+        $by = [ordered]@{}
+        foreach ($i in $named) { $by[[string]$i.pid] = [ordered]@{ start = [int64]$i.startUtcTicks; first = [int64]$i.firstSeenUtcTicks; last = [int64]$i.lastSeenUtcTicks; firstMs = $i.firstMs; aliveMs = $i.aliveMs; goneMs = $i.goneMs; loadSec = $i.loadSec; loadJoined = $i.loadJoined } }
+        $out[$run.mode] = [ordered]@{ exit = $run.h.ExitCode; endedBy = $rec.endedBy; app = $rec.app.pid; launch = $run.launch
+            instances = @(@($rec.instances) | Where-Object { $null -ne $_ } | ForEach-Object { $_.pid })
+            others = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -eq $_.unidentified } | ForEach-Object { $_.pid })
+            unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid })
+            by = $by; sessions = $rec.load.sessions; loadSec = $rec.load.seconds; vwhy = [string]$v.why; bench = $s.benchAffinityApplied; why = [string]$s.corePartitionNullReasons
+            polls = @([IO.File]::ReadAllLines((Join-Path $run.dir 'polls')) | ForEach-Object { [int64]$_ }) }
+    }
+}
+$out | ConvertTo-Json -Compress -Depth 6
+"""
+LATE_READ_DRIVER = "$scenarios = @'\n" + json.dumps(LATE_READ_SCENARIOS) + "\n'@ | ConvertFrom-Json\n" + _LATE_READ_DRIVER_BODY
+
+# The same defect with nothing doubled but the counter category: a real process (a copy of PING.EXE, never MLVApp) held by CREATE_SUSPENDED, so its
+# loader has not run and MainModule cannot read it, exactly the state a poll can catch a just-launched process in. The driver orders itself on the
+# helper's enumeration count, not on time: the process is resumed only after two whole enumerations listed it suspended.
+REAL_SUSPENDED_DRIVER = HELPER_SOURCE + r"""
+$cat = "[Diagnostics.PerformanceCounterCategory]::new('Processor Information')"
+if (-not $hb.Contains($cat)) { throw 'the helper no longer reads the Processor Information category (the stub anchor)' }
+$hb = $hb.Replace($cat, '$cpFakeCat')
+$prelude = @'
+$cpFakeCat = [pscustomobject]@{}; $cpFakeCat | Add-Member -MemberType ScriptMethod -Name ReadCategory -Value { @{} }
+$global:cpPoll = 0
+function Get-Process { [CmdletBinding()] param([string]$Name)
+    $global:cpPoll++
+    [IO.File]::WriteAllText($env:CP_POLLS, [string]$global:cpPoll)
+    Microsoft.PowerShell.Management\Get-Process -Name $Name -ErrorAction SilentlyContinue }
+'@
+$src = $prelude + "`n" + ((@('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') | ForEach-Object { $fn[$_] }) -join "`n") + "`n" + $hb
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CpSuspended {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SI { public int cb; public string r; public string d; public string t; public int x, y, xs, ys, xc, yc, fa, fl; public short sw, c2; public IntPtr r2, i, o, e; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PI { public IntPtr hp, ht; public int pid, tid; }
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref SI si, out PI pi);
+    [DllImport("kernel32", SetLastError = true)] public static extern uint ResumeThread(IntPtr t);
+    public static PI Start(string exe, string args) {
+        SI si = new SI(); si.cb = Marshal.SizeOf(si); PI pi;
+        if (!CreateProcessW(exe, new System.Text.StringBuilder("\"" + exe + "\" " + args), IntPtr.Zero, IntPtr.Zero, false, 0x08000004u, IntPtr.Zero, null, ref si, out pi)) { throw new System.ComponentModel.Win32Exception(); }
+        return pi;
+    }
+}
+"@
+$dir = $env:CP_DIR
+$exe = Join-Path $dir 'mlvfake.exe'
+Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
+$hp = Join-Path $dir 'helper.ps1'; [IO.File]::WriteAllText($hp, $src)
+$pf = Join-Path $dir 'polls'
+$launch = [DateTime]::UtcNow.Ticks
+[IO.File]::WriteAllText((Join-Path $dir 'launch'), [string]$launch)
+$psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$hp`"")
+$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.Environment['CP_POLLS'] = $pf
+$psi.Environment['MLV_CP_EXE'] = $exe
+$psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+$psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+$psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+$psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+$psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+$psi.Environment['MLV_CP_BENCH'] = '4095'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
+$psi.Environment['MLV_CP_NONCE'] = 'real-suspended'; $psi.Environment['MLV_CP_DEADLINE_MS'] = '180000'
+$h = [Diagnostics.Process]::Start($psi)
+function Get-CpPolls { try { [int][IO.File]::ReadAllText($pf) } catch { 0 } }
+function Wait-CpPolls([int]$N) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ((Get-CpPolls) -lt $N) { if ($h.HasExited -or $sw.ElapsedMilliseconds -gt 120000) { throw "the helper reached only enumeration $(Get-CpPolls) of $N (exited=$($h.HasExited))" }; Start-Sleep -Milliseconds 20 }
+}
+$held = $null
+try {
+    Wait-CpPolls 1
+    $info = [CpSuspended]::Start($exe, '-n 3 127.0.0.1')
+    $held = [Diagnostics.Process]::GetProcessById($info.pid)
+    # the first enumeration counted after the process exists lists it; the helper starts the next one only after it has read that one, and so on
+    Wait-CpPolls ((Get-CpPolls) + 3)
+    $pathWhileSuspended = [string](Microsoft.PowerShell.Management\Get-Process -Id $info.pid).Path
+    $resumeTicks = [DateTime]::UtcNow.Ticks
+    [void][CpSuspended]::ResumeThread($info.ht)
+    [void]$held.WaitForExit(60000)
+    $end = [DateTime]::UtcNow.Ticks
+    # two more enumerations, so a pass has seen it gone before the stop arrives
+    Wait-CpPolls ((Get-CpPolls) + 2)
+    [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$info.pid)
+    [IO.File]::WriteAllText((Join-Path $dir 'stop'), 'stop')
+    if (-not $h.WaitForExit(60000)) { $h.Kill(); throw 'the helper did not end' }
+    $rec = [IO.File]::ReadAllText((Join-Path $dir 'helper.json')) | ConvertFrom-Json
+    $app = $rec.app
+    $v = $(if ($null -ne $app) { Test-CorePartitionMeasuredApp $rec $info.pid ([int64]$app.startUtcTicks - 5000000) $end 0 } else { Test-CorePartitionMeasuredApp $rec $info.pid ($launch - 5000000) $end 0 })
+    [ordered]@{ measuredPid = $info.pid; pathWhileSuspended = $pathWhileSuspended; app = $app.pid; instances = @(@($rec.instances) | Where-Object { $null -ne $_ } | ForEach-Object { $_.pid })
+        unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified } | ForEach-Object { $_.pid }); vwhy = [string]$v.why; endedBy = $rec.endedBy
+        launch = $launch; resume = $resumeTicks; start = $app.startUtcTicks; first = $app.firstSeenUtcTicks; last = $app.lastSeenUtcTicks; firstMs = $app.firstMs; aliveMs = $app.aliveMs; goneMs = $app.goneMs } | ConvertTo-Json -Compress
+} finally {
+    if ($null -ne $held -and -not $held.HasExited) { $held.Kill() }
+    if (-not $h.HasExited) { $h.Kill() }
+}
+"""
+
 
 @requires_windows_pwsh
 class CorePartitionR10Tests(unittest.TestCase):
@@ -2561,6 +2757,132 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertIn("appAffinityObserved=same-path-instance-unidentified", case["why"])
         tight = got["tight"]
         self.assertEqual([tight["unidentified"], tight["vwhy"], tight["bench"], tight["load"]], [0, "", True, True], f"the control was refused: {tight}")
+
+    # CORE-PARTITION-SAME-PATH-HANDOVER-RACE-1. Merge_group run 42007264913 and #755 run 41985844336, and Bachelor receipts 695cf45e and b3937729: the
+    # measured process itself was recorded unidentified, because one failed read at first sight settled it for the whole run.
+    _late_read_result: dict | None = None
+    # A scheduler stall over 1000 ms between the app's last two polls refuses on coverage-endpoint-gap. That rule is not under test here; identity is.
+    ACCEPTED = ("", "coverage-endpoint-gap")
+
+    def late_read(self, mode: str) -> dict:
+        cls = type(self)
+        if cls._late_read_result is None:
+            cls._late_read_result = self.drive("late-read", LATE_READ_DRIVER, True)
+        case = cls._late_read_result[mode]
+        self.assertEqual([case["endedBy"], case["exit"]], ["stop-file", 0], case)
+        return case
+
+    def test_handover_a_failed_read_at_first_sight_does_not_settle_the_process(self) -> None:
+        """A failed Path read, in the shape a real process before its loader has run gives (empty) and as a throw; a failed StartTime read; both. Each
+        fails for the first three enumerations and then reads: the app is classed as the instance it is, and the run is not refused for it."""
+        for mode in ("path-empty-late", "path-throw-late", "start-late", "both-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [], f"a read that later succeeded left the process on the record as unidentified: {case}")
+                self.assertEqual(case["instances"], [5000], f"the process was never classed: {case}")
+                self.assertEqual(case["app"], 5000, case)
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_handover_a_late_classed_process_keeps_its_real_first_sight(self) -> None:
+        """The job orders start, first sight and exit from these. The first sight is the enumeration that first listed the process, which is before the
+        one that could read it, and its last-alive stamp comes from the poll that classed it or a later one. Control: a process read at once."""
+        for mode in ("path-empty-late", "path-throw-late", "start-late", "both-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                rec, polls = case["by"]["5000"], case["polls"]
+                self.assertGreaterEqual(rec["first"], polls[0], case)
+                self.assertLess(rec["first"], polls[1], f"the first sight was moved to a later poll: {case}")
+                self.assertGreaterEqual(rec["last"], polls[3], f"the alive stamp is older than the poll that classed the process: {case}")
+                self.assertLessEqual(rec["start"], rec["first"], case)
+                self.assertLessEqual(rec["firstMs"], rec["aliveMs"], case)
+                self.assertLessEqual(rec["aliveMs"], rec["goneMs"], case)
+        control = self.late_read("control")
+        self.assertEqual([control["app"], control["unidentified"], control["instances"]], [5000, [], [5000]], control)
+        self.assertIn(control["vwhy"], self.ACCEPTED, control)
+        self.assertLess(control["by"]["5000"]["first"], control["polls"][1], control)
+
+    def test_handover_a_process_never_identified_is_still_refused_whenever_it_ends(self) -> None:
+        """The fail-closed rule, for the case the retry creates: unreadable for its whole life, it stays on the record as unidentified and refuses the
+        verdict, whether it exits between two polls or is still there when the helper stops."""
+        for mode in ("lifelong-path-exits", "lifelong-start-exits", "lifelong-both-exits", "lifelong-path-to-stop", "lifelong-start-to-stop"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [200], f"the helper dropped a process it never identified: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], f"an unidentified same-name process escaped the refusal: {case}")
+                self.assertIn("appAffinityObserved=same-path-instance-unidentified", case["why"])
+                self.assertEqual(case["app"], 5000, case)
+
+    def test_handover_a_pre_launch_process_read_late_lands_in_others_by_its_real_start(self) -> None:
+        """The launch-instant rule: classed late, a process that started before the launch is still in others, is never an instance and starts no load
+        session, and being alive beside the app refuses the overlap."""
+        for mode in ("prelaunch-late", "prelaunch-start-late"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [], case)
+                self.assertEqual(case["instances"], [5000], f"a pre-launch process read late was classed as an instance: {case}")
+                self.assertEqual(case["others"], [200], case)
+                self.assertLess(case["by"]["200"]["start"], case["launch"], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-overlap", case)
+        self.assertEqual(self.late_read("prelaunch-late")["sessions"], 1, "a pre-launch process read late started a load session")
+        self.assertEqual(self.late_read("prelaunch-late")["by"]["200"]["loadSec"], 0.0)
+
+    def test_handover_a_late_read_does_not_move_the_load_session(self) -> None:
+        """The instance that owns the load keeps it when another is classed late; a late-classed app that does own it is charged only from its classing."""
+        kept = self.late_read("owner-keeps-its-load")
+        self.assertEqual(kept["instances"], [5000, 300], f"the late process was not classed beside the owner: {kept}")
+        self.assertEqual(kept["sessions"], 1, f"a late read started a second load session: {kept}")
+        self.assertEqual(kept["by"]["300"]["loadSec"], 0.0, f"a late read moved the load onto another process: {kept}")
+        self.assertIsNone(kept["by"]["300"]["loadJoined"], kept)
+        self.assertTrue(kept["by"]["5000"]["loadJoined"], kept)
+        self.assertEqual(kept["vwhy"], "same-path-instance-overlap", kept)
+        late = self.late_read("late-app-owns-from-its-classing")
+        self.assertEqual([late["app"], late["sessions"], late["unidentified"]], [5000, 1, []], late)
+        span = late["by"]["5000"]["aliveMs"] - late["by"]["5000"]["firstMs"]
+        self.assertLessEqual(late["loadSec"] * 1000, span, f"load seconds were charged from before the process was classed: {late}")
+        self.assertTrue(late["by"]["5000"]["loadJoined"], late)
+
+    def test_handover_a_tracked_process_whose_reads_fail_is_still_the_tracked_process(self) -> None:
+        """Reads fail as a process exits. Once classed it stays what it was: a failed read of a tracked pid, or of one the same pass saw gone, is not a
+        new unidentified process (on the base both reads failing made the key 'pid,', which nothing had seen, and refused the run)."""
+        for mode in ("reads-fail-while-tracked", "reads-fail-as-seen-gone"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [], f"a tracked process was recorded unidentified as it exited: {case}")
+                self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_handover_a_process_identified_at_another_path_is_dropped_once_readable(self) -> None:
+        """Identified is identified: readable at another path, it is no competing instance, so it is off the record and refuses nothing."""
+        case = self.late_read("other-path-once-readable")
+        self.assertEqual([case["unidentified"], case["others"], case["instances"]], [[], [], [5000]], case)
+        self.assertIn(case["vwhy"], self.ACCEPTED, case)
+
+    def test_handover_a_recycled_pid_does_not_inherit_the_unread_process(self) -> None:
+        """A start read later than the enumeration that first listed the pid is another process on a recycled pid. The one first listed ended unread, so
+        it refuses; the new one is classed with its own first sight, never the earlier one's."""
+        for mode in ("recycled-start-unread", "recycled-path-unread"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertEqual(case["instances"], [5000, 300], case)
+                self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], f"the recycled pid inherited the earlier first sight: {case}")
+
+    def test_handover_a_real_process_caught_before_its_loader_ran_is_classed_after_it_resumes(self) -> None:
+        """Nothing doubled but the counter category: a real stand-in process held suspended through two whole enumerations. Its Path really is unreadable
+        then (the driver checks), and StartTime is not. Once it runs it is the measured app, with its real first sight from before the resume. On the
+        base this is the hosted failure: seen None, instances [], the measured pid unidentified."""
+        got = self.drive("real-suspended", REAL_SUSPENDED_DRIVER, True)
+        self.assertEqual(got["pathWhileSuspended"], "", f"this OS reads Path before the loader runs, so the test no longer reproduces the failed read: {got}")
+        self.assertEqual(got["endedBy"], "stop-file", got)
+        self.assertEqual(got["unidentified"], [], f"the measured process was settled unidentified by a failed first read: {got}")
+        self.assertEqual(got["instances"], [got["measuredPid"]], got)
+        self.assertEqual(got["app"], got["measuredPid"], got)
+        self.assertIn(got["vwhy"], self.ACCEPTED, got)
+        self.assertLess(got["first"], got["resume"], f"the first sight is not the real one, from before the process ran: {got}")
+        self.assertGreater(got["last"], got["resume"], got)
+        self.assertGreaterEqual(got["start"], got["launch"], f"the launch-instant rule: {got}")
 
     def test_b2_a_feed_read_completed_after_the_window_publishes_no_row(self) -> None:
         """B2 (sol r9 B2 = adversary r9 8cf7e883 A2, literal): an end read that completed 120 s (or 40 s) after the smoke end may hold rows written
