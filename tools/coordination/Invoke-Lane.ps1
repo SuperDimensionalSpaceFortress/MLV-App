@@ -183,6 +183,27 @@ if (Test-HubHost) {
     }
 }
 
+# LANE-CHILD-LOADER-DIALOG-ON-OWNER-DESKTOP-1: a child that cannot load a DLL (or crashes, or hits an empty drive) raises a modal Windows System Error
+# box on the owner's desktop, and the child waits on a click nobody makes. A child inherits this process's error mode, so set it before ANY child,
+# version probe or MCP enumeration below starts. It sits AFTER the HUB-VM gate above because a refused prompt starts nothing, and on Windows PowerShell
+# 5.1 this block's Add-Type can start csc.exe. Same flag set as tools/testing/run-windows-test.ps1: SEM_FAILCRITICALERRORS 0x0001 |
+# SEM_NOGPFAULTERRORBOX 0x0002 | SEM_NOOPENFILEERRORBOX 0x8000. 0x0002 stays: the crash box is the thing that hangs a headless lane, and the lane still
+# sees the crash as the child's exit code (e.g. 0xC0000005). 0x0002 also suppresses Windows Error Reporting, not only the box, so a crash under a lane
+# leaves no WER report and no LocalDumps dump. OR-ed onto the current mode, never a replacement. Fail open with a warning. The platform check sits beside
+# $env:OS because a process started with a scrubbed environment has no OS variable, and it would skip this block without a warning.
+# test_coordination_guardrails.py extracts this block between the two markers and runs it, and pins gate, then block, then first launch.
+# LANE-CHILD-ERROR-MODE-BEGIN
+if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq 'Win32NT') {
+    try {
+        if (-not ('LaneChildErrorMode' -as [type])) {
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class LaneChildErrorMode { [DllImport("kernel32.dll")] public static extern uint GetErrorMode(); [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint uMode); }'
+        }
+        [void][LaneChildErrorMode]::SetErrorMode([LaneChildErrorMode]::GetErrorMode() -bor 0x8003)
+    }
+    catch { Write-Warning "LANE_CHILD_ERROR_MODE_NOT_SET: $($_.Exception.Message) -- a child that cannot load a DLL may raise a dialog on the desktop" }
+}
+# LANE-CHILD-ERROR-MODE-END
+
 # ---------------------------------------------------------------- lane table
 # Engine, model and effort per lane. This table IS the topology; there is no
 # other place a lane's model is decided, so a lane cannot silently drift onto

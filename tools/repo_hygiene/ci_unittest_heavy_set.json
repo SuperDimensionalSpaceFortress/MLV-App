@@ -17,6 +17,7 @@
         "tools.repo_hygiene.test_hub_vm_no_local_playback.PromptLintTests",
         "tools.repo_hygiene.test_playback_clip_length_gate.RuntimeBackstopBehaviourTests",
         "tools.repo_hygiene.test_um_presentmon_orphan_sweep.SweepExecutedTests",
+        "tools.repo_hygiene.test_util_sample_leg.UtilSampleGeneratorTests",
         "tools.repo_hygiene.test_venue_baseline.VenueBaselineTests",
         "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests",
         "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests",
