@@ -109,16 +109,60 @@ typedef struct _ljp {
 static int find(ljp* self) {
     int ix = self->ix;
     u8* data = self->data;
+    if (ix < 0 || ix >= self->datalen) return -1; /* r6 A2 class: never read data[ix] past the payload */
     while (data[ix] != 0xFF && ix<(self->datalen-1)) {
         ix += 1;
     }
+    /* r10 (Dot B3): the bound is decided before the step, so `ix += 2` never overflows (the loop can stop at
+     * ix = datalen - 1 = INT_MAX - 1); for every input that did not overflow, the result is the same as before. */
+    if (ix >= self->datalen - 2) return -1;
     ix += 2;
-    if (ix>=self->datalen) return -1;
     self->ix = ix;
     return data[ix-1];
 }
 
 #define BEH(ptr) ((((int)(*&ptr))<<8)|(*(&ptr+1)))
+
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1 r6 (adversary r5 pass 3 A2): every marker segment length is read through
+ * this, and a segment whose length field or whose end (ix + length) is not inside the payload is refused
+ * (LJ92_ERROR_CORRUPT) by its caller. Returns the BEH length at ix, or -1 when ix or ix + 1 is past datalen. */
+static int lj92_segment_length(const ljp* self, int ix) {
+    if (ix < 0 || ix >= self->datalen - 1) return -1;
+    return BEH(self->data[ix]);
+}
+
+/* r6 A2: ix + length stays inside the payload (strictly before datalen: something must follow every
+ * segment, at least the next marker or the entropy data). Overflow-safe for any datalen <= INT_MAX. */
+static int lj92_segment_fits(const ljp* self, int ix, int length) {
+    return length >= 0 && ix >= 0 && ix < self->datalen && length < self->datalen - ix;
+}
+
+/* r6 A2: where the entropy data of the scan at scanstart begins, or -1 when the SOS header runs past the
+ * payload. Every scan variant starts here instead of an unbounded ix += BEH(data[scanstart]). */
+static int lj92_scan_entropy_start(const ljp* self) {
+    const int length = lj92_segment_length(self, self->scanstart);
+    if (!lj92_segment_fits(self, self->scanstart, length)) return -1;
+    return self->scanstart + length;
+}
+
+/* r6 (adversary r5 pass 3 A1/A2): the bit reader's two-byte load. It never reads past datalen: a scan whose
+ * entropy data ends before its last sample reads zero bytes from there on, so one payload decodes to one
+ * picture whatever lies after it in memory (the caller's slack, or nothing at all). The load is the same
+ * little-endian u16 the reader always used while both bytes are inside the payload. */
+/* r9 (adversary r9 pass 1 A1 on 76d8340b): overflow-free -- `ix + 1` overflowed when ix reached INT_MAX. */
+static LJ92_ALWAYS_INLINE int lj92_load_entropy_pair(const u8* data, int ix, int datalen) {
+    if (ix >= 0 && ix < datalen - 1) return *(const u16*)&data[ix];
+    return (ix >= 0 && ix < datalen) ? data[ix] : 0;
+}
+
+/* r9 (adversary r9 pass 1 A1 on 76d8340b): the entropy index never passes datalen. Past the payload every load is zero, so
+ * an index at datalen reads exactly what one further on would; it now stops there. A picture with more samples than its
+ * payload can feed (65535 x 10000 at 31 bits a sample) used to keep advancing it past INT_MAX -- signed overflow, and a
+ * wrapped index that admitted a load outside the payload. Whether ix >= datalen is decided as before: the step that took
+ * it to or past datalen now takes it to datalen. Assumes 0 <= ix <= datalen (every scan starts inside the payload). */
+static LJ92_ALWAYS_INLINE int lj92_advance_entropy_ix(int ix, int step, int datalen) {
+    return datalen - ix > step ? ix + step : datalen;
+}
 
 #ifndef SLOW_HUFF
 #define LJ92_HUFF_DIRECT_FLAG 0x80000000u
@@ -148,11 +192,19 @@ static LJ92_ALWAYS_INLINE int lj92_unpack_huff_direct_diff(u32 entry)
 
 static int parseHuff(ljp* self) {
     int ret = LJ92_ERROR_CORRUPT;
+    /* r6 A2 class: the 19-byte DHT head (length, class/id, 16 counts) is read and written in place, so it
+     * must lie inside the payload before the class/id byte is zeroed or a count is read. */
+    if (self->ix < 0 || self->ix > self->datalen - 19) return ret;
     u8* huffhead = &self->data[self->ix]; // xstruct.unpack('>HB16B',self.data[self.ix:self.ix+19])
     u8* bits = &huffhead[2];
     bits[0] = 0; // Because table starts from 1
     int hufflen = BEH(huffhead[0]);
-    if ((self->ix + hufflen) >= self->datalen) return ret;
+    if (!lj92_segment_fits(self, self->ix, hufflen)) return ret;
+    /* r6 A2 class: the symbol values the table fill reads (sum of the 16 counts, after the head) are inside
+     * the payload too. */
+    int symbols = 0;
+    for (int level = 1; level <= 16; level++) symbols += bits[level];
+    if (symbols > self->datalen - self->ix - 19) return ret;
 #ifdef SLOW_HUFF
     u8* huffval = calloc(hufflen - 19,sizeof(u8));
     if (huffval == NULL) return LJ92_ERROR_NO_MEMORY;
@@ -283,6 +335,9 @@ static int parseHuff(ljp* self) {
         if (bits[maxbits]) break;
         maxbits--;
     }
+    /* r6 (A1 class): a table with no codes leaves the lookup table unwritten, and every sample would be read
+     * from uninitialised memory; it can decode nothing, so it is refused. */
+    if (maxbits == 0) return LJ92_ERROR_CORRUPT;
     self->huffbits = maxbits;
     /* Now fill the lut */
     u32* hufflut = malloc((1<<maxbits) * sizeof(u32));
@@ -337,24 +392,37 @@ static int parseHuff(ljp* self) {
         i++;
         rv++;
     }
+    /* r6 (A1 class): codes the table does not define (every JPEG table leaves at least the all-ones code
+     * free) used to stay uninitialised, so a bitstream that spells one decoded whatever the heap held, a
+     * different picture per call. They now decode as a zero difference over maxbits bits, the same every call. */
+    while (i < 1<<maxbits) {
+        hufflut[i++] = lj92_pack_huff_direct(0, maxbits);
+    }
     ret = LJ92_ERROR_NONE;
 #endif
     return ret;
 }
 
 static int parseSof3(ljp* self) {
-    if (self->ix+6 >= self->datalen) return LJ92_ERROR_CORRUPT;
+    /* r6 A2 class: SOF3 reads bytes ix..ix+7 (the component count is ix+7, which the old ix+6 bound missed),
+     * and its length must end inside the payload. */
+    /* r10 (Dot B3 class): subtraction form, so ix + 7 never overflows near INT_MAX */
+    if (self->ix < 0 || 7 >= self->datalen - self->ix) return LJ92_ERROR_CORRUPT;
+    const int length = lj92_segment_length(self, self->ix);
+    if (!lj92_segment_fits(self, self->ix, length)) return LJ92_ERROR_CORRUPT;
     self->y = BEH(self->data[self->ix+3]);
     self->x = BEH(self->data[self->ix+5]);
     self->bits = self->data[self->ix+2];
     self->components = self->data[self->ix + 7];
-    self->ix += BEH(self->data[self->ix]);
+    self->ix += length;
     return LJ92_ERROR_NONE;
 }
 
 static int parseBlock(ljp* self) {
-    self->ix += BEH(self->data[self->ix]);
-    if (self->ix >= self->datalen) return LJ92_ERROR_CORRUPT;
+    /* r6 A2 class: the length field itself and the segment end are both inside the payload. */
+    const int length = lj92_segment_length(self, self->ix);
+    if (!lj92_segment_fits(self, self->ix, length)) return LJ92_ERROR_CORRUPT;
+    self->ix += length;
     return LJ92_ERROR_NONE;
 }
 
@@ -362,14 +430,11 @@ static int parseBlock(ljp* self) {
 static int nextbit(ljp* self) {
     u32 b = self->b;
     if (self->cnt == 0) {
-        u8* data = &self->data[self->ix];
-        u32 next = *data++;
+        /* r6 A2 class: past the payload the reader reads zero bytes, never memory after it. */
+        u32 next = (self->ix >= 0 && self->ix < self->datalen) ? self->data[self->ix] : 0;
         b = next;
-        if (next == 0xff) {
-            data++;
-            self->ix++;
-        }
-        self->ix++;
+        /* r9 A1: the index stops at datalen (lj92_advance_entropy_ix), never past INT_MAX */
+        self->ix = lj92_advance_entropy_ix(self->ix, next == 0xff ? 2 : 1, self->datalen);
         self->cnt = 8;
     }
     int bit = b >> 7;
@@ -432,19 +497,20 @@ static LJ92_ALWAYS_INLINE int nextdiff_fast(ljp* self, u32* b_io, int* cnt_io, i
     int ix = *ix_io;
     const u8* data = self->data;
     const u32* hufflut = self->hufflut;
+    const int datalen = self->datalen;
     int next;
     while (cnt < huffbits) {
-        next = *(u16*)&data[ix];
+        next = lj92_load_entropy_pair(data, ix, datalen); /* r6 A1/A2: never past the payload */
         int one = next&0xFF;
         int two = next>>8;
         b = (b<<16)|(one<<8)|two;
         cnt += 16;
-        ix += 2;
+        ix = lj92_advance_entropy_ix(ix, 2, datalen); /* r9 A1: never past datalen */
         if (one==0xFF) {
             //printf("%x %x %x %x %d\n",one,two,b,b>>8,cnt);
             b >>= 8;
             cnt -= 8;
-        } else if (two==0xFF) ix++;
+        } else if (two==0xFF) ix = lj92_advance_entropy_ix(ix, 1, datalen);
     }
     int index = b >> (cnt - huffbits);
     u32 huffentry = hufflut[index];
@@ -467,16 +533,16 @@ static LJ92_ALWAYS_INLINE int nextdiff_fast(ljp* self, u32* b_io, int* cnt_io, i
         diff = 1 << 15;
     } else {
         while (cnt < t) {
-            next = *(u16*)&data[ix];
+            next = lj92_load_entropy_pair(data, ix, datalen); /* r6 A1/A2: never past the payload */
             int one = next&0xFF;
             int two = next>>8;
             b = (b<<16)|(one<<8)|two;
             cnt += 16;
-            ix += 2;
+            ix = lj92_advance_entropy_ix(ix, 2, datalen); /* r9 A1: never past datalen */
             if (one==0xFF) {
                 b >>= 8;
                 cnt -= 8;
-            } else if (two==0xFF) ix++;
+            } else if (two==0xFF) ix = lj92_advance_entropy_ix(ix, 1, datalen);
         }
         cnt -= t;
         diff = b >> cnt;
@@ -619,8 +685,8 @@ static int parseScanPred1Fast(ljp* self);
 
 static int parseScanPred1FastMeasured(ljp* self)
 {
-    int ix = self->scanstart;
-    ix += BEH(self->data[ix]);
+    int ix = lj92_scan_entropy_start(self); /* r6 A2: bounded, was ix += BEH(data[scanstart]) */
+    if (ix < 0) return LJ92_ERROR_CORRUPT;
 
     int cnt = 0;
     u32 b = 0;
@@ -695,8 +761,8 @@ static int parseScanPred1FastMeasured(ljp* self)
 
 static int parseScanPred1Fast(ljp* self)
 {
-    int ix = self->scanstart;
-    ix += BEH(self->data[ix]);
+    int ix = lj92_scan_entropy_start(self); /* r6 A2: bounded, was ix += BEH(data[scanstart]) */
+    if (ix < 0) return LJ92_ERROR_CORRUPT;
 
     int cnt = 0;
     u32 b = 0;
@@ -753,9 +819,9 @@ static int parsePred6(ljp* self) {
     double bitstream_ms = 0.0;
     double predictor_ms = 0.0;
     double stage_start = 0.0;
-    int ix = self->scanstart;
     //int compcount = self->data[self->ix+2];
-    ix += BEH(self->data[ix]);
+    int ix = lj92_scan_entropy_start(self); /* r6 A2: bounded, was ix += BEH(data[scanstart]) */
+    if (ix < 0) return LJ92_ERROR_CORRUPT;
     int cnt = 0;
     u32 b = 0;
     int write = self->writelen;
@@ -928,7 +994,11 @@ static int parseScan(ljp* self) {
     int ret = LJ92_ERROR_CORRUPT;
     //memset(self->sssshist,0,sizeof(self->sssshist));
     self->ix = self->scanstart;
+    /* r6 A2 class: lj92_open checked these header bytes; a handle that skipped it is refused, never read past. */
+    /* r10 (Dot B3 class): subtraction form, so scanstart + 2 never overflows near INT_MAX */
+    if (self->scanstart < 0 || 2 >= self->datalen - self->scanstart) return ret;
     int compcount = self->data[self->ix+2];
+    if (3+2*compcount >= self->datalen - self->scanstart) return ret;
     int pred = self->data[self->ix+3+2*compcount];
     const int expected_write_length = self->x * self->y * self->components;
     g_lj92_last_pred6_split_requested = lj92_pred6_split_enabled();
@@ -947,7 +1017,10 @@ static int parseScan(ljp* self) {
                                      compcount,
                                      pred,
                                      g_lj92_last_generic_split_requested);
-    if (pred==6) return parsePred6(self); // Fast path
+    /* r6 pass 1 A1 (adversary on be8e2c33): parsePred6 decodes x * y samples, one component per column, so a
+     * multi-component pred-6 scan returned success with x * y * (components - 1) samples never written. It takes
+     * the generic scan below, which writes every component of every column. */
+    if (pred==6 && self->components == 1) return parsePred6(self); // Fast path
     if (g_lj92_last_pred1_fast_path_eligible)
         return g_lj92_last_pred1_fast_path_measurement_requested
             ? parseScanPred1FastMeasured(self)
@@ -957,8 +1030,8 @@ static int parseScan(ljp* self) {
     double generic_bitstream_ms = 0.0;
     double generic_predictor_ms = 0.0;
     double stage_start = 0.0;
-    int ix = self->scanstart;
-    ix += BEH(self->data[ix]);
+    int ix = lj92_scan_entropy_start(self); /* r6 A2: bounded, was ix += BEH(data[scanstart]) */
+    if (ix < 0) return LJ92_ERROR_CORRUPT;
     int cnt = 0;
     u32 b = 0;
     u16* out = self->image;
@@ -983,7 +1056,11 @@ static int parseScan(ljp* self) {
                     Px = lastrow[c];  // Use value above for first pixel in row
                 } else {
                     int prev_colx = (col - 1) * self->components;
-   
+                    /* r6 pass 2 A1 (adversary on f1659d6a): Ra is the same component's left neighbour. The scalar
+                     * `left` is the previous sample of ANY component, which is Ra only when components == 1 (it then
+                     * equals thisrow[prev_colx + c], so one-component pictures are unchanged). */
+                    const int Ra = thisrow[prev_colx + c];
+
                     switch (pred) {
                         case 0:
                           Px = 0;
@@ -998,16 +1075,16 @@ static int parseScan(ljp* self) {
                           Px = lastrow[prev_colx + c];
                           break;
                         case 4:
-                          Px = left + lastrow[colx + c] - lastrow[prev_colx + c];
+                          Px = Ra + lastrow[colx + c] - lastrow[prev_colx + c];
                           break;
                         case 5:
-                          Px = left + ((lastrow[colx + c] - lastrow[prev_colx + c]) >> 1);
+                          Px = Ra + ((lastrow[colx + c] - lastrow[prev_colx + c]) >> 1);
                           break;
                         case 6:
-                          Px = lastrow[colx + c] + ((left - lastrow[prev_colx + c]) >> 1);
+                          Px = lastrow[colx + c] + ((Ra - lastrow[prev_colx + c]) >> 1);
                           break;
                         case 7:
-                          Px = (left + lastrow[colx + c]) >> 1;
+                          Px = (Ra + lastrow[colx + c]) >> 1;
                           break;
                     }
                 }
@@ -1080,6 +1157,17 @@ static int parseImage(ljp* self) {
             break;
         else if (nextMarker == 0xda) {
             self->scanstart = self->ix;
+            /* r6 (adversary r5 pass 3 A2): an SOS whose header runs past the payload (FF FF as its length in
+             * a 112-byte frame) is refused here, so lj92_open never reports a scan the bit reader would start
+             * outside the buffer. The header bytes parseScan reads (component count, predictor) are inside it. */
+            const int entropy = lj92_scan_entropy_start(self);
+            /* r10 (Dot B3 class): subtraction form (entropy >= 0 implies scanstart >= 0) */
+            const int headerok = entropy >= 0 && 2 < self->datalen - self->scanstart;
+            const int compcount = headerok ? self->data[self->scanstart+2] : 0;
+            if (!headerok || 3+2*compcount >= self->datalen - self->scanstart) {
+                ret = LJ92_ERROR_CORRUPT;
+                break;
+            }
             ret = LJ92_ERROR_NONE;
             break;
         } else if (nextMarker == -1) {
@@ -1133,6 +1221,14 @@ int lj92_open(lj92* lj,
 
     int ret = findSoI(self);
 
+    /* r6 pass 1 A2 (advisory, pre-existing): a scan with no Huffman table before it decoded through a NULL lookup
+     * table. It can decode nothing, so it is refused. */
+#ifdef SLOW_HUFF
+    if (ret == LJ92_ERROR_NONE && self->maxcode == NULL) ret = LJ92_ERROR_CORRUPT;
+#else
+    if (ret == LJ92_ERROR_NONE && self->hufflut == NULL) ret = LJ92_ERROR_CORRUPT;
+#endif
+
     if (ret == LJ92_ERROR_NONE) {
         if (self->x <= 0 || self->components <= 0
             || (size_t)self->x > SIZE_MAX / (size_t)self->components) {
@@ -1152,7 +1248,9 @@ int lj92_open(lj92* lj,
         else {
             self->rowcache = rowcache;
             self->outrow[0] = rowcache;
-            self->outrow[1] = &rowcache[self->x];
+            /* r6 pass 2 A2 (advisory, pre-existing): a row holds x * components samples, so the second row starts
+             * there; at x it overlapped the first row whenever components > 1 (one component: unchanged). */
+            self->outrow[1] = &rowcache[row_elements];
         }
     }
 
