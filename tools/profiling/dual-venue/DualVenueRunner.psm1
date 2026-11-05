@@ -2133,7 +2133,7 @@ function Read-DvContactFrames {
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
 # the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
-$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove')
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample')
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }

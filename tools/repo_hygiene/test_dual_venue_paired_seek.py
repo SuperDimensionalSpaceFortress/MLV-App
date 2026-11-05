@@ -398,13 +398,13 @@ class ControlContainerShapeTests(RunnerHarness, unittest.TestCase):
 
 
 BOOL_SWITCHES = ("forceLookAssist", "corePartitionTelemetry", "disableLookAssist", "presentTrace", "firstPresentCapture", "warmReuseMissDump", "unpaced",
-                 "disablePrepPointwiseFast", "prepConflatedMove")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
+                 "disablePrepPointwiseFast", "prepConflatedMove", "utilSample")   # every generatorArgs member leg-spec.schema.json types as a boolean (prepConflatedMove: const true)
 
 
 @requires_windows_pwsh
 class GeneratorArgsBooleanStrictnessTests(RunnerHarness, unittest.TestCase):
     """DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1: a generatorArgs switch is a JSON boolean or the leg spec is refused (DVE_LEG_SPEC_INVALID), before anything
-    is generated or submitted. Invoke-VenueLeg read seven of the nine with a plain [bool] cast, so any non-empty string was true: "disableLookAssist": "false"
+    is generated or submitted. Invoke-VenueLeg read seven of the ten with a plain [bool] cast, so any non-empty string was true: "disableLookAssist": "false"
     turned Look Assist OFF (the owner's 2026-10-20 objection, hub rule D4b). Fixed once, in the shape predicate the leg and the lease batch's preflight share."""
 
     def predicate(self, name: str, raw_json: str) -> str:
@@ -436,7 +436,7 @@ class GeneratorArgsBooleanStrictnessTests(RunnerHarness, unittest.TestCase):
 
     def test_the_leg_refuses_a_string_switch_before_generating_or_submitting(self) -> None:
         self.make_harness()
-        for name, value in (("disableLookAssist", "false"), ("unpaced", "true"), ("forceLookAssist", "false")):
+        for name, value in (("disableLookAssist", "false"), ("unpaced", "true"), ("forceLookAssist", "false"), ("utilSample", "true")):
             with self.subTest(name=name):
                 self.gen_log.write_text("", encoding="utf-8")
                 path = self.write_spec(leg_type="speed", leg_id=f"str-{name}")
