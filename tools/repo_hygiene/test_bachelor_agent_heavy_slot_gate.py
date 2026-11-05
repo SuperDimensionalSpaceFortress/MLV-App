@@ -2075,12 +2075,28 @@ class BoundedCaptureIoTests(unittest.TestCase):
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget(self) -> None:
-        with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", 3):
-            with self.assertRaises(AssertionError) as caught:
-                _run_pwsh_script("Start-Sleep -Seconds 600\n")
-        message = str(caught.exception)
-        self.assertIn("test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget exceeded its 3 s wall-clock bound", message)
-        self.assertIn("its process tree was killed", message)
+        # The verdict is case-named either way. The kill note depends on the host: taskkill exists only on Windows, so on Ubuntu the
+        # note is "kill is NOT confirmed (taskkill failed: FileNotFoundError)" (hosted run 42004196485). The second pass makes the
+        # Windows host take that same path, so both notes are exercised everywhere.
+        real_popen = subprocess.Popen
+
+        def without_taskkill(argv: object, *args: object, **kwargs: object) -> object:
+            if isinstance(argv, (list, tuple)) and argv and str(argv[0]).lower() == "taskkill":
+                raise FileNotFoundError(2, "taskkill is not installed")
+            return real_popen(argv, *args, **kwargs)
+
+        for label, patch in (("host taskkill", mock.patch.object(subprocess, "Popen", real_popen)),
+                             ("taskkill missing", mock.patch.object(subprocess, "Popen", without_taskkill))):
+            with self.subTest(label), patch:
+                with mock.patch(f"{__name__}.PWSH_SCRIPT_BASE_SEC", 3):
+                    with self.assertRaises(AssertionError) as caught:
+                        _run_pwsh_script("Start-Sleep -Seconds 600\n")
+                message = str(caught.exception)
+                self.assertIn("test_r16_c1_a_genuine_hang_still_fails_by_case_name_at_the_budget exceeded its 3 s wall-clock bound", message)
+                self.assertTrue("its process tree was killed" in message
+                                or "its process tree kill is NOT confirmed (taskkill failed: FileNotFoundError)" in message, message)
+                if label == "taskkill missing":
+                    self.assertIn("kill is NOT confirmed (taskkill failed: FileNotFoundError)", message)
 
     @unittest.skipUnless(PWSH is not None, "pwsh is not on PATH")
     def test_a_factory_that_consumes_the_bound_before_returning_a_completed_task_is_a_timeout_not_a_late_success(self) -> None:
