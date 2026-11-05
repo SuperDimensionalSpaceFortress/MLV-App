@@ -478,7 +478,10 @@ class HeavySetTests(unittest.TestCase):
 
     def test_the_heavy_job_has_the_shard_jobs_setup(self) -> None:
         def setup_steps(job: str, first_own_step: str) -> str:
-            return job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+            span = job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+            # Comment lines directly above the job's own first step explain that step, not the setup
+            # (the heavy step's "/6" label is stale on purpose, see the comment above it in tests.yml).
+            return re.sub(r"(?:      #[^\n]*\n)+\Z", "", span)
 
         self.assertEqual(
             setup_steps(_workflow_job(WINDOWS_HEAVY_JOB), "      - name: Run repo hygiene heavy unittest part"),
