@@ -205,7 +205,7 @@ def _ps_arg(v):
     return f"'{v}'"
 
 
-def _sweep(main, **kw):
+def _sweep_with_stderr(main, **kw):
     args = [f"-RepoRoot '{main}'"]
     for k, v in kw.items():
         args.append(f"-{k}" if v is True else f"-{k} {_ps_arg(v)}")
@@ -214,9 +214,13 @@ def _sweep(main, **kw):
         f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}"
         f"Invoke-SweepMergedLaneWorktrees {' '.join(args)} | ConvertTo-Json -Depth 5"
     )
-    out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
-                         check=True, capture_output=True, text=True).stdout
-    return json.loads(out)
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                       check=True, capture_output=True, text=True)
+    return json.loads(r.stdout), r.stderr
+
+
+def _sweep(main, **kw):
+    return _sweep_with_stderr(main, **kw)[0]
 
 
 def _norm(p):
@@ -507,6 +511,78 @@ def _stop(p):
     p.wait(timeout=30)
 
 
+# RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: three hosted failures of the chain case's shape (merge_group 40157682070, #493 run 40809967854, job 126952032811)
+# could not be told apart, because `_spawn` sends the child's output to DEVNULL and the test never looked at it again. Every test whose expected result
+# depends on a live holder now proves liveness BEFORE the scan (only the holder's startup is retried, never anything after product code has run) and
+# checks it AFTER the scan, and a surprising result prints what the original log lacked.
+
+def _await_ready(p, ready, seconds=60):
+    deadline = time.monotonic() + seconds
+    while p.poll() is None and not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return p.poll() is None and ready.exists()
+
+
+def _spawn_script_proven_alive(args, ready, cwd, attempts=3):
+    """Start a script holder and wait for its ready file. Only this startup is retried, before any product code runs."""
+    for _ in range(attempts):
+        if ready.exists():
+            ready.unlink()
+        p = _spawn(args, cwd=cwd)
+        if _await_ready(p, ready):
+            return p
+        _stop(p)
+    raise AssertionError(f"FIXTURE ERROR: {args} did not reach {ready} in {attempts} attempts")
+
+
+def _spawn_chain_proven_alive(sd, cwd):
+    """The `_chain_scripts` chain. quiet.ps1 writes the ready file AFTER its dot-source and stops on any error before that: readiness proves the chain loaded."""
+    return _spawn_script_proven_alive(["-File", str(sd / "chain.ps1")], sd / "chain.ready", cwd)
+
+
+def _holder_diagnostics(p, wt, result, stderr=""):
+    """What the original log of job 126952032811 did not have: the holder's poll state, its census row, its script corpus, the full disposition."""
+    probe = ("$ErrorActionPreference='Continue'; "
+             f". '{HELPER}'; "
+             f"$row = Get-CimInstance Win32_Process -Filter 'ProcessId={p.pid}'; "
+             "if (-not $row) { 'census: NO ROW for this pid'; return }; "
+             "'census: ' + ($row | Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine | ConvertTo-Json -Compress); "
+             f"$cwd = Get-ProcessCurrentDirectory -ProcessId {p.pid}; 'cwd: ' + $cwd; "
+             "$c = Get-ScriptCorpus -CommandLine ([string]$row.CommandLine) -FileCache @{} -HolderCwd ([string]$cwd); "
+             "'corpus files: ' + @($c.Files).Count; "
+             f"foreach ($f in @($c.Files)) {{ 'corpus: ' + $f.File + ' names-worktree=' + (Test-PathNamed -Text $f.Text -Path '{wt}') }}; "
+             "'corpus unreadable: ' + (@($c.Unreadable | ForEach-Object { $_.File + ' ' + $_.Error }) -join ' ; '); "
+             "'corpus relativeUnresolved: ' + $c.RelativeUnresolved")
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", probe], capture_output=True, text=True, timeout=120)
+        census = r.stdout + r.stderr
+    except Exception as e:  # a diagnostic must never replace the failure it describes
+        census = f"census failed: {type(e).__name__}: {e}"
+    return (f"\nholder pid={p.pid} poll={p.poll()}\n{census}\nresult={json.dumps(result)}\nstderr={stderr}\n")
+
+
+def _kept_by(p):
+    return lambda v: v["action"] == "kept" and v["reason"].startswith(f"live-process: {p.pid} ")
+
+
+def _would_retire(v):
+    return (v["action"], v["reason"]) == ("would-retire", "ok")
+
+
+def _retired(v):
+    return (v["action"], v["reason"]) == ("retired", "ok")
+
+
+def _require_verdict(p, wt, result, stderr, expected=None):
+    """Call INSIDE the try, after the scan and before _stop. A dead holder is a fixture error, never a gate result (no retry: product code has run).
+    With the holder alive, a verdict `expected` rejects is a real gate result: the output says which reading is left (the card's STOP RULE)."""
+    if p.poll() is not None:
+        raise AssertionError("FIXTURE ERROR: the holder exited before the scan finished, so this says nothing about the gate." + _holder_diagnostics(p, wt, result, stderr))
+    if expected is not None and not expected(result):
+        raise AssertionError("GATE RESULT with a proven-live holder. If the corpus below is readable this is a gate defect: do not widen the fixture."
+                             + _holder_diagnostics(p, wt, result, stderr))
+
+
 def _gate_real(workdir, *, whatif=True, prelude="", extra=""):
     """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced; `extra` is
     appended to the Invoke-RetireLaneWorktree arguments."""
@@ -525,9 +601,10 @@ def _gate_real(workdir, *, whatif=True, prelude="", extra=""):
 def test_process_whose_cwd_is_the_worktree_keeps_it_and_the_refusal_names_the_pid(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-cwd")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)   # command line does NOT name the worktree
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)   # command line does NOT name the worktree
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -541,12 +618,19 @@ def test_process_whose_cwd_is_inside_the_worktree_keeps_it(repo):
     wt = _add_wt(main, tmp / "wt-cwd-sub")
     sub = wt / "deep" / "er"
     sub.mkdir(parents=True)
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=sub)
+    p = _spawn_proven_alive(tmp, "holder", cwd=sub)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+
+
+# The ready file comes after the dot-source, and an error before it stops the script, so readiness proves the chain loaded. 600 s outlives any scan shorter
+# than that; _require_verdict catches a longer one as a fixture error.
+_QUIET_PS1 = ('$ErrorActionPreference = "Stop"\n. "$PSScriptRoot\\arms.ps1"\nif ($null -eq $script:Wt) { exit 3 }\n'
+              '[IO.File]::WriteAllText("$PSScriptRoot\\chain.ready", "up")\nStart-Sleep -Seconds 600\n')
 
 
 def _chain_scripts(tmp, wt_text):
@@ -554,8 +638,8 @@ def _chain_scripts(tmp, wt_text):
     sd = tmp / "chain-run" / "tools"
     sd.mkdir(parents=True)
     (sd / "arms.ps1").write_text(f"$script:Wt = '{wt_text}'\n", encoding="utf-8")
-    (sd / "quiet.ps1").write_text('. "$PSScriptRoot\\arms.ps1"\nStart-Sleep -Seconds 120\n', encoding="utf-8")
-    (sd / "chain.ps1").write_text('& "$PSScriptRoot\\quiet.ps1"\n', encoding="utf-8")
+    (sd / "quiet.ps1").write_text(_QUIET_PS1, encoding="utf-8")
+    (sd / "chain.ps1").write_text('$ErrorActionPreference = "Stop"\n& "$PSScriptRoot\\quiet.ps1"\n', encoding="utf-8")
     return sd
 
 
@@ -563,9 +647,10 @@ def test_live_script_whose_dot_sourced_sibling_names_the_worktree_keeps_it(repo)
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-script")
     sd = _chain_scripts(tmp, str(wt))
-    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)           # cwd elsewhere; command line names the RUN DIR only
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)                      # cwd elsewhere; command line names the RUN DIR only
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -578,9 +663,10 @@ def test_live_script_naming_the_worktree_with_forward_slashes_keeps_it(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-script-slash")
     sd = _chain_scripts(tmp, str(wt).replace("\\", "/"))
-    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -590,9 +676,10 @@ def test_live_script_that_does_not_name_the_worktree_does_not_block_retirement(r
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-script-other")
     sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
-    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _would_retire)
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
@@ -615,10 +702,10 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
     """End to end, not WhatIf: refused while the holder lives, retired once it is gone."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-release")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt, whatif=False)
-        assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+        d, err = _gate_real(wt, whatif=False)
+        _require_verdict(p, wt, d, err, _kept_by(p))
         assert wt.exists()
     finally:
         _stop(p)
@@ -1472,12 +1559,13 @@ def test_an_unreadable_cwd_process_that_appears_during_the_retry_no_longer_stops
     wt = _add_wt(main, tmp / "wt-late-unknown")
     ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
     p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
-    late = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # not the holder of anything; its cwd just cannot be read
+    late = _spawn_proven_alive(tmp, "late", cwd=tmp)   # not the holder of anything; its cwd just cannot be read
     prelude = (_counted_scans_and_sleeps(release, 1) + _handle_appears_after_the_rename(trigger, ready)
                + "$origCwdLate = ${function:Get-ProcessCurrentDirectory}; "
                f"function Get-ProcessCurrentDirectory {{ param([int]$ProcessId) if ($script:SnapN -ge 3 -and $ProcessId -eq {late.pid}) {{ return $null }}; & $origCwdLate -ProcessId $ProcessId }}; ")
     try:
         d, err = _gate_real(wt, whatif=False, prelude=prelude)
+        _require_verdict(late, wt, d, err, _retired)
     finally:
         _stop(late)
         _finish_holder(p, release)
@@ -1526,9 +1614,10 @@ def test_sweep_keeps_a_worktree_held_only_by_a_process_cwd(repo):
     root = tmp / "lanes"
     held = _add_wt(main, root / "lane-held")
     free = _add_wt(main, root / "lane-free")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=held)
+    p = _spawn_proven_alive(tmp, "holder", cwd=held)
     try:
-        s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+        s, err = _sweep_with_stderr(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+        _require_verdict(p, held, s, err, lambda v: v["kept"] == {"live-process": 1})
     finally:
         _stop(p)
     assert _swept_paths(s) == [_norm(free)] and s["kept"] == {"live-process": 1}, s
@@ -1584,9 +1673,10 @@ def test_healthy_cwd_probe_is_reported_ok_and_backs_the_would_retire(repo):
 def test_probe_unavailable_with_a_cwd_only_holder_is_refused_not_would_retire(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-probe-off")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)   # its ONLY link to the worktree is its cwd
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)   # its ONLY link to the worktree is its cwd
     try:
         d, err = _gate_real(wt, prelude=FORCE_PROBE_UNAVAILABLE)
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept" and v["reason"].startswith("cwd-probe-unavailable"))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith("cwd-probe-unavailable"), d
@@ -1632,7 +1722,7 @@ def test_a_pid_whose_cwd_read_fails_is_listed_and_left_to_the_rename_probe(repo)
         d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(p.pid))
         control, _ = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)    # same process, cwd readable: not listed at all
         # The holder was alive for both scans (it is killed only below), so a missing pid is the gate's, never a vanished fixture.
-        assert p.poll() is None, f"fixture holder {p.pid} exited before the scans finished"
+        _require_verdict(p, wt, d, err, lambda v: any(u.startswith(f"{p.pid} ") for u in v["cwdUnknown"]))
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), json.dumps(d)   # r7: no longer a refusal (the rename settles it)
@@ -1646,9 +1736,10 @@ def test_a_named_holder_is_reported_as_live_process_when_the_probe_works(repo):
     """Same holder as the probe-unavailable case: with a working probe it is NAMED (live-process), not just doubted."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-named")
-    holder = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    holder = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(holder, wt, d, err, _kept_by(holder))
     finally:
         _stop(holder)
     assert d["reason"].startswith(f"live-process: {holder.pid} ") and d["cwdProbe"] == "ok", d
@@ -1817,7 +1908,7 @@ def _relative_chain(tmp, wt_text, dirname):
     sd = base / dirname
     sd.mkdir(parents=True)
     (sd / "arms.ps1").write_text(f"$script:Wt = '{wt_text}'\n", encoding="utf-8")
-    (sd / "quiet.ps1").write_text('. "$PSScriptRoot\\arms.ps1"\nStart-Sleep -Seconds 120\n', encoding="utf-8")
+    (sd / "quiet.ps1").write_text(_QUIET_PS1, encoding="utf-8")
     return base
 
 
@@ -1827,9 +1918,10 @@ def test_relative_script_path_is_resolved_against_the_holders_cwd(repo, dirname)
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rel-script")
     base = _relative_chain(tmp, str(wt), dirname)
-    p = _spawn(["-File", f"{dirname}\\quiet.ps1"], cwd=base)    # the gate runs from elsewhere, where this relative path does not exist
+    p = _spawn_script_proven_alive(["-File", f"{dirname}\\quiet.ps1"], base / dirname / "chain.ready", base)    # the gate runs from elsewhere, where this relative path does not exist
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -1842,9 +1934,10 @@ def test_relative_script_path_that_does_not_name_the_worktree_does_not_block(rep
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rel-other")
     base = _relative_chain(tmp, str(tmp / "some-other-place"), dirname)
-    p = _spawn(["-File", f"{dirname}\\quiet.ps1"], cwd=base)
+    p = _spawn_script_proven_alive(["-File", f"{dirname}\\quiet.ps1"], base / dirname / "chain.ready", base)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _would_retire)
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
@@ -2320,9 +2413,10 @@ def test_rename_probe_refuses_an_unseen_cwd_holder_and_leaves_the_worktree_intac
     the cwd and cmdline checks have nothing to see, so only the rename can tell. Kept / in-use, worktree untouched at its own path."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rename-inuse")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        d, err = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept" and v["reason"].startswith("in-use"))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
@@ -2336,9 +2430,10 @@ def test_unreadable_cwd_with_no_handle_in_the_worktree_no_longer_blocks_retireme
     """(b) The 2026-10-21 incident shape: a live process whose cwd cannot be read, nowhere near the worktree. Retired."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rename-free")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)
+    p = _spawn_proven_alive(tmp, "holder", cwd=tmp)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        d, err = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        _require_verdict(p, wt, d, err, _retired)
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
@@ -2351,9 +2446,10 @@ def test_readable_cwd_inside_the_worktree_is_still_refused_ahead_of_the_rename_p
     """(c) Unchanged rule: a readable cwd is a named holder (live-process), found before any rename is attempted."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rename-readable")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt, whatif=False)
+        d, err = _gate_real(wt, whatif=False)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -2423,9 +2519,10 @@ def test_rename_probe_refuses_a_cwd_holder_in_a_subdirectory_of_the_worktree(rep
     wt = _add_wt(main, tmp / "wt-nested-cwd")
     sub = wt / "sub"
     sub.mkdir()
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=sub)
+    p = _spawn_proven_alive(tmp, "holder", cwd=sub)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        d, err = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept" and v["reason"].startswith("in-use"))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
@@ -2752,6 +2849,1223 @@ def test_gate_refused_line_carries_reason_live_driver_or_live_process(repo):
     assert re.search(r"REFUSED worktree-removal reason=live-process path=.* pid=999992 .*via=cmdline", err), err
 
 
+# --- RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1: a recorded pid is a live driver only while it is still the RECORDED process ---
+# 2026-11-01 (lane-NONBUILDING-WAITER-SKIPS-BUILD-ADMISSION-LOCK-1-r1 invoke.err.txt): dead lanes' worktrees were never retired because pids read
+# from stale child.json / receipt files in old run dirs had been REUSED by tailscaled.exe, OfficeClickToRun.exe, remoting_host.exe and git.exe.
+# A run-dir record is written after the process it names starts, so a live pid whose image is not a lane driver, or whose creation time does not
+# fit the record, is a different process that got the pid. Fleet doctrine RECEIPTS.md:5103 (procStart defeats PID reuse), TRAPS.md:11541.
+
+def _utc_expr(epoch):
+    return f"[datetime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc).AddSeconds({int(epoch)})"
+
+
+def _fake_proc_created(pid, cmdline, name, epoch):
+    """A fake snapshot row WITH a creation time (epoch seconds, UTC), as Win32_Process rows carry."""
+    cl = str(cmdline).replace("'", "''")
+    return f"[pscustomobject]@{{ ProcessId = {pid}; Name = '{name}'; CommandLine = '{cl}'; CreationDate = {_utc_expr(epoch)} }}"
+
+
+def _stamp_run_dir(rd, epoch):
+    """Pin every record in the run dir to a known write time (the record's 'written' moment)."""
+    for f in rd.iterdir():
+        os.utime(f, (epoch, epoch))
+
+
+@pytest.mark.parametrize("image", ["tailscaled.exe", "OfficeClickToRun.exe", "remoting_host.exe", "git.exe"])
+@pytest.mark.parametrize("cmdline_shape", ["unreadable", "names-run-dir"])
+def test_reused_pid_running_a_foreign_image_is_not_a_live_driver(tmp_path, image, cmdline_shape):
+    """The 2026-11-01 shape: the recorded pid now runs an unrelated image (unreadable command line, or one that merely names the run dir).
+    SUPERSEDED r8 (ruling c, f): the child record carries no creation stamp, and an image never rejects a record, so the live pid HOLDS. Was: free.
+    The stamped form of this shape (the lane launcher's own child.json) is still free: test_r8_gate_retires_a_worktree_whose_stamped_driver_pid_was_reused."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r1", 999971, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    cmdline = "" if cmdline_shape == "unreadable" else f"{image} --state {rd}"
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999971, cmdline, image)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999971, (r, err)
+
+
+def test_reused_pid_that_started_after_its_record_was_written_is_not_a_live_driver(tmp_path):
+    """Even a pwsh.exe: a process created AFTER the record was written cannot be the process the record named.
+    SUPERSEDED r8 (ruling b, f): 'created after the record's write time' is a wall-clock comparison (Dot B1: a clock rollback makes a genuine driver
+    look started-after), and the pid file is unstamped, so the live pid HOLDS. Was: free."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r2", 999972, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    for cmdline in ("", _driver_cmdline(rd)):
+        r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, cmdline, "pwsh.exe", written + 600)), runs)
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (cmdline, r, err)
+
+
+def test_a_driver_that_started_before_its_record_was_written_is_still_a_live_driver(tmp_path):
+    """No regression: the genuine detached driver (process older than its pid file) still refuses, unreadable command line included."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r3", 999973, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    for cmdline in (_driver_cmdline(rd), ""):
+        r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, cmdline, "pwsh.exe", written - 600)), runs)
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999973, (cmdline, r)
+
+
+def test_a_record_that_states_createdutc_binds_the_pid_to_exactly_that_process(tmp_path):
+    """child.json carries createdUtc: a different creation time is a reused pid even when it predates the record file's write time."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r4", 999974, workdir=wt, pid_file="opus-001.child.json", child_json=True)   # ONE record for the pid (a second, createdUtc-less .pid record would legitimately tie it by write time)
+    created = time.time() - 7200
+    (rd / "opus-001.child.json").write_text(json.dumps({
+        "schema": "mlv-lane-child/v1", "pid": 999974,
+        "createdUtc": datetime.datetime.fromtimestamp(created, datetime.timezone.utc).isoformat()}), encoding="utf-8")
+    _stamp_run_dir(rd, time.time() - 60)   # written long after, so the write-time rule alone would call a 1 h old process "the same"
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 1)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["via"].startswith("rundir-pid:"), r
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_a_creation_time_that_cannot_be_read_falls_back_to_the_image_check(tmp_path):
+    """No CreationDate on the row: a lane image is still treated as the driver (fail toward live), a foreign image is not.
+    SUPERSEDED r8 (ruling c, f), second half: an image never rejects a record, and the pid file is unstamped, so tailscaled.exe HOLDS too. Was: free."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    _driver_run_dir(runs, "lane-X-1-r5", 999975, workdir=wt)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999975, "", "pwsh.exe")), runs)
+    assert r is not None and r["reason"] == "live-driver", r
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999975, "", "tailscaled.exe")), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999975, (r, err)
+
+
+def test_gate_retires_a_worktree_whose_only_recorded_driver_pid_was_reused(repo):
+    """End to end through the gate: a dead lane's worktree is would-retire while its recorded pid runs an unrelated image.
+    SUPERSEDED r8 (ruling c, f): the child record is UNSTAMPED, so the live pid holds whatever its image: kept. Was: would-retire. The stamped
+    form still retires: test_r8_gate_retires_a_worktree_whose_stamped_driver_pid_was_reused."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-REUSE-1")
+    runs = tmp / "fleet-runs"
+    _driver_run_dir(runs, "lane-REUSE-1-r1", 999976, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999976, "", "OfficeClickToRun.exe")), runs)
+    assert d["action"] == "kept" and "999976" in d["reason"], (d, err)
+    assert "REFUSED worktree-removal reason=live-driver" in err or "rundir-pid:" in d["reason"], (d, err)
+
+
+def test_r8_gate_retires_a_worktree_whose_stamped_driver_pid_was_reused(repo):
+    """r8 (a), genuine-reuse control end to end: the lane launcher's stamped child.json names pid 999976; the pid now runs OfficeClickToRun.exe, whose
+    CURRENT creation time (per-pid query) differs from the stamp: would-retire, no REFUSED line."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-REUSE-2")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-REUSE-2-r1", 999976, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    now = time.time()
+    (rd / "opus-001.child.json").write_text(json.dumps({"schema": "mlv-lane-child/v1", "pid": 999976, "createdUtc": _iso(now - 7200)}), encoding="utf-8")
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999976, "", "OfficeClickToRun.exe")), runs,
+                       prelude=_r8_live(999976, "OfficeClickToRun.exe", now - 600))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), (d, err)
+    assert "REFUSED" not in err, err
+
+
+# --- RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1 r4 (sol r1 on PR #744): record identity is read from the record's own fields, and a mismatch wins ---
+# B1: a native receipt carries containment.childCreatedUtc (Invoke-Lane.ps1 containment block); a later receipt mtime must not override a
+#     child record's exact creation-time mismatch for the same pid, in either record order.
+# B2: createdUtc is read from the ROOT object only; a nested metadata.createdUtc must not replace it.
+
+def _iso(epoch):
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_record(rd, name, doc, mtime):
+    p = rd / name
+    p.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+    os.utime(p, (mtime, mtime))
+
+
+@pytest.mark.parametrize("child_first", [True, False], ids=["child-record-first", "receipt-first"])
+@pytest.mark.parametrize("receipt_states_created", [True, False], ids=["receipt-has-childCreatedUtc", "receipt-has-no-stamp"])
+def test_b1_exact_mismatch_from_one_record_is_not_overridden_by_a_weaker_record(tmp_path, child_first, receipt_states_created):
+    """sol r1 B1: child {pid,createdUtc=T0}; receipt {containment.childPid,childCreatedUtc=T0}, mtime later than the replacement process
+    that got the pid at T0+1h. The pid is a different process: FREE, in either record order."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    replacement = t0 + 3600
+    receipt_mtime = replacement + 3600           # written after the replacement process started
+    containment = {"childPid": 999974}
+    if receipt_states_created:
+        containment["childCreatedUtc"] = _iso(t0)
+    _write_record(rd, "a-first.child.json" if child_first else "z-last.child.json",
+                  {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t0)}, t0 + 5)
+    _write_record(rd, "z-last.receipt.json" if child_first else "a-first.receipt.json",
+                  {"state": "complete", "exitCode": 0, "workDir": str(wt), "containment": containment}, receipt_mtime)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", replacement)), runs)
+    if receipt_states_created:
+        assert r is None, (r, err)
+    else:
+        # SUPERSEDED r8 (ruling f, g): the receipt names the pid WITHOUT a stamp, and another record's stamp proves nothing about it (a reuse proof
+        # rejects only the record that states it). Unstamped record + live pid = HOLDER. Was: free.
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+def test_b1_native_receipt_childcreatedutc_is_an_exact_stamp(tmp_path):
+    """sol r1 B1, receipt alone: containment.childCreatedUtc binds the pid to that exact process (match refuses, mismatch is free)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt),
+                  "containment": {"childPid": 999974, "childCreatedUtc": _iso(t0)}}, now - 60)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0 + 1)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, r
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0 + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_b1_full_native_containment_block_binds_each_pid_to_its_own_stamp(tmp_path):
+    """The real receipt shape (Invoke-Lane.ps1) names runnerPid, ownerPid and childPid: each stamp binds only ITS pid."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt), "containment": {
+        "runnerPid": 999971, "runnerCreatedUtc": _iso(t0 - 100), "ownerPid": 999972, "ownerCreatedUtc": _iso(t0 - 50),
+        "childPid": 999974, "childCreatedUtc": _iso(t0)}}, now - 60)
+    live = _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0))
+    r, _ = _live_refusal(wt, live, runs)
+    assert r is not None and r["processId"] == 999974, r
+    for pid, ok_at in ((999972, t0 - 50), (999974, t0)):
+        r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc_created(pid, "", "pwsh.exe", ok_at)), runs)
+        assert r is not None and r["processId"] == pid, (pid, r)
+        r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(pid, "", "pwsh.exe", ok_at + 3600)), runs)
+        assert r is None, (pid, r, err)
+
+
+# Adversary pass r4 on 26405132 (A1-A3).
+
+@pytest.mark.parametrize("old_dir_first", [True, False], ids=["stale-dir-first", "current-dir-first"])
+def test_a1_a_stale_record_for_a_reused_pid_number_does_not_hide_the_current_exact_match(tmp_path, old_dir_first):
+    """A1: pid 999974 was recorded (createdUtc T_old) by an OLD run dir and again (createdUtc T_cur) by the CURRENT one, which names the worktree.
+    The live process was created at T_cur: the current record matches EXACTLY, so the stale mismatch must not suppress it (either dir order)."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    now = time.time()
+    t_old, t_cur = now - 30 * 3600, now - 6 * 3600
+    old = runs / ("a-old" if old_dir_first else "z-old")
+    cur = runs / ("z-cur" if old_dir_first else "a-cur")
+    for rd in (old, cur):
+        rd.mkdir(parents=True)
+        (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(old, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t_old)}, t_old + 5)
+    _write_record(cur, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t_cur)}, t_cur + 5)
+    _write_record(cur, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t_cur)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+@pytest.mark.parametrize("old_dir_first", [True, False], ids=["stale-dir-first", "current-dir-first"])
+def test_a1b_a_stale_run_dirs_mismatch_does_not_suppress_another_run_dirs_bare_pid_record(tmp_path, old_dir_first):
+    """Adversary A1 (2nd pass): the exact-mismatch precedence is scoped to ONE run dir's records. An old run dir that stated a different creation
+    time for pid 999974 must not suppress the CURRENT run dir's bare venue-driver.pid (no stamp; written just after the process started)."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    now = time.time()
+    t_old, t_cur = now - 30 * 3600, now - 6 * 3600
+    old = runs / ("a-old" if old_dir_first else "z-old")
+    cur = runs / ("z-cur" if old_dir_first else "a-cur")
+    for rd in (old, cur):
+        rd.mkdir(parents=True)
+        (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(old, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999974, "createdUtc": _iso(t_old)}, t_old + 5)
+    _write_record(cur, "venue-driver.pid", "999974\n", t_cur + 1)
+    _write_record(cur, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t_cur)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+@pytest.mark.parametrize("doc", [
+    '{"containment":{"childPid":"999974","childCreatedUtc":"%s"},"state":"complete","workDir":%s}',                                  # string pid (A2)
+    '{"pid":999974,"c\\u0072eatedUtc":"%s","state":"complete","workDir":%s}',                                                        # escaped property name (A3)
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","CHILDCREATEDUTC":"2026-11-03T10:00:00Z"},"state":"complete","workDir":%s}',  # case-variant extra key (A4)
+], ids=["string-pid", "escaped-name", "case-variant-key"])
+def test_a2_a3_a4_the_stamp_is_read_from_the_parsed_field_whatever_its_spelling(tmp_path, doc):
+    """Adversary A2/A3/A4 (2nd pass): a recognised stamp binds its pid (string pid, JSON-escaped name), an unrelated differently-cased key cannot
+    replace it; a replacement process with another creation time is free, the genuine one refuses."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    t0 = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", doc % (_iso(t0), json.dumps(str(wt))), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", t0 + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_a2_a_root_stamp_does_not_bind_a_nested_containment_pid(tmp_path):
+    """A2: the root createdUtc belongs to a ROOT pid field only. A receipt with an unrelated root createdUtc and containment.childPid whose own
+    childCreatedUtc is null states no identity for that pid, so the genuine driver (created long after the root stamp) still refuses."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", '{"createdUtc":"2026-10-01T00:00:00Z","state":"complete","workDir":%s,"containment":{"childPid":999974,"childCreatedUtc":null}}'
+                  % json.dumps(str(wt)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+
+
+def test_a3_a_small_backward_clock_step_does_not_free_a_genuine_driver(tmp_path):
+    """A3: with no stamp in the record, the write-time rule tolerates clock skew: a genuine driver that started up to a minute AFTER the file's
+    mtime (a backward clock adjustment before the pid file was published) is still the driver; a process minutes later is still a reused pid.
+    SUPERSEDED r8 (ruling b, f), second half: started-after-record is a wall-clock comparison and the pid file is unstamped: HOLDS. Was: free."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r3", 999973, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, "", "pwsh.exe", written + 60)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999973, "", "pwsh.exe", written + 600)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999973, (r, err)
+
+
+def test_b2_nested_createdutc_does_not_replace_the_root_stamp(tmp_path):
+    """sol r1 B2: {"metadata":{"createdUtc":OCTOBER},"pid":P,"createdUtc":NOV1}; the genuine driver created NOV1 must still refuse."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.child.json", '{"schema":"mlv-lane-child/v1","metadata":{"createdUtc":"2026-10-01T00:00:00Z"},"pid":999974,"createdUtc":"%s"}' % _iso(created), now - 60)
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+    # and the root stamp still decides a reused pid: the replacement is not the recorded process
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_b2_nested_stamp_copies_are_ignored_and_unparsable_text_makes_no_claim(tmp_path):
+    """Class: a nested copy of either stamp field, in any position, is not the record's identity; unparsable text makes no claim (image/mtime fallback)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","exitCode":0,"workDir":%s,"metadata":{"childCreatedUtc":"2026-10-01T00:00:00Z"},"containment":{"childPid":999974,"childCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), _iso(created)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    # unparsable JSON text: no stamp claim, so a pwsh.exe that started before the record was written is still treated as the driver
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","workDir":%s,"containment":{"childPid":999974,"childCreatedUtc":"2000-01-01T00:00:00Z"' % json.dumps(str(wt)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+
+
+# Adversary pass r4 on d70bca44 (A1 duplicated keys, A2 mtime cached before the text it describes). r5.
+
+_STALE = "2026-11-02T09:00:00Z"   # an identity the genuine driver does not have
+
+
+@pytest.mark.parametrize("doc", [
+    '{"pid":999974,"pid":null,"createdUtc":"%s","state":"complete","workDir":%s}',                                                    # dup root pid (A1)
+    '{"childPid":999974,"childPid":null,"createdUtc":"%s","state":"complete","workDir":%s}',                                          # dup root childPid
+    '{"pid":999974,"createdUtc":"%s","createdUtc":null,"state":"complete","workDir":%s}',                                             # dup root stamp, stale first
+    '{"pid":999974,"createdUtc":null,"createdUtc":"%s","state":"complete","workDir":%s}',                                             # dup root stamp, stale last
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s"},"containment":{},"state":"complete","workDir":%s}',                    # dup containment (A1 sibling)
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s"},"containment":null,"state":"complete","workDir":%s}',                  # dup containment, null last
+    '{"containment":null,"containment":{"childPid":999974,"childCreatedUtc":"%s"},"state":"complete","workDir":%s}',                  # dup containment, null first
+    '{"containment":{"childPid":999974,"childPid":null,"childCreatedUtc":"%s"},"state":"complete","workDir":%s}',                     # dup inner pid
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","childCreatedUtc":null},"state":"complete","workDir":%s}',              # dup inner stamp
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","ownerPid":1234,"ownerPid":5678},"state":"complete","workDir":%s}',    # dup of ANOTHER pair's key poisons the record
+    '{"containment":{"childPid":999974,"childCreatedUtc":"%s","runnerCreatedUtc":"x","runnerCreatedUtc":"y"},"state":"complete","workDir":%s}',
+], ids=["dup-root-pid", "dup-root-childPid", "dup-root-stamp-stale-first", "dup-root-stamp-stale-last", "dup-containment-empty-last",
+        "dup-containment-null-last", "dup-containment-null-first", "dup-inner-pid", "dup-inner-stamp", "dup-other-pair-pid", "dup-other-pair-stamp"])
+def test_r5_a1_a_duplicated_identity_key_makes_no_identity_claim(tmp_path, doc):
+    """r5 A1: a key that appears twice at the root or inside containment (pid, stamp or the containment object itself) is ambiguous at every
+    level: the record states no identity, so the genuine driver (created at a time the stale stamp does not name) still refuses."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", doc % (_STALE, json.dumps(str(wt))), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+def test_r5_a1_a_non_identity_duplicate_key_does_not_poison_a_good_stamp(tmp_path):
+    """Class guard: only identity keys are ambiguous when duplicated; a duplicated unrelated key leaves a single stamp binding its pid."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", '{"note":"a","note":"b","state":"complete","workDir":%s,"containment":{"childPid":999974,"childCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), _iso(created)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r5_a2_a_record_replaced_between_enumeration_and_read_is_judged_by_its_new_write_time(tmp_path):
+    """r5 A2: the index caches each file's mtime at enumeration but reads its text later. A producer that replaces venue-driver.pid in between
+    (new pid text, new mtime) must not have the NEW pid judged by the OLD mtime: the genuine new driver, started just before the replacement,
+    would read as started-after-record and the guard would say FREE. The seam below performs that replacement at read time."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 3600                     # the genuine driver starts here ...
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "venue-driver.pid", "999900\n", created - 600)   # ... the file enumerated is an OLD record (mtime 10 min before it)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            "if ((Split-Path -Leaf $Path) -eq 'venue-driver.pid') { [IO.File]::WriteAllText($Path, \"999974`n\"); "
+            "[IO.File]::SetLastWriteTimeUtc($Path, [DateTime]::UtcNow.AddSeconds(-30)) }; "
+            "return [IO.File]::ReadAllText($Path) };")
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+def test_r5_a2_an_unchanged_record_is_still_judged_by_its_write_time(tmp_path):
+    """Guard: re-statting after the read must not loosen the started-after rule for a file nobody touched.
+    SUPERSEDED r8 (ruling b, f): the started-after rule (a wall-clock comparison) is gone and the pid file is unstamped: the live pid HOLDS. Was: free."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-CURRENT-r1", 999974, workdir=wt)
+    written = time.time() - 3600
+    _stamp_run_dir(rd, written)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", written + 600)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+# Adversary pass r5 on 380df5f7 (A1 a launch-written pid file vs an old stamp, A2 conflicting stamps for one pid in one record, A3 no post-read stat).
+
+@pytest.mark.parametrize("pid_name", ["a-driver.pid", "z-driver.pid"])
+def test_r5b_a1_a_launch_written_pid_file_that_fits_the_process_outranks_an_old_stamp_in_the_same_run_dir(tmp_path, pid_name):
+    """r5 A1 (2nd pass): child.json states an OLD creation time for pid 999972 (an earlier lineage); venue-driver.pid, written at launch AFTER the
+    live process started, names the same pid. A pid file written after the process started proves the process is the recorded one, so the old
+    stamp must not suppress it (either record name order). A receipt's terminal write time stays weaker evidence (the B1 tests)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "opus-001.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(created - 86400)}, created - 86400 + 5)
+    _write_record(rd, pid_name, "999972\n", created + 3600)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("doc", [
+    '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","ownerPid":999972,"ownerCreatedUtc":"%s"}}',
+    '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","runnerPid":999972,"runnerCreatedUtc":"%s"}}',
+    '{"state":"complete","workDir":%s,"pid":999972,"createdUtc":"%s","containment":{"childPid":999972,"childCreatedUtc":"%s"}}',
+    '{"state":"complete","workDir":%s,"pid":999972,"createdUtc":"%s","containment":{"ownerPid":999972,"ownerCreatedUtc":"%s"}}',
+], ids=["child-vs-owner", "child-vs-runner", "root-vs-child", "root-vs-owner"])
+@pytest.mark.parametrize("match_first", [True, False], ids=["match-first", "mismatch-first"])
+def test_r5b_a2_conflicting_stamps_for_one_pid_in_one_record_are_ambiguous_not_last_wins(tmp_path, doc, match_first):
+    """r5 A2 (2nd pass): two claims for ONE pid in ONE record that disagree (beyond the slack) are ambiguous and state nothing for that pid (the
+    last claim must not silently replace a matching one); the genuine driver, whose creation time the record fits by write time, still refuses."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    good, bad = _iso(created), _iso(created - 86400)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    first, second = (good, bad) if match_first else (bad, good)
+    _write_record(rd, "opus-001.receipt.json", doc % (json.dumps(str(wt)), first, second), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r5b_a2_agreeing_stamps_for_one_pid_still_bind_it(tmp_path):
+    """Guard: two claims for one pid that AGREE are one claim; a replacement process with another creation time is still free."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 6 * 3600
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","ownerPid":999972,"ownerCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), _iso(created), _iso(created)), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r5b_a3_a_record_that_vanishes_after_the_read_makes_no_write_time_claim(tmp_path):
+    """r5 A3 (2nd pass): the index re-stats after the read; when that stat is unavailable (the file is gone) the cached enumeration mtime must not be
+    paired with the NEW text: no write-time claim is made (fail toward live), so the genuine new driver still refuses."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "venue-driver.pid", "999900\n", created - 600)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            "if ((Split-Path -Leaf $Path) -eq 'venue-driver.pid') { [IO.File]::WriteAllText($Path, \"999974`n\"); "
+            "$t = [IO.File]::ReadAllText($Path); [IO.File]::Delete($Path); return $t }; "
+            "return [IO.File]::ReadAllText($Path) };")
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999974, "", "pwsh.exe", created)), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999974, (r, err)
+
+
+# Adversary pass r5 on 042ee981 (A1 slack-boundary claims, A2 unavailable write time vs an old lineage's stamp, A3 snapshot older than the record). Iteration 2.
+
+@pytest.mark.parametrize("offsets", [(0, -5, 5), (0, 4, -4), (0, 5, 5.5)], ids=["child-owner-runner-spread-10s", "spread-8s", "spread-5.5s"])
+def test_r5c_a1_claims_for_one_pid_that_do_not_all_agree_exactly_are_ambiguous(tmp_path, offsets):
+    """r5 A1 (3rd pass): each claim within the slack of the FIRST still let the set span twice the slack and the first claim won; a process 6 s
+    from it read as reused. Claims for one pid in one record stand only when they are the SAME instant; any difference states nothing for the pid."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    base = int(now - 6 * 3600)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    c, o, r_ = (_iso(base + d) if float(d).is_integer() else (_iso(base + d).replace("Z", ".500Z")) for d in offsets)
+    _write_record(rd, "opus-001.receipt.json", '{"state":"complete","workDir":%s,"containment":{"childPid":999972,"childCreatedUtc":"%s","ownerPid":999972,"ownerCreatedUtc":"%s","runnerPid":999972,"runnerCreatedUtc":"%s"}}'
+                  % (json.dumps(str(wt)), c, o, r_), now - 60)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", base + 6)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("leaf,text", [("venue-driver.pid", "999972\n"), ("new.child.json", '{"schema":"mlv-lane-child/v1","pid":999972}')], ids=["pid-file", "unstamped-child-json"])
+def test_r5c_a2_a_new_record_with_no_write_time_still_outranks_an_old_lineages_stamp(tmp_path, leaf, text):
+    """r5 A2 (3rd pass): the post-read stat is unavailable (file gone), so the record states no write time; that must fail toward live and not let
+    the same run dir's OLD child record (a different creation time for this pid) suppress the newly read pid."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    created = now - 3600
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "old.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(created - 86400)}, created - 86400 + 5)
+    _write_record(rd, leaf, "999900\n" if leaf.endswith(".pid") else '{"pid":999900}', created - 600)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq '{leaf}') {{ $t = '{text.strip()}'; [IO.File]::Delete($Path); return $t }}; "
+            "return [IO.File]::ReadAllText($Path) };")
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs, prelude=seam)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def _fake_snapshot_at(age_sec, *procs):
+    return f"[pscustomobject]@{{ Procs = @({', '.join(procs)}); SelfPids = @($PID); CapturedUtc = [DateTime]::UtcNow.AddSeconds(-{age_sec}) }}"
+
+
+def test_r5c_a3_a_snapshot_older_than_the_record_cannot_prove_the_recorded_process_was_reused(tmp_path):
+    """r5 A3 (3rd pass): the snapshot holds the OLD process that had pid 999972; the genuine driver took the pid afterwards and published
+    new.child.json (its own exact createdUtc) after the snapshot. The old row's creation time differs from the stamp only because the snapshot is
+    stale, so the record is not proof of reuse: the lane-image pid still holds the worktree. A snapshot taken AFTER the record still proves reuse."""
+    wt = tmp_path / "lane-CURRENT"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-CURRENT-r1"
+    rd.mkdir(parents=True)
+    now = time.time()
+    new_created = now - 300
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    _write_record(rd, "new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(new_created)}, now - 200)
+    old_row = _fake_proc_created(999972, "", "pwsh.exe", now - 86400)
+    # r8 premise: "the genuine driver took the pid afterwards" (it runs NOW) is stated through the per-pid query, which r8 reads at decision time
+    # instead of inferring it from the snapshot's age (ruling b, d). Assertion unchanged.
+    r, err = _live_refusal(wt, _fake_snapshot_at(3600, old_row), runs, prelude=_r8_live(999972, "pwsh.exe", new_created))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, old_row), runs)    # fresh snapshot: the old process really holds the pid now
+    assert r is None, (r, err)
+
+
+# Adversary pass 6 on 7916f88a (A1 linguistic key match, A2 escaped second pid, A3 snapshot time taken after the scan / absent, A4 stale foreign image). r6.
+
+def _r6_run_dir(tmp_path, now):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = runs / "lane-X-1-r1"
+    rd.mkdir(parents=True)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    _write_record(rd, "opus-001.receipt.json", {"state": "complete", "exitCode": 0, "workDir": str(wt)}, now - 60)
+    return wt, runs, rd
+
+
+@pytest.mark.parametrize("doc,stale_first", [
+    ('{"pid":999972,"created\\u00adUtc":"%s","createdUtc":"%s"}', True),                                       # root stamp lookalike (soft hyphen) BEFORE the real one
+    ('{"pid":999972,"createdUtc":"%s","created\\u00adUtc":"%s"}', False),                                      # ... and after it
+    ('{"state":"complete","contain\\u00adment":{"childPid":999972,"childCreatedUtc":"%s"},"x":"%s"}', True),   # containment lookalike alone
+    ('{"state":"complete","containment":{"childPid":999972,"child\\u00adCreatedUtc":"%s","childCreatedUtc":"%s"}}', True),   # inner stamp lookalike first
+], ids=["root-lookalike-first", "root-lookalike-last", "containment-lookalike", "inner-lookalike"])
+def test_r6_a1_identity_keys_compare_ordinally_so_a_lookalike_key_is_not_an_identity_claim(tmp_path, doc, stale_first):
+    """r6 A1: -ceq / -cin / -ccontains compare linguistically, where U+00AD is ignorable: 'created<soft hyphen>Utc' (a JSON escape) read as the
+    identity key createdUtc, and an unrelated stale stamp replaced the genuine one so the live driver read as reused. Names compare ORDINALLY."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    first, second = (_STALE, _iso(created)) if stale_first else (_iso(created), _STALE)
+    _write_record(rd, "new.child.json", doc % (first, second), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("key", ["child\\u0050id", "driver\\u0050id", "runner\\u0050id", "owner\\u0050id"])
+def test_r6_a2_a_root_stamp_needs_exactly_one_pid_by_the_parsers_count_not_the_regexs(tmp_path, key):
+    """r6 A2: the pid list comes from a regex that does not decode JSON escapes, the claims from a parser that does. A record that names a second
+    pid through an escaped key has TWO pids; its root createdUtc is then ambiguous and must not mark the genuine driver reused."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"%s":999974,"createdUtc":"%s"}' % (key, _STALE), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r6_a2_an_escaped_second_pid_inside_containment_also_voids_the_root_stamp(tmp_path):
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"createdUtc":"%s","containment":{"child\\u0050id":999974}}' % _STALE, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r6_a2_a_single_pid_root_stamp_still_binds_it(tmp_path):
+    """Guard: one pid + one root stamp is still an identity claim (a different process on that pid is free)."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"createdUtc":"%s"}' % _iso(created), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+def test_r6_a3_the_snapshot_capture_time_is_taken_before_the_process_scan(tmp_path):
+    """r6 A3: CapturedUtc was assigned AFTER Get-CimInstance returned, so a record published while the scan ran looked older than the snapshot and
+    the scan's stale row for its pid read as fresh evidence of reuse. The capture time is taken BEFORE the scan: every row is at least that new."""
+    script = (
+        "$ErrorActionPreference='Stop'; "
+        f". '{HELPER}'; "
+        "function Get-CimInstance { [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName) $script:scanAt = [DateTime]::UtcNow; Start-Sleep -Milliseconds 600; "
+        "[pscustomobject]@{ ProcessId = [int]$PID; ParentProcessId = 0; Name = 'pwsh.exe'; CommandLine = ''; CreationDate = [DateTime]::UtcNow } }; "
+        "$s = Get-LaneProcessSnapshot; "
+        "if ($s.CapturedUtc -le $script:scanAt) { 'BEFORE' } else { 'AFTER' }"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert p.stdout.strip() == "BEFORE", p.stdout + p.stderr
+
+
+def test_r6_a3_a_stamped_record_with_no_write_time_and_no_snapshot_time_is_not_proof_of_reuse(tmp_path):
+    """r6 A3 (2nd variant): the post-read stat failed (no write time) and the snapshot states no capture time. Neither side can show the snapshot
+    row is current, so the stamp 'mismatch' (the row may be the previous holder of the pid) must not mark the process reused: fail toward live."""
+    now = time.time()
+    created = now - 300
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999900}', now - 30)
+    text = '{"schema":"mlv-lane-child/v1","pid":999972,"createdUtc":"%s"}' % _iso(created)
+    seam = ("function Read-RunDirRecordText { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq 'new.child.json') {{ $t = '{text}'; [IO.File]::Delete($Path); return $t }}; "
+            "return [IO.File]::ReadAllText($Path) };")
+    old_row = _fake_proc_created(999972, "", "pwsh.exe", now - 86400)
+    # r8 premise: the row may be the previous holder and the recorded driver runs NOW; stated through the per-pid query (ruling b, d). Assertion unchanged.
+    r, err = _live_refusal(wt, _fake_snapshot(old_row), runs, prelude=seam + _r8_live(999972, "pwsh.exe", created))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("stamped", [True, False], ids=["stamped", "unstamped"])
+@pytest.mark.parametrize("image", ["git.exe", "tailscaled.exe"])
+def test_r6_a4_a_snapshot_older_than_the_record_cannot_reject_the_driver_by_the_previous_holders_image(tmp_path, stamped, image):
+    """r6 A4: the snapshot (taken 120 s ago) lists the pid as git.exe; the genuine pwsh driver took the pid afterwards and published its record
+    after the snapshot. The row is the PREVIOUS holder's, so its image says nothing about the recorded process: the worktree is held. A snapshot
+    taken after the record still rejects the foreign image."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    doc = {"schema": "mlv-lane-child/v1", "pid": 999972}
+    if stamped:
+        doc["createdUtc"] = _iso(now - 60)
+    _write_record(rd, "new.child.json", doc, now - 30)
+    row = _fake_proc_created(999972, "", image, now - 3600)
+    # r8 premise: the genuine pwsh driver runs NOW (per-pid query, ruling b, d). Assertion unchanged.
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 60))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs)
+    if stamped:
+        assert r is None, (r, err)
+    else:
+        # SUPERSEDED r8 (ruling c, f): an image never rejects a record, and this one is unstamped: the live pid HOLDS. Was: free.
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+# Adversary pass 7 on fb5c5b1e (A2 an old record's reuse mark rejects a newer record, A3 an escaped second pid outside the parser's walk, A4 escaped pid
+# keys). r7. Folds RETIRE-WORKTREE-PID-JSON-PARSE-1: ONE parser-derived pid reader (Get-RecordPidMembers) feeds the pid rows and the root-stamp count.
+
+def _r7_old_stamped_marker(rd, now):
+    """An older lineage's stamped record for pid 999972: written before the snapshot, stamp differs from the snapshot row's creation time."""
+    _write_record(rd, "old.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972, "createdUtc": _iso(now - 86400)}, now - 86400 + 5)
+
+
+@pytest.mark.parametrize("new_kind", ["pid-file", "child-sorts-before-old", "child-sorts-after-old", "no-write-time"])
+def test_r7_a2_an_older_records_reused_mark_cannot_reject_a_newer_records_driver(tmp_path, new_kind):
+    """r7 A2: old.child.json (stamped, older than the snapshot) marks pid 999972 reused against the snapshot's git.exe row. The genuine driver took
+    the pid after the snapshot and published an UNSTAMPED record after it. The old mark is about an older lineage: the newer record is judged on its
+    own evidence (the snapshot's foreign image is the previous holder's), so the worktree is held. An unknown write time fails toward live too."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _r7_old_stamped_marker(rd, now)
+    prelude = ""
+    if new_kind == "pid-file":
+        _write_record(rd, "venue-driver.pid", "999972\n", now - 30)
+    elif new_kind == "no-write-time":
+        _write_record(rd, "new.child.json", '{"pid":999900}', now - 30)
+        prelude = ("function Read-RunDirRecordText { param([string]$Path) "
+                   "if ((Split-Path -Leaf $Path) -eq 'new.child.json') { $t = '{\"pid\":999972}'; [IO.File]::Delete($Path); return $t }; "
+                   "return [IO.File]::ReadAllText($Path) };")
+    else:
+        _write_record(rd, "a-new.child.json" if new_kind == "child-sorts-before-old" else "z-new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972}, now - 30)
+    row = _fake_proc_created(999972, "", "git.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r7_a2_a_snapshot_taken_after_the_newer_record_still_rejects_the_foreign_image(tmp_path):
+    """Guard: the snapshot is newer than every record, so its git.exe row IS the current holder of the pid: free.
+    SUPERSEDED r8 (ruling c, f): z-new.child.json is unstamped and an image never rejects a record: the live pid HOLDS. Was: free."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _r7_old_stamped_marker(rd, now)
+    _write_record(rd, "z-new.child.json", {"schema": "mlv-lane-child/v1", "pid": 999972}, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, _fake_proc_created(999972, "", "git.exe", now - 3600)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("extra", [
+    '"metadata":{"p\\u0069d":999974}',                     # escaped pid key one level down
+    '"containment":{"driver\\u0050id":999974}',            # escaped key under containment, outside the childPid/ownerPid/runnerPid walk
+    '"a":[{"b":{"o\\u0077nerPid":999974}}]',               # escaped key deep inside an array
+    '"metadata":{"pid":999974}',                           # guard: the plain spelling already counted two pids
+    '"containment":{"driverPid":999974}',                  # guard: plain containment.driverPid
+], ids=["metadata-escaped", "containment-escaped", "deep-escaped", "metadata-plain", "containment-plain"])
+def test_r7_a3_a_second_pid_at_any_nesting_level_voids_the_root_stamp(tmp_path, extra):
+    """r7 A3: the root stamp stands only when the record names exactly one pid; the count walks every nesting level and decodes escapes."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"pid":999972,"createdUtc":"%s",%s}' % (_STALE, extra), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("key", ["p\\u0069d", "child\\u0050id", "driver\\u0050id", "runner\\u0050id", "owner\\u0050id"])
+def test_r7_a4_an_escaped_pid_key_still_names_its_live_driver(tmp_path, key):
+    """r7 A4 (= pass-5 A4, pass-7 A4): a legal JSON escape in a pid key must not hide the record's pid from the pid rows."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"%s":999972}' % key, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", now - 3600)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r7_a4_an_escaped_pid_key_with_a_stamp_for_another_process_is_still_reuse(tmp_path):
+    """Guard: the escaped key now yields a row, and the record's own stamp still proves a different process is free."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"p\\u0069d":999972,"createdUtc":"%s"}' % _iso(created), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created + 3600)), runs)
+    assert r is None, (r, err)
+
+
+@pytest.mark.parametrize("pair", ["childPid:childCreatedUtc", "ownerPid:ownerCreatedUtc", "runnerPid:runnerCreatedUtc"])
+@pytest.mark.parametrize("value", ["999972.0", '"999972 "'], ids=["float-shape", "padded-string"])
+def test_r7_pass8_a1_one_pid_converter_serves_the_members_and_the_containment_stamps(tmp_path, pair, value):
+    """r7 pass-8 A1: member discovery accepted 999972.0 / "999972 " as a pid while the containment stamp pairing used a stricter converter, so the
+    genuine stamp was dropped and the stale root stamp marked the live driver reused. ONE converter (ConvertTo-RecordedPid) serves both."""
+    now = time.time()
+    created = now - 6 * 3600
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    pid_key, stamp_key = pair.split(":")
+    _write_record(rd, "new.receipt.json", '{"pid":999972,"createdUtc":"%s","containment":{"%s":%s,"%s":"%s"}}' % (_STALE, pid_key, value, stamp_key, _iso(created)), now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc_created(999972, "", "pwsh.exe", created)), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r7_unparsable_json_in_a_run_dir_that_names_the_worktree_is_never_free(tmp_path):
+    """r7 (a): text that looks like JSON but does not parse is ambiguous (it may name any pid, e.g. through an escaped key). It fails toward live
+    through the unreadable-record path: a live pid that could be tied through the run dir refuses the worktree. Plain text with no JSON punctuation
+    and valid JSON with no pid are not ambiguous."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    row = _fake_proc_created(999972, "", "pwsh.exe", now - 3600)
+    _write_record(rd, "new.child.json", '{"p\\u0069d":999972,"createdUtc":', now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+    assert r is not None and r["reason"] == "rundir-census-failed" and "unparsable" in r["detail"], (r, err)
+    for ok in ('{"schema":"mlv-lane-child/v1"}', "no json punctuation here"):
+        _write_record(rd, "new.child.json", ok, now - 30)
+        r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+        assert r is None, (ok, r, err)
+
+
+def test_r7_one_reader_feeds_the_pid_rows_and_the_root_stamp_count():
+    """r7 (a), structural: the escape-blind pid regex lives only inside Get-RecordPidMembers; the index and the stamp map call that function."""
+    text = Path(HELPER).read_text(encoding="utf-8")
+    assert "function Get-PidsFromRecordText" not in text
+    body = re.search(r"function Get-RecordPidMembers.*?\n}\n", text, re.S)
+    assert body, "Get-RecordPidMembers is missing"
+    assert text.count("PidJsonRx") == body.group(0).count("PidJsonRx") + 1, "PidJsonRx used outside Get-RecordPidMembers (+1 for its definition)"
+    for fn in ("Get-RunDirPidIndex", "Get-RecordedCreatedUtcMap"):
+        m = re.search(r"function " + fn + r".*?\n}\n", text, re.S)
+        assert m and "Get-RecordPidMembers" in m.group(0), fn
+
+
+# --- r8 (HUB-TICK 20261103T1435Z step E, FAIL-CLOSED IDENTITY): adversary pass 9 on 14825b15 (A1 :1073, A2 :1012, advisory A3 :1065) and Dot B1
+# (cos-feedback pr-744 2026-11-03T14:28:00Z, :294 / :848-850). A live pid named by a record in a run dir tied to the worktree is a HOLDER unless the
+# record's kernel creation stamp differs from the pid's CURRENT creation time, read at decision time (Get-LivePidIdentity, a per-pid query). No
+# wall-clock or snapshot-age comparison, no previous holder's command line or image, can free it. The seam below plays the per-pid query: the pid is
+# running NOW as $name, created at $epoch (None = creation time unreadable).
+
+def _r8_live(pid, name, epoch):
+    created = _utc_expr(epoch) if epoch is not None else "$null"
+    return ("function Get-LivePidIdentity { param([int]$ProcessId) "
+            f"if ($ProcessId -eq {pid}) {{ return [pscustomobject]@{{ Name = '{name}'; CreationDate = {created} }} }}; return $null }};")
+
+
+def test_r8_a1_a_record_published_after_capture_is_not_rejected_by_the_previous_holders_command_line(tmp_path):
+    """r8 A1 (pass 9, :1073): the snapshot row for pid 999972 is the PREVIOUS holder (git.exe -C C:\\other status, created an hour ago). The genuine
+    driver took the pid after capture and published new.child.json with its own stamp; it is running now. A stale non-empty command line that does
+    not name the run dir must not reject the run-dir tie: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 60)}, now - 30)
+    row = _fake_proc_created(999972, "git.exe -C C:\\other status", "git.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120, row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 60))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("cmdline", ["", "pwsh.exe -NoProfile"], ids=["empty-cmdline", "foreign-cmdline"])
+def test_r8_a2_a_backward_clock_step_cannot_turn_a_stale_row_into_a_reuse_proof(tmp_path, cmdline):
+    """r8 A2 (pass 9, :1012): capture at T; the old pid-999972 row (created T-1h) is read; the clock steps back 60 s; the genuine replacement starts at
+    T-59.8 s by the stepped clock and publishes new.child.json (mtime T-59.7 s, BEFORE the capture by wall clock). The record therefore reads as older
+    than the snapshot, and the stale row's creation 'mismatch' used to become a reuse mark. The driver is running now with the stamped creation: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    start = now - 59.8
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat()}, now - 59.7)
+    row = _fake_proc_created(999972, cmdline, "pwsh.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs, prelude=_r8_live(999972, "pwsh.exe", start))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("shape", ["unreadable-cmdline", "names-only-the-run-dir"])
+def test_r8_dot_b1_an_unstamped_driver_after_a_clock_rollback_is_still_a_live_driver(tmp_path, shape):
+    """Dot B1 (:294, :848-850): a genuine UNSTAMPED driver starts at 12:00; the clock rolls back to 11:57; its pid file is written (mtime 11:57). A
+    current snapshot then lists it, created 12:00. started-after-record (180 s > the 120 s skew) made it Bound=false and the refusal was lost.
+    Unstamped record + live pid = HOLDER, always (ruling f)."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    started = now - 600                       # 12:00
+    _write_record(rd, "venue-driver.pid", "999972\n", started - 180)   # written at 11:57 by the rolled-back clock
+    cl = "" if shape == "unreadable-cmdline" else _driver_cmdline(rd)
+    row = _fake_proc_created(999972, cl, "pwsh.exe", started)
+    for prelude in ("", _r8_live(999972, "pwsh.exe", started)):
+        r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs, prelude=prelude)
+        assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (prelude, r, err)
+
+
+def test_r8_a3_a_pid_absent_from_the_snapshot_but_running_now_is_a_live_driver(tmp_path):
+    """r8 A3 (advisory, :1065, in scope by ruling d): the snapshot (captured before the driver started) has no row for pid 999972; the driver is running
+    now and published its stamped record. Liveness comes from the per-pid query at decision time: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 60)}, now - 30)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120), runs, prelude=_r8_live(999972, "pwsh.exe", now - 60))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(120), runs)             # control: not in the snapshot and not running now holds nothing
+    assert r is None, (r, err)
+
+
+def test_r8_an_unreadable_current_creation_time_never_proves_reuse_from_a_stale_row(tmp_path):
+    """r8 (a): the pid is running now but its creation time cannot be read; the snapshot row (the previous holder, older than the record by wall clock)
+    differs from the stamp. Only the CURRENT creation time can prove reuse, so the stale row proves nothing: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 7200)}, now - 7000)
+    row = _fake_proc_created(999972, "", "git.exe", now - 86400)
+    r, err = _live_refusal(wt, _fake_snapshot_at(0, row), runs, prelude=_r8_live(999972, "git.exe", None))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+def test_r8_reuse_is_proven_only_by_the_current_creation_time(tmp_path):
+    """r8 (a), the genuine-reuse control at decision time: the stamped driver exited after the snapshot (whose row still matches the stamp) and the pid
+    now runs another process. The CURRENT creation time differs from the stamp: reuse is proven, free. The same record with the current process
+    matching the stamp is held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    stamp = now - 7200
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(stamp)}, now - 7000)
+    row = _fake_proc_created(999972, "", "pwsh.exe", stamp)
+    r, err = _live_refusal(wt, _fake_snapshot_at(60, row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 30))
+    assert r is None, (r, err)
+    r, err = _live_refusal(wt, _fake_snapshot_at(60, row), runs, prelude=_r8_live(999972, "pwsh.exe", stamp))
+    assert r is not None and r["reason"] == "live-driver", (r, err)
+
+
+def test_r8_an_unreadable_record_is_not_cleared_by_a_live_pids_foreign_command_line(tmp_path):
+    """r8 (c), sibling :1090: a record that cannot be parsed may name any pid. The only live pid's command line names neither the worktree nor the run
+    dir (git.exe -C C:\\other status), which used to clear the record. Command-line evidence only ADDS a holder: refused while the run dir is tied."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.child.json", '{"p\\u0069d":999972,"createdUtc":', now - 30)
+    row = _fake_proc_created(999972, "git.exe -C C:\\other status", "git.exe", now - 3600)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+    assert r is not None and r["reason"] == "rundir-census-failed" and "unparsable" in r["detail"], (r, err)
+
+
+def test_r8_pass10_a1_a_cached_record_stamp_is_re_read_before_it_proves_reuse(tmp_path):
+    """r8 pass-10 A1 (:1042, siblings :900 index cache, gate retry -ReuseRunIndex, sweep): the run-dir index was cached when new.child.json still held
+    the OLD lineage's stamp; the replacement driver has since rewritten it with its own (matching) stamp. A stamp read before the decision is not
+    decision-time evidence: the proof of reuse is re-read from the record, and a record that no longer states the mismatch proves nothing: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.child.json"
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(now - 7200)}, now - 7000)
+    fresh = json.dumps({"pid": 999972, "createdUtc": _iso(now - 600)}).replace("'", "''")
+    row = _fake_proc_created(999972, _driver_cmdline(rd), "pwsh.exe", now - 600)
+    prelude = (_r8_live(999972, "pwsh.exe", now - 600)
+               + f" $snap = ({_fake_snapshot(row)}); $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}'; "
+               f"[IO.File]::WriteAllText('{rec}', '{fresh}');")
+    r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+# --- r9 (Dot B2, cos-feedback pr-744 2026-11-03T17:15:09Z on 25e1dd9b; hub ACK issuecomment-6610883431): the identity is cached per pid (:1015-1032)
+# and the reuse proof re-read the record and compared its NEW stamp to that STALE identity (:1038-1047). Reuse is proven only by ONE consistent pair:
+# read the record, read the live creation time, re-read the record byte-unchanged. A changed record, or a cached identity the live read disagrees with,
+# is UNCERTAIN = HOLDER.
+
+def _r9_live_sequence(pid, first, rest):
+    """Get-LivePidIdentity seam: the FIRST query for $pid answers (name, epoch) `first`, every later query answers `rest`."""
+    def one(nm_ep):
+        return f"[pscustomobject]@{{ Name = '{nm_ep[0]}'; CreationDate = {_utc_expr(nm_ep[1])} }}"
+    return ("$global:r9q = 0; function Get-LivePidIdentity { param([int]$ProcessId) "
+            f"if ($ProcessId -ne {pid}) {{ return $null }}; $global:r9q++; if ($global:r9q -eq 1) {{ return {one(first)} }}; return {one(rest)} }};")
+
+
+def _r9_reads_change(path, from_read, text):
+    """Read-RunDirRecordText seam: read number `from_read` (1-based) of `path` and every later one return `text`; earlier reads see the file."""
+    p = str(path).replace("'", "''")
+    t = text.replace("'", "''")
+    return ("$global:r9r = 0; function Read-RunDirRecordText { param([string]$Path) "
+            f"if ($Path -eq '{p}') {{ $global:r9r++; if ($global:r9r -ge {from_read}) {{ return '{t}' }} }}; return Read-SharedText -Path $Path }};")
+
+
+def test_r9_dot_b2_a_record_re_stamped_after_the_identity_query_is_not_a_reuse_proof(tmp_path):
+    """Dot B2 (:1015-1032, :1038-1047, :1071): the index reads new.child.json as P/T0; the per-pid query answers an unrelated P/T1 (git.exe), which
+    exits; a genuine driver reuses P at T2 and re-stamps the same tied record P/T2. T0, T1 and T2 are pairwise > 5 s apart, and the command line
+    names nothing. Comparing the re-read T2 to the cached T1 'proved' reuse and freed the worktree. The record changed, so the tie is uncertain: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.child.json"
+    t0, t1, t2 = now - 7200, now - 3600, now - 60
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(t0)}, now - 7000)
+    fresh = json.dumps({"pid": 999972, "createdUtc": _iso(t2)}).replace("'", "''")
+    row = _fake_proc_created(999972, "", "git.exe", t1)
+    prelude = (_r9_live_sequence(999972, ("git.exe", t1), ("pwsh.exe", t2))
+               + f" $snap = ({_fake_snapshot(row)}); $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}'; "
+               f"[IO.File]::WriteAllText('{rec}', '{fresh}');")
+    r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("precached", [True, False], ids=["index-cached-before-the-call", "index-built-in-the-call"])
+def test_r9_an_unchanged_stamped_record_and_a_different_live_creation_still_prove_reuse(tmp_path, precached):
+    """r9 control (hub B2 rule): the stamped record is byte-unchanged across the re-read and every live query answers the same process, created
+    long after the stamp. That is one consistent pair, so genuine reuse is still proven: free."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    stamp, live = now - 7200, now - 30
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(stamp)}, now - 7000)
+    row = _fake_proc_created(999972, "", "git.exe", live)
+    prelude = _r9_live_sequence(999972, ("git.exe", live), ("git.exe", live)) + f" $snap = ({_fake_snapshot(row)});"
+    if precached:
+        prelude += f" $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}';"
+    r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    assert r is None, (r, err)
+
+
+@pytest.mark.parametrize("from_read,stamp_shift,extra", [
+    (2, 1800, False),   # re-stamped after the index read, before the pair (the start head's one re-read sees it)
+    (3, 1800, False),   # re-stamped between the pair's two reads
+    (3, 0, True),       # same stamp, other bytes, between the pair's two reads
+], ids=["re-stamped-before-the-pair", "re-stamped-inside-the-pair", "content-changed-inside-the-pair"])
+def test_r9_a_record_changed_between_reads_is_uncertain_even_when_the_identities_match(tmp_path, from_read, stamp_shift, extra):
+    """r9 (hub B2 rule): every live query answers the same process (cached and live identities agree), and both the original and the changed record
+    state a stamp that differs from it. The record changed between reads, so no consistent pair exists: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.child.json"
+    stamp, live = now - 7200, now - 30
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(stamp)}, now - 7000)
+    changed = {"pid": 999972, "createdUtc": _iso(stamp + stamp_shift)}
+    if extra:
+        changed["state"] = "running"
+    row = _fake_proc_created(999972, "", "git.exe", live)
+    prelude = (_r9_live_sequence(999972, ("git.exe", live), ("git.exe", live))
+               + _r9_reads_change(rec, from_read, json.dumps(changed)))
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("pid_name", ["git.exe", "pwsh.exe"], ids=["same-image", "other-image"])
+def test_r9_a_live_identity_that_disagrees_with_the_cached_one_is_uncertain(tmp_path, pid_name):
+    """r9 (hub B2 rule, 'cached and live identities disagree'): the record is unchanged and states T0; the first query answers git.exe/T1 and the
+    pair's live read answers <image>/T2 (the pid changed process between queries). Two queries are not one consistent pair: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    t0, t1, t2 = now - 7200, now - 3600, now - 60
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(t0)}, now - 7000)
+    row = _fake_proc_created(999972, "", "git.exe", t1)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=_r9_live_sequence(999972, ("git.exe", t1), (pid_name, t2)))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+# --- r9 adversary pass 11 on 7eaaa06b (review-adversary-RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1-r9-7eaaa06b): A1 :1077, A2 :1088, advisories A4 :699,
+# A5 :729.
+
+def _r9_live_map(procs):
+    """Get-LivePidIdentity seam: {pid: (name, epoch)} running now; any other pid is not running."""
+    arms = " ".join(f"if ($ProcessId -eq {p}) {{ return [pscustomobject]@{{ Name = '{n}'; CreationDate = {_utc_expr(e)} }} }};"
+                    for p, (n, e) in procs.items())
+    return "function Get-LivePidIdentity { param([int]$ProcessId) " + arms + " return $null };"
+
+
+@pytest.mark.parametrize("when", ["after-a-cached-index", "between-the-index-and-the-pair"])
+def test_r9_a1_a_record_that_gained_a_pid_since_the_index_is_not_a_reuse_proof(tmp_path, when):
+    """r9 pass-11 A1 (:1077, siblings :914 index cache, :1713/:1715 gate -ReuseRunIndex, :1937, :2155, core.py:1578): the index read the receipt as
+    {containment.childPid 999972, childCreatedUtc T0}. Before the proof, the receipt gains runnerPid 999973 (runnerCreatedUtc T3) and then stays
+    unchanged across both pair reads. 999972 now runs git.exe (T1 != T0); 999973 is the live runner (T3). The proof for 999972 used to stand on the
+    unchanged stamp and free the worktree, discarding 999973 (never in the cached rows). The record changed since the index read: uncertain, held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    rec = rd / "new.receipt.json"
+    t0, t1, t3 = now - 7200, now - 3600, now - 60
+    _write_record(rd, "new.receipt.json", {"containment": {"childPid": 999972, "childCreatedUtc": _iso(t0)}}, now - 7000)
+    grown = json.dumps({"containment": {"childPid": 999972, "childCreatedUtc": _iso(t0), "runnerPid": 999973, "runnerCreatedUtc": _iso(t3)}})
+    row = _fake_proc_created(999972, "", "git.exe", t1)
+    live = _r9_live_map({999972: ("git.exe", t1), 999973: ("pwsh.exe", t3)})
+    if when == "after-a-cached-index":
+        prelude = (live + f" $snap = ({_fake_snapshot(row)}); $null = Get-RunDirPidIndex -Snapshot $snap -RunsRoot '{runs}'; "
+                   f"[IO.File]::WriteAllText('{rec}', '{grown}');")
+        r, err = _live_refusal(wt, "$snap", runs, prelude=prelude)
+    else:
+        r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=live + _r9_reads_change(rec, 2, grown))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] in (999972, 999973), (r, err)
+
+
+def test_r9_a2_a_negative_tie_answer_is_asked_again_for_the_next_record(tmp_path):
+    """r9 pass-11 A2 (:1088, siblings :1089, :1093, :1107): a.pid=999972 and b.pid=999973 are unstamped and live, command lines unreadable. The first
+    tie read sees the receipt as {"state":"running"} (no workDir yet); the producer then publishes workDir. A cached negative tie answer suppressed
+    the later positive one and freed the worktree; only a positive (or unknown) tie is kept for the call, so the second record is held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    receipt = rd / "opus-001.receipt.json"
+    _write_record(rd, "a.pid", "999972\n", now - 30)
+    _write_record(rd, "b.pid", "999973\n", now - 30)
+    rows = [_fake_proc_created(999972, "", "pwsh.exe", now - 600), _fake_proc_created(999973, "", "pwsh.exe", now - 600)]
+    prelude = (_r9_live_map({999972: ("pwsh.exe", now - 600), 999973: ("pwsh.exe", now - 600)})
+               + "$global:r9t = 0; function Read-RunDirRecordText { param([string]$Path) "
+               f"if ($Path -eq '{receipt}') {{ $global:r9t++; if ($global:r9t -le 2) {{ return '{{\"state\":\"running\"}}' }} }}; "
+               "return Read-SharedText -Path $Path };")
+    r, err = _live_refusal(wt, _fake_snapshot(*rows), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] in (999972, 999973), (r, err)
+
+
+def _r9_eval(expr):
+    script = f"$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; . '{HELPER}'; {expr}"
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return p.stdout.strip()
+
+
+@pytest.mark.parametrize("doc,want", [
+    ('{"a":{"pid":5000},"b":{"pid":6000}}', "5000,6000"),
+    ('[{"pid":5000},{"pid":6000}]', "5000,6000"),
+    ('{"a":{"x":{"pid":5001}},"pid":5002}', "5001,5002"),
+    ('{"pid":5003,"containment":{"childPid":5004,"runnerPid":5005}}', "5003,5004,5005"),
+], ids=["sibling-objects", "array", "nested-before-root-member", "root-then-containment"])
+def test_r9_a4_record_pids_come_back_in_document_order(doc, want):
+    """r9 pass-11 advisory A4 (:699, sibling :705): Get-RecordPidMembers returns distinct pids in first-seen (document) order; LIFO pops reversed
+    sibling traversal order."""
+    d = doc.replace("'", "''")
+    assert _r9_eval(f"(Get-RecordPidMembers '{d}').Pids -join ','") == want
+
+
+@pytest.mark.parametrize("stamp,want", [
+    ("0001-01-01T00:00:00+14:00", ""),                                    # UTC underflow: no claim
+    ("9999-12-31T23:59:59-14:00", ""),                                    # UTC overflow: no claim
+    ("2026-11-01T12:00:00+02:00", "2026-11-01T10:00:00.0000000Z"),
+    ("2026-11-01T12:00:00.1234567Z", "2026-11-01T12:00:00.1234567Z"),
+], ids=["underflow", "overflow", "offset", "fraction"])
+def test_r9_a5_an_unrepresentable_stamp_is_no_stamp(stamp, want):
+    """r9 pass-11 advisory A5 (:729, siblings :793, :807): a complete stamp converts exactly to UTC, or states no claim when the instant is outside
+    the representable range (DateTime clamped it to a wrong instant, which could 'prove' reuse)."""
+    out = _r9_eval(f"$t = ConvertTo-RecordedUtc '{stamp}'; if ($null -eq $t) {{ '' }} else {{ $t.Kind.ToString() + ' ' + $t.ToString('o') }}")
+    assert out == ("" if not want else "Utc " + want), out
+
+
+# --- r10 adversary pass 12 on 21805daf (review-adversary-RETIRE-WORKTREE-LIVE-DRIVER-PID-REUSE-1-r9-21805daf): A1 :1029, A2 :850.
+
+def test_r10_a1_a_pid_not_running_at_its_first_query_is_asked_again_for_a_later_record(tmp_path):
+    """r10 pass-12 A1 (:1029, siblings :1030, :1115, :1116, :1171, :1731, core.py:1578): the snapshot lists nothing; a.pid=999972, b.pid=999973,
+    c.pid=999972 in a tied run dir. The first query for 999972 finds no process; 999972 then starts (a genuine driver) before c.pid is judged. A
+    cached NULL identity skipped c.pid and freed the worktree. A null identity is never cached as a negative answer: c.pid re-queries, held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    for name, pid in (("a.pid", 999972), ("b.pid", 999973), ("c.pid", 999972)):
+        _write_record(rd, name, f"{pid}\n", now - 30)
+    prelude = ("$global:r10q = 0; function Get-LivePidIdentity { param([int]$ProcessId) "
+               "if ($ProcessId -ne 999972) { return $null }; $global:r10q++; if ($global:r10q -eq 1) { return $null }; "
+               f"return [pscustomobject]@{{ Name = 'pwsh.exe'; CreationDate = {_utc_expr(now - 20)} }} }};")
+    r, err = _live_refusal(wt, _fake_snapshot(), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("slack", ["-1", "-0.000001", "-1e9", "[double]::NegativeInfinity"], ids=["minus-one", "tiny", "huge", "neg-inf"])
+def test_r10_a2_a_negative_slack_never_turns_equal_creation_times_into_a_reuse_proof(tmp_path, slack):
+    """r10 pass-12 A2 (:850, siblings :299, :1080, :1094): RunDirPidCreatedSlackSec overridden below 0. The tied record is unchanged and states the
+    exact creation time the live pid has (snapshot and both live queries agree). 0 > -1 made equal times a 'mismatch' and freed the worktree.
+    A negative slack is refused (no proof) and equal times are never a mismatch: held."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    created = int(now - 600)
+    _write_record(rd, "new.child.json", {"pid": 999972, "createdUtc": _iso(created)}, now - 30)
+    row = _fake_proc_created(999972, "", "pwsh.exe", created)
+    prelude = _r8_live(999972, "pwsh.exe", created) + f" $script:RunDirPidCreatedSlackSec = {slack};"
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=prelude)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("slack,delta,want", [
+    ("-1", 0, "False"), ("-1", 3600, "False"), ("[double]::NaN", 3600, "False"),
+    ("0", 0, "False"), ("0", 1, "True"), ("5", 5, "False"), ("5", 6, "True"),
+], ids=["neg-equal", "neg-different", "nan", "zero-equal", "zero-different", "default-at-slack", "default-past-slack"])
+def test_r10_a2_the_mismatch_test_refuses_an_invalid_slack(slack, delta, want):
+    """r10 pass-12 A2, unit: Test-RecordedCreatedMismatch states a mismatch only for a valid slack (>= 0, a number) and a difference strictly
+    beyond it. A negative or NaN slack proves nothing (fail toward HOLDER); equal times are never a mismatch."""
+    expr = (f"$script:RunDirPidCreatedSlackSec = {slack}; $t = {_utc_expr(1_700_000_000)}; "
+            f"Test-RecordedCreatedMismatch -Proc ([pscustomobject]@{{ CreationDate = $t.AddSeconds({delta}) }}) "
+            "-Record ([pscustomobject]@{ RecordedCreatedUtc = $t })")
+    assert _r9_eval(expr) == want
+
+
+@pytest.mark.parametrize("doc", [
+    '{"pid":999972,"createdUtc":"12:00"}',                                                   # time only: TryParse invents today's date
+    '{"pid":999972,"createdUtc":"2026-11-01"}',                                              # date only
+    '{"pid":999972,"createdUtc":"2026-11-01T12:00:00"}',                                     # no zone: local or UTC is unknown
+    '{"pid":999972,"createdUtc":"11/01/2026 12:00:00 +00:00"}',                              # not ISO 8601
+    '{"state":"complete","containment":{"childPid":999972,"childCreatedUtc":"12:00"}}',      # containment child
+    '{"state":"complete","containment":{"ownerPid":999972,"ownerCreatedUtc":"12:00"}}',      # containment owner
+    '{"state":"complete","containment":{"runnerPid":999972,"runnerCreatedUtc":"12:00"}}',    # containment runner
+], ids=["time-only", "date-only", "no-zone", "not-iso", "child-time-only", "owner-time-only", "runner-time-only"])
+def test_r8_pass10_a2_an_incomplete_stamp_is_no_stamp_and_never_proves_reuse(tmp_path, doc):
+    """r8 pass-10 A2 (:715, siblings :779-:793, :829, :1042): only a COMPLETE kernel creation identity (ISO 8601 date, time and zone) may prove reuse.
+    A stamp missing its date or zone is no stamp, and an unstamped record + a live pid holds (ruling f)."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, "new.receipt.json" if "containment" in doc else "new.child.json", doc, now - 30)
+    row = _fake_proc_created(999972, "", "pwsh.exe", now - 2 * 86400)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs, prelude=_r8_live(999972, "pwsh.exe", now - 2 * 86400))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999972, (r, err)
+
+
+@pytest.mark.parametrize("name,text", [
+    ("venue-driver.pid", "10000000\n"),
+    ("new.child.json", '{"pid":"10000000 "}'),
+    ("new.child.json", '{"pid":10000000}'),
+    ("new.receipt.json", '{"containment":{"childPid":10000000}}'),
+], ids=["bare-8-digit", "padded-string-8-digit", "json-number-8-digit", "containment-8-digit"])
+def test_r8_pass10_a5_a_pid_of_eight_or_more_digits_is_still_a_pid(tmp_path, name, text):
+    """r8 pass-10 A5 (:673, siblings :648-:650, :729): Windows pids are DWORDs; a seven-digit cap dropped 10000000 from the pid rows (no row, no
+    holder). Every reader accepts up to ten digits within the int range."""
+    now = time.time()
+    wt, runs, rd = _r6_run_dir(tmp_path, now)
+    _write_record(rd, name, text, now - 30)
+    row = _fake_proc_created(10000000, _driver_cmdline(rd), "pwsh.exe", now - 600)
+    r, err = _live_refusal(wt, _fake_snapshot(row), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 10000000, (r, err)
+
+
+def test_r8_no_wall_clock_heuristic_remains_in_the_driver_decision():
+    """r8 (b), structural: the started-after-record rule, its clock skew and the record-newer-than-snapshot comparisons are gone; the decision reads the
+    pid's identity through the per-pid query."""
+    text = Path(HELPER).read_text(encoding="utf-8")
+    for gone in ("RunDirRecordClockSkewSec", "started-after-record", "function Test-RecordedPidBound", "$recNewer", "$staleVsSnapshot", "$rejectedAsReused"):
+        assert gone not in text, gone
+    body = re.search(r"function Find-RunDirDriverHolders.*?\n}\n", text, re.S)
+    assert body and "Get-LivePidIdentity" in body.group(0) and "CapturedUtc" not in body.group(0) and "RecordedAtUtc" not in body.group(0)
+
+
 def test_gate_census_failures_write_a_typed_refused_line(repo):
     """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
     tmp, main = repo
@@ -2994,12 +4308,19 @@ ENCODED_LAUNCH_SITES = {
         ("'-ExecutionPolicy','Bypass','-EncodedCommand',$encoded",
          "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
          "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json"),
+        ("'-ExecutionPolicy','Bypass','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($codexHostSource))",
+         "the codex image job host (pwsh -EncodedCommand $codexHostSource) is not a driver: it runs with the lane's worktree as its cwd and waits on its codex child, "
+         "whose argv names <RunDir> through -o <RunDir>\\<lane>-NNN.last.txt and each -i snapshot under <RunDir>"),
     ],
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
         ("-EncodedCommand $CorePartitionHelperEncoded",
          "BACHELOR-CORE-PARTITION-AB-1: the venue-side core-partition telemetry helper (a bounded pwsh the playback job spawns, killed by pid "
          "on a stop timeout and ended by its own deadline); read-only counters plus its ready / record files in the job's $Work, never a lane "
          "driver and never run against a hub lane worktree"),
+        ("-EncodedCommand $Encoded\")",
+         "CUDA-HEADROOM-UTIL-SAMPLER-1: the venue-side CPU utilisation sampler (Start-UtilSampleCpu: a bounded BelowNormal pwsh the playback job "
+         "spawns around the measured smoke launch, ended by its stop file, its own deadline or the parent pid going away); it only reads CPU "
+         "counters into a cpu-util.csv in the job's $Work, never a lane driver and never run against a hub lane worktree"),
     ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("'-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String",
@@ -3254,14 +4575,17 @@ def test_launcher_census_the_lease_batch_probe_seams_are_classified_per_site_and
 
 
 def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
-    """The one Invoke-Lane -EncodedCommand site is safe only while its child names the run dir and is recorded in it."""
+    """The two Invoke-Lane -EncodedCommand sites are safe only while each child names the run dir (and, for the Claude host, is recorded in it)."""
     t = (REPO / "tools/coordination/Invoke-Lane.ps1").read_text(encoding="utf-8")
-    assert len(re.findall(r"'-EncodedCommand'", t)) == 1, "Invoke-Lane.ps1 gained another -EncodedCommand launch: classify it"
+    assert len(re.findall(r"'-EncodedCommand'", t)) == 2, "Invoke-Lane.ps1 gained another -EncodedCommand launch: classify it"
     assert re.search(r"\$candidate = Join-Path \$RunDir", t) and "$base = $candidate" in t, "lane slot base is no longer under $RunDir"
     assert '$settingsPath = "$base.settings.json"' in t and "$argv += @('--settings', $settingsPath)" in t, "child argv no longer names the run dir"
     assert '$controlPath = "$base.child.json"' in t and "pid=$child.Id" in t, "child pid is no longer recorded in the run dir"
     host = t.split("$hostSource = @'", 1)[1].split("'@", 1)[0]
     assert "-File" not in host and "Start-Process" not in host and "WaitForExit()" in host, "the encoded host must only wait on its child"
+    codex_host = t.split("$codexHostSource = @'", 1)[1].split("'@", 1)[0]
+    assert "-File" not in codex_host and "Start-Process" not in codex_host and "WaitForExit()" in codex_host, "the codex image host must only wait on its child"
+    assert "'-o', $lastPath," in t and '$lastPath' in t and "$imageArgs += @('-i', $attachment.path)" in t, "the codex child's argv no longer names the run dir"
 
 
 def test_launcher_census_build_guard_holder_is_its_one_encoded_launch_and_only_holds():
@@ -3982,3 +5306,475 @@ def test_launcher_census_r9_round2_any_compound_entry_write_taints_every_name(wr
 def test_launcher_census_r9_round2_control_a_plain_entry_write_keeps_the_literal(write):
     text = _r9(write)
     assert _unresolved_sites(text) == [], f"a plain default naming another variable made a safe same-scope literal unresolved: {text!r}"
+
+
+# --- RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: a script the corpus names, that exists and cannot be read, makes its holder UNKNOWN ---
+# Reproduced through Invoke-RetireLaneWorktree at 2fcc6fae (run dir repro/step1-fork-master-2fcc6fae.out.txt): live holder, known cwd outside the
+# tree, arms.ps1 open FileShare.None. -WhatIf said would-retire and a REAL call said retired with renameProbe=ok, the worktree gone under the live
+# holder. The rename probe can only see a handle under the tree, so the refusal has to come before it (Dot R1 on #477, comment of 01:38:16Z).
+
+def _chain_under_lock(repo, leaf, *, holder_first=False):
+    """The fixture's chain with a proven-live holder whose cwd is outside the tree. holder_first starts it before the worktree exists."""
+    tmp, main = repo
+    wt = tmp / leaf
+    if not holder_first:
+        _add_wt(main, wt)
+    sd = _chain_scripts(tmp, str(wt))
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    if holder_first:
+        _add_wt(main, wt)
+    return wt, sd, p
+
+
+def _assert_refused_naming(d, p, path):
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), json.dumps(d)
+    assert str(p.pid) in d["reason"] and str(path).lower() in d["reason"].lower(), json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u and str(path).lower() in u.lower() for u in d["cwdUnknown"]), json.dumps(d)
+
+
+@pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
+def test_full_gate_refuses_a_live_holder_whose_sibling_script_is_locked(repo, whatif):
+    """R1: through Invoke-RetireLaneWorktree, known cwd, real live holder, real FileShare.None handle on a sibling. Refused, naming pid and file."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-script")
+    arms = sd / "arms.ps1"
+    try:
+        d, err = _gate_real(wt, whatif=whatif, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+    assert f"pid={p.pid}" in err and "via=script-unreadable" in err and "arms.ps1" in err, err
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists()
+
+
+def test_full_gate_gives_an_unreadable_script_no_creation_time_exemption(repo):
+    """A script can name a directory made after its process started, so a holder older than the worktree is still unknown."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-older", holder_first=True)
+    arms = sd / "arms.ps1"
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+    assert d["cwdExempt"] == 0, json.dumps(d)
+
+
+def test_full_gate_an_unreadable_cwd_does_not_hide_an_unreadable_script(repo):
+    """Both problems on one pid, the holder older than the worktree: the row must carry script-unreadable, because a cwd-unreadable row is exempted
+    by creation time and otherwise deferred to the rename probe."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-nocwd", holder_first=True)
+    arms = sd / "arms.ps1"
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(p.pid) + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+    assert d["cwdExempt"] == 0, json.dumps(d)
+
+
+def test_full_gate_names_every_holder_that_reaches_the_same_locked_script(repo):
+    """The file result is cached per snapshot. A second holder must get the cached unreadable answer, not a cached no-hit."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-two")
+    arms = sd / "arms.ps1"
+    q = _spawn_chain_proven_alive(sd, cwd=repo[0])
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+        _require_verdict(q, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+        _stop(q)
+    _assert_refused_naming(d, p, arms)
+    _assert_refused_naming(d, q, arms)
+
+
+def test_live_refusal_guard_refuses_an_unreadable_script_and_names_the_file(repo):
+    """Get-WorktreeLiveRefusal is the other caller: nothing is deferred there, and its typed refusal must carry the file."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-guard")
+    arms = sd / "arms.ps1"
+    try:
+        r, err = _live_refusal(wt, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        assert p.poll() is None, f"FIXTURE ERROR: holder {p.pid} exited before the guard returned"
+    finally:
+        _stop(p)
+    assert r is not None, "a live holder with an unreadable script was read as FREE"
+    assert r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"].lower() == str(arms).lower(), r
+    assert "arms.ps1" in r["detail"] and "arms.ps1" in err, (r, err)
+
+
+def _deny_metadata(path):
+    """Real ACLs: read-attributes denied on the file and list denied on its parent, so GetFileAttributesEx and its FindFirstFile fallback both fail.
+    Measured on this host: FileInfo.Exists False, File.GetAttributes win32=5 (repro/r3b-metadata-denied.out.txt). READ_CONTROL stays granted on purpose:
+    under a pytest temp dir (an OWNER RIGHTS ACE takes away the owner's implicit rights) denying it locks the undo out too; a first version leaked a holder that way."""
+    me = subprocess.run(["whoami"], check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["icacls", str(path), "/deny", f"{me}:(RA)"], check=True, capture_output=True)
+    subprocess.run(["icacls", str(path.parent), "/deny", f"{me}:(RD)"], check=True, capture_output=True)
+
+
+def _undeny(path):
+    subprocess.run(["icacls", str(path.parent), "/reset"], capture_output=True)
+    subprocess.run(["icacls", str(path), "/reset"], capture_output=True)
+
+
+def test_full_gate_denied_metadata_is_not_absence(repo):
+    """R3, denial: FileInfo.Exists reads False here exactly as for a missing file. Absence and denial are different: this one refuses."""
+    wt, sd, p = _chain_under_lock(repo, "wt-denied-meta")
+    arms = sd / "arms.ps1"
+    try:
+        _deny_metadata(arms)
+        # The precondition, in the gate's own process: if this host's ACLs did not produce a metadata denial, this test is proving nothing.
+        probe = ("$fi = New-Object IO.FileInfo '" + str(arms) + "'; $w = try { [IO.File]::GetAttributes($fi.FullName); 'readable' } catch { 'threw ' + ($_.Exception.GetBaseException().HResult -band 0xFFFF) }; \"$($fi.Exists) $w\"")
+        seen = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", probe], capture_output=True, text=True).stdout.strip()
+        if seen != "False threw 5":
+            pytest.skip(f"this account's ACLs do not deny the metadata read (saw: {seen}); the seam case below still covers the branch")
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        try:
+            _undeny(arms)
+        finally:
+            _stop(p)
+    _assert_refused_naming(d, p, arms)
+
+
+def test_full_gate_a_candidate_confirmed_missing_stays_a_no_hit(repo):
+    """R3, absence: words the corpus regex takes for files, with no file behind them, must never stop retirement. Also a directory wearing a script
+    extension, a wildcard no file can have, and a name longer than any file name."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-missing-candidates")
+    sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
+    (sd / "folder.ps1").mkdir()
+    long_name = "n" * 300 + ".py"
+    (sd / "arms.ps1").write_text(
+        f"$script:Wt = 'x'\n# never-written.ps1 C:\\no\\such\\dir\\ghost.py {tmp}\\a*b.ps1 folder.ps1 {long_name}\n", encoding="utf-8")
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)
+        _require_verdict(p, wt, d, err, lambda v: (v["action"], v["reason"]) == ("would-retire", "ok"))
+    finally:
+        _stop(p)
+    assert d["cwdUnknown"] == [], json.dumps(d)
+
+
+@pytest.mark.parametrize("exc", ["[UnauthorizedAccessException]::new('Access to the path is denied.')",
+                                 "[IO.IOException]::new('The network path was not found.', -2147024843)",
+                                 "[InvalidOperationException]::new('anything else')"],
+                         ids=["denied", "bad-netpath", "other"])
+def test_full_gate_a_metadata_failure_of_any_other_class_refuses(repo, exc):
+    """The classes a real handle cannot produce, through the metadata seam. Only "confirmed missing" is a no-hit."""
+    wt, sd, p = _chain_under_lock(repo, "wt-meta-seam")
+    arms = sd / "arms.ps1"
+    seam = ("$origAttrs = ${function:Read-HolderScriptAttributes}; function Read-HolderScriptAttributes { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq 'arms.ps1') {{ throw ({exc}) }}; & $origAttrs -Path $Path }};")
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + seam)
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+
+
+def test_full_gate_a_script_deleted_between_metadata_and_read_is_a_no_hit(repo):
+    """The file went away in the window: confirmed missing, by the read itself."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-delete-race")
+    sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    seam = ("$origRead = ${function:Read-SharedText}; function Read-SharedText { param([string]$Path) "
+            "if ((Split-Path -Leaf $Path) -eq 'arms.ps1') { throw ([IO.FileNotFoundException]::new('gone')) }; & $origRead -Path $Path };")
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + seam)
+        _require_verdict(p, wt, d, err, lambda v: (v["action"], v["reason"]) == ("would-retire", "ok"))
+    finally:
+        _stop(p)
+
+
+def test_require_verdict_calls_a_dead_holder_a_fixture_error_and_prints_the_census(repo):
+    """Step 5 of the card: a failure of this shape prints the poll state, the census row, the corpus and the full disposition."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-diag")
+    sd = _chain_scripts(tmp, str(wt))
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    result = {"action": "would-retire", "reason": "ok", "marker": "the-full-disposition"}
+    try:
+        with pytest.raises(AssertionError) as live:
+            _require_verdict(p, wt, result, "the-stderr", lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    text = str(live.value)
+    assert "GATE RESULT with a proven-live holder" in text and "poll=None" in text and "census: " in text, text
+    assert "arms.ps1 names-worktree=True" in text and "the-full-disposition" in text and "the-stderr" in text, text
+    with pytest.raises(AssertionError) as dead:
+        _require_verdict(p, wt, result, "", _would_retire)   # the verdict is what was expected: a dead holder still may not pass
+    assert "FIXTURE ERROR" in str(dead.value) and f"poll={p.poll()}" in str(dead.value) and "NO ROW" in str(dead.value), str(dead.value)
+
+
+def test_no_bare_spawn_outside_the_proven_alive_helpers():
+    """A bare Popen proves only that CreateProcess returned. A test that needs a live holder uses a helper that proved it."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    callers = []
+    for block in re.split(r"(?m)^(?=def |@pytest)", src):
+        name = block.split("(")[0].removeprefix("def ")
+        if re.search(r"(?<![\w.])_spawn\(", block) and not block.startswith("def _spawn"):
+            callers.append(name.strip())
+    assert callers == [], callers
+
+
+# OPEN, successor card RETIRE-HOLDER-CORPUS-CAPS-1 (Dot R2 on #477). Each bound still drops text silently, so a holder known only through the dropped text reads as no holder.
+# Not fixed this round: flagging them through the refusal path would stop every retirement on this host (6 snapshots of ~600 processes, processes really affected: over-size 5-7,
+# file cap 19-25, depth cap 32-47; run dir repro/step3-live-table-long.out.txt). xfail(strict): when the card fixes one, this turns red until the mark goes.
+_CAPS_OPEN = "OPEN RETIRE-HOLDER-CORPUS-CAPS-1: this bound still drops corpus text silently"
+
+
+def _gate_on_script(wt, script, cwd):
+    """A snapshot row running `script`, so no real holder and no real scan: Find-WorktreeHolders matches the corpus text whatever the row's liveness."""
+    return _gate_with_snapshot(wt, _fake_row("999991", cmd=f"pwsh -File {script}", name="pwsh.exe", cwd=str(cwd)))
+
+
+@pytest.mark.xfail(strict=True, reason=_CAPS_OPEN)
+def test_open_a_name_below_the_depth_bound_still_holds_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cap-depth")
+    sd = tmp / "cap-depth"
+    sd.mkdir()
+    for i in range(4):
+        (sd / f"a{i}.ps1").write_text(f". .\\a{i + 1}.ps1\n", encoding="utf-8")
+    (sd / "a4.ps1").write_text(f"$script:Wt = '{wt}'\n", encoding="utf-8")
+    d = _gate_on_script(wt, sd / "a0.ps1", tmp)
+    assert d["action"] == "kept", json.dumps(d)
+
+
+@pytest.mark.xfail(strict=True, reason=_CAPS_OPEN)
+def test_open_a_name_past_the_file_count_bound_still_holds_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cap-files")
+    sd = tmp / "cap-files"
+    sd.mkdir()
+    (sd / "main.ps1").write_text("".join(f". .\\f{i:02}.ps1\n" for i in range(45)), encoding="utf-8")
+    for i in range(45):
+        (sd / f"f{i:02}.ps1").write_text(f"$script:Wt = '{wt}'\n" if i == 44 else "# nothing\n", encoding="utf-8")
+    d = _gate_on_script(wt, sd / "main.ps1", tmp)
+    assert d["action"] == "kept", json.dumps(d)
+
+
+@pytest.mark.xfail(strict=True, reason=_CAPS_OPEN)
+def test_open_a_name_in_a_file_over_the_size_bound_still_holds_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cap-size")
+    sd = tmp / "cap-size"
+    sd.mkdir()
+    (sd / "big.ps1").write_text(f"$script:Wt = '{wt}'\n" + "#" * 524288 + "\n", encoding="utf-8")
+    d = _gate_on_script(wt, sd / "big.ps1", tmp)
+    assert d["action"] == "kept", json.dumps(d)
+
+
+def test_full_gate_an_exited_process_with_a_locked_script_is_no_candidate(repo):
+    """Only a live pid can hold anything: the row of a pid that has gone is dropped before any refusal."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-dead-locked")
+    sd = _chain_scripts(tmp, str(wt))
+    arms = sd / "arms.ps1"
+    d = _gate_with_snapshot(wt, _fake_row("999992", cmd=f"pwsh -File {arms}", name="pwsh.exe", cwd=str(tmp)), prelude=_locked(arms))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), json.dumps(d)
+
+
+# --- RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 r3 (sol A1 on #759; carries RETIRE-NOREAD-ROW-PROPERTY-SAFE-1) ---
+# A caller-built holder row (a -ProcessSnapshot's or a -SnapshotProvider's HolderIndex) predates File/FileError/CreatedUtc. Under
+# Set-StrictMode Latest a row missing one threw inside Get-CwdUnknownRefusal, and every caller turned the throw into an anonymous failure
+# (census-failed with no pid; cannot-determine; holder-probe-failed). The holder IS known, so the refusal must still name it. Every case
+# uses a real, proven-live holder pid and asserts the exact refusal and that nothing was removed; a holder that died is a fixture error.
+
+_NOREAD_FILE = "C:\\locked\\arms.ps1"
+_NOREAD_VARIANTS = [
+    pytest.param((), id="complete-row-control"),
+    pytest.param(("FileError",), id="missing-FileError"),
+    pytest.param(("File",), id="missing-File"),
+    pytest.param(("File", "FileError"), id="missing-File-and-FileError"),
+    pytest.param(("CreatedUtc",), id="missing-CreatedUtc"),
+    pytest.param(("CreatedUtc", "File", "FileError"), id="missing-all-optional"),
+]
+
+
+_ROW_KINDS = ["object", "hashtable", "ordered", "dictionary"]
+
+
+def _noread_row(pid, drop=(), kind="object", why="script-unreadable", created="$null"):
+    """One CwdUnknown row as PowerShell text. `kind` is how the caller built it: a PSCustomObject, a hashtable, an [ordered] dictionary or a
+    Dictionary[string,object]; PowerShell reads `$row.Key` on all four, so a guard that reads only PSObject.Properties loses the dictionary keys."""
+    props = [("ProcessId", str(pid)), ("Name", "'pwsh.exe'"), ("Why", f"'{why}'"), ("CreatedUtc", created),
+             ("File", f"'{_NOREAD_FILE}'"), ("FileError", "'IOException win32=32'")]
+    kept = [(k, v) for k, v in props if k not in drop]
+    if kind == "object":
+        return "[pscustomobject]@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    if kind == "hashtable":
+        return "@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    if kind == "ordered":
+        return "[ordered]@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    assert kind == "dictionary", kind
+    return ("(& { $d = New-Object 'System.Collections.Generic.Dictionary[string,object]'; "
+            + "; ".join(f"$d['{k}'] = {v}" for k, v in kept) + "; $d })")
+
+
+def _noread_snapshot(pid, drop=(), kind="object", why="script-unreadable", created="$null"):
+    """A snapshot with a cached HolderIndex: probe ok, one unknown row for `pid` (default Why=script-unreadable), optional properties in `drop` omitted."""
+    return ("[pscustomobject]@{ Procs = @(); SelfPids = @($PID); CapturedUtc = (Get-Date).ToUniversalTime(); "
+            "HolderIndex = [pscustomobject]@{ Cwd = @{}; Scripts = @(); ScriptsByPid = @{}; CwdProbe = 'ok'; "
+            f"CwdUnknown = @({_noread_row(pid, drop, kind, why, created)}) }} }}")
+
+
+def _noread_holder(repo, leaf):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / leaf)
+    return wt, _spawn_proven_alive(tmp, leaf + "-holder", cwd=tmp)
+
+
+def _noread_alive(p):
+    if p.poll() is not None:
+        raise AssertionError(f"FIXTURE ERROR: holder {p.pid} exited before the gate returned, so this says nothing about the refusal")
+
+
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_still_gets_the_identifying_reason(repo, drop):
+    """Get-CwdUnknownRefusal itself, under StrictMode: Reason, Rows and Unknown name the pid (and the file when the row has one)."""
+    wt, p = _noread_holder(repo, "wt-noread-helper")
+    try:
+        script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+                  f"$r = Get-CwdUnknownRefusal -Snapshot ({_noread_snapshot(p.pid, drop)}) -WorktreePath '{wt}'; "
+                  "[pscustomobject]@{ Reason = $r.Reason; Rows = @($r.Rows); Unknown = @($r.Unknown) } | ConvertTo-Json -Depth 4 -Compress")
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r.returncode == 0, r.stdout + r.stderr
+    d = json.loads(r.stdout)
+    assert d["Reason"].startswith("cwd-unknown") and str(p.pid) in d["Reason"] and "script-unreadable" in d["Reason"], d
+    assert len(d["Rows"]) == 1 and d["Rows"][0]["ProcessId"] == p.pid and d["Rows"][0]["Via"] == "script-unreadable", d
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u for u in d["Unknown"]), d
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["Reason"] and d["Rows"][0]["MatchedPath"] == _NOREAD_FILE, d
+        assert any(f"file={_NOREAD_FILE}" in u for u in d["Unknown"]), d
+    if "FileError" in drop:
+        assert "[]" not in d["Reason"], f"an absent FileError must not print an empty bracket pair: {d['Reason']}"
+
+
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_live_refusal_names_the_holder(repo, drop):
+    """Get-WorktreeLiveRefusal: the typed refusal keeps the known pid; it is never census-failed with processId null."""
+    wt, p = _noread_holder(repo, "wt-noread-guard")
+    try:
+        r, err = _live_refusal(wt, snapshot_expr=_noread_snapshot(p.pid, drop))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r is not None, "a known unreadable-script holder was read as FREE"
+    assert r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"] == (_NOREAD_FILE if "File" not in drop else ""), r
+    assert f"pid={p.pid}" in err and "reason=cwd-unknown" in err, err
+
+
+def _gate_snapshot_run(workdir, snapshot_expr, whatif):
+    quarantine = Path(workdir).parent / "q"
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; $snap = {snapshot_expr}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
+        f"{' -WhatIf' if whatif else ''} -ProcessSnapshot $snap | ConvertTo-Json -Depth 4"
+    )
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True)
+    return json.loads(r.stdout), r.stderr
+
+
+@pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_retire_keeps_the_worktree_and_names_the_holder(repo, drop, whatif):
+    """Invoke-RetireLaneWorktree: kept with reason cwd-unknown naming the pid, never cannot-determine; nothing renamed, nothing removed."""
+    wt, p = _noread_holder(repo, "wt-noread-retire")
+    try:
+        d, err = _gate_snapshot_run(wt, _noread_snapshot(p.pid, drop), whatif)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"], json.dumps(d)
+    assert "cannot-determine" not in d["reason"], json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u for u in d["cwdUnknown"]), json.dumps(d)
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["reason"], json.dumps(d)
+    assert f"pid={p.pid}" in err and "via=script-unreadable" in err, err
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists()
+
+
+# adversary pass A1 on 62d3c8bf: a row built as a hashtable / [ordered] / Dictionary[string,object] keeps its keys. PSObject.Properties does not list them, so the
+# first r3 normaliser turned CreatedUtc into $null (losing the creation-time exemption, base said FREE and HEAD said cwd-unknown) and dropped File / FileError.
+
+def _cwd_refusal_fields(wt, snapshot_expr):
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+              f"$r = Get-CwdUnknownRefusal -Snapshot ({snapshot_expr}) -WorktreePath '{wt}'; "
+              "[pscustomobject]@{ Reason = $r.Reason; Exempt = $r.Exempt; Rows = @($r.Rows); Unknown = @($r.Unknown) } | ConvertTo-Json -Depth 4 -Compress")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+@pytest.mark.parametrize("drop", [(), ("FileError",), ("File", "FileError"), ("CreatedUtc",)], ids=["complete", "no-FileError", "no-File-no-FileError", "no-CreatedUtc"])
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_built_as_any_dictionary_or_object_keeps_its_supplied_fields(repo, kind, drop):
+    wt, p = _noread_holder(repo, "wt-noread-kinds")
+    try:
+        d = _cwd_refusal_fields(wt, _noread_snapshot(p.pid, drop, kind))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["Reason"].startswith("cwd-unknown") and str(p.pid) in d["Reason"], d
+    assert len(d["Rows"]) == 1 and d["Rows"][0]["ProcessId"] == p.pid and d["Rows"][0]["Via"] == "script-unreadable", d
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["Reason"] and d["Rows"][0]["MatchedPath"] == _NOREAD_FILE, d
+        assert any(f"file={_NOREAD_FILE}" in u for u in d["Unknown"]), d
+    if "FileError" not in drop and "File" not in drop:
+        assert "[IOException win32=32]" in d["Reason"], d
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_kinds_live_refusal_keeps_file_and_pid(repo, kind):
+    wt, p = _noread_holder(repo, "wt-noread-kinds-guard")
+    try:
+        r, err = _live_refusal(wt, snapshot_expr=_noread_snapshot(p.pid, (), kind))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r is not None and r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"] == _NOREAD_FILE, r
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_cwd_unreadable_row_older_than_the_worktree_stays_exempt_whatever_its_kind(repo, kind):
+    """The creation-time exemption (a process that started before the directory existed) must survive for a caller's row of any kind: base FREE."""
+    wt, p = _noread_holder(repo, "wt-noread-exempt")
+    try:
+        snap = _noread_snapshot(p.pid, ("File", "FileError"), kind, why="cwd-unreadable", created="[datetime]'2020-01-01T00:00:00Z'")
+        d = _cwd_refusal_fields(wt, snap)
+        r, err = _live_refusal(wt, snapshot_expr=snap)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["Exempt"] == 1 and not d["Reason"] and d["Rows"] == [], d
+    assert r is None, f"the creation-time exemption was lost for a {kind} row: {r}"
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_kinds_retire_keeps_the_worktree_naming_pid_and_file(repo, kind):
+    wt, p = _noread_holder(repo, "wt-noread-kinds-retire")
+    try:
+        d, err = _gate_snapshot_run(wt, _noread_snapshot(p.pid, (), kind), True)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"] and _NOREAD_FILE in d["reason"], json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"

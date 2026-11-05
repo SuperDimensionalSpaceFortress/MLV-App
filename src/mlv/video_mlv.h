@@ -259,6 +259,13 @@ int getMlvRawFrameDebayeredFromReducedReconnedRaw16(mlvObject_t * video,
                                                     int * outHeight);
 /* Test-only: an error added to the reduced entry's bit shift (0 in production). */
 void mlvSetDebayered16ReducedReconBitShiftErrorForTesting(int error);
+/* CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 r3: the reconned debayers clear the calling
+ * thread's last decode and llrawproc records (getMlvLastRawUint16*, llrpGetLast*).
+ * A thread that decoded and reconstructed the frame itself saves them before the
+ * debayer and restores them after, so they keep describing that frame. One saved
+ * copy per thread. */
+void mlvSaveLastDecodeAndLlrawprocTelemetryForCurrentThread(void);
+void mlvRestoreLastDecodeAndLlrawprocTelemetryForCurrentThread(void);
 /* Nonzero when getMlvRawFrameDebayered could serve frameIndex from the AMaZE
  * frame cache: the cache is running, or this frame is already cached. */
 int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);
@@ -464,6 +471,9 @@ double getMlvLastDebayerWbPrepareMilliseconds(void);
 double getMlvLastDebayerCaMilliseconds(void);
 double getMlvLastDebayerKernelMilliseconds(void);
 double getMlvLastDebayerWbUndoMilliseconds(void);
+/* debayerBasicU16 that records getMlvLastDebayerKernelMilliseconds for this thread. */
+void debayerBasicU16RecordingKernelMilliseconds(uint16_t * output_frame, uint16_t * raw_frame, int width, int height,
+                                                int threads, int bit_shift);
 double getMlvLastProcessingMilliseconds(void);
 double getMlvLastProcessed16TotalMilliseconds(void);
 double getMlvLastProcessed16For8BitMilliseconds(void);
@@ -524,6 +534,42 @@ void mlv_phase4bv_reset_env_cache_for_testing(void);
  * Needs memory to return to, sized: sizeof(float) * getMlvHeight(urvid) * getMlvWidth(urvid)
  * Output values will be in range 0-65535 (16 bit), float is only because AMAzE uses it */
 int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
+/* PLAYBACK-SOURCE-FRAME-IDENTITY-1: a 64-bit identity of a frame's SOURCE picture, for the
+ * --visual-capture-dir writer's visual.json source_id / source_difference. For LJ92 (r5, adversary r5 A1
+ * on e57fd03e and opus r3 B1 on 27da457e) it is FNV-1a 64 over the picture liblj92 DECODES from the
+ * frame's encoded VIDF payload (mlvLj92FrameSourceHash64), so two frames that decode alike always share
+ * an identity and two that decode differently never do (up to a 64-bit collision). For JPEG2K (r9, r8 adversary
+ * pass 2 A1 = Dot B2) it is mlvJpeg2kFrameSourceHash64 over the frame_size bytes read: the picture the display's
+ * OpenJPH decode DECODES from the four declared channel spans, never the codestream bytes. For uncompressed RAW it is FNV-1a 64
+ * over the packed RAW size the decoder unpacks. The bytes are read under main_file_mutex[chunk]. Returns 0 and sets
+ * *hashOut on success; nonzero (no identity, so the writer omits the field) for NULL inputs, MCRAW and
+ * CinemaDNG-folder sources (MLV containers only), an index out of range, a missing index or file, a zero
+ * byte count, an encoded frame_size the decoder refuses (mlvRawFrameInputCapacity, r5), a failed seek (r5),
+ * a frame whose VIDF header at block_offset cannot be read (the display refuses it, r11), a short read, an LJ92 frame the display decode refuses (lj92_open/lj92_decode fail, or the decoded size
+ * or bit depth is not RAWI's), or a JPEG2K frame the display decode refuses (version not 1, a channel table
+ * mlvJpeg2kBayerLayoutIsValid rejects, a probe, geometry or decode failure) or any JPEG2K frame on a build without ENABLE_JPEG2K. Not for the
+ * playback path: it reads disk and decodes.
+ */
+int getMlvFrameSourceHash64(mlvObject_t * video, uint64_t frameIndex, uint64_t * hashOut);
+/* The LJ92 half of getMlvFrameSourceHash64, over one in-memory payload: decodes a private copy with liblj92
+ * (lj92_open, then lj92_decode of every sample, no skip, no linearisation, as the display decode calls it) and
+ * returns FNV-1a 64 over the decoded samples only (r5 pass 2 A1: not the header's shape). r6: liblj92 never reads
+ * past `length` (a scan that runs out reads zero bits), so bytes after the payload cannot change it. Bytes the decoder never
+ * uses -- COM/APPn segments, header fields it ignores, a table symbol the bitstream never selects, bytes after
+ * the scan -- cannot change it; any change to the decoded picture does. Returns 0 and sets *hashOut, or
+ * nonzero (no identity) for NULL inputs, a payload under 4 bytes or over INT_MAX, or a payload liblj92 refuses.
+ * The caller's payload is never written. */
+int mlvLj92FrameSourceHash64(const uint8_t * data, size_t length, uint64_t * hashOut);
+/* The JPEG2K half of getMlvFrameSourceHash64 (r9), over one in-memory frame payload of `length` (frame_size) bytes:
+ * the payload is decoded by the display's own JPEG2K decode (the same parse, layout check and OpenJPH probe/decode of each
+ * channel span) into private quarter buffers, and FNV-1a 64 runs over the decoded samples as the display stores them
+ * (clamped to uint16, 2 bytes LE), channel 0..3 (x0y0, x1y0, x0y1, x1y1), row-major. Codestream bytes are never the id: two
+ * payloads that decode to one picture (an equal-length COM comment, bytes outside the spans, where a span lies) share it,
+ * and a changed sample changes it (up to a 64-bit collision). Returns 0 and sets *hashOut, or nonzero (no identity, and
+ * *hashOut untouched) for NULL inputs, a payload under the header size, a header version other than 1, a channel table or
+ * geometry mlvJpeg2kBayerLayoutIsValid rejects, a probe, geometry or decode failure, and always on a build without
+ * ENABLE_JPEG2K (it never falls back to hashing bytes). */
+int mlvJpeg2kFrameSourceHash64(const uint8_t * data, size_t length, int width, int height, uint64_t * hashOut);
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
  * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves
  * no frame a later request could hit. Same return contract (0 = ok). */

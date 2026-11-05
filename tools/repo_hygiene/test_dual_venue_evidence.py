@@ -151,6 +151,8 @@ HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip
 PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
                                                                                               # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: A and B1 at a worker-thread cap of 12
                                                                                               "a12", "b1-12-pcore"))
+# CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: the quality-1 Look Assist cells of the inline reduced recon A/B and its D4 matrix.
+Q1_CPU_LOOK_LEGS = tuple(f"legs/m16-1243-q1-cpu-look-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
@@ -158,7 +160,7 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
                 *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
-                *IDENTITY_LEGS, *MISSDUMP_LEGS)
+                *IDENTITY_LEGS, *MISSDUMP_LEGS, *Q1_CPU_LOOK_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -182,12 +184,25 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
 # per-frame playback_smoke.frame rows (telemetryArm HEAVY): the cpu-reduced pace twin at fullscreen s4 with the frame log kept.
 CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
+# CUDA-HEADROOM-UTIL-SAMPLER-1: the one unpaced Cinematic Look-Assist-ON windowed s1 leg (the owner shape, D4b) that arms generatorArgs.utilSample, so it
+# is a real unpaced swap-interval-0 leg and carries presentTearingExpectedReason like the headroom and partition legs.
+UTIL_SAMPLE_LEGS = ("legs/m16-1243-utilsample-unpaced-windowed-s1.json",)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *UTIL_SAMPLE_LEGS)
 # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B (generatorArgs.prepConflatedMove true -> MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1),
 # one per capture-free pace cell the CPU route runs at s2 and s4 (a speed leg, so the post-play visual strips are on by default), keyed to the cell it twins. The
 # OFF arm is the twinned cell itself (env unset).
 PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-pace-cinematic-{mode}-s{scale}-pcm.json": f"legs/m16-1243-pace-cinematic-{mode}-s{scale}.json"
                             for mode in ("fullscreen", "windowed") for scale in (2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1: the quality-1 look cells with look.pairedSeek true (the same frames captured paused after the Play), keyed to
+# the cell each one copies (legId, card and look.pairedSeek are the only differences).
+Q1_CPU_LOOK_PAIRED_LEGS = {f"legs/m16-1243-q1-cpu-look-paired-{mode}-s{scale}.json": f"legs/m16-1243-q1-cpu-look-{mode}-s{scale}.json"
+                           for mode in ("fullscreen", "windowed") for scale in (2, 4)}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *Q1_CPU_LOOK_PAIRED_LEGS)
+# CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r14: the same-frame copies of the paired fullscreen cells (look.pairedSeekFrames 50..550, forwarded to the app's
+# --contact-sheet-seek-frames), so an H and a C arm pause on the SAME frames (SAMEFRAME r2). test_dual_venue_paired_seek.SameFrameLegSpecTests pins their shape.
+Q1_CPU_LOOK_SAMEFRAME_LEGS = tuple(f"legs/m16-1243-q1-cpu-look-sameframe-fullscreen-s{scale}.json" for scale in (2, 4))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *Q1_CPU_LOOK_SAMEFRAME_LEGS)
 # HFR-NATIVE-M16-1457-RECON-LUT-KEEP-1 r2: the paced M16-1457 native s2/s4 legs (the #420 s1 native shape with legId and scaleFactor changed, card
 # CUDA-HEADROOM-1, Look Assist forced Cinematic, visual strips on): the paced picture evidence for the NO_PUBLISH LUT-keep change.
 NATIVE_PACED_LEGS = tuple(f"legs/m16-1457-native-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (2, 4))
@@ -749,6 +764,18 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
 
+    def test_the_util_sample_mapping_is_armed_only_by_a_json_true(self) -> None:
+        """CUDA-HEADROOM-UTIL-SAMPLER-1: the runner maps generatorArgs.utilSample to the generator's -UtilSample only when it is a JSON true (the
+        strict -is [bool] form; a string "true" is not true), for any leg, outside the forceLookAssist branch. The job text it gates is pinned in
+        test_util_sample_leg.py."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['utilSample'] -and $spec.generatorArgs.utilSample -is [bool] "
+                   "-and $spec.generatorArgs.utilSample) { $gen['UtilSample'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertEqual(runner.count("$gen['UtilSample']"), 1, "one mapping site")
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+
     # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof's job text (the generator's -GpuFaultInject / -GpuSafeStart / -AutomationSettingsDir / -GpuPreLaunches).
     SELF_HEAL_PRE_OPEN = "# GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the shared run-scoped settings store and the self-heal pre-launches"
     SELF_HEAL_OWNER_ANCHOR = "# OWNER-FOOTAGE-NO-HARDLINK-1: the last look before the app can read anything."
@@ -1033,6 +1060,35 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -PlaybackProcessing is the default job, byte for byte")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["playbackProcessing"]["enum"], ["receipt", "subset"])
+
+    def test_quality_mode_reaches_the_job_env_and_absent_changes_nothing(self) -> None:
+        """CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: -QualityMode hq changes exactly the job's pinned quality env line, so a cpu leg runs the default mode (Phase 3 Disabled);
+        an absent or empty argument emits the default job byte for byte; a cuda job refuses it (the CUDA texture route needs Phase 3)."""
+        base = ["-Backend", "cpu", "-ContactSheet", "-ContactSheetFrames", "4"]
+        default = self.generate(GENERATOR, "qm-default.job.ps1", base)
+        hq = self.generate(GENERATOR, "qm-hq.job.ps1", [*base, "-QualityMode", "hq"])
+        self.assertEqual(self.parse_errors(hq), 0)
+        text = hq.read_text(encoding="utf-8")
+        self.assertEqual(text.count("'MLVAPP_PLAYBACK_QUALITY_MODE=hq',"), 1)
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq"), 0)
+        self.assertEqual(text.replace("MLVAPP_PLAYBACK_QUALITY_MODE=hq", "MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq"), default.read_text(encoding="utf-8"))
+        explicit_empty = self.generate(GENERATOR, "qm-empty.job.ps1", [*base, "-QualityMode", ""])
+        self.assertEqual(explicit_empty.read_bytes(), default.read_bytes(), "an empty -QualityMode is the default job, byte for byte")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["qualityMode"]["enum"], ["hq"])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['qualityMode']) { $gen['QualityMode'] = [string]$spec.generatorArgs.qualityMode }", runner)
+        for name in ("fullscreen-s4", "windowed-s4", "fullscreen-s2", "windowed-s2"):
+            spec = json.loads((DV / "legs" / f"m16-1243-q1-cpu-look-{name}.json").read_text(encoding="utf-8"))
+            self.assertEqual(spec["backends"], ["cpu"])
+            self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq")
+            self.assertNotIn("playbackProcessing", spec["generatorArgs"], "receipt routes Processed8, not the route under test")
+
+    def test_quality_mode_is_refused_on_a_cuda_job(self) -> None:
+        """CPU-DUALISO-PREVIEW-SCALE-VERIFY-1: a typed refusal, never a job that silently runs the CUDA route without Phase 3."""
+        result = run_pwsh(self.generator_command(GENERATOR, self.tmp / "qm-cuda.job.ps1", ["-QualityMode", "hq"]))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DUAL_VENUE_QUALITY_MODE_CPU_ONLY", result.stdout + result.stderr)
 
     def test_disable_look_assist_reaches_the_smoke_command_and_absent_changes_nothing(self) -> None:
         """UPSTREAM-CPU-BASELINE-1: -DisableLookAssist adds exactly '-DisableLookAssist' to the smoke runner's command (it passes --no-look-assist and fails
@@ -7007,12 +7063,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -7100,6 +7156,21 @@ class LegSpecSchemaTests(unittest.TestCase):
                 # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
                 self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertEqual(spec["legId"], "m16-1243-utilsample-unpaced-windowed-s1", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+                self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
+            elif spec["card"] == "CPU-DUALISO-PREVIEW-SCALE-VERIFY-1":   # the quality-1 Look Assist legs, named by display and scale
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(fullscreen|windowed)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
+            elif spec["card"] == "CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1":   # the paired-seek copies of the quality-1 Look Assist legs (r14: and their same-frame fullscreen copies)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(paired-(fullscreen|windowed)|sameframe-fullscreen)-s[24]$", path.name)
+                self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
+                self.assertIs(spec["look"]["pairedSeek"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -7295,7 +7366,13 @@ class LegSpecSchemaTests(unittest.TestCase):
 NO_PACE_TWIN_BY_DESIGN = {
     **{f"m16-1243-display-{mode}-s{scale}-vsync1": "swapInterval 1 A/B arm; no merged PR cites an absolute figure from it, so a swapInterval 1 pace twin waits for the first PR that does"
        for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
-    "m16-1243-look": "Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
+    **{f"m16-1243-q1-cpu-look-{mode}-s{scale}": "quality-1 A/B arm of the inline reduced recon: its figures compare the arms of one leg, and no capture-free pace leg runs at quality mode 1"
+       for mode in ("fullscreen", "windowed") for scale in (2, 4)},
+    **{f"m16-1243-q1-cpu-look-paired-{mode}-s{scale}": "paired-seek copy of a quality-1 look cell: playing vs paused frames of one leg, and no capture-free pace leg runs at quality mode 1"
+       for mode in ("fullscreen", "windowed") for scale in (2, 4)},
+    **{f"m16-1243-q1-cpu-look-sameframe-fullscreen-s{scale}": "same-frame copy of a paired quality-1 look cell: H vs C paused at the same listed frames, and no capture-free pace leg runs at quality mode 1"
+       for scale in (2, 4)},
+    "m16-1243-look":"Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-scale2": "Classic flavor-parity contact-sheet leg at scale 2; pace claims use the Cinematic display-matrix twins",
     "m16-1243-look-film": "Film flavor-parity contact-sheet leg; no merged PR cites an absolute figure from it",
     "m16-1243-look-scale2-film": "Film flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
@@ -8019,19 +8096,48 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     the force-paint used to hide). r5 (Grok G1/G3 on #456): the paired modes model the r3 order -- the unforced captures are taken half a tail
     after the forced ones, so on a healthy display (paired-ok) unforced k shows a LATER frame than forced k, never the same picture; masked shows
     the last forced paint (play 5's picture) on every unforced capture; partial-freeze (over a known-differ source) shows three moving unforced
-    pictures and then repeats the third, the display's own paint stopping part-way through the unforced half."""
+    pictures and then repeats the third, the display's own paint stopping part-way through the unforced half.
+    PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1) modes, each a frozen picture whose play frames carry the app's per-frame source_id:
+    frozen-source-partial-unsaved (frames 0-4 over source A; frame 5 over source B was never saved; the app's record "differ"),
+    frozen-source-partial-noviewport (the same, but frame 5 was saved without a viewport rectangle), frozen-source-partial-differ (frames 0-4 over
+    five different sources; frame 5 never saved; "differ"), frozen-source-ids-only (frames 0-4 over five different sources; frame 5 never saved and
+    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ")."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
-    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
+    frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport",
+                      "frozen-source-partial-unsaved", "frozen-source-partial-noviewport", "frozen-source-partial-differ", "frozen-source-ids-only",
+                      "frozen-upper-source-id")
     paired = mode in ("paired-ok", "masked", "partial-freeze")
     bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
-                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL", "masked": "differ", "partial-freeze": "differ"}.get(mode)
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL", "masked": "differ", "partial-freeze": "differ",
+                         "frozen-source-partial-unsaved": "differ", "frozen-source-partial-noviewport": "differ",
+                         "frozen-source-partial-differ": "differ", "frozen-upper-source-id": "differ"}.get(mode)
+    # play frame 5's capture is unusable in these modes: never saved (no PNG, no viewport) or saved without a viewport rectangle
+    unsaved = {5} if mode in ("frozen-source-partial-unsaved", "frozen-source-partial-differ", "frozen-source-ids-only") else set()
+    no_viewport = {5} if mode in ("frozen-partial", "partial-ok", "frozen-source-partial-noviewport") else set()
+
+    def source_id(k: int) -> str | None:
+        """A play frame's source_id as the app writes it (16 lowercase hex digits); None leaves the field out (the app could not read the frame)."""
+        if mode in ("frozen", "frozen-partial", "frozen-source-partial-differ"):
+            return f"{k + 1:016x}"
+        if mode == "frozen-source-ids-only":
+            return None if k == 5 else f"{k + 1:016x}"
+        if mode == "frozen-identical":
+            return "00000000000000aa"
+        if mode in ("frozen-source-partial-unsaved", "frozen-source-partial-noviewport"):
+            return "00000000000000bb" if k == 5 else "00000000000000aa"
+        if mode == "frozen-upper-source-id":
+            return f"{k + 10:016X}"
+        return None
+
     for k in range(6):
         seed = 1 if frozen else k
+        if k in unsaved:
+            continue
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
         if paired:
             # (seed, bias): bias 30 marks a frame of the unforced half (later than every forced capture's frame); masked repeats forced play 5's paint
@@ -8044,8 +8150,12 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
-               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode in ("frozen-partial", "partial-ok") and k == 5 else viewport), "saved": True, "reason": ""}
+               "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if k in no_viewport or k in unsaved else viewport),
+               "saved": k not in unsaved, "reason": ("PrintWindow failed" if k in unsaved else "")}
               for k in range(6)]
+    for frame in frames:
+        if source_id(frame["index"]) is not None:
+            frame["source_id"] = source_id(frame["index"])
     if paired:
         # r3 order and shape: the six forced play captures across the first half of the tail, then the six unforced ones across the second, each
         # entry carrying forced_paints_before (see write_stateful_visual_captures for a surface the forced paints change)
@@ -8054,6 +8164,11 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
         frames += [{"kind": "play_unbound", "index": k, "file": f"play-unbound-{k}.png", "display_frame": 612 + 2 * k, "serial": 906 + k, "play_active": True,
                     "tail_elapsed_ms": 1625 + 250 * k, "capture_ms": 40.0, "viewport": viewport, "saved": True, "reason": "", "forced_paints_before": 6}
                    for k in range(6)]
+        if source_difference == "differ":
+            # PLAYBACK-SOURCE-FRAME-IDENTITY-1 (master merge): the app that records "differ" writes each play capture's source_id, forced and unforced
+            for f in frames:
+                if f["kind"] in ("play", "play_unbound"):
+                    f["source_id"] = f"{f['display_frame']:016x}"
     if bound:
         frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
                        "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
@@ -8122,6 +8237,10 @@ def stateful_visual_model(order: str, natural: str, ordinal: bool = True, record
         entry = {"kind": kind, "index": k, "file": file, "display_frame": label, "serial": 900 + label - 600, "play_active": kind.startswith("play"),
                  "tail_elapsed_ms": t, "capture_ms": 40.0, "viewport": None if kind == "play_unbound" and k in no_viewport else VIEWPORT,
                  "saved": True, "reason": ""}
+        if record_source and kind.startswith("play"):
+            # PLAYBACK-SOURCE-FRAME-IDENTITY-1 (master merge): the app writes each play capture's source_id (forced and unforced) beside its record;
+            # the runner judges the source difference from the judged frames' own ids
+            entry["source_id"] = f"{(0xaa if natural == 'static' else label):016x}"
         if kind in ("stop", "paused"):
             entry.update({"painted_serial": 900 + label - 600, "painted_serial_valid": True, "label_bound": True, "label_bound_basis": "gl_window_paint"})
         if kind == "paused":
@@ -8956,6 +9075,154 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["reason"]), ("OK", reason))
                 self.assertTrue(Path(out["stripPath"]).is_file())
+
+    def test_the_source_difference_is_judged_over_the_same_frames_the_picture_is(self) -> None:
+        """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r4 (acting-cos Dot B1, PR #477 head fa20d035): the app's source_difference covers EVERY play capture, a usable
+        picture or not, while the picture is judged only over the play frames with a content hash. Five frozen frames over ONE source beside a sixth over
+        another source whose capture is unusable read `differ` in the app's record, yet the judged frames are a static clip. So the runner derives the
+        source difference from the judged frames' own source_id, and the app's scalar is a cross-check: a disagreement is recorded, never decisive."""
+        # mode, verdict, counted, source difference, the app's record, cross-check, saved play frames, judged play frames
+        rows = (("frozen-source-partial-unsaved", "OK", True, "known-identical", "differ", "disagree", 5, 5),
+                ("frozen-source-partial-noviewport", "OK", True, "known-identical", "differ", "disagree", 6, 5),
+                ("frozen-source-partial-differ", "FROZEN_DISPLAY", False, "known-differ", "differ", "agree", 5, 5),
+                ("frozen-source-ids-only", "FROZEN_DISPLAY", False, "known-differ", None, "disagree", 5, 5),
+                ("frozen-upper-source-id", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", "differ", "disagree", 6, 6),
+                ("frozen-upper-differ", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", "DIFFER", "agree", 6, 6),
+                ("frozen", "FROZEN_DISPLAY", False, "known-differ", "differ", "agree", 6, 6),
+                ("frozen-partial", "FROZEN_DISPLAY", False, "known-differ", "differ", "agree", 6, 5),
+                ("frozen-identical", "OK", True, "known-identical", "identical", "agree", 6, 6),
+                ("frozen-unknown", "FROZEN_DISPLAY_SUSPECTED", True, "unknown", None, "agree", 6, 6))
+        for mode, verdict, counted, source, app, cross, saved, judged in rows:
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", mode)
+                ev = Path(d) / "evidence"
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                self.assertEqual(out["sourceDifference"], source)
+                self.assertEqual(out.get("appSourceDifference"), app, "the app's own record is kept as written")
+                self.assertEqual(out.get("sourceDifferenceCrossCheck"), cross)
+                self.assertEqual((out["savedPlayFrames"], out["playFrames"], out["distinctContentHashes"]), (saved, judged, 1))
+                if cross == "disagree":
+                    self.assertIn("the judged frames decide", out["reason"] or "", "a disagreement is recorded in the reason")
+                else:
+                    self.assertNotIn("the judged frames decide", out["reason"] or "")
+                if verdict == "OK":
+                    self.assertIn("static clip", out["reason"], "the waived frozen check still says so")
+                play_ids = [f.get("sourceId") for f in out["frames"] if f["kind"] == "play"]
+                self.assertEqual(len(play_ids), 6, "every play frame stays in the receipt, judged or not")
+
+    def test_the_source_difference_of_the_judged_frames_follows_the_apps_rule(self) -> None:
+        """Get-DvVisualSourceDifference mirrors visual_capture_source_difference::decide (VisualCaptureSourceDifference.h) over the judged frames:
+        known-differ when two source ids differ; known-identical when every frame has an id, they span two or more distinct display frames and all are
+        equal; unknown otherwise (fewer than two frames, a missing or malformed id, a display frame of -1, one repeated display frame)."""
+        a, b = "00000000000000aa", "00000000000000bb"
+        rows = (([], "unknown"),
+                ([(a, 10)], "unknown"),
+                ([(a, 10), (a, 11)], "known-identical"),
+                ([(a, 10), (b, 11)], "known-differ"),
+                ([(a, 10), (a, 11), (b, 12)], "known-differ"),
+                ([(a, 10), (None, 11), (b, 12)], "unknown"),                  # every judged frame needs an id, as in the app
+                ([(a, 10), ("00000000000000AA", 11)], "unknown"),             # upper case is not the app's form
+                ([(a, 10), ("aa", 11)], "unknown"),                           # nor is a short id
+                ([(a, 10), (a, -1)], "unknown"),
+                ([(a, 10), (a, 10)], "unknown"),                              # a stuck clock is not evidence of a static clip
+                ([(a, 10), (b, 10)], "unknown"))                              # the app's rule: one display frame decides nothing
+        for frames, expected in rows:
+            with self.subTest(frames=frames):
+                items = ", ".join(f"[pscustomobject]@{{ sourceId = {('$null' if sid is None else repr(sid))}; displayFrame = {df} }}" for sid, df in frames)
+                proc, out = run_pwsh_json(f"ConvertTo-Json -Compress -InputObject (Get-DvVisualSourceDifference -Frames @({items}))")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out, expected)
+
+    @requires_windows_imaging
+    def test_a_repeat_is_judged_by_its_own_pairs_source_ids(self) -> None:
+        """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r7 (adversary r6 pass 3 A1 on 3663c8a3, the json's input verbatim): six saved play_unbound records,
+        display frames 0..5, forced_paints_before=6, 64x64 viewports, source ids [aa,bb,bb,bb,bb,bb], pictures [X,Y,Y,Y,Y,Y] (X: grey left half 32 /
+        right half 224; Y: 96 / 224), no top-level source_difference. The set-wide source is known-differ (aa vs bb), but each of the four repeated
+        pictures sits on a pair whose OWN ids are equal: the source repeated its picture, the display did not stop. 3663c8a3 counted four repeats and
+        said PARTIAL_FREEZE. A repeat is now judged by its own pair: equal ids are no repeat, differing ids are a display repeat, a missing id is an
+        UNKNOWN pair (counted in repeatedPlayFrames, never toward PARTIAL_FREEZE)."""
+        a, b, c, d_, e = (f"{n:016x}" for n in (0xaa, 0xbb, 0xcc, 0xdd, 0xee))
+        # ids, pictures (left-half grey levels), verdict, repeatedPlayFrames, repeats over pairs whose own ids differ, note text
+        rows = (
+            ((a, b, b, b, b, b), (32, 96, 96, 96, 96, 96), "OK", 0, 0, None),                                     # the json's input
+            ((a, b, b, c, d_, d_), (32, 96, 96, 96, 96, 96), "PARTIAL_FREEZE", 2, 2, "the display's own paint stopped"),   # bb|bb and dd|dd are the source's own
+            ((a, b, c, d_, e, f"{0xff:016x}"), (32, 96, 96, 96, 160, 160), "PARTIAL_FREEZE", 3, 3, "the display's own paint stopped"),
+            ((a, b, None, c, d_, e), (32, 96, 96, 96, 160, 200), "OK", 2, 0, "not a proven cause"),             # both repeats touch the frame with no id
+        )
+        for ids, levels, verdict, repeats, differ_repeats, note in rows:
+            with self.subTest(ids=ids, levels=levels), tempfile.TemporaryDirectory(prefix="vis-r7-pair-") as d:
+                share = Path(d) / "artifacts" / "visual"
+                share.mkdir(parents=True)
+                draw = ["Add-Type -AssemblyName System.Drawing"]
+                frames = []
+                for k, (sid, left) in enumerate(zip(ids, levels)):
+                    png = share / f"play-unbound-{k}.png"
+                    draw.append(f"$b = [System.Drawing.Bitmap]::new(64, 64); $g = [System.Drawing.Graphics]::FromImage($b); "
+                                f"$g.Clear([System.Drawing.Color]::FromArgb(224, 224, 224)); "
+                                f"$g.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb({left}, {left}, {left})), 0, 0, 32, 64); "
+                                f"$g.Dispose(); $b.Save('{png}', [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()")
+                    entry = {"kind": "play_unbound", "index": k, "file": png.name, "display_frame": k, "serial": 900 + k, "play_active": True,
+                             "tail_elapsed_ms": 1625 + 250 * k, "capture_ms": 40.0, "viewport": {"x": 0, "y": 0, "w": 64, "h": 64}, "saved": True,
+                             "reason": "", "forced_paints_before": 6}
+                    if sid is not None:
+                        entry["source_id"] = sid
+                    frames.append(entry)
+                proc = run_pwsh(["-Command", "\n".join(draw)])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                (share / "visual.json").write_text(json.dumps({"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)",
+                                                              "tail_ms": 3000, "frames": frames, "frames_written": 6, "error": ""}), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{Path(d) / 'artifacts'}' -EvidenceDir '{Path(d) / 'evidence'}' "
+                                          "-LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["flatPlayFrames"]), ("play_unbound", 6, 0), out["reason"])
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True), out["reason"])
+                self.assertEqual((out["repeatedPlayFrames"], out["repeatedPlayFramesSourceDiffer"]), (repeats, differ_repeats), out["reason"])
+                if note is None:
+                    self.assertIsNone(out["repeatedPlayFramesNote"], out["reason"])
+                else:
+                    self.assertIn(note, out["repeatedPlayFramesNote"])
+                    if verdict == "PARTIAL_FREEZE":
+                        self.assertIn(f"{differ_repeats} of the 6 judged play frames repeat the picture before them", out["reason"])
+
+    def test_missing_or_invalid_frame_evidence_is_unknown_never_identical_and_never_a_throw(self) -> None:
+        """PLAYBACK-SOURCE-FRAME-IDENTITY-1 r5 (sol r3 key on 27da457e): equal ids over display frames -0.4 and 1 read known-identical
+        ([int]-0.4 is 0); a $null frame between two good ones was filtered away and the rest read known-identical; a display frame of
+        2147483648 or an object threw. Each is unknown now: a frame without evidence is unknown evidence, never a static clip."""
+        a = "00000000000000aa"
+        good0 = f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 0 }}"
+        good1 = f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 1 }}"
+        rows = ((f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = -0.4 }}, {good1}", "fractional below zero"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 1.5 }}, {good0}", "fractional"),
+                (f"{good0}, $null, {good1}", "a null frame"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = 2147483648 }}, {good0}", "past Int32"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = [long]-3 }}, {good0}", "negative long"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = @{{ value = 1 }} }}, {good0}", "an object"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = '1' }}, {good0}", "a string"),
+                (f"[pscustomobject]@{{ sourceId = '{a}'; displayFrame = $true }}, {good0}", "a boolean"))
+        for items, why in rows:
+            with self.subTest(why=why):
+                proc, out = run_pwsh_json(f"ConvertTo-Json -Compress -InputObject (Get-DvVisualSourceDifference -Frames @({items}))")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out, "unknown", why)
+        # a JSON integer as ConvertFrom-Json gives it ([long]) is still a frame number
+        proc, out = run_pwsh_json("ConvertTo-Json -Compress -InputObject (Get-DvVisualSourceDifference -Frames @(('[{\"sourceId\":\"00000000000000aa\",\"displayFrame\":0},"
+                                  "{\"sourceId\":\"00000000000000aa\",\"displayFrame\":1}]' | ConvertFrom-Json)))")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out, "known-identical")
+
+    def test_the_frame_number_reader_takes_only_whole_numbers_in_range_and_never_throws(self) -> None:
+        """r5 class sweep: Get-DvFrameNumber is what the appDistinctDisplayFrames count and the repeated-play-frame walk read the same display
+        frames through (Read-DvVisualCaptures), so an overflowing or object display frame no longer throws there either."""
+        rows = (("0", 0), ("[long]7", 7), ("2147483647", 2147483647), ("2147483648", None), ("-1", None), ("-0.4", None), ("1.5", None),
+                ("1.0", None), ("'3'", None), ("$null", None), ("@{ value = 1 }", None), ("$true", None))
+        for expr, expected in rows:
+            with self.subTest(expr=expr):
+                proc, out = run_pwsh_json(f"ConvertTo-Json -Compress -InputObject @{{ v = (Get-DvFrameNumber ({expr})) }}")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["v"], expected)
 
     def test_a_visual_reader_without_a_published_directory_says_not_captured(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-none-") as d:

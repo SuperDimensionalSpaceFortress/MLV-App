@@ -48,7 +48,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')]
+    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')]
     [string]$Lane,
 
     [string]$Prompt,
@@ -149,6 +149,11 @@ param(
     # launch. This lane then writes a 'linked' row naming its receipt instead of a second
     # 'reserved' row, so the product-ratio guard counts the launch once.
     [string]$DispatchReservationId = '',
+    # VISUAL-JUDGE-TERRA-LANE-1: image files attached to the initial prompt (`codex exec -i <FILE>`, from
+    # `codex exec --help` on the pinned codex 0.160.1). CODEX ENGINE ONLY: a claude lane given any path
+    # fails closed with the typed error image-paths-codex-only before a run dir or receipt exists.
+    # Each path must exist and be a .png or .jpg; the receipt's `imagePaths` lists path, sha256 and bytes.
+    [string[]]$ImagePaths = @(),
     [switch]$KeepScratch
 )
 
@@ -182,6 +187,27 @@ if (Test-HubHost) {
                "(playback runs only as a venue job through the tracked chain): " + (($localPlaybackFindings | Select-Object -First 3) -join " | "))
     }
 }
+
+# LANE-CHILD-LOADER-DIALOG-ON-OWNER-DESKTOP-1: a child that cannot load a DLL (or crashes, or hits an empty drive) raises a modal Windows System Error
+# box on the owner's desktop, and the child waits on a click nobody makes. A child inherits this process's error mode, so set it before ANY child,
+# version probe or MCP enumeration below starts. It sits AFTER the HUB-VM gate above because a refused prompt starts nothing, and on Windows PowerShell
+# 5.1 this block's Add-Type can start csc.exe. Same flag set as tools/testing/run-windows-test.ps1: SEM_FAILCRITICALERRORS 0x0001 |
+# SEM_NOGPFAULTERRORBOX 0x0002 | SEM_NOOPENFILEERRORBOX 0x8000. 0x0002 stays: the crash box is the thing that hangs a headless lane, and the lane still
+# sees the crash as the child's exit code (e.g. 0xC0000005). 0x0002 also suppresses Windows Error Reporting, not only the box, so a crash under a lane
+# leaves no WER report and no LocalDumps dump. OR-ed onto the current mode, never a replacement. Fail open with a warning. The platform check sits beside
+# $env:OS because a process started with a scrubbed environment has no OS variable, and it would skip this block without a warning.
+# test_coordination_guardrails.py extracts this block between the two markers and runs it, and pins gate, then block, then first launch.
+# LANE-CHILD-ERROR-MODE-BEGIN
+if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq 'Win32NT') {
+    try {
+        if (-not ('LaneChildErrorMode' -as [type])) {
+            Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class LaneChildErrorMode { [DllImport("kernel32.dll")] public static extern uint GetErrorMode(); [DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint uMode); }'
+        }
+        [void][LaneChildErrorMode]::SetErrorMode([LaneChildErrorMode]::GetErrorMode() -bor 0x8003)
+    }
+    catch { Write-Warning "LANE_CHILD_ERROR_MODE_NOT_SET: $($_.Exception.Message) -- a child that cannot load a DLL may raise a dialog on the desktop" }
+}
+# LANE-CHILD-ERROR-MODE-END
 
 # ---------------------------------------------------------------- lane table
 # Engine, model and effort per lane. This table IS the topology; there is no
@@ -221,6 +247,10 @@ $LANES = @{
     # guardrail test pins it). It is a machine-readable label, NOT current routing authority; the
     # posture is the comment block above (optional diversity seat; design/arbiter duties -> sol).
     astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }
+    # VISUAL-JUDGE-TERRA-LANE-1 (owner directive 2026-10-31): terra is the visual-judge seat -- it reads image
+    # strips (-ImagePaths) and answers a JSON verdict. Read-only like every codex row (codex-lane-never-edits),
+    # high effort, tier resolved at launch to the highest listed gpt-<ver>-terra slug.
+    terra  = @{ engine = 'codex';  tier = 'terra';   effort = 'high'; role = 'visual-judge' }
 }
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
@@ -378,15 +408,15 @@ $CODEX_MCP_DISABLED_FEATURES = @('plugins', 'apps')
 $CODEX_MCP_LIST_STREAM_CAP_CHARS = 1048576
 function Get-CodexMcpDisableArgs {
     param(
-        [Parameter(Mandatory = $true)][string]$CodexExe,
+        # r12 (ADVISORY A3 on c4f381a7, CI run 41644166247): the RESOLVED launch (Resolve-CodexShimLaunch), never the raw shim, so an
+        # unsupported shim is refused before this probe and the probe never runs the shim through cmd.exe.
+        [Parameter(Mandatory = $true)]$CodexLaunch,
         [Parameter(Mandatory = $true)][string]$WorkDir,
         [Parameter(Mandatory = $true)][int]$TimeoutMs
     )
     $featureArgs = @()
     foreach ($f in $CODEX_MCP_DISABLED_FEATURES) { $featureArgs += @('-c', "features.$f=false") }
     $listPsi = [System.Diagnostics.ProcessStartInfo]::new()
-    $listPsi.FileName = $CodexExe
-    foreach ($a in @('mcp', 'list', '--json', '-c', 'features.plugins=false')) { [void]$listPsi.ArgumentList.Add($a) }
     $listPsi.WorkingDirectory = $WorkDir
     $listPsi.UseShellExecute = $false
     $listPsi.CreateNoWindow = $true
@@ -401,6 +431,8 @@ function Get-CodexMcpDisableArgs {
         # `.Result`, and each stream is capped as it arrives; overflow refuses, never truncates.
         $probeBudgetMs = [math]::Max(1, $TimeoutMs)
         $probeSw = [System.Diagnostics.Stopwatch]::StartNew()
+        Set-CodexLaunchStartInfo -Psi $listPsi -Launch $CodexLaunch -Argv @('mcp', 'list', '--json', '-c', 'features.plugins=false')
+        if ($probeSw.ElapsedMilliseconds -ge $probeBudgetMs) { throw [TimeoutException]::new('launch-budget-exhausted') }
         $listProc = [System.Diagnostics.Process]::Start($listPsi)
         $listProc.StandardInput.Close()
         $pipes = @(
@@ -441,7 +473,8 @@ function Get-CodexMcpDisableArgs {
         $listText = $pipes[0].Text.ToString()
         $listErrText = $pipes[1].Text.ToString()
     } catch {
-        if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*') { throw }
+        if ($_.Exception -is [TimeoutException]) { throw }
+        if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*' -or $_.Exception.Message -like 'codex-shim-*' -or $_.Exception.Message -like 'codex-args-too-long:*') { throw }
         throw "codex-mcp-list-unreadable: could not run 'codex mcp list --json': $($_.Exception.Message)"
     }
     if ($listExit -ne 0) {
@@ -498,21 +531,29 @@ function Get-CodexCliVersion {
         [Parameter(Mandatory = $true)][string]$CodexExe,
         [int]$TimeoutMs = 15000
     )
+    $outerShimDeadline = $script:CodexShimDeadline
     try {
         if (-not (Test-Path -LiteralPath $CodexExe -PathType Leaf)) { return $null }
         $vPsi = [System.Diagnostics.ProcessStartInfo]::new()
-        $vPsi.FileName = $CodexExe
-        [void]$vPsi.ArgumentList.Add('--version')
+        # r12 (ADVISORY A3 on c4f381a7): the probe runs the RESOLVED launch, so an unsupported shim is never run (it answers $null here and
+        # the lane refuses it, typed, at its own resolution); the shim is re-hashed immediately before this Process.Start.
+        # r12 fix iteration 1 (adversary A2 on 2d55c467): the shim reads count against the same $TimeoutMs as the process wait.
+        $vSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $script:CodexShimDeadline = Get-CodexShimDeadline -Ms $TimeoutMs
+        $vLaunch = Resolve-CodexShimLaunch -Exe $CodexExe
         $vPsi.UseShellExecute = $false
         $vPsi.CreateNoWindow = $true
         $vPsi.RedirectStandardInput = $true
         $vPsi.RedirectStandardOutput = $true
         $vPsi.RedirectStandardError = $true
+        Set-CodexLaunchStartInfo -Psi $vPsi -Launch $vLaunch -Argv @('--version')
+        $vLeftMs = [int]($TimeoutMs - $vSw.ElapsedMilliseconds)
+        if ($vLeftMs -le 0) { return $null }
         $vProc = [System.Diagnostics.Process]::Start($vPsi)
         $vProc.StandardInput.Close()
         $vOut = $vProc.StandardOutput.ReadToEndAsync()
         $vErr = $vProc.StandardError.ReadToEndAsync()
-        if (-not $vProc.WaitForExit($TimeoutMs)) {
+        if (-not $vProc.WaitForExit($vLeftMs)) {
             try { $vProc.Kill($true) } catch { }
             return $null
         }
@@ -522,6 +563,10 @@ function Get-CodexCliVersion {
         return $null
     } catch {
         return $null
+    } finally {
+        # r14 (Dot B4): the narrowing lasts as long as this probe. Left in place, the lane's own deadline (Get-CodexShimDeadline keeps the earlier of the two) inherited this
+        # probe's budget, and a later shim read inside a much longer lane budget ended in launch-budget-exhausted.
+        $script:CodexShimDeadline = $outerShimDeadline
     }
 }
 
@@ -886,13 +931,16 @@ function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
 }
 
 # Windows job ownership is established around an inert PowerShell host before that
-# host receives any provider configuration. Descendants then inherit kill-on-close. This is the Claude-engine path only: a Codex lane is started
-# without a job object, so nothing here contains its descendants.
+# host receives any provider configuration. Descendants then inherit kill-on-close. This is the Claude-engine path, and (r13, Dot B2) the path of a
+# Codex lane that carries -ImagePaths, because its image holds are released by job membership. A Codex lane with no image is still started without a job.
 if (-not ('MlvLaneJob' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 public static class MlvLaneJob {
   [StructLayout(LayoutKind.Sequential)] struct IO_COUNTERS { public UInt64 a,b,c,d,e,f; }
   [StructLayout(LayoutKind.Sequential)] struct BASIC_LIMIT {
@@ -935,6 +983,121 @@ public static class MlvLaneJob {
     if(!AssignProcessToJobObject(job,process))
       throw new Win32Exception(Marshal.GetLastWin32Error(),"AssignProcessToJobObject");
   }
+  // r13 (Dot B2): a tree kill that does not depend on the direct process being alive, and the job's own count of live members.
+  [StructLayout(LayoutKind.Sequential)] struct BASIC_ACCOUNTING {
+    public Int64 TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+    public UInt32 TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out BASIC_ACCOUNTING info, uint length, IntPtr returned);
+  public static void TerminateOrThrow(IntPtr job) {
+    if(!TerminateJobObject(job,1)) throw new Win32Exception(Marshal.GetLastWin32Error(),"TerminateJobObject");
+  }
+  public static bool WaitJobEmpty(IntPtr job, int timeoutMs) {
+    Stopwatch clock=Stopwatch.StartNew();
+    while(true) {
+      BASIC_ACCOUNTING info;
+      if(!QueryInformationJobObject(job,1,out info,(uint)Marshal.SizeOf(typeof(BASIC_ACCOUNTING)),IntPtr.Zero))
+        throw new Win32Exception(Marshal.GetLastWin32Error(),"QueryInformationJobObject");
+      if(info.ActiveProcesses==0) return true;
+      if(clock.ElapsedMilliseconds>=timeoutMs) return false;
+      Thread.Sleep(25);
+    }
+  }
+  // r13 (Dot B2): an image hold whose readers are not known gone stays open until the lane PROCESS exits. Rooted here so that neither the end of a
+  // caller's scope nor a finalizer can close it earlier.
+  static readonly List<object> keptToProcessExit=new List<object>();
+  public static void KeepToProcessExit(object item) { lock(keptToProcessExit) { keptToProcessExit.Add(item); } }
+  // r14 (Dot B3): the descendants of a live process with no job, each already holding a handle, so a wait after the kill reads these exact processes and not a reused pid.
+  // A descendant whose parent has already exited has no path from the root, so it is not found. Throws when the snapshot, or a descendant it found, cannot be read.
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct PROCESSENTRY32 {
+    public UInt32 dwSize, cntUsage, th32ProcessID;
+    public IntPtr th32DefaultHeapID;
+    public UInt32 th32ModuleID, cntThreads, th32ParentProcessID;
+    public Int32 pcPriClassBase;
+    public UInt32 dwFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=260)] public string szExeFile;
+  }
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern IntPtr CreateToolhelp32Snapshot(UInt32 flags, UInt32 processId);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool Process32FirstW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern bool Process32NextW(IntPtr snapshot, ref PROCESSENTRY32 entry);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetProcessTimes(IntPtr process, out Int64 creation, out Int64 exit, out Int64 kernel, out Int64 user);
+  // r14 fix iteration 1 (adversary A1 on 1d4adafb): creation FILETIMEs, which are UTC. Process.StartTime is local time and runs backward when daylight time ends, so a real child read as older than its parent.
+  static Int64 CreatedFileTime(Process p) {
+    Int64 creation,exit,kernel,user;
+    if(!GetProcessTimes(p.Handle,out creation,out exit,out kernel,out user)) throw new Win32Exception(Marshal.GetLastWin32Error(),"GetProcessTimes");
+    return creation;
+  }
+  public static bool StartedBeforeParent(Int64 kidCreated, Int64 parentCreated) { return kidCreated<parentCreated; }
+  // r15 (Dot B5 = adversary A1 on 05e95288): the snapshot only names pids, and a pid can change hands before it is opened. The parent is read from the handle this object keeps,
+  // the same one a later Kill or wait uses, so what was checked is what gets killed.
+  [StructLayout(LayoutKind.Sequential)] struct PROCESS_BASIC_INFORMATION {
+    public IntPtr ExitStatus, PebBaseAddress, AffinityMask, BasePriority, UniqueProcessId, InheritedFromUniqueProcessId;
+  }
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out PROCESS_BASIC_INFORMATION info, int length, out int returned);
+  static int ParentPidOf(Process p) {
+    PROCESS_BASIC_INFORMATION info; int returned;
+    int status=NtQueryInformationProcess(p.Handle,0,out info,Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)),out returned);
+    if(status<0) throw new Win32Exception(status,"NtQueryInformationProcess");
+    return (int)info.InheritedFromUniqueProcessId.ToInt64();
+  }
+  // r15 (Dot B5; adversary A2 = Dot B6): Members are the processes shown to be in the tree. Uncertain says why 'killed' would claim too much; the first reason found stands.
+  //   ancestry-unreadable: a candidate, or a parent, could not be read.
+  //   older-than-parent: the parent matches and the child reads older. A backward clock step and a reused parent pid look the same, so it is neither killed nor called gone.
+  //   descendant-unreachable: the snapshot saw a process under a pid whose holder has since gone, so that process cannot be shown to be in the tree, or to be gone.
+  public sealed class DescendantWalk {
+    public readonly List<Process> Members=new List<Process>();
+    public string Uncertain;
+    internal void Note(string why) { if(Uncertain==null) Uncertain=why; }
+    internal void NoteIfAnyBelow(Dictionary<int,List<int>> kids, int id) { if(kids.ContainsKey(id)) Note("descendant-unreachable"); }
+  }
+  public static DescendantWalk SnapshotDescendants(Process root) {
+    Dictionary<int,List<int>> kids=new Dictionary<int,List<int>>();
+    IntPtr snap=CreateToolhelp32Snapshot(2,0);
+    if(snap==new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error(),"CreateToolhelp32Snapshot");
+    try {
+      PROCESSENTRY32 e=new PROCESSENTRY32(); e.dwSize=(UInt32)Marshal.SizeOf(typeof(PROCESSENTRY32));
+      if(!Process32FirstW(snap,ref e)) throw new Win32Exception(Marshal.GetLastWin32Error(),"Process32First");
+      do {
+        int parent=(int)e.th32ParentProcessID;
+        if(!kids.ContainsKey(parent)) kids[parent]=new List<int>();
+        kids[parent].Add((int)e.th32ProcessID);
+      } while(Process32NextW(snap,ref e));
+    } finally { CloseHandle(snap); }
+    DescendantWalk seen=new DescendantWalk();
+    Queue<Process> walk=new Queue<Process>(); walk.Enqueue(root);
+    while(walk.Count>0) {
+      Process parent=walk.Dequeue();
+      if(!kids.ContainsKey(parent.Id)) continue;
+      Int64 parentCreated;
+      try { parentCreated=CreatedFileTime(parent); } catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
+      foreach(int id in kids[parent.Id]) {
+        Process kid;
+        try { kid=Process.GetProcessById(id); }
+        catch(ArgumentException) { seen.NoteIfAnyBelow(kids,id); continue; }   // exited since the snapshot
+        catch(Win32Exception) { seen.Note("ancestry-unreadable"); continue; }
+        int parentPid; Int64 created;
+        try {
+          // The first read opens the handle, which this object then keeps, so both reads and any later Kill or wait are about one process.
+          parentPid=ParentPidOf(kid);
+          created=CreatedFileTime(kid);
+        }
+        catch(InvalidOperationException) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // exited since the snapshot
+        catch(Win32Exception) { seen.Note("ancestry-unreadable"); kid.Dispose(); continue; }
+        if(parentPid!=parent.Id) { seen.NoteIfAnyBelow(kids,id); kid.Dispose(); continue; }   // the pid changed hands: this process was never in the tree
+        if(StartedBeforeParent(created,parentCreated)) { seen.Note("older-than-parent"); kid.Dispose(); continue; }
+        seen.Members.Add(kid); walk.Enqueue(kid);
+      }
+    }
+    return seen;
+  }
 }
 '@
 }
@@ -954,6 +1117,13 @@ try {
 } catch { }
 
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)
+# (a0) r7 (sol B3 / ADV-A3): every native wait on the lane budget (WaitForExit, both image-read CancelAfter) takes Int32 milliseconds. A
+# budget above Int32.MaxValue ms was clamped to ONE capped wait whose expiry was booked as timedOut/124 with budget unspent. Instead of
+# looping each wait, the accepted budget is capped where every remaining-ms value derives from it: 2147483 s * 1000 <= 2147483647 ms.
+$MAX_TIMEOUT_SEC = 2147483
+if ($TimeoutSec -gt $MAX_TIMEOUT_SEC) {
+    throw "timeout-sec-too-large: -TimeoutSec $TimeoutSec exceeds $MAX_TIMEOUT_SEC (about 24.8 days, the largest budget a native Int32-millisecond wait can hold in one call)"
+}
 # (a) A codex lane can never be granted write access: no Claude hook is visible to codex exec,
 # so nothing here could enforce NA-1..NA-10 against it. Keyed on ENGINE, not an enumerated list
 # of lane names -- a new codex row (e.g. astra) refuses edits by construction, with nothing left
@@ -961,6 +1131,830 @@ try {
 if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
     throw "codex-lane-never-edits: -Lane $Lane with -AllowEdits (no Claude hook is visible to codex exec)"
 }
+# (a2) VISUAL-JUDGE-TERRA-LANE-1: -ImagePaths is a codex-engine feature (`codex exec -i <FILE>`); the claude
+# argv has no image flag, so a claude lane given one would silently judge nothing. Fail closed, typed, before any
+# run dir or receipt exists. Every path must exist as a FileSystem file, be a .png or .jpg and carry no ',' (codex
+# 0.160.1 splits an `-i` value on commas, so `strip,one.png` would attach two other files: adversary A1). The path is
+# the NATIVE one (.ProviderPath: `Provider::C:/dir/x.png` would pass Test-Path but not File.Exists: A3). Hashing is NOT done
+# here: the launch copies each image into the run dir and hashes THAT copy, so the receipt names the exact bytes the
+# lane was handed even if the source is replaced after validation (A2). Keyed on ENGINE, not lane name.
+$ImageAttachments = @()
+# r4 B2: one held read handle per snapshot, kept open from the copy until the codex child has exited (never serialised into the receipt).
+$ImageHolds = [System.Collections.Generic.List[object]]::new()
+# r13 (Dot B2 on 01fa433d): what the receipt says about releasing those holds: 'released', or 'uncertain:<kill-failed|wait-timeout|tree-unreadable>'.
+$imageHoldRelease = $null
+# The inert host of a codex lane with images (see the launch below); $null on every other lane.
+$codexImageHost = $null
+$IMAGE_READER_KILL_WAIT_MS = 15000
+# r13 (Dot B2): the readers of a snapshot are the members of the lane's job, not the direct process: a descendant that was handed the path can outlive
+# its parent. The tree kill runs whether or not the direct process has exited, and only the job reporting no live member answers 'released'. Never throws.
+function Stop-CodexImageReaderTree {
+    param([IntPtr]$Job)
+    if ($Job -eq [IntPtr]::Zero) { return 'uncertain:tree-unreadable' }
+    try { [MlvLaneJob]::TerminateOrThrow($Job) } catch { return 'uncertain:kill-failed' }
+    try {
+        if (-not ([MlvLaneJob]::WaitJobEmpty($Job, $IMAGE_READER_KILL_WAIT_MS))) { return 'uncertain:wait-timeout' }
+    } catch { return 'uncertain:tree-unreadable' }
+    return 'released'
+}
+# Closes the holds on 'released'; on any uncertain outcome they stay open until this process exits, so a reader still alive keeps seeing the held bytes.
+function Complete-CodexImageHolds {
+    param([Parameter(Mandatory = $true)][string]$Outcome)
+    foreach ($hold in $ImageHolds) {
+        if ($Outcome -eq 'released') { try { $hold.Dispose() } catch { } } else { [MlvLaneJob]::KeepToProcessExit($hold) }
+    }
+    $ImageHolds.Clear()
+}
+# r14 (Dot B3 on afdc228b): a Codex lane with no image has no job, so when its launch path throws only this can stop the child, and only the child's own tree can be reached.
+# The answer is what was observed, never what was attempted: 'killed' = the child and every descendant seen before the kill were each seen to exit within the bound.
+# 'uncertain:<already-exited|kill-failed|wait-timeout|tree-unreadable|ancestry-unreadable|older-than-parent|descendant-unreachable>' = they are not known to be gone. A child that has already
+# exited leaves its descendants out of reach, so that is uncertainty and not a clean stop. A descendant whose parent had already exited is not seen, so 'killed' makes no claim about it.
+# r15 (Dot B5): only a process the walk showed to be in the tree is killed here; the root's Kill($true) is the runtime's own walk. Never throws.
+$codexDirectChildStop = $null
+$CODEX_DIRECT_KILL_WAIT_MS = 15000
+function Stop-CodexDirectChildTree {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Proc, [Parameter(Mandatory = $true)][double]$LimitMs)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    try { if ($Proc.HasExited) { return 'uncertain:already-exited' } } catch { return 'uncertain:tree-unreadable' }
+    # Before the kill: afterwards the parents are gone and the tree cannot be walked. A snapshot that fails still leaves the kill to do.
+    $treeWalk = $null
+    try { $treeWalk = [MlvLaneJob]::SnapshotDescendants($Proc) } catch { $treeWalk = $null }
+    try { $Proc.Kill($true) } catch { return 'uncertain:kill-failed' }
+    if ($null -eq $treeWalk) { return 'uncertain:tree-unreadable' }
+    $members = @($treeWalk.Members)
+    # r14 fix iteration 1 (adversary A1 on 1d4adafb): Kill($true) walks the tree with local start times, so across the end of daylight time it can miss a real descendant. Everything the walk showed to be in the tree is killed here too.
+    foreach ($member in $members) {
+        try { if (-not $member.HasExited) { $member.Kill() } } catch { return 'uncertain:kill-failed' }
+    }
+    foreach ($member in (@($Proc) + $members)) {
+        $leftMs = [int][math]::Max(0.0, [math]::Floor($LimitMs - $clock.Elapsed.TotalMilliseconds))
+        try { if (-not ($member.WaitForExit($leftMs))) { return 'uncertain:wait-timeout' } } catch { return 'uncertain:tree-unreadable' }
+    }
+    if ($treeWalk.Uncertain) { return "uncertain:$($treeWalk.Uncertain)" }
+    return 'killed'
+}
+# `pwsh -File` cannot bind an array: it hands over ONE string, and a second path would bind positionally to
+# -PromptFile. '|' is not a legal Windows file-name character, so it is an unambiguous separator inside a
+# single -ImagePaths value (`-ImagePaths 'a.png|b.png'`); a real array from `&`/dot-calls works unchanged.
+# r2 adversary A1: an empty or blank element is NOT silently dropped. Dropping it let `-ImagePaths ' '` / `'||'` reach a claude
+# lane (or a codex lane) as "no images", bypassing the engine refusal and judging nothing. Any supplied element must be a path.
+$ImagePathsGiven = @($ImagePaths | ForEach-Object { [string]$_ -split '\|' })
+if ($ImagePathsGiven.Count -gt 0) {
+    if ($LANES[$Lane].engine -ne 'codex') {
+        throw "image-paths-codex-only: -Lane $Lane is a $($LANES[$Lane].engine)-engine lane; -ImagePaths is accepted only by codex-engine lanes"
+    }
+    foreach ($imagePath in $ImagePathsGiven) {
+        if ([string]::IsNullOrWhiteSpace($imagePath)) {
+            throw "image-path-empty: -ImagePaths carries an empty entry (a stray '|' or a blank value); every entry must be a file path"
+        }
+        if (-not (Test-Path -LiteralPath $imagePath -PathType Leaf)) {
+            throw "image-path-missing: -ImagePaths entry is not an existing file: $imagePath"
+        }
+        $imageResolved = Resolve-Path -LiteralPath $imagePath
+        if ($imageResolved.Provider.Name -ne 'FileSystem') {
+            throw "image-path-missing: -ImagePaths entry is not on the FileSystem provider ($($imageResolved.Provider.Name)): $imagePath"
+        }
+        $imageFull = $imageResolved.ProviderPath
+        $imageExt = [System.IO.Path]::GetExtension($imageFull).ToLowerInvariant()
+        if ($imageExt -ne '.png' -and $imageExt -ne '.jpg') {
+            throw "image-path-bad-extension: -ImagePaths accepts only .png or .jpg (got '$imageExt'): $imageFull"
+        }
+        if ($imageFull.Contains(',')) {
+            throw "image-path-bad-character: -ImagePaths entry contains ',' (codex splits an -i value on commas); copy the file to a name without one: $imageFull"
+        }
+        $ImageAttachments += [ordered]@{ source = $imageFull; path = $null; sha256 = $null; bytes = $null; ext = $imageExt; consumedVerified = $null }
+    }
+}
+# BEGIN Copy-ImageSnapshot (VISUAL-JUDGE-TERRA-LANE-1 r2, adversary A2 + A3)
+# Copies Source to Dest in 256 KiB chunks, hashing the very bytes it writes (one read, so sha256/bytes cannot drift from the copy), and
+# checks Clock against LimitMs between chunks so a slow share spends the lane's -TimeoutSec budget instead of an unbounded wall (A3).
+# Plain .NET streams only: Get-Item without -Force throws on a Hidden snapshot (A2). A failed copy deletes ONLY the partial file this
+# call created (pass-2b A1: a Dest that already existed, e.g. the caller's own file, is never touched). The source is read through an
+# overlapped FileStream and every read carries a CancellationToken that fires at the deadline, so a read that never returns is cut at
+# the lane budget instead of holding the lane (pass-2b A2). The deadline is raised as a TimeoutException, the type the lane books as
+# timedOut=true / exit 124 (launch-budget-exhausted uses the same one; pass-2b A3).
+# r4 B1 (sol): the destination is opened with FileOptions.DeleteOnClose and share None, so a failed copy is cleaned up BY THE HANDLE
+# this call owns -- never by path after the handle is gone (a path delete could remove a file someone moved into the name in that
+# window). The delete-on-close flag is cleared through the handle (FileDispositionInfoEx, ON_CLOSE without DELETE) only once the copy is
+# complete. r4 B2 (sol): the success result carries a HELD read handle on the snapshot (FileShare.Read: no writer, no delete, so a write
+# through any hard link fails) that the caller keeps open until the codex child has exited, then re-hashes (Get-ImageHoldDigest).
+# The held handle is opened after the writer closes and its digest is compared with the copy's, so a write that slipped into that gap is
+# a typed `image-snapshot-mutated` failure, not a silent pass.
+# r3 scope statement: only the source READ is cancellable. The source open, the destination open/write and the flush are synchronous, so
+# this is NOT a universal hard-I/O deadline.
+# r3 G2: every other I/O failure is typed with the `image-path-` prefix the validation refusals use, so a failed receipt greps the same:
+#   image-path-missing: source vanished before snapshot (<source>)    the source was deleted between validation and launch
+#   image-path-unreadable: <reason> (<source>)                        the source is locked / unreadable / a read failed
+#   image-path-snapshot-collision: ... (<source>)                    the destination path IS the source file (refused before any open)
+#   image-path-snapshot-exists: ... (<dest>)                          the destination already existed (left untouched, never deleted)
+#   image-snapshot-mutated: ... (<dest>)                             the held snapshot's bytes differ from the digest taken at copy time
+#   image-path-snapshot-failed: <reason> (<dest>)                     destination write / flush / close failed
+#   image-path-snapshot-unreadable: <reason> (<dest>)                 r5: the held snapshot could not be read back (an I/O error, not a mismatch)
+#   image-path-reparse-ancestor: ... (<path>)                         r5: the resolved snapshot path has a reparse point in its ancestry
+#   image-digest-timeout: ...                                         r5: a digest read ran past the lane budget (TimeoutException -> timeout/124)
+#   image-path-noncanonical: ...                                      r7: the resolved path, once \\?\ is removed, would open a different object
+#   image-path-bad-character: ... a cmd.exe metacharacter ...        r7 (sol B1) / r8 (ADV-A1): cmd.exe (the codex .cmd shim) would rewrite the -i argument
+#   image-args-too-long: ...                                          r8 (ADV-A2): the codex command line would exceed what cmd.exe accepts
+# r7 (sol B1): ProcessStartInfo quotes an argument only when it has a space or a quote, and the codex launcher is a .cmd shim that forwards
+# %*, so cmd.exe expands %VAR%, drops '^' and splits at '&' in the attached path. Measured on this host: C:\x\%OS%\f.png reached the child
+# as C:\x\Windows_NT\f.png and C:\x\a^b\f.png as C:\x\ab\f.png. The held snapshot would verify while codex read another file: refuse.
+# r8 (ADV-A1): the refused set is the CLASS cmd.exe can rewrite in an argument the shim forwards via %*, not a list of observed cases:
+#   %        expanded in the command-line and batch phases, quoted or not
+#   !        expanded (or, unpaired, deleted) by delayed expansion, quoted or not. Delayed expansion is on for every batch the host runs when
+#            HKCU or HKLM 'Software\Microsoft\Command Processor\DelayedExpansion' is 1 (no /V:ON is needed), or when the shim turns it on.
+#            Measured: C:\x\!OS!\f.png -> C:\x\Windows_NT\f.png under /V:ON, and unchanged with it off. So '!' is refused exactly when
+#            Test-CmdDelayedExpansion says delayed expansion can be on for the codex shim (-RefuseBang), NOT unconditionally: the default
+#            -RunDir is under C:\!Layi Wkspc\MLV-App, and an unconditional refusal made every default image launch refuse its own snapshot
+#            (r8 iteration-2 adversary A1 on 0f0450d7).
+#   ^ & | < > the escape and the command separators / redirections of an unquoted argument
+#   ( )      block delimiters; measured unchanged through today's npm shim, refused because a shim that forwards %* inside a block splits on ')'
+#   "        quote state: toggles whether every character after it is special
+# '|', '<', '>' and '"' cannot occur in a Windows file name, so for them this is defence in depth. Every other file-name-legal character
+# (space # $ ' + , - . ; = @ [ ] _ ` { } ~) was measured to reach the child unchanged; ',' is refused separately (codex splits on it).
+# r12 (Dot item 4 on c4f381a7): since r11 the codex launch is a direct CreateProcess, never cmd.exe, so the launch path no longer applies this
+# pattern or the '!' rule (Copy-ImageSnapshot -RefuseCmdMeta/-RefuseBang $false); both stay here, fail closed by default, for a cmd.exe transport.
+$IMAGE_CMD_META_PATTERN = '[%^&|<>()"]'
+$IMAGE_CMD_META_TEXT = "a cmd.exe metacharacter (% ^ & | < > ( ) or a double quote; codex is launched through a .cmd shim, and cmd.exe rewrites them -- choose a run dir without them)"
+$IMAGE_CMD_BANG_TEXT = "'!' while cmd.exe delayed expansion can be on for the codex shim (Command Processor\DelayedExpansion, or the shim enables it), which rewrites it -- choose a run dir without '!'"
+if (-not ('MlvImageSnap' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class MlvImageSnap {
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool SetFileInformationByHandle(SafeFileHandle h, int infoClass, ref uint info, uint size);
+  // FileDispositionInfoEx (21) with FILE_DISPOSITION_FLAG_ON_CLOSE (8) and no DELETE (1): cancels the delete-on-close the handle was opened with.
+  public static void KeepOnClose(SafeFileHandle h) {
+    uint flags = 8;
+    if (!SetFileInformationByHandle(h, 21, ref flags, 4)) throw new Win32Exception(Marshal.GetLastWin32Error(), "SetFileInformationByHandle(FileDispositionInfoEx)");
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  static extern uint GetFinalPathNameByHandleW(SafeFileHandle h, StringBuilder buf, uint len, uint flags);
+  // r5 B1 (sol A1): the path of the OBJECT the handle holds, with every junction/symlink in the chain already resolved (VOLUME_NAME_DOS),
+  // minus the long-path prefix so codex gets an ordinary path (the UNC form becomes \\server\share\...).
+  public static string FinalPath(SafeFileHandle h) {
+    var sb = new StringBuilder(1024);
+    uint n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0);
+    if (n >= sb.Capacity) { sb = new StringBuilder((int)n + 1); n = GetFinalPathNameByHandleW(h, sb, (uint)sb.Capacity, 0); }
+    if (n == 0) throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFinalPathNameByHandle");
+    return StripVerbatim(sb.ToString());
+  }
+  // r7 (opus B1 = sol B2, ADV-A1): removing the \\?\ prefix hands the path back to Win32 normalization, which drops a trailing '.' from a
+  // segment. A held object in a native directory `judge.` would then be named by a string that opens the ordinary sibling `judge`. So the
+  // stripped string must already be canonical (GetFullPath returns it unchanged, ordinal); otherwise it names some other object: refuse.
+  public static string StripVerbatim(string p) {
+    string r = p;
+    if (p.StartsWith("\\\\?\\UNC\\", StringComparison.Ordinal)) r = "\\\\" + p.Substring(8);
+    else if (p.StartsWith("\\\\?\\", StringComparison.Ordinal)) r = p.Substring(4);
+    string full = System.IO.Path.GetFullPath(r);
+    if (!string.Equals(full, r, StringComparison.Ordinal)) {
+      throw new System.IO.IOException("image-path-noncanonical: the held image snapshot's resolved path '" + p + "' is not canonical once its \\\\?\\ prefix is removed (Win32 would open '" + full + "'), so codex could read a different file");
+    }
+    return r;
+  }
+}
+'@
+}
+# Re-reads a held snapshot from the start through the handle itself and returns its digest.
+# r5 H1 (sol/ADV-A2): every read is cancellable and checked against Clock/LimitMs (the hold is opened FileOptions.Asynchronous), so a
+# stalled share ends as a TimeoutException (`image-digest-timeout`) instead of holding the lane. Any other failure propagates as the raw I/O error.
+function Get-ImageHoldDigest {
+    param([System.IO.FileStream]$Hold, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs)
+    $h = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $null = $Hold.Seek(0, [System.IO.SeekOrigin]::Begin)
+        $b = New-Object byte[] 262144; $len = [long]0
+        while ($true) {
+            $remainingMs = $LimitMs - $Clock.Elapsed.TotalMilliseconds
+            if ($remainingMs -le 0) { throw [System.TimeoutException]::new("image-digest-timeout: re-reading the held image snapshot spent the lane's -TimeoutSec budget") }
+            $cts = [System.Threading.CancellationTokenSource]::new()
+            try {
+                $cts.CancelAfter([int][math]::Min(2147483647.0, [math]::Ceiling($remainingMs)))
+                $n = $Hold.ReadAsync($b, 0, $b.Length, $cts.Token).GetAwaiter().GetResult()
+            } catch {
+                if ($cts.IsCancellationRequested -or $Clock.Elapsed.TotalMilliseconds -ge $LimitMs -or $_.Exception.GetBaseException() -is [System.OperationCanceledException]) {
+                    throw [System.TimeoutException]::new("image-digest-timeout: a read of the held image snapshot did not return inside the lane's -TimeoutSec budget")
+                }
+                throw
+            } finally { $cts.Dispose() }
+            if ($n -le 0) { break }
+            [void]$h.TransformBlock($b, 0, $n, $null, 0); $len += $n
+            # hold-digest-read-tick
+        }
+        [void]$h.TransformFinalBlock($b, 0, 0)
+        return [pscustomobject]@{ sha256 = ([System.BitConverter]::ToString($h.Hash).Replace('-', '').ToLowerInvariant()); bytes = $len }
+    } finally { $h.Dispose() }
+}
+# r5 B1: the first ancestor directory of Path that is a reparse point (junction / symlink / mount point), or $null. The hold is opened
+# with a name that may pass through one; GetFinalPathNameByHandle resolves it, so a non-null answer for the RESOLVED path is anomalous.
+function Get-ImageReparseAncestor {
+    param([string]$Path)
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    while (-not [string]::IsNullOrEmpty($dir)) {
+        if (([System.IO.File]::GetAttributes($dir) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $dir }
+        $dir = [System.IO.Path]::GetDirectoryName($dir)
+    }
+    return $null
+}
+function Get-ImageIoException {
+    param([System.Management.Automation.ErrorRecord]$Err, [string]$Source, [string]$Dest, [string]$Side)
+    $base = $Err.Exception.GetBaseException()
+    if ($base -is [System.TimeoutException]) { return $base }
+    if ($Side -eq 'dest') {
+        if ($base -is [System.IO.IOException] -and [System.IO.File]::Exists($Dest) -and (($base.HResult -band 0xFFFF) -eq 80 -or ($base.HResult -band 0xFFFF) -eq 183)) {   # ERROR_FILE_EXISTS / ERROR_ALREADY_EXISTS, locale-independent
+            return [System.IO.IOException]::new("image-path-snapshot-exists: the image snapshot destination already exists and was left untouched ($Dest): $($base.Message)")
+        }
+        return [System.IO.IOException]::new("image-path-snapshot-failed: $($base.Message) ($Dest)")
+    }
+    if ($base -is [System.IO.FileNotFoundException] -or $base -is [System.IO.DirectoryNotFoundException]) {
+        return [System.IO.IOException]::new("image-path-missing: source vanished before snapshot ($Source)")
+    }
+    return [System.IO.IOException]::new("image-path-unreadable: $($base.Message) ($Source)")
+}
+function Copy-ImageSnapshot {
+    # -RefuseBang: refuse '!' in the resolved path (the launcher passes Test-CmdDelayedExpansion's answer; unset = refuse, fail closed).
+    # -RefuseCmdMeta (r12): refuse the cmd.exe metacharacters only when cmd.exe would forward the path; unset = refuse (fail closed). The
+    # codex launch is a direct CreateProcess and passes $false.
+    param([string]$Source, [string]$Dest, [System.Diagnostics.Stopwatch]$Clock, [double]$LimitMs, [bool]$RefuseBang = $true, [bool]$RefuseCmdMeta = $true)
+    if ([string]::Equals([System.IO.Path]::GetFullPath($Source), [System.IO.Path]::GetFullPath($Dest), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "image-path-snapshot-collision: the image snapshot path is the source file itself: $Source"
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $in = $null; $out = $null; $hold = $null; $total = [long]0; $ok = $false; $created = $false; $finalPath = $null
+    try {
+        try {
+            $in = [System.IO.FileStream]::new($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source') }
+        try {
+            $out = [System.IO.FileStream]::new($Dest, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::DeleteOnClose)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # $created turns true only AFTER CreateNew succeeded: a destination that already existed is never this call's to delete (Grok G3).
+        $created = $true
+        $buf = New-Object byte[] 262144
+        while ($true) {
+            $remainingMs = $LimitMs - $Clock.Elapsed.TotalMilliseconds
+            if ($remainingMs -le 0) { throw [System.TimeoutException]::new("image-copy-timeout: copying the image snapshot spent the lane's -TimeoutSec budget: $Source") }
+            $cts = [System.Threading.CancellationTokenSource]::new()
+            try {
+                $cts.CancelAfter([int][math]::Min(2147483647.0, [math]::Ceiling($remainingMs)))
+                $n = $in.ReadAsync($buf, 0, $buf.Length, $cts.Token).GetAwaiter().GetResult()
+            } catch {
+                if ($cts.IsCancellationRequested -or $Clock.Elapsed.TotalMilliseconds -ge $LimitMs -or $_.Exception.GetBaseException() -is [System.OperationCanceledException]) {
+                    throw [System.TimeoutException]::new("image-copy-timeout: a read of the image snapshot source did not return inside the lane's -TimeoutSec budget: $Source")
+                }
+                throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'source')
+            } finally { $cts.Dispose() }
+            if ($n -le 0) { break }
+            try { $out.Write($buf, 0, $n) } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+            [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+            $total += $n
+            # copy-loop-tick
+        }
+        [void]$sha.TransformFinalBlock($buf, 0, 0)
+        $copySha = ([System.BitConverter]::ToString($sha.Hash).Replace('-', '').ToLowerInvariant())
+        # Flush, cancel delete-on-close and close are part of the copy: a quota failure at close must fail the copy (typed), not escape
+        # from the finally below. Until KeepOnClose has run, closing the handle deletes the partial file BY HANDLE (r4 B1).
+        try { $out.Flush(); [MlvImageSnap]::KeepOnClose($out.SafeFileHandle); $out.Dispose() } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # r4 B2: hold the snapshot read-only (FileShare.Read: no writer, no delete) from here until the caller releases it, then prove the
+        # held bytes are the bytes that were hashed while copying. The file is no longer delete-on-close, so a mismatch is reported, not deleted.
+# writer-closed-pre-hold-tick
+        try {
+            $hold = [System.IO.FileStream]::new($Dest, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)
+        } catch { throw (Get-ImageIoException -Err $_ -Source $Source -Dest $Dest -Side 'dest') }
+        # r5 B2 (sol/ADV-A3): a digest I/O failure is a typed image-path error (never a raw exception), and a deadline is the lane's timeout.
+        try {
+            $held = Get-ImageHoldDigest -Hold $hold -Clock $Clock -LimitMs $LimitMs
+        } catch {
+            $hb = $_.Exception.GetBaseException()
+            if ($hb -is [System.TimeoutException]) { throw $hb }
+            throw [System.IO.IOException]::new("image-path-snapshot-unreadable: the held image snapshot could not be read back: $($hb.Message) ($Dest)")
+        }
+        if ($held.sha256 -ne $copySha -or $held.bytes -ne $total) {
+            throw [System.IO.IOException]::new("image-snapshot-mutated: the image snapshot changed between the copy and the hold (copied $copySha/$total bytes, held $($held.sha256)/$($held.bytes) bytes) ($Dest)")
+        }
+        # r5 B1 (sol A1): hand codex the path of the OBJECT this handle holds (junctions resolved), not the name the copy went through. A
+        # pathname that crosses a junction can be retargeted between the hold and codex's open; the resolved path cannot, because every
+        # directory in it is an ancestor of a file this handle keeps open (Windows refuses to rename or replace such a directory).
+        try {
+            $finalPath = [MlvImageSnap]::FinalPath($hold.SafeFileHandle)
+            $reparse = Get-ImageReparseAncestor -Path $finalPath
+        } catch {
+            $fb = $_.Exception.GetBaseException()
+            if ($fb.Message.StartsWith('image-path-noncanonical:', [System.StringComparison]::Ordinal)) { throw $fb }
+            throw [System.IO.IOException]::new("image-path-snapshot-failed: could not resolve the held image snapshot path: $($fb.Message) ($Dest)")
+        }
+        if ($null -ne $reparse) { throw [System.IO.IOException]::new("image-path-reparse-ancestor: the resolved image snapshot path has a reparse point in its ancestry ($reparse) ($finalPath)") }
+        if ($finalPath.Contains(',')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ',' (codex splits an -i value on commas): $finalPath") }
+        if ($RefuseCmdMeta -and $finalPath -match $IMAGE_CMD_META_PATTERN) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_META_TEXT}: $finalPath") }
+        if ($RefuseBang -and $finalPath.Contains('!')) { throw [System.IO.IOException]::new("image-path-bad-character: the resolved image snapshot path contains ${IMAGE_CMD_BANG_TEXT}: $finalPath") }
+        $ok = $true
+    } finally {
+        # Each handle is released on its own, so one Dispose that throws can neither replace the original error nor skip the other
+        # handle (pass-4 A3). There is NO delete by path here: a partial destination is removed by closing its delete-on-close handle (r4 B1).
+        if ($null -ne $out) { try { $out.Dispose() } catch { } }
+        if ($null -ne $in) { try { $in.Dispose() } catch { } }
+        if (-not $ok -and $null -ne $hold) { try { $hold.Dispose() } catch { } }
+    }
+    return [pscustomobject]@{ sha256 = $copySha; bytes = $total; Hold = $hold; Path = $finalPath }
+}
+# END Copy-ImageSnapshot
+# BEGIN Assert-CodexCommandLineFits (VISUAL-JUDGE-TERRA-LANE-1 r8, adversary ADV-A2)
+# Every accepted -ImagePaths entry adds one `-i <path>` pair, and a codex launch through a .cmd/.bat shim is bounded by cmd.exe's 8191-character
+# line, so enough images made cmd.exe answer "The command line is too long." and nothing ran. The length is computed EXACTLY as .NET builds it from
+# ProcessStartInfo.ArgumentList ("<FileName>" then each argument, quoted and backslash-escaped only when it is empty or carries whitespace or a quote:
+# PasteArguments.AppendArgument), and refused, typed, before the child is started. The shim's own expanded line (`... "%_prog%" "%dp0%\...\codex.js" %*`)
+# is longer than the line .NET hands it, so a reserve of (FileName length + 512) is kept: measured on this host, an npm-shaped shim whose path is
+# 101 characters launched an outer line of 7996 characters and failed at 7997 (195 characters of shim overhead; the reserve there is 613).
+# A native executable is held to CreateProcess's 32767-character limit instead.
+# r8 iteration 2 (adversary A1 on 7ba1883b): the computed length is the length BEFORE cmd.exe expands it. Through a shim, %NAME% in ANY argument
+# (-ModelOverride, -C, -o, an MCP name ...) is replaced by the variable's value, quoted or not, and with :~ / :a=b modifiers its length is not
+# knowable from the argument, so `-ModelOverride '%PAD%'` measured 332 characters before expansion and 8419 after: the guard accepted, cmd.exe refused.
+# Through a shim an argument carrying '%' is therefore refused (codex-arg-cmd-expansion), and so is one carrying '!' whenever delayed expansion
+# can be on (Test-CmdDelayedExpansion). '!' is NOT refused unconditionally here: every run dir under C:\!Layi Wkspc puts one in `-o`, and with
+# delayed expansion off cmd.exe passes it through unchanged (measured, probe-cmd-meta.txt). Every other cmd.exe rewrite only removes characters
+# ('^') or splits the line ('&', '|', '<', '>'), so it cannot make the line longer than counted.
+$CMD_LINE_LIMIT_SHIM = 8191
+$CMD_LINE_LIMIT_NATIVE = 32766
+$CMD_SHIM_RESERVE = 512
+function Get-NativeCommandLineLength {
+    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @())
+    $n = $Exe.Length + 2
+    foreach ($a in @($Argv)) {
+        $s = [string]$a
+        $n++
+        # .NET's ContainsNoWhitespaceOrQuotes is char.IsWhiteSpace or '"'; the .NET regex class \s is the same set.
+        if ($s.Length -gt 0 -and $s -notmatch '[\s"]') { $n += $s.Length; continue }
+        $n += 2
+        $i = 0
+        while ($i -lt $s.Length) {
+            $c = $s[$i]; $i++
+            if ($c -eq [char]'\') {
+                $bs = 1
+                while ($i -lt $s.Length -and $s[$i] -eq [char]'\') { $i++; $bs++ }
+                if ($i -eq $s.Length) { $n += 2 * $bs }
+                elseif ($s[$i] -eq [char]'"') { $n += 2 * $bs + 2; $i++ }
+                else { $n += $bs }
+                continue
+            }
+            if ($c -eq [char]'"') { $n += 2; continue }
+            $n++
+        }
+    }
+    return $n
+}
+function Get-CmdRegistryDelayedExpansion {
+    # r9 (sol B1): the EFFECTIVE registry setting, not "either hive". cmd.exe /? on this host:
+    #   "HKEY_LOCAL_MACHINE\Software\Microsoft\Command Processor\DelayedExpansion and/or
+    #    HKEY_CURRENT_USER\Software\Microsoft\Command Processor\DelayedExpansion to either 0x1 or 0x0. The user specific setting takes
+    #    precedence over the machine setting. The command line switches take precedence over the registry settings."
+    # So HKCU decides when it holds the value; HKLM decides only when HKCU does not. A missing key or value is "not set" (next hive); a value
+    # that is not an integer, or a read that fails for any other reason, is unknowable and counts as ON (fail closed).
+    foreach ($hive in 'HKCU:', 'HKLM:') {
+        try {
+            $props = Get-ItemProperty -LiteralPath "$hive\Software\Microsoft\Command Processor" -ErrorAction Stop
+        } catch {
+            if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) { continue }
+            return $true
+        }
+        $p = if ($null -ne $props) { $props.PSObject.Properties['DelayedExpansion'] } else { $null }
+        if ($null -eq $p) { continue }
+        $v = $p.Value
+        if ($v -is [int] -or $v -is [long] -or $v -is [uint32] -or $v -is [uint64]) { return ([int64]$v -ne 0) }
+        return $true
+    }
+    return $false
+}
+function Test-CmdShimTextEnablesDelayedExpansion {
+    # r9 (sol B2, fable hardening 2): match the shim the way cmd.exe parses it, not as raw text.
+    # - A physical line ending in an odd run of '^' continues onto the next one; the joined logical line is matched whole and is never
+    #   treated as a comment (measured: 'rem x ^' does not swallow a following 'setlocal enabledelayedexpansion').
+    # - Every '^' is removed before matching. cmd.exe removes the escaping carets outside quotes ('setlocal enable^delayedexpansion' and
+    #   'cmd /v:o^n' both turned expansion on, measured); removing ALL of them can only add matches, never lose one, because no pattern
+    #   below contains a caret.
+    # - A logical line whose first token is literally 'rem' or '::' is a comment and is skipped (measured: 'rem x & setlocal
+    #   enabledelayedexpansion' and ':: x & setlocal ...' leave expansion off). 'r^em' is not skipped (fail closed).
+    # - r9 fix iteration 1 (adversary A1 on 0da1f4ef): cmd.exe turns delayed expansion on for EVERY '/v' switch except one starting
+    #   '/v:off' (measured: /v /von /v1 /voff /v:of on; /v:off /V:OFF /v:offx off), so that is the only spelling read as off.
+    # - r9 fix iteration 1 (adversary A2 on 0da1f4ef): a static reading cannot see a command built at run time ('%L%local %E%expansion',
+    #   'setlocal %E%', a for variable, call, start, or a nested .cmd/.bat that may enable it before forwarding). Any such construct counts
+    #   as ON (fail closed). Only the forwarded positional references (%*, %0-%9, %~...) are static here.
+    # - The npm cmd-shim template (the real codex.cmd) uses %dp0% / %_prog% / %COMSPEC%, so it is recognised by its exact text instead
+    #   (Test-NpmShimForwardsToNativeNode) and is OFF only when the 'node' it runs is a native .exe/.com, never another batch file.
+    param([AllowEmptyString()][string]$Text, [string]$ShimDir = '', [string]$WorkingDirectory = '')
+    $npm = [regex]::Match(($Text -replace '\r\n', "`n"), $NPM_CMD_SHIM_PATTERN)
+    if ($npm.Success) { return (-not (Test-NpmShimForwardsToNativeNode -ShimDir $ShimDir -WorkingDirectory $WorkingDirectory)) }
+    $logical = [System.Collections.Generic.List[object]]::new()
+    $buf = $null; $joined = $false; $sawNative = $false
+    foreach ($phys in ($Text -split '\r?\n')) {
+        $tail = [regex]::Match($phys, '\^+$')
+        $continues = $tail.Success -and ($tail.Length % 2 -eq 1)
+        if ($continues) { $phys = $phys.Substring(0, $phys.Length - 1) }
+        if ($null -eq $buf) { $buf = $phys } else { $buf += $phys; $joined = $true }
+        if ($continues) { $joined = $true; continue }
+        $logical.Add(@($buf, $joined)); $buf = $null; $joined = $false
+    }
+    if ($null -ne $buf) { $logical.Add(@($buf, $true)) }
+    foreach ($entry in $logical) {
+        $raw = [string]$entry[0]
+        if (-not [bool]$entry[1] -and $raw -match '^[\s@;,=]*(?i:rem(\s|$)|::)') { continue }
+        $t = $raw.Replace('^', '')
+        if ($t -match '(?i)enabledelayedexpansion') { return $true }
+        if ($t -match '(?i)/v(?!:off)') { return $true }
+        # dynamic text: a percent reference other than %*, %0-%9 and %~... (this includes %NAME%, %NAME:x=y% and a %%x for variable)
+        if ($t -match '%[^%*~0-9\s]') { return $true }
+        if ($t -match '(?i)\.(cmd|bat)(?![a-z0-9_])') { return $true }
+        # keywords outside quoted spans (a quoted internal command is not recognised by cmd.exe, measured with '"setlocal"')
+        $u = [regex]::Replace($t, '"[^"]*("|$)', '""')
+        if ($u -match '(?i)(?<![a-z0-9_.\\/:-])(call|for|start)(?![a-z0-9_.-])') { return $true }
+        # r9 fix iteration 2 (adversary A1 on 353df92c): 'C:\pins\inner %*' runs inner.cmd, which can enable it before forwarding. Every
+        # command a shim runs must be a harmless internal command or name a native program by its .exe/.com extension; anything else (an
+        # extensionless or batch target, or if/else, whose inner command is not at the segment start) counts as ON.
+        # r10 (sol r9 B1, fable r9 B1): the shim is OFF only when EVERY segment is POSITIVELY recognised; the default is ON. cmd.exe runs
+        # the command that follows leading '@' and redirections ('2>nul C:\pins\inner %*' runs inner.cmd), so those are stripped and the
+        # remainder is classified; a redirection-only segment runs nothing. A redirection target, or a command token, this reading cannot
+        # parse (an unquoted ',;=/', text glued to a quote) counts as ON. '>&1' / '<&0' is a handle duplication, not a command separator.
+        $class = Get-CmdLineClass -Line $t
+        if ($class -eq 'on') { return $true }
+        if ($class -eq 'native') { $sawNative = $true }
+    }
+    # r10: a shim that runs no native program at all (a 0-byte shim, only internal commands) is not positively recognised either: ON.
+    return (-not $sawNative)
+}
+function Get-CmdLineClass {
+    # r10: classifies one logical command line (carets already removed): 'on' when any segment is not positively recognised, else 'native'
+    # when some segment runs a native program, else 'none'. r10 fix iteration 1 (adversary A1 on b04222df): a native cmd.exe target runs
+    # ANOTHER command line ('cmd.exe /d /c C:\pins\inner %*' runs inner.cmd), so the text after its /c or /k is classified the same way;
+    # cmd.exe with neither switch, nested past depth 2, or with a quoting its /c rules may rewrite, counts as ON.
+    param([string]$Line, [int]$Depth = 0)
+    $sawNative = $false
+    foreach ($seg in [regex]::Split($Line, '(?:(?<![<>])&|(?<=[<>])&(?!\d)|[|()])(?=(?:[^"]*"[^"]*")*[^"]*$)')) {
+        $s = $seg.Trim()
+        if ($s.TrimStart('@').TrimStart().StartsWith(':')) { continue }
+        while ($true) {
+            $s = $s.TrimStart()
+            if ($s.StartsWith('@')) { $s = $s.Substring(1); continue }
+            if ($s -notmatch '\A\d?(>>?|<)') { break }
+            $r = [regex]::Match($s, '\A\d?(?:>>?|<)\s*(?:&\d|"[^"]*"|[A-Za-z0-9_.:\\~-]+)(?=\s|\z)')
+            if (-not $r.Success) { return 'on' }
+            $s = $s.Substring($r.Length)
+        }
+        if ($s -eq '') { continue }
+        $m = [regex]::Match($s, '\A(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)')
+        if (-not $m.Success) { return 'on' }
+        $cmd = if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }
+        # r10 fix iteration 2 (adversary A1 on b0a71c84): a QUOTED name is never an internal command (measured with '"setlocal"'); cmd.exe
+        # searches PATH for it, so '"setlocal" %*' runs a setlocal.cmd. Only an unquoted name is read as internal.
+        if (-not $m.Groups['q'].Success -and $cmd -match '(?i)\A(echo|echo\.|set|setlocal|endlocal|title|exit|goto|rem|cd|chdir|pushd|popd|shift|cls|ver)\z') { continue }
+        if (-not ($cmd -match '(?i)\.(exe|com)\z' -and ($cmd -ireplace '%~dp0', '') -notmatch '%' -and ($m.Groups['q'].Success -or $cmd -notmatch '[,;=/]'))) { return 'on' }
+        if ([regex]::Replace($cmd, '\A.*[\\/:]', '') -match '(?i)\Acmd\.(exe|com)\z') {
+            $sw = [regex]::Match($s.Substring($m.Length), '(?i)/[ck]')
+            if ($Depth -ge 2 -or -not $sw.Success) { return 'on' }
+            $inner = $s.Substring($m.Length).Substring($sw.Index + 2).TrimStart()
+            # cmd /? : with a leading quote, /c may strip the first and the last quote of the line. Only the shape that strips to the same
+            # text is read (exactly two quotes around a first token with no whitespace or special character); any other leading quote is ON.
+            if ($inner.StartsWith('"')) {
+                $q = [regex]::Match($inner, '\A"(?<t>[^"\s&<>()@^|]+)"(?=\s|\z)')
+                if (-not $q.Success -or ($inner.Length - $inner.Replace('"', '').Length) -ne 2) { return 'on' }
+            }
+            $nested = Get-CmdLineClass -Line $inner -Depth ($Depth + 1)
+            if ($nested -ne 'native') { return 'on' }
+        }
+        $sawNative = $true
+    }
+    if ($sawNative) { return 'native' }
+    return 'none'
+}
+# The npm cmd-shim template, exactly as npm writes it (the real %APPDATA%\npm\codex.cmd), with LF line ends; only the target path varies.
+$NPM_CMD_SHIM_PATTERN = '\A@ECHO off\nGOTO start\n:find_dp0\nSET dp0=%~dp0\nEXIT /b\n:start\nSETLOCAL\nCALL :find_dp0\n\nIF EXIST "%dp0%\\node\.exe" \(\n  SET "_prog=%dp0%\\node\.exe"\n\) ELSE \(\n  SET "_prog=node"\n  SET PATHEXT=%PATHEXT:;\.JS;=;%\n\)\n\nendLocal & goto #_undefined_# 2>NUL \|\| title %COMSPEC% & "%_prog%"  "%dp0%\\[^"%!^&|<>\n]+" %\*\n?\z'
+function Test-NpmShimForwardsToNativeNode {
+    # The template runs "<shim dir>\node.exe" when it exists, else the first 'node' cmd.exe finds: the working directory first, then each
+    # PATH entry, trying each PATHEXT extension in order. The FULL PATHEXT is searched (the template's .JS removal is undone by the
+    # endLocal that runs before the search), which can only find more candidates. True only when that first hit is a native .exe/.com;
+    # a node.cmd / node.bat would parse the forwarded arguments again under its own settings, and no hit at all is unknowable: both false.
+    param([string]$ShimDir, [string]$WorkingDirectory = '')
+    if ([string]::IsNullOrEmpty($ShimDir)) { return $false }
+    try { if ([System.IO.File]::Exists([System.IO.Path]::Combine($ShimDir, 'node.exe'))) { return $true } } catch { return $false }
+    $pathExt = if ([string]::IsNullOrEmpty($env:PATHEXT)) { '.COM;.EXE;.BAT;.CMD' } else { $env:PATHEXT }
+    $exts = @($pathExt -split ';' | Where-Object { $_ })
+    # r10 (sol r9 B2): empty entries are KEPT so the search below can refuse them (they used to be dropped silently).
+    $pathDirs = @(([string]$env:PATH) -split ';' | ForEach-Object { $_.Trim().Trim('"') })
+    # r9 fix iteration 2 (adversary A2 on 353df92c): NoDefaultCurrentDirectoryInExePath makes cmd.exe skip the working directory. Rather
+    # than model that switch, both searches (with and without the working directory first) must find a native node.
+    $searches = @(, $pathDirs)
+    if (-not [string]::IsNullOrEmpty($WorkingDirectory)) { $searches += , (@($WorkingDirectory) + $pathDirs) }
+    foreach ($dirs in $searches) {
+        $native = $false
+        :search foreach ($d in $dirs) {
+            # r10 (sol r9 B2): File.Exists resolves a relative entry against THIS process's directory, while the codex child runs in its own
+            # working directory, so the two can pick different 'node' files. Only absolute entries are searched: an empty or relative entry
+            # ('rel', '.', '.\bin', 'C:rel', '\bin') reached before the hit makes the exemption unavailable (ON), resolved against neither.
+            $qualified = $false
+            try { $qualified = (-not [string]::IsNullOrEmpty($d)) -and [System.IO.Path]::IsPathFullyQualified($d) } catch { $qualified = $false }
+            if (-not $qualified) {
+                Write-Warning "npm-shim-node-path-relative: the search for the 'node' the npm codex shim runs reached the empty or relative entry '$d' (PATH or working directory) before any node, so the native-node exemption is unavailable and delayed expansion counts as on"
+                return $false
+            }
+            foreach ($e in $exts) {
+                try { $c = [System.IO.Path]::Combine($d, 'node' + $e) } catch { continue }
+                if ([System.IO.File]::Exists($c)) { $native = ($e -ieq '.exe' -or $e -ieq '.com'); break search }
+            }
+        }
+        if (-not $native) { return $false }
+    }
+    return $true
+}
+function Test-CmdDelayedExpansion {
+    # Delayed expansion is on for the shim's %* forwarding when the effective registry setting is on (Get-CmdRegistryDelayedExpansion) or
+    # the shim turns it on itself (Test-CmdShimTextEnablesDelayedExpansion). An unreadable shim counts as ON (fail closed). A shim that
+    # enables it and later ends that scope with endlocal still counts as ON: a static reading cannot follow goto/call, so this over-refuses
+    # (typed, visible) rather than guessing. -WorkingDirectory is the codex child's working directory (cmd.exe searches it first).
+    param([Parameter(Mandatory = $true)][string]$Shim, [string]$WorkingDirectory = '')
+    if (Get-CmdRegistryDelayedExpansion) { return $true }
+    try { $text = [System.IO.File]::ReadAllText($Shim) } catch { return $true }
+    $shimDir = try { [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Shim)) } catch { '' }
+    return (Test-CmdShimTextEnablesDelayedExpansion -Text $text -ShimDir $shimDir -WorkingDirectory $WorkingDirectory)
+}
+function Assert-CodexCommandLineFits {
+    param([Parameter(Mandatory = $true)][string]$Exe, [string[]]$Argv = @(), [int]$ImageCount = 0, [object]$DelayedExpansion = $null, [string]$WorkingDirectory = '')
+    $len = Get-NativeCommandLineLength -Exe $Exe -Argv $Argv
+    $ext = [System.IO.Path]::GetExtension($Exe).ToLowerInvariant()
+    $isShim = ($ext -eq '.cmd' -or $ext -eq '.bat')
+    if ($isShim) {
+        $bad = @($Argv | Where-Object { ([string]$_).Contains('%') })
+        if ($bad.Count -eq 0) {
+            if ($null -eq $DelayedExpansion) { $DelayedExpansion = Test-CmdDelayedExpansion -Shim $Exe -WorkingDirectory $WorkingDirectory }
+            if ([bool]$DelayedExpansion) { $bad = @($Argv | Where-Object { ([string]$_).Contains('!') }) }
+        }
+        if ($bad.Count -gt 0) {
+            throw "codex-arg-cmd-expansion: the codex argument '$($bad[0])' carries a character cmd.exe expands ('%', or '!' with delayed expansion on) in '$Exe', so neither the argument codex would receive nor the command-line length is knowable; refused before launch"
+        }
+    }
+    # r10 fix iteration 1 (adversary A2 on b04222df): the measured 512 is a floor, not a bound. A shim's own literal text is forwarded with the
+    # arguments, so a shim longer than that (1001 spaces before %*) is charged its whole text plus every %~dp0 / %dp0% expansion (its directory).
+    # r10 fix iteration 2 (adversary A2 on b0a71c84): a shim that forwards the arguments more than once ('codex.exe %* %*', or %1..%9 references)
+    # puts them on its line that many times, so the counted length is charged once per forwarding reference (every %* and %1-%9 in the text).
+    $reserve = $CMD_SHIM_RESERVE
+    $forwards = 1
+    if ($isShim) {
+        try {
+            $shimText = [System.IO.File]::ReadAllText($Exe)
+            $dirLen = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Exe)).Length + 1
+            $dp0 = [regex]::Matches($shimText, '(?i)%~dp0|%dp0%').Count
+            $reserve = [Math]::Max($CMD_SHIM_RESERVE, $shimText.Length + $dp0 * $dirLen)
+            $forwards = [Math]::Max(1, [regex]::Matches($shimText, '%\*|%~?[a-zA-Z]*[1-9]').Count)
+        } catch { $reserve = $CMD_SHIM_RESERVE; $forwards = 1 }
+    }
+    $limit = if ($isShim) { $CMD_LINE_LIMIT_SHIM - ($Exe.Length + $reserve) } else { $CMD_LINE_LIMIT_NATIVE }
+    $charged = [int64]$len * $forwards
+    if ($charged -gt $limit) {
+        $kind = if ($ImageCount -gt 0) { 'image-args-too-long' } else { 'codex-args-too-long' }
+        throw "${kind}: the codex command line would be $charged characters with $ImageCount image(s) attached; the limit through '$Exe' is $limit (attach fewer -ImagePaths entries or use a shorter -RunDir)"
+    }
+    return $len
+}
+# r11 (sol r10 B1, sol r10 B2, fable r10 B1; hub step E): rounds 7-10 each read one more cmd.exe parsing shape and each left a sibling.
+# The codex launch no longer runs a .cmd/.bat through cmd.exe at all, so no shim-side expansion, redirection, delayed expansion,
+# registry setting or later rewrite of the shim can change the arguments codex receives or the length of its command line:
+# - the standard npm cmd-shim template is launched as the native node it would run plus its script (Resolve-CodexShimLaunch, kind
+#   'npm-node');
+# - any other shim must be exactly ONE command line '<native .exe/.com> <literal args> %*' (optional '@echo off' and blank lines), and
+#   that program is launched directly with the literal args (kind 'single-exe');
+# - every other shim is refused, typed 'codex-shim-unsupported', before launch: a '%' other than the one '%*' (and a leading '%~dp0'),
+#   any '!', any '<' '>' '|' '&' '^' '(' ')', more than one command line, a target that is not a native program, or an unparsable token.
+# The shim bytes are hashed when they are read here and re-hashed immediately before Process.Start ('codex-shim-changed' on a change).
+$CODEX_SHIM_MAX_BYTES = 65536
+# r12 fix iteration 1 (adversary A2 on 2d55c467): a shim on a slow share made the synchronous read (and the re-hash) unbounded, ahead of every
+# probe timeout and the lane deadline. r13: the OPEN is bounded too; an asynchronous read only covered the read. The whole open-and-read runs on a pool
+# thread that this call stops waiting for at the deadline, and one that does not finish is refused, typed.
+$CODEX_SHIM_READ_TIMEOUT_MS = 5000
+if (-not ('MlvBoundedRead' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Threading.Tasks;
+public static class MlvBoundedRead {
+  public static byte[] ReadFile(string path, long maxBytes, int timeoutMs) {
+    Task<byte[]> work=Task.Run(() => {
+      using(FileStream fs=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read,4096)) {
+        if(fs.Length>maxBytes) throw new InvalidDataException("larger than "+maxBytes+" bytes");
+        MemoryStream ms=new MemoryStream(); byte[] buf=new byte[81920]; int n;
+        while((n=fs.Read(buf,0,buf.Length))>0) {
+          ms.Write(buf,0,n);
+          if(ms.Length>maxBytes) throw new InvalidDataException("larger than "+maxBytes+" bytes");
+        }
+        return ms.ToArray();
+      }
+    });
+    if(!work.Wait(timeoutMs)) throw new TimeoutException("the open and read did not finish within "+timeoutMs+" ms");
+    return work.Result;
+  }
+}
+'@
+}
+# r13 fix iteration 2 (adversary A1 on afdc228b): a read gets what is left of its caller's budget, not a fresh 5000 ms. The deadline is a monotonic timestamp: the lane
+# sets it when its stopwatch starts, and a probe narrows it for its own duration. A read cut short by that budget is a timeout of the caller, not an unreadable shim.
+$script:CodexShimDeadline = $null
+function Get-CodexShimDeadline {
+    param([Parameter(Mandatory = $true)][double]$Ms)
+    $d = [System.Diagnostics.Stopwatch]::GetTimestamp() + [int64]($Ms * [System.Diagnostics.Stopwatch]::Frequency / 1000.0)
+    if ($null -ne $script:CodexShimDeadline -and $script:CodexShimDeadline -lt $d) { return $script:CodexShimDeadline }
+    return $d
+}
+function Read-CodexShimBytes {
+    # One read through one handle that denies writers, so the hashed bytes are a single version of the file.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $limitMs = $CODEX_SHIM_READ_TIMEOUT_MS; $budgetBinds = $false
+    if ($null -ne $script:CodexShimDeadline) {
+        $leftMs = [math]::Floor(($script:CodexShimDeadline - [System.Diagnostics.Stopwatch]::GetTimestamp()) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency)
+        if ($leftMs -le $limitMs) { $limitMs = [int][math]::Max(0.0, $leftMs); $budgetBinds = $true }
+    }
+    if ($budgetBinds -and $limitMs -eq 0) { throw [TimeoutException]::new('launch-budget-exhausted') }
+    try {
+        $bytes = [MlvBoundedRead]::ReadFile($Path, $CODEX_SHIM_MAX_BYTES, $limitMs)
+    } catch {
+        if ($budgetBinds -and $_.Exception.GetBaseException() -is [TimeoutException]) { throw [TimeoutException]::new('launch-budget-exhausted') }
+        throw "codex-shim-unreadable: the codex shim '$Path' could not be read ($($_.Exception.GetBaseException().Message)); refused before launch"
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    $printable = $true
+    foreach ($b in $bytes) { if (($b -lt 0x20 -and $b -ne 9 -and $b -ne 10 -and $b -ne 13) -or $b -gt 0x7E) { $printable = $false; break } }
+    return [pscustomobject]@{ Text = [System.Text.Encoding]::ASCII.GetString($bytes); Sha256 = $hash; PrintableAscii = $printable }
+}
+function Find-CodexProgramOnPath {
+    # The first existing <dir>\<Name><ext> over the ABSOLUTE PATH entries, in PATH order and then $Extensions order. An empty or relative
+    # entry is skipped: the program is launched by the absolute path returned here, never searched for again by anyone else.
+    # r11 fix iteration 2 (adversary A1 on 06b68082): PATHEXT '.EXE;\..\cmd.exe' made 'node' + '\..\cmd.exe' resolve to cmd.exe. A candidate
+    # counts only when it is a plain leaf name (no separator, ':' or '..') whose full path is exactly <entry>\<Name><ext>.
+    # r12 (adversary A1 on c4f381a7): the check compares FULL candidate paths, never trimmed directory strings. GetDirectoryName('C:\node.exe')
+    # is 'C:\' while GetFullPath('C:\').TrimEnd('\') is 'C:', so a drive-root PATH entry was skipped and a later node selected.
+    param([Parameter(Mandatory = $true)][string]$Name, [string[]]$Extensions = @(''))
+    foreach ($raw in (([string]$env:PATH) -split ';')) {
+        $d = $raw.Trim().Trim('"')
+        $qualified = $false
+        try { $qualified = (-not [string]::IsNullOrEmpty($d)) -and [System.IO.Path]::IsPathFullyQualified($d) } catch { $qualified = $false }
+        if (-not $qualified) { continue }
+        foreach ($e in $Extensions) {
+            $leaf = $Name + $e
+            if ($leaf -match '[\\/:]' -or $leaf.Contains('..') -or $leaf.Trim() -ne $leaf -or $leaf.EndsWith('.')) { continue }
+            try {
+                $want = [System.IO.Path]::Combine([System.IO.Path]::GetFullPath($d), $leaf)
+                $c = [System.IO.Path]::GetFullPath($want)
+                $same = [string]::Equals($c, $want, [System.StringComparison]::OrdinalIgnoreCase)
+            } catch { continue }
+            if (-not $same) { continue }
+            if ([System.IO.File]::Exists($c)) { return $c }
+        }
+    }
+    return $null
+}
+function Resolve-CodexShimLaunch {
+    # Returns { Kind; FileName; PrefixArgs; Shim; ShimSha256 }: the program Process.Start runs and the literal arguments placed before the
+    # codex argv. A native -Exe is returned unchanged (Kind 'native'). Throws 'codex-shim-unsupported' / 'codex-shim-unreadable'.
+    param([Parameter(Mandatory = $true)][string]$Exe)
+    $ext = [System.IO.Path]::GetExtension($Exe).ToLowerInvariant()
+    if ($ext -ne '.cmd' -and $ext -ne '.bat') {
+        return [pscustomobject]@{ Kind = 'native'; FileName = $Exe; PrefixArgs = @(); Shim = $null; ShimSha256 = $null }
+    }
+    $read = Read-CodexShimBytes -Path $Exe
+    $shimDir = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($Exe))
+    $lf = $read.Text -replace '\r\n', "`n"
+    $refuse = { param($why) throw "codex-shim-unsupported: the codex shim '$Exe' $why; refused before launch (only the npm cmd-shim template or ONE command line '<native .exe/.com> <literal args> %*' is launched)" }
+    # r11 fix iteration 1 (adversary A2 on 9de900bd): what a byte above 0x7F means to cmd.exe depends on the code page, and an ASCII decode
+    # turned UTF-8 'cafe-acute' into 'caf??', a different literal argument. Any byte outside printable ASCII (plus TAB, CR, LF) is refused.
+    if (-not $read.PrintableAscii) { & $refuse "holds a byte outside printable ASCII (TAB, CR, LF and 0x20-0x7E only)" }
+    if ([regex]::IsMatch($lf, $NPM_CMD_SHIM_PATTERN)) {
+        $rel = [regex]::Match($lf, '"%dp0%\\(?<rel>[^"%!^&|<>\n]+)" %\*\n?\z').Groups['rel'].Value
+        # r11 fix iteration 2 (adversary A2 on 06b68082): Path.Combine drops the shim directory when rel is rooted ('\codex.js' from
+        # '"%dp0%\\codex.js"'), so the text is joined exactly as cmd.exe builds it: '<shim dir>\' + '\' + rel. A ':' (a drive or a stream
+        # name) is refused.
+        if ($rel.Contains(':')) { & $refuse "is the npm template but its script '$rel' holds ':'" }
+        $script = try { [System.IO.Path]::GetFullPath($shimDir.TrimEnd('\') + '\\' + $rel) } catch { $null }
+        if (-not $script -or -not [System.IO.File]::Exists($script)) { & $refuse "is the npm template but its script '$rel' does not exist beside it" }
+        $node = $null
+        try { $adj = [System.IO.Path]::Combine($shimDir, 'node.exe'); if ([System.IO.File]::Exists($adj)) { $node = $adj } } catch { $node = $null }
+        if (-not $node) {
+            $pathExt = if ([string]::IsNullOrEmpty($env:PATHEXT)) { '.COM;.EXE;.BAT;.CMD' } else { $env:PATHEXT }
+            $node = Find-CodexProgramOnPath -Name 'node' -Extensions @($pathExt -split ';' | Where-Object { $_ })
+        }
+        if (-not $node) { & $refuse "is the npm template but no 'node' is on an absolute PATH entry" }
+        if ([System.IO.Path]::GetFileName($node) -notmatch '(?i)\Anode\.(exe|com)\z') { & $refuse "is the npm template but the first 'node' on PATH is '$node', not a native node.exe/node.com" }
+        return [pscustomobject]@{ Kind = 'npm-node'; FileName = $node; PrefixArgs = @($script); Shim = $Exe; ShimSha256 = $read.Sha256 }
+    }
+    $lines = @($lf -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' -and $_ -notmatch '\A(?i)@echo\s+off\z' })
+    if ($lines.Count -ne 1) { & $refuse "holds $($lines.Count) command lines" }
+    $line = [string]$lines[0]
+    if ($line -match '[!<>|&^()]') { & $refuse "has a cmd.exe operator or '!' ('$($Matches[0])') in '$line'" }
+    $tokens = [System.Collections.Generic.List[object]]::new()
+    $at = 0
+    while ($at -lt $line.Length) {
+        $m = [regex]::new('\G\s*(?:"(?<q>[^"]*)"|(?<w>[^\s"]+))(?=\s|\z)').Match($line, $at)
+        if (-not $m.Success -or $m.Length -eq 0) { & $refuse "has a token that is not a plain or fully quoted word in '$line'" }
+        $tokens.Add([pscustomobject]@{ Quoted = $m.Groups['q'].Success; Value = $(if ($m.Groups['q'].Success) { $m.Groups['q'].Value } else { $m.Groups['w'].Value }) })
+        $at = $m.Index + $m.Length
+        while ($at -lt $line.Length -and [char]::IsWhiteSpace($line[$at])) { $at++ }
+    }
+    if ($tokens.Count -lt 2 -or $tokens[$tokens.Count - 1].Quoted -or $tokens[$tokens.Count - 1].Value -ne '%*') { & $refuse "does not end in exactly one unquoted '%*'" }
+    $head = @($tokens | Select-Object -SkipLast 1)
+    for ($i = 0; $i -lt $head.Count; $i++) {
+        $v = [string]$head[$i].Value
+        $probe = if ($i -eq 0) { [regex]::Replace($v, '(?i)\A%~dp0', '') } else { $v }
+        if ($probe.Contains('%')) { & $refuse "has a '%' expansion other than the one forwarding '%*' ('$v')" }
+        if (-not $head[$i].Quoted -and $v -match '[,;=]') { & $refuse "has an unquoted cmd.exe separator in '$v'" }
+        if ($head[$i].Quoted -and ($v -eq '' -or $v.EndsWith('\'))) { & $refuse "has a quoted argument a program would read differently ('`"$v`"')" }
+    }
+    $target = [string]$head[0].Value
+    if ($target -match '(?i)\A%~dp0') { $target = $shimDir.TrimEnd('\') + '\' + $target.Substring(5) }
+    if ($target -notmatch '(?i)\.(exe|com)\z') { & $refuse "runs '$target', which is not named as a native .exe/.com program" }
+    $prefix = @($head | Select-Object -Skip 1 | ForEach-Object { [string]$_.Value })
+    # r11 fix iteration 1 (adversary A1 on 9de900bd): a native program that parses its own command line again (cmd.exe /c, a PowerShell
+    # -Command, forfiles /c, wscript, node -e) re-reads the forwarded arguments, so 'C:\Review&QA' after -C split at '&'. Only an ALLOWLIST
+    # is launched: codex.exe with any literal args; node.exe with exactly one script; pwsh.exe / powershell.exe with only -NoProfile,
+    # -NonInteractive, -NoLogo and then -File <script> last. Any other program is refused, so an interpreter nobody listed is refused too.
+    $leaf = [regex]::Replace($target, '\A.*[\\/:]', '').ToLowerInvariant()
+    $n = $prefix.Count
+    $allowed = switch ($leaf) {
+        'codex.exe' { $true }
+        'node.exe' { $n -eq 1 -and -not $prefix[0].StartsWith('-') }
+        { $_ -eq 'pwsh.exe' -or $_ -eq 'powershell.exe' } {
+            $ok = $n -ge 2 -and $prefix[$n - 2] -ieq '-File' -and -not $prefix[$n - 1].StartsWith('-')
+            for ($k = 0; $ok -and $k -lt $n - 2; $k++) { $ok = $prefix[$k] -in @('-NoProfile', '-NonInteractive', '-NoLogo') }
+            $ok
+        }
+        default { $false }
+    }
+    if (-not $allowed) { & $refuse "runs '$leaf' with [$($prefix -join ' ')], which is not a launchable program (codex.exe; node.exe <script>; pwsh.exe or powershell.exe [-NoProfile] [-NonInteractive] [-NoLogo] -File <script>)" }
+    $file = $null
+    $qualified = $false
+    try { $qualified = [System.IO.Path]::IsPathFullyQualified($target) } catch { $qualified = $false }
+    if ($qualified) {
+        if ([System.IO.File]::Exists($target)) { $file = $target }
+    } elseif ($target -notmatch '[\\/:]') {
+        $file = Find-CodexProgramOnPath -Name $target
+    } else {
+        & $refuse "runs the relative path '$target'"
+    }
+    if (-not $file) { & $refuse "runs '$target', which does not exist (absolute PATH entries searched for a bare name)" }
+    return [pscustomobject]@{ Kind = 'single-exe'; FileName = $file; PrefixArgs = $prefix; Shim = $Exe; ShimSha256 = $read.Sha256 }
+}
+# r12 (adversary A2 on c4f381a7, Dot B1 on c4f381a7; hub step E): ONE binding model. The shim is read once (Resolve-CodexShimLaunch), the launch
+# (program + full argv) is derived from that read, THAT command line is bounded for the transport that runs it, the shim is re-hashed
+# immediately before Process.Start, and only then is the process started. r11 bounded the ORIGINAL .cmd with the cmd.exe allowance (~7.6k)
+# before resolving, so a direct native launch that fits CreateProcess's 32767 was refused, and a shim replaced between that check and the
+# resolver's read was never bounded at all. A resolved launch is always a native program, so its transport is CreateProcess; a resolved
+# batch file is not a launch this model knows and is refused (fail closed). Every codex process (the --version and 'mcp list' probes and
+# the lane itself) is started through Set-CodexLaunchStartInfo, so none of them runs the raw shim through cmd.exe.
+# r15 fix iteration 1 (adversary A1 on 82faecd9): CreateProcess reads its command line up to the first NUL, so a NUL in one argument drops every argument after it (a sandbox, the MCP disables, a
+# deny list) while the receipt records them. `pwsh -File` cannot carry one, the call operator can. Both engines' argv pass through here before anything is told what to run.
+function Assert-ArgvHasNoNul {
+    param([string[]]$Argv = @())
+    foreach ($a in @($Argv)) {
+        if (([string]$a).IndexOf([char]0) -ge 0) {
+            throw "argv-nul-refused: the argument '$(([string]$a).Replace([string][char]0, '\0'))' carries a NUL, which would cut the command line there and drop every argument after it; refused before launch"
+        }
+    }
+}
+# r16 (OPEN A1 on feeea1f9): UTF-8 and the image host's Encoding.Unicode frame turn a lone surrogate into U+FFFD, which names a DIFFERENT path, so the child could read another directory's file while the held
+# snapshot verifies. Refused where a path enters and at the codex launch bound, so no frame or sibling encoder sees one. `pwsh -File` has already replaced it before this script runs; see docs/lane-containment.md.
+function Assert-NoLoneSurrogate {
+    param([string[]]$Text = @())
+    $lone = '[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]'
+    foreach ($t in @($Text)) {
+        if ([regex]::IsMatch([string]$t, $lone)) {
+            throw "lone-surrogate-refused: '$([regex]::Replace([string]$t, $lone, { param($m) '\u{0:X4}' -f [int]$m.Value[0] }))' holds a lone surrogate, which would reach the provider as a different path; refused before launch"
+        }
+    }
+}
+function Assert-CodexLaunchFits {
+    param([Parameter(Mandatory = $true)]$Launch, [string[]]$Argv = @(), [int]$ImageCount = 0)
+    $file = [string]$Launch.FileName
+    $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
+    if ($ext -eq '.cmd' -or $ext -eq '.bat') {
+        throw "codex-shim-unsupported: the resolved codex launch '$file' is itself a batch file, which only cmd.exe runs; refused before launch"
+    }
+    Assert-ArgvHasNoNul -Argv (@($Launch.PrefixArgs) + @($Argv))
+    Assert-NoLoneSurrogate -Text (@($file) + @($Launch.PrefixArgs) + @($Argv))
+    return (Assert-CodexCommandLineFits -Exe $file -Argv (@($Launch.PrefixArgs) + @($Argv)) -ImageCount $ImageCount)
+}
+function Set-CodexLaunchStartInfo {
+    # Bounds the resolved command line, re-hashes the shim it was derived from, and only then sets FileName and ArgumentList. The caller
+    # calls Process.Start on $Psi next, with nothing in between.
+    param([Parameter(Mandatory = $true)]$Psi, [Parameter(Mandatory = $true)]$Launch, [string[]]$Argv = @(), [int]$ImageCount = 0)
+    $null = Assert-CodexLaunchFits -Launch $Launch -Argv $Argv -ImageCount $ImageCount
+    if ($Launch.Shim) {
+        $shimNow = (Read-CodexShimBytes -Path $Launch.Shim).Sha256
+        if ($shimNow -ne $Launch.ShimSha256) {
+            throw "codex-shim-changed: the codex shim '$($Launch.Shim)' changed between inspection (sha256 $($Launch.ShimSha256)) and launch (sha256 $shimNow); refused before launch"
+        }
+    }
+    $Psi.FileName = [string]$Launch.FileName
+    $Psi.ArgumentList.Clear()
+    foreach ($a in (@($Launch.PrefixArgs) + @($Argv))) { [void]$Psi.ArgumentList.Add([string]$a) }
+}
+# END Assert-CodexCommandLineFits
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
 # never accepted - that is the exact grant this whole patch exists to narrow.
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
@@ -1063,8 +2057,10 @@ if (-not $RunDir) {
     # product-ratio guard's coverage check reads the board tree first.
     $RunDir = Join-Path $RepoRoot ".claude-state\fleet-runs\$stamp"
 }
+Assert-NoLoneSurrogate -Text (@($RunDir, $WorkDir) + @($ImagePathsGiven))
 if (-not (Test-Path -LiteralPath $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
+Assert-NoLoneSurrogate -Text @($RunDir)
 
 $cfg = $LANES[$Lane].Clone()
 if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
@@ -1188,6 +2184,7 @@ Write-Utf8NoBom $rcptPath (([ordered]@{
 # is the exact defect this runner's own card list called SWEEP-RECEIPT-1.
 $startedUtc = (Get-Date).ToUniversalTime()
 $sw         = [System.Diagnostics.Stopwatch]::StartNew()
+$script:CodexShimDeadline = Get-CodexShimDeadline -Ms ($TimeoutSec * 1000.0)
 $exitCode   = -999
 $timedOut   = $false
 $final      = ''
@@ -1259,6 +2256,9 @@ $OWNER_KILL_OUTCOME_KILL_WAIT_TIMEOUT = 'kill-wait-timeout'  # Kill() did not th
 # and a bare `ReadToEndAsync().Result` waits for EOF, not for the process (Process.WaitForExit() does NOT: measured 27 ms against a
 # pipe-holding descendant that kept ReadToEndAsync open for 20 s). Keep the literal on its own line: test_lane_containment.py shortens it.
 $OUTPUT_DRAIN_GRACE_MS = 10000
+# r5 H1: the post-exit re-read of a held image snapshot gets whatever lane budget is left, but never less than this, so a child that used
+# the whole budget can still be verified (a few MB hash in well under a second); a stalled share is still cut at this bound.
+$IMAGE_VERIFY_FLOOR_MS = 5000
 # LANE-CONTAINED-CHILD-START-DEADLINE-1: how long the runner waits for the contained host to write <base>.child.json before it books
 # contained-child-start-timeout (-> failure=launch-no-child). It was a fixed 10 s; PR 726 r2/r2b lost the launch after 13.3 s and 28.8 s
 # on a loaded host (commit charge 75-78 %, worktreeSweep 205 s) although the host was merely slow, not broken. Bounded, never unbounded: the
@@ -1605,13 +2605,48 @@ if ($cfg.engine -eq 'claude') {
     # CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): a read-only lane gets NO MCP tool,
     # since every MCP server runs outside the sandbox (see Get-CodexMcpDisableArgs). Throws, so
     # the launch is refused, when the server list cannot be read. workspace-write is untouched.
+    # r11 (sol r10 B1/B2, fable r10 B1): the codex child is never a cmd.exe running the shim (see Resolve-CodexShimLaunch); an
+    # unsupported shim is refused here, typed, before launch, and the bytes read here are re-hashed immediately before Process.Start.
+    # r12 (CI run 41644166247, ADVISORY A3 on c4f381a7): resolved BEFORE the 'mcp list' probe, which runs this same launch. r11 ran the
+    # probe on the raw shim through cmd.exe first: on Windows Server 2025 'nul.exe' is no longer the NUL device, so the fixture shim
+    # '<inner><nul.exe %*' failed inside cmd.exe, the probe refused the lane as codex-mcp-list-unreadable (exit 127), and the resolver's
+    # typed refusal never ran. On Windows 10 'nul.exe' is still NUL, which is why the same test passed locally.
+    $codexLaunch = Resolve-CodexShimLaunch -Exe $exe
     $mcpServers = 'default'; $mcpDisabledServers = @(); $mcpArgs = @()
     if ($sandbox -eq 'read-only') {
         $mcpListTimeoutMs = [int][math]::Min(60000.0, [math]::Max(1.0, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
-        $mcpDisable = Get-CodexMcpDisableArgs -CodexExe $exe -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
+        $mcpDisable = Get-CodexMcpDisableArgs -CodexLaunch $codexLaunch -WorkDir $WorkDir -TimeoutMs $mcpListTimeoutMs
         $mcpServers = 'disabled'; $mcpDisabledServers = @($mcpDisable.Servers); $mcpArgs = @($mcpDisable.Args)
     }
-    $argv = @('exec',
+    # VISUAL-JUDGE-TERRA-LANE-1: `-i, --image <FILE>...` is VARIADIC on codex 0.160.1 (codex-image-flag.txt), so
+    # each `-i <path>` pair sits BEFORE `-m` (a flag token always ends the list) and is never the last option
+    # before the '-' stdin marker, which a trailing variadic could otherwise swallow as one more "file".
+    # Snapshot every image into the run dir and attach THE COPY, hashed after the copy: the receipt's sha256/bytes
+    # describe the very bytes codex reads, whatever happens to the source afterwards (adversary A2). The copies stay
+    # in the run dir as evidence of exactly what the judge saw.
+    $imageSeq = 0
+    # r12 (Dot improvement on c4f381a7, item 4): the cmd.exe metacharacter ('%' '^' '&' '(' ')') and delayed-expansion ('!') refusals were
+    # for an argument cmd.exe forwards via %*. The codex launch is a direct CreateProcess (Assert-CodexLaunchFits refuses a batch file), which
+    # hands every -i path to codex unchanged, so those refusals are gone from this path. The genuine constraints stay: ',' (codex splits an
+    # -i value on commas), the snapshot/hold/reparse checks, and the native command-line bound.
+    foreach ($attachment in $ImageAttachments) {
+        $imageSeq++
+        $snapshot = '{0}.image-{1:d2}{2}' -f $base, $imageSeq, $attachment.ext
+        if ($snapshot.Contains(',')) { throw "image-path-bad-character: the image snapshot path contains ',' (codex splits an -i value on commas): $snapshot" }
+        $snapshotInfo = Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0) -RefuseBang $false -RefuseCmdMeta $false
+        # A3: prove the EXACT string handed to codex is a native file path (no provider prefix, resolvable by .NET).
+        # r5 B1: that string is the RESOLVED path of the held object (Copy-ImageSnapshot's Path), not the name the copy went through.
+        $snapshot = [string]$snapshotInfo.Path
+        if (-not [System.IO.File]::Exists($snapshot)) { throw "image-path-missing: the image snapshot is not a native file path: $snapshot" }
+        $attachment.path   = $snapshot
+        $attachment.sha256 = $snapshotInfo.sha256
+        $attachment.bytes  = $snapshotInfo.bytes
+        $ImageHolds.Add($snapshotInfo.Hold)
+    }
+    # post-snapshot-pre-launch-tick: from here codex reads ONLY the snapshot paths in $attachment.path; the source is never consulted again.
+    $imageArgs = @()
+    foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }
+    $argv = @('exec') + $imageArgs + @(
               '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
               '-s', $sandbox) + $windowsSandboxArgs + $mcpArgs + @(
@@ -1619,6 +2654,14 @@ if ($cfg.engine -eq 'claude') {
               '-o', $lastPath,
               '--skip-git-repo-check',
               '-')
+    # r12 (adversary A2, Dot B1 on c4f381a7): the command line bounded is the RESOLVED one (program + prefix + argv) derived from the single
+    # shim read above, held to the limit of the transport that runs it (CreateProcess). Set-CodexLaunchStartInfo bounds it again, re-hashes
+    # the shim, and sets the start info immediately before Process.Start.
+    $null = Assert-CodexLaunchFits -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count
+    $launchFile = [string]$codexLaunch.FileName
+    $launchArgv = @($codexLaunch.PrefixArgs) + $argv
+    # post-shim-resolution-tick
+    Write-Host ("[codex-launch] {0}: {1}{2}" -f $codexLaunch.Kind, $launchFile, $(if ($codexLaunch.Shim) { " (shim $($codexLaunch.Shim) sha256 $($codexLaunch.ShimSha256))" } else { '' }))
     # '-' MEANS "READ THE PROMPT FROM STDIN", and it is not optional here.
     # Passing a multi-line prompt POSITIONALLY is silently TRUNCATED AT THE FIRST
     # NEWLINE, because the launcher is a .cmd batch wrapper and cmd.exe breaks the
@@ -1725,9 +2768,17 @@ if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) {
     throw [TimeoutException]::new('launch-budget-exhausted')
 }
 
+# r13 fix iteration 1 (adversary A1 on 993583ac): what this invocation reads back from a sidecar must have been written by this invocation. A file left in the slot
+# by an earlier attempt read as a start failure of a clean child, an output-drain timeout, or the child's answer. Removed before any process can write one; a file
+# that cannot be removed fails the launch.
+$hostDrainPath = "$base.host-drain.json"
+foreach ($sidecar in @($hostDrainPath, "$base.codex-host-failure.txt", $lastPath)) {
+    if ($sidecar -and (Test-Path -LiteralPath $sidecar)) { Remove-Item -LiteralPath $sidecar -Force -ErrorAction Stop }
+}
+
 if ($cfg.engine -eq 'claude') {
     # This trusted host is inert until it reads frame one. It is assigned to the job
-    # before frame one is sent, so the provider and every descendant inherit the job. Claude-engine lanes only: the Codex branch below has no job.
+    # before frame one is sent, so the provider and every descendant inherit the job. A Codex lane with images uses the same order below; one without has no job.
     $hostSource = @'
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -1784,9 +2835,43 @@ $enc=[Text.UTF8Encoding]::new($false)
     [MlvLaneJob]::AssignOrThrow($jobHandle, $proc.Handle)
     $jobAssigned = $true
 } else {
-    $psi.FileName = $exe
-    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }
+    # r11 (sol r10 B2): the shim bytes Resolve-CodexShimLaunch read must still be the bytes on disk now; a change is refused, typed.
+    Set-CodexLaunchStartInfo -Psi $psi -Launch $codexLaunch -Argv $argv -ImageCount @($ImageAttachments).Count
+    if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) { throw [TimeoutException]::new('launch-budget-exhausted') }
+    # r13 (Dot B2 on 01fa433d): a lane holding image snapshots needs every reader in a job, and Process.Start has no suspended start, so a job assigned
+    # after it could miss a descendant. As on the Claude path, an inert host is assigned first and only then told what to run. The child inherits the
+    # host's stdout and stderr, so the lane's pipes stream exactly as they do on the direct path. Frame: '.'-joined base64 (UTF-16 text, no JSON date
+    # coercion, no console code page): failure path, stdin bytes, cwd, program, then each argument.
+    if ($ImageHolds.Count -gt 0) {
+        $codexImageHost = [pscustomobject]@{ Program = [string]$psi.FileName; Args = @($psi.ArgumentList); FailurePath = "$base.codex-host-failure.txt" }
+        $codexHostSource = @'
+$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+$line=[Console]::In.ReadLine(); if([string]::IsNullOrEmpty($line)){exit 126}
+$t=$line.Split('.')
+function Text([int]$i){[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($t[$i]))}
+function Fail([string]$kind,$err){
+  $path=Text 0; $tmp=$path+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+  [IO.File]::WriteAllText($tmp,"${kind}: $($err.Exception.GetBaseException().Message)",[Text.UTF8Encoding]::new($false)); [IO.File]::Move($tmp,$path); exit 127
+}
+$p=[Diagnostics.ProcessStartInfo]::new(); $p.WorkingDirectory=Text 2; $p.FileName=Text 3
+for($i=4;$i -lt $t.Count;$i++){[void]$p.ArgumentList.Add((Text $i))}
+$p.UseShellExecute=$false; $p.RedirectStandardInput=$true
+try{$c=[Diagnostics.Process]::Start($p)}catch{Fail 'codex-start-failed' $_}
+try{$b=[Convert]::FromBase64String($t[1]);$c.StandardInput.BaseStream.Write($b,0,$b.Length);$c.StandardInput.Close()}catch{Fail 'codex-stdin-write-failed' $_}
+$c.WaitForExit(); exit $c.ExitCode
+'@
+        $psi.FileName = (Get-Command pwsh.exe -ErrorAction Stop).Source
+        $psi.ArgumentList.Clear()
+        foreach ($a in @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($codexHostSource)))) {
+            [void]$psi.ArgumentList.Add($a)
+        }
+        $jobHandle = [MlvLaneJob]::CreateKillOnClose()
+    }
     $proc = [Diagnostics.Process]::Start($psi)
+}
+if ($null -ne $codexImageHost) {
+    [MlvLaneJob]::AssignOrThrow($jobHandle, $proc.Handle)
+    $jobAssigned = $true
 }
 
 # Start the async reads BEFORE waiting: a child that fills a redirected pipe
@@ -1802,13 +2887,13 @@ $outBuf = [System.IO.MemoryStream]::new()
 $errBuf = [System.IO.MemoryStream]::new()
 $outTask = $outStream.CopyToAsync($outBuf)
 $errTask = $errStream.CopyToAsync($errBuf)
-$hostDrainPath = "$base.host-drain.json"
 
 # The prompt reaches claude this way; codex gets an empty stdin that is CLOSED,
 # which is what stops it waiting on "Reading additional input from stdin...".
 if ($cfg.engine -eq 'claude') {
     $controlPath = "$base.child.json"
     if (Test-Path -LiteralPath $controlPath) { throw "control-path-exists: $controlPath" }
+    Assert-ArgvHasNoNul -Argv $argv
     $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath; drainPath=$hostDrainPath; drainGraceMs=$OUTPUT_DRAIN_GRACE_MS } | ConvertTo-Json -Compress -Depth 5
     $awaitingChild = $true
     $proc.StandardInput.WriteLine($launchFrame); $proc.StandardInput.Flush()
@@ -1851,27 +2936,87 @@ if ($cfg.engine -eq 'claude') {
     $promptDelivered = $true; $containment.promptDelivered = $true
     Write-Utf8NoBomAtomic $rcptPath ($runningReceipt | ConvertTo-Json -Depth 6)
     $proc.StandardInput.Close()
+} elseif ($null -ne $codexImageHost) {
+    # The same bytes the direct path's StandardInput.Write would send, written by the host once the child exists.
+    $hostText = { param([string]$s) [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($s)) }
+    $hostFrame = @((& $hostText $codexImageHost.FailurePath), [Convert]::ToBase64String($proc.StandardInput.Encoding.GetBytes($stdinContent)), (& $hostText $WorkDir), (& $hostText $codexImageHost.Program))
+    $hostFrame += @($codexImageHost.Args | ForEach-Object { & $hostText $_ })
+    $proc.StandardInput.WriteLine($hostFrame -join '.')
+    $proc.StandardInput.Close()
 } else {
     $proc.StandardInput.Write($stdinContent)
     $proc.StandardInput.Close()
 }
 
 $timedOut = $false
-$remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
-if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int]$remainingMs)) {
+$remainingMs = [math]::Max(0.0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
+if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int][math]::Min(2147483647.0, $remainingMs))) {
     $timedOut = $true
-    # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane has no
-    # job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
+    # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane with no image has
+    # no job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
     # harvesting pipes, which descendants could otherwise keep open indefinitely.
-    if ($jobHandle -ne [IntPtr]::Zero) {
-        [void][MlvLaneJob]::CloseHandle($jobHandle)
-        $jobHandle = [IntPtr]::Zero
+    # r13 (Dot B2): a codex lane with images keeps its job open: Stop-CodexImageReaderTree below kills the tree and must still be able to ask whether it is empty.
+    if ($null -eq $codexImageHost) {
+        if ($jobHandle -ne [IntPtr]::Zero) {
+            [void][MlvLaneJob]::CloseHandle($jobHandle)
+            $jobHandle = [IntPtr]::Zero
+        }
+        try { $proc.Kill($true) } catch { }
+        try { [void]$proc.WaitForExit(15000) } catch { }
     }
-    try { $proc.Kill($true) } catch { }
-    try { [void]$proc.WaitForExit(15000) } catch { }
 }
+# r13 (Dot B2 on 01fa433d): the tree before anything else: a clean exit of the direct process says nothing about a descendant it left running. r13 fix iteration 2
+# (adversary A2 on afdc228b): before the stopwatch stops, so this wait is charged to the budget the verification below is given what is left of.
+if ($ImageHolds.Count -gt 0) { $imageHoldRelease = Stop-CodexImageReaderTree -Job $jobHandle }
 $sw.Stop()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
+
+# r4 B2: the codex child has exited (or been killed), so the snapshots it could read have been held read-only since the copy. Re-read each
+# through its held handle and compare with the digest the receipt carries; a mismatch is a typed failure, never a silent pass.
+if ($ImageHolds.Count -gt 0) {
+    # r5: three distinct outcomes, never conflated. `mutated` = both digests were computed and differ. `unverifiable` = the re-read failed or ran
+    # past its bound (the reason, IOException message included, is kept). `pathchanged` = the held object is no longer at the path codex was
+    # given, or that path gained a reparse-point ancestor: what codex opened may not be what was hashed.
+    $imageMutated = @(); $imageUnverifiable = @(); $imagePathChanged = @()
+    $verifyLimitMs = [math]::Max([double]$IMAGE_VERIFY_FLOOR_MS, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds)
+    $verifyClock = [System.Diagnostics.Stopwatch]::StartNew()
+    for ($hi = 0; $hi -lt $ImageHolds.Count; $hi++) {
+        $verified = $false; $verifyReason = $null
+        # r13 (Dot B2): a reader may still be alive, so a digest taken now would prove nothing about what it reads next.
+        if ($imageHoldRelease -ne 'released') { continue }
+        try {
+            $nowPath = [MlvImageSnap]::FinalPath($ImageHolds[$hi].SafeFileHandle)
+            $nowReparse = Get-ImageReparseAncestor -Path $nowPath
+            if (-not [string]::Equals($nowPath, [string]$ImageAttachments[$hi].path, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $imagePathChanged += $ImageAttachments[$hi].path
+                $verifyReason = "image-snapshot-path-changed: the held snapshot is now at '$nowPath', not the path codex was given"
+            } elseif ($null -ne $nowReparse) {
+                $imagePathChanged += $ImageAttachments[$hi].path
+                $verifyReason = "image-path-reparse-ancestor: '$nowReparse' became a reparse point in the snapshot path's ancestry"
+            } else {
+                $again = Get-ImageHoldDigest -Hold $ImageHolds[$hi] -Clock $verifyClock -LimitMs $verifyLimitMs
+                $verified = ($again.sha256 -eq $ImageAttachments[$hi].sha256 -and $again.bytes -eq $ImageAttachments[$hi].bytes)
+                if (-not $verified) { $imageMutated += $ImageAttachments[$hi].path; $verifyReason = "image-snapshot-mutated: re-read $($again.sha256)/$($again.bytes) bytes, receipt $($ImageAttachments[$hi].sha256)/$($ImageAttachments[$hi].bytes) bytes" }
+            }
+        } catch {
+            $verified = $false
+            $vb = $_.Exception.GetBaseException()
+            $verifyReason = if ($vb -is [System.TimeoutException]) { "timeout: $($vb.Message)" } else { "$($vb.GetType().Name): $($vb.Message)" }
+            $imageUnverifiable += $ImageAttachments[$hi].path
+        }
+        $ImageAttachments[$hi].consumedVerified = $verified
+        if ($null -ne $verifyReason) { $ImageAttachments[$hi]['consumedVerifyReason'] = $verifyReason }
+    }
+    Complete-CodexImageHolds -Outcome $imageHoldRelease
+    $imageProblems = @()
+    if ($imageMutated.Count -gt 0) { $imageProblems += "image-snapshot-mutated: the image snapshot(s) differ from the receipt's sha256/bytes after the child exited: $($imageMutated -join '; ')" }
+    if ($imageUnverifiable.Count -gt 0) { $imageProblems += "image-snapshot-unverifiable: the image snapshot(s) could not be re-read after the child exited, so consumedVerified is false (see imagePaths[].consumedVerifyReason): $($imageUnverifiable -join '; ')" }
+    if ($imagePathChanged.Count -gt 0) { $imageProblems += "image-snapshot-path-changed: the image snapshot(s) are no longer at the path codex was given (or it gained a reparse-point ancestor): $($imagePathChanged -join '; ')" }
+    if ($imageProblems.Count -gt 0) {
+        $failure = $imageProblems -join ' | '
+        if ($exitCode -eq 0) { $exitCode = 1 }
+    }
+}
 
 # ---------------------------------------------------------------- harvest
 # Bounded: the direct child is gone (or was killed) by here, so only a descendant that inherited a pipe can still hold EOF back.
@@ -1880,6 +3025,13 @@ $drain = Complete-BoundedOutputDrain -OutTask $outTask -ErrTask $errTask -OutBuf
     -OutStream $outStream -ErrStream $errStream -GraceMs $OUTPUT_DRAIN_GRACE_MS
 $stdout = [string]$drain.stdout
 $stderrText = [string]$drain.stderr
+# r13: what the codex image host could not do (typed, like the same throw on the direct path). A start failure means no child ever ran. The host exits 127
+# after writing this file, and only that exit makes the file evidence.
+if ($null -ne $codexImageHost -and $exitCode -eq 127 -and (Test-Path -LiteralPath $codexImageHost.FailurePath)) {
+    $hostFailure = try { [System.IO.File]::ReadAllText($codexImageHost.FailurePath) } catch { "codex-host-failure-unreadable: $($_.Exception.Message)" }
+    $failure = if ($failure) { "$hostFailure | $failure" } else { $hostFailure }
+    if ($hostFailure -like 'codex-start-failed:*') { $exitCode = -999 }
+}
 # The contained host runs the same bounded drain on the CHILD's pipes and leaves this marker when it had to give up on them.
 $hostDrain = $null
 if ($cfg.engine -eq 'claude' -and (Test-Path -LiteralPath $hostDrainPath)) {
@@ -2015,6 +3167,25 @@ if ($cfg.engine -eq 'claude') {
 
 }
 catch {
+    # r12 fix iteration 1 (adversary A1 on 2d55c467): a codex child still running when this path throws could read a snapshot after its hold is released.
+    # r13 (Dot B2 on 01fa433d): the outcome comes from the job, whether or not the direct process has exited; a kill failure, a wait timeout or an
+    # unreadable job keeps the holds. A host never assigned to the job was never sent a frame, so no reader exists; it is stopped here, and exits on its own at EOF if that fails.
+    if ($ImageHolds.Count -gt 0) {
+        if ($jobAssigned) {
+            $imageHoldRelease = Stop-CodexImageReaderTree -Job $jobHandle
+        } else {
+            if ($null -ne $proc) { try { $proc.Kill() } catch { } }
+            $imageHoldRelease = 'released'
+        }
+        Complete-CodexImageHolds -Outcome $imageHoldRelease
+    }
+    # r14 (Dot B3 on afdc228b): the direct path, which has no job and no hold. Its child can be alive here, and nothing after this point would stop it. The wait is on the lane's
+    # own stopwatch, restarted if the throw came after it stopped (adversary A2 on afdc228b), and what is left of the lane's budget bounds it, down to the floor a stop needs to be observed at all.
+    if ($cfg.engine -eq 'codex' -and $null -eq $codexImageHost -and $null -ne $proc) {
+        if (-not $sw.IsRunning) { $sw.Start() }
+        $directStopLimitMs = [math]::Min([double]$CODEX_DIRECT_KILL_WAIT_MS, [math]::Max([double]$IMAGE_VERIFY_FLOOR_MS, ($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
+        try { $codexDirectChildStop = Stop-CodexDirectChildTree -Proc $proc -LimitMs $directStopLimitMs } catch { $codexDirectChildStop = 'uncertain:tree-unreadable' }
+    }
     $noChildCause = $_.Exception.Message
     $noChildCauseType = $_.Exception.GetType().Name
     # r3: the lane's own deadline is read ONCE, here, before any cleanup spends time, and applies to
@@ -2175,6 +3346,21 @@ catch {
 }
 finally {
 
+# r13 (Dot B2): on every path, an uncertain release is a typed failure and no image is reported as consumed-and-verified.
+if ([string]$imageHoldRelease -like 'uncertain:*') {
+    foreach ($att in $ImageAttachments) {
+        $att.consumedVerified = $false
+        $att['consumedVerifyReason'] = "image-hold-${imageHoldRelease}: a reader of the snapshot may still be alive, so the hold is kept until the lane process exits"
+    }
+    $holdProblem = "image-hold-${imageHoldRelease}: the image readers are not known to be gone; the holds stay open until the lane process exits"
+    $failure = if ($failure) { "$failure | $holdProblem" } else { $holdProblem }
+    if ($exitCode -eq 0) { $exitCode = 1 }
+}
+# r14 (Dot B3): this lane is already failing or timing out; what it could not stop goes on the record beside the cause.
+if ([string]$codexDirectChildStop -like 'uncertain:*') {
+    $stopProblem = "codex-direct-child-${codexDirectChildStop}: the codex child or a descendant may have outlived this lane"
+    $failure = if ($failure) { "$failure | $stopProblem" } else { $stopProblem }
+}
 # Cleanup must precede all receipt construction and I/O, including exceptional
 # startup paths. Failure to write evidence cannot keep a provider running.
 if ($jobHandle -ne [IntPtr]::Zero) {
@@ -2505,6 +3691,15 @@ $receipt = [ordered]@{
 }
 # Present only on a typed no-child launch, so every other receipt keeps its exact shape.
 if ($null -ne $launchNoChild) { $receipt['launchNoChild'] = $launchNoChild }
+# VISUAL-JUDGE-TERRA-LANE-1: present only when -ImagePaths was given, so every other receipt keeps its exact shape.
+# Each entry is {source, path, sha256, bytes, ext}: `source` is the caller's file, `path` the run-dir COPY handed to
+# `codex exec -i`, sha256/bytes are of that copy (hashed after copying). Null path/sha256 = the launch failed first.
+if ($ImageAttachments.Count -gt 0) { $receipt['imagePaths'] = @($ImageAttachments) }
+# r13 (Dot B2): 'released' = the holds were closed with no possible reader left (the job reported no live member, or no reader was ever started).
+# 'uncertain:<kill-failed|wait-timeout|tree-unreadable>' = they were kept until the lane process exits.
+if ($ImageAttachments.Count -gt 0) { $receipt['imageHoldRelease'] = if ($imageHoldRelease) { $imageHoldRelease } else { 'released' } }
+# r14 (Dot B3): present only when the launch path of a Codex lane with no image threw with a child started, so every other receipt keeps its exact shape. See Stop-CodexDirectChildTree.
+if ($null -ne $codexDirectChildStop) { $receipt['codexDirectChildStop'] = $codexDirectChildStop }
 try {
     Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))
 } finally {
