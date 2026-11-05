@@ -85,6 +85,34 @@ inline QString shownText( bool lookAssistEnabled, const lookassist::LookAssistFl
     return landedFlavor.isEmpty() ? QStringLiteral( "Look: Baseline" ) : text( true, landedFlavor );
 }
 
+/*! \brief r12 (adversary r11 A1): the session row whose receipt owns the loaded clip, or -1. The active row is not it
+ *  while another row's open is pumping events (addFileToSession activates B before B's loader runs, and A is still what
+ *  is on screen). The active row wins when it holds the clip, because a nested session can hold the same path twice.
+ *  `isLoadedRow(row)` answers for one row in [0, rowCount). */
+template <typename IsLoadedRow>
+inline int loadedClipOwnerRow( int activeRow, int rowCount, IsLoadedRow isLoadedRow )
+{
+    if( activeRow >= 0 && activeRow < rowCount && isLoadedRow( activeRow ) ) return activeRow;
+    for( int row = 0; row < rowCount; ++row )
+        if( isLoadedRow( row ) ) return row;
+    return -1;
+}
+
+/*! \brief Whether the look of the loaded clip is on, read from the receipt that owns it. The selector checkbox describes
+ *  the active row, and a click there writes nothing into another row's clip (receiptOwnedByLoadedClip refuses it), so it
+ *  counts only when the owner is the active row. */
+inline bool lookOnForOwner( bool hasOwner, bool ownerLookAssistEnabled, bool ownerIsActiveRow, bool selectorChecked )
+{
+    return hasOwner && ownerLookAssistEnabled && ( !ownerIsActiveRow || selectorChecked );
+}
+
+/*! \brief A clip stays loaded but no session row holds it (its row was removed and the next open has not replaced it):
+ *  no receipt can say what is on screen, so the label keeps the text it had. Nothing loaded is not this case: it reads Off. */
+inline bool keepsTextWithoutOwner( bool clipLoaded, int ownerRow )
+{
+    return clipLoaded && ownerRow < 0;
+}
+
 /*! \brief The corner label is drawn only in fullscreen, and only while the setting shows it. */
 inline bool fullscreenOverlayShown( bool fullscreen, bool showInFullscreenSetting )
 {

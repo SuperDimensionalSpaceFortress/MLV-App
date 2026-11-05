@@ -31684,13 +31684,20 @@ LookAssistFlavor MainWindow::currentLookAssistFlavor()
 // The overlay is rasterised by the surface once per change; nothing here runs per frame.
 void MainWindow::updateLookLabel( void )
 {
-    const bool lookOn = m_fileLoaded && ACTIVE_RECEIPT && ACTIVE_RECEIPT->lookAssistEnabled()
-                     && ui->checkBoxLookAssistEnable->isChecked();
+    // r12 (adversary r11 A1): the label names the look of the receipt that OWNS the loaded clip, never the active row's: a
+    // FullScreen delivered in addFileToSession's event pump has B active while A is loaded. m_fileLoaded is read first because
+    // this also runs from settings loading, before a session model exists.
+    const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(
+        SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, [this]( int row ) { return loadedClipIsRow( row ); } );
+    ReceiptSettings *owner = ownerRow >= 0 ? GET_RECEIPT( ownerRow ) : nullptr;
+    const bool lookOn = look_label::lookOnForOwner( owner != nullptr, owner && owner->lookAssistEnabled(),
+                                                    owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
+                                                    ui->checkBoxLookAssistEnable->isChecked() );
     // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
     // r10: a receipt setSliders put back to its baseline reads "Look: Baseline" until an analysis LANDS on it; the mark lives
     // in the outcome (baselineRestored / showsBaseline), so every landed() forgets it in the same step (shownText reads it).
-    const void *lookReceipt = lookOn ? ACTIVE_RECEIPT : nullptr;
-    const QString text = look_label::shownText(
+    const void *lookReceipt = lookOn ? owner : nullptr;
+    const QString text = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText : look_label::shownText(
         lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
     const bool fullscreenShown =
         look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );

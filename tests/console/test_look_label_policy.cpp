@@ -230,6 +230,87 @@ TEST(LookLabelPolicy, R9AFlavorIsNamedOnlyOnceAnAnalysisLandedOnThisReceipt)
     ASSERT_EQ(std::string("Look: Off"), look_label::shownText(false, outcome, &clip, film).toStdString());
 }
 
+// Adversary r11 A1. Clip A is loaded with a landed Cinematic grade and Look Assist on; an empty clip B is imported, so
+// addFileToSession makes B the active row and pumps events before B's loader runs. B's receipt defaults Look Assist on and
+// nothing landed on it. F11 in that pump re-derives the label, and A is still what is on screen. No clip is opened here.
+TEST(LookLabelPolicy, A1LabelNamesTheReceiptThatOwnsTheLoadedClipNotTheActiveRow)
+{
+    int receiptA = 0, receiptB = 0;
+    const void *receipts[] = { &receiptA, &receiptB };
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&receiptA, cinematic, false);
+
+    const int rowA = 0, rowB = 1, rows = 2;
+    int loadedRow = rowA;
+    const auto isLoadedRow = [&loadedRow](int row) { return row == loadedRow; };
+    // The label as updateLookLabel derives it, with the checkbox still describing A.
+    const auto label = [&](int activeRow) {
+        const int owner = look_label::loadedClipOwnerRow(activeRow, rows, isLoadedRow);
+        const bool on = look_label::lookOnForOwner(owner >= 0, true, owner >= 0 && owner == activeRow, true);
+        return look_label::shownText(on, outcome, on ? receipts[owner] : nullptr, cinematic).toStdString();
+    };
+
+    // The pairing A1 reported: A's outcome read through B's receipt would say "Look: Baseline" over Cinematic A.
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, &receiptB, cinematic).toStdString());
+    // B is active and A is loaded: the owner is A, and the label keeps naming A's look.
+    ASSERT_EQ(rowA, look_label::loadedClipOwnerRow(rowB, rows, isLoadedRow));
+    ASSERT_EQ(std::string("Look: Cinematic"), label(rowB));
+    // B's open succeeds: B owns the clip, and nothing has landed on it.
+    loadedRow = rowB;
+    ASSERT_EQ(rowB, look_label::loadedClipOwnerRow(rowB, rows, isLoadedRow));
+    ASSERT_EQ(std::string("Look: Baseline"), label(rowB));
+}
+
+TEST(LookLabelPolicy, A1OwnerRowEdgeCases)
+{
+    const auto never = [](int) { return false; };
+    const auto always = [](int) { return true; };
+    ASSERT_EQ(-1, look_label::loadedClipOwnerRow(0, 2, never));   // no row holds the clip
+    ASSERT_EQ(-1, look_label::loadedClipOwnerRow(0, 0, always));  // an empty session
+    ASSERT_EQ(1, look_label::loadedClipOwnerRow(1, 3, always));   // the same path twice: the active row wins
+    ASSERT_EQ(0, look_label::loadedClipOwnerRow(-1, 3, always));  // no valid active row: the scan still finds it
+    ASSERT_EQ(0, look_label::loadedClipOwnerRow(9, 3, always));   // a stale active row is never read
+}
+
+TEST(LookLabelPolicy, A1SelectorCountsOnlyWhenTheOwnerIsTheActiveRow)
+{
+    // The owner is the active row: the switch and the checkbox, as before.
+    ASSERT_TRUE(look_label::lookOnForOwner(true, true, true, true));
+    ASSERT_FALSE(look_label::lookOnForOwner(true, true, true, false));
+    ASSERT_FALSE(look_label::lookOnForOwner(true, false, true, true));
+    // B is active: unticking the box writes nothing into A (receiptOwnedByLoadedClip refuses it), so A's look stays named.
+    ASSERT_TRUE(look_label::lookOnForOwner(true, true, false, false));
+    ASSERT_FALSE(look_label::lookOnForOwner(true, false, false, true));
+    // No owner: never on.
+    ASSERT_FALSE(look_label::lookOnForOwner(false, true, false, true));
+}
+
+TEST(LookLabelPolicy, A1NoOwnerKeepsTheTextOnlyWhileAClipIsLoaded)
+{
+    ASSERT_TRUE(look_label::keepsTextWithoutOwner(true, -1));     // loaded, in no row: no receipt can say otherwise
+    ASSERT_FALSE(look_label::keepsTextWithoutOwner(true, 0));     // an owner derives the text
+    ASSERT_FALSE(look_label::keepsTextWithoutOwner(false, -1));   // nothing loaded: "Look: Off"
+}
+
+TEST(LookLabelWiring, A1UpdateLookLabelDerivesFromTheOwnerNeverTheActiveReceipt)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
+    ASSERT_FALSE(update.contains(QStringLiteral("ACTIVE_RECEIPT")));
+    ASSERT_TRUE(update.contains(QStringLiteral("look_label::loadedClipOwnerRow(")));
+    ASSERT_TRUE(update.contains(QStringLiteral("loadedClipIsRow( row )")));
+    ASSERT_TRUE(update.contains(QStringLiteral("look_label::lookOnForOwner(")));
+    ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? owner : nullptr;")));
+    ASSERT_TRUE(update.contains(QStringLiteral("look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText")));
+    // Called from settings loading before the session model exists: the model is read only once a clip is loaded.
+    ASSERT_TRUE(update.contains(QStringLiteral("const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(")));
+    // The pump A1 used still sits between the activation and the loader.
+    const QString add = functionBody(mw, QStringLiteral("ClipInformation *MainWindow::addFileToSession(QString fileName)"));
+    const int activated = add.indexOf(QStringLiteral("m_pModel->setActiveRow( SESSION_CLIP_COUNT - 1 );"));
+    ASSERT_TRUE(activated >= 0 && add.indexOf(QStringLiteral("qApp->processEvents();"), activated) > activated);
+}
+
 TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
 {
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
@@ -346,8 +427,8 @@ TEST(LookLabelWiring, LabelReadsTheGradesStateAndUpdatesOnEveryChange)
 {
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
-    // One source of truth: the receipt's switch, the checkbox and the flavor the grade uses.
-    ASSERT_TRUE(update.contains(QStringLiteral("ACTIVE_RECEIPT->lookAssistEnabled()")));
+    // One source of truth: the switch of the receipt that owns the loaded clip, the checkbox and the flavor the grade uses.
+    ASSERT_TRUE(update.contains(QStringLiteral("owner->lookAssistEnabled()")));
     ASSERT_TRUE(update.contains(QStringLiteral("ui->checkBoxLookAssistEnable->isChecked()")));
     ASSERT_TRUE(update.contains(QStringLiteral("lookAssistFlavorName( currentLookAssistFlavor() )")));
     // Once per change: nothing is pushed when neither the text nor the fullscreen state changed.
@@ -448,9 +529,9 @@ TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
     // setSliders mark and the begin() reset) are gone; the mark lives in the outcome, so no landing site can forget it.
     ASSERT_EQ(0, mw.count(QStringLiteral("m_lookLabelBaselineReceipt")));
     ASSERT_EQ(0, readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).count(QStringLiteral("m_lookLabelBaselineReceipt")));
-    // updateLookLabel passes the active receipt through; shownText reads the mark.
+    // updateLookLabel passes the receipt that owns the loaded clip through (r12, adversary r11 A1); shownText reads the mark.
     const QString update = functionBody(mw, QStringLiteral("void MainWindow::updateLookLabel( void )"));
-    ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? ACTIVE_RECEIPT : nullptr;")));
+    ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? owner : nullptr;")));
     const QString policy = readRepoFile(QStringLiteral("platform/qt/LookLabelPolicy.h"));
     ASSERT_TRUE(functionBody(policy, QStringLiteral("inline QString shownText("))
                     .contains(QStringLiteral("if( outcome.showsBaseline( receipt ) ) return QStringLiteral( \"Look: Baseline\" );")));
