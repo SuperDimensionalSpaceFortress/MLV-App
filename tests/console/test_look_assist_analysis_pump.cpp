@@ -361,6 +361,46 @@ TEST(LookAssistAnalysisPump, AWidgetTimerAndAFocusChangeWaitAndOtherTimersRun)
     ASSERT_TRUE( fired > 0 );
 }
 
+// Adversary A1 on 27ac7f9d: an IME commit into lineEditTransferFunction and a text drop into it both changed the clip's
+// processing under the worker. Neither was in the classifier. The commit waits. A drag's data lives only while its event
+// is delivered, so a drag cannot wait: it is refused, and nothing is kept for the landing.
+TEST(LookAssistAnalysisPump, AnImeCommitWaitsForTheLandingAndADragIsRefused)
+{
+    using look_assist_pump::heldDuringSession;
+    for( const QEvent::Type type : { QEvent::InputMethod, QEvent::DragEnter, QEvent::DragMove, QEvent::Drop,
+                                     QEvent::Gesture, QEvent::NativeGesture } )
+    {
+        ASSERT_TRUE( heldDuringSession( type, true ) );
+    }
+    ASSERT_TRUE( !look_assist_pump::isRefusedDuringSession( QEvent::InputMethod ) );
+    for( const QEvent::Type type : { QEvent::DragEnter, QEvent::DragMove, QEvent::Drop } )
+    {
+        ASSERT_TRUE( look_assist_pump::isRefusedDuringSession( type ) );
+    }
+
+    EventCounter target;
+    AnalysisWorker worker;
+    AnalysisPump pump;
+    pump.beginSession( &worker );
+    QEvent drop( QEvent::Drop );
+    drop.accept();
+    ASSERT_TRUE( QCoreApplication::sendEvent( &target, &drop ) );   // the filter ate it
+    ASSERT_TRUE( !drop.isAccepted() );
+    QEvent dragEnter( QEvent::DragEnter );
+    dragEnter.accept();
+    ASSERT_TRUE( QCoreApplication::sendEvent( &target, &dragEnter ) );
+    ASSERT_TRUE( !dragEnter.isAccepted() );
+    QCoreApplication::postEvent( &target, new QEvent( QEvent::InputMethod ) );
+    pump.call( []() { sleepMs( 50 ); } );
+    const auto held = pump.endSession();
+    ASSERT_EQ( 0, target.inputEvents );
+    ASSERT_EQ( 1, static_cast<int>( held.size() ) );   // the commit, and no drag
+
+    for( const auto &work : held ) work();
+    QCoreApplication::processEvents();
+    ASSERT_EQ( 1, target.inputEvents );
+}
+
 // Adversary A2 on ff4e96ed: the request survives the analysis. The filter does not touch it: MainWindow::event holds it.
 TEST(LookAssistAnalysisPump, ADialogThatIsUpKeepsItsInputAndOtherEventsPass)
 {

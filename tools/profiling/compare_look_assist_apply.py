@@ -132,10 +132,12 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
         for key in LOOK_STATE_FIELDS:
             if not fields.get(key):
                 failures.append("%s: %s has no %s" % (arm, VISUAL_STATE_EVENT, key))
-    if result is not None and require_walk and result.get("post_walk_ran") != "1":
-        failures.append("%s: post_walk_ran=%s, this arm cannot catch a skipped refinement" % (arm, result.get("post_walk_ran")))
-    if result is not None and require_surface_search and result.get("surface_search") != "converged":
-        failures.append("%s: surface_search=%s, this arm does not cover the window-lit route" % (arm, result.get("surface_search")))
+    # Every analysis in the log, not only the last: an earlier one that skipped the walk is what the requirement is for.
+    for fields in (fields for _n, _s, event, fields in rows if event == "look_assist.apply.result"):
+        if require_walk and fields.get("post_walk_ran") != "1":
+            failures.append("%s: post_walk_ran=%s, this arm cannot catch a skipped refinement" % (arm, fields.get("post_walk_ran")))
+        if require_surface_search and fields.get("surface_search") != "converged":
+            failures.append("%s: surface_search=%s, this arm does not cover the window-lit route" % (arm, fields.get("surface_search")))
     return failures
 
 
@@ -150,6 +152,8 @@ def play_after_landing_failure(rows, arm):
     for number, _stamp, event, fields in rows:
         if event == "look_assist.toggle.frame_ready_apply":
             toggle_open = True
+            landed = False
+        elif event == "look_assist.setSliders.frame_ready_apply":
             landed = False
         elif event == "look_assist.toggle.end" and fields.get("checked") == "1":
             toggle_open = False

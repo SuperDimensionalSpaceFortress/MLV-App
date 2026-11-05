@@ -135,11 +135,18 @@ private:
 };
 
 // The event types that are the user's hand on the app. Focus counts: a spin box commits typed text to the clip when focus
-// leaves it, and the window losing activation is not input to ExcludeUserInputEvents.
+// leaves it, and the window losing activation is not input to ExcludeUserInputEvents. So does an IME commit or a drop into
+// a line edit: either changes its text, and the slot behind that text changes the clip.
 inline bool isUserInputEvent( QEvent::Type type )
 {
     switch( type )
     {
+    case QEvent::InputMethod:
+    case QEvent::DragEnter:
+    case QEvent::DragMove:
+    case QEvent::Drop:
+    case QEvent::Gesture:
+    case QEvent::NativeGesture:
     case QEvent::FocusIn:
     case QEvent::FocusOut:
     case QEvent::MouseButtonPress:
@@ -174,6 +181,13 @@ inline bool isUserInputEvent( QEvent::Type type )
 inline bool heldDuringSession( QEvent::Type type, bool targetIsWidget )
 {
     return isUserInputEvent( type ) || ( type == QEvent::Timer && targetIsWidget );
+}
+
+// A drag's data lives only while its event is delivered, so a copy could not be posted at landing: it is refused instead,
+// and the user drops again.
+inline bool isRefusedDuringSession( QEvent::Type type )
+{
+    return type == QEvent::DragEnter || type == QEvent::DragMove || type == QEvent::Drop;
 }
 
 // The GUI thread's side of one analysis. With no session open every call runs inline on the caller, which is the route
@@ -320,6 +334,11 @@ private:
             if( !heldDuringSession( event->type(), watched->isWidgetType() ) || ( mayTakeInput && mayTakeInput() ) ) return false;
             // A running timer fires again by itself after landing; only one shot of it is skipped.
             if( event->type() == QEvent::Timer ) return true;
+            if( isRefusedDuringSession( event->type() ) )
+            {
+                event->ignore();
+                return true;
+            }
             const QPointer<QObject> target( watched );
             QEvent *const held = event->clone();
             m_pump->hold( [target, held]()

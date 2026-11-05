@@ -157,6 +157,23 @@ class CompareLookAssistApply(unittest.TestCase):
         failure = compare.play_after_landing_failure(compare.parse_log("\n".join([load, load_result] + lines) + "\n"), "arm")
         self.assertIn("comes before the analysis landed", failure or "")
 
+    def test_adversary_a3_a_finished_analysis_does_not_land_a_later_clip_load_one(self):
+        earlier = [
+            line("00.010", "0x1", "look_assist.apply.result", result()),
+            line("00.020", "0x1", "look_assist.setSliders.frame_ready_apply", "analysis_frame=0"),
+            line("00.030", "0x1", "play.toggled.begin", "checked=1"),
+        ]
+        log = "\n".join(earlier) + "\n" + arm()
+        report = compare.run(log, log)
+        self.assertEqual(report["verdict"], "differs")
+        self.assertTrue(any("comes before the analysis landed" in f for f in report["failures"]), report)
+
+    def test_adversary_a2_every_analysis_in_a_log_must_cover_what_the_arm_requires(self):
+        walk = arm(result_line=result(post_walk_ran="0")) + arm(stamp_offset=20)
+        self.assertEqual(compare.run(walk, walk, require_walk=True)["verdict"], "differs")
+        search = arm(result_line=result(surface_search="not-run")) + arm(stamp_offset=20, result_line=result(surface_search="converged"))
+        self.assertEqual(compare.run(search, search, require_surface_search=True)["verdict"], "differs")
+
     def test_adversary_a3_the_clip_load_route_has_no_toggle_end(self):
         log = arm().replace("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply")
         log = log.replace("look_assist.toggle.end", "look_assist.setSliders.end")
