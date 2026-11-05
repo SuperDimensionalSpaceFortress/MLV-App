@@ -4229,6 +4229,29 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
 
+    def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
+        # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
+        # the BATCH entrypoint (scalar -LegSpec mode and -LegPlan mode), not only the predicate and the leg. A string, 0/1 and null are each refused, naming the field.
+        base = json.loads(self._valid_leg_spec_text())
+        cases = (("disableLookAssist", "false"), ("utilSample", "true"), ("unpaced", 1))   # few launches: the predicate test covers every switch and value
+        for name, value in cases:
+            with self.subTest(mode="scalar", name=name, value=value):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"bool-{name}.json"
+                spec.write_text(json.dumps({**base, "generatorArgs": {name: value}}), encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertIn(f"generatorArgs.{name} must be JSON true or false", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+        for name, value in cases[1:2]:
+            with self.subTest(mode="plan", name=name, value=value):
+                p = self.case / f"bool-plan-{name}.json"
+                p.write_text(json.dumps({**base, "generatorArgs": {name: value}}), encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(p, "B", self.commit_a)]), "LEG_SPEC_INVALID item=2 ")
+
     def test_r9_dualiso_a_scalar_leg_spec_whose_legtype_is_not_one_enumerated_string_is_refused_before_the_claim(self) -> None:
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r9 (adversary r8 cc8061a2 A1): legType ["look","speed"] with no look stringified to 'look speed', passed the shared
         # shape predicate, opened the lease, and the leg then indexed the absent look (LEG_FAILED, no receipt). Every non-enum legType is refused before any claim.

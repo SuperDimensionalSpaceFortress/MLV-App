@@ -110,6 +110,15 @@
     LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1: the run-dir tie (Find-RunDirDriverHolders) reads the decoded text too, so a recorded driver
     that names its RUN DIR only inside -EncodedCommand is a live driver (via=rundir-pid:<file>+cmdline-encoded).
 
+    UNREADABLE SCRIPT (RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1, 2026-11-05, Dot R1-R3 on #477): a script the corpus names, that exists and cannot be read (a sharing
+      violation, a denial, an unreachable server, a metadata failure), used to be dropped as if it named nothing. Reproduced through Invoke-RetireLaneWorktree: a live holder
+      with its cwd outside the tree and arms.ps1 open FileShare.None was `retired` with renameProbe=ok, the worktree gone under the holder (a rename can only see a handle
+      under the tree). Such a holder is now kept / cwd-unknown, Why=script-unreadable, naming the pid and the file: no creation-time or service-owner exemption, never
+      deferred to the rename probe. A confirmed-missing candidate stays a no-hit, because the corpus regex matches many words that are not files (Read-HolderCorpusFile says
+      what counts as confirmed). Measured read-only before shipping: 0 such rows over 6 snapshots of ~600 live processes on this host. THE COST, accepted: while such a
+      holder lives it refuses EVERY worktree, since its text could name any of them; the refusal names both so the file's owner can be found.
+      OPEN, RETIRE-HOLDER-CORPUS-CAPS-1: the size, file-count and depth bounds still drop text silently (see Get-ScriptCorpus).
+
     RENAME PROBE (r7, 2026-10-23, LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1): the cwd-unknown rule retired 0 worktrees in 55 lane
       receipts. Its question - "could a process whose cwd I cannot read be sitting in this tree?" - is one the ACL of that
       process puts out of reach, and on this host ~14 unreadable pids (IIS w3wp.exe app pools, TeamViewer_Desktop, WmiPrvSE,
@@ -249,6 +258,9 @@ $script:HolderScriptExt = 'ps1|psm1|py|cmd|bat|js|mjs'
 $script:HolderMaxFilesPerProcess = 40
 $script:HolderMaxBytes = 524288
 $script:HolderMaxDepth = 3
+# RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 (Dot R1 on #477): the rows -DeferUnreadableCwd never moves to the rename probe. A rename can only see a handle under the
+# tree, and a holder known only through its script text, with its cwd outside the tree, may hold none.
+$script:HolderNeverDeferredWhy = @('relative-script-unresolved', 'encoded-command-undecodable', 'script-unreadable')
 # CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: a handle can outlive the process that held it (a exited holder, Defender, the indexer), so the one
 # `git worktree remove` can fail with access-denied after the gate saw nothing. Git renders the Windows errors as "Permission denied" (EACCES) or
 # "Invalid argument" (EINVAL from a sharing violation on a file open without FILE_SHARE_DELETE); native tools as "Access is denied" / "being used by
@@ -470,12 +482,50 @@ function Get-EncodedCommandText {
     return $res
 }
 
+function Read-HolderScriptAttributes {
+    # File.GetAttributes, which THROWS on a failure, where FileInfo.Exists answers false for a missing file AND for a denied one (measured: read-attributes
+    # denied on the file and list denied on its parent gives Exists=False, GetAttributes win32=5). A seam: a test redefines it to throw a class a real handle cannot produce.
+    param([string]$Path)
+    return [IO.File]::GetAttributes($Path)
+}
+
+function Read-HolderCorpusFile {
+    # One corpus candidate, classified. RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 (Dot R3 on #477): absence and denial are different answers.
+    #   text        read; Text holds it
+    #   absent      CONFIRMED not a file: win32 2/3 (no such file / path), 123 (a name no file can have), 206 (longer than any file name), or a directory.
+    #               The corpus regex matches many words that are not files; refusing on those would stop all retirement, so these stay a no-hit.
+    #   unreadable  anything else, a sharing violation or a denial or an unreachable server: the file may name the worktree and nothing can say it does not.
+    #   over-size   exists, longer than HolderMaxBytes, not read. Treated as a no-hit today: OPEN, RETIRE-HOLDER-CORPUS-CAPS-1.
+    param([string]$Full)
+    $res = [pscustomobject]@{ State = 'absent'; Text = $null; Error = '' }
+    try {
+        $attrs = Read-HolderScriptAttributes -Path $Full
+        if ([int]$attrs -band [int][IO.FileAttributes]::Directory) { return $res }
+        $len = ([IO.FileInfo]::new($Full)).Length
+        if ($len -gt $script:HolderMaxBytes) { $res.State = 'over-size'; $res.Error = "length=$len"; return $res }
+        $res.Text = Read-SharedText -Path $Full
+        $res.State = 'text'
+    } catch {
+        $e = $_.Exception.GetBaseException()   # a .NET call from PowerShell arrives wrapped (MethodInvocationException, GetValueInvocationException)
+        $hr = [int]$e.HResult
+        $win32 = if ((($hr -shr 16) -band 0xFFFF) -eq 0x8007) { $hr -band 0xFFFF } else { 0 }
+        if ($e -is [IO.FileNotFoundException] -or $e -is [IO.DirectoryNotFoundException] -or $win32 -in @(2, 3, 123, 206)) { return $res }
+        $res.State = 'unreadable'
+        $res.Error = "$($e.GetType().Name)$(if ($win32) { " win32=$win32" })"
+    }
+    return $res
+}
+
 function Get-ScriptCorpus {
     # The text a live script process can load: the script on its command line plus, transitively (same directory,
     # or an absolute path written in the text), the scripts it names. A chain whose command line names only its RUN
     # DIR still reaches the worktree through a dot-sourced arms.ps1 (2026-10-09). Bounded by file count, size and depth.
     # r2: a relative script path on the command line (quoted or not) is resolved against the HOLDER's cwd; if that is
     # unknown the path cannot be followed and RelativeUnresolved is set so the caller fails closed.
+    # RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: Unreadable lists {File; Error} for each named file that exists and could not be read, so the caller can keep the holder.
+    # OPEN, successor card RETIRE-HOLDER-CORPUS-CAPS-1: the three bounds still drop text silently (a file over HolderMaxBytes, files past HolderMaxFilesPerProcess, names
+    # below HolderMaxDepth). Not flagged here because a refusal on them would stop every retirement on this host: measured 2026-11-05 over 6 snapshots of ~600 processes,
+    # processes that really left a file unread were over-size 5-7, file cap 19-25, depth cap 32-47. Measuring does not make a bound safe; the card has to.
     param([string]$CommandLine, [hashtable]$FileCache, [string]$HolderCwd = '')
     $ext = $script:HolderScriptExt
     $queue = New-Object System.Collections.Generic.Queue[object]
@@ -489,21 +539,20 @@ function Get-ScriptCorpus {
     }
     $seen = @{}
     $out = New-Object System.Collections.Generic.List[object]
+    $unreadable = New-Object System.Collections.Generic.List[object]
     while ($queue.Count -gt 0 -and $out.Count -lt $script:HolderMaxFilesPerProcess) {
         $item = $queue.Dequeue()
-        $full = $null; $text = $null
-        try {
-            $full = [IO.Path]::GetFullPath(([string]$item[0] -replace '/', '\'))
-            if ($seen.ContainsKey($full.ToLowerInvariant())) { continue }
-            $seen[$full.ToLowerInvariant()] = $true
-            if ($FileCache.ContainsKey($full.ToLowerInvariant())) { $text = $FileCache[$full.ToLowerInvariant()] }
-            else {
-                $fi = New-Object IO.FileInfo $full
-                $text = if ($fi.Exists -and $fi.Length -le $script:HolderMaxBytes) { Read-SharedText -Path $full } else { $null }
-                $FileCache[$full.ToLowerInvariant()] = $text
-            }
-        } catch { continue }
-        if ($null -eq $text) { continue }
+        # A candidate GetFullPath refuses (an embedded NUL, say) is not a path: a no-hit.
+        $full = try { [IO.Path]::GetFullPath(([string]$item[0] -replace '/', '\')) } catch { continue }
+        $key = $full.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        # One classified answer per path per snapshot: a second holder of a locked file gets the same answer, never a cached no-hit.
+        if (-not $FileCache.ContainsKey($key)) { $FileCache[$key] = Read-HolderCorpusFile -Full $full }
+        $r = $FileCache[$key]
+        if ($r.State -eq 'unreadable') { $unreadable.Add([pscustomobject]@{ File = $full; Error = $r.Error }); continue }
+        if ($r.State -ne 'text') { continue }
+        $text = $r.Text
         $out.Add([pscustomobject]@{ File = $full; Text = $text })
         if ([int]$item[1] -ge $script:HolderMaxDepth) { continue }
         $dir = Split-Path -Parent $full
@@ -512,7 +561,7 @@ function Get-ScriptCorpus {
             $queue.Enqueue(@($cand, ([int]$item[1] + 1)))
         }
     }
-    return [pscustomobject]@{ Files = $out.ToArray(); RelativeUnresolved = $unresolved }
+    return [pscustomobject]@{ Files = $out.ToArray(); RelativeUnresolved = $unresolved; Unreadable = $unreadable.ToArray() }
 }
 
 function Get-LaneHolderIndex {
@@ -539,6 +588,7 @@ function Get-LaneHolderIndex {
         $c = if ($c) { (([string]$c -replace '/', '\').TrimEnd('\')) } else { $null }
         if ($c) { $cwd[$procId] = $c }
         $relUnresolved = $false
+        $unreadableFiles = @()
         # r6: the command line read WITH any -EncodedCommand argument decoded. The decoded text is matched like the raw line
         # and followed into the script corpus; an argument that does not decode makes the holder unknown (kept) below.
         $enc = Get-EncodedCommandText -Name ([string]$proc.Name) -CommandLine ([string]$proc.CommandLine)
@@ -546,12 +596,13 @@ function Get-LaneHolderIndex {
         if ([string]$proc.Name -match $scriptRunner) {
             $corpus = Get-ScriptCorpus -CommandLine (([string]$proc.CommandLine) + "`n" + $enc.Text) -FileCache $fileCache -HolderCwd ([string]$c)
             $relUnresolved = [bool]$corpus.RelativeUnresolved
+            $unreadableFiles = @($corpus.Unreadable)
             foreach ($f in @($corpus.Files)) {
                 $scripts.Add([pscustomobject]@{ ProcessId = $procId; File = $f.File; Text = $f.Text })
             }
         }
-        if ($c -and -not $enc.Failed) { continue }
-        # cwd unknown (or, r6, an -EncodedCommand argument that does not decode). Only a pid that exited since the snapshot holds nothing, and pids 0 and 4 (System Idle, System) are
+        if ($c -and -not $enc.Failed -and -not $unreadableFiles.Count) { continue }
+        # cwd unknown (or, r6, an -EncodedCommand argument that does not decode; or a script the corpus names that exists and cannot be read). Only a pid that exited since the snapshot holds nothing, and pids 0 and 4 (System Idle, System) are
         # kernel pseudo-processes with no user-mode current directory. Every other process is a candidate whatever its
         # session id (r3: a session id is not evidence); Get-CwdUnknownRefusal applies the one creation-time exemption.
         if ($procId -le 4) { continue }
@@ -562,10 +613,17 @@ function Get-LaneHolderIndex {
         }
         $alive = if ($null -ne $livePids) { $livePids.ContainsKey($procId) } else { [bool](Get-Process -Id $procId -ErrorAction SilentlyContinue) }
         if (-not $alive) { continue }
-        $why = if ($enc.Failed) { 'encoded-command-undecodable' } elseif ($relUnresolved) { 'relative-script-unresolved' } elseif ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' }
+        # script-unreadable outranks every cwd reason: a cwd-unreadable row is exempted by creation time or by service owner and otherwise deferred to the rename
+        # probe, and neither answers this question (a script can name a directory made after its process started, and a holder may have no handle under the tree).
+        $why = if ($enc.Failed) { 'encoded-command-undecodable' } elseif ($unreadableFiles.Count) { 'script-unreadable' } elseif ($relUnresolved) { 'relative-script-unresolved' } elseif ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' }
         $cdp = $proc.PSObject.Properties['CreationDate']
         $created = if ($cdp -and $cdp.Value -is [datetime]) { ([datetime]$cdp.Value).ToUniversalTime() } else { $null }
-        $unknown.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$proc.Name; Why = $why; CreatedUtc = $created })
+        $row = [pscustomobject]@{ ProcessId = $procId; Name = [string]$proc.Name; Why = $why; CreatedUtc = $created }
+        if ($unreadableFiles.Count) {
+            $row | Add-Member -NotePropertyName File -NotePropertyValue ([string]$unreadableFiles[0].File)
+            $row | Add-Member -NotePropertyName FileError -NotePropertyValue ("$($unreadableFiles[0].Error)$(if ($unreadableFiles.Count -gt 1) { " +$($unreadableFiles.Count - 1) more" })")
+        }
+        $unknown.Add($row)
     }
     $byPid = @{}
     foreach ($s in $scripts) {
@@ -586,7 +644,8 @@ function Find-WorktreeHolders {
     #   cwd      the process current directory is the worktree or inside it
     #   script   a script the process runs, or one it loads from its directory, names the path
     # Returns one row per pid {ProcessId; Name; Via}. Unreadable cwd / script is not a hit here (system and other-user
-    # processes cannot be opened) - Get-CwdUnknownRefusal turns it into a refusal; the three probes together are what a
+    # processes cannot be opened) - Get-CwdUnknownRefusal turns an unreadable script into a refusal always (Why=script-unreadable) and an unreadable cwd
+    # subject to its exemptions and -DeferUnreadableCwd; the three probes together are what a
     # command-line-only check missed. A null command line cannot match 'cmdline' but is still checked by cwd and script.
     param([string]$WorktreePath, [object]$Snapshot)
     $wd = $WorktreePath.TrimEnd('\')
@@ -1159,7 +1218,7 @@ function Get-WorktreeLiveRefusal {
     #         census-failed         the process table could not be read      } fail closed: unknown is never free
     #         rundir-census-failed  the run dirs could not be read, or (r2) a  }
     #                               record or tie file in one could not be read, or its tie hit RunDirTieMaxFiles; detail names the file and error class
-    #         cwd-unknown           a candidate holder's cwd is unreadable (not exempt) or its -EncodedCommand does not decode } Get-CwdUnknownRefusal,
+    #         cwd-unknown           a candidate holder's cwd is unreadable (not exempt), its -EncodedCommand does not decode, or a script it can load cannot be read (via=script-unreadable, matched=<file>) } Get-CwdUnknownRefusal,
     #         cwd-probe-unavailable the cwd probe cannot run here                                                              } never deferred here
     # -Snapshot: a Get-LaneProcessSnapshot result (a sweep passes one); taken here when absent. -RunsRoot: the fleet-runs root ('' skips the run-dir check).
     param([Parameter(Mandatory = $true)][string]$WorktreePath, [object]$Snapshot = $null, [string]$RunsRoot = '')
@@ -1242,6 +1301,24 @@ function Get-ServiceAccountByPid {
     return $map
 }
 
+function ConvertTo-CwdUnknownRow {
+    # RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 r3 (sol A1 on #759, RETIRE-NOREAD-ROW-PROPERTY-SAFE-1): a holder-index row built by a caller (a -ProcessSnapshot or
+    # -SnapshotProvider index) predates the optional properties. Get-LaneHolderIndex always writes CreatedUtc, and File/FileError only on a script-unreadable
+    # row, so a caller's row may omit any of the three, and under Set-StrictMode Latest a bare read of a missing property throws. The throw reached
+    # Get-WorktreeLiveRefusal (census-failed, no pid), Test-CwdRefusal (cannot-determine) and Remove-LaneBulkScratch (holder-probe-failed): the holder
+    # was known and the refusal lost it. Every optional read goes through this copy (never the shared index row), so a missing one is '' / $null and the
+    # row still names its pid. ProcessId, Name and Why are not optional: a row without them is malformed and still fails closed through the callers' catch.
+    # A caller may build the row as a hashtable, an [ordered] dictionary or a Dictionary[string,object] as well as a PSCustomObject, and PowerShell reads
+    # `$row.Key` on all of them; PSObject.Properties lists none of a dictionary's keys, so a dictionary is asked by key (adversary pass A1 on 62d3c8bf: the
+    # first version lost CreatedUtc, and with it the creation-time exemption, plus File and FileError, for every dictionary row).
+    param([object]$Row)
+    $opt = { param([string]$n)
+        if ($Row -is [System.Collections.IDictionary]) { if (([System.Collections.IDictionary]$Row).Contains($n)) { return $Row[$n] } else { return $null } }
+        $p = $Row.PSObject.Properties[$n]; if ($p) { $p.Value } else { $null } }
+    [pscustomobject]@{ ProcessId = $Row.ProcessId; Name = $Row.Name; Why = $Row.Why; CreatedUtc = (& $opt 'CreatedUtc')
+                       File = [string](& $opt 'File'); FileError = [string](& $opt 'FileError') }
+}
+
 function Get-CwdUnknownRefusal {
     # r2: the cwd probe's own verdict for this snapshot and worktree. Unknown is empty when every candidate holder's cwd was
     # read or exempted; otherwise Reason/Rows/Unknown describe a kept / cwd-probe-unavailable | cwd-unknown result. Never a
@@ -1256,12 +1333,15 @@ function Get-CwdUnknownRefusal {
     # time unreadable (scm-config-time-unreadable:<svc>) or process time unreadable (scm-process-time-unreadable): refused.
     # r7: -DeferUnreadableCwd (the retirement gate only) moves every row whose ONLY problem is an unreadable cwd (cwd-unreadable, or
     # the r5 scm-* binding refusals derived from it) out of Unknown/Reason/Rows into Deferred: the rename probe answers it. Rows
-    # that name a different problem (relative-script-unresolved, encoded-command-undecodable, cwd-probe-unavailable) stay refusals.
+    # that name a different problem (HolderNeverDeferredWhy; or cwd-probe-unavailable, where nothing is deferred) stay refusals.
+    # RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: neither exemption can swallow Why=script-unreadable: both test Why -eq 'cwd-unreadable', and Get-LaneHolderIndex gives a pid
+    # with an unreadable script that Why even when its cwd is unreadable too.
     param([object]$Snapshot, [string]$WorktreePath, [switch]$DeferUnreadableCwd)
     $idx = Get-LaneHolderIndex -Snapshot $Snapshot
     $wtCreated = try { (Get-Item -LiteralPath $WorktreePath -ErrorAction Stop).CreationTimeUtc } catch { $null }
     $unk = @(); $exempt = 0; $owner = @(); $ownerProbe = $null; $ownerSkipped = @()
-    foreach ($u in @($idx.CwdUnknown)) {
+    foreach ($raw in @($idx.CwdUnknown)) {
+        $u = ConvertTo-CwdUnknownRow $raw
         if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable' -and $null -ne $wtCreated -and $null -ne $u.CreatedUtc -and $u.CreatedUtc -lt $wtCreated) { $exempt++; continue }
         if ($idx.CwdProbe -eq 'ok' -and $u.Why -eq 'cwd-unreadable') {
             # One SCM query per snapshot, cached on the index; a failed query exempts nothing.
@@ -1285,17 +1365,19 @@ function Get-CwdUnknownRefusal {
                 }
                 if (-not $unbound) { $owner += "$($u.ProcessId) $($u.Name) exempt=service-sid:$($o.Sid) via=scm:$($o.Services) bound=config-older-than-process"; continue }
                 # A copy: the index row is shared by every worktree of a sweep and must keep Why=cwd-unreadable.
-                $u = [pscustomobject]@{ ProcessId = $u.ProcessId; Name = $u.Name; Why = $unbound; CreatedUtc = $u.CreatedUtc }
+                $u = [pscustomobject]@{ ProcessId = $u.ProcessId; Name = $u.Name; Why = $unbound; CreatedUtc = $u.CreatedUtc; File = $u.File; FileError = $u.FileError }
             }
         }
         $unk += $u
     }
     $made = if ($null -ne $wtCreated) { ([datetime]$wtCreated).ToString('o') } else { $null }
-    $describe = { param($u) $t = if ($u.CreatedUtc) { ([datetime]$u.CreatedUtc).ToString('o') } else { 'unreadable' }; "$($u.ProcessId) $($u.Name) $($u.Why) created=$t" }
+    # Every row in $unk went through ConvertTo-CwdUnknownRow, so File / FileError / CreatedUtc always exist (as '' / $null when the caller's row lacked them).
+    $fileOf = { param($u) [string]$u.File }
+    $describe = { param($u) $t = if ($u.CreatedUtc) { ([datetime]$u.CreatedUtc).ToString('o') } else { 'unreadable' }; $f = & $fileOf $u; "$($u.ProcessId) $($u.Name) $($u.Why) created=$t$(if ($f) { " file=$f" })" }
     $deferred = @()
     if ($DeferUnreadableCwd -and $idx.CwdProbe -eq 'ok') {
-        $deferred = @($unk | Where-Object { $_.Why -ne 'relative-script-unresolved' -and $_.Why -ne 'encoded-command-undecodable' })
-        $unk = @($unk | Where-Object { $_.Why -eq 'relative-script-unresolved' -or $_.Why -eq 'encoded-command-undecodable' })
+        $deferred = @($unk | Where-Object { $_.Why -notin $script:HolderNeverDeferredWhy })
+        $unk = @($unk | Where-Object { $_.Why -in $script:HolderNeverDeferredWhy })
     }
     $res = [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $null; Rows = @(); Unknown = @(); Exempt = $exempt; WorktreeCreatedUtc = $made
                               ExemptOwner = $owner; OwnerProbe = $ownerProbe; OwnerSkipped = $ownerSkipped
@@ -1308,7 +1390,18 @@ function Get-CwdUnknownRefusal {
     if (@($unk | Where-Object { $_.Why -eq 'encoded-command-undecodable' }).Count) {
         $res.Reason += ' (encoded-command-undecodable: an -EncodedCommand argument that does not decode as UTF-16LE base64 is never treated as "not a holder")'
     }
-    $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $(if ($_.Why -eq 'encoded-command-undecodable') { 'encoded-command-undecodable' } else { $via }) } })
+    $noRead = @($unk | Where-Object { $_.Why -eq 'script-unreadable' })
+    if ($noRead.Count) {
+        # The refusal names each pid and file; the sentence above is about a cwd, which is not this row's problem when every row is this kind.
+        if ($noRead.Count -eq $unk.Count -and $idx.CwdProbe -eq 'ok') { $res.Reason = "cwd-unknown: $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
+        $res.Reason += ' (script-unreadable: a script the process can load exists and could not be read, so it may name this worktree: ' + (($noRead | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId)$(if ($_.File) { " $($_.File)" })$(if ($_.FileError) { " [$($_.FileError)]" })" }) -join ', ') + ')'
+    }
+    $res.Rows = @($unk | Select-Object -First 20 | ForEach-Object {
+        $row = [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $(if ($_.Why -in @('encoded-command-undecodable', 'script-unreadable')) { $_.Why } else { $via }) }
+        $f = & $fileOf $_
+        if ($f) { $row | Add-Member -NotePropertyName MatchedPath -NotePropertyValue $f }
+        $row
+    })
     $res.Unknown = @($unk | ForEach-Object { & $describe $_ })
     return $res
 }

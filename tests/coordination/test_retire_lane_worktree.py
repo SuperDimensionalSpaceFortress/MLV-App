@@ -205,7 +205,7 @@ def _ps_arg(v):
     return f"'{v}'"
 
 
-def _sweep(main, **kw):
+def _sweep_with_stderr(main, **kw):
     args = [f"-RepoRoot '{main}'"]
     for k, v in kw.items():
         args.append(f"-{k}" if v is True else f"-{k} {_ps_arg(v)}")
@@ -214,9 +214,13 @@ def _sweep(main, **kw):
         f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}"
         f"Invoke-SweepMergedLaneWorktrees {' '.join(args)} | ConvertTo-Json -Depth 5"
     )
-    out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
-                         check=True, capture_output=True, text=True).stdout
-    return json.loads(out)
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                       check=True, capture_output=True, text=True)
+    return json.loads(r.stdout), r.stderr
+
+
+def _sweep(main, **kw):
+    return _sweep_with_stderr(main, **kw)[0]
 
 
 def _norm(p):
@@ -507,6 +511,78 @@ def _stop(p):
     p.wait(timeout=30)
 
 
+# RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: three hosted failures of the chain case's shape (merge_group 40157682070, #493 run 40809967854, job 126952032811)
+# could not be told apart, because `_spawn` sends the child's output to DEVNULL and the test never looked at it again. Every test whose expected result
+# depends on a live holder now proves liveness BEFORE the scan (only the holder's startup is retried, never anything after product code has run) and
+# checks it AFTER the scan, and a surprising result prints what the original log lacked.
+
+def _await_ready(p, ready, seconds=60):
+    deadline = time.monotonic() + seconds
+    while p.poll() is None and not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return p.poll() is None and ready.exists()
+
+
+def _spawn_script_proven_alive(args, ready, cwd, attempts=3):
+    """Start a script holder and wait for its ready file. Only this startup is retried, before any product code runs."""
+    for _ in range(attempts):
+        if ready.exists():
+            ready.unlink()
+        p = _spawn(args, cwd=cwd)
+        if _await_ready(p, ready):
+            return p
+        _stop(p)
+    raise AssertionError(f"FIXTURE ERROR: {args} did not reach {ready} in {attempts} attempts")
+
+
+def _spawn_chain_proven_alive(sd, cwd):
+    """The `_chain_scripts` chain. quiet.ps1 writes the ready file AFTER its dot-source and stops on any error before that: readiness proves the chain loaded."""
+    return _spawn_script_proven_alive(["-File", str(sd / "chain.ps1")], sd / "chain.ready", cwd)
+
+
+def _holder_diagnostics(p, wt, result, stderr=""):
+    """What the original log of job 126952032811 did not have: the holder's poll state, its census row, its script corpus, the full disposition."""
+    probe = ("$ErrorActionPreference='Continue'; "
+             f". '{HELPER}'; "
+             f"$row = Get-CimInstance Win32_Process -Filter 'ProcessId={p.pid}'; "
+             "if (-not $row) { 'census: NO ROW for this pid'; return }; "
+             "'census: ' + ($row | Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine | ConvertTo-Json -Compress); "
+             f"$cwd = Get-ProcessCurrentDirectory -ProcessId {p.pid}; 'cwd: ' + $cwd; "
+             "$c = Get-ScriptCorpus -CommandLine ([string]$row.CommandLine) -FileCache @{} -HolderCwd ([string]$cwd); "
+             "'corpus files: ' + @($c.Files).Count; "
+             f"foreach ($f in @($c.Files)) {{ 'corpus: ' + $f.File + ' names-worktree=' + (Test-PathNamed -Text $f.Text -Path '{wt}') }}; "
+             "'corpus unreadable: ' + (@($c.Unreadable | ForEach-Object { $_.File + ' ' + $_.Error }) -join ' ; '); "
+             "'corpus relativeUnresolved: ' + $c.RelativeUnresolved")
+    try:
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", probe], capture_output=True, text=True, timeout=120)
+        census = r.stdout + r.stderr
+    except Exception as e:  # a diagnostic must never replace the failure it describes
+        census = f"census failed: {type(e).__name__}: {e}"
+    return (f"\nholder pid={p.pid} poll={p.poll()}\n{census}\nresult={json.dumps(result)}\nstderr={stderr}\n")
+
+
+def _kept_by(p):
+    return lambda v: v["action"] == "kept" and v["reason"].startswith(f"live-process: {p.pid} ")
+
+
+def _would_retire(v):
+    return (v["action"], v["reason"]) == ("would-retire", "ok")
+
+
+def _retired(v):
+    return (v["action"], v["reason"]) == ("retired", "ok")
+
+
+def _require_verdict(p, wt, result, stderr, expected=None):
+    """Call INSIDE the try, after the scan and before _stop. A dead holder is a fixture error, never a gate result (no retry: product code has run).
+    With the holder alive, a verdict `expected` rejects is a real gate result: the output says which reading is left (the card's STOP RULE)."""
+    if p.poll() is not None:
+        raise AssertionError("FIXTURE ERROR: the holder exited before the scan finished, so this says nothing about the gate." + _holder_diagnostics(p, wt, result, stderr))
+    if expected is not None and not expected(result):
+        raise AssertionError("GATE RESULT with a proven-live holder. If the corpus below is readable this is a gate defect: do not widen the fixture."
+                             + _holder_diagnostics(p, wt, result, stderr))
+
+
 def _gate_real(workdir, *, whatif=True, prelude="", extra=""):
     """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced; `extra` is
     appended to the Invoke-RetireLaneWorktree arguments."""
@@ -525,9 +601,10 @@ def _gate_real(workdir, *, whatif=True, prelude="", extra=""):
 def test_process_whose_cwd_is_the_worktree_keeps_it_and_the_refusal_names_the_pid(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-cwd")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)   # command line does NOT name the worktree
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)   # command line does NOT name the worktree
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -541,12 +618,19 @@ def test_process_whose_cwd_is_inside_the_worktree_keeps_it(repo):
     wt = _add_wt(main, tmp / "wt-cwd-sub")
     sub = wt / "deep" / "er"
     sub.mkdir(parents=True)
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=sub)
+    p = _spawn_proven_alive(tmp, "holder", cwd=sub)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+
+
+# The ready file comes after the dot-source, and an error before it stops the script, so readiness proves the chain loaded. 600 s outlives any scan shorter
+# than that; _require_verdict catches a longer one as a fixture error.
+_QUIET_PS1 = ('$ErrorActionPreference = "Stop"\n. "$PSScriptRoot\\arms.ps1"\nif ($null -eq $script:Wt) { exit 3 }\n'
+              '[IO.File]::WriteAllText("$PSScriptRoot\\chain.ready", "up")\nStart-Sleep -Seconds 600\n')
 
 
 def _chain_scripts(tmp, wt_text):
@@ -554,8 +638,8 @@ def _chain_scripts(tmp, wt_text):
     sd = tmp / "chain-run" / "tools"
     sd.mkdir(parents=True)
     (sd / "arms.ps1").write_text(f"$script:Wt = '{wt_text}'\n", encoding="utf-8")
-    (sd / "quiet.ps1").write_text('. "$PSScriptRoot\\arms.ps1"\nStart-Sleep -Seconds 120\n', encoding="utf-8")
-    (sd / "chain.ps1").write_text('& "$PSScriptRoot\\quiet.ps1"\n', encoding="utf-8")
+    (sd / "quiet.ps1").write_text(_QUIET_PS1, encoding="utf-8")
+    (sd / "chain.ps1").write_text('$ErrorActionPreference = "Stop"\n& "$PSScriptRoot\\quiet.ps1"\n', encoding="utf-8")
     return sd
 
 
@@ -563,9 +647,10 @@ def test_live_script_whose_dot_sourced_sibling_names_the_worktree_keeps_it(repo)
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-script")
     sd = _chain_scripts(tmp, str(wt))
-    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)           # cwd elsewhere; command line names the RUN DIR only
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)                      # cwd elsewhere; command line names the RUN DIR only
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -578,9 +663,10 @@ def test_live_script_naming_the_worktree_with_forward_slashes_keeps_it(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-script-slash")
     sd = _chain_scripts(tmp, str(wt).replace("\\", "/"))
-    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -590,9 +676,10 @@ def test_live_script_that_does_not_name_the_worktree_does_not_block_retirement(r
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-script-other")
     sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
-    p = _spawn(["-File", str(sd / "chain.ps1")], cwd=tmp)
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _would_retire)
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
@@ -615,10 +702,10 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
     """End to end, not WhatIf: refused while the holder lives, retired once it is gone."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-release")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt, whatif=False)
-        assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+        d, err = _gate_real(wt, whatif=False)
+        _require_verdict(p, wt, d, err, _kept_by(p))
         assert wt.exists()
     finally:
         _stop(p)
@@ -1472,12 +1559,13 @@ def test_an_unreadable_cwd_process_that_appears_during_the_retry_no_longer_stops
     wt = _add_wt(main, tmp / "wt-late-unknown")
     ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
     p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
-    late = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # not the holder of anything; its cwd just cannot be read
+    late = _spawn_proven_alive(tmp, "late", cwd=tmp)   # not the holder of anything; its cwd just cannot be read
     prelude = (_counted_scans_and_sleeps(release, 1) + _handle_appears_after_the_rename(trigger, ready)
                + "$origCwdLate = ${function:Get-ProcessCurrentDirectory}; "
                f"function Get-ProcessCurrentDirectory {{ param([int]$ProcessId) if ($script:SnapN -ge 3 -and $ProcessId -eq {late.pid}) {{ return $null }}; & $origCwdLate -ProcessId $ProcessId }}; ")
     try:
         d, err = _gate_real(wt, whatif=False, prelude=prelude)
+        _require_verdict(late, wt, d, err, _retired)
     finally:
         _stop(late)
         _finish_holder(p, release)
@@ -1526,9 +1614,10 @@ def test_sweep_keeps_a_worktree_held_only_by_a_process_cwd(repo):
     root = tmp / "lanes"
     held = _add_wt(main, root / "lane-held")
     free = _add_wt(main, root / "lane-free")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=held)
+    p = _spawn_proven_alive(tmp, "holder", cwd=held)
     try:
-        s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+        s, err = _sweep_with_stderr(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+        _require_verdict(p, held, s, err, lambda v: v["kept"] == {"live-process": 1})
     finally:
         _stop(p)
     assert _swept_paths(s) == [_norm(free)] and s["kept"] == {"live-process": 1}, s
@@ -1584,9 +1673,10 @@ def test_healthy_cwd_probe_is_reported_ok_and_backs_the_would_retire(repo):
 def test_probe_unavailable_with_a_cwd_only_holder_is_refused_not_would_retire(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-probe-off")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)   # its ONLY link to the worktree is its cwd
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)   # its ONLY link to the worktree is its cwd
     try:
         d, err = _gate_real(wt, prelude=FORCE_PROBE_UNAVAILABLE)
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept" and v["reason"].startswith("cwd-probe-unavailable"))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith("cwd-probe-unavailable"), d
@@ -1632,7 +1722,7 @@ def test_a_pid_whose_cwd_read_fails_is_listed_and_left_to_the_rename_probe(repo)
         d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(p.pid))
         control, _ = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)    # same process, cwd readable: not listed at all
         # The holder was alive for both scans (it is killed only below), so a missing pid is the gate's, never a vanished fixture.
-        assert p.poll() is None, f"fixture holder {p.pid} exited before the scans finished"
+        _require_verdict(p, wt, d, err, lambda v: any(u.startswith(f"{p.pid} ") for u in v["cwdUnknown"]))
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), json.dumps(d)   # r7: no longer a refusal (the rename settles it)
@@ -1646,9 +1736,10 @@ def test_a_named_holder_is_reported_as_live_process_when_the_probe_works(repo):
     """Same holder as the probe-unavailable case: with a working probe it is NAMED (live-process), not just doubted."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-named")
-    holder = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    holder = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(holder, wt, d, err, _kept_by(holder))
     finally:
         _stop(holder)
     assert d["reason"].startswith(f"live-process: {holder.pid} ") and d["cwdProbe"] == "ok", d
@@ -1817,7 +1908,7 @@ def _relative_chain(tmp, wt_text, dirname):
     sd = base / dirname
     sd.mkdir(parents=True)
     (sd / "arms.ps1").write_text(f"$script:Wt = '{wt_text}'\n", encoding="utf-8")
-    (sd / "quiet.ps1").write_text('. "$PSScriptRoot\\arms.ps1"\nStart-Sleep -Seconds 120\n', encoding="utf-8")
+    (sd / "quiet.ps1").write_text(_QUIET_PS1, encoding="utf-8")
     return base
 
 
@@ -1827,9 +1918,10 @@ def test_relative_script_path_is_resolved_against_the_holders_cwd(repo, dirname)
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rel-script")
     base = _relative_chain(tmp, str(wt), dirname)
-    p = _spawn(["-File", f"{dirname}\\quiet.ps1"], cwd=base)    # the gate runs from elsewhere, where this relative path does not exist
+    p = _spawn_script_proven_alive(["-File", f"{dirname}\\quiet.ps1"], base / dirname / "chain.ready", base)    # the gate runs from elsewhere, where this relative path does not exist
     try:
         d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -1842,9 +1934,10 @@ def test_relative_script_path_that_does_not_name_the_worktree_does_not_block(rep
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rel-other")
     base = _relative_chain(tmp, str(tmp / "some-other-place"), dirname)
-    p = _spawn(["-File", f"{dirname}\\quiet.ps1"], cwd=base)
+    p = _spawn_script_proven_alive(["-File", f"{dirname}\\quiet.ps1"], base / dirname / "chain.ready", base)
     try:
-        d, _ = _gate_real(wt)
+        d, err = _gate_real(wt)
+        _require_verdict(p, wt, d, err, _would_retire)
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
@@ -2320,9 +2413,10 @@ def test_rename_probe_refuses_an_unseen_cwd_holder_and_leaves_the_worktree_intac
     the cwd and cmdline checks have nothing to see, so only the rename can tell. Kept / in-use, worktree untouched at its own path."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rename-inuse")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        d, err = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept" and v["reason"].startswith("in-use"))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
@@ -2336,9 +2430,10 @@ def test_unreadable_cwd_with_no_handle_in_the_worktree_no_longer_blocks_retireme
     """(b) The 2026-10-21 incident shape: a live process whose cwd cannot be read, nowhere near the worktree. Retired."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rename-free")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)
+    p = _spawn_proven_alive(tmp, "holder", cwd=tmp)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        d, err = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        _require_verdict(p, wt, d, err, _retired)
     finally:
         _stop(p)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
@@ -2351,9 +2446,10 @@ def test_readable_cwd_inside_the_worktree_is_still_refused_ahead_of_the_rename_p
     """(c) Unchanged rule: a readable cwd is a named holder (live-process), found before any rename is attempted."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-rename-readable")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    p = _spawn_proven_alive(tmp, "holder", cwd=wt)
     try:
-        d, _ = _gate_real(wt, whatif=False)
+        d, err = _gate_real(wt, whatif=False)
+        _require_verdict(p, wt, d, err, _kept_by(p))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
@@ -2423,9 +2519,10 @@ def test_rename_probe_refuses_a_cwd_holder_in_a_subdirectory_of_the_worktree(rep
     wt = _add_wt(main, tmp / "wt-nested-cwd")
     sub = wt / "sub"
     sub.mkdir()
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=sub)
+    p = _spawn_proven_alive(tmp, "holder", cwd=sub)
     try:
-        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        d, err = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept" and v["reason"].startswith("in-use"))
     finally:
         _stop(p)
     assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
@@ -5209,3 +5306,475 @@ def test_launcher_census_r9_round2_any_compound_entry_write_taints_every_name(wr
 def test_launcher_census_r9_round2_control_a_plain_entry_write_keeps_the_literal(write):
     text = _r9(write)
     assert _unresolved_sites(text) == [], f"a plain default naming another variable made a safe same-scope literal unresolved: {text!r}"
+
+
+# --- RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1: a script the corpus names, that exists and cannot be read, makes its holder UNKNOWN ---
+# Reproduced through Invoke-RetireLaneWorktree at 2fcc6fae (run dir repro/step1-fork-master-2fcc6fae.out.txt): live holder, known cwd outside the
+# tree, arms.ps1 open FileShare.None. -WhatIf said would-retire and a REAL call said retired with renameProbe=ok, the worktree gone under the live
+# holder. The rename probe can only see a handle under the tree, so the refusal has to come before it (Dot R1 on #477, comment of 01:38:16Z).
+
+def _chain_under_lock(repo, leaf, *, holder_first=False):
+    """The fixture's chain with a proven-live holder whose cwd is outside the tree. holder_first starts it before the worktree exists."""
+    tmp, main = repo
+    wt = tmp / leaf
+    if not holder_first:
+        _add_wt(main, wt)
+    sd = _chain_scripts(tmp, str(wt))
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    if holder_first:
+        _add_wt(main, wt)
+    return wt, sd, p
+
+
+def _assert_refused_naming(d, p, path):
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), json.dumps(d)
+    assert str(p.pid) in d["reason"] and str(path).lower() in d["reason"].lower(), json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u and str(path).lower() in u.lower() for u in d["cwdUnknown"]), json.dumps(d)
+
+
+@pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
+def test_full_gate_refuses_a_live_holder_whose_sibling_script_is_locked(repo, whatif):
+    """R1: through Invoke-RetireLaneWorktree, known cwd, real live holder, real FileShare.None handle on a sibling. Refused, naming pid and file."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-script")
+    arms = sd / "arms.ps1"
+    try:
+        d, err = _gate_real(wt, whatif=whatif, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+    assert f"pid={p.pid}" in err and "via=script-unreadable" in err and "arms.ps1" in err, err
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists()
+
+
+def test_full_gate_gives_an_unreadable_script_no_creation_time_exemption(repo):
+    """A script can name a directory made after its process started, so a holder older than the worktree is still unknown."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-older", holder_first=True)
+    arms = sd / "arms.ps1"
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+    assert d["cwdExempt"] == 0, json.dumps(d)
+
+
+def test_full_gate_an_unreadable_cwd_does_not_hide_an_unreadable_script(repo):
+    """Both problems on one pid, the holder older than the worktree: the row must carry script-unreadable, because a cwd-unreadable row is exempted
+    by creation time and otherwise deferred to the rename probe."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-nocwd", holder_first=True)
+    arms = sd / "arms.ps1"
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(p.pid) + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+    assert d["cwdExempt"] == 0, json.dumps(d)
+
+
+def test_full_gate_names_every_holder_that_reaches_the_same_locked_script(repo):
+    """The file result is cached per snapshot. A second holder must get the cached unreadable answer, not a cached no-hit."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-two")
+    arms = sd / "arms.ps1"
+    q = _spawn_chain_proven_alive(sd, cwd=repo[0])
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+        _require_verdict(q, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+        _stop(q)
+    _assert_refused_naming(d, p, arms)
+    _assert_refused_naming(d, q, arms)
+
+
+def test_live_refusal_guard_refuses_an_unreadable_script_and_names_the_file(repo):
+    """Get-WorktreeLiveRefusal is the other caller: nothing is deferred there, and its typed refusal must carry the file."""
+    wt, sd, p = _chain_under_lock(repo, "wt-locked-guard")
+    arms = sd / "arms.ps1"
+    try:
+        r, err = _live_refusal(wt, prelude=ONLY_PYTEST_CHILDREN + _locked(arms))
+        assert p.poll() is None, f"FIXTURE ERROR: holder {p.pid} exited before the guard returned"
+    finally:
+        _stop(p)
+    assert r is not None, "a live holder with an unreadable script was read as FREE"
+    assert r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"].lower() == str(arms).lower(), r
+    assert "arms.ps1" in r["detail"] and "arms.ps1" in err, (r, err)
+
+
+def _deny_metadata(path):
+    """Real ACLs: read-attributes denied on the file and list denied on its parent, so GetFileAttributesEx and its FindFirstFile fallback both fail.
+    Measured on this host: FileInfo.Exists False, File.GetAttributes win32=5 (repro/r3b-metadata-denied.out.txt). READ_CONTROL stays granted on purpose:
+    under a pytest temp dir (an OWNER RIGHTS ACE takes away the owner's implicit rights) denying it locks the undo out too; a first version leaked a holder that way."""
+    me = subprocess.run(["whoami"], check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["icacls", str(path), "/deny", f"{me}:(RA)"], check=True, capture_output=True)
+    subprocess.run(["icacls", str(path.parent), "/deny", f"{me}:(RD)"], check=True, capture_output=True)
+
+
+def _undeny(path):
+    subprocess.run(["icacls", str(path.parent), "/reset"], capture_output=True)
+    subprocess.run(["icacls", str(path), "/reset"], capture_output=True)
+
+
+def test_full_gate_denied_metadata_is_not_absence(repo):
+    """R3, denial: FileInfo.Exists reads False here exactly as for a missing file. Absence and denial are different: this one refuses."""
+    wt, sd, p = _chain_under_lock(repo, "wt-denied-meta")
+    arms = sd / "arms.ps1"
+    try:
+        _deny_metadata(arms)
+        # The precondition, in the gate's own process: if this host's ACLs did not produce a metadata denial, this test is proving nothing.
+        probe = ("$fi = New-Object IO.FileInfo '" + str(arms) + "'; $w = try { [IO.File]::GetAttributes($fi.FullName); 'readable' } catch { 'threw ' + ($_.Exception.GetBaseException().HResult -band 0xFFFF) }; \"$($fi.Exists) $w\"")
+        seen = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", probe], capture_output=True, text=True).stdout.strip()
+        if seen != "False threw 5":
+            pytest.skip(f"this account's ACLs do not deny the metadata read (saw: {seen}); the seam case below still covers the branch")
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        try:
+            _undeny(arms)
+        finally:
+            _stop(p)
+    _assert_refused_naming(d, p, arms)
+
+
+def test_full_gate_a_candidate_confirmed_missing_stays_a_no_hit(repo):
+    """R3, absence: words the corpus regex takes for files, with no file behind them, must never stop retirement. Also a directory wearing a script
+    extension, a wildcard no file can have, and a name longer than any file name."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-missing-candidates")
+    sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
+    (sd / "folder.ps1").mkdir()
+    long_name = "n" * 300 + ".py"
+    (sd / "arms.ps1").write_text(
+        f"$script:Wt = 'x'\n# never-written.ps1 C:\\no\\such\\dir\\ghost.py {tmp}\\a*b.ps1 folder.ps1 {long_name}\n", encoding="utf-8")
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)
+        _require_verdict(p, wt, d, err, lambda v: (v["action"], v["reason"]) == ("would-retire", "ok"))
+    finally:
+        _stop(p)
+    assert d["cwdUnknown"] == [], json.dumps(d)
+
+
+@pytest.mark.parametrize("exc", ["[UnauthorizedAccessException]::new('Access to the path is denied.')",
+                                 "[IO.IOException]::new('The network path was not found.', -2147024843)",
+                                 "[InvalidOperationException]::new('anything else')"],
+                         ids=["denied", "bad-netpath", "other"])
+def test_full_gate_a_metadata_failure_of_any_other_class_refuses(repo, exc):
+    """The classes a real handle cannot produce, through the metadata seam. Only "confirmed missing" is a no-hit."""
+    wt, sd, p = _chain_under_lock(repo, "wt-meta-seam")
+    arms = sd / "arms.ps1"
+    seam = ("$origAttrs = ${function:Read-HolderScriptAttributes}; function Read-HolderScriptAttributes { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq 'arms.ps1') {{ throw ({exc}) }}; & $origAttrs -Path $Path }};")
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + seam)
+        _require_verdict(p, wt, d, err, lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    _assert_refused_naming(d, p, arms)
+
+
+def test_full_gate_a_script_deleted_between_metadata_and_read_is_a_no_hit(repo):
+    """The file went away in the window: confirmed missing, by the read itself."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-delete-race")
+    sd = _chain_scripts(tmp, str(tmp / "some-other-place"))
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    seam = ("$origRead = ${function:Read-SharedText}; function Read-SharedText { param([string]$Path) "
+            "if ((Split-Path -Leaf $Path) -eq 'arms.ps1') { throw ([IO.FileNotFoundException]::new('gone')) }; & $origRead -Path $Path };")
+    try:
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + seam)
+        _require_verdict(p, wt, d, err, lambda v: (v["action"], v["reason"]) == ("would-retire", "ok"))
+    finally:
+        _stop(p)
+
+
+def test_require_verdict_calls_a_dead_holder_a_fixture_error_and_prints_the_census(repo):
+    """Step 5 of the card: a failure of this shape prints the poll state, the census row, the corpus and the full disposition."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-diag")
+    sd = _chain_scripts(tmp, str(wt))
+    p = _spawn_chain_proven_alive(sd, cwd=tmp)
+    result = {"action": "would-retire", "reason": "ok", "marker": "the-full-disposition"}
+    try:
+        with pytest.raises(AssertionError) as live:
+            _require_verdict(p, wt, result, "the-stderr", lambda v: v["action"] == "kept")
+    finally:
+        _stop(p)
+    text = str(live.value)
+    assert "GATE RESULT with a proven-live holder" in text and "poll=None" in text and "census: " in text, text
+    assert "arms.ps1 names-worktree=True" in text and "the-full-disposition" in text and "the-stderr" in text, text
+    with pytest.raises(AssertionError) as dead:
+        _require_verdict(p, wt, result, "", _would_retire)   # the verdict is what was expected: a dead holder still may not pass
+    assert "FIXTURE ERROR" in str(dead.value) and f"poll={p.poll()}" in str(dead.value) and "NO ROW" in str(dead.value), str(dead.value)
+
+
+def test_no_bare_spawn_outside_the_proven_alive_helpers():
+    """A bare Popen proves only that CreateProcess returned. A test that needs a live holder uses a helper that proved it."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    callers = []
+    for block in re.split(r"(?m)^(?=def |@pytest)", src):
+        name = block.split("(")[0].removeprefix("def ")
+        if re.search(r"(?<![\w.])_spawn\(", block) and not block.startswith("def _spawn"):
+            callers.append(name.strip())
+    assert callers == [], callers
+
+
+# OPEN, successor card RETIRE-HOLDER-CORPUS-CAPS-1 (Dot R2 on #477). Each bound still drops text silently, so a holder known only through the dropped text reads as no holder.
+# Not fixed this round: flagging them through the refusal path would stop every retirement on this host (6 snapshots of ~600 processes, processes really affected: over-size 5-7,
+# file cap 19-25, depth cap 32-47; run dir repro/step3-live-table-long.out.txt). xfail(strict): when the card fixes one, this turns red until the mark goes.
+_CAPS_OPEN = "OPEN RETIRE-HOLDER-CORPUS-CAPS-1: this bound still drops corpus text silently"
+
+
+def _gate_on_script(wt, script, cwd):
+    """A snapshot row running `script`, so no real holder and no real scan: Find-WorktreeHolders matches the corpus text whatever the row's liveness."""
+    return _gate_with_snapshot(wt, _fake_row("999991", cmd=f"pwsh -File {script}", name="pwsh.exe", cwd=str(cwd)))
+
+
+@pytest.mark.xfail(strict=True, reason=_CAPS_OPEN)
+def test_open_a_name_below_the_depth_bound_still_holds_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cap-depth")
+    sd = tmp / "cap-depth"
+    sd.mkdir()
+    for i in range(4):
+        (sd / f"a{i}.ps1").write_text(f". .\\a{i + 1}.ps1\n", encoding="utf-8")
+    (sd / "a4.ps1").write_text(f"$script:Wt = '{wt}'\n", encoding="utf-8")
+    d = _gate_on_script(wt, sd / "a0.ps1", tmp)
+    assert d["action"] == "kept", json.dumps(d)
+
+
+@pytest.mark.xfail(strict=True, reason=_CAPS_OPEN)
+def test_open_a_name_past_the_file_count_bound_still_holds_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cap-files")
+    sd = tmp / "cap-files"
+    sd.mkdir()
+    (sd / "main.ps1").write_text("".join(f". .\\f{i:02}.ps1\n" for i in range(45)), encoding="utf-8")
+    for i in range(45):
+        (sd / f"f{i:02}.ps1").write_text(f"$script:Wt = '{wt}'\n" if i == 44 else "# nothing\n", encoding="utf-8")
+    d = _gate_on_script(wt, sd / "main.ps1", tmp)
+    assert d["action"] == "kept", json.dumps(d)
+
+
+@pytest.mark.xfail(strict=True, reason=_CAPS_OPEN)
+def test_open_a_name_in_a_file_over_the_size_bound_still_holds_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cap-size")
+    sd = tmp / "cap-size"
+    sd.mkdir()
+    (sd / "big.ps1").write_text(f"$script:Wt = '{wt}'\n" + "#" * 524288 + "\n", encoding="utf-8")
+    d = _gate_on_script(wt, sd / "big.ps1", tmp)
+    assert d["action"] == "kept", json.dumps(d)
+
+
+def test_full_gate_an_exited_process_with_a_locked_script_is_no_candidate(repo):
+    """Only a live pid can hold anything: the row of a pid that has gone is dropped before any refusal."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-dead-locked")
+    sd = _chain_scripts(tmp, str(wt))
+    arms = sd / "arms.ps1"
+    d = _gate_with_snapshot(wt, _fake_row("999992", cmd=f"pwsh -File {arms}", name="pwsh.exe", cwd=str(tmp)), prelude=_locked(arms))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), json.dumps(d)
+
+
+# --- RETIRE-WORKTREE-TESTS-PROVEN-ALIVE-1 r3 (sol A1 on #759; carries RETIRE-NOREAD-ROW-PROPERTY-SAFE-1) ---
+# A caller-built holder row (a -ProcessSnapshot's or a -SnapshotProvider's HolderIndex) predates File/FileError/CreatedUtc. Under
+# Set-StrictMode Latest a row missing one threw inside Get-CwdUnknownRefusal, and every caller turned the throw into an anonymous failure
+# (census-failed with no pid; cannot-determine; holder-probe-failed). The holder IS known, so the refusal must still name it. Every case
+# uses a real, proven-live holder pid and asserts the exact refusal and that nothing was removed; a holder that died is a fixture error.
+
+_NOREAD_FILE = "C:\\locked\\arms.ps1"
+_NOREAD_VARIANTS = [
+    pytest.param((), id="complete-row-control"),
+    pytest.param(("FileError",), id="missing-FileError"),
+    pytest.param(("File",), id="missing-File"),
+    pytest.param(("File", "FileError"), id="missing-File-and-FileError"),
+    pytest.param(("CreatedUtc",), id="missing-CreatedUtc"),
+    pytest.param(("CreatedUtc", "File", "FileError"), id="missing-all-optional"),
+]
+
+
+_ROW_KINDS = ["object", "hashtable", "ordered", "dictionary"]
+
+
+def _noread_row(pid, drop=(), kind="object", why="script-unreadable", created="$null"):
+    """One CwdUnknown row as PowerShell text. `kind` is how the caller built it: a PSCustomObject, a hashtable, an [ordered] dictionary or a
+    Dictionary[string,object]; PowerShell reads `$row.Key` on all four, so a guard that reads only PSObject.Properties loses the dictionary keys."""
+    props = [("ProcessId", str(pid)), ("Name", "'pwsh.exe'"), ("Why", f"'{why}'"), ("CreatedUtc", created),
+             ("File", f"'{_NOREAD_FILE}'"), ("FileError", "'IOException win32=32'")]
+    kept = [(k, v) for k, v in props if k not in drop]
+    if kind == "object":
+        return "[pscustomobject]@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    if kind == "hashtable":
+        return "@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    if kind == "ordered":
+        return "[ordered]@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    assert kind == "dictionary", kind
+    return ("(& { $d = New-Object 'System.Collections.Generic.Dictionary[string,object]'; "
+            + "; ".join(f"$d['{k}'] = {v}" for k, v in kept) + "; $d })")
+
+
+def _noread_snapshot(pid, drop=(), kind="object", why="script-unreadable", created="$null"):
+    """A snapshot with a cached HolderIndex: probe ok, one unknown row for `pid` (default Why=script-unreadable), optional properties in `drop` omitted."""
+    return ("[pscustomobject]@{ Procs = @(); SelfPids = @($PID); CapturedUtc = (Get-Date).ToUniversalTime(); "
+            "HolderIndex = [pscustomobject]@{ Cwd = @{}; Scripts = @(); ScriptsByPid = @{}; CwdProbe = 'ok'; "
+            f"CwdUnknown = @({_noread_row(pid, drop, kind, why, created)}) }} }}")
+
+
+def _noread_holder(repo, leaf):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / leaf)
+    return wt, _spawn_proven_alive(tmp, leaf + "-holder", cwd=tmp)
+
+
+def _noread_alive(p):
+    if p.poll() is not None:
+        raise AssertionError(f"FIXTURE ERROR: holder {p.pid} exited before the gate returned, so this says nothing about the refusal")
+
+
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_still_gets_the_identifying_reason(repo, drop):
+    """Get-CwdUnknownRefusal itself, under StrictMode: Reason, Rows and Unknown name the pid (and the file when the row has one)."""
+    wt, p = _noread_holder(repo, "wt-noread-helper")
+    try:
+        script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+                  f"$r = Get-CwdUnknownRefusal -Snapshot ({_noread_snapshot(p.pid, drop)}) -WorktreePath '{wt}'; "
+                  "[pscustomobject]@{ Reason = $r.Reason; Rows = @($r.Rows); Unknown = @($r.Unknown) } | ConvertTo-Json -Depth 4 -Compress")
+        r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r.returncode == 0, r.stdout + r.stderr
+    d = json.loads(r.stdout)
+    assert d["Reason"].startswith("cwd-unknown") and str(p.pid) in d["Reason"] and "script-unreadable" in d["Reason"], d
+    assert len(d["Rows"]) == 1 and d["Rows"][0]["ProcessId"] == p.pid and d["Rows"][0]["Via"] == "script-unreadable", d
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u for u in d["Unknown"]), d
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["Reason"] and d["Rows"][0]["MatchedPath"] == _NOREAD_FILE, d
+        assert any(f"file={_NOREAD_FILE}" in u for u in d["Unknown"]), d
+    if "FileError" in drop:
+        assert "[]" not in d["Reason"], f"an absent FileError must not print an empty bracket pair: {d['Reason']}"
+
+
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_live_refusal_names_the_holder(repo, drop):
+    """Get-WorktreeLiveRefusal: the typed refusal keeps the known pid; it is never census-failed with processId null."""
+    wt, p = _noread_holder(repo, "wt-noread-guard")
+    try:
+        r, err = _live_refusal(wt, snapshot_expr=_noread_snapshot(p.pid, drop))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r is not None, "a known unreadable-script holder was read as FREE"
+    assert r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"] == (_NOREAD_FILE if "File" not in drop else ""), r
+    assert f"pid={p.pid}" in err and "reason=cwd-unknown" in err, err
+
+
+def _gate_snapshot_run(workdir, snapshot_expr, whatif):
+    quarantine = Path(workdir).parent / "q"
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; $snap = {snapshot_expr}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
+        f"{' -WhatIf' if whatif else ''} -ProcessSnapshot $snap | ConvertTo-Json -Depth 4"
+    )
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True)
+    return json.loads(r.stdout), r.stderr
+
+
+@pytest.mark.parametrize("whatif", [True, False], ids=["whatif", "real-retirement"])
+@pytest.mark.parametrize("drop", _NOREAD_VARIANTS)
+def test_noread_row_missing_optional_property_retire_keeps_the_worktree_and_names_the_holder(repo, drop, whatif):
+    """Invoke-RetireLaneWorktree: kept with reason cwd-unknown naming the pid, never cannot-determine; nothing renamed, nothing removed."""
+    wt, p = _noread_holder(repo, "wt-noread-retire")
+    try:
+        d, err = _gate_snapshot_run(wt, _noread_snapshot(p.pid, drop), whatif)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"], json.dumps(d)
+    assert "cannot-determine" not in d["reason"], json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert any(u.startswith(f"{p.pid} ") and "script-unreadable" in u for u in d["cwdUnknown"]), json.dumps(d)
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["reason"], json.dumps(d)
+    assert f"pid={p.pid}" in err and "via=script-unreadable" in err, err
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists()
+
+
+# adversary pass A1 on 62d3c8bf: a row built as a hashtable / [ordered] / Dictionary[string,object] keeps its keys. PSObject.Properties does not list them, so the
+# first r3 normaliser turned CreatedUtc into $null (losing the creation-time exemption, base said FREE and HEAD said cwd-unknown) and dropped File / FileError.
+
+def _cwd_refusal_fields(wt, snapshot_expr):
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+              f"$r = Get-CwdUnknownRefusal -Snapshot ({snapshot_expr}) -WorktreePath '{wt}'; "
+              "[pscustomobject]@{ Reason = $r.Reason; Exempt = $r.Exempt; Rows = @($r.Rows); Unknown = @($r.Unknown) } | ConvertTo-Json -Depth 4 -Compress")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+@pytest.mark.parametrize("drop", [(), ("FileError",), ("File", "FileError"), ("CreatedUtc",)], ids=["complete", "no-FileError", "no-File-no-FileError", "no-CreatedUtc"])
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_built_as_any_dictionary_or_object_keeps_its_supplied_fields(repo, kind, drop):
+    wt, p = _noread_holder(repo, "wt-noread-kinds")
+    try:
+        d = _cwd_refusal_fields(wt, _noread_snapshot(p.pid, drop, kind))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["Reason"].startswith("cwd-unknown") and str(p.pid) in d["Reason"], d
+    assert len(d["Rows"]) == 1 and d["Rows"][0]["ProcessId"] == p.pid and d["Rows"][0]["Via"] == "script-unreadable", d
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["Reason"] and d["Rows"][0]["MatchedPath"] == _NOREAD_FILE, d
+        assert any(f"file={_NOREAD_FILE}" in u for u in d["Unknown"]), d
+    if "FileError" not in drop and "File" not in drop:
+        assert "[IOException win32=32]" in d["Reason"], d
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_kinds_live_refusal_keeps_file_and_pid(repo, kind):
+    wt, p = _noread_holder(repo, "wt-noread-kinds-guard")
+    try:
+        r, err = _live_refusal(wt, snapshot_expr=_noread_snapshot(p.pid, (), kind))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r is not None and r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"] == _NOREAD_FILE, r
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_cwd_unreadable_row_older_than_the_worktree_stays_exempt_whatever_its_kind(repo, kind):
+    """The creation-time exemption (a process that started before the directory existed) must survive for a caller's row of any kind: base FREE."""
+    wt, p = _noread_holder(repo, "wt-noread-exempt")
+    try:
+        snap = _noread_snapshot(p.pid, ("File", "FileError"), kind, why="cwd-unreadable", created="[datetime]'2020-01-01T00:00:00Z'")
+        d = _cwd_refusal_fields(wt, snap)
+        r, err = _live_refusal(wt, snapshot_expr=snap)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["Exempt"] == 1 and not d["Reason"] and d["Rows"] == [], d
+    assert r is None, f"the creation-time exemption was lost for a {kind} row: {r}"
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_kinds_retire_keeps_the_worktree_naming_pid_and_file(repo, kind):
+    wt, p = _noread_holder(repo, "wt-noread-kinds-retire")
+    try:
+        d, err = _gate_snapshot_run(wt, _noread_snapshot(p.pid, (), kind), True)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"] and _NOREAD_FILE in d["reason"], json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
