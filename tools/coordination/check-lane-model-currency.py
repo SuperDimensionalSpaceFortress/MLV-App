@@ -79,9 +79,14 @@ whose newest non-live run is an expired running receipt (the expired receipt alo
 one, or an older live receipt beside one) and a lane with no proven finished run in the window. IN-FLIGHT is given only when the newest FINISHED run is proven too: a failed run in
 between is not papered over (the lane stays NO-DATA), because missing evidence is never CURRENT.
 ONE EXCEPTION to "missing evidence is never CURRENT" (hub-ruled trade, r4; r6 widens what counts as unreadable
-to every stamp outside the one shape above): a newest FAILED run whose startedUtc is unreadable is dropped from
-the lane (counted in `unreadableReceipts`), so the lane is judged on the runs that could be read and can read
-CURRENT where the base read NO-DATA.
+to every stamp outside the one shape above, r7 words it for every state): a receipt of ANY state, a newest FAILED
+run included, whose startedUtc is unreadable is dropped from the lane (counted in `unreadableReceipts`), so the lane
+is judged on the runs that could be read and can read CURRENT where the base read NO-DATA. THE COST, plainly: a
+dropped receipt can hide a VIOLATION, not only a gap. A complete run with effort 'low' and a foreign stamp beside a
+current run reads CURRENT, exit 0, BAD-EFFORT hidden (the base read STALE, exit 1); a finished run with no effort
+would have read INCOMPLETE and an expired running receipt NO-DATA. Every verdict sentence in this docstring and in
+the outbox entry holds unless a dropped stamp removed the receipt it names. The tests pin this as the ruled
+behaviour (OneStampShapeTests); the stamp census (8301 real receipts) found none in a foreign shape.
 
 The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
 else NO-DATA when no lane ran in the window, else CURRENT. IN-FLIGHT lanes count as CURRENT here and are
@@ -129,12 +134,13 @@ MAX_FUTURE_START_SKEW_SEC = 300     # a running receipt may be dated at most thi
 MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a real lane is 12600 s
 # THE ONE startedUtc SHAPE (r6, hub ruling 20261105T1245Z): what Invoke-Lane.ps1 writes (ToString('o') of a UTC
 # DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
-# digits only, hour 00-23 (3.14's fromisoformat reads 24 as the next day, 3.13's refuses it), matched with fullmatch
+# digits only, hour 00-23 (3.14's fromisoformat reads 24 as the next day, 3.13's refuses it), offset hour 00-23 and
+# offset minute 00-59 (fromisoformat adds an offset's minutes with no range check: '+00:99' reads as +01:39; r7), matched with fullmatch
 # against the RAW text: no strip, no comma normalization, no basic, week or ordinal date, no other separator, no
 # other offset. Every other string is unreadable, so no spelling is ever read
 # as something it was not (six rounds of per-spelling rules each left the next spelling for the next pass).
 LIVE_START_RE = re.compile(r"(?P<head>[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2})"
-                           r"(?:\.(?P<fraction>[0-9]{1,9}))?(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})")
+                           r"(?:\.(?P<fraction>[0-9]{1,9}))?(?P<zone>Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])")
 MAX_TIMEOUT_SIGNIFICANT_DIGITS = 15  # a decimal this short survives the trip through a binary float unchanged
 MAX_TIMEOUT_EXPONENT = 30            # |decimal exponent of the leading digit|; keeps Fraction() cheap on a hostile token
 RECEIPT_GLOB = "*/*-001.receipt.json"

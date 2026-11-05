@@ -705,8 +705,11 @@ class LiveShapeTests(CurrencyFixture):
     """r3 (hub ruling 20261105T0250Z): a receipt is a live candidate only in the shape Invoke-Lane.ps1 writes.
 
     startedUtc must be YYYY-MM-DDTHH:MM:SS(.d{1,9})?(Z|+-HH:MM) and timeoutSec an int, or a number of at most 15
-    significant digits judged on its RAW token (json.load rounds a longer one before the script sees it). Any other
-    shape is not live: it stays unproven (NO-DATA), as before this PR. Closes adversary pass 5 A1 and A2 as a class."""
+    significant digits judged on its RAW token (json.load rounds a longer one before the script sees it). A timeoutSec
+    in any other shape is not live and stays unproven (NO-DATA), as before this PR. A startedUtc in any other shape
+    (r6, hub ruling 20261105T1245Z; see OneStampShapeTests) is NOT NO-DATA: the receipt is unreadable, dropped and
+    counted in `unreadableReceipts`, and the lane is judged on the receipts that could be read, so it can read CURRENT.
+    Closes adversary pass 5 A1 and A2 as a class."""
 
     def _lane_verdict(self, started, timeout_token):
         """A completed sol/gpt-6.1-sol/high run at 19:00Z plus a running receipt written as RAW JSON text, so the
@@ -977,7 +980,15 @@ class LiveShapeTests(CurrencyFixture):
             with self.subTest(tail=tail):
                 self.assertIsNone(check.parse_utc(base + tail))
                 self.assertEqual(check.sub_microsecond_digits(base + tail), "")
-        for tail in ("Z", "+00:00", "+01:00", "-05:30", "+23:59"):
+        # r7 (opus blocker 1): offset minutes above 59 (and an offset hour above 23) used to match [0-9]{2}:[0-9]{2}, and
+        # fromisoformat adds the minutes with no range check, so '+00:99' was READ as +01:39 and took part in the sort
+        # with nothing counted. They are unreadable now, like every other stamp outside the one shape.
+        for tail in ("+00:60", "+00:99", "-00:99", "-00:60", "+01:60", "+23:60", "+23:99", "-23:99", "+24:00", "-24:00",
+                     "+99:00", "+00:61"):
+            with self.subTest(tail=tail):
+                self.assertIsNone(check.parse_utc(base + tail))
+                self.assertEqual(check.sub_microsecond_digits(base + tail), "")
+        for tail in ("Z", "+00:00", "+01:00", "-05:30", "+23:59", "-23:59", "+00:59", "-00:59"):
             with self.subTest(tail=tail):
                 self.assertIsNotNone(check.parse_utc(base + tail))
                 self.assertEqual(check.sub_microsecond_digits(base + tail), "9")
@@ -1167,6 +1178,77 @@ class OneStampShapeTests(CurrencyFixture):
                     self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
                                      ("CURRENT", "CURRENT", 0), result)
                     self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 1)
+
+    def test_r7_b1_offset_minutes_above_59_are_unreadable_and_counted_never_a_time(self):
+        # opus r6 blocker 1. Clock 2026-10-12T20:00:00Z; every receipt is lane sol, gpt-6.1-sol, effort high.
+        # (a) complete 19:00:00Z + failed null '19:59:00+00:99'. On c58ad03d the failed stamp read as 18:20Z, sorted
+        # OLDER than the complete run and nothing was counted. Now it is unreadable (unreadableReceipts 1) and the r4
+        # exception gives its verdict: the failed run is dropped, the lane is judged on the complete run, CURRENT, exit 0.
+        specs = {"fin": self.complete("2026-10-12T19:00:00Z"), "bad": self.failed("2026-10-12T19:59:00+00:99")}
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(row="failed +00:99", order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual(result["unreadableReceipts"], 1)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("CURRENT", "CURRENT", 0), result)    # the r4 exception, named: failed run dropped
+                self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 1)
+        # (b) failed null 19:30:00Z + complete '19:00:00-00:99'. On c58ad03d the complete run read as 20:39Z, sorted
+        # NEWEST and the lane read CURRENT from it. Now the complete run is unreadable (counted) and the lane is the
+        # failed run alone: NO-DATA, overall INCOMPLETE, exit 3 -- never CURRENT from that complete run.
+        specs = {"fin": self.complete("2026-10-12T19:00:00-00:99"), "bad": self.failed("2026-10-12T19:30:00Z")}
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(row="complete -00:99", order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual(result["unreadableReceipts"], 1)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertIsNone(result["lanes"]["sol"]["judgedOn"])
+        # (c) CONTROL (must pass on both heads): a valid offset stays readable and sorts by its instant. 19:30+01:00 is
+        # 18:30Z, OLDER than the complete run at 19:00Z, so the lane is judged on the 19:00Z run.
+        specs = {"fin": self.complete("2026-10-12T19:00:00Z"), "off": self.complete("2026-10-12T19:30:00+01:00")}
+        for order in (("fin", "off"), ("off", "fin")):
+            with self.subTest(row="valid +01:00 control", order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual(result["unreadableReceipts"], 0)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("CURRENT", "CURRENT", 0), result)
+                self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 2)
+                self.assertEqual(result["lanes"]["sol"]["judgedOn"]["startedUtc"], "2026-10-12T19:00:00+00:00")
+        self.assertEqual(check.parse_utc("2026-10-12T19:30:00+01:00"),
+                         datetime.datetime(2026, 10, 12, 18, 30, tzinfo=datetime.timezone.utc))
+
+    def test_r7_b3_the_exception_covers_a_receipt_of_any_state_and_can_hide_a_violation_the_ruled_behaviour(self):
+        # opus r6 blocker 3. The r4 exception is not limited to a newest FAILED run: a receipt of ANY state whose
+        # startedUtc is outside the one shape is dropped and counted, so it can hide a VIOLATION, not only a gap. The
+        # hub ruled this trade (r6, 20261105T1245Z); these pin it so the words (outbox, docstring) cannot drift from it.
+        # F = complete gpt-6.1-sol/high at 19:00Z is the current run beside each foreign-stamped receipt.
+        fin = self.complete("2026-10-12T19:00:00Z")
+        cases = {
+            # a BAD-EFFORT run, hidden: the base read STALE, exit 1
+            "complete effort low, basic-format stamp": dict(state="complete", startedUtc="20261012T195900Z",
+                                                            resolvedModel="gpt-6.1-sol", effort="low"),
+            # a run that recorded no effort, hidden: the base read INCOMPLETE, exit 3
+            "complete no effort, comma stamp": dict(state="complete", startedUtc="2026-10-12T19:30:00,5Z",
+                                                    resolvedModel="gpt-6.1-sol"),
+            # an expired running receipt, hidden: the base read NO-DATA, exit 3
+            "expired running, comma stamp": dict(state="running", startedUtc="2026-10-12T19:50:00,0Z", timeoutSec=1),
+            # the offset-minutes shape of the same class
+            "complete effort low, +00:99 stamp": dict(state="complete", startedUtc="2026-10-12T19:59:00+00:99",
+                                                      resolvedModel="gpt-6.1-sol", effort="low"),
+        }
+        for label, foreign in cases.items():
+            for order in (("fin", "foreign"), ("foreign", "fin")):
+                with self.subTest(case=label, order=order):
+                    self.setUp()
+                    code, result = self.run_main(order, {"fin": fin, "foreign": foreign})
+                    entry = result["lanes"]["sol"]
+                    self.assertEqual((entry["verdict"], result["verdict"], code), ("CURRENT", "CURRENT", 0), result)
+                    self.assertEqual(result["unreadableReceipts"], 1)
+                    self.assertEqual(entry["reasons"], [])           # BAD-EFFORT is hidden, by the ruled trade
+                    self.assertEqual(entry["runsInWindow"], 1)
 
     def test_row5_two_receipts_in_the_writers_shape_keep_every_digit_of_their_order(self):
         # 9-digit fractions 800 ns apart: the failed run is newer, so the newest run failed: never CURRENT.
