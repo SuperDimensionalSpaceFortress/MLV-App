@@ -178,17 +178,21 @@ def load_receipts(runs_dir):
         if started is None:
             unreadable += 1
             continue
+        # parse_utc keeps microseconds; Invoke-Lane writes 7 fractional digits (100 ns ticks), so keep the
+        # digits it drops as a tie-break and two runs started within one microsecond still order correctly.
+        extra = re.search(r"\.[0-9]{6}([0-9]+)", str(data.get("startedUtc")))
+        order = (started, int(extra.group(1)[:3].ljust(3, "0")) if extra else 0)
         resolved = data.get("resolvedModel")
         timeout = data.get("timeoutSec")
         receipts.append({
-            "path": path, "lane": data["lane"], "started": started, "state": data.get("state"),
+            "path": path, "lane": data["lane"], "started": started, "order": order, "state": data.get("state"),
             "ended": data.get("endedUtc"),
             "timeoutSec": timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else None,
             "card": data.get("card"), "effort": data.get("effort"),
             "resolvedModel": resolved if isinstance(resolved, str) else None,
             "parsed": parse_model_id(resolved),
         })
-    receipts.sort(key=lambda r: r["started"])
+    receipts.sort(key=lambda r: r["order"])
     return receipts, unreadable
 
 
@@ -266,7 +270,7 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
             verdict = "NO-DATA"
         elif unrecorded:
             verdict = "INCOMPLETE"
-        elif live and live[-1]["started"] >= runs[-1]["started"]:     # >=: equal after microsecond truncation
+        elif live and live[-1]["order"] >= runs[-1]["order"]:     # >=: an exact tie reads the running run as newer
             verdict = "IN-FLIGHT"       # newest receipt is running; the newest finished run is proven and CURRENT
         else:
             verdict = "CURRENT"
@@ -288,8 +292,11 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
         overall = "INCOMPLETE"
     else:
         overall = "CURRENT" if report else "NO-DATA"
+    # Reported as the documented 0 (= every receipt) when the window is not a finite number: inf and nan
+    # are not JSON.
+    reported_hours = since_hours if isinstance(since_hours, (int, float)) and math.isfinite(since_hours) and since_hours > 0 else 0
     return {
-        "sinceHours": since_hours, "receiptsRead": len(receipts), "receiptsInWindow": len(window),
+        "sinceHours": reported_hours, "receiptsRead": len(receipts), "receiptsInWindow": len(window),
         "familyNewest": {family: pair[1] for family, pair in sorted(newest.items())},
         "lanes": report, "verdict": overall, "inFlightLanes": in_flight,
     }

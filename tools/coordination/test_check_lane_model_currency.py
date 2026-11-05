@@ -386,12 +386,23 @@ class InFlightTests(CurrencyFixture):
         entry = self.evaluate()["lanes"]["opus"]
         self.assertEqual(entry["verdict"], "IN-FLIGHT")
 
+    def test_a3_the_seventh_fractional_digit_orders_receipts_so_an_older_live_run_is_not_in_flight(self):
+        # adversary pass 2 A1: the finished run is the NEWER one by 800 ns; the running one must not win the tie
+        self._write_raw("fin", lane="opus", state="complete", startedUtc="2026-10-12T19:00:00.1234569Z",
+                        resolvedModel="claude-opus-5-5", effort="high")
+        self._write_raw("run", lane="opus", state="running", startedUtc="2026-10-12T19:00:00.1234561Z",
+                        timeoutSec=7200)
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "CURRENT")
+
     def test_a4_a_huge_or_infinite_window_means_every_receipt_not_a_crash(self):
         self.receipt("fable", "claude-fable-5-1", 5)
-        for value in ("1e20", "inf", "nan"):
-            result = self._cli("--json", "--since-hours", value)
+
+        def strict(token):
+            raise ValueError("non-JSON constant %s" % token)
+        for value in ("1e20", "inf", "nan", "-inf"):
+            result = self._cli("--json", "--since-hours=" + value)
             self.assertNotIn("Traceback", result.stderr, value)
-            payload = json.loads(result.stdout)
+            payload = json.loads(result.stdout, parse_constant=strict)     # strict: no Infinity / NaN
             self.assertTrue(payload["ok"], value)
             self.assertEqual(payload["receiptsInWindow"], 1, value)
 
