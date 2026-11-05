@@ -166,6 +166,79 @@ TEST(LookAssistAnalysisPump, WorkHeldInATurnComesBackAtLandingInOrder)
     ASSERT_TRUE( pump.endSession().isEmpty() );
 }
 
+// Adversary A1 on 4f4b1a45: an async result dispatched before a toggle was delivered in an early worker call of the next
+// analysis and overwrote the receipt and sliders under the worker. It must wait for the landing, and the generation that
+// analysis takes then drops it. The queued call is real; the result itself is MainWindow's and is pinned below.
+TEST(LookAssistAnalysisPump, AQueuedResultFromBeforeASessionWaitsForTheLandingAndThenSeesItsGeneration)
+{
+    QObject context;
+    AnalysisWorker worker;
+    AnalysisPump pump;
+    int generation = 7;
+    const int dispatchGeneration = generation;
+    bool inCall = false;
+    int overwroteDuringCall = 0;
+    int overwrote = 0;
+    int dropped = 0;
+    const std::function<void()> land = [&]()
+    {
+        if( generation != dispatchGeneration )
+        {
+            ++dropped;
+            return;
+        }
+        ++overwrote;
+        if( inCall ) ++overwroteDuringCall;
+    };
+
+    pump.beginSession( &worker );
+    QMetaObject::invokeMethod( &context, [&pump, land]() { pump.runOrHold( land ); }, Qt::QueuedConnection );
+    inCall = true;
+    pump.call( []() { sleepMs( 100 ); } );
+    inCall = false;
+    ASSERT_TRUE( pump.pumpTicks() >= 1ULL );
+    ASSERT_EQ( 0, overwroteDuringCall );
+    ASSERT_EQ( 0, overwrote );
+    ASSERT_EQ( 0, dropped );
+
+    ++generation;   // the dispatch of the analysis that was running
+    const auto held = pump.endSession();
+    ASSERT_EQ( 1, static_cast<int>( held.size() ) );
+    for( const auto &work : held ) work();
+    ASSERT_EQ( 0, overwrote );
+    ASSERT_EQ( 1, dropped );
+}
+
+// Control for the test above: with no session open the result lands as it always did.
+TEST(LookAssistAnalysisPump, WithNoSessionAQueuedResultLandsAtOnce)
+{
+    AnalysisPump pump;
+    int ran = 0;
+    pump.runOrHold( [&ran]() { ++ran; } );
+    ASSERT_EQ( 1, ran );
+    ASSERT_TRUE( pump.endSession().isEmpty() );
+}
+
+// Held work comes back on a later turn, and another analysis may have opened by then. A result must not slip into it.
+TEST(LookAssistAnalysisPump, AHeldResultThatComesBackDuringAnotherSessionIsHeldAgain)
+{
+    AnalysisWorker worker;
+    AnalysisPump pump;
+    int ran = 0;
+    pump.beginSession( &worker );
+    pump.runOrHold( [&ran]() { ++ran; } );
+    auto held = pump.endSession();
+    ASSERT_EQ( 1, static_cast<int>( held.size() ) );
+
+    pump.beginSession( &worker );
+    for( const auto &work : held ) work();
+    ASSERT_EQ( 0, ran );
+    held = pump.endSession();
+    ASSERT_EQ( 1, static_cast<int>( held.size() ) );
+    for( const auto &work : held ) work();
+    ASSERT_EQ( 1, ran );
+}
+
 TEST(LookAssistAnalysisPump, TheRenderDrainPresentsAndIsBounded)
 {
     AnalysisWorker worker;
@@ -449,6 +522,36 @@ TEST(LookAssistAnalysisPumpWiring, EverySiteAPumpTurnCanReachHoldsItself)
     }
 }
 
+// Adversary A1 on 4f4b1a45: the async result goes through runOrHold, so it never lands inside an analysis.
+TEST(LookAssistAnalysisPumpWiring, TheAsyncResultIsDeliveredThroughTheHold)
+{
+    const QString source = mainWindowSource();
+    ASSERT_TRUE( source.contains( QStringLiteral( "std::function<void()> landAsyncResult = [this, r, dispatchGeneration, receipt, restoreLookAssistSafetyBaseline]() mutable" ) ) );
+    ASSERT_TRUE( source.contains( QStringLiteral( "QMetaObject::invokeMethod( this, [this, landAsyncResult]() { m_lookAssistPump.runOrHold( landAsyncResult ); }, Qt::QueuedConnection );" ) ) );
+}
+
+// Adversary A1 and A3 on 4f4b1a45: what the user did at this toggle or flavor change outdates a result dispatched before it,
+// and the generation has to move before either branch, so the result that lands after it is dropped.
+TEST(LookAssistAnalysisPumpWiring, ATogglePutsAPendingResultOutOfDate)
+{
+    const QString body = functionBody( mainWindowSource(), QStringLiteral( "void MainWindow::on_checkBoxLookAssistEnable_clicked(" ) );
+    const int bump = body.indexOf( QStringLiteral( "++m_lookAssistAsyncGeneration;" ) );
+    ASSERT_TRUE( bump >= 0 );
+    const int fork = body.indexOf( QStringLiteral( "if( checked )" ) );
+    ASSERT_TRUE( fork > bump );
+}
+
+// The census of what a pump turn can deliver: everything posted from another thread to MainWindow has been looked at. A new
+// one must be classified (held, or harmless to the analysis) and this count moved with it.
+TEST(LookAssistAnalysisPumpWiring, TheQueuedDeliveriesToMainWindowAreTheOnesInTheCensus)
+{
+    const QString source = mainWindowSource();
+    // The async result. Its one other mention is in a comment.
+    ASSERT_EQ( 1, static_cast<int>( source.count( QStringLiteral( "QMetaObject::invokeMethod( this," ) ) ) );
+    // The async result, and playbackPrepResultReady -> onPlaybackPrepResultReady, which holds itself.
+    ASSERT_EQ( 2, static_cast<int>( source.count( QStringLiteral( "Qt::QueuedConnection" ) ) ) );
+}
+
 // Hazard 5: a close that reaches the window during the analysis waits for the landing and does not wait on the barrier.
 TEST(LookAssistAnalysisPumpWiring, CloseEventHoldsTheCloseUntilLanding)
 {
@@ -463,7 +566,7 @@ TEST(LookAssistAnalysisPumpWiring, CloseEventHoldsTheCloseUntilLanding)
     ASSERT_TRUE( !body.left( guard ).contains( QStringLiteral( "freeActiveMlvObjectAfterLifecycleBarrier" ) ) );
 }
 
-// The design: the render inside each wrapped callback runs on the worker, and the dormant async route is not touched.
+// The design: the render inside each wrapped callback runs on the worker. The dormant async route's own worker is not touched.
 TEST(LookAssistAnalysisPumpWiring, EachRendererOfTheAnalysisIsWrapped)
 {
     const QString source = mainWindowSource();

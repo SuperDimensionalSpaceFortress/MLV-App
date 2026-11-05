@@ -139,6 +139,24 @@ class CompareLookAssistApply(unittest.TestCase):
         self.assertEqual(report["verdict"], "differs")
         self.assertTrue(any("comes before the analysis landed" in f for f in report["failures"]), report)
 
+    def test_adversary_a2_a_play_before_toggle_end_fails_even_after_the_result_line(self):
+        # The toggle route lands at toggle.end: setReceipt and the refresh come after apply.result.
+        lines = [l for l in arm().splitlines() if "play.toggled.begin" not in l]
+        at = next(i for i, l in enumerate(lines) if "look_assist.toggle.end" in l)
+        lines.insert(at, line("07.500", "0xdcb8", "play.toggled.begin", "checked=1 position=0"))
+        report = compare.run(arm(), "\n".join(lines) + "\n")
+        self.assertEqual(report["verdict"], "differs")
+        self.assertTrue(any("comes before the analysis landed" in f for f in report["failures"]), report)
+
+    def test_adversary_a2_a_finished_clip_load_analysis_does_not_land_a_later_toggle(self):
+        load = line("00.100", "0xdcb8", "look_assist.setSliders.frame_ready_apply", "analysis_frame=0")
+        load_result = line("00.200", "0xdcb8", "look_assist.apply.result", result())
+        lines = [l for l in arm().splitlines() if "play.toggled.begin" not in l]
+        at = next(i for i, l in enumerate(lines) if "look_assist.apply.result" in l)
+        lines.insert(at + 1, line("07.500", "0xdcb8", "play.toggled.begin", "checked=1 position=0"))
+        failure = compare.play_after_landing_failure(compare.parse_log("\n".join([load, load_result] + lines) + "\n"), "arm")
+        self.assertIn("comes before the analysis landed", failure or "")
+
     def test_adversary_a3_the_clip_load_route_has_no_toggle_end(self):
         log = arm().replace("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply")
         log = log.replace("look_assist.toggle.end", "look_assist.setSliders.end")

@@ -17896,8 +17896,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             r.autoWhiteBalanceCandidateTemperature = autoWhiteBalanceCandidateTemperature;
             r.autoWhiteBalanceCandidateTint        = autoWhiteBalanceCandidateTint;
 
-            // Marshal results back to the UI thread.
-            QMetaObject::invokeMethod( this, [this, r, dispatchGeneration, receipt, restoreLookAssistSafetyBaseline]() mutable
+            // Marshal results back to the UI thread. An analysis may be pumping when this is delivered: the result waits for
+            // its landing, then the generation check below decides, as it would have with no pump.
+            std::function<void()> landAsyncResult = [this, r, dispatchGeneration, receipt, restoreLookAssistSafetyBaseline]() mutable
             {
                 // Re-check: clip must not have changed since dispatch.
                 if( m_lookAssistAsyncGeneration.load() != dispatchGeneration )
@@ -18251,7 +18252,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 syncLookAssistDerivedUiToReceipt( activeReceipt );
                 setReceipt( activeReceipt );
                 requestFrameRefresh( true, "look-assist-async-applied" );
-            }, Qt::QueuedConnection );
+            };
+            QMetaObject::invokeMethod( this, [this, landAsyncResult]() { m_lookAssistPump.runOrHold( landAsyncResult ); }, Qt::QueuedConnection );
         }).detach();
 
         return; // UI thread released; apply arrives via queued invocation above.
@@ -31902,6 +31904,9 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             .arg( ui->horizontalSliderPosition->value() ) );
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
+
+    // Off, on, or a new flavor: an async result dispatched before this no longer describes what the user asked for.
+    ++m_lookAssistAsyncGeneration;
 
     if( checked )
     {

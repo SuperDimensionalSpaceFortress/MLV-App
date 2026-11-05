@@ -142,12 +142,19 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
 def play_after_landing_failure(rows, arm):
     """The first Play in a log must come after the analysis landed, or a played frame showed the baseline look.
 
-    The toggle route ends with look_assist.toggle.end. The clip-load route has no such line, and its result line is the
-    last thing the analysis writes.
+    The toggle route lands at look_assist.toggle.end, not at its result line: the receipt sync and the refresh come after
+    that line. The clip-load route has no such line, and its result line is the last thing the analysis writes.
     """
     landed = False
+    toggle_open = False
     for number, _stamp, event, fields in rows:
-        if event == "look_assist.apply.result" or (event == "look_assist.toggle.end" and fields.get("checked") == "1"):
+        if event == "look_assist.toggle.frame_ready_apply":
+            toggle_open = True
+            landed = False
+        elif event == "look_assist.toggle.end" and fields.get("checked") == "1":
+            toggle_open = False
+            landed = True
+        elif event == "look_assist.apply.result" and not toggle_open:
             landed = True
         if event == "play.toggled.begin" and fields.get("checked") == "1":
             if not landed:

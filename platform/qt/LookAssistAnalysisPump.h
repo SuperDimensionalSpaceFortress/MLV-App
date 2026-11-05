@@ -219,6 +219,18 @@ public:
 
     void hold( std::function<void()> work ) { m_held.push_back( std::move( work ) ); }
 
+    // Work that arrives by itself and must not run inside an analysis, such as a queued result. Held work comes back on a
+    // later turn, and another analysis may have opened by then, so it asks again.
+    void runOrHold( std::function<void()> work )
+    {
+        if( !sessionOpen() )
+        {
+            work();
+            return;
+        }
+        hold( [this, work]() { runOrHold( work ); } );
+    }
+
     // gui_block_max_ms: the longest the event queue went unserved, whatever held it (GUI-side code between heavy calls,
     // or a slot that ran long inside a turn).
     void noteTurn()
