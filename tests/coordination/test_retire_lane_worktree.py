@@ -5594,14 +5594,31 @@ _NOREAD_VARIANTS = [
 ]
 
 
-def _noread_snapshot(pid, drop=()):
-    """A snapshot with a cached HolderIndex: probe ok, one unknown row Why=script-unreadable for `pid`, optional properties in `drop` omitted."""
-    props = [("ProcessId", str(pid)), ("Name", "'pwsh.exe'"), ("Why", "'script-unreadable'"), ("CreatedUtc", "$null"),
+_ROW_KINDS = ["object", "hashtable", "ordered", "dictionary"]
+
+
+def _noread_row(pid, drop=(), kind="object", why="script-unreadable", created="$null"):
+    """One CwdUnknown row as PowerShell text. `kind` is how the caller built it: a PSCustomObject, a hashtable, an [ordered] dictionary or a
+    Dictionary[string,object]; PowerShell reads `$row.Key` on all four, so a guard that reads only PSObject.Properties loses the dictionary keys."""
+    props = [("ProcessId", str(pid)), ("Name", "'pwsh.exe'"), ("Why", f"'{why}'"), ("CreatedUtc", created),
              ("File", f"'{_NOREAD_FILE}'"), ("FileError", "'IOException win32=32'")]
-    row = "; ".join(f"{k} = {v}" for k, v in props if k not in drop)
+    kept = [(k, v) for k, v in props if k not in drop]
+    if kind == "object":
+        return "[pscustomobject]@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    if kind == "hashtable":
+        return "@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    if kind == "ordered":
+        return "[ordered]@{ " + "; ".join(f"{k} = {v}" for k, v in kept) + " }"
+    assert kind == "dictionary", kind
+    return ("(& { $d = New-Object 'System.Collections.Generic.Dictionary[string,object]'; "
+            + "; ".join(f"$d['{k}'] = {v}" for k, v in kept) + "; $d })")
+
+
+def _noread_snapshot(pid, drop=(), kind="object", why="script-unreadable", created="$null"):
+    """A snapshot with a cached HolderIndex: probe ok, one unknown row for `pid` (default Why=script-unreadable), optional properties in `drop` omitted."""
     return ("[pscustomobject]@{ Procs = @(); SelfPids = @($PID); CapturedUtc = (Get-Date).ToUniversalTime(); "
             "HolderIndex = [pscustomobject]@{ Cwd = @{}; Scripts = @(); ScriptsByPid = @{}; CwdProbe = 'ok'; "
-            f"CwdUnknown = @([pscustomobject]@{{ {row} }}) }} }}")
+            f"CwdUnknown = @({_noread_row(pid, drop, kind, why, created)}) }} }}")
 
 
 def _noread_holder(repo, leaf):
@@ -5685,3 +5702,73 @@ def test_noread_row_missing_optional_property_retire_keeps_the_worktree_and_name
     assert f"pid={p.pid}" in err and "via=script-unreadable" in err, err
     assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
     assert not _retiring_of(wt).exists()
+
+
+# adversary pass A1 on 62d3c8bf: a row built as a hashtable / [ordered] / Dictionary[string,object] keeps its keys. PSObject.Properties does not list them, so the
+# first r3 normaliser turned CreatedUtc into $null (losing the creation-time exemption, base said FREE and HEAD said cwd-unknown) and dropped File / FileError.
+
+def _cwd_refusal_fields(wt, snapshot_expr):
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; " f". '{HELPER}'; "
+              f"$r = Get-CwdUnknownRefusal -Snapshot ({snapshot_expr}) -WorktreePath '{wt}'; "
+              "[pscustomobject]@{ Reason = $r.Reason; Exempt = $r.Exempt; Rows = @($r.Rows); Unknown = @($r.Unknown) } | ConvertTo-Json -Depth 4 -Compress")
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return json.loads(r.stdout)
+
+
+@pytest.mark.parametrize("drop", [(), ("FileError",), ("File", "FileError"), ("CreatedUtc",)], ids=["complete", "no-FileError", "no-File-no-FileError", "no-CreatedUtc"])
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_built_as_any_dictionary_or_object_keeps_its_supplied_fields(repo, kind, drop):
+    wt, p = _noread_holder(repo, "wt-noread-kinds")
+    try:
+        d = _cwd_refusal_fields(wt, _noread_snapshot(p.pid, drop, kind))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["Reason"].startswith("cwd-unknown") and str(p.pid) in d["Reason"], d
+    assert len(d["Rows"]) == 1 and d["Rows"][0]["ProcessId"] == p.pid and d["Rows"][0]["Via"] == "script-unreadable", d
+    if "File" not in drop:
+        assert _NOREAD_FILE in d["Reason"] and d["Rows"][0]["MatchedPath"] == _NOREAD_FILE, d
+        assert any(f"file={_NOREAD_FILE}" in u for u in d["Unknown"]), d
+    if "FileError" not in drop and "File" not in drop:
+        assert "[IOException win32=32]" in d["Reason"], d
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_kinds_live_refusal_keeps_file_and_pid(repo, kind):
+    wt, p = _noread_holder(repo, "wt-noread-kinds-guard")
+    try:
+        r, err = _live_refusal(wt, snapshot_expr=_noread_snapshot(p.pid, (), kind))
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert r is not None and r["reason"] == "cwd-unknown" and r["processId"] == p.pid and r["via"] == "script-unreadable", r
+    assert r["matchedPath"] == _NOREAD_FILE, r
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_cwd_unreadable_row_older_than_the_worktree_stays_exempt_whatever_its_kind(repo, kind):
+    """The creation-time exemption (a process that started before the directory existed) must survive for a caller's row of any kind: base FREE."""
+    wt, p = _noread_holder(repo, "wt-noread-exempt")
+    try:
+        snap = _noread_snapshot(p.pid, ("File", "FileError"), kind, why="cwd-unreadable", created="[datetime]'2020-01-01T00:00:00Z'")
+        d = _cwd_refusal_fields(wt, snap)
+        r, err = _live_refusal(wt, snapshot_expr=snap)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["Exempt"] == 1 and not d["Reason"] and d["Rows"] == [], d
+    assert r is None, f"the creation-time exemption was lost for a {kind} row: {r}"
+
+
+@pytest.mark.parametrize("kind", _ROW_KINDS)
+def test_noread_row_kinds_retire_keeps_the_worktree_naming_pid_and_file(repo, kind):
+    wt, p = _noread_holder(repo, "wt-noread-kinds-retire")
+    try:
+        d, err = _gate_snapshot_run(wt, _noread_snapshot(p.pid, (), kind), True)
+        _noread_alive(p)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown") and str(p.pid) in d["reason"] and _NOREAD_FILE in d["reason"], json.dumps(d)
+    assert d["renameProbe"] == "not-run", json.dumps(d)
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"

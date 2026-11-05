@@ -531,3 +531,27 @@ def test_an_unreadable_script_row_missing_an_optional_property_still_keeps_the_d
         assert "C:\\locked\\arms.ps1" in e["error"], e
     assert any(str(holder.pid) in h and "via=script-unreadable" in h for h in e["holders"]), e
     assert (asm / "a.txt").exists() and not (world["run"] / "scratch-receipts").exists()
+
+
+def test_an_unreadable_script_row_built_as_a_hashtable_keeps_its_file_in_the_bulk_refusal(world):
+    """Adversary pass A1 on 62d3c8bf: a caller's row may be a hashtable; its File / FileError keys must survive into the refusal."""
+    ready = world["tmp"] / "noread-ht-holder.ready"
+    holder = subprocess.Popen([PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                               "[IO.File]::WriteAllText('%s', 'up'); Start-Sleep -Seconds 300" % ready],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 60
+        while holder.poll() is None and not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert holder.poll() is None and ready.exists(), "FIXTURE ERROR: the holder never became ready"
+        asm = make_asm(world)
+        row = ("@{ ProcessId = %d; Name = 'pwsh.exe'; Why = 'script-unreadable'; CreatedUtc = $null; "
+               "File = 'C:\\locked\\arms.ps1'; FileError = 'IOException win32=32' }" % holder.pid)
+        d = call_helper(world, [asm], extra=provider(unknown="@(%s)" % row), strict=True)
+        assert holder.poll() is None, "FIXTURE ERROR: the holder exited before the guard returned"
+    finally:
+        holder.kill(); holder.wait(timeout=30)
+    e = entry(d)
+    assert e["action"] == "kept" and e["reason"] == "holder-cwd-unknown", e
+    assert str(holder.pid) in e["error"] and "C:\\locked\\arms.ps1" in e["error"] and "[IOException win32=32]" in e["error"], e
+    assert (asm / "a.txt").exists()

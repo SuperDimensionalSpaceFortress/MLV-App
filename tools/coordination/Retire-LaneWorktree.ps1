@@ -1308,8 +1308,13 @@ function ConvertTo-CwdUnknownRow {
     # Get-WorktreeLiveRefusal (census-failed, no pid), Test-CwdRefusal (cannot-determine) and Remove-LaneBulkScratch (holder-probe-failed): the holder
     # was known and the refusal lost it. Every optional read goes through this copy (never the shared index row), so a missing one is '' / $null and the
     # row still names its pid. ProcessId, Name and Why are not optional: a row without them is malformed and still fails closed through the callers' catch.
+    # A caller may build the row as a hashtable, an [ordered] dictionary or a Dictionary[string,object] as well as a PSCustomObject, and PowerShell reads
+    # `$row.Key` on all of them; PSObject.Properties lists none of a dictionary's keys, so a dictionary is asked by key (adversary pass A1 on 62d3c8bf: the
+    # first version lost CreatedUtc, and with it the creation-time exemption, plus File and FileError, for every dictionary row).
     param([object]$Row)
-    $opt = { param([string]$n) $p = $Row.PSObject.Properties[$n]; if ($p) { $p.Value } else { $null } }
+    $opt = { param([string]$n)
+        if ($Row -is [System.Collections.IDictionary]) { if (([System.Collections.IDictionary]$Row).Contains($n)) { return $Row[$n] } else { return $null } }
+        $p = $Row.PSObject.Properties[$n]; if ($p) { $p.Value } else { $null } }
     [pscustomobject]@{ ProcessId = $Row.ProcessId; Name = $Row.Name; Why = $Row.Why; CreatedUtc = (& $opt 'CreatedUtc')
                        File = [string](& $opt 'File'); FileError = [string](& $opt 'FileError') }
 }
