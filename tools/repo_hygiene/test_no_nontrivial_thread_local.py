@@ -41,11 +41,14 @@ ALLOW_LIST = {
 
 
 def is_digit_separator(text, i):
-    """True when the ' at i sits inside a token that starts with a digit: a pp-number, not a literal's prefix."""
+    """True when the ' at i sits inside a pp-number, not a literal's prefix.
+
+    A pp-number starts with a digit or with .digit, and may hold a point (0x1.A'Bp0).
+    """
     j = i
-    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_'"):
+    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_'."):
         j -= 1
-    return j < i and text[j].isdigit()
+    return any(part[:1].isdigit() for part in text[j:i].split("."))
 
 
 def strip_comments(text):
@@ -175,6 +178,22 @@ class ThreadLocalGrammarTests(unittest.TestCase):
             ["int n = 0xA'B; thread_local Foo g;"],
             thread_local_lines("int n = 0xA'B; thread_local Foo g;\n"),
         )
+
+    def test_a_hex_float_digit_separator_does_not_hide_the_token(self):
+        # Adversary third pass A1 (r1): the check used to stop at the point and read the separator as an opening quote.
+        source = "double d = 0x1.A'Bp0; const char c = '\"'; const char * s = \"//\"; thread_local Foo g;\n"
+        self.assertEqual([source.strip()], thread_local_lines(source))
+
+    def test_a_pp_number_that_starts_at_its_point_still_has_a_digit_separator(self):
+        # The scan now crosses the point, so it must not take what lies before a leading .digit as the number's start.
+        for number in (".5'0", "return.5'0", "a.b.5'0"):
+            source = "x = %s; const char c = '\"'; const char * s = \"//\"; thread_local Foo g;\n" % number
+            self.assertEqual([source.strip()], thread_local_lines(source), number)
+
+    def test_a_character_literal_after_a_point_is_still_a_literal(self):
+        for literal in (".'\"'", "s.L'\"'"):
+            source = "x = %s; const char * s = \"//\"; thread_local Foo g;\n" % literal
+            self.assertEqual([source.strip()], thread_local_lines(source), literal)
 
     def test_a_longer_identifier_is_not_the_token(self):
         self.assertEqual([], thread_local_lines("int my_thread_local_count;\nint thread_locals;\n"))
