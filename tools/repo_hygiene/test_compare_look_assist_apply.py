@@ -174,6 +174,21 @@ class CompareLookAssistApply(unittest.TestCase):
         search = arm(result_line=result(surface_search="not-run")) + arm(stamp_offset=20, result_line=result(surface_search="converged"))
         self.assertEqual(compare.run(search, search, require_surface_search=True)["verdict"], "differs")
 
+    def test_adversary_a2_an_analysis_that_started_and_wrote_no_result_fails(self):
+        searched = arm(result_line=result(surface_search="converged"))
+        for start in ("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply"):
+            unfinished = searched + line("12.000", "0xdcb8", start, "baseline_valid=1 analysis_frame=0") + "\n"
+            report = compare.run(searched, unfinished, require_walk=True, require_surface_search=True)
+            self.assertEqual(report["verdict"], "differs", start)
+            self.assertTrue(any("wrote no result" in f for f in report["failures"]), report)
+
+    def test_adversary_a2_a_toggle_end_before_its_result_does_not_land(self):
+        rows = [l for l in arm().splitlines() if "look_assist.apply.result" not in l and "play.toggled.begin" not in l]
+        rows.append(line("12.000", "0xdcb8", "play.toggled.begin", "checked=1 position=0"))
+        rows.append(line("13.000", "0xdcb8", "look_assist.apply.result", result()))
+        failure = compare.play_after_landing_failure(compare.parse_log("\n".join(rows) + "\n"), "arm")
+        self.assertIn("comes before the analysis landed", failure or "")
+
     def test_adversary_a3_the_clip_load_route_has_no_toggle_end(self):
         log = arm().replace("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply")
         log = log.replace("look_assist.toggle.end", "look_assist.setSliders.end")

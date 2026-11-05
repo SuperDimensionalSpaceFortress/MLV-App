@@ -15,6 +15,7 @@
 #include <QString>
 #include <QStringLiteral>
 #include <QVector>
+#include <QtGlobal>
 
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +30,16 @@
 #endif
 
 namespace look_assist_pump {
+
+// A held event comes back as a copy, and only Qt 6 can copy any QEvent. A Qt 5 build (still a documented kit) analyses
+// inline as before this card, so no session opens there and it never asks for a copy.
+#if QT_VERSION >= QT_VERSION_CHECK( 6, 0, 0 )
+constexpr bool kWorkerRouteAvailable = true;
+inline QEvent *heldCopy( const QEvent *event ) { return event->clone(); }
+#else
+constexpr bool kWorkerRouteAvailable = false;
+inline QEvent *heldCopy( const QEvent * ) { return nullptr; }
+#endif
 
 // One look_assist.apply.timing line: the time the apply spent in each segment. A daylight verdict that falls back to
 // master's pass re-enters the apply, and that pass adds to the same line, so one analysis writes one line.
@@ -340,7 +351,8 @@ private:
                 return true;
             }
             const QPointer<QObject> target( watched );
-            QEvent *const held = event->clone();
+            QEvent *const held = heldCopy( event );
+            if( !held ) return true;
             m_pump->hold( [target, held]()
             {
                 if( target ) QCoreApplication::postEvent( target.data(), held );

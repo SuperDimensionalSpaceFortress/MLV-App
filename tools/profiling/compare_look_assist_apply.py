@@ -132,6 +132,10 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
         for key in LOOK_STATE_FIELDS:
             if not fields.get(key):
                 failures.append("%s: %s has no %s" % (arm, VISUAL_STATE_EVENT, key))
+    started = sum(1 for _n, _s, event, _f in rows if event in ("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply"))
+    finished = sum(1 for _n, _s, event, _f in rows if event == "look_assist.apply.result")
+    if started > finished:
+        failures.append("%s: %d analyses started and %d results: an analysis wrote no result" % (arm, started, finished))
     # Every analysis in the log, not only the last: an earlier one that skipped the walk is what the requirement is for.
     for fields in (fields for _n, _s, event, fields in rows if event == "look_assist.apply.result"):
         if require_walk and fields.get("post_walk_ran") != "1":
@@ -149,17 +153,22 @@ def play_after_landing_failure(rows, arm):
     """
     landed = False
     toggle_open = False
+    result_seen = False
     for number, _stamp, event, fields in rows:
         if event == "look_assist.toggle.frame_ready_apply":
             toggle_open = True
             landed = False
+            result_seen = False
         elif event == "look_assist.setSliders.frame_ready_apply":
             landed = False
+            result_seen = False
         elif event == "look_assist.toggle.end" and fields.get("checked") == "1":
             toggle_open = False
-            landed = True
-        elif event == "look_assist.apply.result" and not toggle_open:
-            landed = True
+            landed = result_seen
+        elif event == "look_assist.apply.result":
+            result_seen = True
+            if not toggle_open:
+                landed = True
         if event == "play.toggled.begin" and fields.get("checked") == "1":
             if not landed:
                 return "%s: first play.toggled at line %d comes before the analysis landed" % (arm, number)

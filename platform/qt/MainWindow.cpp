@@ -3223,8 +3223,8 @@ bool MainWindow::event(QEvent *event)
         // request runs at landing.
         if( m_lookAssistPump.sessionOpen() )
         {
-            QEvent *const heldOpen = event->clone();
-            m_lookAssistPump.hold( [this, heldOpen]() { QCoreApplication::postEvent( this, heldOpen ); } );
+            QEvent *const heldOpen = look_assist_pump::heldCopy( event );
+            if( heldOpen ) m_lookAssistPump.hold( [this, heldOpen]() { QCoreApplication::postEvent( this, heldOpen ); } );
             return true;
         }
         if( QFile(fileName).exists() && fileName.endsWith( ".mlv", Qt::CaseInsensitive ) )
@@ -17055,8 +17055,9 @@ void MainWindow::drainLookAssistWorkers( const char *reason )
 // through a state change that an event loop must not interleave.
 void MainWindow::applyLookAssistFromFrameReady( ReceiptSettings *receipt, int analysisFrame )
 {
-    // Rollback only: the wrapped calls run on this thread, as before this card.
-    static const bool s_analysisInline = qEnvironmentVariableIntValue( "MLVAPP_LOOK_ASSIST_ANALYSIS_INLINE" ) != 0;
+    // Rollback, and every Qt 5 build: the wrapped calls run on this thread, as before this card.
+    static const bool s_analysisInline = qEnvironmentVariableIntValue( "MLVAPP_LOOK_ASSIST_ANALYSIS_INLINE" ) != 0
+                                       || !look_assist_pump::kWorkerRouteAvailable;
     if( s_analysisInline || m_exportInProgress || m_lookAssistPump.sessionOpen() )
     {
         applyLookAssistToReceipt( receipt, analysisFrame );

@@ -541,7 +541,7 @@ TEST(LookAssistAnalysisPumpWiring, EverySiteAPumpTurnCanReachHoldsItself)
         { "void MainWindow::resizeEvent(", "m_lookAssistPump.sessionOpen()" },
         { "void MainWindow::updateCheck(", "m_lookAssistPump.pumping()" },
         // Adversary A2: the request comes back at landing, it is not dropped.
-        { "bool MainWindow::event(", "QEvent *const heldOpen = event->clone();" },
+        { "bool MainWindow::event(", "QEvent *const heldOpen = look_assist_pump::heldCopy( event );" },
         { "void MainWindow::dropEvent(", "m_lookAssistPump.pumping()" },
         { "void MainWindow::openMlvSet(", "m_lookAssistPump.pumping()" },
         { "void MainWindow::onPlaybackPrepResultReady(", "m_lookAssistPump.holdsPresentation()" },
@@ -590,6 +590,28 @@ TEST(LookAssistAnalysisPumpWiring, TheQueuedDeliveriesToMainWindowAreTheOnesInTh
     ASSERT_EQ( 1, static_cast<int>( source.count( QStringLiteral( "QMetaObject::invokeMethod( this," ) ) ) );
     // The async result, and playbackPrepResultReady -> onPlaybackPrepResultReady, which holds itself.
     ASSERT_EQ( 2, static_cast<int>( source.count( QStringLiteral( "Qt::QueuedConnection" ) ) ) );
+}
+
+// Adversary A1 on c9759a07: QEvent::clone is Qt 6, and Qt 5 is still a documented kit (macOS-Intel.yml installs it). No code
+// outside the pump's Qt 6 branch names clone, and a Qt 5 build takes the inline route, so no session opens there.
+TEST(LookAssistAnalysisPumpWiring, AQt5BuildAnalysesInlineAndNeverClonesAnEvent)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ( 0, static_cast<int>( source.count( QStringLiteral( "->clone()" ) ) ) );
+    const QString route = functionBody( source, QStringLiteral( "void MainWindow::applyLookAssistFromFrameReady(" ) );
+    ASSERT_TRUE( route.contains( QStringLiteral( "!look_assist_pump::kWorkerRouteAvailable" ) ) );
+
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/LookAssistAnalysisPump.h" ) );
+    QFile file( path );
+    ASSERT_TRUE( !path.isEmpty() && file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+    QTextStream in( &file );
+    const QString header = in.readAll();
+    ASSERT_EQ( 1, static_cast<int>( header.count( QStringLiteral( "->clone()" ) ) ) );
+    const int guard = header.indexOf( QStringLiteral( "#if QT_VERSION >= QT_VERSION_CHECK( 6, 0, 0 )" ) );
+    const int clone = header.indexOf( QStringLiteral( "->clone()" ) );
+    const int otherwise = header.indexOf( QStringLiteral( "#else" ), guard );
+    ASSERT_TRUE( guard >= 0 && guard < clone && clone < otherwise );
+    ASSERT_TRUE( look_assist_pump::kWorkerRouteAvailable == ( QT_VERSION >= QT_VERSION_CHECK( 6, 0, 0 ) ) );
 }
 
 // Hazard 5: a close that reaches the window during the analysis waits for the landing and does not wait on the barrier.
