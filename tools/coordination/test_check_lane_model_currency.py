@@ -410,19 +410,20 @@ class InFlightTests(CurrencyFixture):
                 ("exactly at the bound", "2026-10-12T20:05:00.0000000Z", "IN-FLIGHT"),
                 ("100 ns past, 7 digits", "2026-10-12T20:05:00.0000001Z", "NO-DATA"),
                 ("1 ns past, 9 digits", "2026-10-12T20:05:00.000000001Z", "NO-DATA"),
-                ("1 unit at the 10th digit", "2026-10-12T20:05:00.0000000001Z", "NO-DATA"),
-                # r3: a comma fraction is no longer read at all, so it is not live even exactly at the bound
-                ("comma fraction past", "2026-10-12T20:05:00,0000001Z", "NO-DATA"),
-                ("comma fraction at the bound", "2026-10-12T20:05:00,0000000Z", "NO-DATA"),
+                # r6 (changed expectation NO-DATA -> CURRENT): a stamp outside the one shape (a 10th fraction digit, a
+                # comma) is unreadable, so the running receipt is dropped and the lane is its finished run alone
+                ("1 unit at the 10th digit", "2026-10-12T20:05:00.0000000001Z", "CURRENT"),
+                ("comma fraction past", "2026-10-12T20:05:00,0000001Z", "CURRENT"),
+                ("comma fraction at the bound", "2026-10-12T20:05:00,0000000Z", "CURRENT"),
                 ("100 ns inside", "2026-10-12T20:04:59.9999999Z", "IN-FLIGHT")):
             with self.subTest(label):
                 self.setUp()
                 self.assertEqual(self._verdict_for_running_stamp(stamp), expected)
 
-    def test_a2_comma_fraction_timestamps_keep_their_sub_microsecond_order(self):
-        # Since r3 a comma-spelled running receipt is not a live candidate (LIVE_START_RE), so the lane reads
-        # INCOMPLETE (an unproven run with no effort) instead of CURRENT; what stays pinned is the ORDER: the
-        # comma form still parses and sorts exactly like the dot form, and the receipt is never IN-FLIGHT.
+    def test_a2_comma_fraction_timestamps_are_unreadable_since_r6(self):
+        # CHANGED in r6 (was test_a2_comma_fraction_timestamps_keep_their_sub_microsecond_order, which pinned that the
+        # comma form parsed and sorted like the dot form, with the lane reading INCOMPLETE). The checker now reads one
+        # shape only: a comma stamp is unreadable, counted, and left out, so no lane exists and nothing is IN-FLIGHT.
         specs = {"fin": dict(state="complete", resolvedModel="gpt-6.1-sol", effort="high",
                              startedUtc="2026-10-12T19:00:00,1234569Z"),
                  "run": dict(state="running", timeoutSec=7200, startedUtc="2026-10-12T19:00:00,1234561Z")}
@@ -431,11 +432,11 @@ class InFlightTests(CurrencyFixture):
                 self.setUp()
                 for name in order:
                     self._write_raw(name, lane="sol", **specs[name])
-                entry = self.evaluate()["lanes"]["sol"]
-                self.assertEqual(entry["verdict"], "INCOMPLETE")
-                self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (0, 1))
-        # and the comma form orders exactly like the dot form
-        self.assertEqual(check.parse_utc("2026-10-12T19:00:00,1234569Z"), check.parse_utc("2026-10-12T19:00:00.1234569Z"))
+                receipts, unreadable = check.load_receipts(str(self.runs))
+                self.assertEqual((len(receipts), unreadable), (0, 2))
+                self.assertEqual(check.evaluate(receipts, now=NOW)["verdict"], "NO-DATA")
+        self.assertIsNone(check.parse_utc("2026-10-12T19:00:00,1234569Z"))
+        self.assertIsNotNone(check.parse_utc("2026-10-12T19:00:00.1234569Z"))
 
     # --- adversary pass 4 (sol, head 421f4a82): A1-A3, introduced majors --------------------------------
     def _fin_and_run(self, fin, run, order):
@@ -462,21 +463,26 @@ class InFlightTests(CurrencyFixture):
                     self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], expected)
 
     def test_r3_a_running_receipt_spelled_past_nine_digits_or_with_a_comma_is_never_in_flight(self):
-        # pass 4 pinned these as live; r3 stops reading them (LIVE_START_RE), so the order of the digits no
-        # longer decides IN-FLIGHT vs CURRENT: the running receipt is an unproven one in every case.
-        for fin, run in (
-                ("2026-10-12T19:00:00.1234560009Z", "2026-10-12T19:00:00.1234560001Z"),
-                ("2026-10-12T19:00:00,1234560009Z", "2026-10-12T19:00:00,1234560001Z"),
-                ("2026-10-12T19:00:00.1234560001Z", "2026-10-12T19:00:00.1234560009Z"),
-                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.1234560000000Z"),
-                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.12345600001Z")):
+        # pass 4 pinned these as live; r3 stopped reading them as live; r6 (changed expectation) stops reading them at
+        # all: a stamp with a comma or more than 9 fraction digits is unreadable, counted, and dropped, so it can never
+        # be IN-FLIGHT. Each row: (finished stamp, running stamp, how many of the two are unreadable).
+        for fin, run, unreadable_expected in (
+                ("2026-10-12T19:00:00.1234560009Z", "2026-10-12T19:00:00.1234560001Z", 2),
+                ("2026-10-12T19:00:00,1234560009Z", "2026-10-12T19:00:00,1234560001Z", 2),
+                ("2026-10-12T19:00:00.1234560001Z", "2026-10-12T19:00:00.1234560009Z", 2),
+                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.1234560000000Z", 1),
+                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.12345600001Z", 1)):
             for order in (("fin", "run"), ("run", "fin")):
                 with self.subTest(fin=fin, run=run, order=order):
                     self.setUp()
                     self._fin_and_run(fin, run, order)
-                    entry = self.evaluate()["lanes"]["sol"]
-                    self.assertNotEqual(entry["verdict"], "IN-FLIGHT")
-                    self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (0, 1))
+                    receipts, unreadable = check.load_receipts(str(self.runs))
+                    self.assertEqual(unreadable, unreadable_expected)
+                    result = check.evaluate(receipts, now=NOW)
+                    self.assertEqual(result["inFlightLanes"], [])
+                    for entry in result["lanes"].values():
+                        self.assertNotEqual(entry["verdict"], "IN-FLIGHT")
+                        self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (0, 0))
 
     def test_p4a2_liveness_is_exact_at_sub_microsecond_timeouts_and_starts(self):
         # now = 20:00:00. Bound: now <= started + timeout + 300 s, read exactly.
@@ -862,7 +868,8 @@ class LiveShapeTests(CurrencyFixture):
 
     def test_r3p6_a2_the_sub_microsecond_digits_come_from_the_seconds_fraction_only(self):
         for text, expected in (("2026-10-12T19:59:00.1234567Z", "7"), ("2026-10-12T19:59:00.1234560Z", ""),
-                               ("2026-10-12T19:59:00,12345678Z", "78"), ("2026-10-12T19:59:00.123456Z", ""),
+                               ("2026-10-12T19:59:00,12345678Z", ""),     # r6: was "78"; a comma stamp is unreadable
+                               ("2026-10-12T19:59:00.12345678Z", "78"), ("2026-10-12T19:59:00.123456Z", ""),
                                ("2026-10-12T19:59:00.123456+01:00", ""),
                                ("2026-10-12T20:59:00+01:00:00.0000001", ""),     # an offset fraction is not seconds
                                ("2026-10-12T19:59:00-00:00:00.0000001", ""),
@@ -872,16 +879,16 @@ class LiveShapeTests(CurrencyFixture):
                 self.assertEqual(check.sub_microsecond_digits(text), expected)
 
     # --- adversary pass 7 (sol, head 86f2dbf4): A1 and A2, both introduced majors in the pass-6 fold ---------
-    def test_r3p7_a1_every_accepted_spelling_keeps_its_sub_microsecond_order(self):
-        # A failed run 800 ns NEWER than the complete one, in spellings fromisoformat accepts but the first anchor missed.
-        if check.parse_utc("20261012T195900Z") is None:
-            self.skipTest("this Python's fromisoformat does not read the basic format")
-        for label, failed in (("basic", "20261012T195900.0000009Z"),
-                              ("week date", "2026-W42-1T19:59:00.0000009Z"),
-                              ("newline separator", "2026-10-12\n19:59:00.0000009Z"),
-                              # r4: 'basic with compact offset' (+0100) and 'hour-only offset' (+01) moved out of this
-                              # list: they are no longer designators, so they are unreadable (see the r4 tests)
-                              ("extended, the control", "2026-10-12T19:59:00.0000009Z")):
+    def test_r3p7_a1_a_newer_failed_run_in_the_writers_shape_wins_and_foreign_spellings_are_unreadable(self):
+        # CHANGED in r6 (was test_r3p7_a1_every_accepted_spelling_keeps_its_sub_microsecond_order, whose name stopped
+        # being true: it claimed 'every accepted spelling' and skipped itself where basic format was unreadable). A
+        # failed run 800 ns NEWER than the complete one. Only the extended control is readable: it keeps the order
+        # (NO-DATA, 2 receipts read). The basic, week-date and newline spellings were read before r6; now each is
+        # unreadable (counted) and the lane is judged on the complete run alone (the r4 exception), CURRENT.
+        for label, failed, readable in (("basic", "20261012T195900.0000009Z", False),
+                                        ("week date", "2026-W42-1T19:59:00.0000009Z", False),
+                                        ("newline separator", "2026-10-12\n19:59:00.0000009Z", False),
+                                        ("extended, the control", "2026-10-12T19:59:00.0000009Z", True)):
             for order in (("a-fin", "b-fail"), ("a-fail", "b-fin")):
                 with self.subTest(label=label, order=order):
                     self.setUp()
@@ -894,10 +901,10 @@ class LiveShapeTests(CurrencyFixture):
                                  "resolvedModel": "gpt-6.1-sol", "effort": "high"})
                         (run / "sol-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
                     receipts, unreadable = check.load_receipts(str(self.runs))
-                    self.assertEqual((len(receipts), unreadable), (2, 0))
+                    self.assertEqual((len(receipts), unreadable), (2, 0) if readable else (1, 1))
                     result = check.evaluate(receipts, now=NOW)
-                    self.assertEqual(result["lanes"]["sol"]["verdict"], "NO-DATA")      # the newest run failed
-                    self.assertEqual(result["verdict"], "INCOMPLETE")
+                    self.assertEqual(result["lanes"]["sol"]["verdict"], "NO-DATA" if readable else "CURRENT")
+                    self.assertEqual(result["verdict"], "INCOMPLETE" if readable else "CURRENT")
 
     def test_r3p7_a2_a_compact_offset_with_seconds_is_unreadable_too(self):
         for text in ("2026-10-12T18:59:00.0000000-010000.0000009", "2026-10-12T18:59:00-010000",
@@ -915,11 +922,14 @@ class LiveShapeTests(CurrencyFixture):
         receipts, unreadable = check.load_receipts(str(self.runs))
         self.assertEqual((len(receipts), unreadable), (1, 1))
 
-    def test_r3p7_the_sub_microsecond_digits_are_the_seconds_fraction_in_every_spelling(self):
-        for text, expected in (("20261012T195900.0000009Z", "9"), ("2026-W42-1T19:59:00.0000009Z", "9"),
-                               ("2026-10-12\n19:59:00.0000009Z", "9"), ("20261012T195900.1234567-05:00", "7"),
+    def test_r3p7_the_sub_microsecond_digits_exist_only_for_the_one_readable_shape(self):
+        # CHANGED in r6 (was ..._are_the_seconds_fraction_in_every_spelling): basic, week-date, newline, comma and
+        # whitespace-padded stamps used to give '9' or '7'; they are unreadable now, so they give no digits.
+        for text, expected in (("20261012T195900.0000009Z", ""), ("2026-W42-1T19:59:00.0000009Z", ""),
+                               ("2026-10-12\n19:59:00.0000009Z", ""), ("20261012T195900.1234567-05:00", ""),
+                               ("2026-10-12T19:59:00.0000009Z", "9"),
                                ("2026-10-12T19:59:00.1234567-05:30", "7"),
-                               ("  2026-10-12T19:59:00,1234567Z\n", "7"),
+                               ("  2026-10-12T19:59:00,1234567Z\n", ""),
                                # r4: outside the designator allowlist, so unreadable and no digits at all
                                ("20261012T195900.1234567-0500", ""), ("2026-10-12T19:59:00.1234567-05", ""),
                                ("2026-10-12T19:59:00.1234567", ""),
@@ -971,13 +981,15 @@ class LiveShapeTests(CurrencyFixture):
             with self.subTest(tail=tail):
                 self.assertIsNotNone(check.parse_utc(base + tail))
                 self.assertEqual(check.sub_microsecond_digits(base + tail), "9")
-        # surrounding whitespace was always trimmed before reading; that is unchanged
-        self.assertIsNotNone(check.parse_utc("  " + base + "Z\n"))
+        # CHANGED in r6: surrounding whitespace was trimmed before reading (asserted readable here); the text is
+        # now matched raw, so padding makes a stamp unreadable
+        self.assertIsNone(check.parse_utc("  " + base + "Z\n"))
 
     def test_r4_the_two_offset_denylists_are_gone(self):
         self.assertFalse(hasattr(check, "OFFSET_WITH_SECONDS_RE"))
         self.assertFalse(hasattr(check, "OFFSET_TAIL_RE"))
-        self.assertTrue(hasattr(check, "DESIGNATOR_RE"))
+        # r6 (changed): DESIGNATOR_RE itself is gone too; LIVE_START_RE is the only shape (see OneStampShapeTests)
+        self.assertTrue(hasattr(check, "LIVE_START_RE"))
 
     def test_r3_a5_the_docstring_says_past_the_skew_bound(self):
         doc = check.__doc__
@@ -1088,6 +1100,120 @@ class RunningIsNeverEvidenceTests(CurrencyFixture):
         entry = result["lanes"]["sol"]
         self.assertEqual((entry["verdict"], result["verdict"], code), ("IN-FLIGHT", "CURRENT", 0), result)
         self.assertEqual(entry["judgedOn"]["model"], "gpt-6.1-sol")
+
+
+class OneStampShapeTests(CurrencyFixture):
+    """r6 (PR 753, hub ruling 20261105T1245Z): the checker reads ONE startedUtc shape, the writer's
+    (LIVE_START_RE, matched against the RAW text: no strip, no comma normalization). Every other string is
+    unreadable and counted in `unreadableReceipts`; nothing is guessed from it, so no spelling can be mis-sorted.
+    Rows 3 and 4 read CURRENT on purpose: that is the r4 exception (docstring: a newest FAILED run whose startedUtc
+    is unreadable is dropped and counted), not an oversight. Clock: 2026-10-12T20:00:00Z, through main --json."""
+
+    run_main = RunningIsNeverEvidenceTests.run_main
+
+    def complete(self, stamp):
+        return dict(state="complete", startedUtc=stamp, resolvedModel="gpt-6.1-sol", effort="high")
+
+    def failed(self, stamp):
+        return dict(state="failed", startedUtc=stamp, resolvedModel=None, effort="high")
+
+    RUNNING = dict(state="running", startedUtc="2026-10-12T19:59:30Z", timeoutSec=3600)
+
+    def test_row1_a_dot_after_the_date_is_unreadable_so_the_newer_failure_is_never_hidden(self):
+        # sol A1 / opus: '2026-10-12.1959001Z' used to read as 19:59:00 plus an invented '1' ns digit and sort AFTER the
+        # failure at 19:59:00.00000005. Now the complete run is unreadable (dropped, counted); the failure is the lane.
+        specs = {"fin": self.complete("2026-10-12.1959001Z"), "bad": self.failed("2026-10-12T19:59:00.00000005Z")}
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertEqual(result["unreadableReceipts"], 1)
+
+    def test_row2_adding_a_live_receipt_never_turns_row1_into_in_flight_over_current(self):
+        # What it reads: the lane's readable runs are the failed one and the live one. There is no proven finished run
+        # (the complete run is unreadable), so IN-FLIGHT has no foundation: NO-DATA, overall INCOMPLETE, exit 3.
+        specs = {"fin": self.complete("2026-10-12.1959001Z"), "bad": self.failed("2026-10-12T19:59:00.00000005Z"),
+                 "live": self.RUNNING}
+        for order in (("fin", "bad", "live"), ("live", "bad", "fin"), ("bad", "live", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                entry = result["lanes"]["sol"]
+                self.assertEqual((entry["verdict"], result["verdict"], code), ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertEqual(result["inFlightLanes"], [])
+                self.assertEqual(result["unreadableReceipts"], 1)
+
+    def test_row3_a_newest_failed_run_in_a_foreign_spelling_is_dropped_and_counted_the_r4_exception(self):
+        # DELIBERATELY not NO-DATA (sol's stated reading): the r4 exception. The failed stamp is unreadable, so the
+        # run is dropped and counted in unreadableReceipts, and the lane is judged on the complete run: CURRENT, exit 0.
+        for failed_stamp in ("20261012T1959001234569Z", "2026-10-12T1959001234569Z", "2026-W42-1T1959001234569Z"):
+            for order in (("fin", "bad"), ("bad", "fin")):
+                with self.subTest(failed=failed_stamp, order=order):
+                    self.setUp()
+                    code, result = self.run_main(order, {"fin": self.complete("2026-10-12T19:59:00.1234561Z"),
+                                                         "bad": self.failed(failed_stamp)})
+                    self.assertEqual(result["unreadableReceipts"], 1)
+                    self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                     ("CURRENT", "CURRENT", 0), result)
+                    self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 1)
+
+    def test_row5_two_receipts_in_the_writers_shape_keep_every_digit_of_their_order(self):
+        # 9-digit fractions 800 ns apart: the failed run is newer, so the newest run failed: never CURRENT.
+        older, newer = "2026-10-12T19:59:00.123456100Z", "2026-10-12T19:59:00.123456900Z"
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, {"fin": self.complete(older), "bad": self.failed(newer)})
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertEqual(result["unreadableReceipts"], 0)
+        # and the reverse: the complete run is the newer one, so the lane is CURRENT
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(reverse=True, order=order):
+                self.setUp()
+                code, result = self.run_main(order, {"fin": self.complete(newer), "bad": self.failed(older)})
+                self.assertEqual((result["lanes"]["sol"]["verdict"], code), ("CURRENT", 0), result)
+
+    def test_only_the_writers_shape_is_readable_and_the_text_is_never_cleaned_first(self):
+        for text in ("2026-10-12T19:59:00Z", "2026-10-12T19:59:00.0000000Z", "2026-10-12T19:59:00.1Z",
+                     "2026-10-12T19:59:00.123456789Z", "2026-10-12T19:59:00+00:00", "2026-10-12T14:59:00-05:00"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(check.parse_utc(text))
+        for text in ("2026-10-12.1959001Z", "20261012T195900Z", "2026-10-12T1959001234569Z",
+                     "2026-W42-1T19:59:00Z", "2026-285T19:59:00Z", "2026-10-12", "2026-10-12+19:59",
+                     "2026-10-12T19:59:00,5Z",                        # comma: no normalization any more
+                     "  2026-10-12T19:59:00Z", "2026-10-12T19:59:00Z\n", "2026-10-12T19:59:00Z ",   # no strip
+                     "2026-10-12 19:59:00Z", "2026-10-12\n19:59:00Z", "2026-10-12t19:59:00Z", "2026-10-12T19:59:00z",
+                     "2026-10-12T19:59:00", "2026-10-12T19:59:00+0100", "2026-10-12T19:59:00+01",
+                     "2026-10-12T19:59:00.0000000000Z", "2026-10-12T19:59:00.Z",
+                     "2026-13-12T19:59:00Z", "2026-10-12T24:00:00Z",
+                     "٢٠٢٦-10-12T19:59:00Z",       # Arabic-Indic digits
+                     None, 12, b"2026-10-12T19:59:00Z"):
+            with self.subTest(text=text):
+                self.assertIsNone(check.parse_utc(text))
+                self.assertEqual(check.sub_microsecond_digits(text), "")
+
+    def test_the_sub_microsecond_digits_of_the_one_shape(self):
+        for text, expected in (("2026-10-12T19:59:00.1234567Z", "7"), ("2026-10-12T19:59:00.1234560Z", ""),
+                               ("2026-10-12T19:59:00.123456789Z", "789"), ("2026-10-12T19:59:00.123456Z", ""),
+                               ("2026-10-12T19:59:00.12345Z", ""), ("2026-10-12T19:59:00Z", ""),
+                               ("2026-10-12T19:59:00.1234569+01:00", "9"), ("2026-10-12T19:59:00.123456900-05:30", "9")):
+            with self.subTest(text=text):
+                self.assertEqual(check.sub_microsecond_digits(text), expected)
+
+    def test_the_spelling_helpers_and_the_duplicate_live_flag_are_gone(self):
+        for name in ("normalize_fraction", "split_designator", "DESIGNATOR_RE", "SECONDS_FRACTION_RE"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(check, name))
+        self.assertTrue(hasattr(check, "LIVE_START_RE"))
+        run = self.runs / "x"
+        run.mkdir()
+        (run / "sol-001.receipt.json").write_text(json.dumps(dict(lane="sol", **self.complete("2026-10-12T19:59:00Z"))),
+                                                  encoding="utf-8")
+        receipts, _ = check.load_receipts(str(self.runs))
+        self.assertNotIn("strictStart", receipts[0])
 
 
 class WindowTests(CurrencyFixture):

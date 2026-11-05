@@ -46,20 +46,18 @@ MAX_LIVE_TIMEOUT_SEC (48 h; nan, inf, a non-positive or an absurd value is no bo
 dated more than MAX_FUTURE_START_SKEW_SEC (300 s) past now (a receipt dated past the skew bound has no age, so it
 is never a candidate), and now is no later than startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the
 wrapper's post-run cleanup and the hub clock's measured skew of up to ~20 s).
-SHAPES (r3, hub ruling 20261105T0250Z). The receipt is a candidate only if its two fields are spelled the way the
-writer spells them: startedUtc must fullmatch YYYY-MM-DDTHH:MM:SS(.d{1,9})?(Z|+-HH:MM) (ASCII digits, upper-case
-T and Z, no comma, no padding; LIVE_START_RE), and timeoutSec must be a JSON int or a number whose RAW token has at
-most 15 significant digits (exact_timeout: json.load rounds a longer token before the script could see it, so the
-digits are counted on the token itself; padding zeros do not count). Anything else is not a candidate and stays
-unproven, as before this PR; no exotic spelling is read, so none can be mis-read. The arithmetic on an accepted
-receipt stays exact. ONE OFFSET ALLOWLIST (r4, pass 8 A1): every site that reads a startedUtc goes through
-split_designator, and a stamp must end in 'Z' or '+-HH:MM' (DESIGNATOR_RE). Any other ending ('+01', '+0100',
-'+01:00:00', '+01:00.0000001', a lower-case 'z', no designator at all) cannot be placed to the microsecond, so the
-receipt is not even readable: counted in `unreadableReceipts` like any malformed timestamp, and left out of the
-verdict, not read as a failure or a success. That is the same treatment the hub ruled for an offset with seconds
-(pass 6, A2); it can make a hand-written receipt that the base read disappear, and never makes a real one do so.
-Measured on the real writer: every receipt under fleet-runs that has a startedUtc matches. That
-is an AGE WINDOW derived
+ONE STAMP SHAPE (r6, hub ruling 20261105T1245Z; it replaces the per-spelling rules of r3 to r5). The checker reads
+a startedUtc only if the RAW text fullmatches YYYY-MM-DDTHH:MM:SS(.d{1,9})?(Z|+-HH:MM) (ASCII digits, upper-case T
+and Z; LIVE_START_RE): no strip, no comma normalization, no basic, week or ordinal date, no other separator, no other
+offset. Every other string, a date-only one included, is unreadable: counted in `unreadableReceipts` like any
+malformed timestamp and left out of the verdict, never read as a failure or a success. So no spelling can be read as
+something it was not, and the sort key is built from that one shape only. The cost is that a hand-written receipt that
+an earlier version read can disappear into `unreadableReceipts`; a real one never does (a census of 8301 real receipts
+found 8290 with a startedUtc, every one in the writer's shape). A live candidate additionally needs a timeoutSec that
+is a JSON int or a number whose RAW token has at most 15 significant digits (exact_timeout: json.load rounds a
+longer token before the script could see it, so the digits are counted on the token itself; padding zeros do not
+count); anything else is no candidate and stays unproven, as before this PR. The arithmetic on a candidate stays
+exact. A candidate is an AGE WINDOW derived
 from the receipt's own start time and timeout, not a process probe: this script reads receipts only, it
 never proves that a process exists, and the board's authoritative liveness rule (hub-queue-lib.ps1
 Get-LaneRunState: child pid alive, command line names the run dir, start time matches within 10 s) needs
@@ -76,13 +74,14 @@ STALE pair either), and the lane is judged on its finished runs alone, with the 
 `judgedOn` and in the table. A LIVE candidate is also left out of the effort rule and `unrecordedEffort`; an
 EXPIRED running receipt is not (it is an unproven run that may have recorded no effort, so a lane whose
 expired receipt is older than a proven finished run and recorded no effort reads INCOMPLETE, not CURRENT).
-Two consequences, both NO-DATA: a lane whose newest non-live run is an expired running receipt (the expired
-receipt alone, a finished run followed by one, or an older live receipt beside one) and a lane with no proven
-finished run in the window. IN-FLIGHT is given only when the newest FINISHED run is proven too: a failed run in
+Two consequences, both NO-DATA unless a STALE-MODEL or BAD-EFFORT reason outranks them (that reads STALE): a lane
+whose newest non-live run is an expired running receipt (the expired receipt alone, a finished run followed by
+one, or an older live receipt beside one) and a lane with no proven finished run in the window. IN-FLIGHT is given only when the newest FINISHED run is proven too: a failed run in
 between is not papered over (the lane stays NO-DATA), because missing evidence is never CURRENT.
-ONE EXCEPTION to "missing evidence is never CURRENT" (hub-ruled trade, r4): a newest FAILED run whose startedUtc
-is unreadable is dropped from the lane (counted in `unreadableReceipts`), so the lane is judged on the runs
-that could be read and can read CURRENT where the base read NO-DATA.
+ONE EXCEPTION to "missing evidence is never CURRENT" (hub-ruled trade, r4; r6 widens what counts as unreadable
+to every stamp outside the one shape above): a newest FAILED run whose startedUtc is unreadable is dropped from
+the lane (counted in `unreadableReceipts`), so the lane is judged on the runs that could be read and can read
+CURRENT where the base read NO-DATA.
 
 The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
 else NO-DATA when no lane ran in the window, else CURRENT. IN-FLIGHT lanes count as CURRENT here and are
@@ -128,15 +127,14 @@ DEFAULT_SINCE_HOURS = 72.0
 LIVE_GRACE_SEC = 300.0
 MAX_FUTURE_START_SKEW_SEC = 300     # a running receipt may be dated at most this far past now (clock skew)
 MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a real lane is 12600 s
-# The ONLY startedUtc spelling a live candidate may have: what Invoke-Lane.ps1 writes (ToString('o') of a UTC
+# THE ONE startedUtc SHAPE (r6, hub ruling 20261105T1245Z): what Invoke-Lane.ps1 writes (ToString('o') of a UTC
 # DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
-# digits only and matched against the raw, unstripped string with fullmatch, so a trailing newline or space is out.
-LIVE_START_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
-# THE ONE OFFSET ALLOWLIST (r4, adversary pass 8 A1): a stamp ends in 'Z' or '+-HH:MM' and in nothing else. Every site
-# that reads a startedUtc goes through split_designator, so no site can read an offset one way and another site another
-# way. A stamp that ends otherwise (naive, 'z', '+01', '+0100', '+01:00:00', '+01:00.5', ...) is unreadable.
-DESIGNATOR_RE = re.compile(r"(?:Z|[+-][0-9]{2}:[0-9]{2})$")
-SECONDS_FRACTION_RE = re.compile(r"\.[0-9]{6}([0-9]+)$")
+# digits only, hour 00-23 (3.14's fromisoformat reads 24 as the next day, 3.13's refuses it), matched with fullmatch
+# against the RAW text: no strip, no comma normalization, no basic, week or ordinal date, no other separator, no
+# other offset. Every other string is unreadable, so no spelling is ever read
+# as something it was not (six rounds of per-spelling rules each left the next spelling for the next pass).
+LIVE_START_RE = re.compile(r"(?P<head>[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2})"
+                           r"(?:\.(?P<fraction>[0-9]{1,9}))?(?P<zone>Z|[+-][0-9]{2}:[0-9]{2})")
 MAX_TIMEOUT_SIGNIFICANT_DIGITS = 15  # a decimal this short survives the trip through a binary float unchanged
 MAX_TIMEOUT_EXPONENT = 30            # |decimal exponent of the leading digit|; keeps Fraction() cheap on a hostile token
 RECEIPT_GLOB = "*/*-001.receipt.json"
@@ -165,54 +163,26 @@ def parse_model_id(model_id):
     return None
 
 
-def normalize_fraction(text):
-    """ISO 8601 allows a comma as the decimal sign ('19:00:00,1234569Z'); fromisoformat accepts it and drops
-    every digit past the microsecond. Normalize to a dot first so parse_utc and the sub-microsecond tie-break
-    below read one shape (adversary pass 3, A2)."""
-    return re.sub(r"(?<=[0-9]),(?=[0-9])", ".", text)
-
-
-def split_designator(text):
-    """(body, designator) for a stamp that ends in 'Z' or '+-HH:MM' (surrounding whitespace trimmed, a comma fraction
-    normalized to a dot); None for every other ending. The single reader of the offset for parse_utc and
-    sub_microsecond_digits (adversary passes 6, 7 and 8 each found a spelling the previous pattern read as something
-    it was not: '+01:00:00.0000001', '+0100', '+01:00.0000001')."""
-    if not isinstance(text, str):
-        return None
-    cleaned = normalize_fraction(text.strip())
-    match = DESIGNATOR_RE.search(cleaned)
-    if match is None:
-        return None
-    return cleaned[:match.start()], match.group(0)
-
-
 def sub_microsecond_digits(text):
-    """The digits of the SECONDS fraction past the sixth, trailing zeros removed ('' when there are none, and for a
-    stamp outside the designator allowlist, which parse_utc cannot read either).
-
-    Read from the END of the body once the designator is split off, so it holds for every date and time spelling
-    fromisoformat accepts (extended, basic, week date, any separator) and a fraction inside an offset can never be
-    mistaken for a fraction of a second (adversary passes 6 and 7)."""
-    split = split_designator(text)
-    if split is None:
-        return ""
-    match = SECONDS_FRACTION_RE.search(split[0])
-    return match.group(1).rstrip("0") if match else ""
+    """The digits of the seconds fraction past the sixth, trailing zeros removed ('' when there are none, and for a
+    stamp that is not in the one readable shape, which parse_utc cannot read either)."""
+    match = LIVE_START_RE.fullmatch(text) if isinstance(text, str) else None
+    fraction = match.group("fraction") if match else None
+    return fraction[6:].rstrip("0") if fraction else ""
 
 
 def parse_utc(text):
-    split = split_designator(text)
-    if split is None:
+    """The aware datetime (microsecond-truncated) of a stamp in the one readable shape, LIVE_START_RE; else None."""
+    match = LIVE_START_RE.fullmatch(text) if isinstance(text, str) else None
+    if match is None:
         return None
-    body, designator = split
-    cleaned = re.sub(r"(\.[0-9]{6})[0-9]+$", r"\1", body) + ("+00:00" if designator == "Z" else designator)
+    fraction = match.group("fraction")
+    zone = "+00:00" if match.group("zone") == "Z" else match.group("zone")
+    micro = "." + fraction[:6].ljust(6, "0") if fraction else ""
     try:
-        moment = datetime.datetime.fromisoformat(cleaned)
+        return datetime.datetime.fromisoformat(match.group("head") + micro + zone)
     except ValueError:
         return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    return moment
 
 
 class RawFloat(float):
@@ -310,10 +280,10 @@ def load_receipts(runs_dir):
         if started is None:
             unreadable += 1
             continue
-        # parse_utc keeps microseconds; Invoke-Lane writes 7 fractional digits (100 ns ticks). Keep EVERY digit it
-        # drops, as a string with trailing zeros removed: digit strings compare in numeric order of the fraction
-        # ('09' < '1', '12' < '123', equal fractions equal), so no digit is ever lost and there is no int() size
-        # limit to trip over. `order` ties only on a true tie; `subus` also feeds the exact liveness test.
+        # parse_utc keeps microseconds; Invoke-Lane writes 7 fractional digits (100 ns ticks) and the one readable
+        # shape allows up to 9. The 0-3 digits it drops are kept here (`subus`) as a string with trailing zeros
+        # removed, which compares in the numeric order of the fraction ('09' < '1', '12' < '123', equal fractions
+        # equal). `order` ties only on a true tie; `subus` also feeds the exact liveness test.
         subus = sub_microsecond_digits(data.get("startedUtc"))
         order = (started, subus)
         resolved = data.get("resolvedModel")
@@ -323,11 +293,8 @@ def load_receipts(runs_dir):
             "state": data.get("state"),
             "ended": data.get("endedUtc"),
             "timeoutSec": timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else None,
-            # the two facts a live candidate needs, decided once here on the RAW text (r3): the exact timeout, and
-            # whether startedUtc is spelled in the one shape the writer produces
+            # the exact timeout a live candidate needs, decided once here on the RAW token (r3)
             "timeoutExact": exact_timeout(timeout),
-            "strictStart": (isinstance(data.get("startedUtc"), str)
-                            and LIVE_START_RE.fullmatch(data["startedUtc"]) is not None),
             "card": data.get("card"), "effort": data.get("effort"),
             "resolvedModel": resolved if isinstance(resolved, str) else None,
             "parsed": parse_model_id(resolved),
@@ -355,12 +322,9 @@ def is_live_running(receipt, now):
     This is an age window, not a process probe; it does not prove anything is running (see the docstring)."""
     if receipt["state"] != "running" or receipt["ended"]:
         return False
-    # Only the writer's own spellings are read at all (r3): startedUtc in LIVE_START_RE and a timeoutSec whose RAW
-    # token has at most 15 significant digits (exact_timeout). Any other shape (a comma fraction, a fractional or
-    # compact offset, a lowercase z, a 16-digit timeout that json.load would have rounded) is not provably inside
-    # the window, so it is not a candidate: it stays unproven, exactly as before this PR.
-    if not receipt.get("strictStart"):
-        return False
+    # startedUtc is already in the one readable shape: a receipt with any other stamp is unreadable and never gets
+    # here. timeoutSec counts only when its RAW token has at most 15 significant digits (exact_timeout; json.load
+    # rounds a longer one), else the receipt is not provably inside the window and is no candidate.
     timeout = receipt.get("timeoutExact")
     try:
         # a missing, non-positive or over-cap value is not a bound at all (nan, inf and non-numbers are None here)
@@ -380,13 +344,13 @@ def is_live_running(receipt, now):
             return False
         return start_minus_now + timeout + int(LIVE_GRACE_SEC) >= 0
     except (OverflowError, ValueError, TypeError):
-        return False        # includes an unreadably long digit string: not provably inside the window
+        return False        # not provably inside the window
 
 
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
-    # The family's newest id is judged over every receipt, the window only decides what is reported.
-    # A receipt whose state is `running` is never evidence, live or expired (r5, B1), so it cannot raise the newest id.
+    # The family's newest id is judged over every receipt that is not `running`, however old; the window only decides
+    # what is reported. A `running` receipt is never evidence, live or expired (r5, B1), so it cannot raise the newest id.
     live_ids = {id(r) for r in receipts if is_live_running(r, now)}
     newest = newest_per_family([r for r in receipts if r["state"] != "running"], overrides or {})
     window = list(receipts)
