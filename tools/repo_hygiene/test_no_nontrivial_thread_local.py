@@ -40,6 +40,14 @@ ALLOW_LIST = {
 }
 
 
+def is_digit_separator(text, i):
+    """True when the ' at i sits inside a token that starts with a digit: a pp-number, not a literal's prefix."""
+    j = i
+    while j > 0 and (text[j - 1].isalnum() or text[j - 1] in "_'"):
+        j -= 1
+    return j < i and text[j].isdigit()
+
+
 def strip_comments(text):
     """Blank // and /* */ comments, leaving string, character and raw string literals as they are."""
     out = []
@@ -67,8 +75,8 @@ def strip_comments(text):
             i = stop
             continue
         if c in "\"'":
-            # A digit separator (1'000) is not a character literal.
-            if c == "'" and i > 0 and text[i - 1].isalnum():
+            # A digit separator (1'000, 0xA'B) is not a character literal; a prefixed literal (L'x', u8'x') is.
+            if c == "'" and is_digit_separator(text, i):
                 out.append(c)
                 i += 1
                 continue
@@ -155,6 +163,17 @@ class ThreadLocalGrammarTests(unittest.TestCase):
         self.assertEqual(
             ["int n = 1'000; thread_local Foo g;"],
             thread_local_lines("int n = 1'000; thread_local Foo g;\n"),
+        )
+
+    def test_a_prefixed_character_literal_does_not_desynchronise_quotes(self):
+        # Adversary second pass A1.
+        source = "const wchar_t c = L'\"'; const char * s = \"//\"; thread_local Foo g;\n"
+        self.assertEqual([source.strip()], thread_local_lines(source))
+
+    def test_a_hex_digit_separator_does_not_open_a_literal(self):
+        self.assertEqual(
+            ["int n = 0xA'B; thread_local Foo g;"],
+            thread_local_lines("int n = 0xA'B; thread_local Foo g;\n"),
         )
 
     def test_a_longer_identifier_is_not_the_token(self):

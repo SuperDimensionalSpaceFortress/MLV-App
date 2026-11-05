@@ -267,11 +267,16 @@ int reportOrder(const std::string & kind, const bool finished)
 
 int reportReuse(const std::string & kind, const bool finished)
 {
+    // A worker still running after the wait may still write g_search, so read nothing from it.
+    if (!finished)
+    {
+        printResult("reuse", kind, "INVALID", "why=worker_never_finished");
+        std::_Exit(3);
+    }
     const SearchResult & s = g_search;
     const std::string detail = "k_seq=" + std::to_string(g_k_stamp.load()) + " probe_seq=" + std::to_string(g_probe_stamp.load())
         + " base_found=" + std::to_string(s.base_found) + " pos_found=" + std::to_string(s.pos_found)
         + " neg_found=" + std::to_string(s.neg_found) + " attempts=" + std::to_string(s.attempts);
-    if (!finished) return printResult("reuse", kind, "INVALID", detail + " why=worker_never_finished");
     if (g_base_mismatch.load()) return printResult("reuse", kind, "INVALID", detail + " why=base_is_not_object_minus_8");
     if (!s.ran) return printResult("reuse", kind, "INVALID", detail + " why=search_never_ran");
     if (!s.pos_found) return printResult("reuse", kind, "INVALID", detail + " why=positive_control_not_found");
@@ -334,13 +339,17 @@ int runHelper(const std::string & kind)
         return printResult("helper", kind, g_helper_ctor.load() == 1 ? "GREEN" : "INVALID",
                            "ctor=" + std::to_string(g_helper_ctor.load()) + " dtor=" + std::to_string(g_helper_dtor.load()));
     }
-    const bool finished = runOnKind(kind, helperBody);
+    // A worker still running after the wait may still write g_search, so nothing below reads it without a finished worker.
+    if (!runOnKind(kind, helperBody))
+    {
+        printResult("helper", kind, "INVALID", "why=worker_never_finished");
+        std::_Exit(3);
+    }
     const SearchResult & s = g_search;
     const std::string detail = "ctor=" + std::to_string(g_helper_ctor.load()) + " dtor=" + std::to_string(g_helper_dtor.load())
         + " bad=" + std::to_string(g_helper_bad.load()) + " k_seq=" + std::to_string(g_k_stamp.load())
         + " dtor_seq=" + std::to_string(g_helper_dtor_stamp.load()) + " base_found=" + std::to_string(s.base_found)
         + " pos_found=" + std::to_string(s.pos_found) + " neg_found=" + std::to_string(s.neg_found) + " attempts=" + std::to_string(s.attempts);
-    if (!finished) return printResult("helper", kind, "INVALID", detail + " why=worker_never_finished");
     if (g_base_mismatch.load()) return printResult("helper", kind, "INVALID", detail + " why=base_is_not_object_minus_8");
     // The adversary has to have run, or this exit 0 says nothing.
     if (!s.ran || !s.pos_found || !s.base_found || s.neg_found) return printResult("helper", kind, "INVALID", detail + " why=adversary_did_not_take_the_block");
@@ -409,7 +418,13 @@ size_t pagefileUsage()
 {
     PROCESS_MEMORY_COUNTERS counters{};
     counters.cb = sizeof(counters);
-    GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters));
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters)))
+    {
+        // A zero reading would make any growth look like none: INVALID, never GREEN.
+        std::printf("RESULT mode=churn kind=stdthread verdict=INVALID why=GetProcessMemoryInfo_failed\n");
+        std::fflush(stdout);
+        std::_Exit(3);
+    }
     return counters.PagefileUsage;
 }
 
@@ -511,10 +526,14 @@ int main(int argc, char ** argv)
     if (mode == "crash")
     {
         g_mode = Mode::Crash;
-        const bool finished = runOnKind(kind, workerBody);
+        if (!runOnKind(kind, workerBody))
+        {
+            printResult("crash", kind, "INVALID", "why=worker_never_finished");
+            std::_Exit(3);
+        }
         // Reached only when the free() did not fast-fail. Not a gate: heap termination policy may differ on this OS.
         return printResult("crash", kind, "NO_FAST_FAIL",
-                           "finished=" + std::to_string(finished) + " base_found=" + std::to_string(g_search.base_found)
+                           "base_found=" + std::to_string(g_search.base_found)
                                + " pos_found=" + std::to_string(g_search.pos_found) + " attempts=" + std::to_string(g_search.attempts));
     }
     if (mode == "setspecific_fail") return runSetspecificFail();
