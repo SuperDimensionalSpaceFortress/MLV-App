@@ -87,6 +87,7 @@ Usage: python check-lane-model-currency.py [--runs-dir DIR] [--since-hours N] [-
 """
 import argparse
 import datetime
+import fractions
 import glob
 import json
 import math
@@ -193,16 +194,17 @@ def load_receipts(runs_dir):
         if started is None:
             unreadable += 1
             continue
-        # parse_utc keeps microseconds; Invoke-Lane writes 7 fractional digits (100 ns ticks), so keep the
-        # digits it drops as a tie-break and two runs started within one microsecond still order correctly.
+        # parse_utc keeps microseconds; Invoke-Lane writes 7 fractional digits (100 ns ticks). Keep EVERY digit it
+        # drops, as a string with trailing zeros removed: digit strings compare in numeric order of the fraction
+        # ('09' < '1', '12' < '123', equal fractions equal), so no digit is ever lost and there is no int() size
+        # limit to trip over. `order` ties only on a true tie; `subus` also feeds the exact liveness test.
         extra = re.search(r"\.[0-9]{6}([0-9]+)", normalize_fraction(str(data.get("startedUtc"))))
-        order = (started, int(extra.group(1)[:3].ljust(3, "0")) if extra else 0)
-        # Any non-zero digit past the microsecond puts the real start after the truncated `started`.
-        beyond_us = bool(extra and extra.group(1).strip("0"))
+        subus = extra.group(1).rstrip("0") if extra else ""
+        order = (started, subus)
         resolved = data.get("resolvedModel")
         timeout = data.get("timeoutSec")
         receipts.append({
-            "path": path, "lane": data["lane"], "started": started, "order": order, "beyond_us": beyond_us,
+            "path": path, "lane": data["lane"], "started": started, "order": order, "subus": subus,
             "state": data.get("state"),
             "ended": data.get("endedUtc"),
             "timeoutSec": timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else None,
@@ -238,18 +240,22 @@ def is_live_running(receipt, now):
         # nan, inf, a non-positive value, a huge int or anything past the cap is not a bound at all
         if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= MAX_LIVE_TIMEOUT_SEC:
             return False
-        started = receipt["started"]
         # Bounded at both ends: not older than timeout + grace, and not dated past the future-skew bound. A
         # receipt dated in the future has no age at all, so it is no evidence that a run is in progress.
-        future_limit = now + datetime.timedelta(seconds=MAX_FUTURE_START_SKEW_SEC)
-        # `started` is truncated to the microsecond, so a start exactly on the limit is past it when digits
-        # beyond the microsecond are non-zero (adversary pass 3, A1). The age end needs no such care: `now`
-        # has microsecond resolution, so now <= the real end iff now <= the truncated end.
-        if started > future_limit or (started == future_limit and receipt.get("beyond_us")):
+        # The arithmetic is EXACT (fractions, no timedelta rounding), so the bounds hold to the last digit the
+        # receipt wrote: the microsecond-truncated `started`, the digits it dropped (`subus`) and a fractional
+        # timeoutSec (read as its decimal text, not as a binary float) all enter unrounded.
+        micro = (receipt["started"] - now) // datetime.timedelta(microseconds=1)
+        digits = receipt.get("subus") or ""
+        start_minus_now = fractions.Fraction(micro, 10 ** 6)
+        if digits:
+            start_minus_now += fractions.Fraction(int(digits), 10 ** len(digits)) / 10 ** 6
+        timeout_exact = fractions.Fraction(timeout if isinstance(timeout, int) else repr(timeout))
+        if start_minus_now > MAX_FUTURE_START_SKEW_SEC:
             return False
-        return now <= started + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC)
+        return start_minus_now + timeout_exact + int(LIVE_GRACE_SEC) >= 0
     except (OverflowError, ValueError, TypeError):
-        return False
+        return False        # includes an unreadably long digit string: not provably inside the window
 
 
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
@@ -298,8 +304,12 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
             verdict = "NO-DATA"
         elif unrecorded:
             verdict = "INCOMPLETE"
+        elif live and live[-1]["order"] >= runs[-1]["order"] and runs[-1]["state"] == "running":
+            # The run before the live one is an expired running receipt: it never finished, so whatever model it
+            # carries is not finished evidence and IN-FLIGHT has no foundation (adversary pass 4, A3).
+            verdict = "NO-DATA"
         elif live and live[-1]["order"] >= runs[-1]["order"]:     # >=: an exact tie reads the running run as newer
-            verdict = "IN-FLIGHT"       # newest receipt is running; the newest finished run is proven and CURRENT
+            verdict = "IN-FLIGHT"      # newest receipt is running; the newest finished run is proven and CURRENT
         else:
             verdict = "CURRENT"
         report[lane] = {
@@ -310,7 +320,8 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
             "reasons": reasons, "unrecordedEffort": len(unrecorded),
             "inFlightRuns": len(live), "deadRunning": len(dead_running),
             "judgedOn": ({"model": runs[-1]["resolvedModel"], "startedUtc": runs[-1]["started"].isoformat(),
-                          "receipt": runs[-1]["path"]} if proven and runs[-1]["parsed"] else None),
+                          "receipt": runs[-1]["path"]}
+                         if proven and runs[-1]["parsed"] and runs[-1]["state"] != "running" else None),
         }
     verdicts = {entry["verdict"] for entry in report.values()}
     in_flight = sorted(lane for lane, entry in report.items() if entry["verdict"] == "IN-FLIGHT")

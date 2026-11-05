@@ -411,6 +411,64 @@ class InFlightTests(CurrencyFixture):
         # and the comma form orders exactly like the dot form
         self.assertEqual(check.parse_utc("2026-10-12T19:00:00,1234569Z"), check.parse_utc("2026-10-12T19:00:00.1234569Z"))
 
+    # --- adversary pass 4 (sol, head 421f4a82): A1-A3, introduced majors --------------------------------
+    def test_p4a1_every_fractional_digit_orders_receipts_only_an_exact_tie_favours_the_running_one(self):
+        # the finished run is newer at the 10th digit (…0009 vs …0001): CURRENT, not IN-FLIGHT
+        for fin, run, expected in (
+                ("2026-10-12T19:00:00.1234560009Z", "2026-10-12T19:00:00.1234560001Z", "CURRENT"),
+                ("2026-10-12T19:00:00,1234560009Z", "2026-10-12T19:00:00,1234560001Z", "CURRENT"),
+                ("2026-10-12T19:00:00.1234560001Z", "2026-10-12T19:00:00.1234560009Z", "IN-FLIGHT"),
+                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.1234560000000Z", "IN-FLIGHT"),  # equal
+                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.12345600001Z", "IN-FLIGHT"),
+                ("2026-10-12T19:00:00.12345600001Z", "2026-10-12T19:00:00.123456Z", "CURRENT")):
+            for order in (("fin", "run"), ("run", "fin")):
+                with self.subTest(fin=fin, run=run, order=order):
+                    self.setUp()
+                    for name in order:
+                        if name == "fin":
+                            self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol",
+                                            effort="high", startedUtc=fin)
+                        else:
+                            self._write_raw("run", lane="sol", state="running", timeoutSec=7200, startedUtc=run)
+                    self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], expected)
+
+    def test_p4a2_liveness_is_exact_at_sub_microsecond_timeouts_and_starts(self):
+        # now = 20:00:00. Bound: now <= started + timeout + 300 s, read exactly.
+        for label, stamp, timeout, expected in (
+                ("rounds up into live", "2026-10-12T19:54:59.9999990Z", 0.0000006, "NO-DATA"),
+                ("actual expiry equals now", "2026-10-12T19:54:59.9999999Z", 0.0000001, "IN-FLIGHT"),
+                ("one tick short of now", "2026-10-12T19:54:59.9999998Z", 0.0000001, "NO-DATA"),
+                ("timeout 0 is no bound at all", "2026-10-12T19:55:00.0000000Z", 0, "NO-DATA"),
+                ("whole-second edge, timeout 1", "2026-10-12T19:54:59.0000000Z", 1, "IN-FLIGHT"),
+                ("sub-us start on the edge", "2026-10-12T19:54:59.0000001Z", 1, "IN-FLIGHT"),
+                ("one tick short at timeout 1", "2026-10-12T19:54:58.9999999Z", 1, "NO-DATA")):
+            with self.subTest(label):
+                self.setUp()
+                self._write_raw("fin", lane="sol", state="complete", startedUtc="2026-10-12T18:00:00Z",
+                                resolvedModel="gpt-6.1-sol", effort="high")
+                self._write_raw("run", lane="sol", state="running", startedUtc=stamp, timeoutSec=timeout)
+                self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], expected)
+
+    def test_p4a3_an_expired_running_receipt_that_carries_a_model_is_not_the_foundation_of_in_flight(self):
+        # no finished run at all: the lane has nothing proven but an expired running receipt
+        self._write_raw("dead", lane="sol", state="running", startedUtc="2026-10-12T18:00:00Z", timeoutSec=1,
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        self._write_raw("run", lane="sol", state="running", startedUtc="2026-10-12T19:00:00Z", timeoutSec=7200)
+        result = self.evaluate()
+        entry = result["lanes"]["sol"]
+        self.assertEqual(entry["verdict"], "NO-DATA")
+        self.assertEqual(entry["deadRunning"], 1)
+        self.assertIsNone(entry["judgedOn"])
+        self.assertEqual(result["inFlightLanes"], [])
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_p4a3_a_finished_run_before_an_expired_modelled_running_one_does_not_make_in_flight(self):
+        self.receipt("sol", "gpt-6.1-sol", 5)
+        self._write_raw("dead", lane="sol", state="running", startedUtc="2026-10-12T18:00:00Z", timeoutSec=1,
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        self._write_raw("run", lane="sol", state="running", startedUtc="2026-10-12T19:00:00Z", timeoutSec=7200)
+        self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], "NO-DATA")
+
     def test_b1_a_future_dated_receipt_is_not_live_through_the_cli_with_the_real_clock(self):
         real_now = datetime.datetime.now(datetime.timezone.utc)
         self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol", effort="high",
