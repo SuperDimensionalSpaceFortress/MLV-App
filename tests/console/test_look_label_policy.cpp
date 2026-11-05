@@ -5,6 +5,7 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include "../../platform/qt/ClipOpenAbortPolicy.h"
 #include "../../platform/qt/LookLabelPolicy.h"
 #include "../../src/batch/LookAssistAnalysis.h"
 
@@ -262,6 +263,68 @@ TEST(LookLabelPolicy, A1LabelNamesTheReceiptThatOwnsTheLoadedClipNotTheActiveRow
     ASSERT_EQ(std::string("Look: Baseline"), label(rowB));
 }
 
+// Adversary r12 A1. Clip A is loaded with Cinematic landed; Open Session's Search gives a second row A's path (that branch has
+// no duplicate check), so the row is active before its loader runs, and the name alone matches both rows. F11 in that pump.
+TEST(LookLabelPolicy, A1r12SamePathTwiceTheRecordedRowOwnsTheClip)
+{
+    int receiptA = 0, receiptB = 0;
+    const void *receipts[] = { &receiptA, &receiptB };
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&receiptA, cinematic, false);
+
+    const int rowA = 0, rowB = 1, rows = 2;
+    const void *recorded = &receiptA;
+    const auto holdsPath = [](int) { return true; };   // both rows hold the loaded path
+    const auto isRecorded = [&](int row) { return receipts[row] == recorded; };
+    const auto isLoadedRow = [&](int row) {
+        return holdsPath(row) && !loadedClipRecordedOnAnotherRow(row, rows, holdsPath, isRecorded);
+    };
+
+    // The row's own open has not run: the recorded row owns the clip, and the label keeps naming A's look.
+    ASSERT_FALSE(isLoadedRow(rowB));
+    ASSERT_TRUE(isLoadedRow(rowA));
+    const int before = look_label::loadedClipOwnerRow(rowB, rows, isLoadedRow);
+    ASSERT_EQ(rowA, before);
+    ASSERT_EQ(std::string("Look: Cinematic"), look_label::shownText(true, outcome, receipts[before], cinematic).toStdString());
+    // Its open succeeds and records it: the new row owns the clip, and nothing has landed on it.
+    recorded = &receiptB;
+    const int after = look_label::loadedClipOwnerRow(rowB, rows, isLoadedRow);
+    ASSERT_EQ(rowB, after);
+    ASSERT_EQ(std::string("Look: Baseline"), look_label::shownText(true, outcome, receipts[after], cinematic).toStdString());
+    // Nothing recorded in the session (the recorded row is gone): the name decides and the active row breaks the tie.
+    recorded = nullptr;
+    ASSERT_EQ(rowB, look_label::loadedClipOwnerRow(rowB, rows, isLoadedRow));
+    // A recorded row that does not hold the path never takes a clip from the row that does.
+    recorded = &receiptA;
+    const auto onlyB = [](int row) { return row == 1; };
+    ASSERT_FALSE(loadedClipRecordedOnAnotherRow(rowB, rows, onlyB, isRecorded));
+}
+
+TEST(LookLabelWiring, A1r12EveryOwnershipPredicateHonoursTheRecordedRow)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("bool MainWindow::loadedClipIsRow( int row ) const"))
+                    .contains(QStringLiteral("&& !loadedClipRecordedOnAnotherRow( row );")));
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("bool MainWindow::receiptOwnedByLoadedClip( const char *site )"))
+                    .contains(QStringLiteral("&& !loadedClipRecordedOnAnotherRow( SESSION_ACTIVE_CLIP_ROW );")));
+    // Both opens record it in the step that names the file.
+    const QString recordThenName = QStringLiteral("recordLoadedClipReceipt( fileName );\n    m_loadedClipFileName = fileName;");
+    ASSERT_EQ(2, mw.count(recordThenName));
+    ASSERT_EQ(2, mw.count(QStringLiteral("m_loadedClipFileName = fileName;")));
+    ASSERT_EQ(1, mw.count(QStringLiteral("m_loadedClipReceipt = ")));
+}
+
+// Adversary r12 A2: a windowed clip with the GPU device-loss notice up. That notice is showMessage( text, 0 ), and QStatusBar
+// hides a normal widget during a message, so the look would be off the GUI until the notice clears. Pinned as source
+// because console_tests links no widgets; the pixels are owed to the venue leg.
+TEST(LookLabelWiring, A2r12WindowedLabelIsAPermanentWidgetSoNoMessageHidesIt)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(mw.contains(QStringLiteral("statusBar()->addPermanentWidget( m_pLookLabelStatus );")));
+    ASSERT_FALSE(mw.contains(QStringLiteral("statusBar()->addWidget( m_pLookLabelStatus );")));
+}
+
 TEST(LookLabelPolicy, A1OwnerRowEdgeCases)
 {
     const auto never = [](int) { return false; };
@@ -300,7 +363,11 @@ TEST(LookLabelWiring, A1UpdateLookLabelDerivesFromTheOwnerNeverTheActiveReceipt)
     ASSERT_FALSE(update.contains(QStringLiteral("ACTIVE_RECEIPT")));
     ASSERT_TRUE(update.contains(QStringLiteral("look_label::loadedClipOwnerRow(")));
     ASSERT_TRUE(update.contains(QStringLiteral("loadedClipIsRow( row )")));
-    ASSERT_TRUE(update.contains(QStringLiteral("look_label::lookOnForOwner(")));
+    // The whole call, so an inverted argument fails here (tools/.../policy_callsite_mutation_smoke.py).
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "look_label::lookOnForOwner( owner != nullptr, owner && owner->lookAssistEnabled(),\n"
+        "                                                    owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,\n"
+        "                                                    ui->checkBoxLookAssistEnable->isChecked() );")));
     ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? owner : nullptr;")));
     ASSERT_TRUE(update.contains(QStringLiteral("look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText")));
     // Called from settings loading before the session model exists: the model is read only once a clip is loaded.

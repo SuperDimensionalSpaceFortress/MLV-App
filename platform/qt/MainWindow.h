@@ -913,6 +913,8 @@ private:
     // r5 (Dot 29eac4d5 A1): the file the last successful open loaded; receiptOwnedByLoadedClip compares it with
     // the active row. A refused direct receipt write is logged once per clip-open generation.
     QString m_loadedClipFileName;
+    // LOOK-FULLSCREEN-PARITY-1 r12: the receipt of the row that open loaded for (two rows can hold one path). Compared, never read.
+    const ReceiptSettings *m_loadedClipReceipt = nullptr;
     unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
     bool m_exportInProgress = false;
     // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
@@ -1954,6 +1956,8 @@ private:
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
     bool loadedClipIsRow( int row ) const;
+    bool loadedClipRecordedOnAnotherRow( int row ) const;
+    void recordLoadedClipReceipt( const QString &fileName );
     bool receiptOwnedByLoadedClip( const char *site );
     void retryClipReopenAfterPrepAbort( int row );
     void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );

@@ -87,8 +87,8 @@ inline QString shownText( bool lookAssistEnabled, const lookassist::LookAssistFl
 
 /*! \brief r12 (adversary r11 A1): the session row whose receipt owns the loaded clip, or -1. The active row is not it
  *  while another row's open is pumping events (addFileToSession activates B before B's loader runs, and A is still what
- *  is on screen). The active row wins when it holds the clip, because a nested session can hold the same path twice.
- *  `isLoadedRow(row)` answers for one row in [0, rowCount). */
+ *  is on screen). `isLoadedRow(row)` answers for one row in [0, rowCount); MainWindow::loadedClipIsRow already separates two
+ *  rows of one path by the receipt the open recorded, so the active row winning only breaks a tie nothing recorded. */
 template <typename IsLoadedRow>
 inline int loadedClipOwnerRow( int activeRow, int rowCount, IsLoadedRow isLoadedRow )
 {
