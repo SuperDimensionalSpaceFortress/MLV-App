@@ -714,6 +714,369 @@ def test_invoke_lane_maps_the_negative_sentinels_rather_than_passing_them_throug
     assert "-999    { 127 }" in body, "never-completed sentinel is not mapped"
 
 
+# --- LANE-CHILD-LOADER-DIALOG-ON-OWNER-DESKTOP-1: a lane child must never raise a modal dialog ----------
+# MEASURED 2026-11-04 ~21:09Z: lj92-find-old.exe (libwinpthread-1.dll, then libgomp-1.dll not found) put Windows System Error boxes on the owner's
+# desktop. A child inherits its parent's error mode, so Invoke-Lane sets SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+# before it starts anything. Covered here: a grandchild through cmd.exe and one through ProcessStartInfo (the way Invoke-Lane starts its lane child).
+# NOT covered: a child that resets its own mode, and a process started through WMI (its parent is WmiPrvSE, so it inherits nothing from the lane).
+LANE_ERROR_MODE_FLAGS = 0x8003
+_LANE_ERROR_MODE_PWSH = shutil.which("pwsh")
+lane_error_mode_only = pytest.mark.skipif(
+    sys.platform != "win32" or _LANE_ERROR_MODE_PWSH is None,
+    reason="the Windows error mode (SetErrorMode / GetErrorMode) exists only on the Windows venue",
+)
+
+
+def _lane_error_mode_block(runner):
+    body = runner.read_text(encoding="utf-8").replace("\r\n", "\n")
+    begin, end = "# LANE-CHILD-ERROR-MODE-BEGIN\n", "# LANE-CHILD-ERROR-MODE-END"
+    assert begin in body and end in body, "Invoke-Lane lacks the LANE-CHILD-ERROR-MODE block"
+    return body[body.index(begin) + len(begin):body.index(end)]
+
+
+def _lane_error_mode_chain(tmp_path, runner, env=None):
+    """Parent resets its mode to 0, runs Invoke-Lane's own block, then reads the mode in two grandchildren."""
+    probe = tmp_path / "get-mode.ps1"
+    probe.write_text(
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; "
+        "public static class ProbeErrMode { [DllImport(\"kernel32.dll\")] public static extern uint GetErrorMode(); }'\n"
+        "'mode={0}' -f [ProbeErrMode]::GetErrorMode()\n",
+        encoding="ascii",
+    )
+    parent = tmp_path / "parent.ps1"
+    parent.write_text(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; "
+        "public static class TestErrModeReset { [DllImport(\"kernel32.dll\")] public static extern uint SetErrorMode(uint m); }'\n"
+        "[void][TestErrModeReset]::SetErrorMode(0)   # a clean parent: the test must not pass on a mode it inherited\n"
+        + _lane_error_mode_block(runner)
+        + f"$pwsh = '{_LANE_ERROR_MODE_PWSH}'\n"
+        f"$probe = '{probe}'\n"
+        "$viaCmd = (& cmd.exe /c \"`\"$pwsh`\" -NoProfile -NonInteractive -File `\"$probe`\"\") -join ' '\n"
+        "$psi = [System.Diagnostics.ProcessStartInfo]::new()\n"
+        "$psi.FileName = $pwsh; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true\n"
+        "foreach ($a in '-NoProfile','-NonInteractive','-File',$probe) { $psi.ArgumentList.Add($a) }\n"
+        "$p = [System.Diagnostics.Process]::Start($psi); $viaPsi = $p.StandardOutput.ReadToEnd(); $p.WaitForExit()\n"
+        "'cmd: ' + $viaCmd\n"
+        "'psi: ' + $viaPsi.Trim()\n",
+        encoding="ascii",
+    )
+    done = subprocess.run(
+        [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(parent)],
+        text=True, capture_output=True, timeout=120, env=env,
+    )
+    modes = {m.group(1): int(m.group(2)) for m in re.finditer(r"^(cmd|psi): mode=(\d+)", done.stdout, re.M)}
+    return done, modes
+
+
+@lane_error_mode_only
+def test_invoke_lane_error_mode_reaches_a_grandchild(tmp_path):
+    done, modes = _lane_error_mode_chain(tmp_path, LANE_RUNNER)
+    assert set(modes) == {"cmd", "psi"}, f"the probe chain did not report both grandchildren: {done.stdout!r} {done.stderr!r}"
+    for path, mode in modes.items():
+        assert mode & LANE_ERROR_MODE_FLAGS == LANE_ERROR_MODE_FLAGS, (
+            f"grandchild via {path} has error mode 0x{mode:04X}; SEM_FAILCRITICALERRORS (0x0001) is what keeps a missing-DLL "
+            "dialog off the desktop, and the grandchild must carry 0x8003"
+        )
+
+
+@lane_error_mode_only
+def test_invoke_lane_error_mode_is_set_when_the_environment_has_no_os_variable(tmp_path):
+    # Adversary A1 on 74a5d6e7: a Windows process started with OS unset skipped the whole block, warning included, so its children kept the default mode.
+    env = {name: value for name, value in os.environ.items() if name.upper() != "OS"}
+    done, modes = _lane_error_mode_chain(tmp_path, LANE_RUNNER, env=env)
+    assert set(modes) == {"cmd", "psi"}, f"the probe chain did not report both grandchildren: {done.stdout!r} {done.stderr!r}"
+    for path, mode in modes.items():
+        assert mode & LANE_ERROR_MODE_FLAGS == LANE_ERROR_MODE_FLAGS, f"with OS unset, the grandchild via {path} has error mode 0x{mode:04X}"
+
+
+# The ordering pin: HUB-VM gate, then the error-mode block, then the first launch. r1 searched the text for three spellings, so a native `&` or a helper
+# call ahead of the block passed. This reads PowerShell's own AST, so comments, strings and function DEFINITIONS are not launches, by construction.
+#
+# How a new helper gets covered: nothing to register. Ahead of the block ONLY the commands in LANE_PRE_BLOCK_COMMANDS may run, so a call to any other
+# name (a new helper, a bare native such as `git status`, Start-Process, Invoke-CimMethod, Add-Type) fails, including a helper that starts nothing.
+# A new command that is truly in-process joins the list in review, or goes below the block. The lint is dot-sourced and called ahead of the block, so
+# its whole text is held to the same rule (LANE_LINT_COMMANDS, plus the functions it defines), and its top level may only define functions and assign.
+# GAP, stated plainly: this reads syntax, not runtime. A launch through reflection, $ExecutionContext.InvokeCommand, a method of an unlisted .NET type
+# other than `.Start(...)`, or a function that shadows a listed command is not seen.
+LANE_PRE_BLOCK_COMMANDS = (
+    "Set-StrictMode", "Test-Path", "Get-Content", "Resolve-Path", "Join-Path", "Select-Object",
+    "Test-HubHost", "Get-LocalPlaybackPromptFindings",
+)
+LANE_LINT_COMMANDS = (
+    "ConvertFrom-Json", "ForEach-Object", "Get-Content", "Join-Path", "New-Object", "Sort-Object", "Test-Path", "Where-Object",
+)
+# $env:OS alone is not enough: a process started with a scrubbed environment has no OS variable (adversary A1), so the platform check sits beside it.
+LANE_ERROR_MODE_GUARD = "if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq 'Win32NT') {"
+_LANE_LAUNCH_SCANNER = r"""
+using namespace System.Management.Automation.Language
+param([Parameter(Mandatory = $true)][string]$CaseRoot, [Parameter(Mandatory = $true)][string]$AllowFile, [Parameter(Mandatory = $true)][string]$LintAllowFile)
+$ErrorActionPreference = 'Stop'
+$allow = @(Get-Content -LiteralPath $AllowFile)
+$lintAllow = @(Get-Content -LiteralPath $LintAllowFile)
+
+function Test-InsideFunction($Node) {
+    for ($p = $Node.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [FunctionDefinitionAst]) { return $true } }
+    return $false
+}
+# A process-start primitive, whatever the allowlist says. $null when the node is none.
+function Get-Primitive($Node) {
+    if ($Node -is [CommandAst]) {
+        if ($Node.InvocationOperator -eq [TokenKind]::Ampersand) { return 'call-operator' }
+        if ($Node.Extent.Text -match 'Diagnostics\.Process') { return 'process-type-by-name' }
+        return $null
+    }
+    if ($Node -is [InvokeMemberExpressionAst]) {
+        if ($Node.Member -isnot [StringConstantExpressionAst]) { return 'dynamic-member' }
+        if ($Node.Member.Value -ieq 'Start') { return 'member-Start' }
+        return $null
+    }
+    if ($Node -is [TypeExpressionAst] -or $Node -is [TypeConstraintAst]) {
+        if ($Node.TypeName.FullName -match '(^|\.)(Process|ProcessStartInfo|wmiclass|wmi|ManagementClass)$') { return 'process-type' }
+    }
+    return $null
+}
+function Get-LaunchKind($Node, [string[]]$AllowNames, [string[]]$AllowedDotSource) {
+    $primitive = Get-Primitive $Node
+    if ($primitive) { return $primitive }
+    if ($Node -isnot [CommandAst]) { return $null }
+    if ($Node.InvocationOperator -eq [TokenKind]::Dot) {
+        if ($AllowedDotSource -ccontains $Node.Extent.Text) { return $null }
+        return 'dot-source'
+    }
+    $name = $Node.GetCommandName()
+    if (-not $name) { return 'dynamic-command' }
+    if ($AllowNames -notcontains $name) { return 'command-not-on-the-allowlist' }
+    return $null
+}
+function ConvertTo-Row($Node, [string]$Kind) {
+    $text = ($Node.Extent.Text -replace '\s+', ' ')
+    return [ordered]@{ kind = $Kind; line = $Node.Extent.StartLineNumber; text = $text.Substring(0, [Math]::Min(120, $text.Length)) }
+}
+function Get-ProcessHelpers($Ast) {
+    $functions = @($Ast.FindAll({ param($n) $n -is [FunctionDefinitionAst] }, $true))
+    $names = @($functions | ForEach-Object { $_.Name })
+    $starts = @{}
+    foreach ($f in $functions) {
+        foreach ($n in $f.Body.FindAll({ param($x) $true }, $true)) {
+            $bare = ($n -is [CommandAst]) -and $n.GetCommandName() -and ($n.GetCommandName() -notmatch '-') -and ($names -notcontains $n.GetCommandName())
+            $cmdlet = ($n -is [CommandAst]) -and ($n.GetCommandName() -in @('Start-Process', 'Invoke-CimMethod', 'Invoke-WmiMethod', 'Start-Job', 'Start-ThreadJob'))
+            if ($bare -or $cmdlet -or (Get-Primitive $n)) { $starts[$f.Name] = $true; break }
+        }
+    }
+    do {
+        $grew = $false
+        foreach ($f in $functions) {
+            if ($starts.ContainsKey($f.Name)) { continue }
+            foreach ($c in $f.Body.FindAll({ param($x) $x -is [CommandAst] }, $true)) {
+                if ($c.GetCommandName() -and $starts.ContainsKey($c.GetCommandName())) { $starts[$f.Name] = $true; $grew = $true; break }
+            }
+        }
+    } while ($grew)
+    return @($starts.Keys | Sort-Object)
+}
+
+$out = [ordered]@{}
+$lintCache = @{}
+foreach ($case in @(Get-ChildItem -LiteralPath $CaseRoot -Directory)) {
+    $tokens = $null; $errors = $null
+    $ast = [Parser]::ParseFile((Join-Path $case.FullName 'Invoke-Lane.ps1'), [ref]$tokens, [ref]$errors)
+    $begin = @($tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Text.Trim() -ceq '# LANE-CHILD-ERROR-MODE-BEGIN' })
+    $end = @($tokens | Where-Object { $_.Kind -eq 'Comment' -and $_.Text.Trim() -ceq '# LANE-CHILD-ERROR-MODE-END' })
+    $beginAt = if ($begin.Count -eq 1) { $begin[0].Extent.StartOffset } else { -1 }
+    $endAt = if ($end.Count -eq 1) { $end[0].Extent.StartOffset } else { -1 }
+    $top = @($ast.EndBlock.Statements)
+    $gates = @($top | Where-Object { $_ -is [IfStatementAst] -and $_.Extent.Text.Contains('local-playback-prompt-refused') })
+    $laneTable = @($top | Where-Object { $_ -is [AssignmentStatementAst] -and $_.Left.Extent.Text -ceq '$LANES' })
+    $blockStatements = @($top | Where-Object { $beginAt -ge 0 -and $endAt -ge 0 -and $_.Extent.StartOffset -gt $beginAt -and $_.Extent.EndOffset -lt $endAt } | ForEach-Object { $_.Extent.Text })
+    $launches = New-Object System.Collections.Generic.List[object]
+    # Only the param block and the top-level statements that start ahead of BEGIN can hold a launch ahead of it, which skips the thousands of lines below.
+    # With no usable BEGIN marker nothing is scanned here; the marker check reports that case.
+    $roots = @($top | Where-Object { $_ -isnot [FunctionDefinitionAst] -and $_.Extent.StartOffset -lt $beginAt })
+    foreach ($root in $roots) {
+        foreach ($n in $root.FindAll({ param($x) $true }, $true)) {
+            if ($n.Extent.StartOffset -ge $beginAt -or (Test-InsideFunction $n)) { continue }
+            $kind = Get-LaunchKind $n $allow @('. $localPlaybackLint')
+            if ($kind) { $launches.Add((ConvertTo-Row $n $kind)) }
+        }
+    }
+    # These run ahead of the block wherever they sit in the text: the param defaults, a begin or process block, and a trap, which fires from anywhere in its scope.
+    $early = @($ast.ParamBlock, $ast.DynamicParamBlock, $ast.BeginBlock, $ast.ProcessBlock) + @($ast.EndBlock.Traps)
+    foreach ($root in @($early | Where-Object { $null -ne $_ })) {
+        foreach ($n in $root.FindAll({ param($x) $true }, $true)) {
+            if (Test-InsideFunction $n) { continue }
+            $kind = Get-LaunchKind $n $allow @()
+            if ($kind) { $launches.Add((ConvertTo-Row $n $kind)) }
+        }
+    }
+    # Inside the block only its own Add-Type and its warning may run: anything else could start ahead of SetErrorMode, and the inheritance probes would not see it.
+    foreach ($statement in @($top | Where-Object { $beginAt -ge 0 -and $endAt -ge 0 -and $_.Extent.StartOffset -gt $beginAt -and $_.Extent.EndOffset -lt $endAt })) {
+        foreach ($n in $statement.FindAll({ param($x) $true }, $true)) {
+            $kind = Get-LaunchKind $n @('Add-Type', 'Write-Warning') @()
+            if ($kind) { $launches.Add((ConvertTo-Row $n "in-the-block:$kind")) }
+        }
+    }
+    # Most cases share one lint text, so it is read once per distinct text.
+    $lintPath = Join-Path $case.FullName 'lane-local-playback-lint.ps1'
+    $lintText = Get-Content -LiteralPath $lintPath -Raw
+    if (-not $lintCache.ContainsKey($lintText)) {
+        $lintTokens = $null; $lintErrors = $null
+        $lint = [Parser]::ParseFile($lintPath, [ref]$lintTokens, [ref]$lintErrors)
+        $lintFunctions = @($lint.FindAll({ param($x) $x -is [FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+        $lintLaunches = New-Object System.Collections.Generic.List[object]
+        $lintNodes = $lint.FindAll({ param($x) $x -is [CommandAst] -or $x -is [InvokeMemberExpressionAst] -or $x -is [TypeExpressionAst] -or $x -is [TypeConstraintAst] }, $true)
+        foreach ($n in $lintNodes) {
+            $kind = Get-LaunchKind $n @($lintAllow + $lintFunctions) @()
+            if ($kind) { $lintLaunches.Add((ConvertTo-Row $n $kind)) }
+        }
+        $lintCache[$lintText] = @{
+            errors = @($lintErrors | ForEach-Object { $_.Message })
+            launches = $lintLaunches.ToArray()
+            top = @($lint.EndBlock.Statements | Where-Object { $_ -isnot [FunctionDefinitionAst] -and $_ -isnot [AssignmentStatementAst] } | ForEach-Object { ConvertTo-Row $_ 'lint-top-level-statement' })
+        }
+    }
+    $lintResult = $lintCache[$lintText]
+    $out[$case.Name] = [ordered]@{
+        parseErrors = @($errors | ForEach-Object { $_.Message }) + @($lintResult.errors)
+        beginCount = $begin.Count; endCount = $end.Count; beginAt = $beginAt; endAt = $endAt
+        gateCount = $gates.Count; gateEnd = if ($gates.Count -eq 1) { $gates[0].Extent.EndOffset } else { -1 }
+        laneTableAt = if ($laneTable.Count -eq 1) { $laneTable[0].Extent.StartOffset } else { -1 }
+        blockStatements = @($blockStatements)
+        launches = $launches.ToArray(); lintLaunches = @($lintResult.launches); lintTop = @($lintResult.top)
+        helpers = if ($case.Name -ceq 'real') { @(Get-ProcessHelpers $ast) } else { @() }
+    }
+}
+$out | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+def _lane_launch_scan(tmp_path, cases):
+    """Scan {case name: (Invoke-Lane text, lint text)} in one pwsh process. Writes temp copies only; the tracked scripts are never edited."""
+    root = tmp_path / "cases"
+    for name, (script, lint) in cases.items():
+        (root / name).mkdir(parents=True)
+        (root / name / "Invoke-Lane.ps1").write_text(script, encoding="utf-8", newline="\n")
+        (root / name / "lane-local-playback-lint.ps1").write_text(lint, encoding="utf-8", newline="\n")
+    scanner = tmp_path / "scan.ps1"
+    scanner.write_text(_LANE_LAUNCH_SCANNER, encoding="ascii", newline="\n")
+    allow, lint_allow = tmp_path / "allow.txt", tmp_path / "lint-allow.txt"
+    allow.write_text("\n".join(LANE_PRE_BLOCK_COMMANDS) + "\n", encoding="ascii")
+    lint_allow.write_text("\n".join(LANE_LINT_COMMANDS) + "\n", encoding="ascii")
+    done = subprocess.run(
+        [_LANE_ERROR_MODE_PWSH, "-NoProfile", "-NonInteractive", "-File", str(scanner), "-CaseRoot", str(root),
+         "-AllowFile", str(allow), "-LintAllowFile", str(lint_allow)],
+        text=True, capture_output=True, timeout=300,
+    )
+    assert done.returncode == 0, f"the launch scanner failed: {done.stdout!r} {done.stderr!r}"
+    return json.loads(done.stdout)
+
+
+def _lane_order_problems(scan):
+    """Every way this script text breaks HUB-VM gate -> error-mode block -> first launch. Empty when the order holds."""
+    problems = [f"parse error: {e}" for e in scan["parseErrors"]]
+    if scan["beginCount"] != 1 or scan["endCount"] != 1:
+        return problems + [f"need exactly one BEGIN and one END marker comment, found {scan['beginCount']} and {scan['endCount']}"]
+    if scan["gateCount"] != 1:
+        problems.append(f"need exactly one top-level HUB-VM gate, found {scan['gateCount']}")
+    elif scan["gateEnd"] >= scan["beginAt"]:
+        problems.append("block ahead of the gate: a refused prompt must reach the refusal before any Add-Type, and on Windows PowerShell 5.1 Add-Type can start csc.exe")
+    if scan["laneTableAt"] != -1 and scan["endAt"] >= scan["laneTableAt"]:
+        problems.append("block below the lane table")
+    statements = scan["blockStatements"]
+    # Exactly one top-level statement, so a block wrapped in `if ($false) { ... }` (no top-level statement left between the markers) cannot pass.
+    if len(statements) != 1 or not statements[0].startswith(LANE_ERROR_MODE_GUARD) or "SetErrorMode" not in statements[0]:
+        problems.append(f"the markers must hold one top-level `{LANE_ERROR_MODE_GUARD}` statement that calls SetErrorMode")
+    problems += [f"launch ahead of the block ({r['kind']}) at line {r['line']}: {r['text']}" for r in scan["launches"]]
+    problems += [f"launch in the dot-sourced lint ({r['kind']}) at line {r['line']}: {r['text']}" for r in scan["lintLaunches"]]
+    problems += [f"the lint runs a statement when dot-sourced, at line {r['line']}: {r['text']}" for r in scan["lintTop"]]
+    return problems
+
+
+_lane_scanner_only = pytest.mark.skipif(_LANE_ERROR_MODE_PWSH is None, reason="the launch scanner reads PowerShell's own AST and needs pwsh")
+
+
+def _lane_sources():
+    lint = LANE_RUNNER.parent / "lane-local-playback-lint.ps1"
+    return LANE_RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n"), lint.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+@_lane_scanner_only
+def test_invoke_lane_sets_the_error_mode_before_it_starts_any_child(tmp_path):
+    script, lint = _lane_sources()
+    scan = _lane_launch_scan(tmp_path, {"real": (script, lint)})["real"]
+    assert _lane_order_problems(scan) == [], "Invoke-Lane must run the HUB-VM gate, then the error-mode block, then its first launch"
+    assert "SetErrorMode" in _lane_error_mode_block(LANE_RUNNER)
+
+
+def _lane_order_mutants(script, lint, helpers):
+    """(texts the pin must refuse, texts it must accept), each a (script, lint) pair. `helpers` is what the scanner derived from the script."""
+    begin_marker, end_marker = "# LANE-CHILD-ERROR-MODE-BEGIN\n", "# LANE-CHILD-ERROR-MODE-END\n"
+
+    def ahead(statement):
+        return script.replace(begin_marker, statement + "\n" + begin_marker, 1), lint
+
+    block = script[script.index(begin_marker):script.index(end_marker) + len(end_marker)]
+    without_block = script.replace(block, "", 1)
+    strict = "Set-StrictMode -Version Latest\n"
+    gate_test = "if (Test-HubHost) {\n"
+    mutants = {
+        "native-call-operator": ahead("& git --version"),
+        "native-call-operator-variable": ahead("& $env:ComSpec /c ver"),
+        "native-bare": ahead("git --version"),
+        "native-at-the-top": (script.replace(strict, strict + "& git --version\n", 1), lint),
+        "native-inside-the-gate": (script.replace(gate_test, gate_test + "    & git --version\n", 1), lint),
+        "native-in-a-param-default": (script.replace("[string]$PromptFile,", "[string]$PromptFile = (& git --version),", 1), lint),
+        "process-start": ahead("[System.Diagnostics.Process]::Start('git')"),
+        "process-start-info": ahead("$p = [System.Diagnostics.ProcessStartInfo]::new()"),
+        "start-process": ahead("Start-Process git"),
+        "wmi": ahead("Invoke-CimMethod -ClassName Win32_Process -MethodName Create"),
+        "add-type": ahead("Add-Type -TypeDefinition 'public class X {}'"),
+        "block-at-the-r1-position": (without_block.replace(strict, strict + block, 1), lint),
+        "block-below-the-lane-table": (without_block.replace("# Absolute launcher paths.", block + "# Absolute launcher paths.", 1), lint),
+        "block-disabled": (script.replace(begin_marker, "if ($false) {\n" + begin_marker, 1).replace(end_marker, end_marker + "}\n", 1), lint),
+        "block-without-the-guard": (script.replace(LANE_ERROR_MODE_GUARD, "if ($true) {", 1), lint),
+        "block-guard-reads-only-the-environment": (script.replace(LANE_ERROR_MODE_GUARD, "if ($env:OS -eq 'Windows_NT') {", 1), lint),
+        "native-inside-the-block": (script.replace("    try {\n        if (-not ('LaneChildErrorMode'", "    try {\n        & git --version\n        if (-not ('LaneChildErrorMode'", 1), lint),
+        "native-in-a-begin-block": (script.replace("\n)\n\n$ErrorActionPreference = 'Stop'\n", "\n)\n\nbegin { & git --version }\nend {\n$ErrorActionPreference = 'Stop'\n", 1) + "\n}\n", lint),
+        "native-in-a-trap": (script.replace(strict, strict + "trap { & git --version; break }\n", 1), lint),
+        "native-in-a-trap-below-the-block": (script.replace("# Absolute launcher paths.", "trap { & git --version; break }\n# Absolute launcher paths.", 1), lint),
+        "marker-duplicated": ahead(end_marker.strip()),
+        "lint-launch-in-test-hubhost": (script, lint.replace("    $cfg = if ($HostsFile)", "    & git --version\n    $cfg = if ($HostsFile)", 1)),
+        "lint-runs-when-dot-sourced": (script, lint + "\nWrite-Output 'dot-source time'\n"),
+    }
+    for helper in helpers:
+        mutants[f"helper-{helper}"] = ahead(f"{helper} -Anything 'x'")
+    not_launches = {
+        "line-comment": ahead("# & git --version; Start-Process git; [System.Diagnostics.Process]::Start('git')"),
+        "block-comment": ahead("<# & git --version\nInvoke-GitCaptureUtf8 'x' #>"),
+        "string": ahead("$note = '& git --version; Start-Process git'"),
+        "here-string": ahead("$note = @'\n& git --version\nStart-Process git\n'@"),
+        "function-definition": ahead("function Get-Later { & git --version; Start-Process git; [System.Diagnostics.Process]::Start('git'); Invoke-GitCaptureUtf8 'x' @('y') }"),
+    }
+    return mutants, not_launches
+
+
+@_lane_scanner_only
+def test_invoke_lane_error_mode_pin_catches_each_launch_ahead_of_the_block(tmp_path):
+    """Each mutation runs on a temp copy of the script text; the tracked script is never edited."""
+    script, lint = _lane_sources()
+    helpers = _lane_launch_scan(tmp_path / "derive", {"real": (script, lint)})["real"]["helpers"]
+    # A floor, so a broken derivation cannot empty the helper rows and pass with nothing tested. The rows themselves come from the script.
+    assert {"Invoke-GitCaptureUtf8", "Get-CodexCliVersion", "Get-CodexMcpDisableArgs", "Resolve-CodexModelTier"} <= set(helpers), helpers
+    mutants, not_launches = _lane_order_mutants(script, lint, helpers)
+    for name, source in {**mutants, **not_launches}.items():
+        assert source != (script, lint), f"mutation {name} changed nothing; re-pin its anchor"
+    scans = _lane_launch_scan(tmp_path, {**mutants, **not_launches})
+    assert scans.keys() == {**mutants, **not_launches}.keys()
+    # A row that does not parse proves nothing: it would be refused for the parse error, not for the launch it names.
+    unparsed = {name: scan["parseErrors"] for name, scan in scans.items() if scan["parseErrors"]}
+    assert unparsed == {}, "a mutation must still be valid PowerShell"
+    survivors =[name for name in mutants if not _lane_order_problems(scans[name])]
+    assert survivors == [], f"these mutations passed the pin: {survivors}"
+    false_alarms = {name: _lane_order_problems(scans[name]) for name in not_launches if _lane_order_problems(scans[name])}
+    assert false_alarms == {}, "a comment, a string or a function definition is not a launch"
+
+
 def test_invoke_lane_marks_only_the_claude_child_as_a_fleet_lane():
     # KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1. The user-level Stop hook usage-guard.py skips
     # its rotation-checkpoint block when MLV_FLEET_LANE is set; without it a headless lane takes one more
@@ -1500,7 +1863,7 @@ def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
     # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }" in body
-    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')" in body
+    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra', 'terra')" in body
 
 
 def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
@@ -1511,7 +1874,7 @@ def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
     lane_lines = [ln for ln in lanes_block.splitlines() if "engine = " in ln]
-    assert len(lane_lines) == 6, "expected six lane rows (opus, sonnet, fable, sol, luna, astra)"
+    assert len(lane_lines) == 7, "expected seven lane rows (opus, sonnet, fable, sol, luna, astra, terra)"
     for line in lane_lines:
         assert not re.search(r"model = 'claude-[a-z0-9.-]+'", line), (
             "a claude-engine row pins a versioned model id instead of a floating alias: %s" % line
@@ -1524,6 +1887,85 @@ def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
             assert "model = '" in line and "tier = " not in line
         else:
             assert "tier = '" in line and "model = " not in line
+
+
+def test_terra_lane_row_is_a_read_only_high_effort_codex_visual_judge():
+    # VISUAL-JUDGE-TERRA-LANE-1: terra names a TIER (resolved at launch to the highest listed
+    # gpt-<ver>-terra slug, today gpt-6.1-terra), never a pinned slug; high effort; and, being a
+    # codex-engine row, read-only by construction (codex-lane-never-edits).
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "terra  = @{ engine = 'codex';  tier = 'terra';   effort = 'high'; role = 'visual-judge' }" in body
+
+
+def test_invoke_lane_terra_edit_is_refused_before_any_rundir_is_created(tmp_path):
+    cmd = (
+        "try { & '%s' -Lane terra -Prompt 'x' -WorkDir '%s' -AllowEdits -AllowedTools 'Read' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    assert "codex-lane-never-edits" in (result.stdout + result.stderr), result.stdout + result.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+
+
+def test_image_paths_is_keyed_on_engine_and_attached_with_the_codex_image_flag():
+    # VISUAL-JUDGE-TERRA-LANE-1: `codex exec -i, --image <FILE>...` (pinned codex 0.160.1 help). The
+    # guard reads the engine from the lane table (never a lane name), and the codex argv puts the
+    # variadic -i pairs ahead of -m so a flag token ends the list before the '-' stdin marker.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "[string[]]$ImagePaths = @()," in body
+    assert "if ($LANES[$Lane].engine -ne 'codex') {" in body
+    assert "image-paths-codex-only" in body and "image-path-missing" in body and "image-path-bad-extension" in body
+    assert "$imageExt -ne '.png' -and $imageExt -ne '.jpg'" in body
+    # adversary A1-A3: native ProviderPath on the FileSystem provider only, no comma, and a hashed run-dir snapshot is attached.
+    assert "$imageFull = $imageResolved.ProviderPath" in body and "$imageResolved.Provider.Name -ne 'FileSystem'" in body
+    assert "image-path-bad-character" in body and "$imageFull.Contains(',')" in body
+    assert "[System.IO.File]::Exists($snapshot)" in body
+    copy_call = "Copy-ImageSnapshot -Source $attachment.source -Dest $snapshot -Clock $sw -LimitMs ($TimeoutSec * 1000.0)"
+    assert copy_call in body
+    assert body.index(copy_call) < body.index("$imageArgs += @('-i', $attachment.path)")
+    # r2 adversary A1-A3: empty entries are refused (not filtered away), the snapshot is hashed while it is copied under the
+    # lane deadline, and no -Force-less Get-Item/Get-FileHash metadata read of the (possibly Hidden) snapshot remains.
+    assert "image-path-empty" in body and "Where-Object { -not [string]::IsNullOrWhiteSpace($_) })" not in body.split("$ImagePathsGiven =")[1].split("\n")[0]
+    assert "image-copy-timeout" in body and "$Clock.Elapsed.TotalMilliseconds -ge $LimitMs" in body
+    # pass-2b A1-A3: only a file this call created is deleted, reads are cancellable at the deadline, and the deadline is a TimeoutException.
+    # r4 B1: no delete BY PATH after the handle is gone (the partial is removed by closing its delete-on-close handle); the collision refusal carries the image-path- prefix.
+    copy_body = body[body.index("# BEGIN Copy-ImageSnapshot"):body.index("# END Copy-ImageSnapshot")]
+    assert "[System.IO.FileOptions]::DeleteOnClose" in copy_body and "[MlvImageSnap]::KeepOnClose" in copy_body
+    assert "[System.IO.File]::Delete(" not in copy_body and "image-path-snapshot-collision" in body and "image-snapshot-collision" not in body
+    # r4 B2: the snapshot is held FileShare.Read until the child exits, then re-hashed; a mismatch is the typed image-snapshot-mutated failure.
+    # r5: the hold is opened Asynchronous so its digest reads are cancellable at the lane deadline (H1).
+    assert "[System.IO.FileShare]::Read, 4096, [System.IO.FileOptions]::Asynchronous)" in copy_body and "image-snapshot-mutated" in body
+    assert body.index("Get-ImageHoldDigest -Hold $ImageHolds[$hi]") > body.index("$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }")
+    # r5 B1: codex is handed the RESOLVED path of the held object (GetFinalPathNameByHandle), with the reparse-ancestor refusal; r5 B2: a
+    # digest I/O failure is typed (image-path-snapshot-unreadable before launch, image-snapshot-unverifiable after it), never a false mutation.
+    assert "[MlvImageSnap]::FinalPath($hold.SafeFileHandle)" in copy_body and "image-path-reparse-ancestor" in copy_body
+    assert "$snapshot = [string]$snapshotInfo.Path" in body
+    assert "image-path-snapshot-unreadable" in copy_body and "image-snapshot-unverifiable" in body and "image-snapshot-path-changed" in body
+    assert "image-digest-timeout" in copy_body
+    assert "$in.ReadAsync($buf, 0, $buf.Length, $cts.Token)" in body and "[System.IO.FileOptions]::Asynchronous" in body
+    assert 'throw [System.TimeoutException]::new("image-copy-timeout' in body
+    assert "(Get-Item -LiteralPath $snapshot)" not in body and "Get-FileHash -LiteralPath $snapshot" not in body
+    assert "foreach ($attachment in $ImageAttachments) { $imageArgs += @('-i', $attachment.path) }" in body
+    i_images = body.index("$argv = @('exec') + $imageArgs + @(")
+    i_model = body.index("'-m', $codexLaunchModel,")
+    assert i_images < i_model
+    assert "$receipt['imagePaths'] = @($ImageAttachments)" in body
+    argv_block = body[i_images:body.index("# ---------------------------------------------------------------- run, bounded")]
+    assert "terra" not in argv_block and "$Lane -eq" not in argv_block, (
+        "the codex argv build must stay lane-name-agnostic"
+    )
+
+
+def test_invoke_lane_claude_lane_with_image_paths_is_refused_with_a_typed_error(tmp_path):
+    png = tmp_path / "strip.png"
+    png.write_bytes(b"\x89PNG")
+    cmd = (
+        "try { & '%s' -Lane sonnet -Prompt 'x' -WorkDir '%s' -ImagePaths '%s' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix(), png.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    assert "image-paths-codex-only" in (result.stdout + result.stderr), result.stdout + result.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
 
 
 def test_astra_reuses_the_engine_generic_codex_argv_branch_verbatim():
@@ -1640,6 +2082,9 @@ def test_astra_is_absent_from_the_timer_reachable_lane_lists():
     assert "ValidateSet('', 'opus', 'sonnet', 'fable', 'sol', 'luna')" in loop_body
     assert "astra" not in workstream_body
     assert "astra" not in loop_body
+    # VISUAL-JUDGE-TERRA-LANE-1: terra is likewise reachable only by an explicit Invoke-Lane call.
+    assert "terra" not in workstream_body
+    assert "terra" not in loop_body
 
 
 # =============================================================================================

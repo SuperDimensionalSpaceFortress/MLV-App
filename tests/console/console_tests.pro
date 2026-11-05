@@ -67,6 +67,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
     $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
     $$REPO_ROOT/tests/console/test_llrawproc_residual_telemetry_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_dualiso_gpu_split_telemetry_wiring.cpp \
     $$REPO_ROOT/tests/console/test_debayered16_recon_provenance_wiring.cpp \
     $$REPO_ROOT/tests/console/test_debayered16_honour_scale_wiring.cpp \
     $$REPO_ROOT/tests/console/test_contact_sheet_capture_wiring.cpp \
@@ -100,7 +101,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gpu_launch_budget.cpp \
     $$REPO_ROOT/tests/console/test_playback_present_trace.cpp \
     $$REPO_ROOT/tests/console/test_playback_scopes_during_playback.cpp \
-    $$REPO_ROOT/tests/console/test_playback_scale_label.cpp
+    $$REPO_ROOT/tests/console/test_playback_scale_label.cpp \
+    $$REPO_ROOT/tests/console/test_visual_capture_source_difference.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -164,7 +166,9 @@ HEADERS += \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_timing_format.h \
     $$REPO_ROOT/tools/gpu/backend/igpu_launch_budget.h \
     $$REPO_ROOT/platform/qt/GpuFieldTelemetryCore.h \
-    $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h
+    $$REPO_ROOT/platform/qt/GpuDeviceLossBreakerCore.h \
+    $$REPO_ROOT/platform/qt/VisualCaptureSourceDifference.h \
+    $$REPO_ROOT/platform/qt/VisualCaptureSourceGuard.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

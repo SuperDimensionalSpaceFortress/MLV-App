@@ -11,14 +11,36 @@
  *   cudaError_t e = IGPU_LT_SYNC_CALL(stage, <synchronising runtime call>);
  *       host time around a synchronising call; the call's own result is
  *       returned unchanged, so CK(IGPU_LT_SYNC_CALL(...)) keeps CK outside.
- *       This header itself never synchronises.
+ *       This header waits on the device only at each DLL's first attach() (backend
+ *       create), never per frame: one call site, run kAnchorTries times, for
+ *       the device-clock anchor (CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1).
+ *   igpu_lt::SpanScope s(stage, stream);   igpu_lt::record_span(stage, issue, t0, m0, m1, t1, ms);
+ *       kind=span records: an event pair around non-kernel device work, or four
+ *       events the caller already waited on. Resolved pairs carry dev_t0_utc_ms /
+ *       dev_t1_utc_ms: device times on the host epoch scale (anchor_utc_ms +
+ *       cudaEventElapsedTime from the anchor), comparable across both DLLs within
+ *       igpu_lt_cross_dll_bound_ms(): both anchor_bracket_ms, both stamps' float
+ *       rounding (stamp_rounding_ms) and the anchors' skew.
+ *       With a CUDA error already pending, the recorder makes no CUDA call that can
+ *       fail (no anchor, event, stamp or span that time), so it never replaces the
+ *       backend's error; a recorder call that fails with none pending is cleared,
+ *       but only when its code is one the recorder's own call produces
+ *       (igpu_lt_recorder_clearable) and the slot still holds exactly that code, so
+ *       an asynchronous backend fault is never consumed. A failed call's code is
+ *       cleared BEFORE its cleanup, and cleanup (every cudaEventDestroy, a query or
+ *       elapsed read in poll/teardown) makes no CUDA call while an error is pending:
+ *       the handles wait in a retired list for the next launch, poll, destroy or
+ *       teardown with nothing pending, so the backend always observes its error
+ *       first and a failed pair is never held past the backend's next launch.
  *   IGPU_LT_SYNC_BLOCK(stage, statement);
  *       host time around a statement (e.g. a free of every clip buffer).
  *   igpu_lt::FrameScope f(width, height);   igpu_lt::TileScope t(top, left);
  *       the frame dims / tile origin stamped on every record on this thread.
  *   igpu_lt::attach();   igpu_lt::teardown("destroy");
  *       backend create / the last step of backend destroy: teardown destroys
- *       every event the recorder created, without waiting on the device.
+ *       every event the recorder created, without waiting on the device, except
+ *       the one device-clock anchor, which lives with the (leaked) recorder so a
+ *       later backend of the same DLL stamps against the same anchor.
  *
  * OFF: every site above tests one cached bool and does nothing else.
  * Each DLL is one translation unit, so each has its own recorder; define
@@ -53,12 +75,17 @@
 #define IGPU_LT_DLL_NAME "probe"
 #endif
 
+static_assert(cudaErrorInvalidValue == 1 && cudaErrorMemoryAllocation == 2 && cudaErrorInvalidResourceHandle == 400
+                  && cudaErrorNotReady == 600,
+              "igpu_lt_recorder_clearable() names these cudaError_t values by number");
+
 namespace igpu_lt
 {
 
 static const double kSummaryIntervalMs = 5000.0;
 static const std::size_t kMaxPending = 200000;
 static const unsigned long long kMaxErrorLines = 64;
+static const int kAnchorTries = 3;
 
 inline bool enabled()
 {
@@ -175,10 +202,16 @@ public:
     }
 
     bool begin_kernel(Pending & p, const char * stage, const dim3 & grid, const dim3 & block,
-                      cudaStream_t stream)
+                      cudaStream_t stream, const char * kind = "kernel")
     {
+        if (backend_error_pending()) return false;
         {
             std::lock_guard<std::mutex> lock(mu_);
+            /* r4 pass 7 A1: handles retired over an error the backend has since consumed are
+             * destroyed at the next launch (nothing is pending here), so a failed launch's pair is
+             * never held past it, poll or no poll; a flush that fails or meets a pending error
+             * leaves this launch untimed. */
+            if (!retired_.empty() && !flush_retired_locked()) return false;
             if (!take_event_locked(&p.start)) return false;
             if (!take_event_locked(&p.stop))
             {
@@ -186,32 +219,54 @@ public:
                 p.start = nullptr;
                 return false;
             }
-            fill_locked(&p.rec, "kernel", stage);
+            fill_locked(&p.rec, kind, stage);
         }
         p.rec.grid = to_dim(grid);
         p.rec.block = to_dim(block);
-        if (cudaEventRecord(p.start, stream) != cudaSuccess)
+        const cudaError_t started = cudaEventRecord(p.start, stream);
+        if (started != cudaSuccess)
         {
             std::lock_guard<std::mutex> lock(mu_);
+            /* r4 (r3 pass 6 A1 sibling :220): the recorder's own failure is cleared FIRST; an
+             * asynchronous fault stays pending, and the destroy then makes no call over it. */
+            drop_own_error_locked(started);
             destroy_events_locked(p);
             return false;
         }
         return true;
     }
 
-    void end_kernel(Pending & p, cudaStream_t stream)
+    /* peek_launch: a kernel checks its launch with cudaPeekAtLastError; a span (no launch of
+     * its own) checks only its stop record, so an earlier unrelated error is not pinned on it.
+     * Adversary r2 pass 3 A4: a span whose bracketed work left an error pending is dropped with no
+     * further CUDA call (its events go back to the pool), and a failed stop record of a span is the
+     * recorder's own, so it is cleared after it is logged. r4 (r3 pass 6 A1 siblings :240 :251): the
+     * pending error is read BEFORE the stop record, so a kernel's launch error is logged and its
+     * events are retired with no CUDA call over it; a failed stop record (none pending before it)
+     * is the recorder's own for a kernel too, and is cleared before its events are destroyed. */
+    void end_kernel(Pending & p, cudaStream_t stream, bool peek_launch = true)
     {
-        const cudaError_t recorded = cudaEventRecord(p.stop, stream);
         const cudaError_t launch = cudaPeekAtLastError();
-        std::lock_guard<std::mutex> lock(mu_);
-        if (launch != cudaSuccess || recorded != cudaSuccess)
+        if (launch != cudaSuccess)
         {
-            const cudaError_t e = launch != cudaSuccess ? launch : recorded;
-            p.rec.ms = -1.0;
-            p.rec.err = (int)e;
-            p.rec.err_name = cudaGetErrorName(e);
-            finish_locked(p.rec);
-            /* Events touched by a faulted context are not reused. */
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!peek_launch)
+            {
+                discard_events_locked(p);
+                return;
+            }
+            fail_pending_locked(p, launch);
+            /* Events touched by a faulted context are not reused; over the pending error
+             * destroy_events_locked() makes no CUDA call and only retires them. */
+            destroy_events_locked(p);
+            return;
+        }
+        const cudaError_t recorded = cudaEventRecord(p.stop, stream);
+        std::lock_guard<std::mutex> lock(mu_);
+        if (recorded != cudaSuccess)
+        {
+            fail_pending_locked(p, recorded);
+            drop_own_error_locked(recorded);
             destroy_events_locked(p);
             return;
         }
@@ -241,6 +296,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mu_);
         resolve_locked();
+        if (!retired_.empty()) flush_retired_locked(); /* r4 pass 7 A1 */
         const double now = steady_ms();
         if (at || now - last_summary_ms_ >= kSummaryIntervalMs)
         {
@@ -249,23 +305,51 @@ public:
         }
     }
 
+    /* A span the caller bounded with events it already recorded and already waited on (the
+     * recon run: ev_start, ev_after_up, ev_after_kernel, ev_after_dl, after the run's own
+     * wait on ev_after_dl). Reads elapsed times only; never waits. utc_ms is the caller's host
+     * clock at issue (adversary r2 pass 2 A3), not the time this record is written. */
+    void record_span(const char * stage, double issue_utc, cudaEvent_t t0, cudaEvent_t mark0,
+                     cudaEvent_t mark1, cudaEvent_t t1, double ms)
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        IgpuLtRecord rec;
+        fill_locked(&rec, "span", stage);
+        rec.utc_ms = issue_utc;
+        rec.ms = ms;
+        stamp_locked(&rec, t0, t1);
+        if (rec.has_dev && dev_utc_locked(mark0, &rec.dev_mark_utc_ms[0])
+            && dev_utc_locked(mark1, &rec.dev_mark_utc_ms[1]))
+            rec.dev_marks = 2;
+        finish_locked(rec);
+    }
+
     void attach()
     {
         std::lock_guard<std::mutex> lock(mu_);
         live_backends_ += 1;
+        if (!anchor_tried_ && !backend_error_pending())
+        {
+            anchor_tried_ = true;
+            establish_anchor_locked();
+            if (anchor_ || !config_written_) write_config_locked();
+        }
     }
 
     /* Backend teardown, called after the destructor's own completion points:
      * resolves what has completed (never blocks), writes the summaries, and
      * destroys the idle pool. The last live backend also destroys the pairs
      * still pending; cudaEventDestroy on an unfinished event returns at once
-     * and the runtime frees it when the device reaches it. */
+     * and the runtime frees it when the device reaches it. r4 (r3 pass 6 A1
+     * siblings :330 :335): every handle goes through destroy_events_locked() /
+     * flush_retired_locked(), so over a pending error none is destroyed (they stay
+     * retired for a later teardown with nothing pending). */
     void teardown(const char * at)
     {
         std::lock_guard<std::mutex> lock(mu_);
         resolve_locked();
         if (live_backends_ > 0) live_backends_ -= 1;
-        for (cudaEvent_t ev : pool_) cudaEventDestroy(ev);
+        retired_.insert(retired_.end(), pool_.begin(), pool_.end());
         pool_.clear();
         if (live_backends_ == 0)
         {
@@ -273,15 +357,20 @@ public:
             for (Pending & p : pending_) destroy_events_locked(p);
             pending_.clear();
         }
+        flush_retired_locked();
         write_summaries_locked(at);
         last_summary_ms_ = steady_ms();
     }
 
 private:
+    /* r4 (r3 pass 6 A1 siblings :347 :356 :379): no query, elapsed read or destroy is made while an
+     * error is pending (the pairs wait for a later poll, or the last teardown); a failed query or
+     * read is cleared by its own code before the pair's events are destroyed. */
     void resolve_locked()
     {
         for (auto it = pending_.begin(); it != pending_.end();)
         {
+            if (backend_error_pending()) return;
             const cudaError_t q = cudaEventQuery(it->stop);
             if (q == cudaErrorNotReady)
             {
@@ -295,6 +384,7 @@ private:
                 if (e == cudaSuccess)
                 {
                     it->rec.ms = (double)elapsed;
+                    stamp_locked(&it->rec, it->start, it->stop);
                     pool_.push_back(it->start);
                     pool_.push_back(it->stop);
                     it->start = it->stop = nullptr;
@@ -304,6 +394,7 @@ private:
                     it->rec.ms = -1.0;
                     it->rec.err = (int)e;
                     it->rec.err_name = cudaGetErrorName(e);
+                    drop_own_error_locked(e);
                 }
             }
             else
@@ -311,6 +402,7 @@ private:
                 it->rec.ms = -1.0;
                 it->rec.err = (int)q;
                 it->rec.err_name = cudaGetErrorName(q);
+                drop_own_error_locked(q);
             }
             finish_locked(it->rec);
             destroy_events_locked(*it); /* no-op when the pair went back to the pool */
@@ -318,11 +410,161 @@ private:
         }
     }
 
-    Recorder() : min_ms_(min_ms()), last_summary_ms_(steady_ms())
+    void fail_pending_locked(Pending & p, cudaError_t e)
     {
-        char line[160];
-        igpu_lt_format_config(line, sizeof(line), IGPU_LT_DLL_NAME, min_ms_);
-        std::fprintf(stderr, "%s\n", line);
+        p.rec.ms = -1.0;
+        p.rec.err = (int)e;
+        p.rec.err_name = cudaGetErrorName(e);
+        finish_locked(p.rec);
+    }
+
+    /* The config line is written by the first attach() (after the anchor, so it can name it),
+     * or before the first other line if one comes first. */
+    Recorder() : min_ms_(min_ms()), last_summary_ms_(steady_ms()) {}
+
+    /* Adversary r2 A3: every line is sized from its formatter's return, so a long value (e.g.
+     * MLVAPP_CUDA_LAUNCH_TIMING_MIN_MS=1e308) never truncates the fields after it. */
+    template <typename F>
+    static void write_line(F && format)
+    {
+        char small[512];
+        const int need = format(small, sizeof(small));
+        if (need < 0) return;
+        if ((std::size_t)need < sizeof(small))
+        {
+            std::fprintf(stderr, "%s\n", small);
+            return;
+        }
+        std::vector<char> big((std::size_t)need + 1);
+        format(big.data(), big.size());
+        std::fprintf(stderr, "%s\n", big.data());
+    }
+
+    void write_config_locked()
+    {
+        if (anchor_)
+            write_line([&](char * out, std::size_t cap) {
+                return igpu_lt_format_config_anchored(out, cap, IGPU_LT_DLL_NAME, min_ms_, anchor_utc_ms_,
+                                                      anchor_bracket_ms_, anchor_steady_ms_);
+            });
+        else
+            write_line([&](char * out, std::size_t cap) {
+                return igpu_lt_format_config(out, cap, IGPU_LT_DLL_NAME, min_ms_);
+            });
+        config_written_ = true;
+    }
+
+    void ensure_config_locked()
+    {
+        if (!config_written_) write_config_locked();
+    }
+
+    /* CUDA-RECON-PRESENT-OVERLAP-TIMELINE-1: the device-clock anchor. Called once per DLL, from
+     * the first attach() (backend create), never on a per-frame path. Each try records an event
+     * on stream 0, waits for it, and reads the clocks right after; the event's device time lies
+     * inside the monotonic bracket [before the record, after the wait], which bounds the anchor's
+     * host/device offset error. Each wall read is pinned between two monotonic reads, and a try
+     * with a long pin or across which the wall clock stepped is dropped
+     * (igpu_lt_anchor_try_bracket); the shortest usable bracket of kAnchorTries is kept. This is
+     * the recorder's only synchronising call; with the timer OFF it is never reached. attach()
+     * calls it only with no CUDA error pending (adversary r2 pass 3 A4), a failed call ends the
+     * tries, and no try starts over a pending error. A failed call's code is passed at once to
+     * drop_own_error_locked(), which clears it only if it is the recorder's own (adversary r3 pass
+     * 4 A1), BEFORE any cleanup: r4 (r3 pass 6 A1, :459) an asynchronous fault (719) from the wait
+     * stays pending, and the try's event is then retired with no CUDA call over it. */
+    void establish_anchor_locked()
+    {
+        for (int i = 0; i < kAnchorTries && !backend_error_pending(); ++i)
+        {
+            cudaEvent_t ev = nullptr;
+            const cudaError_t created = cudaEventCreate(&ev);
+            if (created != cudaSuccess)
+            {
+                drop_own_error_locked(created);
+                break;
+            }
+            const double steady_b0 = steady_ms();
+            const double utc_before = utc_ms();
+            const double steady_b1 = steady_ms();
+            const cudaError_t recorded = cudaEventRecord(ev, 0);
+            const cudaError_t waited = recorded == cudaSuccess ? cudaEventSynchronize(ev) : recorded;
+            const double steady_a0 = steady_ms();
+            const double utc_after = utc_ms();
+            const double steady_a1 = steady_ms();
+            if (waited != cudaSuccess)
+            {
+                drop_own_error_locked(waited);
+                destroy_event_locked(ev);
+                break;
+            }
+            double bracket = 0.0;
+            cudaEvent_t drop = ev;
+            if (igpu_lt_anchor_try_bracket(steady_b0, utc_before, steady_b1, steady_a0, utc_after, steady_a1, &bracket)
+                && (!anchor_ || bracket < anchor_bracket_ms_))
+            {
+                drop = anchor_;
+                anchor_ = ev;
+                anchor_utc_ms_ = utc_after;
+                /* the monotonic time of the utc_after read, to within half its pin */
+                anchor_steady_ms_ = 0.5 * (steady_a0 + steady_a1);
+                anchor_bracket_ms_ = bracket;
+            }
+            /* adversary r3 pass 5 A2: a failed call ends the tries, a destroy included */
+            if (drop && !destroy_event_locked(drop)) break;
+        }
+    }
+
+    /* Adversary r2 pass 3 A4: true when a CUDA error is pending. Every recorder-only path (the
+     * anchor, an event pair's start, a span's stop, a pool create, a stamp's elapsed read) tests
+     * it first and, when it is set, makes no CUDA call that could fail, so a recorder failure can
+     * never replace the backend's pending error in the runtime's last-error slot. */
+    static bool backend_error_pending() { return cudaPeekAtLastError() != cudaSuccess; }
+
+    /* Adversary r2 pass 2 A2, r3 pass 4 A1: a recorder-only CUDA failure must not stay pending for
+     * the backend's own CK(cudaGetLastError()), and clearing it must never consume any other
+     * error. `own` is the code the recorder's last failed call returned (cudaSuccess: none failed,
+     * nothing is cleared). The slot is cleared only when `own` is a code the recorder's own call
+     * produces (igpu_lt_recorder_clearable: never an asynchronous launch fault) AND the slot still
+     * holds exactly that code; the last error is per host thread, so only this thread's calls
+     * reach it. If the clear itself observes another code (an asynchronous fault surfacing at that
+     * instant), the recorder cannot put it back, so it logs it as an error record
+     * (kind=recorder stage=clear), past the error-line cap, never silently. Such a fault is a
+     * kernel-execution error, which leaves the context unusable: every later runtime call of the
+     * backend returns it again. */
+    void drop_own_error_locked(cudaError_t own)
+    {
+        if (own == cudaSuccess || !igpu_lt_recorder_clearable((int)own)) return;
+        if (cudaPeekAtLastError() != own) return;
+        const cudaError_t got = cudaGetLastError();
+        if (got == own || got == cudaSuccess) return;
+        IgpuLtRecord rec;
+        fill_locked(&rec, "recorder", "clear");
+        rec.err = (int)got;
+        rec.err_name = cudaGetErrorName(got);
+        finish_locked(rec);
+    }
+
+    /* The device time of a completed event on the host's Unix-epoch ms scale. No read is made
+     * while an error is pending, and a failed read is cleared by drop_own_error_locked(), so a
+     * backend's own CK(cudaGetLastError()) never sees this recorder's failure, nor loses its own. */
+    bool dev_utc_locked(cudaEvent_t ev, double * out)
+    {
+        if (!anchor_ || !ev) return false;
+        if (backend_error_pending()) return false;
+        float elapsed = 0.0f;
+        const cudaError_t read = cudaEventElapsedTime(&elapsed, anchor_, ev);
+        if (read != cudaSuccess)
+        {
+            drop_own_error_locked(read);
+            return false;
+        }
+        /* Adversary r2 A2: no stamp past the float-precision age limit. */
+        return igpu_lt_dev_stamp(anchor_utc_ms_, (double)elapsed, out) != 0;
+    }
+
+    void stamp_locked(IgpuLtRecord * rec, cudaEvent_t start, cudaEvent_t stop)
+    {
+        rec->has_dev = dev_utc_locked(start, &rec->dev_t0_utc_ms) && dev_utc_locked(stop, &rec->dev_t1_utc_ms);
     }
 
     bool take_event_locked(cudaEvent_t * ev)
@@ -333,7 +575,11 @@ private:
             pool_.pop_back();
             return true;
         }
-        return cudaEventCreate(ev) == cudaSuccess;
+        if (backend_error_pending()) return false;
+        const cudaError_t created = cudaEventCreate(ev);
+        if (created == cudaSuccess) return true;
+        drop_own_error_locked(created);
+        return false;
     }
 
     void discard_events_locked(Pending & p)
@@ -343,12 +589,48 @@ private:
         p.start = p.stop = nullptr;
     }
 
-    /* Error branches and teardown: the handles are destroyed, never just dropped. */
+    /* Error branches and teardown: the handles are destroyed, never just dropped. Adversary r3
+     * pass 5 A2: once a destroy fails, the other is not attempted over that pending error. r4 (r3
+     * pass 6 A1 sibling :571): both go through destroy_event_locked(). */
     void destroy_events_locked(Pending & p)
     {
-        if (p.start) cudaEventDestroy(p.start);
-        if (p.stop) cudaEventDestroy(p.stop);
+        if (p.start) retired_.push_back(p.start);
+        if (p.stop) retired_.push_back(p.stop);
         p.start = p.stop = nullptr;
+        flush_retired_locked();
+    }
+
+    /* r4 (r3 pass 6 A1): every event the recorder destroys goes through here. True when it (and
+     * every handle retired before it) was destroyed. With an error pending (the backend's, or an
+     * asynchronous fault) it makes no CUDA call: the handle stays in retired_ until the next
+     * launch, poll, destroy or teardown finds nothing pending, so the backend observes its error
+     * first and a failed pair is held at most until the backend's next launch (r4 pass 7 A1). */
+    bool destroy_event_locked(cudaEvent_t ev)
+    {
+        if (ev) retired_.push_back(ev);
+        return flush_retired_locked();
+    }
+
+    /* Destroys retired handles while no error is pending. A destroy that fails is the recorder's
+     * own call (nothing was pending before it): its code is cleared only if drop_own_error_locked()
+     * says it is the recorder's own, and the handle is given up (a failing destroy means a faulted
+     * context); an asynchronous fault it returns stays pending and stops the flush. */
+    bool flush_retired_locked()
+    {
+        bool ok = true;
+        while (!retired_.empty())
+        {
+            if (backend_error_pending()) return false;
+            const cudaEvent_t ev = retired_.back();
+            retired_.pop_back();
+            const cudaError_t destroyed = cudaEventDestroy(ev);
+            if (destroyed != cudaSuccess)
+            {
+                ok = false;
+                drop_own_error_locked(destroyed);
+            }
+        }
+        return ok;
     }
 
     void fill_locked(IgpuLtRecord * rec, const char * kind, const char * stage)
@@ -356,8 +638,9 @@ private:
         std::memset(rec, 0, sizeof(*rec));
         const Context & c = context();
         rec->dll = IGPU_LT_DLL_NAME;
-        rec->kind = kind;
-        rec->stage = stage;
+        /* adversary r3 pass 4 A3 / pass 5 A4: never a null C string downstream */
+        rec->kind = kind ? kind : "?";
+        rec->stage = stage ? stage : "?";
         rec->seq = ++seq_;
         rec->utc_ms = utc_ms();
         rec->width = c.width;
@@ -369,33 +652,36 @@ private:
 
     void finish_locked(const IgpuLtRecord & rec)
     {
+        ensure_config_locked();
         const std::string key = std::string(rec.kind) + '\x1f' + rec.stage;
         auto found = stats_.find(key);
         const int first = found == stats_.end();
         IgpuLtStats & s = stats_[key];
         igpu_lt_stats_add(&s, rec, min_ms_);
         if (!igpu_lt_should_log_record(rec, min_ms_, first)) return;
-        if (rec.err != 0)
+        /* Adversary r3 pass 5 A1: the record of an error the recorder's clear consumed is never
+         * suppressed by the error-line cap (it is the only trace of that error). */
+        const bool always = std::strcmp(rec.kind, "recorder") == 0;
+        if (rec.err != 0 && !always)
         {
             error_lines_ += 1;
             if (error_lines_ > kMaxErrorLines) return;
         }
-        char line[512];
-        igpu_lt_format_record(line, sizeof(line), rec);
-        std::fprintf(stderr, "%s\n", line);
+        write_line([&](char * out, std::size_t cap) { return igpu_lt_format_record(out, cap, rec); });
     }
 
     void write_summaries_locked(const char * at)
     {
-        char line[640];
+        ensure_config_locked();
         for (const auto & kv : stats_)
         {
             const std::size_t sep = kv.first.find('\x1f');
             const std::string kind = kv.first.substr(0, sep);
             const std::string stage = kv.first.substr(sep + 1);
-            igpu_lt_format_summary(line, sizeof(line), IGPU_LT_DLL_NAME, kind.c_str(), stage.c_str(), at,
-                                   kv.second);
-            std::fprintf(stderr, "%s\n", line);
+            write_line([&](char * out, std::size_t cap) {
+                return igpu_lt_format_summary(out, cap, IGPU_LT_DLL_NAME, kind.c_str(), stage.c_str(), at,
+                                              kv.second);
+            });
         }
         if (dropped_ || abandoned_ || error_lines_ > kMaxErrorLines)
         {
@@ -409,6 +695,8 @@ private:
 
     std::mutex mu_;
     std::vector<cudaEvent_t> pool_;
+    /* r4: handles to destroy once no error is pending (flush_retired_locked) */
+    std::vector<cudaEvent_t> retired_;
     std::deque<Pending> pending_;
     std::map<std::string, IgpuLtStats> stats_;
     unsigned long long seq_ = 0;
@@ -418,6 +706,14 @@ private:
     unsigned long long live_backends_ = 0;
     const double min_ms_;
     double last_summary_ms_;
+    bool config_written_ = false;
+    bool anchor_tried_ = false;
+    /* Created once and kept for the recorder's (leaked) lifetime, so every later backend of
+     * this DLL stamps against the same anchor: the one event teardown() does not destroy. */
+    cudaEvent_t anchor_ = nullptr;
+    double anchor_utc_ms_ = 0.0;
+    double anchor_steady_ms_ = 0.0;
+    double anchor_bracket_ms_ = 0.0;
 };
 
 class LaunchScope
@@ -435,6 +731,32 @@ public:
     }
     LaunchScope(const LaunchScope &) = delete;
     LaunchScope & operator=(const LaunchScope &) = delete;
+private:
+    bool active_;
+    cudaStream_t stream_;
+    Pending pending_;
+};
+
+/* A device span on `stream` with no launch of its own (e.g. the AMaZE GL map/copy/unmap
+ * handoff): an event pair like IGPU_LT_LAUNCH, recorded as kind=span, resolved by poll().
+ * end() closes it early; the destructor closes it on any other exit. Adds no synchronisation. */
+class SpanScope
+{
+public:
+    SpanScope(const char * stage, cudaStream_t stream) : active_(false), stream_(stream)
+    {
+        if (!enabled()) return;
+        active_ = Recorder::get().begin_kernel(pending_, stage, dim3(0, 0, 0), dim3(0, 0, 0), stream, "span");
+    }
+    ~SpanScope() { end(); }
+    void end()
+    {
+        if (!active_) return;
+        active_ = false;
+        Recorder::get().end_kernel(pending_, stream_, false);
+    }
+    SpanScope(const SpanScope &) = delete;
+    SpanScope & operator=(const SpanScope &) = delete;
 private:
     bool active_;
     cudaStream_t stream_;
@@ -496,6 +818,23 @@ inline void teardown(const char * at)
 {
     if (!enabled()) return;
     Recorder::get().teardown(at);
+}
+
+/* The host wall clock to pass as a later record_span's issue time; 0 when OFF. */
+inline double issue_utc_ms()
+{
+    if (!enabled()) return 0.0;
+    return utc_ms();
+}
+
+/* One kind=span record over four events the caller has already waited on (t0, two inner
+ * marks, t1), with `ms` the caller's own elapsed(t0, t1) and `issue_utc` its issue_utc_ms()
+ * from just before t0 was recorded. Never waits; a no-op when OFF. */
+inline void record_span(const char * stage, double issue_utc, cudaEvent_t t0, cudaEvent_t mark0,
+                        cudaEvent_t mark1, cudaEvent_t t1, double ms)
+{
+    if (!enabled()) return;
+    Recorder::get().record_span(stage, issue_utc, t0, mark0, mark1, t1, ms);
 }
 
 } // namespace igpu_lt

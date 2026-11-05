@@ -2097,7 +2097,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         e.update(env)
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
-        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegPlan", str(plan),
+        # plan_runner: a case that runs a patched mirror of the runner (_mirror_with_bad_sidecar) names it here; unset, it is the runner under test
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(getattr(self, "plan_runner", RUNNER)), "-LegPlan", str(plan),
                 "-RunDir", str(self.run_dir), "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg-args.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
                 "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
@@ -4209,6 +4210,70 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
                 self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
 
+    def test_r8_dualiso_a_scalar_leg_spec_the_leg_would_refuse_by_shape_is_refused_before_the_claim(self) -> None:
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): scalar -LegSpec mode skipped Get-LegSpecRefusal, so a look leg whose look is an array (or
+        # absent) opened the lease and the leg then threw DVE_LEG_SPEC_INVALID (LEG_FAILED, no receipt). The leg's shape predicate now runs before any claim.
+        # fix 2 (adversary r8 fix-1 A1): a JSON null root and bytes that are not JSON, which the leg rejects after the lease too
+        base = json.loads(self._valid_leg_spec_text())
+        for case, text in (("look-array", json.dumps({**base, "legType": "look", "look": []})), ("look-absent", json.dumps({**base, "legType": "look"})),
+                           ("generatorArgs-array", json.dumps({**base, "generatorArgs": [{"qualityMode": "hq"}]})),
+                           ("null-root", "null"), ("not-json", "this is not json")):
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"shape-{case}.json"
+                spec.write_text(text, encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
+        # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
+        # the BATCH entrypoint (scalar -LegSpec mode and -LegPlan mode), not only the predicate and the leg. A string, 0/1 and null are each refused, naming the field.
+        base = json.loads(self._valid_leg_spec_text())
+        cases = (("disableLookAssist", "false"), ("utilSample", "true"), ("unpaced", 1))   # few launches: the predicate test covers every switch and value
+        for name, value in cases:
+            with self.subTest(mode="scalar", name=name, value=value):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"bool-{name}.json"
+                spec.write_text(json.dumps({**base, "generatorArgs": {name: value}}), encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertIn(f"generatorArgs.{name} must be JSON true or false", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+        for name, value in cases[1:2]:
+            with self.subTest(mode="plan", name=name, value=value):
+                p = self.case / f"bool-plan-{name}.json"
+                p.write_text(json.dumps({**base, "generatorArgs": {name: value}}), encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(p, "B", self.commit_a)]), "LEG_SPEC_INVALID item=2 ")
+
+    def test_r9_dualiso_a_scalar_leg_spec_whose_legtype_is_not_one_enumerated_string_is_refused_before_the_claim(self) -> None:
+        # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r9 (adversary r8 cc8061a2 A1): legType ["look","speed"] with no look stringified to 'look speed', passed the shared
+        # shape predicate, opened the lease, and the leg then indexed the absent look (LEG_FAILED, no receipt). Every non-enum legType is refused before any claim.
+        # fix 1 (adversary r9 a0936637 A2): and a look leg whose look.contactSheetFrames is outside the generator's 1..60, or not a whole number
+        base = {k: v for k, v in json.loads(self._valid_leg_spec_text()).items() if k != "look"}
+        cases = [(case, {**base, "legType": value}, "legType must be one of")
+                 for case, value in (("array", ["look", "speed"]), ("object", {"type": "look"}), ("number", 1), ("null", None), ("empty", ""), ("case", "LOOK"))]
+        cases += [(f"count-{n}", {**base, "legType": "look", "look": {"contactSheetFrames": n, "lookFlavor": "classic"}}, "look.contactSheetFrames must be a whole number")
+                  for n in (61, 0, 1.4)]
+        for case, doc, needle in cases:
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"legtype-{case}.json"
+                spec.write_text(json.dumps(doc), encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertIn(needle, r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
     def test_r9_a_spec_in_the_run_dir_under_another_name_is_not_refused(self) -> None:
         # the guard names the runner's outputs, not the directory: a spec kept beside them under any other name still runs
         shutil.rmtree(self.run_dir, ignore_errors=True)
@@ -4966,7 +5031,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # shadow that spends fake time, window 4 s / minimum 2 s. Every file has the minimum checked before its existence check AND again after it, for EACH label; the wrong digest makes
     # a file that was opened and hashed visible as a MISMATCH line, so "no open" is an observable absence. The shadow also records which files had an existence read STARTED: the check
     # before it is what keeps a file from even being looked at with the window spent (a UNC Test-Path can itself block), and an absent file shows it as NOTIME, never MISSING.
-    def _artifact_worker_run(self, case: str, end_sec: float = 4.0, start_now: float = 0.0, delay_label: str = "", consume_label: str = "", absent_label: str = "", open_label: str = "") -> tuple[list[str], list[str]]:
+    def _artifact_worker_run(self, case: str, end_sec: float = 4.0, start_now: float = 0.0, delay_label: str = "", consume_label: str = "", absent_label: str = "", open_label: str = "",
+                             match_labels: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
+        # match_labels: the files whose digest is the real one (they hash clean and print nothing); every other file has the wrong digest, so it prints a MISMATCH line
+        import hashlib
+        shas = {label: (hashlib.sha256(f"{label} bytes".encode("utf-8")).hexdigest() if label in match_labels else "0" * 64) for label in ("packageZip", "exe", "dll")}
         d = self.case / ("worker-files-" + case)
         d.mkdir(exist_ok=True)
         for label in ("packageZip", "exe", "dll"):
@@ -4981,14 +5050,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "Add-Member -InputObject $clock -MemberType ScriptProperty -Name Elapsed -Value { [pscustomobject]@{ TotalSeconds = $global:clk.now } }\n"
             "$global:delayPath = '" + (str(d / f"{delay_label}.bin") if delay_label else "") + "'\n"
             "$global:tp = [System.Collections.Generic.List[string]]::new()\n"
+            "$global:shas = @{ " + "; ".join(f"{k} = '{v}'" for k, v in shas.items()) + " }\n"
             "function Test-Path { param([string]$LiteralPath, [string]$PathType) $global:tp.Add((Split-Path -Leaf $LiteralPath)); if ($global:delayPath -and $LiteralPath -ceq $global:delayPath) { $global:clk.now += 3 }; Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType }\n"
             "$items = foreach ($label in 'packageZip', 'exe', 'dll') {\n"
             "    $it = [pscustomobject]@{ label = $label; name = \"$label.bin\"; path = '" + str(d) + "\\' + $label + '.bin'; clock = $clock; endSec = " + repr(end_sec) + "; minSec = 2.0 }\n"
             # r10 adversary A1: the open spends the window -- the 2nd read of .path is [IO.File]::Open's own argument (the 1st is Test-Path's), so the fake clock moves between the
             # existence check and the open's return, exactly where a slow SMB open spends it
             "    if ($label -ceq '" + open_label + "') { $p0 = $it.path; $it.PSObject.Properties.Remove('path'); Add-Member -InputObject $it -MemberType NoteProperty -Name _reads -Value 0; Add-Member -InputObject $it -MemberType NoteProperty -Name _p -Value $p0; Add-Member -InputObject $it -MemberType ScriptProperty -Name path -Value { $this._reads++; if ($this._reads -eq 2) { $global:clk.now += 3 }; $this._p } }\n"
-            "    if ($label -ceq '" + consume_label + "') { Add-Member -InputObject $it -MemberType ScriptProperty -Name sha -Value { $global:clk.now += 3; ('0' * 64) } }\n"
-            "    else { Add-Member -InputObject $it -MemberType NoteProperty -Name sha -Value ('0' * 64) }\n"
+            "    if ($label -ceq '" + consume_label + "') { Add-Member -InputObject $it -MemberType ScriptProperty -Name sha -Value { $global:clk.now += 3; $global:shas[$this.label] } }\n"
+            "    else { Add-Member -InputObject $it -MemberType NoteProperty -Name sha -Value $global:shas[$label] }\n"
             "    $it\n"
             "}\n"
             "$lines = @(& $w $items | ForEach-Object { [string]$_ })\n"
@@ -5027,6 +5097,27 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             with self.subTest(open_spends_the_window=label):
                 # file L was looked at and opened (its Test-Path ran), then its open spent 3 of the 4 s: NOTIME:L, no hash of it (no MISMATCH:L), nothing after it touched
                 self.assertEqual(self._artifact_worker_run("open-" + label, open_label=label), ([f"MISMATCH:{k}" for k in order[:i]] + [f"NOTIME:{label}"], order[:i + 1]))
+
+    # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 2 (Dot on #705): every depletion row above gives its files the WRONG digest, so the first file is always a MISMATCH -- a refusal -- before the
+    # window runs out. These rows give the files before the depleted one the REAL digest (they hash clean and print nothing) and spend the window afterwards: the next file is still
+    # NOTIME, with no existence read started on it and no hash, and the clean files are not reported at all. Control: nothing spent, every file clean, nothing printed.
+    def test_artifact_preflight_iso1_item2_a_window_spent_after_a_file_that_hashed_clean_still_stops_the_next_file_unread(self) -> None:
+        order = ["packageZip", "exe", "dll"]
+        self.assertEqual(self._artifact_worker_run("clean-control", match_labels=tuple(order)), ([], order), "the control: every file clean and nothing spent prints nothing")
+        # the hash of a clean file spends the window: the NEXT file starts with 1 s left, under the 2 s minimum: NOTIME, no existence read on it, and the clean file(s) print nothing
+        for i, label in enumerate(order[:-1]):
+            nxt = order[i + 1]
+            with self.subTest(hash_of_a_clean_file_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("clean-hash-" + label, consume_label=label, match_labels=tuple(order[:i + 1])), ([f"NOTIME:{nxt}"], order[:i + 1]))
+                self.assertEqual(self._artifact_worker_run("clean-hash-" + label + "-next-absent", consume_label=label, match_labels=tuple(order[:i + 1]), absent_label=nxt), ([f"NOTIME:{nxt}"], order[:i + 1]))
+        # the existence check of the file after a clean one spends the window: it is NOTIME and was not opened or hashed (its existence read did start)
+        for i, label in enumerate(order[1:], start=1):
+            with self.subTest(existence_check_after_a_clean_file_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("clean-exists-" + label, delay_label=label, match_labels=tuple(order[:i])), ([f"NOTIME:{label}"], order[:i + 1]))
+        # the open of the file after a clean one spends the window: NOTIME and not hashed
+        for i, label in enumerate(order[1:], start=1):
+            with self.subTest(open_after_a_clean_file_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("clean-open-" + label, open_label=label, match_labels=tuple(order[:i])), ([f"NOTIME:{label}"], order[:i + 1]))
 
     def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
         c = "3" * 40
@@ -5186,8 +5277,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             if kind == "UMRUN":
                 ticks.setdefault("open" if rest.startswith("lease-batch-open-") else "close", int(t))
         self.assertIn("open", ticks, r.stdout + r.stderr)
+        # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 3: the second number returned is a CLOSE-submitted measurement ONLY when close_substituted is False. When no close was submitted
+        # (NO_CLOSE_EXPECTED) the runner's finishedUtc stands in for it, and the number is then how long the RUN took after the open: it proves termination (and, with the claim file
+        # check beside it, claim cleanup), never a successful close and never a physical release of the lease.
+        self.close_substituted = False
         if "close" not in ticks and env.get("NO_CLOSE_EXPECTED"):
-            # r6: a close redirect that failed closed submits no close job (JOB_WRITE_FAILED); the hold then ends when the run does
+            # r6: a close redirect that failed closed submits no close job (JOB_WRITE_FAILED); the run's end then stands in for the close
+            self.close_substituted = True
             done = datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))
             ticks["close"] = (done - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
         self.assertIn("close", ticks, r.stdout + r.stderr)
@@ -5491,17 +5587,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # its identity on the main thread, unbounded, and the claim-time refusal probed batch.log: a -RunDir that stopped answering (a UNC share, a junction whose target went away) then
     # held the run before the typed refusal and the lease close. '<guard>:rundir=<sec>' stalls every read of -RunDir in that guard and after it; GUARD_READ_DELAY_SEAM on stderr names
     # each main-thread read that reached the stall.
-    def test_artifact_preflight_r5_item2_a_stalled_rundir_after_the_open_reaches_the_typed_refusal_and_the_close_inside_the_room(self) -> None:
+    # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 3: renamed from ..._reaches_the_typed_refusal_and_the_close_inside_the_room. No close job is submitted here (JOB_WRITE_FAILED), so
+    # the measurement is the run's own end (finishedUtc), which proves termination and the claim release, not a close.
+    def test_artifact_preflight_r5_item2_a_stalled_rundir_after_the_open_reaches_the_typed_refusal_and_the_run_ends_with_the_claim_released_inside_the_room(self) -> None:
         # sol's repro: cap 75, leg budget 60, margin 0 (the post-open guard has 14 s); -RunDir's metadata reads stall 40 s once the open is answered
-        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", NO_CLOSE_EXPECTED="1")
+        r, ended_after_open = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", NO_CLOSE_EXPECTED="1")
+        self.assertTrue(self.close_substituted, "a close was submitted: this row measures the run's end only when none was")
         self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
         self.assertEqual(self.leg_calls(), [])
         self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
-        # the 14 s room, the close, and the documented 2 s bounded re-read of -RunDir (adversary r5 A1), never the 40 s stall
-        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close: the stalled -RunDir was waited for")
-        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
+        # the 14 s room and the documented 2 s bounded re-read of -RunDir (adversary r5 A1), never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): the stalled -RunDir was waited for")
+        self.assertFalse(self.claim_path.exists(), "the claim file was removed (claim cleanup; says nothing of the lease's physical release)")
         self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
         # r7 (sol r6 B2): a -RunDir re-read that does not answer leaves its location unknown, never the preflight's: the redirect fails closed and the close job is typed unwritable
@@ -5642,7 +5741,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # so a TEMP inside the stalled -RunDir held the typed refusal and the close. '<guard>:rundir=<sec>' now stalls every TEMP read that reaches -RunDir (TEMP_READ_DELAY_SEAM on
     # stderr says it was armed). RED on 52bd3050's logic with that seam: the 40 s stall is waited for before the close.
     def _stalled_rundir_temp_run(self, temp: Path, expect: str, armed: bool = True) -> None:
-        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", TEMP=str(temp), TMP=str(temp), NO_CLOSE_EXPECTED="1")
+        r, ended_after_open = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", TEMP=str(temp), TMP=str(temp), NO_CLOSE_EXPECTED="1")
+        self.assertTrue(self.close_substituted, "a close was submitted: this row measures the run's end only when none was")
         self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
         self.assertIn('"closeOutcome":"JOB_WRITE_FAILED"', r.stderr, "the failed redirect leaves the close job unwritable, typed")
         if armed:
@@ -5651,12 +5751,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
         self.assertEqual(self.leg_calls(), [])
-        # the 14 s room, the close, and the 2 s bound on the -RunDir re-read and the TEMP walk (raced, one bound), never the 40 s stall
-        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close: a TEMP read that reached the stalled -RunDir was waited for")
+        # the 14 s room and the 2 s bound on the -RunDir re-read and the TEMP walk (raced, one bound), never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): a TEMP read that reached the stalled -RunDir was waited for")
         self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the redirect fails closed")
         self.assertIn(expect, r.stderr)
         self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
-        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
+        self.assertFalse(self.claim_path.exists(), "the claim file was removed (claim cleanup; says nothing of the lease's physical release)")
 
     def test_artifact_preflight_r6_b1_a_temp_nested_in_a_stalled_rundir_fails_the_redirect_closed_by_spelling_before_any_temp_read(self) -> None:
         temp = self.run_dir / "tmp"
@@ -5687,6 +5787,61 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, r.stderr)
         self.assertEqual(len(list(temp.glob("venue-lease-batch-close-*"))), 1, r.stderr)
         self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close")
+
+    # LEASE-BATCH-PREFLIGHT-TEST-ISOLATION-1 item 1 (Dot on #705, ledger 2026-10-28T13:07:37Z): the r6_b1 rows above stall -RunDir AND TEMP together. '<guard>:rundir=<sec>' is the one
+    # seam that stalls TEMP's walk, and only because TEMP reaches -RunDir, while the redirect gives up on its 2 s re-read of -RunDir BEFORE it awaits TEMP's walk (Finish). The
+    # "did not answer within 2 s" those rows assert is therefore -RunDir's own throw, and the Finish branch that throws for TEMP is never reached by them. These rows keep -RunDir
+    # responsive and current (the guard gives up on a location through open:identity=25, a stall that is not on the main thread, as the r6_b1 control does) and stall ONLY TEMP's walk:
+    # a patched mirror of the runner sets $tempSeam itself, because the runner's seam cannot name TEMP alone. The no-stall mirror is the control for the harness.
+    # (The responsive -RunDir controls with an independent TEMP already exist: r6_b1_control_an_independent_answering_temp_... and r7_b2_control_a_rundir_reread_that_answers_...)
+    TEMP_SEAM_ANCHOR = "$tempSeam = @(0, 0)"
+    TEMP_WALK_REFUSAL_TAIL = "once the guard gave up on a location: it is not known to be outside -RunDir"
+    RUNDIR_REREAD_REFUSAL_TAIL = "once the guard gave up on a location: where it is now is unknown, so TEMP is not known to be outside it"
+
+    def _responsive_rundir_temp_run(self, resolve_ms: int, identity_ms: int, stalled: bool) -> tuple[subprocess.CompletedProcess, float, Path]:
+        temp = self.case / "iso-temp-elsewhere"
+        temp.mkdir(parents=True, exist_ok=True)
+        self._mirror_with_bad_sidecar(runner_patches=((self.TEMP_SEAM_ANCHOR, f"$tempSeam = @({resolve_ms}, {identity_ms})"),))
+        self.plan_runner = self.runner
+        env = {"NO_CLOSE_EXPECTED": "1"} if stalled else {}
+        r, measured = self._post_open_hash_run(0, "-GuardReadDelay", "open:identity=25", cap="75", TEMP=str(temp), TMP=str(temp), **env)
+        # the stall is the injected TEMP-only one: -RunDir answered, so neither of the runner's own '<guard>:rundir' seams was armed
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, r.stderr)
+        self.assertNotIn("TEMP_READ_DELAY_SEAM", r.stderr, r.stderr)
+        self.assertNotIn(self.RUNDIR_REREAD_REFUSAL_TAIL, r.stderr, "-RunDir's own re-read did not answer: this row would not reach TEMP's walk")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "the claim file was removed (claim cleanup; says nothing of the lease's physical release)")
+        return r, measured, temp
+
+    def _assert_temp_walk_stalled(self, resolve_ms: int, identity_ms: int) -> None:
+        r, ended_after_open, temp = self._responsive_rundir_temp_run(resolve_ms, identity_ms, stalled=True)
+        self.assertTrue(self.close_substituted, "a close was submitted: this row measures the run's end only when none was")
+        # TEMP's own branch: the redirect fails closed with TEMP's message, not -RunDir's
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr)
+        self.assertIn(self.TEMP_WALK_REFUSAL_TAIL, r.stderr, "the redirect did not fail closed on TEMP's own walk")
+        self.assertEqual(batch_result(r.stdout)["outputRedirect"]["state"], "FAILED", r.stdout)
+        self.assertIn('"closeOutcome":"JOB_WRITE_FAILED"', r.stderr, "the failed redirect leaves the close job unwritable, typed")
+        self.assertEqual(list(temp.glob("venue-lease-batch-close-*")), [], "a close redirect was made in a TEMP that did not answer")
+        self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
+        # the 14 s room and TEMP's 2 s bound, never the 40 s stall: the run ENDED inside that (termination; no close was submitted)
+        self.assertLess(ended_after_open, 75 - 60 + 4 + 2, f"the run ended {ended_after_open:.1f} s after the open (finishedUtc stands in for a close that was never submitted): TEMP's stalled walk was waited for")
+
+    def test_artifact_preflight_iso1_item1_control_a_responsive_rundir_and_an_unstalled_temp_walk_on_the_patched_mirror_still_gets_the_redirect(self) -> None:
+        r, held, temp = self._responsive_rundir_temp_run(0, 0, stalled=False)
+        self.assertFalse(self.close_substituted, "the control ran no close job")
+        self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, r.stderr)
+        self.assertNotIn(self.TEMP_WALK_REFUSAL_TAIL, r.stderr)
+        self.assertEqual(len(list(temp.glob("venue-lease-batch-close-*"))), 1, r.stderr)
+        self.assertEqual(batch_result(r.stdout)["outputRedirect"]["state"], "MADE", r.stdout)
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close")
+
+    def test_artifact_preflight_iso1_item1_a_temp_whose_final_path_resolve_alone_stalls_fails_the_redirect_closed_on_temps_own_walk(self) -> None:
+        self._assert_temp_walk_stalled(40000, 0)
+
+    def test_artifact_preflight_iso1_item1_a_temp_whose_identity_check_alone_stalls_fails_the_redirect_closed_on_temps_own_walk(self) -> None:
+        self._assert_temp_walk_stalled(0, 40000)
 
     # r5 adversary A2 (pass 1 on 8559ef31): no content read starts with under 2 s of the guard's room, but Get-VenueStagedBuildManifest started the hash with 1 s left of its call.
     # cap 66 / leg 60 / margin 0 leaves the post-open guard about 5 s (one build: a 4 s read); the manifest read takes 2.2 s once the open is answered, so the hash would start with 1.8 s.
@@ -7070,12 +7225,20 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
             "if ($a -lt 0 -or $e -lt 0) { throw 'the leg strip block was not found' }\n"
             "$e = $legText.IndexOf(\"`n\", $e)\n"
             "$block = $legText.Substring($a, $e - $a) + \"`n        }`n    }`n\"\n"
+            # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r12: the block may call a helper the LEG defines (Invoke-DvCollect wraps every copy). Carry each
+            # top-level leg function the block names, from the leg's own text, so the block runs as the leg runs it; and any error the block raises
+            # fails the test instead of printing a copy path for a copy that never happened (the r11 hosted red: PRIMARY=<path>, 0 PNGs written).
+            "$legAst = [System.Management.Automation.Language.Parser]::ParseInput($legText, [ref]$null, [ref]$null)\n"
+            "foreach ($fn in @($legAst.FindAll({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false))) {\n"
+            "    if ($block -match ('(?<![\\w-])' + [regex]::Escape($fn.Name) + '(?![\\w-])')) { . ([scriptblock]::Create($fn.Extent.Text)) } }\n"
             "function global:Read-DvVisualCaptures { param($Requested, $ArtifactsDir, $EvidenceDir, $LegId, $Header) "
             f"[pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null; verdict = 'OK'; reason = '' }} }}\n"
             f"$receipt = [ordered]@{{ visual = [pscustomobject]@{{ stripPath = '{psq(png)}'; stripCopyPath = $null }} }}\n"
             "$spec = [pscustomobject]@{ legId = 'leg-r6' }; $Venue = 'bachelor'; $Backend = 'cuda'; $SourceCommit = '0123456789abcdef0123'; $runStamp = '20261031T000000Z'; $OfflineTestMode = $false\n"
             f"$SheetCopyDir = '{psq(sheet_copy_dir)}'; $ReceiptRoot = '{psq(receipt_root)}'; $evidenceDir = '{psq(evidence_dir)}'\n"
+            "$Error.Clear()\n"
             "$null = . ([scriptblock]::Create($block))\n"
+            "if ($Error.Count -gt 0) { throw ('the leg strip block raised: ' + [string]$Error[0]) }\n"
             "'PRIMARY=' + [string]$receipt.visual.stripCopyPath\n"
             "foreach ($k in @($receipt['selfHealVisual'].Keys)) { 'SELFHEAL ' + $k + '=' + [string]$receipt['selfHealVisual'][$k].stripCopyPath }\n"
         )
