@@ -37,8 +37,8 @@ DOC_HEAD = re.compile(r"^(\S+) \(([A-Za-z0-9_.]+)\)$")
 DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
 # The shard tool's own per-class figure, printed after every job's `SHARD_SLOWEST profile=... total=...s`
 # header (its TOP_CLASSES slowest classes, setUpClass included): `  316.2s tools.repo_hygiene.test_x.Cls`.
-SLOWEST_HEAD = re.compile(r"^SHARD_SLOWEST profile=\S+ shard=\S+ total=[0-9.]+s$")
-SLOWEST_ROW = re.compile(r"^\s+([0-9.]+)s ([A-Za-z0-9_.]+)$")
+SLOWEST_HEAD = re.compile(r"^SHARD_SLOWEST profile=\S+ shard=\S+ total=[0-9]+(?:\.[0-9]+)?s$")
+SLOWEST_ROW = re.compile(r"^\s+([0-9]+(?:\.[0-9]+)?)s ([A-Za-z0-9_.]+)$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -80,8 +80,9 @@ def class_seconds(log_text: str) -> dict[str, float]:
             # previous stamped line to it is the class's setUpClass (and the previous test's teardown),
             # which a plain one-line test is charged too. The clock therefore stays on the previous
             # line and the result line is charged previous -> result. An id line that replaces a
-            # still-pending one abandons it (its interval is not separable) and restarts the clock.
-            if pending is not None:
+            # still-pending one abandons it (its interval is not separable) and restarts the clock;
+            # so does an id line with no earlier stamped line or one stamped before the previous line.
+            if pending is not None or previous is None or now < previous:
                 previous = now
             name, pending = None, doc_head
             continue

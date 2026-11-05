@@ -1003,6 +1003,33 @@ class TimingsTests(unittest.TestCase):
             {"tools.repo_hygiene.test_x.Quiet": 9.0, "tools.repo_hygiene.test_x.Loud": 62.7},
         )
 
+    def test_a_docstring_id_line_with_no_earlier_stamped_line_starts_the_clock(self) -> None:
+        # adversary r2 pass 2 A1: the id line is the first stamped line (a log cut after the setup
+        # steps), so there is no previous line to charge from; the test keeps head -> result.
+        log = (
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:04.0000000Z doc ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 3.0})
+
+    def test_a_docstring_id_line_stamped_before_the_previous_line_keeps_head_to_result(self) -> None:
+        # adversary r2 pass 2 A1: stamps out of order (interleaved job output); a negative gap is not
+        # a setUpClass, so the clock restarts at the id line instead of clamping the test to 0 s.
+        log = (
+            "2026-10-04T00:00:03.0000000Z test_p (tools.repo_hygiene.test_x.P.test_p) ... ok\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:02.0000000Z doc ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 1.0})
+
+    def test_a_malformed_slowest_row_is_not_a_measurement(self) -> None:
+        # adversary r2 pass 2 A2: "1.2.3s" matched the row pattern and raised ValueError in float().
+        log = (
+            "2026-10-04T00:00:00.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=1.0s\n"
+            "2026-10-04T00:00:00.0000000Z   1.2.3s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {})
+
     def test_a_docstring_test_that_logs_a_line_keeps_its_whole_runtime(self) -> None:
         # CoS on #449: a stamped line between the id line and "<docstring> ... ok" (a logged
         # warning) cleared the pending test, so its result line was never counted. The test
