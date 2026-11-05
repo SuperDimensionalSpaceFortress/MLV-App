@@ -375,6 +375,42 @@ class InFlightTests(CurrencyFixture):
                     self.assertEqual(entry["verdict"], expected)
                     self.assertEqual(entry["inFlightRuns"], 1 if expected == "IN-FLIGHT" else 0)
 
+    # --- adversary pass 3 (sol, head 44797227): A1 and A2, both introduced majors ------------------------
+    def _verdict_for_running_stamp(self, stamp, timeout=3600):
+        self._write_raw("fin", lane="sol", state="complete", startedUtc="2026-10-12T19:00:00.0000000Z",
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        self._write_raw("run", lane="sol", state="running", startedUtc=stamp, timeoutSec=timeout)
+        return self.evaluate()["lanes"]["sol"]["verdict"]
+
+    def test_a1_a_start_one_hundred_nanoseconds_past_the_future_bound_is_not_live(self):
+        # now = 20:00:00; the bound is 20:05:00. The seventh fractional digit used to be dropped, so
+        # 20:05:00.0000001 looked like exactly +300 s and was admitted.
+        for label, stamp, expected in (
+                ("exactly at the bound", "2026-10-12T20:05:00.0000000Z", "IN-FLIGHT"),
+                ("100 ns past, 7 digits", "2026-10-12T20:05:00.0000001Z", "NO-DATA"),
+                ("1 ns past, 9 digits", "2026-10-12T20:05:00.000000001Z", "NO-DATA"),
+                ("1 unit at the 10th digit", "2026-10-12T20:05:00.0000000001Z", "NO-DATA"),
+                ("comma fraction past", "2026-10-12T20:05:00,0000001Z", "NO-DATA"),
+                ("comma fraction at the bound", "2026-10-12T20:05:00,0000000Z", "IN-FLIGHT"),
+                ("100 ns inside", "2026-10-12T20:04:59.9999999Z", "IN-FLIGHT")):
+            with self.subTest(label):
+                self.setUp()
+                self.assertEqual(self._verdict_for_running_stamp(stamp), expected)
+
+    def test_a2_comma_fraction_timestamps_keep_their_sub_microsecond_order(self):
+        # The finished run is 800 ns NEWER than the running one: the lane is CURRENT, in both creation orders.
+        specs = {"fin": dict(state="complete", resolvedModel="gpt-6.1-sol", effort="high",
+                             startedUtc="2026-10-12T19:00:00,1234569Z"),
+                 "run": dict(state="running", timeoutSec=7200, startedUtc="2026-10-12T19:00:00,1234561Z")}
+        for order in (("fin", "run"), ("run", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                for name in order:
+                    self._write_raw(name, lane="sol", **specs[name])
+                self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], "CURRENT")
+        # and the comma form orders exactly like the dot form
+        self.assertEqual(check.parse_utc("2026-10-12T19:00:00,1234569Z"), check.parse_utc("2026-10-12T19:00:00.1234569Z"))
+
     def test_b1_a_future_dated_receipt_is_not_live_through_the_cli_with_the_real_clock(self):
         real_now = datetime.datetime.now(datetime.timezone.utc)
         self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol", effort="high",

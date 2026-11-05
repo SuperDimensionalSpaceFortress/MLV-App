@@ -129,10 +129,17 @@ def parse_model_id(model_id):
     return None
 
 
+def normalize_fraction(text):
+    """ISO 8601 allows a comma as the decimal sign ('19:00:00,1234569Z'); fromisoformat accepts it and drops
+    every digit past the microsecond. Normalize to a dot first so parse_utc and the sub-microsecond tie-break
+    below read one shape (adversary pass 3, A2)."""
+    return re.sub(r"(?<=[0-9]),(?=[0-9])", ".", text)
+
+
 def parse_utc(text):
     if not isinstance(text, str):
         return None
-    cleaned = text.strip()
+    cleaned = normalize_fraction(text.strip())
     if cleaned.endswith(("Z", "z")):
         cleaned = cleaned[:-1] + "+00:00"
     cleaned = re.sub(r"(\.[0-9]{6})[0-9]+", r"\1", cleaned)
@@ -188,12 +195,15 @@ def load_receipts(runs_dir):
             continue
         # parse_utc keeps microseconds; Invoke-Lane writes 7 fractional digits (100 ns ticks), so keep the
         # digits it drops as a tie-break and two runs started within one microsecond still order correctly.
-        extra = re.search(r"\.[0-9]{6}([0-9]+)", str(data.get("startedUtc")))
+        extra = re.search(r"\.[0-9]{6}([0-9]+)", normalize_fraction(str(data.get("startedUtc"))))
         order = (started, int(extra.group(1)[:3].ljust(3, "0")) if extra else 0)
+        # Any non-zero digit past the microsecond puts the real start after the truncated `started`.
+        beyond_us = bool(extra and extra.group(1).strip("0"))
         resolved = data.get("resolvedModel")
         timeout = data.get("timeoutSec")
         receipts.append({
-            "path": path, "lane": data["lane"], "started": started, "order": order, "state": data.get("state"),
+            "path": path, "lane": data["lane"], "started": started, "order": order, "beyond_us": beyond_us,
+            "state": data.get("state"),
             "ended": data.get("endedUtc"),
             "timeoutSec": timeout if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) else None,
             "card": data.get("card"), "effort": data.get("effort"),
@@ -231,8 +241,13 @@ def is_live_running(receipt, now):
         started = receipt["started"]
         # Bounded at both ends: not older than timeout + grace, and not dated past the future-skew bound. A
         # receipt dated in the future has no age at all, so it is no evidence that a run is in progress.
-        return (started <= now + datetime.timedelta(seconds=MAX_FUTURE_START_SKEW_SEC)
-                and now <= started + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC))
+        future_limit = now + datetime.timedelta(seconds=MAX_FUTURE_START_SKEW_SEC)
+        # `started` is truncated to the microsecond, so a start exactly on the limit is past it when digits
+        # beyond the microsecond are non-zero (adversary pass 3, A1). The age end needs no such care: `now`
+        # has microsecond resolution, so now <= the real end iff now <= the truncated end.
+        if started > future_limit or (started == future_limit and receipt.get("beyond_us")):
+            return False
+        return now <= started + datetime.timedelta(seconds=timeout + LIVE_GRACE_SEC)
     except (OverflowError, ValueError, TypeError):
         return False
 
