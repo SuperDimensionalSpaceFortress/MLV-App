@@ -7610,6 +7610,67 @@ class LookReceiptLegSpecTests(unittest.TestCase):
                 self.assertEqual(dict(arm, legId=twin["legId"], card=twin["card"]), twin)
                 self.assertEqual(list(arm), list(twin), "the twin's keys in the twin's order")
 
+    def test_chainattr_arms_differ_from_the_control_only_in_the_intended_setting(self) -> None:
+        """CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r2 (I1): the four arms' relationship, not just their names. Against C, P adds only the prep kill switch, T12 adds
+        only the worker cap of 12, and L replaces forced cinematic Look Assist with disabled Look Assist; every other setting is common. This reads committed
+        specs only. It cannot see an inherited MLVAPP_DISABLE_PREP_POINTWISE_FAST (adversary A1), and the per-run prep-state counting rule is not in tracked code."""
+        names = ("c", "p", "t12", "l")
+        arms = {arm: json.loads((DV / f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json").read_text(encoding="utf-8")) for arm in names}
+        intended = {"p": ({"disablePrepPointwiseFast": True}, ()), "t12": ({"playbackMaxThreads": 12}, ()), "l": ({"disableLookAssist": True}, ("forceLookAssist", "lookFlavor"))}
+        switches = ("disablePrepPointwiseFast", "playbackMaxThreads", "disableLookAssist")
+        no_criteria = {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}
+
+        def problems(specs: dict) -> list[str]:
+            control = specs["c"]
+            found = [f"c sets {key}" for key in switches if key in control["generatorArgs"]]
+            if control["generatorArgs"].get("forceLookAssist") is not True or control["generatorArgs"].get("lookFlavor") != "cinematic":
+                found.append("c is not forced cinematic")
+            for arm, (added, removed) in intended.items():
+                spec = specs[arm]
+                want = {k: v for k, v in control["generatorArgs"].items() if k not in removed} | added
+                if spec["generatorArgs"] != want:
+                    found.append(f"{arm} generatorArgs differ from the intended change")
+                if {k: v for k, v in spec.items() if k not in ("legId", "generatorArgs", "criteria")} != {k: v for k, v in control.items() if k not in ("legId", "generatorArgs", "criteria")}:
+                    found.append(f"{arm} differs in a common setting")
+                if spec["criteria"] != (no_criteria if arm == "l" else control["criteria"]):
+                    found.append(f"{arm} criteria differ")
+            return found
+
+        self.assertEqual(problems(arms), [])
+        pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s1.json").read_text(encoding="utf-8"))
+        partition = {"corePartitionTelemetry": True, "corePartitionHelperMask": "0xFF000"}
+        self.assertEqual(arms["c"]["generatorArgs"], pace["generatorArgs"] | partition)
+        self.assertEqual(arms["c"]["criteria"]["acceptance"]["cpu"], pace["criteria"]["acceptance"]["cpu"])
+        self.assertNotIn("cinematic", (DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json").read_text(encoding="utf-8"))
+
+        def with_args(arm: str, drop: tuple = (), **add) -> dict:
+            specs = json.loads(json.dumps(arms))
+            specs[arm]["generatorArgs"] = {k: v for k, v in specs[arm]["generatorArgs"].items() if k not in drop} | add
+            return specs
+
+        def with_field(arm: str, **fields) -> dict:
+            specs = json.loads(json.dumps(arms))
+            specs[arm].update(fields)
+            return specs
+
+        for name, bad in (("the control carries the prep kill switch", with_args("c", disablePrepPointwiseFast=True)),
+                          ("T12 carries the prep kill switch", with_args("t12", disablePrepPointwiseFast=True)),
+                          ("L carries the prep kill switch", with_args("l", disablePrepPointwiseFast=True)),
+                          ("P loses the prep kill switch", with_args("p", drop=("disablePrepPointwiseFast",))),
+                          ("P sets the prep kill switch false", with_args("p", disablePrepPointwiseFast=False)),
+                          ("P also caps workers", with_args("p", playbackMaxThreads=12)),
+                          ("T12 runs another cap", with_args("t12", playbackMaxThreads=16)),
+                          ("L keeps forced Look Assist", with_args("l", forceLookAssist=True)),
+                          ("L drops the Look Assist disable", with_args("l", drop=("disableLookAssist",))),
+                          ("one arm loses the core partition signal", with_args("t12", drop=("corePartitionTelemetry",))),
+                          ("one arm plays longer", with_field("p", playSeconds=30)),
+                          ("one arm changes scale", with_field("t12", scaleFactor=2)),
+                          ("one arm changes display", with_field("l", displayMode="windowed")),
+                          ("one arm changes criteria", with_field("p", criteria=no_criteria)),
+                          ("L gains criteria", with_field("l", criteria=arms["c"]["criteria"]))):
+            with self.subTest(case=name):
+                self.assertTrue(problems(bad), name)
+
     def test_the_schema_admits_a_pace_receipt_only_on_a_forced_look_speed_leg_and_whole(self) -> None:
         """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: generatorArgs.lookReceipt needs lookReceiptSha256 and forceLookAssist true and a speed leg;
         the hash alone, a look leg, or a speed leg that does not force Look Assist is refused."""
