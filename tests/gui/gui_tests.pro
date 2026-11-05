@@ -28,6 +28,7 @@ SOURCES += \
     $$REPO_ROOT/tests/gui/test_gui_smoke.cpp
 
 HEADERS += \
+    $$REPO_ROOT/src/processing/ThreadExitCache.h \
     $$REPO_ROOT/platform/qt/ColorToolButton.h \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \

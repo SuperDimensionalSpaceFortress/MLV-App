@@ -75,6 +75,7 @@ SOURCES += \
     $$REPO_ROOT/tests/perf/perf_main.cpp
 
 HEADERS += \
+    $$REPO_ROOT/src/processing/ThreadExitCache.h \
     $$REPO_ROOT/tests/common/repo_paths.h \
     $$REPO_ROOT/tests/common/test_runtime.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
