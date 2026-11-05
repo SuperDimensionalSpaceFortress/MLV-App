@@ -5476,8 +5476,7 @@ $rec =[ordered]@{ schema = 'mlv-app/core-partition-helper/v1'; pid = $PID; start
 $u8 = [Text.Encoding]::UTF8; $hk = [Security.Cryptography.HMACSHA256]::new($u8.GetBytes([string]$env:MLV_CP_NONCE))
 $c0 = $dt::UtcNow.Ticks; $rec.monoBaseMs = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000; $cw = [Diagnostics.Stopwatch]::StartNew()
 $clk = { $t = $dt::UtcNow.Ticks; $g = [math]::Abs(($t - $c0) / 1e4 - $cw.Elapsed.TotalMilliseconds); if ($g -gt $rec.clockSkewMaxMs) { $rec.clockSkewMaxMs = $g }; $t }
-$errs = [Collections.Generic.List[string]]::new()
-$lo = [Collections.Generic.List[object]]; $sm = $lo::new(); $ins = $lo::new()
+$lo = [Collections.Generic.List[object]]; $errs = $lo::new(); $sm = $lo::new(); $ins = $lo::new()
 $loadOn = $false; $ls0 = 0; $lb = 0
 # r9 (Dot 4 = adversary r8 aeacec83 A4): the owner's load seconds and bytes are clipped to its last poll that saw it alive (aliveMs, and the byte
 # count read at that poll, $lb), so load that ran after it exited, before the next poll saw it gone, is not its own.
@@ -5539,16 +5538,18 @@ public sealed class MlvCorePartitionLoad {
         if ($cw.ElapsedMilliseconds -ge $deadline) { $rec.endedBy = 'deadline'; break }
         $held = @{}
         foreach ($k in @($live.Keys)) {
-            $q = $live[$k]; $held[$q.r.pid] = 1
+            $q = $live[$k]
             # r10 B1 (sol r9 B1 = adversary r9 8cf7e883 A1): the alive stamp and the load byte count are read BEFORE the liveness query, so a helper
             # descheduled after the query can only make aliveMs earlier (the gap to goneMs, the endpoint bound, longer), never charge post-exit work
             $mo = $cw.ElapsedMilliseconds; if ($k -eq $own -and $loadOn) { $bn = $ld.Bytes }
-            $gone = $true; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
-            # The getter's throw reaches here as $null, not through the catch: this user can no longer open that pid, so it is no longer the process that was read.
+            # A failed query proves neither: the getter's throw reaches here as $null, not through the catch. That is no exit, since the seen key would stop the process
+            # being tracked again and the job accepts an observed exit as coverage; and it is no alive stamp and holds no pid, since it can be a successor this user cannot open.
+            $gone = $null; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
             if ($gone -eq $false) {
+                $held[$q.r.pid] = 1
                 try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
                 $q.r.lastSeenUtcTicks = & $clk; $q.r.aliveMs = $mo; if ($k -eq $own -and $loadOn) { $lb = $bn }
-            } else {
+            } elseif ($gone) {
                 if ($k -eq $own) { if ($loadOn) { $q.r.loadJoined = $ld.Halt(); $loadOn = $false; & $lc $q.r }; $own = $null }
                 $q.r.goneUtcTicks = & $clk; $q.r.goneMs = $cw.ElapsedMilliseconds; $live.Remove($k)
             }
@@ -5568,12 +5569,13 @@ public sealed class MlvCorePartitionLoad {
                 $k = "$($p.Id),$($pst.Ticks)"
                 if ($seen[$k]) { continue }
                 $pe = $pn[$p.Id]
-                # A start read at first sight ($pe.s) is the identity, whatever the clock did since: any other start on that pid is a process on a recycled pid,
-                # and the one first listed ended unread. With none, only the stamp of the enumeration that first listed the pid ($pe.t) is left, and only one process
+                # The first start read for a pending pid ($pe.s) is its identity, whatever the clock did since: any other start on that pid is a process on a recycled pid,
+                # and the one first listed ended unread. With none read yet, only the stamp of the enumeration that first listed the pid ($pe.t) is left, and only one process
                 # holds a pid at a time, so a later start is the recycled one. Both stamps are wall clock, so "later" is by more than the job's $slack, twice the largest gap.
-                if ($pe -and $pst -and $pst.Ticks -ne $pe.s -and ($pe.s -or $pst.Ticks -gt $pe.t + 2e4 * $rec.clockSkewMaxMs)) { & $un $p.Id; $pe = $null }
-                # A readable start that got here is a process nothing has seen, so it is new even on a pid this pass is tracking (HasExited opens by pid, so a tracked
-                # process can hand its pid over unnoticed). With both reads failing nothing separates it from the tracked process exiting, which is what that is taken for.
+                if ($pe -and $pst) { if ($pst.Ticks -ne $pe.s -and ($pe.s -or $pst.Ticks -gt $pe.t + 2e4 * $rec.clockSkewMaxMs)) { & $un $p.Id; $pe = $null } else { $pe.s = $pst.Ticks } }
+                # A readable start that got here is a process nothing has seen, so it is new even on a pid this pass saw alive (HasExited opens by pid, so a tracked process can
+                # hand its pid over unnoticed). With both reads failing on a pid this pass saw alive it is taken for that process exiting. Only an alive pid is held: a pass
+                # that saw it gone proves nothing about what is on it now, so both reads failing there go pending and refuse, as they did before pending existed.
                 # A read at another path with no start cannot say which process it read, so it clears an unread entry only once the start is read too.
                 if (!$pp -or ($pp -ieq $exe -and !$pst)) { if (!$pe -and ($pst -or !$held[$p.Id])) { $pn[$p.Id] = @{ t = $lt; s = $pst.Ticks; f = & $clk; m = $cw.ElapsedMilliseconds } } }
                 elseif ($pst) { $pn.Remove($p.Id) }
@@ -5624,7 +5626,7 @@ finally {
     # sol r4 CP-02 (was the longest instance): the app is the instance whose pid the job hands over after the smoke run (the runner's launched
     # process); none, or two with that pid, binds nothing. Only its samples are app samples and the load totals are its own (sol r4 A2).
     $mp = [int64]0; try { $mp = [int64]([IO.File]::ReadAllText([string]$env:MLV_CP_MEASURED).Trim()) } catch { }
-    $m = @($ins | Where-Object { $_.pid -eq $mp })
+    $m = @($ins | ? { $_.pid -eq $mp })
     $app = $(if ($m.Count -eq 1) { $m[0] })
     $rec.measuredPid = $mp; $rec.app = $app
     # r9 (Dot 4): a sample stamped after the app's last observed-alive poll is not its own

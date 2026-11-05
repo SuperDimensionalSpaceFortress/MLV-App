@@ -2514,8 +2514,9 @@ R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
 # r2 additions. Two doubles may share an id: the pid passes from one to the other, and which one is listed is decided by from/to alone. stepMs: every wall
 # clock read the helper makes is that much earlier from enumeration 1 on (a backward step, which its own clock sampling then sees); startBeforeFirstPollMs:
 # the start is that long before enumeration 1 on the unstepped clock, so the process really did start before the first listing that stamps a later time.
-# exitedNullAt: from that enumeration count HasExited gives nothing, which is what PowerShell makes of the getter's access-denied throw once the pid belongs to a
-# process this user cannot open (measured on csrss, wininit and smss from an unelevated pwsh 7.6: Path '', StartTime null, HasExited null, no throw).
+# exitedNullAt (to exitedNullTo, when set): from that enumeration count HasExited gives nothing, which is what PowerShell makes of the getter's access-denied throw once
+# the pid belongs to a process this user cannot open (measured on csrss, wininit and smss from an unelevated pwsh 7.6: Path '', StartTime null, HasExited null, no throw).
+# exitedThrowAt: Refresh throws at that one enumeration count. A negative startBeforeFirstPollMs is a start after enumeration 1 on the unstepped clock.
 _APP = {"id": 5000, "from": 1, "to": 6, "goneAt": 6, "startSec": 1}
 _Q = {"from": 1, "to": 99, "goneAt": 999}
 # Opus key3's pid 300: P1 is tracked and read at once. P2 takes the pid in the pass that sees P1 gone (enumeration 4), Path empty, its start readable and new.
@@ -2553,6 +2554,13 @@ LATE_READ_SCENARIOS = {
     "recycled-over-tracked-read-later": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 6, "pathFail": 5}]},
     "recycled-over-tracked-never-seen-gone": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 999}, {**_P2_PATH_UNREAD, "to": 5, "pathFail": -1}]},
     "recycled-over-tracked-unopenable": {"procs": [_APP, {**_P1_TRACKED, "goneAt": 999, "exitedNullAt": 3}, {**_P2_PATH_UNREAD, "to": 6, "pathFail": -1, "pathMode": "throw", "startFail": -1}]},
+    "recycled-over-tracked-both-unread-one-pass": {"procs": [_APP, _P1_TRACKED, {**_P2_PATH_UNREAD, "to": 4, "pathFail": -1, "startFail": -1}]},
+    "start-recovered-then-recycled-other-path": {"stepMs": 500, "procs": [_APP, {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startBeforeFirstPollMs": 100, "pathFail": -1, "pathMode": "empty", "startFail": 1},
+                                                                          {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startBeforeFirstPollMs": -50, "exe": "other"}]},
+    "start-recovered-then-recycled-same-path": {"stepMs": 500, "procs": [_APP, {"id": 300, "from": 1, "to": 2, "goneAt": 999, "startBeforeFirstPollMs": 100, "pathFail": -1, "pathMode": "empty", "startFail": 1},
+                                                                         {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startBeforeFirstPollMs": -50}]},
+    "liveness-null-once": {"procs": [{**_APP, "exitedNullAt": 2, "exitedNullTo": 2}]},
+    "liveness-throw-once": {"procs": [{**_APP, "exitedThrowAt": 2}]},
     "recycled-other-path-start-unread": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startSec": 2, "exe": "other", "startFail": -1}]},
     "recycled-start-not-later": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 99, "goneAt": 999, "startSec": 2}]},
     "other-path-start-unread-from-the-first": {"procs": [_APP, {**_Q, "id": 400, "startSec": 1, "exe": "other", "startFail": -1}]},
@@ -2575,7 +2583,8 @@ function Test-CpFails($Up, $From) { ($Up -eq -1) -or ($null -ne $Up -and $global
 $global:cpDoubles = @(foreach ($s in @($global:cpSpec.procs)) {
     $d = [pscustomobject]@{ Id = [int]$s.id; cpS = $s; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095 }
     $d | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
-    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { if ($null -ne $this.cpS.exitedNullAt -and $global:cpPoll -ge $this.cpS.exitedNullAt -and ($null -eq $this.cpS.exitedNullTo -or $global:cpPoll -le $this.cpS.exitedNullTo)) { return $null }; $global:cpPoll -ge $this.cpS.goneAt }
+    $d | Add-Member -MemberType ScriptMethod -Name Refresh -Force -Value { if ($global:cpPoll -eq $this.cpS.exitedThrowAt) { throw [ComponentModel.Win32Exception]::new(5) } }
     $d | Add-Member -MemberType ScriptProperty -Name Path -Value {
         $s = $this.cpS
         if (Test-CpFails $s.pathFail $s.pathFailFrom) { if ($s.pathMode -eq 'throw') { throw [ComponentModel.Win32Exception]::new(5) }; return '' }
@@ -2694,7 +2703,17 @@ $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
 $psi.Environment['MLV_CP_BENCH'] = '4095'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
 $psi.Environment['MLV_CP_NONCE'] = 'real-suspended'; $psi.Environment['MLV_CP_DEADLINE_MS'] = '180000'
 $h = [Diagnostics.Process]::Start($psi)
-function Get-CpPolls { try { [int][IO.File]::ReadAllText($pf) } catch { 0 } }
+# Opened shared for writing: a plain ReadAllText here makes the helper's WriteAllText throw a sharing violation inside its loop, which ends the helper early. A read that
+# still fails gives the last count, never 0, so 'the next N enumerations' cannot be satisfied at once.
+$global:cpLastPolls = 0
+function Get-CpPolls {
+    try {
+        $s = [IO.FileStream]::new($pf, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try { $t = [IO.StreamReader]::new($s).ReadToEnd() } finally { $s.Dispose() }
+        if ($t) { $global:cpLastPolls = [int]$t }
+    } catch { }
+    $global:cpLastPolls
+}
 function Wait-CpPolls([int]$N) {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ((Get-CpPolls) -lt $N) { if ($h.HasExited -or $sw.ElapsedMilliseconds -gt 120000) { throw "the helper reached only enumeration $(Get-CpPolls) of $N (exited=$($h.HasExited))" }; Start-Sleep -Milliseconds 20 }
@@ -2874,14 +2893,15 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertTrue(late["by"]["5000"]["loadJoined"], late)
 
     def test_handover_a_tracked_process_whose_reads_fail_is_still_the_tracked_process(self) -> None:
-        """Reads fail as a process exits. Once classed it stays what it was: a failed read of a tracked pid, or of one the same pass saw gone, is not a
-        new unidentified process (on the base both reads failing made the key 'pid,', which nothing had seen, and refused the run)."""
-        for mode in ("reads-fail-while-tracked", "reads-fail-as-seen-gone"):
-            with self.subTest(mode=mode):
-                case = self.late_read(mode)
-                self.assertEqual(case["unidentified"], [], f"a tracked process was recorded unidentified as it exited: {case}")
-                self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
-                self.assertIn(case["vwhy"], self.ACCEPTED, case)
+        """Reads fail as a process exits. Once classed it stays what it was: a failed read of a pid this pass saw alive is not a new unidentified process (on the
+        base both reads failing made the key 'pid,', which nothing had seen, and refused the run). A pass that saw the pid gone proves nothing about what is on it
+        now: both reads failing there cannot be told from a successor, so it refuses, as on the base (adversary A1 on 6b63c057)."""
+        case = self.late_read("reads-fail-while-tracked")
+        self.assertEqual(case["unidentified"], [], f"a tracked process was recorded unidentified as it exited: {case}")
+        self.assertEqual([case["app"], case["instances"]], [5000, [5000]], case)
+        self.assertIn(case["vwhy"], self.ACCEPTED, case)
+        gone = self.late_read("reads-fail-as-seen-gone")
+        self.assertEqual([gone["app"], gone["instances"], gone["unidentified"], gone["vwhy"]], [5000, [5000], [5000], "same-path-instance-unidentified"], gone)
 
     def test_handover_a_process_identified_at_another_path_is_dropped_once_readable(self) -> None:
         """Identified is identified: readable at another path, it is no competing instance, so it is off the record and refuses nothing."""
@@ -2903,16 +2923,30 @@ class CorePartitionR10Tests(unittest.TestCase):
     def test_handover_a_process_on_a_recycled_tracked_pid_is_never_dropped(self) -> None:
         """Opus key3 on e048ccc6: P1 on pid 300 is tracked, and P2 is listed on that pid with Path empty and a readable new start. A readable start that no
         process has held is not P1 exiting, so a pid-only guard must not swallow it. P2 unread for its whole life is recorded and refuses the run: when it is gone by
-        the next pass, and when P1 is never seen gone because HasExited, which opens by pid, reads P2 (master refuses in both). When this user cannot open P2 at all
-        both reads fail and HasExited gives nothing: that is not P1 alive, so P1 is seen gone and P2 is on the record from the next pass."""
-        for mode in ("recycled-over-tracked-gone-next-pass", "recycled-over-tracked-never-seen-gone", "recycled-over-tracked-unopenable"):
+        the next pass, and when P1 is never seen gone because HasExited, which opens by pid, reads P2 (master refuses in both). When this user cannot open P2 at all,
+        both reads fail and HasExited gives nothing, which proves neither that P1 is alive nor that it is gone: P1 is held to no pid, its exit stays unobserved, and P2 is
+        on the record. Adversary A1 on 6b63c057: a pass that saw P1 gone holds nothing either, so P2 unread both ways and listed only in that pass still refuses."""
+        for mode in ("recycled-over-tracked-gone-next-pass", "recycled-over-tracked-never-seen-gone", "recycled-over-tracked-unopenable", "recycled-over-tracked-both-unread-one-pass"):
             with self.subTest(mode=mode):
                 case = self.late_read(mode)
                 self.assertEqual(case["unidentified"], [300], f"a process on a recycled pid that was never identified left no record: {case}")
                 self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
                 self.assertFalse(case["bench"], case)
         p1 = self.late_read("recycled-over-tracked-unopenable")["by"]["300"]
-        self.assertIsNotNone(p1["goneMs"], f"a HasExited that gave nothing was read as alive: {p1}")
+        self.assertIsNone(p1["goneMs"], f"a HasExited that gave nothing was recorded as an observed exit: {p1}")
+        self.assertLess(p1["aliveMs"], self.late_read("recycled-over-tracked-unopenable")["by"]["5000"]["aliveMs"], f"a HasExited that gave nothing stamped the process alive: {p1}")
+
+    def test_handover_a_failed_liveness_query_is_no_observed_exit(self) -> None:
+        """Adversary A3 on 6b63c057, and its sibling at the catch: a liveness query that fails once on the measured app, alive throughout, records no exit. The seen
+        key stops a later enumeration from tracking it again, so a false exit would stand and end its coverage early, and it would be accepted."""
+        for mode in ("liveness-null-once", "liveness-throw-once"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                rec, polls = case["by"]["5000"], case["polls"]
+                self.assertEqual([case["app"], case["instances"], case["unidentified"]], [5000, [5000], []], case)
+                self.assertGreaterEqual(rec["last"], polls[4], f"a failed liveness query ended the tracking of a live process: {case}")
+                self.assertIsNotNone(rec["goneMs"], case)
+                self.assertIn(case["vwhy"], self.ACCEPTED, case)
 
     def test_handover_a_process_on_a_recycled_tracked_pid_keeps_its_real_first_sight(self) -> None:
         """The same P2 alive and readable from enumeration 6: its first sight is enumeration 4, the pass that first listed it, not one pass late."""
@@ -2941,6 +2975,21 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertEqual(case["unidentified"], [300], f"P2 inherited an unread P1 and P1 left no record: {case}")
         self.assertEqual(case["instances"], [5000, 300], case)
         self.assertGreaterEqual(case["by"]["300"]["first"], case["polls"][2], case)
+
+    def test_handover_a_start_recovered_after_first_sight_is_kept_as_the_identity(self) -> None:
+        """Adversary A2 on 6b63c057: P1 is unread both ways at first sight, and its start reads on the next enumeration with its Path still empty. That start is the
+        identity from then on. P2 then takes the pid, started inside the clock gap's slack, so only the saved start tells them apart: at another path it must not
+        erase P1, and at the app's path it must not inherit P1's first sight."""
+        for mode, instances in (("start-recovered-then-recycled-other-path", [5000]), ("start-recovered-then-recycled-same-path", [5000, 300])):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertGreaterEqual(case["skew"], 250, f"the clock double did not reach the helper: {case}")
+                self.assertEqual(case["unidentified"], [300], f"a successor erased or inherited an unread process whose start had been read: {case}")
+                self.assertEqual(case["instances"], instances, case)
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+        p2 = self.late_read("start-recovered-then-recycled-same-path")["by"]["300"]
+        polls = self.late_read("start-recovered-then-recycled-same-path")["polls"]
+        self.assertGreaterEqual(p2["first"], polls[2] - 500 * 10000, f"the successor inherited the earlier first sight: {p2}")
 
     def test_handover_a_backward_clock_step_within_tolerance_is_not_a_recycled_pid(self) -> None:
         """Sol on e048ccc6, catalogue row CP-CLOCK-REUSE: the process started before its first listing, but a backward step within the supported 1000 ms makes the
