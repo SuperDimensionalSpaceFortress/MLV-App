@@ -41,8 +41,9 @@ Missing evidence is never CURRENT (r3 blocker B1; one hub-ruled exception, named
 IN-FLIGHT (CURRENCY-CHECK-WIRED-INTO-HUB-TICK-1). A running receipt records no resolvedModel and no
 effort yet (Invoke-Lane.ps1 writes both at the end), so before this verdict a lane that was merely busy
 read NO-DATA and pulled the overall verdict to INCOMPLETE. A receipt counts as a LIVE CANDIDATE when it
-says state=running, has no endedUtc, has a finite timeoutSec between 0 (exclusive) and
-MAX_LIVE_TIMEOUT_SEC (48 h; nan, inf, a non-positive or an absurd value is no bound, never a crash), is not
+says state=running, has no endedUtc, has a timeoutSec that exact_timeout accepts and that is above 0 and at
+most MAX_LIVE_TIMEOUT_SEC (48 h; for example nan, inf, a non-positive or an out-of-range value is no bound, never a
+crash; exact_timeout and is_live_running decide every corner), is not
 dated more than MAX_FUTURE_START_SKEW_SEC (300 s) past now (a receipt dated past the skew bound has no age, so it
 is never a candidate), and now is no later than startedUtc + timeoutSec + LIVE_GRACE_SEC (300 s: the
 wrapper's post-run cleanup and the hub clock's measured skew of up to ~20 s).
@@ -53,10 +54,11 @@ offset. Every other string, a date-only one included, is unreadable: counted in 
 malformed timestamp and left out of the verdict, never read as a failure or a success. So no spelling can be read as
 something it was not, and the sort key is built from that one shape only. The cost is that a hand-written receipt that
 an earlier version read can disappear into `unreadableReceipts`; a real one never does (a census of 8301 real receipts
-found 8290 with a startedUtc, every one in the writer's shape). A live candidate additionally needs a timeoutSec that
-is a JSON int or a number whose RAW token has at most 15 significant digits (exact_timeout: json.load rounds a
-longer token before the script could see it, so the digits are counted on the token itself; padding zeros do not
-count); anything else is no candidate and stays unproven, as before this PR. The arithmetic on a candidate stays
+found 8290 with a startedUtc, every one in the writer's shape). A live candidate additionally needs a timeoutSec
+that exact_timeout accepts: a JSON number token, not a string, bool or nan, with at most 15 significant digits
+(json.load rounds a longer token before the script could see it, so the digits are counted on the token itself;
+padding zeros do not count) and a decimal exponent within MAX_TIMEOUT_EXPONENT, so a very small value such as 9e-31
+is refused too; anything else is no candidate and stays unproven, as before this PR. The arithmetic on a candidate stays
 exact. A candidate is an AGE WINDOW derived
 from the receipt's own start time and timeout, not a process probe: this script reads receipts only, it
 never proves that a process exists, and the board's authoritative liveness rule (hub-queue-lib.ps1
@@ -84,8 +86,8 @@ run included, whose startedUtc is unreadable is dropped from the lane (counted i
 is judged on the runs that could be read and can read CURRENT where the base read NO-DATA. THE COST, plainly: a
 dropped receipt can hide a VIOLATION, not only a gap. A complete run with effort 'low' and a foreign stamp beside a
 current run reads CURRENT, exit 0, BAD-EFFORT hidden (the base read STALE, exit 1); a finished run with no effort
-would have read INCOMPLETE and an expired running receipt NO-DATA. Every verdict sentence in this docstring and in
-the outbox entry holds unless a dropped stamp removed the receipt it names. The tests pin this as the ruled
+would have read INCOMPLETE and an expired running receipt NO-DATA. The verdict sentences in this docstring and in
+the outbox entry describe the receipts the checker kept; a dropped stamp removes the receipt it names. The tests pin this as the ruled
 behaviour (OneStampShapeTests); the stamp census (8301 real receipts) found none in a foreign shape.
 
 The overall verdict is STALE if any lane is, else INCOMPLETE if any lane is NO-DATA or INCOMPLETE,
