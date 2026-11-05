@@ -30,7 +30,8 @@
       run-dir-active (action kept)                a live process names this run's own dir (command line, cwd or script text):
                                                   the detached chain that registered the path is still running
       holder-cwd-unknown (action kept)            a live process's current directory could not be read and Retire-LaneWorktree.ps1's
-                                                  Get-CwdUnknownRefusal does not exempt it, so it cannot be ruled out as a holder
+                                                  Get-CwdUnknownRefusal does not exempt it, or a script it can load exists and could not
+                                                  be read, so it cannot be ruled out as a holder
       holder-probe-failed                         the process scan or the cwd probe could not answer; remembered for the run, so
                                                   every remaining entry gets the same refusal with no new scan
       producer-pr-open / pr-state-unknown         the lane's branch has an open PR, or that could not be learned (`gh` gets
