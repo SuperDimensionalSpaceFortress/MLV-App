@@ -850,6 +850,60 @@ class LiveShapeTests(CurrencyFixture):
             with self.subTest(text=text):
                 self.assertEqual(check.sub_microsecond_digits(text), expected)
 
+    # --- adversary pass 7 (sol, head 86f2dbf4): A1 and A2, both introduced majors in the pass-6 fold ---------
+    def test_r3p7_a1_every_accepted_spelling_keeps_its_sub_microsecond_order(self):
+        # A failed run 800 ns NEWER than the complete one, in spellings fromisoformat accepts but the first anchor missed.
+        if check.parse_utc("20261012T195900Z") is None:
+            self.skipTest("this Python's fromisoformat does not read the basic format")
+        for label, failed in (("basic", "20261012T195900.0000009Z"),
+                              ("week date", "2026-W42-1T19:59:00.0000009Z"),
+                              ("newline separator", "2026-10-12\n19:59:00.0000009Z"),
+                              ("basic with compact offset", "20261012T205900.0000009+0100"),
+                              ("hour-only offset", "2026-10-12T20:59:00.0000009+01"),
+                              ("extended, the control", "2026-10-12T19:59:00.0000009Z")):
+            for order in (("a-fin", "b-fail"), ("a-fail", "b-fin")):
+                with self.subTest(label=label, order=order):
+                    self.setUp()
+                    for name in order:
+                        run = self.runs / name
+                        run.mkdir()
+                        body = ({"lane": "sol", "state": "failed", "startedUtc": failed, "resolvedModel": None,
+                                 "effort": "high"} if name.endswith("fail") else
+                                {"lane": "sol", "state": "complete", "startedUtc": "2026-10-12T19:59:00.0000001Z",
+                                 "resolvedModel": "gpt-6.1-sol", "effort": "high"})
+                        (run / "sol-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+                    receipts, unreadable = check.load_receipts(str(self.runs))
+                    self.assertEqual((len(receipts), unreadable), (2, 0))
+                    result = check.evaluate(receipts, now=NOW)
+                    self.assertEqual(result["lanes"]["sol"]["verdict"], "NO-DATA")      # the newest run failed
+                    self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_r3p7_a2_a_compact_offset_with_seconds_is_unreadable_too(self):
+        for text in ("2026-10-12T18:59:00.0000000-010000.0000009", "2026-10-12T18:59:00-010000",
+                     "2026-10-12T18:59:00+01:0000", "2026-10-12T18:59:00+01:00:00"):
+            with self.subTest(text):
+                self.assertIsNone(check.parse_utc(text))
+        self.setUp()
+        for name, stamp in (("fin", "2026-10-12T19:59:00.0000001Z"),
+                            ("fail", "2026-10-12T18:59:00.0000000-010000.0000009")):
+            run = self.runs / name
+            run.mkdir()
+            (run / "sol-001.receipt.json").write_text(json.dumps({
+                "lane": "sol", "state": "complete" if name == "fin" else "failed", "startedUtc": stamp,
+                "resolvedModel": "gpt-6.1-sol" if name == "fin" else None, "effort": "high"}), encoding="utf-8")
+        receipts, unreadable = check.load_receipts(str(self.runs))
+        self.assertEqual((len(receipts), unreadable), (1, 1))
+
+    def test_r3p7_the_sub_microsecond_digits_are_the_seconds_fraction_in_every_spelling(self):
+        for text, expected in (("20261012T195900.0000009Z", "9"), ("2026-W42-1T19:59:00.0000009Z", "9"),
+                               ("2026-10-12\n19:59:00.0000009Z", "9"), ("20261012T195900.1234567-0500", "7"),
+                               ("2026-10-12T19:59:00.1234567-05", "7"), ("2026-10-12T19:59:00.1234567-05:30", "7"),
+                               ("  2026-10-12T19:59:00,1234567Z\n", "7"), ("2026-10-12T19:59:00.1234567", "7"),
+                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", "9"),
+                               ("2026-10-12T19:59:00+01:00", ""), ("2026-10-12T19:59:00Z", ""), ("2026-10-12", "")):
+            with self.subTest(text=text):
+                self.assertEqual(check.sub_microsecond_digits(text), expected)
+
     def test_r3_a5_the_docstring_says_past_the_skew_bound(self):
         doc = check.__doc__
         self.assertIn("past the skew bound", doc)

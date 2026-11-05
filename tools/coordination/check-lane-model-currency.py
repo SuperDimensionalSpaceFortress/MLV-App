@@ -119,8 +119,11 @@ MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a rea
 # DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
 # digits only and matched against the raw, unstripped string with fullmatch, so a trailing newline or space is out.
 LIVE_START_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})")
-OFFSET_WITH_SECONDS_RE = re.compile(r"[+-][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
-SECONDS_FRACTION_RE = re.compile(r"\s*[0-9]{4}-[0-9]{2}-[0-9]{2}.[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}([0-9]+)")
+# A UTC offset that carries seconds, extended ('+01:00:00.5') or compact ('-010000.5'): not placeable to the microsecond.
+OFFSET_WITH_SECONDS_RE = re.compile(r"[+-][0-9]{2}:?[0-9]{2}:?[0-9]{2}(?:\.[0-9]+)?$")
+# Any trailing UTC designator or offset, with or without minutes or seconds; removed before the seconds fraction is read.
+OFFSET_TAIL_RE = re.compile(r"(?:[Zz]|[+-][0-9]{2}(?::?[0-9]{2}(?::?[0-9]{2}(?:\.[0-9]+)?)?)?)$")
+SECONDS_FRACTION_RE = re.compile(r"\.[0-9]{6}([0-9]+)$")
 MAX_TIMEOUT_SIGNIFICANT_DIGITS = 15  # a decimal this short survives the trip through a binary float unchanged
 MAX_TIMEOUT_EXPONENT = 30            # |decimal exponent of the leading digit|; keeps Fraction() cheap on a hostile token
 RECEIPT_GLOB = "*/*-001.receipt.json"
@@ -159,9 +162,14 @@ def normalize_fraction(text):
 def sub_microsecond_digits(text):
     """The digits of the SECONDS fraction past the sixth, trailing zeros removed ('' when there are none).
 
-    Anchored to the date and time of day, so a fraction inside a UTC offset can never be read as a fraction of a
-    second (adversary pass 6, A2: '...+01:00:00.0000001' used to put '0000001' into the sort key)."""
-    match = SECONDS_FRACTION_RE.match(normalize_fraction(str(text)))
+    Read from the END of the string after the UTC designator or offset is removed, so it holds for every date and
+    time spelling fromisoformat accepts (extended, basic, week date, any separator) and a fraction inside an offset
+    can never be mistaken for a fraction of a second (adversary passes 6 and 7: '...+01:00:00.0000001' and
+    '20261012T195900.0000009Z' each put the wrong digits, or none, into the sort key)."""
+    if not isinstance(text, str):
+        return ""
+    body = OFFSET_TAIL_RE.sub("", normalize_fraction(text.strip()), count=1)
+    match = SECONDS_FRACTION_RE.search(body)
     return match.group(1).rstrip("0") if match else ""
 
 
