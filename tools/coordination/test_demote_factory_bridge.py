@@ -6,7 +6,9 @@ whose SHA-256 is pinned by the actor.
 """
 
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -82,7 +84,8 @@ def run_gate(receipts_dir, board_root=None):
     return result
 
 
-def run_demotion(receipts_dir, repo_root, apply=False, board_root=None):
+def demotion_args(receipts_dir, repo_root, apply, board_root):
+    """The argv `run_demotion` hands to the actor. `board_root` must already be resolved."""
     args = [
         "pwsh",
         "-NoProfile",
@@ -98,7 +101,114 @@ def run_demotion(receipts_dir, repo_root, apply=False, board_root=None):
         args += ["-BoardRoot", str(board_root)]
     if apply:
         args += ["-Apply"]
-    return subprocess.run(args, text=True, capture_output=True)
+    return args
+
+
+def run_demotion(receipts_dir, repo_root, apply=False, board_root=None):
+    """Runs the actor. An apply-mode call without an explicit `board_root` gets a fresh,
+    EXISTING temporary one (distinct from `repo_root`): the actor's own default is the owner
+    path (`C:\\!Layi Wkspc\\MLV-App`) and -Apply runs `Resolve-Path` on it, so without this the
+    test passes only on a host where that path happens to exist and fails on a hosted runner
+    (CI-SHARD8-GUARDRAILS-COST-2-R2-RUN-BODY-SPLIT-1 r1: 10 failed, 34 passed). Preview calls
+    never resolve -BoardRoot and keep their old argv. A caller-supplied `board_root` is passed
+    through untouched, so the refusal and alias controls exercise exactly what they did."""
+    if apply and board_root is None:
+        with tempfile.TemporaryDirectory(prefix="demote-board-root-") as scratch_board:
+            return subprocess.run(
+                demotion_args(receipts_dir, repo_root, apply, scratch_board),
+                text=True,
+                capture_output=True,
+            )
+    return subprocess.run(
+        demotion_args(receipts_dir, repo_root, apply, board_root), text=True, capture_output=True
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# Hermeticity guard. The actor's default -BoardRoot is the owner path; an apply-mode call
+# that reaches the actor without an explicit, existing -BoardRoot distinct from -RepoRoot
+# silently depends on that path existing on the host. `apply_call_violation` is the rule;
+# the autouse fixture below applies it to every real actor invocation in this module.
+# ---------------------------------------------------------------------------------------
+
+# Tests that deliberately omit -BoardRoot or make it equal -RepoRoot, because the refusal is
+# the thing under test. They are named here, not exempted by pattern.
+DELIBERATE_BOARD_ROOT_CONTROLS = {
+    "test_explicit_repo_root_required_for_apply",  # refuses before -BoardRoot is read
+    "test_apply_refuses_repo_root_equal_to_board_root",  # -RepoRoot == -BoardRoot
+    "test_apply_refuses_dotdot_alias_of_board_root",  # -RepoRoot resolves to -BoardRoot
+}
+
+
+def _arg_after(args, flag):
+    return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+
+
+def apply_call_violation(args):
+    """Returns a reason string if `args` is an apply-mode actor call that is not hermetic,
+    else None. Calls that are not apply-mode actor calls are never violations."""
+    if str(SCRIPT) not in args or "-Apply" not in args:
+        return None
+    board_root = _arg_after(args, "-BoardRoot")
+    repo_root = _arg_after(args, "-RepoRoot")
+    if board_root is None:
+        return "apply-mode call has no -BoardRoot (the actor would fall back to the owner path)"
+    if not os.path.isdir(board_root):
+        return "apply-mode call -BoardRoot does not exist: %s" % board_root
+    if repo_root is not None and os.path.normcase(os.path.abspath(board_root)) == os.path.normcase(
+        os.path.abspath(repo_root)
+    ):
+        return "apply-mode call -BoardRoot equals -RepoRoot: %s" % board_root
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _apply_calls_are_hermetic(request, monkeypatch):
+    real_run = subprocess.run
+
+    def checked_run(args, *a, **kw):
+        if request.node.originalname not in DELIBERATE_BOARD_ROOT_CONTROLS:
+            reason = apply_call_violation([str(x) for x in args])
+            assert reason is None, "non-hermetic apply call in %s: %s" % (request.node.name, reason)
+        return real_run(args, *a, **kw)
+
+    monkeypatch.setattr(subprocess, "run", checked_run)
+
+
+def test_apply_calls_carry_an_isolated_existing_board_root(tmp_path, monkeypatch):
+    """Guard for the helper itself: run_demotion(apply=True) with no board_root must hand the
+    actor an existing -BoardRoot that is not -RepoRoot, and `apply_call_violation` must reject
+    each way of getting that wrong. The recorder replaces subprocess.run, so no actor runs."""
+    seen = []
+
+    def record(args, *a, **kw):
+        # Evaluated while the call is in flight: the temporary -BoardRoot is removed after.
+        args = [str(x) for x in args]
+        seen.append((args, apply_call_violation(args)))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", record)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_demotion(tmp_path, repo, apply=True)
+    run_demotion(tmp_path, repo, apply=False)
+    (apply_args, apply_violation), (preview_args, preview_violation) = seen
+    assert "-BoardRoot" in apply_args
+    assert apply_violation is None, apply_violation
+    assert preview_violation is None
+    assert "-BoardRoot" not in preview_args  # preview argv is unchanged
+
+    def call(board, apply=True):
+        args = [str(SCRIPT), "-RepoRoot", str(repo)]
+        if board is not None:
+            args += ["-BoardRoot", str(board)]
+        return args + (["-Apply"] if apply else [])
+
+    assert apply_call_violation(call(tmp_path)) is None
+    assert apply_call_violation(call(None)) is not None  # no -BoardRoot
+    assert apply_call_violation(call(tmp_path / "absent")) is not None  # does not exist
+    assert apply_call_violation(call(repo)) is not None  # equals -RepoRoot
+    assert apply_call_violation(call(None, apply=False)) is None  # preview is not apply-mode
 
 
 def assert_refused(result, expected_substring):
