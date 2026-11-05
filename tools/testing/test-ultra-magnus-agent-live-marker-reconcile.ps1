@@ -19,6 +19,7 @@ param(
 #         live-locked-then-withdrawn  sol pass-3 A1: locked through a live pass, then the result withdrawn: no exit-127 receipt, the marker is not orphaned
 #         live-locked-stale-tmp-then-withdrawn  the same with an old result tmp on disk: the tmp is not promoted
 #         completion-denied-then-withdrawn  the same class by the ordinary completion route: a retire denied as the job finished, then the result withdrawn
+#         retire-over-readonly-record  sol pass-4 A1: an older read-only processed\ record of the id does not keep a finished marker in running\ for good
 #   unit  the agent's real functions, lifted from its AST:
 #         inbox-job-left-alone       a job whose script is in inbox\ is the live set: no recovery runs, even with marker + result
 #         own-claim-retire-retried   this agent's own unlaunched claim whose retire failed stays quarantined, then clears
@@ -28,13 +29,14 @@ param(
 #         live-withdrawn-inside-complete  the result deleted inside Complete-StartedMarker, after the live re-check: nothing lands in the start-up quarantine
 #         live-quarantine-lifecycle  a live-origin entry is dropped when the marker went, the result went, or a script came back; retried and released otherwise
 #         live-path-no-startup-recovery  the live functions call no start-up recovery, and the flags that used to guard it are gone
+#         move-checked-readonly-destination  the helper every replacing rename shares: Overwrite replaces a read-only file; without Overwrite it still refuses
 # Prints one JSON object. Exit 0 = every row passed. Exit 1 = a row failed; the object says which (a RED run needs the rows, not the first throw).
 
 $ErrorActionPreference = 'Stop'
 # PowerShell variables are case-insensitive: assigning $agentScript below also assigns $AgentScript, so the override is captured first.
 $agentScriptOverridden = [bool]$AgentScript
 $agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
-$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move', 'live-reconcile-result-withdrawn', 'live-locked-then-withdrawn', 'live-locked-stale-tmp-then-withdrawn', 'completion-denied-then-withdrawn', 'live-withdrawn-stale-result-tmp', 'live-withdrawn-inside-complete', 'live-quarantine-lifecycle', 'live-path-no-startup-recovery')
+$caseNames = @('reader-denied-completion', 'incident-fixture', 'tmp-only-fixture', 'live-job-left-alone', 'no-result-left-alone', 'locked-marker-quarantined', 'inbox-job-left-alone', 'own-claim-retire-retried', 'completed-tmp-kept-on-failed-move', 'live-reconcile-result-withdrawn', 'live-locked-then-withdrawn', 'live-locked-stale-tmp-then-withdrawn', 'completion-denied-then-withdrawn', 'live-withdrawn-stale-result-tmp', 'live-withdrawn-inside-complete', 'live-quarantine-lifecycle', 'live-path-no-startup-recovery', 'retire-over-readonly-record', 'move-checked-readonly-destination')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Want([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -365,6 +367,26 @@ try {
         finally { Stop-Agent $c }
     }
 
+    # sol pass-4 A1: the base retired with Move-Item -Force, which replaces a read-only destination. A bare replacing rename is denied by one, so a reused id's older
+    # read-only record in processed\ would deny every retire and read GATE_BUSY for good.
+    Invoke-Row 'retire-over-readonly-record' {
+        $c = New-Case 'retire-over-readonly-record'
+        try {
+            Start-Agent $c
+            $job = 'readonly-record'
+            $record = Join-Path $c.processed "$job.started.completed.json"
+            Put-File $record '{"jobId":"readonly-record","status":"completed","fixture":"older record"}'
+            [IO.File]::SetAttributes($record, [IO.FileAttributes]::ReadOnly)
+            Put-File (Join-Path $c.running "$job.started.json") (New-MarkerJson $job)
+            Put-File (Join-Path $c.outbox "$job.result.json") (New-ResultJson $job)
+            Assert-True (Wait-Until { (Get-RunningCounted $c).Count -eq 0 } 12) "running\ empties past the read-only record: left [$((Get-RunningCounted $c) -join ',')]; $((Get-LogLines $c "job=$job") -join ' | ')"
+            $now = Get-Content -LiteralPath $record -Raw | ConvertFrom-Json
+            Assert-True ($null -eq $now.fixture -and $now.status -eq 'completed') "processed\ holds this retire's record: $($now | ConvertTo-Json -Compress)"
+            return 'retired'
+        }
+        finally { Stop-Agent $c }
+    }
+
     # ------------------------------------------------------------ unit: the agent's real functions, lifted from its AST
     $tokens = $null; $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($agentScript, [ref]$tokens, [ref]$parseErrors)
@@ -520,6 +542,26 @@ try {
             Assert-True (Test-Path -LiteralPath $markerPath) 'the marker is left as found'
             Assert-True (-not (Test-Path -LiteralPath $resultPath)) 'nothing republished a result'
             return 'left alone'
+        }
+    }
+
+    # The class behind pass-4 A1: every replacing rename goes through this helper (marker write, result publish, marker retire, tmp promotion).
+    if (-not (Skip-OnBase 'move-checked-readonly-destination')) {
+        Invoke-Row 'move-checked-readonly-destination' {
+            $c = New-Case 'move-checked-readonly-destination'
+            . ([scriptblock]::Create((Get-AgentFunction 'Move-FileChecked').Extent.Text))
+            $src = Join-Path $c.root 'src.json'; $dst = Join-Path $c.root 'dst.json'
+            Put-File $src 'NEW'; Put-File $dst 'OLD'
+            [IO.File]::SetAttributes($dst, [IO.FileAttributes]::ReadOnly)
+            $refused = Move-FileChecked -Source $src -Destination $dst -Overwrite $false -Attempts 1
+            Assert-True (-not $refused.ok) 'without Overwrite an existing file is refused'
+            Assert-True ([IO.File]::ReadAllText($dst) -eq 'OLD' -and [IO.File]::GetAttributes($dst).HasFlag([IO.FileAttributes]::ReadOnly)) 'and it is left exactly as found'
+            $replaced = Move-FileChecked -Source $src -Destination $dst -Overwrite $true -Attempts 1
+            Assert-True $replaced.ok "Overwrite replaces a read-only destination: $($replaced.error)"
+            Assert-True ([IO.File]::ReadAllText($dst) -eq 'NEW' -and -not (Test-Path -LiteralPath $src)) 'the new file is in place and the source is gone'
+            $missing = Move-FileChecked -Source (Join-Path $c.root 'absent.json') -Destination (Join-Path $c.root 'absent2.json') -Overwrite $true -Attempts 1
+            Assert-True (-not $missing.ok) 'a failed rename is still reported as failed'
+            return 'replaced'
         }
     }
 

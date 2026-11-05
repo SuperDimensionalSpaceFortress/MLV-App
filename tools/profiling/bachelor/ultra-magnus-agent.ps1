@@ -432,6 +432,12 @@ function Move-FileChecked {
     $lastError = $null
     for ($i = 1; $i -le $Attempts; $i++) {
         try {
+            # BACHELOR-AGENT-LIVE-MARKER-RECONCILE-1 (sol pass-4 A1): a replacing rename is denied by a read-only destination, which Move-Item -Force replaced. Clearing the bit
+            # first keeps the ONE rename: the destination stays in place until it lands, and if it never does, only its attribute changed.
+            if ($Overwrite -and [System.IO.File]::Exists($Destination)) {
+                $destAttributes = [System.IO.File]::GetAttributes($Destination)
+                if ($destAttributes.HasFlag([System.IO.FileAttributes]::ReadOnly)) { [System.IO.File]::SetAttributes($Destination, $destAttributes -bxor [System.IO.FileAttributes]::ReadOnly) }
+            }
             [System.IO.File]::Move($Source, $Destination, $Overwrite)
             return [pscustomobject]@{ ok = $true; attempts = $i; error = $null }
         }
