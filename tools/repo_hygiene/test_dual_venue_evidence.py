@@ -11687,12 +11687,16 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
     def test_an_uncapped_leg_that_ran_under_an_inherited_worker_override_is_not_a_valid_receipt(self) -> None:
         # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754; adversary A1 on 6ffe18f8): the validator re-derives the same INHERITED_WORKER_OVERRIDE the runner gates
         # on, so a receipt cannot carry a PASS for a control that ran at the venue's cap or forced count.
-        for variable in ("playback_max_threads", "force_threads", "force_singlethread", "disable_playback_thread_cap"):
+        # r4 (B1, B2 on 70d55f42): OMP_NUM_THREADS, whose value 1 is also what literal MLVAPP_FORCE_SINGLETHREAD=unset writes, and the prefetch decoder variables.
+        for variable in ("playback_max_threads", "force_threads", "force_singlethread", "disable_playback_thread_cap", "omp_num_threads", "raw_uint16_prefetch_decoders",
+                         "disable_raw_uint16_prefetch"):
             for env in ("12", "8"):
                 with self.subTest(variable=variable, inherited=env):
                     repo, receipt = self.uncapped_under(env, variable)
                     self.assertNotValid(receipt, repo, "INHERITED_WORKER_OVERRIDE", status="INVALID")
-        for variable in ("playback_max_threads", "force_threads"):
+        repo, receipt = self.uncapped_under("1", "omp_num_threads")
+        self.assertNotValid(receipt, repo, "OMP_NUM_THREADS=1", status="INVALID")
+        for variable in ("playback_max_threads", "force_threads", "omp_num_threads", "raw_uint16_prefetch_decoders", "disable_raw_uint16_prefetch"):
             repo, receipt = self.uncapped_under("unset", variable)
             self.assertAdvisory(receipt, repo)
 

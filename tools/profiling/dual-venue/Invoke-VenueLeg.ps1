@@ -967,7 +967,7 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $outcome = 'INVALID'
 }
 # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1, FAIL CLOSED: a leg that asks for a worker-thread cap of n counts only when the measured session's own worker count and the
-# job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
+# job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is INVALID only under an inherited thread-count variable.
 $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary
 if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
 if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {

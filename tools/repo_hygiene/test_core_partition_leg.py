@@ -3713,7 +3713,7 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
     def start_with(cls, workers: str, **env: str) -> str:
         # a start line whose env_<name>= fields say what the app saw of the venue's worker-count variables (every one not named is "unset")
         line = cls.start(workers, env="unset").replace(" env_force_threads=0", " env_force_threads=unset")
-        line += " env_force_singlethread=unset env_disable_playback_thread_cap=unset"
+        line += " env_force_singlethread=unset env_disable_playback_thread_cap=unset env_omp_num_threads=unset env_disable_raw_uint16_prefetch=unset env_raw_uint16_prefetch_decoders=unset"
         for key, value in env.items():
             marker = f" env_{key}=unset"
             assert marker in line, key
@@ -3721,7 +3721,95 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         return line
 
     WORKER_ENV = (("playback_max_threads", "MLVAPP_PLAYBACK_MAX_THREADS"), ("force_threads", "MLVAPP_FORCE_THREADS"),
-                  ("force_singlethread", "MLVAPP_FORCE_SINGLETHREAD"), ("disable_playback_thread_cap", "MLVAPP_DISABLE_PLAYBACK_THREAD_CAP"))
+                  ("force_singlethread", "MLVAPP_FORCE_SINGLETHREAD"), ("disable_playback_thread_cap", "MLVAPP_DISABLE_PLAYBACK_THREAD_CAP"),
+                  ("omp_num_threads", "OMP_NUM_THREADS"), ("disable_raw_uint16_prefetch", "MLVAPP_DISABLE_RAW_UINT16_PREFETCH"))
+
+    # The start lines of two recorded legs of this card, byte for byte (Bachelor, build 4f480f19): C dda2ea51, automatic at 16; T12 392add3b, capped at 12.
+    REAL_TAIL = ("env_disable_playback_thread_cap=unset env_playback_scale=1 env_hq_mean23=unset env_playback_smoke_telemetry=1 env_playback_scope_interval_ms=unset "
+                 "env_omp_num_threads=unset env_disable_raw_uint16_prefetch=unset env_disable_play_start_preroll=unset preview_mode=sharp_smooth env_aggressive_preview=0 "
+                 "env_preview_mode=sharp_smooth env_quality_mode=phase3_hq env_gpu_playback_recon=unset env_gpu_playback_recon_texture_present=unset auto_target_fps=30 "
+                 "auto_reason_start=warmup_hq env_raw_uint16_prefetch_decoders=unset")
+    REAL_HEAD = ("[2026-11-05T06:25:09.095Z] [INFO] [0x1373c] playback_smoke.start session=3 position=0 cut_in=1 cut_out=937 scale_request=1 quality_mode=4 worker_threads={workers} "
+                 "start_serial=6 frame_telemetry=1 drop_frame=1 audio=1 scopes=0 zebras=0 file_loaded=1 env_force_threads=unset env_force_singlethread=unset env_playback_max_threads={cap} ")
+    REAL_C = REAL_HEAD.format(workers=16, cap="unset") + REAL_TAIL
+    REAL_T12 = REAL_HEAD.format(workers=12, cap=12) + REAL_TAIL
+
+    def test_inherited_openmp_count_on_the_unchanged_control_is_refused(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r4 B1 (opus and fable on 70d55f42). Catalogue row: an unchanged control spec with venue OMP_NUM_THREADS=12 gives INVALID, never
+        # PASS. The worker count stays 16 (WorkerThreadCount.h does not read the variable), but libgomp starts at it and :93-94 keeps the smaller, so only the env field shows it.
+        for value in ("12", "1", "8"):
+            with self.subTest(inherited=value):
+                line = self.REAL_C.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")
+                v = self.verdict(self.UNCAPPED, self.log(line), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"], v["requested"], v["observed"], v["inheritedOverrides"]),
+                                 ("INHERITED_WORKER_OVERRIDE", True, None, 16, f"OMP_NUM_THREADS={value}"), v)
+
+    def test_literal_unset_singlethread_is_caught_by_the_openmp_field_it_writes(self) -> None:
+        # r4 B2 (sol, opus; the producer's OPEN A1). MLVAPP_FORCE_SINGLETHREAD=unset is true to envTruthy (ForceSingleThread.cpp:15-24), so :55 writes OMP_NUM_THREADS=1 at
+        # main.cpp:1868, before any session; the start line logs its own field as the same "unset" an absent variable gets (LogLineField.h:70) and env_omp_num_threads=1.
+        # The chain _putenv_s -> qEnvironmentVariable was executed on the toolchain's Qt6Core and msvcrt (r4 probe-qt-env.txt), inherited OMP_NUM_THREADS=12 included.
+        line = self.REAL_C.replace("env_omp_num_threads=unset", "env_omp_num_threads=1")
+        self.assertIn(" env_force_singlethread=unset ", line)
+        v = self.verdict(self.UNCAPPED, self.log(line), self.DONE)
+        self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, "OMP_NUM_THREADS=1"), v)
+        # the same value on a capped arm: its worker count honours the cap, and only this field shows OpenMP was forced
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", "env_omp_num_threads=1")), self.PROOF)
+        self.assertEqual((v["verdict"], v["blocks"], v["observed"], v["inheritedOverrides"]), ("NOT_HONOURED", True, 12, "OMP_NUM_THREADS=1"), v)
+        self.assertIn("INHERITED_WORKER_OVERRIDE", v["reason"])
+
+    def test_a_capped_arm_under_an_inherited_openmp_count_is_not_honoured(self) -> None:
+        # opus's T12 row: workers 12, OpenMP 8. Reading worker_threads alone, this read HONOURED.
+        for value in ("8", "12", "abc"):
+            with self.subTest(inherited=value):
+                v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")), self.PROOF)
+                self.assertEqual((v["verdict"], v["blocks"], v["observed"], v["inheritedOverrides"]), ("NOT_HONOURED", True, 12, f"OMP_NUM_THREADS={value}"), v)
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", "env_omp_num_threads=unset env_omp_num_threads=8")), self.PROOF)
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("more than once", v["reason"])
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_omp_num_threads=unset", "env_omp_num_threads=8")), {"result": "CPU_FALLBACK_DETECTED"})
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), "a failure terminal is no way around it")
+
+    def test_the_recorded_control_and_capped_arm_stay_clean(self) -> None:
+        control = self.verdict(self.UNCAPPED, self.log(self.REAL_C), self.DONE)
+        self.assertEqual((control["verdict"], control["blocks"], control["observed"], control["inheritedOverrides"]), ("NOT_REQUESTED", False, None, None), control)
+        arm = self.verdict(self.CAPPED, self.log(self.REAL_T12), self.PROOF)
+        self.assertEqual((arm["verdict"], arm["blocks"], arm["observed"], arm["inheritedOverrides"]), ("HONOURED", False, 12, None), arm)
+        # OMP_NUM_THREADS=0 and =unset: libgomp refuses both and keeps its default (executed, r4 probe-libgomp.txt)
+        for value in ("0", "unset"):
+            with self.subTest(omp=value):
+                line = self.REAL_C.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")
+                self.assertEqual(self.verdict(self.UNCAPPED, self.log(line), self.DONE)["verdict"], "NOT_REQUESTED")
+                line = self.REAL_T12.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")
+                self.assertEqual(self.verdict(self.CAPPED, self.log(line), self.PROOF)["verdict"], "HONOURED")
+
+    def test_the_prefetch_decoder_count_must_be_the_one_the_spec_names(self) -> None:
+        # r4 class census: the third thread count on the start line. The job passes -PreserveExperimentalEnvironment (playback-attr-3-cuda-job.ps1:3001), so the smoke runner's
+        # clear does not apply and an inherited value reaches the app. 0 is NOT inert here: video_mlv.c:1356 reads it as one decoder.
+        dec = "raw_uint16_prefetch_decoders"
+        off = "disable_raw_uint16_prefetch"
+        name = "MLVAPP_RAW_UINT16_PREFETCH_DECODERS"
+        one = {"generatorArgs": {"rawPrefetchDecoders": 1}}
+        none = {"generatorArgs": {"rawPrefetchDecoders": 0}}
+        refused = ((self.UNCAPPED, {dec: "1"}, f"{name}=1"), (self.UNCAPPED, {dec: "0"}, f"{name}=0"), (self.UNCAPPED, {dec: "4"}, f"{name}=4"),
+                   (self.UNCAPPED, {off: "1"}, "MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1"),
+                   (one, {dec: "2"}, f"{name}=2"), (one, {}, f"{name}=unset"), (one, {dec: "1", off: "1"}, "MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1"),
+                   (none, {}, "MLVAPP_DISABLE_RAW_UINT16_PREFETCH=unset"), (none, {off: "1", dec: "2"}, f"{name}=2"))
+        for spec, env, expected in refused:
+            with self.subTest(spec=spec, env=env):
+                v = self.verdict(spec, self.log(self.start_with("16", **env)), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("INHERITED_WORKER_OVERRIDE", True, expected), v)
+        for spec, env in ((self.UNCAPPED, {}), (self.UNCAPPED, {off: "0"}), (one, {dec: "1"}), (one, {dec: "1", off: "0"}), (none, {off: "1"})):
+            with self.subTest(spec=spec, env=env):
+                v = self.verdict(spec, self.log(self.start_with("16", **env)), self.DONE)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), v)
+        # a build before the fields is not refused, and a capped arm is held to the same rule
+        self.assertEqual(self.verdict(one, self.log(self.start("16")), self.DONE)["verdict"], "NOT_REQUESTED")
+        v = self.verdict(self.CAPPED, self.log(self.REAL_T12.replace("env_raw_uint16_prefetch_decoders=unset", "env_raw_uint16_prefetch_decoders=1")), self.PROOF)
+        self.assertEqual((v["verdict"], v["blocks"], v["inheritedOverrides"]), ("NOT_HONOURED", True, f"{name}=1"), v)
+        for key in (dec, off):
+            v = self.verdict(self.UNCAPPED, self.log(self.start_with("16") + f" env_{key}=unset"), self.DONE)
+            self.assertEqual((v["verdict"], v["blocks"]), ("INHERITED_WORKER_OVERRIDE", True), v)
+            self.assertIn("more than once", v["reason"])
 
     def test_an_inherited_worker_override_on_a_leg_that_names_no_cap_blocks(self) -> None:
         # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754; adversary A1 on 6ffe18f8): a venue MLVAPP_PLAYBACK_MAX_THREADS=12 caps the control exactly as the T12
@@ -3863,6 +3951,21 @@ class PlaybackMaxThreadsRunnerTests(RunnerHarness, unittest.TestCase):
                 self.assertIn(f"MLVAPP_PLAYBACK_MAX_THREADS={env}", receipt["outcomeDetail"])
                 self.assertNotIn("workerThreads", receipt, "the block exists only for a leg whose spec names a cap")
         receipt = self.leg({"playbackMaxThreads": 12}, "mt-capped-with-env", "12", self.PROOF, env="12")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+
+    def test_the_openmp_count_gates_the_runner_too(self) -> None:
+        # r4 B1 and B2 through Invoke-VenueLeg:973-975: PASS becomes a typed INVALID naming the variable. The literal-unset input is the row whose own field reads "unset".
+        evidence = PlaybackWorkerThreadsEvidenceTests
+        for name, value in (("omp12", "12"), ("omp1", "1")):
+            with self.subTest(case=name):
+                self.write_artifacts(summary=None, extra_log_lines=[evidence.REAL_C.replace("env_omp_num_threads=unset", f"env_omp_num_threads={value}")])
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with(None, f"mt-{name}"), extra=["-Backend", "cpu"])
+                self.assertIsNotNone(receipt, proc.stdout[-2000:] + proc.stderr[-2000:])
+                self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+                self.assertIn("INHERITED_WORKER_OVERRIDE", receipt["outcomeDetail"])
+                self.assertIn(f"OMP_NUM_THREADS={value}", receipt["outcomeDetail"])
+        self.write_artifacts(summary=None, extra_log_lines=[evidence.REAL_C])
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with(None, "mt-real-c"), extra=["-Backend", "cpu"])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
 
 
