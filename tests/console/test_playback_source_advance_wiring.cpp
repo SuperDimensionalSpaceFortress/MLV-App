@@ -62,6 +62,8 @@ TEST(PlaybackSourceAdvanceWiring, TheTrackerReadsTheFramesOwnStampNotAnEngineRec
     const int call = body.indexOf(QStringLiteral("presentationLoopWraps( m_playbackWrapRecorder.engineWraps,"));
     ASSERT_TRUE(call >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("requestContext.engineWrapsAtRequest,"), call) > call);
+    // and a landing is credited the cut width each wrap had when the engine made it, not the cut range as it stands now
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,"), call) > call);
     ASSERT_FALSE(readRepoFile(QStringLiteral("platform/qt/MainWindow.h")).contains(QStringLiteral("m_playbackEngineRequest")));
 }
 
@@ -70,10 +72,10 @@ TEST(PlaybackSourceAdvanceWiring, AnEngineWrapIsNotedBeforeTheFrameItLandsOnIsRe
 {
     const QString body = functionBody(readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp")),
                                       QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
-    const int loopWrap = body.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap();"));
+    const int loopWrap = body.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );"));
     ASSERT_TRUE(loopWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"), loopWrap) > loopWrap);
-    const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap();"));
+    const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );"));
     ASSERT_TRUE(dropWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( m_newPosDropMode );"), dropWrap) > dropWrap);
     // playbackHandling only moves the target; the request and its stamp come after it, in drawFrame

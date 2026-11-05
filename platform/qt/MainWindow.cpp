@@ -12069,7 +12069,7 @@ void MainWindow::playbackHandling(int timeDiff)
                     : clampedCutInFrame;
                 //Loop, goto cut in
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred.
-                m_playbackWrapRecorder.noteEngineWrap();
+                m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );
                 m_sourceAdvance.noteEngineTick( ui->horizontalSliderPosition->value(), cutInFrame, true );
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
@@ -12144,7 +12144,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 // still advance the timeline; a wrap never counts).
                 m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens.
-                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap();
+                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );
                 //Sync audio
                 if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {
@@ -26380,6 +26380,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // credited one cut width per wrap it crossed.
     // r20 (adversary A1 and A2 on dbeb9424): direction decides nothing, and a presented lookahead carries the stamp
     // drawFrameReady gave it at its target check (presentationAcceptedLookaheadStamp).
+    const int sourceAdvanceWrapsBefore = m_playbackSmokeTrackerEngineWraps;
     const int sourceAdvanceWraps = presentationLoopWraps( m_playbackWrapRecorder.engineWraps,
                                                           requestContext.engineWrapsAtRequest,
                                                           m_playbackSmokeTrackerEngineWraps,
@@ -26387,8 +26388,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokeSourceAdvance.notePresented( now,
                                                 static_cast<int>( displayFrame ),
                                                 sourceAdvanceWraps,
-                                                ui->spinBoxCutIn->value() - 1,
-                                                ui->spinBoxCutOut->value() - 1 );
+                                                m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,
+                                                                                         sourceAdvanceWraps ) );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
     if( m_playbackWrapRecorder.replayCount() > 0 ) m_playbackSmokeWrapped = true;
 

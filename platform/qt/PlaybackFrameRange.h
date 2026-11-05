@@ -336,11 +336,23 @@ inline bool isContactSheetLoopWrapTransition(
 struct PlaybackWrapRecorder
 {
     int engineWraps = 0;
+    // HFR-NATIVE-60FPS-FULLRES-1 r20 (adversary A1 on ce603f37): each engine wrap's cut width when it was made. The cut can
+    // change before the wrap's landing is presented (cut 1..8, 7 -> wrap -> 0, Cut Out 16 first), so the landing cannot
+    // read the current one: 0 + 16 - 7 = 9 credited where the loop it crossed makes 0 + 8 - 7 = 1.
+    std::vector<int> engineWrapWidths;
     int jumpToFirstCount = 0;
     int restartCount = 0;
     bool inferredWrap = false;
 
-    void noteEngineWrap() { ++engineWraps; }
+    void noteEngineWrap( int cutWidth = 0 ) { ++engineWraps; engineWrapWidths.push_back( cutWidth ); }
+    // The total cut width of `count` wraps from wrap number `firstWrap` (0-based, as engineWraps counts them).
+    int64_t engineWrapsWidth( int firstWrap, int count ) const
+    {
+        int64_t width = 0;
+        for( int i = firstWrap; i < firstWrap + count && i < static_cast<int>( engineWrapWidths.size() ); ++i )
+            width += engineWrapWidths[static_cast<size_t>( i )];
+        return width;
+    }
     void noteJumpToFirst() { ++jumpToFirstCount; }
     void noteRestart() { ++restartCount; }
     void noteInferredWrap() { inferredWrap = true; }

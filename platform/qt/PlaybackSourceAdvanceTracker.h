@@ -32,6 +32,14 @@ public:
     void notePresented( double nowSeconds, int frame, int wrapsCrossed,
                         int cutInIndex, int cutOutIndex )
     {
+        const int64_t width = static_cast<int64_t>( cutOutIndex ) - cutInIndex + 1;
+        notePresented( nowSeconds, frame, wrapsCrossed, width * wrapsCrossed );
+    }
+
+    /*! r20 (adversary A1 on ce603f37): the same, with the total cut width of the wraps crossed as each had it when the
+     *  engine made it (PlaybackWrapRecorder::engineWrapsWidth), not the cut range as it stands at this presentation. */
+    void notePresented( double nowSeconds, int frame, int wrapsCrossed, int64_t wrapsCrossedWidth )
+    {
         if( m_presented == 0 )
         {
             m_firstTime = nowSeconds;
@@ -39,8 +47,7 @@ public:
         else if( wrapsCrossed > 0 )
         {
             m_wraps += static_cast<uint64_t>( wrapsCrossed );
-            const int64_t width = static_cast<int64_t>( cutOutIndex ) - cutInIndex + 1;
-            const int64_t distance = frame + width * wrapsCrossed - m_lastFrame;
+            const int64_t distance = frame + wrapsCrossedWidth - m_lastFrame;
             if( distance > 0 ) m_advanced += distance;
         }
         else if( frame > m_lastFrame )

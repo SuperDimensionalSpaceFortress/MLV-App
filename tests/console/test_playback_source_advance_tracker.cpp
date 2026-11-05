@@ -633,3 +633,36 @@ TEST(PlaybackSourceAdvanceTracker, R20AdversaryA2ABackwardFrameStampedBeforeAWra
     ASSERT_EQ(1u, s.tracker.wraps());
     ASSERT_EQ(3 + 4, static_cast<int>(s.tracker.advancedFrames()));
 }
+
+// r20 (adversary A1 on ce603f37): Loop on, drop-frame off, cut 1..8 (0..7). 7 is presented, the engine wraps and requests 0, and Cut
+// Out moves to 16 before 0 presents. MainWindow passed the current width, so the landing was credited 0 + 16 - 7 = 9, inflating source
+// advance and source fps. The recorder keeps each wrap's width from when the engine made it: 0 + 8 - 7 = 1.
+TEST(PlaybackSourceAdvanceTracker, R20AdversaryA1AWrapIsCreditedTheCutWidthItHadWhenTheEngineMadeIt)
+{
+    playback_frame_range::PlaybackWrapRecorder wraps;
+    PlaybackSourceAdvanceTracker t;
+    int consumed = wraps.engineWraps;
+    t.notePresented(1.000, 7, 0, 0, 7);
+    wraps.noteEngineWrap(8);
+    const int stamp = wraps.engineWraps;      // the request for 0; Cut Out then becomes 16, and no later wrap has happened
+    int before = consumed;
+    int crossed = presentationLoopWraps(wraps.engineWraps, stamp, consumed, true);
+    t.notePresented(1.050, 0, crossed, wraps.engineWrapsWidth(before, crossed));
+    ASSERT_EQ(1, crossed);
+    ASSERT_EQ(1, static_cast<int>(t.advancedFrames()));
+    ASSERT_EQ(1u, t.wraps());
+    ASSERT_EQ(0, t.maxJump());
+    // two wraps crossed at once, one before and one after the change: 0 -> (8) -> (16) -> 3 = 3 + 8 + 16 - 0 = 27 more
+    wraps.noteEngineWrap(8);
+    wraps.noteEngineWrap(16);
+    before = consumed;
+    crossed = presentationLoopWraps(wraps.engineWraps, wraps.engineWraps, consumed, true);
+    t.notePresented(1.100, 3, crossed, wraps.engineWrapsWidth(before, crossed));
+    ASSERT_EQ(2, crossed);
+    ASSERT_EQ(28, static_cast<int>(t.advancedFrames()));
+    ASSERT_EQ(3u, t.wraps());
+    // the width lookup: nothing crossed, or nothing recorded for a wrap number, is no width
+    ASSERT_EQ(int64_t(0), wraps.engineWrapsWidth(1, 0));
+    ASSERT_EQ(int64_t(16), wraps.engineWrapsWidth(2, 5));
+    ASSERT_EQ(int64_t(0), wraps.engineWrapsWidth(9, 2));
+}

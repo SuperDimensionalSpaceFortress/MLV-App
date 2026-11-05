@@ -7145,6 +7145,16 @@ class LegSpecSchemaTests(unittest.TestCase):
             base["generatorArgs"].pop("telemetryArm")
             self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
 
+    def test_every_leg_on_the_59_94_fps_clips_names_its_conform_arm(self) -> None:
+        """HFR-NATIVE-60FPS-FULLRES-1 r20 (adversary A2 on ce603f37): this PR makes conform the app's default above 30 fps, so a leg on a 59.94 fps clip that
+        names no arm (generatorArgs.playbackConform) silently plays at 24 fps. Get-DvConformArmVerdict has nothing to check, the conform pace rule passes it, and
+        a leg called native reports a 24 fps run as its evidence. So every such leg names its arm: 'on' for a conform leg, 'off' for every other one."""
+        legs = sorted((DV / "legs").glob("m16-145[67]-*.json"))
+        self.assertGreater(len(legs), 20)
+        for path in legs:
+            leg = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(leg["generatorArgs"].get("playbackConform"), "on" if "-conform-" in path.name else "off", path.name)
+
     def test_each_hfr_conform_leg_is_its_display_cell_on_the_hfr_clip_on_cuda(self) -> None:
         """PLAYBACK-HFR-CONFORM-DEFAULT-1: a conform leg is its scale-1 display-matrix cell with only the legId, card, clip and backends (cuda) changed, so its
         numbers compare with the matrix cell's; the leg set names exactly these legs and the card's roles are declared.

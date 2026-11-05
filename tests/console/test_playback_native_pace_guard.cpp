@@ -830,7 +830,7 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     // the loop wrap to cut-in (either mode) spends a whole frame BEFORE it is counted or moves the slider
     const int wrapGate = handling.indexOf(QStringLiteral(
         "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;"));
-    const int wrapCounted = handling.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap();"));
+    const int wrapCounted = handling.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap("));
     const int wrapMove = handling.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
     const int loopBranch = handling.indexOf(QStringLiteral("if( ui->actionLoop->isChecked() )"));
     ASSERT_TRUE(loopBranch >= 0);

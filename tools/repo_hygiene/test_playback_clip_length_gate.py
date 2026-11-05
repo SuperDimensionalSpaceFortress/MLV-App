@@ -1665,7 +1665,7 @@ class AppOptionClassTests(unittest.TestCase):
         text = MAIN_WINDOW.read_text(encoding="utf-8")
         handling = text[text.index("void MainWindow::playbackHandling(int timeDiff)"):]
         handling = handling[:handling.index("void MainWindow::showPerformanceProfilingDialog")]
-        self.assertGreaterEqual(handling.count("m_playbackWrapRecorder.noteEngineWrap()"), 2, handling[:200])
+        self.assertGreaterEqual(handling.count("m_playbackWrapRecorder.noteEngineWrap("), 2, handling[:200])
         # ... and the summary/gate lines print the recorder (engine count + heuristic), not the flag.
         self.assertEqual(text.count(".arg( bool01( m_playbackWrapRecorder.wrapped() ) )"), 2)
         # ENFORCE-2: wrap_count is engine wraps + jump-to-first + restarts (a replay of any kind), with the
