@@ -11,7 +11,11 @@ param(
     [switch]$UnitOnly,
     [string[]]$Only = @(),
     # Overrides the agent under test (the RED run points this at a copy of the base agent).
-    [string]$AgentScript = ''
+    [string]$AgentScript = '',
+    # Wall-clock bounds of the two sub-suites -UnitOnly runs (measured 272 s and 48 s); a suite past its bound fails by name.
+    # The range is refused at binding, before any child exists: -1 or 2147484 would otherwise throw in WaitForExit after the launch.
+    [ValidateRange(1, 3600)][int]$QuietLeaseBoundSec = 400,
+    [ValidateRange(1, 3600)][int]$StageExemptBoundSec = 120
 )
 
 # AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c: the Bachelor agent's heavy-slot gate
@@ -478,15 +482,527 @@ $results.unit = $unit
 
 # BACHELOR-AGENT-QUIET-LEASE-1: the quiet-lease cases (lease mode, the default) run in their own process against a fake
 # heavy-slot.py, so this script's status-mode mocks never meet them. A failure there fails this run.
+# CI-FLAKE-HEAVY-SLOT-GATE-UNIT-HOSTED-HANG-1: each sub-suite runs under a wall-clock bound, so a hung one fails by name (and its
+# whole process tree is killed) instead of running to the CI job cap. Measured 272 s (quiet-lease) and 48 s (stage-exempt) locally.
+# BEGIN bounded capture io (sol r6 B1/B2, adversary r6 A2). After the child is launched EVERY step before the named verdict (the capture
+# open, the read, the completed suite's JSON and the final removal) runs on a pool thread under its own bound; a step that overruns is
+# ABANDONED and named in the verdict, never awaited. Only plain .NET runs on those threads (a PowerShell scriptblock needs a runspace).
+# The worst case after the wait and the kill is 2 x $ReadBoundMs + $CaptureCleanupBoundMs; a Python pin sums it into the outer guard.
+# adversary r14 A1: this region must be SELF-CONTAINED (every test dot-sources only it), so the quoting function it and Invoke-BoundedSuite
+# both call lives inside it; a Python pin fails if the region calls any function the script defines outside it.
+function ConvertTo-CommandLineArg([string]$Value) {
+    # Start-Process joins -ArgumentList with spaces and quotes nothing, so each value is quoted by the Windows rules: backslashes
+    # before a quote (and before the closing quote) are doubled, or a RepoRoot ending in "\" escapes its closing quote (adversary r4 A1).
+    '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+}
+$ReadBoundMs = 10000
+$CaptureCleanupBoundMs = 10000
+$CaptureIoMaxMs = 60000
+function Initialize-BoundedCaptureIo {
+    if ('BoundedCaptureIo' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+    using System;
+    using System.Diagnostics;
+    using System.IO;
+    using System.Threading.Tasks;
+    public static class BoundedCaptureIo {
+        public static Task<string> ReadAllText(string path) { return Task.Run(() => File.ReadAllText(path)); }
+        // null when the file is not there (a capture worker that ended without writing its answer).
+        public static Task<string> ReadIfPresent(string path) { return Task.Run(() => File.Exists(path) ? File.ReadAllText(path) : null); }
+        // Writes a temporary file and renames it, so a reader that polls for the path never sees half of it.
+        public static Task WriteAtomic(string path, string text) {
+            return Task.Run(() => { File.WriteAllText(path + ".tmp", text); File.Move(path + ".tmp", path); });
+        }
+        // sol r12 B1: ends a capture worker and the descendants still visible in its process tree. '' when the kill call returned; otherwise what it raised.
+        // adversary r13 A3: called even when the worker itself has ended. On Windows the held process handle still lets Kill(true) find the
+        // processes it left behind (by parent id and start time); on POSIX an ended worker's orphans are reparented, so KillGroup below ends those that stayed in the worker's group (one that left it is out of reach).
+        public static Task<string> KillTree(Process process) {
+            return Task.Run(() => { try { process.Kill(true); return ""; } catch (Exception e) { return e.GetType().Name + ": " + e.Message; } });
+        }
+        // adversary r13 pass-2 A2 (Windows): Kill(true) walks CURRENT parent links, so a process whose parent already ended (a factory that ran
+        // an intermediate which started a sleeper and exited) is out of its reach. A job object holds the worker and every process started
+        // under it whatever its parent chain, and TerminateJobObject ends them all. The worker is placed in the job before it is handed a factory.
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+        public sealed class WorkerJob { public IntPtr Handle = IntPtr.Zero; public string Error = ""; }
+        public static WorkerJob JoinNewJob(Process process) {
+            var job = new WorkerJob();
+            try {
+                job.Handle = CreateJobObjectW(IntPtr.Zero, null);
+                if (job.Handle == IntPtr.Zero) { job.Error = "CreateJobObject failed with error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error(); return job; }
+                if (!AssignProcessToJobObject(job.Handle, process.Handle)) {
+                    job.Error = "AssignProcessToJobObject failed with error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    CloseHandle(job.Handle); job.Handle = IntPtr.Zero;
+                }
+            }
+            catch (Exception e) { job.Error = e.GetType().Name + ": " + e.Message; }
+            return job;
+        }
+        // '' when every process of the job was terminated (or there is no job); otherwise the error. The job handle is closed either way.
+        public static Task<string> KillJob(WorkerJob job) {
+            return Task.Run(() => {
+                try {
+                    if (job == null || job.Handle == IntPtr.Zero) { return ""; }
+                    string result = TerminateJobObject(job.Handle, 1) ? "" : "TerminateJobObject failed with error " + System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    CloseHandle(job.Handle); job.Handle = IntPtr.Zero;
+                    return result;
+                }
+                catch (Exception e) { return e.GetType().Name + ": " + e.Message; }
+            });
+        }
+        [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+        private static extern int kill(int pid, int sig);
+        // POSIX only (a worker launched by setsid leads its own process group): SIGKILL to the whole group. '' when it was sent or the group is
+        // already empty (ESRCH); otherwise the errno or what the call raised.
+        public static Task<string> KillGroup(int groupId) {
+            return Task.Run(() => {
+                try {
+                    if (kill(-groupId, 9) == 0) { return ""; }
+                    int errno = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    return errno == 3 ? "" : "kill(-" + groupId + ", SIGKILL) failed with errno " + errno;
+                }
+                catch (Exception e) { return e.GetType().Name + ": " + e.Message; }
+            });
+        }
+        // '' only when the directory is confirmed gone (the same rule as Delete below).
+        public static Task<string> DeleteDirectory(string dir) {
+            return Task.Run(() => {
+                try { Directory.Delete(dir, true); } catch (Exception) { }
+                try { File.GetAttributes(dir); return "still present: " + dir; }
+                catch (FileNotFoundException) { return ""; }
+                catch (DirectoryNotFoundException) { return ""; }
+                catch (Exception e) { return "removal not confirmed: " + dir + " (" + e.GetType().Name + ": " + e.Message + ")"; }
+            });
+        }
+        // Returns '' only when EVERY path is confirmed gone. File.Exists / Directory.Exists answer false on ANY error (an access-denied
+        // query included), so a denied delete plus a denied query read as a clean removal (sol r8 B2). GetAttributes is the probe instead:
+        // only "file not found" / "directory not found" proves a path is gone; any other error leaves that path unconfirmed.
+        public static Task<string> Delete(string[] paths) {
+            return Task.Run(() => {
+                var present = new System.Collections.Generic.List<string>();
+                var unconfirmed = new System.Collections.Generic.List<string>();
+                foreach (string p in paths) {
+                    try { File.Delete(p); } catch (Exception) { }
+                    try { File.GetAttributes(p); present.Add(p); }
+                    catch (FileNotFoundException) { }
+                    catch (DirectoryNotFoundException) { }
+                    catch (Exception e) { unconfirmed.Add(p + " (" + e.GetType().Name + ": " + e.Message + ")"); }
+                }
+                var parts = new System.Collections.Generic.List<string>();
+                if (present.Count > 0) { parts.Add("still present: " + string.Join(", ", present)); }
+                if (unconfirmed.Count > 0) { parts.Add("removal not confirmed: " + string.Join(", ", unconfirmed)); }
+                return string.Join("; ", parts);
+            });
+        }
+    }
+'@
+}
+function Assert-CaptureIoBound([string]$What, [int]$BoundMs) {
+    # A bound that is below 1 (-1 is an infinite wait to Task.Wait) or above the cap is refused before anything is opened.
+    if ($BoundMs -lt 1 -or $BoundMs -gt $CaptureIoMaxMs) { throw "FAIL: $What bound $BoundMs ms is outside 1..$CaptureIoMaxMs ms; nothing was opened" }
+}
+# sol r11 B2: ONE deadline for the whole step. The factory, the wait for its task AND the conversion of the task's result all count.
+# sol r12 B1: they run in a CHILD pwsh process (the capture worker), never in this process. A thread cannot be killed on .NET, and an
+# in-process runspace stuck in Thread.Sleep(Infinite) or an endless ToString blocked ordinary pwsh shutdown forever (shutdown disposes every
+# open runspace and stops its pipeline). A process can be killed: on expiry the worker's whole process tree is killed and reaped under
+# their own bounds BEFORE the helper returns, so no part of the step keeps running in this process.
+# WHAT TEARDOWN REACHES (r15, the narrowed contract; the earlier promise that no descendant outlives a step was false): on Windows the worker's job
+# object, which holds the worker and the processes started under it; on POSIX the recorded process group (the worker leads its own, via
+# setsid) plus the descendants still visible in the worker's tree. A factory child that starts its own session or group (setsid) is
+# OUTSIDE this contract and may survive teardown, and the reader does not detect that.
+# PID OWNERSHIP IS A STATED LIMITATION, NOT A GUARANTEE (r16): on POSIX the group is signalled by number, after a separate identity check. The
+# identity check and the group signal are two steps, so a number reused by an unrelated leader between them can still be signalled. That
+# window has not been measured, and nothing here closes it (no pidfd, no group handle).
+# Every accepted -Start input therefore ends one of five ways, each of which lets this process end on its own:
+#   the task completes inside the bound         -> the worker writes its answer and ends; the step succeeds
+#   the factory or the conversion throws       -> the worker writes the innermost message and ends; the step fails by that name
+#   the factory hands back anything but 1 Task -> the same named failure ("exactly one Task")
+#   the task is pending, or the factory or the conversion never returns -> the deadline passes, the tree is killed: a named timeout
+#   the worker cannot start or ends with no answer -> a named failure; the tree is killed if it is still there
+# The accepted -Start input is SELF-CONTAINED script text: it runs in a fresh process, so a variable, function or Add-Type type of the
+# calling process is not visible there (the step fails by name instead). The worker's start-up (a new pwsh) happens BEFORE the step's clock
+# starts, and its teardown after the verdict is decided; both are bounded by the constants below and only a -Start seam has a worker
+# (the default open/delete is plain .NET in this process).
+$CaptureWorkerStartMs = 30000
+$CaptureWorkerKillMs = 5000
+$CaptureWorkerReapMs = 5000
+# adversary r13 A1/A2: the request and the answer cross the process boundary LOSSLESSLY. Every string travels as the base64 of its raw UTF-16
+# code units, so nothing is reinterpreted on the way (JSON had turned an ISO date string into a DateTime), $null stays distinct from '', and
+# the argument keeps its shape (a one-element or empty string[] stays a string[]; a scalar stays a scalar). The same text defines these
+# functions here and at the top of the worker's script.
+$CaptureWireText = @'
+function ConvertTo-CaptureWire($Value) {
+    if ($null -eq $Value) { return '-' }
+    $s = [string]$Value
+    $b = [byte[]]::new($s.Length * 2)
+    [Buffer]::BlockCopy($s.ToCharArray(), 0, $b, 0, $b.Length)
+    return '+' + [Convert]::ToBase64String($b)
+}
+function ConvertFrom-CaptureWire([string]$Wire) {
+    if ($Wire -ceq '-') { return $null }
+    if (-not $Wire.StartsWith('+')) { throw 'malformed capture worker field' }
+    $b = [Convert]::FromBase64String($Wire.Substring(1))
+    $c = [char[]]::new([int]($b.Length / 2))
+    [Buffer]::BlockCopy($b, 0, $c, 0, $b.Length)
+    return [string]::new($c)
+}
+'@ + "`n"
+. ([scriptblock]::Create($CaptureWireText))
+$CaptureWorkerScript = $CaptureWireText + @'
+# The capture worker: one -Start factory, run in its own process so its caller's deadline can end it.
+$ErrorActionPreference = 'Stop'   # a statement-terminating error in the factory fails the step by name instead of letting it carry on
+$answerPath = Join-Path $PSScriptRoot 'answer.txt'
+function Write-WorkerAnswer([string]$Kind, $Value) {
+    $tmp = $answerPath + '.tmp'
+    [IO.File]::WriteAllText($tmp, $Kind + "`n" + (ConvertTo-CaptureWire $Value))
+    [IO.File]::Move($tmp, $answerPath)
+}
+try {
+    # Start-up, before 'ready': the first use of each of these costs a cold process far more than a later one, and is not the step's.
+    $null = ConvertFrom-CaptureWire (ConvertTo-CaptureWire 'x')
+    $null = @(& ([scriptblock]::Create('param($x) [Threading.Tasks.Task]::FromResult([string]$x)')) 'x')[0].Wait(0)
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'ready'), '')
+    $goPath = Join-Path $PSScriptRoot 'go'
+    while (-not [IO.File]::Exists($goPath)) { [Threading.Thread]::Sleep(1) }
+    # The request: wait ms, factory, result function, argument kind, argument count, then one field per argument.
+    $req = [IO.File]::ReadAllText($goPath).Split("`n")
+    $count = [int]$req[4]
+    if ($req.Count -ne 5 + $count) { throw 'malformed capture worker request' }
+    if ($req[3] -ceq 'scalar' -and $count -eq 1) { $argument = ConvertFrom-CaptureWire $req[5] }
+    elseif ($req[3] -ceq 'array') {
+        $argument = [string[]]::new($count)
+        # SetValue, not an indexed assignment: PowerShell turns a $null assigned into a string[] into '' (adversary r13 pass-2 A1).
+        for ($i = 0; $i -lt $count; $i++) { $argument.SetValue((ConvertFrom-CaptureWire $req[5 + $i]), $i) }
+    }
+    else { throw 'malformed capture worker request' }
+    . ([scriptblock]::Create("function Get-CaptureTaskResult {$(ConvertFrom-CaptureWire $req[2])}"))
+    $made = @(& ([scriptblock]::Create((ConvertFrom-CaptureWire $req[1]))) $argument)
+    if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
+    if (-not $made[0].Wait([int]$req[0])) { Write-WorkerAnswer 'pending' $null }
+    else { Write-WorkerAnswer 'done' ([string](Get-CaptureTaskResult $made[0])) }
+}
+catch {
+    $e = $_.Exception
+    while ($null -ne $e.InnerException) { $e = $e.InnerException }
+    Write-WorkerAnswer 'error' ([string]$e.Message)
+}
+'@
+function Get-CaptureWorkerExitText($Worker) {
+    try { if ($Worker.Process.HasExited) { return "exit code $($Worker.Process.ExitCode)" } } catch { }
+    return 'exit code unknown'
+}
+function Get-CaptureGroupIdentityProblem($Worker, [string]$ProcRoot = '/proc') {
+    # adversary r15 A3: the recorded group number is the worker's pid, confirmed once at start-up. After the worker has ended and been reaped its
+    # number is free, and a NEW process leading a group of the same number would be killed by a blind kill(-group). The worker's start time
+    # (field 22 of the process stat file) is recorded with the group: while that file still shows the same start time the group is the worker's;
+    # when the file is NOT FOUND (the read below raises FileNotFound / DirectoryNotFound) the worker has been reaped, so only its orphans can be in
+    # the group; a different start time means the number was reused, and the group is not killed. '' when the group may be killed, else a note.
+    # r16, stated limitation: this check and the group signal (KillGroup, queued afterwards by Stop-CaptureWorker) are SEPARATE steps. A number
+    # that is freed and reused by an unrelated leader between them can still be signalled; the window has not been measured and nothing here
+    # closes it (no pidfd, no group handle). Any other failure to read the file (a permission or I/O error, a directory in its place, an
+    # unparsable line) is NOT read as "gone": the identity is unconfirmed and the group is not killed (orphans of that group may survive).
+    try {
+        $statPath = Join-Path (Join-Path $ProcRoot ([string]$Worker.Group)) 'stat'
+        $stat = [IO.File]::ReadAllText($statPath)
+        $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
+        if ([string]$fields[19] -ceq [string]$Worker.GroupStart) { return '' }
+        return "capture worker group $($Worker.Group) is no longer the worker's (its leader's start time changed, so the number was reused): the group was not killed"
+    }
+    catch [IO.FileNotFoundException] { return '' }
+    catch [IO.DirectoryNotFoundException] { return '' }
+    catch { return "the identity of capture worker group $($Worker.Group) could not be confirmed ($($_.Exception.Message)): the group was not killed" }
+}
+function Stop-CaptureWorker($Worker) {
+    # Kills the worker's process tree, reaps it, and removes its scratch directory, each under its own bound.
+    # adversary r13 A3: the tree is killed EVEN WHEN the worker has already ended. Its root ending proves nothing about what it started (a
+    # factory that launched a process and then threw left that process running). POSIX: the worker leads its own process group (setsid), so the
+    # group is killed too, which reaches orphans of that group that were reparented away from the worker. It does not reach a descendant that left the
+    # group or session (setsid): only the descendants still visible in the worker's tree and the recorded group are covered.
+    # The group is signalled by number after a separate identity check, so a number reused between the two can still be hit (r16, stated
+    # limitation; see Get-CaptureGroupIdentityProblem). Returns '' or a note naming what could not be confirmed. Never throws.
+    if ($null -eq $Worker) { return '' }
+    $notes = [Collections.Generic.List[string]]::new()
+    $p = $Worker.Process
+    if ($null -ne $Worker.Job) {
+        try {
+            $job = [BoundedCaptureIo]::KillJob($Worker.Job)
+            if (-not $job.Wait($CaptureWorkerKillMs)) { $notes.Add("the termination of the capture worker job did not return within $CaptureWorkerKillMs ms") }
+            elseif ($job.Result) { $notes.Add("the termination of the capture worker job failed ($($job.Result))") }
+        }
+        catch { $notes.Add("the termination of the capture worker job failed ($($_.Exception.Message))") }
+    }
+    if ($null -ne $p) {
+        $identity = if ($null -ne $Worker.Group) { Get-CaptureGroupIdentityProblem $Worker } else { '' }
+        if ($identity) { $notes.Add($identity) }
+        elseif ($null -ne $Worker.Group) {
+            try {
+                $group = [BoundedCaptureIo]::KillGroup([int]$Worker.Group)
+                if (-not $group.Wait($CaptureWorkerKillMs)) { $notes.Add("the kill of capture worker group $($Worker.Group) did not return within $CaptureWorkerKillMs ms") }
+                elseif ($group.Result) { $notes.Add("the kill of capture worker group $($Worker.Group) failed ($($group.Result))") }
+            }
+            catch { $notes.Add("the kill of capture worker group $($Worker.Group) failed ($($_.Exception.Message))") }
+        }
+        try {
+            $kill = [BoundedCaptureIo]::KillTree($p)
+            if (-not $kill.Wait($CaptureWorkerKillMs)) { $notes.Add("the kill of capture worker $($p.Id) did not return within $CaptureWorkerKillMs ms") }
+            elseif ($kill.Result) { $notes.Add("the kill of capture worker $($p.Id) failed ($($kill.Result))") }
+        }
+        catch { $notes.Add("the kill of capture worker $($p.Id) failed ($($_.Exception.Message))") }
+        $reaped = $false
+        try { $reaped = $p.WaitForExit($CaptureWorkerReapMs) } catch { $notes.Add("the reap of capture worker $($p.Id) failed ($($_.Exception.Message))") }
+        if (-not $reaped) { $notes.Add("capture worker $($p.Id) is not confirmed ended after $CaptureWorkerReapMs ms") }
+    }
+    try {
+        $del = [BoundedCaptureIo]::DeleteDirectory($Worker.Dir)
+        if (-not $del.Wait($CaptureWorkerReapMs)) { $notes.Add("capture worker scratch removal abandoned: $($Worker.Dir)") }
+        elseif ($del.Result) { $notes.Add("capture worker scratch $($del.Result)") }
+    }
+    catch { $notes.Add("capture worker scratch removal failed ($($_.Exception.Message)): $($Worker.Dir)") }
+    return ($notes -join '; ')
+}
+function Close-CaptureWorker($Worker) {
+    # The teardown in a helper's finally: anything it could not confirm is reported on stderr (never on stdout, which may be a JSON result).
+    $note = ''
+    try { $note = Stop-CaptureWorker $Worker } catch { $note = "capture worker teardown failed ($($_.Exception.Message))" }
+    if ($note) { [Console]::Error.WriteLine("WARNING: $note") }
+}
+function Resolve-CaptureWorkerSetsid([bool]$Windows = $IsWindows, [string[]]$Candidates = @('/usr/bin/setsid', '/bin/setsid')) {
+    # adversary r14 A2: $null on Windows (the worker is tracked by a job object instead). On POSIX the worker is launched through setsid so it
+    # leads its own process group, which is how its teardown reaches a same-group process the factory orphaned; a host without setsid is a named
+    # failure, exactly as a missing job object is on Windows (no tracking means no tree guarantee).
+    if ($Windows) { return $null }
+    foreach ($candidate in $Candidates) { if ([IO.File]::Exists($candidate)) { return $candidate } }
+    throw "the capture worker cannot be tracked: no setsid at $($Candidates -join ', '), so its process group cannot be ended"
+}
+function Start-CaptureWorker {
+    # Starts a capture worker and waits (bounded) until it is ready, BEFORE the step's clock starts. Throws a named failure when it cannot
+    # start; any process it did start is killed first.
+    $worker = [pscustomobject]@{ Dir = (Join-Path ([IO.Path]::GetTempPath()) ('mlv-capture-worker-' + [guid]::NewGuid().ToString('N'))); Process = $null; Group = $null; GroupStart = $null; Job = $null }
+    try {
+        $null = [IO.Directory]::CreateDirectory($worker.Dir)
+        [IO.File]::WriteAllText((Join-Path $worker.Dir 'worker.ps1'), $CaptureWorkerScript)
+        $null = ConvertFrom-CaptureWire (ConvertTo-CaptureWire 'x')   # warm this side too
+        # The script is named relative to its working directory, so no path is ever quoted into a command line.
+        $exe = (Get-Process -Id $PID).Path
+        $argv = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'worker.ps1')
+        # adversary r13 A3 (POSIX): setsid makes the worker the leader of a new process group, so its teardown can end the whole group.
+        $setsid = Resolve-CaptureWorkerSetsid
+        # Dot B2: Start-Process joins -ArgumentList with spaces and quotes nothing, so the pwsh path handed to setsid as its first operand is
+        # quoted here (a path with a space, such as /opt/Power Shell/pwsh, would otherwise split in two and setsid would exec the first half).
+        if ($null -ne $setsid) { $argv = @(ConvertTo-CommandLineArg $exe) + $argv; $exe = $setsid }
+        $worker.Process = Start-Process -FilePath $exe -WorkingDirectory $worker.Dir -NoNewWindow -PassThru -ArgumentList $argv `
+            -RedirectStandardOutput (Join-Path $worker.Dir 'stdout.txt') -RedirectStandardError (Join-Path $worker.Dir 'stderr.txt')
+        $null = $worker.Process.Handle   # keeps ExitCode readable after the exit, and lets Kill(true) find what an ended worker left behind
+        if ($IsWindows) {
+            # Before 'go', so nothing the factory starts can be outside the job. No job means no tree guarantee: a named failure.
+            $worker.Job = [BoundedCaptureIo]::JoinNewJob($worker.Process)
+            if ($worker.Job.Error) { throw "the capture worker could not be placed in a job object ($($worker.Job.Error))" }
+        }
+        $ready = Join-Path $worker.Dir 'ready'
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while (-not [IO.File]::Exists($ready)) {
+            if ($worker.Process.HasExited) { throw "the capture worker ended before it was ready ($(Get-CaptureWorkerExitText $worker))" }
+            if ($clock.ElapsedMilliseconds -ge $CaptureWorkerStartMs) { throw "the capture worker was not ready within $CaptureWorkerStartMs ms" }
+            Start-Sleep -Milliseconds 10
+        }
+        if ($null -ne $setsid) {
+            # The group is recorded only when /proc confirms the worker leads it (field 5 of /proc/<pid>/stat), so no other group is ever killed.
+            $stat = [IO.File]::ReadAllText("/proc/$($worker.Process.Id)/stat")
+            $fields = $stat.Substring($stat.LastIndexOf(')') + 2).Split(' ')
+            if ([int]$fields[2] -eq $worker.Process.Id) { $worker.Group = $worker.Process.Id; $worker.GroupStart = [string]$fields[19] }
+            else { throw "the capture worker does not lead its own process group (pgrp $($fields[2]), pid $($worker.Process.Id)), so its tree cannot be ended" }
+        }
+        return $worker
+    }
+    catch {
+        $failure = $_.Exception.Message
+        $note = Stop-CaptureWorker $worker
+        throw "$failure$(if ($note) { " ($note)" })"
+    }
+}
+function Get-CaptureTaskResult($Task) {
+    # sol r9 B2: a plain (non-generic) Task has NO result. On this runtime [Task]::CompletedTask still exposes a Result property whose value is
+    # the internal VoidTaskResult, so the property's presence proves nothing: only a Task<T> whose T is a real type carries a result.
+    # sol r11 B1: the generic type is found by walking the BaseType chain, never by asking the runtime type. A class that derives from
+    # Task<string> is itself NOT generic (IsGenericType is False) yet carries a real result that a plain IsGenericType test threw away.
+    $open = [Threading.Tasks.Task`1]
+    $type = $Task.GetType()
+    while ($null -ne $type -and -not ($type.IsGenericType -and $type.GetGenericTypeDefinition() -eq $open)) { $type = $type.BaseType }
+    if ($null -eq $type) { return $null }
+    if ($type.GetGenericArguments()[0].FullName -eq 'System.Threading.Tasks.VoidTaskResult') { return $null }
+    return $Task.Result
+}
+function Invoke-CaptureFactory($Worker, [scriptblock]$Factory, $Argument, [Diagnostics.Stopwatch]$Clock, [int]$BoundMs) {
+    # Hands the factory to the ready worker and waits for the worker to END inside what is left of the bound. Returns its answer, or $null
+    # when it did not end in time (the caller's teardown then kills its tree).
+    $left = [Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)
+    # adversary r13 A1/A2: the line format the worker reads (see $CaptureWorkerScript); every string is a lossless wire field.
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add([string]$left)
+    $lines.Add((ConvertTo-CaptureWire $Factory.ToString()))
+    $lines.Add((ConvertTo-CaptureWire ${function:Get-CaptureTaskResult}.ToString()))
+    if ($Argument -is [array]) {
+        $lines.Add('array'); $lines.Add([string]$Argument.Count)
+        foreach ($item in $Argument) { $lines.Add((ConvertTo-CaptureWire $item)) }
+    }
+    else { $lines.Add('scalar'); $lines.Add('1'); $lines.Add((ConvertTo-CaptureWire $Argument)) }
+    $sent = [BoundedCaptureIo]::WriteAtomic((Join-Path $Worker.Dir 'go'), ($lines -join "`n"))
+    if (-not $sent.Wait([Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds))) { return $null }
+    $ended = $false
+    try { $ended = $Worker.Process.WaitForExit([Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)) } catch { $ended = $false }
+    if (-not $ended) { return $null }
+    $read = [BoundedCaptureIo]::ReadIfPresent((Join-Path $Worker.Dir 'answer.txt'))
+    if (-not $read.Wait([Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds))) { return $null }
+    if ($null -eq $read.Result) { throw "the capture worker ended without an answer ($(Get-CaptureWorkerExitText $Worker))" }
+    $answer = $read.Result.Split("`n")
+    if ($answer.Count -ne 2) { throw 'malformed capture worker answer' }
+    if ($answer[0] -ceq 'error') { throw [Exception]::new((ConvertFrom-CaptureWire $answer[1])) }
+    if ($answer[0] -ceq 'pending') { return [pscustomobject]@{ Done = $false; Text = '' } }
+    if ($answer[0] -ceq 'done') { return [pscustomobject]@{ Done = $true; Text = (ConvertFrom-CaptureWire $answer[1]) } }
+    throw 'malformed capture worker answer'
+}
+function Get-CaptureStepText($Worker, [scriptblock]$Start, $Argument, [scriptblock]$Default, [Diagnostics.Stopwatch]$Clock, [int]$BoundMs) {
+    # The text a finished step produced ('' for a plain Task, which has no result), or $null when it did not finish inside the bound.
+    # Throws for a factory that fails or hands back anything but exactly one Task (adversary r7 A4: an array of tasks makes
+    # `$task.Wait($left)` a truthy array, so pending work read as finished).
+    if ($null -ne $Start) {
+        $answer = Invoke-CaptureFactory $Worker $Start $Argument $Clock $BoundMs
+        if ($null -eq $answer -or -not $answer.Done) { return $null }
+        return [string]$answer.Text
+    }
+    # The default open/delete is plain .NET: Task.Run hands back at once, so nothing synchronous can outlast the bound.
+    $made = @(& $Default $Argument)
+    if ($made.Count -ne 1 -or $made[0] -isnot [Threading.Tasks.Task]) { throw "the capture factory must hand back exactly one Task (got $($made.Count))" }
+    $left = [Math]::Max(0, $BoundMs - [int]$Clock.ElapsedMilliseconds)
+    if (-not $made[0].Wait($left)) { return $null }
+    return [string](Get-CaptureTaskResult $made[0])
+}
+function Read-CapturedResult([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) {
+    Assert-CaptureIoBound 'captured-output read' $BoundMs
+    $name = [IO.Path]::GetFileName($Path)
+    $worker = $null
+    try {
+        # Dot B1: the setup is inside the try, so a setup failure is this read's own diagnostic and never an exception that escapes before
+        # the caller builds its suite-named verdict. (Invoke-BoundedSuite establishes the setup before the suite starts.)
+        Initialize-BoundedCaptureIo
+        if ($null -ne $Start) { $worker = Start-CaptureWorker }
+        $clock = [Diagnostics.Stopwatch]::StartNew()   # started BEFORE the open, so a slow start counts against the same bound
+        # sol r9 B1: the deadline is measured from the call's start. A factory that spent the whole bound is a timeout even when the task it
+        # handed back has already completed. adversary r10 A1 / sol r11 B2: turning the result into text is part of the step (it runs in the
+        # same worker as the factory), so the elapsed check is the LAST thing before a success.
+        $text = Get-CaptureStepText $worker $Start $Path { param($a) [BoundedCaptureIo]::ReadAllText($a) } $clock $BoundMs
+        if ($null -eq $text -or $clock.Elapsed.TotalMilliseconds -ge $BoundMs) { return [pscustomobject]@{ Ok = $false; Text = "<read timed out: $name not readable within $BoundMs ms>" } }
+        return [pscustomobject]@{ Ok = $true; Text = $text }
+    }
+    catch {
+        $inner = $_.Exception
+        while ($null -ne $inner.InnerException) { $inner = $inner.InnerException }
+        return [pscustomobject]@{ Ok = $false; Text = "<read failed: $($inner.Message)>" }
+    }
+    finally { Close-CaptureWorker $worker }   # sol r12 B1: a worker that overran is killed here, before the verdict is handed back
+}
+function Read-CapturedText([string]$Path, [int]$BoundMs = $ReadBoundMs, [scriptblock]$Start = $null) { (Read-CapturedResult $Path $BoundMs $Start).Text }
+function Remove-CaptureFiles([string[]]$Paths, [int]$BoundMs = $CaptureCleanupBoundMs, [scriptblock]$Start = $null) {
+    # Returns '' or a note naming the abandoned step and the files left behind.
+    Assert-CaptureIoBound 'capture cleanup' $BoundMs
+    $worker = $null
+    try {
+        Initialize-BoundedCaptureIo   # Dot B1: inside the try, so a setup failure is a cleanup note, never an exception from the caller's finally
+        if ($null -ne $Start) { $worker = Start-CaptureWorker }
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        # sol r9 B1 / adversary r10 A1 / sol r11 B2: elapsed >= bound is an abandoned step even when the task completed, and the factory and
+        # the result conversion count toward it. The task reports the files a failed delete left behind or could not confirm gone (adversary
+        # r7 A3, sol r8 B2); a seam's plain Task has no Result and means none (sol r9 B2: Get-CaptureTaskResult, not the Result property).
+        $incomplete = Get-CaptureStepText $worker $Start $Paths { param($a) [BoundedCaptureIo]::Delete($a) } $clock $BoundMs
+        if ($null -ne $incomplete -and $clock.Elapsed.TotalMilliseconds -lt $BoundMs) {
+            if ($incomplete) { return "capture cleanup incomplete: $incomplete" }
+            return ''
+        }
+        return "capture cleanup abandoned after $([Math]::Round($BoundMs / 1000, 3)) s: $($Paths -join ', ')"
+    }
+    catch { return "capture cleanup failed: $($_.Exception.Message): $($Paths -join ', ')" }
+    finally { Close-CaptureWorker $worker }   # sol r12 B1: see Read-CapturedResult
+}
+# END bounded capture io
+# The largest bound Invoke-BoundedSuite accepts: the same range the public -QuietLeaseBoundSec / -StageExemptBoundSec carry.
+$SuiteBoundMaxSec = 3600
+# adversary r11 A1: everything done to a capture AFTER the bounded read must itself be bounded. The diagnostic keeps only the last
+# $DiagnosticTailChars of each stream (an 8,000,000-line capture took 31.8 s to split, filter and join), and a finished suite's JSON larger
+# than $JsonMaxChars is a named failure instead of being normalised line by line. Substring/Length are O(1)-ish, so the verdict never scales
+# with what the suite printed.
+$DiagnosticTailChars = 4000
+$JsonMaxChars = 262144
+function Get-DiagnosticTail([string]$Text) {
+    if ($null -eq $Text) { return '' }
+    if ($Text.Length -le $DiagnosticTailChars) { return $Text }
+    return '...' + $Text.Substring($Text.Length - $DiagnosticTailChars)
+}
+function Invoke-BoundedSuite([string]$Name, [string]$Script, [int]$TimeoutSec) {
+    # sol r5 B1: the bound is checked, and converted to milliseconds, BEFORE any file or child exists. A direct call with 2147484 (or
+    # 0, or a negative) used to launch the suite and only then fail in WaitForExit, leaving the child running with no named verdict.
+    if ($TimeoutSec -lt 1 -or $TimeoutSec -gt $SuiteBoundMaxSec) { throw "FAIL: $Name ($Script) bound $TimeoutSec s is outside 1..$SuiteBoundMaxSec s; no child was started" }
+    $waitMs = [int]($TimeoutSec * 1000)
+    # Dot B1: the capture setup is established BEFORE the suite starts and before any capture file exists. If it fails, the run fails by its
+    # own named setup error and the suite never starts; the helpers below then only ever repeat a setup that already succeeded.
+    try { Initialize-BoundedCaptureIo } catch { throw "FAIL: $Name ($Script) capture setup failed: $($_.Exception.Message); no child was started" }
+    $outF =[IO.Path]::GetTempFileName(); $errF = [IO.Path]::GetTempFileName()
+    $fail = $null; $result = $null; $cleanupNote = ''
+    try {
+        $suiteArgs = @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $Script, '-RepoRoot', $RepoRoot, '-AgentScript', $agentScript) | ForEach-Object { ConvertTo-CommandLineArg $_ }
+        $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $suiteArgs -NoNewWindow -PassThru -RedirectStandardOutput $outF -RedirectStandardError $errF
+        $null = $p.Handle   # keeps ExitCode readable after the exit
+        $clock = [Diagnostics.Stopwatch]::StartNew()   # monotonic: a local-time subtraction goes negative across a DST fall-back
+        # Any failure of the wait itself is treated as a hung suite: the tree is killed below and the failure names the suite.
+        $finished = $false; $waitNote = ''
+        try { $finished = $p.WaitForExit($waitMs) } catch { $waitNote = " (the wait itself failed: $($_.Exception.Message))" }
+        $killNote = 'its process tree was killed'
+        if (-not $finished) {
+            # The kill itself is bounded (sol adversary A2): a hung taskkill.exe must not hold the suite-named failure back.
+            try {
+                $k = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/F', '/T', '/PID', [string]$p.Id) -NoNewWindow -PassThru
+                if (-not $k.WaitForExit(60000)) { $k.Kill(); $killNote = 'its process tree kill is NOT confirmed (taskkill.exe still running after 60 s)' }
+                elseif ($k.ExitCode -ne 0) { $killNote = "its process tree kill is NOT confirmed (taskkill.exe exited $($k.ExitCode))" }
+            }
+            catch { $killNote = "its process tree kill is NOT confirmed (taskkill.exe failed: $($_.Exception.Message))" }
+            try { $p.Kill() } catch { }
+        }
+        # Each file is opened and read ONCE, under the bound (sol r6 B1): the same text feeds the diagnostic and, for a finished suite, the JSON.
+        $outR = Read-CapturedResult $outF
+        $errR = Read-CapturedResult $errF
+        $text = (@((Get-DiagnosticTail $outR.Text), (Get-DiagnosticTail $errR.Text)) | ForEach-Object { $_ -split '\r?\n' } | Where-Object { $_ }) -join ' | '
+        if (-not $finished) { $fail = "$Name ($Script) exceeded its $TimeoutSec s bound${waitNote} (ran $([int]$clock.Elapsed.TotalSeconds) s) and $killNote; output so far: $text" }
+        # A finished suite's JSON is the result: a read error or a stalled read here must surface, not aggregate as an empty result.
+        elseif (-not $outR.Ok) { $fail = "$Name ($Script) finished but its JSON result could not be read: $($outR.Text)" }
+        # sol r8 B1: the stderr read is a step too. A suite that exited 0 with readable JSON must not keep PASS over an abandoned or failed
+        # stderr capture: the same named failure as the stdout one, so neither caller (nor the aggregate) can report PASS past it.
+        elseif (-not $errR.Ok) { $fail = "$Name ($Script) finished but its stderr capture could not be read: $($errR.Text)" }
+        elseif ($outR.Text.Length -gt $JsonMaxChars) { $fail = "$Name ($Script) finished but its JSON result is larger than $JsonMaxChars characters ($($outR.Text.Length)); it was not parsed" }
+        else { $result = [pscustomobject]@{ ExitCode = $p.ExitCode; Json = (($outR.Text.TrimEnd("`r", "`n")) -split '\r?\n') -join "`n"; Text = $text } }
+    }
+    # The removal is bounded too (sol r6 B2) and runs BEFORE the verdict is raised, so its note can be named in it.
+    finally { $cleanupNote = Remove-CaptureFiles @($outF, $errF) }
+    if ($null -ne $fail) { Assert-True $false "$fail$(if ($cleanupNote) { "; $cleanupNote" })" }
+    # stderr, not Write-Warning: under `pwsh -File` the warning stream lands on STDOUT ahead of the -UnitOnly JSON (adversary r7 A1).
+    if ($cleanupNote) { [Console]::Error.WriteLine("WARNING: $Name ($Script): $cleanupNote") }
+    return $result
+}
 $leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
-$leaseOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $leaseTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
-Assert-True ($LASTEXITCODE -eq 0) "quiet-lease cases ($leaseTest) pass: $($leaseOut -join ' | ')"
-$results.quietLease = ($leaseOut -join "`n") | ConvertFrom-Json
+$lease = Invoke-BoundedSuite 'quiet-lease cases' $leaseTest $QuietLeaseBoundSec
+Assert-True ($lease.ExitCode -eq 0) "quiet-lease cases ($leaseTest) pass: $($lease.Text)"
+Assert-True ($null -ne $lease.Json -and $lease.Json.Trim().Length -gt 0) "quiet-lease cases ($leaseTest) produced no JSON result: $($lease.Text)"
+$results.quietLease = $lease.Json | ConvertFrom-Json
 # STAGE-JOB-LEASE-EXEMPT-1: the staging-job exemption runs the same way (its own process, its own fake heavy-slot.py).
 $stageTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-stage-exempt.ps1'
-$stageOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $stageTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
-Assert-True ($LASTEXITCODE -eq 0) "stage-exempt cases ($stageTest) pass: $($stageOut -join ' | ')"
-$results.stageExempt = ($stageOut -join "`n") | ConvertFrom-Json
+$stage = Invoke-BoundedSuite 'stage-exempt cases' $stageTest $StageExemptBoundSec
+Assert-True ($stage.ExitCode -eq 0) "stage-exempt cases ($stageTest) pass: $($stage.Text)"
+Assert-True ($null -ne $stage.Json -and $stage.Json.Trim().Length -gt 0) "stage-exempt cases ($stageTest) produced no JSON result: $($stage.Text)"
+$results.stageExempt = $stage.Json | ConvertFrom-Json
 
 if ($UnitOnly) {
     [pscustomobject]@{ status = 'PASS'; mode = 'unit-only'; results = $results } | ConvertTo-Json -Depth 8
