@@ -1475,6 +1475,45 @@ function Get-DvUnpacedEvidence {
     [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvInheritedWorkerOverrides {
+    <#
+    .SYNOPSIS
+    CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r4 (B1 and B2 on 70d55f42; env census in the r4 run dir): the thread-count variables the measured session's start line logs (`env_<name lower case>=`,
+    "unset" when unset or empty, log_line_field::envFieldValue) whose value the leg's spec does not name. Returns @{ overrides = 'NAME=value' list; unreadable = names whose field is duplicated;
+    reason = text or $null }. A field a build does not write is not read.
+    Accepted values, per variable: exact "unset" (absent) and exact "0" (src/batch/WorkerThreadCount.h's int reads, mlvappEnvFlagEnabled, ForceSingleThread.cpp's envTruthy, libgomp and
+    mlv_env_value_is_truthy all leave 0 inert). Nothing wider: "00", "+0", "-0" are ON for MLVAPP_FORCE_SINGLETHREAD (adversary A1 on 165d4a30). "0" is not accepted for the decoder count (video_mlv.c
+    reads it as one decoder). The spec's own rawPrefetchDecoders sets what the two prefetch fields must say. A capped leg (-CapRequested) is not read for the four worker variables: its worker_threads=
+    proves what they would change, and T12 under MLVAPP_FORCE_THREADS=12 is a run at 12. It IS read for the three its worker_threads= does not show.
+    Literal MLVAPP_FORCE_SINGLETHREAD=unset logs its own field as "unset", but ForceSingleThread.cpp:55 then writes OMP_NUM_THREADS=1 at main.cpp:1868, so env_omp_num_threads=1 refuses it.
+    #>
+    param([Parameter(Mandatory)]$StartRead, [Parameter(Mandatory)]$Spec, [switch]$CapRequested)
+    $unsetOrZero = @('unset', '0')
+    $decoders = ConvertTo-DvInt64 (Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'rawPrefetchDecoders')
+    $rows = [System.Collections.Generic.List[object]]::new()
+    if (-not $CapRequested) {
+        $rows.Add(@('env_playback_max_threads', 'MLVAPP_PLAYBACK_MAX_THREADS', $unsetOrZero))
+        $rows.Add(@('env_force_threads', 'MLVAPP_FORCE_THREADS', $unsetOrZero))
+        $rows.Add(@('env_force_singlethread', 'MLVAPP_FORCE_SINGLETHREAD', $unsetOrZero))
+        $rows.Add(@('env_disable_playback_thread_cap', 'MLVAPP_DISABLE_PLAYBACK_THREAD_CAP', $unsetOrZero))
+    }
+    $rows.Add(@('env_omp_num_threads', 'OMP_NUM_THREADS', $unsetOrZero))
+    # generatorArgs.rawPrefetchDecoders: 0 = the job sets MLVAPP_DISABLE_RAW_UINT16_PREFETCH=1, k = MLVAPP_RAW_UINT16_PREFETCH_DECODERS=k, absent = neither (playback-attr-3-cuda-job.ps1)
+    $rows.Add(@('env_disable_raw_uint16_prefetch', 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH', $(if ($null -ne $decoders -and $decoders -eq 0) { @('1') } else { $unsetOrZero })))
+    $rows.Add(@('env_raw_uint16_prefetch_decoders', 'MLVAPP_RAW_UINT16_PREFETCH_DECODERS', $(if ($decoders -ge 1) { @([string]$decoders) } else { @('unset') })))
+    $overrides = [System.Collections.Generic.List[string]]::new()
+    $unreadable = [System.Collections.Generic.List[string]]::new()
+    foreach ($row in $rows) {
+        if ($StartRead.duplicates -contains $row[0]) { $unreadable.Add($row[1]); continue }
+        $value = $StartRead.fields[$row[0]]
+        if ($null -ne $value -and $value -cnotin $row[2]) { $overrides.Add("$($row[1])=$value") }
+    }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if ($overrides.Count -gt 0) { $parts.Add("the leg's spec does not name $($overrides -join ', '), yet the app saw it in its environment (worker_threads=$($StartRead.fields['worker_threads'])); the venue's variable, not the leg, set a thread count, so it is not the arm its spec describes") }
+    if ($unreadable.Count -gt 0) { $parts.Add("the measured session's playback_smoke.start line carries the field for $($unreadable -join ', ') more than once, so whether the leg ran under an inherited thread-count variable is unreadable") }
+    @{ overrides = $overrides; unreadable = $unreadable; reason = $(if ($parts.Count -gt 0) { 'INHERITED_WORKER_OVERRIDE: ' + ($parts -join '; ') } else { $null }) }
+}
+
 function Get-DvWorkerThreadsEvidence {
     <#
     .SYNOPSIS
@@ -1485,8 +1524,8 @@ function Get-DvWorkerThreadsEvidence {
     unparsable or not n, when there is no summary, when a summary lacks a proof field and its result is not one of the runner's own product-failure
     terminals ($script:FailureTerminals, compared exactly), or when any proof field a summary states is not n. Only such a terminal's summary may omit
     the proof (only the success summary gains it), and it is then judged on the run log; a summary with no result or any other result must carry it
-    (adversary r1 A1). A leg that does not ask never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the
-    hashed run log and summary.json.
+    (adversary r1 A1). A leg that does not ask blocks only when its start line shows an inherited thread-count variable (INHERITED_WORKER_OVERRIDE, Get-DvInheritedWorkerOverrides); a leg
+    that asks is NOT_HONOURED under the same refusal. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log and summary.json.
     PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 r2 (adversary A2 on #726): a start line that carries worker_threads= more than once is refused
     (DUPLICATE_START_FIELD), never last-key-wins; and a failure terminal that omits a proof field is UNPROVEN (blocks = false, so its FAIL stands), never
     HONOURED, because the run log alone was forgeable by a launcher env value on a build before r2.
@@ -1495,6 +1534,7 @@ function Get-DvWorkerThreadsEvidence {
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
     $requested = ConvertTo-DvInt64 $raw
     $observed = $null
+    $inheritedOverrides = $null
     $verdict = 'NOT_REQUESTED'
     $reason = $null
     if ($null -ne $raw) {
@@ -1522,6 +1562,11 @@ function Get-DvWorkerThreadsEvidence {
                 if ($null -eq $parsed -or $parsed -ne $requested) { $problems.Add("summary.json $name is '$value', not $requested") }
             }
         }
+        if ($read.found) {
+            $inherited = Get-DvInheritedWorkerOverrides -StartRead $read -Spec $Spec -CapRequested
+            if ($inherited.overrides.Count -gt 0) { $inheritedOverrides = $inherited.overrides -join ' ' }
+            if ($null -ne $inherited.reason) { $problems.Add($inherited.reason) }
+        }
         if ($problems.Count -gt 0) { $reason = $problems -join '; ' }
         elseif ($omitted.Count -gt 0) {
             $verdict = 'UNPROVEN'
@@ -1529,7 +1574,25 @@ function Get-DvWorkerThreadsEvidence {
         }
         else { $verdict = 'HONOURED' }
     }
-    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+    else {
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754, adversary A1 on 6ffe18f8): a leg that names NO cap still runs at a count its venue chose when the
+        # venue's environment holds a variable the app reads for its worker count (the smoke runner sets MLVAPP_PLAYBACK_MAX_THREADS only for -Threads and never
+        # removes an inherited one; nothing removes the others), so a control meant to differ from a capped arm in worker count can run at the arm's count and
+        # compare CLEAN. A value the spec does not name is INHERITED_WORKER_OVERRIDE and blocks (Get-DvInheritedWorkerOverrides); a duplicated field is unreadable and blocks too. A start
+        # line without the field (a build before it existed) or no start line at all stays NOT_REQUESTED, so a leg that legitimately runs uncapped is unchanged. No tool in tools/ or
+        # .github sets any of these variables for a dual-venue leg, except the job's own rawPrefetchDecoders route.
+        $startRead = Get-DvSmokeSessionLineRead -LogText $LogText -Marker 'start'
+        if ($startRead.found) {
+            $inherited = Get-DvInheritedWorkerOverrides -StartRead $startRead -Spec $Spec
+            if ($null -ne $inherited.reason) {
+                $verdict = 'INHERITED_WORKER_OVERRIDE'
+                $observed = ConvertTo-DvInt64 $startRead.fields['worker_threads']
+                $inheritedOverrides = ($inherited.overrides -join ' ')
+                $reason = $inherited.reason
+            }
+        }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; inheritedOverrides = $inheritedOverrides; verdict = $verdict; reason = $reason; blocks = ($verdict -cin @('NOT_HONOURED', 'INHERITED_WORKER_OVERRIDE')) }
 }
 
 function Get-DvPrepConflatedMoveEvidence {
@@ -2132,6 +2195,8 @@ function Read-DvContactFrames {
 # look.pairedSeekFrames must be distinct non-negative integers, one per contact-sheet frame, on a look.pairedSeek leg (r14: and, as the generator's
 # -ContactSheetSeekFrames they are now forwarded as, strictly ascending and at most 999999999). Returns the refusal text, or $null.
 $script:LegTypes = @('speed', 'look')   # leg-spec.schema.json properties.legType.enum
+# the generatorArgs members leg-spec.schema.json types boolean (prepConflatedMove: const true); a test pins this list to the schema
+$script:GeneratorArgsBooleanSwitches = @('forceLookAssist', 'corePartitionTelemetry', 'disableLookAssist', 'presentTrace', 'firstPresentCapture', 'warmReuseMissDump', 'unpaced', 'disablePrepPointwiseFast', 'prepConflatedMove', 'utilSample')
 function Get-DvLegSpecShapeRefusal {
     param($Spec)
     if ($Spec -isnot [System.Management.Automation.PSCustomObject]) { return 'the leg spec must be a single JSON object' }
@@ -2140,6 +2205,19 @@ function Get-DvLegSpecShapeRefusal {
         if ($null -ne $present -and $present.Value -isnot [System.Management.Automation.PSCustomObject]) {
             $shape = $(if ($null -eq $present.Value) { 'null' } elseif ($present.Value -is [array]) { 'an array' } else { "a $($present.Value.GetType().Name)" })
             return "$container must be a single JSON object (it is $shape)"
+        }
+    }
+    # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1: every generatorArgs switch is a JSON boolean (leg-spec.schema.json types each one boolean), refused here otherwise.
+    # Invoke-VenueLeg reads most of them with a plain [bool] cast, which is true for ANY non-empty string: "disableLookAssist": "false" ran a Look-Assist-OFF leg,
+    # the failure of the owner's 2026-10-20 objection (hub rule D4b). One check here covers the leg and the lease batch's preflight, so no cast is patched
+    # one by one. A present-but-null, number, array or object value is refused too (a cast read null and 0 as false and 1 as true). Absent stays "not asked for".
+    $genArgsProp = $Spec.PSObject.Properties['generatorArgs']
+    if ($null -ne $genArgsProp) {
+        foreach ($switchName in $script:GeneratorArgsBooleanSwitches) {
+            $switchProp = $genArgsProp.Value.PSObject.Properties[$switchName]
+            if ($null -ne $switchProp -and $switchProp.Value -isnot [bool]) {
+                return "generatorArgs.$switchName must be JSON true or false (it is $(ConvertTo-Json -InputObject $switchProp.Value -Compress -Depth 3))"
+            }
         }
     }
     # r9 (adversary r8 cc8061a2 A1, Dot pr-721, hub ACK 6564543250): legType is ONE string of the schema's enum, compared case-sensitively as the validator
@@ -3345,7 +3423,7 @@ function Test-DvReceiptValid {
             if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED: $($unpacedVerdict.reason); a paced run is no throughput measurement") }
             # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg the app did not run at the cap (or whose count is unreadable) is no measurement under it.
             $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary
-            if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement under the cap its leg names") }
+            if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement of the worker count its leg specifies") }
             # adversary r2b A1: the receipt's own workerThreads block is re-derived like the display block, so a receipt cannot state a count (or a verdict) the
             # hashed evidence does not; the writer emits the block exactly when the spec asks for a cap (Invoke-VenueLeg.ps1), so the same condition decides here.
             $storedWorkerThreads = Get-DvProp $Receipt 'workerThreads'
