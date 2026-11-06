@@ -32092,6 +32092,9 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
         m_lastLookAssistDiagnosticsValid = false;
         m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );
         m_lookAssistFlavorOutcome.clear();   // the baseline is back: no grade, no fallback, only the selector's setting
+        // r18 (adversary r18 82a5a3ad A1): the relabel above recorded the grade with the old outcome (Cinematic landed). Without
+        // this one, a later relabel saw the cleared outcome as a regrade and read a switch pasted onto the then-inactive owner.
+        updateLookLabel();
     }
 
     setReceipt( ACTIVE_RECEIPT );

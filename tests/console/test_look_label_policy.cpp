@@ -875,6 +875,20 @@ struct R17Window
         return relabel();
     }
 
+    // r18 (adversary r18 82a5a3ad A1): the switch turned off for the active row with a valid baseline: the write, the regrade count,
+    // labelFollowsActiveSliders, the relabel, the baseline restore and the outcome cleared, then the relabel after the clear.
+    bool relabelsAfterSwitchOffClear = true;   // false = 82a5a3ad, which had no relabel after the clear
+    std::string switchOff(R17Receipt *row, bool attached = true)
+    {
+        row->on = false;
+        ++label.slidersApplied;
+        if( look_label::activeGradeMovesKey(row, active, attached) ) { key = row; recorded = row->on; }
+        checkbox = false;
+        relabel();
+        outcome.clear();
+        return relabelsAfterSwitchOffClear ? relabel() : label.text.toStdString();
+    }
+
     // A synchronous landing on `row` (applyLookAssistToReceipt): labelFollowsActiveSliders, landed(), the relabel.
     std::string syncLanding(const R17Receipt *row, const char *flavor, bool fallback, bool attached = true)
     {
@@ -1327,6 +1341,75 @@ TEST(LookLabelWiring, A1r18TheSwitchAndTheSelectorWriteEachCountARegrade)
     const int warning = mw.indexOf(QStringLiteral("QMessageBox::warning( this, tr( \"Import MLV\" ),"), restore);
     ASSERT_TRUE(restore > 0 && warning > restore);
     ASSERT_FALSE(mw.mid(restore, warning - restore).contains(QStringLiteral("setSliders(")));
+}
+
+// Adversary r18 (82a5a3ad) A1, introduced by r16's grade rule. A owns the loaded clip (active, attached, valid baseline, Cinematic
+// landed). Look Assist is clicked off: the handler relabels ("Look: Off", the grade recorded with Cinematic landed), restores the
+// baseline and clears the outcome. B is imported; in addFileToSession's pump a paste with Look Assist ON (Raw Correction Enable
+// selected) lands on the now-inactive A; fullscreen is toggled before B loads. RED on 82a5a3ad: the cleared outcome no longer
+// matched the recorded grade, so the label re-derived from A's pasted switch, "Look: Baseline", with no slider applied since.
+TEST(LookLabelPolicy, A1r18bAPasteAfterTheSwitchOffClearedTheOutcomeNeverRelabelsTheBaseline)
+{
+    for( const char *flavorName : { "cinematic", "film", "vision50d" } )
+    {
+        for( const bool attached : { true, false } )
+        {
+            R17Receipt receiptA, receiptB;
+            receiptA.on = true;
+            R17Window w;
+            w.active = w.owner = &receiptA;
+            w.key = &receiptA;
+            w.recorded = true;
+            w.checkbox = true;
+            w.outcome.landed(&receiptA, QString::fromLatin1(flavorName), false);
+            w.relabel();
+            ASSERT_EQ(std::string("Look: Off"), w.switchOff(&receiptA));
+            w.active = &receiptB;     // addFileToSession activates B
+            receiptA.on = true;       // the enabled paste onto the inactive A: no setSliders
+            const std::string shown = w.label.update(w.outcome, w.key, w.owner, receiptA.on, false, attached, w.checkbox, w.recorded);
+            printf("[A1r18b] flavor=%s attached=%d label=\"%s\"\n", flavorName, attached ? 1 : 0, shown.c_str());
+            ASSERT_EQ(std::string("Look: Off"), shown);
+            // ... and with A active again after a refused import (the A1r18 shape), still the baseline's "Look: Off".
+            w.active = &receiptA;
+            ASSERT_EQ(std::string("Look: Off"), w.label.update(w.outcome, w.key, w.owner, receiptA.on, true, attached, w.checkbox,
+                                                               w.recorded));
+        }
+    }
+}
+
+// The class of A1r18b: a relabel records the grade it read, so every change of the outcome (a landing, a baseline mark, a clear)
+// is followed by a relabel in the same step, or by the switch handler, which relabels. begin() is not: shown() keeps what last
+// landed while an analysis is pending, so the grade does not change.
+TEST(LookLabelWiring, A1r18bEveryOutcomeChangeIsFollowedByARelabel)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    int sites = 0;
+    for( const char *mutator : { "m_lookAssistFlavorOutcome.clear(", "m_lookAssistFlavorOutcome.landed(",
+                                 "m_lookAssistFlavorOutcome.baselineRestored(" } )
+    {
+        const QString m = QString::fromLatin1(mutator);
+        for( int at = mw.indexOf(m); at >= 0; at = mw.indexOf(m, at + 1) )
+        {
+            ++sites;
+            const int end = mw.indexOf(QRegularExpression(QStringLiteral("\\n\\}")), at);   // the enclosing function's close
+            const int relabel = mw.indexOf(QStringLiteral("updateLookLabel();"), at);
+            const int handler = mw.indexOf(QStringLiteral("on_checkBoxLookAssistEnable_clicked( true );"), at);
+            const int none = mw.size();
+            const int next = qMin(relabel < 0 ? none : relabel, handler < 0 ? none : handler);
+            const int line = mw.left(at).count(QLatin1Char('\n')) + 1;
+            if( !(end > 0 && next < end) ) printf("[A1r18bW] unfollowed %s at line %d\n", mutator, line);
+            ASSERT_TRUE(end > 0 && next < end);
+            // Nothing else changes the outcome between it and that relabel.
+            const QString between = mw.mid(at + m.size(), next - at - m.size());
+            ASSERT_FALSE(between.contains(QStringLiteral("m_lookAssistFlavorOutcome.clear(")));
+        }
+    }
+    printf("[A1r18bW] sites=%d\n", sites);
+    ASSERT_EQ(10, sites);
+    // The switch-off branch relabels after its clear.
+    const QString toggle = functionBody(mw, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"));
+    const int cleared = toggle.indexOf(QStringLiteral("m_lookAssistFlavorOutcome.clear();   // the baseline is back"));
+    ASSERT_TRUE(cleared > 0 && toggle.indexOf(QStringLiteral("updateLookLabel();"), cleared) > cleared);
 }
 
 // The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
