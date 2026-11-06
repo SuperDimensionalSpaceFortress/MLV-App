@@ -472,8 +472,7 @@ TEST(ReconWorkerSplit, AveragesAndResiduesAtEachLevelOfTheNesting)
     // Two presented frames with the split, one without (not counted). Frame values:
     // llrawproc 40 = dark 1 + vstripes 1 + focus 1 + bad 1 + pattern_noise 1 + dual_iso 30 + chroma_smooth 1 (+4 residue);
     // dual_iso 30 > full20 28 (+2 outside); full20 28 = pattern 1 noise 1 scratch 1 convert20 1 match 1 interp 5 fullres 2
-    // mix 10 final_blend 4 convert16 1 (+1 residue); mix 10 = halfres 2 chroma 6 alias 1 overexposed 0 (+1); chroma 6 = copy 1
-    // fullres 2 halfres 2 (+1).
+    // mix 10 final_blend 4 convert16 1 (+1 residue). The mix / mix_chroma leaves are reported as given (no residue).
     QJsonObject frame;
     const auto put = [&frame](const char *key, double v) {
         frame.insert(recon_worker_split::prefix() + QLatin1String(key), v);
@@ -506,8 +505,6 @@ TEST(ReconWorkerSplit, AveragesAndResiduesAtEachLevelOfTheNesting)
     ASSERT_NEAR(4.0, u.llrawprocMs, 1e-9);
     ASSERT_NEAR(2.0, u.dualIsoOutsideFull20Ms, 1e-9);
     ASSERT_NEAR(1.0, u.full20Ms, 1e-9);
-    ASSERT_NEAR(1.0, u.mixMs, 1e-9);
-    ASSERT_NEAR(1.0, u.mixChromaMs, 1e-9);
     // 40 less the six non-dual-iso stages (6) less full20's ten parts (27) = 7 (= 4 + 2 + 1).
     ASSERT_NEAR(7.0, u.totalMs, 1e-9);
 
@@ -515,6 +512,40 @@ TEST(ReconWorkerSplit, AveragesAndResiduesAtEachLevelOfTheNesting)
     ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_ms=6.000")));
     ASSERT_TRUE(text.contains(QStringLiteral(" avg_unattributed_ms=7.000")));
     ASSERT_FALSE(text.contains(QStringLiteral("= ")));
+}
+
+TEST(ReconWorkerSplit, NoResidueIsComputedUnderMixOrMixChroma)
+{
+    // r1 adversary A1 (exact input): a consumed CPU full20 recon with chroma_smooth_method=1 and
+    // use_fullres=1. The CPU producer runs the chroma smoothing BEFORE mix (dualiso.c:6988), times its
+    // copy outside mix_chroma (:4708-4711) and adds the post-mix fullres reconstruction to
+    // mix_chroma_fullres (:7059-7069), so neither mix nor mix_chroma is the parent of those leaves:
+    // a residue under either is wrong (it read 0 for both, the producer trace gives 1 and 1).
+    QJsonObject frame;
+    const auto put = [&frame](const char *key, double v) {
+        frame.insert(recon_worker_split::prefix() + QLatin1String(key), v);
+    };
+    put("llrawproc_total_ms", 50);
+    put("dual_iso_full20_mix_ms", 5); put("dual_iso_full20_mix_halfres_ms", 3); put("dual_iso_full20_mix_alias_map_ms", 0);
+    put("dual_iso_full20_mix_overexposed_ms", 1); put("dual_iso_full20_mix_chroma_ms", 20);
+    put("dual_iso_full20_mix_chroma_copy_ms", 2); put("dual_iso_full20_mix_chroma_fullres_ms", 14);
+    put("dual_iso_full20_mix_chroma_halfres_ms", 7);
+    recon_worker_split::Totals totals;
+    ASSERT_TRUE(totals.add(frame));
+    const QString text = totals.fieldsText();
+    ASSERT_FALSE(text.contains(QStringLiteral("mix_unattributed")));
+    ASSERT_FALSE(text.contains(QStringLiteral("mix_chroma_unattributed")));
+    // The leaves are reported as measured.
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_ms=5.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_ms=20.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_copy_ms=2.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_fullres_ms=14.000")));
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_full20_mix_chroma_halfres_ms=7.000")));
+    // The fixed-nesting residues use mix only as one of full20's ten parts: 50 - 0 - 5 = 45.
+    ASSERT_TRUE(text.contains(QStringLiteral(" avg_unattributed_ms=45.000")));
+    // The header names the path dependence, so the next reader does not re-add the residue.
+    const QString header = readRepoFile(QStringLiteral("platform/qt/ReconWorkerSplit.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("PATH-DEPENDENT nesting, so NO residue is computed under mix or mix_chroma")));
 }
 
 TEST(ReconWorkerSplit, SummaryLinePinsEveryFieldName)
@@ -539,9 +570,9 @@ TEST(ReconWorkerSplit, SummaryLinePinsEveryFieldName)
         ASSERT_TRUE(expected[i] == QLatin1String(recon_worker_split::fields()[static_cast<size_t>(i)].name));
         ASSERT_EQ(1, text.count(QStringLiteral(" avg_%1_ms=").arg(expected[i])));
     }
-    for (const char *residue : { "llrawproc_unattributed", "dual_iso_outside_full20", "full20_unattributed",
-                                 "full20_mix_unattributed", "full20_mix_chroma_unattributed", "unattributed" })
+    for (const char *residue : { "llrawproc_unattributed", "dual_iso_outside_full20", "full20_unattributed", "unattributed" })
         ASSERT_EQ(1, text.count(QStringLiteral(" avg_%1_ms=").arg(QLatin1String(residue))));
+    ASSERT_EQ(static_cast<int>(recon_worker_split::fields().size()) + 4, static_cast<int>(text.count(QStringLiteral(" avg_"))));
 
     // The line is printed once, from the session totals, with frames and full20_valid_frames.
     const QString finish = finishSmokeBody();
@@ -580,22 +611,25 @@ TEST(ReconWorkerSplit, RenderThreadKeepsTheWorkersValuesOnAConsumedRecon)
 
 TEST(GuiOtherBusySplit, NestedSpansAreExclusiveAndSumToTheGapsOtherBusy)
 {
-    // One gap (serial 7) of other busy 20 ms. timer_frame 0..16 holds playback_handling 2..6 (which
-    // holds slider_position 3..4) and draw_frame 8..14 (2 ms of preview paint inside it); then
-    // draw_frame_ready 17..19 holds 1 ms of runner sleep. Exclusive: slider 1, handling 3, draw 4,
-    // timer 16-4-6 = 6, ready 2-1 = 1 -> named 15, unattributed 5.
+    // One gap (serial 7) of other busy 20 ms; the paint sink's running sum is 10 at the gap's open.
+    // timer_frame 0..16 holds playback_handling 2..6 (which holds slider_position 3..4) and draw_frame
+    // 8..14 (2 ms of preview paint inside it: the sum goes 10 -> 12); then draw_frame_ready 17..19 holds
+    // 1 ms of runner sleep. Inclusive: timer 16-2 = 14, handling 4, draw 6-2 = 4. Exclusive: slider 1,
+    // handling 3, draw 4, timer 14-4-4 = 6, ready 2-1 = 1 -> named 15, unattributed 5.
+    // (r1 adversary A2: the timer's start must carry the same paint sum, 10, as every reading before
+    // the draw; with 0 there it charged 12 ms of paint to the timer and its exclusive time read 0.)
     gui_present_gap::OtherBusySpans spans;
     spans.openGap();
-    spans.begin(spanClock(7, 0));
-    spans.begin(spanClock(7, 2));
-    spans.begin(spanClock(7, 3));
-    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::SliderPosition, spanClock(7, 4)), 1e-9);
-    ASSERT_NEAR(3.0, spans.end(gui_present_gap::OtherBusySpan::PlaybackHandling, spanClock(7, 6)), 1e-9);
+    spans.begin(spanClock(7, 0, 0, 0, 10.0));
+    spans.begin(spanClock(7, 2, 0, 0, 10.0));
+    spans.begin(spanClock(7, 3, 0, 0, 10.0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::SliderPosition, spanClock(7, 4, 0, 0, 10.0)), 1e-9);
+    ASSERT_NEAR(3.0, spans.end(gui_present_gap::OtherBusySpan::PlaybackHandling, spanClock(7, 6, 0, 0, 10.0)), 1e-9);
     spans.begin(spanClock(7, 8, 0, 0, 10.0));
     ASSERT_NEAR(4.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrame, spanClock(7, 14, 0, 0, 12.0)), 1e-9);
     ASSERT_NEAR(6.0, spans.end(gui_present_gap::OtherBusySpan::TimerFrame, spanClock(7, 16, 0, 0, 12.0)), 1e-9);
-    spans.begin(spanClock(7, 17, 0, 0));
-    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrameReady, spanClock(7, 19, 0, 1)), 1e-9);
+    spans.begin(spanClock(7, 17, 0, 0, 12.0));
+    ASSERT_NEAR(1.0, spans.end(gui_present_gap::OtherBusySpan::DrawFrameReady, spanClock(7, 19, 0, 1, 12.0)), 1e-9);
     ASSERT_EQ(0, spans.depth());
     ASSERT_NEAR(5.0, spans.closeGap(20.0), 1e-9);
     ASSERT_NEAR(6.0, spans.sumMs[static_cast<int>(gui_present_gap::OtherBusySpan::TimerFrame)], 1e-9);
