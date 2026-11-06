@@ -40,6 +40,9 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   (``FAILED (failures=1, errors=1)``, ``2 failed``) disagrees with the failure blocks, sections or summary lines
   that could be read, or a short-summary line starts with no summary word. A header this parser cannot read (a
   test name holding a newline) would otherwise drop its failure, an ImportError included.
+* ``file::name`` / ``exception message``: a pytest ``FAILED`` summary node that is not ``file.ext::name`` (a
+  `` - `` inside a directory name), or a ``FAILED`` line with no readable exception message (a multi-line or
+  over-long node id, or a message truncated to ``...`` before its type shows).
 * ``number``: a probe reading or window bound no float can hold (an integer or ``1e400`` spelled out), or an
   infinite reading. A spelled ``inf`` window bound is a real unbounded window and is accepted.
 * ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
@@ -425,6 +428,14 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
                     nodes.append((node, msg))
                     if _empty_segment(node):
                         odd_notes.append(f"empty segment in the test identity {node[:60]!r}")
+                    elif "::" not in node or not re.search(r"\.\w+$", node.split("::")[0]):
+                        odd_notes.append(f"FAILED summary node {node[:60]!r} is not file::name "
+                                         "(a ' - ' inside a directory name?)")
+                    elif not msg or (msg.endswith("...") and not _ASSERT_HEAD.match(msg)):
+                        # A multi-line or over-long node id leaves no exception message; a truncated one has lost
+                        # the exception type. Either way the type of this failure cannot be read.
+                        odd_notes.append(f"FAILED summary line for {node[:60]!r} carries no readable exception "
+                                         "message (multi-line, over-long or truncated)")
                 if ambiguous:
                     summary_blockers.append(f"ambiguous summary line {word} {node[:60]}")
                 elif _IMPORT_ANYWHERE.search(msg) or _EXC_GROUP.match(msg):

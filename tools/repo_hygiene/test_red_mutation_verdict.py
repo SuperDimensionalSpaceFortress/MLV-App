@@ -386,11 +386,27 @@ class NarrowedPromiseR4(unittest.TestCase):
         self.cnc(out, "test_s.T.test_assert", "failure blocks")
         pt = ("def fail(): raise ImportError('missing')\nglobals()['test_import\\nsuffix'] = fail\ndel fail\n"
               "def test_assert(): assert False\n")
-        self.cnc(_run_pytest({"test_memory.py": pt}), "test_memory.py::test_assert", "sections")
-        self.cnc(_run_pytest({"test_memory.py": pt}, "--tb=no"), "test_memory.py::test_assert", "short test summary")
+        # with a summary the unreadable line is named at once; with -rN only the runner's count can give it away
+        self.cnc(_run_pytest({"test_memory.py": pt}), "test_memory.py::test_assert", "exception message")
+        self.cnc(_run_pytest({"test_memory.py": pt}, "--tb=no"), "test_memory.py::test_assert", "exception message")
         self.cnc(_run_pytest({"test_memory.py": pt}, "-rN"), "test_memory.py:4", "sections")
         plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"})
         self.assertEqual(rmv.verdict(plain, "test_memory.py::test_assert")[0], rmv.PASS, plain)
+
+    def test_pass7_a1_a2_summary_line_without_a_readable_message_is_refused(self) -> None:
+        base = "def test_assert(): assert False\ndef fail(): raise ImportError('missing')\n"
+        for name in ("test_import\\nPASSED", "test_import\\nSKIPPED", "test_import_' + 'x' * 90 + '"):
+            src = base + f"globals()['{name}'] = fail\ndel fail\n"
+            out = _run_pytest({"test_memory.py": src}, "--tb=no")
+            self.assertIn("2 failed", out)
+            self.cnc(out, "test_memory.py::test_assert", "exception message")
+
+    def test_pass7_a3_dash_in_a_directory_name_does_not_invent_a_node(self) -> None:
+        files = {"test_control.py": "def test_expected(): pass\n",
+                 "test_expected - assert False/test_memory.py": "def test_other(): raise TypeError('boom')\n"}
+        out = _run_pytest(files)
+        self.assertIn("1 failed, 1 passed", out)
+        self.cnc(out, "test_expected", "file::name")
 
     def test_the_narrowed_promise_is_documented(self) -> None:
         for word in ("NARROWED PROMISE", "COULD-NOT-CHECK", "chained", "Captured"):
