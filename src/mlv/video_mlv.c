@@ -7162,8 +7162,9 @@ static uint16_t * mlv_ensure_thread_reduced_recon_rgb_b(uint64_t required_words)
 /* The CPU reduced recon's debayer at the display dims (out_w x out_h RGB16 in out):
  *  - displayScale == 2 * bayerScale (x4 from an x2 Bayer, "H2c"): bilinear at
  *    bw x bh, chroma-only horizontal [1 2 1], 2x2 box (whole row pairs only);
- *  - displayScale == bayerScale == 2 ("H0c"): bilinear, chroma-only [1 2 1];
- *  - otherwise: the bilinear debayer's bytes, as before this card.
+ *  - otherwise (x2, and x4 from an x4 Bayer): the bilinear debayer's bytes, as
+ *    before this card. r8 (hub ruling HUB-TICK 20261105T2045Z) holds x2 at base
+ *    behaviour; x2's filter is CPU-DUALISO-REDUCED-X2-COMB-FILTER-1.
  * Then the rows past the reconstructed height repeat its last row. bayer takes the
  * bit shift in place (debayerBasicU16). Returns 0 (out untouched) when the dims do
  * not fit or a scratch frame cannot be had. */
@@ -7180,16 +7181,15 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
 {
     if (!out || !bayer || bw <= 0 || bh <= 0 || out_w <= 0 || out_h <= 0) return 0;
     const uint64_t bayer_rgb_words = (uint64_t)bw * (uint64_t)bh * 3u;
-    /* The filtered branches debayer into thread-local scratch: below 4 rows, at an
+    /* The filtered branch debayers into thread-local scratch: below 4 rows, at an
      * odd height (the last row pair is not reconstructed) or under 4 columns
      * debayerBasicU16 leaves rows of a previous frame's scratch in place
-     * (adversary A3, pass 2 A2), so they refuse such a Bayer. The planners only
+     * (adversary A3, pass 2 A2), so it refuses such a Bayer. The planners only
      * produce even heights (whole 4*S-row blocks) and widths of at least 4. */
-    const int filtered_branch = (displayScale == 2 * bayerScale) || (displayScale == 2 && bayerScale == 2);
-    if (filtered_branch && (bh < 4 || (bh & 1) != 0 || bw < 4)) return 0;
     int rows = 0;
     if (displayScale == 2 * bayerScale)
     {
+        if (bh < 4 || (bh & 1) != 0 || bw < 4) return 0;
         const int box_h = bh & ~1;
         if (bw != 2 * out_w || box_h <= 0 || box_h / 2 > out_h) return 0;
         uint16_t * debayered = mlv_ensure_thread_reduced_recon_rgb_a(bayer_rgb_words);
@@ -7199,15 +7199,6 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
         debayer_reduced_hchroma121_rgb16(filtered, debayered, bw, bh, threads);
         if (!processingRgbU16BoxDownsample(filtered, out, bw, box_h, 2, threads)) return 0;
         rows = box_h / 2;
-    }
-    else if (displayScale == 2 && bayerScale == 2)
-    {
-        if (bw != out_w || bh > out_h) return 0;
-        uint16_t * debayered = mlv_ensure_thread_reduced_recon_rgb_a(bayer_rgb_words);
-        if (!debayered) return 0;
-        debayerBasicU16RecordingKernelMilliseconds(debayered, bayer, bw, bh, threads, bit_shift);
-        debayer_reduced_hchroma121_rgb16(out, debayered, bw, bh, threads);
-        rows = bh;
     }
     else
     {

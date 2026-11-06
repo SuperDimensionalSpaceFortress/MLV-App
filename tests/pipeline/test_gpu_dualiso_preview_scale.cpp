@@ -632,8 +632,7 @@ std::vector<uint8_t> emulateReducedPresent(MlvPipelineFixture & fixture,
                                            int reducedHeight,
                                            int outHeight,
                                            bool hnyquist,
-                                           bool amaze = false,
-                                           bool chroma121 = false)
+                                           bool amaze = false)
 {
     const size_t rowWords = static_cast<size_t>(reducedWidth) * 3u;
     std::vector<uint16_t> work(bayer);
@@ -646,13 +645,6 @@ std::vector<uint8_t> emulateReducedPresent(MlvPipelineFixture & fixture,
     else
     {
         debayerBasicU16(rgb.data(), work.data(), reducedWidth, reducedHeight, 1, 0);
-    }
-    if (chroma121)
-    {
-        // CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the CPU x2 consumer's chroma-only [1 2 1] ("H0c").
-        std::vector<uint16_t> filtered(rgb.size(), 0u);
-        debayer_reduced_hchroma121_rgb16(filtered.data(), rgb.data(), reducedWidth, reducedHeight, 1);
-        std::copy_n(filtered.data(), rowWords * static_cast<size_t>(reducedHeight), rgb.data());
     }
     for (int y = reducedHeight; y < outHeight; ++y)
         std::memcpy(rgb.data() + static_cast<size_t>(y) * rowWords,
@@ -925,9 +917,8 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         const int ok = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
             video, 2, bayer.data(), rw, rh, plan.scale, routed.data(), 1, scale);
         // The emulation without the filter, through debayerBasicU16, is the routed frame
-        // (H2C-PORT-1: plus the chroma-only [1 2 1] the CPU consumer takes at x2).
-        const std::vector<uint8_t> emulatedBasic =
-            emulateReducedPresent(fixture, 2, bayer, rw, rh, h, false, false, scale == 2);
+        // (H2C-PORT-1 r8: x2 is held at base, so no chroma filter at x2 either).
+        const std::vector<uint8_t> emulatedBasic = emulateReducedPresent(fixture, 2, bayer, rw, rh, h, false);
         const std::vector<uint8_t> e = emulateReducedPresent(fixture, 2, bayer, rw, rh, h, hnyquist, true);
         const std::vector<uint8_t> refBin = emulateReducedPresent(fixture, 2, binned, rw, rh, h, false, true);
         const std::vector<uint8_t> unnotched =
@@ -1569,9 +1560,10 @@ TEST(GpuDualIsoPreviewScale, AHeightNotAMultipleOf16CropsItsLastRowsAndPadsTheEd
 // with the phase tent to x4 and debayered bilinear there ("H0"). The offline model
 // (EDGE-FRINGE-1 r2 sim_r2.py / sim_r2_alt.py) names H2c for x4: tent x2 + bilinear at x2 +
 // chroma-only horizontal [1 2 1]/4 (R' = G + h121(R - G), B' = G + h121(B - G)) + 2x2 box,
-// phase-mean F/ref 1.10-1.19 (H0 2.16-2.53), per-phase max 2.00-2.03 (H0 2.50-3.38); and, at
-// x2 (this card's P0b, sim_s2.py), H0c: H0 then the chroma-only [1 2 1], gained H0c/H0 phase
-// mean 0.739-0.858. These tests port sim_r2.py's scenes and metric_F onto the real entry.
+// phase-mean F/ref 1.10-1.19 (H0 2.16-2.53), per-phase max 2.00-2.03 (H0 2.50-3.38). These
+// tests port sim_r2.py's scenes and metric_F onto the real entry. r8 (hub ruling HUB-TICK
+// 20261105T2045Z): x2 is held at base behaviour (the plain bilinear); the x2 "H0c" filter and
+// its test left with it, and any x2 filter is CPU-DUALISO-REDUCED-X2-COMB-FILTER-1's.
 namespace {
 
 const double kH2cKr = 0.3977; // fixture_wb.exe on the GPU-eligible fixture's frame 1 (sim_r2.py KR, KB)
@@ -1674,12 +1666,10 @@ double h2cMetricF(const uint16_t * rgb, int stride, int w, int rows, int scale, 
 
 // One scene through the reference (debayerBasicU16 at full res + SxS box) and the CPU reduced
 // route at `scale` (the plan's shrink, then getMlvRawFrameDebayeredFromReducedReconnedRaw16).
-// h0: F of the bilinear debayer of the same shrunk Bayer when it is at the display scale.
 struct H2cPhase
 {
     double ref = 0.0;
     double route = 0.0;
-    double h0 = 0.0;
 };
 
 bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan, int scale, int hq, int shift,
@@ -1707,7 +1697,6 @@ bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan
     if (mlvDualIsoPreviewScaleReconShrink(video, &noFixes, raw.data(), reduced.data(), &worker.state, 1, nullptr,
                                           nullptr) != 1)
         return false;
-    std::vector<uint16_t> h0In(reduced);
     std::vector<uint16_t> rgb(static_cast<size_t>(outW) * static_cast<size_t>(outH) * 3u, 0u);
     int w = 0, h = 0;
     if (getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, reduced.data(), bw, bh, scale, rgb.data(), hq, &w,
@@ -1716,12 +1705,6 @@ bool h2cRunPhase(mlvObject_t * video, const mlvDualIsoPreviewScaleRecon_t & plan
     const int rows = plan.reducedHeight;
     out->ref = h2cMetricF(ref.data(), outW, outW, rows, scale, sc.edges, kr, kb);
     out->route = h2cMetricF(rgb.data(), outW, outW, rows, scale, sc.edges, kr, kb);
-    if (bw == outW)
-    {
-        std::vector<uint16_t> h0(static_cast<size_t>(bw) * static_cast<size_t>(bh) * 3u);
-        debayerBasicU16(h0.data(), h0In.data(), bw, bh, 4, shift);
-        out->h0 = h2cMetricF(h0.data(), bw, bw, rows, scale, sc.edges, kr, kb);
-    }
     return true;
 }
 
@@ -1790,57 +1773,6 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingFringeStaysNearFullRecon)
         std::printf("[h2c-x4-fringe] %-12s bayer x%d: F(route)/F(ref) per phase%s | max %.3f (<= 2.1) mean %.3f "
                     "(<= 1.35) %s\n",
                     spec.name.c_str(), plan.bayerScale, perPhase.c_str(), maxRatio, mean, ok ? "ok" : "FAIL");
-        pass = pass && ok;
-    }
-    ASSERT_TRUE(pass);
-}
-
-// H2C-PORT-1 RED 2 (s2 IN SCOPE by P0b, p0-report.md): at x2 the route is H0c, the chroma-only
-// [1 2 1] on the x2 bilinear. Per gained scene, phase-mean F(H0c)/F(ref) over phase-mean
-// F(H0)/F(ref) <= sim_s2.py's ratio + 0.05 (bars/step 0.772, line1 0.858, line2 0.739, line3
-// 0.758). H0 is the bilinear debayer of the same shrunk Bayer, measured in the test.
-// Mutations: no filter at x2 (ratio 1.0), filter on G too.
-TEST(GpuDualIsoPreviewScale, CpuReducedX2PlayingFringeDropsWithChromaFilter)
-{
-    GpuReconEnv env(false);
-    MlvPipelineFixture fixture;
-    ASSERT_TRUE(openGpuEligibleFixture(fixture));
-    ASSERT_FALSE(fixture.renderFrame8(0).empty());
-    mlvObject_t * video = fixture.video();
-    setMlvDontAlwaysUseAmaze(video);
-    const int hq = llrpHQDualIso(video) ? 1 : 0;
-    const int shift = hq ? 0 : 16 - video->RAWI.raw_info.bits_per_pixel;
-    const int scale = 2;
-    mlvDualIsoPreviewScaleRecon_t plan;
-    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
-    const struct { const char * name; double sim; } bounds[] = {
-        { "bars-gained", 0.772 }, { "step-gained", 0.772 }, { "line1-gained", 0.858 },
-        { "line2-gained", 0.739 }, { "line3-gained", 0.758 },
-    };
-    bool pass = true;
-    for (const H2cSceneSpec & spec : h2cGainedScenes(fixture.width(), scale))
-    {
-        double sumRoute = 0.0, sumH0 = 0.0;
-        std::string perPhase;
-        for (const H2cScene & sc : spec.phases)
-        {
-            H2cPhase ph;
-            ASSERT_TRUE(h2cRunPhase(video, plan, scale, hq, shift, sc, kH2cKr, kH2cKb, &ph));
-            ASSERT_TRUE(ph.ref > 0.0 && ph.h0 > 0.0);
-            sumRoute += ph.route / ph.ref;
-            sumH0 += ph.h0 / ph.ref;
-            char buf[48];
-            std::snprintf(buf, sizeof(buf), " %.3f/%.3f", ph.route / ph.ref, ph.h0 / ph.ref);
-            perPhase += buf;
-        }
-        double bound = 0.0;
-        for (const auto & b : bounds)
-            if (spec.name == b.name) bound = b.sim + 0.05;
-        ASSERT_TRUE(bound > 0.0);
-        const double q = sumRoute / sumH0;
-        const bool ok = q <= bound;
-        std::printf("[h2c-x2-fringe] %-12s per phase route/ref h0/ref%s | H0c/H0 phase mean %.3f (<= %.3f) %s\n",
-                    spec.name.c_str(), perPhase.c_str(), q, bound, ok ? "ok" : "FAIL");
         pass = pass && ok;
     }
     ASSERT_TRUE(pass);
@@ -1921,7 +1853,10 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4ReconstructsAtX2AndBothConsumersTakeIt)
         ASSERT_TRUE(nonzero > out8.size() / 2);
 
         // Adversary A3: a Bayer under 4 rows reconstructs no row pair, so the filtered (scratch)
-        // branches would hand back a previous frame's scratch; the entry refuses it (out untouched).
+        // branch would hand back a previous frame's scratch; the entry refuses it (out untouched).
+        // r8: only x4 takes the filtered branch. x2 is the plain branch again, which writes
+        // straight into the output and takes any height, as fork/master does.
+        if (scale != 4) continue;
         std::vector<uint16_t> shortBayer(static_cast<size_t>(plan.bayerWidth) * 2u, 5000u);
         std::vector<uint16_t> sentinel(rgb.size(), 0xBEEFu);
         w = -1;
@@ -1998,7 +1933,7 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX2PlayingIsTheBaseBilinearDebayer)
     processingSetPlaybackPreviewScaleFactor(scale);
     const int ok8 = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(video, 1, bayer.data(), bw, bh, plan.scale,
                                                                         out8.data(), 1, scale);
-    const std::vector<uint8_t> plain = emulateReducedPresent(fixture, 1, bayer, bw, bh, fh, false, false, false);
+    const std::vector<uint8_t> plain = emulateReducedPresent(fixture, 1, bayer, bw, bh, fh, false);
     processingSetPlaybackPreviewScaleFactor(previousScale);
     processingSetPlaybackPreviewMode(previousMode);
     ASSERT_EQ(1, ok8);

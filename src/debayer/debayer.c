@@ -536,7 +536,7 @@ void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w,
 
 /* CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: the chroma-only [1,2,1]/4 along x (see
  * debayer.h). The x4 CPU reduced route runs it on its x2 debayer before the 2x2 box
- * ("H2c"), the x2 route on its debayer ("H0c"): it lowpasses R-G and B-G across the
+ * ("H2c"; the x2 route does not, r8): it lowpasses R-G and B-G across the
  * columns, where the shrunk Bayer's colour sites sit a full reduced pixel apart, and
  * leaves G (the picture's sharpness) alone. */
 void debayer_reduced_hchroma121_rgb16(uint16_t *out, const uint16_t *in, int w, int h, int threads)
