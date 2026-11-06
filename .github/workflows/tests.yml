@@ -332,7 +332,7 @@ jobs:
     # Six parts since CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the
     # windows suite weighs 12047 s, past the 9666 s that 7 shards plus 2 parts hold at the 85 % limit.
     # Eleven parts since CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: re-derived from seven green merge_group
-    # runs the suite weighs 17515 s at each class's largest measured time, past the 13962 s that
+    # runs the suite weighs 17510 s at each class's largest measured time, past the 13962 s that
     # 7 shards plus 6 parts hold at the 85 % limit; 17 more classes moved into the heavy set.
     name: Repo Hygiene Python windows unittest heavy ${{ matrix.part }}/11
     runs-on: windows-latest
