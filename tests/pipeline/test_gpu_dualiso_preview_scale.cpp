@@ -1933,6 +1933,139 @@ TEST(GpuDualIsoPreviewScale, CpuReducedX4ReconstructsAtX2AndBothConsumersTakeIt)
     }
 }
 
+// H2C-PORT-1 r8 (hub ruling HUB-TICK 20261105T2045Z, r7 row 3): x4 lands alone and x2 is held
+// at base behaviour. On the real entries, the CPU reduced recon at x2 is the plain bilinear
+// debayer of the reduced Bayer, byte for byte, with the rows past the reconstructed height
+// repeating its last row (fork/master's code); the processed8 consumer presents exactly that.
+// x2's filter is CPU-DUALISO-REDUCED-X2-COMB-FILTER-1's, not this card's.
+// Mutations: the chroma-only [1 2 1] at x2 (H0c, 5ae70e21), any other x2 filter, no row pad.
+TEST(GpuDualIsoPreviewScale, CpuReducedX2PlayingIsTheBaseBilinearDebayer)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video);
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    const int shift = hq ? 0 : 16 - video->RAWI.raw_info.bits_per_pixel;
+    const int scale = 2;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+    ASSERT_EQ(scale, plan.bayerScale);
+    const int bw = plan.bayerWidth;
+    const int bh = plan.bayerHeight;
+    const int outW = fixture.width() / scale;
+    const int outH = fixture.height() / scale;
+    ASSERT_EQ(outW, bw);
+    std::vector<uint16_t> raw = decodeRaw(fixture, 1);
+    ASSERT_FALSE(raw.empty());
+    std::vector<uint16_t> bayer(static_cast<size_t>(bw) * static_cast<size_t>(bh), 0u);
+    WorkerState worker;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), bayer.data(), &worker.state, 1, nullptr,
+                                                nullptr));
+
+    // fork/master's x2: debayerBasicU16 straight into the output, then the last-row pad.
+    const size_t rowWords = static_cast<size_t>(outW) * 3u;
+    std::vector<uint16_t> expected(rowWords * static_cast<size_t>(outH), 0u);
+    {
+        std::vector<uint16_t> work(bayer);
+        debayerBasicU16(expected.data(), work.data(), bw, bh, getMlvCpuCores(video), shift);
+        for (int y = bh; y < outH; ++y)
+            std::memcpy(expected.data() + static_cast<size_t>(y) * rowWords,
+                        expected.data() + static_cast<size_t>(bh - 1) * rowWords, rowWords * sizeof(uint16_t));
+    }
+    std::vector<uint16_t> work(bayer);
+    std::vector<uint16_t> routed(expected.size(), 0u);
+    int w = 0, h = 0;
+    ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, work.data(), bw, bh, scale, routed.data(),
+                                                                 hq, &w, &h));
+    ASSERT_EQ(outW, w);
+    ASSERT_EQ(outH, h);
+    size_t differ = 0;
+    for (size_t i = 0; i < routed.size(); ++i) differ += routed[i] != expected[i];
+    std::printf("[h2c-x2-base] debayered16 entry x2 bayer %dx%d out %dx%d: %zu of %zu words differ from the plain "
+                "bilinear debayer (want 0)\n", bw, bh, outW, outH, differ, routed.size());
+    ASSERT_EQ(static_cast<size_t>(0), differ);
+
+    // The processed8 consumer presents the same unfiltered debayer.
+    int fw = 0, fh = 0;
+    mlvFrameOutputDimensions(video, scale, &fw, &fh);
+    std::vector<uint8_t> out8(static_cast<size_t>(fw) * static_cast<size_t>(fh) * 3u, 0u);
+    const int previousMode = processingPlaybackPreviewModeEnabled();
+    const int previousScale = processingPlaybackPreviewScaleFactor();
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackPreviewScaleFactor(scale);
+    const int ok8 = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(video, 1, bayer.data(), bw, bh, plan.scale,
+                                                                        out8.data(), 1, scale);
+    const std::vector<uint8_t> plain = emulateReducedPresent(fixture, 1, bayer, bw, bh, fh, false, false, false);
+    processingSetPlaybackPreviewScaleFactor(previousScale);
+    processingSetPlaybackPreviewMode(previousMode);
+    ASSERT_EQ(1, ok8);
+    size_t differ8 = 0;
+    for (size_t i = 0; i < out8.size() && i < plain.size(); ++i) differ8 += out8[i] != plain[i];
+    std::printf("[h2c-x2-base] processed8 entry x2: %zu of %zu bytes differ from the plain bilinear present (want 0)\n",
+                differ8, out8.size());
+    ASSERT_EQ(plain.size(), out8.size());
+    ASSERT_EQ(static_cast<size_t>(0), differ8);
+}
+
+// H2C-PORT-1 r8: x4 keeps H2c, byte for byte, on the real entry: bilinear at the x2 Bayer,
+// the chroma-only horizontal [1 2 1], the 2x2 box over whole row pairs, then the last-row pad.
+// Passes on 5ae70e21 and on the r8 head (holding x2 at base must not move x4).
+// Mutations: x4 on the plain branch, the filter dropped or moved after the box, odd-row box.
+TEST(GpuDualIsoPreviewScale, CpuReducedX4PlayingIsH2cByteForByte)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video);
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    const int shift = hq ? 0 : 16 - video->RAWI.raw_info.bits_per_pixel;
+    const int scale = 4;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+    ASSERT_EQ(2, plan.bayerScale);
+    const int bw = plan.bayerWidth;
+    const int bh = plan.bayerHeight;
+    const int outW = fixture.width() / scale;
+    const int outH = fixture.height() / scale;
+    ASSERT_EQ(2 * outW, bw);
+    std::vector<uint16_t> raw = decodeRaw(fixture, 1);
+    ASSERT_FALSE(raw.empty());
+    std::vector<uint16_t> bayer(static_cast<size_t>(bw) * static_cast<size_t>(bh), 0u);
+    WorkerState worker;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), bayer.data(), &worker.state, 1, nullptr,
+                                                nullptr));
+    const int threads = getMlvCpuCores(video);
+    const size_t rowWords = static_cast<size_t>(outW) * 3u;
+    std::vector<uint16_t> expected(rowWords * static_cast<size_t>(outH), 0u);
+    {
+        std::vector<uint16_t> work(bayer);
+        std::vector<uint16_t> deb(static_cast<size_t>(bw) * static_cast<size_t>(bh) * 3u, 0u);
+        std::vector<uint16_t> filt(deb.size(), 0u);
+        debayerBasicU16(deb.data(), work.data(), bw, bh, threads, shift);
+        debayer_reduced_hchroma121_rgb16(filt.data(), deb.data(), bw, bh, threads);
+        const int boxH = bh & ~1;
+        ASSERT_EQ(1, processingRgbU16BoxDownsample(filt.data(), expected.data(), bw, boxH, 2, threads));
+        for (int y = boxH / 2; y < outH; ++y)
+            std::memcpy(expected.data() + static_cast<size_t>(y) * rowWords,
+                        expected.data() + static_cast<size_t>(boxH / 2 - 1) * rowWords, rowWords * sizeof(uint16_t));
+    }
+    std::vector<uint16_t> work(bayer);
+    std::vector<uint16_t> routed(expected.size(), 0u);
+    int w = 0, h = 0;
+    ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, work.data(), bw, bh, scale, routed.data(),
+                                                                 hq, &w, &h));
+    size_t differ = 0;
+    for (size_t i = 0; i < routed.size(); ++i) differ += routed[i] != expected[i];
+    std::printf("[h2c-x4-pin] debayered16 entry x4 bayer x2 %dx%d out %dx%d: %zu of %zu words differ from H2c "
+                "(want 0)\n", bw, bh, outW, outH, differ, routed.size());
+    ASSERT_EQ(static_cast<size_t>(0), differ);
+}
+
 // H2C-PORT-1: debayer_reduced_hchroma121_rgb16 leaves G alone, lowpasses R-G and B-G with
 // [1 2 1]/4 along x (mirrored edges), and clamps to [0, 65535].
 // Mutations: filter on G, weights [1 0 1]/2, no mirroring, no clamp, unsigned difference.
