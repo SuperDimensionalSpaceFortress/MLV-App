@@ -172,7 +172,7 @@ def log(**k):
 def read_flag():
     # A read that collides with a replace (PermissionError) is retried, never taken for "no flag": a wrapper that read None skipped its delete and
     # left the flag for `lease release` to poll out (adversary r2 A4).
-    for i in range(100):
+    for i in range(500):
         try:
             with open(flag, encoding="utf-8") as f:
                 return json.load(f)
@@ -396,7 +396,7 @@ function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
     if ($null -ne $script:LeaseBatch -and (Get-Command Close-LeaseBatch -ErrorAction SilentlyContinue)) { Close-LeaseBatch -Reason 'test-reset' }
     $script:LeaseBatch = $null; $script:LeaseBatchKeep = $false
     Set-Fake $Control
-    Remove-Item -LiteralPath (Join-Path $fx 'calls.jsonl'), (Join-Path $fx 'quiet-lease.json'), (Join-Path $fx 'last-lease-end.txt'), (Join-Path $fx 'fake-status.json') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $fx 'calls.jsonl'), (Join-Path $fx 'quiet-lease.json'), (Join-Path $fx 'last-lease-end.txt'), (Join-Path $fx 'fake-status.json'), (Join-Path $fx 'reader-held') -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $fx -Filter 'lease-batch-*.jsonl' -File | Remove-Item -Force
     Get-ChildItem -LiteralPath $fx -Filter 'release-*' -File | Remove-Item -Force
     Get-ChildItem -LiteralPath (Join-Path $fx 'notafter') -File -ErrorAction SilentlyContinue | Remove-Item -Force
@@ -406,6 +406,15 @@ function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
     $script:LogHook = $null; $script:HookFired = $false; $script:BeatHook = $null; $script:SidecarReadHook = $null; $script:VerdictNowPin = $null
 }
 function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) }
+# AGENT-LEASE-QUIET-LEASE-SEAM-PID-CLEANUP-1 (adversary r2 pass 2 A1): a fixture child is identified by its CURRENT command line (it names the fixture dir),
+# queried fresh at the moment of the stop, never by a pid remembered from an earlier snapshot (the OS may have given that pid to an unrelated process).
+function Get-FixtureChildPids([string]$Fx) { return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $PID -and $null -ne $_.CommandLine -and $_.CommandLine.Contains($Fx) } | ForEach-Object { [int]$_.ProcessId }) }
+function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates) {
+    $now = @(Get-FixtureChildPids $Fx)
+    $kill = @($Candidates | Where-Object { $now -contains $_ })
+    foreach ($k in $kill) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+    return $kill
+}
 function Wait-Until([scriptblock]$Cond, [double]$TimeoutSec) { $dl = (Get-Date).AddSeconds($TimeoutSec); while (-not (& $Cond) -and (Get-Date) -lt $dl) { Start-Sleep -Milliseconds 100 }; return [bool](& $Cond) }
 $meta = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 600 }
 
@@ -903,7 +912,7 @@ try {
             $vOut = & $script:RealVerdict -Metadata $Metadata -NowUtc $NowUtc -Sidecar $Sidecar
             # The first verdict that CALLS a sidecar passed, stamped after it returned: the real verdict read its clock inside, so this stamp
             # is never earlier than the sidecar's aliveUntilUtc (a >= 0 lag by construction, and a negative one would be a verdict called early).
-            if ($null -ne $Sidecar -and $null -ne $vOut -and $vOut.state -ceq 'passed' -and $vOut.livenessState -ceq 'lapsed' -and -not $script:VerdictPassedAt.ContainsKey([string]$Sidecar.jobId)) { $script:VerdictPassedAt[[string]$Sidecar.jobId] = [DateTime]::UtcNow }
+            if ($null -ne $Sidecar -and $null -ne $vOut -and $vOut.state -ceq 'passed' -and $vOut.livenessState -ceq 'lapsed' -and $NowUtc -eq [DateTime]::MinValue -and -not $script:VerdictPassedAt.ContainsKey([string]$Sidecar.jobId)) { $script:VerdictPassedAt[[string]$Sidecar.jobId] = [DateTime]::UtcNow }
             return $vOut
         }
     }
@@ -1872,7 +1881,7 @@ function Exit-HeavySlot {
     function Start-FlagReader {
         # Pins the collision: the moment the release file appears (the wrapper is about to delete the flag) this opens the flag and holds the handle for 1 s,
         # like a scan or an indexer that has just got to it. A fixture that deletes once dies on it; one that retries waits it out.
-        $code = "import glob,os,sys,time`np=sys.argv[1]; d=os.path.dirname(p); t=time.time()+60`nwhile time.time()<t:`n    if glob.glob(os.path.join(d,'release-*')):`n        try:`n            with open(p,'rb') as f:`n                f.read(); time.sleep(1.0)`n        except OSError:`n            pass`n        break`n    time.sleep(0.002)"
+        $code = "import glob,os,sys,time`np=sys.argv[1]; d=os.path.dirname(p); t=time.time()+60`nwhile time.time()<t:`n    if glob.glob(os.path.join(d,'release-*')):`n        try:`n            with open(p,'rb') as f:`n                f.read(); open(os.path.join(d,'reader-held'),'w').close(); time.sleep(1.0)`n        except OSError:`n            pass`n        break`n    time.sleep(0.002)"
         $psiR = [Diagnostics.ProcessStartInfo]::new($Python)
         foreach ($a in @('-c', $code, (Join-Path $fx 'quiet-lease.json'))) { [void]$psiR.ArgumentList.Add($a) }
         $psiR.UseShellExecute = $false; $psiR.CreateNoWindow = $true
@@ -1933,6 +1942,7 @@ function Exit-HeavySlot {
             $LeasePendingMaxSec = $savedPendingMax
             if ($null -ne $flagReader) { try { Stop-Process -Id $flagReader.Id -Force -ErrorAction SilentlyContinue; $null = $flagReader.WaitForExit(5000) } catch { } }
         }
+        Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or (Test-Path -LiteralPath (Join-Path $fx 'reader-held'))) "liveness-lapses-while-pending: the flag-reader held the flag open when the release marker appeared (a control that never held it proves nothing)"
         Assert-True ($script:LapseFault.kind -cnotin @('delay-beat', 'skip-beat') -or $script:LapseFaultFired) "liveness-lapses-while-pending: the $($script:LapseFault.kind) fault landed on a gate-wait beat near expiry (a control whose fault never landed proves nothing)"
         # late-observe: the test reads the world late (the old `$ended = now - aliveAt` after this point read the late clock; the events above do not).
         if ($script:LapseFault.kind -ceq 'late-observe') { Start-Sleep -Milliseconds ([int]($script:LapseFault.sec * 1000)) }
@@ -2531,6 +2541,7 @@ function Exit-HeavySlot {
             $flagReaderK = if ($script:LapseFault.kind -ceq 'flag-reader') { Start-FlagReader } else { $null }
             try { $admK = Wait-QuietLeaseAdmission -JobId $openK -Job ([pscustomobject]@{}) -Metadata $mK }
             finally { if ($null -ne $flagReaderK) { try { Stop-Process -Id $flagReaderK.Id -Force -ErrorAction SilentlyContinue; $null = $flagReaderK.WaitForExit(5000) } catch { } } }
+            Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or (Test-Path -LiteralPath (Join-Path $fx 'reader-held'))) "batch-runner-killed-liveness: the flag-reader held the flag open when the release marker appeared (a control that never held it proves nothing)"
             # late-observe (regression control only): the test reads the world late; the end is measured from events, so it must not matter.
             if ($script:LapseFault.kind -ceq 'late-observe') { Start-Sleep -Milliseconds ([int]($script:LapseFault.sec * 1000)) }
             $script:LogHook = $null
@@ -3376,7 +3387,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         try { return ($pr.StartTime.Ticks -eq $StartTicks) } catch { return $false }
     }
     function Add-PsSeamAll($All, $Current, $Starts) {
-        foreach ($k in @($Current)) { if (-not $All.ContainsKey([int]$k)) { $All[[int]$k] = $(if ($Starts.ContainsKey([int]$k)) { [long]$Starts[[int]$k] } else { [long]0 }) } }
+        # The CURRENT start time wins over an older entry for the same pid (an owned child that reused a pid after an earlier one exited).
+        foreach ($k in @($Current)) {
+            if ($Starts.ContainsKey([int]$k)) { $All[[int]$k] = [long]$Starts[[int]$k] }
+            elseif (-not $All.ContainsKey([int]$k)) { $All[[int]$k] = [long]0 }
+        }
     }
     function Stop-PsSeamAll($All, $Current, $Starts) {
         $ids = @(@($All.Keys) + @($Current) | ForEach-Object { [int]$_ } | Select-Object -Unique)
@@ -3395,9 +3410,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $spCur = [System.Collections.Generic.List[int]]::new()
         $spKids = [System.Collections.Generic.List[int]]::new()
         $spBystander = $null
-        function Start-SeamKid([string]$Tag) {
+        function Start-SeamKid([string]$Tag, [switch]$Outside) {
+            # Outside: a command line that does NOT name the fixture dir (an unrelated process that now holds a pid the suite once knew).
             $psiS = [Diagnostics.ProcessStartInfo]::new($Python)
-            foreach ($a in @('-c', 'import time; time.sleep(300)', (Join-Path $fx "seam-child-$Tag"))) { [void]$psiS.ArgumentList.Add($a) }
+            $tagPath = if ($Outside) { Join-Path ([IO.Path]::GetTempPath()) "seam-unrelated-$PID-$Tag" } else { Join-Path $fx "seam-child-$Tag" }
+            foreach ($a in @('-c', 'import time; time.sleep(300)', $tagPath)) { [void]$psiS.ArgumentList.Add($a) }
             $psiS.UseShellExecute = $false; $psiS.CreateNoWindow = $true
             return [Diagnostics.Process]::Start($psiS)
         }
@@ -3409,7 +3426,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 Add-PsSeamAll $spAll $spCur $spStarts
             }
             # A2 (adversary r2): a registered pid that is now an UNRELATED process (start time differs) must survive the cleanup.
-            $spBystander = Start-SeamKid 'bystander'
+            $spBystander = Start-SeamKid 'bystander' -Outside
             $spAll[[int]$spBystander.Id] = [long]($spBystander.StartTime.Ticks + 1)
             Assert-True (@($spKids | Where-Object { Test-PidAlive $_ }).Count -eq 3) "lease-seam-pid-cleanup: three subcases left three live children before the final cleanup: alive=$(@($spKids | Where-Object { Test-PidAlive $_ }).Count)"
             $left = @(Stop-PsSeamAll $spAll $spCur $spStarts)
@@ -3417,11 +3434,18 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $left = @(@($left) + @($spKids | Where-Object { Test-PidAlive $_ }) | Select-Object -Unique)
             Assert-True ($left.Count -eq 0) "lease-seam-pid-cleanup: no fixture child survives the final cleanup: survivors=[$($left -join ',')] of [$($spKids -join ',')]"
             Assert-True (Test-PidAlive $spBystander.Id) "lease-seam-pid-cleanup: a registered pid whose process start time no longer matches (pid reuse) is NOT stopped: bystander $($spBystander.Id) alive=$(Test-PidAlive $spBystander.Id)"
+            # pass-2 A1: the suite-end sweep stops a STALE candidate pid only while its CURRENT command line names the fixture; an unrelated process that
+            # now holds that pid (its command line does not) is left alone, and a real fixture child is stopped.
+            $spFixKid = Start-SeamKid 'sweep'
+            $stopped = @(Stop-FixtureLeftovers $fx @($spBystander.Id, $spFixKid.Id))
+            Assert-True ((Test-PidAlive $spBystander.Id) -and $stopped -notcontains $spBystander.Id) "lease-seam-pid-cleanup: the sweep does not stop a pid whose command line no longer names the fixture: bystander alive=$(Test-PidAlive $spBystander.Id) stopped=[$($stopped -join ',')]"
+            Assert-True ((Wait-Until { -not (Test-PidAlive $spFixKid.Id) } 5) -and $stopped -contains $spFixKid.Id) "lease-seam-pid-cleanup: the sweep stops a real fixture child: stopped=[$($stopped -join ',')]"
             $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count; bystanderSurvived = (Test-PidAlive $spBystander.Id) }
         }
         finally {
             foreach ($k in $spKids) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
             if ($null -ne $spBystander) { Stop-Process -Id $spBystander.Id -Force -ErrorAction SilentlyContinue }
+            if ($null -ne $spFixKid) { Stop-Process -Id $spFixKid.Id -Force -ErrorAction SilentlyContinue }
         }
     }
     if (Test-Case 'lease-start-post-start-failure') {
@@ -3628,13 +3652,15 @@ finally {
     # (300 s) used to outlive the run. Whatever is left is stopped here so a RED run never pollutes the host, and the count is asserted below.
     $script:FixtureLeak = @()
     try {
-        $script:FixtureLeak = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $PID -and $null -ne $_.CommandLine -and $_.CommandLine.Contains($fx) } | ForEach-Object { [int]$_.ProcessId })
+        $script:FixtureLeak = @(Get-FixtureChildPids $fx)
+        if ($script:FixtureLeak.Count -gt 0) {
+            $null = Wait-Until { @(Get-FixtureChildPids $fx).Count -eq 0 } 3
+            $script:FixtureLeak = @(Get-FixtureChildPids $fx)   # fresh: whatever still names the fixture after the grace
+            $null = Stop-FixtureLeftovers $fx $script:FixtureLeak
+        }
     }
     catch { $script:FixtureLeakProbeError = $_.Exception.Message }
     if ($script:FixtureLeak.Count -gt 0) {
-        $null = Wait-Until { @($script:FixtureLeak | Where-Object { Test-PidAlive $_ }).Count -eq 0 } 3
-        $script:FixtureLeak = @($script:FixtureLeak | Where-Object { Test-PidAlive $_ })
-        foreach ($k in $script:FixtureLeak) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
         if ($script:FixtureLeak.Count -gt 0) { [Console]::Error.WriteLine("FIXTURE-LEAK: $($script:FixtureLeak.Count) fixture child process(es) outlived the suite (stopped now): pids=$($script:FixtureLeak -join ',')") }
     }
     Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue
