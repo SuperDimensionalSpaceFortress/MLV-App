@@ -1276,7 +1276,6 @@ function Get-VenueRunStartCap {
     }
     $t = $now; $batches = 0; [long]$waitTotal = 0; $span = [long]0; $margin = [long]0; $computed = $null; $lastLegStart = $now; $projErr = $null
     try {
-        $leaseRows = [System.Collections.Generic.List[object]]::new(); foreach ($l in @($Leases)) { if ($null -ne $l) { $leaseRows.Add($l) } }
         # each leg's own run time (its play seconds + the measured overhead), in plan order: the per-leg list when the caller has one (A1), else every leg is -PlaySeconds
         [long[]]$runs = $(if ($legSecs.Count -gt 0) { @($legSecs | ForEach-Object { [long]$_ + $LegOverheadSec }) } else { @(1..$LegCount | ForEach-Object { [long]$PlaySeconds + $LegOverheadSec }) })
         # a leg starts only with its leg budget + the lease margin still ahead of it. The runner's leg budget grows to the LONGEST leg seen (Invoke-VenueLeaseBatch.ps1, up to 2700 s),
@@ -1284,25 +1283,41 @@ function Get-VenueRunStartCap {
         [long]$longestRun = [Math]::Max(([long[]]$runs | Measure-Object -Maximum).Maximum, $(if ($MaxPlaySeconds -gt 0) { [long]$MaxPlaySeconds + $LegOverheadSec } else { 0 }))
         [long]$legBudget = [Math]::Min(2700, [Math]::Max([long]$LegBudgetSec, $longestRun))
         if ($longestRun -gt 2700) { throw "the longest planned leg needs $longestRun s (playSeconds $([long]$longestRun - $LegOverheadSec) + overhead $LegOverheadSec), more than the 2700 s a lease can hold" }
-        [int]$next = 0
-        while ($next -lt $LegCount) {
-            $w = Get-VenueLeaseBudgetWait -Leases @($leaseRows) -NowUtc $t -CapSec $CapSec -CooldownSec $CooldownSec -WindowSec $WindowSec -BudgetSec $BudgetSec
-            [long]$room = [Math]::Min([long]$CapSec, [long]$w.budgetRoomSec)
-            [long]$need = $LeaseMarginSec + $legBudget + $BatchOpenCloseSec
-            if ($room -lt $need) { throw "a lease holds at most roomSec=$room (capSec=$CapSec, budgetRoomSec=$($w.budgetRoomSec)) and one leg needs $need s (leaseMarginSec=$LeaseMarginSec + legBudgetSec=$legBudget + openCloseSec=$BatchOpenCloseSec): no leg fits a lease" }
-            # leg k of a lease starts at open + OpenClose + the walls (run + the runner's sleep) of the legs before it, and is admitted while that start is within room - margin - leg budget
-            [long]$lastStartOff = $BatchOpenCloseSec; [long]$off = $BatchOpenCloseSec; $first = $true
-            while ($next -lt $LegCount -and ($first -or $off -le ($room - $LeaseMarginSec - $legBudget))) {
-                $lastStartOff = $off; $off += $runs[$next] + $LegCooldownSec; $next++; $first = $false
+        # The projection is replayed under TWO leg-budget models and the LATER end wins (adversary r2 A1: a rolling-budget plan ends hours later when the leases are cut differently):
+        #   static   - the budget is the longest planned leg from the first lease on (never below the runner's, so the batch count is never below the runner's admission count);
+        #   adaptive - the runner's own rule: it starts at -LegBudgetSec and grows to a completed leg's seconds (min 2700), so early leases admit more legs and later ones fewer.
+        # The adaptive replay takes a leg's seconds as its run time (play + overhead), the same timing the lease ledger rows use.
+        $simulate = {
+            param([bool]$Adaptive)
+            $rows = [System.Collections.Generic.List[object]]::new(); foreach ($l in @($Leases)) { if ($null -ne $l) { $rows.Add($l) } }
+            [long]$lb = $(if ($Adaptive) { [Math]::Min(2700, [long]$LegBudgetSec) } else { $legBudget })
+            $tt = $now; $nb = 0; [long]$wt = 0; $lastStart = $now; [int]$next = 0
+            while ($next -lt $LegCount) {
+                $w = Get-VenueLeaseBudgetWait -Leases @($rows) -NowUtc $tt -CapSec $CapSec -CooldownSec $CooldownSec -WindowSec $WindowSec -BudgetSec $BudgetSec
+                [long]$room = [Math]::Min([long]$CapSec, [long]$w.budgetRoomSec)
+                [long]$need = $LeaseMarginSec + $lb + $BatchOpenCloseSec
+                if ($room -lt $need) { throw "a lease holds at most roomSec=$room (capSec=$CapSec, budgetRoomSec=$($w.budgetRoomSec)) and one leg needs $need s (leaseMarginSec=$LeaseMarginSec + legBudgetSec=$lb + openCloseSec=$BatchOpenCloseSec): no leg fits a lease" }
+                # leg k of a lease starts at open + OpenClose + the walls (run + the runner's sleep) of the legs before it, and is admitted while that start is within room - margin - leg budget
+                [long]$lastStartOff = $BatchOpenCloseSec; [long]$off = $BatchOpenCloseSec; $first = $true
+                while ($next -lt $LegCount -and ($first -or $off -le ($room - $LeaseMarginSec - $lb))) {
+                    $lastStartOff = $off; $off += $runs[$next] + $LegCooldownSec
+                    if ($Adaptive) { $lb = [Math]::Min(2700, [Math]::Max($lb, $runs[$next])) }
+                    $next++; $first = $false
+                }
+                $lastStart = $w.openUtc.AddSeconds($lastStartOff)
+                # the lease ends after its last leg (the runner's own sleep follows a leg only while work remains, and the lease never outlasts its room)
+                [long]$inLease = $lastStartOff + $runs[$next - 1] + $(if ($next -lt $LegCount) { $LegCooldownSec } else { 0 })
+                # the runner's sleep after a leg is not cut short by the lease and it records the close it made after the sleep, so the ledger row (what the cooldown and the budget count)
+                # and the time cursor both run to the end of the whole in-lease time, even past the lease's room
+                $rows.Add([pscustomobject]@{ startUtc = $w.openUtc; endUtc = $w.openUtc.AddSeconds($inLease) })
+                $wt += $w.waitSec; $nb++; $tt = $w.openUtc.AddSeconds($inLease)
             }
-            $lastLegStart = $w.openUtc.AddSeconds($lastStartOff)
-            # the lease ends after its last leg (the runner's own sleep follows a leg only while work remains, and the lease never outlasts its room)
-            [long]$inLease = $lastStartOff + $runs[$next - 1] + $(if ($next -lt $LegCount) { $LegCooldownSec } else { 0 })
-            # the runner's sleep after a leg is not cut short by the lease and it records the close it made after the sleep, so the ledger row (what the cooldown and the budget count)
-            # and the time cursor both run to the end of the whole in-lease time, even past the lease's room
-            $leaseRows.Add([pscustomobject]@{ startUtc = $w.openUtc; endUtc = $w.openUtc.AddSeconds($inLease) })
-            $waitTotal += $w.waitSec; $batches++; $t = $w.openUtc.AddSeconds($inLease)
+            [pscustomobject]@{ t = $tt; batches = $nb; wait = $wt; lastLegStart = $lastStart }
         }
+        $simStatic = & $simulate $false
+        $simAdaptive = & $simulate $true
+        $pick = $(if ($simAdaptive.t -gt $simStatic.t) { $simAdaptive } else { $simStatic })
+        $t = $pick.t; $batches = [Math]::Max($simStatic.batches, $simAdaptive.batches); $waitTotal = $pick.wait; $lastLegStart = $pick.lastLegStart
         $span = [long][Math]::Ceiling(($t - $now).TotalSeconds)
         $margin = [Math]::Max([long]$MinMarginSec, [long][Math]::Ceiling($span * $MarginPct / 100.0))
         $computed = $t.AddSeconds($margin)

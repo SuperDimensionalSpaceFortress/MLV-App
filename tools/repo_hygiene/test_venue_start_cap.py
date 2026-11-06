@@ -491,6 +491,49 @@ class StartCapAdversaryR2Tests(unittest.TestCase):
         self.assertLess(code.index("Get-VenuePlanPlaySeconds"), code.index("catch {"))
 
 
+@requires_windows_pwsh
+class StartCapAdversaryR2Pass2Tests(unittest.TestCase):
+    """The adversary pass on 86ea2e86 (r2 pass 1: A1, A2 and the advisory A3)."""
+
+    def test_r2p2a1_a_rolling_budget_plan_is_covered_to_the_runners_last_lease(self):
+        # the runner's leg budget starts at 360 s and grows to a completed leg's seconds: legs 120,300,120,300,600,25 (+210 s each) cut as [1,2,3],[4,5],[6], and with a
+        # 2700 s budget per 6 h window the last lease opens at 20:33:06Z (last leg starts 20:33:46Z). A static longest-leg budget cut the leases differently and ended at 16:35Z.
+        r = call("-LegCount 6 -LegPlaySeconds @(120,300,120,300,600,25) -CapSec 1800 -CooldownSec 1800 -WindowSec 21600 -BudgetSec 2700")
+        self.assertGreaterEqual(parse(r["capUtc"]), parse("2026-10-30T20:33:46Z"), r["lines"][0])
+        self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse("2026-10-30T20:33:46Z"))
+        self.assertGreaterEqual(r["batches"], 3)
+
+    def test_r2p2a1_the_start_test_replays_both_budget_models(self):
+        src = CHAIN.read_text(encoding="utf-8")
+        self.assertIn("$simStatic = & $simulate $false", src)
+        self.assertIn("$simAdaptive = & $simulate $true", src)
+
+    def test_r2p2a2_an_existing_spec_path_is_kept_exactly_not_trimmed_to_another_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / " long.json").write_text(json.dumps({"playSeconds": 1200}), encoding="utf-8")
+            (Path(d) / "long.json").write_text(json.dumps({"playSeconds": 25}), encoding="utf-8")
+            c = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegSpec", " long.json", "-NowUtc", NOW],
+                               capture_output=True, text=True, timeout=180, cwd=d)
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            self.assertIn("legs=1 playSec=1200 ", c.stdout.splitlines()[0])
+
+    def test_r2p2a2_the_pieces_of_a_comma_list_are_still_trimmed(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = write_spec(Path(d), "a.json", 120)
+            b = write_spec(Path(d), "b.json", 120)
+            c = cli("-LegSpec", f"{a} , {b}", "-NowUtc", NOW)
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            self.assertIn("legs=2 playSec=120 ", c.stdout.splitlines()[0])
+
+    def test_r2p2a3_the_cli_help_says_what_an_unreadable_spec_does(self):
+        head = CLI.read_text(encoding="utf-8").split("[CmdletBinding()]")[0]
+        self.assertNotIn("or a spec cannot be read", head)
+        self.assertIn("START_CAP_PLAYSECONDS_UNKNOWN", head)
+        c = cli("-LegSpec", "C:/no/such/spec.json", "-NowUtc", NOW)
+        self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+        self.assertIn("START_CAP_PLAYSECONDS_UNKNOWN", c.stdout)
+
+
 class LeaseBatchWiringTests(unittest.TestCase):
     """Source pins on the tracked runner: the default deadline is sized from the plan, an explicit one is kept."""
 

@@ -11,7 +11,8 @@
 # -NowUtc, -HardEndUtc, -ExplicitCapUtc: a time with a zone keeps it; a zoneless time (no Z, no offset) is UTC on every host (the one parser, ConvertTo-VenueStartCapTime). Text that is not a
 #   time is refused: a START_CAP_BAD_TIME line and exit 2, never a silently skipped bound.
 # -HardEndUtc: the existing safety bound (the run's hard end); the computed cap is never later than it. -ExplicitCapUtc: kept exactly as given.
-# -LegCooldownSec: the runner's own -CooldownSec (slept after every completed leg). Exit 3 + a START_CAP_UNSIZABLE line when no leg fits a lease or a spec cannot be read.
+# -LegCooldownSec: the runner's own -CooldownSec (slept after every completed leg). Exit 3 + a START_CAP_UNSIZABLE line when no leg fits a lease. A spec that cannot be read
+#   is SAID (START_CAP_PLAYSECONDS_UNKNOWN) and counts at the longest readable leg (the default 25 s when none is readable); it is not a refusal.
 # Reads no venue and takes no lease. The lease caps default to the old mirrored constants (the tightest); pass the live ones (the run's CAPS line) when known.
 [CmdletBinding()]
 param(
@@ -45,7 +46,8 @@ $specNote = $null
 try {
     # -File passes one string: a comma list names several specs, but an entry that is itself an existing path is kept whole (the batch runner's own rule)
     $LegSpec = @($LegSpec | Where-Object { $_ })
-    $LegSpec = @($LegSpec | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    # an entry that exists is kept EXACTLY as given (a name with a leading or trailing space is another file than its trimmed twin); only the pieces of a comma list are trimmed (adversary r2 A2)
+    $LegSpec = @($LegSpec | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' | ForEach-Object { $_.Trim() } } } | Where-Object { $_ })
     if ($LegSpec.Count -gt 0) {
         $LegCount = $LegSpec.Count
         $planSecs = Get-VenuePlanPlaySeconds -SpecPaths $LegSpec
