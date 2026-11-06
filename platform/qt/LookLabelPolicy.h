@@ -107,6 +107,18 @@ inline int openRecordRow( int openerRow, int activeRow )
     return openerRow >= 0 ? openerRow : activeRow;
 }
 
+/*! \brief r14 (sol r13 B1 on cc76ab62): whether setSliders' restore or capture of `restoredReceipt`'s baseline marks it
+ *  "Look: Baseline". It keys on the receipt whose state was restored being the one applied to the loaded clip (the opener
+ *  records that row first: showFileInEditor, the export's clone and its final reopen), which is the receipt the label reads.
+ *  The active row is not read: a FileOpen delivered in showFileInEditor(A)'s event pump can leave a duplicate-path row B active
+ *  while A's baseline is restored, and an applied marker already naming A then skips the analysis, so an unmarked restore kept
+ *  naming A's old landed flavor over its baseline pixels. A scratch receipt (Reset Sliders' defaults) is never the applied one. */
+inline bool restoreMarksBaseline( const void *restoredReceipt, const void *appliedReceipt, const void *activeReceipt )
+{
+    Q_UNUSED( activeReceipt );
+    return restoredReceipt != nullptr && restoredReceipt == appliedReceipt;
+}
+
 /*! \brief Whether the look of the loaded clip is on, read from the receipt that owns it. The selector checkbox describes
  *  the active row, and a click there writes nothing into another row's clip (receiptOwnedByLoadedClip refuses it), so it
  *  counts only when the owner is the active row. */

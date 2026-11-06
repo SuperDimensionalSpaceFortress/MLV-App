@@ -16653,7 +16653,8 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     m_lastLookAssistDiagnosticsValid = false;
     // LOOK-FULLSCREEN-PARITY-1 r11 (adversary r10 A1 on 0b840efd): the baseline goes back below, so the screen shows the
     // baseline. The label must not keep naming the flavor that landed before.
-    // r10 (key3 r9 B1 on 2b748fa3): marked whenever the active row's baseline is restored or captured, NOT only when the
+    // r10 (key3 r9 B1 on 2b748fa3): marked whenever the loaded clip's receipt has its baseline restored or captured (r14: the
+    // receipt applied to the loaded clip, not the active row's), NOT only when the
     // de-dupe marker names this receipt -- that marker moves to a clip whose analysis skips before begin() (empty_stats)
     // while the outcome stays here. The mark is the outcome's (keyed by this receipt), so the next landing forgets it
     // (sol + fable r9: an async result already in flight when this runs must still be named when it lands).
@@ -16671,7 +16672,9 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
             captureLookAssistBaseline( receipt );
         }
         // Before the apply block: a grade applied right below lands (landed() forgets the mark) and is named.
-        baselineRestoredUngraded = receipt == activeReceiptAtLoad;
+        // r14 (sol r13 B1 on cc76ab62): keyed on the receipt restored here being the one applied to the loaded clip, never on
+        // the active row -- a nested FileOpen can leave a duplicate-path row active while this receipt's baseline goes back.
+        baselineRestoredUngraded = look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad );
         if( baselineRestoredUngraded ) m_lookAssistFlavorOutcome.baselineRestored( receipt );
 
         if( !deferLookAssistUntilBaselineFrame
@@ -16687,7 +16690,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         restoreLookAssistBaseline( receipt );
         syncLookAssistDerivedUiToReceipt( receipt );
     }
-    // r11: only for the receipt the label reads (the active row's). r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- the
+    // r11: only for the receipt the label reads (r14: the one applied to the loaded clip). r12 (adversary r11 A1 on 4337dad4): LABEL ONLY -- the
     // reported outcome is untouched, because setReceipt saves it as the receipt's flavor (receiptValue: "classic" after a
     // fallback); clearing it would save the selector's flavor over the baseline sliders. r10: the next landed() forgets the mark.
     if( baselineRestoredUngraded )

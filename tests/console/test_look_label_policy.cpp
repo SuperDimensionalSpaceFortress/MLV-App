@@ -449,6 +449,54 @@ TEST(LookLabelPolicy, A1r13TheOpenerNamesTheRowItAppliesNotTheActiveRowsGuess)
     ASSERT_EQ(rowB, look_label::openRecordRow(-1, rowB));
 }
 
+// r14 -- sol r13 B1 on cc76ab62. Catalogue row: previously graded A + disabled duplicate-path B + nested FileOpen during
+// showFileInEditor(A) must label A's restored baseline as Baseline. Row A (Look Assist on, valid baseline) has a flavor that
+// LANDED before and the applied marker names A. Row B holds the same path, Look Assist off, and is active after the pump. The
+// outer opener records A (r13), then setSliders(A) restores A's baseline; the marker already names A, so the analysis is skipped
+// and nothing lands. RED on cc76ab62's predicate (restored == active): B is active, A's restore is unmarked, and the label named
+// A's old flavor ("Look: Cinematic" / "Look: Film grade" / "Look: Kodak Vision3 50D") over the baseline pixels.
+TEST(LookLabelPolicy, B1r14ARestoredBaselineIsMarkedUnderTheAppliedReceiptNotTheActiveRow)
+{
+    int receiptA = 0, receiptB = 0, scratch = 0;
+    const void *receipts[] = { &receiptA, &receiptB };
+    const bool switches[] = { true, false };
+    const int rowA = 0, rowB = 1, rows = 2, activeAfterPump = rowB;
+    const auto bothHoldPath = [](int) { return true; };
+    const char *flavors[] = { "cinematic", "film", "vision50d" };
+    for( const char *flavorName : flavors )
+    {
+        const QString flavor = QString::fromLatin1( flavorName );
+        lookassist::LookAssistFlavorOutcome outcome;
+        lookassist::LookAssistAppliedMarker marker;
+        outcome.landed(&receiptA, flavor, false);   // A was graded before
+        marker.markApplied(&receiptA);              // ... and the de-dupe marker names it
+        // The nested showFileInEditor(B): B is off, so setSliders(B) takes the disabled branch and marks nothing; A's outcome and
+        // the marker are kept. The outer opener then records the row it applies (r13).
+        const int recorded = look_label::loadedClipOwnerRow(look_label::openRecordRow(rowA, activeAfterPump), rows, bothHoldPath);
+        ASSERT_EQ(rowA, recorded);
+        const void *applied = receipts[recorded];
+        // setSliders(A): baseline restored (or captured), then the mark, then the apply block, which the marker skips.
+        if( look_label::restoreMarksBaseline(&receiptA, applied, receipts[activeAfterPump]) ) outcome.baselineRestored(&receiptA);
+        ASSERT_TRUE(marker.isApplied(&receiptA));   // no analysis runs, so nothing lands to correct the label
+        // updateLookLabel, as derived for the recorded owner (attached sliders; the selector describes B, not A).
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, receipts[recorded], switches[recorded], false);
+        const bool on = look_label::lookOnForOwner(true, lookSwitch,
+                                                   look_label::selectorDescribesOwner(recorded == activeAfterPump, true), false);
+        ASSERT_TRUE(on);
+        printf("[B1r14] flavor=%s label=\"%s\"\n", flavorName,
+               qPrintable(look_label::shownText(on, outcome, look_label::outcomeKey(applied, receipts[recorded]), flavor)));
+        ASSERT_EQ(std::string("Look: Baseline"),
+                  look_label::shownText(on, outcome, look_label::outcomeKey(applied, receipts[recorded]), flavor).toStdString());
+        // The receipt value setReceipt saves is untouched (LABEL ONLY, r12).
+        ASSERT_EQ(flavor.toStdString(), outcome.receiptValue(&receiptA, QStringLiteral("classic")).toStdString());
+    }
+    // The ordinary open (A active and applied) is still marked; a scratch receipt (Reset Sliders' defaults) never is, nor nullptr.
+    ASSERT_TRUE(look_label::restoreMarksBaseline(&receiptA, &receiptA, &receiptA));
+    ASSERT_FALSE(look_label::restoreMarksBaseline(&scratch, &receiptA, &receiptA));
+    ASSERT_FALSE(look_label::restoreMarksBaseline(&receiptB, &receiptA, &receiptB));
+    ASSERT_FALSE(look_label::restoreMarksBaseline(nullptr, nullptr, nullptr));
+}
+
 TEST(LookLabelWiring, A1r13EveryOpenerThatAppliesARowRecordsThatRowFirst)
 {
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
@@ -738,7 +786,12 @@ TEST(LookLabelWiring, ABaselineRestoredWithoutARegradeIsLabelledBaseline)
     const int restore = body.indexOf(QStringLiteral("restoreLookAssistBaseline( receipt );"));
     // r13 (adversary r12 A1 on 6d722d33): the fresh-capture branch (Reset Receipt: baseline invalid) is marked the same way.
     const int capture = body.indexOf(QStringLiteral("captureLookAssistBaseline( receipt );"));
-    const int markRead = body.indexOf(QStringLiteral("baselineRestoredUngraded = receipt == activeReceiptAtLoad;"));
+    // Pin update (r14, sol r13 B1 on cc76ab62; was "baselineRestoredUngraded = receipt == activeReceiptAtLoad;"): the mark keys
+    // on the restored receipt being the applied one, never the active row (LookLabelPolicy.B1r14... pins the behaviour).
+    const int markRead = body.indexOf(QStringLiteral(
+        "baselineRestoredUngraded = look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad );"));
+    ASSERT_FALSE(body.contains(QStringLiteral("baselineRestoredUngraded = receipt == activeReceiptAtLoad;")));
+    ASSERT_EQ(1, mw.count(QStringLiteral("look_label::restoreMarksBaseline(")));
     const int marked = body.indexOf(QStringLiteral("if( baselineRestoredUngraded ) m_lookAssistFlavorOutcome.baselineRestored( receipt );"));
     const int apply = body.indexOf(QStringLiteral("&& !m_lookAssistApplied.isApplied( receipt ) )"));
     const int relabelAt = body.indexOf(QStringLiteral("if( baselineRestoredUngraded )\n"));
