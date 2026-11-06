@@ -6039,7 +6039,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "function Test-AliasHit { param($h) $false }\n"
                   "function LogBest { param($m) }\n"
                   "function Start-Sleep { param([int]$Seconds) [Threading.Thread]::Sleep($Seconds * 1000) }\n"
-                  "function Stop-InputIsOutput { param($h) $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $h.why; throw 'REFUSED' }\n"
+                  "function Stop-InputIsOutput { param($h) $script:refusedAt = $clock.Elapsed.TotalSeconds; $script:refused = $h.why; $script:aliasedAtRefusal = [bool]$script:RunOutputAliased; throw 'REFUSED' }\n"
                   f"{extra}\n"
                   f"$clock = [Diagnostics.Stopwatch]::StartNew(); $deadline = [DateTime]::UtcNow.AddSeconds({deadline_sec})\n"
                   "try { . ([scriptblock]::Create($loop.Extent.Text)) } catch { if ($_.Exception.Message -cne 'REFUSED') { $script:thrown = $_.Exception.Message } }\n"
@@ -6048,7 +6048,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$w = @(if (Test-Path '{log}\\requests.log') {{ [IO.File]::ReadAllLines('{log}\\requests.log') }}); $rel = @(if (Test-Path '{log}\\releases.log') {{ [IO.File]::ReadAllLines('{log}\\releases.log') }})\n"
                   "[Console]::Out.WriteLine(([pscustomobject]@{ requests = $script:requests + $w.Count; workerRequests = $w.Count; guards = $script:guards; refused = $script:refused; refusedAt = $script:refusedAt; ended = $ended; deadlineSec = "
                   f"{deadline_sec}; thrown = $script:thrown; claim = $(if ($claim) {{ [string]$claim.nonce }}); releases = $rel; abandoned = (& (Get-Module VenueChain) {{ $script:VenueAbandonedReads }})\n"
-                  "    budgets = @($script:budgets); budgetRooms = @($script:budgetRooms) } | ConvertTo-Json -Compress)); [Console]::Out.Flush()\n"
+                  "    budgets = @($script:budgets); budgetRooms = @($script:budgetRooms); aliasedAtRefusal = [bool]$script:aliasedAtRefusal } | ConvertTo-Json -Compress)); [Console]::Out.Flush()\n"
                   "[Environment]::Exit(0)\n")
         try:
             r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
@@ -6120,11 +6120,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # printed) held the refusal past the deadline. A claim granted on a retry is let go on a bounded worker, given up on (r7: at the reserve at most) and counted. ~4 s.
         # r7: a 6 s deadline, so the grant (about 4.6 s left) has room for its cut guard (under 2 s of it, no guard runs at all: the 1.2 s row below)
         d = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'stuck-n' }; state = 'TAKEN' }", 6,
-                                     extra="function Invoke-InputGuard { $script:guards++; [pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }",
+                                     extra="$script:RunOutputAliased = $false; $script:suppressionHit = $null\nfunction Invoke-InputGuard { $script:guards++; if ($req.granted) { return [pscustomobject]@{ kind = 'content'; item = 1; code = 'LEG_SPEC_INVALID'; why = 'WHY' } }; "
+                                           "[pscustomobject]@{ kind = 'content'; item = 1; code = 'SHARE_UNREACHABLE'; noAnswer = $true; readAbandoned = $true; locationUnknown = $true; why = 'WHY' } }",
                                      release="[Threading.Thread]::Sleep(600000); ")
         self.assertEqual((d["requests"], d["guards"], d["claim"], d["thrown"], d["refused"]), (2, 2, None, "", "WHY"), d)
         self.assertLess(d["refusedAt"], d["deadlineSec"], f"the refusal waited on the release past the deadline: {d}")
         self.assertEqual(d["abandoned"], 1, f"the release given up on is an abandoned read: {d}")
+        # adversary r7 A1: the granted guard ANSWERED a failure (LEG_SPEC_INVALID: no location unknown, no suppression of its own), so the refusal would probe batch.log in -RunDir,
+        # unbounded, on the share that just stopped answering the release: the release given up on turns the write suppression on before the refusal
+        self.assertTrue(d["aliasedAtRefusal"], f"the refusal after a release given up on could still probe -RunDir: {d}")
 
     # r7 (adversary r6 pass 3 A1): the guard of a claim granted on a retry. The stub guard waits exactly what Invoke-InputGuard's worker wait is for the budget it is handed (the
     # budget plus 0.5 s, or a fixed 2 s under 2 s: :872) and then refuses, as a share that stays stuck makes it; Start-Sleep sleeps until `left` s remain.
@@ -6180,9 +6184,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
                   f"$here = '{psq(stub)}'; $Venue = 'bachelor'; $ClaimDir = 'c'\n"
                   "$out = foreach ($c in @(@('stall-past', -1.0), @('stall-short', 0.6), @('ok-n', 30.0))) {\n"
-                  "    $before = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $deadline = [DateTime]::UtcNow.AddSeconds($c[1]); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  "    $script:RunOutputAliased = $false; $script:suppressionHit = $null; $script:batchLog = 'b'; $before = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $deadline = [DateTime]::UtcNow.AddSeconds($c[1]); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
                   "    $r = Invoke-ClaimRetryRelease $deadline $c[0]\n"
-                  "    [pscustomobject]@{ nonce = $c[0]; sec = $sw.Elapsed.TotalSeconds; result = [string]$r; abandoned = (& (Get-Module VenueChain) { $script:VenueAbandonedReads }) - $before } }\n"
+                  "    [pscustomobject]@{ nonce = $c[0]; sec = $sw.Elapsed.TotalSeconds; result = [string]$r; aliased = [bool]$script:RunOutputAliased; abandoned = (& (Get-Module VenueChain) { $script:VenueAbandonedReads }) - $before } }\n"
                   "[Threading.Thread]::Sleep(300)\n"
                   f"[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @{{ cases = @($out); log = @(if (Test-Path '{psq(stub)}\\releases.log') {{ [IO.File]::ReadAllLines('{psq(stub)}\\releases.log') }}) }})); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
@@ -6195,7 +6199,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("start:stall-past", got["log"], f"a release with no room was started: {got}")
         self.assertLess(short["sec"], 0.6, f"a release with 0.6 s left waited past that room: {got}")
         self.assertEqual(short["abandoned"], 1, got)
-        self.assertEqual((ok["result"], ok["abandoned"]), ("RELEASED", 0), got)
+        self.assertEqual((ok["result"], ok["abandoned"], ok["aliased"]), ("RELEASED", 0, False), got)
+        # adversary r7 A1: a release given up on (or never started) turns the write suppression on
+        self.assertEqual((past["aliased"], short["aliased"]), (True, True), got)
         self.assertIn("start:ok-n", got["log"], got)
 
     def test_artifact_preflight_claim_wait_r6_a_fast_retry_request_is_unchanged(self) -> None:

@@ -798,8 +798,18 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
     # r7 (adversary r6 pass 3 A1): no floor past the deadline. The wait is the reserve at most, and never past the room less $script:ClaimRetryRefusalTailSec (the refusal's own print
     # after it); with no such room the release is given up on at once, never started, and counted as abandoned like one not answered. It runs on its own worker (not
     # Invoke-VenueBoundedRead, whose -TimeoutSec starts at 1 s), with the fraction of a second kept.
+    # r7 pass 2 (adversary r7 A1): a release given up on (or never started) turns the write suppression on before it returns: the claim share did not answer, -RunDir may sit on the
+    # same share, and the refusal or log line that follows must not probe batch.log there unbounded (Stop-PlanRefused, L via Test-RunDirWrite). Said on stderr only from then on.
+    $suppress = {
+        param([string]$Why)
+        if (-not $script:RunOutputAliased) {
+            $script:RunOutputAliased = $true; $script:batchLog = $null
+            if (-not $script:suppressionHit) { $script:suppressionHit = [pscustomobject]@{ kind = 'content'; item = 0; code = 'SHARE_UNREACHABLE'; locationUnknown = $true; noAnswer = $false
+                why = "the release of a claim granted on a retry $Why, so nothing more is written into -RunDir (it may be on that share)" } }
+        }
+    }
     $sec = [Math]::Min([double](($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds - $script:ClaimRetryRefusalTailSec), [double]$script:ClaimRetryRequestReserveSec)
-    if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
+    if ($sec -le 0) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }; . $suppress 'had no time left before -DeadlineUtc'; return "NO_ROOM (no time was left before -DeadlineUtc to release it; the claim still names this process, so it is broken as dead-pid once the process exits)" }
     $ps = $null; $abandoned = $false
     try {
         $ps = [powershell]::Create()
@@ -811,6 +821,7 @@ function Invoke-ClaimRetryRelease([DateTime]$DeadlineUtc, [string]$Nonce) {
             $abandoned = $true
             & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
             try { [void]$ps.BeginStop($null, $null) } catch { }
+            . $suppress "did not answer in $([Math]::Round($sec, 2)) s"
             return "NO_ANSWER (no answer in $([Math]::Round($sec, 2)) s)"
         }
         [string]@($ps.EndInvoke($async))[-1]
