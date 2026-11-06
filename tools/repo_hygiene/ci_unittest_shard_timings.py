@@ -102,10 +102,13 @@ def class_seconds(log_text: str) -> dict[str, float]:
     # estimate is low where a class logs lines without a result (git warnings; CandidateAcceptanceTests
     # read 8.8 s here against 62.7 s in its own job's SHARD_SLOWEST) and high where a silent
     # tearDownClass of the previous class lands in the gap before a docstring test (that gap is charged
-    # to the next class as its setUpClass, so the teardown is counted twice). A class outside the job's
-    # top ten keeps the gap estimate, which can only over-count (by the previous class's teardown) and
-    # stays below the job's 10th-slowest figure.
+    # to the next class as its setUpClass, so the teardown is counted twice). A class the block does not
+    # name was outside the job's top ten, so it ran no longer than the block's smallest figure: that is
+    # the ceiling for its gap estimate (a looser one if a log holds several blocks, and one a truncated
+    # block only loosens, because rows are sorted slowest first). Below the ceiling the estimate stands.
     in_slowest = False
+    named: dict[str, float] = {}
+    block_mins: list[float] = []
     for raw in log_text.splitlines():
         stamp = STAMP.match(raw)
         if not stamp:
@@ -113,13 +116,22 @@ def class_seconds(log_text: str) -> dict[str, float]:
         text = stamp.group(3)
         if SLOWEST_HEAD.match(text):
             in_slowest = True
+            block_mins.append(float("inf"))
             continue
         row = SLOWEST_ROW.match(text) if in_slowest else None
         if row is None:
             in_slowest = False
             continue
+        value = float(row.group(1))
+        block_mins[-1] = min(block_mins[-1], value)
         if row.group(2).startswith(KEY_PREFIX):
-            totals[row.group(2)] = float(row.group(1))
+            named[row.group(2)] = value
+    ceiling = max((m for m in block_mins if m != float("inf")), default=None)  # a block with no row says nothing
+    if ceiling is not None:
+        for name in totals:
+            if name not in named:
+                totals[name] = min(totals[name], ceiling)
+    totals.update(named)
     return dict(totals)
 
 

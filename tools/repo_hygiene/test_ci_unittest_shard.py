@@ -1024,6 +1024,42 @@ class TimingsTests(unittest.TestCase):
             {"tools.repo_hygiene.test_x.A": 101.0, "tools.repo_hygiene.test_x.B": 1.0},
         )
 
+    def test_an_unnamed_class_is_capped_at_the_slowest_blocks_smallest_figure(self) -> None:
+        # adversary r3 pass 4 A1 on CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: A = a 1 s test then a silent
+        # 100 s tearDownClass, B = a 1 s docstring test that the block omits (nine C classes of 2 s
+        # fill the top ten with A). B's gap estimate is 101.0 (A's teardown charged again as B's
+        # setUpClass), yet a class outside the top ten cannot have run longer than the block's
+        # smallest figure (2.0 s), so that is B's ceiling and the job no longer sums to 220 s.
+        lines = [
+            "2026-10-04T00:00:00.0000000Z started",
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok",
+            "2026-10-04T00:01:41.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b)",
+            "2026-10-04T00:01:42.0000000Z the docstring first line ... ok",
+        ]
+        for i in range(9):
+            at = 104 + 2 * i
+            lines.append(f"2026-10-04T00:{at // 60:02d}:{at % 60:02d}.0000000Z test_c (tools.repo_hygiene.test_x.C{i}.test_c) ... ok")
+        lines.append("2026-10-04T00:02:00.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=120.0s")
+        lines.append("2026-10-04T00:02:00.0000000Z  101.0s tools.repo_hygiene.test_x.A")
+        lines.extend(f"2026-10-04T00:02:00.0000000Z    2.0s tools.repo_hygiene.test_x.C{i}" for i in range(9))
+        got = timings.class_seconds("\n".join(lines) + "\n")
+        self.assertEqual(got["tools.repo_hygiene.test_x.B"], 2.0)
+        self.assertEqual(got["tools.repo_hygiene.test_x.A"], 101.0)
+        self.assertLessEqual(sum(got.values()), 101.0 + 2.0 * 10)
+
+    def test_an_unnamed_class_below_the_ceiling_keeps_its_gap_estimate(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.Quiet.test_a) ... ok\n"
+            "2026-10-04T00:00:11.0000000Z test_b (tools.repo_hygiene.test_x.Named.test_b) ... ok\n"
+            "2026-10-04T00:00:11.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=11.0s\n"
+            "2026-10-04T00:00:11.0000000Z   10.0s tools.repo_hygiene.test_x.Named\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.Quiet": 1.0, "tools.repo_hygiene.test_x.Named": 10.0},
+        )
+
     def test_a_class_outside_the_slowest_block_keeps_its_gap_estimate(self) -> None:
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
