@@ -457,9 +457,8 @@ function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $Pro
 # queried fresh at the moment of the stop, never by a pid remembered from an earlier snapshot (the OS may have given that pid to an unrelated process).
 # r3 (adversary r3 A2): the fixture dir must be a WHOLE path component of the command line. A sibling dir whose name only starts with it
 # (...-abcd1234-other\log.txt) is not this fixture, so the next character must end the component.
-# r3 pass-4 A1: a space or an apostrophe ends nothing INSIDE a quoted argument ("<fixture> other\log.txt" is another dir). So the path must start an
-# argument: inside double quotes it continues only with a separator or the closing quote; unquoted (an argument with no space) with a separator,
-# whitespace or the end of the line. An apostrophe is never an end.
+# r3 pass-4 A1: a space or an apostrophe ends nothing INSIDE a quoted argument ("<fixture> other\log.txt" is another dir). r3 answered both with a
+# regex over the raw line; r4 replaces that regex with the argument split below, which keeps both rules (the arguments the r3 rows feed still fail).
 # r4 (sol r3 B1): a regex over the raw line cannot know where a quoted argument starts: "--output=<fixture> other\log.txt" matched its unquoted
 # branch at the '='. So the line is split into its arguments by the Windows rules (CommandLineToArgvW: the program name ends at its closing quote or
 # whitespace; then whitespace outside quotes separates, 2n backslashes + quote = n backslashes and a quote toggle, 2n+1 = n and a literal quote),
