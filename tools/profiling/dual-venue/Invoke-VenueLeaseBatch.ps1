@@ -104,7 +104,9 @@
 #         run again next poll, with nothing written into -RunDir or any output meanwhile (each poll's claim request still writes the claim directory, as every poll always has;
 #         CLAIM_WAIT_GUARD_NO_ANSWER or CLAIM_WAIT_GUARD_NO_ROOM on stderr; CLAIM_WAIT_GUARD_ANSWERED in batch.log once a pass finishes). Three in a row, or one with too little time left for
 #         the poll and a whole 30 s pass before the deadline (asked again after the sleep), are the same SHARE_UNREACHABLE refusal. A read that ANSWERED with a failure is refused on that
-#         poll, even when the same pass then runs out of room or a later read is given up on (the refusal names that failure). Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
+#         poll, even when the same pass then runs out of room or a later read is given up on (the refusal names that failure), and a staged manifest the pass found gone is refused
+#         even when a later read in that pass finds it back (fail closed: a manifest that flickers costs a re-run, never a leg). A refusal after a pass that ran out of room, or one
+#         given up on, goes to stderr only: showing batch.log is no input would read the inputs again with no bound. Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
 #         A SHARE_UNREACHABLE from any of these checks says guardReads(sec): what each read took ('+' = still running when given up on; start = the worker's own start, nothing read yet) and
 #         claimWaitBefore=yes|no (waitedSec: first denied poll to the grant, or to now while still denied).
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
@@ -652,7 +654,7 @@ function Get-InputOutputRefusal {
     # r5: an input that cannot be opened any more is its own hit (kind unresolved, Get-InputUnresolvedCode), never "an input is a runner output", and a real alias outranks it.
     # r6 (sol r5b B1 = Dot A1; RPF-06): an output that could not be inspected is its own hit (kind output, OUTPUT_ZONE_UNRESOLVED), never an alias; a real alias outranks it, and it
     # outranks an unresolved input and a content hit (an output zone nobody inspected is never hidden behind them: the receipt guard asks file by file when it sees one)
-    $unresolved = $null; $outputUnresolved = $null
+    $unresolved = $null; $outputUnresolved = $null; $goneBuild = $null
     foreach ($g in $script:guardedInputs) {
         Set-GuardProgress $g "the location of the $($g.kind) input $($g.path)" 'location'
         # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED). r5b (adversary r5b A1): a folder at its name is not gone.
@@ -660,6 +662,7 @@ function Get-InputOutputRefusal {
         if ($g.kind -ceq 'build') { Wait-GuardReadSeam 'existence' }
         if ($g.kind -ceq 'build' -and (Test-NothingAtName $g.path)) {
             if ($script:guardProgress) { $script:guardProgress.answeredFailure = "BUILD_NOT_STAGED $($g.path)" }   # r3 adversary pass 2 A1, r4: read by Invoke-InputGuard if a later read stalls or the pass ends with no room
+            if (-not $goneBuild) { $goneBuild = $g }   # r5 (sol r4 B1): sticky, below
             continue
         }
         # the step above is this input's own share alone; the one below also walks -RunDir and -ClaimDir on this host, so guardReads tells a stalled share from a slow host
@@ -697,7 +700,13 @@ function Get-InputOutputRefusal {
     if ($script:guardProgress) { $script:guardProgress.locationsDone = $true }
     if ($outputUnresolved) { return $outputUnresolved }
     if ($unresolved) { return $unresolved }
-    Get-InputContentRefusal
+    $content = Get-InputContentRefusal
+    # r5 (sol r4 B1; hub ruling, fail closed): a manifest this pass found GONE is that pass's answer, even when a later read in the same pass finds it back (restored, STAGED, the same
+    # digest): the poll refuses, naming what it saw. A build that went and came back mid-check is no build this pass vouched for; a flicker costs a re-run, a plan run on a build that
+    # vanished mid-check costs a leg. Any content hit outranks it (a no-room one names it through answeredFailure, Invoke-InputGuard); the other answered failures are sticky above.
+    if ($content -or -not $goneBuild) { return $content }
+    [pscustomobject]@{ kind = 'content'; item = $goneBuild.item; code = 'BUILD_NOT_STAGED'
+        why = "the staged build manifest $($goneBuild.path) was gone when this guard pass looked for it, so the pass does not vouch for it even though a later read in the same pass found it again; refused on this poll (fail closed), and no leg runs on it" }
 }
 
 function Wait-GuardReadSeam([string]$Read) {
@@ -1071,7 +1080,7 @@ function Get-InputContentRefusal {
         # r4 adversary A1 (pass 1), A2 (pass 2): under 2 s left of the budget no content read STARTS, checked before EACH spec and build read (a spec read comes before the builds,
         # and an earlier read can use up the room): the typed refusal is at once, never after a read that spends the leg reserve
         if (($g.kind -ceq 'spec' -or $g.kind -ceq 'build') -and $null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt $script:GuardReadMinSec) {
-            return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
+            return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; noRoom = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
         }
         Set-GuardProgress $g "the $($g.kind) input $($g.path)" 'content'
         if ($g.kind -ceq 'spec') {
@@ -1096,7 +1105,7 @@ function Get-InputContentRefusal {
             $share = 300
             # r10 (sol r9 B1): 330.0, never 330 -- an integer first operand selects [Math]::Min's Int32 overload and rounds the double room (2.3 s -> 2, under the hash's 2 s minimum)
             if ($null -ne $script:guardBudget) { $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
-            if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
+            if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; noAnswer = $true; noRoom = $true; readAbandoned = $false; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
@@ -1123,6 +1132,13 @@ function Stop-InputIsOutput($Hit) {
     # r4: a guard that could not verify an input's location writes nothing more into -RunDir (Stop-PlanRefused's batch.log line included)
     if ($Hit.locationUnknown) { $script:RunOutputAliased = $true }
     $hr = Get-HitRefusal $Hit
+    # r5 (sol r4 B2): nor after a guard that ran out of room on the inputs' share (noRoom, Get-InputContentRefusal; an answered failure Invoke-InputGuard names on it too). Showing
+    # batch.log is no input would read every input again on this thread with no bound (Test-RunDirWrite), and a share that stopped answering there would hold the typed refusal
+    # for ever. Its locations were verified in that pass, but nothing bounds a second look: the refusal goes to stderr only, as the unknown-location one does, and says so.
+    if ($Hit.noRoom -and -not $Hit.locationUnknown) {
+        $script:RunOutputAliased = $true
+        $hr = @($hr[0], $hr[1], "$($hr[2]); the guard ran out of room on the inputs' share, so batch.log is not written (showing it is no input would read every input again with no bound): this refusal is on stderr only")
+    }
     # r12 (#704 merge): a content hit (in the scalar form only Invoke-InputGuard's own bound or throw makes one) stays LEG_PLAN_REFUSED, as on #705 before the merge
     if ($legPlanMode -or $Hit.kind -ceq 'content') { Stop-PlanRefused $hr[0] $hr[1] $hr[2] } else { Stop-Usage "$($hr[0]) $($hr[2])" }
 }
@@ -1771,7 +1787,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # r3 pass 3 (adversary r3 A1): the summary runs inside the refusal, AFTER its own log line, so the logWriteFailures it reports counts that line too.
             if ($batches.Count -gt 0) {
                 # r12 (#704 merge): a guard that could not verify where an input is (locationUnknown, #705 r4) suppresses as a location hit does
-                if ((Test-SuppressingHit $hit) -or $hit.locationUnknown) { $script:RunOutputAliased = $true; $script:batchLog = $null; $script:suppressionHit = $hit }
+                # r5 (sol r4 B2): and one that ran out of room (noRoom): the summary's write guard would read every input again with no bound, as the refusal's would (Stop-InputIsOutput)
+                if ((Test-SuppressingHit $hit) -or $hit.locationUnknown -or $hit.noRoom) { $script:RunOutputAliased = $true; $script:batchLog = $null; $script:suppressionHit = $hit }
                 Set-Stop (Get-HitRefusal $hit)[0] 2
                 $script:summaryBeforeExit = { Write-RunSummary }
             }

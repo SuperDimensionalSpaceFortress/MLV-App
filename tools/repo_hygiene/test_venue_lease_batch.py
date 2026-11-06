@@ -5860,6 +5860,131 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertNotIn("already answered", d["why"])
                 self.assertEqual(d["readAbandoned"], given_up, d)
 
+    def test_artifact_preflight_claim_wait_r5_a_manifest_gone_then_back_in_the_same_pass_is_refused_on_that_poll(self) -> None:
+        # r5 catalogue row (sol r4 B1; hub ruling: sticky, fail closed): the location step finds the manifest gone, and it is back, STAGED with the original digest, before the content
+        # step reads it. On 30ecd3a4 the content read answered null and the plan was accepted; the pass saw it gone, so the poll refuses naming BUILD_NOT_STAGED. In memory, through the
+        # runner's own Get-InputOutputRefusal (direct) and Invoke-InputGuard (its worker), with VenueChain's real manifest read; only the alias and spec checks are stubbed, and the manifest
+        # is put back at the content step's progress line. Controls: never back (NOT_STAGED), back with other bytes (BUILD_MANIFEST_MISMATCH), never gone (accepted).
+        changed = self.case / "changed-on"
+        manifest = self._staged_manifest(self.commit_a)
+        hook = self.case / "r5-back-hook.ps1"
+        hook.write_text("if ($Phase -ceq 'content' -and [IO.File]::Exists($Input_.path + '.away') -and [IO.File]::Exists($Input_.path + '.back')) { [IO.File]::Move($Input_.path + '.away', $Input_.path); "
+                        f"if ([IO.File]::Exists('{psq(changed)}')) {{ [IO.File]::AppendAllText($Input_.path, ' ') }} }}\n", encoding="utf-8")
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Test-NothingAtName') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  "foreach ($v in '$script:GuardReadMinSec', '$script:GuardWorkerFunctions', '$script:GuardWorker') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq $v }, $true).Extent.Text)) }\n"
+                  # the manifest is put back at the content step's progress line, after the location step found it gone and before the content read
+                  "$t = Get-Def 'Set-GuardProgress'\n"
+                  f". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}}')) + \"`n\" + [IO.File]::ReadAllText('{psq(hook)}') + \"`n}}\"))\n"
+                  "function Get-RunDirOutputRefusal { param($p) '' }\n"
+                  "function Get-InputUnresolvedCode { param($p, [switch]$SkipRead) '' }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) @('', '') }\n"
+                  f"$here = '{psq(RUNNER.parent)}'; Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking\n"
+                  f"$legPlanMode = $true; $AgentShare = '{psq(self.share)}'; $RunDir = 'r'; $Venue = 'bachelor'; $ClaimDir = 'c'; $artifactProbe = $null; $stagedBuildProbe = $null; $script:guardDelaySeam = $null; $script:claimWait = $null\n"
+                  f"$a = [pscustomobject]@{{ kind = 'build'; item = 1; commit = '{self.commit_a}'; sha256 = '{self.manifests[self.commit_a]}'; path = '{psq(manifest)}' }}\n"
+                  "$orig = [IO.File]::ReadAllBytes($a.path)\n"
+                  "$out = foreach ($mode in 'direct', 'wrapper') { foreach ($case in 'back_same', 'back_changed', 'gone_stays', 'never_gone') {\n"
+                  f"    if ($case -ceq 'back_changed') {{ [IO.File]::WriteAllText('{psq(changed)}', '') }} else {{ [IO.File]::Delete('{psq(changed)}') }}\n"
+                  "    if ($case -like 'back_*') { [IO.File]::WriteAllText($a.path + '.back', '') } else { [IO.File]::Delete($a.path + '.back') }\n"
+                  "    if ($case -cne 'never_gone') { [IO.File]::Move($a.path, $a.path + '.away') }\n"
+                  "    $script:guardedInputs = @($a)\n"
+                  "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "    if ($mode -ceq 'direct') { $script:guardProgress = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'x'; steps = [Collections.ArrayList]::Synchronized([Collections.ArrayList]::new()) }); $h = Get-InputOutputRefusal; $script:guardProgress = $null }\n"
+                  "    else { $h = Invoke-InputGuard }\n"
+                  "    $script:guardBudget = $null\n"
+                  "    if ([IO.File]::Exists($a.path + '.away')) { [IO.File]::Delete($a.path); [IO.File]::Move($a.path + '.away', $a.path) }\n"
+                  "    [IO.File]::WriteAllBytes($a.path, $orig); [IO.File]::Delete($a.path + '.back')\n"
+                  "    [pscustomobject]@{ mode = $mode; case = $case; code = $h.code; item = $h.item; noAnswer = [bool]$h.noAnswer; why = $h.why }\n"
+                  "} }\n"
+                  "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out)))\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = {(d["mode"], d["case"]): d for d in json.loads(r.stdout.strip().splitlines()[-1])}
+        self.assertEqual(len(got), 8, got)
+        for mode in ("direct", "wrapper"):
+            with self.subTest(mode=mode, case="back_same"):
+                d = got[(mode, "back_same")]
+                self.assertEqual((d["code"], d["item"], d["noAnswer"]), ("BUILD_NOT_STAGED", 1, False), f"a manifest the pass saw gone is refused on that poll: {d}")
+                self.assertIn(f"{manifest} was gone when this guard pass looked for it", d["why"])
+            with self.subTest(mode=mode, case="controls"):
+                self.assertEqual(got[(mode, "back_changed")]["code"], "BUILD_MANIFEST_MISMATCH", got[(mode, "back_changed")])
+                self.assertEqual(got[(mode, "gone_stays")]["code"], "BUILD_NOT_STAGED", got[(mode, "gone_stays")])
+                self.assertIn("no staged build manifest for", got[(mode, "gone_stays")]["why"], "the content step's own NOT_STAGED wording, unchanged")
+                self.assertIsNone(got[(mode, "never_gone")]["code"], got[(mode, "never_gone")])
+
+    def test_artifact_preflight_claim_wait_r5_a_no_room_refusal_reads_no_input_before_it_prints(self) -> None:
+        # r5 catalogue row (sol r4 B2): a terminal no-room hit, and one that names an answered failure, refused through Stop-InputIsOutput with every input's path and identity read
+        # delayed 1500 ms. On 30ecd3a4 the refusal went through the write guard first (Test-RunDirWrite re-read the inputs with no bound) and printed 1.5 s late or more; here it reads
+        # nothing, writes nothing into -RunDir, and says the line is on stderr only, with batch.log there and not. The hits are the runner's own (Invoke-InputGuard, its room cut to 1 s at
+        # the first content read's progress line, so the next read has none: the spec exit and the build exit); only the final exit is a sentinel. The no-room hit keeps noAnswer, so a
+        # pass that truly did not finish is still read again (INV-1).
+        spec = self.case / "r5-spec.json"
+        spec.write_text("{}", encoding="utf-8")
+        spec2 = self.case / "r5-spec2.json"
+        spec2.write_text("{}", encoding="utf-8")
+        gone = self.case / "r5-gone-build.json"
+        run_dir = self.case / "r5-run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
+                  "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator',\n"
+                  "    'Test-NothingAtName', 'Get-HitRefusal', 'Get-WriteDestinationHit', 'Test-RunDirWrite', 'Register-WriteRefusal', 'Stop-InputIsOutput') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  "$t = Get-Def 'Set-GuardProgress'\n"
+                  ". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}')) + \"`nif (`$Phase -ceq 'content') { `$b = `$script:guardBudget; `$b.sec = `$b.clock.Elapsed.TotalSeconds + 1 }`n}\"))\n"
+                  ". ([scriptblock]::Create(((Get-Def 'Stop-PlanRefused') -replace '(?m)^\\s*exit 2\\s*$', \"throw 'EXIT2'\")))\n"
+                  "foreach ($v in '$script:GuardReadMinSec', '$script:GuardWorkerFunctions', '$script:GuardWorker') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq $v }, $true).Extent.Text)) }\n"
+                  "function Get-RunDirOutputRefusal { param($p) '' }\n"
+                  "function Get-InputUnresolvedCode { param($p, [switch]$SkipRead) '' }\n"
+                  "function Get-LegSpecRefusal { param($p, $b) @('', '') }\n"
+                  "function Wait-RunDirReadSeam { }\n"
+                  "function Complete-VenueProcess { param($ExitCode) }\n"
+                  "function Register-LogFailure { param($w) }\n"
+                  "function Test-AliasHit { param($h) $false }\n"
+                  "function Enable-WriteSuppression { param($h) $script:RunOutputAliased = $true }\n"
+                  f"$here = '{psq(RUNNER.parent)}'; Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking\n"
+                  f"$legPlanMode = $true; $AgentShare = '{psq(self.share)}'; $RunDir = '{psq(run_dir)}'; $Venue = 'bachelor'; $ClaimDir = 'c'; $artifactProbe = $null; $stagedBuildProbe = $null; $script:guardDelaySeam = $null; $script:claimWait = $null\n"
+                  "$script:summaryBeforeExit = $null; $script:receiptGuardHit = $null\n"
+                  f"$spec = [pscustomobject]@{{ kind = 'spec'; item = 1; path = '{psq(spec)}'; backend = 'cpu' }}; $spec2 = [pscustomobject]@{{ kind = 'spec'; item = 3; path = '{psq(spec2)}'; backend = 'cpu' }}\n"
+                  f"$goneBuild = [pscustomobject]@{{ kind = 'build'; item = 2; commit = '{self.commit_a}'; sha256 = '{self.manifests[self.commit_a]}'; path = '{psq(gone)}' }}\n"
+                  "$hits = [ordered]@{}\n"
+                  "foreach ($k in 'no_room', 'answered_no_room') {\n"
+                  "    $script:guardedInputs = $(if ($k -ceq 'no_room') { @($spec, $spec2) } else { @($goneBuild, $spec) })\n"
+                  "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' $true\n"
+                  "    $hits[$k] = Invoke-InputGuard; $script:guardBudget = $null\n"
+                  "}\n"
+                  # from here on every read of an input's (or batch.log's) path or identity is a share that answers 1.5 s late
+                  "function Get-PhysicalPath { param($p) $script:reads++; [Threading.Thread]::Sleep(1500); $p }\n"
+                  "function Get-FileIdentity { param($p) $script:reads++; [Threading.Thread]::Sleep(1500); [pscustomobject]@{ key = \"k:$p\"; links = 1 } }\n"
+                  "$out = foreach ($k in $hits.Keys) { foreach ($log in 'present', 'missing') {\n"
+                  "    $script:guardedInputs = $(if ($k -ceq 'no_room') { @($spec, $spec2) } else { @($goneBuild, $spec) })\n"
+                  "    $batchLog = Join-Path $RunDir 'batch.log'\n"
+                  "    if ($log -ceq 'present') { [IO.File]::WriteAllText($batchLog, \"before`n\") } elseif ([IO.File]::Exists($batchLog)) { [IO.File]::Delete($batchLog) }\n"
+                  "    $script:RunOutputAliased = $false; $script:reads = 0; $err = [IO.StringWriter]::new(); $old = [Console]::Error; [Console]::SetError($err)\n"
+                  "    $sw = [Diagnostics.Stopwatch]::StartNew(); $ended = ''\n"
+                  "    try { Stop-InputIsOutput $hits[$k] } catch { $ended = $_.Exception.Message } finally { $ms = $sw.ElapsedMilliseconds; [Console]::SetError($old) }\n"
+                  "    [pscustomobject]@{ hit = $k; log = $log; ended = $ended; ms = $ms; reads = $script:reads; noAnswer = [bool]$hits[$k].noAnswer; stderr = $err.ToString()\n"
+                  "        logText = $(if ([IO.File]::Exists($batchLog)) { [IO.File]::ReadAllText($batchLog) } else { $null }) }\n"
+                  "} }\n"
+                  "[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @($out)))\n")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(len(got), 4, got)
+        for d in got:
+            with self.subTest(hit=d["hit"], log=d["log"]):
+                self.assertEqual(d["ended"], "EXIT2", d)
+                self.assertEqual(d["reads"], 0, f"the refusal read an input (or batch.log) with no bound before it printed: {d}")
+                self.assertLess(d["ms"], 1000, d)
+                self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=", d["stderr"])
+                self.assertIn("no time is left in the test room", d["stderr"])
+                self.assertIn("batch.log is not written", d["stderr"])
+                self.assertIn("this refusal is on stderr only", d["stderr"])
+                self.assertEqual(d["logText"], "before\n" if d["log"] == "present" else None, "nothing was written into -RunDir")
+                answered = d["hit"] == "answered_no_room"
+                self.assertEqual(d["noAnswer"], not answered, "a pass that truly did not finish is still read again; one that saw a failure is refused (INV-1, INV-2)")
+                self.assertEqual("already answered with a failure: BUILD_NOT_STAGED" in d["stderr"], answered, d)
+
     def test_artifact_preflight_claim_wait_r3_a_claim_request_that_throws_on_a_retry_is_the_typed_refusal(self) -> None:
         # adversary r3 pass 2 A2: the retry goes into a claim request nothing guarded, and a throw there ended the script with a read given up on still stuck on a live thread, which the host
         # then waits for. The runner's own claim loop, in memory, with a request that really throws (a file at the claim folder reads BUSY): the first pass's hit is the refusal, the
