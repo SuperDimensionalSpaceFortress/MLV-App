@@ -17862,6 +17862,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     m_lookAssistApplied.clearIf( receipt );
                     return;
                 }
+                // LOOK-FULLSCREEN-PARITY-1 r14 (adversary r14 0d87c82e A1): this result lands on activeReceipt and grades its sliders, so
+                // the label reads it there -- not under an export clone the job recorded as the key (the clone's own landings are the
+                // synchronous path's, on the receipt it analysed). Label only: nothing here changes the grade.
+                const auto labelFollowsLanding = [this, activeReceipt]()
+                {
+                    m_lookLabelAppliedReceipt = activeReceipt;
+                    m_lookLabelAppliedCloneLookAssist = false;   // activeReceipt's live switch decides
+                };
 
                 // Async has only pre-apply PROXY color stats here. The
                 // processed-floor-lifted-awb-risk guard fires on those proxy
@@ -17890,6 +17898,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
                     m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    labelFollowsLanding();
                     activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
                     updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
                     m_lastLookAssistExposure = activeReceipt->exposure();
@@ -18077,6 +18086,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
                     m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    labelFollowsLanding();
                     activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
                     updateLookLabel();   // L-04: the label names the applied look (the baseline), not the selected flavor
                     m_lastLookAssistExposure = activeReceipt->exposure();
@@ -18114,6 +18124,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 }
 
                 m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, false );
+                labelFollowsLanding();
                 updateLookLabel();   // the analysis landed: the label names the flavor applied
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.auto_wb_async_applied"),

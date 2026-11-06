@@ -347,10 +347,70 @@ TEST(LookLabelWiring, A1r12bTheExportJobsCloneIsTheKeyUntilTheNextOpenRecordsARo
     const int key = mw.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = m_exportQueue.first();"));
     const int apply = mw.indexOf(QStringLiteral("setSliders( m_exportQueue.first(), false );"));
     ASSERT_TRUE(key >= 0 && apply > key);
-    // Every open puts it back on the recorded row. These two are the only writers.
+    // Every open puts it back on the recorded row.
     ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )"))
                     .contains(QStringLiteral("m_lookLabelAppliedReceipt = m_loadedClipReceipt;")));
-    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
+    // Pin count update (r14, adversary r14 0d87c82e A1; was 2): the third writer is the async landing's labelFollowsLanding
+    // (LookLabelWiring.A1r14EveryAsyncLandingMovesTheLabelKeyToItsReceipt pins it).
+    ASSERT_EQ(3, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
+    ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = activeReceipt;")));
+}
+
+// Adversary r14 (0d87c82e) A1. MLVAPP_LOOK_ASSIST_ASYNC=1. A is active, owns the clip and has Look Assist on; an export applies
+// clone Q, which becomes the label key, and Q's analysis is dispatched. The queued result lands on the ACTIVE receipt (A) and grades
+// its sliders (MainWindow.cpp async apply), then the final reopen fails, so nothing records a row. RED on 0d87c82e: the key stayed Q,
+// whose outcome holds nothing, so the label read "Look: Baseline" over the Cinematic grade (and a fallback lost its suffix).
+TEST(LookLabelPolicy, A1r14AnAsyncLandingIsReadUnderTheReceiptItLandedOn)
+{
+    int cloneQ = 0, sessionA = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    for( const bool fallback : { false, true } )
+    {
+        lookassist::LookAssistFlavorOutcome outcome;
+        const void *applied = &cloneQ;            // the export site's key
+        bool recordedCloneSwitch = true;          // ... with the clone's own switch
+        outcome.landed(&sessionA, cinematic, fallback);   // the async result lands on the active receipt
+        // labelFollowsLanding: the key moves to the receipt the result landed on, and that receipt's live switch decides.
+        applied = &sessionA;
+        recordedCloneSwitch = false;
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, &sessionA, true, recordedCloneSwitch);
+        const bool on = look_label::lookOnForOwner(true, lookSwitch, look_label::selectorDescribesOwner(true, false), false);
+        ASSERT_EQ(std::string(fallback ? "Look: Baseline (fallback)" : "Look: Cinematic"),
+                  look_label::shownText(on, outcome, on ? look_label::outcomeKey(applied, &sessionA) : nullptr, cinematic).toStdString());
+        // The pairing A1 reported: read under the clone, nothing landed there.
+        ASSERT_EQ(std::string("Look: Baseline"),
+                  look_label::shownText(true, outcome, look_label::outcomeKey(&cloneQ, &sessionA), cinematic).toStdString());
+    }
+}
+
+TEST(LookLabelWiring, A1r14EveryAsyncLandingMovesTheLabelKeyToItsReceipt)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString apply = functionBody(mw, QStringLiteral("void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,"));
+    ASSERT_FALSE(apply.isEmpty());
+    // Defined once, after the ownership guard, and setting the key with the switch rule of a recorded row.
+    const int guard = apply.indexOf(QStringLiteral("if( !receiptOwnedByLoadedClip( \"look-assist-async-apply\" ) )"));
+    const int helper = apply.indexOf(QStringLiteral("const auto labelFollowsLanding = [this, activeReceipt]()"));
+    ASSERT_TRUE(guard >= 0 && helper > guard);
+    ASSERT_EQ(1, apply.count(QStringLiteral("const auto labelFollowsLanding = ")));
+    const int keyAt = apply.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = activeReceipt;"), helper);
+    const int swAt = apply.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;"), helper);
+    ASSERT_TRUE(keyAt > helper && swAt > keyAt);
+    // Every async landing (on activeReceipt) is followed at once by it, before the label is re-derived.
+    const QString landing = QStringLiteral("m_lookAssistFlavorOutcome.landed( activeReceipt, ");
+    int count = 0;
+    for( int at = apply.indexOf(landing); at >= 0; at = apply.indexOf(landing, at + 1) )
+    {
+        ++count;
+        const int eol = apply.indexOf(QLatin1Char('\n'), at);
+        const int next = apply.indexOf(QStringLiteral("labelFollowsLanding();"), eol);
+        const int relabel = apply.indexOf(QStringLiteral("updateLookLabel();"), eol);
+        printf("[A1r14] landing at=%d follows=%d relabel=%d\n", at, next, relabel);
+        ASSERT_TRUE(next > eol && relabel > next);
+        ASSERT_TRUE(apply.mid(eol, next - eol).trimmed().isEmpty());   // the very next statement
+    }
+    ASSERT_EQ(3, count);
+    ASSERT_EQ(3, apply.count(QStringLiteral("labelFollowsLanding();")));
 }
 
 // Adversary r12 (31016339) A1. A is active; row B's Look Assist switch is off. addClipToExportQueue makes clone Q, which does not
@@ -416,7 +476,8 @@ TEST(LookLabelWiring, A1r13TheExportSiteRecordsTheClonesSwitchWithTheKey)
     ASSERT_TRUE(key >= 0 && sw > key && apply > sw);
     ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )"))
                     .contains(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;")));
-    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
+    // Pin count update (r14, adversary r14 0d87c82e A1; was 2): the async landing's labelFollowsLanding is the third writer.
+    ASSERT_EQ(3, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
 }
 
 // Adversary r13 (63319bdb) A1. Rows A (Look Assist on, Cinematic) and B (Look Assist off, active) hold one path. showFileInEditor(A)
@@ -612,8 +673,12 @@ TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
     };
     for ( const char *caller : callers )
     {
-        const QString body = functionBody(mw, QString::fromLatin1(caller));
+        QString body = functionBody(mw, QString::fromLatin1(caller));
         ASSERT_TRUE(body.contains(QStringLiteral("updateLookLabel();")));
+        // Pin update (r14, sol r13 B1; was a bare ASSERT_FALSE(body.contains("look_label::"))): setSliders calls ONE policy helper,
+        // the baseline-mark predicate (it derives no text). Exactly that call is removed; any other look_label:: use still fails.
+        const QString markCall = QStringLiteral("look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad )");
+        body.remove(markCall);
         ASSERT_FALSE(body.contains(QStringLiteral("look_label::")));
     }
     // The helper reads the outcome ON SCREEN (the last landed one while pending), not the reported one.
