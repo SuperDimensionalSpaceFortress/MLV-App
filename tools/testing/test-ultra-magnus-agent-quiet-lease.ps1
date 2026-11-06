@@ -500,25 +500,74 @@ function Split-WindowsCommandLine([string]$CommandLine) {
 # r4 pass-5 A1: a value that starts with the fixture dir but climbs out of it ("<fixture>\..\unrelated\log.txt") is not inside it, so the value is
 # resolved first ([IO.Path]::GetFullPath folds '.', '..' and '/'), and only a resolved path equal to the dir or under it counts. A4: Windows paths
 # are case-insensitive, so the pre-filter and the comparison ignore case (the same dir in other case is still the fixture).
-function Test-NamesFixture([string]$CommandLine, [string]$Fx) {
-    if ([string]::IsNullOrEmpty($CommandLine) -or [string]::IsNullOrEmpty($Fx)) { return $false }
-    $root = $Fx.TrimEnd([char]'\', [char]'/')
-    if ($CommandLine.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }   # cheap pre-filter: most of the census never names it
-    try { $rootFull = [IO.Path]::GetFullPath($root).TrimEnd([char]'\') } catch { return $false }
+# r5 (sol r4 B1): the fixture path may also sit INSIDE an argument (a `pwsh -Command "... -AgentShare 'C:\Temp\fx' ..."` script) or be written with
+# forward slashes (python.exe C:/Temp/fx/x); r4 only matched an argument that STARTS with the raw dir, so both were a false zero in the census.
+# Hub ruling 20261106T1728Z splits the decision in two:
+#   'fixture' (the census counts it AND the sweep may kill it) only on a token-boundary match, after '/' -> '\' and ignoring case:
+#     - an argument, or the value after its first '=', that resolves (GetFullPath) to the dir or under it (r4's rule, kept), or
+#     - an occurrence INSIDE an argument whose left side is a quote, whitespace or '=' and whose right side is
+#         '\' with no '..' before the next quote or the end (a path under the dir that cannot climb out),
+#         the same quote that opened it ('<dir>' or "<dir>": the quoted string IS the dir),
+#         whitespace or the end with whitespace on the left (a bare script token), or the end with '=' on the left.
+#   'unknown' (counted, never killed): the line contains the dir text in any other form. A sibling ("<dir> other", <dir>2, <dir>-other,
+#     <dir>'other) is unknown, so r4 B1 stays closed (never killed), and no reading of the line can hide a live writer as a zero.
+#   The hub text also names whitespace as a right boundary; inside one quoted argument ("<dir> other\log.txt", r3 pass-4 A1 / r4 B1) that is a
+#   sibling path, so whitespace only bounds a token that whitespace also opened, and every other whitespace case is unknown.
+function Get-FixtureMatch([string]$CommandLine, [string]$Fx) {
+    if ([string]::IsNullOrEmpty($CommandLine) -or [string]::IsNullOrEmpty($Fx)) { return 'none' }
+    $root = $Fx.Replace([char]'/', [char]'\').TrimEnd([char]'\')
+    # The pre-filter is the dir's LEAF name (um-agent-quiet-lease-<pid>-<guid8>, unique to this run): a line that names the dir in a form the
+    # matcher below cannot read (doubled backslashes in a script string, an 8.3 short or long spelling of the temp dir, a relative path) still
+    # carries the leaf, so it is unknown, never none. Most of the census never contains it.
+    $leaf = $root.Substring($root.LastIndexOf([char]'\') + 1)
+    if ($leaf.Length -eq 0) { $leaf = $root }
+    if ($CommandLine.IndexOf($leaf, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return 'none' }
+    try { $rootFull = [IO.Path]::GetFullPath($root).TrimEnd([char]'\') } catch { return 'unknown' }
     foreach ($t in (Split-WindowsCommandLine $CommandLine)) {
-        $vals = @($t)
-        $q = $t.IndexOf([char]'=')
-        if ($q -ge 0) { $vals += $t.Substring($q + 1) }
+        $tn = $t.Replace([char]'/', [char]'\')
+        $vals = @($tn)
+        $q = $tn.IndexOf([char]'=')
+        if ($q -ge 0) { $vals += $tn.Substring($q + 1) }
         foreach ($v in $vals) {
-            if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '/', [StringComparison]::OrdinalIgnoreCase))) { continue }
+            if (-not ($v.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $v.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) { continue }
             $full = $null
-            try { $full = [IO.Path]::GetFullPath($v).TrimEnd([char]'\') } catch { continue }   # an unresolvable value names nothing
-            if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+            try { $full = [IO.Path]::GetFullPath($v).TrimEnd([char]'\') } catch { continue }   # an unresolvable value is not admitted here (it stays unknown)
+            if ($full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { return 'fixture' }
+        }
+        $at = 0
+        while (($i = $tn.IndexOf($root, $at, [StringComparison]::OrdinalIgnoreCase)) -ge 0) {
+            $at = $i + 1
+            if ($i -eq 0) { continue }   # an argument that starts with the dir was judged whole above
+            $l = $tn[$i - 1]
+            $e = $i + $root.Length
+            $lQuote = ($l -eq [char]"'" -or $l -eq [char]'"'); $lSpace = [char]::IsWhiteSpace($l)
+            if (-not ($lQuote -or $lSpace -or $l -eq [char]'=')) { continue }
+            if ($e -ge $tn.Length) { if ($lSpace -or $l -eq [char]'=') { return 'fixture' }; continue }
+            $r = $tn[$e]
+            if ($r -eq [char]'\') {
+                $stop = $tn.IndexOfAny([char[]]@([char]"'", [char]'"'), $e); if ($stop -lt 0) { $stop = $tn.Length }
+                if ($tn.Substring($e, $stop - $e).IndexOf('..') -lt 0) { return 'fixture' }
+                continue
+            }
+            if ($lQuote -and $r -eq $l) { return 'fixture' }
+            if ($lSpace -and [char]::IsWhiteSpace($r)) { return 'fixture' }
         }
     }
-    return $false
+    return 'unknown'
 }
-function Get-FixtureChildPids([string]$Fx) { return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $PID -and (Test-NamesFixture $_.CommandLine $Fx) } | ForEach-Object { [int]$_.ProcessId }) }
+function Test-NamesFixture([string]$CommandLine, [string]$Fx) { return (Get-FixtureMatch $CommandLine $Fx) -ceq 'fixture' }
+function Get-FixtureChildPids([string]$Fx) { return @((Get-FixtureCensus $Fx).survivors) }
+# r5: the census reports both buckets. -Rows is the pure seam (objects with ProcessId and CommandLine); the default is a fresh Win32_Process query.
+function Get-FixtureCensus([string]$Fx, $Rows = $null) {
+    if ($null -eq $Rows) { $Rows = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop) }
+    $sv = [System.Collections.Generic.List[int]]::new(); $uk = [System.Collections.Generic.List[int]]::new()
+    foreach ($row in @($Rows)) {
+        if ([int]$row.ProcessId -eq $PID) { continue }
+        $m = Get-FixtureMatch ([string]$row.CommandLine) $Fx
+        if ($m -ceq 'fixture') { $sv.Add([int]$row.ProcessId) } elseif ($m -ceq 'unknown') { $uk.Add([int]$row.ProcessId) }
+    }
+    return [pscustomobject]@{ survivors = @($sv.ToArray()); unknown = @($uk.ToArray()) }
+}
 # r3 (adversary r3 A1): an identity check and the kill must act on ONE pinned process. The process is opened by pid and its handle held first
 # (Windows never gives a pid to a new process while a handle to the old one is open), the identity check runs against that pinned process, and
 # the kill goes through the same handle. A pid reused BEFORE the pin fails the check; none can be reused between the check and the kill.
@@ -2029,6 +2078,10 @@ function Exit-HeavySlot {
     # QL_TEST_LAPSE_FAULT (the regression controls' hand-set fault; CI leaves it unset): none | delay-beat:<sec> | skip-beat | late-observe:<sec> | flag-reader.
     #   delay-beat / skip-beat act on the first gate-wait beat within 0.2 s of expiry; late-observe pauses the test before it reads its own clock;
     #   flag-reader runs a python process that keeps opening quiet-lease.json (what the release poll, a scan or an indexer do).
+    # r5 (sol r4 H1): skip-beat is an INVARIANCE control, not a regression control, and it has no RED by construction: a skipped beat only drops the
+    # test's record of that beat (Beats / LastWaitBeat) and delays nothing in the agent's loop, while neither the base end check (`$ended`, the
+    # test's own clock after the wait returned) nor the event bounds here read a beat (the last beat is reported, never asserted). It is GREEN on
+    # both by design and pins that no bound depends on a beat record. delay-beat, late-observe and flag-reader are the discriminating controls.
     function Get-LapseFault {
         $raw = [string]$env:QL_TEST_LAPSE_FAULT
         if ([string]::IsNullOrWhiteSpace($raw)) { return [pscustomobject]@{ kind = 'none'; sec = [double]0 } }
@@ -3663,6 +3716,57 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $optStopped = @(Stop-FixtureLeftovers $fx @($spOpt.Id))
             if ($optListed -or $optStopped.Count -ne 0 -or $spOpt.HasExited) { $b1Bad.Add("real quoted option [$($optCl -join '')] listed=$optListed stopped=[$($optStopped -join ',')] alive=$(-not $spOpt.HasExited)") }
             Assert-True ($b1Bad.Count -eq 0) "lease-seam-pid-cleanup: a quoted option argument naming a sibling dir is not the fixture (sol r3 B1): $($b1Bad -join ' ; ')"
+            # r5 (sol r4 B1): the fixture dir EMBEDDED in a script argument, or written with forward slashes, is a live writer: the census must count it
+            # (as a survivor, or at worst as unknown), never report zero. Sol's literal inputs first (pure, through the census's -Rows seam), then real
+            # processes. A sibling (<dir> other, <dir>2) is still never a kill match (r4 B1 stays closed), but it is counted as unknown.
+            $c5Fx = 'C:\Temp\fx'
+            $c5Sol = 'pwsh.exe -Command "Import-Module ''C:\repo\VenueChain.psm1''; $l = Start-VenueJobLiveness -AgentShare ''C:\Temp\fx'' -JobId ''j''; Start-Sleep -Seconds 300"'
+            $c5Rows = @(
+                @{ cl = $c5Sol; want = 'fixture' }                                                    # sol r4 B1, verbatim
+                @{ cl = 'python.exe C:/Temp/fx/x'; want = 'fixture' }                                  # sol r4 B1 class: forward slashes
+                @{ cl = 'pwsh.exe -Command "Start-VenueJobLiveness -AgentShare C:\Temp\fx -JobId j"'; want = 'fixture' }   # a bare script token
+                @{ cl = 'pwsh.exe -Command "& { Get-Item ''C:/Temp/fx/x.json'' }"'; want = 'fixture' }  # embedded, forward slashes, under the dir
+                @{ cl = 'python.exe -c "open(\"C:\Temp\fx\calls.jsonl\")"'; want = 'fixture' }        # embedded in a double-quoted script string
+                @{ cl = 'pwsh.exe -Command "x -AgentShare=C:\Temp\fx"'; want = 'fixture' }             # embedded, '=' on the left, end of argument
+                @{ cl = 'python.exe "C:\Temp\fx other\log.txt"'; want = 'unknown' }                    # r4 B1 sibling: never a kill match
+                @{ cl = 'python.exe C:\Temp\fx2\log.txt'; want = 'unknown' }                           # hub ruling sibling
+                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx other''"'; want = 'unknown' }  # embedded sibling with a space
+                @{ cl = 'pwsh.exe -Command "x -AgentShare ''C:\Temp\fx2''"'; want = 'unknown' }        # embedded sibling
+                @{ cl = 'pwsh.exe -Command "x ''C:\Temp\fx\..\fx2\y''"'; want = 'unknown' }            # embedded, climbs out: not admitted, still counted
+                @{ cl = 'python.exe -c "p = ''C:\\Temp\\fx\\x''"'; want = 'unknown' }                  # doubled backslashes: the leaf still names it
+                @{ cl = 'python.exe C:\Temp\other\y.txt'; want = 'none' }
+            )
+            $c5Bad = [System.Collections.Generic.List[string]]::new()
+            foreach ($r in $c5Rows) {
+                $g = Get-FixtureMatch $r.cl $c5Fx
+                $kill = [bool](Test-NamesFixture $r.cl $c5Fx)
+                if ($g -cne $r.want -or $kill -ne ($r.want -ceq 'fixture')) { $c5Bad.Add("[$($r.cl)] match=$g kill=$kill want $($r.want)") }
+            }
+            $c5Census = Get-FixtureCensus $c5Fx -Rows @([pscustomobject]@{ ProcessId = 24680; CommandLine = $c5Sol }, [pscustomobject]@{ ProcessId = 24681; CommandLine = 'python.exe C:/Temp/fx/x' }, [pscustomobject]@{ ProcessId = 24682; CommandLine = 'python.exe C:\Temp\fx2\log.txt' })
+            if (-not ((@($c5Census.survivors) -join ',') -ceq '24680,24681' -and (@($c5Census.unknown) -join ',') -ceq '24682')) { $c5Bad.Add("sol's census: survivors=[$(@($c5Census.survivors) -join ',')] unknown=[$(@($c5Census.unknown) -join ',')] want survivors=[24680,24681] unknown=[24682]") }
+            # real processes: an embedded single-quoted dir, a forward-slash path under it, and a forward-slash sibling. The first two are counted and
+            # stopped by the sweep; the sibling is counted as unknown and the sweep leaves it alive.
+            function Start-SeamKidArgv([string[]]$Argv) {
+                $psiA = [Diagnostics.ProcessStartInfo]::new($Python)
+                foreach ($a in $Argv) { [void]$psiA.ArgumentList.Add($a) }
+                $psiA.UseShellExecute = $false; $psiA.CreateNoWindow = $true
+                return [Diagnostics.Process]::Start($psiA)
+            }
+            $fxF = $fx.TrimEnd([char]'\').Replace([char]'\', [char]'/')
+            $c5Emb = Start-SeamKidArgv @('-c', "import time; share = r'$($fx.TrimEnd([char]'\'))'; time.sleep(300)"); $spObjs.Add($c5Emb)
+            $c5Fwd = Start-SeamKidArgv @('-c', 'import time; time.sleep(300)', "$fxF/x"); $spObjs.Add($c5Fwd)
+            $c5Sib = Start-SeamKidArgv @('-c', 'import time; time.sleep(300)', "${fxF}2/x"); $spObjs.Add($c5Sib)
+            $null = Wait-Until { @($c5Emb, $c5Fwd, $c5Sib | Where-Object { -not $_.HasExited -and (Test-PidAlive $_.Id) }).Count -eq 3 } 2
+            Start-Sleep -Milliseconds 300   # a child whose script fails exits within this; the census below must see three LIVE writers
+            $c5Live = @($c5Emb, $c5Fwd, $c5Sib | Where-Object { -not $_.HasExited }).Count
+            $c5Real = Get-FixtureCensus $fx
+            if ($c5Live -ne 3) { $c5Bad.Add("real processes: only $c5Live of 3 children were alive before the census (a control that never ran proves nothing)") }
+            $c5Stopped = @(Stop-FixtureLeftovers $fx @($c5Emb.Id, $c5Fwd.Id, $c5Sib.Id))
+            $c5Gone = (Wait-Until { $c5Emb.HasExited -and $c5Fwd.HasExited } 5)
+            $c5Row = "embedded counted=$(@($c5Real.survivors) -contains $c5Emb.Id) forward counted=$(@($c5Real.survivors) -contains $c5Fwd.Id) sibling unknown=$(@($c5Real.unknown) -contains $c5Sib.Id) stopped=[$($c5Stopped -join ',')] embedded+forward gone=$c5Gone sibling alive=$(-not $c5Sib.HasExited)"
+            if (-not ((@($c5Real.survivors) -contains $c5Emb.Id) -and (@($c5Real.survivors) -contains $c5Fwd.Id) -and (@($c5Real.unknown) -contains $c5Sib.Id) -and $c5Gone -and $c5Stopped -notcontains $c5Sib.Id -and -not $c5Sib.HasExited)) { $c5Bad.Add("real processes: $c5Row") }
+            Assert-True ($c5Bad.Count -eq 0) "lease-seam-pid-cleanup: a fixture dir embedded in a script argument or written with forward slashes is counted (never a false zero), and a sibling is counted unknown, never killed (sol r4 B1): $($c5Bad -join ' ; ')"
+            $results.leaseSeamEmbeddedCensus = $c5Row
             # r4 pass-5 A2 (verbatim shape): pid 42424 is a process whose Handle getter fails (no pin) while every other query answers and the identity
             # check accepts it. A stop that goes on without the pin may kill whatever holds 42424 by then: it must refuse, and never call Kill().
             $script:A2Kills = 0
@@ -3747,7 +3851,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         function Wait-FakeCall($H, [int]$Ms = 30000) {
             $done = $H.p.WaitForExit($Ms)
             if (-not $done) { try { $H.p.Kill() } catch { }; $null = $H.p.WaitForExit(5000) }
-            return [pscustomobject]@{ exited = $done; rc = $(if ($done) { $H.p.ExitCode } else { $null }); out = ([string]$H.out.Result).Trim(); err = ([string]$H.err.Result).Trim() }
+            # r5 (sol r4 H2): a call that did not exit and whose Kill threw still holds its pipes open, so .Result would block forever. Each read is
+            # waited for at most 5 s; one that has not finished is reported as '<unread>' (the call is already a failure: exited=False).
+            $outT = if ($H.out.Wait(5000)) { ([string]$H.out.Result).Trim() } else { '<unread>' }
+            $errT = if ($H.err.Wait(5000)) { ([string]$H.err.Result).Trim() } else { '<unread>' }
+            return [pscustomobject]@{ exited = $done; rc = $(if ($done) { $H.p.ExitCode } else { $null }); out = $outT; err = $errT }
         }
         function Lock-FakeFlag([double]$WithinSec = 5) {
             # An exclusive handle (FileShare.None): python's open() then fails with PermissionError until it is closed.
@@ -3766,6 +3874,18 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         }
         $fuLock = $null
         try {
+            # r5 (sol r4 H2): a call that never exits, whose Kill throws, and whose output reads never finish: Wait-FakeCall must still return,
+            # bounded, with the reads reported unread (the base blocked forever on .Result).
+            $h2Tcs = [System.Threading.Tasks.TaskCompletionSource[string]]::new()
+            $h2P = [pscustomobject]@{ Id = 42426; ExitCode = 0 }
+            $h2P | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $false }
+            $h2P | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw 'Access is denied' }
+            $h2Sw = [Diagnostics.Stopwatch]::StartNew()
+            $h2R = Wait-FakeCall ([pscustomobject]@{ p = $h2P; out = $h2Tcs.Task; err = $h2Tcs.Task }) 10
+            $h2Sw.Stop()
+            $fuRows['h2-bounded-collect'] = [ordered]@{ sec = [Math]::Round($h2Sw.Elapsed.TotalSeconds, 2); exited = $h2R.exited; out = $h2R.out; err = $h2R.err }
+            if (-not ($h2Sw.Elapsed.TotalSeconds -lt 20 -and $h2R.exited -eq $false -and $h2R.out -ceq '<unread>' -and $h2R.err -ceq '<unread>')) { $fuFails.Add("(h2) a call that never exits and cannot be killed: want a bounded return with unread output, got sec=$([Math]::Round($h2Sw.Elapsed.TotalSeconds, 2)) exited=$($h2R.exited) out=[$($h2R.out)] err=[$($h2R.err)]") }
+            $h2Tcs.SetResult('')
             # (release) the first read of an existing, unreadable flag: no release marker, typed unreadable, exit 3 (base: state=none, exit 0)
             Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
             Write-FakeFlag 999991
@@ -4032,25 +4152,33 @@ finally {
     # this run's fixture dir: the fake heavy-slot.py wrappers, probes and readers). A healthy suite leaves 0; a fake probe from an earlier RED subcase
     # (300 s) used to outlive the run. Whatever is left is stopped here so a RED run never pollutes the host, and the count is asserted below.
     $script:FixtureLeak = @()
+    $script:FixtureLeakUnknown = @()
     $script:FixtureLeakStopped = @()
     try {
-        $script:FixtureLeak = @(Get-FixtureChildPids $fx)
-        if ($script:FixtureLeak.Count -gt 0) {
-            $null = Wait-Until { @(Get-FixtureChildPids $fx).Count -eq 0 } 3
-            $script:FixtureLeak = @(Get-FixtureChildPids $fx)   # fresh: whatever still names the fixture after the grace
-            $script:FixtureLeakStopped = @(Stop-FixtureLeftovers $fx $script:FixtureLeak)
+        # r5 (sol r4 B1): one census gives both buckets; the grace waits for both, and only 'fixture' (survivors) pids are ever stopped.
+        $c0 = Get-FixtureCensus $fx
+        if ($c0.survivors.Count + $c0.unknown.Count -gt 0) {
+            $null = Wait-Until { $cw = Get-FixtureCensus $fx; ($cw.survivors.Count + $cw.unknown.Count) -eq 0 } 3
+            $c1 = Get-FixtureCensus $fx   # fresh: whatever still names the fixture after the grace
+            $script:FixtureLeak = @($c1.survivors); $script:FixtureLeakUnknown = @($c1.unknown)
+            if ($script:FixtureLeak.Count -gt 0) { $script:FixtureLeakStopped = @(Stop-FixtureLeftovers $fx $script:FixtureLeak) }
         }
     }
     # r3 (adversary r3 A6): a census that throws leaves no trustworthy count, so a stale list from an earlier census is dropped: the result is 'unknown'.
-    catch { $script:FixtureLeakProbeError = $_.Exception.Message; $script:FixtureLeak = @() }
+    catch { $script:FixtureLeakProbeError = $_.Exception.Message; $script:FixtureLeak = @(); $script:FixtureLeakUnknown = @() }
     if ($script:FixtureLeak.Count -gt 0) {
         # r4 (sol r3 hardening): "stopped now" names only the pids whose stop succeeded; a stop that threw or was refused is reported as NOT stopped.
         [Console]::Error.WriteLine((Format-FixtureLeakLine $script:FixtureLeak $script:FixtureLeakStopped))
     }
+    if ($script:FixtureLeakUnknown.Count -gt 0) {
+        [Console]::Error.WriteLine("FIXTURE-LEAK-UNKNOWN: $($script:FixtureLeakUnknown.Count) process(es) name the fixture dir in a form the kill match does not admit (counted, never stopped): pids=$($script:FixtureLeakUnknown -join ',')")
+    }
     Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue
 }
-Assert-True ($script:FixtureLeak.Count -eq 0) "no fixture child process survives the suite: pids=$($script:FixtureLeak -join ',')"
+$results.fixtureCensus = $(if ($null -ne $script:FixtureLeakProbeError) { 'survivors=unknown unknown=unknown' } else { "survivors=$($script:FixtureLeak.Count) unknown=$($script:FixtureLeakUnknown.Count)" })
+Assert-True ($script:FixtureLeak.Count -eq 0 -and $script:FixtureLeakUnknown.Count -eq 0) "no fixture child process survives the suite: $($results.fixtureCensus) pids=$($script:FixtureLeak -join ',') unknownPids=$($script:FixtureLeakUnknown -join ',')"
 $results.fixtureChildrenSurviving = $(if ($null -ne $script:FixtureLeakProbeError) { 'unknown' } else { $script:FixtureLeak.Count })
+$results.fixtureChildrenUnknown = $(if ($null -ne $script:FixtureLeakProbeError) { 'unknown' } else { $script:FixtureLeakUnknown.Count })
 if ($null -ne $script:FixtureLeakProbeError) { $results.fixtureChildrenProbeError = $script:FixtureLeakProbeError }   # a probe that could not run is reported as 'unknown', never as 0 and never a failure of its own
 
 [pscustomobject]@{ status = 'PASS'; agent = $agentScript; agentSha256 = (Get-FileHash -LiteralPath $agentScript -Algorithm SHA256).Hash; results = $results } | ConvertTo-Json -Depth 8
