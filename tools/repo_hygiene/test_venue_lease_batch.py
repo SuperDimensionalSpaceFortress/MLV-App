@@ -6068,6 +6068,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn("(no answer on 1 read in a row while no claim was held)", d["refused"])
                 self.assertEqual(d["abandoned"], 1, f"the request's worker given up on is an abandoned read (Complete-VenueProcess exits at once): {d}")
                 self.assertEqual(d["releases"], [], d)
+        # adversary r6 A1: a deadline 30 days out overflowed WaitOne (past about 24.8 days), and the throw disposed the still-running worker synchronously. The wait is capped (600 s; 2 s
+        # here, the cap lifted from the runner and lowered in memory so the row is quick), so the never-returning request is given up on at the cap. ~4 s.
+        far = self._retry_request_loop("[Threading.Thread]::Sleep(600000); " + self.DENIED, 30 * 86400, extra="$script:ClaimRetryRequestMaxSec = 2")
+        self.assertEqual((far["requests"], far["guards"], far["claim"], far["thrown"], far["abandoned"]), (2, 1, None, "", 1), far)
+        self.assertTrue(far["refused"].startswith("WHY (the claim request did not answer in 2 s, the most a retry's request is waited for;"), far)
 
     def test_artifact_preflight_claim_wait_r6_a_retry_with_less_room_than_the_floor_requests_nothing(self) -> None:
         # the room left at the retry is about 1 s, under the 2 s floor: no request starts, the saved refusal prints now. The room checks are forced true so only the floor can stop it. ~2 s.
@@ -6086,17 +6091,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertLess(late["refusedAt"], late["deadlineSec"], late)
         self.assertEqual(late["releases"], ["worker:late-n"], f"the late grant was not released by its worker: {late}")
         self.assertEqual(late["abandoned"], 1, late)
-        # inside the bound, past the deadline: Invoke-ClaimRetryRequest itself, with a deadline already gone and a grant at once
+        # inside the bound, past the deadline: Invoke-ClaimRetryRequest itself, a grant at once, with the worker's late cutoff moved to yesterday IN MEMORY (the function text lifted from
+        # the runner and that one argument replaced; adversary r6 A2: the runner takes no such parameter), as a caller woken late past the deadline would find it
         stub = Path(tempfile.mkdtemp(prefix="retry-late-", dir=self.case))
         (stub / "VenueChain.psm1").write_text(
             "function Request-VenueClaim { param($Venue, $RunDir, $Purpose, $TtlSec, $ClaimDir) [pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'edge-n' }; state = 'TAKEN' } }\n"
             "function Release-VenueClaim { param($Venue, $Nonce, $ClaimDir) [IO.File]::AppendAllText('" + psq(stub) + "\\releases.log', \"worker:$Nonce`n\"); 'RELEASED' }\n", encoding="utf-8")
         script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
-                  "$f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-ClaimRetryRequest' }, $true); . ([scriptblock]::Create($f.Extent.Text))\n"
+                  "$f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Invoke-ClaimRetryRequest' }, $true)\n"
+                  "$anchor = 'lateAfterUtc = $DeadlineUtc'; if (([regex]::Matches($f.Extent.Text, [regex]::Escape($anchor))).Count -ne 1) { throw 'the late cutoff anchor moved' }\n"
+                  ". ([scriptblock]::Create($f.Extent.Text.Replace($anchor, 'lateAfterUtc = [DateTime]::UtcNow.AddDays(-1)')))\n"
                   "foreach ($a in $ast.EndBlock.Statements) { if ($a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -clike '$script:ClaimRetryRequest*') { . ([scriptblock]::Create($a.Extent.Text)) } }\n"
                   "Import-Module ([IO.Path]::Combine('" + psq(RUNNER.parent) + "', 'VenueChain.psm1')) -Force -DisableNameChecking\n"
                   f"$here = '{psq(stub)}'\n"
-                  "$r = Invoke-ClaimRetryRequest -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(30)) -RequestArgs @{ Venue = 'bachelor'; RunDir = 'r'; Purpose = 'p'; TtlSec = 60; ClaimDir = 'c' } -LateAfterUtc ([DateTime]::UtcNow.AddSeconds(-1))\n"
+                  "$r = Invoke-ClaimRetryRequest -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(30)) -RequestArgs @{ Venue = 'bachelor'; RunDir = 'r'; Purpose = 'p'; TtlSec = 60; ClaimDir = 'c' }\n"
                   f"$s = [Diagnostics.Stopwatch]::StartNew(); while ($s.Elapsed.TotalSeconds -lt 8 -and -not (Test-Path '{psq(stub)}\\releases.log')) {{ [Threading.Thread]::Sleep(100) }}\n"
                   f"[Console]::Out.WriteLine(([pscustomobject]@{{ granted = [bool]$r.granted; state = $r.state; why = $r.why; releases = @(if (Test-Path '{psq(stub)}\\releases.log') {{ [IO.File]::ReadAllLines('{psq(stub)}\\releases.log') }}) }} | ConvertTo-Json -Compress)); [Console]::Out.Flush(); [Environment]::Exit(0)\n")
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60)
@@ -6114,6 +6122,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         granted = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'fast-n' }; state = 'TAKEN' }", 60)
         self.assertEqual((granted["requests"], granted["guards"], granted["claim"], granted["refused"], granted["thrown"]), (2, 2, "fast-n", "", ""), granted)
         self.assertEqual((granted["abandoned"], granted["releases"]), (0, []), granted)
+        # adversary r6 A1 and A2: a grant at once still proceeds with a deadline 30 days out (WaitOne overflowed there), and with a default parameter value naming a late cutoff
+        # (yesterday) in the session, which marked that timely grant late while the helper took one. ~2 s.
+        far = self._retry_request_loop("[pscustomobject]@{ granted = $true; broken = @(); claim = [pscustomobject]@{ nonce = 'far-n' }; state = 'TAKEN' }", 30 * 86400,
+                                       extra="$PSDefaultParameterValues['Invoke-ClaimRetryRequest:LateAfterUtc'] = [DateTime]::UtcNow.AddDays(-1)")
+        self.assertEqual((far["requests"], far["guards"], far["claim"], far["refused"], far["thrown"], far["abandoned"], far["releases"]), (2, 2, "far-n", "", "", 0, []), far)
         self.assertEqual(denied["workerRequests"], 2, f"the two retries did not go through the bounded worker: {denied}")
         self.assertEqual(granted["workerRequests"], 1, f"the retry did not go through the bounded worker: {granted}")
 
@@ -6580,7 +6593,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                  "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
         script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
                   f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
-                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+                  # r6 (adversary r6 A3): Get-InputContentRefusal calls Set-GuardProgress (a no-op with no progress object), so the harness lifts it too, never a CommandNotFound it ignores
+                  "foreach ($n in 'New-GuardBudget', 'Get-InputContentRefusal', 'Set-GuardProgress') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
                   # the runner's own top-level threshold, when it has one
                   "$min = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] -and $x.Left.Extent.Text -ceq '$script:GuardReadMinSec' }, $true)\n"
                   "if ($min) { . ([scriptblock]::Create($min.Extent.Text)) }\n"

@@ -747,20 +747,24 @@ function Invoke-ClaimRetryRequest {
     # Request-VenueClaim runs on a worker runspace (VenueChain.psm1 from $here, as Invoke-InputGuard's worker), given up on after the room less $script:ClaimRetryRequestReserveSec
     # (the refusal's own end): the worker is abandoned and counted in VenueAbandonedReads, as Invoke-VenueBoundedRead and Invoke-InputGuard do, so Complete-VenueProcess exits at once.
     # It is NOT asked to stop (BeginStop): a stop landing between the claim file's creation and the hand-off below would leave a claim nobody releases. The worker runs to its own
-    # end instead, and the hand-off is decided once under a lock: if the caller gave up first, or the grant came at or after -LateAfterUtc (the deadline), the worker RELEASES its
-    # own grant and the caller never uses it. Should the process exit first, the claim's owner pid is dead and the next claimant breaks it as dead-pid.
+    # end instead, and the hand-off is decided once under a lock: if the caller gave up first, or the grant came at or after -DeadlineUtc, the worker RELEASES its own grant and
+    # the caller never uses it. Should the process exit first, the claim's owner pid is dead and the next claimant breaks it as dead-pid.
+    # r6 pass 2 (adversary r6 A1): the wait is also capped at $script:ClaimRetryRequestMaxSec (a far deadline's room overflowed WaitOne), and the hand-off is decided in the finally,
+    # so a throw after the worker started neither hands a grant to nobody nor disposes a running worker (Dispose() would wait for it). A2: the late cutoff is the deadline, no parameter.
     # The first request of a run is master's inline call, untouched; so are Invoke-VenueChain.ps1's two callers. A worker that threw rethrows here (the caller's REQUEST_THREW).
     # .OUTPUTS Request-VenueClaim's object, or { granted = $false; state = REQUEST_NO_ROOM | REQUEST_NO_ANSWER | REQUEST_LATE_GRANT; why; broken = @(); claim = $null }
-    param([Parameter(Mandatory)][DateTime]$DeadlineUtc, [Parameter(Mandatory)][hashtable]$RequestArgs, [DateTime]$LateAfterUtc = $DeadlineUtc)
+    param([Parameter(Mandatory)][DateTime]$DeadlineUtc, [Parameter(Mandatory)][hashtable]$RequestArgs)
     $room = ($DeadlineUtc - [DateTime]::UtcNow).TotalSeconds
     if ($room -lt $script:ClaimRetryRequestMinSec) {
         return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ROOM'; broken = @(); claim = $null
             why = "no claim request was made: $([Math]::Round([Math]::Max(0.0, $room), 2)) s were left before -DeadlineUtc, under the $($script:ClaimRetryRequestMinSec) s a retry's request starts with" }
     }
-    $timeoutSec = $room - $script:ClaimRetryRequestReserveSec
+    $timeoutSec = [Math]::Min($room - $script:ClaimRetryRequestReserveSec, [double]$script:ClaimRetryRequestMaxSec)
+    $boundWhat = $(if ($timeoutSec -lt $room - $script:ClaimRetryRequestReserveSec) { "the most a retry's request is waited for" } else { "the time left before -DeadlineUtc less $($script:ClaimRetryRequestReserveSec) s" })
     $state = [hashtable]::Synchronized(@{ lock = [object]::new(); decided = $false; abandoned = $false; late = $false; result = $null; error = $null; release = $null })
-    $ps = [powershell]::Create(); $leftRunning = $false
+    $ps = $null; $started = $false; $ended = $false; $decided = $false
     try {
+        $ps = [powershell]::Create()
         [void]$ps.AddScript({
             param($A)
             $ErrorActionPreference = 'Stop'
@@ -772,24 +776,28 @@ function Invoke-ClaimRetryRequest {
             finally { [Threading.Monitor]::Exit($S.lock) }
             if ($late -and $null -ne $r -and $r.granted) { try { $S.release = [string](Release-VenueClaim -Venue $A.request.Venue -Nonce $r.claim.nonce -ClaimDir $A.request.ClaimDir) } catch { $S.release = "THREW $($_.Exception.Message -replace '\s+', ' ')" } }
         }.ToString())
-        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $LateAfterUtc; state = $state })
-        $async = $ps.BeginInvoke()
+        [void]$ps.AddArgument(@{ chainModule = (Join-Path $here 'VenueChain.psm1'); request = $RequestArgs; lateAfterUtc = $DeadlineUtc; state = $state })
+        $async = $ps.BeginInvoke(); $started = $true
         $ended = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($timeoutSec))
-        [Threading.Monitor]::Enter($state.lock)
-        try { if (-not $state.decided) { $state.abandoned = $true }; $decided = $state.decided } finally { [Threading.Monitor]::Exit($state.lock) }
-        # a worker still running is a live thread the host would wait for at exit: counted, never joined or disposed (Dispose() would wait for it)
-        if (-not $ended) { $leftRunning = $true; & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } }
-        if (-not $decided) {
-            return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ANSWER'; broken = @(); claim = $null
-                why = "the claim request did not answer in $([Math]::Round($timeoutSec, 2)) s, the time left before -DeadlineUtc less $($script:ClaimRetryRequestReserveSec) s; it was given up on, and a claim it may still be granted is released by it, never used" }
+    } finally {
+        if ($started) {
+            [Threading.Monitor]::Enter($state.lock)
+            try { if (-not $state.decided) { $state.abandoned = $true }; $decided = $state.decided } finally { [Threading.Monitor]::Exit($state.lock) }
+            # a worker still running is a live thread the host would wait for at exit: counted, never joined or disposed (Dispose() would wait for it)
+            if (-not $ended) { & (Get-Module VenueChain) { $script:VenueAbandonedReads++ } }
         }
-        if ($state.late) {
-            return [pscustomobject]@{ granted = $false; state = 'REQUEST_LATE_GRANT'; broken = @(); claim = $null
-                why = "the claim request was granted at or after -DeadlineUtc; that claim is released ($(if ($state.release) { $state.release } else { 'by the request''s worker' })), never used" }
-        }
-        if ($state.error) { throw $state.error }
-        $state.result
-    } finally { if (-not $leftRunning) { $ps.Dispose() } }
+        if ($null -ne $ps -and (-not $started -or $ended)) { $ps.Dispose() }
+    }
+    if (-not $decided) {
+        return [pscustomobject]@{ granted = $false; state = 'REQUEST_NO_ANSWER'; broken = @(); claim = $null
+            why = "the claim request did not answer in $([Math]::Round($timeoutSec, 2)) s, $boundWhat; it was given up on, and a claim it may still be granted is released by it, never used" }
+    }
+    if ($state.late) {
+        return [pscustomobject]@{ granted = $false; state = 'REQUEST_LATE_GRANT'; broken = @(); claim = $null
+            why = "the claim request was granted at or after -DeadlineUtc; that claim is released ($(if ($state.release) { $state.release } else { 'by the request''s worker' })), never used" }
+    }
+    if ($state.error) { throw $state.error }
+    $state.result
 }
 
 function Get-ClaimWaitUnfinishedText([int]$Unfinished, [int]$NoAnswers) {
@@ -823,6 +831,8 @@ $script:ClaimWaitGuardSec = 30   # the budget of one no-claim pass (the claim lo
 # up on at the room less the reserve: 1 s for the refusal's own end, as the claim guard keeps 1 s for its own (so the bound is never under 1 s).
 $script:ClaimRetryRequestMinSec = 2
 $script:ClaimRetryRequestReserveSec = 1
+# r6 pass 2 (adversary r6 A1): and waited for at most this long, Invoke-VenueBoundedRead's own ceiling, however far the deadline is (WaitOne refuses past about 24.8 days)
+$script:ClaimRetryRequestMaxSec = 600
 $script:GuardWorkerFunctions = @('Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Set-GuardProgress', 'Get-RunDirOutputRefusal', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Get-LegSpecRefusal',
     'Test-NothingAtName', 'Get-InputUnresolvedCode')   # r12 (#704 merge): Get-InputOutputRefusal now calls these two (r5b, r6)
 $script:GuardWorker = {
