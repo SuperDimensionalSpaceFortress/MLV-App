@@ -630,6 +630,66 @@ static inline uint16_t debayer_hacd_round16(float v)
     return (uint16_t)(int)(v + 0.5f);
 }
 
+/* One R or B site: its balanced value minus the gradient-directed HA G (row or
+ * column, the smaller |dG| + |Laplacian|; a tie averages both), G clamped to
+ * [0, 65535]. xl1 .. xr2 are the (mirrored) columns x - 1, x + 1, x - 2, x + 2. */
+static inline float debayer_hacd_site(const uint16_t *row, const uint16_t *u1, const uint16_t *d1,
+                                      const uint16_t *u2, const uint16_t *d2, int x, int xl1, int xr1,
+                                      int xl2, int xr2, float ck, float ik)
+{
+#define HACD_BAL(v) (((float)(v) - ck) * ik)
+    const float c = HACD_BAL(row[x]);
+    const float l1 = (float)row[xl1], r1 = (float)row[xr1];
+    const float l2 = HACD_BAL(row[xl2]), r2 = HACD_BAL(row[xr2]);
+    const float up1 = (float)u1[x], dn1 = (float)d1[x];
+    const float lh = 2.0f * c - l2 - r2;
+    const float lv = 2.0f * c - HACD_BAL(u2[x]) - HACD_BAL(d2[x]);
+#undef HACD_BAL
+    const float gh = 0.5f * (l1 + r1) + 0.25f * lh;
+    const float gv = 0.5f * (up1 + dn1) + 0.25f * lv;
+    const float dh = fabsf(l1 - r1) + fabsf(lh);
+    const float dv = fabsf(up1 - dn1) + fabsf(lv);
+    float gg = (dh < dv) ? gh : (dv < dh) ? gv : 0.5f * (gh + gv);
+    if (gg < 0.0f) gg = 0.0f;
+    if (gg > 65535.0f) gg = 65535.0f;
+    return c - gg;
+}
+
+/* One output pixel: the colour difference at its own site or the bilinear mean of its
+ * nearest R / B sites (dif rows ro, uo = y - 1, dof = y + 1, columns xl, xr mirrored),
+ * laid on the pixel's bilinear G and mapped back by the fit. */
+static inline void debayer_hacd_px(uint16_t *out, const float *dif, size_t ro, size_t uo, size_t dof, int x,
+                                   int xl, int xr, int ye, int xe, float aR, float cR, float aB, float cB)
+{
+#define HACD_D(o, xx) (dif[(o) + (size_t)(xx)])
+    float dr, db;
+    if (ye && xe)
+    {   /* R site */
+        dr = HACD_D(ro, x);
+        db = 0.25f * (HACD_D(uo, xl) + HACD_D(uo, xr) + HACD_D(dof, xl) + HACD_D(dof, xr));
+    }
+    else if (!ye && !xe)
+    {   /* B site */
+        db = HACD_D(ro, x);
+        dr = 0.25f * (HACD_D(uo, xl) + HACD_D(uo, xr) + HACD_D(dof, xl) + HACD_D(dof, xr));
+    }
+    else if (ye)
+    {   /* G in an R row: R left and right, B above and below */
+        dr = 0.5f * (HACD_D(ro, xl) + HACD_D(ro, xr));
+        db = 0.5f * (HACD_D(uo, x) + HACD_D(dof, x));
+    }
+    else
+    {   /* G in a B row: R above and below, B left and right */
+        dr = 0.5f * (HACD_D(uo, x) + HACD_D(dof, x));
+        db = 0.5f * (HACD_D(ro, xl) + HACD_D(ro, xr));
+    }
+#undef HACD_D
+    uint16_t *p = out + (size_t)x * 3u;
+    const float gb = (float)p[1];
+    p[0] = debayer_hacd_round16(aR * (gb + dr) + cR);
+    p[2] = debayer_hacd_round16(aB * (gb + db) + cB);
+}
+
 int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int w, int h, int threads,
                                       float *scratch)
 {
@@ -638,53 +698,31 @@ int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int 
     debayer_hacd_fit(bayer, w, h, 0, 0, &aR, &cR); /* R at (even, even) */
     debayer_hacd_fit(bayer, w, h, 1, 1, &aB, &cB); /* B at (odd, odd) */
     const float iR = 1.0f / aR, iB = 1.0f / aB;
-    float *bal = scratch;
-    float *gha = scratch + (size_t)w * (size_t)h;
+    /* scratch[i] at an R or B site = its balanced value minus its HA G (the colour
+     * difference); G sites are not written. Same-colour neighbours (x +- 2, y +- 2)
+     * share the site's balance; the +- 1 neighbours are G, which is never balanced. */
+    float *dif = scratch;
 
     #pragma omp parallel for if(threads > 1) num_threads(threads)
     for (int y = 0; y < h; ++y)
     {
-        const uint16_t *src = bayer + (size_t)y * (size_t)w;
-        float *dst = bal + (size_t)y * (size_t)w;
-        for (int x = 0; x < w; ++x)
-        {
-            const float v = (float)src[x];
-            if (((x | y) & 1) == 0) dst[x] = (v - cR) * iR;
-            else if ((x & y & 1) != 0) dst[x] = (v - cB) * iB;
-            else dst[x] = v;
-        }
-    }
-
-    #pragma omp parallel for if(threads > 1) num_threads(threads)
-    for (int y = 0; y < h; ++y)
-    {
-        const float *row = bal + (size_t)y * (size_t)w;
-        const float *u1 = bal + (size_t)debayer_hacd_reflect(y - 1, h) * (size_t)w;
-        const float *d1 = bal + (size_t)debayer_hacd_reflect(y + 1, h) * (size_t)w;
-        const float *u2 = bal + (size_t)debayer_hacd_reflect(y - 2, h) * (size_t)w;
-        const float *d2 = bal + (size_t)debayer_hacd_reflect(y + 2, h) * (size_t)w;
-        float *g = gha + (size_t)y * (size_t)w;
-        for (int x = 0; x < w; ++x)
-        {
-            const float c = row[x];
-            if (((x ^ y) & 1) != 0)
-            {
-                g[x] = c; /* a G site */
-                continue;
-            }
-            const float l1 = row[debayer_hacd_reflect(x - 1, w)], r1 = row[debayer_hacd_reflect(x + 1, w)];
-            const float l2 = row[debayer_hacd_reflect(x - 2, w)], r2 = row[debayer_hacd_reflect(x + 2, w)];
-            const float lh = 2.0f * c - l2 - r2;
-            const float lv = 2.0f * c - u2[x] - d2[x];
-            const float gh = 0.5f * (l1 + r1) + 0.25f * lh;
-            const float gv = 0.5f * (u1[x] + d1[x]) + 0.25f * lv;
-            const float dh = fabsf(l1 - r1) + fabsf(lh);
-            const float dv = fabsf(u1[x] - d1[x]) + fabsf(lv);
-            float gg = (dh < dv) ? gh : (dv < dh) ? gv : 0.5f * (gh + gv);
-            if (gg < 0.0f) gg = 0.0f;
-            if (gg > 65535.0f) gg = 65535.0f;
-            g[x] = gg;
-        }
+        const uint16_t *row = bayer + (size_t)y * (size_t)w;
+        const uint16_t *u1 = bayer + (size_t)debayer_hacd_reflect(y - 1, h) * (size_t)w;
+        const uint16_t *d1 = bayer + (size_t)debayer_hacd_reflect(y + 1, h) * (size_t)w;
+        const uint16_t *u2 = bayer + (size_t)debayer_hacd_reflect(y - 2, h) * (size_t)w;
+        const uint16_t *d2 = bayer + (size_t)debayer_hacd_reflect(y + 2, h) * (size_t)w;
+        const float ck = (y & 1) ? cB : cR, ik = (y & 1) ? iB : iR;
+        float *dd = dif + (size_t)y * (size_t)w;
+        int x = (y & 1);
+        /* The border sites mirror; the interior (x - 2 >= 0, x + 2 < w) indexes directly. */
+        for (; x < 2; x += 2)
+            dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, debayer_hacd_reflect(x - 1, w), debayer_hacd_reflect(x + 1, w),
+                                      debayer_hacd_reflect(x - 2, w), debayer_hacd_reflect(x + 2, w), ck, ik);
+        for (; x + 2 < w; x += 2)
+            dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, x - 1, x + 1, x - 2, x + 2, ck, ik);
+        for (; x < w; x += 2)
+            dd[x] = debayer_hacd_site(row, u1, d1, u2, d2, x, debayer_hacd_reflect(x - 1, w), debayer_hacd_reflect(x + 1, w),
+                                      debayer_hacd_reflect(x - 2, w), debayer_hacd_reflect(x + 2, w), ck, ik);
     }
 
     #pragma omp parallel for if(threads > 1) num_threads(threads)
@@ -694,38 +732,20 @@ int debayer_reduced_hacd_chroma_rgb16(uint16_t *rgb, const uint16_t *bayer, int 
         const size_t uo = (size_t)debayer_hacd_reflect(y - 1, h) * (size_t)w;
         const size_t dof = (size_t)debayer_hacd_reflect(y + 1, h) * (size_t)w;
         uint16_t *out = rgb + ro * 3u;
-        for (int x = 0; x < w; ++x)
+        const int ye = (y & 1) == 0;
+        /* x = 0 and x = w - 1 mirror; the interior runs in (odd, even) pairs so each call's
+         * column parity is a constant. */
+        debayer_hacd_px(out, dif, ro, uo, dof, 0, 1, 1, ye, 1, aR, cR, aB, cB);
+        int x = 1;
+        for (; x + 2 < w; x += 2)
         {
-            const int xl = debayer_hacd_reflect(x - 1, w), xr = debayer_hacd_reflect(x + 1, w);
-            /* d = bal - gha: the colour difference at the native sites, 0 elsewhere unused. */
-#define HACD_D(o, xx) (bal[(o) + (size_t)(xx)] - gha[(o) + (size_t)(xx)])
-            float dr, db;
-            const int ye = (y & 1) == 0, xe = (x & 1) == 0;
-            if (ye && xe)
-            {   /* R site */
-                dr = HACD_D(ro, x);
-                db = 0.25f * (HACD_D(uo, xl) + HACD_D(uo, xr) + HACD_D(dof, xl) + HACD_D(dof, xr));
-            }
-            else if (!ye && !xe)
-            {   /* B site */
-                db = HACD_D(ro, x);
-                dr = 0.25f * (HACD_D(uo, xl) + HACD_D(uo, xr) + HACD_D(dof, xl) + HACD_D(dof, xr));
-            }
-            else if (ye)
-            {   /* G in an R row: R left and right, B above and below */
-                dr = 0.5f * (HACD_D(ro, xl) + HACD_D(ro, xr));
-                db = 0.5f * (HACD_D(uo, x) + HACD_D(dof, x));
-            }
-            else
-            {   /* G in a B row: R above and below, B left and right */
-                dr = 0.5f * (HACD_D(uo, x) + HACD_D(dof, x));
-                db = 0.5f * (HACD_D(ro, xl) + HACD_D(ro, xr));
-            }
-#undef HACD_D
-            const float gb = (float)out[(size_t)x * 3u + 1u];
-            out[(size_t)x * 3u + 0u] = debayer_hacd_round16(aR * (gb + dr) + cR);
-            out[(size_t)x * 3u + 2u] = debayer_hacd_round16(aB * (gb + db) + cB);
+            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, 0, aR, cR, aB, cB);
+            debayer_hacd_px(out, dif, ro, uo, dof, x + 1, x, x + 2, ye, 1, aR, cR, aB, cB);
         }
+        for (; x < w - 1; ++x)
+            debayer_hacd_px(out, dif, ro, uo, dof, x, x - 1, x + 1, ye, (x & 1) == 0, aR, cR, aB, cB);
+        debayer_hacd_px(out, dif, ro, uo, dof, w - 1, w - 2, debayer_hacd_reflect(w, w), ye, ((w - 1) & 1) == 0, aR, cR,
+                        aB, cB);
     }
     return 1;
 }

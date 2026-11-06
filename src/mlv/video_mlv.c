@@ -7159,9 +7159,21 @@ static uint16_t * mlv_ensure_thread_reduced_recon_rgb_b(uint64_t required_words)
     return mlv_ensure_u16_buffer(&tls_buffer, &tls_capacity_words, required_words);
 }
 
+/* r10: the x4 route's HA-CD chroma step's float plane (one per reduced Bayer site). */
+static float * mlv_ensure_thread_reduced_recon_hacd_scratch(uint64_t required_floats)
+{
+    static MLV_THREAD_LOCAL float * tls_buffer = NULL;
+    static MLV_THREAD_LOCAL uint64_t tls_capacity_floats = 0;
+    if (!mlv_ensure_reusable_buffer((void **)&tls_buffer, &tls_capacity_floats, required_floats, sizeof(float)))
+        return NULL;
+    return tls_buffer;
+}
+
 /* The CPU reduced recon's debayer at the display dims (out_w x out_h RGB16 in out):
  *  - displayScale == 2 * bayerScale (x4 from an x2 Bayer, "H2c"): bilinear at
- *    bw x bh, chroma-only horizontal [1 2 1], 2x2 box (whole row pairs only);
+ *    bw x bh, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10: balanced
+ *    HA G + colour difference on the bilinear G), chroma-only horizontal [1 2 1],
+ *    2x2 box (whole row pairs only);
  *  - otherwise (x2, and x4 from an x4 Bayer): the bilinear debayer's bytes, as
  *    before this card. r8 (hub ruling HUB-TICK 20261105T2045Z) holds x2 at base
  *    behaviour; x2's filter is CPU-DUALISO-REDUCED-X2-COMB-FILTER-1.
@@ -7194,8 +7206,11 @@ static int mlv_reduced_bayer_to_display_rgb16(uint16_t * out,
         if (bw != 2 * out_w || box_h <= 0 || box_h / 2 > out_h) return 0;
         uint16_t * debayered = mlv_ensure_thread_reduced_recon_rgb_a(bayer_rgb_words);
         uint16_t * filtered = mlv_ensure_thread_reduced_recon_rgb_b(bayer_rgb_words);
-        if (!debayered || !filtered) return 0;
+        float * hacd_scratch = mlv_ensure_thread_reduced_recon_hacd_scratch((uint64_t)bw * (uint64_t)bh);
+        if (!debayered || !filtered || !hacd_scratch) return 0;
         debayerBasicU16RecordingKernelMilliseconds(debayered, bayer, bw, bh, threads, bit_shift);
+        /* r10: R and B from HA G + colour difference, on the bilinear G (bayer is shifted now). */
+        if (!debayer_reduced_hacd_chroma_rgb16(debayered, bayer, bw, bh, threads, hacd_scratch)) return 0;
         debayer_reduced_hchroma121_rgb16(filtered, debayered, bw, bh, threads);
         if (!processingRgbU16BoxDownsample(filtered, out, bw, box_h, 2, threads)) return 0;
         rows = box_h / 2;

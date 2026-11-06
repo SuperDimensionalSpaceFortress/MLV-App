@@ -249,7 +249,8 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
  * CPU-DUALISO-REDUCED-RECON-H2C-PORT-1: reducedWidth / reducedHeight are the
  * reduced BAYER's dims (plan.bayerWidth / bayerHeight); bayerScale = Width /
  * reducedWidth is reconScale, or 2 when reconScale is 4 (the x4 "H2c" route:
- * debayer at x2, chroma-only horizontal [1 2 1], 2x2 box). At x2 (bayerScale ==
+ * debayer at x2, R and B rebuilt by debayer_reduced_hacd_chroma_rgb16 (r10),
+ * chroma-only horizontal [1 2 1], 2x2 box). At x2 (bayerScale ==
  * reconScale == 2), and at x4 with bayerScale 4, the bytes are the bilinear
  * debayer's, as before (r8: x2 is held at base behaviour).
  * reconHqDualIso selects the bit shift as in ...FromReconnedRaw16. */
@@ -310,7 +311,8 @@ typedef struct
      * runs on (the reduced Bayer, bayerWidth x bayerHeight words). Equal to
      * scale / reducedWidth / reducedHeight everywhere except the CPU plan at x4, which
      * shrinks and reconstructs at x2 (bayerScale 2, fullWidth / 2 x sourceHeight / 2);
-     * its consumers debayer at x2, take the chroma-only [1 2 1] and box to x4 ("H2c").
+     * its consumers debayer at x2, rebuild R and B (r10 HA-CD), take the chroma-only
+     * [1 2 1] and box to x4 ("H2c").
      * reducedWidth / reducedHeight stay the display dims. */
     int bayerScale;
     int bayerWidth;
