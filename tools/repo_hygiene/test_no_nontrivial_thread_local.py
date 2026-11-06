@@ -8,11 +8,14 @@ Grammar: the whole word thread_local anywhere in any file under platform/ or src
 every approximation it makes fails toward reporting a line, never toward hiding one:
 - Every regular file is read, whatever its suffix (.inc, .hxx, .hh, .ipp, no suffix at all), as bytes decoded as
   UTF-8 with errors=replace. A token in a non-C++ file is an over-report that an allow-list row answers. There is
-  no include list. The one exception is a named skip list of binary suffixes, because reading them cost about 12 s
-  of the 13 s the scan took on the real tree (r3 measurement), and none can hold C++ the compiler reads:
-  .zip and .xz (compressed archives of the prebuilt FFmpeg and raw2mlv binaries under platform/qt; DLLs and
-  executables are out of scope below), .png, .gif, .icns and .ico (images), .blend (a Blender scene) and .ttf
-  (a font). The .fpm pixel maps are text and are read.
+  no include list and no skip list: an #include can name any file (adversary r3 A1: a skip list of binary
+  suffixes let #include "cache.png" hide a declaration).
+- Speed: decoding every file cost about 13 s on the real tree, 12 s of it in the .zip/.xz archives (r3
+  measurement). So a file is decoded only when its raw bytes may hold the token in either view (may_hold_token).
+  That gate is a superset of what the decoded search can find: the token and every continuation are ASCII, and
+  UTF-8 decoding with errors=replace keeps each ASCII byte as the same character in the same order, so a token
+  in either decoded view is the same twelve bytes, contiguous, in the matching byte view. The gate can pass a file
+  the decoded search then finds clean (a longer identifier, say); it cannot fail one the search would report.
 - Each file is searched in two views and the union is reported: the text as it is, and the text with every
   continuation removed (a backslash, optional spaces, tabs, form feeds or vertical tabs, then LF, CR LF or a lone
   CR; GCC accepts the whitespace with a warning). A token split by a continuation shows in the second view. A token
@@ -43,10 +46,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCANNED_DIRECTORIES = ("platform", "src")
-# Binary suffixes the scan skips; the docstring gives the reason. Never turn this into an include list.
-SKIPPED_BINARY_SUFFIXES = frozenset({".zip", ".xz", ".png", ".gif", ".icns", ".ico", ".blend", ".ttf"})
 TOKEN = re.compile(r"\bthread_local\b")
 CONTINUATION = re.compile(r"\\[ \t\f\v]*(?:\r\n|\n|\r)")
+BYTES_CONTINUATION = re.compile(rb"\\[ \t\f\v]*(?:\r\n|\n|\r)")
 
 COMMENT_TEXT = "comment text; declares nothing"
 ALLOW_LIST = {
@@ -85,15 +87,21 @@ def thread_local_lines(text):
     return found
 
 
+def may_hold_token(data):
+    """Bytes-level gate: False only when neither view of the decoded text can hold the token (see the docstring)."""
+    return b"thread_local" in data or b"thread_local" in BYTES_CONTINUATION.sub(b"", data)
+
+
 def scan(root):
-    """Every (relative path, stripped line) in the scanned product trees, from every regular file but the skip list."""
+    """Every (relative path, stripped line) in the scanned product trees, from every regular file."""
     found = []
     for directory in SCANNED_DIRECTORIES:
         for path in sorted((root / directory).rglob("*")):
-            if path.is_file() and path.suffix.lower() not in SKIPPED_BINARY_SUFFIXES:
-                text = path.read_bytes().decode("utf-8", errors="replace")
-                relative = path.relative_to(root).as_posix()
-                found.extend((relative, line) for line in thread_local_lines(text))
+            if path.is_file():
+                data = path.read_bytes()
+                if may_hold_token(data):
+                    relative = path.relative_to(root).as_posix()
+                    found.extend((relative, line) for line in thread_local_lines(data.decode("utf-8", errors="replace")))
     return found
 
 
@@ -133,6 +141,15 @@ HIDDEN_SHAPES = (
         ("x.hh", "static thread_local std::vector<int> v;\n"),
         ("x.ipp", "static thread_local std::vector<int> v;\n"),
         ("NOSUFFIX", "static thread_local std::vector<int> v;\n"),
+        # Adversary r3 A1: a file with a binary suffix can still be #included.
+        ("cache.png", "#include <vector>\nstatic thread_local std::vector<int> hidden;\n"),
+        ("cache.zip", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.tar.xz", "thread_\\\nlocal Foo g;\n"),
+        ("cache.ico", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.gif", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.icns", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.blend", "static thread_local std::vector<int> hidden;\n"),
+        ("cache.ttf", "static thread_local std::vector<int> hidden;\n"),
     ]
 )
 
@@ -259,13 +276,31 @@ class ThreadLocalGrammarTests(unittest.TestCase):
     def test_a_longer_identifier_is_not_the_token(self):
         self.assertEqual([], thread_local_lines("int my_thread_local_count;\nint thread_locals;\n"))
 
+    def test_the_bytes_gate_never_drops_what_the_decoded_search_reports(self):
+        # The gate must be a superset of thread_local_lines on the decoded text, invalid UTF-8 included.
+        import random
+
+        fixed = [source.encode("utf-8") for _, source in HIDDEN_SHAPES] + [
+            b"\xc3\\\n\xa9 thread_local Foo g;\n",
+            b"\xe2thread_local Foo g;\n",
+            b"\xffthread_\\ \r\nlocal\xfe Foo g;\n",
+            b"thread_\xc3\\\nlocal Foo g;\n",
+        ]
+        pieces = [b"thread_", b"local", b"thread_local", b"\\", b"\\ \n", b"\\\r\n", b"\\\r", b"\n", b" ", b"\xc3",
+                  b"\xa9", b"\xe2\x80", b"\xff", b"x", b"_", b"/*", b"*/", b"\"", b"R\"x("]
+        rng = random.Random(761)
+        generated = [b"".join(rng.choice(pieces) for _ in range(rng.randint(1, 12))) for _ in range(3000)]
+        for data in fixed + generated:
+            if thread_local_lines(data.decode("utf-8", errors="replace")):
+                self.assertTrue(may_hold_token(data), data)
+
     def test_every_hidden_shape_is_reported(self):
         for name, source in HIDDEN_SHAPES:
             self.assertTrue(thread_local_lines(source), name)
 
     def test_the_scan_reads_every_file_and_skips_other_trees(self):
-        # Flipped in r3: there is no include list, so note.txt is reported too (opus r2 B3: .inc, .hxx, .hh, .ipp);
-        # only the named binary suffixes are skipped.
+        # Flipped in r3: there is no include list and no skip list, so note.txt, icon.PNG and ffmpeg.tar.xz are
+        # reported too (opus r2 B3: .inc, .hxx, .hh, .ipp; adversary r3 A1: binary suffixes).
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,6 +331,8 @@ class ThreadLocalGrammarTests(unittest.TestCase):
                     "platform/note.txt",
                     "platform/latin1.c",
                     "platform/pixels.fpm",
+                    "platform/icon.PNG",
+                    "platform/ffmpeg.tar.xz",
                 },
                 {path for path, _ in scan(root)},
             )
