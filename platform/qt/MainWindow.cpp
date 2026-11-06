@@ -19023,6 +19023,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( m_lastLookAssistPostGreenArtifactMeanAxis, 0, 'f', 3 )
                 .arg( m_lastLookAssistPostVisibleGreenAxis, 0, 'f', 3 ) );
         m_lastLookAssistSafetyFallback = true;
+        labelFollowsActiveSliders( receipt );   // r17 (adversary r17 4fcae002 A1): this landing grades the sliders
         // The baseline sliders are back: the receipt must not keep naming the selected (Cinematic) flavor over them.
         m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );
         receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( receipt, lookAssistFlavorName( flavor ) ) );
@@ -19044,6 +19045,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         return;
     }
 
+    labelFollowsActiveSliders( receipt );   // r17 (adversary r17 4fcae002 A1): this landing grades the sliders
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
     updateLookLabel();   // the analysis landed: the label names the flavor applied
@@ -31874,6 +31876,19 @@ QString MainWindow::lookLabelShownText( QString *surface )
     return shown;
 }
 
+// r17 (adversary r17 4fcae002 A1): the active row's receipt graded on the attached sliders is what is on screen, so the label reads
+// it there, with its switch (look_label::activeGradeMovesKey). Called before each such grade relabels: both synchronous landings and
+// the switch, which the flavor change goes through.
+void MainWindow::labelFollowsActiveSliders( ReceiptSettings *receipt )
+{
+    ReceiptSettings *activeReceipt = ( SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0 ) ? ACTIVE_RECEIPT : nullptr;
+    if( m_fileLoaded && look_label::activeGradeMovesKey( receipt, activeReceipt, !m_slidersDetachedFromReceipt ) )
+    {
+        m_lookLabelAppliedReceipt = receipt;
+        m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();
+    }
+}
+
 void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
 {
     updateLookLabel();
@@ -31912,6 +31927,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
     invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, "toggle_off" );   // r15 (sol r14 B1): no-op when checked
+    labelFollowsActiveSliders( ACTIVE_RECEIPT );   // r17 (adversary r17 4fcae002 A1): the switch regrades this receipt's sliders
     updateLookLabel();
 
     if( checked )

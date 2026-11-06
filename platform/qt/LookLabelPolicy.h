@@ -149,6 +149,19 @@ inline bool slidersReassertsKeyAfterModal( const void *slidersReceipt, const voi
     return slidersReceipt != nullptr && slidersReceipt == keyAfterEarlyWrite;
 }
 
+/*! \brief r17 (adversary r17 4fcae002 A1): whether a grade applied to the attached sliders for `gradedReceipt` makes it the key,
+ *  with its switch. A synchronous Look Assist landing (MainWindow::applyLookAssistToReceipt, both branches: the flavor and the
+ *  safety fallback) and the switch (on_checkBoxLookAssistEnable_clicked, which the flavor change goes through) grade the active
+ *  row's receipt on the sliders, as the async landing does (it moves the key itself, labelFollowsLanding). After the r17 re-assert
+ *  the key can be A while the nested open's row B is active and owns the clip; B's own regrade (Film grade selected, its analysis
+ *  landing) left the key on A, so the label read "Look: Baseline" over B's Film grade and a fallback lost its suffix. The rule is
+ *  slidersSetAppliedKey's: only the ACTIVE row's receipt (an export clone's landing, or setSliders(A) while B is active, never
+ *  moves it), and only while the sliders are attached (detached, they grade no clip of that receipt's). */
+inline bool activeGradeMovesKey( const void *gradedReceipt, const void *activeReceipt, bool slidersAttached )
+{
+    return slidersAttached && gradedReceipt != nullptr && gradedReceipt == activeReceipt;
+}
+
 /*! \brief r15 (sol r14 B1, catalogue L-08): whether a delivered async Look Assist result may grade. Only the receipt it
  *  analysed (r14: an export clone's result never grades the active row), and only while that receipt's Look Assist is on AT
  *  DELIVERY. Turning it off between dispatch and delivery (the switch, a disabled paste, a reset to a disabled default, an

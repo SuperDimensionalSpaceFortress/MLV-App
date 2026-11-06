@@ -2058,6 +2058,9 @@ private:
     // on, the flavor in force) and pushes it to the status bar and, in fullscreen, to the preview
     // surface's corner. Does nothing when neither the text nor where it shows changed.
     void updateLookLabel( void );
+    // r17 (adversary r17 4fcae002 A1): a grade applied to the attached sliders for the active row's receipt makes it the
+    // label key, with its switch (look_label::activeGradeMovesKey).
+    void labelFollowsActiveSliders( ReceiptSettings *receipt );
     // The look label text actually on screen now, and where ("fullscreen_gpu_window",
     // "fullscreen_cpu_viewport", "windowed_status_bar" or "none"): the receipt's lookLabelShown.
     QString lookLabelShownText( QString *surface );

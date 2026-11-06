@@ -356,9 +356,11 @@ TEST(LookLabelWiring, A1r12bTheExportJobsCloneIsTheKeyUntilTheNextOpenRecordsARo
     // receipt while another receipt is the key (LookLabelWiring.A1r16SetSlidersOfTheActiveRowMovesTheKeyBeforeAnySlider).
     // Pin count update (r17, adversary r16 efd170f4 A1; was 4, and 1 for "= receipt;"): the fifth writer is setSliders re-asserting
     // the key it wrote once its modal work returned (LookLabelWiring.A1r17SetSlidersReassertsItsKeyAfterTheLastModal pins it).
-    ASSERT_EQ(5, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
+    // Pin count update (r17 iteration 1, adversary r17 4fcae002 A1; was 5, and 2 for "= receipt;"): the sixth writer is
+    // labelFollowsActiveSliders (LookLabelWiring.A1r17bEveryGradeOfTheActiveSlidersMovesTheKeyFirst pins it).
+    ASSERT_EQ(6, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
     ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = activeReceipt;")));
-    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = receipt;")));
+    ASSERT_EQ(3, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = receipt;")));
 }
 
 // Adversary r16 (39d1a995) A1. A owns the loaded clip with Look Assist on and Cinematic landed; B is active with attached sliders
@@ -851,6 +853,26 @@ struct R17Window
         if( marked ) outcome.baselineRestored(receipt);
         return marked ? relabel() : label.text.toStdString();
     }
+
+    // r17 iteration 1 (adversary r17 4fcae002 A1): the switch turned on for the active row (on_checkBoxLookAssistEnable_clicked; the
+    // flavor change clears the outcome and goes through it): labelFollowsActiveSliders, the relabel, the baseline mark, the relabel.
+    std::string switchOn(R17Receipt *row, bool attached = true)
+    {
+        row->on = true;
+        if( look_label::activeGradeMovesKey(row, active, attached) ) { key = row; recorded = row->on; }
+        checkbox = true;
+        relabel();
+        outcome.baselineRestored(row);
+        return relabel();
+    }
+
+    // A synchronous landing on `row` (applyLookAssistToReceipt): labelFollowsActiveSliders, landed(), the relabel.
+    std::string syncLanding(const R17Receipt *row, const char *flavor, bool fallback, bool attached = true)
+    {
+        if( look_label::activeGradeMovesKey(row, active, attached) ) { key = row; recorded = row->on; }
+        outcome.landed(row, QString::fromLatin1(flavor), fallback);
+        return relabel();
+    }
 };
 } // namespace
 
@@ -996,6 +1018,119 @@ TEST(LookLabelWiring, A1r17SetSlidersReassertsItsKeyAfterTheLastModal)
                     .contains(QStringLiteral("QMessageBox::critical(")));
     ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::on_lineEditDarkFrameFile_textChanged(const QString &arg1)"))
                     .contains(QStringLiteral("QMessageBox::warning(")));
+}
+
+// Adversary r17 (4fcae002) A1, introduced by r17's re-assert. The A1r17 flow left the key on A while B (the nested open's row) is
+// active and owns the clip. Film grade is then selected: the flavor handler clears the outcome and turns B's Look Assist on, and B's
+// frame-ready synchronous analysis lands Film grade on B. RED on 4fcae002: the synchronous landing never moved the key, so the label
+// read A, "Look: Baseline" over B's Film grade, and a synchronous safety fallback lost its suffix.
+TEST(LookLabelPolicy, A1r17bAGradeOfTheActiveRowAfterTheReassertIsLabelledUnderThatRow)
+{
+    for( const bool fallback : { false, true } )
+    {
+        R17Receipt receiptA, receiptB;
+        receiptA.on = true;
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        w.checkbox = true;
+        w.outcome.landed(&receiptA, QStringLiteral("cinematic"), false);
+        ASSERT_EQ(std::string("Look: Baseline"), w.setSliders(&receiptA, [&] { w.open(&receiptB); }));
+        ASSERT_EQ(static_cast<const void *>(&receiptA), w.key);
+        // Film grade selected on B: the outcome is cleared, then the switch path.
+        w.outcome.clear();
+        ASSERT_EQ(std::string("Look: Baseline"), w.switchOn(&receiptB));
+        ASSERT_EQ(static_cast<const void *>(&receiptB), w.key);
+        const std::string shown = w.syncLanding(&receiptB, "film", fallback);
+        printf("[A1r17b] fallback=%d label=\"%s\"\n", fallback ? 1 : 0, shown.c_str());
+        ASSERT_EQ(std::string(fallback ? "Look: Baseline (fallback)" : "Look: Film grade"), shown);
+    }
+}
+
+// The siblings of A1r17b (MainWindow.cpp applyLookAssistToReceipt's two landing branches, the switch, setSliders' and the switch's
+// frame-ready steps and master's re-pass, which all land through those branches) and the grades that must NOT move the key.
+TEST(LookLabelPolicy, A1r17bOnlyTheActiveRowsGradeOnAttachedSlidersMovesTheKey)
+{
+    R17Receipt receiptA, receiptB, cloneQ;
+    receiptA.on = true;
+    cloneQ.on = true;
+    {
+        // The switch alone (no landing yet: analysis disabled or pending) names B's baseline under B.
+        R17Window w;
+        w.active = w.owner = &receiptB;
+        w.key = &receiptA;
+        w.recorded = true;
+        w.checkbox = false;
+        ASSERT_EQ(std::string("Look: Baseline"), w.switchOn(&receiptB));
+        ASSERT_EQ(static_cast<const void *>(&receiptB), w.key);
+    }
+    {
+        // setSliders(A)'s own landing while B is active (the opener recorded A): A is the key and stays it.
+        R17Window w;
+        w.active = &receiptB;
+        w.owner = &receiptA;
+        w.key = &receiptA;
+        ASSERT_EQ(std::string("Look: Cinematic"), w.syncLanding(&receiptA, "cinematic", false));
+        ASSERT_EQ(static_cast<const void *>(&receiptA), w.key);
+    }
+    {
+        // An export clone's landing (the clone is the key; the active row is A): the key stays the clone.
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &cloneQ;
+        w.recorded = true;
+        w.checkbox = true;
+        ASSERT_EQ(std::string("Look: Film grade"), w.syncLanding(&cloneQ, "film", false));
+        ASSERT_EQ(static_cast<const void *>(&cloneQ), w.key);
+    }
+    {
+        // Detached sliders grade no clip of the active row's: nothing moves.
+        R17Window w;
+        w.active = &receiptB;
+        w.owner = &receiptA;
+        w.key = &receiptA;
+        w.syncLanding(&receiptB, "film", false, false);
+        ASSERT_EQ(static_cast<const void *>(&receiptA), w.key);
+    }
+    ASSERT_TRUE(look_label::activeGradeMovesKey(&receiptB, &receiptB, true));
+    ASSERT_FALSE(look_label::activeGradeMovesKey(&receiptB, &receiptB, false));
+    ASSERT_FALSE(look_label::activeGradeMovesKey(&receiptA, &receiptB, true));
+    ASSERT_FALSE(look_label::activeGradeMovesKey(&cloneQ, &receiptA, true));
+    ASSERT_FALSE(look_label::activeGradeMovesKey(nullptr, nullptr, true));
+}
+
+TEST(LookLabelWiring, A1r17bEveryGradeOfTheActiveSlidersMovesTheKeyFirst)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString call = QStringLiteral("labelFollowsActiveSliders( receipt );");
+    const QString helper = functionBody(mw, QStringLiteral("void MainWindow::labelFollowsActiveSliders( ReceiptSettings *receipt )"));
+    ASSERT_TRUE(helper.contains(QStringLiteral(
+        "if( m_fileLoaded && look_label::activeGradeMovesKey( receipt, activeReceipt, !m_slidersDetachedFromReceipt ) )")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("m_lookLabelAppliedReceipt = receipt;")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();")));
+    // Both synchronous landing branches: the key moves right before landed(), before the relabel.
+    const QString apply = functionBody(mw, QStringLiteral("void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,"));
+    const char *landings[] = {
+        "m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );",
+        "m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );",
+    };
+    for( const char *landing : landings )
+    {
+        const int at = apply.indexOf(QString::fromLatin1(landing));
+        const int moved = apply.lastIndexOf(call, at);
+        printf("[A1r17bW] landing=%d moved=%d\n", at, moved);
+        ASSERT_TRUE(at > 0 && moved > 0 && at - moved < 400);
+        ASSERT_FALSE(apply.mid(moved, at - moved).contains(QStringLiteral("updateLookLabel")));
+    }
+    ASSERT_EQ(2, apply.count(call));
+    // The switch: after its write, before its first relabel.
+    const QString toggle = functionBody(mw, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"));
+    const int write = toggle.indexOf(QStringLiteral("ACTIVE_RECEIPT->setLookAssistEnabled( checked );"));
+    const int moved = toggle.indexOf(QStringLiteral("labelFollowsActiveSliders( ACTIVE_RECEIPT );"));
+    const int relabel = toggle.indexOf(QStringLiteral("updateLookLabel();"));
+    ASSERT_TRUE(write > 0 && moved > write && relabel > moved);
+    // The definition and three calls, nothing else.
+    ASSERT_EQ(4, mw.count(QStringLiteral("labelFollowsActiveSliders(")));
 }
 
 // The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
@@ -1154,7 +1289,8 @@ TEST(LookLabelWiring, A1r13TheExportSiteRecordsTheClonesSwitchWithTheKey)
     // Pin count update (r16, adversary r16 39d1a995 A1; was 3): setSliders moving the key to the active row is the fourth.
     // Pin count update (r17, adversary r16 efd170f4 A1; was 4): setSliders re-asserting its key after its modal work is the fifth
     // (LookLabelWiring.A1r17SetSlidersReassertsItsKeyAfterTheLastModal pins it).
-    ASSERT_EQ(5, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
+    // Pin count update (r17 iteration 1, adversary r17 4fcae002 A1; was 5): labelFollowsActiveSliders is the sixth.
+    ASSERT_EQ(6, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
 }
 
 // Adversary r13 (63319bdb) A1. Rows A (Look Assist on, Cinematic) and B (Look Assist off, active) hold one path. showFileInEditor(A)
