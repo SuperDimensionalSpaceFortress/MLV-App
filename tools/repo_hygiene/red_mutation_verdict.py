@@ -58,6 +58,13 @@ NON-PROMISES:
   message; a directory name holding ``[`` (read as the start of a parameter id). An ``ImportError`` named
   anywhere in a ``FAILED``/``ERROR`` summary message, or a ``FAILED`` message that is an ``ExceptionGroup``
   (its nested errors are not shown with ``--tb=no``), blocks PASS even when an assertion message only quotes it.
+- Test output is not runner output: unittest frames and the exception line are read only from inside a real
+  ``Traceback (most recent call last):`` block, and a pytest section ignores everything after its
+  ``Captured ... `` divider and any section or ``====`` rule whose width differs from the run's own. A test
+  that prints a rule of exactly the run's width, or a whole forged traceback with its chaining line, is not
+  defended. Every pytest ``ERROR`` summary line blocks PASS, because a class-level collection error and a
+  setup error look the same there. A pytest section is judged by its ``FAILED`` summary message when there is
+  one (the runner's own account of the exception type).
 - unittest says ``FAIL`` for any ``failureException``, so an assertion is credited only when the exception
   printed for the LAST traceback is ``AssertionError``; pytest ``E`` lines and summary messages must start with
   ``assert`` or ``AssertionError`` on a word boundary.
@@ -94,6 +101,9 @@ _FRAME = re.compile(r'^\s*File "(?P<file>.+)", line (?P<line>\d+)')
 _UT_HEAD = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<name>.+?)(?: \((?P<ident>[^()]*)\))?(?: \(.*\))?\s*$")
 _UT_KIND = re.compile(r"^(?P<kind>FAIL|ERROR): (?P<rest>.+?)\s*$")
 _DASHES = re.compile(r"^-{70}\s*$")
+_PT_CAPTURED = re.compile(r"^-{3,} Captured .+ -{3,}\s*$")
+_CHAIN = ("The above exception was the direct cause of the following exception:",
+          "During handling of the above exception, another exception occurred:")
 _PT_SECTION = re.compile(r"^_{2,} (?P<name>.+?) _{2,}\s*$")
 _PT_TOP = re.compile(r"^={3,} (?P<title>.+?) ={3,}\s*$")
 _PT_LOC = re.compile(r"^(?P<file>[^\s:][^\n]*?\.py):(?P<line>\d+):(?: (?P<rest>.*))?$")
@@ -127,7 +137,17 @@ class Parsed:
 
 
 def _norm_path(text: str) -> list[str]:
-    return [p for p in text.replace("\\", "/").split("/") if p and p != "."]
+    """Path segments of `text`. A trailing pytest parameter id (from the first `[`) stays inside the last
+    segment, so `/` and `\\` in it never split."""
+    j = text.find("[")
+    head, tail = (text, "") if j < 0 else (text[:j], text[j:])
+    parts = [p for p in head.replace("\\", "/").split("/") if p and p != "."]
+    if tail:
+        if head.endswith(("/", "\\")) or not parts:
+            parts.append(tail)
+        else:
+            parts[-1] += tail
+    return parts
 
 
 def _split_top(text: str, sep: str) -> list[str]:
@@ -154,7 +174,7 @@ def _segs(text: str) -> list[str]:
         if path and path[-1].endswith(".py") and len(path[-1]) > 3:
             path[-1] = path[-1][:-3]
         return path + names
-    if len(_split_top(text.replace("\\", "/") if "[" not in text else text, "/")) > 1:
+    if len(_norm_path(text)) > 1:
         path = _norm_path(text)
         if path and path[-1].endswith(".py") and len(path[-1]) > 3:
             path[-1] = path[-1][:-3]
@@ -201,19 +221,29 @@ def _ut_identity(rest: str) -> tuple[str, str] | None:
     return None
 
 
-def _ut_exception_line(block: list[str]) -> str:
-    """The exception line of the LAST traceback in a unittest block: the first unindented, non-empty line
-    after the last `File "...", line N` frame and its indented source/caret lines."""
-    last = -1
-    for n, ln in enumerate(block):
-        if _FRAME.match(ln):
-            last = n
-    if last < 0:
-        return ""
-    for ln in block[last + 1:]:
-        if ln.strip() and not ln[:1].isspace():
-            return ln
-    return ""
+def _ut_walk(block: list[str]) -> tuple[list[tuple[str, int]], str]:
+    """(frames, exception line) of the REAL tracebacks in a unittest block. A traceback is entered only at
+    `Traceback (most recent call last):` (the first, or one that follows a chaining line); inside it the
+    indented `File "...", line N` lines are frames and the first unindented line is the exception line, after
+    which message text (which may print anything, a forged File line included) is ignored."""
+    frames: list[tuple[str, int]] = []
+    exc, in_tb, expect = "", False, True
+    for ln in block:
+        if not in_tb:
+            if ln.rstrip() == "Traceback (most recent call last):" and expect:
+                in_tb, exc, expect = True, "", False
+            elif ln.strip() in _CHAIN:
+                expect = True
+            continue
+        if not ln.strip():
+            continue
+        if ln[:1].isspace():
+            m = _FRAME.match(ln)
+            if m:
+                frames.append((m["file"], int(m["line"])))
+            continue
+        exc, in_tb = ln, False
+    return frames, exc
 
 
 def _parse_unittest(text: str) -> list[Failure]:
@@ -237,7 +267,7 @@ def _parse_unittest(text: str) -> list[Failure]:
         head = _UT_KIND.match(body[0])
         if not head:
             continue
-        frames = [(m["file"], int(m["line"])) for m in map(_FRAME.match, block) if m]
+        frames, exc_line = _ut_walk(block)
         joined = "\n".join(block)
         collection = ("_FailedTest" in body[0] or "unittest/loader.py" in joined.replace("\\", "/")
                       or bool(_IMPORT_ERR.search(joined)))
@@ -245,14 +275,16 @@ def _parse_unittest(text: str) -> list[Failure]:
         if got:
             name, full = got
         else:  # older Pythons: `name (module.Class)`
-            old = _UT_HEAD.match(body[0])
-            name = old["name"] if old else head["rest"]
-            ident = (old["ident"] or "") if old else ""
-            full = f"{ident}.{name}" if ident else name
+            # The module part is the LAST parenthesised dotted group; an earlier group belongs to the name.
+            groups = list(re.finditer(r" \(([A-Za-z_][\w.]*)\)", head["rest"]))
+            dotted = [g for g in groups if "." in g.group(1)]
+            pick = (dotted or groups or [None])[-1]
+            name = head["rest"][:pick.start()] if pick else head["rest"]
+            full = f"{pick.group(1)}.{name}" if pick else name
         ids = [] if "unittest.loader" in full else [full]
         # FAIL is only unittest's word for "failureException was raised", and a test may set that to any
         # class: the assertion claim rests on the exception actually printed.
-        is_assertion = bool(re.match(r"AssertionError(?::|\s*$)", _ut_exception_line(block)))
+        is_assertion = bool(re.match(r"AssertionError(?::|\s*$)", exc_line))
         out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and is_assertion and not collection,
                            collection=collection, note=body[0].strip()))
     return out
@@ -279,6 +311,9 @@ def _parse_pytest(text: str) -> list[Failure]:
     summary_blockers: list[str] = []
     top = ""
     cur: dict | None = None
+    captured = False
+    width = 0  # length of the run's first `====` rule: every real rule of that kind has this width (+-1)
+    sec_width = 0  # the same for the `____ name ____` section headers
 
     def close() -> None:
         nonlocal cur
@@ -286,10 +321,20 @@ def _parse_pytest(text: str) -> list[Failure]:
             out.append(Failure([cur["name"]], cur["frames"], cur["assertion"], cur["collection"], cur["name"]))
         cur = None
 
+    # Width is checked only INSIDE a captured block, the one place a test can print: there a real rule has the
+    # width of the run's first rule of its kind (+-1); elsewhere any rule is accepted, so hand-trimmed logs work.
+    def real_rule(line: str) -> bool:
+        return not captured or not width or abs(len(line.rstrip()) - width) <= 1
+
+    def real_section(line: str) -> bool:
+        return not captured or not sec_width or abs(len(line.rstrip()) - sec_width) <= 1
+
     for line in text.splitlines():
         m_top = _PT_TOP.match(line)
-        if m_top:
+        if m_top and real_rule(line):
+            width = width or len(line.rstrip())
             close()
+            captured = False
             top = m_top["title"].strip()
             continue
         if top.startswith("short test summary"):
@@ -306,19 +351,30 @@ def _parse_pytest(text: str) -> list[Failure]:
                     # An import error named anywhere in the message, or an ExceptionGroup whose nested
                     # errors a --tb=no line does not show, blocks like a collection error.
                     summary_blockers.append(f"{word} {node[:60]} - {msg[:40]}")
-                elif word == "ERROR" and "::" not in node:
-                    summary_blockers.append(f"ERROR {node}")
+                elif word == "ERROR":
+                    # A collection error of a class or module looks like this; so does a setup error.
+                    # They cannot be told apart from the line, so every ERROR line blocks.
+                    summary_blockers.append(f"ERROR {node[:60]} - {msg[:40]}")
             continue
         if top not in ("FAILURES", "ERRORS"):
             continue
         m_sec = _PT_SECTION.match(line)
-        if m_sec:
+        if m_sec and real_section(line):
+            sec_width = sec_width or len(line.rstrip())
             close()
+            captured = False
             name = m_sec["name"]
             cur = {"name": name, "frames": [], "assertion": None,
                    "collection": name.startswith("ERROR collecting")}
             continue
         if cur is None:
+            continue
+        if _IMPORT_ERR.match(line):  # nested ExceptionGroup errors print without an `E` prefix
+            cur["collection"] = True
+        if _PT_CAPTURED.match(line):
+            captured = True  # what follows is the test's own output, not pytest's traceback
+            continue
+        if captured:
             continue
         if line.startswith("E") and line[1:2] in (" ", "\t"):
             first = line[1:].strip()
@@ -331,6 +387,7 @@ def _parse_pytest(text: str) -> list[Failure]:
         if m_loc:
             cur["frames"].append((m_loc["file"], int(m_loc["line"])))
     close()
+    msgs = dict(nodes)
     for f in out:
         f.assertion = bool(f.assertion) and not f.collection
         bare = f.ids[0]
@@ -342,8 +399,14 @@ def _parse_pytest(text: str) -> list[Failure]:
         # function), so it is not an identity. Its identity is the FAILED-summary node id whose
         # tail is that name and whose file appears in the section's own traceback frames.
         f.ids = _pair_nodes(_segs(bare), f.frames, [n for n, _msg in nodes])
-    if not out:
-        for node, msg in nodes:
+        known = [msgs[i] for i in f.ids if msgs.get(i)]
+        if known and len(known) == len(f.ids):
+            # The summary line is pytest's own account of the exception TYPE; test output printed inside a
+            # section cannot change it.
+            f.assertion = f.assertion and all(_ASSERT_HEAD.match(m) for m in known)
+    paired = {i for f in out for i in f.ids}
+    for node, msg in nodes:  # a failing node no section could be tied to still counts, by its summary line
+        if node not in paired:
             out.append(Failure([node], [], bool(_ASSERT_HEAD.match(msg)), note=msg))
     for note in summary_blockers:
         out.append(Failure([], [], False, True, note))
@@ -410,14 +473,26 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
     return REFUSED, f"the run is red but not at {expected}; it failed at: " + ", ".join(others[:5])
 
 
+def _num(v: object) -> int | float:
+    """An int stays an int: Python compares int and float exactly, while float(2**53 + 1) would round it."""
+    if not isinstance(v, (int, float)):
+        try:
+            v = int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            v = float(v)  # type: ignore[arg-type]
+    if isinstance(v, int):
+        float(v)  # OverflowError for an int no double can hold: not a real reading (callers refuse it)
+    return v
+
+
 def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float, float]) -> tuple[bool, str]:
     """True only when the FIX reading is inside the closed window and the BUG reading is outside."""
     try:
         lo, hi = window
-        bug_value, fix_value, lo, hi = float(bug_value), float(fix_value), float(lo), float(hi)
+        bug_value, fix_value, lo, hi = _num(bug_value), _num(fix_value), _num(lo), _num(hi)
     except (TypeError, ValueError, OverflowError):
         return False, "probe readings and window must be numbers"
-    if any(math.isnan(v) for v in (bug_value, fix_value, lo, hi)):
+    if any(isinstance(v, float) and math.isnan(v) for v in (bug_value, fix_value, lo, hi)):
         return False, "NaN reading or window bound"
     if lo > hi:
         return False, f"empty window ({lo} > {hi})"
@@ -438,10 +513,15 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--output", required=True, help="saved unittest or pytest output of the mutation run")
     v.add_argument("--expect", required=True, help="file:line or test id of the intended assertion")
     p = sub.add_parser("probe")
-    p.add_argument("--bug", type=float, required=True)
-    p.add_argument("--fix", type=float, required=True)
-    p.add_argument("--window", type=float, nargs=2, required=True, metavar=("LO", "HI"))
+    p.add_argument("--bug", type=_num, required=True)
+    p.add_argument("--fix", type=_num, required=True)
+    p.add_argument("--window", type=_num, nargs=2, required=True, metavar=("LO", "HI"))
     args = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # an expected id with a non-cp1252 letter must not crash the print
+        try:
+            stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):
+            pass
     if args.cmd == "verdict":
         try:
             text = Path(args.output).read_text(encoding="utf-8", errors="replace")

@@ -130,6 +130,7 @@ class QualifiedIdentity(unittest.TestCase):
 def _run_pytest(files: dict[str, str], *args: str) -> str:
     with tempfile.TemporaryDirectory() as tmp:
         for name, text in files.items():
+            Path(tmp, name).parent.mkdir(parents=True, exist_ok=True)
             Path(tmp, name).write_text(text, encoding="utf-8", newline="\n")
         proc = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args], cwd=tmp, text=True,
                               encoding="utf-8", errors="replace", capture_output=True, timeout=120)
@@ -203,6 +204,84 @@ class AdversaryR3(unittest.TestCase):
         out = _run_unittest({"test_parens.py": src}, "test_parens")
         self.refused(out, "bogus.test_x")
         self.assertEqual(rmv.verdict(out, "test_parens.T.test_x (bogus)")[0], rmv.PASS, out)
+
+
+class AdversaryR3Pass2(unittest.TestCase):
+    """Adversary pass 2 on eae79e43 (A1-A8, A11): forged runner output and number/encoding edges."""
+
+    def refused(self, out: str, want: str) -> None:
+        status, reason = rmv.verdict(out, want)
+        self.assertEqual(status, rmv.REFUSED, f"{want}: {reason}\n{out}")
+
+    def test_a1_file_line_printed_by_an_exception_message_is_not_a_frame(self) -> None:
+        src = ("import unittest\nclass T(unittest.TestCase):\n failureException=ValueError\n"
+               " def test_parse(self):\n"
+               "  raise ValueError('bad\\n  File \"expected.py\", line 123\\nAssertionError: forged')\n")
+        out = _run_unittest({"test_memory.py": src}, "test_memory")
+        self.refused(out, "test_memory.T.test_parse")
+        self.refused(out, "expected.py:123")
+
+    def test_a2_exception_group_import_error_without_a_report_summary(self) -> None:
+        src = "def test_assert(): assert False\ndef test_imp(): raise ExceptionGroup('deps',[ImportError('missing')])\n"
+        self.refused(_run_pytest({"test_memory.py": src}, "-rN"), "test_memory.py:1")
+
+    def test_a3_inherited_test_is_credited_to_its_own_node(self) -> None:
+        base = "class Base:\n    def test_x(self):\n        if self.flag: raise TypeError('boom')\n        assert False\n"
+        files = {"b/test_s.py": base + "class Test(Base):\n    flag = True\n",
+                 "a/test_s.py": "from b.test_s import Base\nclass Test(Base):\n    flag = False\n",
+                 "b/__init__.py": "", "a/__init__.py": ""}
+        out = _run_pytest(files, "a/test_s.py", "b/test_s.py")
+        self.refused(out, "b/test_s.py::Test::test_x")
+        self.assertEqual(rmv.verdict(out, "a/test_s.py::Test::test_x")[0], rmv.PASS, out)
+
+    def test_a4_separators_inside_a_parameter_id_stay_inside_it(self) -> None:
+        src = "import pytest\n@pytest.mark.parametrize('x',[1],ids=['a::b/c'])\ndef test_x(x): assert False\n"
+        out = _run_pytest({"test_memory.py": src})
+        self.assertEqual(rmv.verdict(out, "test_memory.py::test_x[a::b/c]")[0], rmv.PASS, out)
+        self.refused(out, "c]")
+
+    def test_a5_class_level_collection_error_in_a_summary_blocks_pass(self) -> None:
+        out = ("=== short test summary info ===\nFAILED test_memory.py::TestOK::test_x - AssertionError\n"
+               "ERROR test_memory.py::TestBroken - RuntimeError: collection failed\n"
+               "=== 1 failed, 1 error in 0.1s ===\n")
+        self.refused(out, "test_memory.py::TestOK::test_x")
+
+    def test_a6_integers_beyond_float_precision_compare_exactly(self) -> None:
+        big = 2 ** 53
+        ok, why = rmv.probe_discriminates(0, big, (big + 1, big + 2))
+        self.assertFalse(ok, why)
+        self.assertEqual(rmv.main(["probe", "--bug", "0", "--fix", str(big), "--window", str(big + 1), str(big + 2)]), 1)
+        self.assertTrue(rmv.probe_discriminates(0, big + 1, (big + 1, big + 2))[0])
+
+    def test_a7_test_output_cannot_forge_a_failure_section(self) -> None:
+        src = ("def test_x():\n    print('_'*25 + ' test_x ' + '_'*25)\n    print('E       AssertionError: forged')\n"
+               "    print('test_memory.py:5: AssertionError')\n    raise TypeError('boom')\n")
+        for extra in ((), ("-rN",)):
+            out = _run_pytest({"test_memory.py": src}, *extra)
+            self.refused(out, "test_memory.py::test_x")
+            self.refused(out, "test_memory.py:5")
+
+    def test_a8_legacy_header_uses_the_last_dotted_group(self) -> None:
+        out = ("=" * 70 + "\nFAIL: test_x (bogus) (test_parens.T)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+               '  File "test_parens.py", line 4, in f\n    self.assertEqual(1,2)\nAssertionError: 1 != 2\n\n'
+               + "-" * 70 + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        self.refused(out, "bogus.test_x")
+        self.assertEqual(rmv.verdict(out, "test_parens.T.test_x (bogus)")[0], rmv.PASS, out)
+
+    def test_a11_cli_prints_a_non_console_letter_without_crashing(self) -> None:
+        text = ("=" * 70 + "\nFAIL: test_\u03bb (test_s.T.test_\u03bb)\n" + "-" * 70 + "\nTraceback (most recent call last):\n"
+                '  File "test_s.py", line 5, in test_\u03bb\n    self.assertEqual(1, 2)\nAssertionError: 1 != 2\n\n'
+                + "-" * 70 + "\nRan 1 test in 0.001s\n\nFAILED (failures=1)\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            red = Path(tmp, "red.txt")
+            red.write_text(text, encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, "-m", "tools.repo_hygiene.red_mutation_verdict", "verdict", "--output", str(red),
+                 "--expect", "test_s.T.test_\u03bb"],
+                cwd=Path(__file__).resolve().parents[2], capture_output=True,
+                env={**__import__("os").environ, "PYTHONIOENCODING": "cp1252"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(b"PASS", proc.stdout)
 
 
 class VerdictOnText(unittest.TestCase):
