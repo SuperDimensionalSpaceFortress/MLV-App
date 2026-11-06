@@ -599,8 +599,18 @@ TEST(ReconWorkerSplit, RenderThreadKeepsTheWorkersValuesOnAConsumedRecon)
     ASSERT_TRUE(restoreAt >= 0);
     ASSERT_TRUE(copyAt > restoreAt);
     ASSERT_EQ(1, source.count(QStringLiteral("recon_worker_split::copyWorkerSplit(")));
-    const QString gated = bracedBlockAfter(source.mid(restoreAt), QStringLiteral("    if( decodedRawFrameAlreadyReconned )"));
+    const QString gated = bracedBlockAfter(source.mid(restoreAt), QStringLiteral("    if( renderConsumedWorkerRecon )"));
     ASSERT_TRUE(gated.contains(QStringLiteral("recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,")));
+    // r1 adversary pass 2 A1: the gate is the render CONSUMING the worker's recon, never the slot
+    // merely holding one (a refused reuse renders its own). Set at exactly the three consuming sites.
+    ASSERT_EQ(1, source.count(QStringLiteral("bool renderConsumedWorkerRecon = false;")));
+    ASSERT_EQ(3, source.count(QStringLiteral("renderConsumedWorkerRecon =")) - 1 /* the declaration */);
+    ASSERT_EQ(1, source.count(QStringLiteral("renderConsumedWorkerRecon = decodedRawFrameAlreadyReconned;")));
+    ASSERT_EQ(1, source.count(QStringLiteral("renderConsumedWorkerRecon =\n            consumedPhase3Recon && decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;")));
+    ASSERT_EQ(1, source.count(QStringLiteral("renderConsumedWorkerRecon =\n            decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw;")));
+    // The first is inside the GPU no-readback branch (no CPU recon there at all).
+    const QString gpuNoReadback = bracedBlockAfter(source, QStringLiteral("    bool renderConsumedWorkerRecon = false;\n    if( skipCpuDebayerForGpuTextureNoReadback )"));
+    ASSERT_TRUE(gpuNoReadback.contains(QStringLiteral("renderConsumedWorkerRecon = decodedRawFrameAlreadyReconned;")));
     // The capture the copy reads is taken before resetMetadata.
     const int preserveAt = source.indexOf(QStringLiteral("preserveGpuPlaybackReconTimingTelemetry(\n            slot.stageTimingTelemetry,\n            preservedGpuPlaybackReconTextureTelemetry );"));
     const int resetAt = source.indexOf(QStringLiteral("slot.resetMetadata();"), preserveAt);

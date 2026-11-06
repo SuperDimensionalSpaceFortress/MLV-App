@@ -2793,6 +2793,46 @@
       "lines": [
         1504
       ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( inclusiveMs < 0.0 ) inclusiveMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: OtherBusySpans::end clamps a GUI handler span's inclusive time (wall less idle, runner sleep and paint inside it, from the QElapsedTimer gap clock) to 0 when the subtraction goes negative. A data-validity clamp on an already-measured value before it is recorded; whether the handler ran is the span's begin/end pair, never this value.",
+      "lines": [
+        135
+      ]
+    },
+    {
+      "path": "platform/qt/GuiPresentGapIdle.h",
+      "anchor": "if ( exclusiveMs < 0.0 ) exclusiveMs = 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 Part B: the same clamp for the span's exclusive time (inclusive less its nested spans) before it is added to the per-gap sum. A data-validity clamp, not a proof that any stage ran.",
+      "lines": [
+        138
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , target . value ( QStringLiteral ( \"llrawproc_total_ms\" ) ) . toDouble ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test of recon_worker_split::copyWorkerSplit on a synthetic, test-constructed QJsonObject (no live clock): asserts the copy left the target's own unprefixed key at the 0.0 the test put there, i.e. the copy never rewrites the render thread's keys. Not a proof that any stage ran.",
+      "lines": [
+        466
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_smoke_gui_present_attribution_wiring.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , target . value ( QStringLiteral ( \"dual_iso_full20_total_ms\" ) ) . toDouble ( ) , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input copyWorkerSplit check as the llrawproc_total_ms row above, for the full20 total key.",
+      "lines": [
+        467
+      ]
     }
   ]
 }
