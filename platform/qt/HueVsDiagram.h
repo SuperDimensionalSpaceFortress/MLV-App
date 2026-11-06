@@ -39,6 +39,7 @@ private:
     bool m_lastPoint;
     bool *m_pFrameChanged;
     bool m_LoadAll;
+    bool m_drawOnly;
     DiagramType m_diagramType;
     uint8_t m_activeLine;
     uint16_t m_size;

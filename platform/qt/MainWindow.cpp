@@ -2598,8 +2598,15 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                 if( autoplaySettleMs <= 0 ) autoplaySettleMs = 2500;
                 const bool autoplayExit = qEnvironmentVariableIntValue( "MLVAPP_AUTOPLAY_EXIT" ) > 0;
                 const bool autoplayLoop = qEnvironmentVariableIntValue( "MLVAPP_AUTOPLAY_LOOP" ) > 0;
-                QTimer::singleShot( autoplaySettleMs, this, [this, autoplaySeconds, autoplayExit, autoplayLoop]()
+                // Play waits for a running Look Assist analysis, as a user's Play click does.
+                const auto startAutoplay = std::make_shared<std::function<void()>>();
+                *startAutoplay = [this, startAutoplay, autoplaySeconds, autoplayExit, autoplayLoop]()
                 {
+                    if( m_lookAssistPump.sessionOpen() )
+                    {
+                        QTimer::singleShot( 50, this, [startAutoplay]() { (*startAutoplay)(); } );
+                        return;
+                    }
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 / ENFORCE-2 (owner rule 2026-09-30): the autoplay
                     // hook never loops (MLVAPP_AUTOPLAY_LOOP is ignored, loud) and plays only through the
                     // shared programmaticPlay() gate: the window from the CURRENT position to the cut-out
@@ -2633,6 +2640,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                     connect( autoplayPoll, &QTimer::timeout, this,
                              [this, autoplayPoll, autoplayClock, autoplayExit]()
                     {
+                        if( m_lookAssistPump.sessionOpen() ) return;
                         const playback_frame_range::PlayStopState autoplayState =
                             programmaticPlayState( autoplayClock->elapsed(), playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );
                         if( autoplayState == playback_frame_range::PlayStopState::Continue ) return;
@@ -2657,7 +2665,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                         }
                     } );
                     autoplayPoll->start();
-                } );
+                };
+                QTimer::singleShot( autoplaySettleMs, this, [startAutoplay]() { (*startAutoplay)(); } );
             }
         }
     }
@@ -2885,6 +2894,9 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
+    // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
+    if( m_lookAssistPump.sessionOpen() ) return;
+
     static QTime lastTime;              //Last Time a picture was rendered
     static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
     static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
@@ -3105,7 +3117,8 @@ void MainWindow::timerEvent(QTimerEvent *t)
             m_pCachingStatus->setText( tr( "Caching: idle" ) );
         }
 
-        if( m_fileLoaded )
+        // The analysis worker reads the clip's core count: it changes after the analysis lands.
+        if( m_fileLoaded && !m_lookAssistPump.sessionOpen() )
         {
             //get all cores again
             if( m_countTimeDown == 0 )
@@ -3127,6 +3140,23 @@ void MainWindow::resizeEvent(QResizeEvent *event)
     if( m_inOpeningProcess )
     {
         event->accept();
+        return;
+    }
+
+    // A resize is not user input, so it arrives during a Look Assist analysis. Its redraw waits for landing.
+    if( m_lookAssistPump.sessionOpen() )
+    {
+        event->accept();
+        if( !m_lookAssistResizeHeld )
+        {
+            m_lookAssistResizeHeld = true;
+            m_lookAssistPump.hold( [this]()
+            {
+                m_lookAssistResizeHeld = false;
+                QResizeEvent heldResize( size(), size() );
+                resizeEvent( &heldResize );
+            } );
+        }
         return;
     }
 
@@ -3187,6 +3217,14 @@ bool MainWindow::event(QEvent *event)
         if( m_exportInProgress )
         {
             logInteractionEvent( QStringLiteral("playback_prep.file_open_skipped"), QStringLiteral("reason=export-in-progress") );
+            return true;
+        }
+        // Importing can replace the clip under the analysis (the barrier wait would never return from a pump turn). The
+        // request runs at landing.
+        if( m_lookAssistPump.sessionOpen() )
+        {
+            QEvent *const heldOpen = look_assist_pump::heldCopy( event );
+            if( heldOpen ) m_lookAssistPump.hold( [this, heldOpen]() { QCoreApplication::postEvent( this, heldOpen ); } );
             return true;
         }
         if( QFile(fileName).exists() && fileName.endsWith( ".mlv", Qt::CaseInsensitive ) )
@@ -3254,6 +3292,20 @@ void MainWindow::dropEvent(QDropEvent *event)
         return;
     }
 
+    // OLE delivers a drop through a sent message, which a pump turn dispatches. The same drop runs again on landing.
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this, urls]()
+        {
+            QMimeData heldData;
+            heldData.setUrls( urls );
+            QDropEvent heldDrop( QPointF(), Qt::CopyAction, &heldData, Qt::NoButton, Qt::NoModifier );
+            dropEvent( &heldDrop );
+        } );
+        event->acceptProposedAction();
+        return;
+    }
+
     QStringList localPaths;
     localPaths.reserve( urls.size() );
     for( const QUrl & url : urls )
@@ -3295,6 +3347,12 @@ void MainWindow::dropEvent(QDropEvent *event)
 //Open a couple of MLVs
 void MainWindow::openMlvSet( QStringList list )
 {
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this, list]() { openMlvSet( list ); } );
+        return;
+    }
+
     m_inOpeningProcess = true;
     QStringList normalisedList;
     QString sessionFileName;
@@ -3399,6 +3457,15 @@ void MainWindow::openMlvSet( QStringList list )
 //App shall close -> hammer method, we shot on the main class... for making the app close and killing everything in background
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // Close frees the clip, and that waits on the analysis's barrier borrower. A window-system close stays queued through
+    // the pump, but qApp->quit() sends this event directly (Qt 6), so the event is held here on either path.
+    if( m_lookAssistPump.sessionOpen() )
+    {
+        event->ignore();
+        m_lookAssistPump.hold( [this]() { close(); } );
+        return;
+    }
+
     // CUDA-PERF-DISPLAY-WAKE-1: explicit release on window close, never relied on solely via
     // setChecked(false)'s toggled() signal below -- that only fires when actionPlay was
     // actually checked, and the request must never outlive the window regardless.
@@ -4884,6 +4951,12 @@ void MainWindow::playbackPrepThreadLoop( void )
 
 void MainWindow::onPlaybackPrepResultReady( void )
 {
+    if( m_lookAssistPump.holdsPresentation() )
+    {
+        m_lookAssistPump.hold( [this]() { onPlaybackPrepResultReady(); } );
+        return;
+    }
+
     PlaybackPrepResult result;
     {
         std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
@@ -16693,9 +16766,9 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                 return;
             }
 
-            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
+            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) || m_lookAssistPump.sessionOpen() )
             {
-                // De-dupe: the auto-look analysis already ran for this clip this open.
+                // De-dupe: the auto-look analysis already ran for this clip this open, or is running in the pump below us.
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.dedup_skip"),
                     QStringLiteral("where=frame_ready frame=%1").arg( baselineFrame ) );
@@ -16715,6 +16788,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                  || ACTIVE_RECEIPT != activeReceiptAtLoad
                  || !ACTIVE_RECEIPT->lookAssistEnabled()
                  || m_lookAssistApplied.isApplied( ACTIVE_RECEIPT )
+                 || m_lookAssistPump.sessionOpen()
                  || !receiptOwnedByLoadedClip( "look-assist-setsliders-frame-ready" ) )
                 {
                     return;
@@ -16743,7 +16817,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                 else
                     captureLookAssistBaseline( ACTIVE_RECEIPT );
 
-                applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );
+                applyLookAssistFromFrameReady( ACTIVE_RECEIPT, analysisFrame );
                 m_lookAssistApplied.markApplied( ACTIVE_RECEIPT );
                 syncLookAssistDerivedUiToReceipt( ACTIVE_RECEIPT );
                 setReceipt( ACTIVE_RECEIPT );
@@ -16975,6 +17049,91 @@ void MainWindow::drainLookAssistWorkers( const char *reason )
             .arg( ( mlv_stage_timing_now() - drain_start ) * 1000.0, 0, 'f', 1 ) );
 }
 
+// LOOK-ASSIST-CLIP-OPEN-GUI-BLOCK-1: the first-frame analysis, with the GUI thread pumping through its heavy calls. The
+// baseline frame stays on screen and no frame renders until this returns; the sites a pump turn could reach hold
+// themselves through m_lookAssistPump. The apply's other caller, inside setSliders, stays inline: that caller is partway
+// through a state change that an event loop must not interleave.
+void MainWindow::applyLookAssistFromFrameReady( ReceiptSettings *receipt, int analysisFrame )
+{
+    // Rollback, and every Qt 5 build: the wrapped calls run on this thread, as before this card.
+    static const bool s_analysisInline = qEnvironmentVariableIntValue( "MLVAPP_LOOK_ASSIST_ANALYSIS_INLINE" ) != 0
+                                       || !look_assist_pump::kWorkerRouteAvailable;
+    if( s_analysisInline || m_exportInProgress || m_lookAssistPump.sessionOpen() )
+    {
+        applyLookAssistToReceipt( receipt, analysisFrame );
+        return;
+    }
+
+    // One thread for the life of the process, never ended (AnalysisWorker says why). It holds nothing of the clip
+    // between calls, and process exit ends it.
+    static look_assist_pump::AnalysisWorker *const s_analysisWorker = new look_assist_pump::AnalysisWorker();
+    m_lookAssistPump.beginSession( s_analysisWorker, []() { return QApplication::activeModalWidget() != nullptr; } );
+
+    const QString analyzingMessage = tr( "Analyzing Look Assist" );
+    statusBar()->showMessage( analyzingMessage, 0 );
+
+    // A render already running would overlap the analysis; let it finish and present first.
+    constexpr int kRenderDrainBoundMs = 2000;
+    int renderWaitMs = 0;
+    const bool renderIdle = m_lookAssistPump.drainUntil(
+        [this]()
+        {
+            if( m_pRenderThread && !m_pRenderThread->isIdle() ) return false;
+            std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
+            return !m_playbackPrepInFlight.inFlightLocked();
+        },
+        kRenderDrainBoundMs,
+        &renderWaitMs );
+    if( !renderIdle || renderWaitMs > 0 )
+    {
+        logInteractionEvent(
+            QStringLiteral("look_assist.apply.render_wait"),
+            QStringLiteral("idle=%1 waited_ms=%2 bound_ms=%3")
+                .arg( bool01( renderIdle ) )
+                .arg( renderWaitMs )
+                .arg( kRenderDrainBoundMs ) );
+    }
+
+    applyLookAssistToReceipt( receipt, analysisFrame );
+
+    if( statusBar()->currentMessage() == analyzingMessage ) statusBar()->clearMessage();
+    const QVector<std::function<void()>> held = m_lookAssistPump.endSession();
+    if( !held.isEmpty() )
+    {
+        logInteractionEvent( QStringLiteral("look_assist.apply.held_work"), QStringLiteral("count=%1").arg( held.size() ) );
+    }
+    // On a later turn: the caller still has to mark the clip applied and sync the receipt.
+    for( const std::function<void()> &work : held ) QTimer::singleShot( 0, this, [work]() { work(); } );
+}
+
+MainWindow::LookAssistApplyTimingScope::LookAssistApplyTimingScope( MainWindow *window )
+    : m_window( window )
+{
+    if( m_window->m_lookAssistApplyTimingDepth++ > 0 ) return;
+    m_window->m_lookAssistApplyTiming = look_assist_pump::ApplyTiming();
+    m_clock.start();
+}
+
+MainWindow::LookAssistApplyTimingScope::~LookAssistApplyTimingScope()
+{
+    if( --m_window->m_lookAssistApplyTimingDepth > 0 ) return;
+    look_assist_pump::ApplyTiming &timing = m_window->m_lookAssistApplyTiming;
+    timing.totalMs = m_clock.nsecsElapsed() / 1000000.0;
+    timing.worker = m_window->m_lookAssistPump.sessionOpen();
+    if( timing.worker )
+    {
+        m_window->m_lookAssistPump.noteTurn();
+        timing.guiBlockMaxMs = m_window->m_lookAssistPump.guiBlockMaxMs();
+        timing.pumpTicks = m_window->m_lookAssistPump.pumpTicks();
+    }
+    else
+    {
+        // Nothing pumps on the inline route: the whole apply is one block of the GUI thread.
+        timing.guiBlockMaxMs = timing.totalMs;
+    }
+    logInteractionEvent( QStringLiteral("look_assist.apply.timing"), timing.logFields() );
+}
+
 void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                            int analysisFrame )
 {
@@ -17093,6 +17252,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         return;
     }
 
+    // One look_assist.apply.timing line per analysis: master's pass below re-enters here and adds to the same line.
+    const LookAssistApplyTimingScope timingScope( this );
+
     if( analysisFrame < 0 )
     {
         analysisFrame = ui->horizontalSliderPosition->value();
@@ -17194,10 +17356,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     QByteArray thumbnail;
     thumbnail.resize( width * height * 3 );
-    get_area_average_downscale_raw_thumnail( m_pMlvObject,
-                                             analysisFrame,
-                                             downscaleFactor,
-                                             reinterpret_cast<unsigned char *>( thumbnail.data() ) );
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.rawThumbMs );
+        m_lookAssistPump.call( [&]()
+        {
+            get_area_average_downscale_raw_thumnail( m_pMlvObject,
+                                                     analysisFrame,
+                                                     downscaleFactor,
+                                                     reinterpret_cast<unsigned char *>( thumbnail.data() ) );
+        } );
+    }
 
     LookAssistStats stats = analyzeLookAssistThumbnail(
                 reinterpret_cast<const unsigned char *>( thumbnail.constData() ),
@@ -17240,13 +17408,18 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     {
         if( colorWidth <= 0 || colorHeight <= 0 ) return false;
         processedThumbnail.resize( colorWidth * colorHeight * 3 );
-        if( !ReceiptApplier::processedThumbnailAtExposure(
+        bool renderedAtExposure = false;
+        m_lookAssistPump.call( [&]()
+        {
+            renderedAtExposure = ReceiptApplier::processedThumbnailAtExposure(
                 m_pMlvObject,
                 analysisFrame,
                 colorDownscaleFactor,
                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
                 exposureStops,
-                reinterpret_cast<unsigned char *>( processedThumbnail.data() ) ) )
+                reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+        } );
+        if( !renderedAtExposure )
             return false;
         *out = analyzeLookAssistThumbnail(
                     reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
@@ -17269,8 +17442,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the one master classified (daylight needs the evidence).
     // Not const: a night verdict that the aperture-bounded exposure rules out and a verified surface backs becomes the
     // daylight class after the white balance (resolveLookAssistWindowLitInterior below).
-    LookAssistScene scene = resolveLookAssistScene(
-        &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    LookAssistScene scene = LookAssistScene::Night;
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.sceneMs );
+        scene = resolveLookAssistScene(
+            &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    }
     const LookAssistFlavor flavor = currentLookAssistFlavor();
     m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
@@ -17294,6 +17471,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     bool useProcessedColorStats = false;
     if( canAnalyzeProcessedColor )
     {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.processedMs );
         processedThumbnail.resize( colorWidth * colorHeight * 3 );
         bool renderedAtPresetExposure = false;
         if( scene != LookAssistScene::Night )
@@ -17301,21 +17479,29 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             // Daylight: judge colour at the exposure Look Assist is about to apply, so the
             // neutral-patch search sees the picture the user will see whatever exposure the
             // receipt currently holds (the night path keeps the receipt's exposure, as before).
-            renderedAtPresetExposure = ReceiptApplier::processedThumbnailAtExposure(
-                m_pMlvObject,
-                analysisFrame,
-                colorDownscaleFactor,
-                qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure / 100.0,
-                reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+            const double presetExposureStops =
+                presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure / 100.0;
+            m_lookAssistPump.call( [&]()
+            {
+                renderedAtPresetExposure = ReceiptApplier::processedThumbnailAtExposure(
+                    m_pMlvObject,
+                    analysisFrame,
+                    colorDownscaleFactor,
+                    qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                    presetExposureStops,
+                    reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+            } );
         }
         if( !renderedAtPresetExposure )
         {
-            get_area_average_downscale_thumnail( m_pMlvObject,
-                                                 analysisFrame,
-                                                 colorDownscaleFactor,
-                                                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                                                 reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+            m_lookAssistPump.call( [&]()
+            {
+                get_area_average_downscale_thumnail( m_pMlvObject,
+                                                     analysisFrame,
+                                                     colorDownscaleFactor,
+                                                     qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                                                     reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+            } );
         }
         processedColorStats = analyzeLookAssistThumbnail(
                     reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
@@ -17336,13 +17522,20 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // exposure Look Assist chooses (the headless applier asks the very same function).
     LookAssistStats displayStatsUi;
     int displayMeterSamples = 0;
-    const bool displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(
-        m_pMlvObject,
-        analysisFrame,
-        downscaleFactor,
-        qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-        &displayStatsUi,
-        &displayMeterSamples );
+    bool displayStatsValidUi = false;
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.meterMs );
+        m_lookAssistPump.call( [&]()
+        {
+            displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(
+                m_pMlvObject,
+                analysisFrame,
+                downscaleFactor,
+                qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                &displayStatsUi,
+                &displayMeterSamples );
+        } );
+    }
     if( displayStatsValidUi )
     {
         decisionTrace.displayMeterRan = true;
@@ -17704,8 +17897,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             r.autoWhiteBalanceCandidateTemperature = autoWhiteBalanceCandidateTemperature;
             r.autoWhiteBalanceCandidateTint        = autoWhiteBalanceCandidateTint;
 
-            // Marshal results back to the UI thread.
-            QMetaObject::invokeMethod( this, [this, r, dispatchGeneration, receipt, restoreLookAssistSafetyBaseline]() mutable
+            // Marshal results back to the UI thread. An analysis may be pumping when this is delivered: the result waits for
+            // its landing, then the generation check below decides, as it would have with no pump.
+            std::function<void()> landAsyncResult = [this, r, dispatchGeneration, receipt, restoreLookAssistSafetyBaseline]() mutable
             {
                 // Re-check: clip must not have changed since dispatch.
                 if( m_lookAssistAsyncGeneration.load() != dispatchGeneration )
@@ -18059,7 +18253,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 syncLookAssistDerivedUiToReceipt( activeReceipt );
                 setReceipt( activeReceipt );
                 requestFrameRefresh( true, "look-assist-async-applied" );
-            }, Qt::QueuedConnection );
+            };
+            QMetaObject::invokeMethod( this, [this, landAsyncResult]() { m_lookAssistPump.runOrHold( landAsyncResult ); }, Qt::QueuedConnection );
         }).detach();
 
         return; // UI thread released; apply arrives via queued invocation above.
@@ -18123,18 +18318,35 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // refinement, asked about the picture through the same renderer the async path and headless use.
     wbRequest.rawWidth = raw_w;
     wbRequest.rawHeight = raw_h;
-    wbRequest.renderBalance = ReceiptApplier::lookAssistBalanceRenderer(
+    // The shared decisions stay on this thread and call these renderers, each one a heavy call.
+    const auto renderOnAnalysisWorker = [this]( const LookAssistRenderBalanceFn &render ) -> LookAssistRenderBalanceFn
+    {
+        if( !render ) return render;
+        return [this, render]( double exposureStops, int renderTemperature, int renderTint, LookAssistRenderedPicture *picture ) -> bool
+        {
+            bool rendered = false;
+            m_lookAssistPump.call( [&]() { rendered = render( exposureStops, renderTemperature, renderTint, picture ); } );
+            return rendered;
+        };
+    };
+    wbRequest.renderBalance = renderOnAnalysisWorker( ReceiptApplier::lookAssistBalanceRenderer(
         m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
-        qMax( 1, mlvappEffectiveWorkerThreadCount() ), false );
-    const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ), false ) );
+    LookAssistWhiteBalanceResolution wb;
+    {
+    const look_assist_pump::SegmentClock solveSegment( &m_lookAssistApplyTiming.solveMs );
+    wb = resolveLookAssistWhiteBalance(
         wbRequest,
         [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
         {
             // [Jun-9 WB RESTORE] live solver (was findMlvWhiteBalanceIsolated). Same signature;
             // this is the default path now that sync is the default apply. Same decode, solved at the
             // analysis (clip) levels so a render's level sync cannot move it.
-            findMlvWhiteBalanceAtAnalysisLevels( m_pMlvObject, analysisFrame, rawX, rawY,
-                                                 solvedTemperature, solvedTint, 0 );
+            m_lookAssistPump.call( [&]()
+            {
+                findMlvWhiteBalanceAtAnalysisLevels( m_pMlvObject, analysisFrame, rawX, rawY,
+                                                     solvedTemperature, solvedTint, 0 );
+            } );
             // [WB-TRACE] sync-path mirror of the async worker trace, so the determinism gate
             // (lookassist-wb-determinism.ps1) can measure patch + raw WB in sync mode too.
             if( qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_WB_TRACE" ) )
@@ -18149,6 +18361,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             }
         },
         &preset );
+    }
     logLookAssistDaylightRefine( wb, QStringLiteral("sync"), analysisFrame );
     if( wb.legacyBalance && !s_lookAssistMasterScenePass )
     {
@@ -18189,16 +18402,20 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     LookAssistPreset windowLitPreset = preset;
     LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
     windowLitRequest.stats = &windowLitStats;
-    windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer(
+    windowLitRequest.renderBalance = renderOnAnalysisWorker( ReceiptApplier::lookAssistMeasureOnlyRenderer(
         m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
-        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
-    windowLitRequest.renderDisplayBalance = ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer(
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) ) );
+    windowLitRequest.renderDisplayBalance = renderOnAnalysisWorker( ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer(
         m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
-        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
-    const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
-        windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
-        useProcessedColorStats ? &processedColorStats : nullptr,
-        displayStatsValidUi ? &displayStatsUi : nullptr );
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) ) );
+    LookAssistWindowLitCheck windowLit;
+    {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.windowLitMs );
+        windowLit = resolveLookAssistWindowLitInterior(
+            windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
+            useProcessedColorStats ? &processedColorStats : nullptr,
+            displayStatsValidUi ? &displayStatsUi : nullptr );
+    }
     const bool windowLitApplied = windowLit.applies && !s_lookAssistMasterScenePass;
     if( windowLitApplied )
     {
@@ -18309,17 +18526,21 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     int postTintDelta = 0;
     if( canAnalyzeProcessedColor )
     {
+        const look_assist_pump::SegmentClock segment( &m_lookAssistApplyTiming.walkMs );
         const int minColorBalanceSamples = qMax( 32, ( colorWidth * colorHeight ) / 100 );
         const int postTintCap = lookAssistAutoTintCap( scene, useProcessedColorStats );
         auto analyzePostAppliedLook = [&]() -> bool
         {
             QByteArray postProcessedThumbnail;
             postProcessedThumbnail.resize( colorWidth * colorHeight * 3 );
-            get_area_average_downscale_thumnail( m_pMlvObject,
-                                                 analysisFrame,
-                                                 colorDownscaleFactor,
-                                                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                                                 reinterpret_cast<unsigned char *>( postProcessedThumbnail.data() ) );
+            m_lookAssistPump.call( [&]()
+            {
+                get_area_average_downscale_thumnail( m_pMlvObject,
+                                                     analysisFrame,
+                                                     colorDownscaleFactor,
+                                                     qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                                                     reinterpret_cast<unsigned char *>( postProcessedThumbnail.data() ) );
+            } );
             postColorStats = analyzeLookAssistThumbnail(
                         reinterpret_cast<const unsigned char *>( postProcessedThumbnail.constData() ),
                         colorWidth,
@@ -18632,11 +18853,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     {
         QByteArray dumpThumbnail;
         dumpThumbnail.resize( colorWidth * colorHeight * 3 );
-        get_area_average_downscale_thumnail( m_pMlvObject,
-                                             analysisFrame,
-                                             colorDownscaleFactor,
-                                             qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                                             reinterpret_cast<unsigned char *>( dumpThumbnail.data() ) );
+        m_lookAssistPump.call( [&]()
+        {
+            get_area_average_downscale_thumnail( m_pMlvObject,
+                                                 analysisFrame,
+                                                 colorDownscaleFactor,
+                                                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                                                 reinterpret_cast<unsigned char *>( dumpThumbnail.data() ) );
+        } );
         const QString dumpDir = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
         QDir().mkpath( dumpDir );
         const QImage dumpImage( reinterpret_cast<const uchar *>( dumpThumbnail.constData() ),
@@ -18674,10 +18898,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             dumpSettings.white_balance_tint = v[7].toInt() / 10.0;
             QByteArray stateThumbnail;
             stateThumbnail.resize( colorWidth * colorHeight * 3 );
-            const int stateRendered = get_area_average_downscale_thumnail_with_processing(
-                m_pMlvObject, analysisFrame, colorDownscaleFactor,
-                qMax( 1, mlvappEffectiveWorkerThreadCount() ), dumpClone, &dumpSettings,
-                reinterpret_cast<unsigned char *>( stateThumbnail.data() ) );
+            int stateRendered = 0;
+            m_lookAssistPump.call( [&]()
+            {
+                stateRendered = get_area_average_downscale_thumnail_with_processing(
+                    m_pMlvObject, analysisFrame, colorDownscaleFactor,
+                    qMax( 1, mlvappEffectiveWorkerThreadCount() ), dumpClone, &dumpSettings,
+                    reinterpret_cast<unsigned char *>( stateThumbnail.data() ) );
+            } );
             processingFreeClone( dumpClone );
             if( !stateRendered ) continue;
             const QImage stateImage( reinterpret_cast<const uchar *>( stateThumbnail.constData() ),
@@ -19831,6 +20059,17 @@ void MainWindow::clearPresentationForClipOpen( const char *reason )
 
 void MainWindow::requestFrameRefresh( bool resetCurrentFrameCache, const char *reason )
 {
+    // A pump turn must not reset the frame cache under the analysis. The analysis's own GUI-side steps are not a turn.
+    if( m_lookAssistPump.pumping() )
+    {
+        const QByteArray heldReason( reason ? reason : "" );
+        m_lookAssistPump.hold( [this, resetCurrentFrameCache, heldReason]()
+        {
+            requestFrameRefresh( resetCurrentFrameCache, heldReason.constData() );
+        } );
+        return;
+    }
+
     const QString refreshReason =
         reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
     logInteractionEvent(
@@ -19859,7 +20098,8 @@ void MainWindow::requestFrameRefresh( bool resetCurrentFrameCache, const char *r
     const std::weak_ptr<std::function<void()>> weakRetry( retry );
     *retry = [this, attempts, weakRetry, refreshReason]()
     {
-        if( !m_fileLoaded || !m_frameChanged )
+        // Holds off during a Look Assist analysis: m_frameChanged stays set, and the analysis's caller refreshes on landing.
+        if( !m_fileLoaded || !m_frameChanged || m_lookAssistPump.sessionOpen() )
         {
             return;
         }
@@ -24365,6 +24605,13 @@ void MainWindow::scheduleClipReopenRetry( int row, unsigned long long generation
 {
     QTimer::singleShot( kClipReopenAbortRetryDelayMs, this, [this, row, generation, deferrals]()
     {
+        // The reopen frees the clip, and that waits on the analysis's barrier borrower: it would never return from a pump
+        // turn. Waiting for the analysis spends no deferral.
+        if( m_lookAssistPump.sessionOpen() )
+        {
+            scheduleClipReopenRetry( row, generation, deferrals );
+            return;
+        }
         const bool clipHeld = m_exportInProgress || QApplication::activeModalWidget() != nullptr;
         switch( deferredClipReopenDecision( generation, m_clipOpenGeneration, clipHeld, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, deferrals ) )
         {
@@ -24923,6 +25170,13 @@ void MainWindow::on_actionFullscreen_triggered( bool checked )
 //Gets called when one export is ready
 void MainWindow::exportHandler( void )
 {
+    // An export job replaces the clip, and that waits on the analysis's barrier borrower.
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this]() { exportHandler(); } );
+        return;
+    }
+
     static bool exportRunning = false;
     static int numberOfJobs = 1;
     static int jobNumber = 0;
@@ -28647,6 +28901,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
 // PLAYBACK-STARTUP-WAIT-PREWARM-1 Row B (PlaybackRoutePrewarmPolicy.h): once per clip load, while paused.
 void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
 {
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this, clipGeneration]() { runPlaybackRoutePrewarm( clipGeneration ); } );
+        return;
+    }
+
     playback_route_prewarm::Inputs in;
     in.enabled = !mlvappPlaybackRoutePrewarmDisabled();
     in.playing = ui->actionPlay->isChecked();
@@ -28700,6 +28960,12 @@ void MainWindow::runPlaybackRoutePrewarm( quint64 clipGeneration )
 void MainWindow::postPlaybackReconWarm( quint64 clipGeneration )
 {
     m_playbackReconWarmRepostArmed = false;
+    // The warm renders this clip: it waits for the analysis, without spending a post.
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this, clipGeneration]() { postPlaybackReconWarm( clipGeneration ); } );
+        return;
+    }
     // one warm per clip: a warm that ran is never repeated (a later raw-level change leaves set_clip to Play, correctly)
     if( !m_pRenderThread || !m_fileLoaded || !m_pMlvObject || m_playbackReconWarmRan ) return;
     playback_recon_warm_run::Decision decision = playback_recon_warm_run::decide(
@@ -28747,6 +29013,13 @@ void MainWindow::schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reaso
 // then ALWAYS release the token -- including the skipped, stale-clip and playing cases.
 void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done )
 {
+    if( m_lookAssistPump.pumping() )
+    {
+        const RenderFrameThread::PlaybackReconWarmDone heldDone = done;
+        m_lookAssistPump.hold( [this, heldDone]() { onPlaybackReconWarmDone( heldDone ); } );
+        return;
+    }
+
     const playback_recon_warm_run::Outcome &outcome = done.outcome;
     const bool playing = ui->actionPlay->isChecked();
     const bool clipMatches = done.clipGeneration == m_playbackRoutePrewarmClipGeneration;
@@ -31633,6 +31906,9 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
 
+    // Off, on, or a new flavor: an async result dispatched before this no longer describes what the user asked for.
+    ++m_lookAssistAsyncGeneration;
+
     if( checked )
     {
         if( ACTIVE_RECEIPT->lookAssistBaselineValid() )
@@ -31688,7 +31964,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
                 return;
             }
 
-            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
+            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) || m_lookAssistPump.sessionOpen() )
             {
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.dedup_skip"),
@@ -31720,7 +31996,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             else
                 captureLookAssistBaseline( ACTIVE_RECEIPT );
 
-            applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );
+            applyLookAssistFromFrameReady( ACTIVE_RECEIPT, analysisFrame );
             m_lookAssistApplied.markApplied( ACTIVE_RECEIPT );
             syncLookAssistDerivedUiToReceipt( ACTIVE_RECEIPT );
             setReceipt( ACTIVE_RECEIPT );
@@ -33118,6 +33394,13 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 //Draw the frame when render thread is ready
 void MainWindow::drawFrameReady()
 {
+    // A frame that outlasted the drain bound presents on landing, never under the analysis.
+    if( m_lookAssistPump.holdsPresentation() )
+    {
+        m_lookAssistPump.hold( [this]() { drawFrameReady(); } );
+        return;
+    }
+
     const double drawReadyEntryStageTime = mlv_stage_timing_now();
     RenderFrameThread::ReadyFrame readyFrame;
     PresentationRequestContext requestContext;
@@ -34811,6 +35094,13 @@ void MainWindow::on_actionCheckForUpdates_triggered( void )
 //Autocheck for updates told there is an update
 void MainWindow::updateCheck(void)
 {
+    // The startup timer can fire during a Look Assist analysis, and the check runs an event loop of its own.
+    if( m_lookAssistPump.pumping() )
+    {
+        m_lookAssistPump.hold( [this]() { updateCheck(); } );
+        return;
+    }
+
     Updater *pUpdater = new Updater(this, mlvAppUpdateReleasesUrl(), GITVERSION);
     if( pUpdater->isUpdateAvailable() ) on_actionCheckForUpdates_triggered();
     else checkFocusPixelUpdate();

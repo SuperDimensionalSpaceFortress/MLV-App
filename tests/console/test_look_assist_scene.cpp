@@ -1597,7 +1597,7 @@ TEST(LookAssistScene, EveryConsumerReachesTheRefinementThroughTheOneDecision)
     ASSERT_FALSE( applier.isEmpty() );
     ASSERT_FALSE( window.isEmpty() );
     ASSERT_TRUE( applier.contains( QStringLiteral("wbRequest.renderBalance = lookAssistBalanceRenderer(") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral("wbRequest.renderBalance = ReceiptApplier::lookAssistBalanceRenderer(") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("wbRequest.renderBalance = renderOnAnalysisWorker( ReceiptApplier::lookAssistBalanceRenderer(") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("wbRequest.renderBalance =") ) );   // sync only
     const int guard = window.indexOf( QStringLiteral("const bool daylightNeedsLivePicture") );
     const int dispatch = window.indexOf( QStringLiteral("if( !s_syncMode && !daylightNeedsLivePicture )") );
@@ -1625,10 +1625,10 @@ TEST(LookAssistDisplayMeterWiring, TheGuiRunsTheMeterAtEveryPlaybackScaleThrough
     ASSERT_TRUE( meterAt > 0 );
     ASSERT_TRUE( meterEnd > meterAt );
     const QString meter = window.mid( meterAt, meterEnd - meterAt );
-    ASSERT_TRUE( meter.contains( QStringLiteral("const bool displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(") ) );
+    ASSERT_TRUE( meter.contains( QStringLiteral("displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(") ) );
     // the analysis scale is the RAW-size downscale, not anything the viewport plays at
-    ASSERT_TRUE( meter.contains( QStringLiteral("analysisFrame,\n        downscaleFactor,") )
-              || meter.contains( QStringLiteral("analysisFrame,\r\n        downscaleFactor,") ) );
+    ASSERT_TRUE( meter.contains( QStringLiteral("analysisFrame,\n                downscaleFactor,") )
+              || meter.contains( QStringLiteral("analysisFrame,\r\n                downscaleFactor,") ) );
     // no scale gate of any spelling in front of it
     ASSERT_FALSE( meter.contains( QStringLiteral("PlaybackScale") ) );
     ASSERT_FALSE( meter.contains( QStringLiteral("playback_scale") ) );
@@ -1987,7 +1987,7 @@ TEST(LookAssistScene, BothConsumersAppendTheDecisionFieldsAndChangeNothingElse)
     // and display_meter_ran follows the meter's own result, so it reads 1 at every scale the meter produces samples.
     ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();") ) );
     ASSERT_FALSE( window.contains( QStringLiteral("displayMeterPlaybackScaleUi") ) );
-    const int meterCall = window.indexOf( QStringLiteral("const bool displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(") );
+    const int meterCall = window.indexOf( QStringLiteral("displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(") );
     ASSERT_TRUE( meterCall > 0 );
     const int scaleTrace = window.indexOf( QStringLiteral("decisionTrace.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();") );
     ASSERT_TRUE( scaleTrace > 0 && scaleTrace < meterCall );
@@ -2429,7 +2429,7 @@ TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
     ASSERT_EQ( 1, window.count( copies.arg( QStringLiteral("m_pMlvObject->processing->exposure_stops") ) ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("windowLitRequest.stats = &windowLitStats;") ) );
     const int sync = window.indexOf( QStringLiteral("// --- synchronous fallback (MLVAPP_LOOK_ASSIST_SYNC=1) ---") );
-    const int syncWb = window.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance("), sync );
+    const int syncWb = window.indexOf( QStringLiteral("wb = resolveLookAssistWhiteBalance("), sync );
     const int masterPass = window.indexOf( QStringLiteral("applyLookAssistToReceipt( receipt, analysisFrame );"), syncWb );
     const int guiCheck = window.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), sync );
     const int guiGate = window.indexOf( QStringLiteral("const bool windowLitApplied = windowLit.applies && !s_lookAssistMasterScenePass;"), guiCheck );
@@ -2477,7 +2477,7 @@ TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
     // sol r1: the check's two verification renders go through the isolated, read-only renderer in BOTH consumers (the
     // live one prepares and versions llrawproc's shared pixel maps), set after the copied request, before the check.
     const QString assignments[] = {
-        QStringLiteral("windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer("),
+        QStringLiteral("windowLitRequest.renderBalance = renderOnAnalysisWorker( ReceiptApplier::lookAssistMeasureOnlyRenderer("),
         QStringLiteral("windowLitRequest.renderBalance = lookAssistMeasureOnlyRenderer(") };
     const QString consumers[] = { window, applier };
     for( int i = 0; i < 2; ++i )
@@ -3397,7 +3397,7 @@ TEST(LookAssistScene, BothConsumersAskTheWindowLitCheckAtTheDisplayLevels)
     ASSERT_FALSE( applier.isEmpty() );
     ASSERT_FALSE( window.isEmpty() );
     const QString assignments[] = {
-        QStringLiteral("windowLitRequest.renderDisplayBalance = ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer("),
+        QStringLiteral("windowLitRequest.renderDisplayBalance = renderOnAnalysisWorker( ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer("),
         QStringLiteral("windowLitRequest.renderDisplayBalance = lookAssistMeasureOnlyDisplayRenderer(") };
     const QString consumers[] = { window, applier };
     for( int i = 0; i < 2; ++i )
