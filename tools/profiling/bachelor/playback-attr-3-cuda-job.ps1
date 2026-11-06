@@ -5474,7 +5474,7 @@ $rec =[ordered]@{ schema = 'mlv-app/core-partition-helper/v1'; pid = $PID; start
 # r8: the ready marker and the record's MAC are HMACs under the job's key (A4); each wall-clock read in the poll loop keeps the largest gap between
 # wall-clock and monotonic elapsed time since this instant in clockSkewMaxMs (A1).
 $u8 = [Text.Encoding]::UTF8; $hk = [Security.Cryptography.HMACSHA256]::new($u8.GetBytes([string]$env:MLV_CP_NONCE))
-$c0 = $dt::UtcNow.Ticks; $rec.monoBaseMs = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000; $cw = [Diagnostics.Stopwatch]::StartNew()
+$c0 = $dt::UtcNow.Ticks; $rec.monoBaseMs = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000; $cw = [Diagnostics.Stopwatch]::StartNew(); $ms = { $cw.ElapsedMilliseconds }
 $clk = { $t = $dt::UtcNow.Ticks; $g = [math]::Abs(($t - $c0) / 1e4 - $cw.Elapsed.TotalMilliseconds); if ($g -gt $rec.clockSkewMaxMs) { $rec.clockSkewMaxMs = $g }; $t }
 $errs = [Collections.Generic.List[string]]::new()
 $lo = [Collections.Generic.List[object]]; $sm = $lo::new(); $ins = $lo::new()
@@ -5544,7 +5544,7 @@ public sealed class MlvCorePartitionLoad {
             $q = $live[$k]
             # r10 B1 (sol r9 B1 = adversary r9 8cf7e883 A1): the alive stamp and the load byte count are read BEFORE the liveness query, so a helper
             # descheduled after the query can only make aliveMs earlier (the gap to goneMs, the endpoint bound, longer), never charge post-exit work
-            $mo = $cw.ElapsedMilliseconds; if ($k -eq $own -and $loadOn) { $bn = $ld.Bytes }
+            $mo = & $ms; if ($k -eq $own -and $loadOn) { $bn = $ld.Bytes }
             # A failed query proves neither: the getter's throw reaches here as $null, not through the catch. That is no exit, since the seen key would stop the process
             # being tracked again and the job accepts an observed exit as coverage; and it is no alive stamp, since it can be a successor this user cannot open.
             $gone = $null; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
@@ -5553,7 +5553,8 @@ public sealed class MlvCorePartitionLoad {
                 $q.r.lastSeenUtcTicks = & $clk; $q.r.aliveMs = $mo; if ($k -eq $own -and $loadOn) { $lb = $bn }
             } elseif ($gone) {
                 if ($k -eq $own) { if ($loadOn) { $q.r.loadJoined = $ld.Halt(); $loadOn = $false; & $lc $q.r }; $own = $null }
-                $q.r.goneUtcTicks = & $clk; $q.r.goneMs = $cw.ElapsedMilliseconds; $live.Remove($k)
+                # r5: 2 marks a tracked key whose process has exited (on its held handle), so a later listing that carries it is another process (seen below)
+                $q.r.goneUtcTicks = & $clk; $q.r.goneMs = & $ms; $live.Remove($k); $seen[$k] = 2
             }
         }
         if ($null -eq $lu -and $lf -and (Test-Path -LP $lf)) {
@@ -5563,7 +5564,7 @@ public sealed class MlvCorePartitionLoad {
             # r10 B1 (class): a newly found process's alive stamp is the time before the enumeration that saw it. r10 B3 (sol r9 B3 = adversary r9
             # 8cf7e883 A3): firstMs, the monotonic time after that enumeration, and the wall first-seen stamp through $clk (which samples the clock
             # gap), so the job can order each process's start, first sight and exit and prove concurrency on the monotonic clock alone.
-            $me = $cw.ElapsedMilliseconds
+            $me = & $ms
             $ps = @(Get-Process -Name $appName -ea 0)
             foreach ($p in $ps) {
                 # The handle is opened before the reads and kept with a pending entry ($pe.o). While the process it holds has not exited, that process holds the pid,
@@ -5574,7 +5575,10 @@ public sealed class MlvCorePartitionLoad {
                 $k = "$($p.Id),$($pst.Ticks)"
                 # A seen key settles nothing pending on its pid (r4, adversary pass 6 A1 on 0a40778b): an entry pends only with its start unread or another key, and a
                 # successor can get a gone process's exact start, so the entry refuses, as on the base. A tracked process whose reads fail once refuses too (hub ruling).
-                if ($seen[$k]) { if ($pn[$p.Id]) { & $un $p.Id }; continue }
+                # r5 (sol r4 blocker = adversary pass 7 A1 on 00e5f732, hub ruling 1 of HUB-TICK 20261106T1439Z): a gone tracked key (2) read with its Path unread is a
+                # successor never identified, so it is recorded unidentified, never skipped; the key then goes back to 1, so it is recorded once. A key whose process
+                # is still tracked (1), or one whose Path reads, is skipped as before. An exited process is never listed, even while its handle is held (measured r5).
+                if ($seen[$k]) { if ($pn[$p.Id] -or $seen[$k] * !$pp -gt 1) { & $un $p.Id; $seen[$k] = 1 }; continue }
                 $pe = $pn[$p.Id]
                 # The start read at first sight ($pe.s) is a pending pid's identity, whatever the clock did since: any other start on that pid is a process on a recycled
                 # pid, and the one first listed ended unread. With no start read at first sight nothing can prove identity (r3, HUB RULING 2026-11-06, adversary A1/A2 on
@@ -5584,18 +5588,18 @@ public sealed class MlvCorePartitionLoad {
                 if ($pe -and $pst -and ($pst.Ticks -ne $pe.s -or $pe.o.HasExited -ne $false)) { & $un $p.Id; $pe = $null }
                 # A read that fails settles nothing, on a pid being tracked too: both reads failing cannot be told from that process exiting. A read at another path
                 # with no start cannot say which process it read, so it clears nothing. With no handle nothing can recover, so it is recorded at once, as on the base.
-                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = $cw.ElapsedMilliseconds } } else { & $un $p.Id; $seen[$k] = 1 } }
+                if (!$pp -or ($pp -ieq $exe -and !$pst)) { if ($pe) { } elseif ($h) { $pn[$p.Id] = @{ s = $pst.Ticks; o = $p; f = & $clk; m = & $ms } } else { & $un $p.Id; $seen[$k] = 1 } }
                 elseif ($pst) { $pn.Remove($p.Id) }
                 if ($pp -ieq $exe -and $pst) {
                     # firstSeenUtcTicks and firstMs are the real first sight, also for a process classed late; aliveMs is this poll's, the first it can vouch for.
-                    $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = $cw.ElapsedMilliseconds } }
+                    $seen[$k] = 1; $fs = & $clk; if (!$pe) { $pe = @{ f = $fs; m = & $ms } }
                     $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $pe.f; lastSeenUtcTicks = $fs; firstMs = $pe.m; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }
                     try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
                     $live[$k] = @{ p = $p; r = $r }
                     if ($pst -lt $lu) { $others.Add($r) }
                     else {
                         $ins.Add($r)
-                        if ($null -eq $own) { $own = $k; if ($threads -gt 0) { $ld = [MlvCorePartitionLoad]::new($threads, 32); $loadOn = $true; $ls0 = $cw.ElapsedMilliseconds; $lb = 0; $rec.load.sessions++ } }
+                        if ($null -eq $own) { $own = $k; if ($threads -gt 0) { $ld = [MlvCorePartitionLoad]::new($threads, 32); $loadOn = $true; $ls0 = & $ms; $lb = 0; $rec.load.sessions++ } }
                     }
                 }
             }

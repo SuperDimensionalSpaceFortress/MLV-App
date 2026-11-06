@@ -2582,6 +2582,14 @@ LATE_READ_SCENARIOS = {
     "successor-on-gone-key-start-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "startFailAt": 4}]},
     "reads-fail-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty", "startFailAt": 5}]},
     "reads-and-liveness-fail-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty", "startFailAt": 5, "exitedNullAt": 4, "exitedNullTo": 4}]},
+    # r5 (sol r4 blocker = adversary pass 7 A1 on 00e5f732): P0 is tracked on pid 300 and gone; its successor's FIRST read gives P0's exact start and an unread
+    # Path, so nothing is pending on the pid when it meets P0's seen key. Unread for good (sol's literal row: Path '', start T), unread once, as a throw, and unopenable.
+    "successor-on-gone-key-path-unread": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty"}]},
+    "successor-on-gone-key-path-unread-once": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFailAt": 4, "pathMode": "empty"}]},
+    "successor-on-gone-key-path-throws": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "throw"}]},
+    "successor-on-gone-key-path-unread-unopenable": {"procs": [_APP, _P1_TRACKED, {"id": 300, "from": 4, "to": 99, "goneAt": 999, "startSec": 1, "pathFail": -1, "pathMode": "empty", "handleFail": 1}]},
+    # its control: the tracked process itself, still live, with its Path unread on a later poll and its start readable
+    "path-unread-once-while-tracked": {"procs": [{**_APP, "pathFailAt": 5, "pathMode": "empty"}]},
     "liveness-null-once": {"procs": [{**_APP, "exitedNullAt": 2, "exitedNullTo": 2}]},
     "liveness-throw-once": {"procs": [{**_APP, "exitedThrowAt": 2}]},
     "recycled-other-path-start-unread": {"procs": [_APP, _P1_UNREAD, {"id": 300, "from": 3, "to": 4, "goneAt": 999, "startSec": 2, "exe": "other", "startFail": -1}]},
@@ -2958,6 +2966,22 @@ class CorePartitionR10Tests(unittest.TestCase):
                 self.assertEqual(case["unidentified"], [300], f"a successor unread at first sight was cleared by a gone process's seen key: {case}")
                 self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
                 self.assertFalse(case["bench"], case)
+
+    def test_handover_a_successor_first_read_on_a_gone_tracked_key_with_its_path_unread_is_recorded(self) -> None:
+        """r5 (sol r4 blocker, adversary pass 7 A1 on 00e5f732, hub ruling 1 of HUB-TICK 20261106T1439Z). P0 on pid 300 is tracked and gone; a successor's first read
+        gives P0's exact start and no Path, with nothing pending on the pid. It was skipped at the seen key and never recorded, so the run passed. It is now recorded
+        unidentified, once however many polls list it. Control: the tracked process itself, still live, with its Path unread once, is not newly unidentified."""
+        for mode in ("successor-on-gone-key-path-unread", "successor-on-gone-key-path-unread-once", "successor-on-gone-key-path-throws",
+                     "successor-on-gone-key-path-unread-unopenable"):
+            with self.subTest(mode=mode):
+                case = self.late_read(mode)
+                self.assertEqual(case["unidentified"], [300], f"a successor unread on a gone tracked key was dropped, or recorded more than once: {case}")
+                self.assertEqual([case["app"], case["instances"]], [5000, [5000, 300]], f"the tracked P0 or the app left the instances: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], case)
+        live =self.late_read("path-unread-once-while-tracked")
+        self.assertEqual([live["app"], live["instances"], live["unidentified"]], [5000, [5000], []], f"a live tracked process with an unread Path became unidentified: {live}")
+        self.assertIn(live["vwhy"], self.ACCEPTED, live)
 
     def test_handover_a_process_identified_at_another_path_is_dropped_once_readable(self) -> None:
         """Identified is identified: readable at another path, it is no competing instance, so it is off the record and refuses nothing."""
