@@ -40,6 +40,10 @@ DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
 SLOWEST_HEAD = re.compile(r"^SHARD_SLOWEST profile=\S+ shard=\S+ total=[0-9]+(?:\.[0-9]+)?s$")
 # The runner prints one decimal; a bounded digit count keeps float() finite (400 digits is inf).
 SLOWEST_ROW = re.compile(r"^\s+([0-9]{1,7}(?:\.[0-9]{1,3})?)s ([A-Za-z0-9_.]+)$")
+# A row's shape with the figure unchecked (``1.2.3s name``), and the unittest summary lines that can be
+# interleaved with a block on the log's other stream.
+SLOWEST_ROW_SHAPE = re.compile(r"^\s+\S+s ([A-Za-z0-9_.]+)$")
+SUMMARY_NOISE = re.compile(r"^(?:OK(?: \(.*\))?|FAILED \(.*\))?$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -109,7 +113,11 @@ def class_seconds(log_text: str) -> dict[str, float]:
     # A job log holds exactly one block (all 130 hosted windows logs do); a log with none, several, or a
     # class named twice is concatenated or foreign output whose figures are not this job's, so the gaps
     # stand alone and no SHARD_SLOWEST figure replaces or caps anything.
-    blocks: list[list[tuple[str, float]]] = []
+    # Inside a block, unittest's stderr summary (blank line, ``OK``) can reach the log between the header and
+    # its rows (hosted run 41960424018, heavy part 4) and does not end it; a row of the right shape whose
+    # figure is unreadable is not a measurement but names a top-ten class, so the scan goes on and that
+    # class is exempt from the ceiling; any other line ends the block.
+    blocks: list[tuple[list[tuple[str, float]], list[str]]] = []
     in_slowest = False
     for raw in log_text.splitlines():
         stamp = STAMP.match(raw)
@@ -118,20 +126,29 @@ def class_seconds(log_text: str) -> dict[str, float]:
         text = stamp.group(3)
         if SLOWEST_HEAD.match(text):
             in_slowest = True
-            blocks.append([])
+            blocks.append(([], []))
             continue
-        row = SLOWEST_ROW.match(text) if in_slowest else None
-        if row is None:
+        if not in_slowest:
+            continue
+        row = SLOWEST_ROW.match(text)
+        if row:
+            blocks[-1][0].append((row.group(2), float(row.group(1))))
+            continue
+        loose = SLOWEST_ROW_SHAPE.match(text)
+        if loose:
+            blocks[-1][1].append(loose.group(1))
+        elif not SUMMARY_NOISE.match(text.strip()):
             in_slowest = False
-            continue
-        blocks[-1].append((row.group(2), float(row.group(1))))
-    if len(blocks) == 1 and blocks[0] and len({name for name, _ in blocks[0]}) == len(blocks[0]):
-        ceiling = min(value for _, value in blocks[0])
-        named = {name: value for name, value in blocks[0] if name.startswith(KEY_PREFIX)}
-        for name in totals:
-            if name not in named:
-                totals[name] = min(totals[name], ceiling)
-        totals.update(named)
+    if len(blocks) == 1 and blocks[0][0]:
+        rows, unreadable = blocks[0]
+        names = [name for name, _ in rows] + unreadable
+        if len(set(names)) == len(names):
+            ceiling = min(value for _, value in rows)
+            named = {name: value for name, value in rows if name.startswith(KEY_PREFIX)}
+            for name in totals:
+                if name not in named and name not in unreadable:
+                    totals[name] = min(totals[name], ceiling)
+            totals.update(named)
     return dict(totals)
 
 

@@ -1081,6 +1081,52 @@ class TimingsTests(unittest.TestCase):
             {"tools.repo_hygiene.test_x.A": 1.0, "tools.repo_hygiene.test_x.B": 100.0},
         )
 
+    def test_unittests_stderr_summary_between_the_header_and_the_rows_does_not_end_the_block(self) -> None:
+        # adversary r3 pass 6 A1: hosted run 41960424018, heavy part 4: the stderr summary lines reach
+        # the log between the stdout header and its rows (blank line, "OK"). The block is still read.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:05.0000000Z Ran 1 test in 5.000s\n"
+            "2026-10-04T00:00:05.0000000Z SHARD_SLOWEST profile=windows shard=4/6 total=5.0s\n"
+            "2026-10-04T00:00:05.0000000Z \n"
+            "2026-10-04T00:00:05.0000000Z OK\n"
+            "2026-10-04T00:00:05.0000000Z   9.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:05.0000000Z OK (skipped=1)\n"
+            "2026-10-04T00:00:05.0000000Z   2.0s somewhere.else.Tests\n"
+            "2026-10-04T00:00:06.0000000Z Post job cleanup.\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 9.0})
+
+    def test_a_malformed_row_between_rows_neither_ends_the_block_nor_hides_a_repeated_class(self) -> None:
+        # adversary r3 pass 6 A1: "1.2.3s" is not a measurement but it is a row, so the scan goes on
+        # and sees class A named twice, which makes the block unusable (gap-only A = 5.0).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:05.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=5.0s\n"
+            "2026-10-04T00:00:05.0000000Z   9.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:05.0000000Z   1.2.3s ignored.Row\n"
+            "2026-10-04T00:00:05.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+
+    def test_a_class_with_an_unreadable_row_is_not_capped_at_the_blocks_smallest_figure(self) -> None:
+        # The unreadable row names a top-ten class, which a ceiling for classes OUTSIDE the top ten
+        # must not lower: its gap estimate (50 s) stands, the readable row of C is exact.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:50.0000000Z test_u (tools.repo_hygiene.test_x.U.test_u) ... ok\n"
+            "2026-10-04T00:00:52.0000000Z test_c (tools.repo_hygiene.test_x.C.test_c) ... ok\n"
+            "2026-10-04T00:00:52.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=52.0s\n"
+            "2026-10-04T00:00:52.0000000Z   2.0s tools.repo_hygiene.test_x.C\n"
+            "2026-10-04T00:00:52.0000000Z   1.2.3s tools.repo_hygiene.test_x.U\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.U": 50.0, "tools.repo_hygiene.test_x.C": 2.0},
+        )
+
     def test_a_class_named_twice_in_the_slowest_block_makes_the_block_unusable(self) -> None:
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
