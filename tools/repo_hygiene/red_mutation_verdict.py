@@ -36,7 +36,12 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   expectation) with an empty segment (``test_s..T.test_a``, a trailing ``.`` or ``::``), or any id that does
   not split into exactly its own segments.
 * ``line number``: a ``file:line`` expectation or a traceback frame whose line number has more than 9 digits.
-* ``number``: a probe reading or window bound no float can hold (``--bug 1e400`` written as an integer).
+* ``failure blocks`` / ``sections`` / ``short test summary``: the runner's own failed-or-errored count
+  (``FAILED (failures=1, errors=1)``, ``2 failed``) disagrees with the failure blocks, sections or summary lines
+  that could be read, or a short-summary line starts with no summary word. A header this parser cannot read (a
+  test name holding a newline) would otherwise drop its failure, an ImportError included.
+* ``number``: a probe reading or window bound no float can hold (an integer or ``1e400`` spelled out), or an
+  infinite reading. A spelled ``inf`` window bound is a real unbounded window and is accepted.
 * ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
 
 A refusal is checked BEFORE the older reasons and the older reason is appended (``; also: ...``), so a
@@ -141,6 +146,7 @@ _RESULT_LINE = re.compile(r"^(?:OK\b.*|FAILED \(.*\)|=+ .*\bin \d[\d.]*s\b.*=+)\
 
 _CAPTURED_ANY = re.compile(r"^\s*-{2,}\s*Captured\b|^(?:Stdout|Stderr):\s*$", re.M)
 _INT_TEXT = re.compile(r"\s*[+-]?\d+\s*")
+_INF_TEXT = re.compile(r"\s*[+-]?inf(?:inity)?\s*", re.I)
 _MAX_LINE_DIGITS = 9
 
 
@@ -186,6 +192,7 @@ class Parsed:
     failures: list[Failure] = field(default_factory=list)
     red: bool = False
     green: bool = False
+    mismatch: str = ""  # the runner's own failure count disagrees with what was readable: see _count_mismatch
 
 
 def _norm_path(text: str) -> list[str]:
@@ -362,7 +369,15 @@ def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]
     return cands if len(cands) == 1 else []
 
 
-def _parse_pytest(text: str) -> list[Failure]:
+_PT_SUMMARY_WORDS = ("FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS", "PASSED")
+
+
+def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
+    """`stats` (optional) receives what the text held that the runner's own count can be checked against:
+    `sections` (failure/error sections), `summary` (FAILED/ERROR summary lines), `stray` (a summary-section line
+    that starts with no known summary word, e.g. the continuation of a multi-line node id)."""
+    stats = stats if stats is not None else {}
+    stats.update(sections=0, summary=0, stray=0)
     out: list[Failure] = []
     nodes: list[tuple[str, str]] = []
     summary_blockers: list[str] = []
@@ -376,6 +391,7 @@ def _parse_pytest(text: str) -> list[Failure]:
     def close() -> None:
         nonlocal cur
         if cur is not None:
+            stats["sections"] += 1
             out.append(Failure([cur["name"]], cur["frames"], cur["assertion"], cur["collection"], cur["name"]))
         cur = None
 
@@ -396,10 +412,14 @@ def _parse_pytest(text: str) -> list[Failure]:
             top = m_top["title"].strip()
             continue
         if top.startswith("short test summary"):
+            if line.strip() and not line.startswith(tuple(w + " " for w in _PT_SUMMARY_WORDS)) \
+                    and line.strip() not in _PT_SUMMARY_WORDS:
+                stats["stray"] += 1
             for word in ("FAILED", "ERROR"):
                 got = _parse_summary_line(line, word)
                 if not got:
                     continue
+                stats["summary"] += 1
                 node, msg, ambiguous = got
                 if word == "FAILED":
                     nodes.append((node, msg))
@@ -487,10 +507,40 @@ def _final_green(text: str) -> bool:
     return last.startswith("=") and not re.search(r"\b(?:failed|errors?)\b", last)
 
 
+_UT_COUNTS = re.compile(r"[(,] ?(failures|errors)=(\d+)")
+_UT_RAN = re.compile(r"^Ran \d+ tests? in ", re.M)
+
+
+def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
+    """The runner states how many tests failed; every one must have been recognized as a block, section or summary
+    line. A header this parser could not read (a multi-line test name) would otherwise drop its failure, an import
+    error included, without a trace. "" when the counts agree or the text states none."""
+    last = None
+    for m in _RESULT_LINE.finditer(text):
+        last = m.group(0).strip()
+    if last is None:
+        return ""
+    if last.startswith("FAILED (") and _UT_RAN.search(text):
+        want = sum(int(n) for _kind, n in _UT_COUNTS.findall(last))
+        if want and want != ut_blocks:
+            return f"the runner counts {want} failing unittest tests but {ut_blocks} failure blocks were readable"
+    elif last.startswith("="):
+        want = sum(int(n) for n in re.findall(r"\b(\d+) (?:failed|errors?)\b", last))
+        if want:
+            for what in ("sections", "summary"):
+                if stats[what] and stats[what] != want:
+                    return f"the runner counts {want} failed or errored tests but {stats[what]} {what} were readable"
+    if stats["stray"]:
+        return "a line in the short test summary starts with no summary word (a multi-line test id?)"
+    return ""
+
+
 def parse_run(text: str) -> Parsed:
-    failures = _parse_unittest(text) + _parse_pytest(text)
+    stats: dict = {}
+    ut = _parse_unittest(text)
+    failures = ut + _parse_pytest(text, stats)
     return Parsed(failures=failures, red=bool(_RED_MARK.search(text)) or bool(failures),
-                  green=bool(_GREEN_MARK.search(text)))
+                  green=bool(_GREEN_MARK.search(text)), mismatch=_count_mismatch(text, len(ut), stats))
 
 
 def _matches(failure: Failure, expected: str) -> bool:
@@ -516,7 +566,7 @@ def _precheck(output: str, expected: str) -> str:
         _line_no(site["line"])
     elif _empty_segment(expected):
         return "empty segment in the expected test identity (`..`, a trailing `.` or `::`): no such id exists"
-    return ""
+    return parse_run(output).mismatch
 
 
 def verdict(output: str, expected: str) -> tuple[str, str]:
@@ -577,7 +627,10 @@ def _num(v: object) -> int | float:
         except (TypeError, ValueError):
             if isinstance(v, str) and _INT_TEXT.fullmatch(v):
                 raise OverflowError("integer text beyond the int() digit limit") from None
+            text = v
             v = float(v)  # type: ignore[arg-type]
+            if math.isinf(v) and not _INF_TEXT.fullmatch(str(text)):
+                raise OverflowError("a number spelled out beyond what a float can hold (read as inf)")
     if isinstance(v, int):
         float(v)  # OverflowError for an int no double can hold: not a real reading (callers refuse it)
     return v
@@ -601,6 +654,8 @@ def probe_discriminates(bug_value: float, fix_value: float, window: tuple[float,
         return False, "COULD-NOT-CHECK (number: probe readings and window must be numbers a float can hold)"
     if any(isinstance(v, float) and math.isnan(v) for v in (bug_value, fix_value, lo, hi)):
         return False, "NaN reading or window bound"
+    if any(isinstance(v, float) and math.isinf(v) for v in (bug_value, fix_value)):
+        return False, "COULD-NOT-CHECK (number: a probe reading must be finite; only a window bound may be infinite)"
     if lo > hi:
         return False, f"empty window ({lo} > {hi})"
     bug_in, fix_in = lo <= bug_value <= hi, lo <= fix_value <= hi

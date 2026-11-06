@@ -367,6 +367,31 @@ class NarrowedPromiseR4(unittest.TestCase):
             red.write_text(out, encoding="utf-8")
             self.assertEqual(rmv.main(["verdict", "--output", str(red), "--expect", "test_s.py:" + "9" * 4301]), 1)
 
+    def test_pass4_a1_number_spelled_beyond_a_float_is_refused_at_every_probe_position(self) -> None:
+        for bug, fix, lo, hi in (("1e400", "1", "1", "1"), ("0", "1e400", "1", "1"), ("0", "1", "1e400", "1e400"),
+                                 ("0", "1", "1", "1e400"), ("0", "1", "-1e400", "1")):
+            self.assertEqual(rmv.main(["probe", "--bug", bug, "--fix", fix, "--window", lo, hi]), 1, (bug, fix, lo, hi))
+        ok, why = rmv.probe_discriminates(0, float("inf"), (1, 2))
+        self.assertFalse(ok)
+        self.assertIn("COULD-NOT-CHECK", why)
+        # a spelled-out `inf` window bound is a real, unbounded window and still works
+        self.assertEqual(rmv.main(["probe", "--bug", "0", "--fix", "5", "--window", "5", "inf"]), 0)
+
+    def test_pass4_a2_unreadable_failure_header_is_refused_not_dropped(self) -> None:
+        # A test name holding a newline breaks the header the parser reads; its ImportError must not vanish.
+        ut = ("import unittest\nclass T(unittest.TestCase):\n def test_assert(self): self.assertEqual(1, 2)\n"
+              " def f(self): raise ImportError('missing')\nsetattr(T, 'test_import\\nsuffix', T.f)\ndel T.f\n")
+        out = _run_unittest({"test_s.py": ut}, "test_s")
+        self.assertIn("failures=1, errors=1", out)
+        self.cnc(out, "test_s.T.test_assert", "failure blocks")
+        pt = ("def fail(): raise ImportError('missing')\nglobals()['test_import\\nsuffix'] = fail\ndel fail\n"
+              "def test_assert(): assert False\n")
+        self.cnc(_run_pytest({"test_memory.py": pt}), "test_memory.py::test_assert", "sections")
+        self.cnc(_run_pytest({"test_memory.py": pt}, "--tb=no"), "test_memory.py::test_assert", "short test summary")
+        self.cnc(_run_pytest({"test_memory.py": pt}, "-rN"), "test_memory.py:4", "sections")
+        plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"})
+        self.assertEqual(rmv.verdict(plain, "test_memory.py::test_assert")[0], rmv.PASS, plain)
+
     def test_the_narrowed_promise_is_documented(self) -> None:
         for word in ("NARROWED PROMISE", "COULD-NOT-CHECK", "chained", "Captured"):
             self.assertIn(word, rmv.__doc__)
