@@ -552,10 +552,33 @@ class StartCapAdversaryR3Tests(unittest.TestCase):
         self.assertEqual(r["source"], "computed")
         self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2650))
 
-    def test_r3a1_a_long_leg_last_in_the_plan_is_sized_too(self):
+    def test_r3a1_a_long_leg_last_in_the_plan_is_sized_with_the_lease_it_expires_in(self):
+        # pass 2 (adversary, 08f5d613): legs 25,25,2400. The runner starts leg 3 at 510 s into lease 1 (its leg budget is only 235 s by then); 510 + 2610 s does not end inside the
+        # 2700 s lease, so the lease expires under it (LEASE_EXPIRED, uncounted) and the leg is retried first in lease 2, 1800 s of cooldown later (40 + 2610 = 2650 s).
+        # No lease is ever projected longer than its room (r3 first pass projected one 3120 s lease).
         r = call("-LegCount 3 -LegPlaySeconds @(25,25,2400)")
         self.assertEqual(r["source"], "computed")
-        self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=40 + 235 + 235 + 2610))
+        self.assertEqual(r["batches"], 2, r["lines"][0])
+        self.assertEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2700 + 1800 + 40 + 2610), r["lines"][0])
+
+    def test_r3a1_a_leg_that_ends_after_its_lease_in_every_lease_is_unsizable(self):
+        # pass 2 (adversary, 08f5d613): -PlaySeconds 1200 in a 600 s lease needs 40 + 1410 s and fits no lease; r3 pass 1 reported batches=1 spanSec=1450 for it
+        for args in ("-LegCount 1 -PlaySeconds 1200 -CapSec 600", "-LegCount 2 -LegPlaySeconds @(25,1200) -CapSec 600"):
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' {args}")
+            self.assertNotEqual(p.returncode, 0, args)
+            self.assertIn("START_CAP_UNSIZABLE", p.stderr + p.stdout, args)
+        c = cli("-LegCount", "1", "-PlaySeconds", "1200", "-CapSec", "600", "-NowUtc", NOW)
+        self.assertEqual(c.returncode, 3, c.stdout + c.stderr)
+        self.assertIn("START_CAP_UNSIZABLE", c.stdout)
+        self.assertNotIn("StartCapUtc=", c.stdout)
+
+    def test_r3a1_no_projected_lease_outlasts_its_room(self):
+        # the first leg ends at 40 + 2610 = 2650 s, inside 2700 s: one lease. A cap of 2640 s cannot hold it at all.
+        ok = call("-LegCount 1 -PlaySeconds 2400 -CapSec 2700")
+        self.assertEqual(ok["batches"], 1)
+        p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 -PlaySeconds 2400 -CapSec 2640")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("START_CAP_UNSIZABLE", p.stderr + p.stdout)
 
     def test_r3a1_the_cli_prints_the_cap_for_it(self):
         c = cli("-LegCount", "1", "-PlaySeconds", "2400", "-NowUtc", NOW)

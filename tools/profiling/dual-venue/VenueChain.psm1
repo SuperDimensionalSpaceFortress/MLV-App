@@ -1298,15 +1298,22 @@ function Get-VenueRunStartCap {
                 [long]$need = $LeaseMarginSec + $lb + $BatchOpenCloseSec
                 if ($room -lt $need) { throw "a lease holds at most roomSec=$room (capSec=$CapSec, budgetRoomSec=$($w.budgetRoomSec)) and one leg needs $need s (leaseMarginSec=$LeaseMarginSec + legBudgetSec=$lb + openCloseSec=$BatchOpenCloseSec): no leg fits a lease" }
                 # leg k of a lease starts at open + OpenClose + the walls (run + the runner's sleep) of the legs before it, and is admitted while that start is within room - margin - leg budget
-                [long]$lastStartOff = $BatchOpenCloseSec; [long]$off = $BatchOpenCloseSec; $first = $true
+                [long]$lastStartOff = $BatchOpenCloseSec; [long]$off = $BatchOpenCloseSec; $first = $true; $expired = $false
                 while ($next -lt $LegCount -and ($first -or $off -le ($room - $LeaseMarginSec - $lb))) {
+                    # r3 (adversary A1, pass 2): a leg that cannot END inside the lease's room never completes there. As the first leg of a lease it can complete in no lease at all
+                    # (the same room every time), so the plan is unsizable. As a later leg the runner still starts it (the start test only looks at the leg budget it knows so far),
+                    # the lease expires under it (the lease is clamped, the child is bounded to the expiry: LEASE_EXPIRED, uncounted) and the leg is retried first in the next lease.
+                    if (($off + $runs[$next]) -gt $room) {
+                        if ($first) { throw "a lease holds at most roomSec=$room (capSec=$CapSec, budgetRoomSec=$($w.budgetRoomSec)) and the next leg needs $($BatchOpenCloseSec + $runs[$next]) s (openCloseSec=$BatchOpenCloseSec + the leg's run $($runs[$next]) s = playSeconds + overhead $LegOverheadSec): no leg fits a lease" }
+                        $lastStartOff = $off; $expired = $true; break
+                    }
                     $lastStartOff = $off; $off += $runs[$next] + $LegCooldownSec
                     if ($Adaptive) { $lb = [Math]::Min(2700, [Math]::Max($lb, $runs[$next])) }
                     $next++; $first = $false
                 }
                 $lastStart = $w.openUtc.AddSeconds($lastStartOff)
-                # the lease ends after its last leg (the runner's own sleep follows a leg only while work remains, and the lease never outlasts its room)
-                [long]$inLease = $lastStartOff + $runs[$next - 1] + $(if ($next -lt $LegCount) { $LegCooldownSec } else { 0 })
+                # the lease ends after its last leg (the runner's own sleep follows a leg only while work remains, and the lease never outlasts its room); a leg cut by the expiry ends it at its room
+                [long]$inLease = $(if ($expired) { $room } else { $lastStartOff + $runs[$next - 1] + $(if ($next -lt $LegCount) { $LegCooldownSec } else { 0 }) })
                 # the runner's sleep after a leg is not cut short by the lease and it records the close it made after the sleep, so the ledger row (what the cooldown and the budget count)
                 # and the time cursor both run to the end of the whole in-lease time, even past the lease's room
                 $rows.Add([pscustomobject]@{ startUtc = $w.openUtc; endUtc = $w.openUtc.AddSeconds($inLease) })
