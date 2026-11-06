@@ -982,10 +982,11 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.FixtureTests": 211.0})
 
-    def test_the_tools_own_slowest_figure_outranks_a_lower_gap_estimate(self) -> None:
+    def test_the_tools_own_slowest_figure_replaces_the_gap_estimate(self) -> None:
         # adversary r2 A1 sibling: lines a class logs without a result hide its time from the gaps
         # (CandidateAcceptanceTests: 8.8 s here, 62.7 s in its job's SHARD_SLOWEST). The tool's own
-        # per-class figure wins where it is higher; a lower one never lowers the estimate.
+        # per-class figure is exact, so it replaces the gap estimate in both directions (r3: a floor
+        # kept a gap that charged a neighbour's teardown to the class, see the next test).
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
             "2026-10-04T00:00:09.0000000Z test_a (tools.repo_hygiene.test_x.Quiet.test_a) ... ok\n"
@@ -1000,8 +1001,55 @@ class TimingsTests(unittest.TestCase):
         )
         self.assertEqual(
             timings.class_seconds(log),
-            {"tools.repo_hygiene.test_x.Quiet": 9.0, "tools.repo_hygiene.test_x.Loud": 62.7},
+            {"tools.repo_hygiene.test_x.Quiet": 3.0, "tools.repo_hygiene.test_x.Loud": 62.7},
         )
+
+    def test_a_classs_teardown_is_not_charged_to_the_next_docstring_class(self) -> None:
+        # adversary r2 pass 3 A1 on CI-WINDOWS-UNITTEST-SHARD-HEADROOM-2: A = a 1 s test then a 100 s
+        # tearDownClass (silent), B = a 1 s docstring test. The gap estimate gives B the 100 s as its
+        # setUpClass (B = 101.0, A's teardown counted twice); both classes are in the job's own
+        # SHARD_SLOWEST, whose figure is exact: A = 101.0, B = 1.0.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:01:41.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b)\n"
+            "2026-10-04T00:01:42.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:01:42.0000000Z OK\n"
+            "2026-10-04T00:01:42.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=102.0s\n"
+            "2026-10-04T00:01:42.0000000Z  101.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:01:42.0000000Z    1.0s tools.repo_hygiene.test_x.B\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 101.0, "tools.repo_hygiene.test_x.B": 1.0},
+        )
+
+    def test_a_class_outside_the_slowest_block_keeps_its_gap_estimate(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:04.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:09.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+            "2026-10-04T00:00:09.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=9.0s\n"
+            "2026-10-04T00:00:09.0000000Z    5.0s tools.repo_hygiene.test_x.B\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.B": 5.0},
+        )
+
+    def test_a_slowest_row_of_hundreds_of_digits_is_not_a_measurement(self) -> None:
+        # adversary r2 pass 3 A2: float("9" * 400) is inf, which would poison the class's table row.
+        # The runner prints one decimal, so a row is at most 7 integer digits; anything longer is
+        # ignored and the gap estimate stands.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:02.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:02.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=2.0s\n"
+            + "2026-10-04T00:00:02.0000000Z   " + "9" * 400 + "s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 2.0})
+        for value in timings.class_seconds(log).values():
+            self.assertLess(value, float("inf"))
 
     def test_a_docstring_id_line_with_no_earlier_stamped_line_starts_the_clock(self) -> None:
         # adversary r2 pass 2 A1: the id line is the first stamped line (a log cut after the setup

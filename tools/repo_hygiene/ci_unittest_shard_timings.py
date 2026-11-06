@@ -38,7 +38,8 @@ DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
 # The shard tool's own per-class figure, printed after every job's `SHARD_SLOWEST profile=... total=...s`
 # header (its TOP_CLASSES slowest classes, setUpClass included): `  316.2s tools.repo_hygiene.test_x.Cls`.
 SLOWEST_HEAD = re.compile(r"^SHARD_SLOWEST profile=\S+ shard=\S+ total=[0-9]+(?:\.[0-9]+)?s$")
-SLOWEST_ROW = re.compile(r"^\s+([0-9]+(?:\.[0-9]+)?)s ([A-Za-z0-9_.]+)$")
+# The runner prints one decimal; a bounded digit count keeps float() finite (400 digits is inf).
+SLOWEST_ROW = re.compile(r"^\s+([0-9]{1,7}(?:\.[0-9]{1,3})?)s ([A-Za-z0-9_.]+)$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
@@ -97,9 +98,13 @@ def class_seconds(log_text: str) -> dict[str, float]:
         if name and previous is not None and name.startswith(KEY_PREFIX):
             totals[name.rsplit(".", 1)[0]] += max(0.0, now - previous)
         previous = now
-    # The tool's own figure for a class it names outranks the gap estimate where the estimate is lower:
-    # lines a class logs without a result (git warnings) hide its time from the gaps, e.g.
-    # CandidateAcceptanceTests read 8.8 s here against 62.7 s in its own job's SHARD_SLOWEST.
+    # The tool's own figure for a class it names REPLACES the gap estimate, in both directions. The gap
+    # estimate is low where a class logs lines without a result (git warnings; CandidateAcceptanceTests
+    # read 8.8 s here against 62.7 s in its own job's SHARD_SLOWEST) and high where a silent
+    # tearDownClass of the previous class lands in the gap before a docstring test (that gap is charged
+    # to the next class as its setUpClass, so the teardown is counted twice). A class outside the job's
+    # top ten keeps the gap estimate, which can only over-count (by the previous class's teardown) and
+    # stays below the job's 10th-slowest figure.
     in_slowest = False
     for raw in log_text.splitlines():
         stamp = STAMP.match(raw)
@@ -114,7 +119,7 @@ def class_seconds(log_text: str) -> dict[str, float]:
             in_slowest = False
             continue
         if row.group(2).startswith(KEY_PREFIX):
-            totals[row.group(2)] = max(totals.get(row.group(2), 0.0), float(row.group(1)))
+            totals[row.group(2)] = float(row.group(1))
     return dict(totals)
 
 
