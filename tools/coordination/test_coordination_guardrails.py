@@ -1641,9 +1641,10 @@ def test_provider_refusal_treats_empty_output_as_no_refusal(tmp_path):
 def test_invoke_lane_records_a_provider_refusal_as_refused_not_complete():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "lane-provider-refusal.ps1" in body, "Invoke-Lane must dot-source the one classifier"
-    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout" in body, (
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer" in body, (
         "classification must read the harvested stderr and the harvested answer separately, "
-        "never a blended blob (sol PR #80 R1+R2 BLOCKERs)"
+        "never a blended blob (sol PR #80 R1+R2 BLOCKERs); K4 r2: the answer is the SAME selected answer "
+        "the completion evidence uses (codex: last-message file else stdout), not stdout alone"
     )
     assert "-Prompt $Prompt" in body, "the echoed prompt must be excluded from classification (sol PR #80 R1 BLOCKER)"
     assert "providerRefusal = $providerRefusal" in body, "the receipt must carry the refusal verbatim"
@@ -1671,13 +1672,15 @@ CLAUDE_API_ERROR_SUCCESS_SUBTYPE_ENVELOPE = (
 )
 
 
-def _work_evidence(tmp_path, engine, answer, exit_code):
+def _work_evidence(tmp_path, engine, answer, exit_code, prompt_chars=None, require_verdict=False):
     asrc = tmp_path / "lane-answer.txt"
     asrc.write_text(answer, encoding="utf-8")
+    extra = (f" -PromptChars {prompt_chars}" if prompt_chars is not None else "") + (
+        " -RequireVerdict" if require_verdict else "")
     cmd = (
         f". '{REFUSAL_HELPER}'; "
         f"$a = [IO.File]::ReadAllText('{asrc}'); "
-        f"Get-LaneWorkEvidence -Engine '{engine}' -Answer $a -ExitCode {exit_code} | ConvertTo-Json -Compress"
+        f"Get-LaneWorkEvidence -Engine '{engine}' -Answer $a -ExitCode {exit_code}{extra} | ConvertTo-Json -Compress"
     )
     out = subprocess.run(
         ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
@@ -1720,16 +1723,25 @@ def test_work_evidence_requires_every_success_signal(tmp_path):
     # No envelope on the claude engine is absence of evidence, not completion.
     assert _work_evidence(tmp_path, "claude", "", 0)["reason"] == "no-result-envelope"
     assert _work_evidence(tmp_path, "claude", "not json at all", 0)["workCompleted"] is False
-    # codex exposes no envelope: exit 0 is the only observable, and non-zero defeats it.
-    assert _work_evidence(tmp_path, "codex", "answer", 0)["workCompleted"] is True
-    assert _work_evidence(tmp_path, "codex", "answer", 1)["workCompleted"] is False
+    # codex exposes no envelope: exit 0 plus a real-sized answer is the observable, and non-zero defeats it.
+    # (K4 r2: the control answer is a realistic length; a 6-char "answer" is under the codex answer floor.)
+    assert _work_evidence(tmp_path, "codex", REAL_SIZED_CODEX_ANSWER, 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", REAL_SIZED_CODEX_ANSWER, 1)["workCompleted"] is False
+
+
+REAL_SIZED_CODEX_ANSWER = (
+    "APPROVE. I read the diff in full, ran the read-only checks I could, and every invariant in the table holds "
+    "on the literal inputs I traced; the one open point is recorded under self_failure."
+)  # 170 characters, well above the 120-character codex answer floor
 
 
 # KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1: a codex lane that exits 0 and answers nothing is not a
 # finished lane. Kernel K4 needs POSITIVE completion evidence; "the process exited 0" is not it.
-# Sampled 2026-11-06: 1121 real codex receipts with state=complete and exitCode=0 all carried a
-# non-blank .last.txt AND a non-blank .out.txt (shortest 518 trimmed chars), so the floor below
-# (non-blank after trim) rejects 0 of 1121 real answers.
+# Sampled 2026-11-06 (r2, every fleet-runs codex receipt with state=complete, exitCode=0 and a surviving
+# answer file: 2380): with whitespace and Cf characters removed, the 7 answers under 120 chars are all
+# smoke probes with prompts under 200 bytes; every prompt of 400+ bytes answered with >= 231 chars. So the
+# 120-char floor (prompt 400+ chars) rejects 0 real answers; replaying the real helper over the sample
+# rejects exactly 1, a key whose own answer says "verdict":null (a true positive).
 def test_codex_exit_0_with_an_empty_answer_is_not_complete(tmp_path):
     r = _work_evidence(tmp_path, "codex", "", 0)
     assert r["workCompleted"] is False, r
@@ -1744,9 +1756,9 @@ def test_codex_exit_0_with_a_whitespace_only_answer_is_not_complete(tmp_path):
 
 
 def test_codex_exit_0_with_a_real_answer_stays_complete(tmp_path):
-    assert _work_evidence(tmp_path, "codex", "APPROVE\n\nLooks right.\n", 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", REAL_SIZED_CODEX_ANSWER, 0)["workCompleted"] is True
     # Surrounding whitespace never hides a real answer; only an answer that is ALL whitespace is empty.
-    assert _work_evidence(tmp_path, "codex", "\n\n  ok  \n", 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", "\n\n  " + REAL_SIZED_CODEX_ANSWER + "  \n", 0)["workCompleted"] is True
 
 
 def test_codex_nonzero_exit_keeps_its_exit_code_reason_over_the_empty_answer_reason(tmp_path):
@@ -1773,8 +1785,8 @@ def _codex_answer(tmp_path, last, stdout):
 def test_codex_answer_for_evidence_is_the_last_message_file_when_stdout_is_empty(tmp_path):
     # Adversary A1 (b4372775): exit 0, stdout '', the real answer only in the -o last-message file.
     # Judging stdout alone called that real answer empty, i.e. a false 'not completed' on a real answer.
-    ans = _codex_answer(tmp_path, "APPROVE\n\nLooks right.\n", "")
-    assert ans.replace("\r\n", "\n").strip() == "APPROVE\n\nLooks right.", ans  # write_text writes CRLF on Windows
+    ans = _codex_answer(tmp_path, REAL_SIZED_CODEX_ANSWER + "\n", "")
+    assert ans.replace("\r\n", "\n").strip() == REAL_SIZED_CODEX_ANSWER, ans  # write_text writes CRLF on Windows
     assert _work_evidence(tmp_path, "codex", ans, 0)["workCompleted"] is True
 
 
@@ -1791,20 +1803,189 @@ def test_codex_answer_for_evidence_falls_back_to_stdout_and_never_to_stderr(tmp_
 def test_invoke_lane_judges_codex_completion_on_the_harvested_answer_not_on_stdout_alone():
     body = LANE_RUNNER.read_text(encoding="utf-8")
     assert "$codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout" in body
-    assert "-Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout })" in body, (
+    assert "-Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode" in body, (
         "Get-LaneWorkEvidence must be fed the codex last-message answer; stdout alone mislabels a real answer as empty"
     )
-    # The evidence answer is taken BEFORE the stderr narration fallback, never after it.
+    # The evidence answer is taken BEFORE the stderr narration fallback, never after it, and before the refusal call.
     assert body.index("$codexAnswerEvidence = Get-CodexLaneAnswer") < body.index("$final = $stderrText")
+    assert body.index("$codexAnswerEvidence = Get-CodexLaneAnswer") < body.index("$providerRefusal = Get-ProviderRefusal")
 
 
-def test_codex_unrelated_answer_is_a_documented_non_goal(tmp_path):
-    # NON-GOAL, pinned so a later change is deliberate: a non-blank answer that does not address the
-    # prompt cannot be told apart from a real one by shape. Real codex answers carry no common
-    # terminal marker (reviews, recon notes and producer summaries differ), so any stronger shape
-    # rule would reject real answers, which is worse than this bug. That check belongs to the
-    # verdict parser of the consumer (the key watcher), not to the lane runner.
-    assert _work_evidence(tmp_path, "codex", "Sure, here is a poem about spring.", 0)["workCompleted"] is True
+def test_codex_unrelated_nonblank_answers_under_the_floor_are_not_complete(tmp_path):
+    # sol r1 B1 / catalogue K4-01: the ledger (2026-11-01T17:10:49Z) names an "empty, whitespace-only or
+    # unrelated answer". "Is this answer related" is not decidable, so the rule is evidence-bound: a length
+    # floor on the answer with whitespace and Unicode Cf characters removed.
+    for text in ("Sure, here is a poem about spring.", "Still working; please wait.", "{}"):
+        r = _work_evidence(tmp_path, "codex", text, 0)
+        assert r["workCompleted"] is False, (text, r)
+        assert r["reason"] == "codex-answer-too-short", (text, r)
+
+
+def test_codex_answer_of_only_zero_width_characters_is_empty_not_complete(tmp_path):
+    # opus r1 note: .NET IsNullOrWhiteSpace does not treat U+200B (category Cf) as whitespace.
+    for text in ("\u200b", "\u200b\u200b \n\ufeff", "\u2060\u200d"):
+        r = _work_evidence(tmp_path, "codex", text, 0)
+        assert r["workCompleted"] is False, (text, r)
+        assert r["reason"] == "codex-empty-answer", (text, r)
+    # Cf characters pad nothing: a short answer disguised with zero-width padding is still too short.
+    r = _work_evidence(tmp_path, "codex", "\u200b" * 500 + "ok", 0)
+    assert r["workCompleted"] is False and r["reason"] == "codex-answer-too-short", r
+
+
+def test_codex_answer_floor_boundary_and_probe_exemption(tmp_path):
+    at_floor = "x" * 120
+    assert _work_evidence(tmp_path, "codex", at_floor, 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", "x" * 119, 0)["reason"] == "codex-answer-too-short"
+    # whitespace between words never counts toward the floor
+    assert _work_evidence(tmp_path, "codex", " ".join(["x"] * 119), 0)["reason"] == "codex-answer-too-short"
+    # A short probe prompt ("Reply with exactly: OK") legitimately gets a short answer.
+    assert _work_evidence(tmp_path, "codex", "OK", 0, prompt_chars=22)["workCompleted"] is True
+    # ... but a real task prompt does not, and an empty answer is empty for any prompt.
+    assert _work_evidence(tmp_path, "codex", "OK", 0, prompt_chars=19000)["reason"] == "codex-answer-too-short"
+    assert _work_evidence(tmp_path, "codex", "", 0, prompt_chars=22)["reason"] == "codex-empty-answer"
+    # Unknown prompt size (the helper called without it) applies the floor.
+    assert _work_evidence(tmp_path, "codex", "OK", 0)["reason"] == "codex-answer-too-short"
+
+
+KEY_FINAL_JSON = ('{"verdict":"APPROVE","reviewer":"sol","subject_sha":"' + "a" * 40 + '","pr":771,"findings":[]}')
+KEY_ANSWER_BODY = REAL_SIZED_CODEX_ANSWER + "\n\n"
+
+
+def test_codex_key_answer_needs_a_final_json_object_with_a_verdict(tmp_path):
+    ok = KEY_ANSWER_BODY + "```json\n" + KEY_FINAL_JSON + "\n```\n"
+    assert _work_evidence(tmp_path, "codex", ok, 0, require_verdict=True)["workCompleted"] is True
+    # long prose with no final json: a key that gave no verdict
+    r = _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY * 3, 0, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # the FINAL json decides: an earlier provisional block with a verdict does not rescue a final one without
+    prov = "```json\n" + KEY_FINAL_JSON + "\n```\n" + KEY_ANSWER_BODY + "```json\n{\"findings\":[]}\n```\n"
+    r = _work_evidence(tmp_path, "codex", prov, 0, require_verdict=True)
+    assert r["workCompleted"] is False and r["reason"] == "codex-no-verdict", r
+    # an empty verdict string is not a verdict
+    r = _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY + "```json\n{\"verdict\":\"\"}\n```\n", 0, require_verdict=True)
+    assert r["reason"] == "codex-no-verdict", r
+    # unfenced trailing json object also counts
+    assert _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY + KEY_FINAL_JSON + "\n", 0, require_verdict=True)["workCompleted"] is True
+    # without the switch (a non-key lane) no verdict is demanded
+    assert _work_evidence(tmp_path, "codex", KEY_ANSWER_BODY * 3, 0)["workCompleted"] is True
+
+
+def _prompt_demands_verdict(tmp_path, prompt):
+    psrc = tmp_path / "pd-prompt.txt"
+    psrc.write_text(prompt, encoding="utf-8")
+    cmd = f". '{REFUSAL_HELPER}'; $p = [IO.File]::ReadAllText('{psrc}'); [string](Test-PromptDemandsVerdict -Prompt $p)"
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip().splitlines()[-1] == "True"
+
+
+def test_prompt_demanding_a_verdict_json_is_the_key_signal(tmp_path):
+    assert _prompt_demands_verdict(tmp_path, 'Final json:\n{"verdict":"APPROVE|CHANGES_REQUESTED","reviewer":"sol"}')
+    assert _prompt_demands_verdict(tmp_path, '{ "verdict" : "CLEAN|FINDINGS" }')
+    assert not _prompt_demands_verdict(tmp_path, "Reply with exactly: OK")
+    assert not _prompt_demands_verdict(tmp_path, "Summarise the verdict of the committee.")
+
+
+# The Invoke-Lane wiring is EXECUTED, not string-matched: the statements between the K4 sentinels run
+# against fixture variables, so a later reassignment of $codexAnswerEvidence inside them reds.
+def _sentinel_block(body, name):
+    m = re.search(rf"# {name}-BEGIN\r?\n(.*?)# {name}-END", body, re.S)
+    assert m, f"Invoke-Lane.ps1 lost its {name} sentinels"
+    return m.group(1)
+
+
+def _run_invoke_lane_codex_wiring(tmp_path, last, stdout, stderr, prompt, exit_code=0, engine="codex"):
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    block_a, block_b = _sentinel_block(body, "K4-ANSWER"), _sentinel_block(body, "K4-EVIDENCE")
+    lf = tmp_path / "w.last.txt"
+    if last is not None:
+        lf.write_text(last, encoding="utf-8", newline="")
+    elif lf.exists():
+        lf.unlink()  # a previous call in the same tmp_path must not leave an answer behind
+    (tmp_path / "w.stdout.txt").write_text(stdout, encoding="utf-8", newline="")
+    (tmp_path / "w.stderr.txt").write_text(stderr, encoding="utf-8", newline="")
+    (tmp_path / "w.prompt.txt").write_text(prompt, encoding="utf-8", newline="")
+    (tmp_path / "block-a.ps1").write_text(block_a, encoding="utf-8")
+    (tmp_path / "block-b.ps1").write_text(block_b, encoding="utf-8")
+    script = (
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'\n"
+        f". '{REFUSAL_HELPER}'\n"
+        f"$cfg = @{{ engine = '{engine}' }}\n"
+        f"$lastPath = '{lf}'\n"
+        f"$stdout = [IO.File]::ReadAllText('{tmp_path / 'w.stdout.txt'}')\n"
+        f"$stderrText = [IO.File]::ReadAllText('{tmp_path / 'w.stderr.txt'}')\n"
+        f"$Prompt = [IO.File]::ReadAllText('{tmp_path / 'w.prompt.txt'}')\n"
+        f"$exitCode = {exit_code}\n"
+        "$codexAnswerEvidence = ''\n"
+        f". '{tmp_path / 'block-a.ps1'}'\n"
+        f". '{tmp_path / 'block-b.ps1'}'\n"
+        "[pscustomobject]@{ refusal = $providerRefusal; evidence = $workEvidence } | ConvertTo-Json -Compress -Depth 6\n"
+    )
+    (tmp_path / "wiring.ps1").write_text(script, encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(tmp_path / "wiring.ps1")],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr + out.stdout
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_invoke_lane_wiring_valid_file_only_answer_with_recovered_error_narration_is_complete(tmp_path):
+    # sol r1 B2 / catalogue K4-02: the last-message file holds the answer, stdout is empty, stderr narrates
+    # an error the run recovered from. Refusal detection must judge the SAME answer the evidence uses.
+    for narration in ("ERROR: upstream probe returned 429; recovered",
+                      "ERROR: authentication failed on first attempt; recovered",
+                      "ERROR: usage_limit_reached on first attempt; recovered"):
+        w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER, "", narration + "\n", "Review this change")
+        assert w["refusal"] is None, (narration, w)
+        assert w["evidence"]["workCompleted"] is True, (narration, w)
+
+
+def test_invoke_lane_wiring_genuine_refusals_are_still_detected(tmp_path):
+    # no answer anywhere + an ERROR-framed refusal line on stderr
+    w = _run_invoke_lane_codex_wiring(tmp_path, None, "", "ERROR: you've hit your usage limit. try again at Nov 9th\n", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    assert w["evidence"]["workCompleted"] is False, w
+    # the refusal text IS the answer (nothing else was said)
+    w = _run_invoke_lane_codex_wiring(tmp_path, "ERROR: you've hit your usage limit.\n", "", "", "Review this change")
+    assert w["refusal"] is not None and w["refusal"]["kind"] == "provider-usage-limit", w
+    # a real answer that merely QUOTES refusal vocabulary is not a refusal
+    w = _run_invoke_lane_codex_wiring(tmp_path, REAL_SIZED_CODEX_ANSWER + "\nERROR: you've hit your usage limit (quoted)\n", "", "", "Review this change")
+    assert w["refusal"] is None, w
+
+
+def test_invoke_lane_wiring_judges_the_selected_answer_for_completion_floor_and_verdict(tmp_path):
+    key_prompt = 'Review.\nFinal json: {"verdict":"APPROVE|CHANGES_REQUESTED"}\n' + "x" * 600
+    good = KEY_ANSWER_BODY + "```json\n" + KEY_FINAL_JSON + "\n```\n"
+    # answer only in the last-message file
+    w = _run_invoke_lane_codex_wiring(tmp_path, good, "", "", key_prompt)
+    assert w["evidence"]["workCompleted"] is True, w
+    # stdout alone, last-message file blank
+    w = _run_invoke_lane_codex_wiring(tmp_path, " \n", good, "", key_prompt)
+    assert w["evidence"]["workCompleted"] is True, w
+    # a key prompt and a poem: too short; long prose with no verdict: no verdict
+    w = _run_invoke_lane_codex_wiring(tmp_path, "Sure, here is a poem about spring.", "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-answer-too-short", w
+    w = _run_invoke_lane_codex_wiring(tmp_path, KEY_ANSWER_BODY * 3, "", "", key_prompt)
+    assert w["evidence"]["reason"] == "codex-no-verdict", w
+    # the same prose answering a non-key prompt is complete
+    w = _run_invoke_lane_codex_wiring(tmp_path, KEY_ANSWER_BODY * 3, "", "", "Summarise the layout of the repo. " + "x" * 600)
+    assert w["evidence"]["workCompleted"] is True, w
+    # a probe prompt gets a short answer
+    w = _run_invoke_lane_codex_wiring(tmp_path, "OK", "", "", "Reply with exactly: OK")
+    assert w["evidence"]["workCompleted"] is True, w
+    # stderr narration alone is never an answer
+    w = _run_invoke_lane_codex_wiring(tmp_path, None, "", "working... " * 40, "Reply with exactly: OK")
+    assert w["evidence"]["reason"] == "codex-empty-answer", w
+
+
+def test_invoke_lane_assigns_the_codex_answer_evidence_exactly_once():
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assigns = re.findall(r"\$codexAnswerEvidence\s*=\s*(.+)", body)
+    assert sorted(a.strip() for a in assigns) == sorted(["''", "Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout"]), assigns
+    # both consumers read that one variable; the refusal call no longer reads stdout alone for codex
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt" in body
+    assert "$refusalAnswer = if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }" in body
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout" not in body
 
 
 def test_invoke_lane_receipt_separates_process_ended_from_complete():
@@ -1896,7 +2077,7 @@ def test_lane_provider_refusal_classifies_by_engine_not_lane_name():
         "a matching astra arm and silently miss the next new lane too"
     )
     lane_body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout -Engine $cfg.engine -Prompt $Prompt" in lane_body
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt" in lane_body
 
 
 def test_claude_lane_child_effort_applies_the_resolved_table_effort_not_only_an_override():

@@ -3051,7 +3051,17 @@ Write-Utf8NoBom $errPath $stderrText
 # receipt proved that exitCode alone cannot tell "refused in 7 s" from "reviewed and objected".
 # Structurally, never by scanning the transcript (sol PR #80 R1+R2, both BLOCKER): the
 # transcript legitimately CONTAINS the refusal vocabulary even when the run answered.
-$providerRefusal = Get-ProviderRefusal -Text $stderrText -Answer $stdout -Engine $cfg.engine -Prompt $Prompt
+# K4 r2 (sol r1 B2): a codex lane's answer is the -o last-message file, else stdout. Refusal detection judges
+# that SAME answer the completion evidence uses, so a recovered-error line on stderr cannot turn a real
+# file-only answer into a provider refusal. The answer is selected once, here, and never reassigned.
+# K4-ANSWER-BEGIN
+if ($cfg.engine -eq 'codex') {
+    $lastMessage = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
+    $codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout
+}
+$refusalAnswer = if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }
+$providerRefusal = Get-ProviderRefusal -Text $stderrText -Answer $refusalAnswer -Engine $cfg.engine -Prompt $Prompt
+# K4-ANSWER-END
 
 $final = ''
 if ($cfg.engine -eq 'claude') {
@@ -3133,9 +3143,8 @@ if ($cfg.engine -eq 'claude') {
     if (-not $final) { $final = $stdout }
     Write-Utf8NoBom $lastPath $final
 } else {
-    $lastMessage = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
-    # K4: the codex answer for completion evidence is the last-message file, else stdout -- not stderr (the fallback below).
-    $codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout
+    # K4: the codex answer for completion evidence (selected above, before the refusal call) is the last-message
+    # file, else stdout -- not stderr (the fallback below).
     $final = $codexAnswerEvidence
     # LAST-RESORT FALLBACK TO STDERR. codex writes its -o last-message file only on
     # a CLEAN exit and streams its working narration to STDERR, not stdout - so a
@@ -3437,11 +3446,13 @@ if (-not $NoWorktreeSweep) {
 # finished (exit 0 and, for claude, a success envelope). Until 2026-09-14 `complete` meant only the
 # former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
 $processEnded = ($exitCode -ne -999)
+# K4-EVIDENCE-BEGIN
 try {
-    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode
+    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode -PromptChars ([string]$Prompt).Length -RequireVerdict:(Test-PromptDemandsVerdict -Prompt $Prompt)
 } catch {
     $workEvidence = [ordered]@{ workCompleted = $false; reason = "cannot-determine: $($_.Exception.Message)"; subtype = $null; terminalReason = $null; isError = $null }
 }
+# K4-EVIDENCE-END
 # LANE-NO-BACKGROUND-END-TURN-1: a success envelope is not positive evidence of work if the
 # tree never moved. HEAD still equal to the sha this lane started from, with tracked files
 # left dirty BY THIS LANE, is exactly what "I'll resume when the background job completes"

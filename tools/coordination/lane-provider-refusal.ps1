@@ -97,11 +97,64 @@ function Get-CodexLaneAnswer {
     return ''
 }
 
+# KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1 r2 (sol r1 B1). The codex answer must have substance, not only
+# bytes. SAMPLE (2026-11-06, every fleet-runs receipt with engine=codex, state=complete, exitCode=0 whose
+# answer file still exists: 2379 receipts; 90 more were archived with their answers and are excluded):
+# with whitespace and Unicode Cf characters removed, 7 answers are shorter than 120 characters. All 7 are
+# smoke or acceptance probes whose prompt is under 200 bytes ("Reply with exactly: OK", "run git
+# --version"). Every receipt whose prompt is 400 bytes or more (2372) answered with at least 231 such
+# characters. So the floor is 120 for any prompt of 400+ characters (rejects 0 of 2372 real answers) and
+# a prompt under 400 characters is a probe that may answer in one word (rejects 0 of the 7). Below 400 an
+# empty answer is still empty.
+$script:CODEX_ANSWER_FLOOR_CHARS = 120
+$script:CODEX_PROBE_PROMPT_CHARS = 400
+
+# Characters that count toward the floor: whitespace and Unicode category Cf (U+200B zero-width space,
+# U+FEFF, U+2060, ...) are removed first, because .NET IsNullOrWhiteSpace does not treat Cf as blank.
+function Get-LaneAnswerSubstanceLength {
+    param([AllowEmptyString()][AllowNull()][string]$Answer)
+    if ([string]::IsNullOrEmpty($Answer)) { return 0 }
+    return ([regex]::Replace($Answer, '[\s\p{Cf}]', '')).Length
+}
+
+# A prompt that spells out a {"verdict": ...} json object is a review key (or an adversary pass): the
+# prompt text is the one signal Invoke-Lane already holds, and it names the contract the answer owes.
+# Measured on the same sample: all 1031 key prompts and their answers carried the field.
+function Test-PromptDemandsVerdict {
+    param([AllowEmptyString()][AllowNull()][string]$Prompt)
+    if ([string]::IsNullOrEmpty($Prompt)) { return $false }
+    return [regex]::IsMatch($Prompt, '"verdict"\s*:')
+}
+
+# The FINAL json object of an answer: the last fenced block, else the last line-start '{' that parses to
+# the end of the answer. Returns the object, or $null.
+function Get-LaneFinalJsonObject {
+    param([AllowEmptyString()][AllowNull()][string]$Answer)
+    if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
+    $fenced = [regex]::Matches($Answer, '(?s)```[A-Za-z]*\s*(\{.*?\})\s*```')
+    if ($fenced.Count -gt 0) {
+        try { $o = $fenced[$fenced.Count - 1].Groups[1].Value | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+        if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
+        return $null
+    }
+    $starts = [regex]::Matches($Answer, '(?m)^\s*\{')
+    for ($i = $starts.Count - 1; $i -ge 0; $i--) {
+        $tail = $Answer.Substring($starts[$i].Index).Trim()
+        try { $o = $tail | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($o -is [System.Management.Automation.PSCustomObject]) { return $o }
+    }
+    return $null
+}
+
 function Get-LaneWorkEvidence {
     param(
         [string]$Engine = 'unknown',
         [AllowEmptyString()][AllowNull()][string]$Answer = '',
-        [int]$ExitCode = -999
+        [int]$ExitCode = -999,
+        # Characters in the prompt the lane was given; -1 = unknown, which applies the answer floor.
+        [int]$PromptChars = -1,
+        # Set by Invoke-Lane when the prompt demands a {"verdict": ...} final json object.
+        [switch]$RequireVerdict
     )
     $rec = [ordered]@{ workCompleted = $false; reason = $null; subtype = $null; terminalReason = $null; isError = $null }
     if ($Engine -eq 'claude') {
@@ -122,14 +175,27 @@ function Get-LaneWorkEvidence {
         if ($rec.terminalReason -and $rec.terminalReason -ne 'completed') { $rec.reason = "terminal-reason-$($rec.terminalReason)"; return $rec }
     }
     # KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1: codex has no envelope, so its positive evidence is
-    # the answer itself. Exit 0 with an empty or whitespace-only answer is a lane that said nothing,
-    # not a lane that finished (a key that answered nothing must not read as a key that gave no
-    # verdict). The floor is "non-blank after trim" and nothing stronger: 1121 real complete codex
-    # receipts (2026-11-06) all carried a non-blank answer, shortest 518 chars, so this rejects 0 of
-    # them; real answers share no terminal marker, so a stricter shape would reject real ones. An
-    # unrelated but non-blank answer is a documented non-goal (that is the consumer's verdict parse).
+    # the answer itself. Exit 0 with an empty answer is a lane that said nothing, not a lane that
+    # finished (a key that answered nothing must not read as a key that gave no verdict).
+    #   1. substance 0 after whitespace and Cf removal            -> codex-empty-answer
+    #   2. substance under the floor (120), prompt 400+ chars      -> codex-answer-too-short
+    #   3. a verdict-demanding prompt and no final json "verdict"  -> codex-no-verdict
+    # NARROWED PROMISE (r2): "is this answer about the prompt" is not decidable, so a LONG off-topic answer
+    # to a prompt that demands no verdict is still booked complete; telling that apart is the consumer's
+    # parse. The floor and the verdict shape are evidence-bound (sample above), not a relevance judgement.
     # The state this yields is 'ended-incomplete', the same one a claude 'no-result-envelope' gets.
-    if ($Engine -eq 'codex' -and [string]::IsNullOrWhiteSpace($Answer)) { $rec.reason = 'codex-empty-answer'; return $rec }
+    if ($Engine -eq 'codex') {
+        $substance = Get-LaneAnswerSubstanceLength -Answer $Answer
+        if ($substance -eq 0) { $rec.reason = 'codex-empty-answer'; return $rec }
+        if ($substance -lt $script:CODEX_ANSWER_FLOOR_CHARS -and ($PromptChars -lt 0 -or $PromptChars -ge $script:CODEX_PROBE_PROMPT_CHARS)) {
+            $rec.reason = 'codex-answer-too-short'; return $rec
+        }
+        if ($RequireVerdict) {
+            $fin = Get-LaneFinalJsonObject -Answer $Answer
+            $v = if ($null -ne $fin -and @($fin.PSObject.Properties.Name) -contains 'verdict') { [string]$fin.verdict } else { '' }
+            if ([string]::IsNullOrWhiteSpace($v)) { $rec.reason = 'codex-no-verdict'; return $rec }
+        }
+    }
     $rec.workCompleted = $true
     return $rec
 }
@@ -170,7 +236,19 @@ function Get-ProviderRefusal {
         if ($null -eq $kind) { return $null }
         return New-RefusalRecord -Kind $kind -Engine $Engine -Match ("api_error_status=$status " + $msg)
     }
-    if (-not [string]::IsNullOrWhiteSpace($Answer)) { return $null }   # it answered: not refused
+    if (-not [string]::IsNullOrWhiteSpace($Answer)) {
+        # It answered: not refused, and stderr narration (a recovered 429, say) never overturns that.
+        # K4 r2: the one exception is an answer made ONLY of ERROR-framed lines, i.e. the refusal text
+        # itself delivered as the answer. Anything with a non-ERROR line is a real answer.
+        $answerLines = @(($Answer -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $allFramed = ($answerLines.Count -gt 0) -and (@($answerLines | Where-Object { $_ -notmatch '^\s*ERROR\b' }).Count -eq 0)
+        if (-not $allFramed) { return $null }
+        foreach ($line in $answerLines) {
+            $kind = Get-RefusalKind -Line $line
+            if ($null -ne $kind) { return New-RefusalRecord -Kind $kind -Engine $Engine -Match $line }
+        }
+        return $null
+    }
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $scan = $Text
     if (-not [string]::IsNullOrEmpty($Prompt)) {
