@@ -19391,6 +19391,8 @@ int MainWindow::showFileInEditor(int row)
     }
     //Now set it was loaded once
     GET_RECEIPT( row )->setLoaded();
+    // r13 (adversary r13 63319bdb A1): this row's receipt is the one applied next, whatever row a nested FileOpen made active.
+    recordLoadedClipReceipt( m_loadedClipFileName, row );
     //Set sliders to receipt
     setSliders( GET_RECEIPT( row ), false );
 
@@ -24419,9 +24421,11 @@ bool MainWindow::loadedClipIsRow( int row ) const
 
 // Called where an open names the file it loaded: the active row when it holds that file, else the first row that does.
 // Both pointers are only ever compared, so a row removed later leaves nothing to read.
-void MainWindow::recordLoadedClipReceipt( const QString &fileName )
+// r13 (adversary r13 63319bdb A1): an opener that applies a known row's receipt next records again with that row, because a
+// FileOpen delivered in openMlv's event pump can move the active row to another row of the same path.
+void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )
 {
-    const int openedRow = look_label::loadedClipOwnerRow( SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT,
+    const int openedRow = look_label::loadedClipOwnerRow( look_label::openRecordRow( openerRow, SESSION_ACTIVE_CLIP_ROW ), SESSION_CLIP_COUNT,
         [this, &fileName]( int row ) { return fileName == GET_CLIP( row )->getPath() || fileName == GET_RECEIPT( row )->fileName(); } );
     m_loadedClipReceipt = openedRow >= 0 ? GET_RECEIPT( openedRow ) : nullptr;
     m_lookLabelAppliedReceipt = m_loadedClipReceipt;
@@ -25152,7 +25156,12 @@ void MainWindow::exportHandler( void )
         // r4 (adversary ddda72d6 A3): any failed reopen (prep refusal, or a locked / vanished file) leaves the job's
         // clip loaded, so the sliders detach; only a prep refusal is retried.
         if( reopenResult ) m_slidersDetachedFromReceipt = true;
-        else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
+        else
+        {
+            // r13 (adversary r13 63319bdb A1): the receipt applied next is this row's, not the active row's guess.
+            recordLoadedClipReceipt( m_loadedClipFileName, m_lastClipBeforeExport );
+            setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
+        }
         SET_ACTIVE_CLIP_IDX( m_lastClipBeforeExport );
         if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( m_lastClipBeforeExport );
         //Unblock GUI

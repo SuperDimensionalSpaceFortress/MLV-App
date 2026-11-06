@@ -1960,7 +1960,7 @@ private:
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
     bool loadedClipIsRow( int row ) const;
-    void recordLoadedClipReceipt( const QString &fileName );
+    void recordLoadedClipReceipt( const QString &fileName, int openerRow = -1 );
     bool receiptOwnedByLoadedClip( const char *site );
     void retryClipReopenAfterPrepAbort( int row );
     void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );

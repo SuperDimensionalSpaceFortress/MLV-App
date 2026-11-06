@@ -348,7 +348,7 @@ TEST(LookLabelWiring, A1r12bTheExportJobsCloneIsTheKeyUntilTheNextOpenRecordsARo
     const int apply = mw.indexOf(QStringLiteral("setSliders( m_exportQueue.first(), false );"));
     ASSERT_TRUE(key >= 0 && apply > key);
     // Every open puts it back on the recorded row. These two are the only writers.
-    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName )"))
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )"))
                     .contains(QStringLiteral("m_lookLabelAppliedReceipt = m_loadedClipReceipt;")));
     ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
 }
@@ -414,9 +414,55 @@ TEST(LookLabelWiring, A1r13TheExportSiteRecordsTheClonesSwitchWithTheKey)
     const int sw = mw.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = m_exportQueue.first()->lookAssistEnabled();"));
     const int apply = mw.indexOf(QStringLiteral("setSliders( m_exportQueue.first(), false );"));
     ASSERT_TRUE(key >= 0 && sw > key && apply > sw);
-    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName )"))
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )"))
                     .contains(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;")));
     ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
+}
+
+// Adversary r13 (63319bdb) A1. Rows A (Look Assist on, Cinematic) and B (Look Assist off, active) hold one path. showFileInEditor(A)
+// activates A and opens; a FileOpen of that path delivered in openMlv's event pump opens B and makes it active again. The outer
+// open's record guesses the active row (B), then the outer opener applies A and A's analysis lands. No clip is opened here.
+TEST(LookLabelPolicy, A1r13TheOpenerNamesTheRowItAppliesNotTheActiveRowsGuess)
+{
+    int receiptA = 0, receiptB = 0;
+    const void *receipts[] = { &receiptA, &receiptB };
+    const bool switches[] = { true, false };
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&receiptA, cinematic, false);
+    const int rowA = 0, rowB = 1, rows = 2, activeAfterPump = rowB;
+    const auto bothHoldPath = [](int) { return true; };
+    // The record as recordLoadedClipReceipt picks it, then the label as updateLookLabel derives it (attached sliders).
+    const auto label = [&](int openerRow) {
+        const int recorded = look_label::loadedClipOwnerRow(look_label::openRecordRow(openerRow, activeAfterPump), rows, bothHoldPath);
+        const void *applied = receipts[recorded];
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, receipts[recorded], switches[recorded], false);
+        const bool on = look_label::lookOnForOwner(true, lookSwitch,
+                                                   look_label::selectorDescribesOwner(recorded == activeAfterPump, true), false);
+        return look_label::shownText(on, outcome, on ? look_label::outcomeKey(applied, receipts[recorded]) : nullptr, cinematic).toStdString();
+    };
+    // The pairing A1 reported: openMlv's own record (no opener row) guessed B, and the label read "Look: Off" over A's grade.
+    ASSERT_EQ(std::string("Look: Off"), label(-1));
+    // showFileInEditor records again with the row it applies.
+    ASSERT_EQ(std::string("Look: Cinematic"), label(rowA));
+    ASSERT_EQ(rowA, look_label::openRecordRow(rowA, rowB));
+    ASSERT_EQ(rowB, look_label::openRecordRow(-1, rowB));
+}
+
+TEST(LookLabelWiring, A1r13EveryOpenerThatAppliesARowRecordsThatRowFirst)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )"))
+                    .contains(QStringLiteral("look_label::loadedClipOwnerRow( look_label::openRecordRow( openerRow, SESSION_ACTIVE_CLIP_ROW ), SESSION_CLIP_COUNT,")));
+    const QString show = functionBody(mw, QStringLiteral("int MainWindow::showFileInEditor(int row)"));
+    const int rec = show.indexOf(QStringLiteral("recordLoadedClipReceipt( m_loadedClipFileName, row );"));
+    ASSERT_TRUE(rec >= 0 && show.indexOf(QStringLiteral("setSliders( GET_RECEIPT( row ), false );")) > rec);
+    const QString exp = functionBody(mw, QStringLiteral("void MainWindow::exportHandler( void )"));
+    const int recExp = exp.indexOf(QStringLiteral("recordLoadedClipReceipt( m_loadedClipFileName, m_lastClipBeforeExport );"));
+    ASSERT_TRUE(recExp >= 0 && exp.indexOf(QStringLiteral("setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );")) > recExp);
+    // Every setSliders of a row receipt after an open is one of these two, or the rename reopen, which applies the active row.
+    ASSERT_EQ(1, mw.count(QStringLiteral("setSliders( GET_RECEIPT( row ), false );")));
+    ASSERT_EQ(1, mw.count(QStringLiteral("setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );")));
 }
 
 TEST(LookLabelWiring, A1r12EveryOwnershipPredicateHonoursTheRecordedRow)

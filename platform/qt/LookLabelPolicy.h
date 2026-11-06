@@ -99,6 +99,14 @@ inline int loadedClipOwnerRow( int activeRow, int rowCount, IsLoadedRow isLoaded
     return -1;
 }
 
+/*! \brief r13 (adversary r13 63319bdb A1): the row an open's record prefers. An opener that applies a known row's receipt next
+ *  (showFileInEditor, the export's final reopen) names it; openMlv itself names none (-1) and the active row is the guess. The
+ *  active row is not the opener's when a FileOpen delivered in openMlv's event pump opened another row of the same path. */
+inline int openRecordRow( int openerRow, int activeRow )
+{
+    return openerRow >= 0 ? openerRow : activeRow;
+}
+
 /*! \brief Whether the look of the loaded clip is on, read from the receipt that owns it. The selector checkbox describes
  *  the active row, and a click there writes nothing into another row's clip (receiptOwnedByLoadedClip refuses it), so it
  *  counts only when the owner is the active row. */
