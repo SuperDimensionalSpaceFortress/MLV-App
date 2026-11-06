@@ -182,6 +182,42 @@ class CompareLookAssistApply(unittest.TestCase):
             self.assertEqual(report["verdict"], "differs", start)
             self.assertTrue(any("wrote no result" in f for f in report["failures"]), report)
 
+    def test_r3_adversary_a1_an_earlier_surplus_result_does_not_finish_a_later_analysis(self):
+        # r3 pass on 0ad5d324, A1: the started/finished count was global, so a result before the first start made the
+        # counts equal and the final, unfinished analysis read as identical.
+        control = line("00.000", "0x1", "look_assist.apply.result", result()) + "\n" + arm()
+        for start in ("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply"):
+            with self.subTest(start):
+                treatment = control + line("12.000", "0x1", start, "analysis_frame=0") + "\n"
+                report = compare.run(control, treatment, require_walk=True)
+                self.assertEqual(report["verdict"], "differs", report)
+                self.assertTrue(any("wrote no result" in f for f in report["failures"]), report)
+
+    def test_r3_adversary_a1_an_analysis_superseded_before_its_result_fails(self):
+        # Two starts and two results, but the first start never got its own: the second analysis wrote both.
+        log = arm().replace(
+            line("01.000", "0xdcb8", "look_assist.toggle.frame_ready_apply", "baseline_valid=1 analysis_frame=0"),
+            line("00.500", "0xdcb8", "look_assist.setSliders.frame_ready_apply", "analysis_frame=0") + "\n"
+            + line("01.000", "0xdcb8", "look_assist.toggle.frame_ready_apply", "baseline_valid=1 analysis_frame=0"))
+        log += line("12.000", "0xdcb8", "look_assist.apply.result", result()) + "\n"
+        self.assertIn("look_assist.setSliders.frame_ready_apply", log)
+        failures = compare.requirement_failures(compare.parse_log(log), "arm")
+        self.assertTrue(any("wrote no result" in f for f in failures), failures)
+
+    def test_r3_adversary_a1_sibling_a_later_play_before_a_later_analysis_landed_fails(self):
+        # The landing check returned at the first Play, so a Play after a later, unlanded analysis was never judged.
+        later = (line("12.000", "0xdcb8", "play.toggled.begin", "checked=0 position=0") + "\n"
+                 + line("13.000", "0xdcb8", "look_assist.setSliders.frame_ready_apply", "analysis_frame=0") + "\n"
+                 + line("14.000", "0xdcb8", "play.toggled.begin", "checked=1 position=0") + "\n"
+                 + line("15.000", "0xdcb8", "look_assist.apply.result", result()) + "\n")
+        failure = compare.play_after_landing_failure(compare.parse_log(arm() + later), "arm")
+        self.assertIn("comes before the analysis landed", failure or "")
+        landed = (line("12.000", "0xdcb8", "play.toggled.begin", "checked=0 position=0") + "\n"
+                  + line("13.000", "0xdcb8", "look_assist.setSliders.frame_ready_apply", "analysis_frame=0") + "\n"
+                  + line("14.000", "0xdcb8", "look_assist.apply.result", result()) + "\n"
+                  + line("15.000", "0xdcb8", "play.toggled.begin", "checked=1 position=0") + "\n")
+        self.assertIsNone(compare.play_after_landing_failure(compare.parse_log(arm() + landed), "arm"))
+
     def test_adversary_a2_a_toggle_end_before_its_result_does_not_land(self):
         rows = [l for l in arm().splitlines() if "look_assist.apply.result" not in l and "play.toggled.begin" not in l]
         rows.append(line("12.000", "0xdcb8", "play.toggled.begin", "checked=1 position=0"))

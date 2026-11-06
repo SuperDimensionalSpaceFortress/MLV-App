@@ -51,6 +51,7 @@ LOOK_STATE_FIELDS = (
     "look_assist_flavor",
 )
 EXCLUDED_FIELDS = frozenset(("last_serial", "next_serial"))
+ANALYSIS_START_EVENTS = ("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply")
 REQUIRED_RESULT_FIELDS = ("analysis", "scene", "final_temp", "final_tint")
 
 _LINE_RX = re.compile(
@@ -132,10 +133,19 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
         for key in LOOK_STATE_FIELDS:
             if not fields.get(key):
                 failures.append("%s: %s has no %s" % (arm, VISUAL_STATE_EVENT, key))
-    started = sum(1 for _n, _s, event, _f in rows if event in ("look_assist.toggle.frame_ready_apply", "look_assist.setSliders.frame_ready_apply"))
-    finished = sum(1 for _n, _s, event, _f in rows if event == "look_assist.apply.result")
-    if started > finished:
-        failures.append("%s: %d analyses started and %d results: an analysis wrote no result" % (arm, started, finished))
+    # Each start needs its own result, in log order: a result before a start, or one shared with a later start, does not
+    # finish it. A count over the whole log let an earlier surplus result hide a final analysis that never wrote one.
+    open_start = None
+    for number, _s, event, _f in rows:
+        if event in ANALYSIS_START_EVENTS:
+            if open_start is not None:
+                failures.append("%s: the analysis started at line %d wrote no result before the next one started at line %d"
+                                % (arm, open_start, number))
+            open_start = number
+        elif event == "look_assist.apply.result":
+            open_start = None
+    if open_start is not None:
+        failures.append("%s: the analysis started at line %d wrote no result" % (arm, open_start))
     # Every analysis in the log, not only the last: an earlier one that skipped the walk is what the requirement is for.
     for fields in (fields for _n, _s, event, fields in rows if event == "look_assist.apply.result"):
         if require_walk and fields.get("post_walk_ran") != "1":
@@ -146,10 +156,12 @@ def requirement_failures(rows, arm, require_walk=False, require_surface_search=F
 
 
 def play_after_landing_failure(rows, arm):
-    """The first Play in a log must come after the analysis landed, or a played frame showed the baseline look.
+    """Every Play in a log must come after the latest analysis landed, or a played frame showed the baseline look.
 
+    Every Play, not only the first: a later analysis (a clip load, a toggle) that a Play overtakes shows the same defect.
     The toggle route lands at look_assist.toggle.end, not at its result line: the receipt sync and the refresh come after
     that line. The clip-load route has no such line, and its result line is the last thing the analysis writes.
+    Returns the first failing Play, or None.
     """
     landed = False
     toggle_open = False
@@ -169,10 +181,8 @@ def play_after_landing_failure(rows, arm):
             result_seen = True
             if not toggle_open:
                 landed = True
-        if event == "play.toggled.begin" and fields.get("checked") == "1":
-            if not landed:
-                return "%s: first play.toggled at line %d comes before the analysis landed" % (arm, number)
-            return None
+        if event == "play.toggled.begin" and fields.get("checked") == "1" and not landed:
+            return "%s: play.toggled at line %d comes before the analysis landed" % (arm, number)
     return None
 
 
