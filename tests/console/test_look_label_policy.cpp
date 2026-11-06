@@ -353,6 +353,72 @@ TEST(LookLabelWiring, A1r12bTheExportJobsCloneIsTheKeyUntilTheNextOpenRecordsARo
     ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
 }
 
+// Adversary r12 (31016339) A1. A is active; row B's Look Assist switch is off. addClipToExportQueue makes clone Q, which does not
+// copy the switch, so Q's is on (the default) and the export grades Q Cinematic. The final reopen of A fails: B's clip and Q's
+// grade stay loaded, S (B's receipt) owns the clip by row, and Q is the applied key. The label derived as updateLookLabel does.
+TEST(LookLabelPolicy, A1r13AnExportClonesOwnSwitchDecidesNotTheRowsSwitch)
+{
+    int cloneQ = 0, sessionS = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&cloneQ, cinematic, false);
+    const bool rowSwitch = false, cloneSwitch = true;
+    const auto label = [&](const void *applied, bool recordedCloneSwitch) {
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, &sessionS, rowSwitch, recordedCloneSwitch);
+        // A stays active (B is not the active row), so the selector does not count.
+        const bool on = look_label::lookOnForOwner(true, lookSwitch, look_label::selectorDescribesOwner(false, false), false);
+        return look_label::shownText(on, outcome, on ? look_label::outcomeKey(applied, &sessionS) : nullptr, cinematic).toStdString();
+    };
+    // The pairing A1 reported was "Look: Off" over Q's Cinematic grade.
+    ASSERT_EQ(std::string("Look: Cinematic"), label(&cloneQ, cloneSwitch));
+    // A clone whose own switch is off: Off, whatever the row says.
+    ASSERT_EQ(std::string("Look: Off"), label(&cloneQ, false));
+    // The next open records a row: the applied key is the owner again, and the owner's live switch decides.
+    ASSERT_EQ(std::string("Look: Off"), label(&sessionS, cloneSwitch));
+    ASSERT_FALSE(look_label::appliedLookSwitch(&sessionS, &sessionS, false, true));
+    ASSERT_TRUE(look_label::appliedLookSwitch(&sessionS, &sessionS, true, false));
+    // Nothing applied on record (an open that found no row of its file): the owner's switch.
+    ASSERT_FALSE(look_label::appliedLookSwitch(nullptr, &sessionS, false, true));
+    ASSERT_TRUE(look_label::appliedLookSwitch(nullptr, &sessionS, true, false));
+}
+
+// Adversary r12 (31016339) A2. Active A, Look Assist on, is exported; clone Q lands Cinematic. The final reopen of A fails, so the
+// sliders detach and A (the active row) owns the clip by row. The user unticks Look Assist: toggled re-derives the label, and
+// clicked returns at the ownership guard, so the grade is unchanged.
+TEST(LookLabelPolicy, A2r13ADetachedSelectorNeverRelabelsTheGrade)
+{
+    int cloneQ = 0, sessionA = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&cloneQ, cinematic, false);
+    const auto label = [&](bool slidersAttached, bool selectorChecked) {
+        const bool lookSwitch = look_label::appliedLookSwitch(&cloneQ, &sessionA, true, true);
+        const bool on = look_label::lookOnForOwner(true, lookSwitch, look_label::selectorDescribesOwner(true, slidersAttached),
+                                                   selectorChecked);
+        return look_label::shownText(on, outcome, on ? look_label::outcomeKey(&cloneQ, &sessionA) : nullptr, cinematic).toStdString();
+    };
+    // The pairing A2 reported was "Look: Off" over the unchanged Cinematic grade.
+    ASSERT_EQ(std::string("Look: Cinematic"), label(false, false));
+    ASSERT_EQ(std::string("Look: Cinematic"), label(false, true));
+    // Attached, the owner's own click writes the switch, so the box counts as before.
+    ASSERT_FALSE(look_label::selectorDescribesOwner(true, false));
+    ASSERT_TRUE(look_label::selectorDescribesOwner(true, true));
+    ASSERT_FALSE(look_label::selectorDescribesOwner(false, true));
+    ASSERT_EQ(std::string("Look: Off"), label(true, false));
+}
+
+TEST(LookLabelWiring, A1r13TheExportSiteRecordsTheClonesSwitchWithTheKey)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int key = mw.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = m_exportQueue.first();"));
+    const int sw = mw.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = m_exportQueue.first()->lookAssistEnabled();"));
+    const int apply = mw.indexOf(QStringLiteral("setSliders( m_exportQueue.first(), false );"));
+    ASSERT_TRUE(key >= 0 && sw > key && apply > sw);
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName )"))
+                    .contains(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;")));
+    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
+}
+
 TEST(LookLabelWiring, A1r12EveryOwnershipPredicateHonoursTheRecordedRow)
 {
     const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
@@ -418,8 +484,12 @@ TEST(LookLabelWiring, A1UpdateLookLabelDerivesFromTheOwnerNeverTheActiveReceipt)
     ASSERT_TRUE(update.contains(QStringLiteral("loadedClipIsRow( row )")));
     // The whole call, so an inverted argument fails here (tools/.../policy_callsite_mutation_smoke.py).
     ASSERT_TRUE(update.contains(QStringLiteral(
-        "look_label::lookOnForOwner( owner != nullptr, owner && owner->lookAssistEnabled(),\n"
-        "                                                    owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,\n"
+        "look_label::appliedLookSwitch( m_lookLabelAppliedReceipt, owner, owner && owner->lookAssistEnabled(),\n"
+        "                                                           m_lookLabelAppliedCloneLookAssist );")));
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "look_label::lookOnForOwner( owner != nullptr, lookSwitch,\n"
+        "                                                    look_label::selectorDescribesOwner( owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,\n"
+        "                                                                                        !m_slidersDetachedFromReceipt ),\n"
         "                                                    ui->checkBoxLookAssistEnable->isChecked() );")));
     ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ) : nullptr;")));
     ASSERT_TRUE(update.contains(QStringLiteral("look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText")));

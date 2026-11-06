@@ -107,6 +107,25 @@ inline bool lookOnForOwner( bool hasOwner, bool ownerLookAssistEnabled, bool own
     return hasOwner && ownerLookAssistEnabled && ( !ownerIsActiveRow || selectorChecked );
 }
 
+/*! \brief r13 (adversary r12 31016339 A1): the Look Assist switch of the receipt APPLIED to the loaded clip. An export job
+ *  applies a clone of the row's receipt, and the clone does not copy the row's switch (addClipToExportQueue; the export grades
+ *  under the clone's own switch, MainWindow.cpp startExport*), so the row's switch can say Off over the clone's grade. The
+ *  export site records the clone's switch when it makes the clone the key; a finished job's clone may be freed, so it is never
+ *  read later. Any other applied receipt is the owner's, whose live switch decides. */
+inline bool appliedLookSwitch( const void *appliedReceipt, const void *ownerReceipt, bool ownerLookAssistEnabled,
+                               bool recordedCloneLookAssistEnabled )
+{
+    return ( appliedReceipt && appliedReceipt != ownerReceipt ) ? recordedCloneLookAssistEnabled : ownerLookAssistEnabled;
+}
+
+/*! \brief r13 (adversary r12 31016339 A2): whether the selector checkbox describes the owner's look. Only while the sliders
+ *  are attached: detached (a failed reopen left another receipt's clip and grade loaded), a click returns at the ownership
+ *  guard (receiptOwnedByLoadedClip) and changes no grade, so the box must not relabel it. */
+inline bool selectorDescribesOwner( bool ownerIsActiveRow, bool slidersAttached )
+{
+    return ownerIsActiveRow && slidersAttached;
+}
+
 /*! \brief r12b (adversary r12 A1): which receipt the outcome is read under. The switch comes from the row's receipt, but an
  *  analysis lands on the receipt applied to the clip, and an export job applies a clone of the row's receipt. Identity only:
  *  a finished job's clone is gone, so it is never read. Without one (an open that found no row of its file), the owner. */

@@ -917,6 +917,8 @@ private:
     const ReceiptSettings *m_loadedClipReceipt = nullptr;
     // r12b: the key the look outcome is read under: the recorded row's receipt, or the running export job's clone. Compared, never read.
     const void *m_lookLabelAppliedReceipt = nullptr;
+    // r13: the export clone's Look Assist switch, recorded with the clone as the key (look_label::appliedLookSwitch).
+    bool m_lookLabelAppliedCloneLookAssist = false;
     unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
     bool m_exportInProgress = false;
     // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.

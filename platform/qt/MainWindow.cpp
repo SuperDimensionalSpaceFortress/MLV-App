@@ -24425,6 +24425,7 @@ void MainWindow::recordLoadedClipReceipt( const QString &fileName )
         [this, &fileName]( int row ) { return fileName == GET_CLIP( row )->getPath() || fileName == GET_RECEIPT( row )->fileName(); } );
     m_loadedClipReceipt = openedRow >= 0 ? GET_RECEIPT( openedRow ) : nullptr;
     m_lookLabelAppliedReceipt = m_loadedClipReceipt;
+    m_lookLabelAppliedCloneLookAssist = false;   // the owner's live switch decides again
 }
 
 bool MainWindow::receiptOwnedByLoadedClip( const char *site )
@@ -25097,6 +25098,8 @@ void MainWindow::exportHandler( void )
         // r12b (adversary r12 A1): the job grades this clone, not the row's receipt, so its outcome is read under the clone
         // until the next open records a row. A failed final reopen keeps this clip and grade loaded.
         m_lookLabelAppliedReceipt = m_exportQueue.first();
+        // r13 (adversary r12 31016339 A1): with its own switch -- the clone does not copy the row's.
+        m_lookLabelAppliedCloneLookAssist = m_exportQueue.first()->lookAssistEnabled();
         //Set sliders to receipt
         setSliders( m_exportQueue.first(), false );
         //Fill label in StatusDialog
@@ -31709,8 +31712,13 @@ void MainWindow::updateLookLabel( void )
     const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(
         SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, [this]( int row ) { return loadedClipIsRow( row ); } );
     ReceiptSettings *owner = ownerRow >= 0 ? GET_RECEIPT( ownerRow ) : nullptr;
-    const bool lookOn = look_label::lookOnForOwner( owner != nullptr, owner && owner->lookAssistEnabled(),
-                                                    owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
+    // r13 (adversary r12 31016339 A1, A2): the switch is the applied receipt's (an export clone's was recorded with it), and the
+    // selector counts only while the sliders are attached -- detached, a click changes no grade.
+    const bool lookSwitch = look_label::appliedLookSwitch( m_lookLabelAppliedReceipt, owner, owner && owner->lookAssistEnabled(),
+                                                           m_lookLabelAppliedCloneLookAssist );
+    const bool lookOn = look_label::lookOnForOwner( owner != nullptr, lookSwitch,
+                                                    look_label::selectorDescribesOwner( owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
+                                                                                        !m_slidersDetachedFromReceipt ),
                                                     ui->checkBoxLookAssistEnable->isChecked() );
     // The look APPLIED (L-04): a safety fallback restored the baseline, so the label must not name the selected flavor.
     // r10: a receipt setSliders put back to its baseline reads "Look: Baseline" until an analysis LANDS on it; the mark lives
