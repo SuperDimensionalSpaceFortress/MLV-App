@@ -539,6 +539,10 @@ function Stop-PinnedProcess([int]$ProcessId, [scriptblock]$IsOurs, [scriptblock]
     catch { return $false }
     finally { try { $pr.Dispose() } catch { } }
 }
+# r4 pass-6 A1: a process's identity is its start time in UTC ticks. Process.StartTime is LOCAL time, and in the repeated hour of a fall-back two
+# different instants have the same local ticks (a child that started at 01:30 CDT and a stranger that got its pid at 01:30 CST). A method call, so a
+# start time that cannot be read throws to the caller instead of turning into $null.
+function Get-ProcessStartUtcTicks($Process) { return [long]$Process.get_StartTime().ToUniversalTime().Ticks }
 function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates) {
     # The command line is read AFTER the pin, so it describes the pinned process (an exited one is no longer listed and is not killed).
     # r4: NOT a GetNewClosure() block: a closure binds to a dynamic module that sees only global functions, so under `pwsh -Command "& <this>"`
@@ -1959,6 +1963,9 @@ function Exit-HeavySlot {
             @{ n = 'strict-zero-endpoint';     det = 0.0;  rel = 0.5;  end = 0.0;  total = 10; excl = $true; want = 'TOTAL' }   # an end AT the expiry is not "-gt 0"
             @{ n = 'strict-just-inside';       det = 0.1;  rel = 6.0;  end = 9.99; total = 10; excl = $true; want = '' }
             @{ n = 'inclusive-five-endpoint';  det = 0.1;  rel = 0.4;  end = 5.0;  total = 5;  want = '' }        # batch: exactly 5 s passes, as `-le 5` did
+            # r4 pass-6 A2 (verbatim schedule): a NaN or infinite bound fails the total, as the finite 5 s does.
+            @{ n = 'nan-bound-A2';             det = 0.1;  rel = 5.5;  end = 10.0; total = [double]::NaN; want = 'TOTAL' }
+            @{ n = 'infinite-bound-A2';        det = 0.1;  rel = 5.5;  end = 10.0; total = [double]::PositiveInfinity; want = 'TOTAL' }
         )
         $bad = [System.Collections.Generic.List[string]]::new()
         foreach ($r in $rows) {
@@ -2013,7 +2020,8 @@ function Exit-HeavySlot {
         if ($null -eq $relLag -or $relLag -lt 0 -or $relLag -gt ($detectBound + $script:LapseReleaseSpawnSec)) { $f.Add("RELEASE: the pending request is released $(if ($null -eq $relLag) { 'never' } else { "$([Math]::Round($relLag, 2)) s after aliveUntilUtc" }), want 0..$($detectBound + $script:LapseReleaseSpawnSec) s (detection bound + $($script:LapseReleaseSpawnSec) s python start)") }
         if ($null -eq $endAfterRel -or $endAfterRel -lt 0 -or $endAfterRel -gt $script:LapseEndGraceSec) { $f.Add("END: the wait ends $(if ($null -eq $endAfterRel) { 'never (no release call or no typed end line)' } else { "$([Math]::Round($endAfterRel, 2)) s after its release call" }), want 0..$($script:LapseEndGraceSec) s (Stop-QuietLease's own wrapper-exit grace)") }
         $totalLag = if ($null -ne $endUtc) { ($endUtc - $ExpiryUtc).TotalSeconds } else { $null }
-        $totalOut = if ($null -eq $totalLag) { $true } elseif ($TotalExclusive) { $totalLag -le 0 -or $totalLag -ge $TotalBoundSec } else { $totalLag -lt 0 -or $totalLag -gt $TotalBoundSec }
+        # r4 pass-6 A2: a bound that is not a finite positive number (NaN, +Infinity) bounds nothing, so it fails the total instead of passing every end.
+        $totalOut = if ($null -eq $totalLag -or [double]::IsNaN($TotalBoundSec) -or [double]::IsInfinity($TotalBoundSec) -or $TotalBoundSec -le 0) { $true } elseif ($TotalExclusive) { $totalLag -le 0 -or $totalLag -ge $TotalBoundSec } else { $totalLag -lt 0 -or $totalLag -gt $TotalBoundSec }
         $totalWant = if ($TotalExclusive) { "strictly between 0 and $TotalBoundSec s" } else { "0..$TotalBoundSec s" }
         if ($totalOut) { $f.Add("TOTAL: the wait ends $(if ($null -eq $totalLag) { 'never' } else { "$([Math]::Round($totalLag, 3)) s after aliveUntilUtc" }), want $totalWant (this case's end-to-end bound)") }
         return [pscustomobject]@{ failures = @($f.ToArray()); detectLagSec = $detectLag; releaseLagSec = $relLag; endAfterReleaseSec = $endAfterRel; totalLagSec = $totalLag; detectBoundSec = $detectBound }
@@ -2692,7 +2700,9 @@ function Exit-HeavySlot {
                 $script:KillK = [pscustomobject]@{ at = [DateTime]::UtcNow; seq = [int]$sk.seq; waitingLive = ($null -ne $fk -and $fk.state -eq 'pending') }
             }
             $script:LapseFault = Get-LapseFault
-            $flagReaderK = if ($script:LapseFault.kind -ceq 'flag-reader') { Start-FlagReader } else { $null }
+            # r4 pass-6 A3: this case injects only flag-reader and late-observe; a beat control asked of it would silently not land, so it is refused.
+            Assert-True ($script:LapseFault.kind -cin @('none', 'flag-reader', 'late-observe')) "batch-runner-killed-liveness: QL_TEST_LAPSE_FAULT '$($script:LapseFault.kind)' is not implemented by this case (only flag-reader and late-observe; delay-beat and skip-beat are liveness-lapses-while-pending's)"
+            $flagReaderK =if ($script:LapseFault.kind -ceq 'flag-reader') { Start-FlagReader } else { $null }
             try { $admK = Wait-QuietLeaseAdmission -JobId $openK -Job ([pscustomobject]@{}) -Metadata $mK }
             finally { if ($null -ne $flagReaderK) { try { Stop-Process -Id $flagReaderK.Id -Force -ErrorAction SilentlyContinue; $null = $flagReaderK.WaitForExit(5000) } catch { } } }
             Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or ((Test-Path -LiteralPath (Join-Path $fx 'reader-held')) -and @(Get-Calls | Where-Object { $_.cmd -eq 'fs-collision' -and $_.what -eq 'remove' }).Count -ge 1)) "batch-runner-killed-liveness: the flag-reader held the flag open AND the wrapper's delete collided with it (fs-collision remove; a reader that never overlapped the delete proves nothing)"
@@ -3538,7 +3548,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         if ($StartTicks -eq 0) { return $false }
         $pr = Get-Process -Id $ChildId -ErrorAction SilentlyContinue
         if ($null -eq $pr) { return $false }
-        try { return ($pr.StartTime.Ticks -eq $StartTicks) } catch { return $false }
+        try { return ((Get-ProcessStartUtcTicks $pr) -eq $StartTicks) } catch { return $false }
     }
     function Add-PsSeamAll($All, $Current, $Starts) {
         # The CURRENT start time wins over an older entry for the same pid (an owned child that reused a pid after an earlier one exited).
@@ -3552,7 +3562,8 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $ticks = @{}
         foreach ($k in $ids) { $ticks[$k] = $(if ($All.ContainsKey($k)) { [long]$All[$k] } elseif ($Starts.ContainsKey($k)) { [long]$Starts[$k] } else { [long]0 }) }
         # r3 (adversary r3 A1): the start-time check and the kill act on one pinned process (Stop-PinnedProcess), so a pid reused between them is never hit.
-        foreach ($k in $ids) { $t = [long]$ticks[$k]; if ($t -ne 0) { $null = Stop-PinnedProcess $k { param($p) $p.StartTime.Ticks -eq $t }.GetNewClosure() } }
+        # r4: no GetNewClosure (a closure cannot see Get-ProcessStartUtcTicks under pwsh -Command); $t is this loop's value, read while the block runs.
+        foreach ($k in $ids) { $t = [long]$ticks[$k]; if ($t -ne 0) { $null = Stop-PinnedProcess $k { param($p) (Get-ProcessStartUtcTicks $p) -eq $t } } }
         $null = Wait-Until { @($ids | Where-Object { Test-SeamChildAlive $_ $ticks[$_] }).Count -eq 0 } 5
         return @($ids | Where-Object { Test-SeamChildAlive $_ $ticks[$_] })
     }
@@ -3579,13 +3590,13 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             foreach ($n in 1..3) {
                 $spCur.Clear()
                 $kid = Start-SeamKid $n
-                $spObjs.Add($kid); $spKids.Add($kid.Id); $spCur.Add($kid.Id); $spStarts[[int]$kid.Id] = $kid.StartTime.Ticks
+                $spObjs.Add($kid); $spKids.Add($kid.Id); $spCur.Add($kid.Id); $spStarts[[int]$kid.Id] = Get-ProcessStartUtcTicks $kid
                 Add-PsSeamAll $spAll $spCur $spStarts
             }
             # A2 (adversary r2): a registered pid that is now an UNRELATED process (start time differs) must survive the cleanup.
             $spBystander = Start-SeamKid 'bystander' -Outside
             $spObjs.Add($spBystander)
-            $spAll[[int]$spBystander.Id] = [long]($spBystander.StartTime.Ticks + 1)
+            $spAll[[int]$spBystander.Id] = [long]((Get-ProcessStartUtcTicks $spBystander) + 1)
             Assert-True (@($spKids | Where-Object { Test-PidAlive $_ }).Count -eq 3) "lease-seam-pid-cleanup: three subcases left three live children before the final cleanup: alive=$(@($spKids | Where-Object { Test-PidAlive $_ }).Count)"
             $left = @(Stop-PsSeamAll $spAll $spCur $spStarts)
             # judged over the test's OWN children, not over what the registry knows (a child nothing registered is the leak this case exists for)
@@ -3681,6 +3692,29 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             }
             $a2OkStopped = Stop-PinnedProcess 42425 { param($p) $true } -Open $a2OpenOk
             Assert-True (-not $a2Stopped -and $a2OkStopped -and $script:A2Kills -eq 100) "lease-seam-pid-cleanup: a stop whose pin failed (Handle getter threw) refuses and never calls Kill (pass-5 A2): unpinnedStopped=$a2Stopped pinnedStopped=$a2OkStopped kills=$($script:A2Kills) (want 100: only the pinned one)"
+            # r4 pass-6 A1: a child that started in the first pass of a fall-back's repeated hour and a stranger that got its pid one hour later have the
+            # same LOCAL start ticks. Built from this host's own zone (the next ambiguous local time; a zone without DST has none and the row is skipped),
+            # each as Process.StartTime makes it (DateTime.FromFileTime of the UTC instant): the identity must tell them apart. A static guard backs it
+            # on every host: no identity site reads local start ticks.
+            $a1Tz = [TimeZoneInfo]::Local
+            $a1Row = 'skipped: host zone has no daylight saving'
+            if ($a1Tz.SupportsDaylightSavingTime) {
+                $a1U = [DateTime]::SpecifyKind([DateTime]::UtcNow.Date, [DateTimeKind]::Utc); $a1Stop = $a1U.AddDays(800); $a1A = $null
+                while ($a1U -lt $a1Stop -and $null -eq $a1A) { if ($a1Tz.IsAmbiguousTime($a1U) -and $a1Tz.IsAmbiguousTime($a1U.AddHours(1)) -and [DateTime]::FromFileTime($a1U.ToFileTimeUtc()).Ticks -eq [DateTime]::FromFileTime($a1U.AddHours(1).ToFileTimeUtc()).Ticks) { $a1A = $a1U }; $a1U = $a1U.AddMinutes(30) }
+                if ($null -ne $a1A) {
+                    $a1Child = [pscustomobject]@{ Id = 42424 }; $a1Child | Add-Member -MemberType ScriptMethod -Name get_StartTime -Value { [DateTime]::FromFileTime($a1A.ToFileTimeUtc()) }.GetNewClosure()
+                    $a1Stranger = [pscustomobject]@{ Id = 42424 }; $a1Stranger | Add-Member -MemberType ScriptMethod -Name get_StartTime -Value { [DateTime]::FromFileTime($a1A.AddHours(1).ToFileTimeUtc()) }.GetNewClosure()
+                    $a1Recorded = Get-ProcessStartUtcTicks $a1Child
+                    $a1Same = (Get-ProcessStartUtcTicks $a1Stranger) -eq $a1Recorded
+                    $a1Row = "utc=$($a1A.ToString('o')) localTicksEqual=$([DateTime]::FromFileTime($a1A.ToFileTimeUtc()).Ticks -eq [DateTime]::FromFileTime($a1A.AddHours(1).ToFileTimeUtc()).Ticks) identityEqual=$a1Same"
+                    Assert-True (-not $a1Same) "lease-seam-pid-cleanup: a stranger that got the pid an hour later in a fall-back's repeated local hour is not the recorded child (pass-6 A1): $a1Row"
+                }
+                else { $a1Row = 'skipped: no ambiguous local time within 800 days' }
+            }
+            $a1Src = Get-Content -LiteralPath $PSCommandPath -Raw
+            $a1Local = @([regex]::Matches($a1Src, '\.StartTime\.Ticks') | ForEach-Object { $_.Value })
+            Assert-True ($a1Local.Count -eq 0) "lease-seam-pid-cleanup: no process identity reads local start ticks (StartTime then Ticks): $($a1Local.Count) site(s)"
+            $results.leaseSeamFallBackIdentity = $a1Row
             # r4 (sol r3 hardening): the leak line names a stop that threw as NOT stopped, never "stopped now".
             $leakLine = Format-FixtureLeakLine @(4100, 4200) @(4100)
             Assert-True ($leakLine -like '*stopped now=`[4100`]*' -and $leakLine -like '*NOT stopped (stop refused or threw)=`[4200`]*') "lease-seam-pid-cleanup: the leak line separates stopped from not-stopped pids: $leakLine"
@@ -3820,7 +3854,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
                 if ($null -eq $f) { return [DateTime]::Now }
                 $v = $null
                 try { $v = $f.GetFrameVariables()['p'] } catch { }
-                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id); try { $script:PsSeamStart[[int]$v.Value.Id] = $v.Value.StartTime.Ticks } catch { } } } catch { } }
+                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id); try { $script:PsSeamStart[[int]$v.Value.Id] = Get-ProcessStartUtcTicks $v.Value } catch { } } } catch { } }
                 'not-a-date'
             }
             $WarningPreference = 'Stop'
