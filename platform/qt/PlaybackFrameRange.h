@@ -296,6 +296,17 @@ inline DropFrameTickResult advanceDropFrameTick(
     return result;
 }
 
+// HFR-NATIVE-60FPS-FULLRES-1 r21 fix iteration 1 (adversary A1 on 43db3021): the width a NON-drop Loop wrap is credited
+// (PlaybackWrapRecorder::noteEngineWrap). MainWindow::playbackHandling wraps once the playhead is at or past the cut's last frame
+// and moves it from fromFrame back to cutInFrame in ONE granted frame, so the width is the distance moved back plus that frame.
+// From the cut's last frame that is the cut width (cut 0..7: 7 -> 0 is 8, credited 0 + 8 - 7 = 1). When Cut Out was moved below
+// the playhead first it is still one frame (7, Cut Out 8 -> 4, then 7 -> 0: 8), where the current cut width 4 credited
+// 0 + 4 - 7 < 0, nothing. DropFrameTickResult::wrapWidth is the drop-frame engine's equivalent.
+inline int loopWrapWidth( int fromFrame, int cutInFrame )
+{
+    return fromFrame - cutInFrame + 1;
+}
+
 // isContactSheetLoopWrapTransition decides whether a presented-frame transition from
 // lastPresentedFrame to displayFrame (both 0-based) is a genuine Loop wrap (cutOut back to
 // cutIn) rather than an external backward scrub or a stress seek landing on an arbitrary

@@ -98,8 +98,9 @@ struct PresentDriver
     int engineWraps = 0;
     int consumed = 0;
     int presented = 0;
-    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): the width each wrap is credited. -1 = the non-drop Loop wrap (cutOut0 - cutIn0 + 1,
-    // the engine steps cutOut -> cutIn); a Loop + Drop Frame case sets the width its tick subtracted (recordedDropWrapWidth).
+    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): the width each wrap is credited. -1 = the non-drop Loop wrap from the cut's last frame
+    // (cutOut0 - cutIn0 + 1, which is loopWrapWidth(cutOut0, cutIn0)); a Loop + Drop Frame case sets the width its tick
+    // subtracted (recordedDropWrapWidth).
     int wrapWidth = -1;
     void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; }
     // r17 (adversary A1 on 6451a8d9 / eb5af034): MainWindow passes the live count and the count stamped when the
@@ -124,6 +125,17 @@ int recordedDropWrapWidth(const playback_frame_range::DropFrameTickResult &tick,
     (void)cutInValue;
     (void)cutOutValue;
     return tick.wrapWidth;
+}
+
+// r21 fix iteration 1 (adversary A1 on 43db3021): the width MainWindow::playbackHandling records for a non-drop Loop wrap,
+// `noteEngineWrap( playback_frame_range::loopWrapWidth( ui->horizontalSliderPosition->value(), cutInFrame ) )` (pinned by
+// test_playback_source_advance_wiring.cpp): the distance from the playhead back to cut-in plus the one frame the wrap was
+// granted. 43db3021 recorded the current cut width, cutOut - cutIn + 1.
+int recordedLoopWrapWidth(int fromFrame, int cutInFrame, int cutInValue, int cutOutValue)
+{
+    (void)cutInValue;
+    (void)cutOutValue;
+    return playback_frame_range::loopWrapWidth(fromFrame, cutInFrame);
 }
 }
 
@@ -755,7 +767,48 @@ TEST(PlaybackSourceAdvanceTracker, R21KeyMHfrDropWrapWidthALoopIsCreditedTheFram
         ASSERT_NEAR(24.0, t.sourceFps(), 1e-9);
     }
 }
-// R21-GREEN-ONLY-BEGIN (the RED copy drops this test: DropFrameTickResult::wrapWidth does not exist before the fix)
+// r21 fix iteration 1 (adversary A1 on 43db3021): Loop on, Drop Frame off, cut 1..8 (0..7). 7 is presented, Cut Out moves to 4
+// before the next tick, and the engine's wrap (the playhead 7 is past the new last frame 3) steps 7 -> 0 in one granted frame.
+// 43db3021 recorded the current cut width 4: 0 + 4 - 7 = -3, so nothing was credited (source_advanced 0, source_fps 0). The wrap
+// is credited the distance it moved the playhead back plus its one frame, 7 - 0 + 1 = 8: 0 + 8 - 7 = 1.
+TEST(PlaybackSourceAdvanceTracker, R21AdversaryA1ALoopWrapIsOneFrameWhenTheCutShrankUnderThePlayhead)
+{
+    struct Case { int from; int cutInValue; int cutOutValue; int lastPresented; int expected; };
+    const Case cases[] = {
+        {7, 1, 4, 7, 1},          // the adversary's input: Cut Out 8 -> 4 before the wrap
+        {12, 1, 8, 12, 1},        // Cut Out 16 -> 8 with the playhead at 12
+        {7, 1, 8, 7, 1},          // the steady wrap from the cut's last frame (unchanged: width 8)
+        {7, 3, 8, 7, 1},          // cut-in 2: 7 -> 2 is one frame (unchanged: width 6)
+        {719, 1, 720, 700, 20},   // 700 presented, 701..719 not, then the wrap: 19 + 1 (unchanged: width 720)
+    };
+    for (const Case &c : cases)
+    {
+        playback_frame_range::PlaybackWrapRecorder rec;
+        PlaybackSourceAdvanceTracker t;
+        int consumed = rec.engineWraps;
+        t.notePresented(1.0, c.lastPresented, 0, int64_t(0));
+        const int cutInFrame = c.cutInValue - 1;
+        rec.noteEngineWrap(recordedLoopWrapWidth(c.from, cutInFrame, c.cutInValue, c.cutOutValue));
+        const int before = consumed;
+        const int crossed = presentationLoopWraps(rec.engineWraps, rec.engineWraps, consumed, true);
+        t.notePresented(1.0 + 1.0 / 24.0, cutInFrame, crossed, rec.engineWrapsWidth(before, crossed));
+        ASSERT_EQ(1, crossed);
+        ASSERT_EQ(1u, t.wraps());
+        ASSERT_EQ(c.expected, static_cast<int>(t.advancedFrames()));
+        ASSERT_EQ(0, t.maxJump());
+    }
+}
+// R21-GREEN-ONLY-BEGIN (the RED copy drops these tests: DropFrameTickResult::wrapWidth and loopWrapWidth do not exist before the fix)
+
+// r21 fix iteration 1 (adversary A1 on 43db3021): a non-drop Loop wrap's width is the distance back to cut-in plus its frame.
+TEST(PlaybackSourceAdvanceTracker, R21LoopWrapWidthIsTheDistanceBackPlusTheGrantedFrame)
+{
+    ASSERT_EQ(8, playback_frame_range::loopWrapWidth(7, 0));
+    ASSERT_EQ(720, playback_frame_range::loopWrapWidth(719, 0));
+    ASSERT_EQ(6, playback_frame_range::loopWrapWidth(7, 2));
+    ASSERT_EQ(13, playback_frame_range::loopWrapWidth(12, 0));
+    ASSERT_EQ(1, playback_frame_range::loopWrapWidth(4, 4));
+}
 
 // r21 (key3 M-HFR-DROP-WRAP-WIDTH): the tick reports the width it subtracted, so the wrap recorder stores the distance the
 // timeline moved back, never the cut range's frame count; no wrap is no width.

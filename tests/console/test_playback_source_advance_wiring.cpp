@@ -72,17 +72,23 @@ TEST(PlaybackSourceAdvanceWiring, AnEngineWrapIsNotedBeforeTheFrameItLandsOnIsRe
 {
     const QString body = functionBody(readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp")),
                                       QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
-    const int loopWrap = body.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );"));
+    // r21 (adversary A1 on 43db3021): the non-drop Loop wrap records the distance from the playhead back to cut-in plus its frame
+    const int loopWrap = body.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap( playback_frame_range::loopWrapWidth( ui->horizontalSliderPosition->value(), cutInFrame ) );"));
     ASSERT_TRUE(loopWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"), loopWrap) > loopWrap);
-    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): a drop-frame wrap records the width its tick subtracted (cutOut - cutIn); the non-drop
-    // Loop wrap above, which steps cutOut -> cutIn, is the only site that records cutOut - cutIn + 1
+    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): a drop-frame wrap records the width its tick subtracted (cutOut - cutIn)
     const int dropWrap = body.indexOf(QStringLiteral("if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth );"));
     ASSERT_TRUE(dropWrap >= 0);
     ASSERT_TRUE(body.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( m_newPosDropMode );"), dropWrap) > dropWrap);
-    const QString loopWidth = QStringLiteral("noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 )");
-    ASSERT_EQ(body.indexOf(loopWidth), body.lastIndexOf(loopWidth));
     ASSERT_TRUE(body.indexOf(QStringLiteral("+ static_cast<double>( dropFrameTick.wrapWidth );")) > loopWrap);
+    // and no wrap is credited the cut range as it stands (r21: neither engine moves by it once the cut changes under the playhead)
+    const QString note = QStringLiteral("m_playbackWrapRecorder.noteEngineWrap(");
+    const int firstNote = body.indexOf(note);
+    const int secondNote = body.indexOf(note, firstNote + 1);
+    ASSERT_TRUE(firstNote >= 0);
+    ASSERT_TRUE(secondNote > firstNote);
+    ASSERT_EQ(-1, body.indexOf(note, secondNote + 1));
+    ASSERT_FALSE(body.contains(QStringLiteral("noteEngineWrap( ui->spinBoxCutOut->value()")));
     // playbackHandling only moves the target; the request and its stamp come after it, in drawFrame
     ASSERT_EQ(-1, body.indexOf(QStringLiteral("drawFrame(")));
 }

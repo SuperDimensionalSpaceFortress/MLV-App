@@ -27,10 +27,13 @@ public:
      *         frame and this one (cut range [cutInIndex, cutOutIndex]); 0 = not a
      *         wrap (presentationLoopWraps; true / false read as 1 / 0). Each wrap
      *         is credited one cut width (r19, adversary A1 on 924d3d6f), the
-     *         non-drop Loop wrap's cutOut -> cutIn step. A Loop + Drop Frame wrap
-     *         moves back one frame less (DropFrameTickResult::wrapWidth), and
-     *         MainWindow credits each wrap's recorded width through the overload
-     *         below (r21, key3 M-HFR-DROP-WRAP-WIDTH).
+     *         non-drop Loop wrap's step from the cut's last frame to cut-in.
+     *         That is a test convenience only: MainWindow credits each wrap the
+     *         width the engine recorded when it made it, through the overload
+     *         below (r21: a drop-frame wrap moves back one frame less,
+     *         DropFrameTickResult::wrapWidth, and a non-drop wrap from past a
+     *         Cut Out moved under the playhead moves back further,
+     *         playback_frame_range::loopWrapWidth).
      *  \param cutInIndex first frame index of the loop range
      *  \param cutOutIndex last frame index of the loop range */
     void notePresented( double nowSeconds, int frame, int wrapsCrossed,

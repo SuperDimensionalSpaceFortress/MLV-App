@@ -12068,8 +12068,10 @@ void MainWindow::playbackHandling(int timeDiff)
                     ? requestedCutInFrame
                     : clampedCutInFrame;
                 //Loop, goto cut in
-                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred.
-                m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred. r21 (adversary A1 on
+                // 43db3021): credited the distance from the playhead back to cut-in plus its one frame, so a Cut Out moved
+                // below the playhead before the wrap is still one frame, never a negative distance credited as nothing.
+                m_playbackWrapRecorder.noteEngineWrap( playback_frame_range::loopWrapWidth( ui->horizontalSliderPosition->value(), cutInFrame ) );
                 m_sourceAdvance.noteEngineTick( ui->horizontalSliderPosition->value(), cutInFrame, true );
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
