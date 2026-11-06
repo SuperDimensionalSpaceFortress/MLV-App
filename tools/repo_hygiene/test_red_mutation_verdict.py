@@ -387,26 +387,52 @@ class NarrowedPromiseR4(unittest.TestCase):
         pt = ("def fail(): raise ImportError('missing')\nglobals()['test_import\\nsuffix'] = fail\ndel fail\n"
               "def test_assert(): assert False\n")
         # with a summary the unreadable line is named at once; with -rN only the runner's count can give it away
-        self.cnc(_run_pytest({"test_memory.py": pt}), "test_memory.py::test_assert", "exception message")
-        self.cnc(_run_pytest({"test_memory.py": pt}, "--tb=no"), "test_memory.py::test_assert", "exception message")
+        self.cnc(_run_pytest({"test_memory.py": pt}), "test_memory.py::test_assert", "short-summary line")
+        self.cnc(_run_pytest({"test_memory.py": pt}, "--tb=no"), "test_memory.py::test_assert", "short-summary line")
         self.cnc(_run_pytest({"test_memory.py": pt}, "-rN"), "test_memory.py:4", "sections")
         plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"})
         self.assertEqual(rmv.verdict(plain, "test_memory.py::test_assert")[0], rmv.PASS, plain)
 
-    def test_pass7_a1_a2_summary_line_without_a_readable_message_is_refused(self) -> None:
-        base = "def test_assert(): assert False\ndef fail(): raise ImportError('missing')\n"
-        for name in ("test_import\\nPASSED", "test_import\\nSKIPPED", "test_import_' + 'x' * 90 + '"):
-            src = base + f"globals()['{name}'] = fail\ndel fail\n"
-            out = _run_pytest({"test_memory.py": src}, "--tb=no")
-            self.assertIn("2 failed", out)
-            self.cnc(out, "test_memory.py::test_assert", "exception message")
+    def _two_failures(self, name: str) -> str:
+        src = ("def test_assert(): assert False\ndef fail(): raise ImportError('missing')\n"
+               f"globals()['{name}'] = fail\ndel fail\n")
+        out = _run_pytest({"test_memory.py": src}, "--tb=no")
+        self.assertIn("2 failed", out)
+        return out
+
+    def test_pass7_a1_multi_line_test_id_with_a_summary_word_continuation_is_refused(self) -> None:
+        for word in ("PASSED", "SKIPPED", "XFAIL", "XPASS"):
+            self.cnc(self._two_failures(f"test_import\\n{word}"), "test_memory.py::test_assert", "short-summary line")
+
+    def test_pass7_a2_over_long_node_id_without_a_message_is_refused(self) -> None:
+        self.cnc(self._two_failures("test_import_' + 'x' * 90 + '"), "test_memory.py::test_assert", "short-summary line")
 
     def test_pass7_a3_dash_in_a_directory_name_does_not_invent_a_node(self) -> None:
         files = {"test_control.py": "def test_expected(): pass\n",
                  "test_expected - assert False/test_memory.py": "def test_other(): raise TypeError('boom')\n"}
         out = _run_pytest(files)
         self.assertIn("1 failed, 1 passed", out)
-        self.cnc(out, "test_expected", "file::name")
+        self.cnc(out, "test_expected", "short-summary line")
+
+    def test_r5_class_rule_every_short_summary_line_splits_exactly_and_the_count_agrees(self) -> None:
+        """HUB RULING r5: ANY pytest run in which a FAILED/ERROR short-summary line does not split into exactly
+        `<file>::<name> - <message>` (non-empty message), or whose number of such lines differs from the runner's own
+        failed+errored count, is COULD-NOT-CHECK. Hand-built outputs of both kinds, then runs that still pass."""
+        ok = "FAILED test_s.py::T::test_a - AssertionError: 1 != 2\n"
+        top = "=== short test summary info ===\n"
+        for lines, bar in (
+                ("FAILED test_s.py::T::test_a\n", "=== 1 failed in 0.1s ==="),  # no message
+                ("FAILED test_s.py::T::test_a - \n", "=== 1 failed in 0.1s ==="),  # empty message
+                ("FAILED test_s - AssertionError\n", "=== 1 failed in 0.1s ==="),  # no file::name
+                ("FAILED test_s.py::T::test_a - Assertio...\n", "=== 1 failed in 0.1s ==="),  # type cut off
+                (ok + "ERROR test_s.py::T::test_b\n", "=== 1 failed, 1 error in 0.1s ==="),  # error without message
+                (ok, "=== 2 failed in 0.1s ==="),  # fewer lines than the runner counts
+                (ok + ok.replace("test_a", "test_b"), "=== 1 failed in 0.1s ===")):  # more lines than it counts
+            self.cnc(top + lines + bar + "\n", "test_s.py::T::test_a", "short-summary line")
+        green = top + ok + "=== 1 failed in 0.1s ===\n"
+        self.assertEqual(rmv.verdict(green, "test_s.py::T::test_a")[0], rmv.PASS, green)
+        plain = _run_pytest({"test_memory.py": "def test_assert(): assert False\n"}, "--tb=no")
+        self.assertEqual(rmv.verdict(plain, "test_memory.py::test_assert")[0], rmv.PASS, plain)
 
     def test_the_narrowed_promise_is_documented(self) -> None:
         for word in ("NARROWED PROMISE", "COULD-NOT-CHECK", "chained", "Captured"):

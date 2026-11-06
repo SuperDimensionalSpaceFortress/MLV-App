@@ -36,13 +36,17 @@ REFUSED with a reason that starts ``COULD-NOT-CHECK (<typed reason>)``. That is 
   expectation) with an empty segment (``test_s..T.test_a``, a trailing ``.`` or ``::``), or any id that does
   not split into exactly its own segments.
 * ``line number``: a ``file:line`` expectation or a traceback frame whose line number has more than 9 digits.
-* ``failure blocks`` / ``sections`` / ``short test summary``: the runner's own failed-or-errored count
-  (``FAILED (failures=1, errors=1)``, ``2 failed``) disagrees with the failure blocks, sections or summary lines
-  that could be read, or a short-summary line starts with no summary word. A header this parser cannot read (a
-  test name holding a newline) would otherwise drop its failure, an ImportError included.
-* ``file::name`` / ``exception message``: a pytest ``FAILED`` summary node that is not ``file.ext::name`` (a
-  `` - `` inside a directory name), or a ``FAILED`` line with no readable exception message (a multi-line or
-  over-long node id, or a message truncated to ``...`` before its type shows).
+* ``failure blocks`` / ``sections``: the runner's own failed-or-errored count (``FAILED (failures=1, errors=1)``,
+  ``2 failed``) disagrees with the unittest failure blocks or the pytest failure sections that could be read. A
+  header this parser cannot read (a test name holding a newline) would otherwise drop its failure, an ImportError
+  included.
+* ``short-summary line`` (r5 CLASS RULE, hub ruling; replaces the one-by-one repairs of passes 6 and 7): ANY pytest
+  run in which a short-summary ``FAILED``/``ERROR`` line does not split into exactly ``<file.ext>::<name> -
+  <message>`` with a non-empty message (a multi-line or over-long node id, a `` - `` inside a directory name, a
+  message cut to ``...`` before its exception type shows; a module-level ``ERROR <file.ext> - <message>`` is the one
+  allowed shape without ``::name``), or whose number of such lines differs from the runner's own failed+errored
+  count, or that holds a summary line starting with no summary word. A test name can forge many shapes; none of them
+  is parsed, they all fail this one test.
 * ``number``: a probe reading or window bound no float can hold (an integer or ``1e400`` spelled out), or an
   infinite reading. A spelled ``inf`` window bound is a real unbounded window and is accepted.
 * ``internal-error``: any other exception while reading the text. Never an uncaught traceback.
@@ -375,12 +379,28 @@ def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]
 _PT_SUMMARY_WORDS = ("FAILED", "ERROR", "SKIPPED", "XFAIL", "XPASS", "PASSED")
 
 
+def _summary_problem(word: str, node: str, msg: str) -> str:
+    """The CLASS RULE for one short-summary `FAILED`/`ERROR` line (r5 hub ruling): it must split into exactly
+    `<file.ext>::<name> - <message>` with a message that is not empty. "" when it does. Every shape a test name can
+    forge (a multi-line or over-long id, a ' - ' inside a directory name) fails this one test, so no case is repaired
+    one by one. A module-level collection `ERROR <file.ext> - <message>` has no `::name` and is allowed."""
+    file_part, sep, name = node.partition("::")
+    if not re.search(r"\.\w+$", file_part) or (word == "FAILED" and not (sep and name)):
+        return f"{word} {node[:60]!r} is not <file>::<name> (a ' - ' inside a directory name?)"
+    if not msg.strip():
+        return f"{word} {node[:60]!r} has no message after the ' - ' (a multi-line or over-long node id?)"
+    if msg.endswith("...") and not _ASSERT_HEAD.match(msg):
+        return f"{word} {node[:60]!r} has a message cut to '...' before its exception type shows"
+    return ""
+
+
 def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
     """`stats` (optional) receives what the text held that the runner's own count can be checked against:
-    `sections` (failure/error sections), `summary` (FAILED/ERROR summary lines), `stray` (a summary-section line
-    that starts with no known summary word, e.g. the continuation of a multi-line node id)."""
+    `sections` (failure/error sections), `summary` (FAILED/ERROR summary lines), `has_summary` (a short test summary
+    section exists), `bad` (the first line that fails the class rule, see _summary_problem), `stray` (a summary-section
+    line that starts with no known summary word, e.g. the continuation of a multi-line node id)."""
     stats = stats if stats is not None else {}
-    stats.update(sections=0, summary=0, stray=0)
+    stats.update(sections=0, summary=0, stray=0, has_summary=False, bad="")
     out: list[Failure] = []
     nodes: list[tuple[str, str]] = []
     summary_blockers: list[str] = []
@@ -415,6 +435,7 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
             top = m_top["title"].strip()
             continue
         if top.startswith("short test summary"):
+            stats["has_summary"] = True
             if line.strip() and not line.startswith(tuple(w + " " for w in _PT_SUMMARY_WORDS)) \
                     and line.strip() not in _PT_SUMMARY_WORDS:
                 stats["stray"] += 1
@@ -424,18 +445,11 @@ def _parse_pytest(text: str, stats: dict | None = None) -> list[Failure]:
                     continue
                 stats["summary"] += 1
                 node, msg, ambiguous = got
+                stats["bad"] = stats["bad"] or _summary_problem(word, node, msg)
                 if word == "FAILED":
                     nodes.append((node, msg))
                     if _empty_segment(node):
                         odd_notes.append(f"empty segment in the test identity {node[:60]!r}")
-                    elif "::" not in node or not re.search(r"\.\w+$", node.split("::")[0]):
-                        odd_notes.append(f"FAILED summary node {node[:60]!r} is not file::name "
-                                         "(a ' - ' inside a directory name?)")
-                    elif not msg or (msg.endswith("...") and not _ASSERT_HEAD.match(msg)):
-                        # A multi-line or over-long node id leaves no exception message; a truncated one has lost
-                        # the exception type. Either way the type of this failure cannot be read.
-                        odd_notes.append(f"FAILED summary line for {node[:60]!r} carries no readable exception "
-                                         "message (multi-line, over-long or truncated)")
                 if ambiguous:
                     summary_blockers.append(f"ambiguous summary line {word} {node[:60]}")
                 elif _IMPORT_ANYWHERE.search(msg) or _EXC_GROUP.match(msg):
@@ -525,7 +539,15 @@ _UT_RAN = re.compile(r"^Ran \d+ tests? in ", re.M)
 def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
     """The runner states how many tests failed; every one must have been recognized as a block, section or summary
     line. A header this parser could not read (a multi-line test name) would otherwise drop its failure, an import
-    error included, without a trace. "" when the counts agree or the text states none."""
+    error included, without a trace. "" when the counts agree or the text states none.
+
+    The pytest short summary is judged as a CLASS (r5 hub ruling), typed ``short-summary line``: a FAILED/ERROR line
+    that does not split into exactly ``<file>::<name> - <message>`` (see _summary_problem), a line that starts with
+    no summary word, or a number of FAILED/ERROR lines that differs from the runner's own failed+errored count."""
+    if stats["bad"]:
+        return f"short-summary line: {stats['bad']}"
+    if stats["stray"]:
+        return "short-summary line: a line starts with no summary word (a multi-line test id?)"
     last = None
     for m in _RESULT_LINE.finditer(text):
         last = m.group(0).strip()
@@ -537,12 +559,11 @@ def _count_mismatch(text: str, ut_blocks: int, stats: dict) -> str:
             return f"the runner counts {want} failing unittest tests but {ut_blocks} failure blocks were readable"
     elif last.startswith("="):
         want = sum(int(n) for n in re.findall(r"\b(\d+) (?:failed|errors?)\b", last))
-        if want:
-            for what in ("sections", "summary"):
-                if stats[what] and stats[what] != want:
-                    return f"the runner counts {want} failed or errored tests but {stats[what]} {what} were readable"
-    if stats["stray"]:
-        return "a line in the short test summary starts with no summary word (a multi-line test id?)"
+        if want and stats["sections"] and stats["sections"] != want:
+            return f"the runner counts {want} failed or errored tests but {stats['sections']} sections were readable"
+        if want and stats["has_summary"] and stats["summary"] != want:
+            return (f"short-summary line: the runner counts {want} failed or errored tests but "
+                    f"{stats['summary']} FAILED/ERROR lines were readable")
     return ""
 
 
