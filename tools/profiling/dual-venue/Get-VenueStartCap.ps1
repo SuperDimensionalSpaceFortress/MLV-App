@@ -17,6 +17,7 @@ param(
     [int]$PlaySeconds = 25,
     [int]$LegOverheadSec = 210,
     [int]$LegCooldownSec = 0,
+    [int]$MaxPlaySeconds = 0,
     [int]$CapSec = 2700,
     [int]$CooldownSec = 1800,
     [int]$WindowSec = 10800,
@@ -33,7 +34,7 @@ $LegSpec = @($LegSpec | Where-Object { $_ })
 $LegSpec = @($LegSpec | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if ($LegSpec.Count -gt 0) {
     $planSecs = Get-VenuePlanPlaySeconds -SpecPaths $LegSpec
-    $PlaySeconds = $planSecs.playSeconds
+    $PlaySeconds = $planSecs.playSeconds; $MaxPlaySeconds = $planSecs.maxPlaySeconds
     if ($planSecs.line) { Write-Output $planSecs.line }
     $LegCount = $LegSpec.Count
 }
@@ -43,8 +44,9 @@ $args2 = @{ NowUtc = $now; LegCount = $LegCount; PlaySeconds = $PlaySeconds; Leg
 if ($HardEndUtc) { $args2.HardBoundUtc = $HardEndUtc }
 if ($ExplicitCapUtc) { $args2.ExplicitCapUtc = $ExplicitCapUtc }
 if ($LegCooldownSec -gt 0) { $args2.LegCooldownSec = $LegCooldownSec }
+if ($MaxPlaySeconds -gt 0) { $args2.MaxPlaySeconds = $MaxPlaySeconds }
 # START_CAP_UNSIZABLE (a lease that holds no leg, a value outside the DateTime range) is a typed refusal, exit 3, never a made-up cap
 try { $r = Get-VenueRunStartCap @args2 } catch { Write-Output ("$($_.Exception.Message)" -replace '\s+', ' '); exit 3 }
 $r.lines | ForEach-Object { Write-Output $_ }
-Write-Output ("StartCapUtc=" + $r.capUtc.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+Write-Output ("StartCapUtc=" + $r.capText)
 exit 0

@@ -284,6 +284,55 @@ class StartCapAdversaryTests(unittest.TestCase):
         self.assertIn("projectedPastBound=0", r["lines"][1])
 
 
+@requires_windows_pwsh
+class StartCapAdversaryPass2Tests(unittest.TestCase):
+    """The adversary pass on 59aaa91b (A1-A5): each finding's input."""
+
+    def test_p2a1_a_sleep_longer_than_the_lease_is_not_cut_short_by_the_lease(self):
+        # the runner sleeps the full -CooldownSec after a leg whatever the lease has left: with 3600 s sleeps the twelfth leg starts at 22:06:21Z at the earliest
+        r = call(f"-LegCount 12 -LegCooldownSec 3600 {LIVE_CAPS}")
+        self.assertGreaterEqual(parse(r["capUtc"]), parse("2026-10-30T22:06:21Z"), r["lines"][0])
+        self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse("2026-10-30T22:06:21Z"))
+
+    def test_p2a2_the_leg_budget_follows_the_longest_planned_leg(self):
+        # the runner's leg budget grows to the longest leg seen: one 2000 s leg among 99 of 25 s makes every later lease need 2210 s of room to start a leg
+        r = call(f"-LegCount 100 -PlaySeconds 45 -MaxPlaySeconds 2000 {LIVE_CAPS}")
+        self.assertGreaterEqual(r["batches"], 50)
+        self.assertGreaterEqual(parse(r["capUtc"]), parse("2026-10-30T21:04:56Z"), "the arithmetic replay's last start is the cap's floor")
+        with tempfile.TemporaryDirectory() as d:
+            long_spec = json.loads(LEG_SPEC.read_text(encoding="utf-8")); long_spec["playSeconds"] = 2000
+            short_spec = json.loads(LEG_SPEC.read_text(encoding="utf-8")); short_spec["playSeconds"] = 25
+            a = Path(d) / "long.json"; a.write_text(json.dumps(long_spec), encoding="utf-8")
+            b = Path(d) / "short.json"; b.write_text(json.dumps(short_spec), encoding="utf-8")
+            specs = ",".join([str(a)] + [str(b)] * 99)
+            c = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegSpec", specs, "-NowUtc", NOW, "-CooldownSec", "300", "-BudgetSec", "9720"],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            cap = [ln for ln in c.stdout.splitlines() if ln.startswith("StartCapUtc=")][0].split("=", 1)[1]
+            self.assertGreaterEqual(parse(cap), parse("2026-10-30T21:04:56Z"))
+
+    def test_p2a3_play_seconds_strings_read_as_the_runner_casts_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            for text in ("0x4b0", "1,200", "1200"):
+                spec = json.loads(LEG_SPEC.read_text(encoding="utf-8")); spec["playSeconds"] = text
+                s = Path(d) / "s.json"; s.write_text(json.dumps(spec), encoding="utf-8")
+                p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Write-Output (Get-VenueLegPlaySeconds -SpecPath '{s}')")
+                self.assertEqual(p.stdout.strip(), "1200", f"{text!r}: {p.stderr}")
+
+    def test_p2a4_an_explicit_cap_keeps_its_sub_second_digits(self):
+        c = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(CLI), "-LegCount", "1", "-NowUtc", NOW, "-ExplicitCapUtc", "2026-10-30T10:00:00.900Z"],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+        self.assertEqual(c.stdout.strip().splitlines()[-1], "StartCapUtc=2026-10-30T10:00:00.9Z")
+        self.assertIn("capUtc=2026-10-30T10:00:00.9Z", c.stdout.splitlines()[0])
+
+    def test_p2a5_an_array_root_spec_is_not_a_leg_spec(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = Path(d) / "array.json"; s.write_text(json.dumps([{"playSeconds": 120}]), encoding="utf-8")
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Write-Output ([string]::IsNullOrEmpty([string](Get-VenueLegPlaySeconds -SpecPath '{s}')))")
+            self.assertEqual(p.stdout.strip(), "True", p.stderr)
+
+
 class LeaseBatchWiringTests(unittest.TestCase):
     """Source pins on the tracked runner: the default deadline is sized from the plan, an explicit one is kept."""
 

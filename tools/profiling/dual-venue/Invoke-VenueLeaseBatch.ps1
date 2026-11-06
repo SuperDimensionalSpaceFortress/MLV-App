@@ -1604,13 +1604,13 @@ function Write-RunSummary {
 # BENCH-START-CAP-FROM-LEG-COUNT-1: with no -DeadlineUtc the run's deadline is sized from the planned leg count and the legs' own seconds (Get-VenueRunStartCap, which replays the lease
 # cap, cooldown and budget this run just resolved), never shorter than the legacy fixed 6 h window; a caller's -DeadlineUtc is kept as given. One START_CAP line records the inputs.
 if ($DeadlineUtc) {
-    L "START_CAP source=explicit capUtc=$($deadline.ToString('yyyy-MM-dd''T''HH:mm:ss''Z''')) legs=$($plan.Count) (the caller's -DeadlineUtc is kept)"
+    L "START_CAP source=explicit capUtc=$($deadline.ToString('o')) legs=$($plan.Count) (the caller's -DeadlineUtc is kept)"
 } else {
     # a sizing failure (a lease that holds no leg, a value outside the DateTime range) never stops the run: it is said on a typed line and the legacy 6 h window stands
     try {
         $capPlan = Get-VenuePlanPlaySeconds -SpecPaths @($plan | ForEach-Object { [string]$_.spec })
         if ($capPlan.line) { L $capPlan.line }
-        $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlan.playSeconds -LegCooldownSec $CooldownSec -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
+        $startCap = Get-VenueRunStartCap -NowUtc $t0 -LegCount ([Math]::Max(1, $plan.Count)) -PlaySeconds $capPlan.playSeconds -MaxPlaySeconds $capPlan.maxPlaySeconds -LegCooldownSec $CooldownSec -Leases @($leases) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec -LegBudgetSec $LegBudgetSec -LeaseMarginSec $LeaseMarginSec
         foreach ($capLine in $startCap.lines) { L $capLine }
         if ($startCap.capUtc -gt $deadline) { $deadline = $startCap.capUtc; L "START_CAP_DEADLINE deadline=$($deadline.ToString('o')) (sized from $($plan.Count) planned legs; the legacy 6 h window would have ended earlier)" }
     } catch { L "START_CAP source=legacy legs=$($plan.Count) deadline=$($deadline.ToString('o')) reason=$("$($_.Exception.Message)" -replace '\s+', ' ')" }
