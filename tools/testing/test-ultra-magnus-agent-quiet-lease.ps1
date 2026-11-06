@@ -409,8 +409,15 @@ function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $Pro
 # AGENT-LEASE-QUIET-LEASE-SEAM-PID-CLEANUP-1 (adversary r2 pass 2 A1): a fixture child is identified by its CURRENT command line (it names the fixture dir),
 # queried fresh at the moment of the stop, never by a pid remembered from an earlier snapshot (the OS may have given that pid to an unrelated process).
 # r3 (adversary r3 A2): the fixture dir must be a WHOLE path component of the command line. A sibling dir whose name only starts with it
-# (...-abcd1234-other\log.txt) is not this fixture, so the next character must end the component (a separator, a quote, a space, or the end).
-function Test-NamesFixture([string]$CommandLine, [string]$Fx) { return (-not [string]::IsNullOrEmpty($CommandLine) -and [regex]::IsMatch($CommandLine, [regex]::Escape($Fx) + '(?=[\\/"'' ]|$)')) }
+# (...-abcd1234-other\log.txt) is not this fixture, so the next character must end the component.
+# r3 pass-4 A1: a space or an apostrophe ends nothing INSIDE a quoted argument ("<fixture> other\log.txt" is another dir). So the path must start an
+# argument: inside double quotes it continues only with a separator or the closing quote; unquoted (an argument with no space) with a separator,
+# whitespace or the end of the line. An apostrophe is never an end.
+function Test-NamesFixture([string]$CommandLine, [string]$Fx) {
+    if ([string]::IsNullOrEmpty($CommandLine)) { return $false }
+    $e = [regex]::Escape($Fx)
+    return [regex]::IsMatch($CommandLine, '"' + $e + '(?=[\\/]|")|(?:^|(?<=[\s=]))' + $e + '(?=[\\/]|\s|$)')
+}
 function Get-FixtureChildPids([string]$Fx) { return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $PID -and (Test-NamesFixture $_.CommandLine $Fx) } | ForEach-Object { [int]$_.ProcessId }) }
 # r3 (adversary r3 A1): an identity check and the kill must act on ONE pinned process. The process is opened by pid and its handle held first
 # (Windows never gives a pid to a new process while a handle to the old one is open), the identity check runs against that pinned process, and
@@ -3437,11 +3444,11 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $spKids = [System.Collections.Generic.List[int]]::new()
         $spBystander = $null
         $spObjs = [System.Collections.Generic.List[object]]::new()   # r3 A1: every child this case starts, as the Process object Start returned
-        function Start-SeamKid([string]$Tag, [switch]$Outside, [switch]$Sibling) {
+        function Start-SeamKid([string]$Tag, [switch]$Outside, [switch]$Sibling, [string]$SiblingSuffix = '-other') {
             # Outside: a command line that does NOT name the fixture dir (an unrelated process that now holds a pid the suite once knew).
             # Sibling: a command line naming "<fixture>-other\...", a different dir whose name only starts with the fixture path (r3 A2).
             $psiS = [Diagnostics.ProcessStartInfo]::new($Python)
-            $tagPath = if ($Outside) { Join-Path ([IO.Path]::GetTempPath()) "seam-unrelated-$PID-$Tag" } elseif ($Sibling) { Join-Path "$fx-other" 'log.txt' } else { Join-Path $fx "seam-child-$Tag" }
+            $tagPath = if ($Outside) { Join-Path ([IO.Path]::GetTempPath()) "seam-unrelated-$PID-$Tag" } elseif ($Sibling) { Join-Path "$fx$SiblingSuffix" 'log.txt' } else { Join-Path $fx "seam-child-$Tag" }
             foreach ($a in @('-c', 'import time; time.sleep(300)', $tagPath)) { [void]$psiS.ArgumentList.Add($a) }
             $psiS.UseShellExecute = $false; $psiS.CreateNoWindow = $true
             return [Diagnostics.Process]::Start($psiS)
@@ -3471,12 +3478,17 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             Assert-True ((Test-PidAlive $spBystander.Id) -and $stopped -notcontains $spBystander.Id) "lease-seam-pid-cleanup: the sweep does not stop a pid whose command line no longer names the fixture: bystander alive=$(Test-PidAlive $spBystander.Id) stopped=[$($stopped -join ',')]"
             Assert-True ((Wait-Until { -not (Test-PidAlive $spFixKid.Id) } 5) -and $stopped -contains $spFixKid.Id) "lease-seam-pid-cleanup: the sweep stops a real fixture child: stopped=[$($stopped -join ',')]"
             # r3 A2 (adversary r3): a process whose command line names a SIBLING dir that only starts with the fixture path is not the fixture's.
-            $spSibling = Start-SeamKid 'sibling' -Sibling
-            $spObjs.Add($spSibling)
-            $null = Wait-Until { $spSibling.HasExited -or (Test-PidAlive $spSibling.Id) } 2
-            $sibListed = @(Get-FixtureChildPids $fx) -contains $spSibling.Id
-            $sibStopped = @(Stop-FixtureLeftovers $fx @($spSibling.Id))
-            Assert-True ((-not $sibListed) -and $sibStopped.Count -eq 0 -and -not $spSibling.HasExited) "lease-seam-pid-cleanup: a sibling dir ($fx-other) is not the fixture: listed=$sibListed stopped=[$($sibStopped -join ',')] alive=$(-not $spSibling.HasExited)"
+            # pass-4 A1: the same for a sibling whose name continues with a space (a quoted argument) or an apostrophe.
+            $sibNotes = [System.Collections.Generic.List[string]]::new()
+            foreach ($suffix in @('-other', ' other', "'other")) {
+                $spSibling = Start-SeamKid 'sibling' -Sibling -SiblingSuffix $suffix
+                $spObjs.Add($spSibling)
+                $null = Wait-Until { $spSibling.HasExited -or (Test-PidAlive $spSibling.Id) } 2
+                $sibListed = @(Get-FixtureChildPids $fx) -contains $spSibling.Id
+                $sibStopped = @(Stop-FixtureLeftovers $fx @($spSibling.Id))
+                if ($sibListed -or $sibStopped.Count -ne 0 -or $spSibling.HasExited) { $sibNotes.Add("[$suffix] listed=$sibListed stopped=[$($sibStopped -join ',')] alive=$(-not $spSibling.HasExited)") }
+            }
+            Assert-True ($sibNotes.Count -eq 0) "lease-seam-pid-cleanup: a sibling dir (<fixture>-other, '<fixture> other', <fixture>'other) is not the fixture: $($sibNotes -join ' ; ')"
             # r3 A1 (adversary r3): the case's own children are stopped through their Process objects, never by a remembered number. Input: child K
             # was stopped and ended, then unrelated U was given K's number before the case's cleanup ran. The record of K the cleanup holds is
             # modelled as a Process whose child has exited and whose number is now U's: a stop by number kills U, a stop by the object does not.
@@ -3486,7 +3498,7 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $kRecord | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw 'Kill on an exited child' }
             Stop-OwnedChildren @($kRecord)
             Assert-True ((Wait-Until { $spU.HasExited } 1) -eq $false) "lease-seam-pid-cleanup: the cleanup of an ended child whose number was reused by an unrelated process leaves that process alive: U $($spU.Id) alive=$(-not $spU.HasExited)"
-            $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count; bystanderSurvived = (Test-PidAlive $spBystander.Id); siblingSpared = -not $spSibling.HasExited; reusedPidSpared = -not $spU.HasExited }
+            $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count; bystanderSurvived = (Test-PidAlive $spBystander.Id); siblingSpared = ($sibNotes.Count -eq 0); reusedPidSpared = -not $spU.HasExited }
         }
         finally {
             # r3 A1: through the objects Start handed back (each holds its child's handle), never by pid number.
