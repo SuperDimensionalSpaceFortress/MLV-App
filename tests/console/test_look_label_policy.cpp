@@ -421,6 +421,175 @@ TEST(LookLabelWiring, A1r14EveryAsyncLandingMovesTheLabelKeyToItsReceipt)
     ASSERT_EQ(3, apply.count(QStringLiteral("labelFollowsLanding();")));
 }
 
+namespace
+{
+// r15 (sol r14 B1, catalogue L-08): the async Look Assist sequence of MainWindow.cpp, reduced to its state. dispatch is
+// applyLookAssistToReceipt's async branch (generation bump, target recorded, outcome pending); disable is one of the three
+// disable paths (the switch, a disabled paste through replaceReceipt, a reset to a disabled default), each followed by
+// invalidateLookAssistAsyncOnDisable when `invalidating`; deliver is the queued lambda (generation check, r14 identity guard,
+// the delivery check, then the preset write and the landing). The wiring test below pins MainWindow to this order.
+struct L08Receipt { bool on = true; int exposure = 0; };
+enum class L08Disable { Toggle, DisabledPaste, DisabledDefaultReset };
+
+struct L08Async
+{
+    int generation = 0;
+    const void *target = nullptr;
+    int presetWrites = 0;
+    lookassist::LookAssistFlavorOutcome outcome;
+
+    int dispatch(const L08Receipt *receipt)
+    {
+        outcome.begin();
+        target = receipt;
+        return ++generation;
+    }
+    void disable(L08Receipt *receipt, L08Disable how, bool invalidating)
+    {
+        receipt->on = false;
+        receipt->exposure = 0;                       // every disable path puts the baseline back
+        if( how == L08Disable::Toggle ) outcome.clear();   // the switch also forgets the outcome; paste and reset do not
+        if( invalidating && look_label::disableInvalidatesAsync(receipt, receipt->on, target) )
+        {
+            ++generation;
+            target = nullptr;
+        }
+    }
+    void deliver(int dispatchGeneration, L08Receipt *analysed, L08Receipt *active, int presetExposure, const QString &flavor)
+    {
+        if( generation != dispatchGeneration ) return;                       // stale generation
+        if( analysed != active ) return;                                       // r14: grades only what it analysed
+        if( !look_label::asyncResultLands(analysed, active, active->on) ) return;   // r15: Look Assist off at delivery
+        active->exposure = presetExposure;
+        ++presetWrites;
+        outcome.landed(active, flavor, false);
+    }
+    std::string label(const L08Receipt *owner) const
+    {
+        return look_label::shownText(owner->on, outcome, owner, QString()).toStdString();
+    }
+};
+} // namespace
+
+// Sol r14 B1, catalogue L-08: async analysis on A -> Look Assist turned off on A before the callback -> the callback arrives.
+// MLVAPP_LOOK_ASSIST_ASYNC=1. RED on abf182a4 (no delivery check, no invalidation): the result passed the generation, ownership
+// and identity guards, wrote its preset and landed, and the label re-derived "Look: Off" over the grade.
+TEST(LookLabelPolicy, L08AnAsyncResultDeliveredAfterLookAssistWasTurnedOffNeverGrades)
+{
+    const int kPreset = 37;   // any non-baseline exposure
+    const L08Disable paths[] = { L08Disable::Toggle, L08Disable::DisabledPaste, L08Disable::DisabledDefaultReset };
+    for( const char *flavor : { "cinematic", "film", "vision50d" } )
+    {
+        for( const L08Disable how : paths )
+        {
+            // invalidating=false is a path that turns it off without the invalidation (an automation receipt, setReceipt from
+            // the checkbox): the delivery check alone must hold. invalidating=true is the three named disable paths.
+            for( const bool invalidating : { false, true } )
+            {
+                L08Async async;
+                L08Receipt a;
+                const int generation = async.dispatch(&a);
+                async.disable(&a, how, invalidating);
+                if( invalidating ) ASSERT_TRUE(async.generation != generation);   // the in-flight analysis is invalidated
+                async.deliver(generation, &a, &a, kPreset, QString::fromLatin1(flavor));
+                printf("[L08] flavor=%s path=%d invalidating=%d writes=%d exposure=%d label=\"%s\"\n", flavor,
+                       static_cast<int>(how), invalidating ? 1 : 0, async.presetWrites, a.exposure, async.label(&a).c_str());
+                ASSERT_EQ(0, async.presetWrites);
+                ASSERT_EQ(0, a.exposure);                                  // the baseline stays on screen
+                ASSERT_EQ(std::string("Look: Off"), async.label(&a));
+                // Turned back on later, nothing stale has landed: the label reads the baseline until a new analysis lands.
+                a.on = true;
+                ASSERT_EQ(std::string("Look: Baseline"), async.label(&a));
+            }
+        }
+    }
+}
+
+// The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
+// or Copy writing the clipboard receipt) neither invalidates nor drops the active row's own analysis.
+TEST(LookLabelPolicy, L08AResultForAReceiptStillOnLandsAndADisableElsewhereLeavesItAlone)
+{
+    const QString cinematic = QStringLiteral("cinematic");
+    {
+        L08Async async;
+        L08Receipt a;
+        const int generation = async.dispatch(&a);
+        async.deliver(generation, &a, &a, 37, cinematic);
+        ASSERT_EQ(1, async.presetWrites);
+        ASSERT_EQ(std::string("Look: Cinematic"), async.label(&a));
+    }
+    {
+        L08Async async;
+        L08Receipt a, b;
+        const int generation = async.dispatch(&a);
+        async.disable(&b, L08Disable::DisabledPaste, true);
+        ASSERT_EQ(generation, async.generation);
+        async.deliver(generation, &a, &a, 37, cinematic);
+        ASSERT_EQ(1, async.presetWrites);
+        ASSERT_EQ(37, a.exposure);
+        ASSERT_EQ(std::string("Look: Cinematic"), async.label(&a));
+    }
+    // The pure rules, literally.
+    int a = 0, q = 0;
+    ASSERT_TRUE(look_label::asyncResultLands(&a, &a, true));
+    ASSERT_FALSE(look_label::asyncResultLands(&a, &a, false));
+    ASSERT_FALSE(look_label::asyncResultLands(&q, &a, true));
+    ASSERT_FALSE(look_label::asyncResultLands(nullptr, nullptr, true));
+    ASSERT_TRUE(look_label::disableInvalidatesAsync(&a, false, &a));
+    ASSERT_FALSE(look_label::disableInvalidatesAsync(&a, true, &a));     // turned on: nothing to invalidate
+    ASSERT_FALSE(look_label::disableInvalidatesAsync(&q, false, &a));    // another receipt
+    ASSERT_FALSE(look_label::disableInvalidatesAsync(nullptr, false, nullptr));
+}
+
+TEST(LookLabelWiring, L08TheDeliveryCheckPrecedesEveryPresetWriteAndEveryDisablePathInvalidates)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString apply = functionBody(mw, QStringLiteral("void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,"));
+    ASSERT_FALSE(apply.isEmpty());
+    // Delivery: once, after the r14 identity guard, before the landing helper, every landing and every preset write.
+    const QString check = QStringLiteral("if( !look_label::asyncResultLands( receipt, activeReceipt, activeReceipt->lookAssistEnabled() ) )");
+    ASSERT_EQ(1, apply.count(check));
+    const int analysed = apply.indexOf(QStringLiteral("if( receipt != activeReceipt )"));
+    const int at = apply.indexOf(check);
+    const int helper = apply.indexOf(QStringLiteral("const auto labelFollowsLanding = "));
+    printf("[L08w] identity=%d delivery=%d helper=%d\n", analysed, at, helper);
+    ASSERT_TRUE(analysed >= 0 && at > analysed && helper > at);
+    const int dropEnd = apply.indexOf(QStringLiteral("return;"), at);
+    const QString drop = apply.mid(at, dropEnd - at);
+    ASSERT_TRUE(drop.contains(QStringLiteral("m_lookAssistApplied.clearIf( receipt );")));
+    ASSERT_TRUE(drop.contains(QStringLiteral("reason=look_assist_off_at_delivery")));
+    ASSERT_TRUE(drop.contains(QStringLiteral("m_lastLookAssistDiagnosticsValid = false;")));
+    for( const QString &write : { QStringLiteral("m_lookAssistFlavorOutcome.landed( activeReceipt, "),
+                                  QStringLiteral("activeReceipt->setExposure"),
+                                  QStringLiteral("restoreLookAssistSafetyBaseline(\n                        activeReceipt") } )
+    {
+        const int first = apply.indexOf(write, analysed);
+        printf("[L08w] first write at=%d\n", first);
+        ASSERT_TRUE(first > at);
+    }
+    // Dispatch records the receipt the analysis is for, with its generation.
+    const int dispatched = apply.indexOf(QStringLiteral("const int dispatchGeneration = ++m_lookAssistAsyncGeneration;"));
+    const int target = apply.indexOf(QStringLiteral("m_lookAssistAsyncTarget = receipt;"), dispatched);
+    ASSERT_TRUE(dispatched >= 0 && target > dispatched && apply.mid(dispatched, target - dispatched).count(QLatin1Char('\n')) == 1);
+    // Invalidation: the one helper, keyed on the dispatched receipt, bumps the generation.
+    const QString inval = functionBody(mw, QStringLiteral("void MainWindow::invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason )"));
+    ASSERT_TRUE(inval.contains(QStringLiteral("look_label::disableInvalidatesAsync( receipt, receipt && receipt->lookAssistEnabled(), m_lookAssistAsyncTarget )")));
+    ASSERT_TRUE(inval.contains(QStringLiteral("++m_lookAssistAsyncGeneration;")));
+    // ... called right after each of the three disable writes: the switch, a paste, a reset to the default.
+    const char *sites[][2] = {
+        { "    ACTIVE_RECEIPT->setLookAssistEnabled( checked );\n", "    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, \"toggle_off\" );" },
+        { "        receiptTarget->setLookAssistEnabled( receiptSource->lookAssistEnabled() );\n", "        invalidateLookAssistAsyncOnDisable( receiptTarget, \"disabled_paste\" );" },
+        { "    ACTIVE_RECEIPT->setLookAssistEnabled( resetLookAssistEnabled );\n", "    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, \"disabled_default_reset\" );" },
+    };
+    for( const auto &site : sites )
+    {
+        const QString pair = QString::fromLatin1(site[0]) + QString::fromLatin1(site[1]);
+        printf("[L08w] site %s\n", site[1]);
+        ASSERT_EQ(1, mw.count(pair));
+    }
+    ASSERT_EQ(4, mw.count(QStringLiteral("invalidateLookAssistAsyncOnDisable(")));   // the definition and the three calls
+}
+
 // Adversary r12 (31016339) A1. A is active; row B's Look Assist switch is off. addClipToExportQueue makes clone Q, which does not
 // copy the switch, so Q's is on (the default) and the export grades Q Cinematic. The final reopen of A fails: B's clip and Q's
 // grade stay loaded, S (B's receipt) owns the clip by row, and Q is the applied key. The label derived as updateLookLabel does.

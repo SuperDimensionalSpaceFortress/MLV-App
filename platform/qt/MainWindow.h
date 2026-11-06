@@ -1054,6 +1054,9 @@ private:
     // worker captures it at dispatch; the queued apply lambda re-checks before
     // touching any UI state, ensuring stale results from a previous clip are dropped.
     std::atomic<int> m_lookAssistAsyncGeneration{0};
+    // LOOK-FULLSCREEN-PARITY-1 r15 (sol r14 B1): the receipt the newest async analysis was dispatched for. Identity only (UI
+    // thread), never dereferenced: turning Look Assist off on it invalidates that analysis (invalidateLookAssistAsyncOnDisable).
+    const void *m_lookAssistAsyncTarget = nullptr;
     // Round-4 debt block: count of detached look-assist workers still running.
     // The worker reads m_pMlvObject (findMlvWhiteBalance renders from raw), so
     // every freeMlvObject path must drainLookAssistWorkers() first or the
@@ -1907,6 +1910,7 @@ private:
     void initPlaybackPreviewModeFromSettings( void );
     void initPlaybackPreviewResolutionFromSettings( void );
     void drainLookAssistWorkers( const char *reason );
+    void invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason );
     bool freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
     void initPlaybackScaleFactorFromSettings( void );
     void seedPlaybackQualityActiveStateForCurrentContext( void );

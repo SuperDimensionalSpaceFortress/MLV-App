@@ -17044,6 +17044,20 @@ void MainWindow::drainLookAssistWorkers( const char *reason )
             .arg( ( mlv_stage_timing_now() - drain_start ) * 1000.0, 0, 'f', 1 ) );
 }
 
+/* LOOK-FULLSCREEN-PARITY-1 r15 (sol r14 B1): turning Look Assist off on the receipt an async analysis was dispatched for
+ * invalidates that analysis, so its worker stops early and its queued result is dropped at the generation check. Called by
+ * the three disable paths: the switch, a disabled paste (replaceReceipt) and a reset to a disabled default. The delivery
+ * check (look_label::asyncResultLands) still decides on its own, for any path that turns it off without coming here. */
+void MainWindow::invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason )
+{
+    if( !look_label::disableInvalidatesAsync( receipt, receipt && receipt->lookAssistEnabled(), m_lookAssistAsyncTarget ) )
+        return;
+    const int generation = ++m_lookAssistAsyncGeneration;
+    m_lookAssistAsyncTarget = nullptr;
+    logInteractionEvent( QStringLiteral("look_assist.async_invalidated"),
+                         QStringLiteral("reason=%1 generation=%2").arg( QString::fromLatin1( reason ) ).arg( generation ) );
+}
+
 void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                            int analysisFrame )
 {
@@ -17485,6 +17499,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
         // Bump generation so a stale worker result from a previous clip is discarded.
         const int dispatchGeneration = ++m_lookAssistAsyncGeneration;
+        m_lookAssistAsyncTarget = receipt;   // r15: a disable of this receipt invalidates this analysis
 
         // Capture by value for the worker lambda.
         mlvObject_t *mlvObj = m_pMlvObject;
@@ -17870,6 +17885,18 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     m_lookAssistApplied.clearIf( receipt );
                     logInteractionEvent( QStringLiteral("look_assist.apply.async_dropped"),
                                          QStringLiteral("reason=analysed_receipt_not_active generation=%1").arg( dispatchGeneration ) );
+                    return;
+                }
+                // LOOK-FULLSCREEN-PARITY-1 r15 (sol r14 B1, catalogue L-08): applied only while Look Assist is on for this receipt AT
+                // DELIVERY. Turned off since dispatch (switch, disabled paste, disabled-default reset, automation receipt), the baseline is
+                // back and the label reads "Look: Off"; landing now would put a grade under it. Dropped before any preset write, on all
+                // three landing branches below; the diagnostics written above are withdrawn, as the switch-off itself does.
+                if( !look_label::asyncResultLands( receipt, activeReceipt, activeReceipt->lookAssistEnabled() ) )
+                {
+                    m_lastLookAssistDiagnosticsValid = false;
+                    m_lookAssistApplied.clearIf( receipt );
+                    logInteractionEvent( QStringLiteral("look_assist.apply.async_dropped"),
+                                         QStringLiteral("reason=look_assist_off_at_delivery generation=%1").arg( dispatchGeneration ) );
                     return;
                 }
                 // LOOK-FULLSCREEN-PARITY-1 r14 (adversary r14 0d87c82e A1): this result lands on activeReceipt and grades its sliders, so
@@ -19304,6 +19331,7 @@ void MainWindow::replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings 
     if( paste && cdui->checkBoxRawCorrectEnable->isChecked() )
     {
         receiptTarget->setLookAssistEnabled( receiptSource->lookAssistEnabled() );
+        invalidateLookAssistAsyncOnDisable( receiptTarget, "disabled_paste" );   // r15 (sol r14 B1): no-op unless pasted off
         receiptTarget->setLookAssistBaselineValid( receiptSource->lookAssistBaselineValid() );
         receiptTarget->setLookAssistBaselineExposure( receiptSource->lookAssistBaselineExposure() );
         receiptTarget->setLookAssistBaselineContrast( receiptSource->lookAssistBaselineContrast() );
@@ -23909,6 +23937,7 @@ void MainWindow::on_actionResetReceipt_triggered()
     ACTIVE_RECEIPT->setLookAssistBaselineGradationCurve( receipt->lookAssistBaselineGradationCurve() );
     setReceipt( ACTIVE_RECEIPT );
     ACTIVE_RECEIPT->setLookAssistEnabled( resetLookAssistEnabled );
+    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, "disabled_default_reset" );   // r15 (sol r14 B1): no-op unless the default is off
     if( resetLookAssistEnabled )
     {
         setSliders( ACTIVE_RECEIPT, false );
@@ -31844,6 +31873,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
             .arg( ui->horizontalSliderPosition->value() ) );
 
     ACTIVE_RECEIPT->setLookAssistEnabled( checked );
+    invalidateLookAssistAsyncOnDisable( ACTIVE_RECEIPT, "toggle_off" );   // r15 (sol r14 B1): no-op when checked
     updateLookLabel();
 
     if( checked )

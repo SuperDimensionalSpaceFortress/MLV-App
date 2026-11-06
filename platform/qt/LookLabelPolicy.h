@@ -119,6 +119,24 @@ inline bool restoreMarksBaseline( const void *restoredReceipt, const void *appli
     return restoredReceipt != nullptr && restoredReceipt == appliedReceipt;
 }
 
+/*! \brief r15 (sol r14 B1, catalogue L-08): whether a delivered async Look Assist result may grade. Only the receipt it
+ *  analysed (r14: an export clone's result never grades the active row), and only while that receipt's Look Assist is on AT
+ *  DELIVERY. Turning it off between dispatch and delivery (the switch, a disabled paste, a reset to a disabled default, an
+ *  automation receipt) restores the baseline and the label reads "Look: Off"; a result applied after that put a grade under
+ *  the Off label. Checked before any preset write, on all three async landing branches (they share this prefix). */
+inline bool asyncResultLands( const void *analysedReceipt, const void *activeReceipt, bool activeLookAssistEnabledAtDelivery )
+{
+    return analysedReceipt != nullptr && analysedReceipt == activeReceipt && activeLookAssistEnabledAtDelivery;
+}
+
+/*! \brief r15 (sol r14 B1): whether turning Look Assist off on `receipt` invalidates the async analysis in flight. Only for
+ *  the receipt that analysis was dispatched for (identity only, never read), so a disabled paste onto another row does not
+ *  drop the active row's own result. asyncResultLands still decides at delivery; this also stops the worker early. */
+inline bool disableInvalidatesAsync( const void *receipt, bool lookAssistEnabledNow, const void *asyncTargetReceipt )
+{
+    return receipt != nullptr && !lookAssistEnabledNow && receipt == asyncTargetReceipt;
+}
+
 /*! \brief Whether the look of the loaded clip is on, read from the receipt that owns it. The selector checkbox describes
  *  the active row, and a click there writes nothing into another row's clip (receiptOwnedByLoadedClip refuses it), so it
  *  counts only when the owner is the active row. */
