@@ -13,6 +13,10 @@ Demoted verbatim from [`CLAUDE.md`](../CLAUDE.md) under [docs/22-doc-fragmentati
 - When running a nested `pwsh.exe -Command` from an already-running PowerShell shell, do not put `$env:PATH=...` inside outer double quotes; the outer shell expands `$env:PATH` too early and can corrupt the child PATH. Prefer the current-shell form above, or single-quote the child command string.
 
 
+## Probe values and red-mutation proofs (bus trap 7cf7477; PR #705 B1)
+- A test that pins a unit, scale, rounding or conversion picks a probe value that puts the bug reading and the fix reading on opposite sides of the assertion window, with the arithmetic in a comment (a 2.8 s probe that both the Int32 overload and the fix read as 3 passes under both); a red-mutation proof names the assertion that failed (file:line plus the message), not only "suite red".
+- Check both with `py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect <file:line>` (PASS only when that assertion failed; REFUSED for a green run, a collection or import error, or a different assertion) and `... probe --bug B --fix F --window LO HI`; guard `DG-RED-MUTATION-VERDICT` in `tools/repo_hygiene/test_doctrine_guards.py` pins the checker.
+
 ## Active Investigation Notes
 
 - The content-review gate validates a CLAIMED identity from the ledger; it does NOT authenticate that actor or session. Its blocked `expectedEntryFormat` includes the parsed heading grammar as well as the canonical range and exact `Range:`/`Verdict:` lines.
