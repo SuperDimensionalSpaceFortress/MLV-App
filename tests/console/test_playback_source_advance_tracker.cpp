@@ -98,6 +98,9 @@ struct PresentDriver
     int engineWraps = 0;
     int consumed = 0;
     int presented = 0;
+    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): the width each wrap is credited. -1 = the non-drop Loop wrap (cutOut0 - cutIn0 + 1,
+    // the engine steps cutOut -> cutIn); a Loop + Drop Frame case sets the width its tick subtracted (recordedDropWrapWidth).
+    int wrapWidth = -1;
     void startMeasuredPlay() { tracker.reset(); consumed = engineWraps; presented = 0; }
     // r17 (adversary A1 on 6451a8d9 / eb5af034): MainWindow passes the live count and the count stamped when the
     // frame was REQUESTED (PresentationContext::engineWrapsAtRequest; r20: a presented lookahead's accepted stamp).
@@ -107,10 +110,21 @@ struct PresentDriver
         (void)loop;   // the inference (Loop, the jump size) no longer decides the tracker's wrap (re-pass A2)
         const int stamp = stampAtRequest < 0 ? engineWraps : stampAtRequest;
         const int wraps = presentationLoopWraps(engineWraps, stamp, consumed, presented > 0);
-        tracker.notePresented(t, frame, wraps, cutIn0, cutOut0);
+        if (wrapWidth < 0) tracker.notePresented(t, frame, wraps, cutIn0, cutOut0);
+        else tracker.notePresented(t, frame, wraps, static_cast<int64_t>(wrapWidth) * wraps);
         ++presented;
     }
 };
+
+// r21 (key3 on 818dd037, M-HFR-DROP-WRAP-WIDTH): the width MainWindow::playbackHandling records for a Loop + Drop Frame wrap,
+// `noteEngineWrap( dropFrameTick.wrapWidth )` (pinned by test_playback_source_advance_wiring.cpp): what the tick subtracted,
+// cutOut - cutIn. 818dd037 recorded cutOut - cutIn + 1, one frame more than the timeline travelled.
+int recordedDropWrapWidth(const playback_frame_range::DropFrameTickResult &tick, int cutInValue, int cutOutValue)
+{
+    (void)cutInValue;
+    (void)cutOutValue;
+    return tick.wrapWidth;
+}
 }
 
 TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesIsStillTheWrap)
@@ -121,6 +135,7 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     ASSERT_EQ(0, static_cast<int>(tick.position));
     ASSERT_FALSE(playback_frame_range::isContactSheetLoopWrapTransition(true, 0, 719, 700, 0));
     PresentDriver d;
+    d.wrapWidth = recordedDropWrapWidth(tick, 1, 720);
     d.engineWraps = 3;                  // wraps of an earlier Play in the process are not this Play's
     d.startMeasuredPlay();
     for (int f = 690; f <= 700; ++f) d.present((f - 690) / 24.0, f, true, 0, 719);
@@ -130,7 +145,8 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     d.present(13 / 24.0, 2, true, 0, 719);
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(0u, d.tracker.backwardJumps());
-    ASSERT_EQ(10 + (0 + 720 - 700) + 2, static_cast<int>(d.tracker.advancedFrames()));
+    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): the tick moved 19 frames (700 + 19 - 719 = 0), so the wrap is credited 19, not 20
+    ASSERT_EQ(10 + (0 + 719 - 700) + 2, static_cast<int>(d.tracker.advancedFrames()));
     // a later backward seek with no new engine wrap is still a backward jump, never a second wrap
     d.present(14 / 24.0, 1, true, 0, 719);
     ASSERT_EQ(1u, d.tracker.wraps());
@@ -162,8 +178,15 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     ASSERT_EQ(0u, p.tracker.wraps());
     ASSERT_EQ(1u, p.tracker.backwardJumps());
     // and a wrap followed by a FORWARD presentation requested after it is taken there (r19, sol r18 B1: that frame is
-    // the wrap's forward landing, a full loop plus one, 101 + 720 - 100 = 721): a later backward seek is not the wrap
+    // the wrap's forward landing): a later backward seek is not the wrap. r21 (key3 M-HFR-DROP-WRAP-WIDTH): the drop-frame
+    // tick advanceDropFrameTick(100, 720, 1, 720, true) lands on 101 having moved 720 frames, 101 + 719 - 100 = 720
+    // (818dd037: 101 + 720 - 100 = 721, one frame more)
+    const playback_frame_range::DropFrameTickResult loopPlusOne =
+        playback_frame_range::advanceDropFrameTick(100.0, 720.0, 1, 720, true);
+    ASSERT_TRUE(loopPlusOne.wrapped);
+    ASSERT_EQ(101, static_cast<int>(loopPlusOne.position));
     PresentDriver q;
+    q.wrapWidth = recordedDropWrapWidth(loopPlusOne, 1, 720);
     q.startMeasuredPlay();
     q.present(0.0, 100, true, 0, 719);
     ++q.engineWraps;
@@ -171,7 +194,7 @@ TEST(PlaybackSourceAdvanceTracker, R16AdversaryA1AnEngineWrapTheInferenceMissesI
     q.present(2 / 24.0, 50, true, 0, 719);
     ASSERT_EQ(1u, q.tracker.wraps());
     ASSERT_EQ(1u, q.tracker.backwardJumps());
-    ASSERT_EQ(721, static_cast<int>(q.tracker.advancedFrames()));
+    ASSERT_EQ(720, static_cast<int>(q.tracker.advancedFrames()));
     ASSERT_EQ(0, q.tracker.maxJump());
     // r16 re-pass A2 on 215bd10e: Loop + drop-frame, cut 1..8 (0..7), frame 5 then a backward seek to 4 with no
     // engine wrap. The inference accepts it (a jump of 1 >= 7 - 8), but the tracker takes no wrap and no credit.
@@ -269,8 +292,14 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossT
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(1u, d.tracker.backwardJumps());
     // the wrap's FORWARD landing (a frame requested after it, still ahead of the last presented frame) takes it
-    // (r19, sol r18 B1: credited 5 + 8 - 3 = 10, no forward jump), so a later seek is not credited as the wrap
+    // (r19, sol r18 B1, no forward jump), so a later seek is not credited as the wrap. r21 (key3 M-HFR-DROP-WRAP-WIDTH): the
+    // tick advanceDropFrameTick(3, 9, 1, 8, true) moved 9 frames, so 5 + 7 - 3 = 9 (818dd037: 5 + 8 - 3 = 10)
+    const playback_frame_range::DropFrameTickResult toFive =
+        playback_frame_range::advanceDropFrameTick(3.0, 9.0, 1, 8, true);
+    ASSERT_TRUE(toFive.wrapped);
+    ASSERT_EQ(5, static_cast<int>(toFive.position));
     PresentDriver f;
+    f.wrapWidth = recordedDropWrapWidth(toFive, 1, 8);
     f.startMeasuredPlay();
     f.present(0.0, 3, true, 0, 7);
     ++f.engineWraps;                          // narrow cut 1..8, drop-frame: 3 -> 7 -> wraps -> 5
@@ -278,7 +307,7 @@ TEST(PlaybackSourceAdvanceTracker, R17AdversaryA1ALookaheadFrameRequestedAcrossT
     f.present(0.2, 2, true, 0, 7, f.engineWraps);
     ASSERT_EQ(1u, f.tracker.wraps());
     ASSERT_EQ(1u, f.tracker.backwardJumps());
-    ASSERT_EQ(10, static_cast<int>(f.tracker.advancedFrames()));
+    ASSERT_EQ(9, static_cast<int>(f.tracker.advancedFrames()));
     ASSERT_EQ(0, f.tracker.maxJump());
 }
 
@@ -341,8 +370,9 @@ TEST(PlaybackSourceAdvanceTracker, R18AdversaryA1TheFirstFrameRequestedBeforeThe
 // r19 (sol r18 B1 / fable r18 OPEN 5196d4a6-A1, catalogue row M-HFR-FORWARD-WRAP): Loop + drop-frame, cut 1..8 (0..7).
 // 3 is presented at 1.000 s; the next tick advanceDropFrameTick(3, 9, 1, 8, true) wraps the engine and lands on 5,
 // requested after the wrap and presented at 1.160 s. 5196d4a6 consumed the wrap because 5 > 3 and returned no wrap:
-// advanced 2, wraps 0, maxJump 2, 12.5 source fps. A live engine wrap is the wrap whatever the landing's direction,
-// so the tracker's own wrapped-distance rule credits 5 + 8 - 3 = 10: advanced 10, wraps 1, maxJump 0, 62.5 fps.
+// advanced 2, wraps 0, maxJump 2, 12.5 source fps. A live engine wrap is the wrap whatever the landing's direction.
+// r21 (key3 M-HFR-DROP-WRAP-WIDTH): the tick moved 9 frames (3 + 9 - 7 = 5), so the wrap is credited the 7 frames the tick
+// subtracted, 5 + 7 - 3 = 9: advanced 9, wraps 1, maxJump 0, 56.25 fps (818dd037: 5 + 8 - 3 = 10, one frame more).
 TEST(PlaybackSourceAdvanceTracker, R19SolB1AForwardWrapLandingCreditsTheLoopDistance)
 {
     const playback_frame_range::DropFrameTickResult tick =
@@ -350,34 +380,42 @@ TEST(PlaybackSourceAdvanceTracker, R19SolB1AForwardWrapLandingCreditsTheLoopDist
     ASSERT_TRUE(tick.wrapped);
     ASSERT_EQ(5, static_cast<int>(tick.position));
     PresentDriver d;
+    d.wrapWidth = recordedDropWrapWidth(tick, 1, 8);
     d.startMeasuredPlay();
     d.present(1.000, 3, true, 0, 7);
     ++d.engineWraps;                          // the drop-frame tick wraps (MainWindow notes it in playbackHandling)
     d.present(1.160, static_cast<int>(tick.position), true, 0, 7, d.engineWraps);
     ASSERT_EQ(1u, d.tracker.wraps());
-    ASSERT_EQ(10, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(9, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(0, d.tracker.maxJump());
     ASSERT_EQ(0u, d.tracker.backwardJumps());
     ASSERT_EQ(0u, d.tracker.repeatedFrames());
-    ASSERT_NEAR(10.0 / 0.160, d.tracker.sourceFps(), 1e-9);
+    ASSERT_NEAR(9.0 / 0.160, d.tracker.sourceFps(), 1e-9);
     // the wrap was taken once: the next forward frame is an ordinary step and a later seek back is not a wrap
     d.present(1.200, 6, true, 0, 7);
     d.present(1.240, 2, true, 0, 7);
     ASSERT_EQ(1u, d.tracker.wraps());
-    ASSERT_EQ(11, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(10, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(1, d.tracker.maxJump());
     ASSERT_EQ(1u, d.tracker.backwardJumps());
-    // a landing on the frame it left (a full loop, requested after the wrap) is one cut width, never a repeat
+    // a landing on the frame it left (a full drop-frame loop, requested after the wrap) is the 7 frames the tick moved
+    // (advanceDropFrameTick(3, 7, 1, 8, true) lands on 3), never a repeat
+    const playback_frame_range::DropFrameTickResult full =
+        playback_frame_range::advanceDropFrameTick(3.0, 7.0, 1, 8, true);
+    ASSERT_TRUE(full.wrapped);
+    ASSERT_EQ(3, static_cast<int>(full.position));
     PresentDriver r;
+    r.wrapWidth = recordedDropWrapWidth(full, 1, 8);
     r.startMeasuredPlay();
     r.present(1.000, 3, true, 0, 7);
     ++r.engineWraps;
     r.present(1.160, 3, true, 0, 7, r.engineWraps);
     ASSERT_EQ(1u, r.tracker.wraps());
-    ASSERT_EQ(8, static_cast<int>(r.tracker.advancedFrames()));
+    ASSERT_EQ(7, static_cast<int>(r.tracker.advancedFrames()));
     ASSERT_EQ(0u, r.tracker.repeatedFrames());
     // an in-flight forward frame requested BEFORE the wrap is still not its landing: the wrap stays pending for the
-    // first frame requested after it, here a forward one (6 -> wrap -> 7 over cut 0..7 is 7 + 8 - 6 = 9)
+    // first frame requested after it, here a forward one (6 -> wrap -> 7 over cut 0..7 is 7 + 8 - 6 = 9). 7 is the cut's
+    // last frame, which a Loop + Drop Frame tick never returns, so this is the non-drop engine and its width 8.
     PresentDriver g;
     g.startMeasuredPlay();
     g.present(1.000, 4, true, 0, 7);
@@ -483,7 +521,8 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1EachLandingTakesOnlyTheWrapsItC
 // lands on 1, and drawFrame's request for 1 (at count 1) reuses the cached 1. 1df419eb read the cached frame's own stamp
 // 0, so the forward landing looked like an in-flight frame: advanced 1, wraps 0, 20 source fps. The engine's own request
 // for the frame stamped a reused lookahead here; r20 replaced that record with the count at drawFrameReady's target check
-// (presentationAcceptedLookaheadStamp, as MainWindow::drawFrameReady calls it): 1 + 3 - 0 = 4, wraps 1, 80 source fps.
+// (presentationAcceptedLookaheadStamp, as MainWindow::drawFrameReady calls it): wraps 1. r21 (key3 M-HFR-DROP-WRAP-WIDTH): the
+// tick moved 3 frames and subtracted 2, so 1 + 2 - 0 = 3, 60 source fps (818dd037: 1 + 3 - 0 = 4, one frame more).
 TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEnginesOwnRequest)
 {
     const playback_frame_range::DropFrameTickResult tick =
@@ -491,6 +530,7 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEn
     ASSERT_TRUE(tick.wrapped);
     ASSERT_EQ(1, static_cast<int>(tick.position));
     PresentDriver d;
+    d.wrapWidth = recordedDropWrapWidth(tick, 1, 3);
     d.startMeasuredPlay();
     d.present(1.000, 0, true, 0, 2);
     const int lookaheadStamp = d.engineWraps;                 // the cached 1 was spawned before the wrap
@@ -499,11 +539,11 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEn
     ASSERT_EQ(1, stamp);
     d.present(1.050, 1, true, 0, 2, stamp);
     ASSERT_EQ(1u, d.tracker.wraps());
-    ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(3, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(0, d.tracker.maxJump());
-    ASSERT_NEAR(4.0 / 0.050, d.tracker.sourceFps(), 1e-9);
+    ASSERT_NEAR(3.0 / 0.050, d.tracker.sourceFps(), 1e-9);
     // the reused speculative 0 of eb5af034 (lookahead stamped 0, accepted as the target after the wrap) still lands the
-    // wrap backward, once
+    // wrap backward, once (719 is presented, which a Loop + Drop Frame tick never returns: the non-drop engine, width 720)
     PresentDriver e;
     e.startMeasuredPlay();
     e.present(1.000, 718, true, 0, 719);
@@ -522,12 +562,14 @@ TEST(PlaybackSourceAdvanceTracker, R19AdversaryA1ReusedLookaheadIsStampedByTheEn
 // so the landing read as an in-flight frame: advanced 1, wraps 0, maxJump 1, and advanced 2, wraps 0, maxJump 2.
 TEST(PlaybackSourceAdvanceTracker, R20AdversaryA1ALookaheadIsStampedWhenItIsAcceptedAsTheTarget)
 {
-    // cut 0..3, depth 2: 0 presented, cached 1 stamped 0, advanceDropFrameTick(0, 4, 1, 4, true) wraps and lands on 1
+    // cut 0..3, depth 2: 0 presented, cached 1 stamped 0, advanceDropFrameTick(0, 4, 1, 4, true) wraps and lands on 1.
+    // r21 (key3 M-HFR-DROP-WRAP-WIDTH): the tick moved 4 frames and subtracted 3, so 1 + 3 - 0 = 4 (818dd037: 5)
     const playback_frame_range::DropFrameTickResult tick =
         playback_frame_range::advanceDropFrameTick(0.0, 4.0, 1, 4, true);
     ASSERT_TRUE(tick.wrapped);
     ASSERT_EQ(1, static_cast<int>(tick.position));
     PresentDriver d;
+    d.wrapWidth = recordedDropWrapWidth(tick, 1, 4);
     d.startMeasuredPlay();
     d.present(1.000, 0, true, 0, 3);
     const int context = d.engineWraps;
@@ -535,21 +577,28 @@ TEST(PlaybackSourceAdvanceTracker, R20AdversaryA1ALookaheadIsStampedWhenItIsAcce
     const int accepted = presentationAcceptedLookaheadStamp(context, d.engineWraps);
     ASSERT_EQ(1, accepted);
     d.present(1.050, static_cast<int>(tick.position), true, 0, 3, accepted);
-    ASSERT_EQ(5, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(4, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(0, d.tracker.maxJump());
-    // cut 0..7: 3 presented, cached 5 stamped 0, the engine wraps and requests 5, and 5's own advance then requests 6
+    // cut 0..7: 3 presented, cached 5 stamped 0, the engine wraps (advanceDropFrameTick(3, 9, 1, 8, true) lands on 5) and
+    // requests 5, and 5's own advance then requests 6: 5 + 7 - 3 = 9, the 9 frames the tick moved (818dd037: 10)
+    const playback_frame_range::DropFrameTickResult toFive =
+        playback_frame_range::advanceDropFrameTick(3.0, 9.0, 1, 8, true);
+    ASSERT_TRUE(toFive.wrapped);
+    ASSERT_EQ(5, static_cast<int>(toFive.position));
     PresentDriver f;
+    f.wrapWidth = recordedDropWrapWidth(toFive, 1, 8);
     f.startMeasuredPlay();
     f.present(1.000, 3, true, 0, 7);
     const int contextFive = f.engineWraps;
     ++f.engineWraps;
     f.present(1.050, 5, true, 0, 7, presentationAcceptedLookaheadStamp(contextFive, f.engineWraps));
-    ASSERT_EQ(10, static_cast<int>(f.tracker.advancedFrames()));
+    ASSERT_EQ(9, static_cast<int>(f.tracker.advancedFrames()));
     ASSERT_EQ(1u, f.tracker.wraps());
     ASSERT_EQ(0, f.tracker.maxJump());
     // the count is read BEFORE that draw's own advance: a wrap the advance makes is not this frame's. 6, then cached 7 accepted at
     // count 0 whose early advance wraps (live 1), then cached 0 accepted at count 1 lands it: 7 is one step, 0 is one more
+    // (7 is the cut's last frame, which a Loop + Drop Frame tick never returns: the non-drop engine, width 8)
     PresentDriver g;
     g.startMeasuredPlay();
     g.present(1.000, 6, true, 0, 7);
@@ -573,12 +622,14 @@ TEST(PlaybackSourceAdvanceTracker, R20AdversaryA1ALookaheadIsStampedWhenItIsAcce
 // 4 + 8 - 5 = 7, wraps 1, backward 0, and the real landing then had no wrap left and counted backward.
 TEST(PlaybackSourceAdvanceTracker, R20AdversaryA2ABackwardFrameStampedBeforeAWrapIsNotItsLanding)
 {
-    // advanceDropFrameTick(4, 5, 1, 8, true) lands on 2
+    // advanceDropFrameTick(4, 5, 1, 8, true) lands on 2, having moved 5 frames: the landing is credited 2 + 7 - 4 = 5, the
+    // width the tick subtracted (r21, key3 M-HFR-DROP-WRAP-WIDTH; 818dd037: 2 + 8 - 4 = 6)
     const playback_frame_range::DropFrameTickResult tick =
         playback_frame_range::advanceDropFrameTick(4.0, 5.0, 1, 8, true);
     ASSERT_TRUE(tick.wrapped);
     ASSERT_EQ(2, static_cast<int>(tick.position));
     PresentDriver d;
+    d.wrapWidth = recordedDropWrapWidth(tick, 1, 8);
     d.startMeasuredPlay();
     d.present(1.000, 5, true, 0, 7);
     const int seekStamp = d.engineWraps;
@@ -588,11 +639,12 @@ TEST(PlaybackSourceAdvanceTracker, R20AdversaryA2ABackwardFrameStampedBeforeAWra
     ASSERT_EQ(0u, d.tracker.wraps());
     ASSERT_EQ(1u, d.tracker.backwardJumps());
     d.present(1.100, static_cast<int>(tick.position), true, 0, 7);
-    ASSERT_EQ(6, static_cast<int>(d.tracker.advancedFrames()));
+    ASSERT_EQ(5, static_cast<int>(d.tracker.advancedFrames()));
     ASSERT_EQ(1u, d.tracker.wraps());
     ASSERT_EQ(1u, d.tracker.backwardJumps());
     ASSERT_EQ(0, d.tracker.maxJump());
-    // the same seek when the early advance lands on 0: 0 + 8 - 4 = 4, and the wrap is taken once
+    // the same seek when the early advance lands on 0: 0 + 8 - 4 = 4, and the wrap is taken once. The cases below land on
+    // cut-in 0, where the non-drop engine lands (cutOut -> cutIn, width 8), and keep that width
     PresentDriver z;
     z.startMeasuredPlay();
     z.present(1.000, 5, true, 0, 7);
@@ -665,4 +717,67 @@ TEST(PlaybackSourceAdvanceTracker, R20AdversaryA1AWrapIsCreditedTheCutWidthItHad
     ASSERT_EQ(int64_t(0), wraps.engineWrapsWidth(1, 0));
     ASSERT_EQ(int64_t(16), wraps.engineWrapsWidth(2, 5));
     ASSERT_EQ(int64_t(0), wraps.engineWrapsWidth(9, 2));
+}
+
+// r21 (key3 on 818dd037, catalogue row M-HFR-DROP-WRAP-WIDTH): Loop + Drop Frame, a steady grant of 1.0 per tick at 24 fps.
+// advanceDropFrameTick moves back by cutOut - cutIn when it wraps, so cut 1..8 is a loop of 7 ticks (0..6, then 6 + 1 -> 0).
+// 818dd037 recorded cutOut - cutIn + 1 = 8 per wrap, crediting 8 frames for every 7 travelled: source_fps 27.43 for a timeline
+// moving at 24 (cut 1..24: 25.04, above the 24.72 band; cut 1..1667: 24.014). Driven as MainWindow drives it: the recorder
+// notes each wrap with the width playbackHandling records, and every presentation is the frame the tick requested.
+TEST(PlaybackSourceAdvanceTracker, R21KeyMHfrDropWrapWidthALoopIsCreditedTheFramesItTravelled)
+{
+    const int cuts[][2] = { {1, 8}, {1, 24}, {1, 1667}, {5, 12}, {1, 3} };
+    for (const auto &cut : cuts)
+    {
+        const int cutIn = cut[0];
+        const int cutOut = cut[1];
+        playback_frame_range::PlaybackWrapRecorder rec;
+        PlaybackSourceAdvanceTracker t;
+        int consumed = rec.engineWraps;
+        double position = cutIn - 1;
+        t.notePresented(0.0, static_cast<int>(position), 0, int64_t(0));
+        const int ticks = 3 * (cutOut - cutIn) + 1;    // three loops and one frame more
+        for (int k = 1; k <= ticks; ++k)
+        {
+            const playback_frame_range::DropFrameTickResult tick =
+                playback_frame_range::advanceDropFrameTick(position, 1.0, cutIn, cutOut, true);
+            if (tick.wrapped) rec.noteEngineWrap(recordedDropWrapWidth(tick, cutIn, cutOut));
+            position = tick.position;
+            const int before = consumed;
+            const int crossed = presentationLoopWraps(rec.engineWraps, rec.engineWraps, consumed, true);
+            t.notePresented(k / 24.0, static_cast<int>(position), crossed, rec.engineWrapsWidth(before, crossed));
+        }
+        ASSERT_EQ(3, rec.engineWraps);
+        ASSERT_EQ(3u, t.wraps());
+        ASSERT_EQ(ticks, static_cast<int>(t.advancedFrames()));
+        ASSERT_EQ(1, t.maxJump());
+        ASSERT_EQ(0u, t.backwardJumps());
+        ASSERT_NEAR(24.0, t.sourceFps(), 1e-9);
+    }
+}
+// R21-GREEN-ONLY-BEGIN (the RED copy drops this test: DropFrameTickResult::wrapWidth does not exist before the fix)
+
+// r21 (key3 M-HFR-DROP-WRAP-WIDTH): the tick reports the width it subtracted, so the wrap recorder stores the distance the
+// timeline moved back, never the cut range's frame count; no wrap is no width.
+TEST(PlaybackSourceAdvanceTracker, R21DropFrameTickReportsTheWidthItSubtracted)
+{
+    const playback_frame_range::DropFrameTickResult wrapped =
+        playback_frame_range::advanceDropFrameTick(3.0, 9.0, 1, 8, true);
+    ASSERT_TRUE(wrapped.wrapped);
+    ASSERT_EQ(7, wrapped.wrapWidth);
+    ASSERT_NEAR(3.0 + 9.0 - wrapped.wrapWidth, wrapped.position, 1e-12);
+    const playback_frame_range::DropFrameTickResult step =
+        playback_frame_range::advanceDropFrameTick(3.0, 1.0, 1, 8, true);
+    ASSERT_FALSE(step.wrapped);
+    ASSERT_EQ(0, step.wrapWidth);
+    const playback_frame_range::DropFrameTickResult clamped =
+        playback_frame_range::advanceDropFrameTick(5.0, 9.0, 1, 8, false);
+    ASSERT_FALSE(clamped.wrapped);
+    ASSERT_EQ(0, clamped.wrapWidth);
+    ASSERT_EQ(7, static_cast<int>(clamped.position));
+    const playback_frame_range::DropFrameTickResult offset =
+        playback_frame_range::advanceDropFrameTick(10.0, 2.0, 5, 12, true);
+    ASSERT_TRUE(offset.wrapped);
+    ASSERT_EQ(12 - 5, offset.wrapWidth);
+    ASSERT_EQ(5, static_cast<int>(offset.position));
 }

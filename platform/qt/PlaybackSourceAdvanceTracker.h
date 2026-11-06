@@ -26,7 +26,11 @@ public:
      *  \param wrapsCrossed how many loop wraps lie between the previous presented
      *         frame and this one (cut range [cutInIndex, cutOutIndex]); 0 = not a
      *         wrap (presentationLoopWraps; true / false read as 1 / 0). Each wrap
-     *         is credited one cut width (r19, adversary A1 on 924d3d6f).
+     *         is credited one cut width (r19, adversary A1 on 924d3d6f), the
+     *         non-drop Loop wrap's cutOut -> cutIn step. A Loop + Drop Frame wrap
+     *         moves back one frame less (DropFrameTickResult::wrapWidth), and
+     *         MainWindow credits each wrap's recorded width through the overload
+     *         below (r21, key3 M-HFR-DROP-WRAP-WIDTH).
      *  \param cutInIndex first frame index of the loop range
      *  \param cutOutIndex last frame index of the loop range */
     void notePresented( double nowSeconds, int frame, int wrapsCrossed,
@@ -120,8 +124,9 @@ private:
  *  - a backward seek: cut 0..7, 5, then 4 (stamp 0) whose draw wraps the engine (live 1), then the landing 2 (stamp 1). 4
  *    is an ordinary backward jump and leaves the wrap pending: 2 is credited 2 + 8 - 4 = 6 (r20, adversary A2 on dbeb9424:
  *    a "backward means landing" branch took the wrap and credited 4 + 8 - 5 = 7).
- *  - a forward landing: cut 0..7, 3 -> wrap -> 5 (stamp 1) travelled 5 + 8 - 3 = 10 frames, never a forward jump of 2 (r19,
- *    sol r18 B1, catalogue M-HFR-FORWARD-WRAP).
+ *  - a forward landing: Loop + Drop Frame, cut 0..7, 3 -> wrap -> 5 (stamp 1) travelled 5 + 7 - 3 = 9 frames, never a
+ *    forward jump of 2 (r19, sol r18 B1, catalogue M-HFR-FORWARD-WRAP). The drop-frame tick moves back by cutOut - cutIn =
+ *    7, and that is the width the wrap is credited (r21, key3 M-HFR-DROP-WRAP-WIDTH: 818dd037 credited 8, so 10).
  *  - several wraps: 5 -> wrap -> 1 (stamp 1) -> wrap -> 3 (stamp 2) is 4 + 10 = 14 frames and 2 wraps; 2 -> two wraps -> 4
  *    (stamp 2) is 4 + 2 x 8 - 2 = 18 (r19, adversary A1 on 924d3d6f). A wrap after a landing's request stays pending for
  *    the next frame that crosses it.

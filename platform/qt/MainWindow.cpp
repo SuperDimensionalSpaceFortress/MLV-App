@@ -12138,13 +12138,15 @@ void MainWindow::playbackHandling(int timeDiff)
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
-                    + ( dropFrameTick.wrapped ? static_cast<double>( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() ) : 0.0 );
+                    + static_cast<double>( dropFrameTick.wrapWidth );
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts).
                 m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );
-                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens.
-                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() + 1 );
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens. r21 (key3
+                // M-HFR-DROP-WRAP-WIDTH): it is credited the width the tick subtracted (cutOut - cutIn), not the non-drop
+                // Loop wrap's cutOut - cutIn + 1, which counted one frame the timeline never travelled.
+                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth );
                 //Sync audio
                 if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {

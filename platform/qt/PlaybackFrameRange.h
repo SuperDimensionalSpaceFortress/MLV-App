@@ -260,6 +260,10 @@ struct DropFrameTickResult
 {
     double position = 0.0;
     bool wrapped = false;
+    // HFR-NATIVE-60FPS-FULLRES-1 r21 (key3 M-HFR-DROP-WRAP-WIDTH): how far a wrap moved the position back, cutOut - cutIn (one
+    // less than the cut range's frame count, because the range's last frame is never returned); 0 when the tick did not wrap.
+    // The wrap recorder stores this, so a Loop + Drop Frame wrap is credited the distance the timeline travelled.
+    int wrapWidth = 0;
 };
 
 // advanceDropFrameTick mirrors MainWindow::playbackHandling's drop-frame-mode per-tick position
@@ -281,7 +285,8 @@ inline DropFrameTickResult advanceDropFrameTick(
     const double lastFrame = static_cast<double>( cutOutValue - 1 );
     if( loopEnabled && result.position >= lastFrame )
     {
-        result.position -= static_cast<double>( cutOutValue - cutInValue );
+        result.wrapWidth = cutOutValue - cutInValue;
+        result.position -= static_cast<double>( result.wrapWidth );
         result.wrapped = true;
     }
     else if( result.position >= lastFrame )
