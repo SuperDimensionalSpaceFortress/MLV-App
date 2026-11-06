@@ -2200,6 +2200,8 @@ $dispatchLedgerState = $null
 $dispatchLedgerReservationId = $null
 # Harvested child stdout; initialised here so the finally can classify work evidence on every path.
 $stdout = ''
+# Codex answer (last-message file, else stdout) set at harvest; '' on every path that never harvested one.
+$codexAnswerEvidence = ''
 $authority  =[ordered]@{ permissionMode = 'unset'; allowedTools = 'unset'; sandbox = 'unset'; writableRoot = $null }
 $denyRules  = @()
 # LANE-NO-BACKGROUND-END-TURN-1 round 7: set here so a codex lane (which never enters the
@@ -3131,8 +3133,10 @@ if ($cfg.engine -eq 'claude') {
     if (-not $final) { $final = $stdout }
     Write-Utf8NoBom $lastPath $final
 } else {
-    $final = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
-    if ([string]::IsNullOrWhiteSpace($final)) { $final = $stdout }
+    $lastMessage = if (Test-Path -LiteralPath $lastPath) { Get-Content -LiteralPath $lastPath -Raw } else { '' }
+    # K4: the codex answer for completion evidence is the last-message file, else stdout -- not stderr (the fallback below).
+    $codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout
+    $final = $codexAnswerEvidence
     # LAST-RESORT FALLBACK TO STDERR. codex writes its -o last-message file only on
     # a CLEAN exit and streams its working narration to STDERR, not stdout - so a
     # lane killed at the timeout leaves the last-message file absent and stdout
@@ -3434,7 +3438,7 @@ if (-not $NoWorktreeSweep) {
 # former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
 $processEnded = ($exitCode -ne -999)
 try {
-    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $stdout -ExitCode $exitCode
+    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout }) -ExitCode $exitCode
 } catch {
     $workEvidence = [ordered]@{ workCompleted = $false; reason = "cannot-determine: $($_.Exception.Message)"; subtype = $null; terminalReason = $null; isError = $null }
 }

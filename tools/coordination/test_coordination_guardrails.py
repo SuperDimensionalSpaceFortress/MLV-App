@@ -1754,6 +1754,50 @@ def test_codex_nonzero_exit_keeps_its_exit_code_reason_over_the_empty_answer_rea
     assert _work_evidence(tmp_path, "codex", "", 1)["reason"] == "exit-code-1"
 
 
+def _codex_answer(tmp_path, last, stdout):
+    # Feeds both inputs through files so quoting and newlines cannot change what is tested.
+    lf, sf = tmp_path / "last.txt", tmp_path / "stdout.txt"
+    lf.write_text(last, encoding="utf-8")
+    sf.write_text(stdout, encoding="utf-8")
+    cmd = (
+        f". '{REFUSAL_HELPER}'; "
+        f"$l = [IO.File]::ReadAllText('{lf}'); $s = [IO.File]::ReadAllText('{sf}'); "
+        "Get-CodexLaneAnswer -LastMessage $l -Stdout $s | ConvertTo-Json -Compress"
+    )
+    out = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_codex_answer_for_evidence_is_the_last_message_file_when_stdout_is_empty(tmp_path):
+    # Adversary A1 (b4372775): exit 0, stdout '', the real answer only in the -o last-message file.
+    # Judging stdout alone called that real answer empty, i.e. a false 'not completed' on a real answer.
+    ans = _codex_answer(tmp_path, "APPROVE\n\nLooks right.\n", "")
+    assert ans.replace("\r\n", "\n").strip() == "APPROVE\n\nLooks right.", ans  # write_text writes CRLF on Windows
+    assert _work_evidence(tmp_path, "codex", ans, 0)["workCompleted"] is True
+
+
+def test_codex_answer_for_evidence_falls_back_to_stdout_and_never_to_stderr(tmp_path):
+    assert _codex_answer(tmp_path, "  \n", "from stdout\n").strip() == "from stdout"
+    # last file wins when both are real
+    assert _codex_answer(tmp_path, "from file\n", "from stdout\n").strip() == "from file"
+    # neither has an answer: '' (the helper has no stderr input at all), so the lane is not complete
+    ans = _codex_answer(tmp_path, "", " \n")
+    assert ans == "", ans
+    assert _work_evidence(tmp_path, "codex", ans, 0)["reason"] == "codex-empty-answer"
+
+
+def test_invoke_lane_judges_codex_completion_on_the_harvested_answer_not_on_stdout_alone():
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$codexAnswerEvidence = Get-CodexLaneAnswer -LastMessage $lastMessage -Stdout $stdout" in body
+    assert "-Answer $(if ($cfg.engine -eq 'codex') { $codexAnswerEvidence } else { $stdout })" in body, (
+        "Get-LaneWorkEvidence must be fed the codex last-message answer; stdout alone mislabels a real answer as empty"
+    )
+    # The evidence answer is taken BEFORE the stderr narration fallback, never after it.
+    assert body.index("$codexAnswerEvidence = Get-CodexLaneAnswer") < body.index("$final = $stderrText")
+
+
 def test_codex_unrelated_answer_is_a_documented_non_goal(tmp_path):
     # NON-GOAL, pinned so a later change is deliberate: a non-blank answer that does not address the
     # prompt cannot be told apart from a real one by shape. Real codex answers carry no common

@@ -82,6 +82,21 @@ function Find-ClaudeResultEnvelope {
 # workCompleted is $true only when: exit code 0 AND (codex: a non-blank answer; reason
 # codex-empty-answer otherwise) or (claude: a result envelope exists with is_error=false, subtype=success and terminal_reason
 # absent or 'completed'). A missing envelope on the claude engine is NOT evidence of completion.
+# Get-CodexLaneAnswer: the answer a codex lane gave, for completion evidence. It is the `-o` last-message
+# file, else stdout (codex prints the final message to both). NEVER stderr: that is working narration, so
+# counting it would let a silent exit 0 read as an answer. KERNEL-K4-CODEX-SILENT-EXIT0-COMPLETED-1 r1
+# (adversary A1): Invoke-Lane used to hand Get-LaneWorkEvidence stdout alone, which would call a real answer
+# that reached only the last-message file "empty".
+function Get-CodexLaneAnswer {
+    param(
+        [AllowEmptyString()][AllowNull()][string]$LastMessage = '',
+        [AllowEmptyString()][AllowNull()][string]$Stdout = ''
+    )
+    if (-not [string]::IsNullOrWhiteSpace($LastMessage)) { return $LastMessage }
+    if (-not [string]::IsNullOrWhiteSpace($Stdout)) { return $Stdout }
+    return ''
+}
+
 function Get-LaneWorkEvidence {
     param(
         [string]$Engine = 'unknown',
