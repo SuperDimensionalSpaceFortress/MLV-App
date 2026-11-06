@@ -1152,7 +1152,9 @@ TEST(LookLabelWiring, A1r13TheExportSiteRecordsTheClonesSwitchWithTheKey)
                     .contains(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;")));
     // Pin count update (r14, adversary r14 0d87c82e A1; was 2): the async landing's labelFollowsLanding is the third writer.
     // Pin count update (r16, adversary r16 39d1a995 A1; was 3): setSliders moving the key to the active row is the fourth.
-    ASSERT_EQ(4, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
+    // Pin count update (r17, adversary r16 efd170f4 A1; was 4): setSliders re-asserting its key after its modal work is the fifth
+    // (LookLabelWiring.A1r17SetSlidersReassertsItsKeyAfterTheLastModal pins it).
+    ASSERT_EQ(5, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
 }
 
 // Adversary r13 (63319bdb) A1. Rows A (Look Assist on, Cinematic) and B (Look Assist off, active) hold one path. showFileInEditor(A)
