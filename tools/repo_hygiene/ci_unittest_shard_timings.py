@@ -104,11 +104,13 @@ def class_seconds(log_text: str) -> dict[str, float]:
     # tearDownClass of the previous class lands in the gap before a docstring test (that gap is charged
     # to the next class as its setUpClass, so the teardown is counted twice). A class the block does not
     # name was outside the job's top ten, so it ran no longer than the block's smallest figure: that is
-    # the ceiling for its gap estimate (a looser one if a log holds several blocks, and one a truncated
-    # block only loosens, because rows are sorted slowest first). Below the ceiling the estimate stands.
+    # the ceiling for its gap estimate (a truncated block only loosens it, because rows are sorted slowest
+    # first). Below the ceiling the estimate stands.
+    # A job log holds exactly one block (all 130 hosted windows logs do); a log with none, several, or a
+    # class named twice is concatenated or foreign output whose figures are not this job's, so the gaps
+    # stand alone and no SHARD_SLOWEST figure replaces or caps anything.
+    blocks: list[list[tuple[str, float]]] = []
     in_slowest = False
-    named: dict[str, float] = {}
-    block_mins: list[float] = []
     for raw in log_text.splitlines():
         stamp = STAMP.match(raw)
         if not stamp:
@@ -116,22 +118,20 @@ def class_seconds(log_text: str) -> dict[str, float]:
         text = stamp.group(3)
         if SLOWEST_HEAD.match(text):
             in_slowest = True
-            block_mins.append(float("inf"))
+            blocks.append([])
             continue
         row = SLOWEST_ROW.match(text) if in_slowest else None
         if row is None:
             in_slowest = False
             continue
-        value = float(row.group(1))
-        block_mins[-1] = min(block_mins[-1], value)
-        if row.group(2).startswith(KEY_PREFIX):
-            named[row.group(2)] = value
-    ceiling = max((m for m in block_mins if m != float("inf")), default=None)  # a block with no row says nothing
-    if ceiling is not None:
+        blocks[-1].append((row.group(2), float(row.group(1))))
+    if len(blocks) == 1 and blocks[0] and len({name for name, _ in blocks[0]}) == len(blocks[0]):
+        ceiling = min(value for _, value in blocks[0])
+        named = {name: value for name, value in blocks[0] if name.startswith(KEY_PREFIX)}
         for name in totals:
             if name not in named:
                 totals[name] = min(totals[name], ceiling)
-    totals.update(named)
+        totals.update(named)
     return dict(totals)
 
 

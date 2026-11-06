@@ -1047,6 +1047,50 @@ class TimingsTests(unittest.TestCase):
         self.assertEqual(got["tools.repo_hygiene.test_x.A"], 101.0)
         self.assertLessEqual(sum(got.values()), 101.0 + 2.0 * 10)
 
+    def test_a_log_with_two_slowest_blocks_is_read_by_its_gaps_alone(self) -> None:
+        # adversary r3 pass 5 A1: the sums are per job log and a job log holds one SHARD_SLOWEST block (all
+        # 130 hosted windows logs do). Two blocks mean concatenated or foreign output, whose figures
+        # are neither this job's nor each other's, so none is used: the last block's A = 1.0 must not
+        # replace the 101.0 the gaps accumulated.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:01:40.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:01:40.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=100.0s\n"
+            "2026-10-04T00:01:40.0000000Z   100.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:01:40.0000000Z started\n"
+            "2026-10-04T00:01:41.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:01:41.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=1.0s\n"
+            "2026-10-04T00:01:41.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 101.0})
+
+    def test_an_empty_slowest_block_gives_another_block_no_ceiling_over_its_classes(self) -> None:
+        # adversary r3 pass 5 A2: the second block is empty, so the first block's 1.0 s minimum must
+        # not cap B (100 s by the gaps). Two blocks: no SHARD_SLOWEST figure is used at all.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:01.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=1.0s\n"
+            "2026-10-04T00:00:01.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:01.0000000Z started\n"
+            "2026-10-04T00:01:41.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+            "2026-10-04T00:01:41.0000000Z SHARD_SLOWEST profile=windows shard=2/7 total=100.0s\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 1.0, "tools.repo_hygiene.test_x.B": 100.0},
+        )
+
+    def test_a_class_named_twice_in_the_slowest_block_makes_the_block_unusable(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:05.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:05.0000000Z SHARD_SLOWEST profile=windows shard=1/7 total=5.0s\n"
+            "2026-10-04T00:00:05.0000000Z   9.0s tools.repo_hygiene.test_x.A\n"
+            "2026-10-04T00:00:05.0000000Z   1.0s tools.repo_hygiene.test_x.A\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+
     def test_an_unnamed_class_below_the_ceiling_keeps_its_gap_estimate(self) -> None:
         log = (
             "2026-10-04T00:00:00.0000000Z started\n"
