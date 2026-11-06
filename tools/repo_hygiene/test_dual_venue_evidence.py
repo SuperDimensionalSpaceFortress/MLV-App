@@ -211,6 +211,9 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_PACED_LEGS)
 # Each differs from its twin only in its legId (native- -> native-trace-) and generatorArgs.presentTrace true (still paced, LIGHT, Look Assist Cinematic).
 NATIVE_TRACE_LEGS = {rel.replace("/m16-1457-native-", "/m16-1457-native-trace-"): rel for rel in NATIVE_PACED_LEGS}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *NATIVE_TRACE_LEGS)
+# CPU-S1-RECON-CHAIN-ATTRIBUTION-1: the capture-free CPU fullscreen s1 arms that attribute the frame interval: control (c), prep fast path off (p), a worker cap of 12 (t12), Look Assist off (l).
+CHAINATTR_LEGS = tuple(f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json" for arm in ("c", "p", "t12", "l"))
+SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -7134,6 +7137,9 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-q1-cpu-look-(paired-(fullscreen|windowed)|sameframe-fullscreen)-s[24]$", path.name)
                 self.assertEqual(spec["generatorArgs"]["qualityMode"], "hq", path.name)
                 self.assertIs(spec["look"]["pairedSeek"], True, path.name)
+            elif spec["card"] == "CPU-S1-RECON-CHAIN-ATTRIBUTION-1":   # the Look Assist on arms of the chain attribution (the classic arm l never reaches this chain)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-chainattr-(c|p|t12)-fullscreen-s1$", path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
@@ -7625,6 +7631,80 @@ class LookReceiptLegSpecTests(unittest.TestCase):
                 self.assertIs(arm["generatorArgs"].pop("disablePrepPointwiseFast"), True)
                 self.assertEqual(dict(arm, legId=twin["legId"], card=twin["card"]), twin)
                 self.assertEqual(list(arm), list(twin), "the twin's keys in the twin's order")
+
+    def test_chainattr_arms_differ_from_the_control_only_in_the_intended_setting(self) -> None:
+        """CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r2 (I1): the four arms' relationship, not just their names. Against C, P adds only the prep kill switch, T12 adds
+        only the worker cap of 12, and L replaces forced cinematic Look Assist with disabled Look Assist; every other setting is common. This reads committed
+        specs only. It cannot see an inherited MLVAPP_DISABLE_PREP_POINTWISE_FAST (adversary A1), and the per-run prep-state counting rule is not in tracked code."""
+        names = ("c", "p", "t12", "l")
+        arms = {arm: json.loads((DV / f"legs/m16-1243-chainattr-{arm}-fullscreen-s1.json").read_text(encoding="utf-8")) for arm in names}
+        intended = {"p": ({"disablePrepPointwiseFast": True}, ()), "t12": ({"playbackMaxThreads": 12}, ()), "l": ({"disableLookAssist": True}, ("forceLookAssist", "lookFlavor"))}
+        switches = ("disablePrepPointwiseFast", "playbackMaxThreads", "disableLookAssist")
+        no_criteria = {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}
+        profile = {"card": "CPU-S1-RECON-CHAIN-ATTRIBUTION-1", "legType": "speed", "clipId": "M16-1243", "backends": ["cpu"], "scaleFactor": 1, "displayMode": "fullscreen"}
+
+        def problems(specs: dict) -> list[str]:
+            control = specs["c"]
+            found = [f"c sets {key}" for key in switches if key in control["generatorArgs"]]
+            if control["generatorArgs"].get("forceLookAssist") is not True or control["generatorArgs"].get("lookFlavor") != "cinematic":
+                found.append("c is not forced cinematic")
+            found += [f"c {key} is {control.get(key)!r}" for key, value in profile.items() if control.get(key) != value]
+            found += [f"{arm} legId is {spec.get('legId')!r}" for arm, spec in specs.items() if spec.get("legId") != f"m16-1243-chainattr-{arm}-fullscreen-s1"]
+            for arm, (added, removed) in intended.items():
+                spec = specs[arm]
+                want = {k: v for k, v in control["generatorArgs"].items() if k not in removed} | added
+                if spec["generatorArgs"] != want:
+                    found.append(f"{arm} generatorArgs differ from the intended change")
+                if {k: v for k, v in spec.items() if k not in ("legId", "generatorArgs", "criteria")} != {k: v for k, v in control.items() if k not in ("legId", "generatorArgs", "criteria")}:
+                    found.append(f"{arm} differs in a common setting")
+                if spec["criteria"] != (no_criteria if arm == "l" else control["criteria"]):
+                    found.append(f"{arm} criteria differ")
+            return found
+
+        self.assertEqual(problems(arms), [])
+        pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s1.json").read_text(encoding="utf-8"))
+        partition = {"corePartitionTelemetry": True, "corePartitionHelperMask": "0xFF000"}
+        self.assertEqual(arms["c"]["generatorArgs"], pace["generatorArgs"] | partition)
+        self.assertEqual(arms["c"]["criteria"]["acceptance"]["cpu"], pace["criteria"]["acceptance"]["cpu"])
+        self.assertNotIn("cinematic", (DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json").read_text(encoding="utf-8"))
+
+        def with_args(arm: str, drop: tuple = (), **add) -> dict:
+            specs = json.loads(json.dumps(arms))
+            specs[arm]["generatorArgs"] = {k: v for k, v in specs[arm]["generatorArgs"].items() if k not in drop} | add
+            return specs
+
+        def with_field(arm: str, **fields) -> dict:
+            specs = json.loads(json.dumps(arms))
+            specs[arm].update(fields)
+            return specs
+
+        def with_every_arm(**fields) -> dict:
+            specs = json.loads(json.dumps(arms))
+            for spec in specs.values():
+                spec.update(fields)
+            return specs
+
+        for name, bad in (("every arm runs another backend", with_every_arm(backends=["cuda"])),
+                          ("every arm runs another scale", with_every_arm(scaleFactor=3)),
+                          ("every arm runs another clip", with_every_arm(clipId="M16-1457")),
+                          ("L takes the control's identity", with_field("l", legId="m16-1243-chainattr-c-fullscreen-s1")),
+                          ("the control carries the prep kill switch", with_args("c", disablePrepPointwiseFast=True)),
+                          ("T12 carries the prep kill switch", with_args("t12", disablePrepPointwiseFast=True)),
+                          ("L carries the prep kill switch", with_args("l", disablePrepPointwiseFast=True)),
+                          ("P loses the prep kill switch", with_args("p", drop=("disablePrepPointwiseFast",))),
+                          ("P sets the prep kill switch false", with_args("p", disablePrepPointwiseFast=False)),
+                          ("P also caps workers", with_args("p", playbackMaxThreads=12)),
+                          ("T12 runs another cap", with_args("t12", playbackMaxThreads=16)),
+                          ("L keeps forced Look Assist", with_args("l", forceLookAssist=True)),
+                          ("L drops the Look Assist disable", with_args("l", drop=("disableLookAssist",))),
+                          ("one arm loses the core partition signal", with_args("t12", drop=("corePartitionTelemetry",))),
+                          ("one arm plays longer", with_field("p", playSeconds=30)),
+                          ("one arm changes scale", with_field("t12", scaleFactor=2)),
+                          ("one arm changes display", with_field("l", displayMode="windowed")),
+                          ("one arm changes criteria", with_field("p", criteria=no_criteria)),
+                          ("L gains criteria", with_field("l", criteria=arms["c"]["criteria"]))):
+            with self.subTest(case=name):
+                self.assertTrue(problems(bad), name)
 
     def test_the_schema_admits_a_pace_receipt_only_on_a_forced_look_speed_leg_and_whole(self) -> None:
         """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: generatorArgs.lookReceipt needs lookReceiptSha256 and forceLookAssist true and a speed leg;
@@ -11596,6 +11676,29 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
         self.assertAdvisory(receipt, repo)
         repo, receipt = self.production(None, self.BLOCK)
         self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
+
+    def uncapped_under(self, env: str, variable: str = "playback_max_threads"):
+        # an uncapped leg (its spec names no playbackMaxThreads) whose measured session's start line says what the app saw of one of the venue's worker-count variables
+        line = self.START.replace(" env_force_threads=0", "") + f" env_{variable}={env}"
+        repo = self.prod_repo(spec=self.write_spec())
+        ev = self.evidence("wt-env-" + hashlib.sha1(f"{variable}={env}".encode()).hexdigest()[:8], backend="cuda", extra_log_lines=[line], summary=None)
+        return repo, self.receipt_for(repo, ev, backend="cuda")
+
+    def test_an_uncapped_leg_that_ran_under_an_inherited_worker_override_is_not_a_valid_receipt(self) -> None:
+        # CPU-S1-RECON-CHAIN-ATTRIBUTION-1 r3 (sol A2 on #754; adversary A1 on 6ffe18f8): the validator re-derives the same INHERITED_WORKER_OVERRIDE the runner gates
+        # on, so a receipt cannot carry a PASS for a control that ran at the venue's cap or forced count.
+        # r4 (B1, B2 on 70d55f42): OMP_NUM_THREADS, whose value 1 is also what literal MLVAPP_FORCE_SINGLETHREAD=unset writes, and the prefetch decoder variables.
+        for variable in ("playback_max_threads", "force_threads", "force_singlethread", "disable_playback_thread_cap", "omp_num_threads", "raw_uint16_prefetch_decoders",
+                         "disable_raw_uint16_prefetch"):
+            for env in ("12", "8"):
+                with self.subTest(variable=variable, inherited=env):
+                    repo, receipt = self.uncapped_under(env, variable)
+                    self.assertNotValid(receipt, repo, "INHERITED_WORKER_OVERRIDE", status="INVALID")
+        repo, receipt = self.uncapped_under("1", "omp_num_threads")
+        self.assertNotValid(receipt, repo, "OMP_NUM_THREADS=1", status="INVALID")
+        for variable in ("playback_max_threads", "force_threads", "omp_num_threads", "raw_uint16_prefetch_decoders", "disable_raw_uint16_prefetch"):
+            repo, receipt = self.uncapped_under("unset", variable)
+            self.assertAdvisory(receipt, repo)
 
 
 class PrepConflatedMoveLegSpecTests(unittest.TestCase):
