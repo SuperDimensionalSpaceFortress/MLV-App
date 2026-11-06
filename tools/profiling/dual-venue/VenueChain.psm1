@@ -1314,10 +1314,14 @@ function Get-VenueRunStartCap {
             }
             [pscustomobject]@{ t = $tt; batches = $nb; wait = $wt; lastLegStart = $lastStart }
         }
-        $simStatic = & $simulate $false
+        # r3 (adversary A1): the ADAPTIVE replay is the runner's own admission, so it alone decides whether the plan is sizable (its refusal is the one reported). The static replay is the
+        # conservative second model: its budget is the longest leg from the first lease on, which the runner only reaches after that leg ran, so "no leg fits" there is dropped, not thrown,
+        # and the adaptive end stands. When both succeed the later end still wins.
         $simAdaptive = & $simulate $true
-        $pick = $(if ($simAdaptive.t -gt $simStatic.t) { $simAdaptive } else { $simStatic })
-        $t = $pick.t; $batches = [Math]::Max($simStatic.batches, $simAdaptive.batches); $waitTotal = $pick.wait; $lastLegStart = $pick.lastLegStart
+        $simStatic = $null
+        try { $simStatic = & $simulate $false } catch { $simStatic = $null }
+        $pick = $(if ($null -ne $simStatic -and $simStatic.t -ge $simAdaptive.t) { $simStatic } else { $simAdaptive })
+        $t = $pick.t; $batches = $(if ($null -ne $simStatic) { [Math]::Max($simStatic.batches, $simAdaptive.batches) } else { $simAdaptive.batches }); $waitTotal = $pick.wait; $lastLegStart = $pick.lastLegStart
         $span = [long][Math]::Ceiling(($t - $now).TotalSeconds)
         $margin = [Math]::Max([long]$MinMarginSec, [long][Math]::Ceiling($span * $MarginPct / 100.0))
         $computed = $t.AddSeconds($margin)

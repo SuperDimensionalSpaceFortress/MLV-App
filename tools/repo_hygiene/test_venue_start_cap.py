@@ -534,6 +534,48 @@ class StartCapAdversaryR2Pass2Tests(unittest.TestCase):
         self.assertIn("START_CAP_PLAYSECONDS_UNKNOWN", c.stdout)
 
 
+@requires_windows_pwsh
+class StartCapAdversaryR3Tests(unittest.TestCase):
+    """The adversary pass on 37fc5d49 (r2 pass 5: A1, introduced). The static model finding 'no leg fits' must not decide unsizability: only the runner's adaptive replay does."""
+
+    def test_r3a1_a_2400_s_leg_is_sized_though_the_static_budget_does_not_fit(self):
+        # the runner starts at a 360 s leg budget, opens the lease, runs the leg (40 s open + 2610 s run = 2650 s) inside the 2700 s lease; the static model (longest leg + 210 + margin
+        # + open/close = 2770 s) would not fit, and r2 threw START_CAP_UNSIZABLE for it
+        r = call("-LegCount 1 -PlaySeconds 2400")
+        self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2650), r["lines"][0])
+        self.assertEqual(r["source"], "computed")
+        self.assertGreater(parse(r["capUtc"]), parse(r["projectedEndUtc"]))
+        self.assertEqual(r["batches"], 1)
+
+    def test_r3a1_the_same_plan_through_the_runners_per_leg_arguments(self):
+        r = call("-LegCount 1 -PlaySeconds 2400 -MaxPlaySeconds 2400 -LegPlaySeconds @(2400) -LegCooldownSec 60")
+        self.assertEqual(r["source"], "computed")
+        self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2650))
+
+    def test_r3a1_a_long_leg_last_in_the_plan_is_sized_too(self):
+        r = call("-LegCount 3 -LegPlaySeconds @(25,25,2400)")
+        self.assertEqual(r["source"], "computed")
+        self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=40 + 235 + 235 + 2610))
+
+    def test_r3a1_the_cli_prints_the_cap_for_it(self):
+        c = cli("-LegCount", "1", "-PlaySeconds", "2400", "-NowUtc", NOW)
+        self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+        self.assertNotIn("START_CAP_UNSIZABLE", c.stdout + c.stderr)
+        self.assertIn("StartCapUtc=", c.stdout)
+
+    def test_r3a1_a_plan_the_adaptive_replay_cannot_place_is_still_unsizable(self):
+        for extra in ("-CapSec 60", "-BudgetSec 0", "-PlaySeconds 2800"):
+            p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 {extra}")
+            self.assertNotEqual(p.returncode, 0, extra)
+            self.assertIn("START_CAP_UNSIZABLE", p.stderr + p.stdout, extra)
+
+    def test_r3a1_the_static_replay_failing_is_caught_and_the_adaptive_one_runs_first(self):
+        src = CHAIN.read_text(encoding="utf-8")
+        i = src.index("$simAdaptive = & $simulate $true")
+        self.assertLess(i, src.index("& $simulate $false"), "the adaptive replay (the runner's own admission) runs, and may throw, first")
+        self.assertRegex(src[i:i + 400], r"try \{ \$simStatic = & \$simulate \$false \} catch \{ \$simStatic = \$null \}")
+
+
 class LeaseBatchWiringTests(unittest.TestCase):
     """Source pins on the tracked runner: the default deadline is sized from the plan, an explicit one is kept."""
 
