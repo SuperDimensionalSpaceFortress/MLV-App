@@ -694,7 +694,11 @@ def check_red_mutation_verdict(root: Path, rel_paths: list[str]) -> list[Violati
         for index, case in enumerate(cases, start=1):
             try:
                 kind, want = case["kind"], case["expect"]
+                if want not in (red_mutation_verdict.PASS, red_mutation_verdict.REFUSED):
+                    raise ValueError(f"expect must be PASS or REFUSED, got {want!r}")
                 if kind == "verdict":
+                    if not isinstance(case["output"], str) or not isinstance(case["expected_assertion"], str):
+                        raise TypeError("output and expected_assertion must be strings")
                     got, why = red_mutation_verdict.verdict(case["output"], case["expected_assertion"])
                 elif kind == "probe":
                     ok, why = red_mutation_verdict.probe_discriminates(
@@ -1181,6 +1185,20 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                          json.dumps({"cases": [{"kind": "verdict", "expect": "PASS"}]})):
                 rels = _write_tree(root, {RED_MUTATION_CORPUS: text})
                 with self.assertRaises(CouldNotCheck, msg=text):
+                    run_guard(guard, root, rels)
+
+    def test_red_mutation_verdict_null_or_non_string_fields_are_could_not_check(self) -> None:
+        # A corpus case with `output: null` or a non-string expected_assertion is a malformed
+        # corpus (CouldNotCheck), never an AttributeError out of the checker.
+        guard = GUARDS["DG-RED-MUTATION-VERDICT"]
+        good = {"kind": "verdict", "output": "Ran 1 test\n\nOK\n", "expected_assertion": "a.py:1", "expect": "REFUSED"}
+        bad = [{**good, "output": None}, {**good, "output": 7}, {**good, "expected_assertion": None},
+               {**good, "expected_assertion": ["a.py:1"]}, {**good, "expect": "MAYBE"}, {**good, "expect": None}]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for case in bad:
+                rels = _write_tree(root, {RED_MUTATION_CORPUS: json.dumps({"cases": [case]})})
+                with self.assertRaises(CouldNotCheck, msg=repr(case)):
                     run_guard(guard, root, rels)
 
     def test_ps_one_trap_red_fails(self) -> None:

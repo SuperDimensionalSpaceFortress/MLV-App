@@ -125,7 +125,7 @@
   {
    "id": "probe-705-2.8s-rounds-to-3-both-ways",
    "kind": "probe",
-   "why": "PR #705 B1: probe 2.8 s; Int32 overload ceil(2.8)=3, fixed double overload round(2.8)=3; window [3,3]",
+   "why": "PR #705 B1 as recorded on the bus: the test rounded the reading for display, so the Int32 overload (3) and the fixed double overload (2.8, round = 3) both read 3; window [3,3]",
    "bug_value": 3,
    "fix_value": 3,
    "window": [
@@ -135,16 +135,16 @@
    "expect": "REFUSED"
   },
   {
-   "id": "probe-705-2.2s-separates",
+   "id": "probe-705-2.2s-int32-overload-also-reads-inside",
    "kind": "probe",
-   "why": "probe 2.2 s: bug reads ceil(2.2)=3, fix reads 2.2; window [2.0, 2.5]",
-   "bug_value": 3,
+   "why": "probe 2.2 s, measured in powershell.exe 5.1.19041.6456: [Math]::Min(330,2.2) is Int32 2, [Math]::Min(330.0,2.2) is Double 2.2; both sit inside [2.0, 2.5], so this probe cannot tell the overloads apart",
+   "bug_value": 2,
    "fix_value": 2.2,
    "window": [
     2.0,
     2.5
    ],
-   "expect": "PASS"
+   "expect": "REFUSED"
   },
   {
    "id": "probe-minutes-vs-seconds-30-passes-both",
@@ -193,6 +193,130 @@
     1
    ],
    "expect": "REFUSED"
+  },
+  {
+   "id": "ut-same-method-other-class",
+   "kind": "verdict",
+   "why": "test_scale passed in class A and failed in class B; A.test_scale never failed",
+   "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "test_s.A.test_scale",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-qualified-id-of-the-failing-class",
+   "kind": "verdict",
+   "why": "control: B.test_scale is the one that failed",
+   "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "test_s.B.test_scale",
+   "expect": "PASS"
+  },
+  {
+   "id": "ut-nonexistent-qualified-id",
+   "kind": "verdict",
+   "why": "zz.Nope.test_scale names no test in the run; sharing the last segment is not a match",
+   "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "zz.Nope.test_scale",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-wrong-module-and-class-same-method",
+   "kind": "verdict",
+   "why": "wrong.Expected.test_scale shares only the method name",
+   "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "wrong.Expected.test_scale",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-file-line-other-directory",
+   "kind": "verdict",
+   "why": "elsewhere/test_s.py:12 is not the file the frame names (frame has no directory)",
+   "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "elsewhere/test_s.py:12",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-file-line-bare-name-matches-relative-frame",
+   "kind": "verdict",
+   "why": "control: test_s.py:12 against a frame that is test_s.py:12",
+   "output": "test_scale (test_s.A.test_scale) ... ok\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=1)\n",
+   "expected_assertion": "test_s.py:12",
+   "expect": "PASS"
+  },
+  {
+   "id": "ut-bare-method-name-matches-two-failures",
+   "kind": "verdict",
+   "why": "both A.test_scale and B.test_scale failed; the bare name does not say which",
+   "output": "test_scale (test_s.A.test_scale) ... FAIL\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.A.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 8, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n",
+   "expected_assertion": "test_scale",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "ut-qualified-name-picks-one-of-two-failures",
+   "kind": "verdict",
+   "why": "control: both classes failed, A.test_scale is named",
+   "output": "test_scale (test_s.A.test_scale) ... FAIL\ntest_scale (test_s.B.test_scale) ... FAIL\n\n======================================================================\nFAIL: test_scale (test_s.A.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 8, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n======================================================================\nFAIL: test_scale (test_s.B.test_scale)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"C:\\wk\\test_s.py\", line 12, in test_scale\n    self.assertEqual(scale(2), 121)\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^\nAssertionError: 120 != 121\n\n----------------------------------------------------------------------\nRan 2 tests in 0.001s\n\nFAILED (failures=2)\n",
+   "expected_assertion": "A.test_scale",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-same-function-other-file",
+   "kind": "verdict",
+   "why": "test_x failed in a/test_s.py and passed in b/test_s.py",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
+   "expected_assertion": "b/test_s.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-function-in-the-failing-file",
+   "kind": "verdict",
+   "why": "control: a/test_s.py::test_x is the failure",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
+   "expected_assertion": "a/test_s.py::test_x",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-two-files-name-the-second",
+   "kind": "verdict",
+   "why": "test_x failed in both files; the second is named",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py F                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\nb\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\nFAILED b/test_s.py::test_x - assert 1 == 2\n============================== 2 failed in 0.55s ==============================\n",
+   "expected_assertion": "b/test_s.py::test_x",
+   "expect": "PASS"
+  },
+  {
+   "id": "pt-two-files-name-a-third",
+   "kind": "verdict",
+   "why": "test_x failed in a/ and b/ only; c/test_s.py::test_x never ran",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\na\\test_s.py F                                                            [ 50%]\nb\\test_s.py F                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\na\\test_s.py:2: AssertionError\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\nb\\test_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED a/test_s.py::test_x - assert 1 == 2\nFAILED b/test_s.py::test_x - assert 1 == 2\n============================== 2 failed in 0.55s ==============================\n",
+   "expected_assertion": "c/test_s.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-file-line-other-directory",
+   "kind": "verdict",
+   "why": "elsewhere/test_s.py:2 against a frame that is test_s.py:2",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
+   "expected_assertion": "elsewhere/test_s.py:2",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "pt-node-id-other-directory",
+   "kind": "verdict",
+   "why": "elsewhere/test_s.py::test_x against a node id that is test_s.py::test_x",
+   "output": "============================= test session starts =============================\nplatform win32 -- Python 3.14.3, pytest-9.0.3, pluggy-1.6.0\nrootdir: C:\\wk\nplugins: anyio-4.13.0, hypothesis-6.152.4\ncollected 2 items\n\ntest_s.py F                                                            [ 50%]\nb\\test_s.py .                                                            [100%]\n\n================================== FAILURES ===================================\n___________________________________ test_x ____________________________________\n\n    def test_x():\n>       assert 1 == 2\nE       assert 1 == 2\n\ntest_s.py:2: AssertionError\n=========================== short test summary info ===========================\nFAILED test_s.py::test_x - assert 1 == 2\n========================= 1 failed, 1 passed in 0.52s =========================\n",
+   "expected_assertion": "elsewhere/test_s.py::test_x",
+   "expect": "REFUSED"
+  },
+  {
+   "id": "probe-705-2.8s-raw-readings-separate",
+   "kind": "probe",
+   "why": "probe 2.8 s, raw readings measured in powershell.exe 5.1.19041.6456: [Math]::Min(330,2.8) is Int32 3 (2.8 converts to the nearest integer), [Math]::Min(330.0,2.8) is Double 2.8; window [2.7, 2.9] holds only the fix reading",
+   "bug_value": 3,
+   "fix_value": 2.8,
+   "window": [
+    2.7,
+    2.9
+   ],
+   "expect": "PASS"
   }
  ]
 }

@@ -18,7 +18,7 @@ Two decidable pieces:
   run plus the expected assertion (``file:line`` or a test id) and returns PASS only
   when that assertion is one that failed.
 
-CLI (exit 0 = PASS, 1 = REFUSED, 2 = bad usage)::
+CLI (exit 0 = PASS, 1 = REFUSED, 2 = bad usage or an unreadable --output file)::
 
     py -3 tools/repo_hygiene/red_mutation_verdict.py verdict --output red.txt --expect tools/x/test_y.py:123
     py -3 tools/repo_hygiene/red_mutation_verdict.py probe --bug 3 --fix 3 --window 3 3
@@ -31,14 +31,26 @@ NON-PROMISES:
   line N`` frames) and the default ``pytest`` layout (``FAILURES``/``ERRORS`` sections with
   ``file.py:N:`` lines and ``E`` lines, plus the ``FAILED`` summary). Any other runner or
   ``--tb=no`` output with no ``FAILED`` summary lines is REFUSED as unrecognized, never PASSed.
-- ``file:line`` matches when ANY traceback frame of a failing assertion sits at that
-  file (path-component suffix) and line, so naming the test body line or the helper line
-  that raised both work. A bare test name matches by dotted-component suffix, so it is
-  ambiguous across classes; name the class, or use ``file:line``.
+- Matching is one-directional: the expectation may be a SUFFIX of what the run printed,
+  on a segment boundary, and never the reverse. ``file:line`` matches when ANY traceback
+  frame of a failing assertion sits at that line in a file whose path ENDS WITH the
+  expected path (``pkg/test_x.py:5`` matches a frame in ``/w/pkg/test_x.py``;``elsewhere/test_x.py:5``
+  does not match a frame ``test_x.py``), so naming the test body line or the helper line
+  that raised both work. A test id is compared with the failure's FULL identity (unittest
+  ``module.Class.method``; pytest node id from the ``FAILED`` summary line), so
+  ``zz.Nope.test_scale`` never matches ``test_s.B.test_scale``. A bare ``test_scale`` that
+  matches two different failing tests is REFUSED as ambiguous: name the class.
+- A pytest failure section is tied to its node id by test name AND by the file in its
+  traceback frames. With no ``FAILED`` summary line (``-rN``) the section has no identity,
+  so only ``file:line`` can match it.
 - Other tests that also failed do not block a PASS; a collection or import error anywhere
   in the run does (the run is red for a reason that is not the assertion).
 - It does not know whether the assertion is the RIGHT one: choosing the expected site is
   the author's claim, and this check only binds the run to it.
+- INNERMOST FRAME (follow-up card RMV-INNERMOST-FRAME, not promised here): a ``file:line``
+  match on ANY frame means an ``assert`` inside production code reached from the test, or a
+  chained pytest exception whose earlier frame is the expected site, can read as PASS. The
+  checker does not require the expected site to be the frame that raised.
 - ``probe_discriminates`` compares two numbers against a closed window. It does not model
   how the code under test rounds; the caller computes the readings and writes the
   arithmetic next to the probe.
@@ -94,11 +106,10 @@ def _norm_id(text: str) -> list[str]:
     return [p for p in text.split(".") if p]
 
 
-def _suffix_match(a: list[str], b: list[str]) -> bool:
-    if not a or not b:
-        return False
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    return long_[-len(short):] == short
+def _ends_with(whole: list[str], tail: list[str]) -> bool:
+    """True when `tail` is a non-empty segment-boundary suffix of `whole`. One-directional on purpose:
+    an expectation longer than what the run printed is never a match."""
+    return bool(whole) and bool(tail) and len(tail) <= len(whole) and whole[-len(tail):] == tail
 
 
 def _parse_unittest(text: str) -> list[Failure]:
@@ -121,11 +132,25 @@ def _parse_unittest(text: str) -> list[Failure]:
         frames = [(m["file"], int(m["line"])) for m in map(_FRAME.match, block) if m]
         joined = "\n".join(block)
         collection = ("_FailedTest" in body[0] or "unittest/loader.py" in joined.replace("\\", "/"))
-        ident = head["ident"] or ""
-        ids = [i for i in (ident, head["name"]) if i and "unittest.loader" not in i]
+        ident, name = head["ident"] or "", head["name"]
+        # 3.11+ prints the full id in the parentheses; older Pythons print module.Class only.
+        full = ident if ident.rsplit(".", 1)[-1] == name else (f"{ident}.{name}" if ident else name)
+        ids = [] if "unittest.loader" in full else [full]
         out.append(Failure(ids, frames, assertion=head["kind"] == "FAIL" and not collection,
                            collection=collection, note=body[0].strip()))
     return out
+
+
+def _same_file(a: list[str], b: list[str]) -> bool:
+    return _ends_with(a, b) or _ends_with(b, a)
+
+
+def _pair_nodes(want: list[str], frames: list[tuple[str, int]], nodes: list[str]) -> list[str]:
+    cands = [n for n in nodes if _ends_with(_norm_id(n), want)]
+    if frames:
+        files = [_norm_path(file) for file, _line in frames]
+        return [n for n in cands if any(_same_file(_norm_path(n.split("::", 1)[0]), fp) for fp in files)]
+    return cands if len(cands) == 1 else []
 
 
 def _parse_pytest(text: str) -> list[Failure]:
@@ -173,10 +198,10 @@ def _parse_pytest(text: str) -> list[Failure]:
     for f in out:
         f.assertion = bool(f.assertion) and not f.collection
         bare = f.ids[0].replace("ERROR at setup of ", "").replace("ERROR at teardown of ", "")
-        want = _norm_id(bare)
-        for node, _msg in nodes:
-            if want and _suffix_match(want, _norm_id(node)):
-                f.ids.append(node)
+        # The section header is a bare name (`T.test_a`, or just `test_x` for a module-level
+        # function), so it is not an identity. Its identity is the FAILED-summary node id whose
+        # tail is that name and whose file appears in the section's own traceback frames.
+        f.ids = _pair_nodes(_norm_id(bare), f.frames, [n for n, _msg in nodes])
     if not out:
         for node, msg in nodes:
             out.append(Failure([node], [], bool(re.match(r"(assert\b|AssertionError)", msg)), note=msg))
@@ -193,10 +218,10 @@ def _matches(failure: Failure, expected: str) -> bool:
     site = _EXPECT_SITE.match(expected.strip())
     if site:
         want_file, want_line = _norm_path(site["file"]), int(site["line"])
-        return any(line == want_line and _suffix_match(want_file, _norm_path(file))
+        return any(line == want_line and _ends_with(_norm_path(file), want_file)
                    for file, line in failure.frames)
     want = _norm_id(expected)
-    return any(_suffix_match(want, _norm_id(i)) for i in failure.ids)
+    return any(_ends_with(_norm_id(i), want) for i in failure.ids)
 
 
 def verdict(output: str, expected: str) -> tuple[str, str]:
@@ -215,6 +240,11 @@ def verdict(output: str, expected: str) -> tuple[str, str]:
         return REFUSED, ("collection or import error in the run (" + broken[0].note[:80]
                          + "): red for a reason that is not the assertion")
     hit = [f for f in run.failures if _matches(f, expected)]
+    if not _EXPECT_SITE.match(expected.strip()):
+        named = sorted({i for f in hit for i in f.ids})
+        if len(named) > 1:
+            return REFUSED, (f"{expected} is ambiguous: it matches {len(named)} failing tests ("
+                             + ", ".join(named[:4]) + "); name the class")
     if any(f.assertion for f in hit):
         return PASS, f"assertion failed at {expected}"
     if hit:
@@ -256,7 +286,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--window", type=float, nargs=2, required=True, metavar=("LO", "HI"))
     args = ap.parse_args(argv)
     if args.cmd == "verdict":
-        text = Path(args.output).read_text(encoding="utf-8", errors="replace")
+        try:
+            text = Path(args.output).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"cannot read --output {args.output!r}: {type(exc).__name__}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
         status, reason = verdict(text, args.expect)
     else:
         ok, reason = probe_discriminates(args.bug, args.fix, tuple(args.window))
