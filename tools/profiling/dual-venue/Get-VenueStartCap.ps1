@@ -3,7 +3,10 @@
 # runner (Invoke-VenueLeaseBatch.ps1) calls the same Get-VenueRunStartCap itself when it is given no -DeadlineUtc.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Get-VenueStartCap.ps1 -LegCount 12 [-PlaySeconds 25 | -LegSpec <json>...] [-CooldownSec 300 -BudgetSec 9720]
-#        [-HardEndUtc <iso>] [-ExplicitCapUtc <iso>]
+#        [-HardEndUtc <iso>] [-ExplicitCapUtc <iso>] [-Lease <startUtc>/<endUtc>[,<startUtc>/<endUtc>...]]
+#
+# -Lease: the earlier leases of the venue (rows of its lease ledger), each <startUtc>/<endUtc>, several comma-separated in the one value. They feed the lease cooldown and the 3 h budget wait inside
+#   the projection. With none the CLI prints START_CAP_LEASES_NONE_ASSUMED: the cap then assumes the venue was not leased recently.
 #
 # Prints the typed START_CAP line (and START_CAP_CLAMPED_TO_HARD_BOUND when the run's hard end is what limits the cap), then a last line `StartCapUtc=<iso>`.
 # -LegSpec: one leg spec per planned leg (a spec may repeat; under -File several are one comma-separated value); -LegCount comes from them, and each leg strides by ITS OWN
@@ -28,7 +31,8 @@ param(
     [int]$BudgetSec = 5400,
     [string]$NowUtc = '',
     [string]$HardEndUtc = '',
-    [string]$ExplicitCapUtc = ''
+    [string]$ExplicitCapUtc = '',
+    [string[]]$Lease = @()
 )
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -69,8 +73,19 @@ try {
     if ($LegCooldownSec -gt 0) { $args2.LegCooldownSec = $LegCooldownSec }
     if ($MaxPlaySeconds -gt 0) { $args2.MaxPlaySeconds = $MaxPlaySeconds }
     if ($legSeconds.Count -eq $LegCount) { $args2.LegPlaySeconds = $legSeconds }
+    # r3 (adversary pass 2 A1): the earlier leases of the venue (its lease ledger rows) are inputs of the cooldown and the 3 h budget wait, so they are named here, one -Lease <startUtc>/<endUtc>
+    # per row (a comma list under -File is several). A text that is not two times joined by '/' is START_CAP_BAD_TIME, never a silently dropped row.
+    $leaseRows = @(foreach ($item in @($Lease | Where-Object { $_ })) {
+            foreach ($piece in @("$item" -split ',' | Where-Object { $_.Trim() })) {
+                $ends = @($piece.Trim() -split '/')
+                if ($ends.Count -ne 2) { throw "START_CAP_BAD_TIME name=Lease value='$($piece -replace '\s+', ' ')' (a lease is <startUtc>/<endUtc>)" }
+                [pscustomobject]@{ startUtc = (ConvertTo-VenueStartCapTime $ends[0].Trim() 'Lease.startUtc'); endUtc = (ConvertTo-VenueStartCapTime $ends[1].Trim() 'Lease.endUtc') }
+            }
+        })
+    if ($leaseRows.Count -gt 0) { $args2.Leases = $leaseRows }
     $r = Get-VenueRunStartCap @args2
 } catch { Stop-StartCap $_.Exception.Message }
 $r.lines | ForEach-Object { Write-Output $_ }
+if ($leaseRows.Count -eq 0) { Write-Output 'START_CAP_LEASES_NONE_ASSUMED (no earlier lease was named with -Lease <startUtc>/<endUtc>: the cap assumes no cooldown and no 3 h budget already spent; name the ledger rows when the venue was used recently)' }
 Write-Output ("StartCapUtc=" + $r.capText)
 exit 0

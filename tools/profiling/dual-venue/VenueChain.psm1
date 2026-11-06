@@ -1262,15 +1262,16 @@ function Get-VenueRunStartCap {
     $hard = $(if ($null -ne $HardBoundUtc -and "$HardBoundUtc" -ne '') { ConvertTo-VenueStartCapTime $HardBoundUtc 'HardBoundUtc' } else { $null })
     $hasExplicit = ($null -ne $ExplicitCapUtc -and "$ExplicitCapUtc" -ne '')
     $explicit = $(if ($hasExplicit) { ConvertTo-VenueStartCapTime $ExplicitCapUtc 'ExplicitCapUtc' } else { $null })
-    # the per-leg seconds (A1/A4): each is range-checked in [double] before it is rounded up into a whole second
+    # the per-leg seconds (A1/A4): each is range-checked in [double] before it is rounded into a whole second the way the runner's [int] cast rounds it (r3, adversary pass 2 A3: the runner
+    # reads 2450.1 as 2450, and a rounded-UP 2451 s refused a leg the runner holds in a 2700 s lease). A null list is no list (advisory A5: it passed the count check and left legWallSec 210).
     [long[]]$legSecs = @()
-    if (@($LegPlaySeconds).Count -gt 0) {
+    if ($null -ne $LegPlaySeconds -and @($LegPlaySeconds).Count -gt 0) {
         if (@($LegPlaySeconds).Count -ne $LegCount) { throw "START_CAP_USAGE -LegPlaySeconds names $(@($LegPlaySeconds).Count) legs but -LegCount is $LegCount" }
         $legSecs = @(foreach ($x in $LegPlaySeconds) {
                 $d = [double]::NaN
                 try { $d = [double]$x } catch { $d = [double]::NaN }
                 if (-not ($d -ge 1 -and $d -le 36000)) { throw "START_CAP_BAD_LEG a leg's play seconds '$x' is not a number from 1 to 36000" }
-                [long][Math]::Ceiling($d)
+                [long][Math]::Round($d, [MidpointRounding]::ToEven)
             })
         [long]$legWall = [long][Math]::Ceiling(($legSecs | Measure-Object -Average).Average) + $LegOverheadSec + $LegCooldownSec
     }
@@ -1300,12 +1301,14 @@ function Get-VenueRunStartCap {
                 # leg k of a lease starts at open + OpenClose + the walls (run + the runner's sleep) of the legs before it, and is admitted while that start is within room - margin - leg budget
                 [long]$lastStartOff = $BatchOpenCloseSec; [long]$off = $BatchOpenCloseSec; $first = $true; $expired = $false
                 while ($next -lt $LegCount -and ($first -or $off -le ($room - $LeaseMarginSec - $lb))) {
-                    # r3 (adversary A1, pass 2): a leg that cannot END inside the lease's room never completes there. As the first leg of a lease it can complete in no lease at all
+                    # r3 (adversary A1, pass 1): a leg that cannot END inside the lease's room never completes there. As the first leg of a lease it can complete in no lease at all
                     # (the same room every time), so the plan is unsizable. As a later leg the runner still starts it (the start test only looks at the leg budget it knows so far),
-                    # the lease expires under it (the lease is clamped, the child is bounded to the expiry: LEASE_EXPIRED, uncounted) and the leg is retried first in the next lease.
+                    # the lease expires under it (the lease is clamped, the child is bounded to the expiry: LEASE_EXPIRED, outcome INVALID, uncounted, NEVER re-run: Invoke-VenueLeaseBatch.ps1
+                    # removes it from the pending list and ends the batch). So the leg is consumed, the lease ends at its room, the leg budget does not grow (the leg did not complete), and
+                    # the next lease starts with the following leg (adversary pass 2 A2: a retry of the expired leg was an invented batch).
                     if (($off + $runs[$next]) -gt $room) {
                         if ($first) { throw "a lease holds at most roomSec=$room (capSec=$CapSec, budgetRoomSec=$($w.budgetRoomSec)) and the next leg needs $($BatchOpenCloseSec + $runs[$next]) s (openCloseSec=$BatchOpenCloseSec + the leg's run $($runs[$next]) s = playSeconds + overhead $LegOverheadSec): no leg fits a lease" }
-                        $lastStartOff = $off; $expired = $true; break
+                        $lastStartOff = $off; $expired = $true; $next++; break
                     }
                     $lastStartOff = $off; $off += $runs[$next] + $LegCooldownSec
                     if ($Adaptive) { $lb = [Math]::Min(2700, [Math]::Max($lb, $runs[$next])) }
@@ -1364,7 +1367,7 @@ function Get-VenueLegPlaySeconds {
         if ($null -eq $v -or $v -is [bool]) { return $null }
         # r2 (adversary A4): the value is read as a [double] and range-checked BEFORE any integer cast, so 2147483647.1 (an Int32 cast that works, a Ceiling that does not) is
         # unreadable, not an exception. A number is that double; a string is parsed as a double (so "1,200" is 1200), and only text that is no decimal number ("0x4b0") falls back
-        # to the runner's own [int] cast (Invoke-VenueLeg, the plan preflight), whose result is range-checked as well. A number is rounded up to a whole second.
+        # to the runner's own [int] cast (Invoke-VenueLeg, the plan preflight), whose result is range-checked as well. A number is rounded to a whole second the way that cast rounds it (to nearest, ties to even; r3 A3).
         $d = [double]::NaN
         if ($v -is [double] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [System.Numerics.BigInteger]) { $d = [double]$v }
         elseif ($v -is [string]) {
@@ -1374,7 +1377,10 @@ function Get-VenueLegPlaySeconds {
         }
         else { return $null }
         if (-not ($d -gt 0 -and $d -le 36000)) { return $null }
-        [int][Math]::Ceiling($d)
+        # r3 (adversary pass 2 A3): rounded the way the runner's [int] cast rounds it (to nearest, ties to even), not up: 2450.1 is the 2450 s the runner plays
+        $secs = [int][Math]::Round($d, [MidpointRounding]::ToEven)
+        if ($secs -lt 1) { return $null }
+        $secs
     } catch { return $null }
 }
 

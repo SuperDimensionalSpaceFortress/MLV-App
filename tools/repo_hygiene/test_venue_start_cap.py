@@ -264,7 +264,7 @@ class StartCapAdversaryTests(unittest.TestCase):
         self.assertEqual((r["capUtc"], r["source"]), ("2026-10-30T12:00:00Z", "explicit"))
         # the runner catches a sizing failure and keeps the legacy window
         src = BATCH.read_text(encoding="utf-8")
-        self.assertRegex(src, r'\} catch \{ L "START_CAP source=legacy ')
+        self.assertRegex(src, r'\} catch \{ LogBest "START_CAP source=legacy ')
 
     def test_a5_a_leg_spec_path_with_a_comma_is_one_leg(self):
         with tempfile.TemporaryDirectory() as d:
@@ -473,8 +473,9 @@ class StartCapAdversaryR2Tests(unittest.TestCase):
 
     def test_r2a4_the_whole_number_range_is_checked_in_double_before_any_int_cast(self):
         with tempfile.TemporaryDirectory() as d:
-            want = {"36000": 36000, "35999.2": 36000, "36000.5": None, "1e300": None, "-5": None, "0": None, "0.4": 1, "99999999999999999999": None,
-                    "2147483647": None, "2147483648": None, "2147483647.1": None, "2147483646.5": None, "1200": 1200}
+            # r3 (adversary pass 2 A3): a fraction is rounded as the runner's [int] cast rounds it (nearest, ties to even), so 35999.2 is 35999, 0.4 is 0 (no leg) and 2450.1 is 2450
+            want = {"36000": 36000, "35999.2": 35999, "36000.5": None, "1e300": None, "-5": None, "0": None, "0.4": None, "99999999999999999999": None,
+                    "2147483647": None, "2147483648": None, "2147483647.1": None, "2147483646.5": None, "1200": 1200, "2450.1": 2450, "2450.5": 2450, "2450.6": 2451, "0.6": 1}
             specs = {k: write_spec(Path(d), f"s{i}.json", json.loads(k)) for i, k in enumerate(want)}
             lines = "; ".join(f"Write-Output ('{k}=' + [string](Get-VenueLegPlaySeconds -SpecPath '{p}'))" for k, p in specs.items())
             p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; {lines}")
@@ -553,13 +554,63 @@ class StartCapAdversaryR3Tests(unittest.TestCase):
         self.assertGreaterEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2650))
 
     def test_r3a1_a_long_leg_last_in_the_plan_is_sized_with_the_lease_it_expires_in(self):
-        # pass 2 (adversary, 08f5d613): legs 25,25,2400. The runner starts leg 3 at 510 s into lease 1 (its leg budget is only 235 s by then); 510 + 2610 s does not end inside the
-        # 2700 s lease, so the lease expires under it (LEASE_EXPIRED, uncounted) and the leg is retried first in lease 2, 1800 s of cooldown later (40 + 2610 = 2650 s).
-        # No lease is ever projected longer than its room (r3 first pass projected one 3120 s lease).
+        # pass 1 (adversary, 08f5d613): legs 25,25,2400. The runner starts leg 3 at 510 s into lease 1 (its leg budget is only 235 s by then); 510 + 2610 s does not end inside the
+        # 2700 s lease, so the lease expires under it: LEASE_EXPIRED, uncounted, and (pass 2, 9d4c8e43) NEVER re-run, so the plan is over at the lease's room, 2700 s. No lease is
+        # ever projected longer than its room (the first r3 fix projected one 3120 s lease; the second invented a retry batch).
         r = call("-LegCount 3 -LegPlaySeconds @(25,25,2400)")
         self.assertEqual(r["source"], "computed")
+        self.assertEqual(r["batches"], 1, r["lines"][0])
+        self.assertEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2700), r["lines"][0])
+
+    def test_r3a2_an_expired_leg_is_consumed_not_retried_and_does_not_grow_the_budget(self):
+        # pass 2 (adversary, 9d4c8e43): @(25,2400,25). Leg 2 expires lease 1 at 2700 s and is gone; leg 3 opens lease 2 after the 1800 s cooldown (4500 s) and ends 275 s later.
+        r = call("-LegCount 3 -LegPlaySeconds @(25,2400,25)")
         self.assertEqual(r["batches"], 2, r["lines"][0])
-        self.assertEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2700 + 1800 + 40 + 2610), r["lines"][0])
+        self.assertEqual(parse(r["projectedEndUtc"]), parse(NOW) + timedelta(seconds=2700 + 1800 + 275), r["lines"][0])
+        # the hard-bound input of the finding: the retry the old model invented put the last leg's start past the bound; there is none now
+        h = call("-LegCount 3 -LegPlaySeconds @(25,25,2400) -HardBoundUtc '2026-10-30T10:20:16Z'")
+        self.assertFalse(h["projectedPastBound"], h["lines"])
+        self.assertEqual(h["batches"], 1)
+
+    def test_r3a1p2_the_cli_names_the_earlier_leases_that_feed_the_cooldown_and_budget_waits(self):
+        # pass 2 (adversary, 9d4c8e43): the CLI took no ledger rows, so a venue leased 07:50-09:20Z got a cap before its first possible lease (10:50:16Z)
+        none = cli("-LegCount", "1", "-NowUtc", NOW)
+        self.assertEqual(none.returncode, 0, none.stdout + none.stderr)
+        self.assertIn("START_CAP_LEASES_NONE_ASSUMED", none.stdout)
+        used = cli("-LegCount", "1", "-NowUtc", NOW, "-Lease", "2026-10-30T07:50:16Z/2026-10-30T08:35:16Z,2026-10-30T08:35:16Z/2026-10-30T09:20:16Z")
+        self.assertEqual(used.returncode, 0, used.stdout + used.stderr)
+        self.assertNotIn("START_CAP_LEASES_NONE_ASSUMED", used.stdout)
+        self.assertGreaterEqual(parse(cli_cap(used)), parse("2026-10-30T10:50:16Z") + timedelta(seconds=40 + 235), used.stdout)
+        bad = cli("-LegCount", "1", "-NowUtc", NOW, "-Lease", "yesterday")
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
+        self.assertIn("START_CAP_BAD_TIME", bad.stdout)
+
+    def test_r3a3_a_leg_duration_is_rounded_as_the_runner_casts_it(self):
+        # pass 2 (adversary, 9d4c8e43): playSeconds 2450.1 is the runner's 2450 s (40 + 2450 + 210 = 2700 s, inside the 2700 s lease); rounded UP it was 2451 s and UNSIZABLE
+        ok = call("-LegCount 1 -LegPlaySeconds @(2450.1)")
+        self.assertEqual(ok["source"], "computed")
+        self.assertEqual(ok["legWallSec"], 2660, ok["lines"][0])
+        with tempfile.TemporaryDirectory() as d:
+            spec = write_spec(Path(d), "s.json", 2450.1)
+            c = cli("-LegSpec", spec, "-NowUtc", NOW)
+            self.assertEqual(c.returncode, 0, c.stdout + c.stderr)
+            self.assertIn("StartCapUtc=", c.stdout)
+        p = run_ps(f"Import-Module '{CHAIN}' -Force -DisableNameChecking; Get-VenueRunStartCap -NowUtc '{NOW}' -LegCount 1 -LegPlaySeconds @(2450.6)")
+        self.assertNotEqual(p.returncode, 0, "2450.6 is 2451 s to the runner: 40 + 2451 + 210 = 2701 s")
+        self.assertIn("START_CAP_UNSIZABLE", p.stderr + p.stdout)
+
+    def test_r3a4_the_runners_sizing_block_survives_an_unwritable_batch_log(self):
+        # pass 2 (adversary, 9d4c8e43): L throws on a failed append, so a log failure inside the try reached the catch's own L and escaped before BATCH_RUN_START
+        src = BATCH.read_text(encoding="utf-8")
+        m = re.search(r"with no -DeadlineUtc the run's deadline is sized.*?\nif \(\$DeadlineUtc\) \{(.*?)\n\}\nL \"BATCH_RUN_START", src, re.S)
+        self.assertIsNotNone(m)
+        code = "\n".join(ln for ln in m.group(1).splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"(?<![A-Za-z-])L [\"$]", "no bare L in the sizing block: every line is LogBest")
+        self.assertGreaterEqual(code.count("LogBest"), 5)
+
+    def test_r3a5_a_null_per_leg_list_is_no_list(self):
+        r = call("-LegCount 1 -LegPlaySeconds $null")
+        self.assertEqual(r["legWallSec"], 235, r["lines"][0])
 
     def test_r3a1_a_leg_that_ends_after_its_lease_in_every_lease_is_unsizable(self):
         # pass 2 (adversary, 08f5d613): -PlaySeconds 1200 in a 600 s lease needs 40 + 1410 s and fits no lease; r3 pass 1 reported batches=1 spanSec=1450 for it
@@ -608,7 +659,7 @@ class LeaseBatchWiringTests(unittest.TestCase):
 
     def test_default_deadline_is_sized_from_the_plan_and_never_below_the_legacy_window(self):
         self.assertIn("$t0.AddHours(6)", self.src, "the legacy 6 h window stays as the floor")
-        m = re.search(r"if \(\$DeadlineUtc\) \{\s*\n\s*L \"START_CAP source=explicit.*?\n\} else \{(.*?)\n\}\nL \"BATCH_RUN_START", self.src, re.S)
+        m = re.search(r"if \(\$DeadlineUtc\) \{\s*\n\s*LogBest \"START_CAP source=explicit.*?\n\} else \{(.*?)\n\}\nL \"BATCH_RUN_START", self.src, re.S)
         self.assertIsNotNone(m, "the START_CAP block sits right before BATCH_RUN_START")
         body = m.group(1)
         self.assertIn("Get-VenueRunStartCap", body)
@@ -619,7 +670,7 @@ class LeaseBatchWiringTests(unittest.TestCase):
         self.assertIn("if ($startCap.capUtc -gt $deadline)", body, "the computed cap only ever extends the legacy window")
 
     def test_explicit_deadline_is_logged_and_kept(self):
-        self.assertRegex(self.src, r'if \(\$DeadlineUtc\) \{\s*\n\s*L "START_CAP source=explicit capUtc=')
+        self.assertRegex(self.src, r'if \(\$DeadlineUtc\) \{\s*\n\s*LogBest "START_CAP source=explicit capUtc=')
 
     def test_module_exports_and_the_cli_exist(self):
         chain = CHAIN.read_text(encoding="utf-8")
