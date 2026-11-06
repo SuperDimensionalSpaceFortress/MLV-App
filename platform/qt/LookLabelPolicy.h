@@ -134,6 +134,21 @@ inline bool slidersSetAppliedKey( const void *slidersReceipt, const void *active
     return slidersReceipt != nullptr && slidersReceipt == activeReceipt;
 }
 
+/*! \brief r17 (adversary r16 efd170f4 A1): whether setSliders makes its receipt the key again, with its switch, once its modal
+ *  work has returned. The key is written before any slider (slidersSetAppliedKey, or the opener recorded it), but the dark-frame
+ *  and LUT error dialogs (on_lineEditDarkFrameFile_textChanged, on_lineEditLutName_textChanged, reached through the setText signal
+ *  and the direct call) pump events. A same-path FileOpen delivered there opens another row B, which records B as the key and
+ *  labels it "Look: Off"; the outer setSliders then applies its own receipt's sliders over that clip and restores its baseline, and
+ *  the mark compared it against key B and failed, so "Look: Off" stayed over an enabled baseline. `keyAfterEarlyWrite` is the key
+ *  once setSliders' early write ran: only a receipt that was the key then is the key again (Reset Sliders' scratch defaults never
+ *  are; an export clone the export site keyed is). `activeReceiptNow` is not read: the active row after the pump is the nested
+ *  open's, so keying on it is the defect; it is named so a side tree can reinstate it. */
+inline bool slidersReassertsKeyAfterModal( const void *slidersReceipt, const void *keyAfterEarlyWrite, const void *activeReceiptNow )
+{
+    Q_UNUSED( activeReceiptNow );
+    return slidersReceipt != nullptr && slidersReceipt == keyAfterEarlyWrite;
+}
+
 /*! \brief r15 (sol r14 B1, catalogue L-08): whether a delivered async Look Assist result may grade. Only the receipt it
  *  analysed (r14: an export clone's result never grades the active row), and only while that receipt's Look Assist is on AT
  *  DELIVERY. Turning it off between dispatch and delivery (the switch, a disabled paste, a reset to a disabled default, an

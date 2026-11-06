@@ -354,9 +354,11 @@ TEST(LookLabelWiring, A1r12bTheExportJobsCloneIsTheKeyUntilTheNextOpenRecordsARo
     // (LookLabelWiring.A1r14EveryAsyncLandingMovesTheLabelKeyToItsReceipt pins it).
     // Pin count update (r16, adversary r16 39d1a995 A1; was 3): the fourth writer is setSliders applying the active row's
     // receipt while another receipt is the key (LookLabelWiring.A1r16SetSlidersOfTheActiveRowMovesTheKeyBeforeAnySlider).
-    ASSERT_EQ(4, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
+    // Pin count update (r17, adversary r16 efd170f4 A1; was 4, and 1 for "= receipt;"): the fifth writer is setSliders re-asserting
+    // the key it wrote once its modal work returned (LookLabelWiring.A1r17SetSlidersReassertsItsKeyAfterTheLastModal pins it).
+    ASSERT_EQ(5, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
     ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = activeReceipt;")));
-    ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = receipt;")));
+    ASSERT_EQ(2, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = receipt;")));
 }
 
 // Adversary r16 (39d1a995) A1. A owns the loaded clip with Look Assist on and Cinematic landed; B is active with attached sliders
@@ -645,10 +647,11 @@ struct LabelModel
     look_label::LabelGrade derived;
     quint64 slidersApplied = 0;
 
+    // r17: `recordedSwitch` is m_lookLabelAppliedCloneLookAssist (read only while the key is not the owner's).
     std::string update(const lookassist::LookAssistFlavorOutcome &outcome, const void *applied, const void *owner, bool ownerSwitch,
-                       bool ownerIsActive, bool slidersAttached, bool checkbox)
+                       bool ownerIsActive, bool slidersAttached, bool checkbox, bool recordedSwitch = false)
     {
-        const bool lookSwitch = look_label::appliedLookSwitch(applied, owner, ownerSwitch, false);
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, owner, ownerSwitch, recordedSwitch);
         const bool lookOn = look_label::lookOnForOwner(owner != nullptr, lookSwitch,
                                                        look_label::selectorDescribesOwner(ownerIsActive, slidersAttached), checkbox);
         const void *key = lookOn ? look_label::outcomeKey(applied, owner) : nullptr;
@@ -800,6 +803,199 @@ TEST(LookLabelPolicy, A1r15APasteOntoAnInactiveOwnerNeverRelabelsItsUnchangedGra
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(false, &receiptA, &receiptA, false, true, true, true));
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, false, true));
     ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true, false));   // regraded
+}
+
+namespace
+{
+struct R17Receipt { bool on = false; };
+
+// r17 (adversary r16 efd170f4 A1): MainWindow::setSliders' label steps in source order, with the window state they read. `pump`
+// runs where the dark-frame and LUT error dialogs pump events (on_lineEditDarkFrameFile_textChanged, on_lineEditLutName_textChanged),
+// as a FileOpen delivered there does. Then the re-assert, the "both signals were blocked" relabel, the restore's mark and the relabel.
+struct R17Window
+{
+    const R17Receipt *active = nullptr;   // ACTIVE_RECEIPT
+    const R17Receipt *owner = nullptr;    // the loaded clip's recorded row
+    const void *key = nullptr;            // m_lookLabelAppliedReceipt
+    bool recorded = false;                // m_lookLabelAppliedCloneLookAssist
+    bool checkbox = false;                // checkBoxLookAssistEnable
+    lookassist::LookAssistFlavorOutcome outcome;
+    LabelModel label;
+
+    std::string relabel()
+    {
+        return label.update(outcome, key, owner, owner && owner->on, owner == active, true, checkbox, recorded);
+    }
+
+    // A same-path FileOpen of `row`: addFileToSession activates it, the open records it (owner and key), then setSliders(row).
+    std::string open(const R17Receipt *row)
+    {
+        active = row;
+        owner = row;
+        key = row;
+        return setSliders(row, [] {});
+    }
+
+    template <typename Pump>
+    std::string setSliders(const R17Receipt *receipt, Pump pump)
+    {
+        ++label.slidersApplied;
+        if( look_label::slidersSetAppliedKey(receipt, active, key) ) { key = receipt; recorded = receipt->on; }
+        const void *const keyAfterEarlyWrite = key;
+        pump();   // the modal work
+        if( look_label::slidersReassertsKeyAfterModal(receipt, keyAfterEarlyWrite, active) ) { key = receipt; recorded = receipt->on; }
+        checkbox = receipt->on;
+        relabel();
+        // The enabled branch restores (or captures) the baseline and marks it under the key; the de-dupe marker skips the analysis.
+        const bool marked = receipt->on && look_label::restoreMarksBaseline(receipt, key, active);
+        if( marked ) outcome.baselineRestored(receipt);
+        return marked ? relabel() : label.text.toStdString();
+    }
+};
+} // namespace
+
+// Adversary r16 (efd170f4) A1, introduced by r16's early key write. Rows A=0 and B=1 share one clip path; B is last. A is active,
+// loaded and enabled (valid baseline, exposure 0) with Cinematic landed and the applied marker A; B is disabled with no LUT. A paste
+// onto A carries checkBoxLut=true and an invalid .cube lutName. setSliders(A) keys A, then the LUT error dialog's pump delivers a
+// QFileOpenEvent for that same path: B opens, becomes the key and is labelled "Look: Off". The outer setSliders(A) restores A's
+// enabled baseline. RED on efd170f4: its mark compared A against key B and failed, so "Look: Off" stayed over A's enabled baseline.
+TEST(LookLabelPolicy, A1r17ASamePathOpenInTheLutDialogsPumpNeverLeavesThePastedRowUnlabelled)
+{
+    R17Receipt receiptA, receiptB;
+    receiptA.on = true;
+    receiptB.on = false;
+    const char *flavors[] = { "cinematic", "film", "vision50d" };
+    for( const char *flavorName : flavors )
+    {
+        R17Window w;
+        w.active = &receiptA;
+        w.owner = &receiptA;
+        w.key = &receiptA;
+        w.checkbox = true;
+        w.outcome.landed(&receiptA, QString::fromLatin1(flavorName), false);
+        ASSERT_EQ(std::string("Look: ") + look_label::flavorDisplayName(QString::fromLatin1(flavorName)).toStdString(), w.relabel());
+        std::string nested;
+        const std::string shown = w.setSliders(&receiptA, [&] { nested = w.open(&receiptB); });
+        printf("[A1r17] flavor=%s nested=\"%s\" label=\"%s\"\n", flavorName, nested.c_str(), shown.c_str());
+        ASSERT_EQ(std::string("Look: Off"), nested);              // B's own open labelled B
+        ASSERT_EQ(static_cast<const void *>(&receiptA), w.key);   // A's sliders are applied last
+        ASSERT_TRUE(w.recorded);                                  // ... with A's switch
+        ASSERT_EQ(std::string("Look: Baseline"), shown);
+        // A later re-derivation with nothing regraded (F11) keeps it.
+        ASSERT_EQ(std::string("Look: Baseline"), w.relabel());
+    }
+    // No modal: the paste onto A labels A as before.
+    R17Window plain;
+    plain.active = plain.owner = &receiptA;
+    plain.key = &receiptA;
+    plain.outcome.landed(&receiptA, QStringLiteral("cinematic"), false);
+    ASSERT_EQ(std::string("Look: Baseline"), plain.setSliders(&receiptA, [] {}));
+}
+
+// The siblings of A1r17: re-entrancy across the early key write through the other modal (the dark-frame dialogs, MainWindow.cpp
+// on_lineEditDarkFrameFile_textChanged's critical and warning), and the keys the early write does not set itself. This is the case
+// that would have caught r16: showFileInEditor(A) recorded A while B was the active row, so the early write did not fire
+// (slidersSetAppliedKey: A is not active) -- a re-assert keyed on the active row or on that rule never puts A back.
+TEST(LookLabelPolicy, A1r17EveryModalOfSetSlidersHandsTheKeyBackToTheReceiptItApplies)
+{
+    R17Receipt receiptA, receiptB, scratch, cloneQ;
+    receiptA.on = true;
+    scratch.on = true;    // Reset Sliders' defaults: Look Assist on
+    cloneQ.on = true;     // the export clone's own switch
+    const QString cinematic = QStringLiteral("cinematic");
+    {
+        // The opener recorded A with B active (the r14 B1 shape); the dark-frame warning's pump opens B.
+        R17Window w;
+        w.active = &receiptB;
+        w.owner = &receiptA;
+        w.key = &receiptA;
+        w.outcome.landed(&receiptA, cinematic, false);
+        const std::string shown = w.setSliders(&receiptA, [&] { w.open(&receiptB); });
+        printf("[A1r17d] label=\"%s\" key=%s\n", shown.c_str(), w.key == &receiptA ? "A" : "other");
+        ASSERT_EQ(static_cast<const void *>(&receiptA), w.key);
+        ASSERT_EQ(std::string("Look: Baseline"), shown);
+    }
+    {
+        // Two modals in one apply (the dark-frame critical, then the LUT error), each pump opening B: A still ends as the key.
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        w.outcome.landed(&receiptA, cinematic, false);
+        const std::string shown = w.setSliders(&receiptA, [&] { w.open(&receiptB); w.open(&receiptB); });
+        ASSERT_EQ(std::string("Look: Baseline"), shown);
+    }
+    {
+        // Reset Sliders' scratch receipt is never the key: the nested open's key B stays.
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &receiptA;
+        w.outcome.landed(&receiptA, cinematic, false);
+        const std::string shown = w.setSliders(&scratch, [&] { w.open(&receiptB); });
+        ASSERT_EQ(static_cast<const void *>(&receiptB), w.key);
+        ASSERT_EQ(std::string("Look: Off"), shown);
+    }
+    {
+        // An export clone keyed by the export site (its own switch recorded) is the key again, with its switch.
+        R17Window w;
+        w.active = w.owner = &receiptA;
+        w.key = &cloneQ;
+        w.recorded = cloneQ.on;
+        w.outcome.landed(&cloneQ, QStringLiteral("film"), false);
+        w.setSliders(&cloneQ, [&] { w.open(&receiptB); });
+        ASSERT_EQ(static_cast<const void *>(&cloneQ), w.key);
+        ASSERT_TRUE(w.recorded);
+        ASSERT_EQ(std::string("Look: Baseline"), w.relabel());
+    }
+    // The literal rule: the key the early write left, never the active row after the pump.
+    ASSERT_TRUE(look_label::slidersReassertsKeyAfterModal(&receiptA, &receiptA, &receiptB));
+    ASSERT_TRUE(look_label::slidersReassertsKeyAfterModal(&receiptA, &receiptA, &receiptA));
+    ASSERT_TRUE(look_label::slidersReassertsKeyAfterModal(&cloneQ, &cloneQ, &receiptA));
+    ASSERT_FALSE(look_label::slidersReassertsKeyAfterModal(&scratch, &receiptA, &scratch));
+    ASSERT_FALSE(look_label::slidersReassertsKeyAfterModal(&receiptA, &receiptB, &receiptA));
+    ASSERT_FALSE(look_label::slidersReassertsKeyAfterModal(nullptr, nullptr, nullptr));
+}
+
+TEST(LookLabelWiring, A1r17SetSlidersReassertsItsKeyAfterTheLastModal)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString sliders = functionBody(mw, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"));
+    const int early = sliders.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = receipt;"));
+    const int kept = sliders.indexOf(QStringLiteral("const void *const lookLabelKeyAfterEarlyWrite = m_lookLabelAppliedReceipt;"));
+    const int first = sliders.indexOf(QStringLiteral("ui->horizontalSliderExposure->setValue( receipt->exposure() );"));
+    // Every modal-capable step: setText fires the handler through its signal, then the direct call.
+    const char *modals[] = {
+        "ui->lineEditDarkFrameFile->setText( receipt->darkFrameFileName() );",
+        "on_lineEditDarkFrameFile_textChanged( receipt->darkFrameFileName() );",
+        "ui->lineEditLutName->setText( receipt->lutName() );",
+        "on_lineEditLutName_textChanged( receipt->lutName() );",
+    };
+    int lastModal = -1;
+    for( const char *modal : modals )
+    {
+        const int at = sliders.indexOf(QString::fromLatin1(modal));
+        ASSERT_TRUE(at > first);
+        lastModal = qMax(lastModal, at);
+    }
+    const int rule = sliders.indexOf(QStringLiteral("if( look_label::slidersReassertsKeyAfterModal( receipt, lookLabelKeyAfterEarlyWrite,"));
+    const int key = sliders.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = receipt;"), rule);
+    const int sw = sliders.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();"), key);
+    const int relabel = sliders.indexOf(QStringLiteral("updateLookLabel();   // both signals were blocked above"));
+    const int mark = sliders.indexOf(QStringLiteral("look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad )"));
+    printf("[A1r17W] early=%d kept=%d lastModal=%d rule=%d key=%d sw=%d relabel=%d mark=%d\n", early, kept, lastModal, rule, key, sw,
+           relabel, mark);
+    ASSERT_TRUE(early >= 0 && kept > early && first > kept);
+    ASSERT_TRUE(rule > lastModal && key > rule && sw > key && relabel > sw && mark > relabel);
+    // Nothing after the re-assert reaches a modal handler or pumps events.
+    const QString tail = sliders.mid(rule);
+    ASSERT_FALSE(tail.contains(QStringLiteral("lineEditDarkFrameFile")));
+    ASSERT_FALSE(tail.contains(QStringLiteral("lineEditLutName")));
+    ASSERT_FALSE(sliders.contains(QStringLiteral("QMessageBox")));
+    ASSERT_FALSE(sliders.contains(QStringLiteral("processEvents")));
+    // The two handlers are the dialogs this pins (the class): each still shows one.
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::on_lineEditLutName_textChanged(const QString &arg1)"))
+                    .contains(QStringLiteral("QMessageBox::critical(")));
+    ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::on_lineEditDarkFrameFile_textChanged(const QString &arg1)"))
+                    .contains(QStringLiteral("QMessageBox::warning(")));
 }
 
 // The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
@@ -1180,6 +1376,8 @@ TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
         body.remove(markCall);
         // r16 (adversary r16 39d1a995 A1): and the key-move predicate (it derives no text either).
         body.remove(QStringLiteral("look_label::slidersSetAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt )"));
+        // r17 (adversary r16 efd170f4 A1): and the key re-assert predicate (no text either).
+        body.remove(QStringLiteral("look_label::slidersReassertsKeyAfterModal( receipt, lookLabelKeyAfterEarlyWrite,"));
         ASSERT_FALSE(body.contains(QStringLiteral("look_label::")));
     }
     // The helper reads the outcome ON SCREEN (the last landed one while pending), not the reported one.

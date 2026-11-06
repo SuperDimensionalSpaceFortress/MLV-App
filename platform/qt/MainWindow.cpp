@@ -16148,6 +16148,8 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         m_lookLabelAppliedReceipt = receipt;
         m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();
     }
+    // r17 (adversary r16 efd170f4 A1): the key as this apply wrote it, re-asserted below once the modal work has returned.
+    const void *const lookLabelKeyAfterEarlyWrite = m_lookLabelAppliedReceipt;
     ui->horizontalSliderExposure->setValue( receipt->exposure() );
     ui->horizontalSliderContrast->setValue( receipt->contrast() );
     ui->horizontalSliderPivot->setValue( receipt->pivot() );
@@ -16597,6 +16599,17 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     ui->horizontalSliderVidstabSmoothing->setValue( receipt->vidStabSmoothing() );
     ui->checkBoxVidstabTripod->setChecked( receipt->vidStabTripod() );
     on_checkBoxVidstabTripod_toggled( receipt->vidStabTripod() );
+
+    // r17 (adversary r16 efd170f4 A1): every modal above has returned (the dark-frame dialogs at lineEditDarkFrameFile and the LUT
+    // error dialog at lineEditLutName, via setText's signal and the direct call). A same-path FileOpen in their event pump opened
+    // another row, which made itself the key; these sliders are what is on screen now, so the key (and its switch) is this
+    // receipt again before the relabel and the baseline mark below read it. Nothing from here to the mark pumps events.
+    if( look_label::slidersReassertsKeyAfterModal( receipt, lookLabelKeyAfterEarlyWrite,
+                                                   ( SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0 ) ? ACTIVE_RECEIPT : nullptr ) )
+    {
+        m_lookLabelAppliedReceipt = receipt;
+        m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();
+    }
 
     {
         const bool lookAssistEnabled = receipt->lookAssistEnabled();
