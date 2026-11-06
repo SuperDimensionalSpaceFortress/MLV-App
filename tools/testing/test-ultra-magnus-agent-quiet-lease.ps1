@@ -169,27 +169,46 @@ def log(**k):
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     finally:
         os.close(fd)
+class FlagUnreadable(Exception):
+    pass
 def read_flag():
     # A read that collides with a replace (PermissionError) is retried, never taken for "no flag": a wrapper that read None skipped its delete and
     # left the flag for `lease release` to poll out (adversary r2 A4).
-    for i in range(500):
+    # r4 (sol r3 B3): only a flag that is NOT THERE is absence (None). A flag that stays unreadable through every retry raises FlagUnreadable, so no
+    # caller can turn "exists but could not be read" into "no lease" (a release that printed state=none and exited 0 without its marker).
+    # read_attempts (fake-control) shortens the retry for the case that drives the exhaustion; every other case keeps 500.
+    n = int(ctl.get("read_attempts", 500))
+    for i in range(n):
         try:
             with open(flag, encoding="utf-8") as f:
                 return json.load(f)
+        except FileNotFoundError:
+            return None
         except PermissionError:
             time.sleep(0.01)
-        except (OSError, ValueError):
-            return None
-    return None
+        except (OSError, ValueError) as e:
+            raise FlagUnreadable("%s: %s" % (type(e).__name__, e))
+    raise FlagUnreadable("PermissionError on all %d reads" % n)
+def flag_unreadable_exit(where, e, rc, stdout_state=True):
+    # The typed end of a command whose flag read was exhausted: a log line, a stderr reason, state=unreadable on stdout, a NON-ZERO exit.
+    log(cmd="flag-unreadable", where=where, why=str(e), label=label)
+    if stdout_state:
+        print(json.dumps({"state": "unreadable", "why": str(e)}), flush=True)
+    print("[heavy-slot] quiet lease flag unreadable (%s): %s" % (where, e), file=sys.stderr, flush=True)
+    sys.exit(rc)
 # CI-FLAKE-QUIET-LEASE-LIVENESS-PENDING-END-BOUND-1 (the ~10.1 s end): on Windows a replace or delete of the flag fails with PermissionError
 # (WinError 32) while ANY other handle has it open (release's own 0.1 s poll, an AV scan, an indexer). The wrapper then died with the flag
 # left behind and `lease release` spun out its whole 10 s wait for the flag to go: the test saw the pending job end ~10.1 s after expiry
 # although the agent had released on time. A real heavy-slot.py does not poll a file it must delete, so the fixture retries instead.
-def retry_fs(fn):
+def retry_fs(fn, what="fs"):
     for i in range(500):
         try:
             return fn()
         except PermissionError:
+            if i == 0:
+                # r4 (sol r3 hardening): the flag-reader control asserts on THIS line, i.e. that a delete or replace really collided with a reader
+                # (a reader-held marker alone does not prove the two overlapped).
+                log(cmd="fs-collision", what=what)
             if i == 499:
                 raise
             time.sleep(0.01)
@@ -197,7 +216,7 @@ def write_flag(o):
     tmp = flag + "." + str(os.getpid()) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(o, f)
-    retry_fs(lambda: os.replace(tmp, flag))
+    retry_fs(lambda: os.replace(tmp, flag), "replace")
 a = sys.argv[1:]
 label = a[a.index("--label") + 1] if "--label" in a else None
 if a[:2] == ["lease", "request"]:
@@ -240,9 +259,12 @@ if a[:2] == ["lease", "request"]:
             time.sleep(0.1)
         if not os.path.exists(rel):
             log(cmd="request-end", released=False, refused=True)
-            o = read_flag()
+            try:
+                o = read_flag()
+            except FlagUnreadable as e:
+                flag_unreadable_exit("request-refused-cleanup", e, 4, stdout_state=False)
             if o and o.get("pid") == me:
-                retry_fs(lambda: os.remove(flag))
+                retry_fs(lambda: os.remove(flag), "remove")
             print("[heavy-slot] admission refused for %r: still pending after --admit-timeout %s s" % (label, a[a.index("--admit-timeout") + 1]), file=sys.stderr, flush=True)
             sys.exit(75)
     if mode == "active":
@@ -255,9 +277,12 @@ if a[:2] == ["lease", "request"]:
     while time.time() < t_end and not os.path.exists(rel):
         time.sleep(0.1)
     log(cmd="request-end", released=os.path.exists(rel))
-    o = read_flag()
+    try:
+        o = read_flag()
+    except FlagUnreadable as e:
+        flag_unreadable_exit("request-end-cleanup", e, 4, stdout_state=False)
     if o and o.get("pid") == me:
-        retry_fs(lambda: os.remove(flag))
+        retry_fs(lambda: os.remove(flag), "remove")
     if mode == "active":
         with open(os.path.join(d, "last-lease-end.txt"), "w", encoding="utf-8") as f:
             f.write(repr(time.time()))
@@ -268,7 +293,10 @@ if a[:2] == ["lease", "renew"]:
         time.sleep(30)
     if ctl.get("renew_sleep"):
         time.sleep(float(ctl["renew_sleep"]))
-    o = read_flag()
+    try:
+        o = read_flag()
+    except FlagUnreadable as e:
+        flag_unreadable_exit("renew", e, 3)
     if o is None or o.get("label") != label:
         print(json.dumps({"state": "none"}), flush=True)
         sys.exit(1)
@@ -278,15 +306,30 @@ if a[:2] == ["lease", "renew"]:
     sys.exit(0)
 if a[:2] == ["lease", "release"]:
     log(cmd="release", label=label)
-    o = read_flag()
+    try:
+        o = read_flag()
+    except FlagUnreadable as e:
+        flag_unreadable_exit("release", e, 3)
     if o is None or o.get("label") != label:
         print(json.dumps({"state": "none"}), flush=True)
         sys.exit(0)
     with open(os.path.join(d, "release-%d" % int(o["pid"])), "w") as f:
         f.write("release")
-    t_end = time.time() + 10
-    while time.time() < t_end and read_flag() is not None:
+    # r4 (sol r3 B3, :288): an unreadable flag is still THERE, so it never ends the poll as if the wrapper had deleted it; still unreadable at the
+    # end of the wait is the typed failure, never state=none.
+    t_end = time.time() + float(ctl.get("release_wait_s", 10))   # release_wait_s: only fake-flag-unreadable shortens it
+    last = None
+    while time.time() < t_end:
+        try:
+            if read_flag() is None:
+                last = None
+                break
+            last = None
+        except FlagUnreadable as e:
+            last = e
         time.sleep(0.1)
+    if last is not None:
+        flag_unreadable_exit("release-poll", last, 3)
     print(json.dumps({"state": "none"}), flush=True)
     sys.exit(0)
 if a[:1] == ["status"]:
@@ -413,10 +456,57 @@ function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $Pro
 # r3 pass-4 A1: a space or an apostrophe ends nothing INSIDE a quoted argument ("<fixture> other\log.txt" is another dir). So the path must start an
 # argument: inside double quotes it continues only with a separator or the closing quote; unquoted (an argument with no space) with a separator,
 # whitespace or the end of the line. An apostrophe is never an end.
+# r4 (sol r3 B1): a regex over the raw line cannot know where a quoted argument starts: "--output=<fixture> other\log.txt" matched its unquoted
+# branch at the '='. So the line is split into its arguments by the Windows rules (CommandLineToArgvW: the program name ends at its closing quote or
+# whitespace; then whitespace outside quotes separates, 2n backslashes + quote = n backslashes and a quote toggle, 2n+1 = n and a literal quote),
+# and the fixture is named only by an argument (or the value after an option's first '=') that IS the fixture dir or starts with it plus a separator.
+function Split-WindowsCommandLine([string]$CommandLine) {
+    $out = [System.Collections.Generic.List[string]]::new()
+    $s = $CommandLine; $n = $s.Length; $i = 0
+    if ($n -gt 0) {
+        if ($s[0] -eq [char]'"') { $j = $s.IndexOf([char]'"', 1); if ($j -lt 0) { $j = $n }; $out.Add($s.Substring(1, $j - 1)); $i = [Math]::Min($n, $j + 1) }
+        else { $j = 0; while ($j -lt $n -and $s[$j] -ne [char]' ' -and $s[$j] -ne [char]"`t") { $j++ }; $out.Add($s.Substring(0, $j)); $i = $j }
+    }
+    while ($true) {
+        while ($i -lt $n -and ($s[$i] -eq [char]' ' -or $s[$i] -eq [char]"`t")) { $i++ }
+        if ($i -ge $n) { break }
+        $sb = [System.Text.StringBuilder]::new(); $inQ = $false
+        while ($i -lt $n) {
+            $c = $s[$i]
+            if (-not $inQ -and ($c -eq [char]' ' -or $c -eq [char]"`t")) { break }
+            if ($c -eq [char]'\') {
+                $k = $i; while ($k -lt $n -and $s[$k] -eq [char]'\') { $k++ }
+                $bs = $k - $i
+                if ($k -lt $n -and $s[$k] -eq [char]'"') {
+                    [void]$sb.Append([char]'\', [int][Math]::Floor($bs / 2))
+                    if ($bs % 2 -eq 1) { [void]$sb.Append([char]'"'); $i = $k + 1 } else { $i = $k }
+                }
+                else { [void]$sb.Append([char]'\', $bs); $i = $k }
+                continue
+            }
+            if ($c -eq [char]'"') {
+                if ($inQ -and $i + 1 -lt $n -and $s[$i + 1] -eq [char]'"') { [void]$sb.Append([char]'"'); $i += 2; continue }
+                $inQ = -not $inQ; $i++; continue
+            }
+            [void]$sb.Append($c); $i++
+        }
+        $out.Add($sb.ToString())
+    }
+    return , $out.ToArray()
+}
 function Test-NamesFixture([string]$CommandLine, [string]$Fx) {
-    if ([string]::IsNullOrEmpty($CommandLine)) { return $false }
-    $e = [regex]::Escape($Fx)
-    return [regex]::IsMatch($CommandLine, '"' + $e + '(?=[\\/]|")|(?:^|(?<=[\s=]))' + $e + '(?=[\\/]|\s|$)')
+    if ([string]::IsNullOrEmpty($CommandLine) -or [string]::IsNullOrEmpty($Fx)) { return $false }
+    $root = $Fx.TrimEnd([char]'\', [char]'/')
+    if ($CommandLine.IndexOf($root, [StringComparison]::Ordinal) -lt 0) { return $false }   # cheap pre-filter: most of the census never names it
+    foreach ($t in (Split-WindowsCommandLine $CommandLine)) {
+        $vals = @($t)
+        $q = $t.IndexOf([char]'=')
+        if ($q -ge 0) { $vals += $t.Substring($q + 1) }
+        foreach ($v in $vals) {
+            if ($v -ceq $root -or $v.StartsWith($root + '\', [StringComparison]::Ordinal) -or $v.StartsWith($root + '/', [StringComparison]::Ordinal)) { return $true }
+        }
+    }
+    return $false
 }
 function Get-FixtureChildPids([string]$Fx) { return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.ProcessId -ne $PID -and (Test-NamesFixture $_.CommandLine $Fx) } | ForEach-Object { [int]$_.ProcessId }) }
 # r3 (adversary r3 A1): an identity check and the kill must act on ONE pinned process. The process is opened by pid and its handle held first
@@ -437,10 +527,17 @@ function Stop-PinnedProcess([int]$ProcessId, [scriptblock]$IsOurs) {
 }
 function Stop-FixtureLeftovers([string]$Fx, [int[]]$Candidates) {
     # The command line is read AFTER the pin, so it describes the pinned process (an exited one is no longer listed and is not killed).
-    $isFixture = { param($p) $row = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction Stop); $row.Count -eq 1 -and (Test-NamesFixture $row[0].CommandLine $Fx) }.GetNewClosure()
+    # r4: NOT a GetNewClosure() block: a closure binds to a dynamic module that sees only global functions, so under `pwsh -Command "& <this>"`
+    # Test-NamesFixture was "not recognized", the throw was caught as "not ours" and the sweep stopped nothing. $Fx is read from this
+    # function's scope (Stop-PinnedProcess runs the block as its child).
+    $isFixture = { param($p) $row = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction Stop); $row.Count -eq 1 -and (Test-NamesFixture $row[0].CommandLine $Fx) }
     $kill = [System.Collections.Generic.List[int]]::new()
     foreach ($k in @($Candidates)) { if (Stop-PinnedProcess $k $isFixture) { $kill.Add($k) } }
     return @($kill)
+}
+function Format-FixtureLeakLine([int[]]$Leak, [int[]]$Stopped) {
+    $notStopped = @(@($Leak) | Where-Object { @($Stopped) -notcontains $_ })
+    return "FIXTURE-LEAK: $(@($Leak).Count) fixture child process(es) outlived the suite: pids=$(@($Leak) -join ','); stopped now=[$(@($Stopped) -join ',')]; NOT stopped (stop refused or threw)=[$($notStopped -join ',')]"
 }
 # r3 (adversary r3 A1): a child the test STARTED is stopped through the Process object it got from Start (that object holds the child's handle
 # since its creation), never by its pid number: after the child has ended, the number may belong to an unrelated process.
@@ -873,7 +970,7 @@ try {
         'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
         'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
         'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
-        'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws')
+        'lapse-end-timing-pure', 'lease-seam-pid-cleanup', 'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws', 'fake-flag-unreadable')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -1843,6 +1940,11 @@ function Exit-HeavySlot {
             @{ n = 'slow-release-10s';         det = 0.1;  rel = 0.4;  end = 10.5; total = 10; want = 'END' }      # the hosted shape: the release poll ran its full 10 s
             @{ n = 'release-before-expiry';    det = 0.1;  rel = -0.5; end = 0.9;  total = 5;  want = 'RELEASE' }
             @{ n = 'never-detected';           det = $null; rel = 0.4; end = 0.9;  total = 5;  want = 'DETECTION' }
+            # r4 (sol r3 B2): the pending case's original `$ended -gt 0 -and $ended -lt 10` is strict at both ends; the batch case's `-le 5` is not.
+            @{ n = 'strict-ten-endpoint-B2';   det = 0.1;  rel = 6.0;  end = 10.0; total = 10; excl = $true; want = 'TOTAL' }   # every event inside its bound, the end exactly 10 s
+            @{ n = 'strict-zero-endpoint';     det = 0.0;  rel = 0.5;  end = 0.0;  total = 10; excl = $true; want = 'TOTAL' }   # an end AT the expiry is not "-gt 0"
+            @{ n = 'strict-just-inside';       det = 0.1;  rel = 6.0;  end = 9.99; total = 10; excl = $true; want = '' }
+            @{ n = 'inclusive-five-endpoint';  det = 0.1;  rel = 0.4;  end = 5.0;  total = 5;  want = '' }        # batch: exactly 5 s passes, as `-le 5` did
         )
         $bad = [System.Collections.Generic.List[string]]::new()
         foreach ($r in $rows) {
@@ -1852,7 +1954,7 @@ function Exit-HeavySlot {
             $relTs = ([DateTimeOffset]$e.AddSeconds($r.rel)).ToUnixTimeMilliseconds() / 1000.0
             [IO.File]::WriteAllText((Join-Path $fx 'calls.jsonl'), ((@{ cmd = 'release'; ts = $relTs } | ConvertTo-Json -Compress) + "`n"))
             $script:EvLog.Add([pscustomobject]@{ utc = $e.AddSeconds($r.end); msg = 'quiet-lease: expired-not-after job=jPure phase=pending' })
-            $t = Get-LapseEndTiming -ExpiryUtc $e -JobId 'jPure' -TotalBoundSec $r.total
+            $t = Get-LapseEndTiming -ExpiryUtc $e -JobId 'jPure' -TotalBoundSec $r.total -TotalExclusive:([bool]$r.excl)
             $got = (@($t.failures | ForEach-Object { ($_ -split ':')[0] }) | Select-Object -Unique) -join ','
             $ok = if ($r.want -eq '') { $t.failures.Count -eq 0 } else { $got -split ',' -contains $r.want }
             if (-not $ok) { $bad.Add("$($r.n): want [$($r.want)] got [$got]") }
@@ -1880,7 +1982,9 @@ function Exit-HeavySlot {
         # TotalBoundSec: the case's own end-to-end promise measured from the same expiry on the agent's own end event (the old 10 s of
         # liveness-lapses-while-pending, the #663 5 s of batch-runner-killed-liveness): the three event bounds below compose to more than either
         # (adversary r2 A1), so the total is checked as well and no composition of them can end a wait later than the case promised.
-        param([Parameter(Mandatory = $true)][DateTime]$ExpiryUtc, [Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][double]$TotalBoundSec)
+        # r4 (sol r3 B2): -TotalExclusive keeps a case's ORIGINAL strict comparison: liveness-lapses-while-pending was `$ended -gt 0 -and $ended -lt 10`
+        # (0 and 10 themselves fail), batch-runner-killed-liveness `$retK -ge $lastUntil -and $lagK -le 5` (inclusive). Neither bound is widened.
+        param([Parameter(Mandatory = $true)][DateTime]$ExpiryUtc, [Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][double]$TotalBoundSec, [switch]$TotalExclusive)
         $f = [System.Collections.Generic.List[string]]::new()
         $detect = if ($script:VerdictPassedAt.ContainsKey($JobId)) { [Nullable[DateTime]]$script:VerdictPassedAt[$JobId] } else { $null }
         $rel = @(Get-Calls | Where-Object { $_.cmd -eq 'release' } | Select-Object -First 1)
@@ -1895,7 +1999,9 @@ function Exit-HeavySlot {
         if ($null -eq $relLag -or $relLag -lt 0 -or $relLag -gt ($detectBound + $script:LapseReleaseSpawnSec)) { $f.Add("RELEASE: the pending request is released $(if ($null -eq $relLag) { 'never' } else { "$([Math]::Round($relLag, 2)) s after aliveUntilUtc" }), want 0..$($detectBound + $script:LapseReleaseSpawnSec) s (detection bound + $($script:LapseReleaseSpawnSec) s python start)") }
         if ($null -eq $endAfterRel -or $endAfterRel -lt 0 -or $endAfterRel -gt $script:LapseEndGraceSec) { $f.Add("END: the wait ends $(if ($null -eq $endAfterRel) { 'never (no release call or no typed end line)' } else { "$([Math]::Round($endAfterRel, 2)) s after its release call" }), want 0..$($script:LapseEndGraceSec) s (Stop-QuietLease's own wrapper-exit grace)") }
         $totalLag = if ($null -ne $endUtc) { ($endUtc - $ExpiryUtc).TotalSeconds } else { $null }
-        if ($null -eq $totalLag -or $totalLag -lt 0 -or $totalLag -gt $TotalBoundSec) { $f.Add("TOTAL: the wait ends $(if ($null -eq $totalLag) { 'never' } else { "$([Math]::Round($totalLag, 2)) s after aliveUntilUtc" }), want 0..$TotalBoundSec s (this case's end-to-end bound)") }
+        $totalOut = if ($null -eq $totalLag) { $true } elseif ($TotalExclusive) { $totalLag -le 0 -or $totalLag -ge $TotalBoundSec } else { $totalLag -lt 0 -or $totalLag -gt $TotalBoundSec }
+        $totalWant = if ($TotalExclusive) { "strictly between 0 and $TotalBoundSec s" } else { "0..$TotalBoundSec s" }
+        if ($totalOut) { $f.Add("TOTAL: the wait ends $(if ($null -eq $totalLag) { 'never' } else { "$([Math]::Round($totalLag, 3)) s after aliveUntilUtc" }), want $totalWant (this case's end-to-end bound)") }
         return [pscustomobject]@{ failures = @($f.ToArray()); detectLagSec = $detectLag; releaseLagSec = $relLag; endAfterReleaseSec = $endAfterRel; totalLagSec = $totalLag; detectBoundSec = $detectBound }
     }
     # QL_TEST_LAPSE_FAULT (the regression controls' hand-set fault; CI leaves it unset): none | delay-beat:<sec> | skip-beat | late-observe:<sec> | flag-reader.
@@ -1963,7 +2069,9 @@ function Exit-HeavySlot {
             if ($Activity -notlike 'gate-wait job=jLp *') { return }
             if (-not $script:LapseFaultFired -and [DateTime]::UtcNow -ge $script:LapseFaultAt) {
                 $script:LapseFaultFired = $true
-                if ($script:LapseFault.kind -ceq 'skip-beat') { return }
+                # r4 (sol r3 hardening): Write-AgentHeartbeat appended the beat before this hook ran, so a skip also takes it back out of Beats
+                # (the beat never happened), not only out of LastWaitBeat.
+                if ($script:LapseFault.kind -ceq 'skip-beat') { if ($script:Beats.Count -gt 0) { $script:Beats.RemoveAt($script:Beats.Count - 1) }; $script:LapseSkippedBeat = $Activity; return }
                 if ($script:LapseFault.kind -ceq 'delay-beat') { Start-Sleep -Milliseconds ([int]($script:LapseFault.sec * 1000)) }
             }
             $script:LastWaitBeat = [DateTime]::UtcNow
@@ -1974,7 +2082,7 @@ function Exit-HeavySlot {
             $LeasePendingMaxSec = $savedPendingMax
             if ($null -ne $flagReader) { try { Stop-Process -Id $flagReader.Id -Force -ErrorAction SilentlyContinue; $null = $flagReader.WaitForExit(5000) } catch { } }
         }
-        Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or (Test-Path -LiteralPath (Join-Path $fx 'reader-held'))) "liveness-lapses-while-pending: the flag-reader held the flag open when the release marker appeared (a control that never held it proves nothing)"
+        Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or ((Test-Path -LiteralPath (Join-Path $fx 'reader-held')) -and @(Get-Calls | Where-Object { $_.cmd -eq 'fs-collision' -and $_.what -eq 'remove' }).Count -ge 1)) "liveness-lapses-while-pending: the flag-reader held the flag open AND the wrapper's delete collided with it (fs-collision remove; a reader that never overlapped the delete proves nothing)"
         Assert-True ($script:LapseFault.kind -cnotin @('delay-beat', 'skip-beat') -or $script:LapseFaultFired) "liveness-lapses-while-pending: the $($script:LapseFault.kind) fault landed on a gate-wait beat near expiry (a control whose fault never landed proves nothing)"
         # late-observe: the test reads the world late (the old `$ended = now - aliveAt` after this point read the late clock; the events above do not).
         if ($script:LapseFault.kind -ceq 'late-observe') { Start-Sleep -Milliseconds ([int]($script:LapseFault.sec * 1000)) }
@@ -1985,7 +2093,7 @@ function Exit-HeavySlot {
         Assert-True ($adm.notAfterSource -ceq 'sidecar' -and $adm.notAfterState -ceq 'passed' -and $adm.livenessUntilUtc -ceq $until) "liveness-lapses-while-pending: typed source=sidecar: $($adm | Select-Object notAfterSource, notAfterState, livenessUntilUtc | ConvertTo-Json -Compress)"
         # The last gate-wait beat is a PRE-expiry value (the iteration that calls the lapse returns before it beats), so it is reported, never asserted.
         $seen = if ($null -ne $script:LastWaitBeat) { ($script:LastWaitBeat - $aliveAt).TotalSeconds } else { $null }
-        $timing = Get-LapseEndTiming -ExpiryUtc $aliveAt -JobId 'jLp' -TotalBoundSec 10
+        $timing = Get-LapseEndTiming -ExpiryUtc $aliveAt -JobId 'jLp' -TotalBoundSec 10 -TotalExclusive
         # The cleanup asserts run whatever the timing says (a failed bound used to throw before them), and both verdicts are thrown together.
         $cleanupErr = $null
         try {
@@ -2573,7 +2681,7 @@ function Exit-HeavySlot {
             $flagReaderK = if ($script:LapseFault.kind -ceq 'flag-reader') { Start-FlagReader } else { $null }
             try { $admK = Wait-QuietLeaseAdmission -JobId $openK -Job ([pscustomobject]@{}) -Metadata $mK }
             finally { if ($null -ne $flagReaderK) { try { Stop-Process -Id $flagReaderK.Id -Force -ErrorAction SilentlyContinue; $null = $flagReaderK.WaitForExit(5000) } catch { } } }
-            Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or (Test-Path -LiteralPath (Join-Path $fx 'reader-held'))) "batch-runner-killed-liveness: the flag-reader held the flag open when the release marker appeared (a control that never held it proves nothing)"
+            Assert-True ($script:LapseFault.kind -cne 'flag-reader' -or ((Test-Path -LiteralPath (Join-Path $fx 'reader-held')) -and @(Get-Calls | Where-Object { $_.cmd -eq 'fs-collision' -and $_.what -eq 'remove' }).Count -ge 1)) "batch-runner-killed-liveness: the flag-reader held the flag open AND the wrapper's delete collided with it (fs-collision remove; a reader that never overlapped the delete proves nothing)"
             # late-observe (regression control only): the test reads the world late; the end is measured from events, so it must not matter.
             if ($script:LapseFault.kind -ceq 'late-observe') { Start-Sleep -Milliseconds ([int]($script:LapseFault.sec * 1000)) }
             $script:LogHook = $null
@@ -3444,12 +3552,12 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
         $spKids = [System.Collections.Generic.List[int]]::new()
         $spBystander = $null
         $spObjs = [System.Collections.Generic.List[object]]::new()   # r3 A1: every child this case starts, as the Process object Start returned
-        function Start-SeamKid([string]$Tag, [switch]$Outside, [switch]$Sibling, [string]$SiblingSuffix = '-other') {
+        function Start-SeamKid([string]$Tag, [switch]$Outside, [switch]$Sibling, [string]$SiblingSuffix = '-other', [string]$OptionPrefix = '') {
             # Outside: a command line that does NOT name the fixture dir (an unrelated process that now holds a pid the suite once knew).
             # Sibling: a command line naming "<fixture>-other\...", a different dir whose name only starts with the fixture path (r3 A2).
             $psiS = [Diagnostics.ProcessStartInfo]::new($Python)
             $tagPath = if ($Outside) { Join-Path ([IO.Path]::GetTempPath()) "seam-unrelated-$PID-$Tag" } elseif ($Sibling) { Join-Path "$fx$SiblingSuffix" 'log.txt' } else { Join-Path $fx "seam-child-$Tag" }
-            foreach ($a in @('-c', 'import time; time.sleep(300)', $tagPath)) { [void]$psiS.ArgumentList.Add($a) }
+            foreach ($a in @('-c', 'import time; time.sleep(300)', ($OptionPrefix + $tagPath))) { [void]$psiS.ArgumentList.Add($a) }
             $psiS.UseShellExecute = $false; $psiS.CreateNoWindow = $true
             return [Diagnostics.Process]::Start($psiS)
         }
@@ -3498,11 +3606,129 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $kRecord | Add-Member -MemberType ScriptMethod -Name Kill -Value { throw 'Kill on an exited child' }
             Stop-OwnedChildren @($kRecord)
             Assert-True ((Wait-Until { $spU.HasExited } 1) -eq $false) "lease-seam-pid-cleanup: the cleanup of an ended child whose number was reused by an unrelated process leaves that process alive: U $($spU.Id) alive=$(-not $spU.HasExited)"
-            $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count; bystanderSurvived = (Test-PidAlive $spBystander.Id); siblingSpared = ($sibNotes.Count -eq 0); reusedPidSpared = -not $spU.HasExited }
+            # r4 (sol r3 B1): a quoted OPTION argument whose value names a sibling dir ("--output=<fixture> other\log.txt") is not the fixture's. Sol's literal
+            # input first (pure), then a real process started with that argument (.NET quotes it exactly as in sol's command line): not listed, not stopped.
+            $b1Fx = 'C:\Temp\um-agent-quiet-lease-1234-abcd1234'
+            $b1Rows = @(
+                @{ cl = 'python.exe "--output=C:\Temp\um-agent-quiet-lease-1234-abcd1234 other\log.txt"'; want = $false }   # sol r3 B1, verbatim
+                @{ cl = 'python.exe --output=C:\Temp\um-agent-quiet-lease-1234-abcd1234 other\log.txt'; want = $true }      # unquoted: the argument ends at the space, so its value IS the fixture dir
+                @{ cl = 'python.exe "C:\Temp\um-agent-quiet-lease-1234-abcd1234 other\log.txt"'; want = $false }
+                @{ cl = 'python.exe "x=C:\Temp\um-agent-quiet-lease-1234-abcd1234-other\log.txt"'; want = $false }
+                @{ cl = 'python.exe "--output=C:\Temp\um-agent-quiet-lease-1234-abcd1234\log.txt"'; want = $true }
+                @{ cl = 'python.exe --output=C:\Temp\um-agent-quiet-lease-1234-abcd1234\log.txt'; want = $true }
+                @{ cl = '"C:\Python\python.exe" "C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py" lease release'; want = $true }
+                @{ cl = 'python.exe C:\Temp\um-agent-quiet-lease-1234-abcd1234\heavy-slot-fake.py status'; want = $true }
+                @{ cl = 'python.exe -c "import x; y = \"C:\Temp\um-agent-quiet-lease-1234-abcd1234 other\"" C:\Temp\elsewhere\f.json'; want = $false }
+            )
+            $b1Bad = [System.Collections.Generic.List[string]]::new()
+            foreach ($r in $b1Rows) { $g = [bool](Test-NamesFixture $r.cl $b1Fx); if ($g -ne $r.want) { $b1Bad.Add("[$($r.cl)] names the fixture=$g want $($r.want)") } }
+            $spOpt = Start-SeamKid 'option' -Sibling -SiblingSuffix ' other' -OptionPrefix '--output='
+            $spObjs.Add($spOpt)
+            $null = Wait-Until { $spOpt.HasExited -or (Test-PidAlive $spOpt.Id) } 2
+            $optCl = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($spOpt.Id)" -ErrorAction SilentlyContinue | ForEach-Object { $_.CommandLine })
+            $optListed = @(Get-FixtureChildPids $fx) -contains $spOpt.Id
+            $optStopped = @(Stop-FixtureLeftovers $fx @($spOpt.Id))
+            if ($optListed -or $optStopped.Count -ne 0 -or $spOpt.HasExited) { $b1Bad.Add("real quoted option [$($optCl -join '')] listed=$optListed stopped=[$($optStopped -join ',')] alive=$(-not $spOpt.HasExited)") }
+            Assert-True ($b1Bad.Count -eq 0) "lease-seam-pid-cleanup: a quoted option argument naming a sibling dir is not the fixture (sol r3 B1): $($b1Bad -join ' ; ')"
+            # r4 (sol r3 hardening): the leak line names a stop that threw as NOT stopped, never "stopped now".
+            $leakLine = Format-FixtureLeakLine @(4100, 4200) @(4100)
+            Assert-True ($leakLine -like '*stopped now=`[4100`]*' -and $leakLine -like '*NOT stopped (stop refused or threw)=`[4200`]*') "lease-seam-pid-cleanup: the leak line separates stopped from not-stopped pids: $leakLine"
+            $results.leaseSeamPidCleanup = [ordered]@{ children = $spKids.Count; survivors = $left.Count; bystanderSurvived = (Test-PidAlive $spBystander.Id); siblingSpared = ($sibNotes.Count -eq 0); reusedPidSpared = -not $spU.HasExited; quotedOptionSpared = ($b1Bad.Count -eq 0) }
         }
         finally {
             # r3 A1: through the objects Start handed back (each holds its child's handle), never by pid number.
             Stop-OwnedChildren $spObjs
+        }
+    }
+    # fake-flag-unreadable (sol r3 B3): the fake heavy-slot.py run directly against a flag that EXISTS but is held with no sharing (every open is a
+    # PermissionError, as under a scan that never lets go). Each command that reads it must end typed and non-zero, never as "no flag": release
+    # (initial read and its poll) prints state=unreadable and exits 3 without claiming success, renew the same, and a request wrapper's cleanup read
+    # exits 4 instead of skipping its delete. read_attempts / release_wait_s shorten the waits (a base fake ignores them and takes its full 500 reads).
+    if (Test-Case 'fake-flag-unreadable') {
+        Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+        $fuObjs = [System.Collections.Generic.List[object]]::new()
+        $fuFlag = Join-Path $fx 'quiet-lease.json'
+        $fuFails = [System.Collections.Generic.List[string]]::new()
+        $fuRows = [ordered]@{}
+        function Start-FakeCall([string[]]$Argv) {
+            $psiF = [Diagnostics.ProcessStartInfo]::new($Python)
+            foreach ($a in @($fakePath) + @($Argv)) { [void]$psiF.ArgumentList.Add($a) }
+            $psiF.UseShellExecute = $false; $psiF.CreateNoWindow = $true; $psiF.RedirectStandardOutput = $true; $psiF.RedirectStandardError = $true
+            $psiF.Environment['HEAVY_SLOT_DIR'] = $fx
+            $pF = [Diagnostics.Process]::Start($psiF)
+            $fuObjs.Add($pF)
+            return [pscustomobject]@{ p = $pF; out = $pF.StandardOutput.ReadToEndAsync(); err = $pF.StandardError.ReadToEndAsync() }
+        }
+        function Wait-FakeCall($H, [int]$Ms = 30000) {
+            $done = $H.p.WaitForExit($Ms)
+            if (-not $done) { try { $H.p.Kill() } catch { }; $null = $H.p.WaitForExit(5000) }
+            return [pscustomobject]@{ exited = $done; rc = $(if ($done) { $H.p.ExitCode } else { $null }); out = ([string]$H.out.Result).Trim(); err = ([string]$H.err.Result).Trim() }
+        }
+        function Lock-FakeFlag([double]$WithinSec = 5) {
+            # An exclusive handle (FileShare.None): python's open() then fails with PermissionError until it is closed.
+            $dlF = [DateTime]::UtcNow.AddSeconds($WithinSec)
+            while ([DateTime]::UtcNow -lt $dlF) { try { return [IO.File]::Open($fuFlag, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch { Start-Sleep -Milliseconds 5 } }
+            return $null
+        }
+        function Write-FakeFlag([int]$OwnerPid) { [IO.File]::WriteAllText($fuFlag, (@{ label = $script:QuietLeaseLabel; pid = $OwnerPid; state = 'pending'; renewed = 0 } | ConvertTo-Json -Compress)) }
+        function Test-Unreadable([string]$Name, $R, [int]$WantRc, [bool]$WantStdout, [string]$MarkerPid) {
+            $markerNow = if ($MarkerPid) { Test-Path -LiteralPath (Join-Path $fx "release-$MarkerPid") } else { $false }
+            $typedLog = @(Get-Calls | Where-Object { $_.cmd -eq 'flag-unreadable' }).Count -ge 1
+            $outOk = if ($WantStdout) { $R.out -match '"state": "unreadable"' -and $R.out -notmatch '"state": "none"' } else { $R.out -notmatch '"state": "none"' }
+            $fuRows[$Name] = [ordered]@{ rc = $R.rc; out = $R.out; err = $R.err; typedLog = $typedLog }
+            if (-not ($R.exited -and $R.rc -eq $WantRc -and $outOk -and $typedLog -and $R.err -like '*quiet lease flag unreadable*')) { $fuFails.Add("($Name) want exit $WantRc typed unreadable, got exited=$($R.exited) rc=$($R.rc) out=[$($R.out)] err=[$($R.err)] typedLog=$typedLog") }
+            return $markerNow
+        }
+        $fuLock = $null
+        try {
+            # (release) the first read of an existing, unreadable flag: no release marker, typed unreadable, exit 3 (base: state=none, exit 0)
+            Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+            Write-FakeFlag 999991
+            $fuLock = Lock-FakeFlag
+            Assert-True ($null -ne $fuLock) "fake-flag-unreadable: the test holds the flag exclusively"
+            $r = Wait-FakeCall (Start-FakeCall @('lease', 'release', '--label', $script:QuietLeaseLabel))
+            $fuLock.Dispose(); $fuLock = $null
+            if (Test-Unreadable 'release' $r 3 $true '999991') { $fuFails.Add('(release) a release marker was written for a flag it could not read') }
+            # (renew) the same read in renew: typed unreadable, exit 3 (base: state=none)
+            Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+            Write-FakeFlag 999992
+            $fuLock = Lock-FakeFlag
+            $r = Wait-FakeCall (Start-FakeCall @('lease', 'renew', '--label', $script:QuietLeaseLabel))
+            $fuLock.Dispose(); $fuLock = $null
+            $null = Test-Unreadable 'renew' $r 3 $true ''
+            # (release-poll, :288) the flag was read and the marker written, then it turns unreadable: the poll must not take that for "deleted"
+            Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+            Write-FakeFlag 999993
+            $h = Start-FakeCall @('lease', 'release', '--label', $script:QuietLeaseLabel)
+            $null = Wait-Until { Test-Path -LiteralPath (Join-Path $fx 'release-999993') } 15
+            $fuLock = Lock-FakeFlag
+            $r = Wait-FakeCall $h
+            if ($null -ne $fuLock) { $fuLock.Dispose(); $fuLock = $null }
+            $null = Test-Unreadable 'release-poll' $r 3 $true ''
+            # (request-end cleanup, :258) a pending wrapper told to release finds its flag unreadable: it exits 4, typed, never 0 with the flag kept
+            Reset-Case @{ request = 'hang'; read_attempts = 30; release_wait_s = 2 }
+            $h = Start-FakeCall @('lease', 'request', '--label', $script:QuietLeaseLabel)
+            $null = Wait-Until { $o = Get-FakeFlag; $null -ne $o -and [int]$o.pid -eq $h.p.Id } 15
+            $fuLock = Lock-FakeFlag
+            [IO.File]::WriteAllText((Join-Path $fx "release-$($h.p.Id)"), 'release')
+            $r = Wait-FakeCall $h
+            if ($null -ne $fuLock) { $fuLock.Dispose(); $fuLock = $null }
+            $null = Test-Unreadable 'request-end' $r 4 $false ''
+            # (request refused cleanup, :243) an admit_timeout wrapper whose flag is unreadable when it gives up: exit 4, typed, not the 75 refusal
+            Reset-Case @{ request = 'admit_timeout'; read_attempts = 30; release_wait_s = 2 }
+            $h = Start-FakeCall @('lease', 'request', '--label', $script:QuietLeaseLabel, '--admit-timeout', '2')
+            $null = Wait-Until { $o = Get-FakeFlag; $null -ne $o -and [int]$o.pid -eq $h.p.Id } 15
+            $fuLock = Lock-FakeFlag
+            $r = Wait-FakeCall $h
+            if ($null -ne $fuLock) { $fuLock.Dispose(); $fuLock = $null }
+            $null = Test-Unreadable 'request-refused' $r 4 $false ''
+            Assert-True ($fuFails.Count -eq 0) "fake-flag-unreadable: an existing flag that stays unreadable is a typed non-zero failure, never absence (sol r3 B3): $($fuFails -join ' ;; ')"
+            $results.fakeFlagUnreadable = $fuRows
+        }
+        finally {
+            if ($null -ne $fuLock) { $fuLock.Dispose() }
+            Stop-OwnedChildren $fuObjs
+            Reset-Case @{ request = 'active' }
         }
     }
     if (Test-Case 'lease-start-post-start-failure') {
@@ -3708,18 +3934,20 @@ finally {
     # this run's fixture dir: the fake heavy-slot.py wrappers, probes and readers). A healthy suite leaves 0; a fake probe from an earlier RED subcase
     # (300 s) used to outlive the run. Whatever is left is stopped here so a RED run never pollutes the host, and the count is asserted below.
     $script:FixtureLeak = @()
+    $script:FixtureLeakStopped = @()
     try {
         $script:FixtureLeak = @(Get-FixtureChildPids $fx)
         if ($script:FixtureLeak.Count -gt 0) {
             $null = Wait-Until { @(Get-FixtureChildPids $fx).Count -eq 0 } 3
             $script:FixtureLeak = @(Get-FixtureChildPids $fx)   # fresh: whatever still names the fixture after the grace
-            $null = Stop-FixtureLeftovers $fx $script:FixtureLeak
+            $script:FixtureLeakStopped = @(Stop-FixtureLeftovers $fx $script:FixtureLeak)
         }
     }
     # r3 (adversary r3 A6): a census that throws leaves no trustworthy count, so a stale list from an earlier census is dropped: the result is 'unknown'.
     catch { $script:FixtureLeakProbeError = $_.Exception.Message; $script:FixtureLeak = @() }
     if ($script:FixtureLeak.Count -gt 0) {
-        if ($script:FixtureLeak.Count -gt 0) { [Console]::Error.WriteLine("FIXTURE-LEAK: $($script:FixtureLeak.Count) fixture child process(es) outlived the suite (stopped now): pids=$($script:FixtureLeak -join ',')") }
+        # r4 (sol r3 hardening): "stopped now" names only the pids whose stop succeeded; a stop that threw or was refused is reported as NOT stopped.
+        [Console]::Error.WriteLine((Format-FixtureLeakLine $script:FixtureLeak $script:FixtureLeakStopped))
     }
     Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue
 }
