@@ -1110,15 +1110,16 @@ function Get-InputContentRefusal {
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
             if ($script:receiptGuardActive) { $verifyArtifacts = $false }
-            $abandonedBefore = & (Get-Module VenueChain) { $script:VenueAbandonedReads }
+            $abandonedBefore = & (Get-Module VenueChain) { $script:VenueAbandonedReads }; $shareClock = [Diagnostics.Stopwatch]::StartNew()
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe
             $within = $(if ($null -ne $script:guardBudget) { "a $([Math]::Round($share, 2)) s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
             # #705 r14 (adversary r14 A1 sibling): a bounded manifest read or hash given up on under a guard budget is a read still held on the manifest's share, so its location is
             # left unknown as Invoke-InputGuard leaves it for a worker given up on (a "no time left" refusal gave up on no read, and keeps the location it verified)
             $gaveUp = ($null -ne $script:guardBudget) -and ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
-            # r5 adversary A1 (sol r4 B2 sibling): a manifest read that answered and left the hash no room (VenueChain: artifactsUnhashed, the budget under its 2 s minimum, no read given up on)
-            # is a no-room hit like the two above (noRoom: its refusal reads no input again). An artifact read that ERRORED with room left stays an answered failure.
-            $noRoomHash = (-not $gaveUp) -and [bool]$st.artifactsUnhashed -and $null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt $script:GuardReadMinSec
+            # r5 adversary A1 (sol r4 B2 sibling): a manifest read that answered and left the hash no room (VenueChain: artifactsUnhashed, under 2 s left of THIS read's share, no read given up on)
+            # is a no-room hit like the two above (noRoom: its refusal reads no input again). The share's own remainder, measured from before the call, never the budget's (pass 2 A1: the
+            # share is capped at 330 s, so a 1000 s budget still had 671 s when the share ran out). An artifact read that ERRORED with room left stays an answered failure.
+            $noRoomHash = (-not $gaveUp) -and [bool]$st.artifactsUnhashed -and ($share - $shareClock.Elapsed.TotalSeconds) -lt $script:GuardReadMinSec
             if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; locationUnknown = $gaveUp; noAnswer = $gaveUp; noRoom = $noRoomHash; readAbandoned = $gaveUp; why = "the staged build manifest for $short could not be read after the claim wait (or the open) within $within at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no leg runs on it$(if ($gaveUp) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' })" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }

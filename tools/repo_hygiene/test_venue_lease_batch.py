@@ -5929,8 +5929,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         run_dir.mkdir(parents=True, exist_ok=True)
         script = (f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
                   "function Get-Def([string]$n) { $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text }\n"
-                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Get-InputContentRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator',\n"
+                  "foreach ($n in 'New-GuardBudget', 'Invoke-InputGuard', 'Get-GuardTimingText', 'Get-InputOutputRefusal', 'Wait-GuardReadSeam', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator',\n"
                   "    'Test-NothingAtName', 'Get-HitRefusal', 'Get-WriteDestinationHit', 'Test-RunDirWrite', 'Register-WriteRefusal', 'Stop-InputIsOutput') { . ([scriptblock]::Create((Get-Def $n))) }\n"
+                  # adversary r5 pass 2 A1: a build read's share is capped at 330 s, under a larger budget; the cap is 6 s here (the extracted function's literal), so a share runs out in seconds
+                  "$c = Get-Def 'Get-InputContentRefusal'; if (-not $c.Contains('[Math]::Min(330.0,')) { throw 'the 330 s share cap moved' }; . ([scriptblock]::Create($c.Replace('[Math]::Min(330.0,', '[Math]::Min(6.0,')))\n"
                   "$t = Get-Def 'Set-GuardProgress'\n"
                   ". ([scriptblock]::Create($t.Substring(0, $t.LastIndexOf('}')) + \"`nif (`$Phase -ceq 'content') { `$b = `$script:guardBudget; `$b.sec = `$b.clock.Elapsed.TotalSeconds + `$b.room }`n}\"))\n"
                   ". ([scriptblock]::Create(((Get-Def 'Stop-PlanRefused') -replace '(?m)^\\s*exit 2\\s*$', \"throw 'EXIT2'\")))\n"
@@ -5955,8 +5957,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   "foreach ($k in 'no_room', 'answered_no_room', 'hash_no_room') {\n"
                   "    $script:guardedInputs = @(Get-Inputs $k)\n"
                   "    $script:guardBudget = New-GuardBudget 60 'the test room' 'SHARE_UNREACHABLE' $false 'claim' ($k -cne 'hash_no_room')\n"
-                  # the hash row: a 6 s room, a manifest read that answers at 4 s, so the hash has under its 2 s minimum (VenueChain: UNREACHABLE, artifactsUnhashed, no read given up on)
-                  "    $script:guardBudget | Add-Member room $(if ($k -ceq 'hash_no_room') { 6 } else { 1 })\n"
+                  # the hash row: a 60 s room, the build's 6 s share, a manifest read that answers at 4 s: the hash has under its 2 s minimum of the share while the budget has some 56 s left
+                  # (VenueChain: UNREACHABLE, artifactsUnhashed, no read given up on; adversary r5 A1 and its pass 2 form)
+                  "    $script:guardBudget | Add-Member room $(if ($k -ceq 'hash_no_room') { 60 } else { 1 })\n"
                   "    $hits[$k] = Invoke-InputGuard; $script:guardBudget = $null\n"
                   "}\n"
                   # from here on every read of an input's (or batch.log's) path or identity is a share that answers 1.5 s late
