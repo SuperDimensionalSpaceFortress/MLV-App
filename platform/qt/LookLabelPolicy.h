@@ -179,6 +179,20 @@ inline bool keepsTextWithoutOwner( bool clipLoaded, int ownerRow )
     return clipLoaded && ownerRow < 0;
 }
 
+/*! \brief r15 (adversary r15 f2588355 A1): the label also keeps its text while the receipt applied to the loaded clip is the
+ *  owner's own and the owner is not the active row with attached sliders. Nothing can regrade that clip then: the switch, the
+ *  flavor, Reset Receipt and the async landing all refuse at receiptOwnedByLoadedClip, and a paste reaches setSliders only for
+ *  the active row. A paste onto the owner's row still writes its switch, though, so reading it relabelled an unchanged Cinematic
+ *  grade "Look: Off". An export clone's key (applied is not the owner) and a new open (it records a row) still re-derive, and a
+ *  label never derived yet (empty) is derived. */
+inline bool keepsTextForInactiveOwner( bool clipLoaded, const void *appliedReceipt, const void *ownerReceipt, bool ownerIsActiveRow,
+                                       bool slidersAttached, bool hasText )
+{
+    return clipLoaded && hasText && ownerReceipt != nullptr
+        && ( appliedReceipt == nullptr || appliedReceipt == ownerReceipt )
+        && !( ownerIsActiveRow && slidersAttached );
+}
+
 /*! \brief The corner label is drawn only in fullscreen, and only while the setting shows it. */
 inline bool fullscreenOverlayShown( bool fullscreen, bool showInFullscreenSetting )
 {

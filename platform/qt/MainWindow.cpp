@@ -17048,7 +17048,7 @@ void MainWindow::drainLookAssistWorkers( const char *reason )
  * invalidates that analysis, so its worker stops early and its queued result is dropped at the generation check. Called by
  * the three disable paths: the switch, a disabled paste (replaceReceipt) and a reset to a disabled default. The delivery
  * check (look_label::asyncResultLands) still decides on its own, for any path that turns it off without coming here. */
-void MainWindow::invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason )
+void MainWindow::invalidateLookAssistAsyncOnDisable( ReceiptSettings *receipt, const char *reason )
 {
     if( !look_label::disableInvalidatesAsync( receipt, receipt && receipt->lookAssistEnabled(), m_lookAssistAsyncTarget ) )
         return;
@@ -31792,7 +31792,13 @@ void MainWindow::updateLookLabel( void )
     // r12b (adversary r12 A1): the outcome is read under the receipt applied to this clip. An export job grades a clone of
     // the row's receipt, and a failed final reopen leaves that job's clip and grade loaded.
     const void *lookReceipt = lookOn ? look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ) : nullptr;
-    const QString text = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText : look_label::shownText(
+    // r15 (adversary r15 f2588355 A1): an owner that is not the active row with attached sliders cannot be regraded, but a paste
+    // onto its row still writes its switch; its text is kept, so an unchanged grade is never relabelled "Look: Off".
+    const bool keepText = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow )
+                       || look_label::keepsTextForInactiveOwner( m_fileLoaded, m_lookLabelAppliedReceipt, owner,
+                                                                 owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,
+                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty() );
+    const QString text = keepText ? m_lookLabelText : look_label::shownText(
         lookOn, m_lookAssistFlavorOutcome, lookReceipt, lookAssistFlavorName( currentLookAssistFlavor() ) );
     const bool fullscreenShown =
         look_label::fullscreenOverlayShown( ui->actionFullscreen->isChecked(), m_lookLabelShowInFullscreen );

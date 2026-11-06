@@ -544,6 +544,62 @@ TEST(LookLabelPolicy, A1r15AnInvalidatedAnalysisReleasesTheMarkerSoTurningItBack
     }
 }
 
+namespace
+{
+// updateLookLabel's derivation (MainWindow.cpp), for the owner row's receipt `owner` and the applied key `applied`.
+std::string derivedLabel(const QString &previous, const lookassist::LookAssistFlavorOutcome &outcome, const void *applied,
+                         const void *owner, bool ownerSwitch, bool ownerIsActive, bool slidersAttached, bool checkbox,
+                         bool recordedCloneSwitch = false)
+{
+    const bool lookSwitch = look_label::appliedLookSwitch(applied, owner, ownerSwitch, recordedCloneSwitch);
+    const bool lookOn = look_label::lookOnForOwner(owner != nullptr, lookSwitch,
+                                                   look_label::selectorDescribesOwner(ownerIsActive, slidersAttached), checkbox);
+    const void *key = lookOn ? look_label::outcomeKey(applied, owner) : nullptr;
+    const bool keepText = look_label::keepsTextWithoutOwner(true, owner ? 0 : -1)
+                       || look_label::keepsTextForInactiveOwner(true, applied, owner, ownerIsActive, slidersAttached, !previous.isEmpty());
+    return (keepText ? previous : look_label::shownText(lookOn, outcome, key, QString())).toStdString();
+}
+} // namespace
+
+// Adversary r15 (f2588355) A1. Rows A=0 and B=1 share one path; A owns the loaded clip and is the applied key, with Cinematic
+// landed; B is active. A paste with Look Assist off (Raw Correction Enable selected) onto A writes A's switch, but A is not the
+// active row, so setSliders is skipped and the Cinematic grade stays on screen; then F11 re-derives the label. RED on f2588355:
+// the label read A's edited switch, "Look: Off" over Cinematic.
+TEST(LookLabelPolicy, A1r15APasteOntoAnInactiveOwnerNeverRelabelsItsUnchangedGrade)
+{
+    int receiptA = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&receiptA, cinematic, false);
+    // While A was the active row: "Look: Cinematic".
+    const QString before = QString::fromStdString(derivedLabel(QString(), outcome, &receiptA, &receiptA, true, true, true, true));
+    ASSERT_EQ(std::string("Look: Cinematic"), before.toStdString());
+    // B made active (the same path, no reopen): A still owns and is applied. The paste writes A's switch off; F11 re-derives.
+    for( const bool attached : { true, false } )
+    {
+        const std::string after = derivedLabel(before, outcome, &receiptA, &receiptA, false, false, attached, true);
+        printf("[A1r15b] attached=%d label=\"%s\"\n", attached ? 1 : 0, after.c_str());
+        ASSERT_EQ(std::string("Look: Cinematic"), after);
+    }
+    // The cases that still re-derive. The owner active with attached sliders: the switch regrades, so it is read ("Look: Off").
+    ASSERT_EQ(std::string("Look: Off"), derivedLabel(before, outcome, &receiptA, &receiptA, false, true, true, false));
+    // An export clone Q as the key: its own outcome and its recorded switch decide.
+    int cloneQ = 0;
+    outcome.landed(&cloneQ, QStringLiteral("film"), false);
+    ASSERT_EQ(std::string("Look: Film grade"), derivedLabel(before, outcome, &cloneQ, &receiptA, false, false, true, true, true));
+    // Never derived yet (empty): derived.
+    ASSERT_EQ(std::string("Look: Off"), derivedLabel(QString(), outcome, &receiptA, &receiptA, false, false, true, true));
+    // The literal rule.
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, true));
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, nullptr, &receiptA, false, true, true));
+    ASSERT_TRUE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, false, true));   // detached active owner
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, true, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &cloneQ, &receiptA, false, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, nullptr, false, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(false, &receiptA, &receiptA, false, true, true));
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, &receiptA, &receiptA, false, true, false));
+}
+
 // The controls: Look Assist still on at delivery lands as before, and a disabled paste onto ANOTHER row (multi-select paste,
 // or Copy writing the clipboard receipt) neither invalidates nor drops the active row's own analysis.
 TEST(LookLabelPolicy, L08AResultForAReceiptStillOnLandsAndADisableElsewhereLeavesItAlone)
@@ -611,7 +667,7 @@ TEST(LookLabelWiring, L08TheDeliveryCheckPrecedesEveryPresetWriteAndEveryDisable
     const int target = apply.indexOf(QStringLiteral("m_lookAssistAsyncTarget = receipt;"), dispatched);
     ASSERT_TRUE(dispatched >= 0 && target > dispatched && apply.mid(dispatched, target - dispatched).count(QLatin1Char('\n')) == 1);
     // Invalidation: the one helper, keyed on the dispatched receipt, bumps the generation.
-    const QString inval = functionBody(mw, QStringLiteral("void MainWindow::invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason )"));
+    const QString inval = functionBody(mw, QStringLiteral("void MainWindow::invalidateLookAssistAsyncOnDisable( ReceiptSettings *receipt, const char *reason )"));
     ASSERT_TRUE(inval.contains(QStringLiteral("look_label::disableInvalidatesAsync( receipt, receipt && receipt->lookAssistEnabled(), m_lookAssistAsyncTarget )")));
     const int bump = inval.indexOf(QStringLiteral("++m_lookAssistAsyncGeneration;"));
     // Adversary r15 A1: the invalidated worker's early-out queues nothing, so the helper itself releases the marker.
@@ -867,7 +923,13 @@ TEST(LookLabelWiring, A1UpdateLookLabelDerivesFromTheOwnerNeverTheActiveReceipt)
         "                                                                                        !m_slidersDetachedFromReceipt ),\n"
         "                                                    ui->checkBoxLookAssistEnable->isChecked() );")));
     ASSERT_TRUE(update.contains(QStringLiteral("const void *lookReceipt = lookOn ? look_label::outcomeKey( m_lookLabelAppliedReceipt, owner ) : nullptr;")));
-    ASSERT_TRUE(update.contains(QStringLiteral("look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow ) ? m_lookLabelText")));
+    ASSERT_TRUE(update.contains(QStringLiteral("const bool keepText = look_label::keepsTextWithoutOwner( m_fileLoaded, ownerRow )\n")));
+    ASSERT_TRUE(update.contains(QStringLiteral("const QString text = keepText ? m_lookLabelText : look_label::shownText(")));
+    // r15 (adversary r15 f2588355 A1): an inactive owner's text is kept too, with the same inputs the switch reads.
+    ASSERT_TRUE(update.contains(QStringLiteral(
+        "|| look_label::keepsTextForInactiveOwner( m_fileLoaded, m_lookLabelAppliedReceipt, owner,\n"
+        "                                                                 owner && ownerRow == SESSION_ACTIVE_CLIP_ROW,\n"
+        "                                                                 !m_slidersDetachedFromReceipt, !m_lookLabelText.isEmpty() );")));
     // Called from settings loading before the session model exists: the model is read only once a clip is loaded.
     ASSERT_TRUE(update.contains(QStringLiteral("const int ownerRow = !m_fileLoaded ? -1 : look_label::loadedClipOwnerRow(")));
     // The pump A1 used still sits between the activation and the loader.

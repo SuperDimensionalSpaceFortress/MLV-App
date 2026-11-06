@@ -1910,7 +1910,7 @@ private:
     void initPlaybackPreviewModeFromSettings( void );
     void initPlaybackPreviewResolutionFromSettings( void );
     void drainLookAssistWorkers( const char *reason );
-    void invalidateLookAssistAsyncOnDisable( const ReceiptSettings *receipt, const char *reason );
+    void invalidateLookAssistAsyncOnDisable( ReceiptSettings *receipt, const char *reason );
     bool freeActiveMlvObjectAfterLifecycleBarrier( const char *reason );
     void initPlaybackScaleFactorFromSettings( void );
     void seedPlaybackQualityActiveStateForCurrentContext( void );
