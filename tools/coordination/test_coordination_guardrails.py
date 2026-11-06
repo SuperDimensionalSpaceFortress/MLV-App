@@ -1086,8 +1086,20 @@ _CODEX_RUNTIME_PATH_PWSH = shutil.which("pwsh")
 codex_runtime_path_only = pytest.mark.skipif(_CODEX_RUNTIME_PATH_PWSH is None, reason="needs pwsh to run the extracted function")
 
 
-def _codex_runtime_path_run(tmp_path, call, env=None):
-    """Extract Add-CodexLaneRuntimePath from Invoke-Lane.ps1 by AST, run `call` against a fresh ProcessStartInfo, print PATH= and ADDED= lines."""
+def _ps_quote(value):
+    """A value inside a PowerShell single-quoted literal."""
+    return str(value).replace("'", "''")
+
+
+def _free_drive_letter():
+    for letter in "ZYXWVUTSRQPONMLKJIHGFED":
+        if not os.path.exists(f"{letter}:\\"):
+            return letter
+    pytest.skip("no unused drive letter to stand in for a retired toolchain drive")
+
+
+def _codex_runtime_path_run(tmp_path, call, env=None, cwd=None):
+    """Extract Add-CodexLaneRuntimePath from Invoke-Lane.ps1 by AST, run `call` against a fresh ProcessStartInfo, print its PATH= line."""
     driver = tmp_path / "driver.ps1"
     driver.write_text(
         "param([string]$Script)\n"
@@ -1100,11 +1112,11 @@ def _codex_runtime_path_run(tmp_path, call, env=None):
         "$psi = [System.Diagnostics.ProcessStartInfo]::new()\n"
         + call
         + "\n'PATH=' + [string]$psi.Environment['PATH']\n",
-        encoding="ascii",
+        encoding="utf-8-sig",  # a non-ASCII tmp_path (an accented profile name) must not break the harness
     )
     return subprocess.run(
         [_CODEX_RUNTIME_PATH_PWSH, "-NoProfile", "-NonInteractive", "-File", str(driver), str(LANE_RUNNER)],
-        text=True, capture_output=True, timeout=120, env=env,
+        text=True, capture_output=True, timeout=120, env=env, cwd=cwd,
     )
 
 
@@ -1122,7 +1134,7 @@ def test_codex_lane_environment_ends_in_the_mingw_bin_directory(tmp_path):
     done = _codex_runtime_path_run(
         tmp_path,
         "$psi.Environment['PATH'] = 'C:\\first;C:\\second'\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{mingw}'))",
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(mingw)}'))",
     )
     path = _codex_runtime_path_field(done, "PATH")
     # APPENDED: tools already on PATH (git, python, pwsh) keep resolving to what they resolved to before.
@@ -1136,8 +1148,8 @@ def test_codex_lane_runtime_path_skips_a_missing_directory_and_never_duplicates(
     absent = tmp_path / "no-such-dir"
     done = _codex_runtime_path_run(
         tmp_path,
-        f"$psi.Environment['PATH'] = 'C:\\first;' + '{str(present).upper()}' + '\\'\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{absent}', '{present}', '{present}'))",
+        f"$psi.Environment['PATH'] = 'C:\\first;' + '{_ps_quote(str(present).upper())}' + '\\'\n"
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(absent)}', '{_ps_quote(present)}', '{_ps_quote(present)}'))",
     )
     path = _codex_runtime_path_field(done, "PATH")
     # `present` is already there under another case and a trailing backslash: not added again. `absent` does not exist: not added.
@@ -1151,7 +1163,7 @@ def test_codex_lane_runtime_path_builds_a_path_when_the_environment_has_none(tmp
     done = _codex_runtime_path_run(
         tmp_path,
         "[void]$psi.Environment.Remove('PATH')\n"
-        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{present}'))",
+        f"[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('{_ps_quote(present)}'))",
     )
     assert _codex_runtime_path_field(done, "PATH") == str(present)
 
@@ -1168,6 +1180,38 @@ def test_codex_lane_runtime_path_default_candidates_include_mingw_root_bin(tmp_p
     )
     path = _codex_runtime_path_field(done, "PATH")
     assert path.split(";")[:2] == ["C:\\first", str(root / "bin")], path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_survives_a_mingw_root_on_an_absent_drive(tmp_path):
+    # Adversary A1 on 6372cc4e: Join-Path throws DriveNotFound for a drive that is gone, which failed the whole lane before codex started.
+    # A retired MINGW_ROOT must only cost the candidate it names; the default toolchain, when installed, is still added.
+    drive = _free_drive_letter()
+    env = {**os.environ, "MINGW_ROOT": f"{drive}:\\retired-toolchain"}
+    done = _codex_runtime_path_run(
+        tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env,
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert path.split(";")[0] == "C:\\first" and f"{drive}:" not in path, path
+
+
+@codex_runtime_path_only
+def test_codex_lane_runtime_path_never_adds_a_relative_directory(tmp_path):
+    # Adversary A2 on 6372cc4e: Test-Path judged a relative candidate from the launcher's cwd, but a relative PATH entry is searched from the CHILD's
+    # cwd (the lane's WorkDir), where the DLLs are not. A directory is added only when it is fully qualified.
+    (tmp_path / "mingw" / "bin").mkdir(parents=True)
+    done = _codex_runtime_path_run(
+        tmp_path,
+        "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi -Candidates @('mingw\\bin', '.\\mingw\\bin', '\\Windows'))",
+        cwd=str(tmp_path),
+    )
+    assert _codex_runtime_path_field(done, "PATH") == "C:\\first"
+    env = {**os.environ, "MINGW_ROOT": "mingw"}
+    done = _codex_runtime_path_run(
+        tmp_path, "$psi.Environment['PATH'] = 'C:\\first'\n[void](Add-CodexLaneRuntimePath -Psi $psi)", env=env, cwd=str(tmp_path),
+    )
+    path = _codex_runtime_path_field(done, "PATH")
+    assert "mingw" not in path.replace("mingw1310_64", ""), path
 
 
 def test_codex_lane_runtime_path_is_wired_into_the_codex_child_only():

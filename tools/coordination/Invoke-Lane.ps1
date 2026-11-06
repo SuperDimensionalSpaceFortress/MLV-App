@@ -1972,7 +1972,9 @@ function Add-CodexLaneRuntimePath {
     )
     if ($null -eq $Candidates) {
         $Candidates = @()
-        if (-not [string]::IsNullOrWhiteSpace($env:MINGW_ROOT)) { $Candidates += (Join-Path $env:MINGW_ROOT 'bin') }
+        # String concatenation, NOT Join-Path: Join-Path throws DriveNotFound for a MINGW_ROOT on a drive that is gone, which failed the whole lane
+        # before codex started (adversary A1 on 6372cc4e). A retired MINGW_ROOT now only costs its own candidate.
+        if (-not [string]::IsNullOrWhiteSpace($env:MINGW_ROOT)) { $Candidates += ($env:MINGW_ROOT.Trim().TrimEnd('\', '/') + '\bin') }
         $Candidates += 'C:\Qt\Tools\mingw1310_64\bin'
     }
     $current = if ($Psi.Environment.ContainsKey('PATH')) { [string]$Psi.Environment['PATH'] } else { '' }
@@ -1984,9 +1986,14 @@ function Add-CodexLaneRuntimePath {
     $added = @()
     foreach ($dir in $Candidates) {
         if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+        # Fully qualified only (X:\... or \\server\...): a relative PATH entry is searched from the CHILD's working directory, not the launcher's
+        # where Test-Path would judge it, so a relative candidate would be validated in one place and searched in another (adversary A2 on 6372cc4e).
+        if ($dir.Trim() -notmatch '^([A-Za-z]:[\\/]|\\\\)') { continue }
         $key = $dir.Trim().TrimEnd('\').ToLowerInvariant()
         if ($seen.ContainsKey($key)) { continue }
-        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        $exists = $false
+        try { $exists = Test-Path -LiteralPath $dir -PathType Container } catch { $exists = $false }
+        if (-not $exists) { continue }
         $seen[$key] = $true
         $added += $dir.Trim()
     }
@@ -2769,8 +2776,12 @@ if ($cfg.engine -eq 'claude') {
 }
 # LANE-CHILD-LOADER-DIALOG-CODEX-SANDBOX-1: codex lanes only; the claude lane's environment is unchanged. See Add-CodexLaneRuntimePath.
 if ($cfg.engine -eq 'codex') {
-    $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi)
-    if ($codexRuntimePathAdded.Count -gt 0) { Write-Host ("[codex-runtime-path] appended to the lane PATH: {0}" -f ($codexRuntimePathAdded -join ';')) }
+    # Fail open with a warning, like the error-mode block: a PATH nicety must never be the reason a review lane does not start.
+    try {
+        $codexRuntimePathAdded = @(Add-CodexLaneRuntimePath -Psi $psi)
+        if ($codexRuntimePathAdded.Count -gt 0) { Write-Host ("[codex-runtime-path] appended to the lane PATH: {0}" -f ($codexRuntimePathAdded -join ';')) }
+    }
+    catch { Write-Warning "CODEX_RUNTIME_PATH_NOT_SET: $($_.Exception.Message) -- a MinGW-built exe the model runs may raise a loader dialog on the desktop" }
 }
 # LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): a CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
 # child-environment flag was here through round 1. docs/never-authorized.json NA-3 prohibits
