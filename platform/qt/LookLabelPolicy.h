@@ -119,6 +119,17 @@ inline bool restoreMarksBaseline( const void *restoredReceipt, const void *appli
     return restoredReceipt != nullptr && restoredReceipt == appliedReceipt;
 }
 
+/*! \brief r16 (adversary r16 39d1a995 A1): whether setSliders' receipt becomes the key the label reads. Attached sliders grade
+ *  the loaded clip, so the ACTIVE row's receipt applied to them is what is on screen even while another row owns the clip: in
+ *  addFileToSession's event pump B is active and A is still loaded, and a paste onto B runs setSliders(B). The key stayed A and
+ *  the label named A's Cinematic over B's disabled baseline. A scratch receipt (Reset Sliders' defaults, the no-session receipt)
+ *  and an export clone are never the active row's receipt, and an opener records its row before applying it, so the key is
+ *  already that receipt. The caller records the receipt's switch with it, as the export site records its clone's. */
+inline bool slidersMoveAppliedKey( const void *slidersReceipt, const void *activeReceipt, const void *appliedReceipt )
+{
+    return slidersReceipt != nullptr && slidersReceipt == activeReceipt && slidersReceipt != appliedReceipt;
+}
+
 /*! \brief r15 (sol r14 B1, catalogue L-08): whether a delivered async Look Assist result may grade. Only the receipt it
  *  analysed (r14: an export clone's result never grades the active row), and only while that receipt's Look Assist is on AT
  *  DELIVERY. Turning it off between dispatch and delivery (the switch, a disabled paste, a reset to a disabled default, an

@@ -352,8 +352,68 @@ TEST(LookLabelWiring, A1r12bTheExportJobsCloneIsTheKeyUntilTheNextOpenRecordsARo
                     .contains(QStringLiteral("m_lookLabelAppliedReceipt = m_loadedClipReceipt;")));
     // Pin count update (r14, adversary r14 0d87c82e A1; was 2): the third writer is the async landing's labelFollowsLanding
     // (LookLabelWiring.A1r14EveryAsyncLandingMovesTheLabelKeyToItsReceipt pins it).
-    ASSERT_EQ(3, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
+    // Pin count update (r16, adversary r16 39d1a995 A1; was 3): the fourth writer is setSliders applying the active row's
+    // receipt while another receipt is the key (LookLabelWiring.A1r16SetSlidersOfTheActiveRowMovesTheKeyBeforeAnySlider).
+    ASSERT_EQ(4, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = ")));
     ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = activeReceipt;")));
+    ASSERT_EQ(1, mw.count(QStringLiteral("m_lookLabelAppliedReceipt = receipt;")));
+}
+
+// Adversary r16 (39d1a995) A1. A owns the loaded clip with Look Assist on and Cinematic landed; B is active with attached sliders
+// during addFileToSession's event pump. A paste onto B of a receipt with Look Assist off (baseline valid, exposure -100; Exposure and
+// Raw Correction Enable selected) runs setSliders(B): B's disabled baseline grades A's clip. RED on 39d1a995: the key stayed A, so
+// the label read A's switch and outcome, "Look: Cinematic" over B's baseline.
+TEST(LookLabelPolicy, A1r16APasteOntoTheActiveRowInAnotherOwnersPumpIsLabelledUnderThatRow)
+{
+    int receiptA = 0, receiptB = 0, scratch = 0, cloneQ = 0;
+    const QString cinematic = QStringLiteral("cinematic");
+    lookassist::LookAssistFlavorOutcome outcome;
+    outcome.landed(&receiptA, cinematic, false);
+    const bool switchA = true, switchB = false;   // B's switch after the paste
+    // setSliders(B): the key follows the active row's receipt, with B's switch recorded (MainWindow::setSliders).
+    const void *applied = &receiptA;
+    bool recorded = false;
+    if( look_label::slidersMoveAppliedKey(&receiptB, &receiptB, applied) ) { applied = &receiptB; recorded = switchB; }
+    ASSERT_EQ(static_cast<const void *>(&receiptB), applied);
+    // B's baseline goes back with Look Assist off: the else-if restore, no mark (restoreMarksBaseline is the enabled branch's).
+    // updateLookLabel for the owner A (B is active, so the selector does not describe A).
+    const auto derive = [&]() {
+        const bool lookSwitch = look_label::appliedLookSwitch(applied, &receiptA, switchA, recorded);
+        const bool on = look_label::lookOnForOwner(true, lookSwitch, look_label::selectorDescribesOwner(false, true), false);
+        return look_label::shownText(on, outcome, on ? look_label::outcomeKey(applied, &receiptA) : nullptr, cinematic).toStdString();
+    };
+    printf("[A1r16p] label=\"%s\"\n", derive().c_str());
+    ASSERT_EQ(std::string("Look: Off"), derive());
+    // The freeze never keeps A's text over it: the key is not the owner's.
+    ASSERT_FALSE(look_label::keepsTextForInactiveOwner(true, applied, &receiptA, false, true, true, true));
+    // The same paste with Look Assist ON: B's baseline is marked under B, so "Look: Baseline", never A's Cinematic.
+    outcome.baselineRestored(&receiptB);
+    recorded = true;
+    ASSERT_EQ(std::string("Look: Baseline"), derive());
+    // The literal rule: only the active row's receipt, and only when it is not the key already.
+    ASSERT_TRUE(look_label::slidersMoveAppliedKey(&receiptB, &receiptB, &receiptA));
+    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&receiptA, &receiptA, &receiptA));   // the opener recorded it
+    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&receiptA, &receiptB, &receiptA));   // A applied while B is active (A1r16 open)
+    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&scratch, &receiptB, &receiptA));    // Reset Sliders' defaults
+    ASSERT_FALSE(look_label::slidersMoveAppliedKey(&cloneQ, &receiptB, &cloneQ));       // the export's clone
+    ASSERT_FALSE(look_label::slidersMoveAppliedKey(nullptr, nullptr, &receiptA));
+}
+
+TEST(LookLabelWiring, A1r16SetSlidersOfTheActiveRowMovesTheKeyBeforeAnySlider)
+{
+    const QString mw = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString sliders = functionBody(mw, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"));
+    const int detached = sliders.indexOf(QStringLiteral("if( m_slidersDetachedFromReceipt )"));
+    const int rule = sliders.indexOf(QStringLiteral(
+        "if( m_fileLoaded && SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0\n"
+        "     && look_label::slidersMoveAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt ) )"));
+    const int key = sliders.indexOf(QStringLiteral("m_lookLabelAppliedReceipt = receipt;"), rule);
+    const int sw = sliders.indexOf(QStringLiteral("m_lookLabelAppliedCloneLookAssist = receipt->lookAssistEnabled();"), key);
+    const int first = sliders.indexOf(QStringLiteral("ui->horizontalSliderExposure->setValue( receipt->exposure() );"));
+    ASSERT_TRUE(detached >= 0 && rule > detached && key > rule && sw > key && first > sw);
+    // ... and before the relabel and the baseline mark, which read the key.
+    ASSERT_TRUE(sliders.indexOf(QStringLiteral("updateLookLabel();   // both signals were blocked above")) > sw);
+    ASSERT_TRUE(sliders.indexOf(QStringLiteral("look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad )")) > sw);
 }
 
 // Adversary r14 (0d87c82e) A1. MLVAPP_LOOK_ASSIST_ASYNC=1. A is active, owns the clip and has Look Assist on; an export applies
@@ -880,7 +940,8 @@ TEST(LookLabelWiring, A1r13TheExportSiteRecordsTheClonesSwitchWithTheKey)
     ASSERT_TRUE(functionBody(mw, QStringLiteral("void MainWindow::recordLoadedClipReceipt( const QString &fileName, int openerRow )"))
                     .contains(QStringLiteral("m_lookLabelAppliedCloneLookAssist = false;")));
     // Pin count update (r14, adversary r14 0d87c82e A1; was 2): the async landing's labelFollowsLanding is the third writer.
-    ASSERT_EQ(3, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
+    // Pin count update (r16, adversary r16 39d1a995 A1; was 3): setSliders moving the key to the active row is the fourth.
+    ASSERT_EQ(4, mw.count(QStringLiteral("m_lookLabelAppliedCloneLookAssist = ")));
 }
 
 // Adversary r13 (63319bdb) A1. Rows A (Look Assist on, Cinematic) and B (Look Assist off, active) hold one path. showFileInEditor(A)
@@ -1102,6 +1163,8 @@ TEST(LookLabelWiring, EveryLabelDerivationGoesThroughTheOnePendingAwareHelper)
         // the baseline-mark predicate (it derives no text). Exactly that call is removed; any other look_label:: use still fails.
         const QString markCall = QStringLiteral("look_label::restoreMarksBaseline( receipt, m_lookLabelAppliedReceipt, activeReceiptAtLoad )");
         body.remove(markCall);
+        // r16 (adversary r16 39d1a995 A1): and the key-move predicate (it derives no text either).
+        body.remove(QStringLiteral("look_label::slidersMoveAppliedKey( receipt, ACTIVE_RECEIPT, m_lookLabelAppliedReceipt )"));
         ASSERT_FALSE(body.contains(QStringLiteral("look_label::")));
     }
     // The helper reads the outcome ON SCREEN (the last landed one while pending), not the reported one.
