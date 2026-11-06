@@ -2044,6 +2044,33 @@ static QImage build_fast_playback_scaled_image(const uint8_t * source,
                                          targetBytesPerLine );
 }
 
+/* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the fast branch's RGB32 writer (same samples,
+ * 0xFFRRGGBB). MLVAPP_DISABLE_PLAYBACK_PREP_RGB32 (any value but 0) restores RGB888. */
+static QImage build_fast_playback_scaled_image_rgb32(const uint8_t * source,
+                                                     int sourceWidth,
+                                                     int sourceHeight,
+                                                     int targetWidth,
+                                                     int targetHeight)
+{
+    static thread_local FastPlaybackScaleCache cache;
+    // r2 (adversary A1): an image that OWNS its pixels (fromImage shares RGB32 data).
+    return playbackBuildFastScaledImageRgb32( source,
+                                              sourceWidth,
+                                              sourceHeight,
+                                              targetWidth,
+                                              targetHeight,
+                                              cache );
+}
+
+static bool playbackPrepRgb32FastBranchEnabled()
+{
+    static const bool enabled =
+        !( qEnvironmentVariableIsSet( "MLVAPP_DISABLE_PLAYBACK_PREP_RGB32" )
+           && qEnvironmentVariable( "MLVAPP_DISABLE_PLAYBACK_PREP_RGB32" ).trimmed()
+                != QStringLiteral("0") );
+    return enabled;
+}
+
 static const char * playback_profile_scope_name(MainWindow::PlaybackProfileScope scope)
 {
     switch( scope )
@@ -2885,6 +2912,7 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
     static QTime lastTime;              //Last Time a picture was rendered
     static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
     static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
@@ -4319,6 +4347,9 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     // rgb8DisplaySource uses these.
     int displaySourceWidth = sourceWidth;
     int displaySourceHeight = sourceHeight;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the CPU prep route ran for this frame
+    // (only then does the fast branch write RGB32; every other route stays RGB888).
+    bool cpuPrepRouteRan = false;
 
     if( gpu16PreviewActive && rgb16DisplaySource )
     {
@@ -4416,6 +4447,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         result.task.scopeSourceImageSize = processedBytes;
         rgb8DisplaySource = result.task.scopeSourceImage;
 
+        cpuPrepRouteRan = true;
         QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
         spanTelemetry.insert( QStringLiteral("playback_prep_cpu_route_active"), true );
         spanTelemetry.insert( QStringLiteral("playback_prep_alloc_ms"), cpuRoute.allocMs );
@@ -4576,15 +4608,31 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                 std::max( 1, qRound( sceneWidth * devicePixelRatio ) );
             const int scaledHeight =
                 std::max( 1, qRound( sceneHeight * devicePixelRatio ) );
-            const int scaledBytesPerLine = ((scaledWidth * 3) + 3) & ~3;
-            displayImage = build_fast_playback_scaled_image( rgb8DisplaySource,
-                                                             displaySourceWidth,
-                                                             displaySourceHeight,
-                                                             scaledWidth,
-                                                             scaledHeight,
-                                                             displayImageBacking,
-                                                             scaledBytesPerLine );
-            displayImageOwnsData = false;
+            if( cpuPrepRouteRan && playbackPrepRgb32FastBranchEnabled() )
+            {
+                // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the same pixels as
+                // RGB32 so QPixmap::fromImage on the GUI thread is a no-convert wrap.
+                // r2 (adversary A1): the image owns its pixels and is handed over as
+                // preparedOwnedImage, so the GUI's pixmap shares a buffer that lives as long as it does.
+                displayImage = build_fast_playback_scaled_image_rgb32( rgb8DisplaySource,
+                                                                       displaySourceWidth,
+                                                                       displaySourceHeight,
+                                                                       scaledWidth,
+                                                                       scaledHeight );
+                displayImageOwnsData = true;
+            }
+            else
+            {
+                const int scaledBytesPerLine = ((scaledWidth * 3) + 3) & ~3;
+                displayImage = build_fast_playback_scaled_image( rgb8DisplaySource,
+                                                                 displaySourceWidth,
+                                                                 displaySourceHeight,
+                                                                 scaledWidth,
+                                                                 scaledHeight,
+                                                                 displayImageBacking,
+                                                                 scaledBytesPerLine );
+                displayImageOwnsData = false;
+            }
         }
         else if( zoomFitEnabled )
         {
@@ -4646,15 +4694,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     const qint64 postStartNs = prepSpanClock.nsecsElapsed();
     int suppressedTopMagentaBandRows = 0;
     if( playbackPolicyActive
-     && !displayImage.isNull()
-     && displayImage.format() == QImage::Format_RGB888 )
+     && !displayImage.isNull() )
     {
+        // RGB888 or RGB32 (Part C); any other format is left untouched, as before.
         suppressedTopMagentaBandRows =
-            playbackSuppressUniformTopMagentaBandRgb8(
-                displayImage.bits(),
-                displayImage.width(),
-                displayImage.height(),
-                displayImage.bytesPerLine() );
+            playbackSuppressUniformTopMagentaBandImage( displayImage );
     }
     result.task.readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("draw_frame_ready_top_magenta_band_rows"),
@@ -4680,7 +4724,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     {
         result.preparedWidth = displayImage.width();
         result.preparedHeight = displayImage.height();
-        const int rowContentBytes = result.preparedWidth * 3;
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the fast CPU-route branch hands over
+        // RGB32 (4 B/px, rows already 4-byte aligned); every other branch RGB888 (3 B/px).
+        result.preparedRgb32 = displayImage.format() == QImage::Format_RGB32;
+        const int rowContentBytes =
+            result.preparedWidth * playbackPreparedBytesPerPixel( displayImage.format() );
         // Pad each row up to a 4-byte boundary so the GUI side can wrap
         // this buffer with a Format_RGB888 QImage without overshooting
         // (Qt requires 32-bit-aligned scanlines; for odd widths,
@@ -4706,6 +4754,12 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         else if( displayImageOwnsData )
         {
             result.preparedOwnedImage = displayImage;
+        }
+        else if( result.preparedRgb32 )
+        {
+            // r2 (adversary A1): an RGB32 frame is never handed over as a borrowed or moved byte
+            // buffer: QPixmap::fromImage would share it past the result's lifetime.
+            result.preparedOwnedImage = displayImage.copy();
         }
         else if( !displayImageBacking.empty()
               && displayImageBacking.size() == preparedSize
@@ -4758,6 +4812,12 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         spanTelemetry.insert( QStringLiteral("playback_prep_downscale_ms"), downscaleMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_downscale_branch"),
                               QString::fromLatin1( downscaleBranch ) );
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the prepared frame's format, per frame.
+        spanTelemetry.insert( QStringLiteral("playback_prep_prepared_format"),
+                              displayImage.isNull()
+                                  ? QStringLiteral("none")
+                                  : ( result.preparedRgb32 ? QStringLiteral("rgb32")
+                                                           : QStringLiteral("rgb888") ) );
         spanTelemetry.insert( QStringLiteral("playback_prep_post_ms"), postMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_span_build_ms"),
                               prepSpanMs( 0 ) );
@@ -4944,7 +5004,36 @@ void MainWindow::openGuiPresentGap( void )
     if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
     m_guiPresentGapRunnerSleepNs = 0;
     m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
+    ++m_guiPresentGapSerial;
+    m_guiOtherBusySpans.openGap();
     m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+}
+
+// CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): the clock a GUI handler span reads at its start and
+// end. gapSerial 0 = no gap open, so a span outside a gap (or across a gap's open or close) is dropped.
+gui_present_gap::SpanClock MainWindow::guiOtherBusySpanClock( void ) const
+{
+    gui_present_gap::SpanClock clock;
+    clock.gapSerial = m_guiPresentGapStartNs >= 0 ? m_guiPresentGapSerial : 0;
+    clock.nowNs = m_guiPresentGapClock.nsecsElapsed();
+    clock.idleNs = m_guiPresentGapIdle.idleNs;
+    clock.runnerSleepNs = m_guiPresentGapRunnerSleepNs;
+    clock.paintMs = ui->graphicsView->paintTiming().sumMs;
+    return clock;
+}
+
+// Only inside a smoke session whose idle probe is connected (the gap is never open otherwise): one
+// branch per handler call when off.
+MainWindow::GuiOtherBusyScope::GuiOtherBusyScope( MainWindow *window, gui_present_gap::OtherBusySpan span )
+    : m_window( ( window->m_playbackSmokeActive && window->m_guiPresentIdleProbeConnected ) ? window : nullptr )
+    , m_span( span )
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.begin( m_window->guiOtherBusySpanClock() );
+}
+
+MainWindow::GuiOtherBusyScope::~GuiOtherBusyScope()
+{
+    if( m_window ) m_window->m_guiOtherBusySpans.end( m_span, m_window->guiOtherBusySpanClock() );
 }
 
 void MainWindow::closeGuiPresentGap( void )
@@ -4967,6 +5056,7 @@ void MainWindow::closeGuiPresentGap( void )
     gaps.busyMaxMs = qMax( gaps.busyMaxMs, split.busyMs );
     gaps.otherBusySumMs += split.otherBusyMs;
     gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, split.otherBusyMs );
+    m_guiOtherBusySpans.closeGap( split.otherBusyMs );
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
 }
@@ -6390,11 +6480,19 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
 
         if( preparedImageData )
         {
-            displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( preparedImageData ),
-                                                result.preparedWidth,
-                                                result.preparedHeight,
-                                                result.preparedBytesPerLine );
+            displayImage = playbackWrapPreparedImage( const_cast<uint8_t *>( preparedImageData ),
+                                                      result.preparedWidth,
+                                                      result.preparedHeight,
+                                                      result.preparedBytesPerLine,
+                                                      result.preparedRgb32 );
             displayImageOwnsData = false;
+            if( result.preparedRgb32 )
+            {
+                // r2 (adversary A1): the worker hands RGB32 over as preparedOwnedImage; should a
+                // byte buffer ever carry it, own a copy, because fromImage would share these bytes.
+                displayImage = displayImage.copy();
+                displayImageOwnsData = true;
+            }
         }
     }
 
@@ -6435,15 +6533,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     int suppressedPresentedTopMagentaBandRows = 0;
     if( !framePresentedByViewport
      && playbackPolicyActive()
-     && !displayImage.isNull()
-     && displayImage.format() == QImage::Format_RGB888 )
+     && !displayImage.isNull() )
     {
+        // RGB888 or RGB32 (Part C); any other format is left untouched, as before.
         suppressedPresentedTopMagentaBandRows =
-            playbackSuppressUniformTopMagentaBandRgb8(
-                displayImage.bits(),
-                displayImage.width(),
-                displayImage.height(),
-                displayImage.bytesPerLine() );
+            playbackSuppressUniformTopMagentaBandImage( displayImage );
     }
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("draw_frame_ready_present_top_magenta_band_rows"),
@@ -6460,21 +6554,10 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
      * hashed. */
     if( interactiveTraceEnabled() && !displayImage.isNull() )
     {
-        const uchar *contentBits = displayImage.constBits();
-        const size_t contentBytes =
-            static_cast<size_t>( displayImage.bytesPerLine() )
-            * static_cast<size_t>( displayImage.height() );
-        uint64_t contentHash = 1469598103934665603ull;
-        if( contentBits && contentBytes > 0 )
-        {
-            const size_t contentStep =
-                std::max( static_cast<size_t>( 1 ), contentBytes / 8192 );
-            for( size_t i = 0; i < contentBytes; i += contentStep )
-            {
-                contentHash ^= contentBits[i];
-                contentHash *= 1099511628211ull;
-            }
-        }
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 r3 (adversary r2 pass-3 A1): the shared helper samples
+        // the base's RGB888 grid and reads each channel through the frame's layout, so an RGB32 frame
+        // hashes bit-identically to the base hash of its RGB888 twin (pinned by pipeline_tests).
+        const uint64_t contentHash = playbackPresentedContentHash( displayImage );
         logInteractionEvent(
             QStringLiteral("draw_frame_ready.present_content"),
             QStringLiteral("display_frame=%1 play_checked=%2 position=%3 hash=%4")
@@ -6486,16 +6569,21 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     }
 
     bool imagePresentedByViewport = false;
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image split into its two calls.
+    double prepRegionImageViewportMs = 0.0;
+    double prepRegionImageFromImageMs = 0.0;
     if( !framePresentedByViewport )
     {
         // Threaded through so GpuDisplayWindow can record which requestSerial it actually
         // swapped in -- see GpuDisplayWindow::grabPresentedFramebufferIfActive.
         GpuDisplayViewport::PresentationOptions presentationOptions = task.gpuPresentationOptions;
         presentationOptions.presentationSerial = task.requestSerial;
+        const qint64 prepRegionImageViewportStartNs = prepRegionClock.nsecsElapsed();
         imagePresentedByViewport = GpuDisplayViewport::presentImage( ui->graphicsView,
                                                                       m_pGraphicsItem,
                                                                       displayImage,
                                                                       presentationOptions );
+        prepRegionImageViewportMs = prepRegionElapsedMs( prepRegionImageViewportStartNs );
     }
 
     if( !framePresentedByViewport && !imagePresentedByViewport )
@@ -6519,14 +6607,20 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
          && !displayImage.isNull()
          && mlv_pipeline_capture_should_capture_frame( display_frame ) )
         {
+            // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): the capture stays RGB888 (3 B/px);
+            // an RGB32 frame is converted for the capture only (the same R, G, B bytes).
+            const QImage captureImage =
+                displayImage.format() == QImage::Format_RGB32
+                    ? displayImage.convertToFormat( QImage::Format_RGB888 )
+                    : displayImage;
             mlv_pipeline_capture_meta_t meta;
             memset( &meta, 0, sizeof meta );
             meta.stage = MLV_PIPELINE_STAGE_S6_DISPLAYIMAGE;
             meta.format = MLV_PIPELINE_FORMAT_UINT8_RGB;
             meta.format_label = "uint8_rgb_displayImage_pre_pixmap";
-            meta.width = displayImage.width();
-            meta.height = displayImage.height();
-            meta.bytes_per_line = (int)displayImage.bytesPerLine();
+            meta.width = captureImage.width();
+            meta.height = captureImage.height();
+            meta.bytes_per_line = (int)captureImage.bytesPerLine();
             meta.bytes_per_pixel = 3;
             meta.channels = 3;
             meta.bit_depth = 8;
@@ -6536,11 +6630,21 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 task.gpuPresentationOptions.previewProcessing.enabled ? 1 : 0;
             meta.settings_hash = (uint64_t)display_signature;
             mlv_pipeline_capture( display_frame,
-                                  displayImage.constBits(),
+                                  captureImage.constBits(),
                                   &meta );
         }
 
-        QPixmap pic = cachedPixmapAvailable ? cachedPixmap : QPixmap::fromImage( displayImage );
+        QPixmap pic;
+        if( cachedPixmapAvailable )
+        {
+            pic = cachedPixmap;
+        }
+        else
+        {
+            const qint64 prepRegionImageFromImageStartNs = prepRegionClock.nsecsElapsed();
+            pic = QPixmap::fromImage( displayImage );
+            prepRegionImageFromImageMs = prepRegionElapsedMs( prepRegionImageFromImageStartNs );
+        }
         if( zoomFitEnabled && pic.devicePixelRatio() == 1.0 )
         {
             pic.setDevicePixelRatio( devicePixelRatioF() );
@@ -6567,6 +6671,12 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("playback_prep_region_image_ms"),
         prepRegionImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_from_image_ms"),
+        prepRegionImageFromImageMs );
+    readyFrame.stageTimingTelemetry.insert(
+        QStringLiteral("playback_prep_region_image_viewport_ms"),
+        prepRegionImageViewportMs );
     m_lastDrawFrameReadyImageMs = prepRegionImageMs;
     mlv_stage_timing_note_elapsed("drawFrameReady.image", display_frame, m_lastDrawFrameReadyImageMs);
 
@@ -6761,6 +6871,7 @@ void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
 //Draw a raw picture to the gui -> start render thread
 void MainWindow::drawFrame( bool updateTimecodeLabel )
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrame );
     if( !m_clipLifecycleBarrier.acceptingRequests() )
     {
         m_frameStillDrawing = false;
@@ -12009,6 +12120,7 @@ int MainWindow::openMlv( QString fileName )
 //Handles the playback and must be triggered from timer
 void MainWindow::playbackHandling(int timeDiff)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::PlaybackHandling );
     if( ui->actionPlay->isChecked() )
     {
         if( m_fileLoaded && m_pMlvObject )
@@ -19684,31 +19796,38 @@ static uint8_t applyZebrasToImage( QImage *image, bool enableZebras )
 
     if( !image ) return underOver;
 
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part C): a playback frame may be RGB32 (B,G,R,0xFF);
+    // every other caller hands RGB888 (R,G,B).
+    const PlaybackRgb8Layout layout =
+        image->format() == QImage::Format_RGB32 ? kPlaybackLayoutRgb32 : kPlaybackLayoutRgb888;
     for( int y = 0; y < image->height(); y++ )
     {
         uchar * line = image->scanLine( y );
         for( int x = 0; x < image->width(); x++ )
         {
-            uchar * pixel = line + (x * 3);
-            const int maxChannel = qMax(pixel[0], qMax(pixel[1], pixel[2]));
-            const int minChannel = qMin(pixel[0], qMin(pixel[1], pixel[2]));
+            uchar * pixel = line + (x * layout.bytesPerPixel);
+            uchar &r = pixel[layout.r];
+            uchar &g = pixel[layout.g];
+            uchar &b = pixel[layout.b];
+            const int maxChannel = qMax(r, qMax(g, b));
+            const int minChannel = qMin(r, qMin(g, b));
             const int lightness = (maxChannel + minChannel) / 2;
             //Overexposed
             if( lightness >= preview_zebra::kOverThreshold8Bit )
             {
                 //Set color red
-                pixel[0] = 255;
-                pixel[1] = 0;
-                pixel[2] = 0;
+                r = 255;
+                g = 0;
+                b = 0;
                 underOver |= 0x02;
             }
             //Underexposed
             if( lightness <= preview_zebra::kUnderThreshold8Bit )
             {
                 //Set color blue
-                pixel[0] = 0;
-                pixel[1] = 0;
-                pixel[2] = 255;
+                r = 0;
+                g = 0;
+                b = 255;
                 underOver |= 0x01;
             }
         }
@@ -20517,6 +20636,7 @@ void MainWindow::on_actionAboutQt_triggered()
 //Position Slider
 void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::SliderPosition );
     if( !m_playbackInternalSliderAdvance )
     {
         invalidatePlaybackPrepForDisplayChange( "playback-position-change" );
@@ -25928,6 +26048,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_guiPresentGaps = GuiPresentGapTotals();
     m_guiPresentGapStartNs = -1;
     m_guiPresentGapIdle = gui_present_gap::IdleWaits();
+    m_guiOtherBusySpans.resetSession();
+    m_playbackSmokeReconWorkerSplit.reset();
     ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
@@ -27103,6 +27225,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                 telemetryStringValue( timing, "playback_prep_downscale_branch" );
             ++spans.downscaleBranchCounts[spans.downscaleBranchLast];
         }
+        if( timing.contains( QStringLiteral("playback_prep_prepared_format") ) )
+            ++spans.preparedFormatCounts[telemetryStringValue( timing, "playback_prep_prepared_format" )];
         if( telemetryBoolValue( timing, "playback_prep_cpu_route_active" ) )
         {
             ++spans.cpuRouteFrames;
@@ -27128,8 +27252,16 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             spans.regionTotalMs += telemetryDoubleValue( timing, "playback_prep_region_total_ms" );
             spans.regionUnattributedMs +=
                 telemetryDoubleValue( timing, "playback_prep_region_unattributed_ms" );
+            // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): region_image's two calls.
+            spans.regionImageFromImageMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_from_image_ms" );
+            spans.regionImageViewportMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_image_viewport_ms" );
         }
     }
+    // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): frames whose render consumed the phase-3 recon
+    // carry the worker's sub-spans under recon_worker_ (RenderFrameThread drawFrame).
+    m_playbackSmokeReconWorkerSplit.add( timing );
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
     m_playbackSmokePrepResultQueueSumMs += prepResultQueueMs;
     m_playbackSmokePrepTotalBeforeFinishSumMs += prepTotalBeforeFinishMs;
@@ -30295,7 +30427,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "pointwise_fast_refusal_counts=%30 "
                    "avg_playback_prep_region_setup_ms=%31 avg_playback_prep_region_image_ms=%32 "
                    "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
-                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36" )
+                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36 "
+                   "avg_playback_prep_region_image_from_image_ms=%37 "
+                   "avg_playback_prep_region_image_viewport_ms=%38 "
+                   "prepared_format_counts=%39" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -30333,7 +30468,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgCpuRouteMs( spans.regionPresentMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionFinishMs ), 0, 'f', 3 )
                    .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
-                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 );
+                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageFromImageMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageViewportMs ), 0, 'f', 3 )
+                   .arg( joinCounts( spans.preparedFormatCounts ) );
     }
 
     /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
@@ -30350,6 +30488,18 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         {
             return count > 0 ? sum / static_cast<double>( count ) : 0.0;
         };
+        // CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part B): other busy by GUI handler (exclusive time
+        // inside the gap), appended after every existing field; per gap, like avg_gui_other_busy_ms.
+        QString otherBusySplit;
+        for( int i = 0; i < gui_present_gap::OtherBusySpans::kCount; ++i )
+        {
+            otherBusySplit += QStringLiteral( " avg_gui_other_busy_%1_ms=%2" )
+                                  .arg( QLatin1String( gui_present_gap::otherBusySpanName(
+                                            static_cast<gui_present_gap::OtherBusySpan>( i ) ) ) )
+                                  .arg( avgOver( m_guiOtherBusySpans.sumMs[i], gaps.gaps ), 0, 'f', 3 );
+        }
+        otherBusySplit += QStringLiteral( " avg_gui_other_busy_unattributed_ms=%1" )
+                              .arg( avgOver( m_guiOtherBusySpans.unattributedSumMs, gaps.gaps ), 0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.gui_present_summary session=%1 frames=%2 "
@@ -30373,8 +30523,20 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( avgOver( gaps.otherBusySumMs, gaps.gaps ), 0, 'f', 3 )
                    .arg( gaps.otherBusyMaxMs, 0, 'f', 3 )
                    .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
-                                                        : QStringLiteral("none") );
+                                                        : QStringLiteral("none") )
+               + otherBusySplit;
     }
+
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): the phase-3 recon WORKER's own llrawproc /
+     * dual_iso_full20 sub-spans on presented frames whose render consumed its recon (the render
+     * thread's llrawproc_* keys are its own, zero on those frames). Fields: ReconWorkerSplit.h. */
+    qInfo().noquote()
+        << QStringLiteral( "playback_smoke.recon_worker_split_summary session=%1 frames=%2 "
+                           "full20_valid_frames=%3" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.frames ) )
+               .arg( static_cast<qulonglong>( m_playbackSmokeReconWorkerSplit.full20ValidFrames ) )
+           + m_playbackSmokeReconWorkerSplit.fieldsText();
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
      * consumed the phase-3 recon (one recon per frame) versus ran its own decode
@@ -33118,6 +33280,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
 //Draw the frame when render thread is ready
 void MainWindow::drawFrameReady()
 {
+    const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::DrawFrameReady );
     const double drawReadyEntryStageTime = mlv_stage_timing_now();
     RenderFrameThread::ReadyFrame readyFrame;
     PresentationRequestContext requestContext;

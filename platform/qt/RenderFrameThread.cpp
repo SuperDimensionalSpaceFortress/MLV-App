@@ -16,6 +16,7 @@
 #include "PlaybackQualityPolicy.h"
 #include "PlaybackSlotRelease.h"
 #include "ReconWorker.h"
+#include "ReconWorkerSplit.h"
 
 #include "../../src/batch/WorkerThreadCount.h"
 #include "../../src/debayer/debayer.h"
@@ -465,6 +466,16 @@ void insertLlrawprocReconTimingTelemetry( QJsonObject &target )
                    dualIsoFull20.mix_ev_lut_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_halfres_ms"),
                    dualIsoFull20.mix_halfres_ms );
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1: the worker's mix_chroma split, carried to the
+     * presented frame as recon_worker_* (ReconWorkerSplit.h). */
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_ms"),
+                   dualIsoFull20.mix_chroma_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_copy_ms"),
+                   dualIsoFull20.mix_chroma_copy_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_fullres_ms"),
+                   dualIsoFull20.mix_chroma_fullres_ms );
+    target.insert( QStringLiteral("dual_iso_full20_mix_chroma_halfres_ms"),
+                   dualIsoFull20.mix_chroma_halfres_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_alias_map_ms"),
                    dualIsoFull20.mix_alias_map_ms );
     target.insert( QStringLiteral("dual_iso_full20_mix_overexposed_ms"),
@@ -5059,8 +5070,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * thread-local and stale otherwise. */
     bool renderThreadProcessed8StageRan = false;
     bool renderThreadProcessed16StageRan = false;
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A, r1 adversary pass 2 A1): set only where this
+     * render actually consumed the worker's reconstruction; a refused reuse leaves it false. */
+    bool renderConsumedWorkerRecon = false;
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
+        renderConsumedWorkerRecon = decodedRawFrameAlreadyReconned;
         slot.usedGpuAmazeDebayer = true;
         slot.gpuAmazeFallbackReason.clear();
         slot.gpuAmazeRendererDescription =
@@ -5420,6 +5435,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
         }
         const bool consumedPhase3Recon =
             phase3ReconReuseOutcome == Debayered16ReconRefusal::None;
+        renderConsumedWorkerRecon =
+            consumedPhase3Recon && decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;
         /* CPU-DEBAYERED16-HONOUR-SCALE-1: only a reduced debayer that actually ran
          * changes the frame's dims (the gpuReducedReconSlot precedent above); the
          * prep worker sees them through slot.renderedImageWidth/Height. */
@@ -5633,9 +5650,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
         slot.stageTimingTelemetry.insert(
             QStringLiteral("phase3_decoded_raw_consumed"),
             decodedRawFrame && !decodedRawFrameAlreadyReconned && renderedFromPhase3Raw );
+        renderConsumedWorkerRecon =
+            decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw;
         slot.stageTimingTelemetry.insert(
             QStringLiteral("phase3_reconned_raw_consumed"),
-            decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw );
+            renderConsumedWorkerRecon );
         slot.stageTimingTelemetry.insert(
             QStringLiteral("cpu_dualiso_reduced_recon_consumed"),
             renderedFromReducedRecon );
@@ -7186,6 +7205,17 @@ void RenderFrameThread::drawFrame( int slotIndex,
         restoreGpuPlaybackReconTimingTelemetry(
             slot.stageTimingTelemetry,
             preservedGpuPlaybackReconTextureTelemetry );
+    }
+    /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A): a render that consumed the phase-3 recon
+     * wrote its own (zero) llrawproc_* / dual_iso_full20_* values over the worker's above; the
+     * worker's, captured before resetMetadata, are kept under recon_worker_ (no writer here
+     * touches that prefix). The render thread's own keys are left as they are. Gated on the
+     * render CONSUMING it: a refused reuse (e.g. MLVAPP_DISABLE_DEBAYERED16_RECON_REUSE=1) leaves
+     * decodedRawFrameAlreadyReconned true but renders its own recon (r1 adversary pass 2 A1). */
+    if( renderConsumedWorkerRecon )
+    {
+        recon_worker_split::copyWorkerSplit( preservedGpuPlaybackReconTextureTelemetry,
+                                             slot.stageTimingTelemetry );
     }
 
     slot.processedFrame8Active =
