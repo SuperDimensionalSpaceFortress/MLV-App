@@ -1,5 +1,6 @@
 import datetime
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "check-lane-model-currency.py"
@@ -30,7 +32,7 @@ class CurrencyFixture(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(self.runs, ignore_errors=True))
         self.count = 0
 
-    def receipt(self, lane, model, hours_ago, effort="high", state="complete"):
+    def receipt(self, lane, model, hours_ago, effort="high", state="complete", timeout=None):
         self.count += 1
         run = self.runs / ("run-%03d" % self.count)
         run.mkdir()
@@ -38,6 +40,8 @@ class CurrencyFixture(unittest.TestCase):
                 "resolvedModel": model, "card": "TEST"}
         if effort is None:
             del body["effort"]
+        if timeout is not None:
+            body["timeoutSec"] = timeout
         (run / ("%s-001.receipt.json" % lane)).write_text(json.dumps(body), encoding="utf-8")
 
     def evaluate(self, **kwargs):
@@ -244,6 +248,1089 @@ class MissingEvidenceTests(CurrencyFixture):
         self.assertIn("unrecordedEffort=1", sonnet)
         self.assertNotIn("unrecordedEffort", fable)
         self.assertIn("INCOMPLETE", lines[0])
+
+
+class InFlightTests(CurrencyFixture):
+    """CURRENCY-CHECK-WIRED-INTO-HUB-TICK-1: a lane whose newest receipt is a LIVE running run (no
+    resolvedModel and no effort yet, by design) is IN-FLIGHT, judged on its newest finished run. A dead
+    running receipt (past startedUtc + timeoutSec + grace) is not in flight and stays unproven."""
+
+    def running(self, lane, hours_ago, timeout=7200):
+        self.receipt(lane, None, hours_ago, effort=None, state="running", timeout=timeout)
+
+    def test_running_newest_over_a_current_finished_run_is_in_flight_and_names_the_run(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        result = self.evaluate()
+        entry = result["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "IN-FLIGHT")
+        self.assertEqual(entry["inFlightRuns"], 1)
+        self.assertEqual(entry["judgedOn"]["model"], "claude-opus-5-5")
+        self.assertEqual(entry["unrecordedEffort"], 0)       # the running receipt is not evidence either way
+        self.assertEqual(result["verdict"], "CURRENT")        # IN-FLIGHT alone never taints the overall verdict
+        self.assertEqual(result["inFlightLanes"], ["opus"])
+
+    def test_running_newest_over_a_stale_pair_keeps_stale(self):
+        self.receipt("sol", "gpt-6-sol", 30)
+        self.receipt("sol", "gpt-6-sol", 20)
+        self.receipt("peer", "gpt-6.1-sol", 10)
+        self.running("sol", 1)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "STALE")
+        self.assertEqual(result["verdict"], "STALE")
+
+    def test_running_newest_over_an_incomplete_finished_run_keeps_incomplete(self):
+        self.receipt("sonnet", "claude-sonnet-5-5", 10, effort=None)
+        self.running("sonnet", 1)
+        self.assertEqual(self.evaluate()["lanes"]["sonnet"]["verdict"], "INCOMPLETE")
+
+    def test_running_with_no_finished_run_stays_no_data(self):
+        self.running("opus", 1)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["opus"]["verdict"], "NO-DATA")
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+        self.assertIsNone(result["lanes"]["opus"]["judgedOn"])
+
+    def test_a_running_receipt_past_its_timeout_is_dead_not_in_flight(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 5, timeout=3600)                 # bound = 1 h + grace; 5 h old
+        result = self.evaluate()
+        entry = result["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "NO-DATA")
+        self.assertEqual(entry["inFlightRuns"], 0)
+        self.assertEqual(entry["deadRunning"], 1)
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    # --- r2 (PR 753 fix round): the grace and the cap are pinned at their edges ---------------------------
+    def _running_at(self, started, timeout, **extra):
+        """A running receipt written as a real file with an exact startedUtc (a datetime)."""
+        self.count += 1
+        run = self.runs / ("raw-run-%03d" % self.count)
+        run.mkdir()
+        body = {"lane": "opus", "state": "running", "card": "TEST", "timeoutSec": timeout,
+                "startedUtc": started.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"}
+        body.update(extra)
+        (run / "opus-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+
+    def _opus_verdict_with_running_started(self, started, timeout, since_hours=72):
+        self.receipt("opus", "claude-opus-5-5", 40)           # a CURRENT finished run well before any case
+        self._running_at(started, timeout)
+        return self.evaluate(since_hours=since_hours)["lanes"]["opus"]
+
+    def test_the_liveness_bound_is_timeout_plus_grace_before_at_and_after(self):
+        grace = datetime.timedelta(seconds=300)               # literal on purpose: not read back from the script
+        timeout = 3600
+        edge = NOW - datetime.timedelta(seconds=timeout) - grace    # the instant the bound is exactly reached
+        for label, started, expected in (
+                ("at the timeout, no grace used", NOW - datetime.timedelta(seconds=timeout), "IN-FLIGHT"),
+                ("1 s inside the grace", edge + datetime.timedelta(seconds=1), "IN-FLIGHT"),
+                ("exactly at timeout + grace", edge, "IN-FLIGHT"),
+                ("1 s past timeout + grace", edge - datetime.timedelta(seconds=1), "NO-DATA"),
+                ("1 microsecond past timeout + grace", edge - datetime.timedelta(microseconds=1), "NO-DATA")):
+            with self.subTest(label):
+                self.setUp()
+                entry = self._opus_verdict_with_running_started(started, timeout)
+                self.assertEqual(entry["verdict"], expected)
+                self.assertEqual(entry["inFlightRuns"], 1 if expected == "IN-FLIGHT" else 0)
+                self.assertEqual(entry["deadRunning"], 0 if expected == "IN-FLIGHT" else 1)
+
+    def test_the_grace_is_three_hundred_seconds_and_removing_it_is_caught(self):
+        self.assertEqual(check.LIVE_GRACE_SEC, 300.0)
+        # between the timeout and timeout + grace the receipt is live only because of the grace
+        started = NOW - datetime.timedelta(seconds=3600 + 100)
+        self.assertEqual(self._opus_verdict_with_running_started(started, 3600)["verdict"], "IN-FLIGHT")
+
+    def test_the_timeout_cap_is_pinned_at_its_edge_independent_of_the_age_bound(self):
+        started = NOW - datetime.timedelta(hours=1)           # young: only the cap can make it dead
+        for label, timeout, expected in (
+                ("cap itself", check.MAX_LIVE_TIMEOUT_SEC, "IN-FLIGHT"),
+                ("cap - 1", check.MAX_LIVE_TIMEOUT_SEC - 1, "IN-FLIGHT"),
+                ("cap + 1", check.MAX_LIVE_TIMEOUT_SEC + 1, "NO-DATA"),
+                ("zero", 0, "NO-DATA"),
+                ("one second", 1, "NO-DATA")):                # 1 s timeout, 1 h old: past timeout + grace
+            with self.subTest(label):
+                self.setUp()
+                self.assertEqual(self._opus_verdict_with_running_started(started, timeout)["verdict"], expected)
+
+    # --- r2 B1: a receipt dated in the future is not live ---------------------------------------------
+    def test_b1_the_hub_counterexample_through_real_receipt_files(self):
+        # hub repro-753-b1.py: completed sol run 19:00Z on gpt-6.1-sol/high, then a running receipt that
+        # starts 31 days later with timeout 3600. now = 2026-10-12T20:00Z.
+        for since in (72, 0):
+            with self.subTest(since_hours=since):
+                self.setUp()
+                self.receipt("sol", "gpt-6.1-sol", 1)
+                self.count += 1
+                run = self.runs / "future"
+                run.mkdir()
+                started = NOW + datetime.timedelta(days=31)
+                (run / "sol-001.receipt.json").write_text(json.dumps({
+                    "lane": "sol", "state": "running", "card": "TEST", "timeoutSec": 3600,
+                    "startedUtc": started.strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"}), encoding="utf-8")
+                receipts, _ = check.load_receipts(str(self.runs))
+                future = next(r for r in receipts if r["state"] == "running")
+                self.assertFalse(check.is_live_running(future, NOW))
+                result = check.evaluate(receipts, since_hours=since, now=NOW)
+                entry = result["lanes"]["sol"]
+                if since == 72:       # the window reaches back from now, so the future receipt is in it
+                    self.assertEqual(entry["runsInWindow"], 2)
+                self.assertEqual(entry["verdict"], "NO-DATA")      # unproven, as before this PR
+                self.assertEqual(entry["inFlightRuns"], 0)
+                self.assertEqual(entry["deadRunning"], 1)
+                self.assertEqual(result["inFlightLanes"], [])
+                self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_b1_the_future_start_skew_bound_is_pinned_inside_at_and_past(self):
+        self.assertEqual(check.MAX_FUTURE_START_SKEW_SEC, 300)
+        skew = datetime.timedelta(seconds=check.MAX_FUTURE_START_SKEW_SEC)
+        for since in (72, 0):
+            for label, started, expected in (
+                    ("1 s inside the bound", NOW + skew - datetime.timedelta(seconds=1), "IN-FLIGHT"),
+                    ("exactly at the bound", NOW + skew, "IN-FLIGHT"),
+                    ("1 microsecond past the bound", NOW + skew + datetime.timedelta(microseconds=1), "NO-DATA"),
+                    ("1 s past the bound", NOW + skew + datetime.timedelta(seconds=1), "NO-DATA"),
+                    ("an hour ahead", NOW + datetime.timedelta(hours=1), "NO-DATA")):
+                with self.subTest(label=label, since_hours=since):
+                    self.setUp()
+                    entry = self._opus_verdict_with_running_started(started, 3600, since_hours=since)
+                    self.assertEqual(entry["verdict"], expected)
+                    self.assertEqual(entry["inFlightRuns"], 1 if expected == "IN-FLIGHT" else 0)
+
+    # --- adversary pass 3 (sol, head 44797227): A1 and A2, both introduced majors ------------------------
+    def _verdict_for_running_stamp(self, stamp, timeout=3600):
+        self._write_raw("fin", lane="sol", state="complete", startedUtc="2026-10-12T19:00:00.0000000Z",
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        self._write_raw("run", lane="sol", state="running", startedUtc=stamp, timeoutSec=timeout)
+        return self.evaluate()["lanes"]["sol"]["verdict"]
+
+    def test_a1_a_start_one_hundred_nanoseconds_past_the_future_bound_is_not_live(self):
+        # now = 20:00:00; the bound is 20:05:00. The seventh fractional digit used to be dropped, so
+        # 20:05:00.0000001 looked like exactly +300 s and was admitted.
+        for label, stamp, expected in (
+                ("exactly at the bound", "2026-10-12T20:05:00.0000000Z", "IN-FLIGHT"),
+                ("100 ns past, 7 digits", "2026-10-12T20:05:00.0000001Z", "NO-DATA"),
+                ("1 ns past, 9 digits", "2026-10-12T20:05:00.000000001Z", "NO-DATA"),
+                # r6 (changed expectation NO-DATA -> CURRENT): a stamp outside the one shape (a 10th fraction digit, a
+                # comma) is unreadable, so the running receipt is dropped and the lane is its finished run alone
+                ("1 unit at the 10th digit", "2026-10-12T20:05:00.0000000001Z", "CURRENT"),
+                ("comma fraction past", "2026-10-12T20:05:00,0000001Z", "CURRENT"),
+                ("comma fraction at the bound", "2026-10-12T20:05:00,0000000Z", "CURRENT"),
+                ("100 ns inside", "2026-10-12T20:04:59.9999999Z", "IN-FLIGHT")):
+            with self.subTest(label):
+                self.setUp()
+                self.assertEqual(self._verdict_for_running_stamp(stamp), expected)
+
+    def test_a2_comma_fraction_timestamps_are_unreadable_since_r6(self):
+        # CHANGED in r6 (was test_a2_comma_fraction_timestamps_keep_their_sub_microsecond_order, which pinned that the
+        # comma form parsed and sorted like the dot form, with the lane reading INCOMPLETE). The checker now reads one
+        # shape only: a comma stamp is unreadable, counted, and left out, so no lane exists and nothing is IN-FLIGHT.
+        specs = {"fin": dict(state="complete", resolvedModel="gpt-6.1-sol", effort="high",
+                             startedUtc="2026-10-12T19:00:00,1234569Z"),
+                 "run": dict(state="running", timeoutSec=7200, startedUtc="2026-10-12T19:00:00,1234561Z")}
+        for order in (("fin", "run"), ("run", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                for name in order:
+                    self._write_raw(name, lane="sol", **specs[name])
+                receipts, unreadable = check.load_receipts(str(self.runs))
+                self.assertEqual((len(receipts), unreadable), (0, 2))
+                self.assertEqual(check.evaluate(receipts, now=NOW)["verdict"], "NO-DATA")
+        self.assertIsNone(check.parse_utc("2026-10-12T19:00:00,1234569Z"))
+        self.assertIsNotNone(check.parse_utc("2026-10-12T19:00:00.1234569Z"))
+
+    # --- adversary pass 4 (sol, head 421f4a82): A1-A3, introduced majors --------------------------------
+    def _fin_and_run(self, fin, run, order):
+        for name in order:
+            if name == "fin":
+                self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol",
+                                effort="high", startedUtc=fin)
+            else:
+                self._write_raw("run", lane="sol", state="running", timeoutSec=7200, startedUtc=run)
+
+    def test_p4a1_every_fractional_digit_orders_receipts_only_an_exact_tie_favours_the_running_one(self):
+        # Spellings a live candidate may have (1-9 fraction digits, dot): the finished run is newer at the 9th
+        # digit (...009 vs ...001): CURRENT, not IN-FLIGHT.
+        for fin, run, expected in (
+                ("2026-10-12T19:00:00.123456009Z", "2026-10-12T19:00:00.123456001Z", "CURRENT"),
+                ("2026-10-12T19:00:00.123456001Z", "2026-10-12T19:00:00.123456009Z", "IN-FLIGHT"),
+                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.123456000Z", "IN-FLIGHT"),  # equal
+                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.123456001Z", "IN-FLIGHT"),
+                ("2026-10-12T19:00:00.123456001Z", "2026-10-12T19:00:00.123456Z", "CURRENT")):
+            for order in (("fin", "run"), ("run", "fin")):
+                with self.subTest(fin=fin, run=run, order=order):
+                    self.setUp()
+                    self._fin_and_run(fin, run, order)
+                    self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], expected)
+
+    def test_r3_a_running_receipt_spelled_past_nine_digits_or_with_a_comma_is_never_in_flight(self):
+        # pass 4 pinned these as live; r3 stopped reading them as live; r6 (changed expectation) stops reading them at
+        # all: a stamp with a comma or more than 9 fraction digits is unreadable, counted, and dropped, so it can never
+        # be IN-FLIGHT. Each row: (finished stamp, running stamp, how many of the two are unreadable).
+        for fin, run, unreadable_expected in (
+                ("2026-10-12T19:00:00.1234560009Z", "2026-10-12T19:00:00.1234560001Z", 2),
+                ("2026-10-12T19:00:00,1234560009Z", "2026-10-12T19:00:00,1234560001Z", 2),
+                ("2026-10-12T19:00:00.1234560001Z", "2026-10-12T19:00:00.1234560009Z", 2),
+                ("2026-10-12T19:00:00.12345600Z", "2026-10-12T19:00:00.1234560000000Z", 1),
+                ("2026-10-12T19:00:00.123456Z", "2026-10-12T19:00:00.12345600001Z", 1)):
+            for order in (("fin", "run"), ("run", "fin")):
+                with self.subTest(fin=fin, run=run, order=order):
+                    self.setUp()
+                    self._fin_and_run(fin, run, order)
+                    receipts, unreadable = check.load_receipts(str(self.runs))
+                    self.assertEqual(unreadable, unreadable_expected)
+                    result = check.evaluate(receipts, now=NOW)
+                    self.assertEqual(result["inFlightLanes"], [])
+                    for entry in result["lanes"].values():
+                        self.assertNotEqual(entry["verdict"], "IN-FLIGHT")
+                        self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (0, 0))
+
+    def test_p4a2_liveness_is_exact_at_sub_microsecond_timeouts_and_starts(self):
+        # now = 20:00:00. Bound: now <= started + timeout + 300 s, read exactly.
+        for label, stamp, timeout, expected in (
+                ("rounds up into live", "2026-10-12T19:54:59.9999990Z", 0.0000006, "NO-DATA"),
+                ("actual expiry equals now", "2026-10-12T19:54:59.9999999Z", 0.0000001, "IN-FLIGHT"),
+                ("one tick short of now", "2026-10-12T19:54:59.9999998Z", 0.0000001, "NO-DATA"),
+                ("timeout 0 is no bound at all", "2026-10-12T19:55:00.0000000Z", 0, "NO-DATA"),
+                ("whole-second edge, timeout 1", "2026-10-12T19:54:59.0000000Z", 1, "IN-FLIGHT"),
+                ("sub-us start on the edge", "2026-10-12T19:54:59.0000001Z", 1, "IN-FLIGHT"),
+                ("one tick short at timeout 1", "2026-10-12T19:54:58.9999999Z", 1, "NO-DATA")):
+            with self.subTest(label):
+                self.setUp()
+                self._write_raw("fin", lane="sol", state="complete", startedUtc="2026-10-12T18:00:00Z",
+                                resolvedModel="gpt-6.1-sol", effort="high")
+                self._write_raw("run", lane="sol", state="running", startedUtc=stamp, timeoutSec=timeout)
+                self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], expected)
+
+    def test_p4a3_an_expired_running_receipt_that_carries_a_model_is_not_the_foundation_of_in_flight(self):
+        # no finished run at all: the lane has nothing proven but an expired running receipt
+        self._write_raw("dead", lane="sol", state="running", startedUtc="2026-10-12T18:00:00Z", timeoutSec=1,
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        self._write_raw("run", lane="sol", state="running", startedUtc="2026-10-12T19:00:00Z", timeoutSec=7200)
+        result = self.evaluate()
+        entry = result["lanes"]["sol"]
+        self.assertEqual(entry["verdict"], "NO-DATA")
+        self.assertEqual(entry["deadRunning"], 1)
+        self.assertIsNone(entry["judgedOn"])
+        self.assertEqual(result["inFlightLanes"], [])
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_p4a3_a_finished_run_before_an_expired_modelled_running_one_does_not_make_in_flight(self):
+        self.receipt("sol", "gpt-6.1-sol", 5)
+        self._write_raw("dead", lane="sol", state="running", startedUtc="2026-10-12T18:00:00Z", timeoutSec=1,
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        self._write_raw("run", lane="sol", state="running", startedUtc="2026-10-12T19:00:00Z", timeoutSec=7200)
+        self.assertEqual(self.evaluate()["lanes"]["sol"]["verdict"], "NO-DATA")
+
+    def test_b1_a_future_dated_receipt_is_not_live_through_the_cli_with_the_real_clock(self):
+        real_now = datetime.datetime.now(datetime.timezone.utc)
+        self._write_raw("fin", lane="sol", state="complete", resolvedModel="gpt-6.1-sol", effort="high",
+                        startedUtc=(real_now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z")
+        self._write_raw("fut", lane="sol", state="running", timeoutSec=3600,
+                        startedUtc=(real_now + datetime.timedelta(days=31)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z")
+        for flags in ((), ("--since-hours", "0")):
+            with self.subTest(flags=flags):
+                result = self._cli("--json", *flags)
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["lanes"]["sol"]["verdict"], "NO-DATA")
+                self.assertEqual(payload["inFlightLanes"], [])
+
+    def test_a_running_receipt_with_no_timeout_cannot_be_proven_live(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 1, effort=None, state="running")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_running_receipt_that_already_has_an_end_time_is_not_live(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        path = next(p for p in self.runs.glob("*/opus-001.receipt.json") if "running" in p.read_text())
+        body = json.loads(path.read_text())
+        body["endedUtc"] = _ts(0.5)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_running_receipt_with_any_non_null_end_field_is_not_live(self):
+        # adversary r10 A1: a falsey non-null endedUtc ([], {}, false, 0, "") is not "no endedUtc" and gets no live exemption
+        for ended in ([], {}, False, 0, ""):
+            with self.subTest(ended=ended):
+                shutil.rmtree(self.runs, ignore_errors=True)
+                self.runs.mkdir()
+                self.receipt("opus", "claude-opus-5-5", 10)
+                self.running("opus", 1)
+                path = next(p for p in self.runs.glob("*/opus-001.receipt.json") if "running" in p.read_text())
+                body = json.loads(path.read_text())
+                body["endedUtc"] = ended
+                path.write_text(json.dumps(body), encoding="utf-8")
+                result = self.evaluate()
+                self.assertEqual(result["lanes"]["opus"]["verdict"], "NO-DATA")
+                self.assertEqual(result["inFlightLanes"], [])
+                self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_a_running_receipt_with_a_null_end_field_is_still_a_live_candidate(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        path = next(p for p in self.runs.glob("*/opus-001.receipt.json") if "running" in p.read_text())
+        body = json.loads(path.read_text())
+        body["endedUtc"] = None
+        path.write_text(json.dumps(body), encoding="utf-8")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+
+    def test_a_failed_newest_run_still_reads_no_data(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 2, state="failed")
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_failed_run_before_a_live_running_one_is_not_papered_over(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.receipt("opus", None, 3, state="failed")
+        self.running("opus", 1)
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a_live_running_run_older_than_a_finished_one_is_ignored_as_evidence(self):
+        self.running("opus", 3, timeout=14400)                # still live (3 h of 4 h), but not the newest receipt
+        self.receipt("opus", "claude-opus-5-5", 1)
+        entry = self.evaluate()["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "CURRENT")
+        self.assertEqual(entry["unrecordedEffort"], 0)
+
+    def test_in_flight_beside_a_no_data_lane_leaves_the_overall_incomplete(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        self.receipt("fable", None, 2, state="failed")
+        self.assertEqual(self.evaluate()["verdict"], "INCOMPLETE")
+
+    def test_the_table_shows_in_flight_and_the_run_it_was_judged_on(self):
+        self.receipt("opus", "claude-opus-5-5", 10)
+        self.running("opus", 1)
+        line = next(l for l in check.render(self.evaluate()).splitlines() if l.strip().startswith("opus"))
+        self.assertIn("IN-FLIGHT", line)
+        self.assertIn("judged-on=claude-opus-5-5", line)
+
+    # --- adversary pass 1 (sol, head 70403d1c): A1-A4 -------------------------------------------------
+    def _write_raw(self, name, **fields):
+        run = self.runs / name
+        run.mkdir()
+        (run / ("%s-001.receipt.json" % fields["lane"])).write_text(json.dumps(fields), encoding="utf-8")
+
+    def _cli(self, *args):
+        return subprocess.run([sys.executable, str(SCRIPT), "--runs-dir", str(self.runs), *args],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_a1_an_absurd_timeout_cannot_crash_the_check_it_is_simply_not_provably_live(self):
+        for index, bad in enumerate((1e20, float("inf"), float("nan"), 2147483647, -5, True)):
+            self._write_raw("bad-%d" % index, lane="opus", state="running",
+                            startedUtc="2026-11-04T11:00:00Z", timeoutSec=bad)
+        result = self._cli("--json", "--since-hours", "0")
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["lanes"]["opus"]["verdict"], "NO-DATA")
+        self.assertEqual(payload["lanes"]["opus"]["inFlightRuns"], 0)
+
+    def test_a1_the_liveness_bound_is_capped_so_a_huge_but_finite_timeout_is_dead(self):
+        self.receipt("opus", "claude-opus-5-5", 100)
+        self.running("opus", 90, timeout=check.MAX_LIVE_TIMEOUT_SEC + 1)
+        self.assertEqual(self.evaluate(since_hours=0)["lanes"]["opus"]["verdict"], "NO-DATA")
+
+    def test_a2_a_live_running_receipt_does_not_raise_the_family_newest_either(self):
+        self.receipt("sol", "gpt-6-sol", 30)
+        self.receipt("sol", "gpt-6-sol", 20)
+        # a running receipt that already carries a newer id: not evidence, so it cannot make the two
+        # finished runs STALE
+        self.receipt("sol", "gpt-6.1-sol", 1, effort="high", state="running", timeout=7200)
+        result = self.evaluate()
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(result["familyNewest"]["sol"], "gpt-6-sol")
+        self.assertEqual(result["verdict"], "CURRENT")
+
+    def test_a2_the_adversary_input_with_an_eligible_timeout_exits_zero_in_flight_through_the_cli(self):
+        # The adversary's shape (two finished gpt-6-sol runs, then a running receipt that already names the
+        # newer gpt-6.1-sol), with a timeout the liveness rule accepts, stamped against the real clock the
+        # CLI uses. The over-cap timeout 2147483647 is the separate case in test_a1_an_absurd_timeout....
+        real_now = datetime.datetime.now(datetime.timezone.utc)
+
+        def stamp(hours_ago):
+            return (real_now - datetime.timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+        self._write_raw("a", lane="sol", state="complete", startedUtc=stamp(30), resolvedModel="gpt-6-sol", effort="high")
+        self._write_raw("b", lane="sol", state="complete", startedUtc=stamp(20), resolvedModel="gpt-6-sol", effort="high")
+        self._write_raw("c", lane="sol", state="running", startedUtc=stamp(1), timeoutSec=7200,
+                        resolvedModel="gpt-6.1-sol", effort="high")
+        result = self._cli("--json", "--since-hours", "0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["lanes"]["sol"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(payload["familyNewest"]["sol"], "gpt-6-sol")     # the running receipt raised nothing
+        self.assertEqual(payload["verdict"], "CURRENT")
+        self.assertEqual(payload["inFlightLanes"], ["sol"])
+
+    def test_n1_an_exact_tie_in_started_reads_the_running_receipt_as_the_newer_in_both_creation_orders(self):
+        stamp = "2026-10-12T19:00:00.1234567Z"      # the same seven digits on both receipts: a true tie
+        specs = {"fin": dict(state="complete", resolvedModel="claude-opus-5-5", effort="high"),
+                 "run": dict(state="running", timeoutSec=7200)}
+        for order in (("fin", "run"), ("run", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                for name in order:
+                    self._write_raw(name, lane="opus", startedUtc=stamp, **specs[name])
+                receipts, _ = check.load_receipts(str(self.runs))
+                self.assertEqual(receipts[0]["order"], receipts[1]["order"])     # truly equal sort keys
+                self.assertEqual(check.evaluate(receipts, now=NOW)["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+
+    def test_a3_equal_started_timestamps_after_microsecond_truncation_still_read_in_flight(self):
+        for name, state, extra in (("fin", "complete", {"resolvedModel": "claude-opus-5-5", "effort": "high"}),
+                                   ("run", "running", {"timeoutSec": 7200})):
+            self._write_raw(name, lane="opus", state=state,
+                            startedUtc=("2026-10-12T19:00:00.1234561Z" if name == "fin" else "2026-10-12T19:00:00.1234569Z"),
+                            **extra)
+        entry = self.evaluate()["lanes"]["opus"]
+        self.assertEqual(entry["verdict"], "IN-FLIGHT")
+
+    def test_a3_the_seventh_fractional_digit_orders_receipts_so_an_older_live_run_is_not_in_flight(self):
+        # adversary pass 2 A1: the finished run is the NEWER one by 800 ns; the running one must not win the tie
+        self._write_raw("fin", lane="opus", state="complete", startedUtc="2026-10-12T19:00:00.1234569Z",
+                        resolvedModel="claude-opus-5-5", effort="high")
+        self._write_raw("run", lane="opus", state="running", startedUtc="2026-10-12T19:00:00.1234561Z",
+                        timeoutSec=7200)
+        self.assertEqual(self.evaluate()["lanes"]["opus"]["verdict"], "CURRENT")
+
+    def test_a4_a_huge_or_infinite_window_means_every_receipt_not_a_crash(self):
+        self.receipt("fable", "claude-fable-5-1", 5)
+
+        def strict(token):
+            raise ValueError("non-JSON constant %s" % token)
+        for value in ("1e20", "inf", "nan", "-inf"):
+            result = self._cli("--json", "--since-hours=" + value)
+            self.assertNotIn("Traceback", result.stderr, value)
+            payload = json.loads(result.stdout, parse_constant=strict)     # strict: no Infinity / NaN
+            self.assertTrue(payload["ok"], value)
+            self.assertEqual(payload["receiptsInWindow"], 1, value)
+
+    def test_cli_exit_zero_when_the_only_non_current_lane_is_in_flight(self):
+        # The CLI judges against the real clock, so these receipts are stamped relative to it.
+        real_now = datetime.datetime.now(datetime.timezone.utc)
+
+        def write(name, lane, hours_ago, **fields):
+            run = self.runs / name
+            run.mkdir()
+            started = (real_now - datetime.timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+            body = {"lane": lane, "startedUtc": started, "card": "TEST"}
+            body.update(fields)
+            (run / ("%s-001.receipt.json" % lane)).write_text(json.dumps(body), encoding="utf-8")
+
+        write("a", "fable", 2, state="complete", effort="high", resolvedModel="claude-fable-5-1")
+        write("b", "opus", 2, state="complete", effort="high", resolvedModel="claude-opus-5-5")
+        write("c", "opus", 0.5, state="running", timeoutSec=7200)
+        result = subprocess.run([sys.executable, str(SCRIPT), "--runs-dir", str(self.runs), "--since-hours", "0",
+                                 "--json"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["lanes"]["opus"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(payload["verdict"], "CURRENT")
+
+
+class LiveShapeTests(CurrencyFixture):
+    """r3 (hub ruling 20261105T0250Z): a receipt is a live candidate only in the shape Invoke-Lane.ps1 writes.
+
+    startedUtc must be YYYY-MM-DDTHH:MM:SS(.d{1,9})?(Z|+-HH:MM) and timeoutSec an int, or a number of at most 15
+    significant digits judged on its RAW token (json.load rounds a longer one before the script sees it). A timeoutSec
+    in any other shape is not live and stays unproven (NO-DATA), as before this PR. A startedUtc in any other shape
+    (r6, hub ruling 20261105T1245Z; see OneStampShapeTests) is NOT NO-DATA: the receipt is unreadable, dropped and
+    counted in `unreadableReceipts`, and the lane is judged on the receipts that could be read, so it can read CURRENT.
+    Closes adversary pass 5 A1 and A2 as a class."""
+
+    def _lane_verdict(self, started, timeout_token):
+        """A completed sol/gpt-6.1-sol/high run at 19:00Z plus a running receipt written as RAW JSON text, so the
+        timeout token reaches the script exactly as spelled. `started` is any string. -> (lane entry, running)."""
+        fin = self.runs / "fin"
+        fin.mkdir()
+        (fin / "sol-001.receipt.json").write_text(json.dumps({
+            "lane": "sol", "state": "complete", "card": "TEST", "startedUtc": "2026-10-12T19:00:00.0000000Z",
+            "resolvedModel": "gpt-6.1-sol", "effort": "high"}), encoding="utf-8")
+        run = self.runs / "run"
+        run.mkdir()
+        (run / "sol-001.receipt.json").write_text(
+            '{"lane":"sol","state":"running","card":"TEST","startedUtc":%s,"timeoutSec":%s}' % (
+                json.dumps(started), timeout_token), encoding="utf-8")
+        receipts, _ = check.load_receipts(str(self.runs))
+        running = [r for r in receipts if r["state"] == "running"]
+        return check.evaluate(receipts, now=NOW)["lanes"]["sol"], running
+
+    def _not_live(self, started, timeout_token, label=""):
+        self.setUp()
+        entry, running = self._lane_verdict(started, timeout_token)
+        message = "%s %r %s" % (label, started, timeout_token)
+        self.assertNotEqual(entry["verdict"], "IN-FLIGHT", message)
+        self.assertEqual(entry["inFlightRuns"], 0, message)
+        for receipt in running:
+            self.assertFalse(check.is_live_running(receipt, NOW), message)
+        return entry
+
+    def _live(self, started, timeout_token, label=""):
+        self.setUp()
+        entry, running = self._lane_verdict(started, timeout_token)
+        message = "%s %r %s" % (label, started, timeout_token)
+        self.assertEqual(entry["verdict"], "IN-FLIGHT", message)
+        self.assertEqual(entry["inFlightRuns"], 1, message)
+        self.assertTrue(running and all(check.is_live_running(r, NOW) for r in running), message)
+
+    def test_r3_a1_the_hub_timeout_inputs_read_unproven_not_in_flight(self):
+        # json.load rounds both to a value the exact arithmetic then trusted (adversary pass 5, A1).
+        for started, token in (("2026-10-12T19:54:59.9999999Z", "0.000000099999999999999999"),
+                               ("2026-10-12T19:30:00Z", "172800.000000000001")):
+            with self.subTest(token=token):
+                self.assertEqual(self._not_live(started, token)["verdict"], "NO-DATA")
+
+    def test_r3_a1_the_fifteen_digit_edge_of_the_raw_timeout_token(self):
+        young = "2026-10-12T19:59:00Z"
+        for token, live in (("7200.12345678901", True),          # 15 significant digits
+                            ("7200.123456789012", False),         # 16
+                            ("7200", True), ("7200.0", True), ("7.2e3", True), ("72E2", True), ("1e-7", True),
+                            ("172800.000000000000", True),        # zero padding is exact, not a longer digit string
+                            ("0.100000000000000000", True),
+                            ("0.1000000000000001", False),        # 16 significant digits
+                            ("1e400", False), ("1e-400", False), ("1E+31", False),
+                            ("9" * 400 + ".5", False), ("0." + "0" * 400 + "1", False), ("-3600", False),
+                            ("0", False), ("0.0", False)):
+            with self.subTest(token=token):
+                if live:
+                    self._live(young if token != "1e-7" else "2026-10-12T19:54:59.9999999Z", token)
+                else:
+                    self._not_live(young, token)
+
+    def test_r3_a1_each_sibling_site_sees_the_raw_digits(self):
+        # :241 (the 0 < timeout <= cap test), :253 (the exact liveness sum) and :256 (the expiry compare) all
+        # read one value now, and a 17-digit token never becomes a float on the way.
+        started = "2026-10-12T19:30:00Z"                           # 30 min old
+        self._not_live(started, "172800.00000000000001", "cap edge, 19 digits")      # a cap sibling
+        self._not_live("2026-10-12T14:54:59Z", "18000.000000000001", "expiry edge")   # an expiry sibling
+        self._not_live("2026-10-12T19:54:59.9999999Z", "0.0000001000000000000001", "tiny + a trailing digit")
+        self._live("2026-10-12T19:54:59.9999999Z", "0.0000001", "the same value, short")
+
+    def test_r3_a2_offset_fractions_are_not_live(self):
+        # Hub inputs (adversary pass 5, A2): the offset fraction was dropped by parse_utc.
+        for started, token in (("2026-10-12T20:05:00.0000000-00:00:00.0000001", "3600"),
+                               ("2026-10-12T20:54:59.0000000+01:00:00.0000001", "1"),
+                               ("2026-10-12T19:59:00+00:00:00.0000001", "3600"),
+                               ("2026-10-12T19:59:00+00:00:00", "3600"),
+                               ("2026-10-12T19:59:00.0000000-00:00:00.0000001", "3600")):
+            with self.subTest(started=started):
+                self._not_live(started, token)
+
+    def test_r3_a2_only_the_writers_start_shapes_can_be_live(self):
+        # every spelling below names 19:59:00Z (60 s before now) or is a near miss of that
+        for label, stamp in (("lowercase z", "2026-10-12T19:59:00z"), ("lowercase t", "2026-10-12t19:59:00Z"),
+                             ("space separator", "2026-10-12 19:59:00Z"), ("comma fraction", "2026-10-12T19:59:00,5Z"),
+                             ("no zone", "2026-10-12T19:59:00"), ("compact offset", "2026-10-12T19:59:00+0000"),
+                             ("hour-only offset", "2026-10-12T19:59:00+00"),
+                             ("ten fraction digits", "2026-10-12T19:59:00.0000000000Z"),
+                             ("empty fraction", "2026-10-12T19:59:00.Z"),
+                             ("leading space", " 2026-10-12T19:59:00Z"), ("trailing space", "2026-10-12T19:59:00Z "),
+                             ("trailing newline", "2026-10-12T19:59:00Z\n"),
+                             ("basic format", "20261012T195900Z"), ("week date", "2026-W42-1T19:59:00Z"),
+                             ("ordinal date", "2026-285T19:59:00Z"), ("date only", "2026-10-12"),
+                             ("arabic-indic digits", "٢٠٢٦-10-12T19:59:00Z"),
+                             ("minus sign U+2212 offset", "2026-10-12T19:59:00−00:00"),
+                             ("hour 24", "2026-10-12T24:00:00Z")):
+            with self.subTest(label):
+                self._not_live(stamp, "3600", label)
+
+    def test_r3_a2_the_writers_shapes_stay_live(self):
+        # 60 s before now in every spelling the writer or a normal ISO 8601 producer emits
+        for stamp in ("2026-10-12T19:59:00Z", "2026-10-12T19:59:00.0000000Z", "2026-10-12T19:59:00.1Z",
+                      "2026-10-12T19:59:00.123456789Z", "2026-10-12T19:59:00+00:00", "2026-10-12T19:59:00.5+00:00",
+                      "2026-10-12T14:59:00-05:00", "2026-10-12T21:59:00+02:00", "2026-10-12T19:59:00.0000000Z"):
+            with self.subTest(stamp):
+                self._live(stamp, "3600")
+
+    def test_r3_non_numeric_and_boolean_timeouts_stay_unproven(self):
+        for token in ('"3600"', "true", "null", "[3600]", '{"a":1}', "NaN", "Infinity", "-Infinity"):
+            with self.subTest(token=token):
+                self._not_live("2026-10-12T19:59:00Z", token)
+
+    # --- adversary pass 6 (sol, head e6828cb2): A1 and A2, both introduced majors in the r3 code ---------------
+    def test_r3p6_a1_a_zero_or_hostile_exponent_is_decided_without_computing_a_power(self):
+        # A zero token skipped the exponent guard and reached Fraction(10) ** exponent: for 0e-999999999999999999 that
+        # asks for a 10**(10**18) integer. The power is patched to fail loudly so the test never allocates it.
+        import fractions
+        with mock.patch.object(fractions.Fraction, "__pow__", side_effect=AssertionError("a power was computed")):
+            for token in ("0e-999999999999999999", "0E+999999999999999999", "0.0e-9999999999999", "-0e-999999999999999999",
+                          "0e0", "0", "0.000", "1e-999999999999999999", "1e999999999999999999",
+                          "1e999999999999999999999999", "9e-31", "1e31"):
+                with self.subTest(token=token):
+                    self._not_live("2026-10-12T19:59:00Z", token)
+            self.assertEqual(check.exact_timeout(check._raw_float("0e-999999999999999999")), 0)
+            self.assertIsNone(check.exact_timeout(check._raw_float("1e-999999999999999999")))
+            self.assertIsNone(check.exact_timeout(check._raw_float("1e999999999999999999999999")))
+
+    def test_r3p6_a2_an_offset_with_seconds_is_unreadable_not_a_fraction_of_a_second(self):
+        # The failure really started 100 ns BEFORE the complete run (offset +01:00:00.0000001). The offset fraction
+        # used to be read as a seconds fraction, sorting the OLDER failure last and turning the lane NO-DATA.
+        for order in (("a-fail", "b-fin"), ("a-fin", "b-fail")):
+            with self.subTest(order=order):
+                self.setUp()
+                for name in order:
+                    run = self.runs / name
+                    run.mkdir()
+                    body = ({"lane": "sol", "state": "failed", "startedUtc": "2026-10-12T20:59:00+01:00:00.0000001",
+                             "resolvedModel": None, "effort": "high"} if name.endswith("fail") else
+                            {"lane": "sol", "state": "complete", "startedUtc": "2026-10-12T19:59:00Z",
+                             "resolvedModel": "gpt-6.1-sol", "effort": "high"})
+                    (run / "sol-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+                receipts, unreadable = check.load_receipts(str(self.runs))
+                self.assertEqual((len(receipts), unreadable), (1, 1))
+                result = check.evaluate(receipts, now=NOW)
+                self.assertEqual(result["lanes"]["sol"]["verdict"], "CURRENT")
+                self.assertEqual(result["verdict"], "CURRENT")
+
+    def test_r3p6_a2_offsets_with_seconds_do_not_parse_and_plain_offsets_still_do(self):
+        for text in ("2026-10-12T20:59:00+01:00:00.0000001", "2026-10-12T20:59:00+01:00:00",
+                     "2026-10-12T19:59:00-00:00:00.5", "2026-10-12T19:59:00,5-05:00:00",
+                     "2026-10-12T19:59:00.5"):      # r4: no designator at all is unreadable too (was readable as UTC)
+            with self.subTest(text):
+                self.assertIsNone(check.parse_utc(text))
+        minute_ago = NOW - datetime.timedelta(seconds=60)
+        for text, expected in (("2026-10-12T19:59:00Z", minute_ago),
+                               ("2026-10-12T20:59:00+01:00", minute_ago),
+                               ("2026-10-12T14:59:00-05:00", minute_ago),
+                               ("2026-10-12T19:59:00.1234567+00:00", minute_ago + datetime.timedelta(microseconds=123456))):
+            with self.subTest(text):
+                self.assertEqual(check.parse_utc(text), expected)
+
+    def test_r3p6_a2_the_sub_microsecond_digits_come_from_the_seconds_fraction_only(self):
+        for text, expected in (("2026-10-12T19:59:00.1234567Z", "7"), ("2026-10-12T19:59:00.1234560Z", ""),
+                               ("2026-10-12T19:59:00,12345678Z", ""),     # r6: was "78"; a comma stamp is unreadable
+                               ("2026-10-12T19:59:00.12345678Z", "78"), ("2026-10-12T19:59:00.123456Z", ""),
+                               ("2026-10-12T19:59:00.123456+01:00", ""),
+                               ("2026-10-12T20:59:00+01:00:00.0000001", ""),     # an offset fraction is not seconds
+                               ("2026-10-12T19:59:00-00:00:00.0000001", ""),
+                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", ""),   # r4: unreadable, not a '9'
+                               (None, ""), (12, "")):
+            with self.subTest(text=text):
+                self.assertEqual(check.sub_microsecond_digits(text), expected)
+
+    # --- adversary pass 7 (sol, head 86f2dbf4): A1 and A2, both introduced majors in the pass-6 fold ---------
+    def test_r3p7_a1_a_newer_failed_run_in_the_writers_shape_wins_and_foreign_spellings_are_unreadable(self):
+        # CHANGED in r6 (was test_r3p7_a1_every_accepted_spelling_keeps_its_sub_microsecond_order, whose name stopped
+        # being true: it claimed 'every accepted spelling' and skipped itself where basic format was unreadable). A
+        # failed run 800 ns NEWER than the complete one. Only the extended control is readable: it keeps the order
+        # (NO-DATA, 2 receipts read). The basic, week-date and newline spellings were read before r6; now each is
+        # unreadable (counted) and the lane is judged on the complete run alone (the r4 exception), CURRENT.
+        for label, failed, readable in (("basic", "20261012T195900.0000009Z", False),
+                                        ("week date", "2026-W42-1T19:59:00.0000009Z", False),
+                                        ("newline separator", "2026-10-12\n19:59:00.0000009Z", False),
+                                        ("extended, the control", "2026-10-12T19:59:00.0000009Z", True)):
+            for order in (("a-fin", "b-fail"), ("a-fail", "b-fin")):
+                with self.subTest(label=label, order=order):
+                    self.setUp()
+                    for name in order:
+                        run = self.runs / name
+                        run.mkdir()
+                        body = ({"lane": "sol", "state": "failed", "startedUtc": failed, "resolvedModel": None,
+                                 "effort": "high"} if name.endswith("fail") else
+                                {"lane": "sol", "state": "complete", "startedUtc": "2026-10-12T19:59:00.0000001Z",
+                                 "resolvedModel": "gpt-6.1-sol", "effort": "high"})
+                        (run / "sol-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+                    receipts, unreadable = check.load_receipts(str(self.runs))
+                    self.assertEqual((len(receipts), unreadable), (2, 0) if readable else (1, 1))
+                    result = check.evaluate(receipts, now=NOW)
+                    self.assertEqual(result["lanes"]["sol"]["verdict"], "NO-DATA" if readable else "CURRENT")
+                    self.assertEqual(result["verdict"], "INCOMPLETE" if readable else "CURRENT")
+
+    def test_r3p7_a2_a_compact_offset_with_seconds_is_unreadable_too(self):
+        for text in ("2026-10-12T18:59:00.0000000-010000.0000009", "2026-10-12T18:59:00-010000",
+                     "2026-10-12T18:59:00+01:0000", "2026-10-12T18:59:00+01:00:00"):
+            with self.subTest(text):
+                self.assertIsNone(check.parse_utc(text))
+        self.setUp()
+        for name, stamp in (("fin", "2026-10-12T19:59:00.0000001Z"),
+                            ("fail", "2026-10-12T18:59:00.0000000-010000.0000009")):
+            run = self.runs / name
+            run.mkdir()
+            (run / "sol-001.receipt.json").write_text(json.dumps({
+                "lane": "sol", "state": "complete" if name == "fin" else "failed", "startedUtc": stamp,
+                "resolvedModel": "gpt-6.1-sol" if name == "fin" else None, "effort": "high"}), encoding="utf-8")
+        receipts, unreadable = check.load_receipts(str(self.runs))
+        self.assertEqual((len(receipts), unreadable), (1, 1))
+
+    def test_r3p7_the_sub_microsecond_digits_exist_only_for_the_one_readable_shape(self):
+        # CHANGED in r6 (was ..._are_the_seconds_fraction_in_every_spelling): basic, week-date, newline, comma and
+        # whitespace-padded stamps used to give '9' or '7'; they are unreadable now, so they give no digits.
+        for text, expected in (("20261012T195900.0000009Z", ""), ("2026-W42-1T19:59:00.0000009Z", ""),
+                               ("2026-10-12\n19:59:00.0000009Z", ""), ("20261012T195900.1234567-05:00", ""),
+                               ("2026-10-12T19:59:00.0000009Z", "9"),
+                               ("2026-10-12T19:59:00.1234567-05:30", "7"),
+                               ("  2026-10-12T19:59:00,1234567Z\n", ""),
+                               # r4: outside the designator allowlist, so unreadable and no digits at all
+                               ("20261012T195900.1234567-0500", ""), ("2026-10-12T19:59:00.1234567-05", ""),
+                               ("2026-10-12T19:59:00.1234567", ""),
+                               ("2026-10-12T19:59:00.1234569+01:00:00.0000001", ""),
+                               ("2026-10-12T19:59:00+01:00", ""), ("2026-10-12T19:59:00Z", ""), ("2026-10-12", "")):
+            with self.subTest(text=text):
+                self.assertEqual(check.sub_microsecond_digits(text), expected)
+
+    # --- adversary pass 8 (sol, head 38502f66): A1, an introduced major in the pass-7 fold -------------------------
+    def test_r4_a1_the_adversary_input_a_fractional_minutes_offset_is_unreadable(self):
+        # Exact input of pass 8 A1 (now=2026-10-12T20:00:00Z, main(['--runs-dir', R, '--json'])). The failed run sorted
+        # 'newer' only because offset digit 1 was read as the seconds digit. Python 3.14 rejects the stamp by itself
+        # and masks the defect; run this file under 3.13 to see it fail on 38502f66.
+        specs = {"complete": dict(state="complete", startedUtc="2026-10-12T19:59:00.0000005Z",
+                                  resolvedModel="gpt-6.1-sol", effort="high"),
+                 "failed": dict(state="failed", startedUtc="2026-10-12T20:59:00.0000009+01:00.0000001",
+                                resolvedModel=None, effort="high"),
+                 "running": dict(state="running", startedUtc="2026-10-12T19:59:30Z", timeoutSec=3600)}
+        for name, fields in specs.items():
+            run = self.runs / name
+            run.mkdir()
+            (run / "sol-001.receipt.json").write_text(json.dumps(dict(lane="sol", **fields)), encoding="utf-8")
+        real_evaluate = check.evaluate
+        out = io.StringIO()
+        with mock.patch.object(check, "evaluate", lambda *a, **k: real_evaluate(*a, now=NOW, **k)), \
+                mock.patch("sys.stdout", out):
+            code = check.main(["--runs-dir", str(self.runs), "--json"])
+        result = json.loads(out.getvalue())
+        # the failed stamp cannot be placed, so it is unreadable (counted) and the lane is judged on the complete
+        # run with the running one in flight
+        self.assertEqual(result["unreadableReceipts"], 1)
+        self.assertEqual(result["lanes"]["sol"]["verdict"], "IN-FLIGHT")
+        self.assertEqual(result["lanes"]["sol"]["judgedOn"]["startedUtc"], "2026-10-12T19:59:00+00:00")
+        self.assertEqual(code, 0)
+        self.assertIsNone(check.parse_utc("2026-10-12T20:59:00.0000009+01:00.0000001"))
+        self.assertEqual(check.sub_microsecond_digits("2026-10-12T20:59:00.0000009+01:00.0000001"), "")
+
+    def test_r4_a1_only_z_and_hh_mm_are_designators_everywhere_a_stamp_is_read(self):
+        # ONE allowlist (DESIGNATOR_RE): 'Z' or '+-HH:MM' ends the stamp, anything else is unreadable, at every site
+        # that reads one: parse_utc and the sub-microsecond digits (so the sort key). Each spelling below was readable
+        # before r4 (the pass 3..7 tests pinned some of them).
+        base = "2026-10-12T19:59:00.1234569"
+        for tail in ("+01", "+0100", "-0500", "z", "", "+01:00.5", "+01:00.0000001", "+01:00:00", "-010000",
+                     "+01:0", "+1:00", "+01:000", "ZZ", "+01:00Z", "UTC", "+01:00:", "Z\x00"):
+            with self.subTest(tail=tail):
+                self.assertIsNone(check.parse_utc(base + tail))
+                self.assertEqual(check.sub_microsecond_digits(base + tail), "")
+        # r7 (opus blocker 1): offset minutes above 59 (and an offset hour above 23) used to match [0-9]{2}:[0-9]{2}, and
+        # fromisoformat adds the minutes with no range check, so '+00:99' was READ as +01:39 and took part in the sort
+        # with nothing counted. They are unreadable now, like every other stamp outside the one shape.
+        for tail in ("+00:60", "+00:99", "-00:99", "-00:60", "+01:60", "+23:60", "+23:99", "-23:99", "+24:00", "-24:00",
+                     "+99:00", "+00:61"):
+            with self.subTest(tail=tail):
+                self.assertIsNone(check.parse_utc(base + tail))
+                self.assertEqual(check.sub_microsecond_digits(base + tail), "")
+        for tail in ("Z", "+00:00", "+01:00", "-05:30", "+23:59", "-23:59", "+00:59", "-00:59"):
+            with self.subTest(tail=tail):
+                self.assertIsNotNone(check.parse_utc(base + tail))
+                self.assertEqual(check.sub_microsecond_digits(base + tail), "9")
+        # CHANGED in r6: surrounding whitespace was trimmed before reading (asserted readable here); the text is
+        # now matched raw, so padding makes a stamp unreadable
+        self.assertIsNone(check.parse_utc("  " + base + "Z\n"))
+
+    def test_r4_the_two_offset_denylists_are_gone(self):
+        self.assertFalse(hasattr(check, "OFFSET_WITH_SECONDS_RE"))
+        self.assertFalse(hasattr(check, "OFFSET_TAIL_RE"))
+        # r6 (changed): DESIGNATOR_RE itself is gone too; LIVE_START_RE is the only shape (see OneStampShapeTests)
+        self.assertTrue(hasattr(check, "LIVE_START_RE"))
+
+    def test_r3_a5_the_docstring_says_past_the_skew_bound(self):
+        doc = check.__doc__
+        self.assertIn("past the skew bound", doc)
+        self.assertNotIn("a receipt dated in the future has no age, so it is never a candidate", doc)
+
+
+class RunningIsNeverEvidenceTests(CurrencyFixture):
+    """r5 (PR 753, B1): a receipt whose state is `running` is never evidence, live or expired. It enters neither
+    the proven runs, nor `latestModel`, nor the family's newest id; a lane whose newest run in the window is
+    such a receipt, or that has no proven FINISHED run, reads NO-DATA, never CURRENT. Clock: 2026-10-12T20:00:00Z.
+    Every case runs through main() with --json, in both enumeration orders."""
+
+    FIN = dict(state="complete", startedUtc="2026-10-12T19:00:00Z", resolvedModel="gpt-6.1-sol", effort="high")
+    LIVE = dict(state="running", startedUtc="2026-10-12T19:00:00Z", timeoutSec=7200)               # live, older
+    DEAD = dict(state="running", startedUtc="2026-10-12T19:50:00Z", timeoutSec=1,                  # expired, models
+                resolvedModel="gpt-6.1-sol", effort="high")
+
+    def run_main(self, names, specs):
+        """-> (exit code, parsed --json output) for the receipts in `specs`, written in the order of `names`."""
+        for name in names:
+            run = self.runs / name
+            run.mkdir()
+            (run / "sol-001.receipt.json").write_text(json.dumps(dict(lane="sol", **specs[name])), encoding="utf-8")
+        real_evaluate = check.evaluate
+        out = io.StringIO()
+        with mock.patch.object(check, "evaluate", lambda *a, **k: real_evaluate(*a, now=NOW, **k)), \
+                mock.patch("sys.stdout", out):
+            code = check.main(["--runs-dir", str(self.runs), "--json"])
+        return code, json.loads(out.getvalue())
+
+    def assert_no_data(self, names, specs):
+        code, result = self.run_main(names, specs)
+        entry = result["lanes"]["sol"]
+        self.assertEqual((entry["verdict"], result["verdict"], code), ("NO-DATA", "INCOMPLETE", 3), result)
+        self.assertIsNone(entry["judgedOn"])
+        self.assertEqual(result["inFlightLanes"], [])
+        return entry, result
+
+    def test_b1_an_older_live_and_a_newer_expired_modelled_running_receipt_read_no_data_in_both_orders(self):
+        for order in (("live", "dead"), ("dead", "live")):
+            with self.subTest(order=order):
+                self.setUp()
+                entry, _ = self.assert_no_data(order, {"live": self.LIVE, "dead": self.DEAD})
+                self.assertEqual((entry["inFlightRuns"], entry["deadRunning"]), (1, 1))
+                self.assertEqual(entry["provenModelRuns"], 0)
+                self.assertIsNone(entry["latestModel"])
+
+    def test_b1_an_expired_modelled_running_receipt_alone_reads_no_data(self):
+        entry, result = self.assert_no_data(("dead",), {"dead": self.DEAD})
+        self.assertEqual((entry["provenModelRuns"], entry["deadRunning"]), (0, 1))
+        self.assertIsNone(entry["latestModel"])
+        self.assertEqual(result["familyNewest"], {})
+
+    def test_b1_a_finished_run_then_a_newer_expired_modelled_running_receipt_reads_no_data(self):
+        for order in (("fin", "dead"), ("dead", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                entry, _ = self.assert_no_data(order, {"fin": self.FIN, "dead": self.DEAD})
+                # the finished run stays the only proven one; the expired receipt is not a model of its own
+                self.assertEqual((entry["provenModelRuns"], entry["latestModel"]), (1, "gpt-6.1-sol"))
+
+    def test_b1_the_complete_expired_and_live_case_still_reads_no_data(self):
+        live = dict(self.LIVE, startedUtc="2026-10-12T19:55:00Z")
+        self.assert_no_data(("fin", "dead", "live"), {"fin": self.FIN, "dead": self.DEAD, "live": live})
+
+    def test_b1_an_older_expired_receipt_then_a_newer_live_one_still_reads_no_data(self):
+        dead = dict(self.DEAD, startedUtc="2026-10-12T18:00:00Z")
+        for order in (("dead", "live"), ("live", "dead")):
+            with self.subTest(order=order):
+                self.setUp()
+                self.assert_no_data(order, {"dead": dead, "live": dict(self.LIVE, startedUtc="2026-10-12T19:30:00Z")})
+
+    def test_b1_an_expired_receipt_naming_a_newer_id_raises_no_family_newest_and_hides_no_stale(self):
+        old = dict(self.FIN, resolvedModel="gpt-6-sol")
+        specs = {"a": dict(old, startedUtc="2026-10-12T17:00:00Z"), "b": dict(old, startedUtc="2026-10-12T18:00:00Z"),
+                 "dead": self.DEAD}
+        # the expired gpt-6.1-sol receipt is not evidence: the pair is current as far as finished runs know, and the
+        # lane is unproven because its newest receipt is the expired one
+        entry, result = self.assert_no_data(("a", "b", "dead"), specs)
+        self.assertEqual(result["familyNewest"], {"sol": "gpt-6-sol"})
+        self.assertEqual((entry["latestModel"], entry["familyNewest"]), ("gpt-6-sol", "gpt-6-sol"))
+        # a FINISHED newer id earlier in the window still makes the pair STALE; the expired receipt must not hide it
+        for order in (("n", "a", "b", "dead"), ("dead", "b", "a", "n")):
+            with self.subTest(order=order):
+                self.setUp()
+                newer = dict(self.FIN, startedUtc="2026-10-12T16:00:00Z")
+                code, result = self.run_main(order, dict(specs, n=newer))
+                entry = result["lanes"]["sol"]
+                self.assertEqual((entry["verdict"], result["verdict"], code), ("STALE", "STALE", 1), result)
+                self.assertEqual(entry["reasons"][0]["ranModels"], ["gpt-6-sol", "gpt-6-sol"])
+
+    def test_r6_a_stale_reason_outranks_the_expired_running_no_data_and_reads_stale_exit_1(self):
+        # The outbox sentence (doctrine-outbox/20261104-...): NO-DATA for an expired newest running receipt, "unless a
+        # STALE-MODEL or BAD-EFFORT reason outranks it: that reads STALE, exit 1". The model case is pinned above; this
+        # is the effort case: an expired running receipt alone, with effort low, is a BAD-EFFORT reason.
+        code, result = self.run_main(("dead",), {"dead": dict(self.DEAD, effort="low")})
+        entry = result["lanes"]["sol"]
+        self.assertEqual((entry["verdict"], result["verdict"], code), ("STALE", "STALE", 1), result)
+        self.assertEqual(entry["reasons"][0]["kind"], "BAD-EFFORT")
+
+    def test_b1_an_older_expired_receipt_with_no_effort_before_a_finished_run_stays_incomplete(self):
+        # unchanged by r5: the expired receipt is an unproven run that recorded no effort, so the lane cannot be
+        # CURRENT; it is INCOMPLETE (its newest run is the finished one, which is proven)
+        dead = dict(state="running", startedUtc="2026-10-12T18:00:00Z", timeoutSec=1)
+        for order in (("dead", "fin"), ("fin", "dead")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, {"dead": dead, "fin": self.FIN})
+                entry = result["lanes"]["sol"]
+                self.assertEqual((entry["verdict"], result["verdict"], code), ("INCOMPLETE", "INCOMPLETE", 3), result)
+                self.assertEqual(entry["unrecordedEffort"], 1)
+
+    def test_b1_a_live_receipt_over_a_finished_run_is_still_in_flight(self):
+        live = dict(self.LIVE, startedUtc="2026-10-12T19:30:00Z")
+        code, result = self.run_main(("fin", "live"), {"fin": self.FIN, "live": live})
+        entry = result["lanes"]["sol"]
+        self.assertEqual((entry["verdict"], result["verdict"], code), ("IN-FLIGHT", "CURRENT", 0), result)
+        self.assertEqual(entry["judgedOn"]["model"], "gpt-6.1-sol")
+
+
+class OneStampShapeTests(CurrencyFixture):
+    """r6 (PR 753, hub ruling 20261105T1245Z): the checker reads ONE startedUtc shape, the writer's
+    (LIVE_START_RE, matched against the RAW text: no strip, no comma normalization). Every other string is
+    unreadable and counted in `unreadableReceipts`; nothing is guessed from it, so no spelling can be mis-sorted.
+    Rows 3 and 4 read CURRENT on purpose: that is the r4 exception (docstring: a newest FAILED run whose startedUtc
+    is unreadable is dropped and counted), not an oversight. Clock: 2026-10-12T20:00:00Z, through main --json."""
+
+    run_main = RunningIsNeverEvidenceTests.run_main
+
+    def complete(self, stamp):
+        return dict(state="complete", startedUtc=stamp, resolvedModel="gpt-6.1-sol", effort="high")
+
+    def failed(self, stamp):
+        return dict(state="failed", startedUtc=stamp, resolvedModel=None, effort="high")
+
+    RUNNING = dict(state="running", startedUtc="2026-10-12T19:59:30Z", timeoutSec=3600)
+
+    def test_row1_a_dot_after_the_date_is_unreadable_so_the_newer_failure_is_never_hidden(self):
+        # sol A1 / opus: '2026-10-12.1959001Z' used to read as 19:59:00 plus an invented '1' ns digit and sort AFTER the
+        # failure at 19:59:00.00000005. Now the complete run is unreadable (dropped, counted); the failure is the lane.
+        specs = {"fin": self.complete("2026-10-12.1959001Z"), "bad": self.failed("2026-10-12T19:59:00.00000005Z")}
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertEqual(result["unreadableReceipts"], 1)
+
+    def test_row2_adding_a_live_receipt_never_turns_row1_into_in_flight_over_current(self):
+        # What it reads: the lane's readable runs are the failed one and the live one. There is no proven finished run
+        # (the complete run is unreadable), so IN-FLIGHT has no foundation: NO-DATA, overall INCOMPLETE, exit 3.
+        specs = {"fin": self.complete("2026-10-12.1959001Z"), "bad": self.failed("2026-10-12T19:59:00.00000005Z"),
+                 "live": self.RUNNING}
+        for order in (("fin", "bad", "live"), ("live", "bad", "fin"), ("bad", "live", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                entry = result["lanes"]["sol"]
+                self.assertEqual((entry["verdict"], result["verdict"], code), ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertEqual(result["inFlightLanes"], [])
+                self.assertEqual(result["unreadableReceipts"], 1)
+
+    def test_row3_a_newest_failed_run_in_a_foreign_spelling_is_dropped_and_counted_the_r4_exception(self):
+        # DELIBERATELY not NO-DATA (sol's stated reading): the r4 exception. The failed stamp is unreadable, so the
+        # run is dropped and counted in unreadableReceipts, and the lane is judged on the complete run: CURRENT, exit 0.
+        for failed_stamp in ("20261012T1959001234569Z", "2026-10-12T1959001234569Z", "2026-W42-1T1959001234569Z"):
+            for order in (("fin", "bad"), ("bad", "fin")):
+                with self.subTest(failed=failed_stamp, order=order):
+                    self.setUp()
+                    code, result = self.run_main(order, {"fin": self.complete("2026-10-12T19:59:00.1234561Z"),
+                                                         "bad": self.failed(failed_stamp)})
+                    self.assertEqual(result["unreadableReceipts"], 1)
+                    self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                     ("CURRENT", "CURRENT", 0), result)
+                    self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 1)
+
+    def test_r7_b1_offset_minutes_above_59_are_unreadable_and_counted_never_a_time(self):
+        # opus r6 blocker 1. Clock 2026-10-12T20:00:00Z; every receipt is lane sol, gpt-6.1-sol, effort high.
+        # (a) complete 19:00:00Z + failed null '19:59:00+00:99'. On c58ad03d the failed stamp read as 18:20Z, sorted
+        # OLDER than the complete run and nothing was counted. Now it is unreadable (unreadableReceipts 1) and the r4
+        # exception gives its verdict: the failed run is dropped, the lane is judged on the complete run, CURRENT, exit 0.
+        specs = {"fin": self.complete("2026-10-12T19:00:00Z"), "bad": self.failed("2026-10-12T19:59:00+00:99")}
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(row="failed +00:99", order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual(result["unreadableReceipts"], 1)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("CURRENT", "CURRENT", 0), result)    # the r4 exception, named: failed run dropped
+                self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 1)
+        # (b) failed null 19:30:00Z + complete '19:00:00-00:99'. On c58ad03d the complete run read as 20:39Z, sorted
+        # NEWEST and the lane read CURRENT from it. Now the complete run is unreadable (counted) and the lane is the
+        # failed run alone: NO-DATA, overall INCOMPLETE, exit 3 -- never CURRENT from that complete run.
+        specs = {"fin": self.complete("2026-10-12T19:00:00-00:99"), "bad": self.failed("2026-10-12T19:30:00Z")}
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(row="complete -00:99", order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual(result["unreadableReceipts"], 1)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertIsNone(result["lanes"]["sol"]["judgedOn"])
+        # (c) CONTROL (must pass on both heads): a valid offset stays readable and sorts by its instant. 19:30+01:00 is
+        # 18:30Z, OLDER than the complete run at 19:00Z, so the lane is judged on the 19:00Z run.
+        specs = {"fin": self.complete("2026-10-12T19:00:00Z"), "off": self.complete("2026-10-12T19:30:00+01:00")}
+        for order in (("fin", "off"), ("off", "fin")):
+            with self.subTest(row="valid +01:00 control", order=order):
+                self.setUp()
+                code, result = self.run_main(order, specs)
+                self.assertEqual(result["unreadableReceipts"], 0)
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("CURRENT", "CURRENT", 0), result)
+                self.assertEqual(result["lanes"]["sol"]["runsInWindow"], 2)
+                self.assertEqual(result["lanes"]["sol"]["judgedOn"]["startedUtc"], "2026-10-12T19:00:00+00:00")
+        self.assertEqual(check.parse_utc("2026-10-12T19:30:00+01:00"),
+                         datetime.datetime(2026, 10, 12, 18, 30, tzinfo=datetime.timezone.utc))
+
+    def test_r7_b3_the_exception_covers_a_receipt_of_any_state_and_can_hide_a_violation_the_ruled_behaviour(self):
+        # opus r6 blocker 3. The r4 exception is not limited to a newest FAILED run: a receipt of ANY state whose
+        # startedUtc is outside the one shape is dropped and counted, so it can hide a VIOLATION, not only a gap. The
+        # hub ruled this trade (r6, 20261105T1245Z); these pin it so the words (outbox, docstring) cannot drift from it.
+        # F = complete gpt-6.1-sol/high at 19:00Z is the current run beside each foreign-stamped receipt.
+        fin = self.complete("2026-10-12T19:00:00Z")
+        cases = {
+            # a BAD-EFFORT run, hidden: the base read STALE, exit 1
+            "complete effort low, basic-format stamp": dict(state="complete", startedUtc="20261012T195900Z",
+                                                            resolvedModel="gpt-6.1-sol", effort="low"),
+            # a run that recorded no effort, hidden: the base read INCOMPLETE, exit 3
+            "complete no effort, comma stamp": dict(state="complete", startedUtc="2026-10-12T19:30:00,5Z",
+                                                    resolvedModel="gpt-6.1-sol"),
+            # an expired running receipt, hidden: the base read NO-DATA, exit 3
+            "expired running, comma stamp": dict(state="running", startedUtc="2026-10-12T19:50:00,0Z", timeoutSec=1),
+            # the offset-minutes shape of the same class
+            "complete effort low, +00:99 stamp": dict(state="complete", startedUtc="2026-10-12T19:59:00+00:99",
+                                                      resolvedModel="gpt-6.1-sol", effort="low"),
+        }
+        for label, foreign in cases.items():
+            for order in (("fin", "foreign"), ("foreign", "fin")):
+                with self.subTest(case=label, order=order):
+                    self.setUp()
+                    code, result = self.run_main(order, {"fin": fin, "foreign": foreign})
+                    entry = result["lanes"]["sol"]
+                    self.assertEqual((entry["verdict"], result["verdict"], code), ("CURRENT", "CURRENT", 0), result)
+                    self.assertEqual(result["unreadableReceipts"], 1)
+                    self.assertEqual(entry["reasons"], [])           # BAD-EFFORT is hidden, by the ruled trade
+                    self.assertEqual(entry["runsInWindow"], 1)
+
+    def test_row5_two_receipts_in_the_writers_shape_keep_every_digit_of_their_order(self):
+        # 9-digit fractions 800 ns apart: the failed run is newer, so the newest run failed: never CURRENT.
+        older, newer = "2026-10-12T19:59:00.123456100Z", "2026-10-12T19:59:00.123456900Z"
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(order=order):
+                self.setUp()
+                code, result = self.run_main(order, {"fin": self.complete(older), "bad": self.failed(newer)})
+                self.assertEqual((result["lanes"]["sol"]["verdict"], result["verdict"], code),
+                                 ("NO-DATA", "INCOMPLETE", 3), result)
+                self.assertEqual(result["unreadableReceipts"], 0)
+        # and the reverse: the complete run is the newer one, so the lane is CURRENT
+        for order in (("fin", "bad"), ("bad", "fin")):
+            with self.subTest(reverse=True, order=order):
+                self.setUp()
+                code, result = self.run_main(order, {"fin": self.complete(newer), "bad": self.failed(older)})
+                self.assertEqual((result["lanes"]["sol"]["verdict"], code), ("CURRENT", 0), result)
+
+    def test_only_the_writers_shape_is_readable_and_the_text_is_never_cleaned_first(self):
+        for text in ("2026-10-12T19:59:00Z", "2026-10-12T19:59:00.0000000Z", "2026-10-12T19:59:00.1Z",
+                     "2026-10-12T19:59:00.123456789Z", "2026-10-12T19:59:00+00:00", "2026-10-12T14:59:00-05:00"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(check.parse_utc(text))
+        for text in ("2026-10-12.1959001Z", "20261012T195900Z", "2026-10-12T1959001234569Z",
+                     "2026-W42-1T19:59:00Z", "2026-285T19:59:00Z", "2026-10-12", "2026-10-12+19:59",
+                     "2026-10-12T19:59:00,5Z",                        # comma: no normalization any more
+                     "  2026-10-12T19:59:00Z", "2026-10-12T19:59:00Z\n", "2026-10-12T19:59:00Z ",   # no strip
+                     "2026-10-12 19:59:00Z", "2026-10-12\n19:59:00Z", "2026-10-12t19:59:00Z", "2026-10-12T19:59:00z",
+                     "2026-10-12T19:59:00", "2026-10-12T19:59:00+0100", "2026-10-12T19:59:00+01",
+                     "2026-10-12T19:59:00.0000000000Z", "2026-10-12T19:59:00.Z",
+                     "2026-13-12T19:59:00Z", "2026-10-12T24:00:00Z",
+                     "٢٠٢٦-10-12T19:59:00Z",       # Arabic-Indic digits
+                     None, 12, b"2026-10-12T19:59:00Z"):
+            with self.subTest(text=text):
+                self.assertIsNone(check.parse_utc(text))
+                self.assertEqual(check.sub_microsecond_digits(text), "")
+
+    def test_the_sub_microsecond_digits_of_the_one_shape(self):
+        for text, expected in (("2026-10-12T19:59:00.1234567Z", "7"), ("2026-10-12T19:59:00.1234560Z", ""),
+                               ("2026-10-12T19:59:00.123456789Z", "789"), ("2026-10-12T19:59:00.123456Z", ""),
+                               ("2026-10-12T19:59:00.12345Z", ""), ("2026-10-12T19:59:00Z", ""),
+                               ("2026-10-12T19:59:00.1234569+01:00", "9"), ("2026-10-12T19:59:00.123456900-05:30", "9")):
+            with self.subTest(text=text):
+                self.assertEqual(check.sub_microsecond_digits(text), expected)
+
+    def test_the_spelling_helpers_and_the_duplicate_live_flag_are_gone(self):
+        for name in ("normalize_fraction", "split_designator", "DESIGNATOR_RE", "SECONDS_FRACTION_RE"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(check, name))
+        self.assertTrue(hasattr(check, "LIVE_START_RE"))
+        run = self.runs / "x"
+        run.mkdir()
+        (run / "sol-001.receipt.json").write_text(json.dumps(dict(lane="sol", **self.complete("2026-10-12T19:59:00Z"))),
+                                                  encoding="utf-8")
+        receipts, _ = check.load_receipts(str(self.runs))
+        self.assertNotIn("strictStart", receipts[0])
 
 
 class WindowTests(CurrencyFixture):
